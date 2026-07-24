@@ -24,7 +24,7 @@ pub struct OwnedPty {
     master: std::sync::Arc<std::sync::Mutex<Option<OwnedFd>>>,
     /// Terminal input is written by a dedicated worker. A full PTY kernel buffer
     /// therefore backpressures that worker rather than GTK's main thread.
-    input_tx: mpsc::Sender<Vec<u8>>,
+    input_tx: std::sync::Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     pid: Pid,
     /// Tracks explicit bracketed-paste frames whose start, body, and end are
     /// delivered through separate `write_bytes` calls.
@@ -420,7 +420,7 @@ impl OwnedPty {
                 };
                 Ok(OwnedPty {
                     master: std::sync::Arc::new(std::sync::Mutex::new(Some(master))),
-                    input_tx,
+                    input_tx: std::sync::Mutex::new(Some(input_tx)),
                     pid: child,
                     outgoing_bracketed_paste: AtomicBool::new(false),
                     shell_bracketed_paste: Arc::new(AtomicBool::new(false)),
@@ -457,7 +457,19 @@ impl OwnedPty {
         if safe_data.is_empty() {
             return;
         }
-        if let Err(error) = self.input_tx.send(safe_data.into_owned()) {
+        let input_tx = self
+            .input_tx
+            .lock()
+            .ok()
+            .and_then(|sender| sender.as_ref().cloned());
+        let Some(input_tx) = input_tx else {
+            log::warn!(
+                "PTY input queue is closed; discarded {} byte(s)",
+                safe_data.len()
+            );
+            return;
+        };
+        if let Err(error) = input_tx.send(safe_data.into_owned()) {
             log::warn!(
                 "PTY input queue is closed; discarded {} byte(s)",
                 error.0.len()
@@ -483,7 +495,14 @@ impl OwnedPty {
 
     pub fn kill(&self) {
         self.close_master_fd();
+        self.close_input_writer();
         terminate_terminal_process(self.pid.as_raw());
+    }
+
+    fn close_input_writer(&self) {
+        if let Ok(mut sender) = self.input_tx.lock() {
+            sender.take();
+        }
     }
 
     /// Start an async reader. A bounded channel transfers 32 KiB chunks to the
@@ -623,9 +642,11 @@ fn spawn_reader_thread(
     tx: mpsc::SyncSender<PtyMsg>,
     thread_name: &'static str,
     shell_bracketed_paste: Arc<AtomicBool>,
-    notify: impl Fn() + Send + 'static,
+    notify: impl Fn() + Send + Clone + 'static,
 ) {
-    std::thread::Builder::new()
+    let failure_tx = tx.clone();
+    let failure_notify = notify.clone();
+    if let Err(error) = std::thread::Builder::new()
         .name(thread_name.to_string())
         .spawn(move || {
             let mut file = std::fs::File::from(reader_fd);
@@ -660,7 +681,13 @@ fn spawn_reader_thread(
                 notify();
             }
         })
-        .expect("failed to spawn PTY reader thread");
+    {
+        log::error!("failed to spawn PTY reader thread '{thread_name}': {error}");
+        terminate_terminal_process(child_pid.as_raw());
+        if failure_tx.try_send(PtyMsg::Exit(1)).is_ok() {
+            failure_notify();
+        }
+    }
 }
 
 fn wait_for_child_exit(child_pid: Pid) -> i32 {
@@ -736,6 +763,7 @@ fn signal_eventfd(efd: RawFd) {
 impl Drop for OwnedPty {
     fn drop(&mut self) {
         self.close_master_fd();
+        self.close_input_writer();
         terminate_terminal_process(self.pid.as_raw());
     }
 }
@@ -805,6 +833,11 @@ mod tests {
                 .any(|window| window == b"jterm4-test|/tmp"),
             "unexpected PTY output: {:?}",
             String::from_utf8_lossy(&output)
+        );
+        pty.kill();
+        assert!(
+            pty.input_tx.lock().expect("input sender").is_none(),
+            "kill must disconnect the dedicated input writer"
         );
     }
 

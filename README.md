@@ -15,7 +15,7 @@ jterm4 是一个面向开发工作流的原生 GTK4 终端。它默认使用 Blo
 - 配置热重载、可覆盖快捷键、8 套内置主题
 - CJK 输入法和 Unicode 安全的搜索/通知显示
 
-从 Block pane 发起分屏时会保留当前 Block，并创建一个传统 VTE sibling；VTE pane 可继续嵌套分屏。每个可见 pane 都独立拥有并清理其进程，关闭 pane、标签或窗口前会统一检查前台任务。
+分屏会继承当前 pane 的后端：Block 创建 Block sibling，VTE 创建 VTE sibling，并可继续嵌套。每个可见 pane 都独立拥有并清理其进程，关闭 pane、标签或窗口前会统一检查前台任务。
 
 ## 构建与运行
 
@@ -138,6 +138,7 @@ jterm4 --config-path
 jterm4 --restore-config-backup
 jterm4 --print-default-config
 jterm4 --shell-integration bash
+jterm4 --generate-completion zsh
 jterm4-support-bundle ~/Desktop
 ```
 
@@ -153,6 +154,22 @@ RUST_LOG='warn,jterm4=debug,jterm4::state=trace' jterm4
 ```
 
 `JTERM4_LOG` 优先于 `RUST_LOG`；未知指令会被忽略，默认级别保持 `warn`。
+
+CLI 补全可按需加载，支持 bash、zsh、fish 和 PowerShell，不需要额外运行时依赖：
+
+```bash
+# bash
+source <(jterm4 --generate-completion bash)
+
+# zsh
+source <(jterm4 --generate-completion zsh)
+
+# fish
+jterm4 --generate-completion fish | source
+
+# PowerShell
+jterm4 --generate-completion pwsh | Out-String | Invoke-Expression
+```
 
 Block 模式可通过 `finished_block_viewport_rows` 调整长块出现顶部/底部导航控件的行数阈值；`block_compact = true` 可启用更接近 jterm1/Warp 的紧凑块间距。两项配置均保持 GTK4 原生实现，不增加运行时依赖。
 

@@ -153,9 +153,11 @@ impl UiState {
         self.setup_context_menu(&terminal);
 
         let ui_for_exit = UiState::clone(self);
-        let terminal_for_exit = terminal.clone();
+        let root_for_exit = view.widget().downgrade();
         view.connect_exited(move |_| {
-            ui_for_exit.handle_terminal_exited(&terminal_for_exit.clone().upcast::<gtk4::Widget>());
+            if let Some(root) = root_for_exit.upgrade() {
+                ui_for_exit.handle_terminal_exited(&root);
+            }
         });
 
         let leaf = PaneLeaf::Vte(view);
@@ -165,20 +167,23 @@ impl UiState {
         leaf.set_remote(false);
         if tab_widget_name.is_some() {
             let ui_for_bell = self.clone();
-            let leaf_for_bell = leaf.clone();
+            let root_for_bell = root.downgrade();
             if let PaneLeaf::Vte(view) = &leaf {
                 view.connect_bell(move || {
                     log::debug!("Bell signal received (split)");
-                    ui_for_bell.mark_tab_bell(&leaf_for_bell.root_widget().widget_name());
+                    if let Some(root) = root_for_bell.upgrade() {
+                        ui_for_bell.mark_tab_bell(&root.widget_name());
+                    }
                 });
             }
 
             let ui_for_activity = self.clone();
-            let leaf_for_activity = leaf.clone();
+            let root_for_activity = root.downgrade();
             if let PaneLeaf::Vte(view) = &leaf {
                 view.connect_activity(move || {
-                    ui_for_activity
-                        .mark_tab_activity(&leaf_for_activity.root_widget().widget_name());
+                    if let Some(root) = root_for_activity.upgrade() {
+                        ui_for_activity.mark_tab_activity(&root.widget_name());
+                    }
                 });
             }
         }
@@ -214,11 +219,17 @@ impl UiState {
         self.setup_context_menu(&terminal);
 
         let ui_for_exit = UiState::clone(self);
-        let view_for_exit = view.clone();
-        let root_for_exit = view.widget();
+        let view_for_exit = Rc::downgrade(&view);
+        let root_for_exit = view.widget().downgrade();
         view.connect_exited(move |_| {
-            let _ = view_for_exit.save_history();
-            ui_for_exit.handle_terminal_exited(&root_for_exit);
+            let Some(view) = view_for_exit.upgrade() else {
+                return;
+            };
+            let Some(root) = root_for_exit.upgrade() else {
+                return;
+            };
+            let _ = view.save_history();
+            ui_for_exit.handle_terminal_exited(&root);
         });
 
         self.connect_block_command_history(&view);
@@ -231,17 +242,20 @@ impl UiState {
         if tab_widget_name.is_some() {
             if let PaneLeaf::Block(view) = &leaf {
                 let ui_for_bell = self.clone();
-                let leaf_for_bell = leaf.clone();
+                let root_for_bell = root.downgrade();
                 view.connect_bell(move || {
                     log::debug!("Bell signal received (split)");
-                    ui_for_bell.mark_tab_bell(&leaf_for_bell.root_widget().widget_name());
+                    if let Some(root) = root_for_bell.upgrade() {
+                        ui_for_bell.mark_tab_bell(&root.widget_name());
+                    }
                 });
 
                 let ui_for_activity = self.clone();
-                let leaf_for_activity = leaf.clone();
+                let root_for_activity = root.downgrade();
                 view.connect_activity(move || {
-                    ui_for_activity
-                        .mark_tab_activity(&leaf_for_activity.root_widget().widget_name());
+                    if let Some(root) = root_for_activity.upgrade() {
+                        ui_for_activity.mark_tab_activity(&root.widget_name());
+                    }
                 });
             }
         }

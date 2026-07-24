@@ -54,6 +54,7 @@ enum EarlyCommand {
     InitConfig,
     PrintDefaultConfig,
     PrintShellIntegration(ShellIntegration),
+    PrintCompletion(ShellIntegration),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -93,6 +94,8 @@ Utilities:
       --init-config           Create a documented config without overwriting one
       --print-default-config  Print the bundled example configuration
       --shell-integration SH  Print integration for bash, zsh, fish, or pwsh
+      --generate-completion SH
+                              Print CLI completion for bash, zsh, fish, or pwsh
   -h, --help                  Print help
   -V, --version               Print version
 
@@ -102,6 +105,7 @@ Examples:
   jterm4 --safe-mode
   jterm4 -d /tmp -e bash -lc 'printf "hello\\n"'
   source <(jterm4 --shell-integration bash)
+  source <(jterm4 --generate-completion bash)
 
 Environment overrides include JTERM4_CONFIG, JTERM4_MODE, JTERM4_THEME,
 JTERM4_FONT, JTERM4_OPACITY, and JTERM4_LOG.
@@ -200,6 +204,18 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs, St
                     EarlyCommand::PrintShellIntegration(parse_shell(shell)?),
                 )?;
             }
+            "--generate-completion" | "--completion" => {
+                index += 1;
+                let shell = args
+                    .get(index)
+                    .ok_or_else(|| format!("{arg} requires a shell"))?
+                    .to_str()
+                    .ok_or_else(|| "shell name must be valid UTF-8".to_string())?;
+                set_command(
+                    &mut parsed,
+                    EarlyCommand::PrintCompletion(parse_shell(shell)?),
+                )?;
+            }
             "--no-restore" => parsed.launch.no_restore = true,
             "--safe-mode" => {
                 parsed.launch.safe_mode = true;
@@ -254,6 +270,20 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs, St
                 set_command(
                     &mut parsed,
                     EarlyCommand::PrintShellIntegration(parse_shell(value)?),
+                )?;
+            }
+            _ if arg.starts_with("--generate-completion=") => {
+                let value = arg.trim_start_matches("--generate-completion=");
+                set_command(
+                    &mut parsed,
+                    EarlyCommand::PrintCompletion(parse_shell(value)?),
+                )?;
+            }
+            _ if arg.starts_with("--completion=") => {
+                let value = arg.trim_start_matches("--completion=");
+                set_command(
+                    &mut parsed,
+                    EarlyCommand::PrintCompletion(parse_shell(value)?),
                 )?;
             }
             _ if arg.starts_with("--mode=") => {
@@ -955,6 +985,16 @@ fn print_shell_integration(shell: ShellIntegration) {
     print!("{script}");
 }
 
+fn print_completion(shell: ShellIntegration) {
+    let script = match shell {
+        ShellIntegration::Bash => include_str!("../scripts/completions/jterm4.bash"),
+        ShellIntegration::Zsh => include_str!("../scripts/completions/_jterm4"),
+        ShellIntegration::Fish => include_str!("../scripts/completions/jterm4.fish"),
+        ShellIntegration::PowerShell => include_str!("../scripts/completions/jterm4.ps1"),
+    };
+    print!("{script}");
+}
+
 fn validate_launch_options(options: &LaunchOptions) -> Result<(), String> {
     if let Some(directory) = &options.working_directory {
         if !directory.is_dir() {
@@ -1049,6 +1089,10 @@ pub(crate) fn handle_early_args() -> Option<glib::ExitCode> {
         },
         EarlyCommand::PrintShellIntegration(shell) => {
             print_shell_integration(shell);
+            true
+        }
+        EarlyCommand::PrintCompletion(shell) => {
+            print_completion(shell);
             true
         }
         EarlyCommand::RestoreConfigBackup => match crate::config_store::restore_backup() {
@@ -1168,6 +1212,37 @@ mod tests {
             parse(&["--config-path"]).unwrap().command,
             Some(EarlyCommand::ConfigPath)
         );
+        assert_eq!(
+            parse(&["--generate-completion=fish"]).unwrap().command,
+            Some(EarlyCommand::PrintCompletion(ShellIntegration::Fish))
+        );
+        assert_eq!(
+            parse(&["--completion", "powershell"]).unwrap().command,
+            Some(EarlyCommand::PrintCompletion(ShellIntegration::PowerShell))
+        );
+    }
+
+    #[test]
+    fn bundled_completions_cover_every_shell_and_core_option() {
+        for (shell, registration) in [
+            (ShellIntegration::Bash, "complete -o"),
+            (ShellIntegration::Zsh, "#compdef jterm4"),
+            (ShellIntegration::Fish, "complete -c jterm4"),
+            (ShellIntegration::PowerShell, "Register-ArgumentCompleter"),
+        ] {
+            let script = match shell {
+                ShellIntegration::Bash => include_str!("../scripts/completions/jterm4.bash"),
+                ShellIntegration::Zsh => include_str!("../scripts/completions/_jterm4"),
+                ShellIntegration::Fish => include_str!("../scripts/completions/jterm4.fish"),
+                ShellIntegration::PowerShell => {
+                    include_str!("../scripts/completions/jterm4.ps1")
+                }
+            };
+            assert!(script.contains(registration));
+            assert!(script.contains("doctor"));
+            assert!(script.contains("generate-completion"));
+            assert!(script.ends_with('\n'));
+        }
     }
 
     #[test]

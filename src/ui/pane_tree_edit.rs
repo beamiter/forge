@@ -26,6 +26,13 @@ pub(crate) fn detach_leaf_and_promote(notebook: &Notebook, leaf_root: &Widget) -
         return None;
     };
 
+    // Clear root focus while both children still belong to GtkPaned. If a
+    // focused child is unparented first, GtkPaned can retain a stale private
+    // last-focus pointer and warn while the sibling is detached for promotion.
+    if let Some(root) = parent.root() {
+        root.set_focus(None::<&Widget>);
+    }
+
     parent.set_start_child(None::<&Widget>);
     parent.set_end_child(None::<&Widget>);
 

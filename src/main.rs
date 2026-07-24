@@ -381,27 +381,41 @@ pub fn run() -> glib::ExitCode {
         // Top bar: [☰ toggle] [spacer] [+ new tab] [✕ close window]
         let toggle_sidebar_btn = gtk4::Button::from_icon_name("open-menu-symbolic");
         toggle_sidebar_btn.set_focus_on_click(false);
-        toggle_sidebar_btn.set_can_focus(false);
+        toggle_sidebar_btn.set_focusable(true);
         toggle_sidebar_btn.set_tooltip_text(Some("Toggle sidebar (Ctrl+\\)"));
+        toggle_sidebar_btn.update_property(&[
+            gtk4::accessible::Property::Label("Show or hide sidebar"),
+            gtk4::accessible::Property::KeyShortcuts("Control+\\"),
+        ]);
         toggle_sidebar_btn.add_css_class("flat");
 
         let add_tab_button = gtk4::Button::from_icon_name("list-add-symbolic");
         add_tab_button.set_focus_on_click(false);
-        add_tab_button.set_can_focus(false);
+        add_tab_button.set_focusable(true);
         add_tab_button.set_tooltip_text(Some("New tab (Ctrl+Shift+T)"));
+        add_tab_button.update_property(&[
+            gtk4::accessible::Property::Label("New terminal tab"),
+            gtk4::accessible::Property::KeyShortcuts("Control+Shift+T"),
+        ]);
         add_tab_button.add_css_class("flat");
 
         let close_window_button = gtk4::Button::from_icon_name("window-close-symbolic");
         close_window_button.set_focus_on_click(false);
-        close_window_button.set_can_focus(false);
+        close_window_button.set_focusable(true);
         close_window_button.set_tooltip_text(Some("Close window"));
+        close_window_button
+            .update_property(&[gtk4::accessible::Property::Label("Close window")]);
         close_window_button.add_css_class("flat");
 
         // Toggles the tab bar between the left sidebar and the top bar.
         let toggle_placement_btn = gtk4::Button::from_icon_name("view-list-symbolic");
         toggle_placement_btn.set_focus_on_click(false);
-        toggle_placement_btn.set_can_focus(false);
+        toggle_placement_btn.set_focusable(true);
         toggle_placement_btn.set_tooltip_text(Some("Toggle tabs: sidebar / top bar"));
+        toggle_placement_btn.update_property(&[
+            gtk4::accessible::Property::Label("Move tabs between sidebar and top bar"),
+            gtk4::accessible::Property::KeyShortcuts("Control+Alt+B"),
+        ]);
         toggle_placement_btn.add_css_class("flat");
 
         // The tab filter moves here when tabs are placed horizontally.
@@ -431,8 +445,12 @@ pub fn run() -> glib::ExitCode {
         // follows the lifetime of the approval-gated Shell Agent session.
         let agent_toggle = gtk4::ToggleButton::with_label("Agent");
         agent_toggle.set_focus_on_click(false);
-        agent_toggle.set_can_focus(false);
+        agent_toggle.set_focusable(true);
         agent_toggle.set_tooltip_text(Some("Activate Shell Agent (Ctrl+Alt+G)"));
+        agent_toggle.update_property(&[
+            gtk4::accessible::Property::Label("Shell Agent"),
+            gtk4::accessible::Property::KeyShortcuts("Control+Alt+G"),
+        ]);
         agent_toggle.add_css_class("flat");
         top_bar.append(&agent_toggle);
         top_bar.append(&add_tab_button);
@@ -505,14 +523,19 @@ pub fn run() -> glib::ExitCode {
 
         let file_tree_cwd_btn = gtk4::Button::from_icon_name("go-home-symbolic");
         file_tree_cwd_btn.set_focus_on_click(false);
-        file_tree_cwd_btn.set_can_focus(false);
+        file_tree_cwd_btn.set_focusable(true);
         file_tree_cwd_btn.set_tooltip_text(Some("Jump to current tab directory"));
+        file_tree_cwd_btn.update_property(&[gtk4::accessible::Property::Label(
+            "Show current terminal directory",
+        )]);
         file_tree_cwd_btn.add_css_class("flat");
 
         let file_tree_up_btn = gtk4::Button::from_icon_name("go-up-symbolic");
         file_tree_up_btn.set_focus_on_click(false);
-        file_tree_up_btn.set_can_focus(false);
+        file_tree_up_btn.set_focusable(true);
         file_tree_up_btn.set_tooltip_text(Some("Go to parent directory"));
+        file_tree_up_btn
+            .update_property(&[gtk4::accessible::Property::Label("Go to parent directory")]);
         file_tree_up_btn.add_css_class("flat");
 
         let file_tree_header = gtk4::Box::new(Orientation::Horizontal, 2);
@@ -530,13 +553,19 @@ pub fn run() -> glib::ExitCode {
         // Segmented switcher at the top of the sidebar: Tabs | Files.
         let sidebar_tabs_btn = gtk4::ToggleButton::with_label("Tabs");
         sidebar_tabs_btn.set_focus_on_click(false);
-        sidebar_tabs_btn.set_can_focus(false);
+        sidebar_tabs_btn.set_focusable(true);
         sidebar_tabs_btn.set_hexpand(true);
         sidebar_tabs_btn.set_active(true);
+        sidebar_tabs_btn.set_tooltip_text(Some("Show terminal tabs"));
+        sidebar_tabs_btn
+            .update_property(&[gtk4::accessible::Property::Label("Show terminal tabs")]);
         let sidebar_files_btn = gtk4::ToggleButton::with_label("Files");
         sidebar_files_btn.set_focus_on_click(false);
-        sidebar_files_btn.set_can_focus(false);
+        sidebar_files_btn.set_focusable(true);
         sidebar_files_btn.set_hexpand(true);
+        sidebar_files_btn.set_tooltip_text(Some("Browse files from the current directory"));
+        sidebar_files_btn
+            .update_property(&[gtk4::accessible::Property::Label("Show file browser")]);
         let sidebar_switcher = gtk4::Box::new(Orientation::Horizontal, 0);
         sidebar_switcher.add_css_class("linked");
         sidebar_switcher.add_css_class("sidebar-switcher");

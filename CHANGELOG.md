@@ -6,6 +6,8 @@ All notable user-visible and operational changes are recorded here.
 
 ### Added
 
+- Bash、zsh、fish 与 PowerShell 的内置 CLI 补全生成（`--generate-completion`）。
+- 顶栏、标签栏与文件导航的完整键盘焦点链、语义化无障碍标签，以及 Enter/Space 标签激活。
 - Project licensing under `MIT OR Apache-2.0`, including canonical license texts, Cargo/AppStream metadata, inbound-contribution terms, and license files in release artifacts.
 - Reproducible GNOME 50 Flatpak packaging, stable desktop application ID, AppStream metadata, scalable/raster icons, checksummed CI bundles, and X11/Wayland VTE/Block smoke tests.
 - A Flatpak host-command bridge so shells, SSH, Git probes, AI curl requests, and desktop notifications operate on the host instead of the application sandbox.
@@ -29,11 +31,16 @@ All notable user-visible and operational changes are recorded here.
 
 ### Changed
 
+- Block 前台与后台输出改用固定上限环缓冲，持续大输出不再为每个 PTY chunk 搬移整个 8 MiB 尾缓冲。
+- 关闭 pane/tab 会同步关闭 Block PTY 输入 worker、释放 GTK root controller，并让 live VTE、完成块、右键菜单、滚动/筛选/选择控制器以弱引用跨越 widget 边界；批量关闭标签或嵌套分屏后读写线程可回落到基线。
+- 嵌套分屏折叠会在 `GtkPaned` 子节点仍有效时清空根焦点，再聚焦保留的 sibling，消除关闭聚焦分屏时的 GTK 运行时警告。
+- `remote_hosts` 配置现在完整校验嵌套字段、未知键、类型、空值和控制字符。
+- Block 样式不再注入未使用且 GTK 无法解析的组合关键帧规则，消除每次新建 Block pane 的 CSS 警告。
 - Default shortcuts now share the jterm ergonomic layout: directional Pane
   focus/resize layers, browser-style tab digits, symmetric zoom/opacity keys,
   and shell-owned `Ctrl+P` passthrough.
 - Session snapshots and Block history now use owner-only Unix permissions and durable atomic replacement.
-- Block is now the default terminal backend. Starting a split from Block preserves the Block leaf and creates a managed VTE sibling instead of rejecting the action.
+- Block is now the default terminal backend. New splits inherit the focused pane's backend, so Block and VTE layouts both remain structurally consistent.
 - Repeated same-axis splits rebalance by pane-tree span, keeping three or more panes evenly sized instead of recursively squeezing newer siblings.
 - Directional pane focus now recognizes the complete focused Block/VTE subtree and retains the last active leaf across transient container focus, so all four focus shortcuts work from finished blocks and other pane descendants.
 - Runtime configuration updates propagate to Block leaves nested in pane trees.

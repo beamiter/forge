@@ -1,8 +1,9 @@
 //! tabs — UiState methods extracted from ui (mechanical split, no logic changes)
 use adw::prelude::*;
 use gtk4::gdk::ffi::GDK_BUTTON_PRIMARY;
+use gtk4::gdk::{Key, ModifierType};
 use gtk4::{glib, Label};
-use gtk4::{GestureClick, ToggleButton};
+use gtk4::{EventControllerKey, GestureClick, ToggleButton};
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -57,7 +58,65 @@ fn custom_tab_title(notebook: &gtk4::Notebook, page: &gtk4::Widget) -> Option<St
         .flatten()
 }
 
+fn is_plain_tab_activation_key(keyval: Key, modifiers: ModifierType) -> bool {
+    let command_modifiers = ModifierType::CONTROL_MASK
+        | ModifierType::SHIFT_MASK
+        | ModifierType::ALT_MASK
+        | ModifierType::SUPER_MASK
+        | ModifierType::HYPER_MASK
+        | ModifierType::META_MASK;
+    !modifiers.intersects(command_modifiers)
+        && matches!(keyval, Key::Return | Key::KP_Enter | Key::space)
+}
+
 impl UiState {
+    fn activate_tab_named(&self, name: &str) {
+        self.clear_tab_selection();
+        for index in 0..self.notebook.n_pages() {
+            if self
+                .notebook
+                .nth_page(Some(index))
+                .is_some_and(|page| page.widget_name().as_str() == name)
+            {
+                self.notebook.set_current_page(Some(index));
+                self.sync_tab_strip_active(Some(index));
+                break;
+            }
+        }
+    }
+
+    fn make_tab_strip_button_keyboard_accessible(
+        &self,
+        button: &ToggleButton,
+        label: &Label,
+        page_name: &str,
+    ) {
+        // Mouse selection should keep terminal focus, while keyboard traversal
+        // must still be able to reach and activate every visible tab.
+        button.set_focus_on_click(false);
+        button.set_focusable(true);
+        button.update_relation(&[gtk4::accessible::Relation::LabelledBy(
+            &[label.upcast_ref()],
+        )]);
+        button.update_property(&[gtk4::accessible::Property::Description(
+            "Activate terminal tab",
+        )]);
+
+        let keys = EventControllerKey::new();
+        keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let ui = self.clone();
+        let page_name = page_name.to_string();
+        keys.connect_key_pressed(move |_, keyval, _, modifiers| {
+            if is_plain_tab_activation_key(keyval, modifiers) {
+                ui.activate_tab_named(&page_name);
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        button.add_controller(keys);
+    }
+
     fn retitle_tab_from_active_leaf(&self, tab_num: u32) {
         let name = format!("tab-{tab_num}");
         let Some(page) = notebook_page_named(&self.notebook, &name) else {
@@ -198,6 +257,7 @@ impl UiState {
             .unwrap_or_else(|| term_widget.clone());
 
         if let Some(sibling) = detach_leaf_and_promote(&self.notebook, &leaf_root) {
+            let _detached = PaneLeaf::detach_from(&leaf_root);
             if let Some(node) = PaneNode::from_widget(&sibling) {
                 node.grab_focus();
             }
@@ -218,6 +278,9 @@ impl UiState {
         let widget = self
             .notebook_page_for_widget(widget)
             .unwrap_or_else(|| widget.clone());
+        let pane_leaves = PaneNode::from_widget(&widget)
+            .map(|node| node.leaves())
+            .unwrap_or_default();
         // Kill shell processes and remove the strip button for the current page
         if !kill_widget_child_processes(&widget) {
             let mut terms = Vec::new();
@@ -240,6 +303,9 @@ impl UiState {
 
         if let Some(page_num) = self.notebook.page_num(&widget) {
             self.notebook.remove_page(Some(page_num));
+        }
+        for leaf in pane_leaves {
+            let _detached = PaneLeaf::detach_from(&leaf.root_widget());
         }
 
         if self.notebook.n_pages() == 0 {
@@ -387,10 +453,11 @@ impl UiState {
         label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         let close_button = gtk4::Button::from_icon_name("window-close-symbolic");
         close_button.set_focus_on_click(false);
-        close_button.set_can_focus(false);
+        close_button.set_focusable(true);
         close_button.set_has_frame(false);
         close_button.add_css_class("flat");
         close_button.set_tooltip_text(Some("Close tab"));
+        close_button.update_property(&[gtk4::accessible::Property::Label("Close tab")]);
         let tab_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         tab_box.append(&label);
         tab_box.append(&close_button);
@@ -449,10 +516,9 @@ impl UiState {
         if pinned {
             button.add_css_class("tab-pinned");
         }
-        button.set_focus_on_click(false);
-        button.set_can_focus(false);
         button.set_hexpand(true);
         button.set_widget_name(&tab_widget_name);
+        self.make_tab_strip_button_keyboard_accessible(&button, &strip_label, &tab_widget_name);
         unsafe {
             button.set_data::<Label>("tab-title-label", strip_label.clone());
             button.set_data::<bool>("pinned", pinned);
@@ -496,12 +562,15 @@ impl UiState {
         // instead of updating a sibling tab's chrome.
         match &leaf {
             PaneLeaf::Block(view) => {
-                let identity = page_widget.clone();
+                let identity = page_widget.downgrade();
                 let expected_name = tab_widget_name.clone();
                 let header = label.clone();
                 let strip = strip_label.clone();
                 let custom = custom_title.clone();
                 view.connect_cwd_changed(move |dir| {
+                    let Some(identity) = identity.upgrade() else {
+                        return;
+                    };
                     if identity.widget_name() != expected_name || custom.get() {
                         return;
                     }
@@ -509,12 +578,15 @@ impl UiState {
                     header.set_text(&title);
                     strip.set_text(&title);
                 });
-                let identity = page_widget.clone();
+                let identity = page_widget.downgrade();
                 let expected_name = tab_widget_name.clone();
                 let header = label.clone();
                 let strip = strip_label.clone();
                 let custom = custom_title.clone();
                 view.connect_title_changed(move |title| {
+                    let Some(identity) = identity.upgrade() else {
+                        return;
+                    };
                     if identity.widget_name() != expected_name || custom.get() {
                         return;
                     }
@@ -523,12 +595,15 @@ impl UiState {
                 });
             }
             PaneLeaf::Vte(view) => {
-                let identity = page_widget.clone();
+                let identity = page_widget.downgrade();
                 let expected_name = tab_widget_name.clone();
                 let header = label.clone();
                 let strip = strip_label.clone();
                 let custom = custom_title.clone();
                 view.connect_cwd_changed(move |dir| {
+                    let Some(identity) = identity.upgrade() else {
+                        return;
+                    };
                     if identity.widget_name() != expected_name || custom.get() {
                         return;
                     }
@@ -536,12 +611,15 @@ impl UiState {
                     header.set_text(&title);
                     strip.set_text(&title);
                 });
-                let identity = page_widget.clone();
+                let identity = page_widget.downgrade();
                 let expected_name = tab_widget_name.clone();
                 let header = label.clone();
                 let strip = strip_label.clone();
                 let custom = custom_title.clone();
                 view.connect_title_changed(move |title| {
+                    let Some(identity) = identity.upgrade() else {
+                        return;
+                    };
                     if identity.widget_name() != expected_name || custom.get() {
                         return;
                     }
@@ -1133,25 +1211,28 @@ impl UiState {
         match &view_type {
             PaneLeaf::Block(term_view) => {
                 let ui_for_exit = UiState::clone(self);
-                let term_view_for_exit = term_view.clone();
-                let root_for_exit = term_view.widget();
+                let term_view_for_exit = Rc::downgrade(term_view);
+                let root_for_exit = term_view.widget().downgrade();
                 let tab_num_for_exit = tab_num;
                 term_view.connect_exited(move |code| {
-                    let _ = term_view_for_exit.save_history();
-                    let current_tab_num =
-                        tab_num_for_widget(&root_for_exit).unwrap_or(tab_num_for_exit);
-                    let is_split = root_for_exit
+                    let Some(term_view) = term_view_for_exit.upgrade() else {
+                        return;
+                    };
+                    let Some(root) = root_for_exit.upgrade() else {
+                        return;
+                    };
+                    let _ = term_view.save_history();
+                    let current_tab_num = tab_num_for_widget(&root).unwrap_or(tab_num_for_exit);
+                    let is_split = root
                         .parent()
                         .is_some_and(|parent| parent.is::<gtk4::Paned>())
                         || ui_for_exit
                             .zoom_state
                             .borrow()
                             .as_ref()
-                            .is_some_and(|state| {
-                                state.zoomed_terminal == *term_view_for_exit.vte()
-                            });
+                            .is_some_and(|state| state.zoomed_terminal == *term_view.vte());
                     if is_remote && !is_split {
-                        ui_for_exit.handle_tab_exit(current_tab_num, code, &root_for_exit);
+                        ui_for_exit.handle_tab_exit(current_tab_num, code, &root);
                     } else {
                         if is_remote {
                             ui_for_exit
@@ -1160,14 +1241,17 @@ impl UiState {
                                 .remove(&current_tab_num);
                             ui_for_exit.clear_tab_conn_status(current_tab_num);
                         }
-                        ui_for_exit.handle_terminal_exited(&root_for_exit);
+                        ui_for_exit.handle_terminal_exited(&root);
                     }
                 });
 
                 let conns_for_session = self.tab_connections.clone();
-                let root_for_session = term_view.widget();
+                let root_for_session = term_view.widget().downgrade();
                 term_view.connect_remote_session_id(move |id| {
-                    let current_tab_num = tab_num_for_widget(&root_for_session).unwrap_or(tab_num);
+                    let Some(root) = root_for_session.upgrade() else {
+                        return;
+                    };
+                    let current_tab_num = tab_num_for_widget(&root).unwrap_or(tab_num);
                     if let Some(conn) = conns_for_session.borrow_mut().get_mut(&current_tab_num) {
                         conn.host.session = Some(id.to_string());
                     }
@@ -1180,22 +1264,27 @@ impl UiState {
             }
             PaneLeaf::Vte(vte_view) => {
                 let ui_for_exit = UiState::clone(self);
-                let root_for_exit = vte_view.widget();
-                let terminal_for_exit = vte_view.vte().clone();
+                let root_for_exit = vte_view.widget().downgrade();
+                let terminal_for_exit = vte_view.vte().downgrade();
                 let tab_num_for_exit = tab_num;
                 vte_view.connect_exited(move |code| {
-                    let current_tab_num =
-                        tab_num_for_widget(&root_for_exit).unwrap_or(tab_num_for_exit);
-                    let is_split = root_for_exit
+                    let Some(root) = root_for_exit.upgrade() else {
+                        return;
+                    };
+                    let Some(terminal) = terminal_for_exit.upgrade() else {
+                        return;
+                    };
+                    let current_tab_num = tab_num_for_widget(&root).unwrap_or(tab_num_for_exit);
+                    let is_split = root
                         .parent()
                         .is_some_and(|parent| parent.is::<gtk4::Paned>())
                         || ui_for_exit
                             .zoom_state
                             .borrow()
                             .as_ref()
-                            .is_some_and(|state| state.zoomed_terminal == terminal_for_exit);
+                            .is_some_and(|state| state.zoomed_terminal == terminal);
                     if is_remote && !is_split {
-                        ui_for_exit.handle_tab_exit(current_tab_num, code, &root_for_exit);
+                        ui_for_exit.handle_tab_exit(current_tab_num, code, &root);
                     } else {
                         if is_remote {
                             ui_for_exit
@@ -1204,7 +1293,7 @@ impl UiState {
                                 .remove(&current_tab_num);
                             ui_for_exit.clear_tab_conn_status(current_tab_num);
                         }
-                        ui_for_exit.handle_terminal_exited(&root_for_exit);
+                        ui_for_exit.handle_terminal_exited(&root);
                     }
                 });
             }
@@ -1214,14 +1303,16 @@ impl UiState {
         if remote.is_some() {
             let ui_for_conn = self.clone();
             let fired = Rc::new(Cell::new(false));
-            let root_for_conn = view_type.root_widget();
+            let root_for_conn = view_type.root_widget().downgrade();
             terminal.connect_contents_changed(move |_| {
                 if fired.get() {
                     return;
                 }
                 fired.set(true);
-                let current_tab_num = tab_num_for_widget(&root_for_conn).unwrap_or(tab_num);
-                ui_for_conn.mark_tab_connected(current_tab_num);
+                if let Some(root) = root_for_conn.upgrade() {
+                    let current_tab_num = tab_num_for_widget(&root).unwrap_or(tab_num);
+                    ui_for_conn.mark_tab_connected(current_tab_num);
+                }
             });
         }
 
@@ -1268,12 +1359,13 @@ impl UiState {
 
         match &view_type {
             PaneLeaf::Block(term_view) => {
-                let term_view_for_pwd = term_view.clone();
-                let identity_for_pwd = view_type.root_widget();
+                let identity_for_pwd = view_type.root_widget().downgrade();
                 let expected_name_for_pwd = format!("tab-{tab_num}");
-                term_view_for_pwd.connect_cwd_changed(move |dir| {
-                    if identity_for_pwd.widget_name() != expected_name_for_pwd
-                        || custom_title_for_pwd.get()
+                term_view.connect_cwd_changed(move |dir| {
+                    let Some(identity) = identity_for_pwd.upgrade() else {
+                        return;
+                    };
+                    if identity.widget_name() != expected_name_for_pwd || custom_title_for_pwd.get()
                     {
                         return;
                     }
@@ -1287,12 +1379,13 @@ impl UiState {
                 });
             }
             PaneLeaf::Vte(vte_view) => {
-                let vte_view_for_pwd = vte_view.clone();
-                let identity_for_pwd = view_type.root_widget();
+                let identity_for_pwd = view_type.root_widget().downgrade();
                 let expected_name_for_pwd = format!("tab-{tab_num}");
-                vte_view_for_pwd.connect_cwd_changed(move |dir| {
-                    if identity_for_pwd.widget_name() != expected_name_for_pwd
-                        || custom_title_for_pwd.get()
+                vte_view.connect_cwd_changed(move |dir| {
+                    let Some(identity) = identity_for_pwd.upgrade() else {
+                        return;
+                    };
+                    if identity.widget_name() != expected_name_for_pwd || custom_title_for_pwd.get()
                     {
                         return;
                     }
@@ -1310,7 +1403,7 @@ impl UiState {
         // Keep the existing tab widgets alive for OSC 0/2 title changes.
         // Some applications animate their title with a spinner; replacing the
         // strip button for every frame loses in-flight click and drag gestures.
-        let identity_for_title = view_type.root_widget();
+        let identity_for_title = view_type.root_widget().downgrade();
         let expected_name_for_title = format!("tab-{tab_num}");
         let update_title = |connect: &dyn Fn(TitleChangedCallback)| {
             let label_for_title = label.clone();
@@ -1319,7 +1412,10 @@ impl UiState {
             let identity_for_title = identity_for_title.clone();
             let expected_name_for_title = expected_name_for_title.clone();
             connect(Box::new(move |title| {
-                if identity_for_title.widget_name() != expected_name_for_title
+                let Some(identity) = identity_for_title.upgrade() else {
+                    return;
+                };
+                if identity.widget_name() != expected_name_for_title
                     || custom_title_for_title.get()
                     || label_for_title.text().as_str() == title
                 {
@@ -1342,10 +1438,11 @@ impl UiState {
 
         let close_button = gtk4::Button::from_icon_name("window-close-symbolic");
         close_button.set_focus_on_click(false);
-        close_button.set_can_focus(false);
+        close_button.set_focusable(true);
         close_button.set_has_frame(false);
         close_button.add_css_class("flat");
         close_button.set_tooltip_text(Some("Close tab"));
+        close_button.update_property(&[gtk4::accessible::Property::Label("Close tab")]);
 
         tab_box.append(&label);
         tab_box.append(&close_button);
@@ -1440,8 +1537,6 @@ impl UiState {
         strip_btn.add_css_class("tab-strip-btn");
         strip_btn.add_css_class("flat");
         strip_btn.set_active(true); // new tab is current
-        strip_btn.set_focus_on_click(false);
-        strip_btn.set_can_focus(false);
         strip_btn.set_hexpand(true); // Fill sidebar width
 
         // Show close icon on hover, hide on leave
@@ -1533,6 +1628,7 @@ impl UiState {
         // Give button a unique name to correlate with notebook page
         let tab_widget_name = format!("tab-{}", tab_num);
         strip_btn.set_widget_name(&tab_widget_name);
+        self.make_tab_strip_button_keyboard_accessible(&strip_btn, &strip_label, &tab_widget_name);
         // Also name the wrapper widget so we can find the button when removing
         term_wrapper.set_widget_name(&tab_widget_name);
 
@@ -1564,17 +1660,21 @@ impl UiState {
 
         // Bell signal: flash the tab strip button when bell rings on non-active tab
         let ui_for_bell = self.clone();
-        let leaf_for_bell = view_type.clone();
+        let root_for_bell = view_type.root_widget().downgrade();
         terminal.connect_bell(move |_| {
             log::debug!("Bell signal received");
-            ui_for_bell.mark_tab_bell(&leaf_for_bell.root_widget().widget_name());
+            if let Some(root) = root_for_bell.upgrade() {
+                ui_for_bell.mark_tab_bell(&root.widget_name());
+            }
         });
 
         // Activity indicator: mark tab when there's output on a non-active tab
         let ui_for_activity = self.clone();
-        let leaf_for_activity = view_type.clone();
+        let root_for_activity = view_type.root_widget().downgrade();
         terminal.connect_commit(move |_, _, _| {
-            ui_for_activity.mark_tab_activity(&leaf_for_activity.root_widget().widget_name());
+            if let Some(root) = root_for_activity.upgrade() {
+                ui_for_activity.mark_tab_activity(&root.widget_name());
+            }
         });
 
         // Double-click to rename on strip button too
@@ -1937,5 +2037,31 @@ impl UiState {
         }
 
         terminal
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_enter_and_space_activate_focused_tab_buttons() {
+        for key in [Key::Return, Key::KP_Enter, Key::space] {
+            assert!(is_plain_tab_activation_key(key, ModifierType::empty()));
+            assert!(is_plain_tab_activation_key(key, ModifierType::LOCK_MASK));
+        }
+    }
+
+    #[test]
+    fn modified_or_unrelated_keys_do_not_activate_tab_buttons() {
+        for modifiers in [
+            ModifierType::CONTROL_MASK,
+            ModifierType::SHIFT_MASK,
+            ModifierType::ALT_MASK,
+            ModifierType::SUPER_MASK,
+        ] {
+            assert!(!is_plain_tab_activation_key(Key::Return, modifiers));
+        }
+        assert!(!is_plain_tab_activation_key(Key::a, ModifierType::empty()));
     }
 }

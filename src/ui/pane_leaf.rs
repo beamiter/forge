@@ -181,8 +181,13 @@ impl PaneLeaf {
     /// Terminate this leaf's shell and its process group through the
     /// backend-neutral process teardown path.
     pub(crate) fn kill(&self) {
-        let (_, shell_pid) = self.process_probe();
-        crate::state::terminate_terminal_process(shell_pid);
+        match self {
+            // Block mode also owns a dedicated PTY input worker. Route teardown
+            // through TermView so the channel and cloned master fd close before
+            // terminating the process group.
+            Self::Block(view) => view.kill(),
+            Self::Vte(view) => crate::state::terminate_terminal_process(view.pid_i32()),
+        }
     }
 
     /// Store the typed controller on its GTK leaf root. Keeping the unsafe GTK
@@ -212,6 +217,17 @@ impl PaneLeaf {
                 }
             }
         });
+    }
+
+    /// Release the strong controller stored on a leaf root before that widget is
+    /// permanently removed from the pane tree.
+    ///
+    /// The root is also owned by the controller, so leaving the qdata attached
+    /// after unparenting would form `root -> PaneLeaf -> controller -> root` and
+    /// keep the PTY, callbacks, and finished Block widgets alive indefinitely.
+    /// Temporary reparenting (split moves and zoom) must not call this method.
+    pub(crate) fn detach_from(widget: &gtk4::Widget) -> Option<Self> {
+        unsafe { widget.steal_data::<Self>(PANE_LEAF_DATA_KEY) }
     }
 
     /// Recover a directly attached pane leaf from a GTK root widget.

@@ -270,6 +270,9 @@ pub(crate) fn build_file_tree_widgets() -> (FileTreeModel, ListView) {
     file_tree.set_single_click_activate(false);
     file_tree.set_show_separators(false);
     file_tree.set_can_focus(true);
+    file_tree.update_property(&[gtk4::accessible::Property::Label(
+        "Files in current directory",
+    )]);
     file_tree.add_css_class("file-tree");
 
     (model, file_tree)

@@ -4,7 +4,7 @@ use gtk4::prelude::*;
 use gtk4::{glib, Orientation, ScrolledWindow};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use vte4::Terminal;
@@ -14,10 +14,12 @@ use crate::config::Config;
 use crate::parser::{ColorKind, KeyboardProtocolQuery, Parser, ParserConfig, ParserEvent};
 use crate::pty::OwnedPty;
 use crate::terminal::{apply_terminal_theme, focus_terminal};
+use bounded_bytes::BoundedByteRing;
 
 mod alt_screen;
 mod ansi;
 mod blocks;
+mod bounded_bytes;
 mod cross_selection;
 mod css;
 mod export;
@@ -971,9 +973,9 @@ fn install_finished_block_selection(
     selected_block_id: &Rc<Cell<Option<u64>>>,
     selection_anchor_id: &Rc<Cell<Option<u64>>>,
 ) {
-    let active_for_click = active.clone();
+    let active_for_click = Rc::downgrade(active);
     let header_for_click = block.header_row.clone();
-    let finished_blocks_for_select = finished_blocks.clone();
+    let finished_blocks_for_select = Rc::downgrade(finished_blocks);
     let selected_ids_for_click = selected_block_ids.clone();
     let selected_for_click = selected_block_id.clone();
     let anchor_for_click = selection_anchor_id.clone();
@@ -990,6 +992,9 @@ fn install_finished_block_selection(
         let ctrl = state.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
         let shift = state.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
         let over_terminal_surface = y > header_for_click.height() as f64;
+        let Some(finished_blocks_for_select) = finished_blocks_for_select.upgrade() else {
+            return;
+        };
         let finished = finished_blocks_for_select.borrow();
         if over_terminal_surface && !shift {
             // A normal click/drag in a snapshot VTE means text interaction, not
@@ -1005,7 +1010,9 @@ fn install_finished_block_selection(
                 );
             }
         } else {
-            active_for_click.borrow().grab_focus();
+            if let Some(active_for_click) = active_for_click.upgrade() {
+                active_for_click.borrow().grab_focus();
+            }
             if ctrl && shift {
                 toggle_finished_block_selection(
                     &finished,
@@ -1039,6 +1046,12 @@ fn install_finished_block_selection(
         });
     });
     block.widget().add_controller(left_click);
+}
+
+fn popdown_if_alive(popover: &glib::WeakRef<gtk4::Popover>) {
+    if let Some(popover) = popover.upgrade() {
+        popover.popdown();
+    }
 }
 
 /// Cap on the retained raw output buffer for a single running command. The raw
@@ -1126,7 +1139,7 @@ pub struct TermView {
     /// per-tab block-history file so concurrent tabs never overwrite each
     /// other's saved history.
     session_id: Option<String>,
-    /// Per-frame resize tick installed on `root`. Held so it can be removed on
+    /// Per-frame resize tick installed on `active_vte`. Held so it can be removed on
     /// Drop — otherwise the callback runs forever and keeps its Rc captures
     /// (pty/active/vte/vte_box) alive past tab close.
     resize_tick_id: RefCell<Option<gtk4::TickCallbackId>>,
@@ -1172,7 +1185,7 @@ struct ReaderCtx {
     /// Bytes emitted asynchronously after PromptEnd and before the next PromptStart.
     /// Empty-command blocks are inferred from this separate buffer, so no history
     /// schema change is needed.
-    background_output_rc: Rc<RefCell<Vec<u8>>>,
+    background_output_rc: Rc<RefCell<BoundedByteRing>>,
     /// Once the user starts editing at an idle prompt, output is intentionally left
     /// inline: shell echo/completion and true background output are ambiguous then.
     idle_input_dirty_rc: Rc<Cell<bool>>,
@@ -1291,8 +1304,8 @@ fn background_output_has_visible_text(bytes: &[u8]) -> bool {
         .any(|ch| !ch.is_whitespace() && !ch.is_control())
 }
 
-fn take_background_output(pending: &RefCell<Vec<u8>>) -> Option<String> {
-    let bytes = std::mem::take(&mut *pending.borrow_mut());
+fn take_background_output(pending: &RefCell<BoundedByteRing>) -> Option<String> {
+    let bytes = pending.borrow_mut().take_vec();
     background_output_has_visible_text(&bytes).then(|| String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -1409,12 +1422,7 @@ impl ReaderCtx {
                                         idle_input_dirty_rc.get(),
                                         pty_synced_rc.get(),
                                     ) {
-                                        let mut pending = background_output_rc.borrow_mut();
-                                        pending.extend_from_slice(bytes);
-                                        if pending.len() > MAX_RAW_OUTPUT_BYTES {
-                                            let drop = pending.len() - MAX_RAW_OUTPUT_BYTES;
-                                            pending.drain(..drop);
-                                        }
+                                        background_output_rc.borrow_mut().append(bytes);
                                     }
                                     scroll_debouncer.mark_dirty(&block_scroll_rc);
                                     true
@@ -1674,12 +1682,13 @@ impl ReaderCtx {
                                 }
 
                                 // Right-click context menu.
-                                let finished_blocks_for_menu = finished_blocks_for_cb.clone();
-                                let block_list_for_menu = block_list_rc.clone();
-                                let vte_for_copy = active_vte.clone();
+                                let finished_blocks_for_menu =
+                                    Rc::downgrade(&finished_blocks_for_cb);
+                                let block_list_for_menu = block_list_rc.downgrade();
+                                let vte_for_copy = active_vte.downgrade();
                                 let pty_for_rerun_menu = pty_for_init.clone();
                                 let pty_synced_for_rerun_menu = pty_synced_rc.clone();
-                                let active_for_rerun_menu = active_rc.clone();
+                                let active_for_rerun_menu = Rc::downgrade(&active_rc);
                                 let bstate_for_rerun_menu = bstate_rc.clone();
                                 let bracketed_paste_for_menu = bracketed_paste_rc.clone();
                                 let typed_cmd_for_rerun_menu = typed_cmd_rc.clone();
@@ -1693,13 +1702,27 @@ impl ReaderCtx {
                                 let right_click = gtk4::GestureClick::new();
                                 right_click.set_button(3);
 
-                                let finished_menu_clone = finished_clone.clone();
+                                let finished_widget_for_menu = finished_widget.downgrade();
+                                let long_output_for_menu = finished_clone.long_output;
                                 let block_data_for_export = block_data_for_cb.clone();
-                                let block_scroll_for_menu = block_scroll_rc.clone();
+                                let block_scroll_for_menu = block_scroll_rc.downgrade();
                                 right_click.connect_pressed(move |gesture, _n_press, x, y| {
+                                    let Some(finished_blocks) =
+                                        finished_blocks_for_menu.upgrade()
+                                    else {
+                                        return;
+                                    };
+                                    let Some(vte_for_copy) = vte_for_copy.upgrade() else {
+                                        return;
+                                    };
+                                    let Some(finished_widget) =
+                                        finished_widget_for_menu.upgrade()
+                                    else {
+                                        return;
+                                    };
                                     gesture.set_state(gtk4::EventSequenceState::Claimed);
                                     {
-                                        let finished = finished_blocks_for_menu.borrow();
+                                        let finished = finished_blocks.borrow();
                                         clear_vte_text_selections(&finished, &vte_for_copy);
                                         activate_finished_block_selection(
                                             &finished,
@@ -1711,11 +1734,7 @@ impl ReaderCtx {
                                     }
 
                                     let popover = gtk4::Popover::new();
-                                    let widget: &gtk4::Widget = &finished_menu_clone
-                                        .widget()
-                                        .clone()
-                                        .upcast::<gtk4::Widget>();
-                                    popover.set_parent(widget);
+                                    popover.set_parent(&finished_widget);
                                     popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
                                         x as i32, y as i32, 1, 1,
                                     )));
@@ -1750,12 +1769,16 @@ impl ReaderCtx {
                                         } else {
                                             "Copy Command"
                                         });
-                                        let popover_c = popover.clone();
+                                        let popover_c = popover.downgrade();
                                         let block_data_for_copy = block_data_for_export.clone();
                                         let selected_ids_for_copy = selected_ids_for_menu.clone();
-                                        let vte_for_action = vte_for_copy.clone();
+                                        let vte_for_action = vte_for_copy.downgrade();
                                         item.connect_clicked(move |_| {
-                                            popover_c.popdown();
+                                            popdown_if_alive(&popover_c);
+                                            let Some(vte_for_action) = vte_for_action.upgrade()
+                                            else {
+                                                return;
+                                            };
                                             let selected = selected_ids_for_copy.borrow();
                                             let blocks = block_data_for_copy.borrow();
                                             let text = selected_command_text(
@@ -1775,12 +1798,16 @@ impl ReaderCtx {
                                         } else {
                                             "Copy Output"
                                         });
-                                        let popover_c = popover.clone();
+                                        let popover_c = popover.downgrade();
                                         let block_data_for_copy = block_data_for_export.clone();
                                         let selected_ids_for_copy = selected_ids_for_menu.clone();
-                                        let vte_for_action = vte_for_copy.clone();
+                                        let vte_for_action = vte_for_copy.downgrade();
                                         item.connect_clicked(move |_| {
-                                            popover_c.popdown();
+                                            popdown_if_alive(&popover_c);
+                                            let Some(vte_for_action) = vte_for_action.upgrade()
+                                            else {
+                                                return;
+                                            };
                                             let selected = selected_ids_for_copy.borrow();
                                             let blocks = block_data_for_copy.borrow();
                                             let text = blocks
@@ -1800,12 +1827,16 @@ impl ReaderCtx {
                                         } else {
                                             "Copy Block"
                                         });
-                                        let popover_c = popover.clone();
+                                        let popover_c = popover.downgrade();
                                         let block_data_for_copy = block_data_for_export.clone();
                                         let selected_ids_for_copy = selected_ids_for_menu.clone();
-                                        let vte_for_action = vte_for_copy.clone();
+                                        let vte_for_action = vte_for_copy.downgrade();
                                         item.connect_clicked(move |_| {
-                                            popover_c.popdown();
+                                            popdown_if_alive(&popover_c);
+                                            let Some(vte_for_action) = vte_for_action.upgrade()
+                                            else {
+                                                return;
+                                            };
                                             let selected = selected_ids_for_copy.borrow();
                                             let blocks = block_data_for_copy.borrow();
                                             let text = blocks
@@ -1831,7 +1862,7 @@ impl ReaderCtx {
                                         } else {
                                             "Insert Command at Prompt"
                                         });
-                                        let popover_c = popover.clone();
+                                        let popover_c = popover.downgrade();
                                         let finished_for_rerun = finished_blocks_for_menu.clone();
                                         let selected_ids_for_rerun = selected_ids_for_menu.clone();
                                         let selected_for_rerun = selected_for_menu.clone();
@@ -1850,7 +1881,12 @@ impl ReaderCtx {
                                             "Available when the shell prompt is ready",
                                         ));
                                         item.connect_clicked(move |_| {
-                                            popover_c.popdown();
+                                            popdown_if_alive(&popover_c);
+                                            let Some(finished_for_rerun) =
+                                                finished_for_rerun.upgrade()
+                                            else {
+                                                return;
+                                            };
                                             let finished = finished_for_rerun.borrow();
                                             let recalled = {
                                                 let selected = selected_ids_for_rerun.borrow();
@@ -1871,7 +1907,11 @@ impl ReaderCtx {
                                                     &selected_for_rerun,
                                                     &anchor_for_rerun,
                                                 );
-                                                active_for_action.borrow().grab_focus();
+                                                if let Some(active_for_action) =
+                                                    active_for_action.upgrade()
+                                                {
+                                                    active_for_action.borrow().grab_focus();
+                                                }
                                             }
                                         });
                                         vbox.append(&item);
@@ -1879,33 +1919,61 @@ impl ReaderCtx {
 
                                     {
                                         let item = make_item("Scroll to Top of Block");
-                                        let popover_c = popover.clone();
-                                        let block = finished_menu_clone.clone();
+                                        let popover_c = popover.downgrade();
+                                        let finished = finished_blocks_for_menu.clone();
                                         let scroll = block_scroll_for_menu.clone();
                                         item.connect_clicked(move |_| {
-                                            popover_c.popdown();
-                                            block.scroll_to_edge(&scroll, false);
+                                            popdown_if_alive(&popover_c);
+                                            let (Some(finished), Some(scroll)) =
+                                                (finished.upgrade(), scroll.upgrade())
+                                            else {
+                                                return;
+                                            };
+                                            let finished = finished.borrow();
+                                            if let Some(block) =
+                                                finished.iter().find(|b| b.id == block_id)
+                                            {
+                                                block.scroll_to_edge(&scroll, false);
+                                            }
                                         });
                                         vbox.append(&item);
                                     }
-                                    if finished_menu_clone.long_output {
+                                    if long_output_for_menu {
                                         let item = make_item("Jump to Bottom of Block");
-                                        let popover_c = popover.clone();
-                                        let block = finished_menu_clone.clone();
+                                        let popover_c = popover.downgrade();
+                                        let finished = finished_blocks_for_menu.clone();
                                         let scroll = block_scroll_for_menu.clone();
                                         item.connect_clicked(move |_| {
-                                            popover_c.popdown();
-                                            block.scroll_to_edge(&scroll, true);
+                                            popdown_if_alive(&popover_c);
+                                            let (Some(finished), Some(scroll)) =
+                                                (finished.upgrade(), scroll.upgrade())
+                                            else {
+                                                return;
+                                            };
+                                            let finished = finished.borrow();
+                                            if let Some(block) =
+                                                finished.iter().find(|b| b.id == block_id)
+                                            {
+                                                block.scroll_to_edge(&scroll, true);
+                                            }
                                         });
                                         vbox.append(&item);
                                     }
                                     {
                                         let item = make_item("Toggle Output Filter");
-                                        let popover_c = popover.clone();
-                                        let block = finished_menu_clone.clone();
+                                        let popover_c = popover.downgrade();
+                                        let finished = finished_blocks_for_menu.clone();
                                         item.connect_clicked(move |_| {
-                                            popover_c.popdown();
-                                            (block.toggle_filter)();
+                                            popdown_if_alive(&popover_c);
+                                            let Some(finished) = finished.upgrade() else {
+                                                return;
+                                            };
+                                            let finished = finished.borrow();
+                                            if let Some(block) =
+                                                finished.iter().find(|b| b.id == block_id)
+                                            {
+                                                (block.toggle_filter)();
+                                            }
                                         });
                                         vbox.append(&item);
                                     }
@@ -1917,11 +1985,20 @@ impl ReaderCtx {
                                         } else {
                                             "Bookmark Block"
                                         });
-                                        let popover_c = popover.clone();
-                                        let block = finished_menu_clone.clone();
+                                        let popover_c = popover.downgrade();
+                                        let finished = finished_blocks_for_menu.clone();
                                         let bookmarks = bookmarks_for_menu.clone();
                                         item.connect_clicked(move |_| {
-                                            popover_c.popdown();
+                                            popdown_if_alive(&popover_c);
+                                            let Some(finished) = finished.upgrade() else {
+                                                return;
+                                            };
+                                            let finished = finished.borrow();
+                                            let Some(block) =
+                                                finished.iter().find(|b| b.id == block_id)
+                                            else {
+                                                return;
+                                            };
                                             let mut marks = bookmarks.borrow_mut();
                                             let now_bookmarked = if marks.remove(&block_id) {
                                                 false
@@ -1945,12 +2022,15 @@ impl ReaderCtx {
 
                                     {
                                         let item = make_item("Export as JSON");
-                                        let popover_c = popover.clone();
+                                        let popover_c = popover.downgrade();
                                         let block_data_for_json = block_data_for_export.clone();
-                                        let vte_for_json = vte_for_copy.clone();
+                                        let vte_for_json = vte_for_copy.downgrade();
                                         let block_id_json = block_id;
                                         item.connect_clicked(move |_| {
-                                            popover_c.popdown();
+                                            popdown_if_alive(&popover_c);
+                                            let Some(vte_for_json) = vte_for_json.upgrade() else {
+                                                return;
+                                            };
                                             let blocks = block_data_for_json.borrow();
                                             if let Some(block) =
                                                 blocks.iter().find(|b| b.id == block_id_json)
@@ -1964,12 +2044,15 @@ impl ReaderCtx {
 
                                     {
                                         let item = make_item("Export as Markdown");
-                                        let popover_c = popover.clone();
+                                        let popover_c = popover.downgrade();
                                         let block_data_for_md = block_data_for_export.clone();
-                                        let vte_for_md = vte_for_copy.clone();
+                                        let vte_for_md = vte_for_copy.downgrade();
                                         let block_id_md = block_id;
                                         item.connect_clicked(move |_| {
-                                            popover_c.popdown();
+                                            popdown_if_alive(&popover_c);
+                                            let Some(vte_for_md) = vte_for_md.upgrade() else {
+                                                return;
+                                            };
                                             let blocks = block_data_for_md.borrow();
                                             if let Some(block) =
                                                 blocks.iter().find(|b| b.id == block_id_md)
@@ -1983,7 +2066,7 @@ impl ReaderCtx {
 
                                     {
                                         let item = make_item("Delete Block");
-                                        let popover_c = popover.clone();
+                                        let popover_c = popover.downgrade();
                                         let finished_blocks_for_delete =
                                             finished_blocks_for_menu.clone();
                                         let block_list_for_delete = block_list_for_menu.clone();
@@ -1995,7 +2078,17 @@ impl ReaderCtx {
                                         let visible_for_delete = visible_for_menu.clone();
                                         let block_id_del = block_id;
                                         item.connect_clicked(move |_| {
-                                            popover_c.popdown();
+                                            popdown_if_alive(&popover_c);
+                                            let (
+                                                Some(finished_blocks_for_delete),
+                                                Some(block_list_for_delete),
+                                            ) = (
+                                                finished_blocks_for_delete.upgrade(),
+                                                block_list_for_delete.upgrade(),
+                                            )
+                                            else {
+                                                return;
+                                            };
                                             let _ = remove_finished_block(
                                                 block_id_del,
                                                 &finished_blocks_for_delete,
@@ -2638,17 +2731,17 @@ fn running_root_control_bytes(
 /// fall through to the VTE.
 struct KeyCtx {
     pty_for_key: Rc<OwnedPty>,
-    active_vte_for_key: Terminal,
+    active_vte_for_key: glib::WeakRef<Terminal>,
     pty_synced_for_key: Rc<Cell<bool>>,
     bracketed_paste_for_key: Rc<Cell<bool>>,
     typed_cmd_for_key: Rc<RefCell<String>>,
-    finished_blocks_for_key: Rc<RefCell<Vec<FinishedBlock>>>,
+    finished_blocks_for_key: Weak<RefCell<Vec<FinishedBlock>>>,
     block_data_for_key: Rc<RefCell<VecDeque<BlockData>>>,
-    block_list_for_key: gtk4::Box,
+    block_list_for_key: glib::WeakRef<gtk4::Box>,
     selected_block_ids_for_key: SelectedBlockIds,
     selected_block_id_for_key: Rc<Cell<Option<u64>>>,
     selection_anchor_id_for_key: Rc<Cell<Option<u64>>>,
-    block_scroll_for_key: ScrolledWindow,
+    block_scroll_for_key: glib::WeakRef<ScrolledWindow>,
     bookmarks_for_key: Rc<RefCell<std::collections::HashSet<u64>>>,
     visible_indices_for_key: Rc<RefCell<std::collections::HashSet<usize>>>,
     bstate_for_key: Rc<Cell<BlockState>>,
@@ -2675,6 +2768,18 @@ impl KeyCtx {
         } = self;
         key_ctrl.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
             use gtk4::gdk::Key;
+            let Some(active_vte_for_key) = active_vte_for_key.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            let Some(block_list_for_key) = block_list_for_key.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            let Some(block_scroll_for_key) = block_scroll_for_key.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            let Some(finished_blocks_for_key) = finished_blocks_for_key.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
             let ctrl = modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
             let shift = modifiers.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
             let alt = modifiers.contains(gtk4::gdk::ModifierType::ALT_MASK);
@@ -3109,10 +3214,15 @@ impl TermView {
         let sticky_minimized: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         {
             let minimized = sticky_minimized.clone();
-            let label = sticky_label.clone();
-            let jump = sticky_jump_bottom_btn.clone();
-            let bar = sticky_bar.clone();
+            let label = sticky_label.downgrade();
+            let jump = sticky_jump_bottom_btn.downgrade();
+            let bar = sticky_bar.downgrade();
             sticky_minimize_btn.connect_clicked(move |button| {
+                let (Some(label), Some(jump), Some(bar)) =
+                    (label.upgrade(), jump.upgrade(), bar.upgrade())
+                else {
+                    return;
+                };
                 let now = !minimized.get();
                 minimized.set(now);
                 label.set_visible(!now);
@@ -3210,7 +3320,8 @@ impl TermView {
         // a shell-integration anchor cannot be captured.
         let typed_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let external_submission: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-        let background_output: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+        let background_output: Rc<RefCell<BoundedByteRing>> =
+            Rc::new(RefCell::new(BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES)));
         let idle_input_dirty: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         // Command text snapshot taken at CommandStart from the VTE itself,
         // between `prompt_end_pos` and the current cursor. This is what
@@ -3238,13 +3349,22 @@ impl TermView {
         // full live VTE. PTY rows are NOT taken from this visual height; see
         // `pty_grid_size`, which always reports the full viewport to the child.
         let layout_active_surface: Rc<dyn Fn()> = {
-            let holder = active.borrow().widget().clone();
-            let vte = active_vte.clone();
-            let scroll = block_scroll.clone();
+            let holder = active.borrow().widget().downgrade();
+            let vte = active_vte.downgrade();
+            let scroll = block_scroll.downgrade();
             let bstate = bstate.clone();
             let typed_cmd = typed_cmd.clone();
             let last_size_target: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
             Rc::new(move || {
+                let Some(holder) = holder.upgrade() else {
+                    return;
+                };
+                let Some(vte) = vte.upgrade() else {
+                    return;
+                };
+                let Some(scroll) = scroll.upgrade() else {
+                    return;
+                };
                 let cell_h = (vte.char_height() as i32).max(1);
                 let Some(viewport_rows) = viewport_rows_for(&vte, &scroll) else {
                     return;
@@ -3289,7 +3409,7 @@ impl TermView {
             // per content burst, AFTER layout settles (so `upper` is final), and is
             // never re-triggered by the visibility side-effects of its own scroll.
             let f = layout_active_surface.clone();
-            let scroll = block_scroll.clone();
+            let scroll = block_scroll.downgrade();
             let user_scrolled = user_scrolled_up.clone();
             let programmatic = programmatic_scroll.clone();
             let pin_pending = pin_pending.clone();
@@ -3308,6 +3428,9 @@ impl TermView {
                     if user_scrolled.get() {
                         return;
                     }
+                    let Some(scroll) = scroll.upgrade() else {
+                        return;
+                    };
                     let adj = scroll.vadjustment();
                     let target = (adj.upper() - adj.page_size()).max(adj.lower());
                     if (adj.value() - target).abs() > 1.0 {
@@ -3422,11 +3545,10 @@ impl TermView {
         {
             let cwd_cbs = cwd_callbacks.clone();
             let current_cwd_for_signal = current_cwd.clone();
-            let vte_for_cwd = active_vte.clone();
             let repo_strip_for_cwd = repo_strip.clone();
             let fullscreen_for_cwd = fullscreen.clone();
-            active_vte.connect_current_directory_uri_notify(move |_| {
-                if let Some(uri) = vte_for_cwd.current_directory_uri() {
+            active_vte.connect_current_directory_uri_notify(move |terminal| {
+                if let Some(uri) = terminal.current_directory_uri() {
                     let file = gtk4::gio::File::for_uri(uri.as_str());
                     if let Some(path) = file
                         .path()
@@ -3456,9 +3578,8 @@ impl TermView {
         }
         {
             let title_cbs = title_callbacks.clone();
-            let vte_for_title = active_vte.clone();
-            active_vte.connect_window_title_changed(move |_| {
-                if let Some(title) = vte_for_title.window_title() {
+            active_vte.connect_window_title_changed(move |terminal| {
+                if let Some(title) = terminal.window_title() {
                     let title_str = title.to_string();
                     if !title_str.is_empty() {
                         for cb in title_cbs.borrow().iter() {
@@ -3585,10 +3706,10 @@ impl TermView {
         // history and follow mode must stop. Sample on idle after layout settles.
         {
             let user_scrolled = user_scrolled_up.clone();
-            let fab = jump_fab.clone();
+            let fab = jump_fab.downgrade();
             let unread = unread_count.clone();
-            let scroll = block_scroll.clone();
-            let holder = active.borrow().widget().clone();
+            let scroll = block_scroll.downgrade();
+            let holder = active.borrow().widget().downgrade();
             let programmatic_scroll = programmatic_scroll.clone();
             let fullscreen = fullscreen.clone();
             let check_pending = Rc::new(Cell::new(false));
@@ -3615,6 +3736,7 @@ impl TermView {
                     let unread = unread.clone();
                     let scroll = scroll.clone();
                     let holder = holder.clone();
+                    let fab = fab.clone();
                     let fullscreen = fullscreen.clone();
                     let check_pending = check_pending.clone();
                     let pending_programmatic_only = pending_programmatic_only.clone();
@@ -3623,6 +3745,15 @@ impl TermView {
                         if pending_programmatic_only.replace(true) {
                             return;
                         }
+                        let Some(fab) = fab.upgrade() else {
+                            return;
+                        };
+                        let Some(scroll) = scroll.upgrade() else {
+                            return;
+                        };
+                        let Some(holder) = holder.upgrade() else {
+                            return;
+                        };
                         if fullscreen.get() {
                             user_scrolled.set(false);
                             unread.set(0);
@@ -3672,8 +3803,7 @@ impl TermView {
             let programmatic = programmatic_scroll.clone();
             let user_scrolled = user_scrolled_up.clone();
             let unread = unread_count.clone();
-            let fab = jump_fab.clone();
-            jump_fab.connect_clicked(move |_| {
+            jump_fab.connect_clicked(move |button| {
                 // Returning to the live prompt is not a single set_value: blocks
                 // below the viewport are virtualized to 0 height, so `upper` only
                 // grows as they scroll into view. One jump lands partway; we have
@@ -3681,7 +3811,7 @@ impl TermView {
                 // growing (true bottom reached) or we hit a small iteration cap.
                 user_scrolled.set(false);
                 unread.set(0);
-                fab.set_visible(false);
+                button.set_visible(false);
                 let adj = scroll.vadjustment();
                 programmatic.set(true);
                 adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
@@ -3834,7 +3964,7 @@ impl TermView {
             let typed_cmd_for_commit = typed_cmd.clone();
             let idle_input_dirty_for_commit = idle_input_dirty.clone();
             let pty_synced_for_commit = pty_synced.clone();
-            let finished_blocks_for_commit = finished_blocks_rc.clone();
+            let finished_blocks_for_commit = Rc::downgrade(&finished_blocks_rc);
             let selected_block_ids_for_commit = selected_block_ids.clone();
             let selected_block_id_for_commit = selected_block_id.clone();
             let selection_anchor_id_for_commit = selection_anchor_id.clone();
@@ -3843,13 +3973,15 @@ impl TermView {
                 // later Enter could unexpectedly recall the old selection instead
                 // of submitting the line the user has just started editing.
                 if selected_block_id_for_commit.get().is_some() {
-                    let finished = finished_blocks_for_commit.borrow();
-                    clear_finished_block_selection(
-                        &finished,
-                        &selected_block_ids_for_commit,
-                        &selected_block_id_for_commit,
-                        &selection_anchor_id_for_commit,
-                    );
+                    if let Some(finished_blocks_for_commit) = finished_blocks_for_commit.upgrade() {
+                        let finished = finished_blocks_for_commit.borrow();
+                        clear_finished_block_selection(
+                            &finished,
+                            &selected_block_ids_for_commit,
+                            &selected_block_id_for_commit,
+                            &selection_anchor_id_for_commit,
+                        );
+                    }
                 }
 
                 let awaiting_command = bstate_for_commit.get() == BlockState::AwaitingCommand;
@@ -3916,7 +4048,7 @@ impl TermView {
         {
             let pty_for_key = pty.clone();
             let typed_cmd_for_key = typed_cmd.clone();
-            let finished_blocks_for_key = finished_blocks_rc.clone();
+            let finished_blocks_for_key = Rc::downgrade(&finished_blocks_rc);
             let block_data_for_key = block_data_rc.clone();
             let block_list_for_key = block_list.clone();
             let selected_block_ids_for_key = selected_block_ids.clone();
@@ -3928,17 +4060,17 @@ impl TermView {
 
             KeyCtx {
                 pty_for_key,
-                active_vte_for_key: active_vte.clone(),
+                active_vte_for_key: active_vte.downgrade(),
                 pty_synced_for_key: pty_synced.clone(),
                 bracketed_paste_for_key: bracketed_paste.clone(),
                 typed_cmd_for_key,
                 finished_blocks_for_key,
                 block_data_for_key,
-                block_list_for_key,
+                block_list_for_key: block_list_for_key.downgrade(),
                 selected_block_ids_for_key,
                 selected_block_id_for_key,
                 selection_anchor_id_for_key,
-                block_scroll_for_key,
+                block_scroll_for_key: block_scroll_for_key.downgrade(),
                 bookmarks_for_key: block_bookmarks.clone(),
                 visible_indices_for_key: visible_indices.clone(),
                 bstate_for_key: bstate.clone(),
@@ -3952,7 +4084,7 @@ impl TermView {
         // block selection. Programmatic focus from a header click does not trigger
         // this gesture, so keyboard block navigation remains intact.
         {
-            let finished_for_click = finished_blocks_rc.clone();
+            let finished_for_click = Rc::downgrade(&finished_blocks_rc);
             let selected_ids_for_click = selected_block_ids.clone();
             let selected_for_click = selected_block_id.clone();
             let anchor_for_click = selection_anchor_id.clone();
@@ -3961,13 +4093,15 @@ impl TermView {
             active_click.set_propagation_phase(gtk4::PropagationPhase::Capture);
             active_click.connect_pressed(move |_, _, _, _| {
                 if selected_for_click.get().is_some() {
-                    let finished = finished_for_click.borrow();
-                    clear_finished_block_selection(
-                        &finished,
-                        &selected_ids_for_click,
-                        &selected_for_click,
-                        &anchor_for_click,
-                    );
+                    if let Some(finished_for_click) = finished_for_click.upgrade() {
+                        let finished = finished_for_click.borrow();
+                        clear_finished_block_selection(
+                            &finished,
+                            &selected_ids_for_click,
+                            &selected_for_click,
+                            &anchor_for_click,
+                        );
+                    }
                 }
             });
             active_vte.add_controller(active_click);
@@ -3990,10 +4124,13 @@ impl TermView {
             let pointer_cell: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((1, 1)));
             {
                 let pointer_for_motion = pointer_cell.clone();
-                let vte_for_motion = active_vte.clone();
+                let vte_for_motion = active_vte.downgrade();
                 let motion = gtk4::EventControllerMotion::new();
                 motion.set_propagation_phase(gtk4::PropagationPhase::Capture);
                 motion.connect_motion(move |_, x, y| {
+                    let Some(vte_for_motion) = vte_for_motion.upgrade() else {
+                        return;
+                    };
                     let cw = (vte_for_motion.char_width() as f64).max(1.0);
                     let ch = (vte_for_motion.char_height() as f64).max(1.0);
                     let col = (x / cw).floor() as i64 + 1;
@@ -4186,7 +4323,7 @@ impl TermView {
             let block_scroll = term_view.block_scroll.clone();
             let block_data = term_view.block_data.clone();
             let config = term_view.config.clone();
-            let finished_blocks = term_view.finished_blocks.clone();
+            let finished_blocks = Rc::downgrade(&term_view.finished_blocks);
             let visible_indices = term_view.visible_indices.clone();
             let fullscreen = term_view.fullscreen.clone();
             let visibility_update_pending = Rc::new(Cell::new(false));
@@ -4202,6 +4339,10 @@ impl TermView {
                 {
                     return;
                 }
+                let Some(finished_blocks) = finished_blocks.upgrade() else {
+                    visibility_update_pending.set(false);
+                    return;
+                };
 
                 let vp = viewport.clone();
                 let scroll = block_scroll.clone();
@@ -4272,9 +4413,12 @@ impl TermView {
     /// push TIOCSWINSZ synchronously so apps never see a stale first layout.
     fn install_resize_tick(&self) {
         let pty_for_resize = self.pty.clone();
-        let scroll_for_resize = self.block_scroll.clone();
+        let scroll_for_resize = self.block_scroll.downgrade();
         let last: Rc<Cell<(u16, u16)>> = Rc::new(Cell::new((0, 0)));
         let tick_id = self.active_vte.add_tick_callback(move |vte, _clock| {
+            let Some(scroll_for_resize) = scroll_for_resize.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
             let (cols, rows) = pty_grid_size(vte, &scroll_for_resize);
             if cols > 0 && rows > 0 && (cols, rows) != last.get() {
                 last.set((cols, rows));
@@ -5032,7 +5176,7 @@ mod tests {
         selected_command_text, selected_id_range, should_buffer_background_output, strip_ansi,
         strip_ansi_with_clear_detect, take_background_output, truncate_plain_output_for_height,
         viewport_state_for_scroll, visible_indices_for_viewport, BlockData, BlockState,
-        CommandPromptStatus, ViewportState,
+        BoundedByteRing, CommandPromptStatus, ViewportState, MAX_RAW_OUTPUT_BYTES,
     };
     use crate::parser::{KeyboardProtocolQuery, ParserEvent};
     use std::cell::{Cell, RefCell};
@@ -5049,7 +5193,9 @@ mod tests {
 
     #[test]
     fn taking_background_output_drains_the_pending_buffer() {
-        let pending = RefCell::new(b"async line\r\n".to_vec());
+        let mut bytes = BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES);
+        bytes.append(b"async line\r\n");
+        let pending = RefCell::new(bytes);
         assert_eq!(
             take_background_output(&pending).as_deref(),
             Some("async line\r\n")

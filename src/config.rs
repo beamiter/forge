@@ -665,6 +665,17 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "show_repo_strip",
 ];
 
+const REMOTE_HOST_CONFIG_KEYS: &[&str] = &[
+    "name",
+    "host",
+    "user",
+    "remote_shell",
+    "session",
+    "ssh_args",
+    "login_shell",
+    "multiplex",
+];
+
 fn config_issue(
     issues: &mut Vec<ConfigIssue>,
     level: ConfigIssueLevel,
@@ -676,6 +687,39 @@ fn config_issue(
         path: path.into(),
         message: message.into(),
     });
+}
+
+fn validate_remote_host_string(
+    issues: &mut Vec<ConfigIssue>,
+    value: Option<&toml::Value>,
+    path: &str,
+    required: bool,
+) {
+    let Some(value) = value else {
+        if required {
+            config_issue(
+                issues,
+                ConfigIssueLevel::Error,
+                path,
+                "missing required string",
+            );
+        }
+        return;
+    };
+    let Some(value) = value.as_str() else {
+        config_issue(issues, ConfigIssueLevel::Error, path, "expected a string");
+        return;
+    };
+    if value.trim().is_empty() {
+        config_issue(issues, ConfigIssueLevel::Error, path, "must not be empty");
+    } else if value.chars().any(char::is_control) {
+        config_issue(
+            issues,
+            ConfigIssueLevel::Error,
+            path,
+            "must not contain control characters",
+        );
+    }
 }
 
 fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
@@ -1010,25 +1054,53 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
                     config_issue(&mut issues, Error, path, "expected a table");
                     continue;
                 };
-                match host.get("host").and_then(toml::Value::as_str) {
-                    Some(value) if !value.trim().is_empty() => {}
-                    _ => config_issue(
-                        &mut issues,
-                        Error,
-                        format!("{path}.host"),
-                        "missing non-empty host",
-                    ),
+                for key in host.keys() {
+                    if !REMOTE_HOST_CONFIG_KEYS.contains(&key.as_str()) {
+                        config_issue(
+                            &mut issues,
+                            Warning,
+                            format!("{path}.{key}"),
+                            "unknown remote host option; it will be ignored",
+                        );
+                    }
+                }
+                validate_remote_host_string(
+                    &mut issues,
+                    host.get("host"),
+                    &format!("{path}.host"),
+                    true,
+                );
+                for key in ["name", "user", "remote_shell", "session"] {
+                    let field_path = format!("{path}.{key}");
+                    validate_remote_host_string(&mut issues, host.get(key), &field_path, false);
                 }
                 if let Some(args) = host.get("ssh_args") {
-                    if !args
-                        .as_array()
-                        .is_some_and(|values| values.iter().all(toml::Value::is_str))
-                    {
-                        config_issue(
+                    match args.as_array() {
+                        Some(values) => {
+                            for (arg_index, value) in values.iter().enumerate() {
+                                validate_remote_host_string(
+                                    &mut issues,
+                                    Some(value),
+                                    &format!("{path}.ssh_args[{arg_index}]"),
+                                    true,
+                                );
+                            }
+                        }
+                        None => config_issue(
                             &mut issues,
                             Error,
                             format!("{path}.ssh_args"),
                             "expected an array of strings",
+                        ),
+                    }
+                }
+                for key in ["login_shell", "multiplex"] {
+                    if host.get(key).is_some_and(|value| !value.is_bool()) {
+                        config_issue(
+                            &mut issues,
+                            Error,
+                            format!("{path}.{key}"),
+                            "expected true or false",
                         );
                     }
                 }
@@ -1921,6 +1993,108 @@ unknown_action = "F8"
     #[test]
     fn fresh_install_has_no_personal_remote_targets() {
         assert!(default_remote_hosts().is_empty());
+    }
+
+    #[test]
+    fn remote_host_config_accepts_complete_and_minimal_entries() {
+        let issues = validate_config_contents(
+            r#"
+[[remote_hosts]]
+name = "开发机"
+host = "dev.example.com"
+user = "alice"
+remote_shell = "/opt/tools/rsh --resume"
+session = "开发-main"
+ssh_args = ["-p", "2222", "-o", "ProxyCommand=ssh bastion -W %h:%p"]
+login_shell = false
+multiplex = true
+
+[[remote_hosts]]
+host = "backup.example.com"
+"#,
+        )
+        .unwrap();
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    #[test]
+    fn remote_host_config_validates_every_nested_field_type_and_unknown_key() {
+        let issues = validate_config_contents(
+            r#"
+[[remote_hosts]]
+name = 42
+host = 42
+user = false
+remote_shell = []
+session = { value = "dev" }
+ssh_args = "not-an-array"
+login_shell = "yes"
+multiplex = 1
+unexpected = true
+
+[[remote_hosts]]
+name = "missing host"
+"#,
+        )
+        .unwrap();
+
+        for key in [
+            "name",
+            "host",
+            "user",
+            "remote_shell",
+            "session",
+            "ssh_args",
+            "login_shell",
+            "multiplex",
+        ] {
+            let path = format!("remote_hosts[0].{key}");
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.path == path && issue.is_error()),
+                "missing error for {path}: {issues:?}"
+            );
+        }
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == "remote_hosts[1].host" && issue.is_error()));
+        assert!(issues.iter().any(|issue| {
+            issue.path == "remote_hosts[0].unexpected" && issue.level == ConfigIssueLevel::Warning
+        }));
+    }
+
+    #[test]
+    fn remote_host_config_rejects_empty_and_control_character_strings() {
+        let issues = validate_config_contents(
+            r#"
+[[remote_hosts]]
+name = " "
+host = "example.com\u001b"
+user = ""
+remote_shell = "rsh\u0007"
+session = "\t"
+ssh_args = ["", "ok\u007f"]
+"#,
+        )
+        .unwrap();
+
+        for path in [
+            "remote_hosts[0].name",
+            "remote_hosts[0].host",
+            "remote_hosts[0].user",
+            "remote_hosts[0].remote_shell",
+            "remote_hosts[0].session",
+            "remote_hosts[0].ssh_args[0]",
+            "remote_hosts[0].ssh_args[1]",
+        ] {
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.path == path && issue.is_error()),
+                "missing error for {path}: {issues:?}"
+            );
+        }
     }
 
     #[test]

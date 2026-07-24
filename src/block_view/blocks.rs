@@ -1,4 +1,5 @@
 //! blocks — finished-block widgets (VTE-backed) and the live ActiveBlock.
+use super::bounded_bytes::BoundedByteRing;
 use super::*;
 use crate::config::Config;
 use crate::terminal::open_uri;
@@ -516,6 +517,30 @@ fn forward_outer_scroll(outer: &gtk4::ScrolledWindow, dy: f64) {
     outer_adj.set_value(target);
 }
 
+fn schedule_block_edge_scroll(widget: &gtk4::Box, outer: &gtk4::ScrolledWindow, bottom: bool) {
+    let widget = widget.downgrade();
+    let outer = outer.downgrade();
+    glib::idle_add_local_once(move || {
+        let (Some(widget), Some(outer)) = (widget.upgrade(), outer.upgrade()) else {
+            return;
+        };
+        let Some(bounds) = widget.compute_bounds(&outer) else {
+            return;
+        };
+        let adj = outer.vadjustment();
+        let target = block_edge_scroll_target(
+            adj.value(),
+            bounds.y() as f64,
+            bounds.height() as f64,
+            adj.page_size(),
+            adj.lower(),
+            adj.upper(),
+            bottom,
+        );
+        adj.set_value(target);
+    });
+}
+
 pub(crate) fn estimated_cell_height_px(config: &Config) -> i32 {
     let parts: Vec<&str> = config.font_desc.split_whitespace().collect();
     let base_size = parts
@@ -967,15 +992,25 @@ impl FinishedBlock {
         }
         header_row.append(&action_box);
 
-        let outer_for_enter = outer.clone();
-        let action_box_for_enter = action_box.clone();
+        let outer_for_enter = outer.downgrade();
+        let action_box_for_enter = action_box.downgrade();
         hover_ctrl.connect_enter(move |_, _, _| {
+            let (Some(outer_for_enter), Some(action_box_for_enter)) =
+                (outer_for_enter.upgrade(), action_box_for_enter.upgrade())
+            else {
+                return;
+            };
             outer_for_enter.add_css_class("block-hovered");
             action_box_for_enter.set_visible(true);
         });
-        let outer_for_leave = outer.clone();
-        let action_box_for_leave = action_box.clone();
+        let outer_for_leave = outer.downgrade();
+        let action_box_for_leave = action_box.downgrade();
         hover_ctrl.connect_leave(move |_| {
+            let (Some(outer_for_leave), Some(action_box_for_leave)) =
+                (outer_for_leave.upgrade(), action_box_for_leave.upgrade())
+            else {
+                return;
+            };
             outer_for_leave.remove_css_class("block-hovered");
             // Only the active edge of a multi-selection owns persistent actions.
             if !outer_for_leave.has_css_class("block-selection-active") {
@@ -1047,9 +1082,14 @@ impl FinishedBlock {
             let current_cap_for_map = current_viewport_cap.clone();
             let displayed_for_map = displayed_output.clone();
             let expanded_for_map = expanded.clone();
-            let expand_btn_for_map = expand_btn.clone();
-            let jump_btn_for_map = jump_bottom_btn.clone();
+            let expand_btn_for_map = expand_btn.downgrade();
+            let jump_btn_for_map = jump_bottom_btn.downgrade();
             output_vte.connect_map(move |w| {
+                let (Some(expand_btn_for_map), Some(jump_btn_for_map)) =
+                    (expand_btn_for_map.upgrade(), jump_btn_for_map.upgrade())
+                else {
+                    return;
+                };
                 let text = displayed_for_map.borrow();
                 let rows = output_visual_row_count(&text, cols_for_map);
                 let fitted_cap = fitted_output_rows_for_widget(w, fallback_cap_for_map, rows);
@@ -1088,11 +1128,14 @@ impl FinishedBlock {
         expand_btn.set_visible(long_output && !uses_outer_document_scroll(output_rows));
         {
             let expand_for_btn = expanded.clone();
-            let output_vte_for_btn = output_vte.clone();
+            let output_vte_for_btn = output_vte.downgrade();
             let displayed_for_btn = displayed_output.clone();
             let current_cap_for_btn = current_viewport_cap.clone();
             let cols_for_btn = cols.max(1);
             expand_btn.connect_clicked(move |btn| {
+                let Some(output_vte_for_btn) = output_vte_for_btn.upgrade() else {
+                    return;
+                };
                 let now_expanded = !expand_for_btn.get();
                 expand_for_btn.set(now_expanded);
                 let rows = output_visual_row_count(&displayed_for_btn.borrow(), cols_for_btn);
@@ -1169,11 +1212,14 @@ impl FinishedBlock {
         {
             let click = gtk4::GestureClick::new();
             click.set_button(1);
-            let vte_for_click = output_vte.clone();
+            let vte_for_click = output_vte.downgrade();
             click.connect_pressed(move |controller, n_press, x, y| {
                 if n_press != 1 {
                     return;
                 }
+                let Some(vte_for_click) = vte_for_click.upgrade() else {
+                    return;
+                };
                 let state = controller.current_event_state();
                 if !state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
                     return;
@@ -1207,10 +1253,17 @@ impl FinishedBlock {
         // Header chevron and the inline summary share one folded-state update,
         // so either target consistently restores the same output surface.
         let set_collapsed: Rc<dyn Fn(bool)> = {
-            let output_widget = output_widget.clone();
-            let collapsed_summary = collapsed_summary.clone();
-            let collapse_btn = collapse_btn.clone();
+            let output_widget = output_widget.downgrade();
+            let collapsed_summary = collapsed_summary.downgrade();
+            let collapse_btn = collapse_btn.downgrade();
             Rc::new(move |collapsed| {
+                let (Some(output_widget), Some(collapsed_summary), Some(collapse_btn)) = (
+                    output_widget.upgrade(),
+                    collapsed_summary.upgrade(),
+                    collapse_btn.upgrade(),
+                ) else {
+                    return;
+                };
                 output_widget.set_visible(!collapsed);
                 collapsed_summary.set_visible(collapsed);
                 collapse_btn.set_label(if collapsed { "\u{f054}" } else { "\u{f078}" });
@@ -1223,8 +1276,12 @@ impl FinishedBlock {
         };
         {
             let set_collapsed = set_collapsed.clone();
-            let output_widget = output_widget.clone();
-            collapse_btn.connect_clicked(move |_| set_collapsed(output_widget.is_visible()));
+            let output_widget = output_widget.downgrade();
+            collapse_btn.connect_clicked(move |_| {
+                if let Some(output_widget) = output_widget.upgrade() {
+                    set_collapsed(output_widget.is_visible());
+                }
+            });
         }
         {
             let set_collapsed = set_collapsed.clone();
@@ -1274,23 +1331,51 @@ impl FinishedBlock {
             content.reorder_child_after(&filter_row, Some(&cmd_row));
 
             let apply = {
-                let output_vte = output_vte.clone();
+                let output_vte = output_vte.downgrade();
                 let full_output = full_output.clone();
                 let displayed_output = displayed_output.clone();
                 let filter_enabled = filter_enabled.clone();
-                let filter_entry = filter_entry.clone();
-                let regex_tg = regex_tg.clone();
-                let case_tg = case_tg.clone();
-                let invert_tg = invert_tg.clone();
-                let ctx_spin = ctx_spin.clone();
-                let filter_status = filter_status.clone();
-                let expand_btn = expand_btn.clone();
+                let filter_entry = filter_entry.downgrade();
+                let regex_tg = regex_tg.downgrade();
+                let case_tg = case_tg.downgrade();
+                let invert_tg = invert_tg.downgrade();
+                let ctx_spin = ctx_spin.downgrade();
+                let filter_status = filter_status.downgrade();
+                let expand_btn = expand_btn.downgrade();
                 let expanded = expanded.clone();
                 let current_viewport_cap = current_viewport_cap.clone();
-                let filter_btn = filter_btn.clone();
-                let jump_bottom_btn = jump_bottom_btn.clone();
-                let collapsed_summary = collapsed_summary.clone();
+                let filter_btn = filter_btn.downgrade();
+                let jump_bottom_btn = jump_bottom_btn.downgrade();
+                let collapsed_summary = collapsed_summary.downgrade();
                 move || {
+                    let (
+                        Some(output_vte),
+                        Some(filter_entry),
+                        Some(regex_tg),
+                        Some(case_tg),
+                        Some(invert_tg),
+                        Some(ctx_spin),
+                        Some(filter_status),
+                        Some(expand_btn),
+                        Some(filter_btn),
+                        Some(jump_bottom_btn),
+                        Some(collapsed_summary),
+                    ) = (
+                        output_vte.upgrade(),
+                        filter_entry.upgrade(),
+                        regex_tg.upgrade(),
+                        case_tg.upgrade(),
+                        invert_tg.upgrade(),
+                        ctx_spin.upgrade(),
+                        filter_status.upgrade(),
+                        expand_btn.upgrade(),
+                        filter_btn.upgrade(),
+                        jump_bottom_btn.upgrade(),
+                        collapsed_summary.upgrade(),
+                    )
+                    else {
+                        return;
+                    };
                     let q = filter_entry.text().to_string();
                     let full = full_output.borrow();
                     let full_rows = output_row_count(&full);
@@ -1487,24 +1572,7 @@ impl FinishedBlock {
 
     /// Scroll this block's top or bottom edge into the outer history canvas.
     pub(crate) fn scroll_to_edge(&self, outer: &gtk4::ScrolledWindow, bottom: bool) {
-        let widget = self.widget.clone();
-        let outer = outer.clone();
-        glib::idle_add_local_once(move || {
-            let Some(bounds) = widget.compute_bounds(&outer) else {
-                return;
-            };
-            let adj = outer.vadjustment();
-            let target = block_edge_scroll_target(
-                adj.value(),
-                bounds.y() as f64,
-                bounds.height() as f64,
-                adj.page_size(),
-                adj.lower(),
-                adj.upper(),
-                bottom,
-            );
-            adj.set_value(target);
-        });
+        schedule_block_edge_scroll(&self.widget, outer, bottom);
     }
 
     /// Forward wheel events on the output VTE to the outer ScrolledWindow once
@@ -1514,24 +1582,35 @@ impl FinishedBlock {
     /// page never resumes. Closes the perceptual gap with a single-scrollback
     /// VTE pane (terminator/xterm).
     pub(crate) fn connect_scroll_forwarding(&self, outer: &gtk4::ScrolledWindow) {
-        let block_for_jump = self.clone();
-        let outer_for_jump = outer.clone();
+        let output_for_jump = self.output_vte.downgrade();
+        let widget_for_jump = self.widget.downgrade();
+        let outer_for_jump = outer.downgrade();
         self.jump_bottom_btn.connect_clicked(move |_| {
-            if let Some(adj) = block_for_jump.output_vte.vadjustment() {
+            let (Some(output), Some(widget), Some(outer)) = (
+                output_for_jump.upgrade(),
+                widget_for_jump.upgrade(),
+                outer_for_jump.upgrade(),
+            ) else {
+                return;
+            };
+            if let Some(adj) = output.vadjustment() {
                 let target = (adj.upper() - adj.page_size()).max(adj.lower());
                 if target > adj.lower() + f64::EPSILON {
                     adj.set_value(target);
                     return;
                 }
             }
-            block_for_jump.scroll_to_edge(&outer_for_jump, true);
+            schedule_block_edge_scroll(&widget, &outer, true);
         });
 
         let command_scroll =
             gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
         command_scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
-        let outer_for_command = outer.clone();
+        let outer_for_command = outer.downgrade();
         command_scroll.connect_scroll(move |_, _dx, dy| {
+            let Some(outer_for_command) = outer_for_command.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
             forward_outer_scroll(&outer_for_command, dy);
             glib::Propagation::Stop
         });
@@ -1539,9 +1618,12 @@ impl FinishedBlock {
 
         let scroll_ctrl =
             gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
-        let vte = self.output_vte.clone();
-        let outer_for_vte = outer.clone();
+        let vte = self.output_vte.downgrade();
+        let outer_for_vte = outer.downgrade();
         scroll_ctrl.connect_scroll(move |_, _dx, dy| {
+            let (Some(vte), Some(outer_for_vte)) = (vte.upgrade(), outer_for_vte.upgrade()) else {
+                return glib::Propagation::Proceed;
+            };
             // The cap is determined only after map/resize. Inspect the actual
             // VTE adjustment on every wheel event rather than trusting a stale
             // construction-time flag.
@@ -1578,19 +1660,25 @@ impl FinishedBlock {
         bstate: &Rc<Cell<BlockState>>,
         bracketed_paste: &Rc<Cell<bool>>,
     ) {
-        let vte_for_cmd = vte.clone();
+        let vte_for_cmd = vte.downgrade();
         let cmd_for_copy = self.cmd_text.clone();
         self.copy_cmd_btn.connect_clicked(move |btn| {
+            let Some(vte_for_cmd) = vte_for_cmd.upgrade() else {
+                return;
+            };
             vte_for_cmd.clipboard().set_text(&cmd_for_copy);
             flash_button_label(btn, "\u{f00c}", "Command copied");
         });
 
-        let vte_for_out = vte.clone();
+        let vte_for_out = vte.downgrade();
         // Copy the FULL output (ANSI stripped), not just the collapsed first-N
         // lines shown in output_buffer before "Show more" is clicked.
         let full_output_for_copy = self.full_output.clone();
         let stripped_output_for_copy = self.stripped_output.clone();
         self.copy_output_btn.connect_clicked(move |btn| {
+            let Some(vte_for_out) = vte_for_out.upgrade() else {
+                return;
+            };
             let text = Self::with_cached_stripped_output(
                 &full_output_for_copy,
                 &stripped_output_for_copy,
@@ -1602,7 +1690,7 @@ impl FinishedBlock {
 
         let pty_for_rerun = Rc::clone(pty);
         let pty_synced_for_rerun = pty_synced.clone();
-        let active_for_rerun = active.clone();
+        let active_for_rerun = Rc::downgrade(active);
         let typed_cmd_for_rerun = typed_cmd.clone();
         let bstate_for_rerun = bstate.clone();
         let bracketed_for_rerun = bracketed_paste.clone();
@@ -1616,7 +1704,9 @@ impl FinishedBlock {
                 &cmd_for_rerun,
                 bracketed_for_rerun.get(),
             ) {
-                active_for_rerun.borrow().grab_focus();
+                if let Some(active_for_rerun) = active_for_rerun.upgrade() {
+                    active_for_rerun.borrow().grab_focus();
+                }
                 flash_button_label(btn, "\u{f00c}", "Command inserted");
             } else {
                 flash_button_label(btn, "\u{f071}", "Wait for an editable prompt");
@@ -1637,7 +1727,7 @@ pub(crate) struct ActiveBlock {
     pub(crate) active_vte: Terminal,
     /// Raw output bytes accumulated during CollectingOutput, consumed by the
     /// finalize path to build the styled finished block (jterm1's `out_buf`).
-    pub(crate) raw_output: Rc<RefCell<Vec<u8>>>,
+    raw_output: Rc<RefCell<BoundedByteRing>>,
 }
 
 impl ActiveBlock {
@@ -1665,17 +1755,16 @@ impl ActiveBlock {
         // `realize` is too early: the VTE's IM context does not have a mapped
         // surface yet. Taking logical focus there can suppress the real
         // focus-in fcitx/ibus need. `map` is the first valid point to focus.
-        {
-            let av = active_vte.clone();
-            active_vte.connect_map(move |_| {
-                av.grab_focus();
-            });
-        }
+        active_vte.connect_map(|terminal| {
+            terminal.grab_focus();
+        });
 
         ActiveBlock {
             widget,
             active_vte,
-            raw_output: Rc::new(RefCell::new(Vec::new())),
+            raw_output: Rc::new(RefCell::new(BoundedByteRing::new(
+                super::MAX_RAW_OUTPUT_BYTES,
+            ))),
         }
     }
 
@@ -1683,20 +1772,15 @@ impl ActiveBlock {
     /// are also fed to the live VTE separately by the reader; this buffer is only
     /// the source the finalize path styles into a finished block.
     pub(crate) fn accumulate_output(&self, raw_bytes: &[u8]) {
-        let mut buf = self.raw_output.borrow_mut();
-        buf.extend_from_slice(raw_bytes);
-        if buf.len() > super::MAX_RAW_OUTPUT_BYTES {
-            let drop = buf.len() - super::MAX_RAW_OUTPUT_BYTES;
-            buf.drain(..drop);
-        }
+        self.raw_output.borrow_mut().append(raw_bytes);
     }
 
     pub(crate) fn output_text(&self) -> String {
-        let raw = self.raw_output.borrow();
+        let mut raw = self.raw_output.borrow_mut();
         if raw.is_empty() {
             return String::new();
         }
-        String::from_utf8_lossy(&raw).into_owned()
+        String::from_utf8_lossy(raw.make_contiguous()).into_owned()
     }
 
     /// Clear the accumulated output buffer (without touching the VTE).

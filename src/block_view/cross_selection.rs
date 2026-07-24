@@ -54,9 +54,15 @@ impl CrossSelection {
         let click = gtk4::GestureClick::new();
         click.set_button(gtk4::gdk::BUTTON_PRIMARY);
         click.set_propagation_phase(gtk4::PropagationPhase::Capture);
-        let scroll_for_click = block_scroll.clone();
-        let this_for_click = this.clone();
+        let scroll_for_click = block_scroll.downgrade();
+        let this_for_click = Rc::downgrade(&this);
         click.connect_pressed(move |gesture, _n_press, x, y| {
+            let Some(this_for_click) = this_for_click.upgrade() else {
+                return;
+            };
+            let Some(scroll_for_click) = scroll_for_click.upgrade() else {
+                return;
+            };
             let target = this_for_click.vte_at(&scroll_for_click, x, y);
             if target.is_some() {
                 this_for_click.clear_block_selection();
@@ -71,9 +77,15 @@ impl CrossSelection {
         drag.set_button(gtk4::gdk::BUTTON_PRIMARY);
         drag.set_propagation_phase(gtk4::PropagationPhase::Capture);
 
-        let scroll_for_begin = block_scroll.clone();
-        let this_for_begin = this.clone();
+        let scroll_for_begin = block_scroll.downgrade();
+        let this_for_begin = Rc::downgrade(&this);
         drag.connect_drag_begin(move |_, x, y| {
+            let Some(this_for_begin) = this_for_begin.upgrade() else {
+                return;
+            };
+            let Some(scroll_for_begin) = scroll_for_begin.upgrade() else {
+                return;
+            };
             let start = this_for_begin.vte_index_at(&scroll_for_begin, x, y);
             this_for_begin.start_idx.set(start);
             this_for_begin.claimed.set(false);
@@ -84,10 +96,16 @@ impl CrossSelection {
             }
         });
 
-        let scroll_for_update = block_scroll.clone();
-        let this_for_update = this.clone();
+        let scroll_for_update = block_scroll.downgrade();
+        let this_for_update = Rc::downgrade(&this);
         drag.connect_drag_update(move |gesture, dx, dy| {
+            let Some(this_for_update) = this_for_update.upgrade() else {
+                return;
+            };
             let Some(start) = this_for_update.start_idx.get() else {
+                return;
+            };
+            let Some(scroll_for_update) = scroll_for_update.upgrade() else {
                 return;
             };
             let Some((sx, sy)) = gesture.start_point() else {
@@ -106,9 +124,11 @@ impl CrossSelection {
             this_for_update.paint_range(start, cur_idx);
         });
 
-        let this_for_end = this.clone();
+        let this_for_end = Rc::downgrade(&this);
         drag.connect_drag_end(move |_, _, _| {
-            this_for_end.start_idx.set(None);
+            if let Some(this_for_end) = this_for_end.upgrade() {
+                this_for_end.start_idx.set(None);
+            }
             // Keep the painted selection after release so the copy shortcut works.
         });
 

@@ -197,30 +197,44 @@ pub(crate) fn show_command_palette(
     // Toggling a filter re-runs the current query through the new predicate.
     {
         let populate = populate.clone();
-        let entry = entry.clone();
+        let entry = entry.downgrade();
         let failed_only = failed_only.clone();
         failed_toggle.connect_toggled(move |btn| {
+            let Some(entry) = entry.upgrade() else {
+                return;
+            };
             failed_only.set(btn.is_active());
             populate(entry.text().as_str());
         });
     }
     {
         let populate = populate.clone();
-        let entry = entry.clone();
+        let entry = entry.downgrade();
         let slow_only = slow_only.clone();
         slow_toggle.connect_toggled(move |btn| {
+            let Some(entry) = entry.upgrade() else {
+                return;
+            };
             slow_only.set(btn.is_active());
             populate(entry.text().as_str());
         });
     }
 
-    let live_vte_for_choose = live_vte.clone();
+    let live_vte_for_choose = live_vte.downgrade();
     let choose: Rc<dyn Fn()> = {
-        let list = list.clone();
+        let list = list.downgrade();
         let filtered = filtered.clone();
-        let popover = popover.clone();
-        let scroll = parent.clone();
+        let popover = popover.downgrade();
+        let scroll = parent.downgrade();
         Rc::new(move || {
+            let (Some(list), Some(popover), Some(scroll), Some(live_vte)) = (
+                list.upgrade(),
+                popover.upgrade(),
+                scroll.upgrade(),
+                live_vte_for_choose.upgrade(),
+            ) else {
+                return;
+            };
             let idx = list.selected_row().map(|r| r.index()).unwrap_or(-1);
             let Some(cmd) = (idx >= 0)
                 .then(|| filtered.borrow().get(idx as usize).cloned())
@@ -237,9 +251,12 @@ pub(crate) fn show_command_palette(
             // ScrolledWindow scroll to reveal the holder's *top* (jumping up into
             // history). Re-pin to the bottom so the user lands back on the prompt
             // with the recalled command.
-            let scroll = scroll.clone();
-            let live_vte = live_vte_for_choose.clone();
+            let scroll = scroll.downgrade();
+            let live_vte = live_vte.downgrade();
             glib::idle_add_local_once(move || {
+                let (Some(scroll), Some(live_vte)) = (scroll.upgrade(), live_vte.upgrade()) else {
+                    return;
+                };
                 live_vte.grab_focus();
                 let adj = scroll.vadjustment();
                 adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
@@ -261,13 +278,16 @@ pub(crate) fn show_command_palette(
     }
 
     {
-        let list = list.clone();
-        let popover = popover.clone();
+        let list = list.downgrade();
+        let popover = popover.downgrade();
         let choose = choose.clone();
         let key = gtk4::EventControllerKey::new();
         key.set_propagation_phase(gtk4::PropagationPhase::Capture);
         key.connect_key_pressed(move |_, keyval, _, _| {
             use gtk4::gdk::Key;
+            let Some(list) = list.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
             let n_rows = {
                 let mut n = 0;
                 while list.row_at_index(n).is_some() {
@@ -304,7 +324,9 @@ pub(crate) fn show_command_palette(
                     glib::Propagation::Stop
                 }
                 Key::Escape => {
-                    popover.popdown();
+                    if let Some(popover) = popover.upgrade() {
+                        popover.popdown();
+                    }
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
@@ -316,9 +338,11 @@ pub(crate) fn show_command_palette(
     // A Popover with an explicit parent must be unparented when dismissed or it
     // leaks (and warns at teardown). Restore terminal focus on Escape/click-away;
     // previously only choosing a command returned focus to the prompt.
-    let live_vte_for_close = live_vte.clone();
+    let live_vte_for_close = live_vte.downgrade();
     popover.connect_closed(move |p| {
-        live_vte_for_close.grab_focus();
+        if let Some(live_vte_for_close) = live_vte_for_close.upgrade() {
+            live_vte_for_close.grab_focus();
+        }
         p.unparent();
     });
 
