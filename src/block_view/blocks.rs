@@ -440,6 +440,99 @@ fn collapsed_output_summary(rows: i64) -> String {
     format!("▸ {} hidden — click to show", line_count_text(rows))
 }
 
+/// Human duration for the header badge. Minute-plus durations keep their
+/// seconds ("1m32s") — a bare "2m" can't distinguish a 61s build from a 179s
+/// one, which is exactly the range users compare across runs.
+pub(crate) fn format_block_duration(dur_ms: u64) -> String {
+    if dur_ms < 1000 {
+        format!("{dur_ms}ms")
+    } else if dur_ms < 60_000 {
+        format!("{:.1}s", dur_ms as f64 / 1000.0)
+    } else if dur_ms < 3_600_000 {
+        let m = dur_ms / 60_000;
+        let s = (dur_ms % 60_000) / 1000;
+        if s == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m{s:02}s")
+        }
+    } else {
+        let h = dur_ms / 3_600_000;
+        let m = (dur_ms % 3_600_000) / 60_000;
+        if m == 0 {
+            format!("{h}h")
+        } else {
+            format!("{h}h{m:02}m")
+        }
+    }
+}
+
+/// Shell convention: exit code 128+n means the process died from signal n.
+/// Name the signals a terminal user actually meets so "exit:130" reads as
+/// Ctrl-C and "exit:137" as the OOM killer at a glance.
+pub(crate) fn signal_name_for_exit(exit_code: i32) -> Option<&'static str> {
+    match exit_code.checked_sub(128)? {
+        1 => Some("SIGHUP"),
+        2 => Some("SIGINT"),
+        3 => Some("SIGQUIT"),
+        4 => Some("SIGILL"),
+        5 => Some("SIGTRAP"),
+        6 => Some("SIGABRT"),
+        7 => Some("SIGBUS"),
+        8 => Some("SIGFPE"),
+        9 => Some("SIGKILL"),
+        10 => Some("SIGUSR1"),
+        11 => Some("SIGSEGV"),
+        12 => Some("SIGUSR2"),
+        13 => Some("SIGPIPE"),
+        14 => Some("SIGALRM"),
+        15 => Some("SIGTERM"),
+        24 => Some("SIGXCPU"),
+        25 => Some("SIGXFSZ"),
+        _ => None,
+    }
+}
+
+/// Gregorian date for a count of days since 1970-01-01 (may be negative).
+/// Howard Hinnant's civil-from-days; avoids pulling a chrono dependency for
+/// one label.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y, m, d)
+}
+
+/// (label, tooltip) for the header timestamp. Blocks finished today show
+/// wall-clock "HH:MM:SS"; blocks restored from earlier days get a
+/// "MM-DD HH:MM" label so old history can't masquerade as fresh output. The
+/// tooltip always carries the full local date-time.
+pub(crate) fn format_block_timestamp(
+    end_ms: u64,
+    now_ms: u64,
+    tz_offset_secs: i64,
+) -> (String, String) {
+    let local = end_ms as i64 / 1000 + tz_offset_secs;
+    let day = local.div_euclid(86_400);
+    let tod = local.rem_euclid(86_400);
+    let (h, m, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    let (year, month, dom) = civil_from_days(day);
+    let today = (now_ms as i64 / 1000 + tz_offset_secs).div_euclid(86_400);
+    let label = if day == today {
+        format!("{h:02}:{m:02}:{s:02}")
+    } else {
+        format!("{month:02}-{dom:02} {h:02}:{m:02}")
+    };
+    let tooltip = format!("{year:04}-{month:02}-{dom:02} {h:02}:{m:02}:{s:02}");
+    (label, tooltip)
+}
+
 /// Rows consumed by a finished block outside its output VTE: metadata header,
 /// command row, and card chrome. Together with the compact live input rows this
 /// leaves a long block filling the rest of the pane without growing the outer
@@ -908,36 +1001,38 @@ impl FinishedBlock {
 
         // Timestamp label
         if let Some(et_ms) = end_time_ms {
-            let secs = et_ms / 1000;
-            let local_offset = chrono_local_offset_secs();
-            let local_secs = (secs as i64 + local_offset).rem_euclid(86400) as u64;
-            let h = local_secs / 3600;
-            let m = (local_secs % 3600) / 60;
-            let sec = local_secs % 60;
-            let ts_label = gtk4::Label::new(Some(&format!("{:02}:{:02}:{:02}", h, m, sec)));
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(et_ms);
+            let (label, tooltip) =
+                format_block_timestamp(et_ms, now_ms, chrono_local_offset_secs());
+            let ts_label = gtk4::Label::new(Some(&label));
             ts_label.add_css_class("block-header-label");
+            ts_label.set_tooltip_text(Some(&tooltip));
             header_row.append(&ts_label);
         }
 
         // Duration badge
         if let Some(dur_ms) = duration_ms {
-            let dur_sec = dur_ms as f64 / 1000.0;
-            let duration_text = if dur_sec < 1.0 {
-                format!("{:.0}ms", dur_ms)
-            } else if dur_sec < 60.0 {
-                format!("{:.1}s", dur_sec)
-            } else {
-                let min = dur_sec / 60.0;
-                format!("{:.0}m", min)
-            };
-            let dur_label = gtk4::Label::new(Some(&duration_text));
+            let dur_label = gtk4::Label::new(Some(&format_block_duration(dur_ms)));
             dur_label.add_css_class("block-meta-badge");
             header_row.append(&dur_label);
         }
 
         // Exit code badge
         if !is_background && exit_code != 0 {
-            let badge = gtk4::Label::new(Some(&format!("exit:{}", exit_code)));
+            let badge = match signal_name_for_exit(exit_code) {
+                Some(sig) => {
+                    let badge =
+                        gtk4::Label::new(Some(&format!("exit:{exit_code} {sig}")));
+                    badge.set_tooltip_text(Some(&format!(
+                        "128 + signal number: terminated by {sig}"
+                    )));
+                    badge
+                }
+                None => gtk4::Label::new(Some(&format!("exit:{exit_code}"))),
+            };
             badge.add_css_class("block-exit-bad");
             header_row.append(&badge);
         }
@@ -1920,6 +2015,56 @@ mod tests {
         for required in ["\x1b[H", "\x1b[2J", "\x1b[3J"] {
             assert!(clear.contains(required), "missing {required:?}");
         }
+    }
+
+    #[test]
+    fn duration_badge_keeps_seconds_past_the_minute_mark() {
+        use super::format_block_duration;
+        assert_eq!(format_block_duration(250), "250ms");
+        assert_eq!(format_block_duration(2500), "2.5s");
+        assert_eq!(format_block_duration(59_940), "59.9s");
+        assert_eq!(format_block_duration(60_000), "1m");
+        assert_eq!(format_block_duration(61_000), "1m01s");
+        assert_eq!(format_block_duration(179_000), "2m59s");
+        assert_eq!(format_block_duration(3_600_000), "1h");
+        assert_eq!(format_block_duration(3_840_000), "1h04m");
+    }
+
+    #[test]
+    fn signal_exits_name_the_signal_and_plain_codes_do_not() {
+        use super::signal_name_for_exit;
+        assert_eq!(signal_name_for_exit(130), Some("SIGINT"));
+        assert_eq!(signal_name_for_exit(137), Some("SIGKILL"));
+        assert_eq!(signal_name_for_exit(139), Some("SIGSEGV"));
+        assert_eq!(signal_name_for_exit(143), Some("SIGTERM"));
+        for plain in [0, 1, 2, 127, 128, 255, -1] {
+            assert_eq!(signal_name_for_exit(plain), None, "code {plain}");
+        }
+    }
+
+    #[test]
+    fn civil_from_days_round_trips_known_dates() {
+        use super::civil_from_days;
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        assert_eq!(civil_from_days(19_723), (2024, 1, 1));
+        assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+    }
+
+    #[test]
+    fn restored_blocks_from_earlier_days_carry_a_date_label() {
+        use super::format_block_timestamp;
+        // Same local day: wall-clock only.
+        let (label, tooltip) = format_block_timestamp(0, 0, 0);
+        assert_eq!(label, "00:00:00");
+        assert_eq!(tooltip, "1970-01-01 00:00:00");
+        // Viewed a day later: the label must expose the date.
+        let (label, _) = format_block_timestamp(0, 86_400_000, 0);
+        assert_eq!(label, "01-01 00:00");
+        // A negative zone offset can move the local date behind UTC.
+        let (label, tooltip) = format_block_timestamp(3_600_000, 90_000_000, -7200);
+        assert_eq!(label, "12-31 23:00");
+        assert_eq!(tooltip, "1969-12-31 23:00:00");
     }
 
     #[test]

@@ -27,7 +27,11 @@ pub fn long_block_finished(cmd: &str, exit_code: i32, duration_ms: u64) {
 
     let status = if exit_code == 0 { "✓" } else { "✗" };
     let title = format!("{status} {title_cmd}");
-    let body = format!("Exit {exit_code} after {}", humanize_duration(duration_ms));
+    let exit_text = match crate::block_view::signal_name_for_exit(exit_code) {
+        Some(sig) => format!("Exit {exit_code} ({sig})"),
+        None => format!("Exit {exit_code}"),
+    };
+    let body = format!("{exit_text} after {}", humanize_duration(duration_ms));
 
     let urgency = if exit_code == 0 { "normal" } else { "critical" };
 
