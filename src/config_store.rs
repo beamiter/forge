@@ -436,6 +436,10 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         toml::Value::Integer(config.agent_max_turns as i64),
     );
     table.insert(
+        "agent_auto_approve_readonly".into(),
+        toml::Value::Boolean(config.agent_auto_approve_readonly),
+    );
+    table.insert(
         "command_correction_enabled".into(),
         toml::Value::Boolean(config.command_correction_enabled),
     );
@@ -887,6 +891,7 @@ mod tests {
         config.ai_enabled = true;
         config.agent_enabled = true;
         config.agent_max_turns = 17;
+        config.agent_auto_approve_readonly = true;
         config.command_correction_enabled = false;
         config.ai_provider = "ollama".into();
         config.ai_base_url = "http://localhost:11434".into();
@@ -906,6 +911,12 @@ mod tests {
                 .get("agent_max_turns")
                 .and_then(toml::Value::as_integer),
             Some(17)
+        );
+        assert_eq!(
+            table
+                .get("agent_auto_approve_readonly")
+                .and_then(toml::Value::as_bool),
+            Some(true)
         );
         assert_eq!(
             table

@@ -247,6 +247,11 @@ pub struct Config {
     pub(crate) agent_enabled: bool,
     /// Maximum number of model replies in one Agent session.
     pub(crate) agent_max_turns: u32,
+    /// Opt-in: let the Agent run proposals that pass the strict read-only
+    /// allowlist without a per-command click. Everything else — writes,
+    /// chaining, redirection, flagged danger — still requires explicit
+    /// approval. Off by default.
+    pub(crate) agent_auto_approve_readonly: bool,
     /// Offer an editable, review-first correction when a Block command fails
     /// with a narrow typo-shaped error. Nothing is inserted or run
     /// automatically.
@@ -349,6 +354,7 @@ impl Config {
             ai_enabled: false,
             agent_enabled: false,
             agent_max_turns: 20,
+            agent_auto_approve_readonly: false,
             command_correction_enabled: false,
             ai_provider: "anthropic".to_string(),
             ai_base_url: "https://api.anthropic.com".to_string(),
@@ -650,6 +656,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "ai_enabled",
     "agent_enabled",
     "agent_max_turns",
+    "agent_auto_approve_readonly",
     "command_correction_enabled",
     "ai_provider",
     "ai_base_url",
@@ -764,6 +771,7 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
         "sidebar_visible",
         "ai_enabled",
         "agent_enabled",
+        "agent_auto_approve_readonly",
         "command_correction_enabled",
         "ai_panel_visible",
         "ai_redact_secrets",
@@ -1167,6 +1175,7 @@ struct FileConfig {
     ai_enabled: Option<bool>,
     agent_enabled: Option<bool>,
     agent_max_turns: Option<u32>,
+    agent_auto_approve_readonly: Option<bool>,
     command_correction_enabled: Option<bool>,
     ai_provider: Option<String>,
     ai_base_url: Option<String>,
@@ -1347,6 +1356,9 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
         ai_enabled: table.get("ai_enabled").and_then(|v| v.as_bool()),
         agent_enabled: table.get("agent_enabled").and_then(|v| v.as_bool()),
         agent_max_turns: table_u32(&table, "agent_max_turns"),
+        agent_auto_approve_readonly: table
+            .get("agent_auto_approve_readonly")
+            .and_then(|v| v.as_bool()),
         command_correction_enabled: table
             .get("command_correction_enabled")
             .and_then(|v| v.as_bool()),
@@ -1604,6 +1616,10 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .or(fc.agent_max_turns)
         .unwrap_or(20)
         .clamp(1, 100);
+    // Auto-execution is a policy change, so it never defaults on.
+    let agent_auto_approve_readonly = env_bool("JTERM4_AGENT_AUTO_APPROVE_READONLY")
+        .or(fc.agent_auto_approve_readonly)
+        .unwrap_or(false);
     let command_correction_enabled = env_bool("JTERM4_COMMAND_CORRECTION_ENABLED")
         .or(fc.command_correction_enabled)
         .unwrap_or(true);
@@ -1677,6 +1693,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         ai_enabled,
         agent_enabled,
         agent_max_turns,
+        agent_auto_approve_readonly,
         command_correction_enabled,
         ai_provider,
         ai_base_url,
@@ -2138,7 +2155,7 @@ ssh_args = ["", "ok\u007f"]
     #[test]
     fn ai_and_agent_config_is_semantically_validated() {
         let valid = validate_config_contents(
-            "ai_enabled = true\nagent_enabled = true\nagent_max_turns = 20\ncommand_correction_enabled = true\nai_provider = 'openai-compatible'\nai_base_url = 'http://localhost:8000/v1'\nai_api_key_file = '~/.config/jterm4/ai.key'\nai_model = 'local-model'\nai_max_tokens = 4096\nai_redact_secrets = true\n",
+            "ai_enabled = true\nagent_enabled = true\nagent_max_turns = 20\nagent_auto_approve_readonly = true\ncommand_correction_enabled = true\nai_provider = 'openai-compatible'\nai_base_url = 'http://localhost:8000/v1'\nai_api_key_file = '~/.config/jterm4/ai.key'\nai_model = 'local-model'\nai_max_tokens = 4096\nai_redact_secrets = true\n",
         )
         .unwrap();
         assert!(valid.is_empty(), "{valid:?}");
@@ -2179,6 +2196,7 @@ ssh_args = ["", "ok\u007f"]
         config.ai_api_key_file = Some("/tmp/ai-key".into());
         config.ai_api_key_file_configured = Some("/tmp/ai-key".into());
         config.agent_enabled = true;
+        config.agent_auto_approve_readonly = true;
         config.command_correction_enabled = true;
         config.ai_panel_visible = true;
         config.notify_long_blocks = true;
@@ -2207,6 +2225,7 @@ ssh_args = ["", "ok\u007f"]
         assert!(config.ai_api_key_file.is_none());
         assert!(config.ai_api_key_file_configured.is_none());
         assert!(!config.agent_enabled);
+        assert!(!config.agent_auto_approve_readonly);
         assert!(!config.command_correction_enabled);
         assert!(!config.ai_panel_visible);
         assert!(!config.notify_long_blocks);

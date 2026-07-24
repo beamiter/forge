@@ -77,12 +77,14 @@ show_repo_strip = true
 # ai_api_key_file = "~/.config/jterm4/ai.key"
 # 环境 Key 优先于文件。路径可由 JTERM4_AI_API_KEY_FILE 覆盖。
 # 通用覆盖：JTERM4_AI_ENABLED、JTERM4_AGENT_ENABLED、JTERM4_AGENT_MAX_TURNS、
+#           JTERM4_AGENT_AUTO_APPROVE_READONLY、
 #           JTERM4_COMMAND_CORRECTION_ENABLED、JTERM4_AI_API_KEY、
 #           JTERM4_AI_API_KEY_FILE、JTERM4_AI_PROVIDER、JTERM4_AI_MODEL、
 #           JTERM4_AI_BASE_URL、JTERM4_AI_MAX_TOKENS、JTERM4_AI_REDACT_SECRETS
 ai_enabled = true
 agent_enabled = true          # Ctrl+Alt+G；仅绑定当前 Block pane
 agent_max_turns = 20          # 1 .. 100；每条命令可编辑且始终需要单独批准
+agent_auto_approve_readonly = false # 严格白名单内的单条只读命令免点击执行；写操作与危险命令仍需逐条批准
 command_correction_enabled = true # typo-like Block 命令失败后提供可审阅的 AI/本地纠正
 ai_provider = "anthropic"
 ai_base_url = "https://api.anthropic.com"

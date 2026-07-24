@@ -261,7 +261,7 @@ selected Block、pane cwd 与配置 shell 不再拼进高信任 system prompt。
 
 一次性建议、失败命令纠正与 Shell Agent proposal 共用同一套审阅卡逻辑：编辑时实时重算危险模式，Copy 永不写入 PTY，Enter 只触发卡片上明确标出的主操作。已验证的本地纠正只有在文本完全未改且非危险时才显示 **Run verified command**；任何编辑或新风险都会立即降级成 **Insert for review**。
 
-`Ctrl+Alt+G` 或顶部栏的 **Agent** 开关在当前 active Block pane 打开原生 **Shell Agent**；开关保持选中时表示 Agent 会话正在激活。Agent 卡显示固定目标 cwd、安全状态、回合进度、实时 prompt readiness 和 proposal 审阅区，活动消息以普通块留在同一条 conversation flow 中；设置按钮显示 provider/model、shell 和命令纠正开关。readiness 会区分空闲、已有输入、命令运行中、全屏程序、prompt 初始化和缺少 shell integration，审批失败时给出对应恢复步骤。打开 Agent 时若已有 selected finished Block，它会作为可见的“不可信上下文”chip 附加，也可移除。Agent 在打开时固定目标 pane，切换标签不会悄悄改变执行目标。VTE pane 不提供 Agent。
+`Ctrl+Alt+G` 或顶部栏的 **Agent** 开关在当前 active Block pane 打开原生 **Shell Agent**；开关保持选中时表示 Agent 会话正在激活。Agent 卡显示固定目标 cwd、安全状态、回合进度、实时 prompt readiness 和 proposal 审阅区，活动消息以普通块留在同一条 conversation flow 中；设置按钮显示 provider/model、shell、命令纠正开关和只读自动放行开关。readiness 会区分空闲、已有输入、命令运行中、全屏程序、prompt 初始化和缺少 shell integration，审批失败时给出对应恢复步骤。打开 Agent 时若已有 selected finished Block，它会作为可见的“不可信上下文”chip 附加，也可移除；会话空闲（Ready）时可用 **Attach selected Block** 把当前选中的 finished Block 附加或替换为新的上下文。请求还会附带有界的 git 元数据（branch、dirty、ahead/behind），与 cwd/shell/OS 一样只作为不可信 user-role 数据发送。Agent 在打开时固定目标 pane，切换标签不会悄悄改变执行目标。VTE pane 不提供 Agent。
 
 一次 Agent 会话的安全流程是：
 
@@ -275,6 +275,8 @@ selected Block、pane cwd 与配置 shell 不再拼进高信任 system prompt。
 dashboard 和 Settings 中的 **AI command correction** 开关控制 `command_correction_enabled`。开启后，Block 命令出现 typo、unknown executable/package、invalid subcommand/option 等窄范围错误时才会提供可编辑纠正；候选不会自动插入或执行。关闭开关会立即阻止新的纠正，也会丢弃仍在解析中的待显示结果。默认开启，可用 `JTERM4_COMMAND_CORRECTION_ENABLED` 临时覆盖；确定性目标提示与本地索引优先，AI 仅为 fallback，完整边界见 `docs/SMART_COMMAND_CORRECTION.md`。
 
 `agent_enabled = false` 可独立关闭 Agent，`agent_max_turns` 限制模型回合数；`ai_enabled = false` 和 safe mode 都会同时阻止打开。Agent 必须被视为有用户权限的命令执行辅助工具，危险模式提示不是完整 shell 安全分析，也不替代逐字审阅。
+
+`agent_auto_approve_readonly = true`（或 `JTERM4_AGENT_AUTO_APPROVE_READONLY=1`，默认关闭）开启后，通过严格只读白名单的 proposal 会跳过逐条点击直接运行：仅限单条简单命令（`ls`、`cat`、`git status` 等固定清单），不含管道、链式、重定向、后台任务、命令替换，也不含 `find -exec`/`-delete`、`fd -x`、`rg --pre`、git 全局 flag 等可执行或可写入的旁路；任何命中危险模式的命令永远回到人工审阅卡。自动放行仍经过同一套单行校验和 prompt-ready 门，每次自动批准都会在 conversation 中留下可见记录，回合预算照常消耗；开启期间 Agent 卡会显示 `auto: read-only` chip。该白名单是保守分类器而非完整 shell 求值器——宁可漏放也不误放，被拒的只读命令只是多一次点击。开关可在 Settings → AI & Agent 或 Agent 卡的设置弹窗中切换。
 
 `ai_redact_secrets = true` 默认遮蔽常见密钥格式，并在持久化前重新处理所有 active、non-active、archived chat 及其 draft/context；但脱敏不是秘密保护边界，发送前仍应检查上下文。`--safe-mode` 同时关闭 AI 与 Agent。
 

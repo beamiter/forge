@@ -859,6 +859,79 @@ pub fn is_dangerous(command: &str) -> Option<&'static str> {
     None
 }
 
+/// Conservative allowlist deciding whether a proposal qualifies for the
+/// opt-in auto-approve-read-only mode. This never executes anything; the UI
+/// still routes the approval through the normal single-line validation and
+/// prompt-ready gate.
+///
+/// Fail closed: only a single simple command whose program is a known
+/// read-only inspector qualifies. Chaining, redirection, background jobs,
+/// command substitution, per-program flags that can execute or write, and
+/// anything `is_dangerous` recognizes all keep the manual approval card.
+pub fn is_auto_approvable(command: &str) -> bool {
+    let command = command.trim();
+    if command.is_empty() || command.len() > MAX_COMMAND_BYTES {
+        return false;
+    }
+    if command.chars().any(char::is_control) || is_dangerous(command).is_some() {
+        return false;
+    }
+    if command.contains(['|', ';', '&', '>', '<', '`']) || command.contains("$(") {
+        return false;
+    }
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let Some(program) = tokens.first().copied() else {
+        return false;
+    };
+    let arguments = &tokens[1..];
+    match program {
+        "ls" | "pwd" | "du" | "df" | "free" | "ps" | "id" | "whoami" | "uname" | "date"
+        | "uptime" | "hostname" | "printenv" | "echo" | "which" | "whereis" | "basename"
+        | "dirname" | "realpath" | "readlink" | "tree" => true,
+        // Readers that block on stdin without an operand; require one so an
+        // auto-approved command cannot silently hang the pinned prompt.
+        "cat" | "head" | "tail" | "wc" | "file" | "stat" | "grep" => {
+            arguments.iter().any(|argument| !argument.starts_with('-'))
+        }
+        "rg" => arguments
+            .iter()
+            .all(|argument| !argument.starts_with("--pre")),
+        "fd" => arguments
+            .iter()
+            .all(|argument| !matches!(*argument, "-x" | "-X") && !argument.starts_with("--exec")),
+        "find" => arguments.iter().all(|argument| {
+            !matches!(
+                *argument,
+                "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir" | "-fls"
+            ) && !argument.starts_with("-fprint")
+        }),
+        // The read-only subcommand must follow `git` directly: global flags
+        // like `-c` can register executable helpers, so they disqualify
+        // auto-approval instead of being skipped.
+        "git" => {
+            matches!(
+                arguments.first().copied(),
+                Some(
+                    "status"
+                        | "log"
+                        | "diff"
+                        | "show"
+                        | "blame"
+                        | "shortlog"
+                        | "describe"
+                        | "rev-parse"
+                        | "ls-files"
+                        | "reflog"
+                        | "grep"
+                )
+            ) && arguments
+                .iter()
+                .all(|argument| !argument.starts_with("--output"))
+        }
+        _ => false,
+    }
+}
+
 fn strip_shell_prefixes<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
     let mut index = 0;
     loop {
@@ -1374,6 +1447,61 @@ mod tests {
         assert!(is_dangerous("env systemctl reboot").is_some());
         assert!(is_dangerous("git status").is_none());
         assert!(is_dangerous("git -C repo status").is_none());
+    }
+
+    #[test]
+    fn auto_approval_accepts_only_simple_read_only_commands() {
+        assert!(is_auto_approvable("ls -la"));
+        assert!(is_auto_approvable("pwd"));
+        assert!(is_auto_approvable("cat Cargo.toml"));
+        assert!(is_auto_approvable("grep -rn TODO src"));
+        assert!(is_auto_approvable("git status"));
+        assert!(is_auto_approvable("git log --oneline -20"));
+        assert!(is_auto_approvable("git diff --stat"));
+        assert!(is_auto_approvable("find . -name '*.rs'"));
+        assert!(is_auto_approvable("rg -n unsafe src"));
+        assert!(is_auto_approvable("du -sh target"));
+        assert!(is_auto_approvable("  uname -a  "));
+    }
+
+    #[test]
+    fn auto_approval_fails_closed_on_writes_chaining_and_execution() {
+        // Not on the allowlist at all.
+        assert!(!is_auto_approvable("rm -rf build"));
+        assert!(!is_auto_approvable("touch marker"));
+        assert!(!is_auto_approvable("cargo check"));
+        assert!(!is_auto_approvable("sed -i s/a/b/ file"));
+        assert!(!is_auto_approvable("FOO=1 ls"));
+        assert!(!is_auto_approvable("env ls"));
+        assert!(!is_auto_approvable("LS"));
+        assert!(!is_auto_approvable(""));
+        // Chaining, redirection, jobs, and substitution.
+        assert!(!is_auto_approvable("ls; rm -rf build"));
+        assert!(!is_auto_approvable("ls && rm x"));
+        assert!(!is_auto_approvable("cat a > b"));
+        assert!(!is_auto_approvable("cat < a"));
+        assert!(!is_auto_approvable("grep foo src | wc -l"));
+        assert!(!is_auto_approvable("echo `whoami`"));
+        assert!(!is_auto_approvable("echo $(rm x)"));
+        assert!(!is_auto_approvable("du -sh &"));
+        // Per-program escape hatches.
+        assert!(!is_auto_approvable("find . -name x -delete"));
+        assert!(!is_auto_approvable("find . -exec rm {} +"));
+        assert!(!is_auto_approvable("fd -x rm"));
+        assert!(!is_auto_approvable("fd --exec-batch rm"));
+        assert!(!is_auto_approvable("rg --pre=sh pattern"));
+        // Stdin-blocking readers without an operand.
+        assert!(!is_auto_approvable("cat"));
+        assert!(!is_auto_approvable("grep -v"));
+        // Git: only direct read-only subcommands, no output redirection.
+        assert!(!is_auto_approvable("git push"));
+        assert!(!is_auto_approvable("git branch -D main"));
+        assert!(!is_auto_approvable("git stash list"));
+        assert!(!is_auto_approvable("git -c core.fsmonitor=rm status"));
+        assert!(!is_auto_approvable("git -C repo status"));
+        assert!(!is_auto_approvable("git log --output=/tmp/x"));
+        // Anything the danger heuristic flags stays manual.
+        assert!(!is_auto_approvable("sudo ls"));
     }
 
     #[test]

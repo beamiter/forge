@@ -1275,6 +1275,16 @@ impl UiState {
         agent_enabled_row.set_sensitive(!safe_mode && config.ai_enabled);
         ai_group.add(&agent_enabled_row);
 
+        let agent_auto_row = adw::SwitchRow::builder()
+            .title("Auto-run Read-only Agent Proposals")
+            .subtitle(
+                "Run strictly read-only inspection commands (ls, cat, git status, …) without a per-command click; writes and anything risky still require approval",
+            )
+            .active(config.agent_auto_approve_readonly)
+            .build();
+        agent_auto_row.set_sensitive(!safe_mode && config.ai_enabled && config.agent_enabled);
+        ai_group.add(&agent_auto_row);
+
         let correction_enabled_row = adw::SwitchRow::builder()
             .title("Correct Mistyped Block Commands")
             .subtitle(
@@ -1479,6 +1489,7 @@ impl UiState {
             redact_row.clone().upcast(),
         ];
         let agent_turns_for_ai = agent_turns_row.clone();
+        let agent_auto_for_ai = agent_auto_row.clone();
         let agent_enabled_for_ai = agent_enabled_row.clone();
         let ui = self.clone();
         ai_enabled_row.connect_active_notify(move |row| {
@@ -1488,17 +1499,26 @@ impl UiState {
                 dependent.set_sensitive(enabled);
             }
             agent_turns_for_ai.set_sensitive(enabled && agent_enabled_for_ai.is_active());
+            agent_auto_for_ai.set_sensitive(enabled && agent_enabled_for_ai.is_active());
             ui.sync_agent_toggle();
             ui.persist_config();
         });
 
         let turns_for_agent = agent_turns_row.clone();
+        let auto_for_agent = agent_auto_row.clone();
         let ui = self.clone();
         agent_enabled_row.connect_active_notify(move |row| {
             let enabled = row.is_active();
             ui.config.borrow_mut().agent_enabled = enabled;
             turns_for_agent.set_sensitive(enabled);
+            auto_for_agent.set_sensitive(enabled);
             ui.sync_agent_toggle();
+            ui.persist_config();
+        });
+
+        let ui = self.clone();
+        agent_auto_row.connect_active_notify(move |row| {
+            ui.config.borrow_mut().agent_auto_approve_readonly = row.is_active();
             ui.persist_config();
         });
 

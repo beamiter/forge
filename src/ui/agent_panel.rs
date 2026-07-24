@@ -62,7 +62,10 @@ struct AgentRuntime {
     stop_request: Button,
     retry_request: Button,
     context_clear: Button,
+    context_attach: Button,
     context_card: GBox,
+    context_label: Label,
+    auto_chip: Label,
     status: Label,
     status_spinner: Spinner,
     prompt_status: Label,
@@ -127,9 +130,12 @@ impl AgentRuntime {
             .set_visible(self.alive.get() && !self.busy.get() && session.can_retry_model());
         self.retry_request
             .set_sensitive(self.retry_request.is_visible());
-        self.context_clear.set_sensitive(
-            self.alive.get() && !self.busy.get() && session.state() == AgentState::Ready,
-        );
+        let context_editable =
+            self.alive.get() && !self.busy.get() && session.state() == AgentState::Ready;
+        self.context_clear.set_sensitive(context_editable);
+        self.context_attach.set_sensitive(context_editable);
+        self.auto_chip
+            .set_visible(self.config.borrow().agent_auto_approve_readonly);
         let can_follow_up =
             self.alive.get() && !self.busy.get() && session.can_continue_after_completion();
         let can_start_new = self.alive.get()
@@ -279,6 +285,40 @@ impl AgentRuntime {
         }
     }
 
+    /// Attach (or replace) the currently selected finished Block as untrusted
+    /// context mid-session, mirroring the capture that happens when the card
+    /// opens.
+    fn attach_block_context(&self) {
+        if self.busy.get()
+            || !self.alive.get()
+            || self.session.borrow().state() != AgentState::Ready
+        {
+            return;
+        }
+        let Some(context) = self.target.selected_block_context(80) else {
+            self.set_status(
+                "Select a finished Block in this pane first, then attach it.",
+                false,
+            );
+            return;
+        };
+        self.context_label
+            .set_text(&agent_block_context_label(&context));
+        self.context_label
+            .set_tooltip_text(Some(&agent_block_context_tooltip(&context)));
+        self.context_card.set_visible(true);
+        let replaced = self.block_context.borrow_mut().replace(context).is_some();
+        self.append(
+            "Agent",
+            if replaced {
+                "Replaced the attached Block context with the currently selected finished Block."
+            } else {
+                "Attached the selected finished Block as untrusted context for upcoming instructions."
+            },
+        );
+        self.render_session_state(None);
+    }
+
     fn submit(runtime: Rc<Self>) {
         if runtime.busy.get() || !runtime.alive.get() {
             return;
@@ -317,12 +357,16 @@ impl AgentRuntime {
             }
         };
         let cwd = runtime.target.cwd();
+        // Bounded probe (short UI wait, then cached/stale): branch and dirty
+        // state let the model tailor proposals to the repository.
+        let git = crate::git_meta::read(std::path::Path::new(&cwd));
         let system = crate::ai::build_agent_system_prompt();
         let prompt = crate::ai::agent_user_prompt(
             &runtime.session.borrow().build_user_prompt(),
             if cwd.is_empty() { "." } else { &cwd },
             &runtime.shell,
             std::env::consts::OS,
+            git.as_ref(),
             runtime.block_context.borrow().as_ref(),
         );
         let session_cancellation = runtime.session.borrow().cancellation_token();
@@ -427,8 +471,27 @@ impl AgentRuntime {
         runtime: &Rc<Self>,
         id: ProposalId,
         command: String,
-        _danger: Option<&'static str>,
+        danger: Option<&'static str>,
     ) {
+        if danger.is_none()
+            && runtime.config.borrow().agent_auto_approve_readonly
+            && crate::agent::is_auto_approvable(&command)
+            && runtime.target.command_prompt_status().is_ready()
+        {
+            runtime.append(
+                "Agent",
+                &format!("Auto-approved read-only proposal (auto-run is on): {command}"),
+            );
+            Self::approve_validated(runtime.clone(), id, command.clone());
+            if matches!(
+                runtime.session.borrow().state(),
+                AgentState::AwaitingObservation { .. }
+            ) {
+                return;
+            }
+            // The approval path re-checked the prompt gate and refused; fall
+            // back to the ordinary review card so the proposal stays visible.
+        }
         runtime.clear_proposal();
         runtime.proposal_box.set_visible(true);
         let review = CommandReviewCard::new(CommandReviewSpec {
@@ -783,12 +846,13 @@ fn compact_one_line(text: &str, max_chars: usize) -> String {
 /// from the inline card's header: identity, provider/shell chips, and the AI
 /// command-correction toggle. Session activity never renders here.
 fn show_agent_settings_dialog(ui: &UiState, cwd: &str, shell: &str) {
-    let (provider, model, correction_enabled) = {
+    let (provider, model, correction_enabled, auto_approve_readonly) = {
         let config = ui.config.borrow();
         (
             config.ai_provider.clone(),
             config.ai_model.clone(),
             config.command_correction_enabled,
+            config.agent_auto_approve_readonly,
         )
     };
 
@@ -875,6 +939,36 @@ fn show_agent_settings_dialog(ui: &UiState, cwd: &str, shell: &str) {
         ui_for_correction.persist_config();
     });
 
+    let auto_row = GBox::new(Orientation::Horizontal, 12);
+    auto_row.add_css_class("agent-setting-card");
+    let auto_copy = GBox::new(Orientation::Vertical, 2);
+    auto_copy.set_hexpand(true);
+    let auto_title = Label::new(Some("Auto-run read-only proposals"));
+    auto_title.set_xalign(0.0);
+    auto_title.add_css_class("heading");
+    let auto_hint = Label::new(Some(
+        "Run strictly read-only inspection commands (ls, cat, git status, …) without a \
+         per-command click. Writes, chaining, and anything risky still require approval.",
+    ));
+    auto_hint.set_xalign(0.0);
+    auto_hint.set_wrap(true);
+    auto_hint.add_css_class("dim-label");
+    auto_copy.append(&auto_title);
+    auto_copy.append(&auto_hint);
+    let auto_switch = Switch::builder()
+        .active(auto_approve_readonly)
+        .valign(gtk4::Align::Center)
+        .build();
+    auto_switch.set_tooltip_text(Some("Enable auto-approval for read-only proposals"));
+    auto_row.append(&auto_copy);
+    auto_row.append(&auto_switch);
+
+    let ui_for_auto = ui.clone();
+    auto_switch.connect_active_notify(move |toggle| {
+        ui_for_auto.config.borrow_mut().agent_auto_approve_readonly = toggle.is_active();
+        ui_for_auto.persist_config();
+    });
+
     let body = GBox::new(Orientation::Vertical, 10);
     body.add_css_class("agent-dashboard");
     body.set_margin_start(12);
@@ -882,6 +976,7 @@ fn show_agent_settings_dialog(ui: &UiState, cwd: &str, shell: &str) {
     body.set_margin_top(10);
     body.set_margin_bottom(12);
     body.append(&overview);
+    body.append(&auto_row);
     body.append(&correction_row);
     let toolbar = adw::ToolbarView::new();
     toolbar.add_css_class("agent-surface");
@@ -1071,6 +1166,13 @@ impl UiState {
         prompt_status.add_css_class("agent-prompt-status");
         prompt_status.add_css_class("agent-prompt-blocked");
         prompt_status.set_accessible_role(gtk4::AccessibleRole::Status);
+        let auto_chip = Label::new(Some("auto: read-only"));
+        auto_chip.add_css_class("agent-chip");
+        auto_chip.set_tooltip_text(Some(
+            "Auto-run is on: strictly read-only proposals run without a per-command click. \
+             Writes and anything risky still require explicit approval.",
+        ));
+        auto_chip.set_visible(false);
         let turn_progress = ProgressBar::new();
         turn_progress.set_hexpand(true);
         turn_progress.set_fraction(0.0);
@@ -1080,6 +1182,7 @@ impl UiState {
         status_top.append(&retry_request);
         status_top.append(&stop_request);
         status_top.append(&session_action);
+        status_top.append(&auto_chip);
         status_top.append(&prompt_status);
         status_top.append(&turn_label);
         let status_card = GBox::new(Orientation::Vertical, 6);
@@ -1111,12 +1214,22 @@ impl UiState {
             "Enter sends · every proposed command stays editable and requires approval",
         ));
         input_hint.set_xalign(0.0);
+        input_hint.set_hexpand(true);
         input_hint.add_css_class("dim-label");
         input_hint.add_css_class("agent-input-hint");
+        let context_attach = Button::with_label("Attach selected Block");
+        context_attach.add_css_class("flat");
+        context_attach.set_tooltip_text(Some(
+            "Attach the selected finished Block in this pane as untrusted context \
+             for upcoming instructions (replaces a previously attached Block)",
+        ));
+        let hint_row = GBox::new(Orientation::Horizontal, 6);
+        hint_row.append(&input_hint);
+        hint_row.append(&context_attach);
         let composer = GBox::new(Orientation::Vertical, 6);
         composer.add_css_class("agent-composer");
         composer.append(&input_row);
-        composer.append(&input_hint);
+        composer.append(&hint_row);
 
         let body = GBox::new(Orientation::Vertical, 8);
         body.set_margin_start(if compact { 8 } else { 12 });
@@ -1142,7 +1255,10 @@ impl UiState {
             stop_request: stop_request.clone(),
             retry_request: retry_request.clone(),
             context_clear: context_clear.clone(),
+            context_attach: context_attach.clone(),
             context_card: context_card.clone(),
+            context_label: context_label.clone(),
+            auto_chip,
             status,
             status_spinner,
             prompt_status,
@@ -1249,6 +1365,12 @@ impl UiState {
         context_clear.connect_clicked(move |_| {
             if let Some(runtime) = weak.upgrade() {
                 runtime.detach_block_context();
+            }
+        });
+        let weak = Rc::downgrade(&runtime);
+        context_attach.connect_clicked(move |_| {
+            if let Some(runtime) = weak.upgrade() {
+                runtime.attach_block_context();
             }
         });
         let weak = Rc::downgrade(&runtime);

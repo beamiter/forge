@@ -77,6 +77,9 @@ python3 -c 'print("x" * 1000000)'
 | A-7 | 统一命令审阅 | `?` 建议、命令纠正与 Agent proposal 使用相同的编辑校验、Copy 和动态风险反馈；各自主操作必须准确标出 Insert 或 Run，Enter 不得绕过其语义。 | unit + GUI |
 | A-8 | 手动审阅分支 | Agent **Insert only** 保留编辑后的精确单行文本、只写入 shell 编辑行且不提交，transcript 明确记录未执行，后续不得等待或伪造 observation。 | unit + PTY GUI |
 | A-9 | Prompt 诊断与续接 | Agent 实时区分 ready、已有输入、运行中、alt-screen、初始化和缺少 shell integration；`done` 后 **Follow up** 保留上下文，turn limit 后 **New task** 清空模型 transcript 并恢复预算。 | unit + GUI |
+| A-10 | 只读自动放行 | `agent_auto_approve_readonly` 默认关闭；开启后仅严格白名单内的单条只读命令免点击执行，管道、链式、重定向、命令替换、`find -exec`/`-delete`、`fd -x`、`rg --pre`、git 全局 flag、危险模式与非白名单程序全部 fail closed 回到人工审阅卡。自动批准仍经过单行校验与 prompt-ready 门，产生可见 conversation 记录并消耗回合预算；prompt 被占用时回退为普通审阅卡而不是丢弃 proposal。 | unit + PTY GUI |
+| A-11 | 会话中附加 Block | **Attach selected Block** 只在 Ready 且非 busy 时可用，只附加当前固定 pane 中明确选中的 finished block，可替换旧上下文并更新可见 chip；无选中块时给出可恢复提示且不改变已附加上下文。附加内容与开卡附加走同一 untrusted user-role 边界。 | unit + GUI |
+| A-12 | Git 环境元数据 | Agent 请求中的 branch/dirty/ahead/behind 经有界采样后与 cwd/shell/OS 一起作为 untrusted user-role JSON 发送，绝不进入 system prompt；probe 有超时且失败时请求照常发出（`git` 字段为 null）。 | unit |
 
 ### Privacy、accessibility 与性能
 

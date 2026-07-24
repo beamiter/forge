@@ -6,6 +6,9 @@ All notable user-visible and operational changes are recorded here.
 
 ### Added
 
+- Shell Agent 可选的只读命令自动放行（`agent_auto_approve_readonly` / `JTERM4_AGENT_AUTO_APPROVE_READONLY`，默认关闭）：通过严格白名单的单条只读命令免点击执行，写操作、管道/链式/重定向/命令替换、可执行旁路 flag 与危险模式仍逐条人工审批；自动批准留下可见记录、照常消耗回合预算，开启期间 Agent 卡显示 `auto: read-only` chip，开关位于 Settings 与 Agent 卡设置弹窗。
+- Shell Agent 会话进行中可用 **Attach selected Block** 附加或替换当前选中的 finished Block 作为不可信上下文，不再局限于开卡瞬间的一次性捕获。
+- Agent 请求现在附带有界的 git 元数据（branch、dirty、ahead/behind），与 cwd/shell/OS 一样仅作为不可信 user-role 数据发送，帮助模型贴合仓库状态提出命令。
 - Bash、zsh、fish 与 PowerShell 的内置 CLI 补全生成（`--generate-completion`）。
 - 顶栏、标签栏与文件导航的完整键盘焦点链、语义化无障碍标签，以及 Enter/Space 标签激活。
 - Project licensing under `MIT OR Apache-2.0`, including canonical license texts, Cargo/AppStream metadata, inbound-contribution terms, and license files in release artifacts.
