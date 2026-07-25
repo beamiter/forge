@@ -1281,8 +1281,10 @@ pub fn run() -> glib::ExitCode {
             while notebook_for_close_request.n_pages() > 0 {
                 notebook_for_close_request.remove_page(Some(0));
             }
-            if !crate::command_history::flush_async(std::time::Duration::from_secs(2)) {
-                log::warn!("command-history worker did not flush before shutdown");
+            if let Err(error) =
+                crate::command_history::flush_pending(std::time::Duration::from_secs(2))
+            {
+                log::warn!("command-history worker did not flush before shutdown: {error}");
             }
             // Make the final snapshot visible only after this window is fully
             // quiesced. Any queued auto-save callbacks become no-ops.
