@@ -472,6 +472,14 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         "ai_max_tokens".into(),
         toml::Value::Integer(config.ai_max_tokens as i64),
     );
+    if let Some(temperature) = config.ai_temperature {
+        table.insert(
+            "ai_temperature".into(),
+            toml::Value::Float(temperature as f64),
+        );
+    } else {
+        table.remove("ai_temperature");
+    }
     table.insert(
         "ai_redact_secrets".into(),
         toml::Value::Boolean(config.ai_redact_secrets),

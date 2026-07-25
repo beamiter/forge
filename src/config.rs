@@ -277,6 +277,8 @@ pub struct Config {
     pub(crate) ai_model: String,
     /// Per-request max output tokens.
     pub(crate) ai_max_tokens: u32,
+    /// Optional sampling temperature (0.0..=2.0); None keeps the provider default.
+    pub(crate) ai_temperature: Option<f32>,
     /// Run AI-bound text (system prompt block context + chat turns) through
     /// the secrets redactor before posting to the API. On by default; flip
     /// off only if the noise of mass `[REDACTED:...]` markers in a session
@@ -364,6 +366,7 @@ impl Config {
             ai_panel_width: 360,
             ai_model: "claude-sonnet-4-6".to_string(),
             ai_max_tokens: 1_024,
+            ai_temperature: None,
             ai_redact_secrets: true,
             allow_remote_clipboard_write: false,
             notify_long_blocks: false,
@@ -511,6 +514,10 @@ fn env_f64(name: &str) -> Option<f64> {
 
 fn env_u32(name: &str) -> Option<u32> {
     std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok())
+}
+
+fn env_f32(name: &str) -> Option<f32> {
+    std::env::var(name).ok().and_then(|v| v.trim().parse::<f32>().ok())
 }
 
 fn env_bool(name: &str) -> Option<bool> {
@@ -665,6 +672,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "ai_panel_width",
     "ai_model",
     "ai_max_tokens",
+    "ai_temperature",
     "ai_redact_secrets",
     "allow_remote_clipboard_write",
     "notify_long_blocks",
@@ -1184,6 +1192,7 @@ struct FileConfig {
     ai_panel_width: Option<u32>,
     ai_model: Option<String>,
     ai_max_tokens: Option<u32>,
+    ai_temperature: Option<f32>,
     ai_redact_secrets: Option<bool>,
     allow_remote_clipboard_write: Option<bool>,
     notify_long_blocks: Option<bool>,
@@ -1381,6 +1390,10 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         ai_max_tokens: table_u32(&table, "ai_max_tokens"),
+        ai_temperature: table
+            .get("ai_temperature")
+            .and_then(toml::Value::as_float)
+            .map(|value| value as f32),
         ai_redact_secrets: table.get("ai_redact_secrets").and_then(|v| v.as_bool()),
         allow_remote_clipboard_write: table
             .get("allow_remote_clipboard_write")
@@ -1702,6 +1715,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         ai_panel_visible: fc.ai_panel_visible.unwrap_or(false),
         ai_panel_width: fc.ai_panel_width.unwrap_or(360).clamp(240, 1200),
         ai_model,
+        ai_temperature: env_f32("JTERM4_AI_TEMPERATURE")
+            .or(fc.ai_temperature)
+            .filter(|t| t.is_finite() && (0.0..=2.0).contains(t)),
         ai_max_tokens: env_u32("JTERM4_AI_MAX_TOKENS")
             .or(fc.ai_max_tokens)
             .unwrap_or(1024)
