@@ -7,17 +7,20 @@ pub mod cli;
 mod command_history;
 pub mod config;
 pub mod config_store;
-pub mod git_meta;
-pub mod host;
+pub use jterm_core::{git_meta, notify, parser, review_input};
+
+pub mod host {
+    pub use jterm_core::host::*;
+
+    pub const APP_ID: &str = "io.github.beamiter.jterm4";
+}
+
 pub mod keybindings;
 pub mod logging;
 pub mod notebook;
-pub mod notify;
 mod palette;
-pub mod parser;
 pub mod pty;
 pub mod redact;
-mod review_input;
 pub mod state;
 pub mod terminal;
 pub mod workflows;

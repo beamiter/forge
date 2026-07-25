@@ -254,6 +254,10 @@ fn init_input_method_env() {
 }
 
 pub fn run() -> glib::ExitCode {
+    jterm_core::identity::init(jterm_core::identity::AppIdentity {
+        app_name: "jterm4",
+        app_id: crate::host::APP_ID,
+    });
     if let Some(code) = crate::cli::handle_early_args() {
         return code;
     }

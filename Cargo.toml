@@ -17,6 +17,7 @@ test = false
 bench = false
 
 [dependencies]
+jterm_core = { path = "../jterm_core" }
 log = { version = "0.4", features = ["std"] }
 memchr = "2"
 nix = { version = "0.31.3", features = ["term", "signal", "process", "ioctl"] }

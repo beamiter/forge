@@ -675,6 +675,7 @@ dependencies = [
  "fuzzy-matcher",
  "gdk4",
  "gtk4",
+ "jterm_core",
  "libadwaita",
  "log",
  "memchr",
@@ -689,6 +690,14 @@ dependencies = [
  "unicode-width",
  "vte4",
  "zstd",
+]
+
+[[package]]
+name = "jterm_core"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "memchr",
 ]
 
 [[package]]

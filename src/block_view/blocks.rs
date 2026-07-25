@@ -467,31 +467,7 @@ pub(crate) fn format_block_duration(dur_ms: u64) -> String {
     }
 }
 
-/// Shell convention: exit code 128+n means the process died from signal n.
-/// Name the signals a terminal user actually meets so "exit:130" reads as
-/// Ctrl-C and "exit:137" as the OOM killer at a glance.
-pub(crate) fn signal_name_for_exit(exit_code: i32) -> Option<&'static str> {
-    match exit_code.checked_sub(128)? {
-        1 => Some("SIGHUP"),
-        2 => Some("SIGINT"),
-        3 => Some("SIGQUIT"),
-        4 => Some("SIGILL"),
-        5 => Some("SIGTRAP"),
-        6 => Some("SIGABRT"),
-        7 => Some("SIGBUS"),
-        8 => Some("SIGFPE"),
-        9 => Some("SIGKILL"),
-        10 => Some("SIGUSR1"),
-        11 => Some("SIGSEGV"),
-        12 => Some("SIGUSR2"),
-        13 => Some("SIGPIPE"),
-        14 => Some("SIGALRM"),
-        15 => Some("SIGTERM"),
-        24 => Some("SIGXCPU"),
-        25 => Some("SIGXFSZ"),
-        _ => None,
-    }
-}
+pub(crate) use jterm_core::exit_status::signal_name_for_exit;
 
 /// Gregorian date for a count of days since 1970-01-01 (may be negative).
 /// Howard Hinnant's civil-from-days; avoids pulling a chrono dependency for
@@ -2028,18 +2004,6 @@ mod tests {
         assert_eq!(format_block_duration(179_000), "2m59s");
         assert_eq!(format_block_duration(3_600_000), "1h");
         assert_eq!(format_block_duration(3_840_000), "1h04m");
-    }
-
-    #[test]
-    fn signal_exits_name_the_signal_and_plain_codes_do_not() {
-        use super::signal_name_for_exit;
-        assert_eq!(signal_name_for_exit(130), Some("SIGINT"));
-        assert_eq!(signal_name_for_exit(137), Some("SIGKILL"));
-        assert_eq!(signal_name_for_exit(139), Some("SIGSEGV"));
-        assert_eq!(signal_name_for_exit(143), Some("SIGTERM"));
-        for plain in [0, 1, 2, 127, 128, 255, -1] {
-            assert_eq!(signal_name_for_exit(plain), None, "code {plain}");
-        }
     }
 
     #[test]
