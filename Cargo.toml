@@ -17,7 +17,7 @@ test = false
 bench = false
 
 [dependencies]
-jterm_core = { path = "../jterm_core" }
+jterm_core = { git = "https://github.com/beamiter/jterm_core.git", branch = "master" }
 log = { version = "0.4", features = ["std"] }
 memchr = "2"
 nix = { version = "0.31.3", features = ["term", "signal", "process", "ioctl"] }
