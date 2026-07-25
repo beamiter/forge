@@ -266,7 +266,7 @@ fn request_correction(
     // A missing credential should not disable verified local correction. The AI
     // client is optional and is consulted only when deterministic resolution
     // cannot produce a candidate.
-    let client = AiClient::from_config(&config.borrow()).ok();
+    let client = crate::ai::client_from_config(&config.borrow()).ok();
     let original_for_worker = original_command.clone();
     let cwd_for_worker = cwd.clone();
     let (tx, rx) = std::sync::mpsc::channel();

@@ -1452,7 +1452,7 @@ impl AiPanel {
             restore_pending_as_draft,
         };
 
-        let client = ai::AiClient::from_config(&self.config.borrow());
+        let client = ai::client_from_config(&self.config.borrow());
         let provider_label = client
             .as_ref()
             .map(ai::AiClient::display_name)

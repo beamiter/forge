@@ -16,7 +16,7 @@ use libadwaita as adw;
 
 use super::command_review::{CommandReviewCard, CommandReviewSpec, ReviewPresentation};
 use super::UiState;
-use crate::agent::{AgentSession, AgentState, ModelOutcome, ProposalId};
+use crate::agent::{AgentSession, AgentState, ModelOutcome, ProposalId, ProposalStatus, Turn};
 use crate::block_view::TermView;
 
 /// Bind the next completed foreground block to the approved proposal.
@@ -47,6 +47,27 @@ impl AgentHandle {
     pub(crate) fn shutdown(&self) {
         self.runtime.shutdown();
     }
+
+    /// Persist the live session for the next run (or clear a stale snapshot
+    /// when there is nothing to save). Called on window close, before
+    /// shutdown cancels the session.
+    pub(crate) fn persist(&self) {
+        let path = agent_snapshot_path();
+        match self.runtime.session.borrow().snapshot() {
+            Some(snapshot) => {
+                if let Err(error) = crate::agent::write_snapshot_file(&path, &snapshot) {
+                    log::warn!("agent: could not persist session: {error}");
+                }
+            }
+            None => crate::agent::remove_snapshot_file(&path),
+        }
+    }
+}
+
+fn agent_snapshot_path() -> std::path::PathBuf {
+    let mut path = crate::config::config_file_path();
+    path.set_file_name("agent_session.json");
+    path
 }
 
 struct AgentRuntime {
@@ -346,7 +367,7 @@ impl AgentRuntime {
             return;
         }
 
-        let client = match crate::ai::AiClient::from_config(&runtime.config.borrow()) {
+        let client = match crate::ai::client_from_config(&runtime.config.borrow()) {
             Ok(client) => client,
             Err(error) => {
                 let message = error.to_string();
@@ -492,6 +513,13 @@ impl AgentRuntime {
             // The approval path re-checked the prompt gate and refused; fall
             // back to the ordinary review card so the proposal stays visible.
         }
+        Self::render_proposal_card(runtime, id, command);
+    }
+
+    /// The manual review card, without the auto-approve fast path. Restored
+    /// sessions use this directly so a proposal saved before a restart can
+    /// never execute without a fresh explicit click.
+    fn render_proposal_card(runtime: &Rc<Self>, id: ProposalId, command: String) {
         runtime.clear_proposal();
         runtime.proposal_box.set_visible(true);
         let review = CommandReviewCard::new(CommandReviewSpec {
@@ -1243,8 +1271,20 @@ impl UiState {
         outer.append(&body);
 
         let card: gtk4::Widget = outer.clone().upcast();
+        // A snapshot persisted by the previous run is restored one-shot and
+        // rebound to the pane the user opened the Agent on.
+        let restored_session = {
+            let path = agent_snapshot_path();
+            crate::agent::read_snapshot_file(&path).and_then(|snapshot| {
+                crate::agent::remove_snapshot_file(&path);
+                AgentSession::restore(snapshot).ok()
+            })
+        };
+        let was_restored = restored_session.is_some();
         let runtime = Rc::new(AgentRuntime {
-            session: RefCell::new(AgentSession::new(max_turns)),
+            session: RefCell::new(
+                restored_session.unwrap_or_else(|| AgentSession::new(max_turns)),
+            ),
             target: target.clone(),
             config: self.config.clone(),
             shell: shell.clone(),
@@ -1277,6 +1317,63 @@ impl UiState {
             "Bound to this Block pane. I can propose commands, but cannot run one without your explicit approval."
         };
         runtime.append("Agent", intro);
+        if was_restored {
+            runtime.append(
+                "Agent",
+                "Restored the previous agent session from your last run.",
+            );
+            let transcript: Vec<Turn> = runtime.session.borrow().transcript().to_vec();
+            for turn in &transcript {
+                match turn {
+                    Turn::User(message) => runtime.append("You", message),
+                    Turn::AssistantThought(thought) => runtime.append("Agent (thought)", thought),
+                    Turn::AssistantSay(message) => runtime.append("Agent", message),
+                    Turn::AssistantProposed {
+                        id,
+                        command,
+                        status,
+                    } => {
+                        let verdict = match status {
+                            ProposalStatus::Pending => "awaiting approval",
+                            ProposalStatus::Approved => "approved and ran",
+                            ProposalStatus::Rejected => "rejected",
+                            ProposalStatus::ManualReview => "moved to manual review",
+                        };
+                        runtime.append(
+                            "Agent",
+                            &format!("Proposed command #{} ({verdict}): {command}", id.get()),
+                        );
+                    }
+                    Turn::Observation {
+                        exit_code,
+                        output_sample,
+                        ..
+                    } => runtime.append("Output", &format!("exit {exit_code}\n{output_sample}")),
+                    Turn::ProtocolError(message) => runtime.append("Error", message),
+                }
+            }
+            // Resume what the snapshot left in flight: a pending proposal is
+            // re-rendered as a manual review card (never auto-approved), and
+            // a lost model turn is simply re-requested.
+            let state = runtime.session.borrow().state();
+            match state {
+                AgentState::AwaitingApproval { proposal_id } => {
+                    let pending = transcript.iter().rev().find_map(|turn| match turn {
+                        Turn::AssistantProposed {
+                            id,
+                            command,
+                            status: ProposalStatus::Pending,
+                        } if *id == proposal_id => Some(command.clone()),
+                        _ => None,
+                    });
+                    if let Some(command) = pending {
+                        AgentRuntime::render_proposal_card(&runtime, proposal_id, command);
+                    }
+                }
+                AgentState::AwaitingModel => AgentRuntime::request_model(runtime.clone()),
+                _ => {}
+            }
+        }
         runtime.render_session_state(None);
 
         // Close this specific session: clear the UiState slot only when it

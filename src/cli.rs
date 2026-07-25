@@ -844,7 +844,7 @@ fn doctor(format: ReportFormat) -> bool {
             detail: "disabled by configuration".to_string(),
         });
     } else {
-        match crate::ai::AiClient::from_config(&config) {
+        match crate::ai::client_from_config(&config) {
             Ok(client) => checks.push(DoctorCheck {
                 name: "AI provider",
                 status: if curl_available { "ok" } else { "warning" },

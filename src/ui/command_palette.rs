@@ -91,7 +91,7 @@ impl CommandSuggestionRuntime {
         if !runtime.alive.get() || runtime.busy.get() {
             return;
         }
-        let client = match crate::ai::AiClient::from_config(&runtime.config.borrow()) {
+        let client = match crate::ai::client_from_config(&runtime.config.borrow()) {
             Ok(client) => client,
             Err(error) => {
                 runtime.set_status(&error.to_string(), false, true);
@@ -390,7 +390,7 @@ impl UiState {
     }
 
     fn generate_command_for_review(&self, request: String) {
-        match crate::ai::AiClient::from_config(&self.config.borrow()) {
+        match crate::ai::client_from_config(&self.config.borrow()) {
             Ok(_) => {}
             Err(error) => {
                 self.show_ai_error(&error.to_string());

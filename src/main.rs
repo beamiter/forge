@@ -1264,6 +1264,11 @@ pub fn run() -> glib::ExitCode {
                 suggestion.shutdown();
             }
             if let Some(agent) = agent_session_for_close.borrow_mut().take() {
+                // Snapshot before shutdown cancels the session; a cancelled
+                // session refuses to snapshot by design.
+                if session_persistence {
+                    agent.persist();
+                }
                 agent.shutdown();
             }
             ai_panel_for_close.cancel_all_requests();

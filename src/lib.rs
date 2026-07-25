@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
-pub mod agent;
+pub mod agent {
+    pub use jterm_core::agent::*;
+}
 pub mod ai;
 pub mod block_view;
 pub mod cli;
@@ -22,7 +24,9 @@ pub mod logging;
 pub mod notebook;
 mod palette;
 pub mod pty;
-pub mod redact;
+pub mod redact {
+    pub use jterm_core::redact::*;
+}
 pub mod state;
 pub mod terminal;
 pub mod workflows;
