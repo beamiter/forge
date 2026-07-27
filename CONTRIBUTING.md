@@ -11,6 +11,8 @@ cargo run
 
 A native Cargo build also works after installing GTK4, libadwaita, VTE GTK4, PCRE2, and `pkg-config` development packages. The repository toolchain file installs stable Rust with rustfmt and Clippy.
 
+`jagent` and `jterm_core` are Git dependencies, and Cargo.lock carries no checksum for those. When you repin either revision, update the matching entry in `cargoLock.outputHashes` in `flake.nix` as well, otherwise `nix develop` and `nix build` fail to evaluate. Set the entry to `pkgs.lib.fakeHash`, run `nix build .#default`, and copy the `got:` hash from the mismatch error.
+
 ## Required checks
 
 Run the same gates as CI before opening a pull request:

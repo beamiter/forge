@@ -25,7 +25,16 @@
             version = manifest.package.version;
             src = self;
 
-            cargoLock.lockFile = ./Cargo.lock;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              # Git dependencies are not covered by Cargo.lock checksums, so
+              # Nix needs an explicit hash per revision. Update these whenever
+              # the jagent / jterm_core pins in Cargo.lock change.
+              outputHashes = {
+                "jagent-0.2.0" = "sha256-75lH5fOFoj3serTCC+ZZWv85pqQk0Jw94hMWCJLXImI=";
+                "jterm_core-0.1.0" = "sha256-SI3TodegxwFpb1zEeV2k/NE9xwJXj6NhoIxBA0lMI68=";
+              };
+            };
             strictDeps = true;
 
             nativeBuildInputs = with pkgs; [
