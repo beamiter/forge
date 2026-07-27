@@ -44,6 +44,9 @@ impl UiState {
             swap,
             zoomed_terminal: terminal,
         });
+        // Zoom leaves one leaf on the page, so pane numbering has to be
+        // recomputed in both directions.
+        self.refresh_pane_headers();
     }
 
     pub(crate) fn unzoom_pane(&self, state: ZoomState) {
@@ -52,6 +55,7 @@ impl UiState {
         };
         self.sync_tab_strip_active(Some(inserted));
         state.zoomed_terminal.grab_focus();
+        self.refresh_pane_headers();
     }
 
     pub(crate) fn move_pane_to_new_tab(&self) {
@@ -79,5 +83,7 @@ impl UiState {
             node.grab_focus();
         }
         self.add_pane_leaf_as_new_tab(leaf, working_directory);
+        // The source tab lost a pane and may be back to a single one.
+        self.refresh_pane_headers();
     }
 }

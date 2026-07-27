@@ -48,6 +48,32 @@ impl PaneLeaf {
         }
     }
 
+    /// This pane's status strip, shown only while its tab is split.
+    pub(crate) fn pane_header(&self) -> &super::PaneHeader {
+        match self {
+            Self::Block(view) => view.pane_header(),
+            Self::Vte(view) => view.pane_header(),
+        }
+    }
+
+    /// Wire this pane for rearranging: its header becomes a drag handle
+    /// carrying the pane's session id, and the whole leaf becomes a drop zone.
+    ///
+    /// Session ids, not indices or tab numbers, cross the drag boundary: both
+    /// of those shift when an unrelated pane or tab closes mid-drag.
+    /// The drag closure resolves the leaf from a weak root reference instead of
+    /// capturing it. A strong capture would form
+    /// `root -> controller -> PaneLeaf -> view -> root` and pin the pane's PTY
+    /// and scrollback for the life of the process.
+    pub(crate) fn install_pane_drag(&self, on_drop: impl Fn(&str) -> bool + 'static) {
+        let root = self.root_widget();
+        let source_root = root.downgrade();
+        self.pane_header().install_drag_source(move || {
+            Self::from_widget(&source_root.upgrade()?)?.session_id()
+        });
+        super::pane_header::install_pane_drop_target(&root, on_drop);
+    }
+
     /// Focus the actual live surface rather than the first VTE found in the tree.
     pub(crate) fn grab_focus(&self) {
         self.mark_active();

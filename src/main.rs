@@ -340,7 +340,9 @@ pub fn run() -> glib::ExitCode {
 
         // Custom tab bar CSS
         let css_provider = CssProvider::new();
-        css_provider.load_from_string(
+        css_provider.load_from_string(&format!(
+            "{}{}",
+            ui::PANE_HEADER_CSS,
             ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; border-bottom: 1px solid alpha(currentColor, 0.1); margin-bottom: 2px; }
              .tab-strip-btn:checked { font-weight: bold; border-radius: 4px; background-color: alpha(currentColor, 0.14); outline: 2px solid alpha(currentColor, 0.8); outline-offset: -2px; }
              .tab-strip-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0; }
@@ -375,7 +377,7 @@ pub fn run() -> glib::ExitCode {
              .file-tree-header { padding: 2px 4px; }
              .file-tree-root { font-size: 0.85em; opacity: 0.7; }
              .file-tree { padding: 2px; }",
-        );
+        ));
         gtk4::style_context_add_provider_for_display(
             &gtk4::gdk::Display::default().expect("display"),
             &css_provider,
@@ -1099,6 +1101,9 @@ pub fn run() -> glib::ExitCode {
         notebook.connect_switch_page(move |_, widget, page_num| {
             let generation = tab_focus_generation.get().wrapping_add(1);
             tab_focus_generation.set(generation);
+            // Headers are only maintained for the visible tab, so the newly
+            // selected one has to catch up before it is drawn.
+            ui_for_switch.refresh_pane_headers_for(widget);
             if ui_for_switch.search_bar.is_search_mode() {
                 ui_for_switch.search_apply();
                 ui_for_switch.search_entry.grab_focus();
@@ -1313,6 +1318,17 @@ pub fn run() -> glib::ExitCode {
 
         // Paned positions are meaningful only after the first allocation.
         ui.restore_ai_panel_width();
+
+        // Directories and foreground commands are polled, not pushed, so the
+        // split panes' headers need a slow tick to stay honest. It touches
+        // only the visible tab, and only while that tab is actually split.
+        {
+            let ui = Rc::clone(&ui);
+            glib::timeout_add_seconds_local(1, move || {
+                ui.refresh_pane_headers();
+                glib::ControlFlow::Continue
+            });
+        }
 
         // Focus the active terminal after window is shown
         ui.focus_current_terminal();

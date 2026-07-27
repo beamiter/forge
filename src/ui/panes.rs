@@ -8,6 +8,7 @@ use crate::block_view::TermView;
 use crate::keybindings::Direction;
 use crate::state::generate_session_id;
 use crate::terminal::{setup_terminal_click_handler, terminal_working_directory, VteTerminalView};
+use vte4::TerminalExt as _;
 
 /// Number of equal-size pane slots a subtree occupies along one axis.
 ///
@@ -165,6 +166,7 @@ impl UiState {
         leaf.attach_to(&root);
         leaf.set_session_id(&sid);
         leaf.set_remote(false);
+        self.install_pane_rearrange(&leaf);
         if tab_widget_name.is_some() {
             let ui_for_bell = self.clone();
             let root_for_bell = root.downgrade();
@@ -239,6 +241,7 @@ impl UiState {
         leaf.attach_to(&root);
         leaf.set_session_id(&sid);
         leaf.set_remote(false);
+        self.install_pane_rearrange(&leaf);
         if tab_widget_name.is_some() {
             if let PaneLeaf::Block(view) = &leaf {
                 let ui_for_bell = self.clone();
@@ -319,6 +322,138 @@ impl UiState {
                 tab_widget_name,
             ),
         }
+    }
+
+    /// Make one leaf draggable by its header and droppable as a swap target.
+    ///
+    /// Both sides read the pane's live session id at gesture time rather than
+    /// capturing it: restore can reassign a leaf's id after construction.
+    fn install_pane_rearrange(&self, leaf: &PaneLeaf) {
+        let ui = self.clone();
+        let target_root = leaf.root_widget().downgrade();
+        leaf.install_pane_drag(move |dragged| {
+            let Some(target) = target_root
+                .upgrade()
+                .and_then(|root| PaneLeaf::from_widget(&root))
+                .and_then(|leaf| leaf.session_id())
+            else {
+                return false;
+            };
+            ui.swap_panes_by_session(dragged, &target)
+        });
+    }
+
+    /// Bring the current tab's pane headers up to date: visibility, numbering,
+    /// focus highlight, and the title / directory / running-command line.
+    ///
+    /// A tab with a single pane hides its header entirely — the tab strip and
+    /// window title already name it, and the strip would only cost a row.
+    /// Background tabs are not rendered, so their PTYs are left alone.
+    pub(crate) fn refresh_pane_headers(&self) {
+        let Some(page_widget) = self
+            .notebook
+            .current_page()
+            .and_then(|page| self.notebook.nth_page(Some(page)))
+        else {
+            return;
+        };
+        self.refresh_pane_headers_for(&page_widget);
+    }
+
+    /// Refresh one specific page's headers. `switch-page` fires before the
+    /// notebook's current page has moved, so the new tab must be named
+    /// explicitly rather than looked up.
+    pub(crate) fn refresh_pane_headers_for(&self, page_widget: &gtk4::Widget) {
+        let Some(node) = PaneNode::from_widget(page_widget) else {
+            return;
+        };
+        // `leaves()` walks the tree start-child first, so its order is the
+        // order the user sees. A swap changes it; a creation-order list would
+        // not, and the numbers would stop matching the layout.
+        let leaves = node.leaves();
+        let split = leaves.len() > 1;
+        let focused_root = node.active_leaf().map(|leaf| leaf.root_widget());
+        for (position, leaf) in leaves.iter().enumerate() {
+            let header = leaf.pane_header();
+            header.set_header_visible(split);
+            header.set_focused(focused_root.as_ref() == Some(&leaf.root_widget()));
+            if !split {
+                continue;
+            }
+            let cwd = self.pane_working_directory(leaf);
+            let title = super::pane_header::pane_header_title(
+                self.pane_title(leaf).as_deref(),
+                cwd.as_deref(),
+                position,
+            );
+            header.set_status(
+                position,
+                &title,
+                cwd.as_deref()
+                    .map(super::pane_header::abbreviate_home)
+                    .as_deref(),
+                leaf.foreground_process_name().as_deref(),
+            );
+        }
+    }
+
+    /// A pane's working directory. Block views track it themselves because
+    /// their PTY is not owned by the live VTE, so their own record outranks
+    /// VTE's OSC 7 / child-pid inspection.
+    fn pane_working_directory(&self, leaf: &PaneLeaf) -> Option<String> {
+        leaf.block_view()
+            .map(|view| view.cwd())
+            .filter(|cwd| !cwd.is_empty())
+            .or_else(|| terminal_working_directory(leaf.terminal()))
+    }
+
+    /// The OSC title this pane's terminal last reported, if any.
+    fn pane_title(&self, leaf: &PaneLeaf) -> Option<String> {
+        leaf.terminal()
+            .window_title()
+            .map(|title| title.to_string())
+            .filter(|title| !title.trim().is_empty())
+    }
+
+    /// Exchange two panes' positions in the current tab's split tree after a
+    /// header drag. Only the panes move: the tree shape and every divider
+    /// position the user arranged stay exactly as they were.
+    pub(crate) fn swap_panes_by_session(&self, dragged: &str, target: &str) -> bool {
+        if dragged == target {
+            return false;
+        }
+        let Some(page_widget) = self
+            .notebook
+            .current_page()
+            .and_then(|page| self.notebook.nth_page(Some(page)))
+        else {
+            return false;
+        };
+        let Some(node) = PaneNode::from_widget(&page_widget) else {
+            return false;
+        };
+        let leaves = node.leaves();
+        let find = |session: &str| {
+            leaves
+                .iter()
+                .find(|leaf| leaf.session_id().as_deref() == Some(session))
+                .cloned()
+        };
+        // A drop from another tab would have to move a pane between two page
+        // trees and two tab identities; refuse rather than half-apply it.
+        let (Some(dragged_leaf), Some(target_leaf)) = (find(dragged), find(target)) else {
+            return false;
+        };
+        if !super::pane_header::swap_pane_widgets(
+            &dragged_leaf.root_widget(),
+            &target_leaf.root_widget(),
+        ) {
+            return false;
+        }
+        // Focus follows the dragged pane into its new slot.
+        dragged_leaf.grab_focus();
+        self.refresh_pane_headers();
+        true
     }
 
     pub(crate) fn split_current(&self, orientation: Orientation) {
@@ -417,6 +552,8 @@ impl UiState {
             .and_then(|page| self.notebook.nth_page(Some(page)))
         {
             schedule_pane_rebalance(page);
+            // The tab just became split, so every pane's header appears now.
+            self.refresh_pane_headers();
         }
         new_leaf.grab_focus();
     }
@@ -448,6 +585,7 @@ impl UiState {
             focused - 1
         };
         leaves[next].grab_focus();
+        self.refresh_pane_headers();
     }
 
     pub(crate) fn resize_pane(&self, target_orientation: Orientation, delta: i32) {

@@ -23,6 +23,7 @@ mod dialogs;
 mod file_tree;
 mod layout;
 mod notebooks;
+mod pane_header;
 mod pane_leaf;
 mod pane_node;
 mod pane_tree_edit;
@@ -37,6 +38,7 @@ pub(crate) use agent_panel::AgentHandle;
 pub(crate) use ai_panel::AiPanel;
 pub(crate) use command_palette::CommandSuggestionHandle;
 pub(crate) use file_tree::{build_file_tree_widgets, FileTreeModel};
+pub(crate) use pane_header::{PaneHeader, PANE_HEADER_CSS};
 pub(crate) use pane_leaf::PaneLeaf;
 pub(crate) use pane_node::PaneNode;
 pub(crate) use pane_tree_edit::{

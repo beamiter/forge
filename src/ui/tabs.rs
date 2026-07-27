@@ -15,7 +15,7 @@ use crate::block_view::TermView;
 use crate::keybindings::Action;
 use crate::state::{generate_session_id, kill_terminal_child, kill_widget_child_processes};
 use crate::terminal::{
-    collect_terminals, default_tab_title, find_first_terminal, scrollbar_wrapper_of,
+    collect_terminals, default_tab_title, find_first_terminal,
     setup_terminal_click_handler, show_rename_dialog, show_rename_dialog_with_strip,
     terminal_working_directory, VteTerminalView,
 };
@@ -38,6 +38,23 @@ fn tab_num_for_widget(widget: &gtk4::Widget) -> Option<u32> {
         .widget_name()
         .strip_prefix("tab-")
         .and_then(|value| value.parse().ok())
+}
+
+/// Walk up from any descendant to the widget carrying its `PaneLeaf` — the one
+/// the split tree actually holds.
+///
+/// A pane nests its grid below a status header, and a Block pane also contains
+/// finished-block VTEs, so no fixed number of parent hops finds the leaf. The
+/// controller marker does.
+fn pane_leaf_root_of(widget: &gtk4::Widget) -> Option<gtk4::Widget> {
+    let mut candidate = Some(widget.clone());
+    while let Some(current) = candidate {
+        if PaneLeaf::from_widget(&current).is_some() {
+            return Some(current);
+        }
+        candidate = current.parent();
+    }
+    None
 }
 
 fn notebook_page_named(notebook: &gtk4::Notebook, name: &str) -> Option<gtk4::Widget> {
@@ -252,9 +269,7 @@ impl UiState {
         // swap would lose the still-running sibling and its PTY.
         self.restore_zoom_before_close();
 
-        let leaf_root = scrollbar_wrapper_of(term_widget)
-            .map(|wrapper| wrapper.upcast::<gtk4::Widget>())
-            .unwrap_or_else(|| term_widget.clone());
+        let leaf_root = pane_leaf_root_of(term_widget).unwrap_or_else(|| term_widget.clone());
 
         if let Some(sibling) = detach_leaf_and_promote(&self.notebook, &leaf_root) {
             let _detached = PaneLeaf::detach_from(&leaf_root);
@@ -957,9 +972,8 @@ impl UiState {
         for i in 0..self.notebook.n_pages() {
             if let Some(page_widget) = self.notebook.nth_page(Some(i)) {
                 if page_widget.widget_name() == format!("tab-{}", tab_num) {
-                    let eff_widget = scrollbar_wrapper_of(&page_widget)
-                        .map(|bx| bx.upcast::<gtk4::Widget>())
-                        .unwrap_or_else(|| page_widget.clone());
+                    let eff_widget =
+                        pane_leaf_root_of(&page_widget).unwrap_or_else(|| page_widget.clone());
                     self.handle_terminal_exited(&eff_widget);
                     break;
                 }

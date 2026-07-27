@@ -1071,6 +1071,9 @@ type BlockFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(String, i32, String)>>>>
 
 pub struct TermView {
     root: gtk4::Box,
+    /// Status strip above the block list, shown only while this pane's tab
+    /// is split.
+    pane_header: crate::ui::PaneHeader,
     block_scroll: ScrolledWindow,
     block_list: gtk4::Box,
     jump_fab: gtk4::Button,
@@ -3133,6 +3136,9 @@ impl TermView {
         root.set_vexpand(true);
         root.set_focusable(true);
         root.add_css_class("term-view-root");
+        // Stays hidden until this pane's tab is split.
+        let pane_header = crate::ui::PaneHeader::new();
+        root.append(pane_header.widget());
 
         // Block list inside a scrolled window
         let block_list = gtk4::Box::new(Orientation::Vertical, 0);
@@ -4179,6 +4185,7 @@ impl TermView {
 
         let term_view = TermView {
             root,
+            pane_header,
             block_scroll,
             block_list,
             jump_fab: jump_fab.clone(),
@@ -4430,6 +4437,10 @@ impl TermView {
     }
 
     /// Root GTK widget to embed in the notebook page.
+    pub(crate) fn pane_header(&self) -> &crate::ui::PaneHeader {
+        &self.pane_header
+    }
+
     pub fn widget(&self) -> gtk4::Widget {
         self.root.clone().upcast()
     }

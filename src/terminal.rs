@@ -132,6 +132,8 @@ type VoidCallbacks = Rc<RefCell<Vec<Box<dyn Fn()>>>>;
 #[allow(dead_code)]
 pub struct VteTerminalView {
     root: gtk4::Box,
+    /// Status strip above the grid, shown only while this pane's tab is split.
+    pane_header: crate::ui::PaneHeader,
     terminal: Terminal,
     config: Rc<RefCell<Config>>,
     cwd_callbacks: StrCallbacks,
@@ -153,9 +155,17 @@ impl VteTerminalView {
         // Create Terminal widget
         let terminal = create_terminal(&config.borrow());
 
-        // Wrap with scrollbar
-        let root = wrap_with_scrollbar(&terminal);
+        // Wrap with scrollbar, then stack the pane header above it. The outer
+        // box is the pane's leaf widget, so the split tree still sees exactly
+        // one widget per pane.
+        let content = wrap_with_scrollbar(&terminal);
+        let pane_header = crate::ui::PaneHeader::new();
+        let root = gtk4::Box::new(Orientation::Vertical, 0);
+        root.set_hexpand(true);
+        root.set_vexpand(true);
         root.add_css_class("vte-view-root");
+        root.append(pane_header.widget());
+        root.append(&content);
 
         let cwd_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn(&str)>>::new()));
         let exited_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn(i32)>>::new()));
@@ -230,6 +240,7 @@ impl VteTerminalView {
 
         VteTerminalView {
             root,
+            pane_header,
             terminal,
             config,
             cwd_callbacks,
@@ -238,6 +249,10 @@ impl VteTerminalView {
             title_callbacks,
             activity_callbacks,
         }
+    }
+
+    pub(crate) fn pane_header(&self) -> &crate::ui::PaneHeader {
+        &self.pane_header
     }
 
     pub fn widget(&self) -> gtk4::Widget {
