@@ -12,10 +12,51 @@ use libadwaita as adw;
 use std::cell::{Cell, RefCell};
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
+use std::sync::Arc;
 use vte4::{CursorBlinkMode, CursorShape, PtyFlags, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
 
 use crate::config::Config;
+use crate::process::{ChildLifecycle, EscalationPolicy, ReapOwner};
+
+/// Shutdown ladder for a terminal pane's shell.
+///
+/// Both backends give their child a session of its own — `OwnedPty` calls
+/// `setsid` between fork and exec, and VTE does the same in its PTY child
+/// setup — so a pane owns everything in that session, not merely a process
+/// group. Shell job control puts each foreground command in its own group, so
+/// only the session sweep reaches a stubborn background job on pane close.
+pub(crate) const TERMINAL_ESCALATION: EscalationPolicy = EscalationPolicy::SESSION_DRAIN;
+
+/// Where a pane's child lifecycle is parked on its live VTE widget.
+///
+/// The lifecycle, not a bare pid, is what travels with the widget: it carries
+/// the reap owner (VTE's glib child watch for a conventional pane, this
+/// process for a Block pane), so widget-tree teardown paths never have to
+/// infer ownership from the widget type — and can never signal a pid that has
+/// already been reaped and recycled.
+const CHILD_LIFECYCLE_DATA_KEY: &str = "child-lifecycle";
+
+/// Attach a pane's child lifecycle to the live VTE that displays it.
+pub(crate) fn set_terminal_child_lifecycle(terminal: &Terminal, lifecycle: Arc<ChildLifecycle>) {
+    unsafe {
+        terminal.set_data::<Arc<ChildLifecycle>>(CHILD_LIFECYCLE_DATA_KEY, lifecycle);
+    }
+}
+
+/// The child lifecycle of the shell shown by `terminal`, if one was attached.
+pub(crate) fn terminal_child_lifecycle(terminal: &Terminal) -> Option<Arc<ChildLifecycle>> {
+    unsafe {
+        terminal
+            .data::<Arc<ChildLifecycle>>(CHILD_LIFECYCLE_DATA_KEY)
+            .map(|lifecycle| Arc::clone(lifecycle.as_ref()))
+    }
+}
+
+/// The shell pid behind `terminal`, for `/proc` probes and logging only.
+pub(crate) fn terminal_child_pid(terminal: &Terminal) -> Option<i32> {
+    terminal_child_lifecycle(terminal).map(|lifecycle| lifecycle.pid())
+}
 
 fn belongs_to_selected_notebook_page(terminal: &Terminal) -> bool {
     // GTK4 Notebook keeps its pages inside an internal GtkStack, so walking
@@ -191,11 +232,23 @@ impl VteTerminalView {
             }
         });
 
-        // Listen for child-exited signal
+        // Listen for child-exited signal. VTE hands over the raw `waitpid`
+        // status its glib child watch observed; normalize it to the family's
+        // exit-code convention once, here, so the lifecycle and every observer
+        // see the same number a Block pane reports. Recording it retires the
+        // pid: after this point the lifecycle refuses to signal a number VTE
+        // has already released for reuse.
         let exited_callbacks_clone = exited_callbacks.clone();
-        terminal.connect_child_exited(move |_term, status| {
+        terminal.connect_child_exited(move |term, status| {
+            let Some(code) = crate::process::exit_code_from_wait_status(status) else {
+                // A stop or continue report: the child is still alive.
+                return;
+            };
+            if let Some(lifecycle) = terminal_child_lifecycle(term) {
+                lifecycle.note_foreign_exit(code);
+            }
             for callback in exited_callbacks_clone.borrow().iter() {
-                callback(status);
+                callback(code);
             }
         });
 
@@ -335,23 +388,19 @@ impl VteTerminalView {
         }
     }
 
+    /// Tear this pane's shell down through the shared escalation ladder.
+    ///
+    /// Idempotent by construction: the second call — an explicit pane close
+    /// followed by the widget's own teardown — finds a termination already in
+    /// flight and does nothing.
     pub fn kill(&self) {
-        // Send SIGHUP to child process to gracefully terminate
-        if let Some(pid) = unsafe { self.terminal.data::<i32>("child-pid") } {
-            let pid_val = unsafe { *pid.as_ref() };
-            unsafe {
-                nix::libc::kill(pid_val, nix::libc::SIGHUP);
-            }
+        if let Some(lifecycle) = terminal_child_lifecycle(&self.terminal) {
+            lifecycle.terminate(TERMINAL_ESCALATION);
         }
     }
 
     pub fn pid_i32(&self) -> i32 {
-        unsafe {
-            self.terminal
-                .data::<i32>("child-pid")
-                .map(|pid| *pid.as_ref())
-                .unwrap_or(0)
-        }
+        terminal_child_pid(&self.terminal).unwrap_or(0)
     }
 
     /// Borrow the VTE-managed master-side PTY descriptor for process probes.
@@ -399,10 +448,7 @@ pub(crate) fn terminal_working_directory(terminal: &Terminal) -> Option<String> 
         }
     }
     // Fallback: read /proc/<pid>/cwd
-    let pid: i32 = unsafe { *terminal.data::<i32>("child-pid")?.as_ref() };
-    std::fs::read_link(format!("/proc/{pid}/cwd"))
-        .ok()
-        .map(|p| p.to_string_lossy().to_string())
+    crate::process::process_cwd(terminal_child_pid(terminal)?)
 }
 
 /// Commands typed into a new shell on its behalf, one PTY line each.
@@ -504,8 +550,17 @@ pub(crate) fn spawn_shell(
             log::debug!("spawn_async: {res:?}");
             if let Ok(pid) = res {
                 let pid_i32: i32 = pid.into_glib();
-                unsafe {
-                    terminal_for_pid.set_data::<i32>("child-pid", pid_i32);
+                // VTE spawned this child through glib, and glib's child watch
+                // is what calls `waitpid` for it — hence `Foreign`. The
+                // lifecycle only ever signals it (through a pidfd), and learns
+                // the status from `child-exited`; reaping here would consume
+                // the status VTE is waiting for and free the pid behind its
+                // back.
+                match ChildLifecycle::new(pid_i32, ReapOwner::Foreign) {
+                    Ok(lifecycle) => set_terminal_child_lifecycle(&terminal_for_pid, lifecycle),
+                    Err(error) => {
+                        log::warn!("Cannot manage the lifecycle of VTE child {pid_i32}: {error}")
+                    }
                 }
             }
             // Feed initial commands after the shell has fully initialized.

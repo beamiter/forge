@@ -203,15 +203,20 @@ impl PaneLeaf {
         crate::process::foreground_process_name(pty_fd, shell_pid)
     }
 
-    /// Terminate this leaf's shell and its process group through the
-    /// backend-neutral process teardown path.
+    /// Terminate this leaf's shell and everything in its PTY session through
+    /// the backend-neutral process teardown path.
+    ///
+    /// Each backend terminates its own child lifecycle, which knows who reaps
+    /// that child: jterm4 for a Block pane's forked PTY, VTE's glib child
+    /// watch for a conventional pane. Repeated calls are no-ops, so a pane
+    /// closed explicitly and then dropped tears down only once.
     pub(crate) fn kill(&self) {
         match self {
             // Block mode also owns a dedicated PTY input worker. Route teardown
             // through TermView so the channel and cloned master fd close before
-            // terminating the process group.
+            // the escalation ladder starts.
             Self::Block(view) => view.kill(),
-            Self::Vte(view) => crate::state::terminate_terminal_process(view.pid_i32()),
+            Self::Vte(view) => view.kill(),
         }
     }
 

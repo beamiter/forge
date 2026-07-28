@@ -3551,10 +3551,13 @@ impl TermView {
 
         let pty = Rc::new(OwnedPty::spawn(&argv, cwd, &env_extra).expect("PTY spawn failed"));
 
-        // Store child PID on the live VTE so kill_all_terminal_children can find it
-        unsafe {
-            active_vte.set_data::<i32>("child-pid", pty.pid_i32());
-        }
+        // Share the child lifecycle with the live VTE so widget-tree teardown
+        // (kill_all_terminal_children, tab close) terminates exactly the same
+        // child this pane owns — through the same handle, so a close and this
+        // pane's own drop cannot produce two escalations. Unlike a
+        // conventional pane, this child was forked by jterm4 itself and is
+        // reaped here, which the shared lifecycle records.
+        crate::terminal::set_terminal_child_lifecycle(&active_vte, pty.lifecycle());
 
         // ── Register CSS ──────────────────────────────────────────────────
         install_block_css(config);

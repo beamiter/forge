@@ -13,19 +13,28 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
-use crate::state::terminate_terminal_process;
+use crate::process::{ChildLifecycle, ReapOwner};
+use crate::terminal::TERMINAL_ESCALATION;
 
 enum PtyMsg {
     Data(Vec<u8>),
     Exit(i32),
 }
 
+/// How often the reader thread asks the lifecycle for the child's status once
+/// the PTY master has reached end of file.
+const CHILD_REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
 pub struct OwnedPty {
     master: std::sync::Arc<std::sync::Mutex<Option<OwnedFd>>>,
     /// Terminal input is written by a dedicated worker. A full PTY kernel buffer
     /// therefore backpressures that worker rather than GTK's main thread.
     input_tx: std::sync::Mutex<Option<mpsc::Sender<Vec<u8>>>>,
-    pid: Pid,
+    /// The forked shell. This process reaps it (`ReapOwner::Ours`), so the
+    /// lifecycle — not a raw pid — is the only handle any teardown path holds:
+    /// it serializes every signal against its own `waitpid`, refuses to start a
+    /// second escalation, and never leaves a zombie behind.
+    lifecycle: Arc<ChildLifecycle>,
     /// Tracks explicit bracketed-paste frames whose start, body, and end are
     /// delivered through separate `write_bytes` calls.
     outgoing_bracketed_paste: AtomicBool,
@@ -404,24 +413,25 @@ impl OwnedPty {
             },
             Ok(ForkResult::Parent { child }) => {
                 drop(slave);
-                let writer_fd = match master.try_clone() {
-                    Ok(fd) => fd,
+                let lifecycle = match ChildLifecycle::new(child.as_raw(), ReapOwner::Ours) {
+                    Ok(lifecycle) => lifecycle,
                     Err(error) => {
-                        terminate_terminal_process(child.as_raw());
+                        kill_and_reap_unreferenced(child);
                         return Err(error);
                     }
                 };
+                let writer_fd = match master.try_clone() {
+                    Ok(fd) => fd,
+                    Err(error) => return Err(abort_spawn(&lifecycle, error)),
+                };
                 let input_tx = match spawn_fd_writer(writer_fd) {
                     Ok(tx) => tx,
-                    Err(error) => {
-                        terminate_terminal_process(child.as_raw());
-                        return Err(error);
-                    }
+                    Err(error) => return Err(abort_spawn(&lifecycle, error)),
                 };
                 Ok(OwnedPty {
                     master: std::sync::Arc::new(std::sync::Mutex::new(Some(master))),
                     input_tx: std::sync::Mutex::new(Some(input_tx)),
-                    pid: child,
+                    lifecycle,
                     outgoing_bracketed_paste: AtomicBool::new(false),
                     shell_bracketed_paste: Arc::new(AtomicBool::new(false)),
                 })
@@ -431,7 +441,16 @@ impl OwnedPty {
     }
 
     pub fn pid_i32(&self) -> i32 {
-        self.pid.as_raw()
+        self.lifecycle.pid()
+    }
+
+    /// Share this PTY's child lifecycle with a widget-tree teardown path.
+    ///
+    /// Every holder terminates the same lifecycle, so an explicit pane close,
+    /// a window close sweeping the notebook, and this `OwnedPty`'s own drop
+    /// collapse into exactly one escalation.
+    pub fn lifecycle(&self) -> Arc<ChildLifecycle> {
+        Arc::clone(&self.lifecycle)
     }
 
     /// Raw master-side fd, or -1 if the PTY has already been closed.
@@ -493,10 +512,15 @@ impl OwnedPty {
         }
     }
 
+    /// Close this pane's PTY and tear the shell down.
+    ///
+    /// Safe to call more than once and safe to race with [`Drop`]: the second
+    /// `terminate` sees a teardown already in flight and returns without
+    /// starting another escalation ladder for the same child.
     pub fn kill(&self) {
         self.close_master_fd();
         self.close_input_writer();
-        terminate_terminal_process(self.pid.as_raw());
+        self.lifecycle.terminate(TERMINAL_ESCALATION);
     }
 
     fn close_input_writer(&self) {
@@ -524,13 +548,13 @@ impl OwnedPty {
             None => return,
         };
 
-        let child_pid = self.pid;
+        let lifecycle = self.lifecycle();
         let (tx, rx) = mpsc::sync_channel::<PtyMsg>(PTY_QUEUE_CAPACITY);
 
         // Create an eventfd for signaling data availability to the main thread.
         let efd: RawFd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         if efd < 0 {
-            self.start_reader_polling(reader_fd, child_pid, tx, rx, callback, on_exit);
+            self.start_reader_polling(reader_fd, lifecycle, tx, rx, callback, on_exit);
             return;
         }
         let eventfd = Arc::new(unsafe { OwnedFd::from_raw_fd(efd) });
@@ -540,7 +564,7 @@ impl OwnedPty {
         let shell_bracketed_paste = Arc::clone(&self.shell_bracketed_paste);
         spawn_reader_thread(
             reader_fd,
-            child_pid,
+            lifecycle,
             tx,
             "jterm4-pty-reader",
             shell_bracketed_paste,
@@ -596,7 +620,7 @@ impl OwnedPty {
     fn start_reader_polling<F, E>(
         &self,
         reader_fd: OwnedFd,
-        child_pid: Pid,
+        lifecycle: Arc<ChildLifecycle>,
         tx: mpsc::SyncSender<PtyMsg>,
         rx: mpsc::Receiver<PtyMsg>,
         mut callback: F,
@@ -607,7 +631,7 @@ impl OwnedPty {
     {
         spawn_reader_thread(
             reader_fd,
-            child_pid,
+            lifecycle,
             tx,
             "jterm4-pty-reader-poll",
             Arc::clone(&self.shell_bracketed_paste),
@@ -638,7 +662,7 @@ impl OwnedPty {
 
 fn spawn_reader_thread(
     reader_fd: OwnedFd,
-    child_pid: Pid,
+    lifecycle: Arc<ChildLifecycle>,
     tx: mpsc::SyncSender<PtyMsg>,
     thread_name: &'static str,
     shell_bracketed_paste: Arc<AtomicBool>,
@@ -646,6 +670,7 @@ fn spawn_reader_thread(
 ) {
     let failure_tx = tx.clone();
     let failure_notify = notify.clone();
+    let failure_lifecycle = Arc::clone(&lifecycle);
     if let Err(error) = std::thread::Builder::new()
         .name(thread_name.to_string())
         .spawn(move || {
@@ -676,36 +701,60 @@ fn spawn_reader_thread(
                 }
             }
 
-            let code = wait_for_child_exit(child_pid);
+            let code = wait_for_child_exit(&lifecycle);
             if tx.send(PtyMsg::Exit(code)).is_ok() {
                 notify();
             }
         })
     {
         log::error!("failed to spawn PTY reader thread '{thread_name}': {error}");
-        terminate_terminal_process(child_pid.as_raw());
+        // Nothing will ever read this PTY or observe the child's exit, so the
+        // child must not merely be signaled: without the reap below it would
+        // stay a zombie for the life of the process.
+        failure_lifecycle.force_kill_and_reap();
         if failure_tx.try_send(PtyMsg::Exit(1)).is_ok() {
             failure_notify();
         }
     }
 }
 
-fn wait_for_child_exit(child_pid: Pid) -> i32 {
-    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-
-    for _ in 0..50 {
-        match waitpid(child_pid, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::Exited(_, code)) => return code,
-            Ok(WaitStatus::Signaled(_, signal, _)) => return 128 + signal as i32,
-            Err(_) | Ok(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+/// Wait for the child's terminal status after the PTY master reached end of
+/// file.
+///
+/// The lifecycle is the process' single reaper for this child, so this polls
+/// it instead of calling `waitpid` directly: a concurrent teardown may be
+/// escalating on the same pid, and the reap must not race the signals. A
+/// status always arrives — whoever runs the escalation ladder reaps at the end
+/// of it, and an untouched child is reaped here on its own exit.
+fn wait_for_child_exit(lifecycle: &ChildLifecycle) -> i32 {
+    loop {
+        if let Some(code) = lifecycle.poll_reap() {
+            return code;
         }
+        std::thread::sleep(CHILD_REAP_POLL_INTERVAL);
     }
+}
 
-    match waitpid(child_pid, None) {
-        Ok(WaitStatus::Exited(_, code)) => code,
-        Ok(WaitStatus::Signaled(_, signal, _)) => 128 + signal as i32,
-        _ => 1,
-    }
+/// Abandon a PTY setup that failed after `fork` already succeeded.
+///
+/// Every early return between a successful fork and a working reader thread
+/// goes through here. The child is running with no reader, no writer, and no
+/// owner, so signaling it is not enough: only the reap keeps the failure from
+/// leaking a zombie that lives as long as the application.
+fn abort_spawn(lifecycle: &ChildLifecycle, error: io::Error) -> io::Error {
+    lifecycle.force_kill_and_reap();
+    error
+}
+
+/// Reap a freshly forked child that could not be given a [`ChildLifecycle`].
+///
+/// This is the one place a raw signal is still correct: the pid is an unreaped
+/// child of this process, so the kernel cannot have handed the number to
+/// anybody else, and no lifecycle exists yet to route through. Blocking is
+/// fine — the caller is already returning an error out of `spawn`.
+fn kill_and_reap_unreferenced(child: Pid) {
+    let _ = nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL);
+    let _ = nix::sys::wait::waitpid(child, None);
 }
 
 /// Merge bytes already waiting on the PTY into one bounded delivery. This
@@ -764,7 +813,10 @@ impl Drop for OwnedPty {
     fn drop(&mut self) {
         self.close_master_fd();
         self.close_input_writer();
-        terminate_terminal_process(self.pid.as_raw());
+        // A pane closed explicitly already started this; `terminate` reports
+        // that and does nothing. Whatever runs the ladder also reaps the
+        // child, and the lifecycle's own drop is the backstop if nothing did.
+        self.lifecycle.terminate(TERMINAL_ESCALATION);
     }
 }
 
@@ -773,6 +825,81 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    /// True once `pid` is no longer a reapable child of this process, i.e. it
+    /// left no zombie behind.
+    fn is_fully_reaped(pid: i32) -> bool {
+        let mut status: libc::c_int = 0;
+        // SAFETY: `status` is a live c_int for the duration of the call.
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        waited < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+    }
+
+    fn wait_until(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if ready() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A PTY setup that fails after the fork must not leak the child it
+    /// already created: signaling it is not enough, somebody has to reap it.
+    #[test]
+    fn aborting_a_failed_spawn_reaps_the_forked_child() {
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .spawn()
+            .expect("spawn test child");
+        let pid = child.id() as i32;
+        std::mem::forget(child); // The lifecycle owns waitpid from here on.
+        let lifecycle = ChildLifecycle::new(pid, ReapOwner::Ours).expect("reference the child");
+
+        let returned = abort_spawn(&lifecycle, io::Error::other("master.try_clone failed"));
+
+        assert_eq!(returned.to_string(), "master.try_clone failed");
+        assert_eq!(lifecycle.exit_code(), Some(128 + libc::SIGKILL));
+        assert!(
+            is_fully_reaped(pid),
+            "the aborted spawn left a zombie behind for pid {pid}"
+        );
+    }
+
+    /// An explicit pane close followed by the pane's own drop must run exactly
+    /// one escalation ladder, and that one ladder must still reap the child.
+    #[test]
+    fn an_explicit_close_and_a_later_drop_share_one_teardown() {
+        let pty = OwnedPty::spawn(&["/bin/sh", "-c", "exec sleep 30"], None, &[])
+            .expect("spawn PTY child");
+        let lifecycle = pty.lifecycle();
+        let pid = lifecycle.pid();
+
+        pty.kill();
+        assert!(
+            !lifecycle.terminate(TERMINAL_ESCALATION),
+            "a second teardown must not start another escalation ladder"
+        );
+        drop(pty);
+        assert!(
+            !lifecycle.terminate(TERMINAL_ESCALATION),
+            "the pane's own drop must not start another escalation ladder either"
+        );
+
+        assert!(
+            wait_until(Duration::from_secs(5), || lifecycle.exit_code().is_some()),
+            "the single escalation ladder never reaped the child"
+        );
+        assert!(
+            is_fully_reaped(pid),
+            "the closed pane left a zombie behind for pid {pid}"
+        );
+    }
 
     #[test]
     fn spawned_child_receives_prepared_environment_and_cwd() {

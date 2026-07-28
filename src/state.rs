@@ -11,12 +11,14 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use vte4::Terminal;
 use vte4::TerminalExt;
 
-use crate::terminal::{find_first_terminal, terminal_working_directory};
+use crate::terminal::{
+    find_first_terminal, terminal_child_lifecycle, terminal_child_pid, terminal_working_directory,
+    TERMINAL_ESCALATION,
+};
 use crate::ui::{PaneLeaf, PaneNode};
 
 const MAX_READY_WINDOW_STATES: usize = 32;
@@ -204,7 +206,7 @@ fn snapshot_owner_pid(path: &Path) -> Option<i32> {
 
 fn recover_stale_active_snapshots(directory: &Path) {
     for active in snapshots_with_extension(directory, ACTIVE_STATE_EXTENSION) {
-        if snapshot_owner_pid(&active).is_some_and(process_exists) {
+        if snapshot_owner_pid(&active).is_some_and(snapshot_owner_is_running) {
             continue;
         }
         let ready = active.with_extension(READY_STATE_EXTENSION);
@@ -835,80 +837,23 @@ pub(crate) fn tab_label_text(notebook: &Notebook, widget: &gtk4::Widget) -> Opti
     Some(label.text().to_string())
 }
 
-fn process_exists(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
+/// Whether the window process that owns an interrupted snapshot is still
+/// running.
+///
+/// Deliberately not a [`crate::process::ChildLifecycle`] question: this pid
+/// belongs to another jterm4 window, never to a child of this process, so
+/// nothing on this path may ever signal it — not even signal 0. A `/proc` probe
+/// answers the only thing snapshot recovery asks, and anything short of a
+/// definitely-vanished process counts as alive so a live window's snapshot is
+/// never stolen.
+fn snapshot_owner_is_running(pid: i32) -> bool {
+    match crate::process::process_stat_result(pid) {
+        Ok(_) => true,
+        Err(error) => !matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+        ),
     }
-
-    let rc = unsafe { nix::libc::kill(pid, 0) };
-    if rc == 0 {
-        return true;
-    }
-
-    matches!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(nix::libc::EPERM)
-    )
-}
-
-fn signal_pid_and_group(pid: i32, sig: std::ffi::c_int) {
-    if pid <= 0 {
-        return;
-    }
-
-    // First, send signal to the main process
-    let rc = unsafe { nix::libc::kill(pid, sig) };
-    if rc < 0 {
-        // Process doesn't exist or we don't have permission, skip process group signal
-        return;
-    }
-
-    // Verify the process group leader is the process we want to kill
-    // This prevents accidentally killing processes from other sessions if PID was reused
-    if let Some(pgid) = crate::process::process_stat(pid).map(|stat| stat.process_group) {
-        // Only send signal to process group if this process is the group leader
-        // (pgid == pid) or explicitly belongs to a group we created
-        if pgid == pid {
-            unsafe {
-                nix::libc::kill(-pid, sig);
-            }
-        }
-    }
-}
-
-fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
-    let start = std::time::Instant::now();
-    while process_exists(pid) {
-        if start.elapsed() >= timeout {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    true
-}
-
-pub(crate) fn terminate_terminal_process(pid: i32) {
-    if pid <= 0 {
-        return;
-    }
-
-    // Send initial SIGHUP immediately (non-blocking)
-    signal_pid_and_group(pid, nix::libc::SIGHUP);
-
-    // Spawn background thread for escalation to avoid blocking the GTK main thread
-    std::thread::spawn(move || {
-        if wait_for_process_exit(pid, Duration::from_millis(120)) {
-            return;
-        }
-
-        signal_pid_and_group(pid, nix::libc::SIGTERM);
-        if wait_for_process_exit(pid, Duration::from_millis(250)) {
-            return;
-        }
-
-        signal_pid_and_group(pid, nix::libc::SIGKILL);
-        let _ = wait_for_process_exit(pid, Duration::from_millis(150));
-    });
 }
 
 pub(crate) fn kill_widget_child_processes(widget: &gtk4::Widget) -> bool {
@@ -921,18 +866,18 @@ pub(crate) fn kill_widget_child_processes(widget: &gtk4::Widget) -> bool {
     false
 }
 
-/// Terminate a terminal child process and its process group before the UI tears down.
+/// Terminate a terminal child process and everything it dragged into its PTY
+/// session before the UI tears down.
+///
+/// The lifecycle attached to the widget carries who reaps that child — VTE's
+/// glib child watch for a conventional pane, this process for a Block pane —
+/// so this path never has to guess from the widget type. Calling it a second
+/// time (an explicit close followed by the drop of the same pane) is a no-op.
 pub(crate) fn kill_terminal_child(terminal: &Terminal) {
-    let pid: i32 = unsafe {
-        match terminal.data::<i32>("child-pid") {
-            Some(p) => {
-                let v: &i32 = p.as_ref();
-                *v
-            }
-            None => return,
-        }
+    let Some(lifecycle) = terminal_child_lifecycle(terminal) else {
+        return;
     };
-    terminate_terminal_process(pid);
+    lifecycle.terminate(TERMINAL_ESCALATION);
 }
 
 /// Send SIGHUP to all child process groups across every terminal in the notebook.
@@ -947,14 +892,14 @@ pub(crate) fn kill_all_terminal_children(notebook: &Notebook) {
 /// Conventional-VTE compatibility wrapper. Block panes must use their
 /// `PaneLeaf` probe because their custom PTY is intentionally not VTE-owned.
 pub(crate) fn get_restorable_commands(terminal: &Terminal) -> Option<Vec<String>> {
-    let shell_pid: i32 = unsafe { *terminal.data::<i32>("child-pid")?.as_ref() };
+    let shell_pid = terminal_child_pid(terminal)?;
     let pty_fd = terminal.pty()?.fd().as_raw_fd();
     crate::process::restorable_command(pty_fd, shell_pid)
 }
 
 /// Conventional-VTE compatibility wrapper for tooltip callers.
 pub(crate) fn get_foreground_process_name(terminal: &Terminal) -> Option<String> {
-    let shell_pid: i32 = unsafe { *terminal.data::<i32>("child-pid")?.as_ref() };
+    let shell_pid = terminal_child_pid(terminal)?;
     let pty_fd = terminal.pty()?.fd().as_raw_fd();
     crate::process::foreground_process_name(pty_fd, shell_pid)
 }
@@ -1121,6 +1066,28 @@ mod tests {
             Some(123)
         );
         assert_eq!(snapshot_owner_pid(Path::new("other.active")), None);
+    }
+
+    /// Snapshot recovery reclaims a file only from a window process that is
+    /// definitely gone. The probe reads `/proc` and never signals: this pid
+    /// belongs to another window, not to a child of this process.
+    #[test]
+    fn snapshot_recovery_only_reclaims_a_vanished_owner() {
+        assert!(snapshot_owner_is_running(std::process::id() as i32));
+        // Ill-formed owners parsed out of a file name must not read as alive.
+        assert!(!snapshot_owner_is_running(0));
+        assert!(!snapshot_owner_is_running(-1));
+
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn test child");
+        let pid = child.id() as i32;
+        child.wait().expect("reap test child");
+        assert!(
+            !snapshot_owner_is_running(pid),
+            "a reaped process must read as gone so its snapshot can be recovered"
+        );
     }
 
     #[test]
