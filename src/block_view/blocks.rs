@@ -122,10 +122,14 @@ pub(crate) struct FinishedBlock {
     pub(crate) prompt_text: String,
     /// Read-only VTE displaying the executed command line (single-row typically).
     pub(crate) command_vte: vte4::Terminal,
-    /// Read-only VTE displaying captured output. Normal long blocks expand into
-    /// the outer history; only exceptionally large snapshots retain private VTE
-    /// scrollback until explicitly expanded.
+    /// Read-only VTE displaying captured output. A block never grows past the
+    /// space its pane can show at once: longer output keeps private VTE
+    /// scrollback, reachable through `output_scrollbar`.
     pub(crate) output_vte: vte4::Terminal,
+    /// Per-block scrollbar bound to `output_vte`'s private adjustment. Visible
+    /// only while the snapshot is taller than the block's viewport, so long
+    /// output can be walked with the mouse without moving the outer history.
+    pub(crate) output_scrollbar: gtk4::Scrollbar,
     /// Raw ANSI-bearing output bytes — the source for filter re-feed and the
     /// copy-output action. Mutable so filter can swap the displayed slice
     /// without losing the original.
@@ -149,6 +153,9 @@ pub(crate) struct FinishedBlock {
     pub(crate) selection_hint: gtk4::Label,
     /// Toggle the output filter while preserving the current query.
     pub(crate) toggle_filter: Rc<dyn Fn()>,
+    /// Re-fit the output to the pane's current height. See
+    /// [`FinishedBlock::refit_output_to_viewport`].
+    refit_output: Rc<dyn Fn() -> Option<i32>>,
     /// Warp-style jump affordance for oversized output.
     pub(crate) jump_bottom_btn: gtk4::Button,
     pub(crate) bookmark_star: gtk4::Label,
@@ -173,6 +180,7 @@ impl Clone for FinishedBlock {
             prompt_text: self.prompt_text.clone(),
             command_vte: self.command_vte.clone(),
             output_vte: self.output_vte.clone(),
+            output_scrollbar: self.output_scrollbar.clone(),
             cmd_text: self.cmd_text.clone(),
             full_output: self.full_output.clone(),
             displayed_output: self.displayed_output.clone(),
@@ -184,6 +192,7 @@ impl Clone for FinishedBlock {
             action_box: self.action_box.clone(),
             selection_hint: self.selection_hint.clone(),
             toggle_filter: self.toggle_filter.clone(),
+            refit_output: self.refit_output.clone(),
             jump_bottom_btn: self.jump_bottom_btn.clone(),
             bookmark_star: self.bookmark_star.clone(),
             status_icon: self.status_icon.clone(),
@@ -515,22 +524,25 @@ pub(crate) fn format_block_timestamp(
 /// document by hundreds of rows.
 const FINISHED_BLOCK_NON_OUTPUT_ROWS: i64 = 3;
 
-/// A single outer history is the normal Warp-style interaction. Keeping a hard
-/// ceiling avoids constructing a multi-megapixel GTK/VTE widget for pathological
-/// output; those blocks retain the existing inner viewport until expanded.
-const MAX_AUTO_DOCUMENT_OUTPUT_ROWS: i64 = 4096;
-
-fn uses_outer_document_scroll(output_rows: i64) -> bool {
-    output_rows.max(1) <= MAX_AUTO_DOCUMENT_OUTPUT_ROWS
-}
-
+/// A finished block never grows the outer history beyond what its pane can show
+/// at once. Anything longer keeps a bounded viewport plus its own visible
+/// scrollbar, which is what makes long output workable with a mouse: the card
+/// stays anchored under the pointer while the wheel or the slider walks its
+/// content, instead of the whole history sliding past. Manual expansion opts a
+/// single block back into full-height document flow.
 fn finished_output_cap(output_rows: i64, fitted_cap: i64, manually_expanded: bool) -> i64 {
     let output_rows = output_rows.max(1);
-    if manually_expanded || uses_outer_document_scroll(output_rows) {
+    if manually_expanded {
         output_rows
     } else {
         fitted_cap.max(1).min(output_rows)
     }
+}
+
+/// True when the whole snapshot fits the block's current viewport, so the VTE
+/// can take its natural height and needs no inner scrollbar.
+fn output_fits_viewport(output_rows: i64, cap: i64) -> bool {
+    output_rows.max(1) <= cap.max(1)
 }
 
 fn fitted_output_rows_for_viewport(
@@ -576,6 +588,22 @@ fn block_edge_scroll_target(
         absolute_top
     };
     target.clamp(lower, max_value)
+}
+
+/// Move one adjustment by a wheel delta. Returns false when it is already at
+/// the requested edge, letting a nested scroll surface hand off only there.
+fn scroll_adjustment(adj: &gtk4::Adjustment, dy: f64) -> bool {
+    let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
+    if dy < 0.0 && adj.value() <= adj.lower() + f64::EPSILON {
+        return false;
+    }
+    if dy > 0.0 && adj.value() >= max_value - f64::EPSILON {
+        return false;
+    }
+    let step = adj.step_increment().max(1.0);
+    let target = (adj.value() + dy * step).clamp(adj.lower(), max_value);
+    adj.set_value(target);
+    true
 }
 
 fn forward_outer_scroll(outer: &gtk4::ScrolledWindow, dy: f64) {
@@ -625,12 +653,18 @@ pub(crate) fn estimated_cell_height_px(config: &Config) -> i32 {
         .max(1.0) as i32
 }
 
-pub(crate) fn estimated_finished_block_height(config: &Config, output_rows: i64) -> i32 {
-    let cell = estimated_cell_height_px(config);
+/// Card height for an output row count at a known cell height. The two extra
+/// rows cover the command row and the metadata header; the pixel constant
+/// covers card padding and borders.
+fn finished_block_height_for_rows(cell_height_px: i32, output_rows: i64) -> i32 {
     let rows = output_rows.clamp(1, i32::MAX as i64) as i32;
     rows.saturating_add(2)
-        .saturating_mul(cell)
+        .saturating_mul(cell_height_px.max(1))
         .saturating_add(34)
+}
+
+pub(crate) fn estimated_finished_block_height(config: &Config, output_rows: i64) -> i32 {
+    finished_block_height_for_rows(estimated_cell_height_px(config), output_rows)
 }
 
 /// Virtualization metadata must follow terminal visual rows rather than logical
@@ -642,8 +676,8 @@ pub(crate) fn estimated_finished_block_height_for_text(
 ) -> i32 {
     let rows = output_visual_row_count(output, cols).max(1);
     let fallback_cap = (config.finished_block_viewport_rows as i64).max(3);
-    let document_rows = finished_output_cap(rows, fallback_cap, false);
-    estimated_finished_block_height(config, document_rows)
+    let visible_rows = finished_output_cap(rows, fallback_cap, false);
+    estimated_finished_block_height(config, visible_rows)
 }
 
 fn flash_button_label(btn: &gtk4::Button, label: &'static str, tooltip: &'static str) {
@@ -1135,9 +1169,9 @@ impl FinishedBlock {
             });
         }
 
-        // Normal long output expands into the outer block document, matching
-        // Warp's single history. Only exceptionally large snapshots receive a
-        // bounded inner viewport; wheel events then forward at its edges.
+        // Output taller than the pane keeps a bounded viewport and scrolls
+        // inside its own card; wheel events forward to the outer history only
+        // once the inner buffer reaches an edge.
         let full_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
         let displayed_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
         let output_vte = create_finished_terminal(config, cols, output_rows, viewport_cap, false);
@@ -1165,14 +1199,13 @@ impl FinishedBlock {
                 let rows = output_visual_row_count(&text, cols_for_map);
                 let fitted_cap = fitted_output_rows_for_widget(w, fallback_cap_for_map, rows);
                 current_cap_for_map.set(fitted_cap);
-                let document_scroll = uses_outer_document_scroll(rows);
                 let manually_expanded = expanded_for_map.get();
                 let cap = finished_output_cap(rows, fitted_cap, manually_expanded);
                 let visible_rows = rows.min(cap).max(1);
-                let fit_to_content = document_scroll || manually_expanded;
-                let can_expand = rows > fitted_cap && !document_scroll;
+                let fit_to_content = output_fits_viewport(rows, cap);
+                let can_expand = rows > fitted_cap;
                 expand_btn_for_map.set_visible(can_expand);
-                jump_btn_for_map.set_visible(rows > fitted_cap);
+                jump_btn_for_map.set_visible(can_expand);
                 render_bytes_into_finished_vte(
                     w,
                     &text,
@@ -1196,7 +1229,7 @@ impl FinishedBlock {
 
         // Geometry is finalized on map, so install the handler for every
         // block and let the map callback decide whether expansion is useful.
-        expand_btn.set_visible(long_output && !uses_outer_document_scroll(output_rows));
+        expand_btn.set_visible(long_output);
         {
             let expand_for_btn = expanded.clone();
             let output_vte_for_btn = output_vte.downgrade();
@@ -1216,10 +1249,9 @@ impl FinishedBlock {
                     rows,
                 );
                 current_cap_for_btn.set(fitted_cap);
-                let document_scroll = uses_outer_document_scroll(rows);
                 let cap = finished_output_cap(rows, fitted_cap, now_expanded);
                 let visible_rows = rows.min(cap).max(1);
-                let fit_to_content = document_scroll || now_expanded;
+                let fit_to_content = output_fits_viewport(rows, cap);
                 render_bytes_into_finished_vte(
                     &output_vte_for_btn,
                     &displayed_for_btn.borrow(),
@@ -1244,6 +1276,70 @@ impl FinishedBlock {
             });
         }
 
+        // `connect_map` fits a block only as it re-enters the viewport, so a
+        // window or split resize would leave every card that never unmapped
+        // sized to the old geometry — a shrunk pane keeps oversized blocks, a
+        // grown one keeps needlessly short ones. This re-runs the same fit for
+        // cards that are already on screen. It reports the card's new height so
+        // the caller can keep virtualization metadata in step, and `None` when
+        // the pane's geometry left this block's cap unchanged.
+        let refit_output: Rc<dyn Fn() -> Option<i32>> = {
+            let output_vte = output_vte.downgrade();
+            let displayed_for_refit = displayed_output.clone();
+            let current_cap_for_refit = current_viewport_cap.clone();
+            let expanded_for_refit = expanded.clone();
+            let expand_btn_for_refit = expand_btn.downgrade();
+            let jump_btn_for_refit = jump_bottom_btn.downgrade();
+            let cols_for_refit = cols.max(1);
+            Rc::new(move || {
+                let (Some(output_vte), Some(expand_btn), Some(jump_btn)) = (
+                    output_vte.upgrade(),
+                    expand_btn_for_refit.upgrade(),
+                    jump_btn_for_refit.upgrade(),
+                ) else {
+                    return None;
+                };
+                // Virtualized cards are unmapped; their `connect_map` handler
+                // fits them against the current pane when they come back.
+                if !output_vte.is_mapped() {
+                    return None;
+                }
+                let text = displayed_for_refit.borrow();
+                let rows = output_visual_row_count(&text, cols_for_refit);
+                let fitted_cap =
+                    fitted_output_rows_for_widget(&output_vte, current_cap_for_refit.get(), rows);
+                if current_cap_for_refit.replace(fitted_cap) == fitted_cap {
+                    return None;
+                }
+                // Pane sizing is authoritative over a manual expansion: a block
+                // expanded for the old geometry must not outlive it.
+                if expanded_for_refit.replace(false) {
+                    expand_btn.set_label("\u{f065}");
+                    expand_btn.set_tooltip_text(Some("Expand block"));
+                }
+                let can_expand = rows > fitted_cap;
+                expand_btn.set_visible(can_expand);
+                jump_btn.set_visible(can_expand);
+                let cap = finished_output_cap(rows, fitted_cap, false);
+                let visible_rows = rows.min(cap).max(1);
+                let fit_to_content = output_fits_viewport(rows, cap);
+                render_bytes_into_finished_vte(
+                    &output_vte,
+                    &text,
+                    cols_for_refit,
+                    rows,
+                    fitted_cap,
+                    capture_rows,
+                    fit_to_content,
+                );
+                let cell_height = (output_vte.char_height() as i32).max(1);
+                if !fit_to_content {
+                    output_vte.set_height_request((visible_rows as i32) * cell_height);
+                }
+                Some(finished_block_height_for_rows(cell_height, visible_rows))
+            })
+        };
+
         // Command row: Warp-style accent prompt chevron + the command VTE.
         let cmd_row = gtk4::Box::new(Orientation::Horizontal, 0);
         let chevron = gtk4::Label::new(Some("\u{276f}")); // ❯
@@ -1257,8 +1353,33 @@ impl FinishedBlock {
         // Always use a read-only VTE, including short output. The previous Label
         // fast path stripped ANSI SGR bytes, so `ls` and `git status` lost the
         // colors users see in regular VTE mode.
-        let output_widget: gtk4::Widget = output_vte.clone().upcast::<gtk4::Widget>();
-        content.append(&output_vte);
+        let output_box = gtk4::Box::new(Orientation::Horizontal, 0);
+        output_box.set_hexpand(true);
+        output_box.append(&output_vte);
+        let output_scrollbar =
+            gtk4::Scrollbar::new(Orientation::Vertical, output_vte.vadjustment().as_ref());
+        output_scrollbar.add_css_class("block-output-scrollbar");
+        output_scrollbar.set_tooltip_text(Some("Scroll within this block"));
+        output_scrollbar.set_visible(false);
+        output_box.append(&output_scrollbar);
+        // Drive visibility from the adjustment itself rather than from each
+        // sizing site. VTE applies `feed()` asynchronously and re-measures the
+        // block on map, expand, filter, and theme changes; the adjustment is the
+        // one place that always knows whether content overflows the viewport.
+        if let Some(adj) = output_vte.vadjustment() {
+            let scrollbar = output_scrollbar.downgrade();
+            let sync_visibility = move |adj: &gtk4::Adjustment| {
+                let Some(scrollbar) = scrollbar.upgrade() else {
+                    return;
+                };
+                let overflows = adj.upper() - adj.lower() > adj.page_size() + f64::EPSILON;
+                scrollbar.set_visible(overflows);
+            };
+            sync_visibility(&adj);
+            adj.connect_changed(sync_visibility);
+        }
+        let output_widget: gtk4::Widget = output_box.clone().upcast::<gtk4::Widget>();
+        content.append(&output_box);
 
         // Folding used to leave only a tiny chevron in the header. That made a
         // collapsed block look like it had no output at all, especially once it
@@ -1474,8 +1595,7 @@ impl FinishedBlock {
                         shown_visual_rows,
                     );
                     current_viewport_cap.set(fitted_cap);
-                    let document_scroll = uses_outer_document_scroll(shown_visual_rows);
-                    let can_expand = shown_visual_rows > fitted_cap && !document_scroll;
+                    let can_expand = shown_visual_rows > fitted_cap;
                     // A narrow filter result must not leave the block logically
                     // expanded; clearing the query should return to its default mode.
                     if !can_expand && expanded.replace(false) {
@@ -1485,7 +1605,7 @@ impl FinishedBlock {
                     let manually_expanded = expanded.get();
                     let active_cap =
                         finished_output_cap(shown_visual_rows, fitted_cap, manually_expanded);
-                    let fit_to_content = document_scroll || manually_expanded;
+                    let fit_to_content = output_fits_viewport(shown_visual_rows, active_cap);
                     render_bytes_into_finished_vte(
                         &output_vte,
                         &shown,
@@ -1597,6 +1717,7 @@ impl FinishedBlock {
             displayed_output,
             stripped_output: Rc::new(RefCell::new(None)),
             cmd_text: cmd.to_string(),
+            output_scrollbar,
             copy_cmd_btn,
             copy_output_btn,
             rerun_btn,
@@ -1604,6 +1725,7 @@ impl FinishedBlock {
             action_box,
             selection_hint,
             toggle_filter,
+            refit_output,
             jump_bottom_btn,
             bookmark_star,
             status_icon,
@@ -1639,6 +1761,15 @@ impl FinishedBlock {
             self.widget.set_height_request(-1);
             self.virtualized_height.get().max(1)
         }
+    }
+
+    /// Re-fit this block's output to the space the pane currently offers,
+    /// returning the card's new height when the geometry actually changed.
+    /// Cheap to call on a block whose cap is unchanged, and a no-op for
+    /// virtualized cards — those refit through `connect_map` on their way back
+    /// into the viewport.
+    pub(crate) fn refit_output_to_viewport(&self) -> Option<i32> {
+        (self.refit_output)()
     }
 
     /// Scroll this block's top or bottom edge into the outer history canvas.
@@ -1715,6 +1846,31 @@ impl FinishedBlock {
             glib::Propagation::Stop
         });
         self.output_vte.add_controller(scroll_ctrl);
+
+        // Wheeling over the slider itself should move the block it belongs to,
+        // not the history behind it. GtkScrollbar would scroll its own
+        // adjustment natively, but it stops dead at the ends; capture the event
+        // so the same edge hand-off as the VTE applies.
+        let scrollbar_scroll =
+            gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+        scrollbar_scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let vte_for_scrollbar = self.output_vte.downgrade();
+        let outer_for_scrollbar = outer.downgrade();
+        scrollbar_scroll.connect_scroll(move |_, _dx, dy| {
+            let (Some(vte), Some(outer)) =
+                (vte_for_scrollbar.upgrade(), outer_for_scrollbar.upgrade())
+            else {
+                return glib::Propagation::Proceed;
+            };
+            if let Some(inner_adj) = vte.vadjustment() {
+                if scroll_adjustment(&inner_adj, dy) {
+                    return glib::Propagation::Stop;
+                }
+            }
+            forward_outer_scroll(&outer, dy);
+            glib::Propagation::Stop
+        });
+        self.output_scrollbar.add_controller(scrollbar_scroll);
     }
 
     /// Wire the hover quick-action buttons (copy command, copy output, re-run).
@@ -2133,17 +2289,30 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_long_output_uses_the_outer_document() {
-        assert!(super::uses_outer_document_scroll(200));
-        assert_eq!(super::finished_output_cap(200, 30, false), 200);
+    fn long_output_scrolls_inside_its_own_block() {
+        // Taller than the pane: capped, so the block keeps a private scrollbar.
+        assert_eq!(super::finished_output_cap(200, 30, false), 30);
+        assert!(!super::output_fits_viewport(200, 30));
+        // Expanding opts one block back into full-height document flow.
+        assert_eq!(super::finished_output_cap(200, 30, true), 200);
+        assert!(super::output_fits_viewport(200, 200));
     }
 
     #[test]
-    fn pathological_output_stays_bounded_until_expanded() {
-        let rows = super::MAX_AUTO_DOCUMENT_OUTPUT_ROWS + 1;
-        assert!(!super::uses_outer_document_scroll(rows));
-        assert_eq!(super::finished_output_cap(rows, 42, false), 42);
-        assert_eq!(super::finished_output_cap(rows, 42, true), rows);
+    fn card_height_follows_visible_rows() {
+        // The re-fit path reports a card height from VTE's measured cell
+        // height, the virtualization estimate from the configured font. Both
+        // go through this formula: if they diverge, a resize shifts every
+        // block below it in the virtualized document.
+        assert_eq!(super::finished_block_height_for_rows(20, 10), 12 * 20 + 34);
+        assert_eq!(super::finished_block_height_for_rows(20, 1), 3 * 20 + 34);
+        assert_eq!(super::finished_block_height_for_rows(0, 1), 3 + 34);
+    }
+
+    #[test]
+    fn short_output_takes_its_natural_height() {
+        assert_eq!(super::finished_output_cap(12, 30, false), 12);
+        assert!(super::output_fits_viewport(12, 12));
     }
 
     #[test]

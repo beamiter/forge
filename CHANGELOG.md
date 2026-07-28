@@ -34,6 +34,7 @@ All notable user-visible and operational changes are recorded here.
 
 ### Changed
 
+- Block 模式长输出改为块内滚动（对齐 jterm1）：超出当前 pane 可视高度的 finished Block 不再撑满外层历史，而是保留自适应视口并在右侧显示专属滚动条，鼠标滚轮与滑块都只移动该 Block，滚到首/末行才把滚动交还外层历史；短输出仍取自然高度、不显示滚动条，展开按钮可把单个 Block 恢复为整段铺开。改变窗口或分屏大小时，屏幕上已可见的 Block 会立即按新高度重新适配（此前只有滚出视口再回来的 Block 才会重算），虚拟化高度同步更新，展开状态让位于新的 pane 尺寸。
 - Block 头部元数据更易读：分钟级耗时保留秒数（`1m32s`、`1h04m`），不再丢失 61s 与 179s 的差异；信号退出码标注信号名（如 `exit:130 SIGINT`、`exit:137 SIGKILL`，悬停解释 128+n 约定），长命令完成通知同样附带信号名；从历史恢复的非当日 Block 时间戳带日期（`MM-DD HH:MM`），悬停显示完整本地日期时间，旧输出不再伪装成当天结果。
 - Block 前台与后台输出改用固定上限环缓冲，持续大输出不再为每个 PTY chunk 搬移整个 8 MiB 尾缓冲。
 - 关闭 pane/tab 会同步关闭 Block PTY 输入 worker、释放 GTK root controller，并让 live VTE、完成块、右键菜单、滚动/筛选/选择控制器以弱引用跨越 widget 边界；批量关闭标签或嵌套分屏后读写线程可回落到基线。

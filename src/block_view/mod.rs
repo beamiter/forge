@@ -3349,6 +3349,10 @@ impl TermView {
             programmatic_scroll.clone(),
         );
 
+        let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
+            Rc::new(RefCell::new(VecDeque::new()));
+        let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
+
         // ── Hybrid live-surface layout ─────────────────────────────────────
         // Idle prompts use a compact visual cell so completed output exists only
         // once, in blocks above. Running commands and terminal apps receive the
@@ -3360,7 +3364,14 @@ impl TermView {
             let scroll = block_scroll.downgrade();
             let bstate = bstate.clone();
             let typed_cmd = typed_cmd.clone();
+            let finished_for_layout = finished_blocks_rc.clone();
+            let block_data_for_layout = block_data_rc.clone();
             let last_size_target: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
+            // Change detector for the finished-block re-fit. Their cap follows
+            // the scroll viewport's pixel height and the cell height (font
+            // zoom), and nothing else — so this runs once per real geometry
+            // change rather than on every contents-changed signal.
+            let last_output_layout: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((-1, -1)));
             Rc::new(move || {
                 let Some(holder) = holder.upgrade() else {
                     return;
@@ -3398,6 +3409,35 @@ impl TermView {
                     last_size_target.set(target);
                 }
                 holder.set_height_request((target_rows as i32) * cell_h);
+
+                // Re-fit already-visible finished blocks to the resized pane.
+                // Blocks that scroll off and back are handled by their own map
+                // pass; this reaches the ones that never unmapped.
+                let page_height = scroll.vadjustment().page_size() as i32;
+                let layout_key = (page_height, cell_h);
+                if last_output_layout.replace(layout_key) == layout_key {
+                    return;
+                }
+                // Collect first, write after. Re-fitting touches GTK widgets,
+                // and this runs from a size-allocate signal; holding the
+                // metadata borrow across that would turn any re-entrant layout
+                // pass into a RefCell panic.
+                let resized: Vec<(u64, i32)> = {
+                    let finished = finished_for_layout.borrow();
+                    finished
+                        .iter()
+                        .filter_map(|block| block.refit_output_to_viewport().map(|h| (block.id, h)))
+                        .collect()
+                };
+                if resized.is_empty() {
+                    return;
+                }
+                let mut block_data = block_data_for_layout.borrow_mut();
+                for (id, height) in resized {
+                    if let Some(data) = block_data.iter_mut().find(|data| data.id == id) {
+                        data.estimated_height = height;
+                    }
+                }
             })
         };
         // Coalesces follow-bottom pins so a burst of contents-changed signals
@@ -3481,10 +3521,6 @@ impl TermView {
         // DECSET 2004 state here so clipboard pastes can be forwarded as one
         // ordered byte stream instead of relying on VTE's unrelated PTY.
         let bracketed_paste: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
-            Rc::new(RefCell::new(VecDeque::new()));
-        let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
-
         let pending_exit_code: Rc<Cell<i32>> = Rc::new(Cell::new(0));
 
         let widget_pool: Rc<RefCell<WidgetPool>> = Rc::new(RefCell::new(WidgetPool::new()));
