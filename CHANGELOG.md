@@ -6,6 +6,8 @@ All notable user-visible and operational changes are recorded here.
 
 ### Added
 
+- 一键安装/更新配套 shell `rsh`：命令面板的 **Install or update rsh** 在独立标签页里运行安装脚本（标签页即进度界面，可 Ctrl+C 中断，结束后等待 Enter 再关闭）；缺少 rsh 或有新版本时顶栏下方出现可忽略的提示条。安装脚本来自 rsh 仓库并随二进制内嵌，校验和、原子替换、回滚与 `/usr/bin/rsh`（BSD remote shell）遮蔽提示都由它统一处理。更新检查在后台线程进行、从不自动安装，检查频率由 `rsh_update_check`（`startup` / `daily`（默认）/ `never`）控制，缓存与同机其他 jterm 共享。
+
 - Shell Agent 可选的只读命令自动放行（`agent_auto_approve_readonly` / `JTERM4_AGENT_AUTO_APPROVE_READONLY`，默认关闭）：通过严格白名单的单条只读命令免点击执行，写操作、管道/链式/重定向/命令替换、可执行旁路 flag 与危险模式仍逐条人工审批；自动批准留下可见记录、照常消耗回合预算，开启期间 Agent 卡显示 `auto: read-only` chip，开关位于 Settings 与 Agent 卡设置弹窗。
 - Shell Agent 会话进行中可用 **Attach selected Block** 附加或替换当前选中的 finished Block 作为不可信上下文，不再局限于开卡瞬间的一次性捕获。
 - Agent 请求现在附带有界的 git 元数据（branch、dirty、ahead/behind），与 cwd/shell/OS 一样仅作为不可信 user-role 数据发送，帮助模型贴合仓库状态提出命令。

@@ -699,6 +699,11 @@ pub fn run() -> glib::ExitCode {
         ui.apply_dynamic_css();
         ui.sync_agent_toggle();
 
+        // jterm prefers rsh as its shell, so it is worth noticing when the
+        // machine has no rsh or an old one. The bar builds hidden and reveals
+        // itself only if the background check finds something to offer.
+        main_box.insert_child_after(&ui.build_rsh_notice(), Some(&top_bar));
+
         let ui_for_ai_close = Rc::downgrade(&ui);
         ui.ai_panel.connect_close_requested(move || {
             if let Some(ui) = ui_for_ai_close.upgrade() {

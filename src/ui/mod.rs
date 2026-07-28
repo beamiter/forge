@@ -28,6 +28,7 @@ mod pane_leaf;
 mod pane_node;
 mod pane_tree_edit;
 mod panes;
+mod rsh;
 mod search;
 mod session;
 mod tab_strip;

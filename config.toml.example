@@ -23,6 +23,12 @@ theme = "default"
 # 兼容格式：按 ", " 分隔并依次写入新 shell。
 # startup_commands = "cd ~/projects, nix develop"
 
+# 何时检查 rsh 是否有新版本："startup" 每次启动都联网；"daily"（默认）复用
+# 安装器缓存，同机多个终端共享一次请求；"never" 关闭检查。
+# 检查只决定是否显示提示条，安装始终需要显式点击（或命令面板的
+# "Install or update rsh"）。
+rsh_update_check = "daily"
+
 # 布局 -----------------------------------------------------------------------
 
 tab_placement = "sidebar"     # "sidebar" 或 "top"

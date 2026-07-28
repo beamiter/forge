@@ -72,6 +72,10 @@ impl SidebarView {
     }
 }
 
+/// When to check whether a newer rsh has been published. Shared with the other
+/// terminals so one config vocabulary covers the family.
+pub use jterm_core::rsh_install::UpdateCheck as RshUpdateCheck;
+
 // ---------------------------------------------------------------------------
 // Remote host
 // ---------------------------------------------------------------------------
@@ -203,6 +207,9 @@ pub struct Config {
     pub(crate) tab_placement: TabPlacement,
     /// Which single view the sidebar shows (tab list vs file tree).
     pub(crate) sidebar_view: SidebarView,
+    /// When to look for a newer rsh. Installing always stays an explicit
+    /// choice: this only governs whether the offer appears.
+    pub(crate) rsh_update_check: RshUpdateCheck,
     /// Whether the left sidebar is visible. When absent from an older config,
     /// startup derives the default from tab placement: open for sidebar tabs,
     /// closed for top-bar tabs.
@@ -334,6 +341,7 @@ impl Config {
             terminal_mode: TerminalMode::Vte,
             tab_placement: TabPlacement::Sidebar,
             sidebar_view: SidebarView::Tabs,
+            rsh_update_check: RshUpdateCheck::Daily,
             sidebar_visible: true,
             sidebar_width: 220,
             max_visible_blocks: 200,
@@ -641,6 +649,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "terminal_mode",
     "tab_placement",
     "sidebar_view",
+    "rsh_update_check",
     "sidebar_visible",
     "sidebar_width",
     "max_visible_blocks",
@@ -746,6 +755,7 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
         "terminal_mode",
         "tab_placement",
         "sidebar_view",
+        "rsh_update_check",
         "command_history_path",
         "block_history_path",
         "ai_provider",
@@ -965,6 +975,19 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
             );
         }
     }
+    if let Some(value) = table.get("rsh_update_check").and_then(toml::Value::as_str) {
+        if !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "startup" | "launch" | "always" | "daily" | "never" | "off" | "disabled"
+        ) {
+            config_issue(
+                &mut issues,
+                Error,
+                "rsh_update_check",
+                "expected 'startup', 'daily' or 'never'",
+            );
+        }
+    }
     if let Some(theme) = table.get("theme").and_then(toml::Value::as_str) {
         if !builtin_themes()
             .iter()
@@ -1160,6 +1183,7 @@ struct FileConfig {
     terminal_mode: Option<String>,
     tab_placement: Option<String>,
     sidebar_view: Option<String>,
+    rsh_update_check: Option<String>,
     sidebar_visible: Option<bool>,
     sidebar_width: Option<u32>,
     // Block view optimizations
@@ -1323,6 +1347,10 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
             .map(|s| s.to_string()),
         sidebar_view: table
             .get("sidebar_view")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        rsh_update_check: table
+            .get("rsh_update_check")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         sidebar_visible: table.get("sidebar_visible").and_then(|v| v.as_bool()),
@@ -1684,6 +1712,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         terminal_mode,
         tab_placement,
         sidebar_view: SidebarView::parse(&fc.sidebar_view.unwrap_or_else(|| "tabs".to_string())),
+        rsh_update_check: RshUpdateCheck::parse(
+            &fc.rsh_update_check.unwrap_or_else(|| "daily".to_string()),
+        ),
         sidebar_visible,
         sidebar_width: fc.sidebar_width.unwrap_or(220).clamp(120, 800),
         max_visible_blocks,

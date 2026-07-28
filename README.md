@@ -173,6 +173,25 @@ jterm4 --generate-completion pwsh | Out-String | Invoke-Expression
 
 Block 模式可通过 `finished_block_viewport_rows` 调整长块出现顶部/底部导航控件的行数阈值；`block_compact = true` 可启用更接近 jterm1/Warp 的紧凑块间距。两项配置均保持 GTK4 原生实现，不增加运行时依赖。
 
+### 安装与更新 rsh
+
+jterm4 优先使用配套 shell [`rsh`](https://github.com/beamiter/rsh)，找不到时才退回 bash。
+命令面板中的 **Install or update rsh** 会在一个独立标签页里运行安装脚本：标签页本身就是进度界面，
+可以 Ctrl+C 中断，脚本结束后等待 Enter 再关闭，失败原因不会一闪而过。
+
+安装脚本来自 rsh 仓库并内嵌在二进制里，因此一台从未装过 rsh 的机器也能引导；校验和验证、
+`rename(2)` 原子替换（**运行中的 shell 不受影响，新标签页才使用新版本**）、旧二进制回滚副本，
+以及 `PATH` 被 `/usr/bin/rsh`（Debian 系的 BSD remote shell）遮蔽时的提示，全部由脚本统一处理。
+
+缺少 rsh 或有新版本时，顶栏下方出现一条可忽略的提示条。检查在后台线程进行，从不自动安装：
+
+```toml
+rsh_update_check = "daily"    # "startup" 每次启动联网；"daily" 复用缓存；"never" 关闭
+```
+
+`daily` 复用安装脚本自己的缓存（`~/.cache/rsh/update-check.json`），同机同时开着多个 jterm 也只产生一次网络请求。
+检查失败（离线等）时提示条保持隐藏，只写日志。
+
 ## 核心快捷键
 
 | 功能 | 快捷键 |

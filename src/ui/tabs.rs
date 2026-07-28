@@ -928,6 +928,23 @@ impl UiState {
         })
     }
 
+    /// Launch an explicit argv in a named tab, in conventional VTE mode.
+    ///
+    /// Used for one-shot helper processes such as the rsh installer: they emit
+    /// no shell-integration sequences, so Block mode would have nothing to
+    /// build blocks from, and the tab deserves a better name than argv[0].
+    pub(crate) fn add_named_tab_with_argv(&self, tab_name: &str, argv: Vec<String>) -> Terminal {
+        self.add_tab_with_argv(TabLaunch {
+            working_directory: None,
+            tab_name: Some(tab_name.to_string()),
+            session_id: None,
+            initial_commands: None,
+            argv_override: Some(argv),
+            remote: None,
+            terminal_mode: crate::config::TerminalMode::Vte,
+        })
+    }
+
     /// Open a new tab connecting to a saved remote host over ssh.
     pub(crate) fn connect_remote(&self, host: &crate::config::RemoteHost) -> Terminal {
         self.connect_remote_with_attempt(host, 0)
