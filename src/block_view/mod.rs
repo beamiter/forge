@@ -25,6 +25,7 @@ mod css;
 mod export;
 mod find;
 mod history;
+mod kitty_graphics;
 #[allow(dead_code)]
 mod palette;
 mod scroll;
@@ -1383,6 +1384,15 @@ impl ReaderCtx {
             block_finished_cbs,
         } = self;
         let active_alt_screen_mode_rc: Rc<Cell<Option<u32>>> = Rc::new(Cell::new(None));
+        // Kitty graphics (APC G) — multi-chunk uploads assemble here; completed
+        // textures wait against the running command until its block finishes.
+        // The byte counter enforces the shared per-block budget so a runaway
+        // shell cannot balloon RSS between prompts.
+        let kitty_assembler_rc: Rc<RefCell<kitty_graphics::Assembler>> =
+            Rc::new(RefCell::new(kitty_graphics::Assembler::new()));
+        let kitty_pending_images_rc: Rc<RefCell<Vec<gtk4::gdk::Texture>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let kitty_pending_bytes_rc: Rc<Cell<usize>> = Rc::new(Cell::new(0));
         pty.start_reader(
             move |data: Vec<u8>| {
                 let mut events = event_buf.borrow_mut();
@@ -1527,6 +1537,12 @@ impl ReaderCtx {
                                         let preserve =
                                             config_for_cb.borrow().preserve_live_scrollback;
                                         active_rc.borrow().reset_active(preserve);
+                                        // Match jterm1's reset_active: half-uploaded
+                                        // kitty chunks and undisplayed images do not
+                                        // survive into the next command.
+                                        kitty_assembler_rc.borrow_mut().reset();
+                                        kitty_pending_images_rc.borrow_mut().clear();
+                                        kitty_pending_bytes_rc.set(0);
                                         bstate_rc.set(BlockState::CollectingPrompt);
                                         prompt_buf_rc.borrow_mut().clear();
                                         scroll_debouncer.mark_dirty(&block_scroll_rc);
@@ -1628,6 +1644,15 @@ impl ReaderCtx {
 
                                 block_data_for_cb.borrow_mut().push_back(block_data);
 
+                                // Drain the kitty-graphics images decoded during
+                                // this command so the finished block mounts them
+                                // below its text output. Images are display-only:
+                                // BlockData/history stay text-only, so a restored
+                                // session simply omits them.
+                                let kitty_images: Vec<gtk4::gdk::Texture> =
+                                    kitty_pending_images_rc.borrow_mut().drain(..).collect();
+                                kitty_pending_bytes_rc.set(0);
+
                                 let recycled = widget_pool_for_cb.borrow_mut().acquire();
                                 let finished = FinishedBlock::new_with_pool(
                                     block_id,
@@ -1641,6 +1666,7 @@ impl ReaderCtx {
                                     end_time_ms,
                                     block_cwd.as_deref(),
                                     cols,
+                                    &kitty_images,
                                     recycled,
                                 );
                                 finished.widget().insert_before(
@@ -2173,6 +2199,12 @@ impl ReaderCtx {
 
                                 let preserve = config_for_cb.borrow().preserve_live_scrollback;
                                 active_rc.borrow().reset_active(preserve);
+                                // Drop any half-uploaded kitty chunks so they can't
+                                // leak into the next command (the finalize above
+                                // already drained every completed image).
+                                kitty_assembler_rc.borrow_mut().reset();
+                                kitty_pending_images_rc.borrow_mut().clear();
+                                kitty_pending_bytes_rc.set(0);
                                 if !was_user_scrolled {
                                     scroll_debouncer.reset_scroll_lock();
                                     scroll_debouncer.pin_to_bottom_deferred(&block_scroll_rc);
@@ -2489,21 +2521,52 @@ impl ReaderCtx {
                         }
 
                         ParserEvent::ApcSequence(payload) => {
-                            // Forward Kitty graphics (APC G ...) to the live VTE
-                            // regardless of block state — tools like `kitten icat`
-                            // emit them at the shell prompt (main screen), not
-                            // only inside alt-screen apps. Limiting to AltScreen
-                            // dropped images that appeared as part of a finished
-                            // block's output.
-                            let is_kitty = payload.first() == Some(&b'G');
-                            if is_kitty {
-                                let mut seq = Vec::with_capacity(payload.len() + 4);
-                                seq.push(0x1b);
-                                seq.push(b'_');
-                                seq.extend_from_slice(payload);
-                                seq.push(0x1b);
-                                seq.push(b'\\');
-                                active_vte.feed(&seq);
+                            // APC G — Kitty graphics. libvte has no APC graphics
+                            // handler, so forwarding these bytes to the live VTE
+                            // (the previous behaviour) silently dropped every
+                            // inline image. Decode them here instead, regardless
+                            // of block state — tools like `kitten icat` emit them
+                            // at the shell prompt (main screen), not only inside
+                            // alt-screen apps. Completed textures accumulate
+                            // against the running command and are mounted on its
+                            // finished block. Non-G APC payloads keep the silent
+                            // consume today's libvte would apply.
+                            if payload.first() == Some(&b'G') {
+                                let outcome =
+                                    kitty_assembler_rc.borrow_mut().feed(payload);
+                                // Answer before consuming the outcome: clients
+                                // like `kitten icat` block on the `i=`-keyed
+                                // OK/error reply (jterm2's responder semantics;
+                                // jterm1 never answers).
+                                if let Some(reply) =
+                                    kitty_graphics::response_for(payload, &outcome)
+                                {
+                                    pty_for_init.write_bytes(&reply);
+                                }
+                                if let kitty_graphics::Outcome::Complete(texture) = outcome {
+                                    // Rough memory bound: width*height*4 (bytes
+                                    // per RGBA pixel). Once the shared per-block
+                                    // budget is exhausted, further images drop —
+                                    // the transmission was still acknowledged
+                                    // above, only the display is skipped.
+                                    let approx = (texture.width() as usize)
+                                        .saturating_mul(texture.height() as usize)
+                                        .saturating_mul(4);
+                                    let used = kitty_pending_bytes_rc.get();
+                                    if used + approx
+                                        <= kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK
+                                    {
+                                        kitty_pending_bytes_rc.set(used + approx);
+                                        kitty_pending_images_rc.borrow_mut().push(texture);
+                                    } else {
+                                        log::warn!(
+                                            "kitty graphics: per-block image budget exhausted ({} + {} > {}), dropping",
+                                            used,
+                                            approx,
+                                            kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK
+                                        );
+                                    }
+                                }
                             }
                         }
                     }

@@ -825,6 +825,7 @@ impl FinishedBlock {
             end_time_ms,
             cwd,
             cols,
+            &[],
             None,
         )
     }
@@ -842,6 +843,7 @@ impl FinishedBlock {
         end_time_ms: Option<u64>,
         cwd: Option<&str>,
         cols: i64,
+        images: &[gtk4::gdk::Texture],
         recycled: Option<gtk4::Box>,
     ) -> Self {
         let is_background = cmd.trim().is_empty();
@@ -1380,6 +1382,33 @@ impl FinishedBlock {
         let output_widget: gtk4::Widget = output_box.clone().upcast::<gtk4::Widget>();
         content.append(&output_box);
 
+        // Kitty graphics (jterm1 parity): append each decoded texture as a
+        // Picture under the text output. Pictures preserve aspect ratio inside
+        // a max-height bound so a tall plot doesn't push the next block
+        // off-screen; one shared box lets the collapse chevron hide them
+        // together with the text output.
+        let images_box: Option<gtk4::Box> = if images.is_empty() {
+            None
+        } else {
+            let ib = gtk4::Box::new(Orientation::Vertical, 4);
+            ib.add_css_class("block-images");
+            ib.set_margin_start(18);
+            ib.set_margin_end(8);
+            ib.set_margin_bottom(4);
+            for tex in images {
+                let pic = gtk4::Picture::for_paintable(tex);
+                pic.set_can_shrink(true);
+                pic.set_content_fit(gtk4::ContentFit::Contain);
+                pic.set_halign(gtk4::Align::Start);
+                // Cap displayed height so plots/screenshots stay within ~25
+                // rows of block real estate; the outer history scrolls past.
+                pic.set_size_request(-1, tex.height().clamp(64, 600));
+                ib.append(&pic);
+            }
+            content.append(&ib);
+            Some(ib)
+        };
+
         // Folding used to leave only a tiny chevron in the header. That made a
         // collapsed block look like it had no output at all, especially once it
         // had scrolled away from the pointer. Keep a compact, keyboard-focusable
@@ -1428,11 +1457,13 @@ impl FinishedBlock {
         }
 
         let has_output = !output.trim().is_empty();
+        let has_images = images_box.is_some();
         // Output-only controls are noise for commands such as `cd`,
-        // `mkdir`, and successful redirects.
+        // `mkdir`, and successful redirects. Image-only commands (`kitten
+        // icat`) still keep the collapse chevron so their Pictures fold away.
         copy_output_btn.set_visible(has_output);
         filter_btn.set_visible(has_output);
-        collapse_btn.set_visible(has_output);
+        collapse_btn.set_visible(has_output || has_images);
         if !has_output {
             output_widget.set_visible(false);
         } else {
@@ -1447,6 +1478,7 @@ impl FinishedBlock {
             let output_widget = output_widget.downgrade();
             let collapsed_summary = collapsed_summary.downgrade();
             let collapse_btn = collapse_btn.downgrade();
+            let images_box = images_box.as_ref().map(|ib| ib.downgrade());
             Rc::new(move |collapsed| {
                 let (Some(output_widget), Some(collapsed_summary), Some(collapse_btn)) = (
                     output_widget.upgrade(),
@@ -1455,7 +1487,12 @@ impl FinishedBlock {
                 ) else {
                     return;
                 };
-                output_widget.set_visible(!collapsed);
+                // Image-only blocks keep their empty output VTE hidden even
+                // while expanded; only the Pictures fold and unfold.
+                output_widget.set_visible(!collapsed && has_output);
+                if let Some(ib) = images_box.as_ref().and_then(|ib| ib.upgrade()) {
+                    ib.set_visible(!collapsed);
+                }
                 collapsed_summary.set_visible(collapsed);
                 collapse_btn.set_label(if collapsed { "\u{f054}" } else { "\u{f078}" });
                 collapse_btn.set_tooltip_text(Some(if collapsed {
@@ -1467,10 +1504,13 @@ impl FinishedBlock {
         };
         {
             let set_collapsed = set_collapsed.clone();
-            let output_widget = output_widget.downgrade();
+            // The summary's visibility is the one folded-state signal that
+            // also works for image-only blocks, whose output VTE stays hidden
+            // even while expanded.
+            let collapsed_summary = collapsed_summary.downgrade();
             collapse_btn.connect_clicked(move |_| {
-                if let Some(output_widget) = output_widget.upgrade() {
-                    set_collapsed(output_widget.is_visible());
+                if let Some(collapsed_summary) = collapsed_summary.upgrade() {
+                    set_collapsed(!collapsed_summary.is_visible());
                 }
             });
         }

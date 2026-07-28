@@ -6,6 +6,7 @@ All notable user-visible and operational changes are recorded here.
 
 ### Added
 
+- Kitty 图形协议（对齐 jterm1 的最小子集）：Block 模式解码 APC `G` 序列（`kitten icat`、matplotlib kitty 后端等的内联图片），把 PNG（`f=100`）与原始 RGBA/RGB（`f=32`/`f=24`）的 base64 直传载荷（含 `m=1`/`m=0` 分块）渲染为完成 Block 内文字输出下方的 GTK Picture，折叠按钮把图片与文字一并收起，纯图片命令也保留可折叠的 Block；此前这些序列被转发给没有图形协议的 libvte 而被静默丢弃。内存上限与 jterm1 完全一致：单图编码 16 MB、单 Block 解码合计 16 MB、边长至多 16384，超限静默丢弃；文件/共享内存传输与 `a=d`/`a=p` 动作不支持。与 jterm1 不同的是带 `i=`/`I=` 标识的命令会按 jterm2（家族参考应答实现）的语义在 PTY 上收到 `OK`/`EINVAL`/`ENOTSUP` 应答并遵守 `q=` 静默级别，`a=q` 探测会被校验后应答，因此 `kitten icat` 不再因等待应答而超时。图片仅在本次会话内展示，不写入 Block 历史，会话恢复后自然省略。
 - OSC 9 / OSC 777 桌面通知：终端内程序（含 SSH 远端）可通过 `ESC ] 9 ; 正文 BEL` 或 `ESC ] 777 ; notify ; 标题 ; 正文` 请求桌面通知，由 `notify-send` 以 jterm4 身份发出（缺标题时回退为应用名）。文本在共享解析器中去除控制字符并截断至 256 字符，空通知不发；由于序列源自 PTY 内部，进程派生受应用级速率限制——每批至多一条、距上一条不足 2 秒的一律丢弃。
 - 一键安装/更新配套 shell `rsh`：命令面板的 **Install or update rsh** 在独立标签页里运行安装脚本（标签页即进度界面，可 Ctrl+C 中断，结束后等待 Enter 再关闭）；缺少 rsh 或有新版本时顶栏下方出现可忽略的提示条。安装脚本来自 rsh 仓库并随二进制内嵌，校验和、原子替换、回滚与 `/usr/bin/rsh`（BSD remote shell）遮蔽提示都由它统一处理。更新检查在后台线程进行、从不自动安装，检查频率由 `rsh_update_check`（`startup` / `daily`（默认）/ `never`）控制，缓存与同机其他 jterm 共享。
 
