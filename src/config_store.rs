@@ -484,6 +484,7 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
     } else {
         table.remove("ai_temperature");
     }
+    table.insert("ai_stream".into(), toml::Value::Boolean(config.ai_stream));
     table.insert(
         "ai_redact_secrets".into(),
         toml::Value::Boolean(config.ai_redact_secrets),

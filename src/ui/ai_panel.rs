@@ -43,6 +43,60 @@ struct InflightRequest {
     payload: RequestPayload,
 }
 
+/// One message from the request worker thread: an incremental assistant text
+/// fragment, or the request's final result. Blocking requests only send
+/// `Done`; streaming requests send any number of `Delta`s first.
+enum StreamEvent {
+    Delta(String),
+    Done(Result<String, ai::AiError>),
+}
+
+/// Pure accumulation state for one streamed reply. It records every fragment
+/// received from the worker and decides how the visible transcript must
+/// change, so a chat switched away and back mid-stream rematerializes the
+/// full partial text, all without touching GTK.
+#[derive(Debug, Default)]
+struct StreamProgress {
+    accumulated: String,
+}
+
+/// Transcript mutation required after one streamed fragment.
+#[derive(Debug, PartialEq, Eq)]
+enum StreamRender<'a> {
+    /// Nothing visible changes (owner chat hidden, or nothing new to show).
+    None,
+    /// Insert a new in-progress assistant row containing everything received
+    /// so far: the first visible fragment, or the owner chat became visible
+    /// again after a switch dropped its transient partial row.
+    Materialize(&'a str),
+    /// The in-progress row is already the transcript tail: append only the
+    /// new fragment.
+    Append(&'a str),
+}
+
+impl StreamProgress {
+    /// Record `fragment` and decide the transcript update. `can_display` is
+    /// whether the owner chat currently owns the visible transcript and the
+    /// request is still active; `attached` is whether this request's
+    /// in-progress row is already shown as the transcript tail.
+    fn push(&mut self, fragment: &str, can_display: bool, attached: bool) -> StreamRender<'_> {
+        let previous_len = self.accumulated.len();
+        self.accumulated.push_str(fragment);
+        if !can_display || self.accumulated.is_empty() {
+            return StreamRender::None;
+        }
+        if attached {
+            if fragment.is_empty() {
+                StreamRender::None
+            } else {
+                StreamRender::Append(&self.accumulated[previous_len..])
+            }
+        } else {
+            StreamRender::Materialize(&self.accumulated)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ComposerKeyAction {
     Send,
@@ -107,6 +161,10 @@ pub(crate) struct AiPanel {
     retry_btn: Button,
     requests: Rc<RefCell<HashMap<RequestToken, InflightRequest>>>,
     retry_payloads: Rc<RefCell<HashMap<u64, RequestPayload>>>,
+    /// The request whose streamed in-progress reply is currently the tail of
+    /// the visible transcript. Cleared whenever the transcript is re-rendered
+    /// from the store, so stale deltas can never write into another chat.
+    stream_display: Rc<RefCell<Option<RequestToken>>>,
     persistence_callback: Rc<RefCell<Option<PersistenceCallback>>>,
     draft_persist_epoch: Rc<Cell<u64>>,
     config: Rc<RefCell<Config>>,
@@ -415,6 +473,7 @@ impl AiPanel {
             retry_btn: retry_btn.clone(),
             requests: Rc::new(RefCell::new(HashMap::new())),
             retry_payloads: Rc::new(RefCell::new(HashMap::new())),
+            stream_display: Rc::new(RefCell::new(None)),
             persistence_callback: Rc::new(RefCell::new(None)),
             draft_persist_epoch: Rc::new(Cell::new(0)),
             config,
@@ -996,6 +1055,9 @@ impl AiPanel {
     }
 
     fn render_active_chat(&self) {
+        // A full re-render drops any transient streamed partial row; the next
+        // delta rematerializes it if its owner chat is still the visible one.
+        *self.stream_display.borrow_mut() = None;
         let (history, draft) = {
             let store = self.store.borrow();
             (
@@ -1382,6 +1444,34 @@ impl AiPanel {
         }
     }
 
+    /// Grow the in-progress streamed assistant row, which is always the tail
+    /// of the transcript while `stream_display` points at its request. Only
+    /// follow the stream when the user is already reading the bottom.
+    fn append_stream_text(&self, fragment: &str) {
+        let adjustment = self.convo_scroll.vadjustment();
+        let was_near_bottom =
+            adjustment.value() + adjustment.page_size() >= adjustment.upper() - 32.0;
+        let mut end = self.convo_buffer.end_iter();
+        self.convo_buffer.insert(&mut end, fragment);
+        super::bounded_text::trim_ai_transcript(&self.convo_buffer);
+        if was_near_bottom {
+            self.scroll_transcript_to_end();
+        }
+    }
+
+    /// Detach `token`'s streamed row from the transcript, reporting whether it
+    /// was showing. After this the row is plain text that the next re-render
+    /// replaces with store history.
+    fn detach_stream_display(&self, token: RequestToken) -> bool {
+        let mut display = self.stream_display.borrow_mut();
+        if *display == Some(token) {
+            *display = None;
+            true
+        } else {
+            false
+        }
+    }
+
     fn send_from_input(&self, override_text: Option<String>) {
         let (busy, archived) = {
             let store = self.store.borrow();
@@ -1520,19 +1610,52 @@ impl AiPanel {
         self.refresh_chat_chrome();
         self.refresh_chat_library();
 
-        let (tx, rx) = std::sync::mpsc::channel::<Result<String, ai::AiError>>();
+        let stream_replies = self.config.borrow().ai_stream;
+        let (tx, rx) = std::sync::mpsc::channel::<StreamEvent>();
         std::thread::spawn(move || {
             let result = client.and_then(|client| {
-                client.send_turns_blocking_cancellable(system.as_deref(), &history, &cancellation)
+                if stream_replies {
+                    let deltas = tx.clone();
+                    client.send_turns_streaming_cancellable(
+                        system.as_deref(),
+                        &history,
+                        &cancellation,
+                        &mut |delta| {
+                            let _ = deltas.send(StreamEvent::Delta(delta.to_string()));
+                        },
+                    )
+                } else {
+                    client.send_turns_blocking_cancellable(
+                        system.as_deref(),
+                        &history,
+                        &cancellation,
+                    )
+                }
             });
-            let _ = tx.send(result);
+            let _ = tx.send(StreamEvent::Done(result));
         });
 
         let p = self.clone();
-        let rx = RefCell::new(rx);
-        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-            match rx.borrow().try_recv() {
-                Ok(Ok(text)) => {
+        let mut progress = StreamProgress::default();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || loop {
+            match rx.try_recv() {
+                Ok(StreamEvent::Delta(fragment)) => {
+                    // Only the request the store still recognizes as the
+                    // active chat's in-flight epoch may draw; cancelled or
+                    // superseded requests keep accumulating silently.
+                    let can_display = p.store.borrow().active_request_token() == Some(token);
+                    let attached = *p.stream_display.borrow() == Some(token);
+                    match progress.push(&fragment, can_display, attached) {
+                        StreamRender::None => {}
+                        StreamRender::Materialize(text) => {
+                            p.append_visible("Assistant", "role-asst", text);
+                            *p.stream_display.borrow_mut() = Some(token);
+                        }
+                        StreamRender::Append(text) => p.append_stream_text(text),
+                    }
+                }
+                Ok(StreamEvent::Done(Ok(text))) => {
+                    let shown_partial = p.detach_stream_display(token);
                     if p.requests.borrow_mut().remove(&token).is_none() {
                         return glib::ControlFlow::Break;
                     }
@@ -1542,31 +1665,48 @@ impl AiPanel {
                     };
                     p.retry_payloads.borrow_mut().remove(&token.chat_id);
                     if owner_active {
-                        p.append_visible("Assistant", "role-asst", &text);
-                        p.sync_active_status();
-                        p.sync_composer_state();
-                        p.sync_context_chip();
-                        p.refresh_chat_chrome();
+                        if shown_partial {
+                            // The returned text is the single source of truth:
+                            // re-render so the streamed partial row is replaced
+                            // by the recorded reply, which may carry a trailing
+                            // token-limit advisory that never arrived as a
+                            // delta and heals any dropped fragment.
+                            p.render_active_chat();
+                        } else {
+                            p.append_visible("Assistant", "role-asst", &text);
+                            p.sync_active_status();
+                            p.sync_composer_state();
+                            p.sync_context_chip();
+                            p.refresh_chat_chrome();
+                            p.refresh_chat_library();
+                        }
+                    } else {
+                        p.refresh_chat_library();
                     }
-                    p.refresh_chat_library();
                     p.publish_persisted_conversation();
-                    glib::ControlFlow::Break
+                    return glib::ControlFlow::Break;
                 }
-                Ok(Err(error)) => {
-                    p.finish_request_error(token, format!("Error: {error}"));
-                    glib::ControlFlow::Break
+                Ok(StreamEvent::Done(Err(error))) => {
+                    let shown_partial = p.detach_stream_display(token);
+                    p.finish_request_error(token, format!("Error: {error}"), shown_partial);
+                    return glib::ControlFlow::Break;
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    p.finish_request_error(token, "Error: worker thread disconnected".to_string());
-                    glib::ControlFlow::Break
+                    let shown_partial = p.detach_stream_display(token);
+                    p.finish_request_error(
+                        token,
+                        "Error: worker thread disconnected".to_string(),
+                        shown_partial,
+                    );
+                    return glib::ControlFlow::Break;
                 }
             }
         });
         true
     }
 
-    fn finish_request_error(&self, token: RequestToken, message: String) {
+    fn finish_request_error(&self, token: RequestToken, message: String, keep_shown_partial: bool) {
         let Some(request) = self.requests.borrow_mut().remove(&token) else {
             return;
         };
@@ -1581,10 +1721,29 @@ impl AiPanel {
             .borrow_mut()
             .insert(token.chat_id, request.payload);
         if owner_active {
-            // The failed user turn was rolled back into a recoverable draft.
-            // Re-render from the store so Retry adds it exactly once instead
-            // of leaving a duplicate transient row in the shared TextBuffer.
-            self.render_active_chat();
+            if keep_shown_partial {
+                // Mid-stream failure: keep the already-shown partial reply
+                // visible instead of re-rendering it away, and present the
+                // error exactly like any other request failure. Only the
+                // composer is synced with the store's recovered draft, so a
+                // later keystroke cannot clobber it. Retry re-renders from
+                // the store before resending, so the rolled-back user turn
+                // is still added exactly once.
+                let draft = self.store.borrow().active_draft().to_string();
+                if self.input_text() != draft {
+                    self.input_buffer.set_text(&draft);
+                }
+                self.sync_active_status();
+                self.sync_composer_state();
+                self.refresh_chat_chrome();
+                self.refresh_chat_library();
+            } else {
+                // The failed user turn was rolled back into a recoverable
+                // draft. Re-render from the store so Retry adds it exactly
+                // once instead of leaving a duplicate transient row in the
+                // shared TextBuffer.
+                self.render_active_chat();
+            }
         } else {
             self.refresh_chat_library();
         }
@@ -1697,6 +1856,38 @@ mod tests {
         for (key, modifiers, expected) in cases {
             assert_eq!(classify_composer_key(key, modifiers), expected);
         }
+    }
+
+    #[test]
+    fn stream_progress_appends_visible_fragments_and_rematerializes_after_hiding() {
+        let mut progress = StreamProgress::default();
+        // First visible fragment inserts the in-progress assistant row.
+        assert_eq!(
+            progress.push("Hel", true, false),
+            StreamRender::Materialize("Hel")
+        );
+        // While the row is the transcript tail, only new text is appended.
+        assert_eq!(progress.push("lo", true, true), StreamRender::Append("lo"));
+        // Owner chat hidden: fragments accumulate without touching the UI.
+        assert_eq!(progress.push(" wor", false, false), StreamRender::None);
+        // Switching back re-shows the whole partial reply, not just deltas.
+        assert_eq!(
+            progress.push("ld", true, false),
+            StreamRender::Materialize("Hello world")
+        );
+        // Empty keep-alive fragments never mutate an attached row.
+        assert_eq!(progress.push("", true, true), StreamRender::None);
+    }
+
+    #[test]
+    fn stream_progress_shows_nothing_until_a_nonempty_fragment_arrives() {
+        let mut progress = StreamProgress::default();
+        assert_eq!(progress.push("", true, false), StreamRender::None);
+        assert_eq!(progress.push("", false, false), StreamRender::None);
+        assert_eq!(
+            progress.push("first", true, false),
+            StreamRender::Materialize("first")
+        );
     }
 
     #[test]

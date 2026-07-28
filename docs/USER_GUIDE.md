@@ -241,11 +241,13 @@ chmod 600 ~/.config/jterm4/ai.key
 ai_api_key_file = "~/.config/jterm4/ai.key"
 ```
 
-文件必须是当前用户所有的普通文件，Unix 权限不得向 group/other 开放，最大 16 KiB，且只能包含一行非空密钥。环境 Key 优先于文件；`JTERM4_AI_API_KEY_FILE` 可覆盖文件路径。相关配置为 `ai_enabled`、`ai_provider`、`ai_base_url`、`ai_api_key_file`、`ai_model`、`ai_max_tokens` 和 `ai_redact_secrets`。请求通过系统 `curl`/Flatpak host bridge 发送；运行 `--doctor` 可离线检查凭据文件和 curl。右侧聊天面板使用 `Ctrl+Alt+Shift+A`，Block 选择后 `Ctrl+Shift+Q` 可发送命令、退出码、cwd 和截断输出。
+文件必须是当前用户所有的普通文件，Unix 权限不得向 group/other 开放，最大 16 KiB，且只能包含一行非空密钥。环境 Key 优先于文件；`JTERM4_AI_API_KEY_FILE` 可覆盖文件路径。相关配置为 `ai_enabled`、`ai_provider`、`ai_base_url`、`ai_api_key_file`、`ai_model`、`ai_max_tokens`、`ai_stream` 和 `ai_redact_secrets`。请求通过系统 `curl`/Flatpak host bridge 发送；运行 `--doctor` 可离线检查凭据文件和 curl。右侧聊天面板使用 `Ctrl+Alt+Shift+A`，Block 选择后 `Ctrl+Shift+Q` 可发送命令、退出码、cwd 和截断输出。
 
 面板可拖动分隔条，实际宽度会在 400 ms 防抖后写回 `ai_panel_width`，并在启动、配置热重载和重新打开面板时恢复。输入框中 `Enter` 与 `Ctrl+Enter` 均发送，`Shift+Enter` 换行；输入法正在选词时，Enter 只确认候选，不会误发。焦点位于输入框时，`Ctrl+Shift+C/V` 也会作用于输入框，而不是后台终端。空会话提供三个快捷提示，它们只填入 composer，绝不会自动发送。
 
-发送后状态行提供 **Stop**；它会终止并回收对应 curl，而不只是隐藏迟到回复。失败或停止后可 **Retry** 原请求，generation 仍绑定原 chat，期间新输入的 draft 不会被覆盖。删除 busy chat 和关闭窗口同样会先取消 transport。选中 Block 的 command/exit 会显示为 composer 上方的 context chip，可在空闲时 **Clear**；Ask Block 失败后，Retry 实际将使用的 pending context 也会明确显示，若输出因行数或字节预算被裁剪，chip 会标出 `output truncated`。关窗前仍留在内存中的 Ask Block retry 会转成该 chat 的可恢复 draft/context。
+聊天回复默认流式显示（`ai_stream = true` / `JTERM4_AI_STREAM`）：回答在生成过程中逐段出现在会话里，完成时以 provider 返回的完整文本原样落库，与关闭流式时保存的会话完全一致；中途出错时已显示的部分内容保持可见，错误按既有方式提示并可 Retry。流式只用于聊天面板；Agent、命令生成与纠错等严格 JSON 表面始终等待完整回复。关闭 `ai_stream` 则恢复等待完整回复的旧行为。
+
+发送后状态行提供 **Stop**；它会终止并回收对应 curl（流式时同样中断传输），而不只是隐藏迟到回复。失败或停止后可 **Retry** 原请求，generation 仍绑定原 chat，期间新输入的 draft 不会被覆盖。删除 busy chat 和关闭窗口同样会先取消 transport。选中 Block 的 command/exit 会显示为 composer 上方的 context chip，可在空闲时 **Clear**；Ask Block 失败后，Retry 实际将使用的 pending context 也会明确显示，若输出因行数或字节预算被裁剪，chip 会标出 `output truncated`。关窗前仍留在内存中的 Ask Block retry 会转成该 chat 的可恢复 draft/context。
 
 **New chat** 会创建并立即选中一个新会话，旧会话不会被清除。打开 **Chats** 会话库可搜索和选择所有保留的 chat；首条问题会生成自动标题，也可 Rename。Archive 将 chat 移入归档列表而不删除内容，Unarchive 可恢复；Delete 会先要求确认，再永久移除该 chat。切换 chat 时，未发送 draft、该 chat 实际发给 provider 的选中 Block context 以及当前选中的 chat 都会跟随窗口快照持久化。
 

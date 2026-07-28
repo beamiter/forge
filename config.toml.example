@@ -86,7 +86,8 @@ show_repo_strip = true
 #           JTERM4_AGENT_AUTO_APPROVE_READONLY、
 #           JTERM4_COMMAND_CORRECTION_ENABLED、JTERM4_AI_API_KEY、
 #           JTERM4_AI_API_KEY_FILE、JTERM4_AI_PROVIDER、JTERM4_AI_MODEL、
-#           JTERM4_AI_BASE_URL、JTERM4_AI_MAX_TOKENS、JTERM4_AI_REDACT_SECRETS
+#           JTERM4_AI_BASE_URL、JTERM4_AI_MAX_TOKENS、JTERM4_AI_STREAM、
+#           JTERM4_AI_REDACT_SECRETS
 ai_enabled = true
 agent_enabled = true          # Ctrl+Alt+G；仅绑定当前 Block pane
 agent_max_turns = 20          # 1 .. 100；每条命令可编辑且始终需要单独批准
@@ -99,6 +100,7 @@ ai_panel_visible = false
 ai_panel_width = 360           # 240 .. 1200；拖动 AI 分隔条后自动更新
 ai_model = "claude-sonnet-4-6"
 ai_max_tokens = 1024           # 64 .. 32768
+ai_stream = true               # 聊天回复边生成边显示；关闭则等完整回复后一次性显示
 ai_redact_secrets = true
 
 # 自定义颜色（可选；取消注释后覆盖主题对应颜色） ----------------------------

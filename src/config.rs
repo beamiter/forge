@@ -275,6 +275,11 @@ pub struct Config {
     pub(crate) ai_max_tokens: u32,
     /// Optional sampling temperature (0.0..=2.0); None keeps the provider default.
     pub(crate) ai_temperature: Option<f32>,
+    /// Stream AI chat replies into the panel as they arrive instead of
+    /// waiting for the complete response. Only the conversational chat panel
+    /// streams; strict-JSON surfaces (Agent, command generation, correction)
+    /// always wait for the full reply.
+    pub(crate) ai_stream: bool,
     /// Run AI-bound text (system prompt block context + chat turns) through
     /// the secrets redactor before posting to the API. On by default; flip
     /// off only if the noise of mass `[REDACTED:...]` markers in a session
@@ -364,6 +369,7 @@ impl Config {
             ai_model: "claude-sonnet-4-6".to_string(),
             ai_max_tokens: 1_024,
             ai_temperature: None,
+            ai_stream: true,
             ai_redact_secrets: true,
             allow_remote_clipboard_write: false,
             notify_long_blocks: false,
@@ -673,6 +679,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "ai_model",
     "ai_max_tokens",
     "ai_temperature",
+    "ai_stream",
     "ai_redact_secrets",
     "allow_remote_clipboard_write",
     "notify_long_blocks",
@@ -783,6 +790,7 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
         "agent_auto_approve_readonly",
         "command_correction_enabled",
         "ai_panel_visible",
+        "ai_stream",
         "ai_redact_secrets",
         "allow_remote_clipboard_write",
         "notify_long_blocks",
@@ -1208,6 +1216,7 @@ struct FileConfig {
     ai_model: Option<String>,
     ai_max_tokens: Option<u32>,
     ai_temperature: Option<f32>,
+    ai_stream: Option<bool>,
     ai_redact_secrets: Option<bool>,
     allow_remote_clipboard_write: Option<bool>,
     notify_long_blocks: Option<bool>,
@@ -1413,6 +1422,7 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
             .get("ai_temperature")
             .and_then(toml::Value::as_float)
             .map(|value| value as f32),
+        ai_stream: table.get("ai_stream").and_then(|v| v.as_bool()),
         ai_redact_secrets: table.get("ai_redact_secrets").and_then(|v| v.as_bool()),
         allow_remote_clipboard_write: table
             .get("allow_remote_clipboard_write")
@@ -1744,6 +1754,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
             .or(fc.ai_max_tokens)
             .unwrap_or(1024)
             .clamp(64, 32_768),
+        ai_stream: env_bool("JTERM4_AI_STREAM")
+            .or(fc.ai_stream)
+            .unwrap_or(true),
         ai_redact_secrets: env_bool("JTERM4_AI_REDACT_SECRETS")
             .or(fc.ai_redact_secrets)
             .unwrap_or(true),

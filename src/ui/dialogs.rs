@@ -1347,6 +1347,14 @@ impl UiState {
         agent_turns_row.set_sensitive(!safe_mode && config.ai_enabled && config.agent_enabled);
         ai_group.add(&agent_turns_row);
 
+        let stream_row = adw::SwitchRow::builder()
+            .title("Stream Chat Responses")
+            .subtitle("Show AI chat replies incrementally while they are generated")
+            .active(config.ai_stream)
+            .build();
+        stream_row.set_sensitive(!safe_mode && config.ai_enabled);
+        ai_group.add(&stream_row);
+
         let redact_row = adw::SwitchRow::builder()
             .title("Redact Common Secrets")
             .subtitle("Apply before terminal context is sent to a provider")
@@ -1486,6 +1494,7 @@ impl UiState {
             base_url_row.clone().upcast(),
             api_key_row.clone().upcast(),
             max_tokens_row.clone().upcast(),
+            stream_row.clone().upcast(),
             redact_row.clone().upcast(),
         ];
         let agent_turns_for_ai = agent_turns_row.clone();
@@ -1610,6 +1619,12 @@ impl UiState {
         let ui = self.clone();
         agent_turns_row.connect_value_notify(move |row| {
             ui.config.borrow_mut().agent_max_turns = row.value() as u32;
+            ui.persist_config();
+        });
+
+        let ui = self.clone();
+        stream_row.connect_active_notify(move |row| {
+            ui.config.borrow_mut().ai_stream = row.is_active();
             ui.persist_config();
         });
 
