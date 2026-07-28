@@ -193,14 +193,14 @@ impl PaneLeaf {
         }
     }
 
-    pub(crate) fn restorable_command(&self) -> Option<String> {
+    pub(crate) fn restorable_command(&self) -> Option<Vec<String>> {
         let (pty_fd, shell_pid) = self.process_probe();
-        crate::state::restorable_command_for_pty(pty_fd, shell_pid)
+        crate::process::restorable_command(pty_fd, shell_pid)
     }
 
     pub(crate) fn foreground_process_name(&self) -> Option<String> {
         let (pty_fd, shell_pid) = self.process_probe();
-        crate::state::foreground_process_name_for_pty(pty_fd, shell_pid)
+        crate::process::foreground_process_name(pty_fd, shell_pid)
     }
 
     /// Terminate this leaf's shell and its process group through the

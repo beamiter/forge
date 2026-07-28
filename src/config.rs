@@ -121,30 +121,19 @@ fn control_socket_dir() -> Option<PathBuf> {
     Some(base)
 }
 
-fn shell_single_quote(s: &str) -> String {
-    let mut quoted = String::with_capacity(s.len() + 2);
-    quoted.push('\'');
-    for ch in s.chars() {
-        if ch == '\'' {
-            quoted.push_str("'\"'\"'");
-        } else {
-            quoted.push(ch);
-        }
-    }
-    quoted.push('\'');
-    quoted
-}
-
 fn wrap_exec_in_login_bash(command: &str) -> String {
-    format!("bash -lc 'exec {}'", command.replace('\'', "'\\''"))
+    format!(
+        "bash -lc {}",
+        crate::process::shell_single_quote(&format!("exec {command}"))
+    )
 }
 
 fn wrap_rsh_argv_in_interactive_bash(rsh_path: &str) -> Option<Vec<String>> {
-    let bash_path = find_executable_in_path("bash")?;
+    let bash_path = crate::host::find_executable_in_path("bash")?;
     Some(vec![
         bash_path.to_string_lossy().to_string(),
         "-ic".to_string(),
-        format!("exec {}", shell_single_quote(rsh_path)),
+        crate::process::build_rsh_exec_command(rsh_path, None),
     ])
 }
 
@@ -1831,13 +1820,6 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-fn find_executable_in_path(exe_name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_var)
-        .map(|dir| dir.join(exe_name))
-        .find(|candidate| is_executable(candidate))
-}
-
 fn choose_flatpak_host_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
     if let Some(shell) = configured_shell.filter(|value| !value.trim().is_empty()) {
         let shell_name = Path::new(shell)
@@ -1848,7 +1830,7 @@ fn choose_flatpak_host_shell_argv(configured_shell: Option<&str>) -> Vec<String>
             return vec![
                 "bash".to_string(),
                 "-ic".to_string(),
-                format!("exec {}", shell_single_quote(shell)),
+                crate::process::build_rsh_exec_command(shell, None),
             ];
         }
         return vec![shell.to_string()];
@@ -1903,7 +1885,7 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
     }
 
     // Prefer rsh when it's on PATH.
-    if let Some(rsh_path) = find_executable_in_path("rsh") {
+    if let Some(rsh_path) = crate::host::find_executable_in_path("rsh") {
         if let Some(argv) = wrap_rsh_argv_in_interactive_bash(&rsh_path.to_string_lossy()) {
             return argv;
         }
@@ -1911,7 +1893,7 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
     }
 
     // Fallback: bash
-    if let Some(bash_path) = find_executable_in_path("bash") {
+    if let Some(bash_path) = crate::host::find_executable_in_path("bash") {
         return vec![bash_path.to_string_lossy().to_string(), "-l".to_string()];
     }
 
@@ -1970,7 +1952,7 @@ mod tests {
         let argv = build_remote_argv(&h);
         assert_eq!(
             argv.last().unwrap(),
-            r#"bash -lc 'exec /home/yj/.cargo/bin/rsh --session it'\''s'"#
+            r#"bash -lc 'exec /home/yj/.cargo/bin/rsh --session it'"'"'s'"#
         );
     }
 

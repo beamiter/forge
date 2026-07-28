@@ -375,7 +375,7 @@ impl UiState {
             }
 
             let file_path = entry.path.to_string_lossy();
-            let snippet = format!("{} ", shell_quote(file_path.as_ref()));
+            let snippet = file_insert_snippet(file_path.as_ref());
             if let Some(pane) = ui.current_pane_leaf() {
                 ui.insert_review_text(&pane, &snippet);
             }
@@ -400,9 +400,10 @@ fn display_path(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 
-/// Single-quote a path for safe shell insertion.
-fn shell_quote(input: &str) -> String {
-    format!("'{}'", input.replace('\'', "'\\''"))
+/// Shell-quoted path plus the trailing space that separates it from whatever
+/// the user types next. Obviously safe paths stay unquoted for readability.
+fn file_insert_snippet(path: &str) -> String {
+    format!("{} ", crate::process::shell_quote_path(path))
 }
 
 #[cfg(test)]
@@ -441,7 +442,11 @@ mod tests {
     }
 
     #[test]
-    fn shell_quote_preserves_spaces_and_apostrophes() {
-        assert_eq!(shell_quote("a'b c"), "'a'\\''b c'");
+    fn inserted_snippets_quote_unsafe_paths_and_keep_safe_paths_readable() {
+        assert_eq!(file_insert_snippet("a'b c"), "'a'\"'\"'b c' ");
+        assert_eq!(
+            file_insert_snippet("/home/u/notes.txt"),
+            "/home/u/notes.txt "
+        );
     }
 }

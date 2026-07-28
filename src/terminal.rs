@@ -150,7 +150,7 @@ impl VteTerminalView {
         shell_argv: &[String],
         working_directory: Option<&str>,
         session_id: Option<&str>,
-        initial_commands: Option<&str>,
+        initial_commands: &[String],
     ) -> Self {
         // Create Terminal widget
         let terminal = create_terminal(&config.borrow());
@@ -405,12 +405,51 @@ pub(crate) fn terminal_working_directory(terminal: &Terminal) -> Option<String> 
         .map(|p| p.to_string_lossy().to_string())
 }
 
+/// Commands typed into a new shell on its behalf, one PTY line each.
+///
+/// Configuration retains its historical comma-separated syntax, but it is
+/// parsed once at the application boundary. Session restore instead constructs
+/// exactly one safely quoted command from a persisted argv. Downstream terminal
+/// backends therefore never reinterpret a restored command's commas.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InitialCommands(Vec<String>);
+
+impl InitialCommands {
+    pub(crate) fn from_config(configured: Option<&str>) -> Self {
+        let commands = configured
+            .into_iter()
+            .flat_map(|value| value.split(", "))
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .map(str::to_string)
+            .collect();
+        Self(commands)
+    }
+
+    /// Quote a restored argv (e.g. `["ssh", "host"]`) into exactly one command
+    /// for the configured interactive shell. Unsafe argvs and unknown shell
+    /// grammars skip replay instead of risking changed argument boundaries.
+    pub(crate) fn from_restored_argv(argv: Option<&[String]>, shell_argv: &[String]) -> Self {
+        let command = argv.and_then(|argv| crate::process::shell_quote_argv_for(argv, shell_argv));
+        if argv.is_some() && command.is_none() {
+            log::warn!(
+                "Skipping session command replay because its argv is unsafe or the configured shell grammar is unsupported"
+            );
+        }
+        Self(command.into_iter().collect())
+    }
+
+    pub(crate) fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+}
+
 pub(crate) fn spawn_shell(
     terminal: &Terminal,
     argv_owned: &[String],
     working_directory: Option<&str>,
     session_id: Option<&str>,
-    initial_commands: Option<&str>,
+    initial_commands: &[String],
 ) {
     // Append --session <id> to argv when restoring a session (only for rsh)
     let mut argv_vec: Vec<String> = argv_owned.to_vec();
@@ -449,7 +488,7 @@ pub(crate) fn spawn_shell(
     let terminal_for_pid = terminal.clone();
 
     // If initial commands are provided, send them after the shell starts.
-    let init_cmds = initial_commands.map(|s| s.to_string());
+    let init_cmds: Vec<String> = initial_commands.to_vec();
     let terminal_for_init = terminal.clone();
 
     terminal.spawn_async(
@@ -473,20 +512,16 @@ pub(crate) fn spawn_shell(
             // We delay to ensure the shell has entered raw mode; sending \r
             // too early would hit the kernel's cooked-mode icrnl translation
             // (turning \r into \n), which raw-mode shells don't treat as Enter.
-            if let Some(ref cmds) = init_cmds {
-                if !cmds.is_empty() {
-                    let cmds = cmds.clone();
-                    glib::timeout_add_local_once(
-                        std::time::Duration::from_millis(500),
-                        move || {
-                            let lines: Vec<&str> = cmds.split(", ").collect();
-                            for line in lines {
-                                let text = format!("{}\r", line.trim());
-                                terminal_for_init.feed_child(text.as_bytes());
-                            }
-                        },
-                    );
-                }
+            // Each pre-parsed command is fed as exactly one line; splitting
+            // here would let a restored command's own bytes change boundaries.
+            if !init_cmds.is_empty() {
+                let cmds = init_cmds.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
+                    for line in &cmds {
+                        let text = format!("{line}\r");
+                        terminal_for_init.feed_child(text.as_bytes());
+                    }
+                });
             }
         },
     );
@@ -765,4 +800,63 @@ pub(crate) fn reattach_terminal_to_tree(
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InitialCommands;
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn configured_commands_are_split_only_at_the_boundary() {
+        let commands = InitialCommands::from_config(Some("cd /tmp, printf ready"));
+        assert_eq!(
+            commands.as_slice(),
+            strings(&["cd /tmp", "printf ready"]).as_slice()
+        );
+        assert!(InitialCommands::from_config(None).as_slice().is_empty());
+    }
+
+    #[test]
+    fn restored_argv_is_always_one_command_even_when_arguments_contain_commas() {
+        let argv = strings(&["ssh", "host", "printf '%s, %s' one two"]);
+        let commands = InitialCommands::from_restored_argv(Some(&argv), &strings(&["bash"]));
+        assert_eq!(commands.as_slice().len(), 1);
+        assert_eq!(
+            commands.as_slice()[0],
+            "'ssh' 'host' 'printf '\"'\"'%s, %s'\"'\"' one two'"
+        );
+    }
+
+    #[test]
+    fn unsafe_restored_argv_is_not_replayed() {
+        let argv = strings(&["ssh", "host", "echo first\necho second"]);
+        assert!(
+            InitialCommands::from_restored_argv(Some(&argv), &strings(&["bash"]))
+                .as_slice()
+                .is_empty()
+        );
+        // Unknown shell grammars are not guessed either.
+        let plain = strings(&["ssh", "host"]);
+        assert!(InitialCommands::from_restored_argv(
+            Some(&plain),
+            &strings(&["/opt/exotic-shell"])
+        )
+        .as_slice()
+        .is_empty());
+    }
+
+    #[test]
+    fn restored_argv_uses_powershell_call_syntax() {
+        let argv = strings(&["ssh", "host", "printf 'safe'; one argument"]);
+        let commands =
+            InitialCommands::from_restored_argv(Some(&argv), &strings(&["/usr/bin/pwsh"]));
+        assert_eq!(
+            commands.as_slice(),
+            strings(&["& 'ssh' 'host' 'printf ''safe''; one argument'"]).as_slice()
+        );
+    }
 }

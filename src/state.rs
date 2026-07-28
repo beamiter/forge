@@ -319,8 +319,15 @@ pub enum PaneLayout {
     Leaf {
         dir: String,
         sid: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cmds: Option<String>,
+        /// Restorable command argv to replay on restore (e.g. `["ssh", "host"]`).
+        /// Keeping it structured prevents shell metacharacters inside one
+        /// argument from becoming a different local command after a restart.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_restorable_argv"
+        )]
+        cmds: Option<Vec<String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pinned: Option<bool>,
     },
@@ -330,6 +337,31 @@ pub enum PaneLayout {
         start: Box<PaneLayout>,
         end: Box<PaneLayout>,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredRestorableCommand {
+    Argv(Vec<String>),
+    LegacyString(String),
+}
+
+/// Older snapshots stored a shell command string assembled with `argv.join`.
+/// Its original argument boundaries cannot be recovered safely, so accept the
+/// old shape for session compatibility but deliberately do not auto-execute it.
+fn deserialize_restorable_argv<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let stored = Option::<StoredRestorableCommand>::deserialize(deserializer)?;
+    Ok(match stored {
+        Some(StoredRestorableCommand::Argv(argv)) if !argv.is_empty() => Some(argv),
+        Some(StoredRestorableCommand::LegacyString(_)) => {
+            log::debug!("Ignoring legacy session restore command without argv boundaries");
+            None
+        }
+        _ => None,
+    })
 }
 
 /// Serialize a pane layout tree from a GTK widget
@@ -659,21 +691,27 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
                     tabs.push((Some(name), layout));
                 }
                 4 => {
-                    // Legacy: name + dir + session_id + commands
+                    // Legacy: name + dir + session_id + commands. The old
+                    // command field was a joined string whose argv boundaries
+                    // cannot be recovered safely, so the tab loads but the
+                    // command is never replayed.
                     let name = unescape_tab_state(fields[0]);
                     let dir = unescape_tab_state(fields[1]);
                     let sid = unescape_tab_state(fields[2]);
-                    let cmds = unescape_tab_state(fields[3]);
+                    if !fields[3].is_empty() {
+                        log::debug!(
+                            "Ignoring legacy session restore command without argv boundaries"
+                        );
+                    }
                     let effective_sid = if sid.is_empty() {
                         generate_session_id()
                     } else {
                         sid
                     };
-                    let effective_cmds = if cmds.is_empty() { None } else { Some(cmds) };
                     let layout = PaneLayout::Leaf {
                         dir,
                         sid: effective_sid,
-                        cmds: effective_cmds,
+                        cmds: None,
                         pinned: None,
                     };
                     tabs.push((Some(name), layout));
@@ -797,10 +835,6 @@ pub(crate) fn tab_label_text(notebook: &Notebook, widget: &gtk4::Widget) -> Opti
     Some(label.text().to_string())
 }
 
-extern "C" {
-    fn tcgetpgrp(fd: std::ffi::c_int) -> std::ffi::c_int;
-}
-
 fn process_exists(pid: i32) -> bool {
     if pid <= 0 {
         return false;
@@ -817,29 +851,6 @@ fn process_exists(pid: i32) -> bool {
     )
 }
 
-fn get_process_group_id(pid: i32) -> Option<i32> {
-    if pid <= 0 {
-        return None;
-    }
-
-    let path = format!("/proc/{}/stat", pid);
-    let contents = fs::read_to_string(path).ok()?;
-
-    // The stat file format: pid (comm) state ppid pgrp ...
-    // comm is in parentheses and may contain spaces, so we need to find the last ')'
-    let rparen_pos = contents.rfind(')')?;
-    let after_comm = &contents[rparen_pos + 1..];
-
-    // After ')' we have: state ppid pgrp ...
-    let fields: Vec<&str> = after_comm.split_whitespace().collect();
-    if fields.len() >= 3 {
-        // fields[0] = state, fields[1] = ppid, fields[2] = pgrp
-        fields[2].parse().ok()
-    } else {
-        None
-    }
-}
-
 fn signal_pid_and_group(pid: i32, sig: std::ffi::c_int) {
     if pid <= 0 {
         return;
@@ -854,7 +865,7 @@ fn signal_pid_and_group(pid: i32, sig: std::ffi::c_int) {
 
     // Verify the process group leader is the process we want to kill
     // This prevents accidentally killing processes from other sessions if PID was reused
-    if let Some(pgid) = get_process_group_id(pid) {
+    if let Some(pgid) = crate::process::process_stat(pid).map(|stat| stat.process_group) {
         // Only send signal to process group if this process is the group leader
         // (pgid == pid) or explicitly belongs to a group we created
         if pgid == pid {
@@ -933,142 +944,19 @@ pub(crate) fn kill_all_terminal_children(notebook: &Notebook) {
     }
 }
 
-/// Read `/proc/<pid>/cmdline` and return the argv as a `Vec<String>`.
-pub(crate) fn read_proc_cmdline(pid: i32) -> Option<Vec<String>> {
-    let bytes = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    if bytes.is_empty() {
-        return None;
-    }
-    let args: Vec<String> = bytes
-        .split(|&b| b == 0)
-        .filter(|s| !s.is_empty())
-        .map(|s| String::from_utf8_lossy(s).to_string())
-        .collect();
-    if args.is_empty() {
-        None
-    } else {
-        Some(args)
-    }
-}
-
-/// Read the parent PID from `/proc/<pid>/stat`.
-pub(crate) fn read_ppid(pid: i32) -> Option<i32> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // Format: "<pid> (<comm>) <state> <ppid> ..."
-    // comm may contain spaces/parens, so find the last ')' first.
-    let after_comm = stat.rsplit_once(')')?.1;
-    let mut fields = after_comm.split_whitespace();
-    fields.next(); // state
-    fields.next()?.parse::<i32>().ok()
-}
-
-/// Check if an argv matches a known restorable command pattern.
-/// Returns the command string to replay, or None.
-pub(crate) fn match_restorable_command(args: &[String]) -> Option<String> {
-    if args.is_empty() {
-        return None;
-    }
-    let bin = Path::new(&args[0])
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    match bin.as_str() {
-        "nix" => {
-            // e.g. nix develop, nix develop /path/to/flake
-            if args.len() >= 2 && args[1] == "develop" {
-                Some(args.join(" "))
-            } else {
-                None
-            }
-        }
-        "bash" | "zsh" | "fish" => {
-            // nix develop execs into: bash --rcfile /tmp/nix-shell.XXXXX
-            // Detect this pattern and restore as "nix develop" using the CWD's flake.
-            for arg in &args[1..] {
-                if arg.starts_with("/tmp/nix-shell.") || arg.starts_with("/tmp/nix-shell-") {
-                    return Some("nix develop".to_string());
-                }
-            }
-            None
-        }
-        "ssh" | "mosh" => Some(args.join(" ")),
-        "docker" | "podman" => {
-            if args.len() >= 2
-                && (args[1] == "exec"
-                    || (args[1] == "compose" && args.len() >= 3 && args[2] == "exec"))
-            {
-                Some(args.join(" "))
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Foreground process group for a PTY, excluding the pane's ordinary shell.
-fn foreground_pgid(pty_fd: i32, shell_pid: i32) -> Option<i32> {
-    if pty_fd < 0 || shell_pid <= 0 {
-        return None;
-    }
-    let fg_pgid = unsafe { tcgetpgrp(pty_fd) };
-    if fg_pgid <= 0 || fg_pgid == shell_pid {
-        return None;
-    }
-    Some(fg_pgid)
-}
-
-/// Detect a restorable interactive command by inspecting a real PTY master fd
-/// and walking from its foreground process group back toward the pane shell.
-/// This backend-neutral entry point is used by both VTE and Block panes.
-pub(crate) fn restorable_command_for_pty(pty_fd: i32, shell_pid: i32) -> Option<String> {
-    let fg_pgid = foreground_pgid(pty_fd, shell_pid)?;
-
-    // Walk from the foreground process up to the shell, checking each level.
-    // This handles cases like: rsh -> nix develop -> bash (fg)
-    // as well as: rsh -> bash --rcfile /tmp/nix-shell.* (fg, nix exec'd)
-    let mut pid = fg_pgid;
-    let mut visited = 0;
-    while pid != shell_pid && pid > 1 && visited < 16 {
-        if let Some(args) = read_proc_cmdline(pid) {
-            if let Some(cmd) = match_restorable_command(&args) {
-                return Some(cmd);
-            }
-        }
-        pid = match read_ppid(pid) {
-            Some(ppid) => ppid,
-            None => break,
-        };
-        visited += 1;
-    }
-    None
-}
-
-/// Name of the foreground process on a PTY, or `None` while the normal shell
-/// owns the foreground process group.
-pub(crate) fn foreground_process_name_for_pty(pty_fd: i32, shell_pid: i32) -> Option<String> {
-    let fg_pgid = foreground_pgid(pty_fd, shell_pid)?;
-    let args = read_proc_cmdline(fg_pgid)?;
-    Path::new(args.first()?)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(str::to_owned)
-}
-
 /// Conventional-VTE compatibility wrapper. Block panes must use their
 /// `PaneLeaf` probe because their custom PTY is intentionally not VTE-owned.
-pub(crate) fn get_restorable_commands(terminal: &Terminal) -> Option<String> {
+pub(crate) fn get_restorable_commands(terminal: &Terminal) -> Option<Vec<String>> {
     let shell_pid: i32 = unsafe { *terminal.data::<i32>("child-pid")?.as_ref() };
     let pty_fd = terminal.pty()?.fd().as_raw_fd();
-    restorable_command_for_pty(pty_fd, shell_pid)
+    crate::process::restorable_command(pty_fd, shell_pid)
 }
 
 /// Conventional-VTE compatibility wrapper for tooltip callers.
 pub(crate) fn get_foreground_process_name(terminal: &Terminal) -> Option<String> {
     let shell_pid: i32 = unsafe { *terminal.data::<i32>("child-pid")?.as_ref() };
     let pty_fd = terminal.pty()?.fd().as_raw_fd();
-    foreground_process_name_for_pty(pty_fd, shell_pid)
+    crate::process::foreground_process_name(pty_fd, shell_pid)
 }
 
 pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, String>) {

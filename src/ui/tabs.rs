@@ -23,7 +23,7 @@ struct TabLaunch {
     working_directory: Option<String>,
     tab_name: Option<String>,
     session_id: Option<String>,
-    initial_commands: Option<String>,
+    initial_commands: crate::terminal::InitialCommands,
     argv_override: Option<Vec<String>>,
     remote: Option<(crate::config::RemoteHost, u32)>,
     terminal_mode: crate::config::TerminalMode,
@@ -403,7 +403,12 @@ impl UiState {
                     .as_ref()
                     .and_then(terminal_working_directory);
                 let title = custom_tab_title(&self.notebook, &widget);
-                self.add_new_tab(working_directory, title, None, None);
+                self.add_new_tab(
+                    working_directory,
+                    title,
+                    None,
+                    crate::terminal::InitialCommands::default(),
+                );
             }
         }
     }
@@ -893,7 +898,7 @@ impl UiState {
         working_directory: Option<String>,
         tab_name: Option<String>,
         session_id: Option<String>,
-        initial_commands: Option<String>,
+        initial_commands: crate::terminal::InitialCommands,
     ) -> Terminal {
         let terminal_mode = self.config.borrow().terminal_mode.clone();
         self.add_tab_with_argv(TabLaunch {
@@ -920,7 +925,7 @@ impl UiState {
             working_directory,
             tab_name: argv.first().cloned(),
             session_id: None,
-            initial_commands: None,
+            initial_commands: crate::terminal::InitialCommands::default(),
             argv_override: Some(argv),
             remote: None,
             terminal_mode,
@@ -937,7 +942,7 @@ impl UiState {
             working_directory: None,
             tab_name: Some(tab_name.to_string()),
             session_id: None,
-            initial_commands: None,
+            initial_commands: crate::terminal::InitialCommands::default(),
             argv_override: Some(argv),
             remote: None,
             terminal_mode: crate::config::TerminalMode::Vte,
@@ -966,7 +971,7 @@ impl UiState {
             working_directory: None,
             tab_name: Some(host.name.clone()),
             session_id: None,
-            initial_commands: None,
+            initial_commands: crate::terminal::InitialCommands::default(),
             argv_override: Some(argv),
             remote: Some((host.clone(), attempt)),
             terminal_mode,
@@ -1210,7 +1215,7 @@ impl UiState {
                         shell_argv,
                         working_directory.as_deref(),
                         Some(&sid),
-                        initial_commands.as_deref(),
+                        initial_commands.as_slice(),
                     ));
                     let terminal = term_view.vte().clone();
                     (PaneLeaf::Block(term_view), terminal)
@@ -1221,7 +1226,7 @@ impl UiState {
                         shell_argv,
                         working_directory.as_deref(),
                         Some(&sid),
-                        initial_commands.as_deref(),
+                        initial_commands.as_slice(),
                     ));
                     let terminal = vte_view.vte().clone();
                     (PaneLeaf::Vte(vte_view), terminal)
@@ -1799,7 +1804,12 @@ impl UiState {
                     let title = page
                         .as_ref()
                         .and_then(|page| custom_tab_title(&ui_duplicate_ctx.notebook, page));
-                    ui_duplicate_ctx.add_new_tab(working_directory, title, None, None);
+                    ui_duplicate_ctx.add_new_tab(
+                        working_directory,
+                        title,
+                        None,
+                        crate::terminal::InitialCommands::default(),
+                    );
                 });
                 vbox.append(&item);
             }

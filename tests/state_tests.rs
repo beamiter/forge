@@ -46,7 +46,7 @@ fn test_pane_layout_leaf_with_commands() {
     let layout = PaneLayout::Leaf {
         dir: "/home".to_string(),
         sid: "789-012".to_string(),
-        cmds: Some("nix develop".to_string()),
+        cmds: Some(vec!["nix".to_string(), "develop".to_string()]),
         pinned: None,
     };
 
@@ -57,7 +57,47 @@ fn test_pane_layout_leaf_with_commands() {
         PaneLayout::Leaf { dir, sid, cmds, .. } => {
             assert_eq!(dir, "/home");
             assert_eq!(sid, "789-012");
-            assert_eq!(cmds, Some("nix develop".to_string()));
+            assert_eq!(cmds, Some(vec!["nix".to_string(), "develop".to_string()]));
+        }
+        _ => panic!("Expected Leaf layout"),
+    }
+}
+
+#[test]
+fn restorable_command_argv_round_trips_without_losing_boundaries() {
+    // A ';' inside one remote argument must stay inside that argument; a
+    // joined-string format would let it become a second local command.
+    let argv = vec![
+        "ssh".to_string(),
+        "example.test".to_string(),
+        "printf '%s, %s'; touch /tmp/stays-remote".to_string(),
+    ];
+    let layout = PaneLayout::Leaf {
+        dir: "/tmp".to_string(),
+        sid: "123-456".to_string(),
+        cmds: Some(argv.clone()),
+        pinned: None,
+    };
+
+    let encoded = serde_json::to_string(&layout).expect("Serialization failed");
+    let decoded: PaneLayout = serde_json::from_str(&encoded).expect("Deserialization failed");
+    match decoded {
+        PaneLayout::Leaf { cmds, .. } => assert_eq!(cmds, Some(argv)),
+        _ => panic!("Expected Leaf layout"),
+    }
+}
+
+#[test]
+fn legacy_joined_restore_command_is_loaded_but_not_replayed() {
+    let legacy: PaneLayout = serde_json::from_str(
+        r#"{"type":"leaf","dir":"/tmp","sid":"1-2","cmds":"ssh host; touch /tmp/local"}"#,
+    )
+    .expect("legacy snapshot must still load");
+    match legacy {
+        PaneLayout::Leaf { dir, sid, cmds, .. } => {
+            assert_eq!(dir, "/tmp");
+            assert_eq!(sid, "1-2");
+            assert_eq!(cmds, None, "joined command strings must never replay");
         }
         _ => panic!("Expected Leaf layout"),
     }
@@ -77,7 +117,7 @@ fn test_pane_layout_split_serialization() {
         end: Box::new(PaneLayout::Leaf {
             dir: "/home".to_string(),
             sid: "789-012".to_string(),
-            cmds: Some("nix develop".to_string()),
+            cmds: Some(vec!["nix".to_string(), "develop".to_string()]),
             pinned: None,
         }),
     };
@@ -114,7 +154,7 @@ fn test_pane_layout_split_serialization() {
                 } => {
                     assert_eq!(dir, "/home");
                     assert_eq!(sid, "789-012");
-                    assert_eq!(cmds, &Some("nix develop".to_string()));
+                    assert_eq!(cmds, &Some(vec!["nix".to_string(), "develop".to_string()]));
                 }
                 _ => panic!("Expected Leaf in end"),
             }
@@ -175,12 +215,13 @@ tab=Terminal 2	/home	789-012"#;
     assert_eq!(current, Some(0));
     assert_eq!(tabs.len(), 2);
 
-    // First tab
+    // First tab: the legacy 4-field format stored a joined command string
+    // whose argv boundaries cannot be recovered, so it loads without replay.
     match &tabs[0].1 {
         PaneLayout::Leaf { dir, sid, cmds, .. } => {
             assert_eq!(dir, "/tmp");
             assert_eq!(sid, "123-456");
-            assert_eq!(cmds, &Some("nix develop".to_string()));
+            assert_eq!(cmds, &None);
         }
         _ => panic!("Expected Leaf"),
     }
@@ -202,7 +243,7 @@ fn test_parse_tabs_state_new_json_format() {
         "type": "leaf",
         "dir": "/tmp",
         "sid": "123-456",
-        "cmds": "nix develop"
+        "cmds": ["nix", "develop"]
     });
 
     let contents = format!(
@@ -220,7 +261,29 @@ tab=Terminal 1	{}"#,
         PaneLayout::Leaf { dir, sid, cmds, .. } => {
             assert_eq!(dir, "/tmp");
             assert_eq!(sid, "123-456");
-            assert_eq!(cmds, &Some("nix develop".to_string()));
+            assert_eq!(cmds, &Some(vec!["nix".to_string(), "develop".to_string()]));
+        }
+        _ => panic!("Expected Leaf"),
+    }
+}
+
+#[test]
+fn test_parse_tabs_state_legacy_joined_cmds_in_layout_json_loads_without_replay() {
+    let leaf_json = serde_json::json!({
+        "type": "leaf",
+        "dir": "/tmp",
+        "sid": "123-456",
+        "cmds": "ssh host; touch /tmp/local"
+    });
+
+    let contents = format!("current_page=0\ntab=Terminal 1\t{}", leaf_json);
+    let (_, tabs) = parse_tabs_state(&contents);
+
+    assert_eq!(tabs.len(), 1);
+    match &tabs[0].1 {
+        PaneLayout::Leaf { dir, cmds, .. } => {
+            assert_eq!(dir, "/tmp");
+            assert_eq!(cmds, &None, "joined command strings must never replay");
         }
         _ => panic!("Expected Leaf"),
     }

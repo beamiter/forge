@@ -38,6 +38,7 @@ All notable user-visible and operational changes are recorded here.
 
 ### Changed
 
+- 进程探测与 shell 引用迁移到共享库 `jterm_core::process` 并删除本地副本：`/proc` 的 cmdline/ppid/stat 解析、PTY 前台进程发现、可恢复命令识别（ssh / mosh / `nix develop` / `docker|podman exec`）与各处 shell 单引号包装现在与 jterm1 使用同一份经测试加固的实现。行为上的两点变化：前台进程识别现在先检查 PTY 子进程本身（与 jterm1 一致），因此受管 ssh/mosh 面板的命令也能被检测与命名；单引号转义风格从 `'\''` 统一为 `'"'"'`（两者皆为合法 POSIX 引用），涉及 `bash -lc` 登录包装、rsh 的 `exec` 行（改用 core 的 `build_rsh_exec_command`）与文件树的路径插入（改用 core 的 `shell_quote_path`，明显安全的路径不再加引号、保持可读）。`startup_commands` 的逗号分隔配置语法不变，但只在应用边界解析一次，终端后端不再自行拆分。
 - Block 模式长输出改为块内滚动（对齐 jterm1）：超出当前 pane 可视高度的 finished Block 不再撑满外层历史，而是保留自适应视口并在右侧显示专属滚动条，鼠标滚轮与滑块都只移动该 Block，滚到首/末行才把滚动交还外层历史；短输出仍取自然高度、不显示滚动条，展开按钮可把单个 Block 恢复为整段铺开。改变窗口或分屏大小时，屏幕上已可见的 Block 会立即按新高度重新适配（此前只有滚出视口再回来的 Block 才会重算），虚拟化高度同步更新，展开状态让位于新的 pane 尺寸。
 - Block 头部元数据更易读：分钟级耗时保留秒数（`1m32s`、`1h04m`），不再丢失 61s 与 179s 的差异；信号退出码标注信号名（如 `exit:130 SIGINT`、`exit:137 SIGKILL`，悬停解释 128+n 约定），长命令完成通知同样附带信号名；从历史恢复的非当日 Block 时间戳带日期（`MM-DD HH:MM`），悬停显示完整本地日期时间，旧输出不再伪装成当天结果。
 - Block 前台与后台输出改用固定上限环缓冲，持续大输出不再为每个 PTY chunk 搬移整个 8 MiB 尾缓冲。
@@ -77,6 +78,7 @@ All notable user-visible and operational changes are recorded here.
 
 ### Security
 
+- 会话恢复回放加固（移植 jterm1 的同类修复）：可恢复命令此前以空格拼接成字符串保存、恢复时按 `", "` 拆分后原样写入 PTY——远端参数里的 `;`、逗号或换行可以在重启后被拆成一条新的本地命令。现在窗口快照保存结构化 argv（JSON 数组），回放前用配置 shell 对应的语法（POSIX 单引号或 PowerShell `& '...'`）把整个 argv 安全引用为恰好一条命令；含控制字符的 argv 或未知 shell 语法一律跳过回放并记录警告。旧快照里拼接字符串形式的命令仍可正常加载（标签页、目录、会话 ID 不受影响），但绝不自动回放，丢弃时记 debug 日志。
 - Persisted commands, output, working directories, and session metadata are restricted to `0700` directories and `0600` files on Unix.
 - AI credential contents remain outside `config.toml`: environment variables take priority, with an optional owner-only `ai_api_key_file` fallback; safe mode disables AI/Agent, executable notebooks, history, remote hosts, restoration, and persistence.
 - AI chat metadata, completed pairs, drafts, and provider-bound Block context share the bounded, owner-only, atomically replaced per-window snapshot. Redaction covers active, non-active, and archived chats, and in-flight requests are never restored as completed replies.

@@ -801,7 +801,12 @@ pub fn run() -> glib::ExitCode {
                 .as_ref()
                 .and_then(terminal_working_directory);
             let startup = ui_for_add.config.borrow().startup_commands.clone();
-            ui_for_add.add_new_tab(working_directory, None, None, startup);
+            ui_for_add.add_new_tab(
+                working_directory,
+                None,
+                None,
+                crate::terminal::InitialCommands::from_config(startup.as_deref()),
+            );
         });
 
         let requested_cwd = launch
@@ -833,7 +838,12 @@ pub fn run() -> glib::ExitCode {
                 ui.add_new_tab_with_argv(requested_cwd, argv);
             } else {
                 let startup = ui.config.borrow().startup_commands.clone();
-                ui.add_new_tab(requested_cwd, None, None, startup);
+                ui.add_new_tab(
+                    requested_cwd,
+                    None,
+                    None,
+                    crate::terminal::InitialCommands::from_config(startup.as_deref()),
+                );
             }
         } else {
             for (name, layout) in saved_tabs {

@@ -20,8 +20,11 @@ impl UiState {
                 cmds,
                 pinned,
             } => {
-                // Create a simple tab with the leaf layout
-                let _terminal = self.add_new_tab(Some(dir), tab_name, Some(sid), cmds);
+                // Create a simple tab with the leaf layout. The persisted argv
+                // becomes exactly one safely quoted command for the configured
+                // shell; unsafe argvs skip replay instead of being reparsed.
+                let initial_commands = self.restored_initial_commands(cmds.as_deref());
+                let _terminal = self.add_new_tab(Some(dir), tab_name, Some(sid), initial_commands);
                 // Return the page widget (last added page)
                 let page_num = self.notebook.n_pages().saturating_sub(1);
                 let page = self
@@ -58,11 +61,12 @@ impl UiState {
         tab_name: Option<String>,
     ) -> gtk4::Widget {
         let (dir, sid, cmds, pinned) = Self::first_saved_leaf(&layout);
+        let initial_commands = self.restored_initial_commands(cmds.as_deref());
         self.add_new_tab(
             Some(dir.to_string()),
             tab_name,
             Some(sid.to_string()),
-            cmds.clone(),
+            initial_commands,
         );
 
         let page_num = self
@@ -101,7 +105,7 @@ impl UiState {
 
     fn first_saved_leaf(
         layout: &crate::state::PaneLayout,
-    ) -> (&str, &str, &Option<String>, Option<bool>) {
+    ) -> (&str, &str, &Option<Vec<String>>, Option<bool>) {
         match layout {
             crate::state::PaneLayout::Leaf {
                 dir,
@@ -111,6 +115,15 @@ impl UiState {
             } => (dir, sid, cmds, *pinned),
             crate::state::PaneLayout::Split { start, .. } => Self::first_saved_leaf(start),
         }
+    }
+
+    /// Quote a persisted restorable argv for the configured interactive shell,
+    /// skipping replay (with a warning) when it cannot be quoted safely.
+    fn restored_initial_commands(
+        &self,
+        argv: Option<&[String]>,
+    ) -> crate::terminal::InitialCommands {
+        crate::terminal::InitialCommands::from_restored_argv(argv, &self.shell_argv.borrow())
     }
 
     fn restore_pane_layout_internal(
@@ -134,11 +147,12 @@ impl UiState {
                     // Restored split siblings follow the configured terminal
                     // mode, matching what `split_current` would have created.
                     let mode = self.config.borrow().terminal_mode.clone();
+                    let initial_commands = self.restored_initial_commands(cmds.as_deref());
                     self.create_pane_leaf(
                         &mode,
                         Some(&dir),
                         Some(&sid),
-                        cmds.as_deref(),
+                        initial_commands.as_slice(),
                         tab_widget_name,
                     )
                     .root_widget()

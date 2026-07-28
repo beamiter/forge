@@ -3227,7 +3227,7 @@ impl TermView {
         shell_argv: &[String],
         cwd: Option<&str>,
         session_id: Option<&str>,
-        initial_commands: Option<&str>,
+        initial_commands: &[String],
     ) -> Self {
         // ── Build widget tree ──────────────────────────────────────────────
         let root = gtk4::Box::new(Orientation::Vertical, 0);
@@ -3762,18 +3762,11 @@ impl TermView {
             let fullscreen_rc = fullscreen.clone();
             let ftcs_seen_rc = ftcs_seen.clone();
 
-            // Command queue for replaying initial_commands on PromptEnd events
+            // Command queue for replaying initial_commands on PromptEnd events.
+            // Commands are pre-parsed at the application boundary; splitting
+            // here would reinterpret a restored command's own bytes.
             let init_cmds_queue: Rc<RefCell<std::collections::VecDeque<String>>> =
-                Rc::new(RefCell::new(
-                    initial_commands
-                        .map(|s| {
-                            s.split(", ")
-                                .map(|c| c.trim().to_string())
-                                .filter(|c| !c.is_empty())
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                ));
+                Rc::new(RefCell::new(initial_commands.iter().cloned().collect()));
             let init_cmds_queue_for_cb = Rc::clone(&init_cmds_queue);
             let pty_for_init = Rc::clone(&pty);
             let block_start_time_for_cb = block_start_time.clone();

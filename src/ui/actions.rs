@@ -54,7 +54,12 @@ impl UiState {
                     .as_ref()
                     .and_then(terminal_working_directory);
                 let startup = self.config.borrow().startup_commands.clone();
-                self.add_new_tab(working_directory, None, None, startup);
+                self.add_new_tab(
+                    working_directory,
+                    None,
+                    None,
+                    crate::terminal::InitialCommands::from_config(startup.as_deref()),
+                );
             }
             Action::CloseTab => {
                 log::info!("Close tab");

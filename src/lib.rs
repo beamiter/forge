@@ -23,6 +23,9 @@ pub mod keybindings;
 pub mod logging;
 pub mod notebook;
 mod palette;
+pub mod process {
+    pub use jterm_core::process::*;
+}
 pub mod pty;
 pub mod redact {
     pub use jterm_core::redact::*;

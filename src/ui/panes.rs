@@ -133,7 +133,7 @@ impl UiState {
         &self,
         working_directory: Option<&str>,
         session_id: Option<&str>,
-        initial_commands: Option<&str>,
+        initial_commands: &[String],
         tab_widget_name: Option<String>,
     ) -> PaneLeaf {
         let sid = session_id
@@ -200,7 +200,7 @@ impl UiState {
         &self,
         working_directory: Option<&str>,
         session_id: Option<&str>,
-        initial_commands: Option<&str>,
+        initial_commands: &[String],
         tab_widget_name: Option<String>,
     ) -> PaneLeaf {
         let sid = session_id
@@ -305,7 +305,7 @@ impl UiState {
         mode: &crate::config::TerminalMode,
         working_directory: Option<&str>,
         session_id: Option<&str>,
-        initial_commands: Option<&str>,
+        initial_commands: &[String],
         tab_widget_name: Option<String>,
     ) -> PaneLeaf {
         match mode {
@@ -493,7 +493,7 @@ impl UiState {
             &split_mode,
             working_directory.as_deref(),
             None,
-            None,
+            &[],
             tab_widget_name,
         );
         let new_widget = new_leaf.root_widget();
