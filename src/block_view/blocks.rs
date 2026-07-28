@@ -1034,8 +1034,7 @@ impl FinishedBlock {
         if !is_background && exit_code != 0 {
             let badge = match signal_name_for_exit(exit_code) {
                 Some(sig) => {
-                    let badge =
-                        gtk4::Label::new(Some(&format!("exit:{exit_code} {sig}")));
+                    let badge = gtk4::Label::new(Some(&format!("exit:{exit_code} {sig}")));
                     badge.set_tooltip_text(Some(&format!(
                         "128 + signal number: terminated by {sig}"
                     )));

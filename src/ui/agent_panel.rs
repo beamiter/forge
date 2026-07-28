@@ -1282,9 +1282,7 @@ impl UiState {
         };
         let was_restored = restored_session.is_some();
         let runtime = Rc::new(AgentRuntime {
-            session: RefCell::new(
-                restored_session.unwrap_or_else(|| AgentSession::new(max_turns)),
-            ),
+            session: RefCell::new(restored_session.unwrap_or_else(|| AgentSession::new(max_turns))),
             target: target.clone(),
             config: self.config.clone(),
             shell: shell.clone(),

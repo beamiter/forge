@@ -68,9 +68,8 @@ impl PaneLeaf {
     pub(crate) fn install_pane_drag(&self, on_drop: impl Fn(&str) -> bool + 'static) {
         let root = self.root_widget();
         let source_root = root.downgrade();
-        self.pane_header().install_drag_source(move || {
-            Self::from_widget(&source_root.upgrade()?)?.session_id()
-        });
+        self.pane_header()
+            .install_drag_source(move || Self::from_widget(&source_root.upgrade()?)?.session_id());
         super::pane_header::install_pane_drop_target(&root, on_drop);
     }
 

@@ -1312,6 +1312,24 @@ fn take_background_output(pending: &RefCell<BoundedByteRing>) -> Option<String> 
     background_output_has_visible_text(&bytes).then(|| String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// Minimum spacing between OSC 9/777 desktop notifications. The sequence
+/// originates inside the PTY (and may be remote over SSH), so process
+/// spawning is rate-limited app-wide: the first allowed notification also
+/// refreshes the timestamp, which drops the rest of a burst.
+const NOTIFICATION_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+thread_local! {
+    /// Last desktop notification launch, shared by every pane on the GLib
+    /// main thread so the rate limit above holds across the whole app.
+    static LAST_NOTIFICATION_AT: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+}
+
+/// Pure decision behind [`NOTIFICATION_MIN_INTERVAL`]: a notification may
+/// fire when none has fired yet or the previous one is old enough.
+fn notification_allowed(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last.is_none_or(|prev| now.duration_since(prev) >= NOTIFICATION_MIN_INTERVAL)
+}
+
 impl ReaderCtx {
     fn install(self, pty: &Rc<OwnedPty>) {
         let ReaderCtx {
@@ -2449,6 +2467,24 @@ impl ReaderCtx {
                         ParserEvent::RemoteSessionId(id) => {
                             for cb in remote_session_cbs.borrow().iter() {
                                 cb(id);
+                            }
+                        }
+
+                        ParserEvent::Notification { title, body } => {
+                            // Desktop notification requested via OSC 9 / OSC 777.
+                            // The parser already stripped controls and bounded the
+                            // text; this side only enforces the app-wide rate limit
+                            // (at most one per batch, dropping the rest).
+                            let now = std::time::Instant::now();
+                            let allowed = LAST_NOTIFICATION_AT.with(|last| {
+                                let ok = notification_allowed(last.get(), now);
+                                if ok {
+                                    last.set(Some(now));
+                                }
+                                ok
+                            });
+                            if allowed {
+                                crate::notify::app_notification(title.as_deref(), body);
                             }
                         }
 
@@ -5218,17 +5254,41 @@ mod tests {
         background_output_has_visible_text, build_clipboard_paste, build_command_recall,
         build_keyboard_query_reply, classify_command_prompt_status, coalesce_bytes_events,
         collapse_repaint_output, compute_viewport_state, history_edge_navigation_available,
-        normalize_captured_command, normalize_loaded_block_ids, output_has_vertical_repaint,
-        record_external_input, resolve_submitted_command, scroll_delta_to_reveal,
-        selected_command_text, selected_id_range, should_buffer_background_output, strip_ansi,
-        strip_ansi_with_clear_detect, take_background_output, truncate_plain_output_for_height,
-        viewport_state_for_scroll, visible_indices_for_viewport, BlockData, BlockState,
-        BoundedByteRing, CommandPromptStatus, ViewportState, MAX_RAW_OUTPUT_BYTES,
+        normalize_captured_command, normalize_loaded_block_ids, notification_allowed,
+        output_has_vertical_repaint, record_external_input, resolve_submitted_command,
+        scroll_delta_to_reveal, selected_command_text, selected_id_range,
+        should_buffer_background_output, strip_ansi, strip_ansi_with_clear_detect,
+        take_background_output, truncate_plain_output_for_height, viewport_state_for_scroll,
+        visible_indices_for_viewport, BlockData, BlockState, BoundedByteRing, CommandPromptStatus,
+        ViewportState, MAX_RAW_OUTPUT_BYTES,
     };
     use crate::parser::{KeyboardProtocolQuery, ParserEvent};
     use std::cell::{Cell, RefCell};
     use std::collections::{HashSet, VecDeque};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn notification_rate_limit_spacing() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        // First notification ever is always allowed.
+        assert!(notification_allowed(None, start));
+        // A burst right after the first one is dropped...
+        assert!(!notification_allowed(Some(start), start));
+        assert!(!notification_allowed(
+            Some(start),
+            start + Duration::from_millis(1999)
+        ));
+        // ...until the two-second window has fully elapsed.
+        assert!(notification_allowed(
+            Some(start),
+            start + Duration::from_secs(2)
+        ));
+        assert!(notification_allowed(
+            Some(start),
+            start + Duration::from_secs(5)
+        ));
+    }
 
     #[test]
     fn background_output_requires_visible_text() {

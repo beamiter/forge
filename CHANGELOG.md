@@ -6,6 +6,7 @@ All notable user-visible and operational changes are recorded here.
 
 ### Added
 
+- OSC 9 / OSC 777 桌面通知：终端内程序（含 SSH 远端）可通过 `ESC ] 9 ; 正文 BEL` 或 `ESC ] 777 ; notify ; 标题 ; 正文` 请求桌面通知，由 `notify-send` 以 jterm4 身份发出（缺标题时回退为应用名）。文本在共享解析器中去除控制字符并截断至 256 字符，空通知不发；由于序列源自 PTY 内部，进程派生受应用级速率限制——每批至多一条、距上一条不足 2 秒的一律丢弃。
 - 一键安装/更新配套 shell `rsh`：命令面板的 **Install or update rsh** 在独立标签页里运行安装脚本（标签页即进度界面，可 Ctrl+C 中断，结束后等待 Enter 再关闭）；缺少 rsh 或有新版本时顶栏下方出现可忽略的提示条。安装脚本来自 rsh 仓库并随二进制内嵌，校验和、原子替换、回滚与 `/usr/bin/rsh`（BSD remote shell）遮蔽提示都由它统一处理。更新检查在后台线程进行、从不自动安装，检查频率由 `rsh_update_check`（`startup` / `daily`（默认）/ `never`）控制，缓存与同机其他 jterm 共享。
 
 - Shell Agent 可选的只读命令自动放行（`agent_auto_approve_readonly` / `JTERM4_AGENT_AUTO_APPROVE_READONLY`，默认关闭）：通过严格白名单的单条只读命令免点击执行，写操作、管道/链式/重定向/命令替换、可执行旁路 flag 与危险模式仍逐条人工审批；自动批准留下可见记录、照常消耗回合预算，开启期间 Agent 卡显示 `auto: read-only` chip，开关位于 Settings 与 Agent 卡设置弹窗。

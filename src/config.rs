@@ -525,7 +525,9 @@ fn env_u32(name: &str) -> Option<u32> {
 }
 
 fn env_f32(name: &str) -> Option<f32> {
-    std::env::var(name).ok().and_then(|v| v.trim().parse::<f32>().ok())
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
 }
 
 fn env_bool(name: &str) -> Option<bool> {
