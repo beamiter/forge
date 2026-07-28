@@ -1,80 +1,52 @@
-//! Kitty graphics protocol (minimal subset) — APC `\e_G<keys>;<base64>\e\\`.
+//! Kitty graphics protocol — APC `\e_G<keys>;<base64>\e\\`.
 //!
-//! Ported from jterm1's `terminal/kitty_graphics.rs` so the family shares one
-//! behaviour and one set of memory caps. Supported:
-//! - `a=T` (transmit + display, default) and `a=t` (transmit only — buffered
-//!   but not auto-displayed). `a=q` (support probe) is validated and answered
-//!   but never displayed; `a=d`/`a=p` are dropped.
-//! - `f=100` (PNG, default) and `f=32` (RGBA, requires `s=<w>` + `v=<h>`).
-//! - `t=d` (inline base64 payload, default). File / shared-memory transports
-//!   are ignored.
-//! - Chunked transmission via `m=1` (more) + final `m=0` (or absent).
+//! The structural half of the protocol lives in [`jterm_core::kitty_graphics`]
+//! and is shared with the rest of the family: control-data parsing, `m=1` chunk
+//! assembly, base64 decoding, raw-format length validation and the PNG IHDR
+//! sniff. This module keeps only what needs GTK or a reply on the wire:
+//!
+//! - the GDK decode path ([`gdk::Texture::from_bytes`] for `f=100`, a
+//!   [`gdk::MemoryTexture`] for `f=24`/`f=32`),
+//! - the `a=q` support probe ([`query_outcome`]),
+//! - the PTY responder ([`response_for`]),
+//! - the per-block image budget ([`MAX_PENDING_BYTES_PER_BLOCK`], enforced by
+//!   the caller in `block_view/mod.rs`).
+//!
+//! Supported: `a=T` (transmit + display) and `a=t` (transmit only — buffered
+//! but not auto-displayed); `a=q` (support probe) is validated and answered but
+//! never displayed; `a=d`/`a=p` are answered `ENOTSUP` and dropped. `f=100`
+//! (PNG), `f=32` (RGBA, the protocol default) and `f=24` (RGB) with the inline
+//! `t=d` transport only. Chunked transmission via `m=1` + final `m=0`, where a
+//! continuation may carry only `m=` and an optional `q=`; any other action
+//! arriving mid-upload drops the in-flight chunks.
 //!
 //! libvte does not implement this protocol, so block mode consumes APC G
 //! payloads before VTE sees them and renders the decoded image as a GTK
 //! Picture appended to the finished block.
 //!
-//! Per-image and per-block memory caps prevent a runaway shell from ballooning
-//! RSS; oversize payloads are dropped.
+//! Memory caps come from [`Caps::BLOCK`], the family's block-terminal budget:
+//! 16 MiB encoded per image, 16 MiB decoded, 16 MiB across all in-flight
+//! uploads, and a 16384-pixel edge. Oversize payloads are dropped.
 //!
 //! Unlike jterm1 (which never answers), commands that carry an `i=`/`I=`
 //! identifier receive an `OK`/error reply on the PTY via [`response_for`],
 //! following jterm2 — the family's reference responder. See that function for
 //! the deliberate divergences.
 
-use std::collections::HashMap;
-
 use gtk4::gdk;
 use gtk4::glib;
 use gtk4::prelude::Cast;
 
-/// Per-image base64 payload cap (before decoding) — ~16 MB encoded.
-const MAX_ENCODED_BYTES: usize = 16 * 1024 * 1024;
+use jterm_core::kitty_graphics as core;
+use jterm_core::kitty_graphics::{Action, Assembled, Caps, Error, Format, Step};
+
+/// Memory budget for one block's graphics traffic — the family's block preset.
+const CAPS: Caps = Caps::BLOCK;
+
 /// Per-block decoded image bytes cap (sum of all images attached to a block).
-pub(crate) const MAX_PENDING_BYTES_PER_BLOCK: usize = 16 * 1024 * 1024;
-/// Reject dimensions beyond a conservative texture/GPU-friendly ceiling even
-/// when a very thin image would otherwise fit the byte budget.
-const MAX_IMAGE_DIMENSION: u32 = 16_384;
-/// A decoded image may occupy at most the same budget as all pending images in
-/// a block. RGB input is expanded to RGBA, so the output size is authoritative.
-const MAX_DECODED_IMAGE_BYTES: usize = MAX_PENDING_BYTES_PER_BLOCK;
-
-/// Image-data format identifier from the `f=` key.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Format {
-    /// `f=100` — PNG. Decoded via gdk::Texture::from_bytes.
-    Png,
-    /// `f=32` — 32-bit RGBA, raw pixels. Width/height come from `s=`/`v=`.
-    Rgba,
-    /// `f=24` — 24-bit RGB. Expanded to RGBA with alpha=255 before upload.
-    Rgb,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ImageError {
-    Invalid,
-    TooLarge,
-}
-
-struct ImageLayout {
-    width: i32,
-    height: i32,
-    source_bytes: usize,
-    output_bytes: usize,
-    stride: usize,
-}
-
-/// In-progress assembly keyed by client image id (`i=`). Multi-chunk uploads
-/// share an entry; the first chunk records format/size, every chunk appends
-/// its base64 fragment.
-struct Pending {
-    format: Format,
-    width: u32,
-    height: u32,
-    encoded: Vec<u8>,
-    /// `a=T` (display) vs `a=t` (transmit only).
-    display: bool,
-}
+/// A decoded image may occupy at most the same budget, so one image can fill a
+/// block on its own but two oversize ones cannot.
+pub(crate) const MAX_PENDING_BYTES_PER_BLOCK: usize = CAPS.max_decoded_bytes;
 
 /// Parsed result of a single APC G chunk. `Complete` carries a finished image
 /// ready to render; `Pending` means more chunks are expected; `Skipped` means
@@ -93,215 +65,214 @@ pub(crate) enum Outcome {
     QueryOk,
 }
 
-/// Stateful assembler — owns one entry per in-flight image id.
-#[derive(Default)]
+/// Stateful assembler — a thin GTK-side wrapper over the shared one.
 pub(crate) struct Assembler {
-    in_flight: HashMap<u32, Pending>,
-    /// Single anonymous slot for chunked uploads without `i=`. Kitty's spec
-    /// allows omitting the id; in practice only one such upload is active.
-    anon: Option<Pending>,
+    inner: core::Assembler,
+}
+
+impl Default for Assembler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Assembler {
     pub(crate) fn new() -> Self {
-        Self::default()
+        Self {
+            inner: core::Assembler::new(CAPS),
+        }
     }
 
     /// Drop all in-flight state — call when a block ends or the shell resets,
     /// so a half-uploaded image doesn't leak across commands.
     pub(crate) fn reset(&mut self) {
-        self.in_flight.clear();
-        self.anon = None;
+        self.inner.reset();
     }
 
     /// Parse one APC G payload. `payload` is the bytes between `\e_` and the
     /// terminating `\e\\` (i.e. starts with `G`). Returns the outcome the
     /// caller should act on.
     pub(crate) fn feed(&mut self, payload: &[u8]) -> Outcome {
-        if payload.is_empty() || payload[0] != b'G' {
-            return Outcome::Invalid;
-        }
-        // Split header (key=value,key=value...) from base64 body at the first `;`.
-        let rest = &payload[1..];
-        let (header, body) = match rest.iter().position(|&b| b == b';') {
-            Some(i) => (&rest[..i], &rest[i + 1..]),
-            None => (rest, &b""[..]),
+        let step = match self.inner.feed(payload) {
+            Ok(step) => step,
+            Err(error) => return outcome_for(error),
         };
-        let keys = parse_keys(header);
-
-        let action = keys.get("a").copied().unwrap_or("t");
-        // Silently ignore unsupported actions; the caller consumed the APC
-        // bytes already so libvte never sees them as garbage.
-        match action {
-            "T" | "t" => {}
-            "q" => return query_outcome(&keys, body),
-            _ => return Outcome::Skipped,
-        }
-
-        let id: Option<u32> = keys.get("i").and_then(|s| s.parse().ok());
-        let more = keys.get("m").map(|v| *v == "1").unwrap_or(false);
-
-        // Either fetch an existing pending entry (continuation chunk) or seed
-        // a new one from the header keys on the first chunk.
-        let take_existing = |this: &mut Assembler| -> Option<Pending> {
-            match id {
-                Some(k) => this.in_flight.remove(&k),
-                None => this.anon.take(),
-            }
-        };
-
-        let mut entry = match take_existing(self) {
-            Some(p) => p,
-            None => {
-                let format = match keys.get("f").copied().unwrap_or("100") {
-                    "100" => Format::Png,
-                    "32" => Format::Rgba,
-                    "24" => Format::Rgb,
-                    _ => return Outcome::Skipped,
-                };
-                let transport = keys.get("t").copied().unwrap_or("d");
-                if transport != "d" {
-                    // File / shared-memory transports require trusting a path
-                    // from the shell — out of scope for this minimal subset.
-                    return Outcome::Skipped;
+        match step {
+            Step::NotOurs => Outcome::Invalid,
+            Step::NeedMore => Outcome::Pending,
+            Step::Ready(assembled) => complete(assembled),
+            Step::Other {
+                command,
+                interrupted,
+            } => {
+                if interrupted {
+                    log::debug!(
+                        "kitty graphics: a={} dropped an in-flight chunked upload",
+                        command.get("a").unwrap_or("?")
+                    );
                 }
-                let width = keys.get("s").and_then(|s| s.parse().ok()).unwrap_or(0);
-                let height = keys.get("v").and_then(|s| s.parse().ok()).unwrap_or(0);
-                let display = action == "T";
-                Pending {
-                    format,
-                    width,
-                    height,
-                    encoded: Vec::new(),
-                    display,
+                if command.action == Action::Query {
+                    query_outcome(&command)
+                } else {
+                    // Silently drop unsupported actions; the caller consumed
+                    // the APC bytes already so libvte never sees them as
+                    // garbage. The client still gets an ENOTSUP reply.
+                    Outcome::Skipped
                 }
             }
-        };
-
-        // Accumulate this chunk's base64 bytes (skipping any embedded
-        // whitespace some emitters add). Check the final size before reserve:
-        // reserving an attacker-controlled chunk first would briefly bypass the
-        // cap and can panic on capacity/allocation failure.
-        let chunk_len = body.iter().filter(|b| !b.is_ascii_whitespace()).count();
-        let Some(encoded_len) = entry.encoded.len().checked_add(chunk_len) else {
-            return Outcome::Skipped;
-        };
-        if encoded_len > MAX_ENCODED_BYTES {
-            log::warn!(
-                "kitty graphics: dropping oversize image ({} > {} encoded bytes)",
-                encoded_len,
-                MAX_ENCODED_BYTES
-            );
-            return Outcome::Skipped;
-        }
-        if entry.encoded.try_reserve(chunk_len).is_err() {
-            return Outcome::Skipped;
-        }
-        for &b in body {
-            if !b.is_ascii_whitespace() {
-                entry.encoded.push(b);
-            }
-        }
-
-        if more {
-            match id {
-                Some(k) => {
-                    self.in_flight.insert(k, entry);
-                }
-                None => {
-                    self.anon = Some(entry);
-                }
-            }
-            return Outcome::Pending;
-        }
-
-        // Reject terminal-supplied raw dimensions before decoding the base64
-        // body, so an impossible layout cannot force even the bounded decoded
-        // allocation. PNG dimensions live inside the encoded IHDR and are
-        // checked immediately after decoding, before GDK sees the bytes.
-        let raw_layout = match entry.format {
-            Format::Png => Ok(()),
-            Format::Rgba => checked_image_layout(entry.width, entry.height, 4).map(|_| ()),
-            Format::Rgb => checked_image_layout(entry.width, entry.height, 3).map(|_| ()),
-        };
-        match raw_layout {
-            Ok(()) => {}
-            Err(ImageError::TooLarge) => return Outcome::Skipped,
-            Err(ImageError::Invalid) => return Outcome::Invalid,
-        }
-
-        // Final chunk — decode and build a texture.
-        let decoded = match decode_base64(&entry.encoded) {
-            Some(v) => v,
-            None => return Outcome::Invalid,
-        };
-        let texture_result = match entry.format {
-            Format::Png => png_to_texture(decoded),
-            Format::Rgba => rgba_to_texture(entry.width, entry.height, &decoded, true),
-            Format::Rgb => rgba_to_texture(entry.width, entry.height, &decoded, false),
-        };
-        let texture = match texture_result {
-            Ok(texture) => texture,
-            Err(ImageError::TooLarge) => return Outcome::Skipped,
-            Err(ImageError::Invalid) => return Outcome::Invalid,
-        };
-        if entry.display {
-            Outcome::Complete(texture)
-        } else {
-            // Drop the texture — we don't currently honour `a=p` placement.
-            drop(texture);
-            Outcome::CompleteTransmitOnly
         }
     }
+}
+
+/// Map the shared parser's typed failure onto this app's wire codes:
+/// [`Outcome::Invalid`] answers `EINVAL`, [`Outcome::Skipped`] answers
+/// `ENOTSUP` — including size failures, which this responder reports as
+/// "not supported" rather than a per-cause `ENOSPC`.
+fn outcome_for(error: Error) -> Outcome {
+    match error {
+        Error::Invalid(_) => {
+            log::debug!("kitty graphics: {error}");
+            Outcome::Invalid
+        }
+        Error::TooLarge => {
+            log::warn!("kitty graphics: dropping oversize image ({error})");
+            Outcome::Skipped
+        }
+        Error::NotSupported(_) => {
+            log::debug!("kitty graphics: {error}");
+            Outcome::Skipped
+        }
+    }
+}
+
+/// Decode a finished transfer into a texture, honouring `a=t` vs `a=T`.
+fn complete(assembled: Assembled) -> Outcome {
+    let display = assembled.display;
+    let texture = match texture_for(assembled) {
+        Ok(texture) => texture,
+        Err(error) => return outcome_for(error),
+    };
+    if display {
+        Outcome::Complete(texture)
+    } else {
+        // Drop the texture — we don't currently honour `a=p` placement.
+        drop(texture);
+        Outcome::CompleteTransmitOnly
+    }
+}
+
+fn texture_for(assembled: Assembled) -> Result<gdk::Texture, Error> {
+    if assembled.format == Format::Png {
+        // The shared assembler already checked the IHDR geometry against CAPS,
+        // so a tiny payload cannot make the GdkPixbuf loader allocate a huge
+        // canvas.
+        let bytes = glib::Bytes::from_owned(assembled.bytes);
+        return gdk::Texture::from_bytes(&bytes).map_err(|_| Error::Invalid("PNG data"));
+    }
+    let (rgba, width, height) = assembled.into_rgba8()?;
+    memory_texture(rgba, width, height)
+}
+
+/// Upload RGBA pixels as a GDK texture. `f=24` was already expanded to RGBA
+/// with full opacity by the shared decoder.
+fn memory_texture(rgba: Vec<u8>, width: u32, height: u32) -> Result<gdk::Texture, Error> {
+    let stride = (width as usize).checked_mul(4).ok_or(Error::TooLarge)?;
+    let width = i32::try_from(width).map_err(|_| Error::TooLarge)?;
+    let height = i32::try_from(height).map_err(|_| Error::TooLarge)?;
+    let bytes = glib::Bytes::from_owned(rgba);
+    Ok(
+        gdk::MemoryTexture::new(width, height, gdk::MemoryFormat::R8g8b8a8, &bytes, stride)
+            .upcast(),
+    )
 }
 
 /// Validate an `a=q` support probe. `kitten icat` (and other well-behaved
 /// clients) transmit a tiny sample image with `a=q` and block until the
 /// terminal answers, so probes must be validated — not silently skipped like
-/// jterm1 does. Chunking (`m=`) is ignored: known clients probe in one APC.
-fn query_outcome(keys: &HashMap<&str, &str>, body: &[u8]) -> Outcome {
-    if keys.get("t").copied().unwrap_or("d") != "d" {
-        return Outcome::Skipped;
+/// jterm1 does. Nothing is buffered or displayed; chunking (`m=`) is ignored
+/// because known clients probe in one APC.
+fn query_outcome(command: &core::Command<'_>) -> Outcome {
+    if let Err(error) = command.require_direct_transport() {
+        return outcome_for(error);
     }
-    let format = match keys.get("f").copied().unwrap_or("100") {
-        "100" => Format::Png,
-        "32" => Format::Rgba,
-        "24" => Format::Rgb,
-        _ => return Outcome::Skipped,
-    };
-    let encoded: Vec<u8> = body
-        .iter()
-        .copied()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
-    if encoded.len() > MAX_ENCODED_BYTES {
-        return Outcome::Skipped;
+    let encoded = command.payload_b64.as_bytes();
+    let significant = encoded.iter().filter(|b| !b.is_ascii_whitespace()).count();
+    if significant > CAPS.max_encoded_bytes {
+        return outcome_for(Error::TooLarge);
     }
-    if encoded.is_empty() {
+    if significant == 0 {
         return Outcome::Invalid;
     }
-    let Some(decoded) = decode_base64(&encoded) else {
-        return Outcome::Invalid;
+    let decoded = match core::decode_base64(encoded, CAPS.max_decoded_bytes) {
+        Ok(decoded) => decoded,
+        Err(error) => return outcome_for(error),
     };
-    let checked = match format {
-        Format::Png => png_layout(&decoded).map(|_| ()),
-        Format::Rgba | Format::Rgb => {
-            let channels = if format == Format::Rgba { 4 } else { 3 };
-            let width = keys.get("s").and_then(|s| s.parse().ok()).unwrap_or(0);
-            let height = keys.get("v").and_then(|s| s.parse().ok()).unwrap_or(0);
-            checked_image_layout(width, height, channels).and_then(|layout| {
-                if decoded.len() < layout.source_bytes {
-                    Err(ImageError::Invalid)
-                } else {
+    let checked = match command.format {
+        Format::Png => core::png_dimensions(&decoded, &CAPS).map(|_| ()),
+        format => {
+            let Some((width, height)) = command.declared() else {
+                return Outcome::Invalid;
+            };
+            core::raw_layout(width, height, format, &CAPS).and_then(|layout| {
+                if decoded.len() == layout.source_bytes {
                     Ok(())
+                } else {
+                    Err(Error::Invalid("raw image length does not match s= and v="))
                 }
             })
         }
     };
     match checked {
         Ok(()) => Outcome::QueryOk,
-        Err(ImageError::TooLarge) => Outcome::Skipped,
-        Err(ImageError::Invalid) => Outcome::Invalid,
+        Err(error) => outcome_for(error),
+    }
+}
+
+/// The identifiers a reply echoes back, scanned leniently.
+///
+/// Deliberately not read through [`core::parse_command`]: the commands that
+/// most need an answer are the ones the shared parser *rejected*, and a client
+/// blocked on its `i=` correlation key still owes to hear `EINVAL`.
+struct ReplyKeys {
+    id: Option<u32>,
+    number: Option<u32>,
+    placement: Option<u32>,
+    quiet: u8,
+}
+
+impl ReplyKeys {
+    /// `None` when the payload is not a graphics command, is not UTF-8, or
+    /// carries more control data than the shared parser would have read.
+    fn scan(payload: &[u8]) -> Option<Self> {
+        let rest = payload.strip_prefix(b"G")?;
+        // Split once at `;`: base64 padding belongs to the data section and
+        // must never be read back as another control pair.
+        let control = match memchr::memchr(b';', rest) {
+            Some(index) => &rest[..index],
+            None => rest,
+        };
+        if control.len() > CAPS.max_control_bytes {
+            return None;
+        }
+        let control = std::str::from_utf8(control).ok()?;
+        let mut keys = Self {
+            id: None,
+            number: None,
+            placement: None,
+            quiet: 0,
+        };
+        for (key, value) in control.split(',').filter_map(|pair| pair.split_once('=')) {
+            // Last write wins, matching how the shared parser resolves
+            // duplicate keys.
+            match key {
+                "i" => keys.id = value.parse().ok(),
+                "I" => keys.number = value.parse().ok(),
+                "p" => keys.placement = value.parse().ok(),
+                "q" => keys.quiet = value.parse().ok().filter(|q| *q <= 2).unwrap_or(0),
+                _ => {}
+            }
+        }
+        Some(keys)
     }
 }
 
@@ -314,231 +285,54 @@ fn query_outcome(keys: &HashMap<&str, &str>, body: &[u8]) -> Outcome {
 /// - a non-zero `p=` placement id is echoed back.
 ///
 /// Deliberate divergences from jterm2, kept small because this responder sits
-/// on top of jterm1's minimal assembler rather than a full placement table:
+/// on top of the shared structural assembler rather than a full placement
+/// table:
 /// - every unsupported-but-well-formed command answers `ENOTSUP` instead of
 ///   per-cause `ENOENT`/`ENOSPC` codes;
-/// - a chunked upload rejected at its first chunk answers every remaining
-///   chunk too (the assembler keeps no tombstone for the aborted id);
-/// - `q=` is read per-chunk, not remembered across an upload.
+/// - a chunked upload rejected at any chunk keeps no tombstone for the aborted
+///   id, so its remaining chunks are each rejected as "continuation without a
+///   transfer in progress" — silently, since a legal continuation carries no
+///   `i=` to answer;
+/// - `q=` is read per-chunk from the payload being answered, not remembered
+///   across an upload the way the shared assembler remembers it.
 pub(crate) fn response_for(payload: &[u8], outcome: &Outcome) -> Option<Vec<u8>> {
-    if payload.first() != Some(&b'G') {
+    let keys = ReplyKeys::scan(payload)?;
+    if keys.id.is_none() && keys.number.is_none() {
         return None;
     }
-    let rest = &payload[1..];
-    let header = match rest.iter().position(|&b| b == b';') {
-        Some(i) => &rest[..i],
-        None => rest,
-    };
-    let keys = parse_keys(header);
-    let id: Option<u32> = keys.get("i").and_then(|s| s.parse().ok());
-    let number: Option<u32> = keys.get("I").and_then(|s| s.parse().ok());
-    if id.is_none() && number.is_none() {
-        return None;
-    }
-    let quiet: u8 = keys
-        .get("q")
-        .and_then(|s| s.parse().ok())
-        .filter(|q| *q <= 2)
-        .unwrap_or(0);
     let body = match outcome {
         // Chunked uploads are answered once, after the final chunk.
         Outcome::Pending => return None,
         Outcome::Complete(_) | Outcome::CompleteTransmitOnly | Outcome::QueryOk => {
-            if quiet >= 1 {
+            if keys.quiet >= 1 {
                 return None;
             }
             "OK"
         }
         Outcome::Invalid => {
-            if quiet >= 2 {
+            if keys.quiet >= 2 {
                 return None;
             }
             "EINVAL:invalid graphics payload"
         }
         Outcome::Skipped => {
-            if quiet >= 2 {
+            if keys.quiet >= 2 {
                 return None;
             }
             "ENOTSUP:action, format, transport, or size not supported"
         }
     };
     let mut fields = Vec::with_capacity(3);
-    if let Some(id) = id {
+    if let Some(id) = keys.id {
         fields.push(format!("i={id}"));
     }
-    if let Some(number) = number {
+    if let Some(number) = keys.number {
         fields.push(format!("I={number}"));
     }
-    if let Some(placement) = keys
-        .get("p")
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|p| *p != 0)
-    {
+    if let Some(placement) = keys.placement.filter(|p| *p != 0) {
         fields.push(format!("p={placement}"));
     }
     Some(format!("\x1b_G{};{body}\x1b\\", fields.join(",")).into_bytes())
-}
-
-/// Parse `key=value,key=value` into a borrow-only map. Empty / malformed
-/// entries are silently skipped — the protocol mixes optional keys freely.
-fn parse_keys(bytes: &[u8]) -> HashMap<&str, &str> {
-    let mut out = HashMap::new();
-    let s = match std::str::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(_) => return out,
-    };
-    for pair in s.split(',') {
-        if let Some(eq) = pair.find('=') {
-            let (k, v) = (pair[..eq].trim(), pair[eq + 1..].trim());
-            if !k.is_empty() {
-                out.insert(k, v);
-            }
-        }
-    }
-    out
-}
-
-/// Standard base64 decoder. Returns None on invalid alphabet or padding.
-/// Whitespace is already stripped by the caller.
-fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
-    fn idx(b: u8) -> Option<u32> {
-        match b {
-            b'A'..=b'Z' => Some((b - b'A') as u32),
-            b'a'..=b'z' => Some((b - b'a' + 26) as u32),
-            b'0'..=b'9' => Some((b - b'0' + 52) as u32),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    // Trim trailing `=` padding (0–2) and any extra `=` we tolerate.
-    let mut end = input.len();
-    while end > 0 && input[end - 1] == b'=' {
-        end -= 1;
-    }
-    let data = &input[..end];
-    let capacity = data.len().checked_mul(3)?.checked_div(4)?;
-    let mut out = Vec::new();
-    out.try_reserve_exact(capacity).ok()?;
-    let mut buf: u32 = 0;
-    let mut bits = 0u32;
-    for &b in data {
-        let v = idx(b)?;
-        buf = (buf << 6) | v;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8);
-            buf &= (1u32 << bits) - 1;
-        }
-    }
-    Some(out)
-}
-
-fn checked_image_layout(
-    width: u32,
-    height: u32,
-    source_channels: usize,
-) -> Result<ImageLayout, ImageError> {
-    if width == 0 || height == 0 || !matches!(source_channels, 3 | 4) {
-        return Err(ImageError::Invalid);
-    }
-    if width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
-        return Err(ImageError::TooLarge);
-    }
-
-    let width_usize = usize::try_from(width).map_err(|_| ImageError::TooLarge)?;
-    let height_usize = usize::try_from(height).map_err(|_| ImageError::TooLarge)?;
-    let width_i32 = i32::try_from(width).map_err(|_| ImageError::TooLarge)?;
-    let height_i32 = i32::try_from(height).map_err(|_| ImageError::TooLarge)?;
-    let pixels = width_usize
-        .checked_mul(height_usize)
-        .ok_or(ImageError::TooLarge)?;
-    let source_bytes = pixels
-        .checked_mul(source_channels)
-        .ok_or(ImageError::TooLarge)?;
-    let output_bytes = pixels.checked_mul(4).ok_or(ImageError::TooLarge)?;
-    let stride = width_usize.checked_mul(4).ok_or(ImageError::TooLarge)?;
-    if source_bytes > MAX_DECODED_IMAGE_BYTES || output_bytes > MAX_DECODED_IMAGE_BYTES {
-        return Err(ImageError::TooLarge);
-    }
-
-    Ok(ImageLayout {
-        width: width_i32,
-        height: height_i32,
-        source_bytes,
-        output_bytes,
-        stride,
-    })
-}
-
-/// Read PNG dimensions before invoking GDK. A tiny compressed payload can
-/// otherwise advertise a huge canvas and make the image loader allocate it.
-fn png_layout(bytes: &[u8]) -> Result<ImageLayout, ImageError> {
-    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
-    const IHDR_LEN: u32 = 13;
-
-    if bytes.len() < 24
-        || &bytes[..8] != PNG_SIGNATURE
-        || u32::from_be_bytes(bytes[8..12].try_into().map_err(|_| ImageError::Invalid)?) != IHDR_LEN
-        || &bytes[12..16] != b"IHDR"
-    {
-        return Err(ImageError::Invalid);
-    }
-    let width = u32::from_be_bytes(bytes[16..20].try_into().map_err(|_| ImageError::Invalid)?);
-    let height = u32::from_be_bytes(bytes[20..24].try_into().map_err(|_| ImageError::Invalid)?);
-    // GDK exposes a four-byte-per-pixel texture regardless of the PNG's source
-    // color type, so use RGBA for the decoded allocation budget.
-    checked_image_layout(width, height, 4)
-}
-
-/// Decode a PNG payload into a gdk::Texture via the bundled GdkPixbuf loader.
-fn png_to_texture(bytes: Vec<u8>) -> Result<gdk::Texture, ImageError> {
-    if bytes.len() > MAX_ENCODED_BYTES {
-        return Err(ImageError::TooLarge);
-    }
-    let _layout = png_layout(&bytes)?;
-    let gbytes = glib::Bytes::from_owned(bytes);
-    gdk::Texture::from_bytes(&gbytes).map_err(|_| ImageError::Invalid)
-}
-
-/// Build a texture from raw RGB(A) pixels. `has_alpha=false` expands each
-/// 3-byte pixel to 4 bytes with full opacity, matching the kitty protocol's
-/// `f=24` semantics.
-fn rgba_to_texture(
-    width: u32,
-    height: u32,
-    data: &[u8],
-    has_alpha: bool,
-) -> Result<gdk::Texture, ImageError> {
-    let source_channels = if has_alpha { 4 } else { 3 };
-    let layout = checked_image_layout(width, height, source_channels)?;
-    if data.len() < layout.source_bytes {
-        return Err(ImageError::Invalid);
-    }
-
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(layout.output_bytes)
-        .map_err(|_| ImageError::TooLarge)?;
-    if has_alpha {
-        bytes.extend_from_slice(&data[..layout.source_bytes]);
-    } else {
-        for px in data[..layout.source_bytes].chunks_exact(3) {
-            bytes.extend_from_slice(&[px[0], px[1], px[2], 0xFF]);
-        }
-    }
-    debug_assert_eq!(bytes.len(), layout.output_bytes);
-
-    let gbytes = glib::Bytes::from_owned(bytes);
-    Ok(gdk::MemoryTexture::new(
-        layout.width,
-        layout.height,
-        gdk::MemoryFormat::R8g8b8a8,
-        &gbytes,
-        layout.stride,
-    )
-    .upcast())
 }
 
 #[cfg(test)]
@@ -576,61 +370,46 @@ mod tests {
         bytes.extend_from_slice(b"IHDR");
         bytes.extend_from_slice(&width.to_be_bytes());
         bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
         bytes
     }
 
-    #[test]
-    fn base64_round_trip() {
-        let cases: &[(&[u8], &[u8])] = &[
-            (b"", b""),
-            (b"f", b"Zg=="),
-            (b"fo", b"Zm8="),
-            (b"foo", b"Zm9v"),
-            (b"foob", b"Zm9vYg=="),
-            (b"hello world", b"aGVsbG8gd29ybGQ="),
-        ];
-        for (plain, encoded) in cases {
-            let got = decode_base64(encoded).expect("valid base64");
-            assert_eq!(&got, plain);
-        }
+    fn feed(payload: &[u8]) -> Outcome {
+        Assembler::new().feed(payload)
     }
 
-    #[test]
-    fn base64_rejects_garbage() {
-        assert!(decode_base64(b"!!!!").is_none());
-    }
+    // ---- shared caps -----------------------------------------------------
 
     #[test]
-    fn key_parser_handles_whitespace_and_empty() {
-        let m = parse_keys(b"a=T,f=100,i=42,m=1");
-        assert_eq!(m.get("a").copied(), Some("T"));
-        assert_eq!(m.get("f").copied(), Some("100"));
-        assert_eq!(m.get("i").copied(), Some("42"));
-        assert_eq!(m.get("m").copied(), Some("1"));
-        assert_eq!(m.get("q").copied(), None);
+    fn the_block_budget_is_the_shared_block_preset() {
+        assert_eq!(MAX_PENDING_BYTES_PER_BLOCK, 16 * 1024 * 1024);
+        assert_eq!(CAPS, Caps::BLOCK);
+        assert_eq!(CAPS.max_dimension, 16_384);
     }
+
+    // ---- outcomes --------------------------------------------------------
 
     #[test]
     fn rejects_non_g_payload() {
-        let mut a = Assembler::new();
-        assert!(matches!(a.feed(b""), Outcome::Invalid));
-        assert!(matches!(a.feed(b"X"), Outcome::Invalid));
+        assert!(matches!(feed(b""), Outcome::Invalid));
+        assert!(matches!(feed(b"X"), Outcome::Invalid));
     }
 
     #[test]
     fn unsupported_action_is_skipped() {
-        let mut a = Assembler::new();
-        assert!(matches!(a.feed(b"Ga=d,i=1;"), Outcome::Skipped));
-        assert!(matches!(a.feed(b"Ga=p,i=1;"), Outcome::Skipped));
+        assert!(matches!(feed(b"Ga=d,i=1;"), Outcome::Skipped));
+        assert!(matches!(feed(b"Ga=p,i=1;"), Outcome::Skipped));
     }
 
     #[test]
     fn file_transport_is_skipped() {
-        let mut a = Assembler::new();
         assert!(matches!(
-            a.feed(b"Ga=T,t=f;L3RtcC9hLnBuZw=="),
+            feed(b"Ga=T,f=100,t=f;L3RtcC9hLnBuZw=="),
             Outcome::Skipped
         ));
+        // t=t and t=s are recognised and refused the same way.
+        assert!(matches!(feed(b"Ga=T,f=100,t=t,i=1;AAAA"), Outcome::Skipped));
+        assert!(matches!(feed(b"Ga=T,f=100,t=s,i=1;AAAA"), Outcome::Skipped));
     }
 
     #[test]
@@ -640,15 +419,137 @@ mod tests {
         // Split across two chunks via m=1 / m=0.
         let first = a.feed(b"Ga=T,f=24,s=1,v=1,i=7,m=1;/w");
         assert!(matches!(first, Outcome::Pending));
-        let second = a.feed(b"Ga=T,i=7,m=0;AA");
+        // Continuations carry only m= (and optionally q=): repeating the
+        // metadata would start a second upload for i=7.
+        let second = a.feed(b"Gm=0;AA");
         match second {
             Outcome::Complete(_) => {}
             _ => panic!("expected complete texture"),
         }
-        // Assembler state cleared after completion.
-        assert!(a.in_flight.is_empty());
-        assert!(a.anon.is_none());
     }
+
+    #[test]
+    fn a_continuation_that_repeats_metadata_is_invalid() {
+        // Standardized by the shared parser: the protocol sends metadata on the
+        // first chunk only, so a second one is a client that lost track of its
+        // own transfer.
+        let mut a = Assembler::new();
+        assert!(matches!(
+            a.feed(b"Ga=T,f=24,s=1,v=1,i=7,m=1;/w"),
+            Outcome::Pending
+        ));
+        assert!(matches!(a.feed(b"Ga=T,i=7,m=0;AA"), Outcome::Invalid));
+        // The abort clears the slot, so an honest retry still works.
+        assert!(matches!(
+            a.feed(b"Ga=T,f=24,s=1,v=1,i=7,m=1;/w"),
+            Outcome::Pending
+        ));
+        assert!(matches!(a.feed(b"Gm=0;AA"), Outcome::Complete(_)));
+    }
+
+    #[test]
+    fn transmit_only_uploads_are_reported_separately() {
+        assert!(matches!(
+            feed(b"Ga=t,f=32,s=1,v=1,i=4;AQIDBA=="),
+            Outcome::CompleteTransmitOnly
+        ));
+        assert!(matches!(
+            feed(b"Ga=T,f=32,s=1,v=1,i=4;AQIDBA=="),
+            Outcome::Complete(_)
+        ));
+    }
+
+    #[test]
+    fn reset_drops_in_flight_uploads() {
+        let mut a = Assembler::new();
+        assert!(matches!(
+            a.feed(b"Ga=T,f=32,s=1,v=1,i=9,m=1;AQID"),
+            Outcome::Pending
+        ));
+        a.reset();
+        // Nothing is in flight, so the continuation has nowhere to land.
+        assert!(matches!(a.feed(b"Gm=0;BA=="), Outcome::Invalid));
+    }
+
+    // ---- standardizations adopted from the shared module -----------------
+
+    #[test]
+    fn format_now_defaults_to_rgba_not_png() {
+        // Pre-hoist jterm4 defaulted f= to PNG; the protocol default is RGBA,
+        // so an f=-less command now means "raw RGBA, s=/v= required".
+        assert!(matches!(
+            feed(b"Ga=T,i=5,s=1,v=1;AQIDBA=="),
+            Outcome::Complete(_)
+        ));
+        // …and without s=/v= it is a malformed raw transfer, not a PNG.
+        assert!(matches!(feed(b"Ga=T,i=5;AQIDBA=="), Outcome::Invalid));
+    }
+
+    #[test]
+    fn raw_payload_length_must_match_exactly() {
+        // Trailing slack used to be accepted; it no longer is.
+        assert!(matches!(
+            feed(b"Ga=T,f=32,i=13,s=1,v=1;AQIDBAU="),
+            Outcome::Invalid
+        ));
+        assert!(matches!(
+            feed(b"Ga=T,f=32,i=13,s=1,v=1;AQID"),
+            Outcome::Invalid
+        ));
+        assert!(matches!(
+            feed(b"Ga=T,f=32,i=13,s=1,v=1;AQIDBA=="),
+            Outcome::Complete(_)
+        ));
+    }
+
+    #[test]
+    fn non_standard_format_aliases_are_not_supported() {
+        for alias in ["png", "jpeg", "rgba", "0"] {
+            let payload = format!("Ga=T,i=1,f={alias},s=1,v=1;AQIDBA==");
+            assert!(
+                matches!(feed(payload.as_bytes()), Outcome::Skipped),
+                "{alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn id_and_number_are_mutually_exclusive() {
+        assert!(matches!(
+            feed(b"Ga=T,f=32,i=1,I=2,s=1,v=1;AQIDBA=="),
+            Outcome::Invalid
+        ));
+    }
+
+    #[test]
+    fn base64_rejects_garbage_interior_padding_and_impossible_lengths() {
+        assert!(matches!(
+            feed(b"Ga=T,f=32,i=1,s=1,v=1;!!!!"),
+            Outcome::Invalid
+        ));
+        // Interior padding.
+        assert!(matches!(
+            feed(b"Ga=T,f=32,i=1,s=1,v=1;AQ=IDBA=="),
+            Outcome::Invalid
+        ));
+        // len % 4 == 1 is not a possible base64 encoding.
+        assert!(matches!(
+            feed(b"Ga=T,f=32,i=1,s=1,v=1;AQIDB"),
+            Outcome::Invalid
+        ));
+    }
+
+    #[test]
+    fn embedded_whitespace_is_stripped_across_chunks() {
+        let mut a = Assembler::new();
+        assert!(matches!(
+            a.feed(b"Ga=T,f=32,i=14,s=1,v=1,m=1;AQ\r\n"),
+            Outcome::Pending
+        ));
+        assert!(matches!(a.feed(b"Gm=0; ID  BA== \n"), Outcome::Complete(_)));
+    }
+
+    // ---- caps ------------------------------------------------------------
 
     #[test]
     fn oversized_raw_dimensions_are_skipped_without_overflow() {
@@ -658,34 +559,34 @@ mod tests {
             b"Ga=T,f=32,s=16385,v=1;AAAA",
         ];
         for payload in cases {
-            let mut assembler = Assembler::new();
-            assert!(matches!(assembler.feed(payload), Outcome::Skipped));
+            assert!(matches!(feed(payload), Outcome::Skipped));
         }
     }
 
     #[test]
-    fn checked_layout_enforces_decoded_byte_budget() {
-        let at_limit = checked_image_layout(2048, 2048, 4).expect("16 MiB RGBA fits");
-        assert_eq!(at_limit.output_bytes, MAX_DECODED_IMAGE_BYTES);
+    fn zero_dimensions_are_invalid_not_oversize() {
         assert!(matches!(
-            checked_image_layout(2049, 2048, 4),
-            Err(ImageError::TooLarge)
-        ));
-        assert!(matches!(
-            checked_image_layout(u32::MAX, 1, 4),
-            Err(ImageError::TooLarge)
+            feed(b"Ga=T,f=32,i=1,s=0,v=1;AAAA"),
+            Outcome::Invalid
         ));
     }
 
     #[test]
     fn oversized_png_ihdr_is_skipped_before_gdk_decode() {
-        let encoded = encode_base64(&png_header(MAX_IMAGE_DIMENSION + 1, 1));
+        let encoded = encode_base64(&png_header(CAPS.max_dimension + 1, 1));
         let mut payload = b"Ga=T,f=100;".to_vec();
         payload.extend_from_slice(&encoded);
-
-        let mut assembler = Assembler::new();
-        assert!(matches!(assembler.feed(&payload), Outcome::Skipped));
+        assert!(matches!(feed(&payload), Outcome::Skipped));
     }
+
+    #[test]
+    fn f100_that_is_not_a_png_is_invalid() {
+        let mut payload = b"Ga=T,f=100,i=2;".to_vec();
+        payload.extend_from_slice(&encode_base64(b"not a PNG at all"));
+        assert!(matches!(feed(&payload), Outcome::Invalid));
+    }
+
+    // ---- a=q support probe -----------------------------------------------
 
     #[test]
     fn query_probe_validates_raw_pixels() {
@@ -698,30 +599,53 @@ mod tests {
             response_for(payload, &outcome).as_deref(),
             Some(b"\x1b_Gi=31;OK\x1b\\".as_slice())
         );
-        // Probes never buffer anything.
-        assert!(a.in_flight.is_empty());
-        assert!(a.anon.is_none());
+    }
+
+    #[test]
+    fn query_probe_validates_a_png_sample() {
+        let mut payload = b"Ga=q,i=32,f=100;".to_vec();
+        payload.extend_from_slice(&encode_base64(&png_header(1, 1)));
+        assert!(matches!(feed(&payload), Outcome::QueryOk));
     }
 
     #[test]
     fn query_probe_rejects_bad_or_oversize_payloads() {
-        let mut a = Assembler::new();
         // Undecodable body.
         assert!(matches!(
-            a.feed(b"Ga=q,i=1,s=1,v=1,f=24;!!!!"),
+            feed(b"Ga=q,i=1,s=1,v=1,f=24;!!!!"),
             Outcome::Invalid
         ));
-        // Payload shorter than the advertised dimensions.
+        // Payload that does not match the advertised dimensions.
         assert!(matches!(
-            a.feed(b"Ga=q,i=1,s=2,v=2,f=24;AAAA"),
+            feed(b"Ga=q,i=1,s=2,v=2,f=24;AAAA"),
             Outcome::Invalid
         ));
+        // Empty body.
+        assert!(matches!(feed(b"Ga=q,i=1,s=1,v=1,f=24;"), Outcome::Invalid));
         // Dimensions beyond the family cap.
         assert!(matches!(
-            a.feed(b"Ga=q,i=1,s=16385,v=1,f=32;AAAA"),
+            feed(b"Ga=q,i=1,s=16385,v=1,f=32;AAAA"),
+            Outcome::Skipped
+        ));
+        // Non-direct transports are refused before anything is decoded.
+        assert!(matches!(
+            feed(b"Ga=q,i=1,s=1,v=1,f=24,t=f;AAAA"),
             Outcome::Skipped
         ));
     }
+
+    #[test]
+    fn a_probe_never_buffers_anything() {
+        let mut a = Assembler::new();
+        assert!(matches!(
+            a.feed(b"Ga=q,i=31,s=1,v=1,f=24;AAAA"),
+            Outcome::QueryOk
+        ));
+        // Nothing was stored, so a bare continuation has nowhere to land.
+        assert!(matches!(a.feed(b"Gm=0;AAAA"), Outcome::Invalid));
+    }
+
+    // ---- responder -------------------------------------------------------
 
     #[test]
     fn responses_require_an_identifier() {
@@ -733,6 +657,7 @@ mod tests {
             response_for(b"Ga=T;AAAA", &Outcome::CompleteTransmitOnly),
             None
         );
+        assert_eq!(response_for(b"not graphics", &Outcome::Invalid), None);
     }
 
     #[test]
@@ -755,6 +680,28 @@ mod tests {
                 b"\x1b_Gi=5,p=17;ENOTSUP:action, format, transport, or size not supported\x1b\\"
                     .as_slice()
             )
+        );
+    }
+
+    #[test]
+    fn responses_answer_commands_the_shared_parser_rejected() {
+        // The reply keys are scanned leniently on purpose: a client blocked on
+        // its i= must hear EINVAL even when the command never parsed.
+        let payload = b"Ga=T,i=1,I=2,s=1,v=1,f=32;AQIDBA==";
+        let outcome = feed(payload);
+        assert!(matches!(outcome, Outcome::Invalid));
+        assert_eq!(
+            response_for(payload, &outcome).as_deref(),
+            Some(b"\x1b_Gi=1,I=2;EINVAL:invalid graphics payload\x1b\\".as_slice())
+        );
+    }
+
+    #[test]
+    fn responses_ignore_base64_padding_in_the_data_section() {
+        // Splitting once at ';' keeps `=` padding out of the control scan.
+        assert_eq!(
+            response_for(b"Ga=T,i=8;AQIDBA==", &Outcome::Invalid).as_deref(),
+            Some(b"\x1b_Gi=8;EINVAL:invalid graphics payload\x1b\\".as_slice())
         );
     }
 
