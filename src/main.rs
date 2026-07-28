@@ -14,13 +14,14 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::config::{choose_shell_argv, config_file_path, load_config, load_safe_config};
-use crate::keybindings::{normalize_key, Action, KeyCombo};
+use crate::keybindings::Action;
 use crate::logging::init_logging;
 use crate::state::{
     finalize_tabs_state, kill_all_terminal_children, load_tabs_state, save_tabs_state,
 };
 use crate::terminal::terminal_working_directory;
 use crate::ui::{self, UiState};
+use jterm_core::keybindings::{Chord, KeySym, Mods, NamedKey};
 
 /// GApplication receives only a program name. All real launch arguments are
 /// consumed by `cli::handle_early_args` before GTK is initialized.
@@ -30,6 +31,83 @@ const TAB_SWITCH_FOCUS_MAX_FRAMES: u8 = 16;
 
 fn shortcut_modifiers(state: ModifierType) -> ModifierType {
     state & (ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK | ModifierType::ALT_MASK)
+}
+
+/// GTK edge: translate a gdk key event into the family's toolkit-neutral
+/// [`Chord`], or `None` for keys no chord can bind.
+///
+/// The GTK-only facts live here, not in the shared grammar:
+///
+/// - `ISO_Left_Tab` (what GTK reports for Shift+Tab) folds to `Tab` so one
+///   chord entry covers both.
+/// - Only the masked Ctrl/Shift/Alt modifiers participate; Super chords are
+///   not offered on this frontend.
+/// - Keypad keysyms (`KP_*`) are excluded rather than folded onto the main
+///   row — jterm4 has never matched chords on the numpad, and `KP_Enter`
+///   stays distinct from `Return` (the AI-composer veto above the lookup
+///   handles both explicitly).
+/// - Letters and symbols go through `Key::to_unicode()` and are lowercased,
+///   matching the chord core's storage invariant.
+/// - `F1`..`F24` are recognized via the keysym name.
+fn chord_from_gdk(keyval: Key, state: ModifierType) -> Option<Chord> {
+    let masked = shortcut_modifiers(state);
+    let mods = Mods {
+        ctrl: masked.contains(ModifierType::CONTROL_MASK),
+        shift: masked.contains(ModifierType::SHIFT_MASK),
+        alt: masked.contains(ModifierType::ALT_MASK),
+        sup: false,
+    };
+    let key = match keyval {
+        Key::Tab | Key::ISO_Left_Tab => KeySym::Named(NamedKey::Tab),
+        Key::Escape => KeySym::Named(NamedKey::Escape),
+        Key::Return => KeySym::Named(NamedKey::Return),
+        Key::space => KeySym::Named(NamedKey::Space),
+        Key::BackSpace => KeySym::Named(NamedKey::Backspace),
+        Key::Delete => KeySym::Named(NamedKey::Delete),
+        Key::Home => KeySym::Named(NamedKey::Home),
+        Key::End => KeySym::Named(NamedKey::End),
+        Key::Insert => KeySym::Named(NamedKey::Insert),
+        Key::Page_Up => KeySym::Named(NamedKey::PageUp),
+        Key::Page_Down => KeySym::Named(NamedKey::PageDown),
+        Key::Up => KeySym::Named(NamedKey::Up),
+        Key::Down => KeySym::Named(NamedKey::Down),
+        Key::Left => KeySym::Named(NamedKey::Left),
+        Key::Right => KeySym::Named(NamedKey::Right),
+        other => {
+            let name = other.name();
+            if let Some(n) = name.as_deref().and_then(function_key_number) {
+                KeySym::Function(n)
+            } else if name.as_deref().is_some_and(|n| n.starts_with("KP_")) {
+                return None;
+            } else {
+                let c = other.to_unicode()?;
+                if c.is_control() {
+                    return None;
+                }
+                // Store Unicode-lowercased, mirroring the parser; reject
+                // multi-char lowerings the same way it does.
+                let mut low = c.to_lowercase();
+                match (low.next(), low.next()) {
+                    (Some(lc), None) => KeySym::Char(lc),
+                    _ => return None,
+                }
+            }
+        }
+    };
+    Some(Chord { mods, key })
+}
+
+/// `F1`..`F24` from a gdk keysym name; anything else (including `F25`+ and
+/// names that merely start with `F`) is not a bindable function key.
+fn function_key_number(name: &str) -> Option<u8> {
+    let digits = name.strip_prefix('F')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    match digits.parse::<u8>() {
+        Ok(n @ 1..=24) => Some(n),
+        _ => None,
+    }
 }
 
 /// A shortcut which must let its trigger key finish dispatching before
@@ -937,30 +1015,28 @@ pub fn run() -> glib::ExitCode {
             {
                 return false.into();
             }
-            // Mask to only the modifier keys we care about
-            let mods = shortcut_modifiers(state);
-            let combo = KeyCombo {
-                modifiers: mods,
-                key: normalize_key(keyval),
+            // The gdk edge folds the event into the shared chord form
+            // (masked modifiers, ISO_Left_Tab → Tab, lowercased unicode).
+            let Some(chord) = chord_from_gdk(keyval, state) else {
+                return false.into();
             };
 
             let action = {
                 let bindings = ui_clone.keybinding_map.borrow();
-                bindings.lookup(&combo).or_else(|| {
+                bindings.lookup(&chord).or_else(|| {
                     // Alt modifies Copy into "copy block output". The binding
                     // map is intentionally exact, so retry only this one
                     // documented variant without Alt instead of making every
                     // shortcut accidentally accept extra modifiers.
-                    if mods.contains(
-                        ModifierType::CONTROL_MASK
-                            | ModifierType::SHIFT_MASK
-                            | ModifierType::ALT_MASK,
-                    ) {
-                        let copy_combo = KeyCombo {
-                            modifiers: mods & !ModifierType::ALT_MASK,
-                            key: normalize_key(keyval),
+                    if chord.mods.ctrl && chord.mods.shift && chord.mods.alt {
+                        let copy_chord = Chord {
+                            mods: Mods {
+                                alt: false,
+                                ..chord.mods
+                            },
+                            key: chord.key,
                         };
-                        (bindings.lookup(&copy_combo) == Some(Action::Copy))
+                        (bindings.lookup(&copy_chord) == Some(Action::Copy))
                             .then_some(Action::Copy)
                     } else {
                         None
@@ -969,7 +1045,7 @@ pub fn run() -> glib::ExitCode {
             };
 
             if let Some(action) = action {
-                log::debug!("window shortcut matched: {action:?} ({combo:?})");
+                log::debug!("window shortcut matched: {action:?} ({chord:?})");
                 match action {
                     Action::NewTab => {
                         // Keep the old VTE/IME context focused until it has seen
@@ -1397,6 +1473,75 @@ pub fn run() -> glib::ExitCode {
 #[cfg(test)]
 mod tests {
     use crate::keybindings::Action;
+
+    mod gdk_chord_edge {
+        //! The gdk → [`Chord`] translation is pure data (no GTK runtime),
+        //! so its GTK-only facts are pinned here: ISO_Left_Tab folding,
+        //! keypad exclusion, unicode lowercasing, and F-key naming.
+        use super::super::chord_from_gdk;
+        use gtk4::gdk::{Key, ModifierType};
+        use jterm_core::keybindings::parse;
+
+        const CTRL: ModifierType = ModifierType::CONTROL_MASK;
+        const CTRL_SHIFT: ModifierType = ModifierType::CONTROL_MASK.union(ModifierType::SHIFT_MASK);
+
+        #[test]
+        fn events_translate_to_the_same_chords_config_strings_parse_to() {
+            let cases: &[(Key, ModifierType, &str)] = &[
+                // Shifted letters arrive uppercase from GTK.
+                (Key::T, CTRL_SHIFT, "Ctrl+Shift+T"),
+                (Key::t, CTRL, "Ctrl+T"),
+                // Shift+Tab arrives as ISO_Left_Tab and folds to Tab.
+                (Key::ISO_Left_Tab, CTRL_SHIFT, "Ctrl+Shift+Tab"),
+                (Key::Tab, CTRL, "Ctrl+Tab"),
+                // Shifted digit rows deliver the symbol keysym.
+                (Key::exclam, CTRL_SHIFT, "Ctrl+Shift+!"),
+                (Key::equal, CTRL, "Ctrl+="),
+                (Key::backslash, CTRL, "Ctrl+backslash"),
+                // Main-row digits.
+                (Key::_1, CTRL, "Ctrl+1"),
+                (Key::_0, CTRL, "Ctrl+0"),
+                // Named keys and function keys.
+                (Key::Page_Up, CTRL, "Ctrl+PageUp"),
+                (Key::Return, CTRL, "Ctrl+Enter"),
+                (Key::F12, ModifierType::empty(), "F12"),
+            ];
+            for (keyval, state, chord_str) in cases {
+                let want = parse(chord_str).expect("test chord parses");
+                assert_eq!(
+                    chord_from_gdk(*keyval, *state),
+                    Some(want),
+                    "{keyval:?} + {state:?} must translate to {chord_str}"
+                );
+            }
+        }
+
+        #[test]
+        fn irrelevant_modifier_bits_are_masked_out() {
+            let noisy = CTRL_SHIFT | ModifierType::LOCK_MASK | ModifierType::BUTTON1_MASK;
+            assert_eq!(
+                chord_from_gdk(Key::T, noisy),
+                Some(parse("Ctrl+Shift+T").unwrap())
+            );
+        }
+
+        #[test]
+        fn keypad_keysyms_are_not_folded_onto_the_main_row() {
+            // jterm4 has never matched chords on the numpad; keep that
+            // until the family folds numpad digits at every frontend.
+            assert_eq!(chord_from_gdk(Key::KP_1, CTRL), None);
+            assert_eq!(chord_from_gdk(Key::KP_Enter, CTRL), None);
+            assert_eq!(chord_from_gdk(Key::KP_Add, CTRL), None);
+        }
+
+        #[test]
+        fn modifier_only_and_unmappable_keysyms_produce_no_chord() {
+            assert_eq!(chord_from_gdk(Key::Control_L, CTRL), None);
+            assert_eq!(chord_from_gdk(Key::Shift_L, CTRL_SHIFT), None);
+            // F25 exists as a keysym but is outside the family's F1..F24.
+            assert_eq!(chord_from_gdk(Key::F25, ModifierType::empty()), None);
+        }
+    }
 
     #[test]
     fn gtk_receives_only_the_sanitized_program_name() {

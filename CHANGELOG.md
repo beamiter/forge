@@ -77,6 +77,11 @@ All notable user-visible and operational changes are recorded here.
 - Live Chat/Agent activity and the Agent core transcript are now independently bounded; compaction preserves in-flight questions, Block output truncation is visible, and memory-only Ask Block retries become durable draft/context during shutdown.
 - Agent pane environment metadata moved out of the system prompt into bounded untrusted user-role JSON; edited approvals preserve exact whitespace and dangerous-command recognition handles common `env`/`command`, assignment, and Git global-option wrappers.
 - Temporary round-two source-export workflows and marker files were removed.
+- 快捷键 chord 的解析/显示迁移到家族共享的 `jterm_core::keybindings`：配置里的 chord 语法按家族并集放宽——新增 `control`/`option`/`cmd`/`win`/`meta` 等修饰键别名、`esc`/`del`/`ins`/箭头等按键别名、`f1..f24`、更多符号名与 Unicode 字母，重复修饰键（含别名，如 `ctrl+control+t`）现在会被报错拒绝；解除绑定除 false、空串、"none"、"disabled" 外新增 "unbind"。`--doctor`/加载期的 chord 静态校验与运行时覆写走同一解析器，校验通过的 chord 必定能生效（此前两边各自实现可能不一致）。显示形式保持既有的 `Ctrl+Shift+Alt+…` 修饰键顺序与 `Enter` 拼写不变；唯一变化是侧栏快捷键现在显示为 `Ctrl+\` 而非泄漏 X11 keysym 名的 `Ctrl+backslash`（配置里两种写法都照常解析）。默认键位与冲突拒绝策略不变，新增测试钉住家族 38 项默认 chord 契约；示例配置中 resize/AI 面板 chord 注释改为与显示一致的 `Ctrl+Shift+Alt+…` 顺序。旧配置里任意 X11 keysym 名（如 `Menu`）作为键名的写法不再被接受，会在加载时得到明确警告。
+
+### Fixed
+
+- Block 模式的动态颜色查询（OSC 10/11/12 `?`）不再返回过期的主题色：应用通过 OSC 10/11/12 设置前景/背景/光标色后（主题切换工具、vim `background=` 探测等；原始字节仍照常透传，live VTE 原生变色），共享解析器现在发出 `ColorSet`/`ColorReset` 事件，每个 pane 据此跟踪动态覆盖值——支持 `#RRGGBB` 十六进制、X11 `rgb:R/G/B`（每通道 1–4 位十六进制，按 XParseColor 语义缩放）与颜色名，无法解析的值忽略——后续查询以既有的 `rgb:RRRR/GGGG/BBBB` 格式回答动态值，OSC 110/111/112 复位后回落到主题色。动态前景/背景生效期间新完成的 Block 快照 VTE 也叠加同一覆盖色，不再与已变色的 live 视图形成明显割裂。
 
 ### Security
 

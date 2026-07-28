@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::keybindings::{KeyCombo, KeybindingMap};
+use crate::keybindings::KeybindingMap;
 
 // ---------------------------------------------------------------------------
 // Terminal Mode
@@ -1040,7 +1040,9 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
                 .into_iter()
                 .filter_map(|action| action.config_key())
                 .collect();
-            let mut chords: HashMap<KeyCombo, &str> = HashMap::new();
+            // Same parser the runtime override path uses, so a chord that
+            // validates here can never fail to load later (and vice versa).
+            let mut chords: HashMap<jterm_core::keybindings::Chord, &str> = HashMap::new();
             for (action, value) in bindings {
                 let path = format!("keybindings.{action}");
                 if !known.contains(action.as_str()) {
@@ -1059,13 +1061,10 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
                     );
                     continue;
                 };
-                if chord.trim().is_empty()
-                    || chord.eq_ignore_ascii_case("none")
-                    || chord.eq_ignore_ascii_case("disabled")
-                {
+                if jterm_core::keybindings::is_unbind_token(chord) {
                     continue;
                 }
-                match crate::keybindings::parse_key_combo(chord) {
+                match jterm_core::keybindings::parse(chord) {
                     Ok(combo) => {
                         if let Some(previous) = chords.insert(combo, action) {
                             config_issue(
@@ -1076,7 +1075,7 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
                             );
                         }
                     }
-                    Err(err) => config_issue(&mut issues, Error, &path, err),
+                    Err(err) => config_issue(&mut issues, Error, &path, err.to_string()),
                 }
             }
         } else {

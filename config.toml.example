@@ -112,7 +112,7 @@ ai_redact_secrets = true
 # cursor_foreground = "#1b315e"
 
 # 快捷键 ---------------------------------------------------------------------
-# 值可为快捷键字符串；false、"none" 或 "disabled" 可解除绑定。
+# 值可为快捷键字符串；false、"none"、"disabled" 或 "unbind" 可解除绑定。
 # 完整 action 名称可在命令面板（Ctrl+Shift+P）中查看。
 
 # [keybindings]
@@ -140,11 +140,11 @@ ai_redact_secrets = true
 # focus_pane_right = "Ctrl+Alt+Right"
 # focus_pane_up = "Ctrl+Alt+Up"
 # focus_pane_down = "Ctrl+Alt+Down"
-# resize_pane_left = "Ctrl+Alt+Shift+Left"
-# resize_pane_right = "Ctrl+Alt+Shift+Right"
-# resize_pane_up = "Ctrl+Alt+Shift+Up"
-# resize_pane_down = "Ctrl+Alt+Shift+Down"
-# toggle_ai_panel = "Ctrl+Alt+Shift+A"
+# resize_pane_left = "Ctrl+Shift+Alt+Left"
+# resize_pane_right = "Ctrl+Shift+Alt+Right"
+# resize_pane_up = "Ctrl+Shift+Alt+Up"
+# resize_pane_down = "Ctrl+Shift+Alt+Down"
+# toggle_ai_panel = "Ctrl+Shift+Alt+A"
 # open_agent = "Ctrl+Alt+G"
 
 # SSH 远程主机（可重复；默认不会注入任何个人地址） --------------------------
