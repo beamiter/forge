@@ -2872,6 +2872,30 @@ fn visible_indices_for_viewport(vp: &ViewportState) -> std::collections::HashSet
     new_visible
 }
 
+/// Visibility with hysteresis. Toggling a card's virtualization changes
+/// document geometry; when the view is pinned at the bottom, GTK clamps the
+/// scroll value to the shrunken `upper`, and that value change schedules
+/// another visibility pass. Recomputed from the clamped value, a card sitting
+/// exactly on the window boundary flips back, moving the geometry again — a
+/// self-sustaining two-frame oscillation while the terminal is otherwise idle.
+///
+/// Cards inside the strict window always render; already-rendered cards keep
+/// rendering until they leave a window one margin page looser. Sub-page scroll
+/// jitter therefore can never toggle a card's state, and the feedback loop has
+/// no edge to travel.
+fn stable_visible_indices(
+    strict: &ViewportState,
+    loose: Option<&ViewportState>,
+    current: &std::collections::HashSet<usize>,
+) -> std::collections::HashSet<usize> {
+    let mut next = visible_indices_for_viewport(strict);
+    if let Some(loose) = loose {
+        let keep = visible_indices_for_viewport(loose);
+        next.extend(current.iter().copied().filter(|i| keep.contains(i)));
+    }
+    next
+}
+
 fn apply_visible_indices(
     finished: &[FinishedBlock],
     block_data: &mut VecDeque<BlockData>,
@@ -2884,6 +2908,19 @@ fn apply_visible_indices(
         if !should_render {
             if let Some(data) = block_data.get_mut(i) {
                 data.estimated_height = height;
+            }
+        } else {
+            // Keep the metadata document converged to real allocations for
+            // rendered cards too. The font-metric estimate drifts from the
+            // pixels GTK actually allocates, and the pixel→index mapping in
+            // `compute_viewport_state` accumulates that drift — enough of it
+            // moves the virtualization boundary onto cards that are still on
+            // screen.
+            let allocated = block.widget().height();
+            if allocated > 1 {
+                if let Some(data) = block_data.get_mut(i) {
+                    data.estimated_height = allocated;
+                }
             }
         }
     }
@@ -4667,18 +4704,31 @@ impl TermView {
                     // captured during switch-page. Mapping/allocation may have
                     // completed between the signal and this callback.
                     let adj = scroll.vadjustment();
+                    let margin = config.borrow().virtual_scroll_margin;
                     let block_data_ref = block_data.borrow();
                     let Some(next_viewport) = viewport_state_for_scroll(
                         &block_data_ref,
                         adj.value(),
                         adj.page_size(),
-                        config.borrow().virtual_scroll_margin,
+                        margin,
                     ) else {
                         return;
                     };
+                    // One extra margin page of hysteresis: see
+                    // `stable_visible_indices`.
+                    let loose_viewport = viewport_state_for_scroll(
+                        &block_data_ref,
+                        adj.value(),
+                        adj.page_size(),
+                        margin.saturating_add(1),
+                    );
                     drop(block_data_ref);
 
-                    let new_visible = visible_indices_for_viewport(&next_viewport);
+                    let new_visible = stable_visible_indices(
+                        &next_viewport,
+                        loose_viewport.as_ref(),
+                        &visible.borrow(),
+                    );
                     *vp.borrow_mut() = next_viewport;
 
                     let finished_ref = finished.borrow();
@@ -5488,7 +5538,7 @@ mod tests {
         history_edge_navigation_available, normalize_captured_command, normalize_loaded_block_ids,
         notification_allowed, output_has_vertical_repaint, parse_color_spec, record_external_input,
         resolve_submitted_command, scroll_delta_to_reveal, selected_command_text,
-        selected_id_range, should_buffer_background_output, strip_ansi,
+        selected_id_range, should_buffer_background_output, stable_visible_indices, strip_ansi,
         strip_ansi_with_clear_detect, take_background_output, truncate_plain_output_for_height,
         viewport_page_size_changed, viewport_state_for_scroll, visible_indices_for_viewport,
         BlockData, BlockState, BoundedByteRing, CommandPromptStatus, DynamicColors, ViewportState,
@@ -5935,6 +5985,41 @@ mod tests {
         assert_eq!(vp.first_visible, 2);
         assert_eq!(vp.last_visible, 3);
         assert_eq!(visible_indices_for_viewport(&vp), HashSet::from([2, 3]));
+    }
+
+    #[test]
+    fn boundary_jitter_cannot_toggle_a_rendered_block() {
+        let blocks: VecDeque<BlockData> =
+            std::iter::repeat_n(20, 10).map(block_with_height).collect();
+
+        // Pinned near the bottom with one margin page: blocks 4..=9 are strict.
+        let strict = viewport_state_for_scroll(&blocks, 120.0, 40.0, 1)
+            .expect("strict viewport should be valid");
+        let loose = viewport_state_for_scroll(&blocks, 120.0, 40.0, 2)
+            .expect("loose viewport should be valid");
+        assert_eq!(
+            visible_indices_for_viewport(&strict),
+            HashSet::from_iter(4..=9)
+        );
+
+        // Block 2 left the strict window after a sub-page clamp but is still
+        // inside the loose one: it must stay rendered instead of oscillating.
+        let current = HashSet::from_iter(2..=9);
+        let next = stable_visible_indices(&strict, Some(&loose), &current);
+        assert!(next.contains(&2));
+        assert_eq!(next, HashSet::from_iter(2..=9));
+
+        // A block outside even the loose window is released.
+        let far_away = HashSet::from([0]);
+        let next = stable_visible_indices(&strict, Some(&loose), &far_away);
+        assert!(!next.contains(&0));
+        assert_eq!(next, HashSet::from_iter(4..=9));
+
+        // Hysteresis only preserves rendered state; it never devirtualizes a
+        // band block that was already hidden.
+        let none_currently_visible = HashSet::new();
+        let next = stable_visible_indices(&strict, Some(&loose), &none_currently_visible);
+        assert_eq!(next, HashSet::from_iter(4..=9));
     }
 
     #[test]
