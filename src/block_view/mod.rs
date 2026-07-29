@@ -29,6 +29,7 @@ mod kitty_graphics;
 #[allow(dead_code)]
 mod palette;
 mod scroll;
+mod selection_hold;
 pub(crate) use alt_screen::*;
 pub(crate) use ansi::*;
 pub(crate) use blocks::*;
@@ -38,6 +39,7 @@ pub(crate) use find::*;
 #[allow(unused_imports)]
 pub(crate) use palette::*;
 pub(crate) use scroll::*;
+pub(crate) use selection_hold::*;
 
 // ── perf profiling (env JTERM_PROF=1) ───────────────────────────────────────
 pub(crate) fn prof_enabled() -> bool {
@@ -1261,6 +1263,10 @@ pub struct TermView {
     /// copied as one contiguous string via Ctrl+Shift+C.
     cross_selection: Rc<CrossSelection>,
     block_finished_callbacks: BlockFinishedCallbacks,
+    /// Parks PTY output while the user drag-selects on the live VTE; released
+    /// on copy/typing/timeout. Kept here so input and copy paths can resume
+    /// the feed immediately.
+    selection_feed_hold: Rc<SelectionFeedHold>,
 }
 
 impl Drop for TermView {
@@ -1349,6 +1355,9 @@ struct ReaderCtx {
     /// or anything else that changes branch/dirty/ahead-behind).
     repo_strip: gtk4::Label,
     block_finished_cbs: BlockFinishedCallbacks,
+    /// Parks incoming PTY chunks while the user drag-selects text on the live
+    /// VTE, so streaming repaints can't destroy the selection mid-drag.
+    selection_feed_hold: Rc<SelectionFeedHold>,
 }
 
 /// Fold every run of consecutive `ParserEvent::Bytes(_)` entries in `events`
@@ -1489,6 +1498,7 @@ impl ReaderCtx {
             layout_active_surface,
             repo_strip,
             block_finished_cbs,
+            selection_feed_hold,
         } = self;
         let active_alt_screen_mode_rc: Rc<Cell<Option<u32>>> = Rc::new(Cell::new(None));
         // Kitty graphics (APC G) — multi-chunk uploads assemble here; completed
@@ -1506,7 +1516,15 @@ impl ReaderCtx {
         // finished-block snapshots) match what the app actually set.
         let dynamic_colors_rc: Rc<Cell<DynamicColors>> =
             Rc::new(Cell::new(DynamicColors::default()));
-        pty.start_reader(
+        // Selection-hold triggers that live on the VTE itself (selection
+        // cleared, user typed). Wired before the pipeline closure below takes
+        // ownership of `active_vte`.
+        selection_feed_hold.install_vte_hooks(&active_vte);
+
+        // The whole per-chunk pipeline (parser → state machine → live-VTE
+        // feed) behind one re-callable handle, so the selection feed-hold can
+        // replay parked chunks through the exact path it intercepted them from.
+        let process_chunk: Rc<RefCell<dyn FnMut(Vec<u8>)>> = Rc::new(RefCell::new(
             move |data: Vec<u8>| {
                 let mut events = event_buf.borrow_mut();
                 events.clear();
@@ -1875,16 +1893,14 @@ impl ReaderCtx {
                                 let block_data_for_export = block_data_for_cb.clone();
                                 let block_scroll_for_menu = block_scroll_rc.downgrade();
                                 right_click.connect_pressed(move |gesture, _n_press, x, y| {
-                                    let Some(finished_blocks) =
-                                        finished_blocks_for_menu.upgrade()
+                                    let Some(finished_blocks) = finished_blocks_for_menu.upgrade()
                                     else {
                                         return;
                                     };
                                     let Some(vte_for_copy) = vte_for_copy.upgrade() else {
                                         return;
                                     };
-                                    let Some(finished_widget) =
-                                        finished_widget_for_menu.upgrade()
+                                    let Some(finished_widget) = finished_widget_for_menu.upgrade()
                                     else {
                                         return;
                                     };
@@ -2441,8 +2457,7 @@ impl ReaderCtx {
                                 .unwrap_or_default();
                             let prompt_display = prompt_display_rc.borrow().clone();
                             let typed_shadow = typed_cmd_rc.borrow().clone();
-                            let external_submission =
-                                external_submission_rc.borrow_mut().take();
+                            let external_submission = external_submission_rc.borrow_mut().take();
                             let submitted_command = resolve_submitted_command(
                                 &captured,
                                 &prompt_display,
@@ -2675,14 +2690,12 @@ impl ReaderCtx {
                             // finished block. Non-G APC payloads keep the silent
                             // consume today's libvte would apply.
                             if payload.first() == Some(&b'G') {
-                                let outcome =
-                                    kitty_assembler_rc.borrow_mut().feed(payload);
+                                let outcome = kitty_assembler_rc.borrow_mut().feed(payload);
                                 // Answer before consuming the outcome: clients
                                 // like `kitten icat` block on the `i=`-keyed
                                 // OK/error reply (jterm2's responder semantics;
                                 // jterm1 never answers).
-                                if let Some(reply) =
-                                    kitty_graphics::response_for(payload, &outcome)
+                                if let Some(reply) = kitty_graphics::response_for(payload, &outcome)
                                 {
                                     pty_for_init.write_bytes(&reply);
                                 }
@@ -2696,8 +2709,7 @@ impl ReaderCtx {
                                         .saturating_mul(texture.height() as usize)
                                         .saturating_mul(4);
                                     let used = kitty_pending_bytes_rc.get();
-                                    if used + approx
-                                        <= kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK
+                                    if used + approx <= kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK
                                     {
                                         kitty_pending_bytes_rc.set(used + approx);
                                         kitty_pending_images_rc.borrow_mut().push(texture);
@@ -2714,6 +2726,28 @@ impl ReaderCtx {
                         }
                     }
                 }
+            },
+        ));
+
+        // Parked chunks flow back through the pipeline on flush. Weak: the
+        // strong owner is the reader callback below, whose lifetime is the
+        // PTY's — after teardown a late grace-timer flush must not revive it.
+        selection_feed_hold.set_flush({
+            let process = Rc::downgrade(&process_chunk);
+            move |bytes: Vec<u8>| {
+                if let Some(process) = process.upgrade() {
+                    (process.borrow_mut())(bytes);
+                }
+            }
+        });
+
+        let hold_for_reader = selection_feed_hold.clone();
+        pty.start_reader(
+            move |data: Vec<u8>| {
+                if hold_for_reader.try_buffer(&data) {
+                    return;
+                }
+                (process_chunk.borrow_mut())(data);
             },
             move |exit_code| {
                 log::debug!("Shell exited with code {}", exit_code);
@@ -3868,6 +3902,11 @@ impl TermView {
                 block.scroll_to_edge(&scroll, true);
             });
         }
+        // Parks PTY chunks while the user drag-selects on the live VTE, so a
+        // running command's repaints can't clear the selection out from under
+        // the pointer. Shared by the PTY reader (parking/replay) and the
+        // cross-selection gestures (drag lifecycle).
+        let selection_feed_hold = SelectionFeedHold::new();
         // Sticky running-command header state: true while a command is executing,
         // plus the command text captured at CommandStart.
         let cmd_running: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -4024,6 +4063,7 @@ impl TermView {
                 layout_active_surface: layout_active_surface.clone(),
                 repo_strip: repo_strip.clone(),
                 block_finished_cbs: block_finished_callbacks.clone(),
+                selection_feed_hold: selection_feed_hold.clone(),
             }
             .install(&pty);
         }
@@ -4509,6 +4549,9 @@ impl TermView {
             selected_block_ids.clone(),
             selected_block_id.clone(),
             selection_anchor_id.clone(),
+            selection_feed_hold.clone(),
+            bstate.clone(),
+            mouse_reporting_mode.clone(),
         );
 
         let term_view = TermView {
@@ -4560,6 +4603,7 @@ impl TermView {
             sticky_timer_id: RefCell::new(Some(sticky_timer_id)),
             cross_selection,
             block_finished_callbacks,
+            selection_feed_hold,
         };
 
         // Load history if configured. Persisted ids come from another process,
@@ -4813,6 +4857,9 @@ impl TermView {
 
     /// Send key bytes into the PTY (user input).
     pub fn write_input(&self, data: &[u8]) {
+        // Input while the feed is parked for a selection reads as a hang;
+        // resume before the echo of these bytes would be parked too.
+        self.selection_feed_hold.flush_now();
         let changed_editor = record_external_input(
             self.bstate.get(),
             data,
@@ -4962,6 +5009,9 @@ impl TermView {
                 text.len()
             );
             self.active_vte.clipboard().set_text(&text);
+            // The selection is captured; resume any feed parked to keep it
+            // alive while the command kept streaming.
+            self.selection_feed_hold.flush_now();
             return;
         }
 
@@ -5004,6 +5054,7 @@ impl TermView {
         // Pasting is an explicit return to the live editor. Without clearing the
         // card selection, the next Enter is intercepted as “recall selected
         // command” instead of submitting the pasted text.
+        self.selection_feed_hold.flush_now();
         self.clear_block_selection_for_input();
         self.active.borrow().grab_focus();
 

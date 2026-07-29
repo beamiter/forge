@@ -16,7 +16,10 @@ use std::rc::Rc;
 use gtk4::prelude::*;
 use vte4::TerminalExt;
 
-use super::{clear_finished_block_selection, FinishedBlock, SelectedBlockIds};
+use super::{
+    clear_finished_block_selection, feed_hold_eligible, BlockState, FinishedBlock,
+    MouseReportingMode, SelectedBlockIds, SelectionFeedHold,
+};
 
 pub(crate) struct CrossSelection {
     finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
@@ -27,9 +30,15 @@ pub(crate) struct CrossSelection {
     /// Index in the currently mapped document-order VTE list where a drag began.
     start_idx: Cell<Option<usize>>,
     claimed: Cell<bool>,
+    /// Parks the PTY feed while a drag covers the live VTE, so streaming
+    /// repaints can't clear the selection out from under the pointer.
+    feed_hold: Rc<SelectionFeedHold>,
+    bstate: Rc<Cell<BlockState>>,
+    mouse_reporting: Rc<Cell<MouseReportingMode>>,
 }
 
 impl CrossSelection {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn install(
         block_scroll: &gtk4::ScrolledWindow,
         finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
@@ -37,6 +46,9 @@ impl CrossSelection {
         selected_block_ids: SelectedBlockIds,
         selected_block_id: Rc<Cell<Option<u64>>>,
         selection_anchor_id: Rc<Cell<Option<u64>>>,
+        feed_hold: Rc<SelectionFeedHold>,
+        bstate: Rc<Cell<BlockState>>,
+        mouse_reporting: Rc<Cell<MouseReportingMode>>,
     ) -> Rc<Self> {
         let this = Rc::new(Self {
             finished_blocks,
@@ -46,6 +58,9 @@ impl CrossSelection {
             selection_anchor_id,
             start_idx: Cell::new(None),
             claimed: Cell::new(false),
+            feed_hold,
+            bstate,
+            mouse_reporting,
         });
 
         // A normal click starts a new native VTE selection. Clear every other
@@ -92,6 +107,7 @@ impl CrossSelection {
             if let Some(start) = start {
                 this_for_begin.clear_block_selection();
                 let vtes = this_for_begin.ordered_vtes();
+                this_for_begin.maybe_hold_active_feed(vtes.get(start));
                 this_for_begin.clear_other_selections(vtes.get(start));
             }
         });
@@ -122,18 +138,48 @@ impl CrossSelection {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
             this_for_update.claimed.set(true);
             this_for_update.paint_range(start, cur_idx);
+            // A cross-block drag that grows into the live VTE needs the same
+            // feed-hold as a drag that started there: its select-all would
+            // otherwise be wiped by the next repaint.
+            let vtes = this_for_update.ordered_vtes();
+            this_for_update.maybe_hold_active_feed(vtes.get(start.max(cur_idx)));
         });
 
         let this_for_end = Rc::downgrade(&this);
         drag.connect_drag_end(move |_, _, _| {
             if let Some(this_for_end) = this_for_end.upgrade() {
                 this_for_end.start_idx.set(None);
+                this_for_end.end_active_feed_hold();
             }
             // Keep the painted selection after release so the copy shortcut works.
         });
 
+        let this_for_cancel = Rc::downgrade(&this);
+        drag.connect_cancel(move |_, _| {
+            if let Some(this_for_cancel) = this_for_cancel.upgrade() {
+                this_for_cancel.start_idx.set(None);
+                this_for_cancel.end_active_feed_hold();
+            }
+        });
+
         block_scroll.add_controller(drag);
         this
+    }
+
+    /// Park the PTY feed when a drag reaches the live VTE while it streams.
+    /// Idempotent — safe to call once per motion event.
+    fn maybe_hold_active_feed(&self, vte: Option<&vte4::Terminal>) {
+        if vte == Some(&self.active_vte)
+            && feed_hold_eligible(self.bstate.get(), self.mouse_reporting.get())
+        {
+            self.feed_hold.begin_drag();
+        }
+    }
+
+    /// Drag lifecycle over: a surviving live-VTE selection keeps the feed
+    /// parked for the copy grace period; anything else resumes it now.
+    fn end_active_feed_hold(&self) {
+        self.feed_hold.end_drag(self.active_vte.has_selection());
     }
 
     fn clear_block_selection(&self) {
