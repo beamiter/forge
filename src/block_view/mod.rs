@@ -1691,6 +1691,7 @@ impl ReaderCtx {
                                 let cols_for_height = active_rc.borrow().grid_cols() as i64;
                                 let estimated_height = estimated_finished_block_height_for_text(
                                     &config_for_cb.borrow(),
+                                    &cmd,
                                     &output_plain,
                                     cols_for_height,
                                 );
@@ -2844,6 +2845,23 @@ fn viewport_state_for_scroll(
         visible_top,
         visible_bottom,
     ))
+}
+
+/// `Adjustment::changed` covers every range mutation, including `upper`
+/// changes caused by virtualizing a card. Visibility only needs another pass
+/// when the viewport extent itself changed; treating an upper-only mutation as
+/// a resize feeds the visibility side effect straight back into itself.
+fn viewport_page_size_changed(last_page_size: &Cell<Option<f64>>, page_size: f64) -> bool {
+    if !page_size.is_finite() {
+        return false;
+    }
+    let changed = last_page_size
+        .get()
+        .is_none_or(|last| (last - page_size).abs() > 0.5);
+    if changed {
+        last_page_size.set(Some(page_size));
+    }
+    changed
 }
 
 fn visible_indices_for_viewport(vp: &ViewportState) -> std::collections::HashSet<usize> {
@@ -4529,8 +4547,12 @@ impl TermView {
                 } else {
                     fallback_cols
                 };
-                block.estimated_height =
-                    estimated_finished_block_height_for_text(&config, &block.output, cols);
+                block.estimated_height = estimated_finished_block_height_for_text(
+                    &config,
+                    &block.cmd,
+                    &block.output,
+                    cols,
+                );
             }
         }
 
@@ -4595,9 +4617,11 @@ impl TermView {
         term_view.update_viewport();
         term_view.update_block_visibility();
 
-        // Wire virtual scrolling. Both range changes and value changes affect
-        // which cards intersect the viewport; map is the reliable recovery
-        // point after a Notebook page temporarily reports zero-sized geometry.
+        // Wire virtual scrolling. Scroll-value changes and viewport-size range
+        // changes affect which cards intersect the viewport; upper-only range
+        // changes are a visibility side effect and are ignored below. Map is the
+        // reliable recovery point after a Notebook page temporarily reports
+        // zero-sized geometry.
         {
             let viewport = term_view.viewport.clone();
             let block_scroll = term_view.block_scroll.clone();
@@ -4608,6 +4632,7 @@ impl TermView {
             let fullscreen = term_view.fullscreen.clone();
             let visibility_update_pending = Rc::new(Cell::new(false));
             let block_scroll_weak = block_scroll.downgrade();
+            let last_page_size = Rc::new(Cell::new(None::<f64>));
 
             let schedule_visibility_update: Rc<dyn Fn()> = Rc::new(move || {
                 let Some(block_scroll) = block_scroll_weak.upgrade() else {
@@ -4671,7 +4696,12 @@ impl TermView {
             let vadjust = term_view.block_scroll.vadjustment();
             {
                 let schedule = schedule_visibility_update.clone();
-                vadjust.connect_changed(move |_| schedule());
+                let last_page_size = last_page_size.clone();
+                vadjust.connect_changed(move |adj| {
+                    if viewport_page_size_changed(&last_page_size, adj.page_size()) {
+                        schedule();
+                    }
+                });
             }
             {
                 let schedule = schedule_visibility_update.clone();
@@ -5460,8 +5490,9 @@ mod tests {
         resolve_submitted_command, scroll_delta_to_reveal, selected_command_text,
         selected_id_range, should_buffer_background_output, strip_ansi,
         strip_ansi_with_clear_detect, take_background_output, truncate_plain_output_for_height,
-        viewport_state_for_scroll, visible_indices_for_viewport, BlockData, BlockState,
-        BoundedByteRing, CommandPromptStatus, DynamicColors, ViewportState, MAX_RAW_OUTPUT_BYTES,
+        viewport_page_size_changed, viewport_state_for_scroll, visible_indices_for_viewport,
+        BlockData, BlockState, BoundedByteRing, CommandPromptStatus, DynamicColors, ViewportState,
+        MAX_RAW_OUTPUT_BYTES,
     };
     use crate::parser::{ColorKind, KeyboardProtocolQuery, ParserEvent};
     use gtk4::gdk::RGBA;
@@ -5875,6 +5906,20 @@ mod tests {
         // virtualize every card.
         assert!(viewport_state_for_scroll(&blocks, 30.0, 0.0, 0).is_none());
         assert!(viewport_state_for_scroll(&blocks, 30.0, 0.5, 0).is_none());
+    }
+
+    #[test]
+    fn upper_only_adjustment_changes_do_not_recompute_visibility() {
+        let last_page_size = Cell::new(None);
+
+        assert!(viewport_page_size_changed(&last_page_size, 300.0));
+        // Adjustment::changed also fires when virtualization changes only
+        // `upper`; the unchanged viewport extent must not feed that mutation
+        // back into another visibility pass.
+        assert!(!viewport_page_size_changed(&last_page_size, 300.0));
+        assert!(!viewport_page_size_changed(&last_page_size, 300.4));
+        assert!(viewport_page_size_changed(&last_page_size, 301.0));
+        assert!(!viewport_page_size_changed(&last_page_size, f64::NAN));
     }
 
     #[test]

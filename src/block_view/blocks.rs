@@ -653,31 +653,50 @@ pub(crate) fn estimated_cell_height_px(config: &Config) -> i32 {
         .max(1.0) as i32
 }
 
-/// Card height for an output row count at a known cell height. The two extra
-/// rows cover the command row and the metadata header; the pixel constant
-/// covers card padding and borders.
-fn finished_block_height_for_rows(cell_height_px: i32, output_rows: i64) -> i32 {
-    let rows = output_rows.clamp(1, i32::MAX as i64) as i32;
-    rows.saturating_add(2)
-        .saturating_mul(cell_height_px.max(1))
+/// Card height for its visible terminal rows at a known cell height. Every card
+/// has one metadata-header row; background cards have no command row, and
+/// command cards with no output hide the output VTE entirely. Keeping those
+/// structural rows explicit is important for virtualization: an extra phantom
+/// row makes a card at the viewport boundary alternate between its measured and
+/// placeholder heights.
+fn finished_block_height_for_rows(cell_height_px: i32, command_rows: i64, output_rows: i64) -> i32 {
+    let rows = 1i64
+        .saturating_add(command_rows.max(0))
+        .saturating_add(output_rows.max(0))
+        .clamp(1, i32::MAX as i64) as i32;
+    rows.saturating_mul(cell_height_px.max(1))
         .saturating_add(34)
-}
-
-pub(crate) fn estimated_finished_block_height(config: &Config, output_rows: i64) -> i32 {
-    finished_block_height_for_rows(estimated_cell_height_px(config), output_rows)
 }
 
 /// Virtualization metadata must follow terminal visual rows rather than logical
 /// newlines. Wide glyphs and long stack-trace lines can wrap many times.
 pub(crate) fn estimated_finished_block_height_for_text(
     config: &Config,
+    command: &str,
     output: &str,
     cols: i64,
 ) -> i32 {
-    let rows = output_visual_row_count(output, cols).max(1);
+    let command_rows = if command.trim().is_empty() {
+        0
+    } else {
+        output_visual_row_count(command, cols).max(1)
+    };
+    let output_rows = if output.trim().is_empty() {
+        0
+    } else {
+        output_visual_row_count(output, cols).max(1)
+    };
     let fallback_cap = (config.finished_block_viewport_rows as i64).max(3);
-    let visible_rows = finished_output_cap(rows, fallback_cap, false);
-    estimated_finished_block_height(config, visible_rows)
+    let visible_output_rows = if output_rows == 0 {
+        0
+    } else {
+        finished_output_cap(output_rows, fallback_cap, false)
+    };
+    finished_block_height_for_rows(
+        estimated_cell_height_px(config),
+        command_rows,
+        visible_output_rows,
+    )
 }
 
 fn flash_button_label(btn: &gtk4::Button, label: &'static str, tooltip: &'static str) {
@@ -847,6 +866,7 @@ impl FinishedBlock {
         recycled: Option<gtk4::Box>,
     ) -> Self {
         let is_background = cmd.trim().is_empty();
+        let has_output = !output.trim().is_empty();
 
         // A command that repaints in place without the alternate screen (top,
         // watch, multi-line progress) emits one frame per refresh, each behind a
@@ -870,7 +890,7 @@ impl FinishedBlock {
         let current_viewport_cap = Rc::new(Cell::new(viewport_cap));
         let long_output = output_rows > viewport_cap;
         let virtualized_height = Rc::new(Cell::new(estimated_finished_block_height_for_text(
-            config, output, cols,
+            config, cmd, output, cols,
         )));
         let virtualized = Rc::new(Cell::new(false));
         let capture_rows = output_rows
@@ -1292,6 +1312,11 @@ impl FinishedBlock {
             let expand_btn_for_refit = expand_btn.downgrade();
             let jump_btn_for_refit = jump_bottom_btn.downgrade();
             let cols_for_refit = cols.max(1);
+            let command_rows_for_refit = if is_background {
+                0
+            } else {
+                output_visual_row_count(cmd, cols_for_refit).max(1)
+            };
             Rc::new(move || {
                 let (Some(output_vte), Some(expand_btn), Some(jump_btn)) = (
                     output_vte.upgrade(),
@@ -1337,7 +1362,11 @@ impl FinishedBlock {
                 if !fit_to_content {
                     output_vte.set_height_request((visible_rows as i32) * cell_height);
                 }
-                Some(finished_block_height_for_rows(cell_height, visible_rows))
+                Some(finished_block_height_for_rows(
+                    cell_height,
+                    command_rows_for_refit,
+                    if has_output { visible_rows } else { 0 },
+                ))
             })
         };
 
@@ -1456,7 +1485,6 @@ impl FinishedBlock {
             output_vte.add_controller(click);
         }
 
-        let has_output = !output.trim().is_empty();
         let has_images = images_box.is_some();
         // Output-only controls are noise for commands such as `cd`,
         // `mkdir`, and successful redirects. Image-only commands (`kitten
@@ -2343,9 +2371,38 @@ mod tests {
         // height, the virtualization estimate from the configured font. Both
         // go through this formula: if they diverge, a resize shifts every
         // block below it in the virtualized document.
-        assert_eq!(super::finished_block_height_for_rows(20, 10), 12 * 20 + 34);
-        assert_eq!(super::finished_block_height_for_rows(20, 1), 3 * 20 + 34);
-        assert_eq!(super::finished_block_height_for_rows(0, 1), 3 + 34);
+        assert_eq!(
+            super::finished_block_height_for_rows(20, 1, 10),
+            12 * 20 + 34
+        );
+        assert_eq!(super::finished_block_height_for_rows(20, 1, 1), 3 * 20 + 34);
+        assert_eq!(super::finished_block_height_for_rows(0, 1, 1), 3 + 34);
+    }
+
+    #[test]
+    fn card_height_omits_rows_for_hidden_surfaces() {
+        let background = super::finished_block_height_for_rows(20, 0, 1);
+        let command_with_output = super::finished_block_height_for_rows(20, 1, 1);
+        let command_without_output = super::finished_block_height_for_rows(20, 1, 0);
+
+        assert_eq!(background, 2 * 20 + 34);
+        assert_eq!(command_without_output, 2 * 20 + 34);
+        assert_eq!(command_with_output - background, 20);
+    }
+
+    #[test]
+    fn estimated_background_height_does_not_reserve_a_command_row() {
+        let (config, _, _) = crate::config::load_safe_config();
+        let cell_height = super::estimated_cell_height_px(&config);
+        let background =
+            super::estimated_finished_block_height_for_text(&config, "", "one line", 80);
+        let command =
+            super::estimated_finished_block_height_for_text(&config, "printf one", "one line", 80);
+        let command_without_output =
+            super::estimated_finished_block_height_for_text(&config, "cd /tmp", "", 80);
+
+        assert_eq!(command - background, cell_height);
+        assert_eq!(command_without_output, background);
     }
 
     #[test]
