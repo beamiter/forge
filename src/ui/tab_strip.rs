@@ -41,6 +41,7 @@ impl UiState {
             idx += 1;
             child = c.next_sibling();
         }
+        self.refresh_sidebar_tab_mirror();
     }
 
     /// Show the top-bar tab strip only when tabs live there and more than one
@@ -49,9 +50,13 @@ impl UiState {
     pub(crate) fn sync_tab_bar_visibility(&self) {
         use crate::config::TabPlacement;
         let show_strip = self.notebook.n_pages() > 1;
+        // The sidebar's Tabs page holds both the strip's holder and the
+        // mirror; exactly one is shown, decided by where the strip lives, so
+        // the page never renders an empty holder or a duplicate list.
         match self.tab_placement.get() {
             TabPlacement::Sidebar => {
                 self.tab_strip_scroll.set_visible(true);
+                self.sidebar_tab_mirror_scroll.set_visible(false);
                 self.top_tab_scroll.set_visible(false);
                 self.sidebar_tab_search_holder.set_visible(true);
                 self.top_tab_search_holder.set_visible(false);
@@ -60,9 +65,11 @@ impl UiState {
                 self.top_tab_scroll.set_visible(show_strip);
                 self.top_tab_search_holder.set_visible(show_strip);
                 self.sidebar_tab_search_holder.set_visible(false);
-                self.tab_strip_scroll.set_visible(true);
+                self.tab_strip_scroll.set_visible(false);
+                self.sidebar_tab_mirror_scroll.set_visible(true);
             }
         }
+        self.refresh_sidebar_tab_mirror();
     }
 
     pub(crate) fn apply_tab_filter(&self, query: &str) {
@@ -79,6 +86,7 @@ impl UiState {
             }
             child = widget.next_sibling();
         }
+        self.refresh_sidebar_tab_mirror();
     }
 
     /// Keep a filtered tab's visibility correct when OSC title/cwd updates or
@@ -86,11 +94,16 @@ impl UiState {
     pub(crate) fn track_tab_title_for_filter(&self, button: &ToggleButton, title: &gtk4::Label) {
         let filter = self.tab_search_entry.clone();
         let button = button.clone();
+        let ui = self.clone();
         title.connect_notify_local(Some("label"), move |label, _| {
             button.set_visible(tab_title_matches(
                 filter.text().as_str(),
                 label.text().as_str(),
             ));
+            // The mirror binds to this label for its text, but a filtered
+            // tab appearing or disappearing is a visibility change it has to
+            // be told about.
+            ui.refresh_sidebar_tab_mirror();
         });
     }
 
@@ -489,6 +502,7 @@ impl UiState {
             }
             child = c.next_sibling();
         }
+        self.refresh_sidebar_tab_mirror();
     }
 
     /// Stable-partition pages so pinned tabs lead, matching jterm1 while

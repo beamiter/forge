@@ -31,6 +31,7 @@ mod panes;
 mod rsh;
 mod search;
 mod session;
+mod sidebar_tabs;
 mod tab_strip;
 mod tabs;
 mod zoom;
@@ -96,6 +97,10 @@ pub(crate) struct UiState {
     pub(crate) top_spacer: gtk4::Box,
     /// Sidebar scroll holder for the (vertical) tab strip.
     pub(crate) tab_strip_scroll: ScrolledWindow,
+    /// Sidebar list mirroring the strip while the strip lives in the top bar,
+    /// so the Tabs view stays usable in both placements. See `sidebar_tabs`.
+    pub(crate) sidebar_tab_mirror: gtk4::Box,
+    pub(crate) sidebar_tab_mirror_scroll: ScrolledWindow,
     /// Top-bar scroll holder for the (horizontal) tab strip.
     pub(crate) top_tab_scroll: ScrolledWindow,
     /// The single tab filter is reparented between these two holders together

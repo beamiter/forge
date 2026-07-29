@@ -582,13 +582,29 @@ pub fn run() -> glib::ExitCode {
             tab_search_wrapper.add_controller(click_ctrl);
         }
 
-        // Tabs view: filter entry + tab strip.
+        // Mirror list, shown in place of the strip's holder when the strip is
+        // docked to the top bar. Exactly one of the two is ever visible.
+        let sidebar_tab_mirror = gtk4::Box::new(Orientation::Vertical, 2);
+        sidebar_tab_mirror.add_css_class("tab-strip");
+        sidebar_tab_mirror.set_hexpand(false);
+        sidebar_tab_mirror.set_vexpand(true);
+        sidebar_tab_mirror.set_valign(gtk4::Align::Start);
+
+        let sidebar_tab_mirror_scroll = ScrolledWindow::new();
+        sidebar_tab_mirror_scroll.set_hexpand(false);
+        sidebar_tab_mirror_scroll.set_vexpand(true);
+        sidebar_tab_mirror_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        sidebar_tab_mirror_scroll.set_child(Some(&sidebar_tab_mirror));
+        sidebar_tab_mirror_scroll.set_visible(false);
+
+        // Tabs view: filter entry + tab strip (or its mirror).
         let sidebar_tabs_page = gtk4::Box::new(Orientation::Vertical, 0);
         sidebar_tabs_page.set_vexpand(true);
         let sidebar_tab_search_holder = gtk4::Box::new(Orientation::Horizontal, 0);
         sidebar_tab_search_holder.append(&tab_search_wrapper);
         sidebar_tabs_page.append(&sidebar_tab_search_holder);
         sidebar_tabs_page.append(&tab_strip_scroll);
+        sidebar_tabs_page.append(&sidebar_tab_mirror_scroll);
 
         // File tree section (header + tree), shown in the sidebar.
         let (file_tree_model, file_tree) = ui::build_file_tree_widgets();
@@ -732,6 +748,8 @@ pub fn run() -> glib::ExitCode {
             sidebar: sidebar.clone(),
             top_spacer: spacer.clone(),
             tab_strip_scroll: tab_strip_scroll.clone(),
+            sidebar_tab_mirror: sidebar_tab_mirror.clone(),
+            sidebar_tab_mirror_scroll: sidebar_tab_mirror_scroll.clone(),
             top_tab_scroll: top_tab_scroll.clone(),
             sidebar_tab_search_holder: sidebar_tab_search_holder.clone(),
             top_tab_search_holder: top_tab_search_holder.clone(),

@@ -56,7 +56,7 @@ fn pane_leaf_root_of(widget: &gtk4::Widget) -> Option<gtk4::Widget> {
     None
 }
 
-fn notebook_page_named(notebook: &gtk4::Notebook, name: &str) -> Option<gtk4::Widget> {
+pub(super) fn notebook_page_named(notebook: &gtk4::Notebook, name: &str) -> Option<gtk4::Widget> {
     (0..notebook.n_pages()).find_map(|index| {
         notebook
             .nth_page(Some(index))
@@ -86,7 +86,7 @@ fn is_plain_tab_activation_key(keyval: Key, modifiers: ModifierType) -> bool {
 }
 
 impl UiState {
-    fn activate_tab_named(&self, name: &str) {
+    pub(super) fn activate_tab_named(&self, name: &str) {
         self.clear_tab_selection();
         for index in 0..self.notebook.n_pages() {
             if self

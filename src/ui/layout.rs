@@ -57,18 +57,11 @@ impl UiState {
             child = c.next_sibling();
         }
 
-        // The sidebar Tabs view only makes sense when tabs live in the sidebar.
-        match placement {
-            TabPlacement::Sidebar => {
-                self.sidebar_tabs_btn.set_sensitive(true);
-                self.apply_sidebar_view(self.sidebar_view.get(), false);
-            }
-            TabPlacement::TopBar => {
-                self.sidebar_tabs_btn.set_sensitive(false);
-                // Force the file tree without clobbering the saved preference.
-                self.apply_sidebar_view(SidebarView::Files, false);
-            }
-        }
+        // The sidebar Tabs view stays available in both placements: with the
+        // strip in the top bar the sidebar shows the mirror list instead, so
+        // tabs are visible in two places at once rather than moving.
+        self.sidebar_tabs_btn.set_sensitive(true);
+        self.apply_sidebar_view(self.sidebar_view.get(), false);
 
         self.sync_tab_bar_visibility();
     }
