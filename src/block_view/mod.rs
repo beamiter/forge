@@ -3537,9 +3537,19 @@ impl TermView {
         sticky_minimize_btn.add_css_class("sticky-header-control");
         sticky_minimize_btn.add_css_class("flat");
         sticky_minimize_btn.set_focusable(false);
+        // Interrupt without hunting for terminal focus: while reading history
+        // above a running command, one click sends Ctrl+C. Wired to the PTY
+        // further down, once it exists.
+        let sticky_stop_btn = gtk4::Button::with_label("\u{f04d}");
+        sticky_stop_btn.set_tooltip_text(Some("Interrupt the running command (Ctrl+C)"));
+        sticky_stop_btn.add_css_class("sticky-header-control");
+        sticky_stop_btn.add_css_class("flat");
+        sticky_stop_btn.set_focusable(false);
+        sticky_stop_btn.set_visible(false);
         let sticky_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         sticky_bar.add_css_class("sticky-running-header");
         sticky_bar.append(&sticky_label);
+        sticky_bar.append(&sticky_stop_btn);
         sticky_bar.append(&sticky_jump_bottom_btn);
         sticky_bar.append(&sticky_minimize_btn);
         sticky_bar.set_halign(gtk4::Align::Fill);
@@ -3552,6 +3562,7 @@ impl TermView {
             let minimized = sticky_minimized.clone();
             let label = sticky_label.downgrade();
             let jump = sticky_jump_bottom_btn.downgrade();
+            let stop = sticky_stop_btn.downgrade();
             let bar = sticky_bar.downgrade();
             sticky_minimize_btn.connect_clicked(move |button| {
                 let (Some(label), Some(jump), Some(bar)) =
@@ -3563,6 +3574,10 @@ impl TermView {
                 minimized.set(now);
                 label.set_visible(!now);
                 jump.set_visible(false);
+                // The 250ms sticky refresh restores it when expanding.
+                if let Some(stop) = stop.upgrade() {
+                    stop.set_visible(false);
+                }
                 if now {
                     bar.add_css_class("sticky-minimized");
                     button.set_label("\u{f078}");
@@ -3907,6 +3922,30 @@ impl TermView {
         // the pointer. Shared by the PTY reader (parking/replay) and the
         // cross-selection gestures (drag lifecycle).
         let selection_feed_hold = SelectionFeedHold::new();
+        // Frozen output with no explanation reads as a hang. A small badge
+        // appears only once bytes are actually parked (a plain click on the
+        // live surface must not flash it) and disappears on flush.
+        {
+            let hold_badge = gtk4::Label::new(Some("\u{f04c}  Output paused — selection"));
+            hold_badge.add_css_class("feed-hold-badge");
+            hold_badge.set_tooltip_text(Some(
+                "Streaming output is held so your selection survives. Copy it, \
+                 click elsewhere, or wait a few seconds to resume.",
+            ));
+            hold_badge.set_halign(gtk4::Align::Start);
+            hold_badge.set_valign(gtk4::Align::End);
+            hold_badge.set_margin_start(14);
+            hold_badge.set_margin_bottom(14);
+            hold_badge.set_visible(false);
+            hold_badge.set_can_focus(false);
+            scroll_overlay.add_overlay(&hold_badge);
+            let badge = hold_badge.downgrade();
+            selection_feed_hold.set_state_listener(move |parked| {
+                if let Some(badge) = badge.upgrade() {
+                    badge.set_visible(parked);
+                }
+            });
+        }
         // Sticky running-command header state: true while a command is executing,
         // plus the command text captured at CommandStart.
         let cmd_running: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -4177,6 +4216,7 @@ impl TermView {
             let programmatic = programmatic_scroll.clone();
             let user_scrolled = user_scrolled_up.clone();
             let unread = unread_count.clone();
+            let vte_for_fab = active_vte.downgrade();
             jump_fab.connect_clicked(move |button| {
                 // Returning to the live prompt is not a single set_value: blocks
                 // below the viewport are virtualized to 0 height, so `upper` only
@@ -4186,6 +4226,11 @@ impl TermView {
                 user_scrolled.set(false);
                 unread.set(0);
                 button.set_visible(false);
+                // "Jump to latest" also means the latest of the live buffer:
+                // leave any scrolled-up position inside the running output.
+                if let Some(adj) = vte_for_fab.upgrade().and_then(|vte| vte.vadjustment()) {
+                    adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
+                }
                 let adj = scroll.vadjustment();
                 programmatic.set(true);
                 adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
@@ -4230,10 +4275,21 @@ impl TermView {
         // ── Sticky command header ────────────────────────────────────────
         // Running commands keep their status header; oversized finished blocks
         // pin their command after the original header scrolls above the viewport.
+        {
+            let pty_for_stop = pty.clone();
+            let hold_for_stop = selection_feed_hold.clone();
+            sticky_stop_btn.connect_clicked(move |_| {
+                // Resume a parked feed first so the ^C echo and the command's
+                // shutdown output are visible immediately.
+                hold_for_stop.flush_now();
+                pty_for_stop.write_bytes(b"\x03");
+            });
+        }
         let sticky_timer_id = {
             let sticky = sticky_bar.clone();
             let sticky_label = sticky_label.clone();
             let sticky_jump_bottom = sticky_jump_bottom_btn.clone();
+            let sticky_stop = sticky_stop_btn.clone();
             let sticky_target = sticky_target_id.clone();
             let sticky_minimized = sticky_minimized.clone();
             let cmd_running = cmd_running.clone();
@@ -4251,18 +4307,21 @@ impl TermView {
                 if fullscreen.get() {
                     sticky_target.set(None);
                     sticky_jump_bottom.set_visible(false);
+                    sticky_stop.set_visible(false);
                     sticky.set_visible(false);
                     return glib::ControlFlow::Continue;
                 }
                 if !user_scrolled.get() {
                     sticky_target.set(None);
                     sticky_jump_bottom.set_visible(false);
+                    sticky_stop.set_visible(false);
                     sticky.set_visible(false);
                     return glib::ControlFlow::Continue;
                 }
                 if cmd_running.get() {
                     sticky_target.set(None);
                     sticky_jump_bottom.set_visible(false);
+                    sticky_stop.set_visible(!minimized);
                     let cmd = running_cmd.borrow();
                     let cmd_disp = cmd.trim();
                     let elapsed = block_start_time
@@ -4270,7 +4329,9 @@ impl TermView {
                         .and_then(|st| SystemTime::now().duration_since(st).ok())
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    let elapsed_str = if elapsed >= 60 {
+                    let elapsed_str = if elapsed >= 3600 {
+                        format!("{}h{:02}m", elapsed / 3600, (elapsed % 3600) / 60)
+                    } else if elapsed >= 60 {
                         format!("{}m{:02}s", elapsed / 60, elapsed % 60)
                     } else {
                         format!("{}s", elapsed)
@@ -4314,10 +4375,12 @@ impl TermView {
                     sticky_label.set_text(&format!("\u{276f}  {}", command));
                     sticky_label.set_visible(!minimized);
                     sticky_jump_bottom.set_visible(!minimized && long_output);
+                    sticky_stop.set_visible(false);
                     sticky.set_visible(true);
                 } else {
                     sticky_target.set(None);
                     sticky_jump_bottom.set_visible(false);
+                    sticky_stop.set_visible(false);
                     sticky.set_visible(false);
                 }
                 glib::ControlFlow::Continue
@@ -4519,6 +4582,9 @@ impl TermView {
             let scroll_enabled = config.scroll_reporting_enabled;
             let pty_for_scroll = pty.clone();
             let pointer_for_scroll = pointer_cell.clone();
+            let bstate_for_scroll = bstate.clone();
+            let vte_for_scroll = active_vte.downgrade();
+            let outer_for_scroll = block_scroll.downgrade();
             let scroll_ctrl = gtk4::EventControllerScroll::new(
                 gtk4::EventControllerScrollFlags::VERTICAL
                     | gtk4::EventControllerScrollFlags::HORIZONTAL,
@@ -4527,19 +4593,76 @@ impl TermView {
             scroll_ctrl.connect_scroll(move |_, _dx, dy| {
                 let in_mouse_app = fullscreen_for_scroll.get()
                     && mouse_mode_for_scroll.get() != MouseReportingMode::None;
-                if !in_mouse_app {
-                    return glib::Propagation::Proceed;
-                }
-                if !scroll_enabled {
+                if in_mouse_app {
+                    if !scroll_enabled {
+                        return glib::Propagation::Stop;
+                    }
+                    let (col, row) = pointer_for_scroll.get();
+                    if let Some(bytes) =
+                        encode_mouse_wheel(mouse_mode_for_scroll.get(), dy, col, row)
+                    {
+                        pty_for_scroll.write_bytes(&bytes);
+                    }
                     return glib::Propagation::Stop;
                 }
-                let (col, row) = pointer_for_scroll.get();
-                if let Some(bytes) = encode_mouse_wheel(mouse_mode_for_scroll.get(), dy, col, row) {
-                    pty_for_scroll.write_bytes(&bytes);
+                // Alt-screen without mouse reporting: VTE natively fakes
+                // arrow keys for the wheel (less/vim paging). Let it.
+                if bstate_for_scroll.get() == BlockState::AltScreen {
+                    return glib::Propagation::Proceed;
                 }
+                // While a command streams, its scrollback is a first-class
+                // reading surface: the wheel scrolls the live VTE itself and
+                // hands off to the outer history only at the buffer's edge.
+                if matches!(
+                    bstate_for_scroll.get(),
+                    BlockState::CollectingOutput
+                        | BlockState::PostCommand
+                        | BlockState::RawFallback
+                ) {
+                    if let Some(adj) = vte_for_scroll.upgrade().and_then(|vte| vte.vadjustment()) {
+                        if scroll_adjustment_by_wheel(&adj, dy) {
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                }
+                // Prompt states, and streaming edges, scroll the block history.
+                // Never Proceed here: VTE's fallback scrolling swallows every
+                // wheel it receives (even with nothing left to scroll), which
+                // used to make the wheel dead over the idle prompt cell.
+                let Some(outer) = outer_for_scroll.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                forward_outer_scroll(&outer, dy);
                 glib::Propagation::Stop
             });
             active_vte.add_controller(scroll_ctrl);
+
+            // Wheeling over the live scrollbar mirrors the VTE surface: move
+            // the live buffer, hand off to the history at its edges. Without
+            // the capture the GtkScrollbar scrolls natively but sticks dead
+            // at the ends (same trap the finished-block scrollbar closes).
+            let live_scrollbar = active.borrow().live_scrollbar.clone();
+            let scrollbar_scroll =
+                gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+            scrollbar_scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            let vte_for_scrollbar = active_vte.downgrade();
+            let outer_for_scrollbar = block_scroll.downgrade();
+            scrollbar_scroll.connect_scroll(move |_, _dx, dy| {
+                if let Some(adj) = vte_for_scrollbar
+                    .upgrade()
+                    .and_then(|vte| vte.vadjustment())
+                {
+                    if scroll_adjustment_by_wheel(&adj, dy) {
+                        return glib::Propagation::Stop;
+                    }
+                }
+                let Some(outer) = outer_for_scrollbar.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                forward_outer_scroll(&outer, dy);
+                glib::Propagation::Stop
+            });
+            live_scrollbar.add_controller(scrollbar_scroll);
         }
 
         let cross_selection = CrossSelection::install(

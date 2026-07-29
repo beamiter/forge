@@ -245,6 +245,10 @@ pub(crate) fn create_active_terminal(config: &Config) -> Terminal {
         .bold_is_bright(true)
         .input_enabled(true)
         .scrollback_lines(config.terminal_scrollback_lines)
+        // Reading the running command's scrollback must survive streaming:
+        // VTE's default yanks the view to the bottom on every output chunk.
+        // A view that is already at the bottom still follows output natively.
+        .scroll_on_output(false)
         // Keep the live surface behavior-identical to the regular VTE mode.
         // In particular, respect the desktop cursor-blink preference instead
         // of forcing a different policy only in block mode.

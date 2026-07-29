@@ -6,6 +6,12 @@ All notable user-visible and operational changes are recorded here.
 
 ### Added
 
+- Block 模式运行中命令的体验改进（针对 claude 等长时流式 TUI）：
+  - **运行中可框选文本**：在 live 终端面上拖选时，PTY 字节流被暂存（选区期间 + 松手后最多 5 秒宽限，或复制/输入/点击别处即恢复，上限 2 MiB），高频重绘不再瞬间冲掉选区；Shift+拖选在开启鼠标上报的应用里同样受保护。暂存生效时左下角显示 "Output paused — selection" 徽标，消除"卡住了"的错觉。
+  - **运行中可回看输出**：滚轮在 live 终端面上优先滚动当前命令自己的回滚缓冲，滚到顶/底才交给外层 Block 历史（此前 VTE 吞掉滚轮且新输出会把视图拽回底部，运行中的早期输出实际不可达）；右侧出现细滚动条（overlay 覆盖式，出现/消失不改变列宽、不触发 SIGWINCH），跳底按钮同时归位内外两层滚动。空闲提示符上的滚轮现在可靠地滚动 Block 历史。
+  - **运行中可搜索**：Ctrl+F 现在把正在运行命令的已产生输出纳入匹配（排在所有完成 Block 之后），VTE 原生高亮并支持 Next/Prev 跨面步进；关闭搜索一并清除 live 面高亮。
+  - **sticky 运行头更实用**：向上翻历史时的运行中头部新增 Stop 按钮（一键发送 Ctrl+C，无需先找回终端焦点），耗时超过一小时显示 `1h04m` 格式。
+
 - AI 聊天面板流式回复（`ai_stream` / `JTERM4_AI_STREAM`，默认开启）：回答在生成过程中逐段显示在会话里，三个 provider（Anthropic、OpenAI-compatible、Ollama）均支持；完成时以 provider 返回的完整文本替换进行中的消息并原样落库，保存的会话与关闭流式时完全一致（包括 `ai_max_tokens` 截断提示）。中途出错时已显示的部分内容保持可见，错误照常提示并可 Retry；Stop 与关窗仍会中断流式 curl。流式期间切换 chat 不会把片段写进别的会话，切回后已收到的部分回复会完整重现。仅聊天面板流式；Shell Agent、命令生成与纠错等严格 JSON 表面继续等待完整回复。开关同时提供于 Settings（Stream Chat Responses）。
 
 - Kitty 图形协议（对齐 jterm1 的最小子集）：Block 模式解码 APC `G` 序列（`kitten icat`、matplotlib kitty 后端等的内联图片），把 PNG（`f=100`）与原始 RGBA/RGB（`f=32`/`f=24`）的 base64 直传载荷（含 `m=1`/`m=0` 分块）渲染为完成 Block 内文字输出下方的 GTK Picture，折叠按钮把图片与文字一并收起，纯图片命令也保留可折叠的 Block；此前这些序列被转发给没有图形协议的 libvte 而被静默丢弃。内存上限与 jterm1 完全一致：单图编码 16 MB、单 Block 解码合计 16 MB、边长至多 16384，超限静默丢弃；文件/共享内存传输与 `a=d`/`a=p` 动作不支持。与 jterm1 不同的是带 `i=`/`I=` 标识的命令会按 jterm2（家族参考应答实现）的语义在 PTY 上收到 `OK`/`EINVAL`/`ENOTSUP` 应答并遵守 `q=` 静默级别，`a=q` 探测会被校验后应答，因此 `kitten icat` 不再因等待应答而超时。图片仅在本次会话内展示，不写入 Block 历史，会话恢复后自然省略。

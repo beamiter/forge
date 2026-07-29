@@ -606,7 +606,26 @@ fn scroll_adjustment(adj: &gtk4::Adjustment, dy: f64) -> bool {
     true
 }
 
-fn forward_outer_scroll(outer: &gtk4::ScrolledWindow, dy: f64) {
+/// Move one adjustment by a wheel delta at VTE's native wheel speed (a tenth
+/// of a page per unit, minimum one row) — `scroll_adjustment` moves by the
+/// adjustment's own step, which for a VTE is a single row and feels stuck on
+/// long output. Returns false at the requested edge so the caller can hand
+/// the wheel off to the outer history only there.
+pub(crate) fn scroll_adjustment_by_wheel(adj: &gtk4::Adjustment, dy: f64) -> bool {
+    let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
+    if dy < 0.0 && adj.value() <= adj.lower() + f64::EPSILON {
+        return false;
+    }
+    if dy > 0.0 && adj.value() >= max_value - f64::EPSILON {
+        return false;
+    }
+    let step = (adj.page_size() / 10.0).max(1.0);
+    let target = (adj.value() + dy * step).clamp(adj.lower(), max_value);
+    adj.set_value(target);
+    true
+}
+
+pub(crate) fn forward_outer_scroll(outer: &gtk4::ScrolledWindow, dy: f64) {
     let outer_adj = outer.vadjustment();
     let step = outer_adj.step_increment().max(outer_adj.page_size() * 0.1);
     let max_value = (outer_adj.upper() - outer_adj.page_size()).max(outer_adj.lower());
@@ -2019,6 +2038,11 @@ impl FinishedBlock {
 pub(crate) struct ActiveBlock {
     pub(crate) widget: gtk4::Box,
     pub(crate) active_vte: Terminal,
+    /// Slim overlay scrollbar bound to the live VTE's own adjustment, so the
+    /// still-running command's scrollback is visibly navigable. An overlay —
+    /// not a sibling like the finished-block scrollbar — because appearing
+    /// mid-command must not narrow the grid and SIGWINCH the child.
+    pub(crate) live_scrollbar: gtk4::Scrollbar,
     /// Raw output bytes accumulated during CollectingOutput, consumed by the
     /// finalize path to build the styled finished block (jterm1's `out_buf`).
     raw_output: Rc<RefCell<BoundedByteRing>>,
@@ -2044,7 +2068,33 @@ impl ActiveBlock {
         let active_vte = create_active_terminal(config);
         active_vte.set_hexpand(true);
         active_vte.set_vexpand(false);
-        widget.append(&active_vte);
+        let vte_overlay = gtk4::Overlay::new();
+        vte_overlay.set_hexpand(true);
+        vte_overlay.set_vexpand(false);
+        vte_overlay.set_child(Some(&active_vte));
+        let live_scrollbar =
+            gtk4::Scrollbar::new(Orientation::Vertical, active_vte.vadjustment().as_ref());
+        live_scrollbar.add_css_class("block-output-scrollbar");
+        live_scrollbar.set_tooltip_text(Some("Scroll within the running output"));
+        live_scrollbar.set_halign(gtk4::Align::End);
+        live_scrollbar.set_visible(false);
+        vte_overlay.add_overlay(&live_scrollbar);
+        widget.append(&vte_overlay);
+        // Same adjustment-driven visibility as the finished-block scrollbar:
+        // the adjustment is the one place that always knows whether the live
+        // buffer has scrolled past the viewport.
+        if let Some(adj) = active_vte.vadjustment() {
+            let scrollbar = live_scrollbar.downgrade();
+            let sync_visibility = move |adj: &gtk4::Adjustment| {
+                let Some(scrollbar) = scrollbar.upgrade() else {
+                    return;
+                };
+                let overflows = adj.upper() - adj.lower() > adj.page_size() + f64::EPSILON;
+                scrollbar.set_visible(overflows);
+            };
+            sync_visibility(&adj);
+            adj.connect_changed(sync_visibility);
+        }
 
         // `realize` is too early: the VTE's IM context does not have a mapped
         // surface yet. Taking logical focus there can suppress the real
@@ -2056,6 +2106,7 @@ impl ActiveBlock {
         ActiveBlock {
             widget,
             active_vte,
+            live_scrollbar,
             raw_output: Rc::new(RefCell::new(BoundedByteRing::new(
                 super::MAX_RAW_OUTPUT_BYTES,
             ))),

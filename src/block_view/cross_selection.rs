@@ -94,7 +94,7 @@ impl CrossSelection {
 
         let scroll_for_begin = block_scroll.downgrade();
         let this_for_begin = Rc::downgrade(&this);
-        drag.connect_drag_begin(move |_, x, y| {
+        drag.connect_drag_begin(move |gesture, x, y| {
             let Some(this_for_begin) = this_for_begin.upgrade() else {
                 return;
             };
@@ -107,7 +107,7 @@ impl CrossSelection {
             if let Some(start) = start {
                 this_for_begin.clear_block_selection();
                 let vtes = this_for_begin.ordered_vtes();
-                this_for_begin.maybe_hold_active_feed(vtes.get(start));
+                this_for_begin.maybe_hold_active_feed(vtes.get(start), shift_held(gesture));
                 this_for_begin.clear_other_selections(vtes.get(start));
             }
         });
@@ -142,7 +142,8 @@ impl CrossSelection {
             // feed-hold as a drag that started there: its select-all would
             // otherwise be wiped by the next repaint.
             let vtes = this_for_update.ordered_vtes();
-            this_for_update.maybe_hold_active_feed(vtes.get(start.max(cur_idx)));
+            this_for_update
+                .maybe_hold_active_feed(vtes.get(start.max(cur_idx)), shift_held(gesture));
         });
 
         let this_for_end = Rc::downgrade(&this);
@@ -168,9 +169,9 @@ impl CrossSelection {
 
     /// Park the PTY feed when a drag reaches the live VTE while it streams.
     /// Idempotent — safe to call once per motion event.
-    fn maybe_hold_active_feed(&self, vte: Option<&vte4::Terminal>) {
+    fn maybe_hold_active_feed(&self, vte: Option<&vte4::Terminal>, shift_held: bool) {
         if vte == Some(&self.active_vte)
-            && feed_hold_eligible(self.bstate.get(), self.mouse_reporting.get())
+            && feed_hold_eligible(self.bstate.get(), self.mouse_reporting.get(), shift_held)
         {
             self.feed_hold.begin_drag();
         }
@@ -278,6 +279,14 @@ impl CrossSelection {
 
         (!parts.is_empty()).then(|| parts.join("\n"))
     }
+}
+
+/// Whether Shift is down for the gesture's current event — the modifier VTE
+/// reserves for forcing a local selection over a mouse-reporting app.
+fn shift_held(gesture: &gtk4::GestureDrag) -> bool {
+    gesture
+        .current_event_state()
+        .contains(gtk4::gdk::ModifierType::SHIFT_MASK)
 }
 
 /// True if `needle` is `haystack` or one of its descendants. GTK's `pick()`

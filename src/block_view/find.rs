@@ -22,6 +22,9 @@ pub(crate) struct FindMatch {
     pub(crate) block_index: usize,
     /// false = command VTE, true = output VTE.
     pub(crate) is_output: bool,
+    /// Hit lives in the live VTE (the still-running command's output), not in
+    /// any finished block; `block_id`/`block_index` are meaningless then.
+    pub(crate) is_live: bool,
 }
 
 #[derive(Default)]
@@ -198,6 +201,7 @@ impl TermView {
                             block_id: block.id,
                             block_index,
                             is_output: false,
+                            is_live: false,
                         });
                     }
                 }
@@ -209,8 +213,33 @@ impl TermView {
                             block_id: block.id,
                             block_index,
                             is_output: true,
+                            is_live: false,
                         });
                     }
+                }
+            }
+        }
+
+        // The still-running command's output is searchable too (document
+        // order: it sits below every finished block). Counted from the
+        // accumulated raw capture, so only states that accumulate qualify;
+        // VTE's own highlighter paints and steps the on-screen hits.
+        if matches!(
+            self.bstate.get(),
+            super::BlockState::CollectingOutput | super::BlockState::PostCommand
+        ) {
+            let live_text = super::strip_ansi(&self.active.borrow().output_text());
+            let live_count = re.find_iter(&live_text).count();
+            if live_count > 0 {
+                self.active_vte.search_set_regex(Some(&vte_re), 0);
+                self.active_vte.search_set_wrap_around(true);
+                for _ in 0..live_count {
+                    matches.push(FindMatch {
+                        block_id: 0,
+                        block_index: 0,
+                        is_output: true,
+                        is_live: true,
+                    });
                 }
             }
         }
@@ -263,13 +292,16 @@ impl TermView {
         let Some(fm) = st.matches.get(st.current) else {
             return;
         };
-        let Some(block) = find_match_block(&finished, fm) else {
-            return;
-        };
-        let vte = if fm.is_output {
-            &block.output_vte
+        let vte = if fm.is_live {
+            &self.active_vte
+        } else if let Some(block) = find_match_block(&finished, fm) {
+            if fm.is_output {
+                &block.output_vte
+            } else {
+                &block.command_vte
+            }
         } else {
-            &block.command_vte
+            return;
         };
         if delta >= 0 {
             vte.search_find_next();
@@ -285,13 +317,16 @@ impl TermView {
         let Some(fm) = st.matches.get(st.current) else {
             return;
         };
-        let Some(block) = find_match_block(&finished, fm) else {
-            return;
-        };
-        let vte = if fm.is_output {
-            &block.output_vte
+        let vte = if fm.is_live {
+            &self.active_vte
+        } else if let Some(block) = find_match_block(&finished, fm) {
+            if fm.is_output {
+                &block.output_vte
+            } else {
+                &block.command_vte
+            }
         } else {
-            &block.command_vte
+            return;
         };
         vte.search_find_next();
     }
@@ -302,10 +337,13 @@ impl TermView {
         let Some(fm) = st.matches.get(st.current) else {
             return;
         };
-        let Some(block) = find_match_block(&finished, fm) else {
+        let widget = if fm.is_live {
+            self.active.borrow().widget().clone()
+        } else if let Some(block) = find_match_block(&finished, fm) {
+            block.widget().clone()
+        } else {
             return;
         };
-        let widget = block.widget().clone();
         let scroll = self.block_scroll.clone();
         glib::idle_add_local_once(move || {
             if let Some(point) =
@@ -479,6 +517,7 @@ impl TermView {
                 block.output_vte.search_set_regex(None::<&vte4::Regex>, 0);
             }
         }
+        self.active_vte.search_set_regex(None::<&vte4::Regex>, 0);
         let mut st = self.find_state.borrow_mut();
         st.matches.clear();
         st.current = 0;

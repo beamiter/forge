@@ -719,6 +719,18 @@ pub(crate) fn install_block_css(config: &Config) {
         .sticky-running-header.sticky-minimized {{
             padding-left: 4px;
         }}
+        .feed-hold-badge {{
+            color: {bg_hex};
+            background-color: {accent};
+            background-image: none;
+            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.55);
+            border-radius: 999px;
+            font-family: "{font_family}";
+            font-size: 0.85em;
+            font-weight: bold;
+            padding: 4px 12px;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+        }}
         .repo-strip {{
             color: rgba({acc_r},{acc_g},{acc_b},0.85);
             background-color: {block_bg_hex};

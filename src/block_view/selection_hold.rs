@@ -21,6 +21,9 @@ use super::{BlockState, MouseReportingMode};
 /// Replay sink for parked bytes, installed by the PTY reader.
 type FlushFn = Box<dyn Fn(Vec<u8>)>;
 
+/// Observer for the parked/live indicator, installed by the view.
+type StateFn = Box<dyn Fn(bool)>;
+
 /// Hard cap on parked bytes. A hold that accumulates more than this flushes
 /// immediately — the selection is sacrificed — so a firehose command can
 /// neither balloon RSS nor stall the block state machine unboundedly.
@@ -35,8 +38,13 @@ const RELEASE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// what destroys it: states where the child owns the surface and repaints.
 /// With mouse reporting active the drag belongs to the application, not to
 /// VTE's local selection, so parking the feed would only delay the app's own
-/// response to its mouse events.
-pub(crate) fn feed_hold_eligible(state: BlockState, mouse: MouseReportingMode) -> bool {
+/// response to its mouse events — except under Shift, which VTE reserves for
+/// forcing a local selection over a mouse-reporting app.
+pub(crate) fn feed_hold_eligible(
+    state: BlockState,
+    mouse: MouseReportingMode,
+    shift_held: bool,
+) -> bool {
     let streaming = matches!(
         state,
         BlockState::CollectingOutput
@@ -44,7 +52,7 @@ pub(crate) fn feed_hold_eligible(state: BlockState, mouse: MouseReportingMode) -
             | BlockState::AltScreen
             | BlockState::RawFallback
     );
-    streaming && mouse == MouseReportingMode::None
+    streaming && (mouse == MouseReportingMode::None || shift_held)
 }
 
 pub(crate) struct SelectionFeedHold {
@@ -57,6 +65,10 @@ pub(crate) struct SelectionFeedHold {
     parked: RefCell<Vec<u8>>,
     grace_timer: RefCell<Option<glib::SourceId>>,
     flush_cb: RefCell<Option<FlushFn>>,
+    /// Fires with `true` when the first chunk is actually parked (not on
+    /// every drag — a plain click must not flash the indicator) and `false`
+    /// when the hold releases.
+    state_cb: RefCell<Option<StateFn>>,
 }
 
 impl SelectionFeedHold {
@@ -67,6 +79,7 @@ impl SelectionFeedHold {
             parked: RefCell::new(Vec::new()),
             grace_timer: RefCell::new(None),
             flush_cb: RefCell::new(None),
+            state_cb: RefCell::new(None),
         })
     }
 
@@ -74,6 +87,17 @@ impl SelectionFeedHold {
     /// the per-chunk pipeline the parked bytes must flow back through.
     pub(crate) fn set_flush(&self, flush: impl Fn(Vec<u8>) + 'static) {
         *self.flush_cb.borrow_mut() = Some(Box::new(flush));
+    }
+
+    /// Wire the paused-output indicator. Called once by the view.
+    pub(crate) fn set_state_listener(&self, listener: impl Fn(bool) + 'static) {
+        *self.state_cb.borrow_mut() = Some(Box::new(listener));
+    }
+
+    fn notify_state(&self, parked: bool) {
+        if let Some(cb) = self.state_cb.borrow().as_ref() {
+            cb(parked);
+        }
     }
 
     /// The VTE-side triggers that end a hold early: the selection being
@@ -127,14 +151,21 @@ impl SelectionFeedHold {
         if !self.holding.get() {
             return false;
         }
-        {
+        let (first_park, overflow) = {
             let mut parked = self.parked.borrow_mut();
+            let was_empty = parked.is_empty();
             parked.extend_from_slice(data);
-            if parked.len() <= MAX_PARKED_BYTES {
-                return true;
-            }
+            (
+                was_empty && !parked.is_empty(),
+                parked.len() > MAX_PARKED_BYTES,
+            )
+        };
+        if first_park {
+            self.notify_state(true);
         }
-        self.flush_now();
+        if overflow {
+            self.flush_now();
+        }
         true
     }
 
@@ -155,6 +186,7 @@ impl SelectionFeedHold {
         if parked.is_empty() {
             return;
         }
+        self.notify_state(false);
         if let Some(flush) = self.flush_cb.borrow().as_ref() {
             flush(parked);
         }
@@ -201,27 +233,45 @@ mod tests {
     fn eligibility_requires_streaming_state_without_mouse_reporting() {
         assert!(feed_hold_eligible(
             BlockState::CollectingOutput,
-            MouseReportingMode::None
+            MouseReportingMode::None,
+            false
         ));
         assert!(feed_hold_eligible(
             BlockState::AltScreen,
-            MouseReportingMode::None
+            MouseReportingMode::None,
+            false
         ));
         assert!(feed_hold_eligible(
             BlockState::RawFallback,
-            MouseReportingMode::None
+            MouseReportingMode::None,
+            false
         ));
         assert!(!feed_hold_eligible(
             BlockState::Idle,
-            MouseReportingMode::None
+            MouseReportingMode::None,
+            false
         ));
         assert!(!feed_hold_eligible(
             BlockState::AwaitingCommand,
-            MouseReportingMode::None
+            MouseReportingMode::None,
+            false
         ));
         assert!(!feed_hold_eligible(
             BlockState::CollectingOutput,
-            MouseReportingMode::Sgr
+            MouseReportingMode::Sgr,
+            false
+        ));
+        // Shift forces VTE's local selection over a mouse-reporting app; the
+        // hold must protect that selection too.
+        assert!(feed_hold_eligible(
+            BlockState::CollectingOutput,
+            MouseReportingMode::Sgr,
+            true
+        ));
+        assert!(!feed_hold_eligible(
+            BlockState::Idle,
+            MouseReportingMode::Sgr,
+            true
         ));
     }
 
