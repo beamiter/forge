@@ -771,8 +771,7 @@ pub(crate) fn render_bytes_into_finished_vte(
     let scrollback = capture_rows.max(overflow_rows).max(64);
     let cell_height = vte.char_height() as i32;
     if cell_height > 0 {
-        let rows = visible_rows.clamp(1, i32::MAX as i64) as i32;
-        vte.set_height_request(rows.saturating_mul(cell_height));
+        vte.set_height_request(finished_vte_height_px(visible_rows, cell_height));
     }
     vte.set_scroll_on_output(false);
     vte.set_size(cols.max(1), visible_rows);
@@ -781,12 +780,13 @@ pub(crate) fn render_bytes_into_finished_vte(
     vte.set_size(cols.max(1), visible_rows);
     vte.set_scrollback_lines(scrollback);
     vte.feed(&finished_snapshot_stream(display_text));
+    let settle_tail = snapshot_settle_tail(display_text);
     if expand_to_buffer {
-        settle_finished_terminal_after_feed(vte);
+        settle_finished_terminal_after_feed(vte, settle_tail.as_deref());
     } else {
         // feed() settles asynchronously. Keep capped snapshots anchored at the
         // first retained row without invoking the full-height settle path.
-        settle_finished_terminal_at_top(vte);
+        settle_finished_terminal_at_top(vte, settle_tail.as_deref());
     }
     if let Some(adj) = vte.vadjustment() {
         adj.set_value(adj.lower());
@@ -1201,10 +1201,11 @@ impl FinishedBlock {
                 fed.set(true);
                 w.set_size(cols_for_map, cmd_rows_for_map);
                 w.feed(&cmd_bytes_for_map);
-                settle_finished_terminal_after_feed(w);
+                let tail = snapshot_settle_tail(&String::from_utf8_lossy(&cmd_bytes_for_map));
+                settle_finished_terminal_after_feed(w, tail.as_deref());
                 let ch = w.char_height() as i32;
                 if ch > 0 {
-                    w.set_height_request(cmd_rows_for_map as i32 * ch);
+                    w.set_height_request(finished_vte_height_px(cmd_rows_for_map, ch));
                 }
             });
         }
@@ -1216,8 +1217,10 @@ impl FinishedBlock {
         let displayed_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
         let output_vte = create_finished_terminal(config, cols, output_rows, viewport_cap, false);
         let initial_visible_rows = output_rows.min(viewport_cap).max(1);
-        output_vte
-            .set_height_request(initial_visible_rows as i32 * estimated_cell_height_px(config));
+        output_vte.set_height_request(finished_vte_height_px(
+            initial_visible_rows,
+            estimated_cell_height_px(config),
+        ));
         // Tracks whether the user has toggled this block to its complete height.
         // The default cap is recomputed whenever virtualization remaps the card.
         let expanded: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -1261,7 +1264,7 @@ impl FinishedBlock {
                 if !fit_to_content {
                     let ch = w.char_height() as i32;
                     if ch > 0 {
-                        w.set_height_request((visible_rows as i32) * ch);
+                        w.set_height_request(finished_vte_height_px(visible_rows, ch));
                     }
                 }
             });
@@ -1304,7 +1307,8 @@ impl FinishedBlock {
                 if !fit_to_content {
                     let ch = output_vte_for_btn.char_height() as i32;
                     if ch > 0 {
-                        output_vte_for_btn.set_height_request((visible_rows as i32) * ch);
+                        output_vte_for_btn
+                            .set_height_request(finished_vte_height_px(visible_rows, ch));
                     }
                 }
                 btn.set_label(if now_expanded { "\u{f066}" } else { "\u{f065}" });
@@ -1379,7 +1383,8 @@ impl FinishedBlock {
                 );
                 let cell_height = (output_vte.char_height() as i32).max(1);
                 if !fit_to_content {
-                    output_vte.set_height_request((visible_rows as i32) * cell_height);
+                    output_vte
+                        .set_height_request(finished_vte_height_px(visible_rows, cell_height));
                 }
                 Some(finished_block_height_for_rows(
                     cell_height,
@@ -1704,9 +1709,10 @@ impl FinishedBlock {
                     if !fit_to_content {
                         let ch = output_vte.char_height() as i32;
                         if ch > 0 {
-                            output_vte.set_height_request(
-                                (shown_visual_rows.min(active_cap).max(1) as i32) * ch,
-                            );
+                            output_vte.set_height_request(finished_vte_height_px(
+                                shown_visual_rows.min(active_cap).max(1),
+                                ch,
+                            ));
                         }
                     }
                     let has_query = filter_enabled.get() && !q.trim().is_empty();
@@ -2479,5 +2485,213 @@ mod tests {
             filter_output_lines("one\ntwo\nthree\nfour", "three", false, true, false, 1).unwrap(),
             "two\nthree\nfour"
         );
+    }
+
+    /// TEMP diagnostic harness (needs a display): renders four identical short
+    /// `ls`-style blocks and dumps each output VTE's geometry so the
+    /// spurious-scrollbar / inconsistent-rows bug can be observed directly.
+    #[test]
+    #[ignore = "diagnostic; requires DISPLAY"]
+    fn diag_short_ls_block_geometry() {
+        use gtk4::prelude::*;
+        use vte4::TerminalExt;
+
+        gtk4::init().expect("gtk init");
+        let (config, _, _) = crate::config::load_config();
+
+        // Synthetic `ls -C` capture: 6 colored rows, leading + trailing CRLF,
+        // as the PTY delivers them.
+        let ls = "\r\n\
+            Cargo.lock           deny.toml   Makefile             \x1b[01;34msrc\x1b[0m\r\n\
+            Cargo.toml           \x1b[01;34mdocs\x1b[0m        \x1b[01;34mpackaging\x1b[0m            \x1b[01;34mtarget\x1b[0m\r\n\
+            CHANGELOG.md         flake.lock  README.md            \x1b[01;34mtests\x1b[0m\r\n\
+            config.toml.example  flake.nix   rust-toolchain.toml\r\n\
+            CONTRIBUTING.md      LICENSE-APACHE  \x1b[01;34mscripts\x1b[0m\r\n\
+            \x1b[01;34mdata\x1b[0m         LICENSE-MIT     SECURITY.md\r\n";
+
+        let win = gtk4::Window::new();
+        win.set_default_size(1000, 1300);
+        let scroll = gtk4::ScrolledWindow::new();
+        let list = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        scroll.set_child(Some(&list));
+        win.set_child(Some(&scroll));
+
+        // Busy sibling terminal: VTE shares one process scheduler across all
+        // terminals in the process, so a streaming tab (claude) can make it
+        // yield mid-way through a finished block's snapshot feed.
+        let busy = crate::block_view::create_active_terminal(&config);
+        list.append(&busy);
+        {
+            let noise: String = (0..2000)
+                .map(|i| format!("noise line {i} {}\r\n", "x".repeat(80)))
+                .collect();
+            let noise = std::rc::Rc::new(noise.into_bytes());
+            let busy = busy.clone();
+            gtk4::glib::timeout_add_local(std::time::Duration::from_millis(2), move || {
+                busy.feed(&noise);
+                gtk4::glib::ControlFlow::Continue
+            });
+        }
+
+        let blocks: Vec<super::FinishedBlock> = (0..4)
+            .map(|i| {
+                let fb = super::FinishedBlock::new(
+                    i,
+                    "",
+                    "ls",
+                    None,
+                    ls,
+                    0,
+                    &config,
+                    Some(60),
+                    None,
+                    None,
+                    100,
+                );
+                list.append(fb.widget());
+                fb
+            })
+            .collect();
+
+        // A long output exercises the capped path: bounded viewport, inner
+        // scrollbar, anchored at its first row.
+        let long_text: String = (1..=120).map(|i| format!("long line {i}\r\n")).collect();
+        let long_block = super::FinishedBlock::new(
+            99,
+            "",
+            "seq 120",
+            None,
+            &long_text,
+            0,
+            &config,
+            Some(60),
+            None,
+            None,
+            100,
+        );
+        list.append(long_block.widget());
+
+        win.present();
+        let ctx = gtk4::glib::MainContext::default();
+        let pump = |ms: u64| {
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_millis(ms) {
+                while ctx.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        // Simulate the race that produced the 2-row cards: measure each block
+        // mid-feed (single loop iterations between fits, so VTE may not have
+        // applied the whole snapshot yet). The tail-gated settle must recover.
+        for _ in 0..6 {
+            ctx.iteration(false);
+            for fb in &blocks {
+                crate::block_view::fit_finished_terminal_to_content(&fb.output_vte);
+            }
+        }
+        pump(200);
+        // Re-render storm: virtualization unmaps/remaps cards around every
+        // insertion; each map re-feeds the snapshot while the previous feed's
+        // settle idles are still queued.
+        for _ in 0..3 {
+            for fb in &blocks {
+                fb.widget().set_visible(false);
+            }
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_millis(8) {
+                ctx.iteration(false);
+            }
+            for fb in &blocks {
+                fb.widget().set_visible(true);
+            }
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_millis(8) {
+                ctx.iteration(false);
+            }
+        }
+        pump(1500);
+
+        let mut violations: Vec<String> = Vec::new();
+        for (i, fb) in blocks.iter().enumerate() {
+            let vte = &fb.output_vte;
+            let adj = vte.vadjustment().unwrap();
+            eprintln!(
+                "block {i}: grid={}x{} cell_h={} height_req={} alloc_h={} margins={}+{} adj: lower={} upper={} page={} value={} scrollbar_visible={}",
+                vte.column_count(),
+                vte.row_count(),
+                vte.char_height(),
+                vte.height_request(),
+                vte.height(),
+                vte.margin_top(),
+                vte.margin_bottom(),
+                adj.lower(),
+                adj.upper(),
+                adj.page_size(),
+                adj.value(),
+                fb.output_scrollbar.get_visible(),
+            );
+            // A 6-row snapshot must land as a 6-row card: no inner overflow
+            // (spurious scrollbar), no bottom-anchored partial view.
+            if vte.row_count() != 6 {
+                violations.push(format!("block {i}: grid rows {}", vte.row_count()));
+            }
+            if adj.upper() - adj.lower() > adj.page_size() + 0.5 {
+                violations.push(format!("block {i}: buffer overflows viewport"));
+            }
+            if (adj.value() - adj.lower()).abs() > 0.5 {
+                violations.push(format!("block {i}: not anchored at top"));
+            }
+            if fb.output_scrollbar.get_visible() {
+                violations.push(format!("block {i}: scrollbar on fitting output"));
+            }
+        }
+        {
+            let vte = &long_block.output_vte;
+            let adj = vte.vadjustment().unwrap();
+            eprintln!(
+                "long block: grid={}x{} adj: lower={} upper={} page={} value={} scrollbar_visible={}",
+                vte.column_count(),
+                vte.row_count(),
+                adj.lower(),
+                adj.upper(),
+                adj.page_size(),
+                adj.value(),
+                long_block.output_scrollbar.get_visible(),
+            );
+            if adj.upper() - adj.lower() <= adj.page_size() + 0.5 {
+                violations.push("long block: expected inner overflow".into());
+            }
+            if (adj.value() - adj.lower()).abs() > 0.5 {
+                violations.push("long block: not anchored at top".into());
+            }
+            if !long_block.output_scrollbar.get_visible() {
+                violations.push("long block: scrollbar missing".into());
+            }
+        }
+        win.close();
+        while ctx.iteration(false) {}
+        assert!(violations.is_empty(), "geometry violations: {violations:?}");
+    }
+
+    #[test]
+    fn snapshot_settle_tail_finds_last_visible_line() {
+        use crate::block_view::snapshot_settle_tail;
+        assert_eq!(
+            snapshot_settle_tail(
+                "Cargo.lock  deny.toml\r\n\x1b[01;34mdata\x1b[0m  SECURITY.md\r\n"
+            ),
+            Some("data  SECURITY.md".to_string())
+        );
+        // Trailing blank lines are skipped; ANSI is stripped before matching.
+        assert_eq!(
+            snapshot_settle_tail("one\r\n\x1b[32mtwo\x1b[0m\r\n\r\n   \r\n"),
+            Some("two".to_string())
+        );
+        assert_eq!(
+            snapshot_settle_tail("界界界\r\n🙂 done\r\n"),
+            Some("🙂 done".to_string())
+        );
+        assert_eq!(snapshot_settle_tail(""), None);
+        assert_eq!(snapshot_settle_tail("\r\n   \r\n"), None);
     }
 }

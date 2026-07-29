@@ -16,6 +16,23 @@ use vte4::{CursorBlinkMode, CursorShape, Format, Terminal};
 /// monospace fonts often paint close to VTE's default cell boundary.
 pub(crate) const BLOCK_CELL_HEIGHT_SCALE: f64 = 1.12;
 
+/// Headroom added to every finished-VTE pixel height request. VTE re-derives
+/// its grid rows from the *allocated content* height, and CSS border/padding
+/// accounting can leave that a couple of pixels short of `rows * cell` — at
+/// which point the grid loses a row, the snapshot's first line slides into
+/// scrollback, and a fitting output grows a scrollbar. The slack must stay
+/// below one cell height so it can never add a phantom row.
+pub(crate) const FINISHED_VTE_HEIGHT_SLACK_PX: i32 = 6;
+
+/// The one formula for a finished VTE's pixel height: `rows * cell` plus the
+/// bounded slack above.
+pub(crate) fn finished_vte_height_px(rows: i64, cell_height: i32) -> i32 {
+    let cell = cell_height.max(1);
+    (rows.clamp(1, i32::MAX as i64) as i32)
+        .saturating_mul(cell)
+        .saturating_add(FINISHED_VTE_HEIGHT_SLACK_PX.min(cell - 1))
+}
+
 // ─── Mouse Reporting Mode ─────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -184,48 +201,110 @@ pub(crate) fn fit_finished_terminal_to_content(terminal: &Terminal) {
         terminal.set_size(cols, rows);
     }
     let cell_height = (terminal.char_height() as i32).max(1);
-    let rows_i32 = rows.clamp(1, i32::MAX as i64) as i32;
-    terminal.set_height_request(rows_i32.saturating_mul(cell_height));
+    terminal.set_height_request(finished_vte_height_px(rows, cell_height));
     if let Some(adj) = terminal.vadjustment() {
         adj.set_value(adj.lower());
     }
 }
 
-/// VTE updates its buffer asynchronously after `feed()`. Two idle passes fold
-/// all retained rows into the finished card, then a final pass pins the snapshot
-/// to its first row.
-pub(crate) fn settle_finished_terminal_after_feed(terminal: &Terminal) {
-    let terminal = terminal.clone();
-    glib::idle_add_local_once(move || {
+/// Poll cadence and bound for the feed-applied detectors below. The cap is a
+/// worst-case guard: on expiry the pass runs anyway, degrading to the old
+/// (timing-blind) behavior instead of never settling.
+const SETTLE_TICK: std::time::Duration = std::time::Duration::from_millis(16);
+const SETTLE_MAX_TICKS: u32 = 125;
+
+/// The last visible line the snapshot is expected to render — the proof that
+/// VTE has applied the whole asynchronous `feed()`. `None` for all-blank
+/// snapshots (nothing observable to wait for).
+pub(crate) fn snapshot_settle_tail(display_text: &str) -> Option<String> {
+    let plain = super::strip_ansi(display_text);
+    plain.lines().rev().find_map(|line| {
+        let line = line.trim();
+        (!line.is_empty()).then(|| line.to_string())
+    })
+}
+
+/// Whether the terminal's rendered text already ends with the snapshot's
+/// expected final line. Trailing blank rows are ignored on both sides.
+fn feed_tail_applied(terminal: &Terminal, expected_tail: Option<&str>) -> bool {
+    let Some(tail) = expected_tail else {
+        return true;
+    };
+    terminal
+        .text_format(Format::Text)
+        .map(|text| text.trim_end().ends_with(tail))
+        .unwrap_or(false)
+}
+
+fn anchor_terminal_top(terminal: &Terminal) {
+    if let Some(adj) = terminal.vadjustment() {
+        adj.set_value(adj.lower());
+    }
+}
+
+/// VTE updates its buffer asynchronously after `feed()`, and under load (a
+/// streaming sibling terminal shares VTE's process scheduler) that can take
+/// many main-loop turns. Measuring on a fixed idle used to catch the buffer
+/// mid-feed: the grid shrank to however many rows happened to be rendered,
+/// the rest of the snapshot overflowed into scrollback, and the card stuck
+/// bottom-anchored showing only its last lines — with a scrollbar on output
+/// that fits. Wait for proof the feed is fully applied (the snapshot's final
+/// line is rendered), then fold the retained rows into the card and pin the
+/// first row.
+pub(crate) fn settle_finished_terminal_after_feed(
+    terminal: &Terminal,
+    expected_tail: Option<&str>,
+) {
+    let weak = terminal.downgrade();
+    let tail = expected_tail.map(str::to_owned);
+    let mut ticks = 0u32;
+    glib::timeout_add_local(SETTLE_TICK, move || {
+        let Some(terminal) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        ticks += 1;
+        if !feed_tail_applied(&terminal, tail.as_deref()) && ticks < SETTLE_MAX_TICKS {
+            return glib::ControlFlow::Continue;
+        }
         fit_finished_terminal_to_content(&terminal);
         let terminal = terminal.clone();
         glib::idle_add_local_once(move || {
             fit_finished_terminal_to_content(&terminal);
             let terminal = terminal.clone();
-            glib::idle_add_local_once(move || {
-                if let Some(adj) = terminal.vadjustment() {
-                    adj.set_value(adj.lower());
-                }
-            });
+            glib::idle_add_local_once(move || anchor_terminal_top(&terminal));
         });
+        glib::ControlFlow::Break
     });
 }
 
 /// Keep a deliberately capped snapshot anchored at its first retained row.
-/// VTE applies `feed()` asynchronously, so one immediate adjustment write can
-/// be overwritten by the final buffer layout. Reassert the top over two idles.
-pub(crate) fn settle_finished_terminal_at_top(terminal: &Terminal) {
-    let terminal = terminal.clone();
-    glib::idle_add_local_once(move || {
-        if let Some(adj) = terminal.vadjustment() {
-            adj.set_value(adj.lower());
+///
+/// `feed()` is asynchronous; while the buffer still fits the grid the view's
+/// top and bottom coincide, so VTE's at-bottom follow drags the view down as
+/// soon as the content overflows. Reassert the top on every tick until either
+/// the buffer has overflowed (an anchored view detaches from the follow and
+/// later bytes can no longer move it) or the whole snapshot proved shorter
+/// than the grid (its final line is visible).
+pub(crate) fn settle_finished_terminal_at_top(terminal: &Terminal, expected_tail: Option<&str>) {
+    let weak = terminal.downgrade();
+    let tail = expected_tail.map(str::to_owned);
+    let mut ticks = 0u32;
+    glib::timeout_add_local(SETTLE_TICK, move || {
+        let Some(terminal) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        ticks += 1;
+        anchor_terminal_top(&terminal);
+        let overflowed = terminal
+            .vadjustment()
+            .map(|adj| adj.upper() - adj.lower() > adj.page_size() + 0.5)
+            .unwrap_or(false);
+        if overflowed || feed_tail_applied(&terminal, tail.as_deref()) || ticks >= SETTLE_MAX_TICKS
+        {
+            anchor_terminal_top(&terminal);
+            return glib::ControlFlow::Break;
         }
-        let terminal = terminal.clone();
-        glib::idle_add_local_once(move || {
-            if let Some(adj) = terminal.vadjustment() {
-                adj.set_value(adj.lower());
-            }
-        });
+        glib::ControlFlow::Continue
     });
 }
 
@@ -336,7 +415,9 @@ pub(crate) fn create_finished_terminal(
             if expanded.replace(true) {
                 return;
             }
-            settle_finished_terminal_after_feed(terminal);
+            // Re-fit on remap: the snapshot was fed long ago and is fully
+            // applied, so there is no tail to wait for.
+            settle_finished_terminal_after_feed(terminal, None);
         });
     }
 
