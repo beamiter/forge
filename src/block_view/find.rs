@@ -132,15 +132,17 @@ impl TermView {
                     return false;
                 }
 
-                // Exit code filter
+                // Exit code filter. A block whose status the shell never
+                // reported matches no code, not even 0.
                 if let Some(exit_code) = filters.exit_code {
-                    if b.exit_code != exit_code {
+                    if b.exit_code != Some(exit_code) {
                         return false;
                     }
                 }
 
-                // Failed only filter
-                if filters.failed_only && b.exit_code == 0 {
+                // Failed only filter. An unknown status is not a failure — it is
+                // not a success either, so it is simply not this filter's answer.
+                if filters.failed_only && !matches!(b.exit_code, Some(code) if code != 0) {
                     return false;
                 }
 

@@ -20,7 +20,11 @@ pub(crate) struct BlockData {
     pub(crate) cmd: String,
     pub(crate) cmd_markup: Option<String>,
     pub(crate) output: String,
-    pub(crate) exit_code: i32,
+    /// `None` when the shell reported no exit status for this command (a bare
+    /// FinalTerm `D` mark), and for background output, which belongs to no
+    /// command at all. Deliberately not folded into `Some(0)`: an unknown
+    /// outcome rendered as a success is how a failed command looks fine.
+    pub(crate) exit_code: Option<i32>,
     pub(crate) estimated_height: i32,
     pub(crate) line_count: usize,
     #[serde(default)]
@@ -75,7 +79,10 @@ impl BlockData {
         }
 
         if !self.is_background() {
-            md.push_str(&format!("**Exit Code:** {}\n\n", self.exit_code));
+            match self.exit_code {
+                Some(code) => md.push_str(&format!("**Exit Code:** {code}\n\n")),
+                None => md.push_str("**Exit Code:** unknown (the shell reported none)\n\n"),
+            }
         }
 
         if let Some(dur) = self.duration_ms {
@@ -84,6 +91,86 @@ impl BlockData {
         }
 
         md
+    }
+}
+
+/// Shown wherever an unknown exit status is presented, because "the badge says
+/// `?`" is not self-explanatory and the honest answer is short.
+pub(crate) const UNKNOWN_EXIT_TOOLTIP: &str = "The shell reported no exit status for this command";
+
+/// Stand-in code for the shared surfaces whose types predate an unknown status
+/// and take a plain `i32`: the family's command-history JSONL
+/// (`jterm_core::command_history`), the AI block context
+/// (`jterm_core::ai::BlockContext`) and jagent's observation turn.
+///
+/// `-1` is not a POSIX wait status — real ones are `0..=255`, with signals as
+/// `128 + n` — so nothing downstream can read it as a success or as a signal
+/// death, which is exactly what folding the case into `0` used to do. Surfaces
+/// that also carry free text pair it with [`UNKNOWN_EXIT_NOTE`].
+pub(crate) const UNKNOWN_EXIT_SENTINEL: i32 = -1;
+
+/// The same fact in words, for the surfaces that send text to a model.
+pub(crate) const UNKNOWN_EXIT_NOTE: &str =
+    "[terminal] the shell reported no exit status for this command";
+
+/// Split an optional exit status into the `i32` a shared surface requires plus
+/// the note that makes an unknown status legible in accompanying text.
+pub(crate) fn exit_code_for_shared_surface(exit_code: Option<i32>) -> (i32, Option<&'static str>) {
+    match exit_code {
+        Some(code) => (code, None),
+        None => (UNKNOWN_EXIT_SENTINEL, Some(UNKNOWN_EXIT_NOTE)),
+    }
+}
+
+/// How a finished block presents its outcome.
+///
+/// `Unknown` is a case of its own: a shell that emits the bare FinalTerm `D`
+/// mark tells us a command ended but not how, and rendering that with the green
+/// check of a success is how a failure disappears from the history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockOutcome {
+    Background,
+    Success,
+    Failure(i32),
+    Unknown,
+}
+
+impl BlockOutcome {
+    pub(crate) fn classify(is_background: bool, exit_code: Option<i32>) -> Self {
+        match (is_background, exit_code) {
+            (true, _) => Self::Background,
+            (false, Some(0)) => Self::Success,
+            (false, Some(code)) => Self::Failure(code),
+            (false, None) => Self::Unknown,
+        }
+    }
+
+    fn stripe_css_class(self) -> &'static str {
+        match self {
+            Self::Background => "block-background",
+            Self::Success => "block-success",
+            Self::Failure(_) => "block-failed",
+            Self::Unknown => "block-unknown",
+        }
+    }
+
+    /// Nerd-font glyphs: spinner, check, cross, question mark.
+    fn status_glyph(self) -> &'static str {
+        match self {
+            Self::Background => "\u{f110}",
+            Self::Success => "\u{f00c}",
+            Self::Failure(_) => "\u{f00d}",
+            Self::Unknown => "\u{f128}",
+        }
+    }
+
+    fn status_css_class(self) -> &'static str {
+        match self {
+            Self::Background => "block-status-background",
+            Self::Success => "block-status-ok",
+            Self::Failure(_) => "block-status-bad",
+            Self::Unknown => "block-status-unknown",
+        }
     }
 }
 
@@ -844,7 +931,7 @@ impl FinishedBlock {
         cmd: &str,
         cmd_ansi: Option<&str>,
         output: &str,
-        exit_code: i32,
+        exit_code: Option<i32>,
         config: &Config,
         duration_ms: Option<u64>,
         end_time_ms: Option<u64>,
@@ -875,7 +962,7 @@ impl FinishedBlock {
         cmd: &str,
         cmd_ansi: Option<&str>,
         output: &str,
-        exit_code: i32,
+        exit_code: Option<i32>,
         config: &Config,
         duration_ms: Option<u64>,
         end_time_ms: Option<u64>,
@@ -958,14 +1045,10 @@ impl FinishedBlock {
         content.set_vexpand(false);
         outer.append(&content);
 
-        // Status stripe: green on success, red on failure, cyan for idle output.
-        outer.add_css_class(if is_background {
-            "block-background"
-        } else if exit_code == 0 {
-            "block-success"
-        } else {
-            "block-failed"
-        });
+        let outcome = BlockOutcome::classify(is_background, exit_code);
+        // Status stripe: green on success, red on failure, cyan for idle output,
+        // amber when the shell never told us how the command ended.
+        outer.add_css_class(outcome.stripe_css_class());
 
         // Add hover highlighting to show block is interactive (and reveal the
         // quick-action buttons). The action box is created below; it's wired into
@@ -999,21 +1082,12 @@ impl FinishedBlock {
         bookmark_star.set_visible(false);
         header_row.append(&bookmark_star);
 
-        // Status icon: success, failure, or asynchronous/background output.
-        let status_icon = gtk4::Label::new(Some(if is_background {
-            "\u{f110}"
-        } else if exit_code == 0 {
-            "\u{f00c}"
-        } else {
-            "\u{f00d}"
-        }));
-        status_icon.add_css_class(if is_background {
-            "block-status-background"
-        } else if exit_code == 0 {
-            "block-status-ok"
-        } else {
-            "block-status-bad"
-        });
+        // Status icon: success, failure, unknown, or asynchronous/background output.
+        let status_icon = gtk4::Label::new(Some(outcome.status_glyph()));
+        status_icon.add_css_class(outcome.status_css_class());
+        if outcome == BlockOutcome::Unknown {
+            status_icon.set_tooltip_text(Some(UNKNOWN_EXIT_TOOLTIP));
+        }
         status_icon.set_halign(gtk4::Align::Start);
         header_row.append(&status_icon);
         if is_background {
@@ -1071,20 +1145,30 @@ impl FinishedBlock {
             header_row.append(&dur_label);
         }
 
-        // Exit code badge
-        if !is_background && exit_code != 0 {
-            let badge = match signal_name_for_exit(exit_code) {
-                Some(sig) => {
-                    let badge = gtk4::Label::new(Some(&format!("exit:{exit_code} {sig}")));
-                    badge.set_tooltip_text(Some(&format!(
-                        "128 + signal number: terminated by {sig}"
-                    )));
-                    badge
-                }
-                None => gtk4::Label::new(Some(&format!("exit:{exit_code}"))),
-            };
-            badge.add_css_class("block-exit-bad");
-            header_row.append(&badge);
+        // Exit code badge. A successful command shows none; an unknown status
+        // gets its own badge rather than silently looking like a success.
+        match outcome {
+            BlockOutcome::Failure(code) => {
+                let badge = match signal_name_for_exit(code) {
+                    Some(sig) => {
+                        let badge = gtk4::Label::new(Some(&format!("exit:{code} {sig}")));
+                        badge.set_tooltip_text(Some(&format!(
+                            "128 + signal number: terminated by {sig}"
+                        )));
+                        badge
+                    }
+                    None => gtk4::Label::new(Some(&format!("exit:{code}"))),
+                };
+                badge.add_css_class("block-exit-bad");
+                header_row.append(&badge);
+            }
+            BlockOutcome::Unknown => {
+                let badge = gtk4::Label::new(Some("exit:?"));
+                badge.set_tooltip_text(Some(UNKNOWN_EXIT_TOOLTIP));
+                badge.add_css_class("block-exit-unknown");
+                header_row.append(&badge);
+            }
+            BlockOutcome::Success | BlockOutcome::Background => {}
         }
 
         // Selected blocks behave like a lightweight navigation mode. Keep the
@@ -2203,57 +2287,109 @@ pub(crate) fn command_recall_available(state: BlockState) -> bool {
     state == BlockState::AwaitingCommand
 }
 
-/// Select text that can be inserted without accidentally submitting multiple
-/// commands. With bracketed paste enabled, the whole multiline edit buffer is
-/// safe; otherwise fall back to the first line.
-fn recalled_command_text(cmd: &str, bracketed_paste: bool) -> (&str, bool) {
-    let cmd = cmd.trim_end_matches(['\r', '\n']);
-    if bracketed_paste {
-        return (cmd, false);
-    }
-    let first_break = cmd
-        .char_indices()
-        .find_map(|(idx, ch)| matches!(ch, '\r' | '\n').then_some(idx));
-    match first_break {
-        Some(idx) => (&cmd[..idx], true),
-        None => (cmd, false),
-    }
-}
-
-/// Replace the current shell edit buffer with a recalled command. Multiline
-/// commands use bracketed-paste markers when the shell advertised DECSET 2004,
-/// so embedded newlines remain editable instead of executing early.
+/// Replace the current shell edit buffer with a recalled command, optionally
+/// submitting it. Returns whether the command had to be cut to its first line.
+///
+/// The encoding is [`build_command_recall`]'s, so this path cannot disagree with
+/// the block-recall and clipboard paths about when to frame — and it writes the
+/// whole payload in **one** call. Emitting the frame as three separate writes
+/// (as this did) meant the body reached the PTY boundary with a frame already
+/// open, which is exactly the window an embedded `ESC[201~` needs.
 pub(crate) fn write_recalled_command(
     pty: &crate::pty::OwnedPty,
     cmd: &str,
     bracketed_paste: bool,
     execute: bool,
 ) -> bool {
-    let (text, first_line_only) = recalled_command_text(cmd, bracketed_paste);
-    let multiline = text.contains('\n') || text.contains('\r');
-
-    // Always clear the line. User-typed text is not represented by pty_synced,
-    // so conditioning Ctrl+U on that flag appends history to partial input.
-    pty.write_bytes(b"\x15");
-    if bracketed_paste && multiline {
-        pty.write_bytes(b"\x1b[200~");
-        pty.write_bytes(text.as_bytes());
-        pty.write_bytes(b"\x1b[201~");
-    } else {
-        pty.write_bytes(text.as_bytes());
+    let paste = build_command_recall(cmd, bracketed_paste);
+    if paste.is_empty() {
+        return false;
     }
+    pty.write_bytes(&paste.bytes);
     if execute {
+        // Outside the frame: readline does not execute a newline contained in a
+        // bracketed paste, so a CR inside the frame would be swallowed.
         pty.write_bytes(b"\r");
     }
-    first_line_only
+    paste.risk.truncated_to_first_line
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         block_clipboard_text, collapsed_output_summary, command_recall_available,
-        filter_output_lines, terminalize_line_breaks, BlockState,
+        exit_code_for_shared_surface, filter_output_lines, terminalize_line_breaks, BlockData,
+        BlockOutcome, BlockState, UNKNOWN_EXIT_NOTE, UNKNOWN_EXIT_SENTINEL,
     };
+
+    fn block_with_exit(exit_code: Option<i32>) -> BlockData {
+        BlockData {
+            id: 1,
+            prompt: String::new(),
+            cmd: "cargo test".to_string(),
+            cmd_markup: None,
+            output: "running".to_string(),
+            exit_code,
+            estimated_height: 0,
+            line_count: 1,
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            cols: 80,
+        }
+    }
+
+    /// The presentation rule this round adds: a command whose exit status the
+    /// shell never reported is its own outcome, not a success.
+    #[test]
+    fn an_unreported_exit_status_is_neither_success_nor_failure() {
+        assert_eq!(
+            BlockOutcome::classify(false, None),
+            BlockOutcome::Unknown,
+            "an unknown status used to arrive here as Some(0), i.e. as a success"
+        );
+        assert_eq!(
+            BlockOutcome::classify(false, Some(0)),
+            BlockOutcome::Success
+        );
+        assert_eq!(
+            BlockOutcome::classify(false, Some(130)),
+            BlockOutcome::Failure(130)
+        );
+        // Background output belongs to no command, so it keeps its own look
+        // whatever status is attached.
+        assert_eq!(BlockOutcome::classify(true, None), BlockOutcome::Background);
+        assert_eq!(
+            BlockOutcome::classify(true, Some(1)),
+            BlockOutcome::Background
+        );
+    }
+
+    #[test]
+    fn exported_markdown_says_unknown_instead_of_zero() {
+        let unknown = block_with_exit(None).to_markdown();
+        assert!(unknown.contains("**Exit Code:** unknown"), "{unknown}");
+        assert!(block_with_exit(Some(0))
+            .to_markdown()
+            .contains("**Exit Code:** 0"));
+    }
+
+    /// The `i32`-only shared surfaces (command-history JSONL, AI block context,
+    /// jagent observation) must receive something that cannot be read as a
+    /// success, plus the note that explains it.
+    #[test]
+    fn shared_surfaces_get_a_sentinel_and_a_note_for_an_unknown_status() {
+        assert_eq!(exit_code_for_shared_surface(Some(7)), (7, None));
+        assert_eq!(
+            exit_code_for_shared_surface(None),
+            (UNKNOWN_EXIT_SENTINEL, Some(UNKNOWN_EXIT_NOTE))
+        );
+        assert!(
+            !(0..=255).contains(&UNKNOWN_EXIT_SENTINEL),
+            "the sentinel must not collide with a real wait status"
+        );
+    }
 
     #[test]
     fn snapshot_feed_wipes_previous_content_in_stream() {
@@ -2333,20 +2469,48 @@ mod tests {
         }
     }
 
+    /// Updated in round 8: recall now goes through the shared
+    /// `pty_input::encode_prompt_insert`, whose payload leads with the
+    /// unconditional `Ctrl+U` and frames a multiline body when the shell can
+    /// strip the frame. The old local `recalled_command_text` is gone.
     #[test]
     fn multiline_recall_uses_full_text_with_bracketed_paste() {
+        let paste = super::build_command_recall("printf one\nprintf two\n", true);
+        assert_eq!(paste.echo_text, "printf one\nprintf two");
         assert_eq!(
-            super::recalled_command_text("printf one\nprintf two\n", true),
-            ("printf one\nprintf two", false)
+            paste.bytes,
+            b"\x15\x1b[200~printf one\nprintf two\x1b[201~".to_vec()
         );
+        assert!(!paste.risk.truncated_to_first_line);
     }
 
     #[test]
     fn multiline_recall_falls_back_without_bracketed_paste() {
+        let paste = super::build_command_recall("printf one\nprintf two", false);
+        assert_eq!(paste.echo_text, "printf one");
+        assert_eq!(paste.bytes, b"\x15printf one".to_vec());
+        assert!(paste.risk.truncated_to_first_line);
+    }
+
+    /// The injection this round fixes: a recalled command carrying an embedded
+    /// frame terminator must never reach the PTY with the terminator intact.
+    #[test]
+    fn recall_strips_an_embedded_paste_terminator() {
+        let paste = super::build_command_recall("docs\x1b[201~\rrm -rf ~", true);
+        assert!(paste.risk.had_embedded_paste_marker);
+        let terminators = paste
+            .bytes
+            .windows(b"\x1b[201~".len())
+            .filter(|window| *window == b"\x1b[201~")
+            .count();
         assert_eq!(
-            super::recalled_command_text("printf one\nprintf two", false),
-            ("printf one", true)
+            terminators,
+            1,
+            "only the closing frame may carry a terminator: {:?}",
+            String::from_utf8_lossy(&paste.bytes)
         );
+        assert!(paste.bytes.ends_with(b"\x1b[201~"));
+        assert_eq!(paste.echo_text, "docs\nrm -rf ~");
     }
 
     #[test]
@@ -2541,7 +2705,7 @@ mod tests {
                     "ls",
                     None,
                     ls,
-                    0,
+                    Some(0),
                     &config,
                     Some(60),
                     None,
@@ -2562,7 +2726,7 @@ mod tests {
             "seq 120",
             None,
             &long_text,
-            0,
+            Some(0),
             &config,
             Some(60),
             None,

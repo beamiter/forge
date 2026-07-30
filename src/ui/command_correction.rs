@@ -227,6 +227,12 @@ fn attach_term_view(
             return;
         }
 
+        // Correction is a response to a *failure*. A shell that reported no exit
+        // status gives no failure signal, and inventing one would put a
+        // "did you mean" card under a command that may well have succeeded.
+        let Some(exit_code) = exit_code else {
+            return;
+        };
         let Some(failure) = classify_failure(&command, exit_code, &output) else {
             return;
         };

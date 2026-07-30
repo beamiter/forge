@@ -514,16 +514,21 @@ pub(crate) fn spawn_shell(
     }
     let home = std::env::var("HOME").ok();
     let requested_working_directory = working_directory.or(home.as_deref());
-    // `TERM_PROGRAM` must reach both a native child and a shell launched by
-    // `flatpak-spawn --host`; the latter needs it encoded in the wrapper argv.
-    let host_environment = [("TERM_PROGRAM", "jterm4")];
-    let argv_vec =
-        crate::host::wrap_argv(&argv_vec, requested_working_directory, &host_environment);
+    // The terminal identity must reach both a native child and a shell launched
+    // by `flatpak-spawn --host`; the latter needs it encoded in the wrapper argv,
+    // which `wrap_argv` now builds from the same shared policy.
+    let argv_vec = crate::host::wrap_argv(&argv_vec, requested_working_directory, &[]);
     let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
 
-    // VTE inherits the rest of the environment. The explicit value covers a
-    // native child; Flatpak host forwarding is encoded in argv above.
-    let envv: &[&str] = &["TERM_PROGRAM=jterm4"];
+    // VTE inherits the rest of the environment and injects its own
+    // TERM/VTE_VERSION, and an `envv` entry wins unconditionally — so this
+    // carries identity only (TERM, COLORTERM, TERM_PROGRAM,
+    // TERM_PROGRAM_VERSION, VTE_VERSION) and never a pager or locale default
+    // that would clobber one the user set deliberately.
+    let child_identity = crate::child_env::ChildEnv::from_identity();
+    let envv_owned = crate::child_env::vte_envv(&child_identity, &[]);
+    let envv: Vec<&str> = envv_owned.iter().map(String::as_str).collect();
+    let envv: &[&str] = &envv;
     let spawn_flags = SpawnFlags::SEARCH_PATH;
     let cancellable: Option<&Cancellable> = None;
     let spawn_working_directory = if crate::host::is_flatpak() {

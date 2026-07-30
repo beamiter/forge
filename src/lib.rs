@@ -19,6 +19,12 @@ pub mod host {
     pub const APP_ID: &str = "io.github.beamiter.jterm4";
 }
 
+pub mod child_env {
+    pub use jterm_core::child_env::*;
+}
+pub mod execution_journal {
+    pub use jterm_core::execution_journal::*;
+}
 pub mod keybindings;
 pub mod logging;
 pub mod notebook;
@@ -27,8 +33,14 @@ pub mod process {
     pub use jterm_core::process::*;
 }
 pub mod pty;
+pub mod pty_input {
+    pub use jterm_core::pty_input::*;
+}
 pub mod redact {
     pub use jterm_core::redact::*;
+}
+pub mod snapshot_file {
+    pub use jterm_core::snapshot_file::*;
 }
 pub mod jsh_install {
     pub use jterm_core::jsh_install::*;

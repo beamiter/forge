@@ -34,8 +34,61 @@ fn decode_zstd_bounded(data: &[u8], max_decoded_bytes: u64) -> io::Result<Vec<u8
     Ok(decoded)
 }
 
+/// The record shape every save before round 8 used: `exit_code` was a bare
+/// `i32`, so a command whose status the shell never reported was stored as a
+/// fabricated `0`. Kept only so those files still decode; the archived layout
+/// of the current `BlockData` differs and would otherwise reject every old
+/// frame, silently dropping the user's saved history on upgrade.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct LegacyBlockDataV1 {
+    id: u64,
+    prompt: String,
+    cmd: String,
+    cmd_markup: Option<String>,
+    output: String,
+    exit_code: i32,
+    estimated_height: i32,
+    line_count: usize,
+    start_time_ms: Option<u64>,
+    end_time_ms: Option<u64>,
+    duration_ms: Option<u64>,
+    cwd: Option<String>,
+    cols: u16,
+}
+
+impl From<LegacyBlockDataV1> for BlockData {
+    fn from(legacy: LegacyBlockDataV1) -> Self {
+        Self {
+            id: legacy.id,
+            prompt: legacy.prompt,
+            cmd: legacy.cmd,
+            cmd_markup: legacy.cmd_markup,
+            output: legacy.output,
+            // The legacy field cannot distinguish "exited 0" from "no status
+            // reported"; both were written as 0. Some(0) preserves what the old
+            // file actually says rather than re-guessing it.
+            exit_code: Some(legacy.exit_code),
+            estimated_height: legacy.estimated_height,
+            line_count: legacy.line_count,
+            start_time_ms: legacy.start_time_ms,
+            end_time_ms: legacy.end_time_ms,
+            duration_ms: legacy.duration_ms,
+            cwd: legacy.cwd,
+            cols: legacy.cols,
+        }
+    }
+}
+
+/// Current schema first, then the pre-round-8 layout. Order matters: a current
+/// frame must never be squeezed through the legacy shape.
 fn decode_rkyv_block(data: &[u8]) -> Option<BlockData> {
-    rkyv::from_bytes::<BlockData, rkyv::rancor::Error>(data).ok()
+    rkyv::from_bytes::<BlockData, rkyv::rancor::Error>(data)
+        .ok()
+        .or_else(|| {
+            rkyv::from_bytes::<LegacyBlockDataV1, rkyv::rancor::Error>(data)
+                .ok()
+                .map(BlockData::from)
+        })
 }
 
 /// History frames predate an on-disk codec marker. Try the configured codec
@@ -411,7 +464,7 @@ impl TermView {
         for (offset, block) in recent_blocks.into_iter().enumerate() {
             let idx = start_idx + offset;
             log::debug!(
-                "Loaded historical block #{}: prompt={:?}, cmd={:?}, output_len={}, exit_code={}",
+                "Loaded historical block #{}: prompt={:?}, cmd={:?}, output_len={}, exit_code={:?}",
                 idx,
                 block.prompt,
                 block.cmd,
@@ -473,7 +526,7 @@ mod tests {
             cmd: command.to_string(),
             cmd_markup: None,
             output: "output".to_string(),
-            exit_code: 0,
+            exit_code: Some(0),
             estimated_height: 32,
             line_count: 1,
             start_time_ms: None,
@@ -518,6 +571,47 @@ mod tests {
                 "printf hello"
             );
         }
+    }
+
+    /// Round 8 changed `BlockData::exit_code` from `i32` to `Option<i32>`. A
+    /// history file written before that must still decode — dropping every old
+    /// frame on upgrade would silently erase the user's saved blocks.
+    #[test]
+    fn history_decoder_accepts_pre_round8_frames_with_bare_exit_codes() {
+        let legacy = super::LegacyBlockDataV1 {
+            id: 3,
+            prompt: "prompt".to_string(),
+            cmd: "false".to_string(),
+            cmd_markup: None,
+            output: "output".to_string(),
+            exit_code: 1,
+            estimated_height: 32,
+            line_count: 1,
+            start_time_ms: Some(5),
+            end_time_ms: Some(9),
+            duration_ms: Some(4),
+            cwd: Some("/tmp".to_string()),
+            cols: 80,
+        };
+        let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&legacy).unwrap();
+
+        for prefer_compressed in [false, true] {
+            let decoded = decode_block_record(encoded.as_slice(), prefer_compressed).unwrap();
+            assert_eq!(decoded.cmd, "false");
+            assert_eq!(decoded.output, "output");
+            assert_eq!(decoded.exit_code, Some(1));
+            assert_eq!(decoded.cwd.as_deref(), Some("/tmp"));
+        }
+
+        // Round-trip of the current schema still prefers the current shape,
+        // including the honest unknown.
+        let unknown = BlockData {
+            exit_code: None,
+            ..sample_block(4, "unreported")
+        };
+        let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&unknown).unwrap();
+        let decoded = decode_block_record(encoded.as_slice(), false).unwrap();
+        assert_eq!(decoded.exit_code, None);
     }
 
     #[test]

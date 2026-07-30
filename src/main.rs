@@ -346,6 +346,11 @@ pub fn run() -> glib::ExitCode {
     jterm_core::identity::init(jterm_core::identity::AppIdentity {
         app_name: "jterm4",
         app_id: crate::host::APP_ID,
+        // This crate's version, not core's: it is what child shells read as
+        // TERM_PROGRAM_VERSION, so a tool feature-gating on the
+        // TERM_PROGRAM/TERM_PROGRAM_VERSION pair must not be told the shared
+        // library's version alongside our name.
+        app_version: env!("CARGO_PKG_VERSION"),
     });
     if let Some(code) = crate::cli::handle_early_args() {
         return code;
@@ -1469,6 +1474,12 @@ pub fn run() -> glib::ExitCode {
                 crate::command_history::flush_pending(std::time::Duration::from_secs(2))
             {
                 log::warn!("command-history worker did not flush before shutdown: {error}");
+            }
+            // Captured outputs queued for jsh's execution journal ride a
+            // writer thread of their own; without this bounded wait the last
+            // command's output is lost whenever quit wins the race to disk.
+            if !crate::execution_journal::flush(std::time::Duration::from_secs(2)) {
+                log::warn!("execution-journal writer did not flush before shutdown");
             }
             // Make the final snapshot visible only after this window is fully
             // quiesced. Any queued auto-save callbacks become no-ops.

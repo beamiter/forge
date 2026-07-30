@@ -16,6 +16,15 @@ fn feed_all(p: &mut Parser, data: &[u8]) -> Vec<ParserEvent> {
     events
 }
 
+/// The exit status carried by the first `CommandEnd`, and whether the event
+/// fired at all: `Some(None)` is "the shell said done but not how".
+fn command_end_exit(events: &[ParserEvent]) -> Option<Option<i32>> {
+    events.iter().find_map(|event| match event {
+        ParserEvent::CommandEnd { exit, .. } => Some(*exit),
+        _ => None,
+    })
+}
+
 fn collect_bytes(events: &[ParserEvent]) -> Vec<u8> {
     let mut out = Vec::new();
     for e in events {
@@ -47,38 +56,36 @@ fn osc133_a_with_extra_params_still_recognised() {
 fn osc133_d_with_trailing_aid_field_parses_exit_code() {
     let mut p = Parser::new();
     let events = feed_all(&mut p, b"\x1b]133;D;42;aid=7\x07");
-    let code = events.iter().find_map(|e| match e {
-        ParserEvent::CommandEnd(c) => Some(*c),
-        _ => None,
-    });
-    assert_eq!(code, Some(42));
+    assert_eq!(command_end_exit(&events), Some(Some(42)));
 }
 
 /// OSC 133 ; D with no code — some shells emit a bare `D` to signal "done,
-/// unknown exit." Must default to 0 instead of skipping the event.
+/// unknown exit". The event must still fire (otherwise the block never
+/// finalises), but its status is now `None`.
+///
+/// Updated in round 8: this used to assert `Some(0)`, i.e. a command of unknown
+/// outcome was reported to the whole UI as having succeeded.
 #[test]
-fn osc133_d_bare_emits_zero() {
+fn osc133_d_bare_reports_an_unknown_exit() {
     let mut p = Parser::new();
     let events = feed_all(&mut p, b"\x1b]133;D\x07");
-    let code = events.iter().find_map(|e| match e {
-        ParserEvent::CommandEnd(c) => Some(*c),
-        _ => None,
-    });
-    assert_eq!(code, Some(0), "missing exit code defaults to 0");
+    assert_eq!(
+        command_end_exit(&events),
+        Some(None),
+        "a missing exit code is unknown, not a success"
+    );
 }
 
 /// OSC 133 ; D ; <non-numeric> — defensive: a malformed exit code must NOT
 /// drop the CommandEnd event (otherwise the block never finalises and the
 /// active cell stays "running" forever).
+///
+/// Updated in round 8: an unparseable status is `None` rather than 0.
 #[test]
-fn osc133_d_non_numeric_code_defaults_to_zero() {
+fn osc133_d_non_numeric_code_reports_an_unknown_exit() {
     let mut p = Parser::new();
     let events = feed_all(&mut p, b"\x1b]133;D;bogus\x07");
-    let code = events.iter().find_map(|e| match e {
-        ParserEvent::CommandEnd(c) => Some(*c),
-        _ => None,
-    });
-    assert_eq!(code, Some(0));
+    assert_eq!(command_end_exit(&events), Some(None));
 }
 
 /// OSC split across feed boundaries — parser state must persist across the
@@ -93,8 +100,8 @@ fn osc133_d_split_across_feeds_still_fires() {
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, ParserEvent::CommandEnd(1))),
-        "split OSC 133 must still resolve to CommandEnd(1): {events:?}"
+            .any(|e| matches!(e, ParserEvent::CommandEnd { exit: Some(1), .. })),
+        "split OSC 133 must still resolve to exit 1: {events:?}"
     );
     assert!(
         collect_bytes(&events).is_empty(),
@@ -291,8 +298,8 @@ fn full_command_lifecycle_round_trip() {
         .filter_map(|e| match e {
             ParserEvent::PromptStart => Some("A"),
             ParserEvent::PromptEnd => Some("B"),
-            ParserEvent::CommandStart => Some("C"),
-            ParserEvent::CommandEnd(_) => Some("D"),
+            ParserEvent::CommandStart(_) => Some("C"),
+            ParserEvent::CommandEnd { .. } => Some("D"),
             _ => None,
         })
         .collect();

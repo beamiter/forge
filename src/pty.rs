@@ -2,18 +2,16 @@ use gtk4::glib;
 use nix::libc;
 use nix::pty::{openpty, OpenptyResult};
 use nix::unistd::{self, ForkResult, Pid};
-use std::borrow::Cow;
-use std::collections::BTreeMap;
-use std::ffi::{CString, OsString};
+use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use crate::process::{ChildLifecycle, ReapOwner};
+use crate::pty_input::{InputGuard, PasteModes, PastePolicy, UnbracketedMultiline};
 use crate::terminal::TERMINAL_ESCALATION;
 
 enum PtyMsg {
@@ -35,12 +33,17 @@ pub struct OwnedPty {
     /// it serializes every signal against its own `waitpid`, refuses to start a
     /// second escalation, and never leaves a zombie behind.
     lifecycle: Arc<ChildLifecycle>,
-    /// Tracks explicit bracketed-paste frames whose start, body, and end are
-    /// delivered through separate `write_bytes` calls.
-    outgoing_bracketed_paste: AtomicBool,
-    /// Mirrors the shell's DECSET/DECRST 2004 state observed on PTY output so
-    /// multiline insertion can be protected at the central input boundary.
-    shell_bracketed_paste: Arc<AtomicBool>,
+    /// The shared outgoing-byte filter. It removes paste-bracket markers from
+    /// any payload body — a clipboard carrying `ESC[201~` would otherwise close
+    /// the frame early and have its remainder run as a command — and tracks
+    /// frames whose start, body and end arrive through separate `write_bytes`
+    /// calls. Behind a `Mutex` only because `write_bytes` takes `&self`.
+    input_guard: std::sync::Mutex<InputGuard>,
+    /// Mirrors the shell's DECSET/DECRST 2004 state so multiline insertion can
+    /// be protected at the central input boundary. Fed by the block parser's
+    /// `ParserEvent::DecsetMode` (see [`OwnedPty::set_shell_bracketed_paste`]),
+    /// which is the single owner of this mode for a jterm4 pane.
+    shell_bracketed_paste: AtomicBool,
 }
 
 // Raw GLib FFI for g_unix_fd_add_full (not exposed by glib-rs 0.22)
@@ -68,84 +71,15 @@ const PTY_READ_CHUNK_BYTES: usize = 32 * 1024;
 /// chunk is dispatched immediately; queued follow-ups are paced at this rate.
 const PTY_DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
 
-const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
-const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
-const BRACKETED_PASTE_ENABLE: &[u8] = b"\x1b[?2004h";
-const BRACKETED_PASTE_DISABLE: &[u8] = b"\x1b[?2004l";
-
-/// Observe DECSET/DECRST 2004 in output whose escape sequence may be split
-/// across adjacent PTY read chunks.  Only a short suffix is retained.
-fn observe_bracketed_paste_mode(current: bool, tail: &mut Vec<u8>, data: &[u8]) -> bool {
-    let mut combined = Vec::with_capacity(tail.len() + data.len());
-    combined.extend_from_slice(tail);
-    combined.extend_from_slice(data);
-
-    let mut enabled = current;
-    let mut index = 0usize;
-    while index < combined.len() {
-        let rest = &combined[index..];
-        if rest.starts_with(BRACKETED_PASTE_ENABLE) {
-            enabled = true;
-            index += BRACKETED_PASTE_ENABLE.len();
-        } else if rest.starts_with(BRACKETED_PASTE_DISABLE) {
-            enabled = false;
-            index += BRACKETED_PASTE_DISABLE.len();
-        } else {
-            index += 1;
-        }
-    }
-
-    let bridge_len = BRACKETED_PASTE_ENABLE
-        .len()
-        .max(BRACKETED_PASTE_DISABLE.len())
-        .saturating_sub(1);
-    let keep_from = combined.len().saturating_sub(bridge_len);
-    tail.clear();
-    tail.extend_from_slice(&combined[keep_from..]);
-    enabled
-}
-
-/// Protect insertion-only input from becoming several unintended submissions.
+/// Policy for the PTY write boundary.
 ///
-/// Explicit submissions (a payload ending in CR) and explicitly framed paste
-/// data pass through unchanged.  Otherwise multiline input is bracketed when
-/// the shell advertises DECSET 2004, and safely reduced to the first logical
-/// line when it does not.  Single-line typing is never rewritten.
-fn sanitize_input_chunk(
-    data: &[u8],
-    paste_active: bool,
-    shell_supports_bracketed_paste: bool,
-) -> (Cow<'_, [u8]>, bool) {
-    let starts_paste = data.starts_with(BRACKETED_PASTE_START);
-    let ends_paste = data.ends_with(BRACKETED_PASTE_END);
-    let protected_by_paste = paste_active || starts_paste;
-    let next_paste_active = if ends_paste {
-        false
-    } else if starts_paste {
-        true
-    } else {
-        paste_active
-    };
-
-    if protected_by_paste || data.ends_with(b"\r") {
-        return (Cow::Borrowed(data), next_paste_active);
-    }
-
-    let Some(first_break) = data.iter().position(|&byte| byte == b'\r' || byte == b'\n') else {
-        return (Cow::Borrowed(data), next_paste_active);
-    };
-
-    if shell_supports_bracketed_paste {
-        let mut wrapped = Vec::with_capacity(
-            BRACKETED_PASTE_START.len() + data.len() + BRACKETED_PASTE_END.len(),
-        );
-        wrapped.extend_from_slice(BRACKETED_PASTE_START);
-        wrapped.extend_from_slice(data);
-        wrapped.extend_from_slice(BRACKETED_PASTE_END);
-        return (Cow::Owned(wrapped), next_paste_active);
-    }
-
-    (Cow::Owned(data[..first_break].to_vec()), next_paste_active)
+/// `FirstLineOnly` preserves jterm4's behaviour: without DECSET 2004 a
+/// multiline payload is cut to its first logical line rather than submitting
+/// every line. Control stripping stays off — this boundary carries keystrokes,
+/// cursor keys and mouse reports, which are control bytes by construction —
+/// while marker removal happens regardless of the policy.
+fn boundary_paste_policy() -> PastePolicy {
+    PastePolicy::prompt_insert(UnbracketedMultiline::FirstLineOnly)
 }
 
 struct FdWatchData<F: FnMut() -> bool> {
@@ -235,74 +169,24 @@ fn invalid_nul(context: &str) -> io::Error {
     )
 }
 
-fn resolve_executable(argument: &str, cwd: Option<&str>) -> io::Result<PathBuf> {
-    let executable = Path::new(argument);
-    let current_directory = std::env::current_dir()?;
-    let base = cwd
-        .filter(|value| !value.is_empty())
-        .map(Path::new)
-        .map(|path| {
-            if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                current_directory.join(path)
-            }
-        })
-        .unwrap_or(current_directory);
-
-    if argument.as_bytes().contains(&b'/') {
-        return Ok(if executable.is_absolute() {
-            executable.to_path_buf()
-        } else {
-            base.join(executable)
-        });
-    }
-
-    let path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin"));
-    for directory in std::env::split_paths(&path) {
-        let candidate = if directory.is_absolute() {
-            directory.join(executable)
-        } else {
-            base.join(directory).join(executable)
-        };
-        let candidate_bytes = candidate.as_os_str().as_bytes();
-        let Ok(candidate_c) = CString::new(candidate_bytes) else {
-            continue;
-        };
-        if candidate.is_file() && unsafe { libc::access(candidate_c.as_ptr(), libc::X_OK) } == 0 {
-            return Ok(candidate);
-        }
-    }
-
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!("PTY executable '{argument}' was not found in PATH"),
-    ))
+/// The child's environment, built entirely before `fork`.
+///
+/// `LESS` is a flag rather than a hardcoded value because the family disagrees:
+/// jterm4 keeps `R` so a short `git log` still opens an interactive pager on the
+/// alternate screen, while jterm2/jterm3 use `FR`. Everything else — `TERM`,
+/// `COLORTERM`, `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`, `VTE_VERSION` — is the
+/// family's shared identity policy. Block mode never lets libvte spawn the
+/// child, so before this these variables (bar `TERM`) never reached the shell
+/// and `bat`/`delta`/`lazygit` fell back to 256 colours.
+fn child_environment(env_extra: &[(&str, &str)]) -> io::Result<Vec<CString>> {
+    crate::child_env::envp(&block_mode_child_env(), env_extra)
 }
 
-fn child_environment(env_extra: &[(&str, &str)]) -> io::Result<Vec<CString>> {
-    let mut environment: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
-    environment.insert(OsString::from("TERM"), OsString::from("xterm-256color"));
-    for (key, value) in env_extra {
-        if key.is_empty() || key.contains('=') {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid PTY environment variable name '{key}'"),
-            ));
-        }
-        environment.insert(OsString::from(key), OsString::from(value));
+fn block_mode_child_env() -> crate::child_env::ChildEnv<'static> {
+    crate::child_env::ChildEnv {
+        less_default: Some("R"),
+        ..crate::child_env::ChildEnv::from_identity()
     }
-
-    environment
-        .into_iter()
-        .map(|(key, value)| {
-            let mut entry = Vec::with_capacity(key.len() + value.len() + 1);
-            entry.extend_from_slice(key.as_os_str().as_bytes());
-            entry.push(b'=');
-            entry.extend_from_slice(value.as_os_str().as_bytes());
-            CString::new(entry).map_err(|_| invalid_nul("PTY environment"))
-        })
-        .collect()
 }
 
 /// Requested working directory the child may actually start in.
@@ -364,8 +248,14 @@ impl OwnedPty {
         // Prepare every allocation and environment lookup before fork. GTK is
         // multi-threaded, so the child may only use async-signal-safe libc
         // operations until exec replaces the process image.
-        let executable = resolve_executable(
+        // Resolve before fork: a PATH walk between fork and exec would allocate
+        // and read directories in a process where only async-signal-safe calls
+        // are legal. The shared resolver also checks the execute bit, so a
+        // missing or non-executable shell is reported here instead of becoming a
+        // child that exits 127 for no visible reason.
+        let executable = crate::host::resolve_executable(
             &executable_argv[0],
+            std::env::var_os("PATH").as_deref(),
             if host_bridge { None } else { effective_cwd },
         )?;
         let executable_c = CString::new(executable.as_os_str().as_bytes())
@@ -470,8 +360,8 @@ impl OwnedPty {
                     master: std::sync::Arc::new(std::sync::Mutex::new(Some(master))),
                     input_tx: std::sync::Mutex::new(Some(input_tx)),
                     lifecycle,
-                    outgoing_bracketed_paste: AtomicBool::new(false),
-                    shell_bracketed_paste: Arc::new(AtomicBool::new(false)),
+                    input_guard: std::sync::Mutex::new(InputGuard::new()),
+                    shell_bracketed_paste: AtomicBool::new(false),
                 })
             }
             Err(error) => Err(io::Error::other(error)),
@@ -503,13 +393,36 @@ impl OwnedPty {
             .unwrap_or(-1)
     }
 
+    /// Record the shell's DECSET/DECRST 2004 state.
+    ///
+    /// The block parser is the single owner of this mode: it is a real CSI state
+    /// machine, so it also sees an enable split across two PTY read chunks,
+    /// which the raw byte scan this replaced could only approximate with a
+    /// retained tail.
+    pub fn set_shell_bracketed_paste(&self, enabled: bool) {
+        self.shell_bracketed_paste.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether the child advertised DECSET 2004 and will strip paste framing.
+    pub fn shell_bracketed_paste(&self) -> bool {
+        self.shell_bracketed_paste.load(Ordering::Relaxed)
+    }
+
     pub fn write_bytes(&self, data: &[u8]) {
-        let paste_active = self.outgoing_bracketed_paste.load(Ordering::Relaxed);
-        let shell_supports_bracketed_paste = self.shell_bracketed_paste.load(Ordering::Relaxed);
-        let (safe_data, next_paste_active) =
-            sanitize_input_chunk(data, paste_active, shell_supports_bracketed_paste);
-        self.outgoing_bracketed_paste
-            .store(next_paste_active, Ordering::Relaxed);
+        let modes = PasteModes {
+            bracketed: self.shell_bracketed_paste(),
+        };
+        // A poisoned guard would mean another thread panicked mid-filter; keep
+        // the choke point rather than letting writes bypass it.
+        let safe_data = {
+            let mut guard = self
+                .input_guard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard
+                .filter(data, modes, boundary_paste_policy())
+                .into_owned()
+        };
 
         if safe_data.is_empty() {
             return;
@@ -526,7 +439,7 @@ impl OwnedPty {
             );
             return;
         };
-        if let Err(error) = input_tx.send(safe_data.into_owned()) {
+        if let Err(error) = input_tx.send(safe_data) {
             log::warn!(
                 "PTY input queue is closed; discarded {} byte(s)",
                 error.0.len()
@@ -599,17 +512,9 @@ impl OwnedPty {
         let wake_pending = Arc::new(AtomicBool::new(false));
         let eventfd_for_thread = Arc::clone(&eventfd);
         let wake_pending_for_thread = Arc::clone(&wake_pending);
-        let shell_bracketed_paste = Arc::clone(&self.shell_bracketed_paste);
-        spawn_reader_thread(
-            reader_fd,
-            lifecycle,
-            tx,
-            "jterm4-pty-reader",
-            shell_bracketed_paste,
-            move || {
-                notify_eventfd_once(&eventfd_for_thread, &wake_pending_for_thread);
-            },
-        );
+        spawn_reader_thread(reader_fd, lifecycle, tx, "jterm4-pty-reader", move || {
+            notify_eventfd_once(&eventfd_for_thread, &wake_pending_for_thread);
+        });
 
         let on_exit = std::cell::Cell::new(Some(on_exit));
 
@@ -667,14 +572,7 @@ impl OwnedPty {
         F: FnMut(Vec<u8>) + 'static,
         E: FnOnce(i32) + 'static,
     {
-        spawn_reader_thread(
-            reader_fd,
-            lifecycle,
-            tx,
-            "jterm4-pty-reader-poll",
-            Arc::clone(&self.shell_bracketed_paste),
-            || {},
-        );
+        spawn_reader_thread(reader_fd, lifecycle, tx, "jterm4-pty-reader-poll", || {});
 
         let on_exit = std::cell::Cell::new(Some(on_exit));
         let rx = std::cell::RefCell::new(rx);
@@ -703,7 +601,6 @@ fn spawn_reader_thread(
     lifecycle: Arc<ChildLifecycle>,
     tx: mpsc::SyncSender<PtyMsg>,
     thread_name: &'static str,
-    shell_bracketed_paste: Arc<AtomicBool>,
     notify: impl Fn() + Send + Clone + 'static,
 ) {
     let failure_tx = tx.clone();
@@ -715,7 +612,6 @@ fn spawn_reader_thread(
             let mut file = std::fs::File::from(reader_fd);
             let fd = file.as_raw_fd();
             let mut buf = [0u8; PTY_READ_CHUNK_BYTES];
-            let mut mode_tail = Vec::with_capacity(BRACKETED_PASTE_ENABLE.len().saturating_sub(1));
             loop {
                 match file.read(&mut buf) {
                     Ok(0) => break,
@@ -725,12 +621,6 @@ fn spawn_reader_thread(
                         let mut combined = Vec::with_capacity(PTY_READ_CHUNK_BYTES);
                         combined.extend_from_slice(&buf[..n]);
                         coalesce_pending(fd, &mut file, &mut buf, &mut combined);
-                        let mode = observe_bracketed_paste_mode(
-                            shell_bracketed_paste.load(Ordering::Relaxed),
-                            &mut mode_tail,
-                            &combined,
-                        );
-                        shell_bracketed_paste.store(mode, Ordering::Relaxed);
                         if tx.send(PtyMsg::Data(combined)).is_err() {
                             return;
                         }
@@ -863,6 +753,7 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::os::unix::net::UnixStream;
+    use std::path::Path;
     use std::time::{Duration, Instant};
 
     /// True once `pid` is no longer a reapable child of this process, i.e. it
@@ -1093,6 +984,22 @@ mod tests {
         );
     }
 
+    /// Updated in round 8: the shared resolver checks the execute bit before
+    /// fork, so a shell that exists but cannot run fails the spawn with a
+    /// readable error instead of becoming a child that exits 126 silently.
+    #[test]
+    fn a_non_executable_program_fails_the_spawn_before_fork() {
+        assert!(Path::new("/etc/passwd").exists());
+        let error = match OwnedPty::spawn(&["/etc/passwd"], None, &[]) {
+            Ok(pty) => {
+                pty.kill();
+                panic!("a non-executable file must not be spawned");
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
     #[test]
     fn complete_writer_delivers_the_entire_payload() {
         let payload_len = 128 * 1024;
@@ -1144,84 +1051,106 @@ mod tests {
         assert_eq!(value, 1);
     }
 
+    /// The PTY boundary is now `pty_input::InputGuard`; these tests pin the
+    /// wiring (which policy this repo passes) rather than re-testing the shared
+    /// filter, whose own suite lives in jterm_core.
+    fn guarded(chunks: &[&[u8]], bracketed: bool) -> Vec<Vec<u8>> {
+        let mut guard = InputGuard::new();
+        let modes = PasteModes { bracketed };
+        chunks
+            .iter()
+            .map(|chunk| guard.filter(chunk, modes, boundary_paste_policy()).to_vec())
+            .collect()
+    }
+
     #[test]
     fn unframed_multiline_insert_falls_back_without_shell_support() {
-        let (safe, active) = sanitize_input_chunk(b"echo first\necho second", false, false);
-        assert_eq!(safe.as_ref(), b"echo first");
-        assert!(!active);
-
-        let (safe, _) = sanitize_input_chunk(b"echo first\r\necho second", false, false);
-        assert_eq!(safe.as_ref(), b"echo first");
+        assert_eq!(
+            guarded(&[b"echo first\necho second"], false),
+            vec![b"echo first".to_vec()]
+        );
+        assert_eq!(
+            guarded(&[b"echo first\r\necho second"], false),
+            vec![b"echo first".to_vec()]
+        );
     }
 
     #[test]
     fn shell_supported_multiline_insert_is_automatically_bracketed() {
-        let input = b"echo first\necho second";
-        let (safe, active) = sanitize_input_chunk(input, false, true);
-        let mut expected = Vec::new();
-        expected.extend_from_slice(BRACKETED_PASTE_START);
-        expected.extend_from_slice(input);
-        expected.extend_from_slice(BRACKETED_PASTE_END);
-        assert_eq!(safe.as_ref(), expected.as_slice());
-        assert!(!active);
-    }
-
-    #[test]
-    fn explicit_submission_preserves_multiline_bytes() {
-        let submitted = b"if true; then\necho ok\nfi\r";
-        let (safe, active) = sanitize_input_chunk(submitted, false, false);
-        assert_eq!(safe.as_ref(), submitted);
-        assert!(!active);
-    }
-
-    #[test]
-    fn enter_is_carriage_return_not_line_feed() {
-        let (enter, active) = sanitize_input_chunk(b"\r", false, true);
-        assert_eq!(enter.as_ref(), b"\r");
-        assert!(!active);
-
-        let (line_feed, active) = sanitize_input_chunk(b"\n", false, true);
         assert_eq!(
-            line_feed.as_ref(),
-            b"\x1b[200~\n\x1b[201~",
-            "LF is protected as insertion-only multiline content"
+            guarded(&[b"echo first\necho second"], true),
+            vec![b"\x1b[200~echo first\necho second\x1b[201~".to_vec()]
         );
-        assert!(!active);
+    }
+
+    /// Updated in round 8: a trailing CR used to exempt the whole payload from
+    /// the multiline check, so every earlier line of an unbracketed payload was
+    /// submitted. The shared guard only exempts a payload whose *single* line was
+    /// explicitly submitted.
+    #[test]
+    fn a_trailing_return_no_longer_exempts_earlier_lines() {
+        assert_eq!(
+            guarded(&[b"if true; then\necho ok\nfi\r"], false),
+            vec![b"if true; then".to_vec()]
+        );
+        assert_eq!(
+            guarded(&[b"git status\r"], false),
+            vec![b"git status\r".to_vec()],
+            "one submitted line is not multiline input"
+        );
+    }
+
+    /// Updated in round 8: a lone LF used to be wrapped as insertion-only
+    /// content. It is now the explicit submission it looks like, which is what
+    /// the guard's single-line fast path means.
+    #[test]
+    fn enter_and_line_feed_reach_the_child_unchanged() {
+        assert_eq!(guarded(&[b"\r"], true), vec![b"\r".to_vec()]);
+        assert_eq!(guarded(&[b"\n"], true), vec![b"\n".to_vec()]);
     }
 
     #[test]
     fn bracketed_paste_preserves_multiline_body_across_writes() {
-        let (start, active) = sanitize_input_chunk(BRACKETED_PASTE_START, false, false);
-        assert_eq!(start.as_ref(), BRACKETED_PASTE_START);
-        assert!(active);
-
         let body = b"echo first\necho second";
-        let (safe_body, active) = sanitize_input_chunk(body, active, false);
-        assert_eq!(safe_body.as_ref(), body);
-        assert!(active);
+        assert_eq!(
+            guarded(
+                &[
+                    crate::pty_input::PASTE_START,
+                    body,
+                    crate::pty_input::PASTE_END
+                ],
+                false
+            ),
+            vec![
+                crate::pty_input::PASTE_START.to_vec(),
+                body.to_vec(),
+                crate::pty_input::PASTE_END.to_vec(),
+            ]
+        );
+    }
 
-        let (end, active) = sanitize_input_chunk(BRACKETED_PASTE_END, active, false);
-        assert_eq!(end.as_ref(), BRACKETED_PASTE_END);
-        assert!(!active);
+    /// The reason this boundary exists: a hostile clipboard that closes the
+    /// frame early must not leave `rm -rf ~` behind as a typed command line,
+    /// even when the frame's body arrives as its own write.
+    #[test]
+    fn an_embedded_terminator_is_removed_from_a_frame_body() {
+        let filtered = guarded(
+            &[
+                crate::pty_input::PASTE_START,
+                b"docs\x1b[201~\rrm -rf ~\r",
+                crate::pty_input::PASTE_END,
+            ],
+            false,
+        );
+        assert_eq!(filtered[1], b"docs\rrm -rf ~\r".to_vec());
+        assert_eq!(filtered[2], crate::pty_input::PASTE_END.to_vec());
     }
 
     #[test]
     fn ordinary_single_line_input_is_unchanged() {
-        let input = b"git status";
-        let (safe, active) = sanitize_input_chunk(input, false, false);
-        assert_eq!(safe.as_ref(), input);
-        assert!(!active);
-    }
-
-    #[test]
-    fn observes_split_bracketed_paste_mode_sequences() {
-        let mut tail = Vec::new();
-        let enabled = observe_bracketed_paste_mode(false, &mut tail, b"prompt\x1b[?20");
-        assert!(!enabled);
-        let enabled = observe_bracketed_paste_mode(enabled, &mut tail, b"04h");
-        assert!(enabled);
-
-        let enabled = observe_bracketed_paste_mode(enabled, &mut tail, b"\x1b[?2004l");
-        assert!(!enabled);
+        assert_eq!(
+            guarded(&[b"git status"], false),
+            vec![b"git status".to_vec()]
+        );
     }
 }

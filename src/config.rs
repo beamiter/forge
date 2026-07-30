@@ -1819,19 +1819,6 @@ fn safe_mode_persistence_disabled(value: Option<&std::ffi::OsStr>) -> bool {
 // Shell selection
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
-    path.is_file()
-}
-
 fn choose_flatpak_host_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
     if let Some(shell) = configured_shell.filter(|value| !value.trim().is_empty()) {
         let shell_name = Path::new(shell)
@@ -1877,23 +1864,26 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
     }
 
     // Explicit config / env var wins (needed when PATH is stripped by launchers like wofi).
-    if let Some(path) = configured_shell {
-        if is_executable(Path::new(path)) {
-            let shell_name = Path::new(path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("");
-            if shell_name == "jsh" {
-                if let Some(argv) = wrap_jsh_argv_in_interactive_bash(path) {
-                    return argv;
+    if let Some(token) = configured_shell {
+        // A bare name is a PATH lookup and never an implicit `./name`: a pane
+        // opens in whatever directory the user is browsing, so a checkout
+        // containing an executable called `bash` must not hijack
+        // `shell = "bash"`. The resolved absolute path is what we spawn, which
+        // also survives a child that starts in another directory.
+        match crate::host::resolve_configured_program(token, std::env::var_os("PATH").as_deref()) {
+            Some(resolved) => {
+                let path = resolved.to_string_lossy().to_string();
+                if resolved.file_name().and_then(|name| name.to_str()) == Some("jsh") {
+                    if let Some(argv) = wrap_jsh_argv_in_interactive_bash(&path) {
+                        return argv;
+                    }
                 }
+                return vec![path];
             }
-            return vec![path.to_string()];
+            None => log::warn!(
+                "Configured shell '{token}' is not an executable file, falling back to auto-detection"
+            ),
         }
-        log::warn!(
-            "Configured shell '{}' is not executable, falling back to auto-detection",
-            path
-        );
     }
 
     // Prefer jsh when it's on PATH.
@@ -1930,6 +1920,22 @@ mod tests {
             // (multiplex injects an env-dependent ControlPath).
             multiplex: false,
         }
+    }
+
+    /// Updated in round 8: shell selection goes through the shared
+    /// `host::resolve_configured_program`, so a configured path that is not an
+    /// executable file falls back to auto-detection instead of being spawned
+    /// into an exec failure — and the chosen argv is the resolved program, not
+    /// the raw token.
+    #[test]
+    fn a_missing_configured_shell_falls_back_to_auto_detection() {
+        if crate::host::is_flatpak() {
+            return;
+        }
+        let missing = "/definitely/missing/jterm4-shell";
+        let argv = choose_shell_argv(Some(missing));
+        assert!(!argv.is_empty());
+        assert_ne!(argv.first().map(String::as_str), Some(missing));
     }
 
     #[test]

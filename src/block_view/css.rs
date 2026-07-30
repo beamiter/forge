@@ -159,6 +159,17 @@ pub(crate) fn install_block_css(config: &Config) {
     let fg_g = (fg.green() * 255.0) as u8;
     let fg_b = (fg.blue() * 255.0) as u8;
 
+    // Unknown-outcome blocks use the theme's yellow (palette 3): a command whose
+    // exit status the shell never reported is neither the green of a success nor
+    // the red of a failure, and borrowing either colour would state something the
+    // terminal does not know.
+    let warn = &config.palette[3];
+    let warn_hex = rgba_to_hex(warn);
+    let warn_r = (warn.red() * 255.0) as u8;
+    let warn_g = (warn.green() * 255.0) as u8;
+    let warn_b = (warn.blue() * 255.0) as u8;
+    let warn_stripe = format!("rgba({warn_r},{warn_g},{warn_b},0.62)");
+
     // Shell Agent inline cards use the theme's blue (palette 4) so they read
     // distinctly from success/correction accents (palette 2).
     let agent = &config.palette[4];
@@ -227,6 +238,9 @@ pub(crate) fn install_block_css(config: &Config) {
             background-color: rgba({err_r},{err_g},{err_b},0.11);
             box-shadow: inset 2px 0 0 0 {err_stripe};
         }}
+        .block-unknown {{
+            border-left-color: {warn_stripe};
+        }}
         .block-hovered {{
             background-color: rgba({fg_r},{fg_g},{fg_b},0.05);
             border-top-color: rgba({fg_r},{fg_g},{fg_b},0.16);
@@ -265,6 +279,27 @@ pub(crate) fn install_block_css(config: &Config) {
         }}
         .block-status-background {{
             color: rgba({acc_r},{acc_g},{acc_b},0.92);
+        }}
+        .block-status-unknown {{
+            color: {warn_hex};
+            background-color: rgba({warn_r},{warn_g},{warn_b},0.18);
+            border-radius: 999px;
+            min-width: 16px;
+            min-height: 16px;
+            padding: 1px 5px;
+            font-family: "{font_family}";
+            font-size: 0.82em;
+            font-weight: bold;
+        }}
+        .block-exit-unknown {{
+            color: {warn_hex};
+            background-color: rgba({warn_r},{warn_g},{warn_b},0.18);
+            border: 1px solid rgba({warn_r},{warn_g},{warn_b},0.35);
+            border-radius: 999px;
+            font-family: "{font_family}";
+            font-size: 0.78em;
+            font-weight: bold;
+            padding: 1px 8px;
         }}
         .block-correction, .command-suggestion, .command-review-standalone {{
             border-left-color: rgba({acc_r},{acc_g},{acc_b},0.85);

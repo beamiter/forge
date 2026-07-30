@@ -708,13 +708,21 @@ impl AgentRuntime {
         }
     }
 
-    fn observe(runtime: Rc<Self>, command: String, exit_code: i32, output: String) {
+    fn observe(runtime: Rc<Self>, command: String, exit_code: Option<i32>, output: String) {
         let id = {
             let mut pending = runtime.pending_command.borrow_mut();
             take_pending_for_finished_block(&mut pending, &command)
         };
         let Some(id) = id else {
             return;
+        };
+        // The jagent observation turn carries a concrete exit code (frozen
+        // API). An unreported status becomes the sentinel plus a note the
+        // model can actually read, never the successful 0 it used to be.
+        let (exit_code, unknown_note) = crate::block_view::exit_code_for_shared_surface(exit_code);
+        let output = match unknown_note {
+            Some(note) => format!("{note}\n{output}"),
+            None => output,
         };
         let observation_result = runtime.session.borrow_mut().observe(id, exit_code, &output);
         if let Err(error) = observation_result {

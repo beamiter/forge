@@ -286,6 +286,11 @@ impl UiState {
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()
                 .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+            // The family's history JSONL is shared with jsh and the other
+            // terminals, and its schema has a plain exit_code — so a status the
+            // shell never reported is recorded as the sentinel rather than as a
+            // successful 0.
+            let (exit_code, _) = crate::block_view::exit_code_for_shared_surface(exit_code);
             if let Err(err) = crate::command_history::enqueue(
                 std::path::Path::new(path),
                 config.command_history_max_entries as usize,

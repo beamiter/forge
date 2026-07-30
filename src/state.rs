@@ -3,17 +3,19 @@ use gtk4::prelude::*;
 use gtk4::{Label, Notebook, Paned};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use vte4::Terminal;
 use vte4::TerminalExt;
+
+use crate::process::deserialize_restorable_argv;
+use crate::snapshot_file;
 
 use crate::terminal::{
     find_first_terminal, terminal_child_lifecycle, terminal_child_pid, terminal_working_directory,
@@ -22,6 +24,11 @@ use crate::terminal::{
 use crate::ui::{PaneLeaf, PaneNode};
 
 const MAX_READY_WINDOW_STATES: usize = 32;
+/// Quarantined corrupt snapshots kept for manual recovery. Without a bound the
+/// windows/ prune predicate would never match `*.corrupt-*` names and a
+/// snapshot that corrupts on every launch would grow the directory forever —
+/// trading the old data loss for unbounded disk use.
+const MAX_QUARANTINED_SNAPSHOTS: usize = 8;
 const MAX_WORKSPACE_STATE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_AI_METADATA_RESERVE_BYTES: usize = 64 * 1024;
 const MAX_WINDOW_STATE_BYTES: usize = MAX_WORKSPACE_STATE_BYTES + MAX_AI_METADATA_RESERVE_BYTES;
@@ -39,7 +46,6 @@ struct WindowStatePaths {
 
 static WINDOW_STATE_PATHS: OnceLock<WindowStatePaths> = OnceLock::new();
 static WINDOW_STATE_FINALIZED: AtomicBool = AtomicBool::new(false);
-static WINDOW_STATE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static AI_CONVERSATION_SNAPSHOT: OnceLock<Mutex<Option<crate::ai::ConversationSnapshot>>> =
     OnceLock::new();
 
@@ -76,51 +82,12 @@ fn make_file_private(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
 }
 
-fn write_private_file(path: &Path, payload: &[u8]) -> io::Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    file.write_all(payload)?;
-    file.sync_all()
-}
-
-fn unique_state_temp_path(target: &Path) -> io::Result<PathBuf> {
-    let parent = target.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("state path has no parent: {}", target.display()),
-        )
-    })?;
-    let file_name = target.file_name().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("state path has no file name: {}", target.display()),
-        )
-    })?;
-    let sequence = WINDOW_STATE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut temp_name = OsString::from(".");
-    temp_name.push(file_name);
-    temp_name.push(format!(".tmp-{}-{sequence}", std::process::id()));
-    Ok(parent.join(temp_name))
-}
-
 /// Durably replace a private state file without ever truncating the last good
-/// snapshot. The sibling temporary file also prevents cross-filesystem rename.
+/// snapshot. The shared implementation writes a synced sibling temporary (so the
+/// rename cannot cross filesystems), keeps the file `0600`, syncs the directory
+/// entry, and tightens a snapshot directory an older release left at `0755`.
 fn atomic_write_private_file(target: &Path, payload: &[u8]) -> io::Result<()> {
-    let temp_path = unique_state_temp_path(target)?;
-    let result = (|| {
-        write_private_file(&temp_path, payload)?;
-        fs::rename(&temp_path, target)?;
-        make_file_private(target)?;
-        sync_parent_directory(target)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-    result
+    snapshot_file::write_atomic_private(target, payload)
 }
 
 fn sync_parent_directory(path: &Path) -> io::Result<()> {
@@ -254,6 +221,68 @@ fn prune_ready_snapshots_in(directory: &Path, keep: usize) {
     }
 }
 
+/// Whether a directory entry is a snapshot [`quarantine_corrupt_snapshot`] moved
+/// aside. The suffix appends `.corrupt-<millis>-<pid>-<attempt>` after the
+/// original name, so the *final* extension starts with `corrupt-` — which also
+/// keeps such files invisible to [`snapshots_with_extension`]'s `state`/`active`
+/// scans, so a quarantined snapshot can never be restored by accident.
+fn is_quarantined_snapshot(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| extension.starts_with("corrupt-"))
+}
+
+/// Retire all but the newest `keep` quarantined snapshots. The ready-state
+/// prune above matches only the `state` extension, so without this a snapshot
+/// that corrupts on every launch would fill windows/ with `*.corrupt-*` files
+/// nothing ever deletes.
+fn prune_quarantined_snapshots_in(directory: &Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let mut quarantined: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && is_quarantined_snapshot(path))
+        .collect();
+    quarantined.sort_by(|left, right| {
+        modified_time(right)
+            .cmp(&modified_time(left))
+            .then_with(|| right.cmp(left))
+    });
+    for stale in quarantined.into_iter().skip(keep) {
+        if let Err(error) = fs::remove_file(&stale) {
+            log::debug!(
+                "Failed to prune quarantined snapshot {}: {error}",
+                stale.display()
+            );
+        }
+    }
+}
+
+/// Move an unreadable snapshot aside so the fresh state the session is about to
+/// save cannot overwrite it, and report where it went.
+///
+/// Ordering is the point: this window has already *claimed* the snapshot by
+/// renaming a `window-*.state` onto its own `.active` name, so by the time a
+/// parse fails the original file name is gone and the very first autosave (or
+/// the unconditional save right after restore in `main.rs`) would destroy the
+/// only copy. Quarantining before returning from the failed load is what keeps
+/// the bytes recoverable.
+fn quarantine_corrupt_snapshot(path: &Path) {
+    match snapshot_file::quarantine_corrupt(path) {
+        Ok(backup) => log::warn!(
+            "Quarantined corrupt window snapshot {} as {}",
+            path.display(),
+            backup.display()
+        ),
+        Err(error) => log::warn!(
+            "Failed to quarantine corrupt window snapshot {}: {error}",
+            path.display()
+        ),
+    }
+}
+
 fn prepare_active_tabs_state_path() -> PathBuf {
     let paths = window_state_paths();
     if let Err(error) = ensure_private_directory(&paths.directory) {
@@ -302,6 +331,7 @@ fn prepare_active_tabs_state_path() -> PathBuf {
         log::info!("Claimed window snapshot {}", claimed.display());
     }
     prune_ready_snapshots_in(&paths.directory, MAX_READY_WINDOW_STATES);
+    prune_quarantined_snapshots_in(&paths.directory, MAX_QUARANTINED_SNAPSHOTS);
     paths.active.clone()
 }
 
@@ -339,31 +369,6 @@ pub enum PaneLayout {
         start: Box<PaneLayout>,
         end: Box<PaneLayout>,
     },
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum StoredRestorableCommand {
-    Argv(Vec<String>),
-    LegacyString(String),
-}
-
-/// Older snapshots stored a shell command string assembled with `argv.join`.
-/// Its original argument boundaries cannot be recovered safely, so accept the
-/// old shape for session compatibility but deliberately do not auto-execute it.
-fn deserialize_restorable_argv<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let stored = Option::<StoredRestorableCommand>::deserialize(deserializer)?;
-    Ok(match stored {
-        Some(StoredRestorableCommand::Argv(argv)) if !argv.is_empty() => Some(argv),
-        Some(StoredRestorableCommand::LegacyString(_)) => {
-            log::debug!("Ignoring legacy session restore command without argv boundaries");
-            None
-        }
-        _ => None,
-    })
 }
 
 /// Serialize a pane layout tree from a GTK widget
@@ -740,31 +745,11 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
     (current_page, tabs)
 }
 
+/// Read a window snapshot through the family's bounded loader: an oversized
+/// file, a fifo or device at the path, and non-UTF-8 bytes are all rejected
+/// before anything is parsed, and the fifo case cannot block the GTK thread.
 fn read_window_state_bounded(path: &Path) -> io::Result<String> {
-    let file = fs::File::open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_WINDOW_STATE_BYTES as u64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "window snapshot exceeds the {} byte limit",
-                MAX_WINDOW_STATE_BYTES
-            ),
-        ));
-    }
-    let mut contents = String::new();
-    file.take((MAX_WINDOW_STATE_BYTES + 1) as u64)
-        .read_to_string(&mut contents)?;
-    if contents.len() > MAX_WINDOW_STATE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "window snapshot exceeds the {} byte limit",
-                MAX_WINDOW_STATE_BYTES
-            ),
-        ));
-    }
-    Ok(contents)
+    snapshot_file::read_bounded(path, MAX_WINDOW_STATE_BYTES as u64)
 }
 
 pub(crate) fn load_tabs_state() -> (Option<u32>, Vec<(Option<String>, PaneLayout)>) {
@@ -784,11 +769,21 @@ pub(crate) fn load_tabs_state() -> (Option<u32>, Vec<(Option<String>, PaneLayout
                 "Ignoring unreadable window snapshot {}: {error}",
                 path.display()
             );
+            // The claim above already renamed the snapshot onto this window's
+            // .active name, and main.rs saves over that path unconditionally
+            // right after restore — move the bytes aside first or they are
+            // unrecoverable.
+            quarantine_corrupt_snapshot(&path);
             return (None, Vec::new());
         }
     };
 
     set_ai_conversation_snapshot(parse_ai_conversation(&contents));
+    // Quarantine covers the read, not the parse: `parse_tabs_state` cannot fail.
+    // Its last arm takes any non-blank line it does not recognise as a legacy
+    // bare-path tab, so damaged-but-readable contents restore as a tab rather
+    // than as an empty window. Every way of *losing* the snapshot goes through
+    // the error arm above.
     let (current_page, tabs) = parse_tabs_state(&contents);
     log::info!("Loaded {} tabs from window snapshot", tabs.len());
     (current_page, tabs)
@@ -820,6 +815,7 @@ pub(crate) fn finalize_tabs_state() {
                 );
             }
             prune_ready_snapshots_in(&paths.directory, MAX_READY_WINDOW_STATES);
+            prune_quarantined_snapshots_in(&paths.directory, MAX_QUARANTINED_SNAPSHOTS);
             log::info!("Published window snapshot {}", paths.ready.display());
         }
         Err(error) => log::error!(
@@ -1145,8 +1141,7 @@ mod tests {
         let root = temporary_state_dir("private-permissions");
         let directory = root.join("windows");
         let snapshot = directory.join("window-1-1.active");
-        ensure_private_directory(&directory).unwrap();
-        write_private_file(&snapshot, b"state").unwrap();
+        atomic_write_private_file(&snapshot, b"state").unwrap();
 
         assert_eq!(
             fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
@@ -1309,11 +1304,14 @@ mod tests {
                 .unwrap()
                 .file_name()
                 .to_string_lossy()
-                .contains(".tmp-")
+                .contains(".tmp")
         }));
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// Updated in round 8: the shared bounded reader reports an oversized
+    /// snapshot as `FileTooLarge` (the old local reader said `InvalidData`),
+    /// which keeps "too big" distinct from "not UTF-8" in the logs.
     #[test]
     fn bounded_reader_rejects_pathological_snapshot_before_parsing() {
         let root = temporary_state_dir("bounded-read");
@@ -1323,8 +1321,95 @@ mod tests {
         drop(file);
 
         let error = read_window_state_bounded(&path).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The data-loss fix this round exists for: a snapshot this window has
+    /// already claimed (renamed onto its `.active` name) fails to read, and the
+    /// very next save would overwrite it. Quarantine must move the bytes aside
+    /// under a name the `state`/`active` scans can never restore, and the
+    /// quarantine prune must retire old copies the ready-state prune cannot see.
+    #[test]
+    fn unreadable_claimed_snapshot_is_quarantined_before_it_can_be_overwritten() {
+        let directory = temporary_state_dir("quarantine-corrupt");
+        let active = directory.join("window-1-1.active");
+        fs::write(&active, [0xffu8, 0xfe, b'{']).unwrap();
+
+        let error = read_window_state_bounded(&active).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        quarantine_corrupt_snapshot(&active);
+
+        assert!(!active.exists(), "the corrupt bytes must be moved aside");
+        let quarantined: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| is_quarantined_snapshot(path))
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(fs::read(&quarantined[0]).unwrap(), [0xffu8, 0xfe, b'{']);
+        // A fresh save over the claimed path no longer touches the evidence.
+        atomic_write_private_file(&active, b"fresh state").unwrap();
+        assert_eq!(fs::read(&quarantined[0]).unwrap(), [0xffu8, 0xfe, b'{']);
+
+        // Quarantined names must be invisible to every snapshot scan: restoring
+        // one would resurrect state the user was already told was corrupt.
+        assert!(ready_snapshots_in(&directory).is_empty());
+        assert!(snapshots_with_extension(&directory, ACTIVE_STATE_EXTENSION)
+            .iter()
+            .all(|path| path == &active));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn quarantine_prune_bounds_corrupt_backups_without_touching_snapshots() {
+        let directory = temporary_state_dir("quarantine-prune");
+        for index in 0..4 {
+            let active = directory.join(format!("window-{index}-{index}.active"));
+            fs::write(&active, [0xffu8]).unwrap();
+            quarantine_corrupt_snapshot(&active);
+        }
+        fs::write(directory.join("window-9-9.state"), "ready").unwrap();
+
+        prune_quarantined_snapshots_in(&directory, 2);
+
+        let quarantined = fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| is_quarantined_snapshot(path))
+            .count();
+        assert_eq!(quarantined, 2);
+        assert_eq!(
+            ready_snapshots_in(&directory).len(),
+            1,
+            "ready snapshots are not the quarantine prune's to delete"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Pins the serde wiring to the shared decoder: structured argv restores,
+    /// while the legacy joined-string form loads the tab but never replays.
+    #[test]
+    fn restorable_argv_accepts_structured_form_and_drops_legacy_strings() {
+        let structured: PaneLayout = serde_json::from_str(
+            r#"{"type":"leaf","dir":"/tmp","sid":"1-2","cmds":["ssh","host"]}"#,
+        )
+        .unwrap();
+        let PaneLayout::Leaf { cmds, .. } = structured else {
+            panic!("expected a leaf layout");
+        };
+        assert_eq!(cmds, Some(vec!["ssh".to_string(), "host".to_string()]));
+
+        let legacy: PaneLayout = serde_json::from_str(
+            r#"{"type":"leaf","dir":"/tmp","sid":"1-2","cmds":"ssh host 'echo a; rm b'"}"#,
+        )
+        .unwrap();
+        let PaneLayout::Leaf { cmds, .. } = legacy else {
+            panic!("expected a leaf layout");
+        };
+        assert_eq!(cmds, None, "a joined string must never be replayed");
     }
 
     #[test]
