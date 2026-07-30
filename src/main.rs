@@ -533,9 +533,11 @@ pub fn run() -> glib::ExitCode {
         spacer.set_hexpand(true);
         top_bar.append(&spacer);
 
-        // A visible, stateful counterpart to Ctrl+Alt+G. Its checked state
-        // follows the lifetime of the approval-gated Shell Agent session.
-        let agent_toggle = gtk4::ToggleButton::with_label("Agent");
+        // A compact, stateful counterpart to Ctrl+Alt+G. Its checked state
+        // follows the lifetime of the approval-gated Shell Agent session;
+        // the full name remains available through its tooltip/accessibility.
+        let agent_toggle = gtk4::ToggleButton::new();
+        agent_toggle.set_icon_name("system-run-symbolic");
         agent_toggle.set_focus_on_click(false);
         agent_toggle.set_focusable(true);
         agent_toggle.set_tooltip_text(Some("Activate Shell Agent (Ctrl+Alt+G)"));
