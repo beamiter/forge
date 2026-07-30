@@ -3653,6 +3653,14 @@ impl TermView {
             }
         }
 
+        // Every cwd-shaped failure is absorbed inside `OwnedPty::spawn`: a
+        // restored session pointing at a deleted worktree or an unmounted drive
+        // starts in the application directory instead of failing here. What is
+        // left is a missing shell binary or an exhausted fd/pid table, and a
+        // Block pane cannot exist without its PTY — every keystroke, resize and
+        // teardown path dereferences it — so failing loudly beats handing the
+        // user a pane that silently swallows input. `expect` keeps the io::Error
+        // in the message.
         let pty = Rc::new(OwnedPty::spawn(&argv, cwd, &env_extra).expect("PTY spawn failed"));
 
         // Share the child lifecycle with the live VTE so widget-tree teardown

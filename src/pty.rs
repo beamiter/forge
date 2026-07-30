@@ -305,6 +305,40 @@ fn child_environment(env_extra: &[(&str, &str)]) -> io::Result<Vec<CString>> {
         .collect()
 }
 
+/// Requested working directory the child may actually start in.
+///
+/// A restored session names the directory the tab last ran in, and that
+/// directory can be gone by the time the tab comes back — a removed git
+/// worktree, an unmounted drive, a cleaned `/tmp` path. Dropping the request
+/// here (as jterm1 does) starts the shell in the application directory
+/// instead; propagating the failure would cost the user the whole pane.
+fn usable_working_directory(cwd: Option<&str>) -> Option<&str> {
+    cwd.filter(|value| !value.is_empty()).filter(|directory| {
+        let usable = crate::host::working_directory_available(directory);
+        if !usable {
+            log::warn!("PTY working directory is unavailable; using the application directory");
+        }
+        usable
+    })
+}
+
+/// Open the child's working directory for the post-fork `fchdir`.
+///
+/// The directory already passed [`usable_working_directory`], so a failure here
+/// is either a race (the path vanished in between) or a search-only `--x`
+/// directory, which `chdir` accepts but `open` refuses. Neither is worth the
+/// pane: fall back to the application directory with a warning.
+fn open_working_directory(cwd: Option<&str>) -> Option<File> {
+    let directory = cwd?;
+    match File::open(directory) {
+        Ok(file) => Some(file),
+        Err(error) => {
+            log::warn!("Cannot open PTY working directory {directory}: {error}");
+            None
+        }
+    }
+}
+
 impl OwnedPty {
     fn close_master_fd(&self) {
         if let Ok(mut guard) = self.master.lock() {
@@ -315,7 +349,11 @@ impl OwnedPty {
     pub fn spawn(argv: &[&str], cwd: Option<&str>, env_extra: &[(&str, &str)]) -> io::Result<Self> {
         let argv_owned: Vec<String> = argv.iter().map(|value| (*value).to_string()).collect();
         let host_bridge = crate::host::is_flatpak();
-        let executable_argv = crate::host::wrap_argv(&argv_owned, cwd, env_extra);
+        // Decide the directory once, before it is baked into the host-bridge
+        // wrapper argv and used to resolve a relative executable: the bridge
+        // encodes `--directory`, so a caller cannot correct this afterwards.
+        let effective_cwd = usable_working_directory(cwd);
+        let executable_argv = crate::host::wrap_argv(&argv_owned, effective_cwd, env_extra);
         if executable_argv.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -326,8 +364,10 @@ impl OwnedPty {
         // Prepare every allocation and environment lookup before fork. GTK is
         // multi-threaded, so the child may only use async-signal-safe libc
         // operations until exec replaces the process image.
-        let executable =
-            resolve_executable(&executable_argv[0], if host_bridge { None } else { cwd })?;
+        let executable = resolve_executable(
+            &executable_argv[0],
+            if host_bridge { None } else { effective_cwd },
+        )?;
         let executable_c = CString::new(executable.as_os_str().as_bytes())
             .map_err(|_| invalid_nul("PTY executable path"))?;
         let c_argv: Vec<CString> = executable_argv
@@ -355,9 +395,7 @@ impl OwnedPty {
         let cwd_file = if host_bridge {
             None
         } else {
-            cwd.filter(|value| !value.is_empty())
-                .map(File::open)
-                .transpose()?
+            open_working_directory(effective_cwd)
         };
         let cwd_fd = cwd_file.as_ref().map(AsRawFd::as_raw_fd).unwrap_or(-1);
 
@@ -849,6 +887,44 @@ mod tests {
         }
     }
 
+    /// Collect PTY output until `needle` shows up or the deadline passes. The
+    /// caller asserts on the result, so a timeout returns what did arrive
+    /// instead of failing here — that makes the assertion message useful.
+    fn read_until(fd: RawFd, needle: &[u8], timeout: Duration) -> Vec<u8> {
+        let deadline = Instant::now() + timeout;
+        let mut output = Vec::new();
+        while Instant::now() < deadline {
+            let mut poll_fd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut poll_fd, 1, 100) } <= 0 {
+                continue;
+            }
+            let mut buffer = [0u8; 256];
+            let read =
+                unsafe { libc::read(fd, buffer.as_mut_ptr().cast::<libc::c_void>(), buffer.len()) };
+            if read < 0
+                && matches!(
+                    io::Error::last_os_error().kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                )
+            {
+                continue;
+            }
+            if read <= 0 {
+                // EOF, or EIO once the child is gone: nothing more will arrive.
+                break;
+            }
+            output.extend_from_slice(&buffer[..read as usize]);
+            if output.windows(needle.len()).any(|window| window == needle) {
+                break;
+            }
+        }
+        output
+    }
+
     /// A PTY setup that fails after the fork must not leak the child it
     /// already created: signaling it is not enough, somebody has to reap it.
     #[test]
@@ -965,6 +1041,55 @@ mod tests {
         assert!(
             pty.input_tx.lock().expect("input sender").is_none(),
             "kill must disconnect the dedicated input writer"
+        );
+    }
+
+    /// Restoring a session whose recorded directory was deleted or unmounted
+    /// must still open the pane. Before the guard the `File::open` error walked
+    /// out of `spawn` into the block-mode caller's `expect` and took the whole
+    /// application down with it.
+    #[test]
+    fn a_vanished_working_directory_falls_back_to_the_application_directory() {
+        let missing = format!("/tmp/jterm4-removed-worktree-{}", std::process::id());
+        assert!(!Path::new(&missing).exists(), "test path must not exist");
+        let application_directory = std::env::current_dir().expect("process working directory");
+        let expected = application_directory.as_os_str().as_bytes();
+
+        let pty = OwnedPty::spawn(&["/bin/sh", "-c", "pwd"], Some(missing.as_str()), &[])
+            .expect("a deleted working directory must not fail the spawn");
+        let output = read_until(pty.master_fd_raw(), expected, Duration::from_secs(5));
+        pty.kill();
+
+        assert!(
+            output
+                .windows(expected.len())
+                .any(|window| window == expected),
+            "child did not start in the application directory: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    #[test]
+    fn an_unopenable_working_directory_yields_no_directory_handle() {
+        assert!(open_working_directory(None).is_none());
+        assert!(
+            open_working_directory(Some("/tmp")).is_some(),
+            "an ordinary directory must still be handed to fchdir"
+        );
+        assert!(
+            open_working_directory(Some("/tmp/jterm4-unmounted-drive")).is_none(),
+            "a path that disappeared after the probe must not fail the spawn"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_working_directory_is_not_requested_from_the_child() {
+        assert_eq!(usable_working_directory(None), None);
+        assert_eq!(usable_working_directory(Some("")), None);
+        assert_eq!(usable_working_directory(Some("/tmp")), Some("/tmp"));
+        assert_eq!(
+            usable_working_directory(Some("/tmp/jterm4-removed-worktree")),
+            None
         );
     }
 
