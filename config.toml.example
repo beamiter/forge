@@ -146,6 +146,8 @@ ai_redact_secrets = true
 # resize_pane_down = "Ctrl+Shift+Alt+Down"
 # toggle_ai_panel = "Ctrl+Shift+Alt+A"
 # open_agent = "Ctrl+Alt+G"
+# 会话导出默认不占用 chord（在命令面板中直接执行）；如需快捷键，可用
+# export_session_markdown / export_session_json 这两个 key 自行绑定。
 
 # SSH 远程主机（可重复；默认不会注入任何个人地址） --------------------------
 

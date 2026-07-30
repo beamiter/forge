@@ -9,7 +9,7 @@ use vte4::Terminal;
 use vte4::TerminalExt;
 
 use super::*;
-use crate::block_view::TermView;
+use crate::block_view::{SessionExportFormat, TermView};
 use crate::keybindings::{Action, Direction};
 use crate::terminal::terminal_working_directory;
 
@@ -308,6 +308,12 @@ impl UiState {
                     term_view.jump_to_pinned(1);
                 }
             }
+            Action::ExportSessionMarkdown => {
+                self.export_current_session(SessionExportFormat::Markdown);
+            }
+            Action::ExportSessionJson => {
+                self.export_current_session(SessionExportFormat::Json);
+            }
             Action::ToggleDebugDashboard => {
                 log::debug!("Toggle debug dashboard");
                 self.toggle_debug_dashboard();
@@ -435,6 +441,44 @@ impl UiState {
             self.toggle_ai_panel();
         }
         self.ai_panel.ask_about_block(ctx);
+    }
+
+    /// Write the active Block pane's session to disk and tell the user where it
+    /// went. Export is a fire-and-forget action with no visible side effect in
+    /// the terminal, so a silent failure would be indistinguishable from a dead
+    /// palette entry — both outcomes get a dialog.
+    pub(crate) fn export_current_session(&self, format: SessionExportFormat) {
+        let Some(term_view) = self.current_term_view() else {
+            log::debug!("export: no Block pane in the active tab");
+            self.show_session_export_result(
+                "Session export unavailable",
+                "Session export needs a Block-mode pane; the conventional VTE backend keeps no blocks.",
+            );
+            return;
+        };
+        match term_view.export_session_to_file(format) {
+            Ok(path) => {
+                log::info!("Session exported to {}", path.display());
+                self.show_session_export_result(
+                    "Session exported",
+                    &format!("Wrote {}", path.display()),
+                );
+            }
+            Err(error) => {
+                log::warn!("Session export failed: {error}");
+                self.show_session_export_result(
+                    "Session export failed",
+                    &format!("Could not write the export: {error}"),
+                );
+            }
+        }
+    }
+
+    fn show_session_export_result(&self, heading: &str, message: &str) {
+        let dialog = adw::AlertDialog::new(Some(heading), Some(message));
+        dialog.add_response("ok", "OK");
+        dialog.set_default_response(Some("ok"));
+        dialog.present(Some(&self.window));
     }
 
     pub(crate) fn show_ai_error(&self, message: &str) {

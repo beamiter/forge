@@ -68,6 +68,10 @@ pub(crate) enum Action {
     ReinputSelectedCommands,
     JumpToPrevPinned,
     JumpToNextPinned,
+    /// Write every block of the active pane's session to a timestamped
+    /// Markdown / JSON file under the jterm4 data directory.
+    ExportSessionMarkdown,
+    ExportSessionJson,
     ToggleDebugDashboard,
     /// Show/hide the right-side AI chat panel.
     ToggleAiPanel,
@@ -158,6 +162,8 @@ impl Action {
             Action::ReinputSelectedCommands => "Reinput selected commands",
             Action::JumpToPrevPinned => "Jump to previous bookmarked block",
             Action::JumpToNextPinned => "Jump to next bookmarked block",
+            Action::ExportSessionMarkdown => "Export session as Markdown file",
+            Action::ExportSessionJson => "Export session as JSON file",
             Action::ToggleDebugDashboard => "Toggle debug dashboard",
             Action::ToggleAiPanel => "Toggle AI panel",
             Action::AskAiAboutSelectedBlock => "Ask AI about selected block",
@@ -224,6 +230,8 @@ impl Action {
             Action::ReinputSelectedCommands => Some("reinput_selected_commands"),
             Action::JumpToPrevPinned => Some("jump_to_prev_pinned"),
             Action::JumpToNextPinned => Some("jump_to_next_pinned"),
+            Action::ExportSessionMarkdown => Some("export_session_markdown"),
+            Action::ExportSessionJson => Some("export_session_json"),
             Action::ToggleDebugDashboard => Some("toggle_debug_dashboard"),
             Action::ToggleAiPanel => Some("toggle_ai_panel"),
             Action::AskAiAboutSelectedBlock => Some("ask_ai_about_selected_block"),
@@ -290,6 +298,8 @@ impl Action {
             Action::ReinputSelectedCommands,
             Action::JumpToPrevPinned,
             Action::JumpToNextPinned,
+            Action::ExportSessionMarkdown,
+            Action::ExportSessionJson,
             Action::ToggleDebugDashboard,
             Action::ToggleAiPanel,
             Action::AskAiAboutSelectedBlock,
@@ -530,6 +540,10 @@ mod tests {
             Action::FilterPinnedBlocks,
             Action::JumpToPrevPinned,
             Action::JumpToNextPinned,
+            // jterm1 leaves session export chordless too; both GTK terminals
+            // reach it from the command palette only.
+            Action::ExportSessionMarkdown,
+            Action::ExportSessionJson,
             Action::InstallJsh,
         ];
 
@@ -891,6 +905,38 @@ mod tests {
         let new = parse("F11").unwrap();
         assert_eq!(map.lookup(&old), None, "old default must be removed");
         assert_eq!(map.lookup(&new), Some(Action::ScrollUp));
+    }
+
+    /// Session export ships chordless like jterm1's, so the TOML keys are the
+    /// only way a user can put it on a chord — and the command palette is the
+    /// only way to reach it otherwise. Both halves are wiring that a rename
+    /// could silently break.
+    #[test]
+    fn session_export_is_palette_only_yet_bindable_from_config() {
+        let mut map = KeybindingMap::from_defaults();
+        assert!(map
+            .binding_display(&Action::ExportSessionMarkdown)
+            .is_empty());
+        assert!(map.binding_display(&Action::ExportSessionJson).is_empty());
+
+        let markdown = parse("Ctrl+Shift+Alt+E").unwrap();
+        let json = parse("Ctrl+Shift+Alt+U").unwrap();
+        assert_eq!(map.lookup(&markdown), None, "chosen chord must start free");
+        assert_eq!(map.lookup(&json), None, "chosen chord must start free");
+
+        let mut table = toml::Table::new();
+        table.insert(
+            "export_session_markdown".into(),
+            toml::Value::String("Ctrl+Shift+Alt+E".into()),
+        );
+        table.insert(
+            "export_session_json".into(),
+            toml::Value::String("Ctrl+Shift+Alt+U".into()),
+        );
+        map.apply_user_overrides(&table);
+
+        assert_eq!(map.lookup(&markdown), Some(Action::ExportSessionMarkdown));
+        assert_eq!(map.lookup(&json), Some(Action::ExportSessionJson));
     }
 
     #[test]

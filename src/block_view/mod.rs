@@ -35,6 +35,7 @@ pub(crate) use ansi::*;
 pub(crate) use blocks::*;
 pub(crate) use cross_selection::*;
 pub(crate) use css::*;
+pub(crate) use export::SessionExportFormat;
 pub(crate) use find::*;
 #[allow(unused_imports)]
 pub(crate) use palette::*;
