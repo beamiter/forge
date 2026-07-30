@@ -21,6 +21,7 @@ mod command_review;
 mod config_apply;
 mod dialogs;
 mod file_tree;
+mod jsh;
 mod layout;
 mod notebooks;
 mod pane_header;
@@ -28,7 +29,6 @@ mod pane_leaf;
 mod pane_node;
 mod pane_tree_edit;
 mod panes;
-mod rsh;
 mod search;
 mod session;
 mod sidebar_tabs;
@@ -138,7 +138,7 @@ pub(crate) struct UiState {
     pub(crate) keybinding_map: Rc<RefCell<KeybindingMap>>,
     pub(crate) zoom_state: Rc<RefCell<Option<ZoomState>>>,
     pub(crate) scrollbar_css: CssProvider,
-    /// Maps tab_num → session_id for rsh session persistence.
+    /// Maps tab_num → session_id for jsh session persistence.
     pub(crate) session_ids: Rc<RefCell<HashMap<u32, String>>>,
     /// Maps tab_num → remote connection record (status + reconnect info).
     pub(crate) tab_connections: Rc<RefCell<HashMap<u32, TabConnection>>>,

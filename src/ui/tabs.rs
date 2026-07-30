@@ -934,7 +934,7 @@ impl UiState {
 
     /// Launch an explicit argv in a named tab, in conventional VTE mode.
     ///
-    /// Used for one-shot helper processes such as the rsh installer: they emit
+    /// Used for one-shot helper processes such as the jsh installer: they emit
     /// no shell-integration sequences, so Block mode would have nothing to
     /// build blocks from, and the tab deserves a better name than argv[0].
     pub(crate) fn add_named_tab_with_argv(&self, tab_name: &str, argv: Vec<String>) -> Terminal {
@@ -1138,7 +1138,7 @@ impl UiState {
 
     /// Respawn a dead remote tab in place: insert a fresh connection at the dead
     /// tab's notebook slot (preserving position), then remove the dead page. The
-    /// rebuilt argv reuses the host's baked-in `--session` id so rsh restores the
+    /// rebuilt argv reuses the host's baked-in `--session` id so jsh restores the
     /// snapshot.
     fn do_reconnect(&self, dead_tab_num: u32, host: &crate::config::RemoteHost, attempt: u32) {
         let dead_name = format!("tab-{}", dead_tab_num);
@@ -1183,7 +1183,7 @@ impl UiState {
         let tab_num = self.tab_counter.get();
         self.tab_counter.set(tab_num + 1);
 
-        // Generate or reuse session ID for rsh session persistence
+        // Generate or reuse session ID for jsh session persistence
         let sid = session_id.unwrap_or_else(generate_session_id);
         self.session_ids.borrow_mut().insert(tab_num, sid.clone());
 

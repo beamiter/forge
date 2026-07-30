@@ -30,8 +30,8 @@ pub mod pty;
 pub mod redact {
     pub use jterm_core::redact::*;
 }
-pub mod rsh_install {
-    pub use jterm_core::rsh_install::*;
+pub mod jsh_install {
+    pub use jterm_core::jsh_install::*;
 }
 pub mod state;
 pub mod terminal;

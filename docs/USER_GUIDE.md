@@ -203,7 +203,7 @@ jterm4 不预置主机。在配置中显式添加：
 name = "dev"
 host = "dev.example.com"
 user = "alice"
-remote_shell = "rsh"
+remote_shell = "jsh"
 session = "dev-main"
 ssh_args = ["-p", "2222"]
 login_shell = true

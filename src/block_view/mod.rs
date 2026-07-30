@@ -2437,7 +2437,7 @@ impl ReaderCtx {
                             // Read the typed command directly off the live VTE,
                             // not from a shadow keystroke buffer. The VTE shows
                             // what the user actually saw — including history
-                            // recalls and rsh autosuggestion accepts — so what we
+                            // recalls and jsh autosuggestion accepts — so what we
                             // capture here is faithful to the run. Range goes
                             // from the cursor position captured at PromptEnd to
                             // the current cursor position (right before the
@@ -3614,18 +3614,18 @@ impl TermView {
         let unread_count: Rc<Cell<u32>> = Rc::new(Cell::new(0));
 
         // ── PTY ───────────────────────────────────────────────────────────
-        // Detect rsh shell for session_id passing
-        let is_rsh = shell_argv
+        // Detect jsh shell for session_id passing
+        let is_jsh = shell_argv
             .first()
             .and_then(|s| std::path::Path::new(s).file_name())
             .and_then(|f| f.to_str())
-            .map(|name| name == "rsh")
+            .map(|name| name == "jsh")
             .unwrap_or(false);
 
-        // Build argv with optional --session for rsh
+        // Build argv with optional --session for jsh
         let mut argv_vec: Vec<String> = shell_argv.to_vec();
         if let Some(sid) = session_id {
-            if is_rsh {
+            if is_jsh {
                 argv_vec.push("--session".to_string());
                 argv_vec.push(sid.to_string());
             }
@@ -3648,8 +3648,8 @@ impl TermView {
         }
         let session_id_owned = session_id.map(|s| s.to_string());
         if let Some(ref sid) = session_id_owned {
-            if is_rsh {
-                env_extra.push(("RSH_SESSION_ID", sid.as_str()));
+            if is_jsh {
+                env_extra.push(("JSH_SESSION_ID", sid.as_str()));
             }
         }
 

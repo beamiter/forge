@@ -154,7 +154,7 @@ pub(crate) fn tabs_state_file_path() -> PathBuf {
     window_state_paths().active.clone()
 }
 
-/// Generate a unique session ID for rsh session persistence and window-state files.
+/// Generate a unique session ID for jsh session persistence and window-state files.
 pub(crate) fn generate_session_id() -> String {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)

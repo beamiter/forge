@@ -497,17 +497,17 @@ pub(crate) fn spawn_shell(
     session_id: Option<&str>,
     initial_commands: &[String],
 ) {
-    // Append --session <id> to argv when restoring a session (only for rsh)
+    // Append --session <id> to argv when restoring a session (only for jsh)
     let mut argv_vec: Vec<String> = argv_owned.to_vec();
     if let Some(sid) = session_id {
-        let is_rsh = argv_vec
+        let is_jsh = argv_vec
             .first()
             .and_then(|s| std::path::Path::new(s).file_name())
             .and_then(|f| f.to_str())
-            .map(|name| name == "rsh")
+            .map(|name| name == "jsh")
             .unwrap_or(false);
 
-        if is_rsh {
+        if is_jsh {
             argv_vec.push("--session".to_string());
             argv_vec.push(sid.to_string());
         }

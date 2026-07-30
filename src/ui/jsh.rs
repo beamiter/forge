@@ -1,4 +1,4 @@
-//! Install and update surfaces for the companion shell, rsh.
+//! Install and update surfaces for the companion shell, jsh.
 //!
 //! Two entry points, both explicit: the command palette action, and a notice
 //! bar that appears only after a background check found something actionable.
@@ -15,7 +15,7 @@ use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
 use super::UiState;
-use crate::rsh_install::{self, Status};
+use crate::jsh_install::{self, Status};
 
 /// How often the pending check result is polled from the worker thread.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -24,15 +24,15 @@ impl UiState {
     /// Run the installer in its own tab. The script narrates what it does, so
     /// the tab is the progress UI — no bespoke dialog, and the user can read
     /// the failure or interrupt it with Ctrl+C like any other command.
-    pub(crate) fn install_or_update_rsh(&self) {
-        match rsh_install::install_argv() {
+    pub(crate) fn install_or_update_jsh(&self) {
+        match jsh_install::install_argv() {
             Ok(argv) => {
-                self.add_named_tab_with_argv("Install rsh", argv);
+                self.add_named_tab_with_argv("Install jsh", argv);
             }
             Err(error) => {
-                log::warn!("cannot stage the rsh installer: {error}");
+                log::warn!("cannot stage the jsh installer: {error}");
                 let dialog = adw::AlertDialog::new(
-                    Some("Cannot install rsh"),
+                    Some("Cannot install jsh"),
                     Some(&format!("Writing the installer script failed: {error}")),
                 );
                 dialog.add_response("ok", "OK");
@@ -42,9 +42,9 @@ impl UiState {
         }
     }
 
-    /// Build the (initially hidden) rsh notice bar and kick off the update
+    /// Build the (initially hidden) jsh notice bar and kick off the update
     /// check that may reveal it. The caller places the returned widget.
-    pub(crate) fn build_rsh_notice(self: &Rc<Self>) -> GBox {
+    pub(crate) fn build_jsh_notice(self: &Rc<Self>) -> GBox {
         let bar = GBox::new(Orientation::Horizontal, 8);
         bar.add_css_class("toolbar");
         bar.set_margin_start(6);
@@ -76,7 +76,7 @@ impl UiState {
             let bar = bar.clone();
             action.connect_clicked(move |_| {
                 bar.set_visible(false);
-                ui.install_or_update_rsh();
+                ui.install_or_update_jsh();
             });
         }
         {
@@ -84,22 +84,22 @@ impl UiState {
             dismiss.connect_clicked(move |_| bar.set_visible(false));
         }
 
-        self.start_rsh_update_check(&bar, &label, &action);
+        self.start_jsh_update_check(&bar, &label, &action);
         bar
     }
 
     /// Ask the installer what is published, off the main loop, and reveal the
     /// notice bar if the answer is actionable.
-    fn start_rsh_update_check(self: &Rc<Self>, bar: &GBox, label: &Label, action: &Button) {
+    fn start_jsh_update_check(self: &Rc<Self>, bar: &GBox, label: &Label, action: &Button) {
         // "startup" asks the network every launch; "daily" reuses the
         // installer's cache, which every jterm on this machine shares.
-        let Some(max_age) = self.config.borrow().rsh_update_check.max_age() else {
+        let Some(max_age) = self.config.borrow().jsh_update_check.max_age() else {
             return;
         };
 
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = sender.send(rsh_install::check_blocking(max_age));
+            let _ = sender.send(jsh_install::check_blocking(max_age));
         });
 
         let receiver = RefCell::new(receiver);
@@ -108,12 +108,12 @@ impl UiState {
         let action = action.clone();
         glib::timeout_add_local(POLL_INTERVAL, move || match receiver.borrow().try_recv() {
             Ok(status) => {
-                apply_rsh_status(&bar, &label, &action, &status);
+                apply_jsh_status(&bar, &label, &action, &status);
                 glib::ControlFlow::Break
             }
             Err(TryRecvError::Empty) => glib::ControlFlow::Continue,
             Err(TryRecvError::Disconnected) => {
-                log::warn!("rsh update check ended without a result");
+                log::warn!("jsh update check ended without a result");
                 glib::ControlFlow::Break
             }
         });
@@ -123,22 +123,22 @@ impl UiState {
 /// Turn a check result into UI. A check that failed, or found nothing to do,
 /// leaves the bar hidden: an offline machine must not grow a bar whose button
 /// cannot work.
-fn apply_rsh_status(bar: &GBox, label: &Label, action: &Button, status: &Status) {
+fn apply_jsh_status(bar: &GBox, label: &Label, action: &Button, status: &Status) {
     if let Some(error) = &status.error {
-        log::info!("rsh update check unavailable: {error}");
+        log::info!("jsh update check unavailable: {error}");
     }
     if let Some(other) = &status.shadowed_by {
-        // Usually /usr/bin/rsh, the BSD remote shell. Installing does not fix
+        // Some other binary named jsh, earlier on PATH. Installing does not fix
         // PATH order, so the installer explains it in the tab; here it is only
         // worth a log line.
-        log::warn!("PATH resolves rsh to {other}, which jterm does not manage");
+        log::warn!("PATH resolves jsh to {other}, which jterm does not manage");
     }
 
-    let Some(prompt) = rsh_install::prompt_for(status) else {
+    let Some(prompt) = jsh_install::prompt_for(status) else {
         bar.set_visible(false);
         return;
     };
-    log::info!("rsh notice: {}", prompt.banner_title());
+    log::info!("jsh notice: {}", prompt.banner_title());
     label.set_text(&prompt.banner_title());
     action.set_label(prompt.button_label());
     bar.set_visible(true);

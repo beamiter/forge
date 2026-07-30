@@ -88,8 +88,8 @@ pub(crate) enum Action {
     WorkflowsPalette,
     /// Open the bundled executable quick-start notebook.
     OpenWelcome,
-    /// Install rsh, or update the installed one, in a dedicated tab.
-    InstallRsh,
+    /// Install jsh, or update the installed one, in a dedicated tab.
+    InstallJsh,
 }
 
 impl Action {
@@ -166,7 +166,7 @@ impl Action {
             Action::CrossBlockSearch => "Search across blocks (ripgrep)",
             Action::WorkflowsPalette => "Workflows palette",
             Action::OpenWelcome => "Open welcome & quick start notebook",
-            Action::InstallRsh => "Install or update rsh (jterm's shell)",
+            Action::InstallJsh => "Install or update jsh (jterm's shell)",
         }
     }
 
@@ -233,7 +233,7 @@ impl Action {
             Action::WorkflowsPalette => Some("workflows_palette"),
             Action::OpenWelcome => None,
             // Palette-only: too rare to spend a chord on.
-            Action::InstallRsh => None,
+            Action::InstallJsh => None,
         }
     }
 
@@ -298,7 +298,7 @@ impl Action {
             Action::CrossBlockSearch,
             Action::WorkflowsPalette,
             Action::OpenWelcome,
-            Action::InstallRsh,
+            Action::InstallJsh,
         ]
     }
 }
@@ -530,7 +530,7 @@ mod tests {
             Action::FilterPinnedBlocks,
             Action::JumpToPrevPinned,
             Action::JumpToNextPinned,
-            Action::InstallRsh,
+            Action::InstallJsh,
         ];
 
         let map = KeybindingMap::from_defaults();

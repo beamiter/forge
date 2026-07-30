@@ -31,9 +31,9 @@ For example, when `sudo apt install fmpg` fails with `Unable to locate package f
 
 ## Local and remote targets
 
-A local package or PATH index must never be presented as evidence about an rsh/SSH target. Remote panes therefore skip local APT and PATH probes. A suggestion emitted by the remote tool itself is still target evidence; an AI-only remote suggestion is visibly marked as unverified on that target.
+A local package or PATH index must never be presented as evidence about an jsh/SSH target. Remote panes therefore skip local APT and PATH probes. A suggestion emitted by the remote tool itself is still target evidence; an AI-only remote suggestion is visibly marked as unverified on that target.
 
-A future rsh control channel can add remote read-only probes without injecting hidden commands into the interactive PTY.
+A future jsh control channel can add remote read-only probes without injecting hidden commands into the interactive PTY.
 
 ## Model protocol and safety boundary
 

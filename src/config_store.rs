@@ -419,8 +419,8 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         toml::Value::String(config.sidebar_view.as_str().to_string()),
     );
     table.insert(
-        "rsh_update_check".into(),
-        toml::Value::String(config.rsh_update_check.as_str().to_string()),
+        "jsh_update_check".into(),
+        toml::Value::String(config.jsh_update_check.as_str().to_string()),
     );
     table.insert(
         "sidebar_visible".into(),

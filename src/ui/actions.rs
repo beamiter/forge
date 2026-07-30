@@ -334,9 +334,9 @@ impl UiState {
                 self.show_workflows_palette();
             }
             Action::OpenWelcome => self.open_welcome_notebook(),
-            Action::InstallRsh => {
-                log::info!("Install or update rsh");
-                self.install_or_update_rsh();
+            Action::InstallJsh => {
+                log::info!("Install or update jsh");
+                self.install_or_update_jsh();
             }
         }
     }

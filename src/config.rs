@@ -72,9 +72,9 @@ impl SidebarView {
     }
 }
 
-/// When to check whether a newer rsh has been published. Shared with the other
+/// When to check whether a newer jsh has been published. Shared with the other
 /// terminals so one config vocabulary covers the family.
-pub use jterm_core::rsh_install::UpdateCheck as RshUpdateCheck;
+pub use jterm_core::jsh_install::UpdateCheck as JshUpdateCheck;
 
 // ---------------------------------------------------------------------------
 // Remote host
@@ -89,9 +89,9 @@ pub struct RemoteHost {
     pub name: String,
     pub host: String,
     pub user: Option<String>,
-    /// Shell to launch on the remote side (default "rsh").
+    /// Shell to launch on the remote side (default "jsh").
     pub remote_shell: String,
-    /// Stable session id passed to the remote rsh for resume-on-reconnect.
+    /// Stable session id passed to the remote jsh for resume-on-reconnect.
     pub session: Option<String>,
     /// Extra flags inserted before the target (e.g. ["-p", "2222"]).
     pub ssh_args: Vec<String>,
@@ -128,17 +128,17 @@ fn wrap_exec_in_login_bash(command: &str) -> String {
     )
 }
 
-fn wrap_rsh_argv_in_interactive_bash(rsh_path: &str) -> Option<Vec<String>> {
+fn wrap_jsh_argv_in_interactive_bash(jsh_path: &str) -> Option<Vec<String>> {
     let bash_path = crate::host::find_executable_in_path("bash")?;
     Some(vec![
         bash_path.to_string_lossy().to_string(),
         "-ic".to_string(),
-        crate::process::build_rsh_exec_command(rsh_path, None),
+        crate::process::build_jsh_exec_command(jsh_path, None),
     ])
 }
 
 /// Build the local argv that connects to a remote host via ssh.
-/// Produces e.g. `["ssh", "-t", "-p", "2222", "mm@100.x.x.x", "rsh --session home-main"]`.
+/// Produces e.g. `["ssh", "-t", "-p", "2222", "mm@100.x.x.x", "jsh --session home-main"]`.
 pub(crate) fn build_remote_argv(host: &RemoteHost) -> Vec<String> {
     let target = match &host.user {
         Some(u) => format!("{u}@{}", host.host),
@@ -196,9 +196,9 @@ pub struct Config {
     pub(crate) tab_placement: TabPlacement,
     /// Which single view the sidebar shows (tab list vs file tree).
     pub(crate) sidebar_view: SidebarView,
-    /// When to look for a newer rsh. Installing always stays an explicit
+    /// When to look for a newer jsh. Installing always stays an explicit
     /// choice: this only governs whether the offer appears.
-    pub(crate) rsh_update_check: RshUpdateCheck,
+    pub(crate) jsh_update_check: JshUpdateCheck,
     /// Whether the left sidebar is visible. When absent from an older config,
     /// startup derives the default from tab placement: open for sidebar tabs,
     /// closed for top-bar tabs.
@@ -335,7 +335,7 @@ impl Config {
             terminal_mode: TerminalMode::Vte,
             tab_placement: TabPlacement::Sidebar,
             sidebar_view: SidebarView::Tabs,
-            rsh_update_check: RshUpdateCheck::Daily,
+            jsh_update_check: JshUpdateCheck::Daily,
             sidebar_visible: true,
             sidebar_width: 220,
             max_visible_blocks: 200,
@@ -646,7 +646,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "terminal_mode",
     "tab_placement",
     "sidebar_view",
-    "rsh_update_check",
+    "jsh_update_check",
     "sidebar_visible",
     "sidebar_width",
     "max_visible_blocks",
@@ -753,7 +753,7 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
         "terminal_mode",
         "tab_placement",
         "sidebar_view",
-        "rsh_update_check",
+        "jsh_update_check",
         "command_history_path",
         "block_history_path",
         "ai_provider",
@@ -974,7 +974,7 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
             );
         }
     }
-    if let Some(value) = table.get("rsh_update_check").and_then(toml::Value::as_str) {
+    if let Some(value) = table.get("jsh_update_check").and_then(toml::Value::as_str) {
         if !matches!(
             value.to_ascii_lowercase().as_str(),
             "startup" | "launch" | "always" | "daily" | "never" | "off" | "disabled"
@@ -982,7 +982,7 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
             config_issue(
                 &mut issues,
                 Error,
-                "rsh_update_check",
+                "jsh_update_check",
                 "expected 'startup', 'daily' or 'never'",
             );
         }
@@ -1181,7 +1181,7 @@ struct FileConfig {
     terminal_mode: Option<String>,
     tab_placement: Option<String>,
     sidebar_view: Option<String>,
-    rsh_update_check: Option<String>,
+    jsh_update_check: Option<String>,
     sidebar_visible: Option<bool>,
     sidebar_width: Option<u32>,
     // Block view optimizations
@@ -1348,8 +1348,8 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
             .get("sidebar_view")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
-        rsh_update_check: table
-            .get("rsh_update_check")
+        jsh_update_check: table
+            .get("jsh_update_check")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         sidebar_visible: table.get("sidebar_visible").and_then(|v| v.as_bool()),
@@ -1454,7 +1454,7 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
             let remote_shell = t
                 .get("remote_shell")
                 .and_then(|v| v.as_str())
-                .unwrap_or("rsh")
+                .unwrap_or("jsh")
                 .to_string();
             let session = t
                 .get("session")
@@ -1712,8 +1712,8 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         terminal_mode,
         tab_placement,
         sidebar_view: SidebarView::parse(&fc.sidebar_view.unwrap_or_else(|| "tabs".to_string())),
-        rsh_update_check: RshUpdateCheck::parse(
-            &fc.rsh_update_check.unwrap_or_else(|| "daily".to_string()),
+        jsh_update_check: JshUpdateCheck::parse(
+            &fc.jsh_update_check.unwrap_or_else(|| "daily".to_string()),
         ),
         sidebar_visible,
         sidebar_width: fc.sidebar_width.unwrap_or(220).clamp(120, 800),
@@ -1838,25 +1838,25 @@ fn choose_flatpak_host_shell_argv(configured_shell: Option<&str>) -> Vec<String>
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("");
-        if shell_name == "rsh" && crate::host::command_available("bash") {
+        if shell_name == "jsh" && crate::host::command_available("bash") {
             return vec![
                 "bash".to_string(),
                 "-ic".to_string(),
-                crate::process::build_rsh_exec_command(shell, None),
+                crate::process::build_jsh_exec_command(shell, None),
             ];
         }
         return vec![shell.to_string()];
     }
 
-    if crate::host::command_available("rsh") {
+    if crate::host::command_available("jsh") {
         if crate::host::command_available("bash") {
             return vec![
                 "bash".to_string(),
                 "-ic".to_string(),
-                "exec rsh".to_string(),
+                "exec jsh".to_string(),
             ];
         }
-        return vec!["rsh".to_string()];
+        return vec!["jsh".to_string()];
     }
 
     if let Some(shell) = std::env::var("SHELL")
@@ -1883,8 +1883,8 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("");
-            if shell_name == "rsh" {
-                if let Some(argv) = wrap_rsh_argv_in_interactive_bash(path) {
+            if shell_name == "jsh" {
+                if let Some(argv) = wrap_jsh_argv_in_interactive_bash(path) {
                     return argv;
                 }
             }
@@ -1896,12 +1896,12 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
         );
     }
 
-    // Prefer rsh when it's on PATH.
-    if let Some(rsh_path) = crate::host::find_executable_in_path("rsh") {
-        if let Some(argv) = wrap_rsh_argv_in_interactive_bash(&rsh_path.to_string_lossy()) {
+    // Prefer jsh when it's on PATH.
+    if let Some(jsh_path) = crate::host::find_executable_in_path("jsh") {
+        if let Some(argv) = wrap_jsh_argv_in_interactive_bash(&jsh_path.to_string_lossy()) {
             return argv;
         }
-        return vec![rsh_path.to_string_lossy().to_string()];
+        return vec![jsh_path.to_string_lossy().to_string()];
     }
 
     // Fallback: bash
@@ -1922,7 +1922,7 @@ mod tests {
             name: "h".into(),
             host: "1.2.3.4".into(),
             user: Some("yj".into()),
-            remote_shell: "/home/yj/.cargo/bin/rsh".into(),
+            remote_shell: "/home/yj/.cargo/bin/jsh".into(),
             session: Some("cloud-test".into()),
             ssh_args: Vec::new(),
             login_shell: true,
@@ -1941,7 +1941,7 @@ mod tests {
                 "ssh",
                 "-t",
                 "yj@1.2.3.4",
-                "bash -lc 'exec /home/yj/.cargo/bin/rsh --session cloud-test'",
+                "bash -lc 'exec /home/yj/.cargo/bin/jsh --session cloud-test'",
             ]
         );
     }
@@ -1953,7 +1953,7 @@ mod tests {
         let argv = build_remote_argv(&h);
         assert_eq!(
             argv.last().unwrap(),
-            "/home/yj/.cargo/bin/rsh --session cloud-test"
+            "/home/yj/.cargo/bin/jsh --session cloud-test"
         );
     }
 
@@ -1964,16 +1964,16 @@ mod tests {
         let argv = build_remote_argv(&h);
         assert_eq!(
             argv.last().unwrap(),
-            r#"bash -lc 'exec /home/yj/.cargo/bin/rsh --session it'"'"'s'"#
+            r#"bash -lc 'exec /home/yj/.cargo/bin/jsh --session it'"'"'s'"#
         );
     }
 
     #[test]
-    fn local_rsh_is_wrapped_in_interactive_bash() {
-        let argv = wrap_rsh_argv_in_interactive_bash("/home/yj/.cargo/bin/rsh")
+    fn local_jsh_is_wrapped_in_interactive_bash() {
+        let argv = wrap_jsh_argv_in_interactive_bash("/home/yj/.cargo/bin/jsh")
             .expect("bash should be available on the test runner");
         assert_eq!(argv[1], "-ic");
-        assert_eq!(argv[2], "exec '/home/yj/.cargo/bin/rsh'");
+        assert_eq!(argv[2], "exec '/home/yj/.cargo/bin/jsh'");
     }
 
     #[test]
@@ -2063,7 +2063,7 @@ unknown_action = "F8"
 name = "开发机"
 host = "dev.example.com"
 user = "alice"
-remote_shell = "/opt/tools/rsh --resume"
+remote_shell = "/opt/tools/jsh --resume"
 session = "开发-main"
 ssh_args = ["-p", "2222", "-o", "ProxyCommand=ssh bastion -W %h:%p"]
 login_shell = false
@@ -2132,7 +2132,7 @@ name = "missing host"
 name = " "
 host = "example.com\u001b"
 user = ""
-remote_shell = "rsh\u0007"
+remote_shell = "jsh\u0007"
 session = "\t"
 ssh_args = ["", "ok\u007f"]
 "#,
