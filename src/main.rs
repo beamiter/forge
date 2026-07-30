@@ -29,6 +29,17 @@ const GTK_APPLICATION_ARGV: [&str; 1] = ["jterm4"];
 const TAB_SWITCH_FOCUS_STABLE_FRAMES: u8 = 2;
 const TAB_SWITCH_FOCUS_MAX_FRAMES: u8 = 16;
 
+fn sync_maximize_button(window: &adw::ApplicationWindow, button: &gtk4::Button) {
+    let (icon_name, label) = if window.is_maximized() {
+        ("window-restore-symbolic", "Restore window")
+    } else {
+        ("window-maximize-symbolic", "Maximize window")
+    };
+    button.set_icon_name(icon_name);
+    button.set_tooltip_text(Some(label));
+    button.update_property(&[gtk4::accessible::Property::Label(label)]);
+}
+
 fn shortcut_modifiers(state: ModifierType) -> ModifierType {
     state & (ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK | ModifierType::ALT_MASK)
 }
@@ -374,6 +385,8 @@ pub fn run() -> glib::ExitCode {
             .default_height(600)
             .title("jterm4")
             .name("win_name")
+            .modal(false)
+            .resizable(true)
             .opacity(window_opacity.get())
             .build();
 
@@ -445,6 +458,8 @@ pub fn run() -> glib::ExitCode {
              .tab-pin-icon { font-size: 0.9em; opacity: 0.8; margin-right: 2px; color: #ffb86c; }
              .tab-selected { background-color: alpha(currentColor, 0.14); outline: 2px solid alpha(currentColor, 0.8); outline-offset: -2px; }
              .tab-conn-dot { font-size: 0.7em; margin-right: 2px; }
+             .window-controls { margin-left: 2px; }
+             .window-control { min-width: 24px; min-height: 24px; padding: 0; border-radius: 999px; }
              @keyframes conn-pulse { 0% { opacity: 1.0; } 50% { opacity: 0.35; } 100% { opacity: 1.0; } }
              .tab-conn-dot.tab-connecting { color: #f1fa8c; animation: conn-pulse 1.2s ease-in-out infinite; }
              .tab-conn-dot.tab-connected { color: #50fa7b; }
@@ -462,7 +477,7 @@ pub fn run() -> glib::ExitCode {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
 
-        // Top bar: [☰ toggle] [spacer] [+ new tab] [✕ close window]
+        // Top bar: [☰ toggle] [spacer] [+ new tab] [native window controls]
         let toggle_sidebar_btn = gtk4::Button::from_icon_name("open-menu-symbolic");
         toggle_sidebar_btn.set_focus_on_click(false);
         toggle_sidebar_btn.set_focusable(true);
@@ -482,14 +497,6 @@ pub fn run() -> glib::ExitCode {
             gtk4::accessible::Property::KeyShortcuts("Control+Shift+T"),
         ]);
         add_tab_button.add_css_class("flat");
-
-        let close_window_button = gtk4::Button::from_icon_name("window-close-symbolic");
-        close_window_button.set_focus_on_click(false);
-        close_window_button.set_focusable(true);
-        close_window_button.set_tooltip_text(Some("Close window"));
-        close_window_button
-            .update_property(&[gtk4::accessible::Property::Label("Close window")]);
-        close_window_button.add_css_class("flat");
 
         // Toggles the tab bar between the left sidebar and the top bar.
         let toggle_placement_btn = gtk4::Button::from_icon_name("view-list-symbolic");
@@ -520,7 +527,8 @@ pub fn run() -> glib::ExitCode {
         top_bar.append(&toggle_placement_btn);
         top_bar.append(&top_tab_search_holder);
         top_bar.append(&top_tab_scroll);
-        // Spacer pushes + and ✕ to the right (disabled when tabs fill the top bar)
+        // Spacer pushes the trailing actions and window controls to the right
+        // (disabled when tabs fill the top bar).
         let spacer = gtk4::Box::new(Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
         top_bar.append(&spacer);
@@ -538,7 +546,75 @@ pub fn run() -> glib::ExitCode {
         agent_toggle.add_css_class("flat");
         top_bar.append(&agent_toggle);
         top_bar.append(&add_tab_button);
-        top_bar.append(&close_window_button);
+
+        // AdwApplicationWindow does not add a HeaderBar on its own. Keep the
+        // compact custom bar, but give it the two pieces a real titlebar needs:
+        //
+        // - Explicit buttons avoid GtkWindowControls disabling minimize and
+        //   maximize when its inherited window actions are unavailable in the
+        //   current desktop/window state.
+        // - WindowHandle gives non-interactive parts of the bar native
+        //   move/double-click/right-click titlebar behavior on Wayland and X11.
+        //
+        // Interactive children (buttons, tab drag sources, search) continue to
+        // receive their own gestures before the handle considers a window move.
+        let window_controls = gtk4::Box::new(Orientation::Horizontal, 4);
+        window_controls.add_css_class("window-controls");
+
+        let minimize_window_button =
+            gtk4::Button::from_icon_name("window-minimize-symbolic");
+        minimize_window_button.add_css_class("flat");
+        minimize_window_button.add_css_class("window-control");
+        minimize_window_button.set_focus_on_click(false);
+        minimize_window_button.set_tooltip_text(Some("Minimize window"));
+        minimize_window_button
+            .update_property(&[gtk4::accessible::Property::Label("Minimize window")]);
+
+        let maximize_window_button =
+            gtk4::Button::from_icon_name("window-maximize-symbolic");
+        maximize_window_button.add_css_class("flat");
+        maximize_window_button.add_css_class("window-control");
+        maximize_window_button.set_focus_on_click(false);
+        sync_maximize_button(&window, &maximize_window_button);
+
+        let close_window_button = gtk4::Button::from_icon_name("window-close-symbolic");
+        close_window_button.add_css_class("flat");
+        close_window_button.add_css_class("window-control");
+        close_window_button.set_focus_on_click(false);
+        close_window_button.set_tooltip_text(Some("Close window"));
+        close_window_button
+            .update_property(&[gtk4::accessible::Property::Label("Close window")]);
+
+        window_controls.append(&minimize_window_button);
+        window_controls.append(&maximize_window_button);
+        window_controls.append(&close_window_button);
+        top_bar.append(&window_controls);
+
+        let top_bar_handle = gtk4::WindowHandle::new();
+        top_bar_handle.set_child(Some(&top_bar));
+
+        {
+            let window = window.clone();
+            minimize_window_button.connect_clicked(move |_| window.minimize());
+        }
+        {
+            let window = window.clone();
+            maximize_window_button.connect_clicked(move |_| {
+                if window.is_maximized() {
+                    window.unmaximize();
+                } else {
+                    window.maximize();
+                }
+            });
+        }
+        {
+            let button = maximize_window_button.clone();
+            window.connect_maximized_notify(move |window| sync_maximize_button(window, &button));
+        }
+        {
+            let window = window.clone();
+            close_window_button.connect_clicked(move |_| window.close());
+        }
 
         // Vertical sidebar with tab buttons (collapsible)
         let tab_strip = gtk4::Box::new(Orientation::Vertical, 2);
@@ -724,9 +800,9 @@ pub fn run() -> glib::ExitCode {
         content_box.set_shrink_end_child(true);
         content_box.set_position(config.borrow().sidebar_width as i32);
 
-        // Main layout: top_bar + content_box (vertical)
+        // Main layout: draggable top bar + content box (vertical)
         let main_box = gtk4::Box::new(Orientation::Vertical, 0);
-        main_box.append(&top_bar);
+        main_box.append(&top_bar_handle);
         main_box.append(&content_box);
 
         // Shared state
@@ -798,7 +874,7 @@ pub fn run() -> glib::ExitCode {
         // jterm prefers rsh as its shell, so it is worth noticing when the
         // machine has no rsh or an old one. The bar builds hidden and reveals
         // itself only if the background check finds something to offer.
-        main_box.insert_child_after(&ui.build_rsh_notice(), Some(&top_bar));
+        main_box.insert_child_after(&ui.build_rsh_notice(), Some(&top_bar_handle));
 
         let ui_for_ai_close = Rc::downgrade(&ui);
         ui.ai_panel.connect_close_requested(move || {
@@ -882,12 +958,6 @@ pub fn run() -> glib::ExitCode {
         // (which also restores the persisted sidebar view).
         ui.init_file_tree();
         ui.apply_tab_placement();
-
-        // Wire close-window button
-        let window_for_close = window.clone();
-        close_window_button.connect_clicked(move |_| {
-            window_for_close.close();
-        });
 
         // Wire "+" button — inherit working directory from current session
         let ui_for_add = ui.clone();
