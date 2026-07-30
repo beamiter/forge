@@ -11,14 +11,11 @@ impl UiState {
     pub(crate) fn apply_tab_placement(&self) {
         let placement = self.tab_placement.get();
 
-        // Detach the strip from whichever scroll holder currently owns it.
+        // Detach the strip from whichever scroll holder currently owns it. The
+        // tab filter is not part of this move: it stays in the sidebar's Tabs
+        // view for both placements.
         self.tab_strip_scroll.set_child(None::<&gtk4::Widget>);
         self.top_tab_scroll.set_child(None::<&gtk4::Widget>);
-        if let Some(parent) = self.tab_search_wrapper.parent() {
-            if let Ok(parent) = parent.downcast::<gtk4::Box>() {
-                parent.remove(&self.tab_search_wrapper);
-            }
-        }
 
         match placement {
             TabPlacement::Sidebar => {
@@ -28,11 +25,7 @@ impl UiState {
                 self.tab_strip.set_vexpand(true);
                 self.tab_strip.remove_css_class("top-tabs");
                 self.tab_strip_scroll.set_child(Some(&self.tab_strip));
-                self.sidebar_tab_search_holder
-                    .append(&self.tab_search_wrapper);
                 self.top_spacer.set_hexpand(true);
-                self.sidebar_tab_search_holder.set_visible(true);
-                self.top_tab_search_holder.set_visible(false);
             }
             TabPlacement::TopBar => {
                 self.tab_strip.set_orientation(Orientation::Horizontal);
@@ -41,10 +34,7 @@ impl UiState {
                 self.tab_strip.set_vexpand(false);
                 self.tab_strip.add_css_class("top-tabs");
                 self.top_tab_scroll.set_child(Some(&self.tab_strip));
-                self.top_tab_search_holder.append(&self.tab_search_wrapper);
                 self.top_spacer.set_hexpand(false);
-                self.sidebar_tab_search_holder.set_visible(false);
-                self.top_tab_search_holder.set_visible(true);
             }
         }
 

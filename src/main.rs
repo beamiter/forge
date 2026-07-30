@@ -509,10 +509,6 @@ pub fn run() -> glib::ExitCode {
         ]);
         toggle_placement_btn.add_css_class("flat");
 
-        // The tab filter moves here when tabs are placed horizontally.
-        let top_tab_search_holder = gtk4::Box::new(Orientation::Horizontal, 0);
-        top_tab_search_holder.set_visible(false);
-
         // Holder for the tab strip when it lives in the top bar (horizontal).
         let top_tab_scroll = ScrolledWindow::new();
         top_tab_scroll.set_hexpand(true);
@@ -525,7 +521,6 @@ pub fn run() -> glib::ExitCode {
         top_bar.add_css_class("top-bar");
         top_bar.append(&toggle_sidebar_btn);
         top_bar.append(&toggle_placement_btn);
-        top_bar.append(&top_tab_search_holder);
         top_bar.append(&top_tab_scroll);
         // Spacer pushes the trailing actions and window controls to the right
         // (disabled when tabs fill the top bar).
@@ -634,7 +629,10 @@ pub fn run() -> glib::ExitCode {
         let sidebar = gtk4::Box::new(Orientation::Vertical, 0);
         sidebar.add_css_class("sidebar-box");
 
-        // Tab search entry for filtering.
+        // Tab search entry for filtering. It always lives in the sidebar's Tabs
+        // view, in both tab placements: the top bar is reserved for the tabs
+        // themselves and the window controls, and a filter field there would eat
+        // horizontal space the tab strip needs.
         // Non-focusable by default to prevent GTK's automatic focus navigation
         // from landing here when alt-screen VTE is hidden. Enabled on mouse click
         // or via the FilterTabs keybinding.
@@ -678,9 +676,7 @@ pub fn run() -> glib::ExitCode {
         // Tabs view: filter entry + tab strip (or its mirror).
         let sidebar_tabs_page = gtk4::Box::new(Orientation::Vertical, 0);
         sidebar_tabs_page.set_vexpand(true);
-        let sidebar_tab_search_holder = gtk4::Box::new(Orientation::Horizontal, 0);
-        sidebar_tab_search_holder.append(&tab_search_wrapper);
-        sidebar_tabs_page.append(&sidebar_tab_search_holder);
+        sidebar_tabs_page.append(&tab_search_wrapper);
         sidebar_tabs_page.append(&tab_strip_scroll);
         sidebar_tabs_page.append(&sidebar_tab_mirror_scroll);
 
@@ -829,9 +825,6 @@ pub fn run() -> glib::ExitCode {
             sidebar_tab_mirror: sidebar_tab_mirror.clone(),
             sidebar_tab_mirror_scroll: sidebar_tab_mirror_scroll.clone(),
             top_tab_scroll: top_tab_scroll.clone(),
-            sidebar_tab_search_holder: sidebar_tab_search_holder.clone(),
-            top_tab_search_holder: top_tab_search_holder.clone(),
-            tab_search_wrapper: tab_search_wrapper.clone(),
             tab_placement: Rc::new(Cell::new(config.borrow().tab_placement)),
             sidebar_stack: sidebar_stack.clone(),
             sidebar_tabs_btn: sidebar_tabs_btn.clone(),

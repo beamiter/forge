@@ -103,11 +103,6 @@ pub(crate) struct UiState {
     pub(crate) sidebar_tab_mirror_scroll: ScrolledWindow,
     /// Top-bar scroll holder for the (horizontal) tab strip.
     pub(crate) top_tab_scroll: ScrolledWindow,
-    /// The single tab filter is reparented between these two holders together
-    /// with the tab strip, so filtering is available in either placement.
-    pub(crate) sidebar_tab_search_holder: gtk4::Box,
-    pub(crate) top_tab_search_holder: gtk4::Box,
-    pub(crate) tab_search_wrapper: gtk4::Box,
     /// Current tab placement (sidebar vs top bar).
     pub(crate) tab_placement: Rc<Cell<TabPlacement>>,
     /// Sidebar content stack (one of: tab list, file tree).

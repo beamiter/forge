@@ -141,10 +141,10 @@ impl UiState {
             }
             Action::FilterTabs => {
                 log::debug!("Filter tabs");
-                if self.tab_placement.get() == crate::config::TabPlacement::Sidebar {
-                    self.set_sidebar_visible(true, true);
-                    self.apply_sidebar_view(crate::config::SidebarView::Tabs, false);
-                }
+                // The filter only ever lives in the sidebar's Tabs view, so
+                // reveal it regardless of where the tab strip is docked.
+                self.set_sidebar_visible(true, true);
+                self.apply_sidebar_view(crate::config::SidebarView::Tabs, false);
                 self.tab_search_entry.set_can_focus(true);
                 self.tab_search_entry.set_focusable(true);
                 self.tab_search_entry.grab_focus();

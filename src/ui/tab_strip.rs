@@ -52,19 +52,16 @@ impl UiState {
         let show_strip = self.notebook.n_pages() > 1;
         // The sidebar's Tabs page holds both the strip's holder and the
         // mirror; exactly one is shown, decided by where the strip lives, so
-        // the page never renders an empty holder or a duplicate list.
+        // the page never renders an empty holder or a duplicate list. The
+        // filter above them stays put in both cases.
         match self.tab_placement.get() {
             TabPlacement::Sidebar => {
                 self.tab_strip_scroll.set_visible(true);
                 self.sidebar_tab_mirror_scroll.set_visible(false);
                 self.top_tab_scroll.set_visible(false);
-                self.sidebar_tab_search_holder.set_visible(true);
-                self.top_tab_search_holder.set_visible(false);
             }
             TabPlacement::TopBar => {
                 self.top_tab_scroll.set_visible(show_strip);
-                self.top_tab_search_holder.set_visible(show_strip);
-                self.sidebar_tab_search_holder.set_visible(false);
                 self.tab_strip_scroll.set_visible(false);
                 self.sidebar_tab_mirror_scroll.set_visible(true);
             }
