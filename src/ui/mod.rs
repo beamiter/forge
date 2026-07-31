@@ -82,6 +82,12 @@ pub(crate) struct TabConnection {
 #[derive(Clone)]
 pub(crate) struct UiState {
     pub(crate) window: adw::ApplicationWindow,
+    /// Window-level toast host wrapping the main layout.
+    pub(crate) toast_overlay: adw::ToastOverlay,
+    /// The live opacity-hotkey toast, if one is currently shown. Held so rapid
+    /// Ctrl+Alt+=/- presses update one toast in place instead of queueing a
+    /// separate toast per step.
+    pub(crate) opacity_toast: Rc<RefCell<Option<adw::Toast>>>,
     pub(crate) notebook: Notebook,
     pub(crate) tab_counter: Rc<Cell<u32>>,
     pub(crate) font_scale: Rc<Cell<f64>>,

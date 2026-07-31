@@ -42,6 +42,35 @@ fn ai_panel_width_from_geometry(total_width: i32, position: i32) -> Option<u32> 
 }
 
 impl UiState {
+    /// Hotkey path for opacity: apply to the window, write through to the
+    /// config (same persistence as the settings dialog, so the value survives
+    /// restarts like it does in jterm2/jterm3), and show toast feedback.
+    fn apply_opacity(&self, opacity: f64) {
+        self.window_opacity.set(opacity);
+        self.window.set_opacity(opacity);
+        self.config.borrow_mut().window_opacity = opacity;
+        self.persist_config();
+        self.show_opacity_toast();
+    }
+
+    /// Hotkey feedback: show the current opacity as a percentage. Repeat
+    /// presses update the toast in place rather than queueing one per step.
+    fn show_opacity_toast(&self) {
+        let message = format!("Opacity: {:.0}%", self.window_opacity.get() * 100.0);
+        if let Some(toast) = self.opacity_toast.borrow().as_ref() {
+            toast.set_title(&message);
+            return;
+        }
+        let toast = adw::Toast::new(&message);
+        toast.set_timeout(2);
+        let slot = Rc::clone(&self.opacity_toast);
+        toast.connect_dismissed(move |_| {
+            slot.borrow_mut().take();
+        });
+        *self.opacity_toast.borrow_mut() = Some(toast.clone());
+        self.toast_overlay.add_toast(toast);
+    }
+
     pub(crate) fn execute_action(&self, action: Action) {
         let font_step = 0.025;
         let opacity_step = 0.025;
@@ -109,15 +138,11 @@ impl UiState {
             }
             Action::OpacityIncrease => {
                 log::debug!("Opacity increase");
-                self.window_opacity
-                    .set((self.window_opacity.get() + opacity_step).clamp(0.01, 1.0));
-                self.window.set_opacity(self.window_opacity.get());
+                self.apply_opacity((self.window_opacity.get() + opacity_step).clamp(0.01, 1.0));
             }
             Action::OpacityDecrease => {
                 log::debug!("Opacity decrease");
-                self.window_opacity
-                    .set((self.window_opacity.get() - opacity_step).clamp(0.01, 1.0));
-                self.window.set_opacity(self.window_opacity.get());
+                self.apply_opacity((self.window_opacity.get() - opacity_step).clamp(0.01, 1.0));
             }
             Action::ToggleSearch => {
                 log::debug!("Toggle search");

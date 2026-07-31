@@ -1191,6 +1191,9 @@ impl UiState {
         let opacity_scale = Scale::with_range(Orientation::Horizontal, 0.01, 1.0, 0.025);
         opacity_scale.set_value(self.window_opacity.get());
         opacity_scale.set_hexpand(true);
+        opacity_scale.set_draw_value(true);
+        opacity_scale.set_value_pos(gtk4::PositionType::Left);
+        opacity_scale.set_format_value_func(|_, value| format!("{:.0}%", value * 100.0));
         opacity_row.add_suffix(&opacity_scale);
         group.add(&opacity_row);
 

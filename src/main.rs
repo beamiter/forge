@@ -813,8 +813,15 @@ pub fn run() -> glib::ExitCode {
         let font_scale = Rc::new(Cell::new(config.borrow().default_font_scale));
         let tab_counter = Rc::new(Cell::new(0));
 
+        // Window-level toast host: transient feedback (e.g. the opacity
+        // percentage while Ctrl+Alt+=/- is held) floats over the main layout.
+        let toast_overlay = adw::ToastOverlay::new();
+        toast_overlay.set_child(Some(&main_box));
+
         let ui = Rc::new(UiState {
             window: window.clone(),
+            toast_overlay: toast_overlay.clone(),
+            opacity_toast: Rc::new(RefCell::new(None)),
             notebook: notebook.clone(),
             tab_counter: tab_counter.clone(),
             font_scale: font_scale.clone(),
@@ -1499,7 +1506,7 @@ pub fn run() -> glib::ExitCode {
             app_clone.quit();
         });
 
-        window.set_content(Some(&main_box));
+        window.set_content(Some(&toast_overlay));
         window.present();
 
         // Paned positions are meaningful only after the first allocation.
