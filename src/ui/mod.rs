@@ -47,6 +47,9 @@ pub(crate) use pane_tree_edit::{
     detach_leaf_and_promote, detach_leaf_for_zoom, restore_zoomed_leaf, ZoomPageSwap,
 };
 
+/// Quiet period after the last font-scale step before the config is written.
+pub(crate) const FONT_PERSIST_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
+
 pub(crate) struct ZoomState {
     pub(crate) swap: ZoomPageSwap,
     pub(crate) zoomed_terminal: Terminal,
@@ -91,6 +94,12 @@ pub(crate) struct UiState {
     pub(crate) notebook: Notebook,
     pub(crate) tab_counter: Rc<Cell<u32>>,
     pub(crate) font_scale: Rc<Cell<f64>>,
+    /// Generation token for the debounced font-scale config write. Ctrl+wheel
+    /// emits a step per notch, so only the last step in a burst reaches disk.
+    pub(crate) font_persist_generation: Rc<Cell<u64>>,
+    /// Config-file mtime as of our own last successful save. The file monitor
+    /// cannot tell our writes from an external edit; this does.
+    pub(crate) config_last_write: Rc<Cell<Option<std::time::SystemTime>>>,
     pub(crate) window_opacity: Rc<Cell<f64>>,
     pub(crate) shell_argv: Rc<RefCell<Vec<String>>>,
     pub(crate) config: Rc<RefCell<Config>>,

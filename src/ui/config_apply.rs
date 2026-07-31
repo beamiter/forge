@@ -1,6 +1,7 @@
 //! config_apply — UiState methods extracted from ui (mechanical split, no logic changes)
 use adw::prelude::*;
 use gtk4::gdk::RGBA;
+use gtk4::glib;
 use gtk4::pango::FontDescription;
 use libadwaita as adw;
 use std::rc::Rc;
@@ -13,6 +14,14 @@ use crate::config::{
     choose_shell_argv, config_file_path, load_config, validate_config_contents, Theme,
 };
 use crate::terminal::collect_terminals;
+
+/// Modification time of the config file, or `None` when it is absent or
+/// unreadable. Used to tell our own saves apart from external edits.
+fn config_file_mtime() -> Option<std::time::SystemTime> {
+    std::fs::metadata(config_file_path())
+        .and_then(|meta| meta.modified())
+        .ok()
+}
 
 impl UiState {
     pub(crate) fn show_config_error(&self, title: &str, message: &str) {
@@ -40,6 +49,8 @@ impl UiState {
         }
         let result = crate::config::save_config(&self.config.borrow());
         let Err(error) = result else {
+            // Let the file monitor recognise this write as ours.
+            self.config_last_write.set(config_file_mtime());
             return;
         };
         self.show_config_error(
@@ -66,6 +77,25 @@ impl UiState {
                 }
             }
         }
+    }
+
+    /// Apply a font scale to the live panes, the in-memory config, and — once
+    /// the steps stop arriving — the config file. Used by the hotkeys, the
+    /// Ctrl+wheel path, and the settings dialog; all three emit bursts (a held
+    /// key, a wheel notch train, a dragged SpinRow) that must not rewrite the
+    /// config file once per step.
+    pub(crate) fn apply_font_scale(&self, new_scale: f64) {
+        self.set_font_scale_all(new_scale);
+        self.config.borrow_mut().default_font_scale = new_scale;
+        let generation = self.font_persist_generation.get().wrapping_add(1);
+        self.font_persist_generation.set(generation);
+        let ui = self.clone();
+        glib::timeout_add_local_once(FONT_PERSIST_DEBOUNCE, move || {
+            // A newer step superseded this one; it owns the write instead.
+            if ui.font_persist_generation.get() == generation {
+                ui.persist_config();
+            }
+        });
     }
 
     pub(crate) fn set_font_scale_all(&self, new_scale: f64) {
@@ -402,6 +432,14 @@ impl UiState {
             return;
         }
         let path = config_file_path();
+        // The monitor also sees our own saves. Reapplying those is a no-op that
+        // still reparents the tab strip and AI panel, which is disruptive once
+        // Ctrl+wheel writes the font scale on every zoom burst.
+        let disk_mtime = config_file_mtime();
+        if disk_mtime.is_some() && disk_mtime == self.config_last_write.get() {
+            log::debug!("Config reload skipped: file matches the last save");
+            return;
+        }
         if path.exists() {
             let validation = std::fs::read_to_string(&path)
                 .map_err(|err| err.to_string())

@@ -1420,10 +1420,7 @@ impl UiState {
         // --- Signal: Font Scale ---
         let ui = self.clone();
         font_scale_row.connect_notify_local(Some("value"), move |row, _| {
-            let new_scale = row.value();
-            ui.set_font_scale_all(new_scale);
-            ui.config.borrow_mut().default_font_scale = new_scale;
-            ui.persist_config();
+            ui.apply_font_scale(row.value());
         });
 
         // --- Signal: Opacity ---

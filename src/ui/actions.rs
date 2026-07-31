@@ -125,16 +125,18 @@ impl UiState {
             Action::FontIncrease => {
                 log::debug!("Font increase");
                 let new_scale = (self.font_scale.get() + font_step).min(10.0);
-                self.set_font_scale_all(new_scale);
+                // Same apply-and-persist path as the settings dialog, so the
+                // hotkey survives restarts like it does in jterm2/jterm3.
+                self.apply_font_scale(new_scale);
             }
             Action::FontDecrease => {
                 log::debug!("Font decrease");
                 let new_scale = (self.font_scale.get() - font_step).max(0.1);
-                self.set_font_scale_all(new_scale);
+                self.apply_font_scale(new_scale);
             }
             Action::FontReset => {
                 log::debug!("Font reset");
-                self.set_font_scale_all(1.0);
+                self.apply_font_scale(1.0);
             }
             Action::OpacityIncrease => {
                 log::debug!("Opacity increase");

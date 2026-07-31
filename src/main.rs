@@ -825,6 +825,8 @@ pub fn run() -> glib::ExitCode {
             notebook: notebook.clone(),
             tab_counter: tab_counter.clone(),
             font_scale: font_scale.clone(),
+            font_persist_generation: Rc::new(Cell::new(0)),
+            config_last_write: Rc::new(Cell::new(None)),
             window_opacity: window_opacity.clone(),
             shell_argv: shell_argv.clone(),
             config: config.clone(),
@@ -1366,7 +1368,9 @@ pub fn run() -> glib::ExitCode {
         let ui_for_scroll = ui.clone();
         scroll_controller.connect_scroll(move |controller, _dx, dy| {
             let state = controller.current_event_state();
-            if state.contains(ModifierType::CONTROL_MASK) {
+            // Touchpads emit fractional deltas; a zero step would still claim
+            // the event, so let those through untouched.
+            if state.contains(ModifierType::CONTROL_MASK) && dy != 0.0 {
                 let font_step = 0.025;
                 let current = ui_for_scroll.font_scale.get();
                 let new_scale = if dy < 0.0 {
@@ -1374,7 +1378,7 @@ pub fn run() -> glib::ExitCode {
                 } else {
                     (current - font_step).max(0.1)
                 };
-                ui_for_scroll.set_font_scale_all(new_scale);
+                ui_for_scroll.apply_font_scale(new_scale);
                 return true.into();
             }
             false.into()
