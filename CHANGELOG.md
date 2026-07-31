@@ -6,6 +6,8 @@ All notable user-visible and operational changes are recorded here.
 
 ### Fixed
 
+- 顶部栏模式下只剩一个标签页时，右侧的 Agent、新建标签与窗口最小化/最大化/关闭按钮会整体挤到最左边、贴着 ☰ 和标签位置切换按钮，右侧留一片空白。顶部栏靠"某个子控件横向撑开"把这组按钮顶到右边缘，而这个角色由标签条的 `ScrolledWindow` 担任；单标签时标签条按设计隐藏（`sync_tab_bar_visibility`），隐藏控件不参与扩展，偏偏 `apply_tab_placement` 已经因为"顶部栏模式"把备用 spacer 的 `hexpand` 关掉了——两处各自看一半状态，于是没有任何子控件扩展。spacer 的开关改由 `sync_tab_bar_visibility` 独占（它是唯一知道标签条最终可见性的地方），标签条真正可见时才让位。新建/关闭标签、会话恢复与侧栏↔顶部栏切换都经过该函数，因此 1↔多标签来回切换时按钮位置保持钉在右侧。
+
 - 桌面集成安装后应用列表里没有 jterm4 图标：三处成因已分别修复。其一，条目里的 `Exec=jterm4` / `TryExec=jterm4` 依赖 `PATH`，而桌面会话的 `PATH` 在登录时固定，默认安装位置 `~/.local/bin` 常常不在其中——`TryExec` 失败会让条目整个从应用列表里消失；`scripts/install.sh` 与发行包的 `install-release.sh` 现在把这两行改写成二进制绝对路径（`/usr/bin` 等系统 bin 目录仍保持相对形式以便重定位）。其二，安装脚本从不刷新桌面缓存，新条目与新图标要等下次登录才可见，陈旧的 `icon-theme.cache` 甚至会一直盖住刚装进去的图标；现在安装与卸载都会校验条目并刷新 `update-desktop-database` 和 `gtk-update-icon-cache`（`DESTDIR` 打包时跳过，且这些缓存以放宽的 umask 生成，避免 `sudo --prefix /usr` 装出别的用户读不到的 `0600` 缓存）。其三，`StartupWMClass` 写的是 application ID，而 GTK4 的 X11 `WM_CLASS` 取自程序名（实测为 `jterm4`），X11 会话下窗口因此无法与条目关联，dock 里会多出一个没有图标的重复项；现已改为 `jterm4`，Wayland 侧仍按 app_id 匹配不受影响。
 - 安装脚本现在会提示 `PATH` 问题：目标 bin 目录不在 `PATH` 中，或 `PATH` 上已有另一份 jterm4（例如旧的 `cargo install` 副本）会遮蔽刚装好的二进制。
 

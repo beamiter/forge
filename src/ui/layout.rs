@@ -7,7 +7,9 @@ use crate::config::{SidebarView, TabPlacement};
 
 impl UiState {
     /// Move the tab strip into the holder matching the current placement and
-    /// adjust orientation, per-button sizing, and top-bar spacer behavior.
+    /// adjust orientation and per-button sizing. The top-bar spacer is left to
+    /// `sync_tab_bar_visibility` below, which is the only place that knows
+    /// whether the strip ends up visible at all.
     pub(crate) fn apply_tab_placement(&self) {
         let placement = self.tab_placement.get();
 
@@ -25,7 +27,6 @@ impl UiState {
                 self.tab_strip.set_vexpand(true);
                 self.tab_strip.remove_css_class("top-tabs");
                 self.tab_strip_scroll.set_child(Some(&self.tab_strip));
-                self.top_spacer.set_hexpand(true);
             }
             TabPlacement::TopBar => {
                 self.tab_strip.set_orientation(Orientation::Horizontal);
@@ -34,7 +35,6 @@ impl UiState {
                 self.tab_strip.set_vexpand(false);
                 self.tab_strip.add_css_class("top-tabs");
                 self.top_tab_scroll.set_child(Some(&self.tab_strip));
-                self.top_spacer.set_hexpand(false);
             }
         }
 

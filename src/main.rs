@@ -527,8 +527,9 @@ pub fn run() -> glib::ExitCode {
         top_bar.append(&toggle_sidebar_btn);
         top_bar.append(&toggle_placement_btn);
         top_bar.append(&top_tab_scroll);
-        // Spacer pushes the trailing actions and window controls to the right
-        // (disabled when tabs fill the top bar).
+        // Spacer pushes the trailing actions and window controls to the right.
+        // `sync_tab_bar_visibility` turns its expansion off only while the top
+        // tab strip is visible and expanding in its place.
         let spacer = gtk4::Box::new(Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
         top_bar.append(&spacer);
