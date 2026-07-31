@@ -55,12 +55,85 @@ run() {
     fi
 }
 
+run_optional() {
+    print_command "$@"
+    if ((DRY_RUN == 0)); then
+        "$@" || printf 'jterm4 install: warning: %s failed (non-fatal)\n' "$1" >&2
+    fi
+}
+
+# Like run_optional, but relaxes this script's restrictive umask: the desktop
+# and icon caches are generated files that every user of a shared prefix has to
+# be able to read, unlike the config we deliberately keep owner-only.
+run_optional_public() {
+    print_command "$@"
+    if ((DRY_RUN == 0)); then
+        (umask 022 && "$@") \
+            || printf 'jterm4 install: warning: %s failed (non-fatal)\n' "$1" >&2
+    fi
+}
+
 run_in_repo() {
     printf '  (cd %q && ' "${REPO_ROOT}"
     printf '%q ' "$@"
     printf ')\n'
     if ((DRY_RUN == 0)); then
         (cd -- "${REPO_ROOT}" && "$@")
+    fi
+}
+
+bin_dir_on_path() {
+    case ":${PATH}:" in
+        *":${BIN_DIR}:"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# A desktop session fixes its PATH at login, so an entry that only says
+# `Exec=jterm4` fails TryExec and is hidden from the launcher whenever the
+# binary lives in a per-user bin dir that PATH does not list. Point the entry at
+# the real path unless the target is a system bin dir that is always on PATH.
+desktop_exec_path() {
+    case "${BIN_DIR}" in
+        /usr/bin | /usr/local/bin | /bin) printf 'jterm4' ;;
+        *) printf '%s/jterm4' "${BIN_DIR}" ;;
+    esac
+}
+
+install_desktop_entry() {
+    local source="$1" dest="$2" exec_path
+    exec_path="$(desktop_exec_path)"
+    printf '  install -Dm0644 (Exec=%s) %q %q\n' "${exec_path}" "${source}" "${dest}"
+    ((DRY_RUN == 0)) || return 0
+    install -d -m 0755 "$(dirname -- "${dest}")"
+    awk -v exec_path="${exec_path}" '
+        /^Exec=jterm4([[:space:]]|$)/ || /^TryExec=jterm4([[:space:]]|$)/ {
+            eq = index($0, "=")
+            print substr($0, 1, eq) exec_path substr($0, eq + 7)
+            next
+        }
+        { print }
+    ' "${source}" >"${dest}.new"
+    chmod 0644 "${dest}.new"
+    mv -f -- "${dest}.new" "${dest}"
+}
+
+# Freshly installed entries and icons stay invisible until the shell's caches
+# are rebuilt; a stale icon cache can even shadow icons that are already there.
+refresh_desktop_caches() {
+    if [[ -n "${DESTDIR}" ]]; then
+        printf 'Staged install (DESTDIR set); skipping desktop cache refresh.\n'
+        return 0
+    fi
+    if command -v desktop-file-validate >/dev/null 2>&1; then
+        run_optional desktop-file-validate "${SHARE_DIR}/applications/${APP_ID}.desktop"
+    fi
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        run_optional_public update-desktop-database "${SHARE_DIR}/applications"
+    fi
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        run_optional_public gtk-update-icon-cache --force --ignore-theme-index --quiet \
+            "${SHARE_DIR}/icons/hicolor"
     fi
 }
 
@@ -207,7 +280,7 @@ run install -m 0644 \
     "${ASSET_DIR}/notebooks/welcome.jtnb.md"
 
 if ((INSTALL_DESKTOP == 1)); then
-    run install -Dm0644 "${REPO_ROOT}/data/${APP_ID}.desktop" \
+    install_desktop_entry "${REPO_ROOT}/data/${APP_ID}.desktop" \
         "${SHARE_DIR}/applications/${APP_ID}.desktop"
     run install -Dm0644 "${REPO_ROOT}/data/${APP_ID}.metainfo.xml" \
         "${SHARE_DIR}/metainfo/${APP_ID}.metainfo.xml"
@@ -217,6 +290,7 @@ if ((INSTALL_DESKTOP == 1)); then
         "${SHARE_DIR}/icons/hicolor/128x128/apps/${APP_ID}.png"
     run install -Dm0644 "${REPO_ROOT}/data/${APP_ID}-256.png" \
         "${SHARE_DIR}/icons/hicolor/256x256/apps/${APP_ID}.png"
+    refresh_desktop_caches
 fi
 
 CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME_DIR}/.config}"
@@ -237,8 +311,26 @@ printf 'Installed support tool to %s\n' "${BIN_DIR}/jterm4-support-bundle"
 printf 'Installed runtime assets under %s/share/jterm4\n' "${PREFIX}"
 if ((INSTALL_DESKTOP == 1)); then
     printf 'Installed desktop integration under %s/share\n' "${PREFIX}"
+    printf 'Launcher entry: %s (Exec=%s)\n' \
+        "${SHARE_DIR}/applications/${APP_ID}.desktop" "$(desktop_exec_path)"
 fi
 if [[ -n "${DESTDIR}" ]]; then
     printf 'Staged file: %s\n' "${STAGED_BIN_DIR}/jterm4"
+fi
+if [[ -z "${DESTDIR}" ]]; then
+    if ! bin_dir_on_path; then
+        printf '\nNote: %s is not in PATH; the launcher entry uses the absolute path,\n' \
+            "${BIN_DIR}"
+        printf 'but shells will not find jterm4 until you add it, for example:\n'
+        printf "  echo 'export PATH=\"%s:\$PATH\"' >>~/.profile\n" "${BIN_DIR}"
+    fi
+    SHADOWING_BIN="$(command -v jterm4 2>/dev/null || true)"
+    if [[ -n "${SHADOWING_BIN}" && "${SHADOWING_BIN}" != "${BIN_DIR}/jterm4" ]]; then
+        printf '\nNote: typing `jterm4` still runs %s, an older copy earlier in PATH.\n' \
+            "${SHADOWING_BIN}"
+        printf 'Remove it, or put %s ahead of it in PATH.\n' "${BIN_DIR}"
+        printf 'The launcher entry is unaffected: it runs %s directly.\n' \
+            "${BIN_DIR}/jterm4"
+    fi
 fi
 printf 'Validate with: %s --doctor\n' "${BIN_DIR}/jterm4"

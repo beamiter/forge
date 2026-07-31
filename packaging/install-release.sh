@@ -39,7 +39,21 @@ else
     printf 'Keeping existing configuration: %s\n' "${CONFIG_DIR}/config.toml"
 fi
 
-install -Dm0644 "${SCRIPT_DIR}/share/applications/${APP_ID}.desktop" \
+# A desktop session fixes its PATH at login, so `Exec=jterm4` fails TryExec and
+# hides the launcher entry whenever ${BIN_DIR} is missing from that PATH. This
+# bundle always installs per-user, so point the entry at the absolute path.
+install -d -m 0755 "${SHARE_DIR}/applications"
+awk -v exec_path="${BIN_DIR}/jterm4" '
+    /^Exec=jterm4([[:space:]]|$)/ || /^TryExec=jterm4([[:space:]]|$)/ {
+        eq = index($0, "=")
+        print substr($0, 1, eq) exec_path substr($0, eq + 7)
+        next
+    }
+    { print }
+' "${SCRIPT_DIR}/share/applications/${APP_ID}.desktop" \
+    >"${SHARE_DIR}/applications/${APP_ID}.desktop.new"
+chmod 0644 "${SHARE_DIR}/applications/${APP_ID}.desktop.new"
+mv -f -- "${SHARE_DIR}/applications/${APP_ID}.desktop.new" \
     "${SHARE_DIR}/applications/${APP_ID}.desktop"
 install -Dm0644 "${SCRIPT_DIR}/share/metainfo/${APP_ID}.metainfo.xml" \
     "${SHARE_DIR}/metainfo/${APP_ID}.metainfo.xml"
@@ -64,8 +78,18 @@ install -Dm0644 "${SCRIPT_DIR}/share/doc/jterm4/README.md" "${DOC_DIR}/README.md
 install -Dm0644 "${SCRIPT_DIR}/share/doc/jterm4/Cargo.lock" "${DOC_DIR}/Cargo.lock"
 install -Dm0644 "${SCRIPT_DIR}/share/doc/jterm4/BUILDINFO" "${DOC_DIR}/BUILDINFO"
 
+if command -v desktop-file-validate >/dev/null 2>&1; then
+    desktop-file-validate "${SHARE_DIR}/applications/${APP_ID}.desktop" || true
+fi
+# The caches below are generated files the desktop shell reads back, so they run
+# under a relaxed umask instead of the owner-only one this script installs with.
 if command -v update-desktop-database >/dev/null 2>&1; then
-    update-desktop-database "${SHARE_DIR}/applications" >/dev/null 2>&1 || true
+    (umask 022 && update-desktop-database "${SHARE_DIR}/applications") >/dev/null 2>&1 || true
+fi
+# A stale icon cache shadows the icons installed above, so always rebuild it.
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    (umask 022 && gtk-update-icon-cache --force --ignore-theme-index --quiet \
+        "${SHARE_DIR}/icons/hicolor") >/dev/null 2>&1 || true
 fi
 
 printf '\njterm4 installation complete.\n'

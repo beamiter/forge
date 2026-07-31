@@ -6,6 +6,9 @@ All notable user-visible and operational changes are recorded here.
 
 ### Fixed
 
+- 桌面集成安装后应用列表里没有 jterm4 图标：三处成因已分别修复。其一，条目里的 `Exec=jterm4` / `TryExec=jterm4` 依赖 `PATH`，而桌面会话的 `PATH` 在登录时固定，默认安装位置 `~/.local/bin` 常常不在其中——`TryExec` 失败会让条目整个从应用列表里消失；`scripts/install.sh` 与发行包的 `install-release.sh` 现在把这两行改写成二进制绝对路径（`/usr/bin` 等系统 bin 目录仍保持相对形式以便重定位）。其二，安装脚本从不刷新桌面缓存，新条目与新图标要等下次登录才可见，陈旧的 `icon-theme.cache` 甚至会一直盖住刚装进去的图标；现在安装与卸载都会校验条目并刷新 `update-desktop-database` 和 `gtk-update-icon-cache`（`DESTDIR` 打包时跳过，且这些缓存以放宽的 umask 生成，避免 `sudo --prefix /usr` 装出别的用户读不到的 `0600` 缓存）。其三，`StartupWMClass` 写的是 application ID，而 GTK4 的 X11 `WM_CLASS` 取自程序名（实测为 `jterm4`），X11 会话下窗口因此无法与条目关联，dock 里会多出一个没有图标的重复项；现已改为 `jterm4`，Wayland 侧仍按 app_id 匹配不受影响。
+- 安装脚本现在会提示 `PATH` 问题：目标 bin 目录不在 `PATH` 中，或 `PATH` 上已有另一份 jterm4（例如旧的 `cargo install` 副本）会遮蔽刚装好的二进制。
+
 - Block 模式短输出的伪滚动条与行数不一致：同一条 `ls` 有时完整显示、有时只剩末尾两行且带块内滚动条，成因有二并已分别修复。其一，VTE 会按**实际分配的内容高度**重新推导网格行数，而 CSS 边框/内边距的记账差异可能让分配高度比 `行数 × 行高` 少几个像素——网格因此少一行，快照首行被挤进 scrollback，本可完整显示的输出多出滚动条；现在所有 finished VTE 的高度请求都带一个小于一行的像素余量（`finished_vte_height_px`），网格行数不再因像素记账掉行。其二，`feed()` 是异步的，负载下（如另一标签页在流式输出，VTE 的处理调度器为全进程共享）固定两次 idle 的定稿测量会落在喂入中途，把网格缩到当时恰好渲染的行数并永久卡在底部锚定；定稿现在改为确定性完成信号——轮询到快照的最后一行确实已渲染（封顶 2 秒后兜底）才测量收拢，封顶前的截断快照则每拍重申顶部锚定直到缓冲溢出或尾行可见。附带一个需要显示环境的忽略态回归测试（`diag_short_ls_block_geometry`），在真实 GTK 分配下断言 6 行输出恰为 6 行网格、无滚动条、顶部锚定，长输出保留视口滚动。
 
 ### Added

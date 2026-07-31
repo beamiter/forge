@@ -68,6 +68,36 @@ cargo build --release --all-features --locked
 ./scripts/uninstall.sh --purge-config   # 明确删除全部配置和状态
 ```
 
+### 桌面集成（应用列表里的图标）
+
+`./scripts/install.sh` 默认一并安装桌面集成，无需额外步骤，安装后 jterm4 就会出现在
+GNOME/KDE 的应用列表里，可以搜索、点击启动、固定到 dock：
+
+| 安装内容 | 位置（默认 prefix） |
+| --- | --- |
+| 启动器条目 | `~/.local/share/applications/io.github.beamiter.jterm4.desktop` |
+| 应用图标 | `~/.local/share/icons/hicolor/{scalable,128x128,256x256}/apps/io.github.beamiter.jterm4.*` |
+| AppStream 元数据 | `~/.local/share/metainfo/io.github.beamiter.jterm4.metainfo.xml` |
+
+安装时脚本会把 `Exec=` / `TryExec=` 改写成二进制的绝对路径（系统 prefix 如 `/usr` 除外），
+因为桌面会话的 `PATH` 在登录时就固定了：若 `~/.local/bin` 不在其中，`TryExec=jterm4`
+会失败并让条目**整个从应用列表中消失**——这是"装好了却找不到图标"最常见的原因。
+随后脚本会校验条目并刷新 `update-desktop-database` 与 `gtk-update-icon-cache`（陈旧的图标
+缓存会盖住刚装进去的图标）；`DESTDIR` 打包场景下跳过刷新，交由包管理器处理。
+`--no-desktop` 可只装二进制。
+
+自检与手动刷新：
+
+```bash
+desktop-file-validate ~/.local/share/applications/io.github.beamiter.jterm4.desktop
+gtk-launch io.github.beamiter.jterm4          # 按启动器条目实际启动一次
+```
+
+图标若一时没刷新，注销重登（或 X11 下 `Alt+F2` → `r` 重启 GNOME Shell）即可。
+Wayland 下窗口按 app_id 与条目关联，X11 下则依赖 `StartupWMClass=jterm4`——GTK4 的
+X11 `WM_CLASS` 取自程序名而非 application ID，写成 application ID 会导致 dock 里出现
+一个没有图标的重复条目。
+
 `nix build` / `nix run` 分别构建和启动 flake 中的默认 package/app，
 `nix flake check` 验证同一 package。也可为已有 release binary 生成确定性、
 带 SHA-256 的本地安装归档：
