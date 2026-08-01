@@ -34,16 +34,38 @@ const MAX_AGENT_INPUT_BYTES: usize = 16 * 1024;
 /// after the preceding block has already been finalized. The next foreground
 /// completion is therefore the approved command even when VTE's best-effort
 /// command capture is stale or reflects a shell line-editor redraw.
+/// Correlate one finished block with the approval that armed it.
+///
+/// The pending entry is one-shot: it is taken whether or not the block matches,
+/// so a second completion can never be attributed to the same approval. The
+/// captured VTE command must match the approved one before an observation is
+/// submitted, though — feeding the model the output of a command the user did
+/// not approve is worse than losing an observation, and once concurrent or
+/// external prompt writes exist a mismatch is exactly how that would happen.
 fn take_pending_for_finished_block<T>(
-    pending: &mut Option<(T, String)>,
+    pending: &mut Option<PendingExecution<T>>,
     captured_command: &str,
 ) -> Option<T> {
-    let (value, approved_command) = pending.take()?;
+    let PendingExecution {
+        value,
+        command: approved_command,
+        generation: _,
+    } = pending.take()?;
     if captured_command.trim() != approved_command.trim() {
         // Do not log either command: command text can contain sensitive data.
-        log::debug!("Agent command completed with a differing VTE command capture");
+        log::debug!("Agent block completed with a differing VTE command capture; not observed");
+        return None;
     }
     Some(value)
+}
+
+/// One armed execution: the approval it belongs to, the exact command that was
+/// submitted, and a checked, never-reused local identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingExecution<T> {
+    value: T,
+    command: String,
+    generation: u64,
 }
 
 fn proposal_callback_is_current(
@@ -871,7 +893,10 @@ struct AgentRuntime {
     /// the identity, preventing a delayed old card/dialog from authorizing a
     /// new task's same-numbered proposal.
     task_epoch: Cell<u64>,
-    pending_command: RefCell<Option<(ProposalId, String)>>,
+    pending_command: RefCell<Option<PendingExecution<ProposalId>>>,
+    /// Checked, never-reused execution identity. Wrapping it would let a late
+    /// completion from an earlier execution look like the current one.
+    next_execution_generation: Cell<u64>,
     request_cancellation: RefCell<Option<crate::ai::AiCancellationToken>>,
     busy: Cell<bool>,
     alive: Cell<bool>,
@@ -1522,8 +1547,17 @@ impl AgentRuntime {
         };
         // No visible "approved" message: the approved command runs immediately
         // and its real finished block lands in the conversation right here.
-        *runtime.pending_command.borrow_mut() =
-            Some((approved.proposal_id, approved.command.clone()));
+        let Some(generation) = runtime.next_execution_generation.get().checked_add(1) else {
+            runtime.session.borrow_mut().cancel();
+            runtime.render_session_state(Some("Agent execution identities are exhausted."));
+            return;
+        };
+        runtime.next_execution_generation.set(generation);
+        *runtime.pending_command.borrow_mut() = Some(PendingExecution {
+            value: approved.proposal_id,
+            command: approved.command.clone(),
+            generation,
+        });
         runtime.render_session_state(None);
         runtime.target.grab_focus();
         if let Err(error) = runtime.target.submit_command(&approved.command) {
@@ -2172,6 +2206,7 @@ impl UiState {
             proposal_box,
             task_epoch: Cell::new(0),
             pending_command: RefCell::new(None),
+            next_execution_generation: Cell::new(0),
             request_cancellation: RefCell::new(None),
             busy: Cell::new(false),
             alive: Cell::new(true),
@@ -2369,23 +2404,44 @@ mod tests {
     use super::{
         agent_message_display_text, bounded_agent_input, load_agent_snapshot,
         proposal_callback_is_current, read_agent_snapshot_file, restore_agent_snapshot,
-        take_pending_for_finished_block, write_agent_snapshot_file, MAX_AGENT_INPUT_BYTES,
-        MAX_AGENT_MESSAGE_DISPLAY_BYTES,
+        take_pending_for_finished_block, write_agent_snapshot_file, PendingExecution,
+        MAX_AGENT_INPUT_BYTES, MAX_AGENT_MESSAGE_DISPLAY_BYTES,
     };
 
-    #[test]
-    fn finished_block_consumes_approval_even_when_vte_capture_differs() {
-        let mut pending = Some((7_u64, "cat monitor_xilem_bar.sh".to_string()));
+    fn pending(value: u64, command: &str) -> Option<PendingExecution<u64>> {
+        Some(PendingExecution {
+            value,
+            command: command.to_string(),
+            generation: 1,
+        })
+    }
 
-        assert_eq!(take_pending_for_finished_block(&mut pending, "ls"), Some(7));
-        assert!(pending.is_none());
+    #[test]
+    fn finished_block_consumes_the_approval_it_matches() {
+        let mut slot = pending(7, "cat monitor_xilem_bar.sh");
+
+        assert_eq!(
+            take_pending_for_finished_block(&mut slot, "cat monitor_xilem_bar.sh"),
+            Some(7)
+        );
+        assert!(slot.is_none(), "an approval is one-shot");
+    }
+
+    #[test]
+    fn a_differing_capture_consumes_the_approval_without_observing_it() {
+        let mut slot = pending(7, "cat monitor_xilem_bar.sh");
+
+        // Fail closed: the model must not be told that some other command's
+        // output is the result of the command the user approved.
+        assert_eq!(take_pending_for_finished_block(&mut slot, "ls"), None);
+        assert!(slot.is_none(), "the approval is still consumed");
     }
 
     #[test]
     fn finished_block_without_an_approval_is_ignored() {
-        let mut pending: Option<(u64, String)> = None;
+        let mut slot: Option<PendingExecution<u64>> = None;
 
-        assert_eq!(take_pending_for_finished_block(&mut pending, "ls"), None);
+        assert_eq!(take_pending_for_finished_block(&mut slot, "ls"), None);
     }
 
     #[test]
