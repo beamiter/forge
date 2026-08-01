@@ -1,6 +1,7 @@
 //! session — UiState methods extracted from ui (mechanical split, no logic changes)
 use gtk4::prelude::*;
 use gtk4::ToggleButton;
+use std::io;
 
 use super::*;
 
@@ -80,15 +81,59 @@ impl UiState {
         let tab_label = self.notebook.tab_label(&first_page);
         let tab_widget_name = first_page.widget_name().to_string();
 
-        // Detach before parenting the first leaf under a Paned.
-        self.notebook.remove_page(Some(page_num));
-        let mut first_leaf = Some(first_page);
-        let restored = self.restore_pane_layout_internal(
+        // Build every additional leaf around an inert placeholder while the
+        // real first page remains attached to the Notebook. Only a completely
+        // prepared tree is allowed to replace it.
+        let placeholder = gtk4::Box::new(gtk4::Orientation::Vertical, 0).upcast::<gtk4::Widget>();
+        let mut first_leaf = Some(placeholder.clone());
+        let mut prepared_leaves = Vec::new();
+        let restored = match self.restore_pane_layout_internal(
             layout,
             &mut first_leaf,
             Some(tab_widget_name.clone()),
-        );
+            &mut prepared_leaves,
+        ) {
+            Ok(restored) => restored,
+            Err(error) => {
+                Self::discard_prepared_leaves(prepared_leaves);
+                self.report_block_spawn_error(
+                    "restoring a split layout",
+                    &error,
+                    "Restored this tab as a single pane instead.",
+                );
+                self.apply_restored_pin(&first_page, pinned == Some(true));
+                return first_page;
+            }
+        };
         debug_assert!(first_leaf.is_none());
+
+        let Some(parent) = placeholder
+            .parent()
+            .and_then(|parent| parent.downcast::<gtk4::Paned>().ok())
+        else {
+            log::error!("restored split tree lost its prepared first-pane slot");
+            Self::discard_prepared_leaves(prepared_leaves);
+            self.apply_restored_pin(&first_page, pinned == Some(true));
+            return first_page;
+        };
+        let replace_start = parent.start_child().as_ref() == Some(&placeholder);
+        let replace_end = parent.end_child().as_ref() == Some(&placeholder);
+        if !replace_start && !replace_end {
+            log::error!("restored split tree first-pane slot has an invalid parent");
+            Self::discard_prepared_leaves(prepared_leaves);
+            self.apply_restored_pin(&first_page, pinned == Some(true));
+            return first_page;
+        }
+
+        // Commit: detach the live first page only after all fallible Block PTY
+        // creation succeeded, then replace the placeholder and insert the full
+        // tree back into exactly the same Notebook slot.
+        self.notebook.remove_page(Some(page_num));
+        if replace_start {
+            parent.set_start_child(Some(&first_page));
+        } else {
+            parent.set_end_child(Some(&first_page));
+        }
         restored.set_widget_name(&tab_widget_name);
 
         let inserted = self
@@ -131,7 +176,8 @@ impl UiState {
         layout: crate::state::PaneLayout,
         first_leaf: &mut Option<gtk4::Widget>,
         tab_widget_name: Option<String>,
-    ) -> gtk4::Widget {
+        prepared_leaves: &mut Vec<PaneLeaf>,
+    ) -> io::Result<gtk4::Widget> {
         use crate::state::PaneLayout;
 
         match layout {
@@ -148,21 +194,23 @@ impl UiState {
                     // mode, matching what `split_current` would have created.
                     let mode = self.config.borrow().terminal_mode.clone();
                     let initial_commands = self.restored_initial_commands(cmds.as_deref());
-                    self.create_pane_leaf(
+                    let leaf = self.create_pane_leaf(
                         &mode,
                         Some(&dir),
                         Some(&sid),
                         initial_commands.as_slice(),
                         tab_widget_name,
-                    )
-                    .root_widget()
+                    )?;
+                    let root = leaf.root_widget();
+                    prepared_leaves.push(leaf);
+                    root
                 };
                 if pinned == Some(true) {
                     unsafe {
                         root.set_data::<bool>("pinned", true);
                     }
                 }
-                root
+                Ok(root)
             }
             PaneLayout::Split {
                 orientation,
@@ -170,10 +218,18 @@ impl UiState {
                 start,
                 end,
             } => {
-                let start_widget =
-                    self.restore_pane_layout_internal(*start, first_leaf, tab_widget_name.clone());
-                let end_widget =
-                    self.restore_pane_layout_internal(*end, first_leaf, tab_widget_name);
+                let start_widget = self.restore_pane_layout_internal(
+                    *start,
+                    first_leaf,
+                    tab_widget_name.clone(),
+                    prepared_leaves,
+                )?;
+                let end_widget = self.restore_pane_layout_internal(
+                    *end,
+                    first_leaf,
+                    tab_widget_name,
+                    prepared_leaves,
+                )?;
 
                 let paned = gtk4::Paned::new(match orientation {
                     'h' => gtk4::Orientation::Horizontal,
@@ -187,8 +243,23 @@ impl UiState {
                 paned.set_end_child(Some(&end_widget));
                 paned.set_position(position);
 
-                paned.upcast::<gtk4::Widget>()
+                Ok(paned.upcast::<gtk4::Widget>())
             }
+        }
+    }
+
+    /// Tear down off-notebook leaves built before a restore transaction failed.
+    /// `PaneLeaf::attach_to` stores a strong controller on the widget, so the
+    /// qdata must be detached explicitly before the temporary tree can release
+    /// its PTYs and callbacks.
+    fn discard_prepared_leaves(leaves: Vec<PaneLeaf>) {
+        for leaf in leaves {
+            if let PaneLeaf::Block(view) = &leaf {
+                view.suppress_history_persistence();
+            }
+            let root = leaf.root_widget();
+            let _ = PaneLeaf::detach_from(&root);
+            leaf.kill();
         }
     }
 

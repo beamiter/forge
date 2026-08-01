@@ -114,23 +114,24 @@ impl PaneLeaf {
     /// Insert bytes into the pane's live input surface without submitting a
     /// trailing newline. Palettes and workflows use this review-first path for
     /// both terminal backends.
-    pub(crate) fn write_input(&self, data: &[u8]) {
+    #[must_use = "Block-mode PTY input may be rejected by bounded backpressure"]
+    pub(crate) fn write_input(&self, data: &[u8]) -> Result<(), crate::pty::PtyWriteError> {
         match self {
             Self::Block(view) => view.write_input(data),
-            Self::Vte(view) => view.write_input(data),
+            Self::Vte(view) => {
+                view.write_input(data);
+                Ok(())
+            }
         }
     }
 
     /// Insert one command for review without submitting it. Unlike the generic
     /// input path, this rejects all terminal control characters so a history,
     /// workflow, file name, or model response cannot smuggle Enter into the PTY.
-    pub(crate) fn write_review_input(
-        &self,
-        text: &str,
-    ) -> Result<(), crate::review_input::ReviewInputError> {
-        let text = crate::review_input::validate(text)?;
-        self.write_input(text.as_bytes());
-        Ok(())
+    pub(crate) fn write_review_input(&self, text: &str) -> Result<(), String> {
+        let text = crate::review_input::validate(text).map_err(|error| error.to_string())?;
+        self.write_input(text.as_bytes())
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn block_view(&self) -> Option<Rc<TermView>> {
@@ -201,6 +202,7 @@ impl PaneLeaf {
     pub(crate) fn foreground_process_name(&self) -> Option<String> {
         let (pty_fd, shell_pid) = self.process_probe();
         crate::process::foreground_process_name(pty_fd, shell_pid)
+            .map(|name| crate::review_input::safe_inline_display(&name, 256))
     }
 
     /// Terminate this leaf's shell and everything in its PTY session through

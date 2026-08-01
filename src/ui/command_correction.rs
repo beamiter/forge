@@ -14,10 +14,12 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
-use std::process::Stdio;
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Stdio};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
@@ -27,9 +29,11 @@ use gtk4::prelude::*;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::command_review::{CommandReviewCard, CommandReviewSpec, ReviewPresentation};
+use super::command_review::{
+    set_review_feedback, CommandReviewCard, CommandReviewSpec, ReviewPresentation,
+};
 use super::{PaneNode, UiState};
-use crate::ai::{AiClient, Role, Turn};
+use crate::ai::{AiCancellationToken, AiClient, Role, Turn};
 use crate::block_view::TermView;
 use crate::config::Config;
 
@@ -40,6 +44,123 @@ const MAX_MESSAGE_BYTES: usize = 2 * 1024;
 const MAX_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_PROBE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RANKED_NAMES: usize = 12;
+const MAX_RANKED_INPUTS: usize = 50_000;
+const MAX_NAME_BYTES: usize = 256;
+const MAX_CWD_BYTES: usize = 4 * 1024;
+const CORRECTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct ActiveCorrectionRequest {
+    generation: u64,
+    cancellation: AiCancellationToken,
+}
+
+/// Per-Block-pane request epoch. A command finishing in one pane never blocks
+/// another pane, and a newer command invalidates the older request before its
+/// result can be presented against the wrong prompt.
+#[derive(Default)]
+struct CorrectionRequestState {
+    generation: Cell<u64>,
+    active: RefCell<Option<ActiveCorrectionRequest>>,
+}
+
+impl CorrectionRequestState {
+    fn advance(&self) -> u64 {
+        self.cancel_active();
+        let generation = self.generation.get().wrapping_add(1);
+        self.generation.set(generation);
+        generation
+    }
+
+    fn start(&self, generation: u64, cancellation: AiCancellationToken) -> bool {
+        if self.generation.get() != generation {
+            cancellation.cancel();
+            return false;
+        }
+        self.cancel_active();
+        *self.active.borrow_mut() = Some(ActiveCorrectionRequest {
+            generation,
+            cancellation,
+        });
+        true
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.is_generation(generation)
+            && self
+                .active
+                .borrow()
+                .as_ref()
+                .is_some_and(|active| active.generation == generation)
+    }
+
+    fn is_generation(&self, generation: u64) -> bool {
+        self.generation.get() == generation
+    }
+
+    fn finish(&self, generation: u64) -> bool {
+        if self.generation.get() != generation {
+            return false;
+        }
+        let mut active = self.active.borrow_mut();
+        if active
+            .as_ref()
+            .is_some_and(|active| active.generation == generation)
+        {
+            active.take();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn cancel(&self, generation: u64) -> bool {
+        if self.generation.get() != generation {
+            return false;
+        }
+        let mut active = self.active.borrow_mut();
+        if active
+            .as_ref()
+            .is_some_and(|active| active.generation == generation)
+        {
+            if let Some(active) = active.take() {
+                active.cancellation.cancel();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn cancel_active(&self) {
+        if let Some(active) = self.active.borrow_mut().take() {
+            active.cancellation.cancel();
+        }
+    }
+
+    /// Consume a presented card generation exactly once. This advances the
+    /// epoch before a verified command is submitted, so a queued double-click,
+    /// stale key activation, or dismissal callback cannot execute it again.
+    fn retire(&self, generation: u64) -> bool {
+        if self.generation.get() != generation {
+            return false;
+        }
+        self.cancel_active();
+        self.generation.set(generation.wrapping_add(1));
+        true
+    }
+}
+
+impl Drop for CorrectionRequestState {
+    fn drop(&mut self) {
+        if let Some(active) = self.active.get_mut().take() {
+            active.cancellation.cancel();
+        }
+    }
+}
+
+fn request_timed_out(started: Instant, now: Instant, timeout: Duration) -> bool {
+    now.saturating_duration_since(started) >= timeout
+}
 
 fn correction_monitor_enabled(
     ai_enabled: bool,
@@ -139,10 +260,9 @@ impl UiState {
         }
 
         let agent_session = Rc::downgrade(&self.agent_session);
-        let pending = Rc::new(Cell::new(false));
         for index in 0..self.notebook.n_pages() {
             if let Some(page) = self.notebook.nth_page(Some(index)) {
-                attach_page(&page, &self.config, &agent_session, &pending);
+                attach_page(&page, &self.config, &agent_session);
             }
         }
 
@@ -154,11 +274,22 @@ impl UiState {
                 let page = page.clone();
                 let config = config.clone();
                 let agent_session = agent_session.clone();
-                let pending = pending.clone();
                 glib::idle_add_local_once(move || {
-                    attach_page(&page, &config, &agent_session, &pending);
+                    attach_page(&page, &config, &agent_session);
                 });
             });
+    }
+
+    /// Attach correction monitoring immediately to a newly constructed split
+    /// leaf. Nested splits do not emit Notebook `page-added`, so relying on the
+    /// window-level listener alone would leave those panes unmonitored.
+    pub(crate) fn attach_command_correction_to_view(&self, view: Rc<TermView>, remote: bool) {
+        attach_term_view(
+            view,
+            self.config.clone(),
+            Rc::downgrade(&self.agent_session),
+            remote,
+        );
     }
 }
 
@@ -166,7 +297,6 @@ fn attach_page(
     page: &gtk4::Widget,
     config: &Rc<RefCell<Config>>,
     agent_session: &std::rc::Weak<RefCell<Option<super::AgentHandle>>>,
-    pending: &Rc<Cell<bool>>,
 ) {
     let Some(node) = PaneNode::from_widget(page) else {
         return;
@@ -174,13 +304,7 @@ fn attach_page(
     for leaf in node.leaves() {
         let remote = leaf.is_remote();
         if let Some(view) = leaf.block_view() {
-            attach_term_view(
-                view,
-                config.clone(),
-                agent_session.clone(),
-                pending.clone(),
-                remote,
-            );
+            attach_term_view(view, config.clone(), agent_session.clone(), remote);
         }
     }
 }
@@ -189,7 +313,6 @@ fn attach_term_view(
     view: Rc<TermView>,
     config: Rc<RefCell<Config>>,
     agent_session: std::rc::Weak<RefCell<Option<super::AgentHandle>>>,
-    pending: Rc<Cell<bool>>,
     remote: bool,
 ) {
     let root = view.widget();
@@ -201,15 +324,16 @@ fn attach_term_view(
     }
 
     // At most one correction card per pane; a newly finished command makes any
-    // visible card stale, so it is dropped before this failure is classified.
+    // visible card and in-flight request stale before this failure is classified.
     let card_slot: Rc<RefCell<Option<gtk4::Widget>>> = Rc::new(RefCell::new(None));
+    let request_state = Rc::new(CorrectionRequestState::default());
     let view_weak = Rc::downgrade(&view);
     view.connect_block_finished(move |command, exit_code, output| {
+        let generation = request_state.advance();
         if let Some(card) = card_slot.borrow_mut().take() {
             if let Some(view) = view_weak.upgrade() {
                 view.remove_inline_notice(&card);
             }
-            pending.set(false);
         }
 
         let agent_active = agent_session
@@ -223,7 +347,7 @@ fn attach_term_view(
                 agent_active,
             )
         };
-        if pending.get() || !monitor_enabled {
+        if !monitor_enabled {
             return;
         }
 
@@ -233,6 +357,9 @@ fn attach_term_view(
         let Some(exit_code) = exit_code else {
             return;
         };
+        // Block output can be very large. Classification and the worker own a
+        // bounded head/tail sample, never a clone of the entire scrollback.
+        let output = sample_output(&output);
         let Some(failure) = classify_failure(&command, exit_code, &output) else {
             return;
         };
@@ -240,16 +367,21 @@ fn attach_term_view(
             return;
         };
 
-        pending.set(true);
         request_correction(
             config.clone(),
             Rc::downgrade(&view),
             card_slot.clone(),
-            pending.clone(),
+            request_state.clone(),
+            generation,
+            agent_session.clone(),
             command,
             exit_code,
             output,
-            view.cwd(),
+            if view.cwd().len() <= MAX_CWD_BYTES {
+                view.cwd()
+            } else {
+                String::new()
+            },
             failure,
             remote,
         );
@@ -261,7 +393,9 @@ fn request_correction(
     config: Rc<RefCell<Config>>,
     target: std::rc::Weak<TermView>,
     card_slot: Rc<RefCell<Option<gtk4::Widget>>>,
-    pending: Rc<Cell<bool>>,
+    request_state: Rc<CorrectionRequestState>,
+    generation: u64,
+    agent_session: std::rc::Weak<RefCell<Option<super::AgentHandle>>>,
     original_command: String,
     exit_code: i32,
     output: String,
@@ -275,40 +409,82 @@ fn request_correction(
     let client = crate::ai::client_from_config(&config.borrow()).ok();
     let original_for_worker = original_command.clone();
     let cwd_for_worker = cwd.clone();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let result = resolve_correction_blocking(
-            &original_for_worker,
-            exit_code,
-            &output,
-            if cwd_for_worker.is_empty() {
-                "."
-            } else {
-                &cwd_for_worker
-            },
-            &failure,
-            remote,
-            client.as_ref(),
-        );
-        let _ = tx.send(result);
-    });
+    let cancellation = AiCancellationToken::new();
+    if !request_state.start(generation, cancellation.clone()) {
+        return;
+    }
+    let cancellation_for_worker = cancellation.clone();
+    let deadline = Instant::now() + CORRECTION_REQUEST_TIMEOUT;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::Builder::new()
+        .name("jterm4-command-correction".to_string())
+        .spawn(move || {
+            let result = resolve_correction_blocking(
+                &original_for_worker,
+                exit_code,
+                &output,
+                if cwd_for_worker.is_empty() {
+                    "."
+                } else {
+                    &cwd_for_worker
+                },
+                &failure,
+                remote,
+                client.as_ref(),
+                &cancellation_for_worker,
+                deadline,
+            );
+            let _ = tx.send(result);
+        });
+    if let Err(error) = worker {
+        request_state.finish(generation);
+        log::warn!("could not start command correction worker: {error}");
+        return;
+    }
 
     let rx = RefCell::new(rx);
+    let started = Instant::now();
     glib::timeout_add_local(Duration::from_millis(50), move || {
+        if !request_state.is_current(generation) {
+            return glib::ControlFlow::Break;
+        }
         let Some(view) = target.upgrade() else {
-            pending.set(false);
+            request_state.cancel(generation);
             return glib::ControlFlow::Break;
         };
+        let monitor_enabled = {
+            let config = config.borrow();
+            let agent_active = agent_session
+                .upgrade()
+                .is_some_and(|slot| slot.borrow().is_some());
+            correction_monitor_enabled(
+                config.ai_enabled,
+                config.command_correction_enabled,
+                agent_active,
+            )
+        };
+        if !monitor_enabled {
+            request_state.cancel(generation);
+            return glib::ControlFlow::Break;
+        }
+        if request_timed_out(started, Instant::now(), CORRECTION_REQUEST_TIMEOUT) {
+            request_state.cancel(generation);
+            log::warn!(
+                "command correction timed out after {} seconds",
+                CORRECTION_REQUEST_TIMEOUT.as_secs()
+            );
+            return glib::ControlFlow::Break;
+        }
         match rx.borrow().try_recv() {
             Ok(Ok(Some(correction))) => {
-                if !config.borrow().command_correction_enabled {
-                    pending.set(false);
+                if !request_state.finish(generation) {
                     return glib::ControlFlow::Break;
                 }
                 show_correction_card(
                     &view,
                     &card_slot,
-                    pending.clone(),
+                    request_state.clone(),
+                    generation,
                     &config,
                     &original_command,
                     correction,
@@ -316,17 +492,17 @@ fn request_correction(
                 glib::ControlFlow::Break
             }
             Ok(Ok(None)) => {
-                pending.set(false);
+                request_state.finish(generation);
                 glib::ControlFlow::Break
             }
             Ok(Err(error)) => {
-                pending.set(false);
+                request_state.finish(generation);
                 log::warn!("command correction failed: {error}");
                 glib::ControlFlow::Break
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                pending.set(false);
+                request_state.finish(generation);
                 log::warn!("command correction worker disconnected");
                 glib::ControlFlow::Break
             }
@@ -334,6 +510,7 @@ fn request_correction(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_correction_blocking(
     original_command: &str,
     exit_code: i32,
@@ -342,9 +519,20 @@ fn resolve_correction_blocking(
     failure: &FailureKind,
     remote: bool,
     client: Option<&AiClient>,
+    cancellation: &AiCancellationToken,
+    deadline: Instant,
 ) -> Result<Option<CommandCorrection>, String> {
-    if let Some(correction) = resolve_verified_correction(original_command, failure, remote) {
+    if cancellation.is_cancelled() || Instant::now() >= deadline {
+        return Ok(None);
+    }
+    if let Some(correction) =
+        resolve_verified_correction(original_command, failure, remote, cancellation, deadline)
+    {
         return Ok(Some(correction));
+    }
+
+    if cancellation.is_cancelled() || Instant::now() >= deadline {
+        return Ok(None);
     }
 
     let Some(client) = client else {
@@ -353,12 +541,13 @@ fn resolve_correction_blocking(
     let system = correction_system_prompt();
     let user = correction_user_prompt(original_command, exit_code, output, cwd, failure, remote);
     let reply = client
-        .send_turns_blocking(
+        .send_turns_blocking_cancellable(
             Some(system),
             &[Turn {
                 role: Role::User,
                 text: user,
             }],
+            cancellation,
         )
         .map_err(|error| error.to_string())?;
     parse_correction_reply(&reply, original_command)
@@ -368,6 +557,8 @@ fn resolve_verified_correction(
     original_command: &str,
     failure: &FailureKind,
     remote: bool,
+    cancellation: &AiCancellationToken,
+    deadline: Instant,
 ) -> Option<CommandCorrection> {
     match failure {
         FailureKind::ExplicitSuggestion {
@@ -385,20 +576,25 @@ fn resolve_verified_correction(
             })
         }
         FailureKind::AptPackageNotFound { package } if !remote => {
-            resolve_apt_package(original_command, package)
+            resolve_apt_package(original_command, package, cancellation, deadline)
         }
         FailureKind::CommandNotFound { executable } if !remote => {
-            resolve_path_command(original_command, executable)
+            resolve_path_command(original_command, executable, cancellation, deadline)
         }
         _ => None,
     }
 }
 
-fn resolve_apt_package(original_command: &str, package: &str) -> Option<CommandCorrection> {
+fn resolve_apt_package(
+    original_command: &str,
+    package: &str,
+    cancellation: &AiCancellationToken,
+    deadline: Instant,
+) -> Option<CommandCorrection> {
     if !crate::host::command_available("apt-cache") {
         return None;
     }
-    let output = run_capture("apt-cache", &["pkgnames"])?;
+    let output = run_capture("apt-cache", &["pkgnames"], cancellation, deadline)?;
     let replacement = rank_names(
         package,
         output
@@ -419,8 +615,13 @@ fn resolve_apt_package(original_command: &str, package: &str) -> Option<CommandC
     })
 }
 
-fn resolve_path_command(original_command: &str, executable: &str) -> Option<CommandCorrection> {
-    let replacement = rank_names(executable, list_path_commands())
+fn resolve_path_command(
+    original_command: &str,
+    executable: &str,
+    cancellation: &AiCancellationToken,
+    deadline: Instant,
+) -> Option<CommandCorrection> {
+    let replacement = rank_names(executable, list_path_commands(cancellation, deadline))
         .into_iter()
         .find(|candidate| crate::host::command_available(candidate))?;
     let command = replace_shell_word(original_command, executable, &replacement)?;
@@ -435,7 +636,7 @@ fn resolve_path_command(original_command: &str, executable: &str) -> Option<Comm
     })
 }
 
-fn list_path_commands() -> Vec<String> {
+fn list_path_commands(cancellation: &AiCancellationToken, deadline: Instant) -> Vec<String> {
     if crate::host::command_available("bash") {
         if let Some(output) = run_capture(
             "bash",
@@ -445,12 +646,16 @@ fn list_path_commands() -> Vec<String> {
                 "-lc",
                 "compgen -c | LC_ALL=C sort -u",
             ],
+            cancellation,
+            deadline,
         ) {
             let commands: Vec<String> = output
                 .lines()
                 .map(str::trim)
                 .filter(|name| !name.is_empty())
                 .map(str::to_string)
+                .filter(|name| name.len() <= MAX_NAME_BYTES)
+                .take(MAX_RANKED_INPUTS)
                 .collect();
             if !commands.is_empty() {
                 return commands;
@@ -469,35 +674,159 @@ fn list_path_commands() -> Vec<String> {
         return Vec::new();
     };
     let mut commands = HashSet::new();
-    for directory in std::env::split_paths(&path) {
+    'directories: for directory in std::env::split_paths(&path) {
+        if cancellation.is_cancelled() || Instant::now() >= deadline {
+            break;
+        }
         let Ok(entries) = fs::read_dir(directory) else {
             continue;
         };
         for entry in entries.flatten() {
+            if cancellation.is_cancelled()
+                || Instant::now() >= deadline
+                || commands.len() >= MAX_RANKED_INPUTS
+            {
+                break 'directories;
+            }
             let Ok(metadata) = entry.metadata() else {
                 continue;
             };
             if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
-                commands.insert(entry.file_name().to_string_lossy().into_owned());
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.len() <= MAX_NAME_BYTES {
+                    commands.insert(name);
+                }
             }
         }
     }
     commands.into_iter().collect()
 }
 
-fn run_capture(program: &str, args: &[&str]) -> Option<String> {
-    let output = crate::host::command(program)
+fn run_capture(
+    program: &str,
+    args: &[&str],
+    cancellation: &AiCancellationToken,
+    deadline: Instant,
+) -> Option<String> {
+    if cancellation.is_cancelled() || Instant::now() >= deadline {
+        return None;
+    }
+    let mut command = crate::host::helper_command(program).ok()?;
+    // A probe must not be able to leave background work behind. This creates
+    // a group before exec; in Flatpak it contains the `flatpak-spawn
+    // --watch-bus` bridge, whose death also tears down the host-side command.
+    command.process_group(0);
+    let mut child = command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .spawn()
         .ok()?;
-    if !output.status.success() {
+    let Ok(process_group) = i32::try_from(child.id()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        terminate_probe_group(&mut child, process_group);
+        return None;
+    };
+    let reader = std::thread::Builder::new()
+        .name("jterm4-correction-probe-output".to_string())
+        .spawn(move || {
+            let mut kept = Vec::with_capacity(MAX_PROBE_BYTES.min(64 * 1024));
+            let mut buffer = [0_u8; 16 * 1024];
+            loop {
+                match stdout.read(&mut buffer) {
+                    Ok(0) => break Ok(kept),
+                    Ok(count) => {
+                        let remaining = MAX_PROBE_BYTES.saturating_sub(kept.len());
+                        kept.extend_from_slice(&buffer[..count.min(remaining)]);
+                        // Continue draining after the cap so the child cannot
+                        // block forever on a full stdout pipe.
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => break Err(error),
+                }
+            }
+        });
+    let reader = match reader {
+        Ok(reader) => reader,
+        Err(_) => {
+            terminate_probe_group(&mut child, process_group);
+            return None;
+        }
+    };
+
+    loop {
+        if cancellation.is_cancelled() || Instant::now() >= deadline {
+            terminate_probe_group(&mut child, process_group);
+            let _ = reader.join();
+            return None;
+        }
+        match probe_root_has_exited(process_group) {
+            Ok(true) => break,
+            Ok(false) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => {
+                terminate_probe_group(&mut child, process_group);
+                let _ = reader.join();
+                return None;
+            }
+        }
+    }
+
+    // The root may exit successfully while a malicious/background descendant
+    // keeps stdout open. End the dedicated group before joining the reader so
+    // neither that process nor an indefinitely blocked reader can outlive the
+    // correction request.
+    signal_probe_group(process_group);
+    // `probe_root_has_exited` uses WNOWAIT, so the root remains our zombie and
+    // reserves this PID/group identity until after the group signal. That
+    // closes the otherwise tiny window in which a recycled group id could make
+    // cleanup target an unrelated process.
+    let status = child.wait().ok()?;
+    let output = match reader.join() {
+        Ok(Ok(output)) => output,
+        Ok(Err(_)) | Err(_) => return None,
+    };
+    if !status.success() {
         return None;
     }
-    let end = output.stdout.len().min(MAX_PROBE_BYTES);
-    Some(String::from_utf8_lossy(&output.stdout[..end]).into_owned())
+
+    Some(String::from_utf8_lossy(&output).into_owned())
+}
+
+fn probe_root_has_exited(pid: i32) -> std::io::Result<bool> {
+    use nix::sys::wait::{waitid, Id, WaitPidFlag, WaitStatus};
+    use nix::unistd::Pid;
+
+    let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+    match waitid(Id::Pid(Pid::from_raw(pid)), flags).map_err(std::io::Error::from)? {
+        WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _) => Ok(true),
+        WaitStatus::StillAlive => Ok(false),
+        _ => Ok(false),
+    }
+}
+
+fn signal_probe_group(process_group: i32) {
+    // The group was created exclusively for this probe. Validate the id before
+    // using negative-pid group signalling so an impossible setup failure can
+    // never target jterm4's own group.
+    if process_group > 1 && process_group != unsafe { nix::libc::getpgrp() } {
+        // SAFETY: `CommandExt::process_group(0)` made the child its own group
+        // leader before exec. ESRCH merely means every member already exited.
+        unsafe {
+            nix::libc::kill(-process_group, nix::libc::SIGKILL);
+        }
+    }
+}
+
+fn terminate_probe_group(child: &mut Child, process_group: i32) {
+    signal_probe_group(process_group);
+    // Keep a direct-child fallback, and always reap the process we spawned.
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[derive(Debug)]
@@ -510,7 +839,7 @@ struct RankedName {
 
 fn rank_names(needle: &str, names: impl IntoIterator<Item = String>) -> Vec<String> {
     let needle = needle.trim();
-    if needle.is_empty() {
+    if needle.is_empty() || needle.len() > MAX_NAME_BYTES {
         return Vec::new();
     }
 
@@ -524,9 +853,9 @@ fn rank_names(needle: &str, names: impl IntoIterator<Item = String>) -> Vec<Stri
     let mut seen = HashSet::new();
     let mut ranked = Vec::new();
 
-    for name in names {
+    for name in names.into_iter().take(MAX_RANKED_INPUTS) {
         let name = name.trim();
-        if name.is_empty() || name.eq_ignore_ascii_case(needle) {
+        if name.is_empty() || name.len() > MAX_NAME_BYTES || name.eq_ignore_ascii_case(needle) {
             continue;
         }
         let lower = name.to_ascii_lowercase();
@@ -571,34 +900,32 @@ fn rank_names(needle: &str, names: impl IntoIterator<Item = String>) -> Vec<Stri
 fn edit_distance(left: &str, right: &str) -> usize {
     let left: Vec<char> = left.chars().collect();
     let right: Vec<char> = right.chars().collect();
-    let mut matrix = vec![vec![0_usize; right.len() + 1]; left.len() + 1];
-
-    for (index, row) in matrix.iter_mut().enumerate() {
-        row[0] = index;
-    }
-    for (index, value) in matrix[0].iter_mut().enumerate() {
-        *value = index;
-    }
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut previous_previous = previous.clone();
 
     for left_index in 1..=left.len() {
+        let mut current = vec![0_usize; right.len() + 1];
+        current[0] = left_index;
         for right_index in 1..=right.len() {
             let cost = usize::from(left[left_index - 1] != right[right_index - 1]);
-            let mut distance = (matrix[left_index - 1][right_index] + 1)
-                .min(matrix[left_index][right_index - 1] + 1)
-                .min(matrix[left_index - 1][right_index - 1] + cost);
+            let mut distance = (previous[right_index] + 1)
+                .min(current[right_index - 1] + 1)
+                .min(previous[right_index - 1] + cost);
 
             if left_index > 1
                 && right_index > 1
                 && left[left_index - 1] == right[right_index - 2]
                 && left[left_index - 2] == right[right_index - 1]
             {
-                distance = distance.min(matrix[left_index - 2][right_index - 2] + 1);
+                distance = distance.min(previous_previous[right_index - 2] + 1);
             }
-            matrix[left_index][right_index] = distance;
+            current[right_index] = distance;
         }
+        previous_previous = previous;
+        previous = current;
     }
 
-    matrix[left.len()][right.len()]
+    previous[right.len()]
 }
 
 /// Present a correction proposal as an inline card in the block conversation.
@@ -606,12 +933,12 @@ fn edit_distance(left: &str, right: &str) -> usize {
 /// The card is inserted just above the live prompt and styled like a finished
 /// block, so reviewing, editing, accepting, or dismissing the proposal reads
 /// like part of the normal Block-mode command dialogue instead of a modal
-/// window. `pending` stays set while the card is visible so a second proposal
-/// cannot stack on top of it.
+/// window. A later finished command removes it and advances the pane epoch.
 fn show_correction_card(
     view: &Rc<TermView>,
     card_slot: &Rc<RefCell<Option<gtk4::Widget>>>,
-    pending: Rc<Cell<bool>>,
+    request_state: Rc<CorrectionRequestState>,
+    generation: u64,
     config: &Rc<RefCell<Config>>,
     original_command: &str,
     correction: CommandCorrection,
@@ -658,14 +985,12 @@ fn show_correction_card(
 
     let view_weak = Rc::downgrade(view);
     let card_weak = card.downgrade();
-    let dismiss = {
+    let remove_card = {
         let view_weak = view_weak.clone();
         let card_slot = card_slot.clone();
         let card_weak = card_weak.clone();
-        let pending = pending.clone();
         Rc::new(move |refocus_terminal: bool| {
             card_slot.borrow_mut().take();
-            pending.set(false);
             if let Some(view) = view_weak.upgrade() {
                 if let Some(card) = card_weak.upgrade() {
                     view.remove_inline_notice(&card);
@@ -673,6 +998,15 @@ fn show_correction_card(
                 if refocus_terminal {
                     view.grab_focus();
                 }
+            }
+        })
+    };
+    let dismiss = {
+        let request_state = request_state.clone();
+        let remove_card = remove_card.clone();
+        Rc::new(move |refocus_terminal: bool| {
+            if request_state.retire(generation) {
+                remove_card(refocus_terminal);
             }
         })
     };
@@ -726,14 +1060,16 @@ fn show_correction_card(
     }
 
     let feedback = review.feedback.clone();
+    let request_state_for_accept = request_state.clone();
     let accept = Rc::new(move |edited: String| {
+        if !request_state_for_accept.is_generation(generation) {
+            return;
+        }
         let Some(view) = view_weak.upgrade() else {
             return;
         };
         let show_error = |text: &str| {
-            feedback.set_text(text);
-            feedback.add_css_class("error");
-            feedback.set_visible(true);
+            set_review_feedback(&feedback, text, true);
         };
         let command = match validate_candidate(&edited, "") {
             Ok(command) => command,
@@ -752,12 +1088,22 @@ fn show_correction_card(
             && command == proposed_command
             && crate::agent::is_dangerous(&command).is_none();
         view.grab_focus();
-        if run {
-            view.submit_command(&command);
+        let queued = if run {
+            view.submit_command(&command)
         } else {
-            view.write_input(command.as_bytes());
+            view.write_input(command.as_bytes())
+                .map_err(|error| error.to_string())
+        };
+        if let Err(error) = queued {
+            show_error(&format!("Command was not sent: {error}"));
+            return;
         }
-        dismiss(false);
+        // This callback runs on GTK's main thread. No generation change can
+        // interleave between the check above, queue admission, and retirement.
+        if !request_state_for_accept.retire(generation) {
+            log::error!("correction generation changed during synchronous PTY admission");
+        }
+        remove_card(false);
     });
 
     {
@@ -1308,6 +1654,171 @@ mod tests {
     }
 
     #[test]
+    fn newer_pane_generation_cancels_and_rejects_a_late_result() {
+        let state = CorrectionRequestState::default();
+        let first = state.advance();
+        let first_cancellation = AiCancellationToken::new();
+        assert!(state.start(first, first_cancellation.clone()));
+
+        let second = state.advance();
+        assert!(first_cancellation.is_cancelled());
+        let second_cancellation = AiCancellationToken::new();
+        assert!(state.start(second, second_cancellation.clone()));
+
+        assert!(
+            !state.finish(first),
+            "late generation replaced the live one"
+        );
+        assert!(!state.is_generation(first));
+        assert!(state.is_current(second));
+        assert!(!second_cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn correction_request_state_is_isolated_per_pane() {
+        let left = CorrectionRequestState::default();
+        let right = CorrectionRequestState::default();
+        let left_generation = left.advance();
+        let right_generation = right.advance();
+        assert!(left.start(left_generation, AiCancellationToken::new()));
+        assert!(right.start(right_generation, AiCancellationToken::new()));
+
+        left.cancel(left_generation);
+        assert!(!left.is_current(left_generation));
+        assert!(right.is_current(right_generation));
+    }
+
+    #[test]
+    fn presented_generation_can_only_be_consumed_once() {
+        let state = CorrectionRequestState::default();
+        let generation = state.advance();
+        assert!(state.start(generation, AiCancellationToken::new()));
+        assert!(state.finish(generation));
+
+        assert!(state.retire(generation));
+        assert!(!state.retire(generation));
+        assert!(!state.is_generation(generation));
+    }
+
+    #[test]
+    fn dropping_pane_request_state_cancels_its_worker() {
+        let cancellation = AiCancellationToken::new();
+        {
+            let state = CorrectionRequestState::default();
+            let generation = state.advance();
+            assert!(state.start(generation, cancellation.clone()));
+        }
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn correction_timeout_boundary_is_deterministic() {
+        let started = Instant::now();
+        let timeout = Duration::from_secs(30);
+        assert!(!request_timed_out(
+            started,
+            started + timeout - Duration::from_millis(1),
+            timeout
+        ));
+        assert!(request_timed_out(started, started + timeout, timeout));
+    }
+
+    #[test]
+    fn local_probe_deadline_kills_the_child_and_output_is_bounded() {
+        let cancellation = AiCancellationToken::new();
+        let started = Instant::now();
+        assert!(run_capture(
+            "sleep",
+            &["5"],
+            &cancellation,
+            started + Duration::from_millis(50),
+        )
+        .is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let output = run_capture(
+            "head",
+            &["-c", "5000000", "/dev/zero"],
+            &cancellation,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .expect("bounded local probe");
+        assert_eq!(output.len(), MAX_PROBE_BYTES);
+
+        cancellation.cancel();
+        let cancelled = Instant::now();
+        assert!(run_capture(
+            "sleep",
+            &["5"],
+            &cancellation,
+            cancelled + Duration::from_secs(5),
+        )
+        .is_none());
+        assert!(cancelled.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn local_probe_accepts_only_trusted_helper_names() {
+        let cancellation = AiCancellationToken::new();
+        assert!(
+            run_capture(
+                "/bin/sh",
+                &["-c", "printf bypassed"],
+                &cancellation,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .is_none(),
+            "probe programs must be resolved as fixed helper names, not caller paths"
+        );
+        assert_eq!(
+            run_capture(
+                "sh",
+                &["-c", "printf trusted"],
+                &cancellation,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .as_deref(),
+            Some("trusted")
+        );
+    }
+
+    #[test]
+    fn completed_probe_kills_a_background_descendant_holding_stdout() {
+        let cancellation = AiCancellationToken::new();
+        let started = Instant::now();
+        let output = run_capture(
+            "sh",
+            &["-c", "sleep 30 & printf '%s done' \"$!\""],
+            &cancellation,
+            started + Duration::from_secs(3),
+        )
+        .expect("root exit must not wait for a descendant holding stdout");
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let descendant = output
+            .split_whitespace()
+            .next()
+            .expect("background pid")
+            .parse::<i32>()
+            .expect("numeric background pid");
+        assert!(output.ends_with(" done"));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match crate::process::process_stat_result(descendant) {
+                Ok(stat) if stat.is_live() => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "background probe descendant survived root completion"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(_) | Err(_) => break,
+            }
+        }
+    }
+
+    #[test]
     fn apt_package_typo_is_a_correction_candidate() {
         assert!(should_request_correction(
             "apt install fmpg",
@@ -1366,7 +1877,15 @@ mod tests {
                 suggested: "status".into()
             }
         );
-        let correction = resolve_verified_correction("git statsu", &failure, true).unwrap();
+        let cancellation = AiCancellationToken::new();
+        let correction = resolve_verified_correction(
+            "git statsu",
+            &failure,
+            true,
+            &cancellation,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
         assert_eq!(correction.command, "git status");
         assert_eq!(correction.evidence, CorrectionEvidence::TargetOutput);
     }

@@ -960,7 +960,7 @@ impl FinishedBlock {
         id: u64,
         prompt: &str,
         cmd: &str,
-        cmd_ansi: Option<&str>,
+        _cmd_ansi: Option<&str>,
         output: &str,
         exit_code: Option<i32>,
         config: &Config,
@@ -973,6 +973,10 @@ impl FinishedBlock {
     ) -> Self {
         let is_background = cmd.trim().is_empty();
         let has_output = !output.trim().is_empty();
+        let display_cmd = crate::review_input::safe_multiline_display(
+            cmd,
+            crate::review_input::MAX_REVIEW_INPUT_BYTES,
+        );
 
         // A command that repaints in place without the alternate screen (top,
         // watch, multi-line progress) emits one frame per refresh, each behind a
@@ -996,7 +1000,10 @@ impl FinishedBlock {
         let current_viewport_cap = Rc::new(Cell::new(viewport_cap));
         let long_output = output_rows > viewport_cap;
         let virtualized_height = Rc::new(Cell::new(estimated_finished_block_height_for_text(
-            config, cmd, output, cols,
+            config,
+            &display_cmd,
+            output,
+            cols,
         )));
         let virtualized = Rc::new(Cell::new(false));
         let capture_rows = output_rows
@@ -1099,7 +1106,7 @@ impl FinishedBlock {
 
         // Context chips (Warp-style): cwd pill + git-branch pill.
         if let Some(cwd_path) = cwd {
-            let shortened = shorten_path(cwd_path);
+            let shortened = crate::review_input::safe_inline_display(&shorten_path(cwd_path), 512);
             // nf-fa-folder () prefix
             let cwd_chip = gtk4::Label::new(Some(&format!("\u{f07b} {}", shortened)));
             cwd_chip.add_css_class("block-chip");
@@ -1258,10 +1265,9 @@ impl FinishedBlock {
 
         // ── VTE-rendered command + output ─────────────────────────────────
         // Command VTE: full-height read-only renderer for the executed command.
-        let cmd_bytes: Vec<u8> = match cmd_ansi {
-            Some(ansi) if !ansi.is_empty() && !cmd.is_empty() => ansi.as_bytes().to_vec(),
-            _ if cmd.is_empty() => b"(empty)".to_vec(),
-            _ => highlight_command_to_ansi(cmd).into_bytes(),
+        let cmd_bytes: Vec<u8> = match display_cmd.as_str() {
+            "" => b"(empty)".to_vec(),
+            command => highlight_command_to_ansi(command).into_bytes(),
         };
         let cmd_bytes = terminalize_line_breaks(&cmd_bytes);
         let cmd_rows = cmd_bytes.iter().filter(|&&b| b == b'\n').count() as i64 + 1;
@@ -2300,18 +2306,22 @@ pub(crate) fn write_recalled_command(
     cmd: &str,
     bracketed_paste: bool,
     execute: bool,
-) -> bool {
+) -> Result<bool, crate::pty::PtyWriteError> {
     let paste = build_command_recall(cmd, bracketed_paste);
     if paste.is_empty() {
-        return false;
+        return Ok(false);
     }
-    pty.write_bytes(&paste.bytes);
+    let truncated = paste.risk.truncated_to_first_line;
+    let mut payload = paste.bytes;
     if execute {
         // Outside the frame: readline does not execute a newline contained in a
-        // bracketed paste, so a CR inside the frame would be swallowed.
-        pty.write_bytes(b"\r");
+        // bracketed paste, so a CR inside the frame would be swallowed. Keep it
+        // in this same queue item: saturation can reject the whole submission,
+        // never the command while accepting its Enter (or vice versa).
+        payload.push(b'\r');
     }
-    paste.risk.truncated_to_first_line
+    pty.write_bytes(&payload)?;
+    Ok(truncated)
 }
 
 #[cfg(test)]

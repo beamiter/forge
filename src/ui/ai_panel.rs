@@ -20,13 +20,20 @@ use gtk4::{
 };
 use libadwaita as adw;
 
-use super::ai_chat_store::{ChatStatus, ChatStore, ChatStoreError, ChatSummary, RequestToken};
+use super::ai_chat_store::{
+    bounded_live_message, ChatStatus, ChatStore, ChatStoreError, ChatSummary, RequestToken,
+    MAX_LIVE_ASSISTANT_MESSAGE_BYTES, MAX_LIVE_MESSAGE_BYTES,
+};
 use crate::ai::{self, BlockContext, Role};
 use crate::config::Config;
 
 const CHAT_PAGE: &str = "chat";
 const CHAT_LIBRARY_PAGE: &str = "library";
 const STOPPED_STATUS: &str = "Response stopped. You can retry when ready.";
+const MAX_PENDING_STREAM_DELTAS: usize = 64;
+const MAX_STREAM_DELTA_BYTES: usize = 16 * 1024;
+const MAX_STATUS_DISPLAY_BYTES: usize = 16 * 1024;
+const MAX_CHAT_SEARCH_CHARS: i32 = 1024;
 
 type PersistenceCallback = Rc<dyn Fn()>;
 
@@ -43,12 +50,16 @@ struct InflightRequest {
     payload: RequestPayload,
 }
 
-/// One message from the request worker thread: an incremental assistant text
-/// fragment, or the request's final result. Blocking requests only send
-/// `Done`; streaming requests send any number of `Delta`s first.
-enum StreamEvent {
-    Delta(String),
-    Done(Result<String, ai::AiError>),
+/// Queue one best-effort live fragment without ever blocking a provider
+/// worker. The authoritative final response travels over a separate channel,
+/// so a saturated UI queue may drop fragments and still heal the transcript
+/// when the request completes.
+fn try_queue_stream_delta(sender: &std::sync::mpsc::SyncSender<String>, delta: &str) -> bool {
+    let mut end = delta.len().min(MAX_STREAM_DELTA_BYTES);
+    while !delta.is_char_boundary(end) {
+        end -= 1;
+    }
+    sender.try_send(delta[..end].to_string()).is_ok()
 }
 
 /// Pure accumulation state for one streamed reply. It records every fragment
@@ -81,12 +92,17 @@ impl StreamProgress {
     /// in-progress row is already shown as the transcript tail.
     fn push(&mut self, fragment: &str, can_display: bool, attached: bool) -> StreamRender<'_> {
         let previous_len = self.accumulated.len();
-        self.accumulated.push_str(fragment);
+        let remaining = MAX_LIVE_ASSISTANT_MESSAGE_BYTES.saturating_sub(previous_len);
+        let mut end = fragment.len().min(remaining);
+        while !fragment.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.accumulated.push_str(&fragment[..end]);
         if !can_display || self.accumulated.is_empty() {
             return StreamRender::None;
         }
         if attached {
-            if fragment.is_empty() {
+            if self.accumulated.len() == previous_len {
                 StreamRender::None
             } else {
                 StreamRender::Append(&self.accumulated[previous_len..])
@@ -404,6 +420,12 @@ impl AiPanel {
         library_hint.set_wrap(true);
         library_hint.add_css_class("dim-label");
         let chat_search = SearchEntry::new();
+        if let Some(text) = chat_search
+            .delegate()
+            .and_then(|delegate| delegate.downcast::<gtk4::Text>().ok())
+        {
+            text.set_max_length(MAX_CHAT_SEARCH_CHARS);
+        }
         chat_search.set_placeholder_text(Some("Search chats…"));
         chat_search.add_css_class("ai-chat-search");
         let library_toolbar = GBox::new(Orientation::Vertical, 6);
@@ -578,7 +600,20 @@ impl AiPanel {
         {
             let p = panel.clone();
             input_buffer.connect_changed(move |_| {
-                let changed = p.store.borrow_mut().set_active_draft(p.input_text());
+                let input = p.input_text();
+                let truncated = input.len() > MAX_LIVE_MESSAGE_BYTES;
+                let draft = bounded_live_message(input);
+                let changed = p.store.borrow_mut().set_active_draft(draft.clone());
+                if truncated {
+                    // `set_text` emits `changed` synchronously. Store the
+                    // bounded draft first so the nested callback is a no-op.
+                    p.input_buffer.set_text(&draft);
+                    let end = p.input_buffer.end_iter();
+                    p.input_buffer.place_cursor(&end);
+                    if !p.store.borrow().is_active_busy() {
+                        p.show_info_status("Draft was limited to 64 KiB.");
+                    }
+                }
                 p.sync_composer_state();
                 if changed {
                     p.schedule_draft_persistence();
@@ -636,10 +671,11 @@ impl AiPanel {
             "ollama" => "Ollama",
             _ => "Anthropic",
         };
-        let provider_model = if config.ai_model.trim().is_empty() {
+        let model = crate::review_input::safe_inline_display(config.ai_model.trim(), 1024);
+        let provider_model = if model.is_empty() {
             provider.to_string()
         } else {
-            format!("{provider} · {}", config.ai_model.trim())
+            format!("{provider} · {model}")
         };
         drop(config);
         let summary = if self.store.borrow().active_archived() {
@@ -864,6 +900,7 @@ impl AiPanel {
         dialog.set_close_response("cancel");
         dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
         let entry = Entry::new();
+        entry.set_max_length(80);
         entry.set_text(&current);
         entry.set_activates_default(true);
         dialog.set_extra_child(Some(&entry));
@@ -880,6 +917,7 @@ impl AiPanel {
 
     fn show_delete_chat_dialog(&self) {
         let title = self.store.borrow().active_title().to_string();
+        let title = crate::review_input::safe_inline_display(&title, 1024);
         let dialog = adw::AlertDialog::new(
             Some("Delete this chat?"),
             Some(&format!(
@@ -926,6 +964,7 @@ impl AiPanel {
                 store.at_capacity(),
             )
         };
+        let title = crate::review_input::safe_inline_display(&title, 1024);
         self.chat_title.set_text(&title);
         self.chat_title.set_tooltip_text(Some(&title));
         self.archive_chat_btn
@@ -1016,8 +1055,10 @@ impl AiPanel {
         } else {
             summary.preview.clone()
         };
+        let title = crate::review_input::safe_inline_display(&summary.title, 1024);
+        let subtitle = crate::review_input::safe_inline_display(&subtitle, 16 * 1024);
         let row = adw::ActionRow::builder()
-            .title(&summary.title)
+            .title(&title)
             .subtitle(&subtitle)
             .activatable(true)
             .build();
@@ -1153,13 +1194,17 @@ impl AiPanel {
         };
         self.context_label
             .set_text(&context_chip_text(&context, pending_retry));
-        self.context_label.set_tooltip_text(Some(
-            &context
-                .cwd
-                .as_deref()
-                .map(|cwd| format!("cwd: {cwd}"))
-                .unwrap_or_else(|| "cwd unavailable".to_string()),
-        ));
+        let tooltip = context
+            .cwd
+            .as_deref()
+            .map(|cwd| {
+                format!(
+                    "cwd: {}",
+                    crate::review_input::safe_inline_display(cwd, 4 * 1024)
+                )
+            })
+            .unwrap_or_else(|| "cwd unavailable".to_string());
+        self.context_label.set_tooltip_text(Some(&tooltip));
         self.clear_context_btn.set_sensitive(!busy);
         self.context_row.set_visible(true);
     }
@@ -1248,7 +1293,11 @@ impl AiPanel {
         self.root
             .update_state(&[gtk4::accessible::State::Busy(true)]);
         self.status_row.remove_css_class("error");
-        self.status_label.set_text(message);
+        self.status_label
+            .set_text(&crate::review_input::safe_inline_display(
+                message,
+                MAX_STATUS_DISPLAY_BYTES,
+            ));
         self.status_spinner.set_visible(true);
         self.status_spinner.start();
         self.status_row.set_visible(true);
@@ -1260,7 +1309,11 @@ impl AiPanel {
         self.status_spinner.stop();
         self.status_spinner.set_visible(false);
         self.status_row.remove_css_class("error");
-        self.status_label.set_text(message);
+        self.status_label
+            .set_text(&crate::review_input::safe_inline_display(
+                message,
+                MAX_STATUS_DISPLAY_BYTES,
+            ));
         self.status_row.set_visible(!message.is_empty());
     }
 
@@ -1270,7 +1323,11 @@ impl AiPanel {
         self.status_spinner.stop();
         self.status_spinner.set_visible(false);
         self.status_row.add_css_class("error");
-        self.status_label.set_text(message);
+        self.status_label
+            .set_text(&crate::review_input::safe_inline_display(
+                message,
+                MAX_STATUS_DISPLAY_BYTES,
+            ));
         self.status_row.set_visible(true);
     }
 
@@ -1414,7 +1471,11 @@ impl AiPanel {
         self.convo_buffer.insert(&mut end, label);
         let label_end = end.offset();
         self.convo_buffer.insert(&mut end, "\n");
-        self.convo_buffer.insert(&mut end, body);
+        let body = crate::review_input::safe_multiline_display(
+            body,
+            super::bounded_text::MAX_AI_VISIBLE_TRANSCRIPT_BYTES,
+        );
+        self.convo_buffer.insert(&mut end, &body);
         let start = self.convo_buffer.iter_at_offset(label_start);
         let end = self.convo_buffer.iter_at_offset(label_end);
         self.convo_buffer.apply_tag_by_name(role_tag, &start, &end);
@@ -1452,7 +1513,9 @@ impl AiPanel {
         let was_near_bottom =
             adjustment.value() + adjustment.page_size() >= adjustment.upper() - 32.0;
         let mut end = self.convo_buffer.end_iter();
-        self.convo_buffer.insert(&mut end, fragment);
+        let fragment =
+            crate::review_input::safe_multiline_display(fragment, MAX_LIVE_MESSAGE_BYTES);
+        self.convo_buffer.insert(&mut end, &fragment);
         super::bounded_text::trim_ai_transcript(&self.convo_buffer);
         if was_near_bottom {
             self.scroll_transcript_to_end();
@@ -1611,17 +1674,19 @@ impl AiPanel {
         self.refresh_chat_library();
 
         let stream_replies = self.config.borrow().ai_stream;
-        let (tx, rx) = std::sync::mpsc::channel::<StreamEvent>();
+        let (delta_tx, delta_rx) =
+            std::sync::mpsc::sync_channel::<String>(MAX_PENDING_STREAM_DELTAS);
+        let (result_tx, result_rx) =
+            std::sync::mpsc::sync_channel::<Result<String, ai::AiError>>(1);
         std::thread::spawn(move || {
             let result = client.and_then(|client| {
                 if stream_replies {
-                    let deltas = tx.clone();
                     client.send_turns_streaming_cancellable(
                         system.as_deref(),
                         &history,
                         &cancellation,
                         &mut |delta| {
-                            let _ = deltas.send(StreamEvent::Delta(delta.to_string()));
+                            let _ = try_queue_stream_delta(&delta_tx, delta);
                         },
                     )
                 } else {
@@ -1632,34 +1697,43 @@ impl AiPanel {
                     )
                 }
             });
-            let _ = tx.send(StreamEvent::Done(result));
+            let _ = result_tx.send(result);
         });
 
         let p = self.clone();
         let mut progress = StreamProgress::default();
-        glib::timeout_add_local(std::time::Duration::from_millis(50), move || loop {
-            match rx.try_recv() {
-                Ok(StreamEvent::Delta(fragment)) => {
-                    // Only the request the store still recognizes as the
-                    // active chat's in-flight epoch may draw; cancelled or
-                    // superseded requests keep accumulating silently.
-                    let can_display = p.store.borrow().active_request_token() == Some(token);
-                    let attached = *p.stream_display.borrow() == Some(token);
-                    match progress.push(&fragment, can_display, attached) {
-                        StreamRender::None => {}
-                        StreamRender::Materialize(text) => {
-                            p.append_visible("Assistant", "role-asst", text);
-                            *p.stream_display.borrow_mut() = Some(token);
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            // Bound work per GTK tick even if the producer replenishes the
+            // queue while it is being drained.
+            for _ in 0..MAX_PENDING_STREAM_DELTAS {
+                match delta_rx.try_recv() {
+                    Ok(fragment) => {
+                        // Only the request the store still recognizes as the
+                        // active chat's in-flight epoch may draw; cancelled or
+                        // superseded requests keep accumulating silently.
+                        let can_display = p.store.borrow().active_request_token() == Some(token);
+                        let attached = *p.stream_display.borrow() == Some(token);
+                        match progress.push(&fragment, can_display, attached) {
+                            StreamRender::None => {}
+                            StreamRender::Materialize(text) => {
+                                p.append_visible("Assistant", "role-asst", text);
+                                *p.stream_display.borrow_mut() = Some(token);
+                            }
+                            StreamRender::Append(text) => p.append_stream_text(text),
                         }
-                        StreamRender::Append(text) => p.append_stream_text(text),
                     }
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                    | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                 }
-                Ok(StreamEvent::Done(Ok(text))) => {
+            }
+
+            match result_rx.try_recv() {
+                Ok(Ok(text)) => {
                     let shown_partial = p.detach_stream_display(token);
                     if p.requests.borrow_mut().remove(&token).is_none() {
                         return glib::ControlFlow::Break;
                     }
-                    let owner_active = p.store.borrow_mut().complete_success(token, text.clone());
+                    let owner_active = p.store.borrow_mut().complete_success(token, text);
                     let Some(owner_active) = owner_active else {
                         return glib::ControlFlow::Break;
                     };
@@ -1673,7 +1747,18 @@ impl AiPanel {
                             // delta and heals any dropped fragment.
                             p.render_active_chat();
                         } else {
-                            p.append_visible("Assistant", "role-asst", &text);
+                            let stored_text = p
+                                .store
+                                .borrow()
+                                .active_history()
+                                .last()
+                                .filter(|turn| turn.role == Role::Assistant)
+                                .map(|turn| turn.text.clone());
+                            if let Some(text) = stored_text {
+                                p.append_visible("Assistant", "role-asst", &text);
+                            } else {
+                                p.render_active_chat();
+                            }
                             p.sync_active_status();
                             p.sync_composer_state();
                             p.sync_context_chip();
@@ -1684,14 +1769,14 @@ impl AiPanel {
                         p.refresh_chat_library();
                     }
                     p.publish_persisted_conversation();
-                    return glib::ControlFlow::Break;
+                    glib::ControlFlow::Break
                 }
-                Ok(StreamEvent::Done(Err(error))) => {
+                Ok(Err(error)) => {
                     let shown_partial = p.detach_stream_display(token);
                     p.finish_request_error(token, format!("Error: {error}"), shown_partial);
-                    return glib::ControlFlow::Break;
+                    glib::ControlFlow::Break
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     let shown_partial = p.detach_stream_display(token);
                     p.finish_request_error(
@@ -1699,7 +1784,7 @@ impl AiPanel {
                         "Error: worker thread disconnected".to_string(),
                         shown_partial,
                     );
-                    return glib::ControlFlow::Break;
+                    glib::ControlFlow::Break
                 }
             }
         });
@@ -1772,6 +1857,7 @@ fn prompt_button(label: &str) -> Button {
 
 fn context_chip_text(context: &BlockContext, pending_retry: bool) -> String {
     let collapsed = context.cmd.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = crate::review_input::safe_inline_display(&collapsed, 16 * 1024);
     let command = if collapsed.is_empty() {
         "(no command)".to_string()
     } else {
@@ -1891,6 +1977,45 @@ mod tests {
     }
 
     #[test]
+    fn saturated_stream_delta_queue_never_blocks_the_final_result() {
+        let (delta_tx, delta_rx) = std::sync::mpsc::sync_channel(2);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+
+        assert!(try_queue_stream_delta(&delta_tx, "one"));
+        assert!(try_queue_stream_delta(&delta_tx, "two"));
+        assert!(!try_queue_stream_delta(&delta_tx, "dropped"));
+        result_tx
+            .send(Ok::<_, ai::AiError>("complete".to_string()))
+            .unwrap();
+
+        assert_eq!(delta_rx.try_recv().unwrap(), "one");
+        assert_eq!(delta_rx.try_recv().unwrap(), "two");
+        assert_eq!(result_rx.try_recv().unwrap().unwrap(), "complete");
+
+        let (large_tx, large_rx) = std::sync::mpsc::sync_channel(1);
+        let large = "界".repeat(MAX_STREAM_DELTA_BYTES);
+        assert!(try_queue_stream_delta(&large_tx, &large));
+        let retained = large_rx.try_recv().unwrap();
+        assert!(retained.len() <= MAX_STREAM_DELTA_BYTES);
+        assert!(retained.chars().all(|ch| ch == '界'));
+    }
+
+    #[test]
+    fn stream_progress_never_accumulates_an_unbounded_reply() {
+        let mut progress = StreamProgress::default();
+        let oversized = "x".repeat(MAX_LIVE_ASSISTANT_MESSAGE_BYTES + 100);
+
+        match progress.push(&oversized, true, false) {
+            StreamRender::Materialize(text) => {
+                assert!(text.len() <= MAX_LIVE_ASSISTANT_MESSAGE_BYTES)
+            }
+            other => panic!("expected a materialized bounded reply, got {other:?}"),
+        }
+        assert_eq!(progress.push("ignored", true, true), StreamRender::None);
+        assert!(progress.accumulated.len() <= MAX_LIVE_ASSISTANT_MESSAGE_BYTES);
+    }
+
+    #[test]
     fn retry_removes_only_the_recovered_request_from_the_draft() {
         assert_eq!(
             draft_without_retry_message("failed request", "failed request\n\nfollow-up notes"),
@@ -1909,7 +2034,7 @@ mod tests {
     #[test]
     fn context_chip_is_single_line_bounded_and_reports_exit_status() {
         let context = BlockContext {
-            cmd: format!("cargo\n{}", "test ".repeat(30)),
+            cmd: format!("cargo\ntest \u{202e}\u{fff0}{}", "again ".repeat(30)),
             output: String::new(),
             cwd: Some("/tmp/repo".into()),
             exit_code: 101,
@@ -1918,6 +2043,9 @@ mod tests {
         let text = context_chip_text(&context, false);
         assert!(text.starts_with("Block · exit 101 · cargo test"));
         assert!(!text.contains('\n'));
+        assert!(!text.contains('\u{202e}'));
+        assert!(!text.contains('\u{fff0}'));
+        assert!(text.contains("��"));
         assert!(text.ends_with('…'));
         assert!(text.chars().count() < 90);
 

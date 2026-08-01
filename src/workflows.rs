@@ -33,7 +33,20 @@
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+const MAX_WORKFLOW_FILE_BYTES: u64 = 256 * 1024;
+const MAX_DIRECTORY_ENTRIES: usize = 4_096;
+const MAX_WORKFLOW_FILES_PER_DIRECTORY: usize = 512;
+const MAX_WORKFLOW_DIRECTORIES: usize = 64;
+const MAX_WORKFLOWS: usize = 1_024;
+const MAX_WORKFLOW_NAME_BYTES: usize = 256;
+const MAX_WORKFLOW_DESCRIPTION_BYTES: usize = 4 * 1024;
+const MAX_WORKFLOW_COMMAND_BYTES: usize = 64 * 1024;
+const MAX_WORKFLOW_FIELD_BYTES: usize = 4 * 1024;
+const MAX_WORKFLOW_TAGS: usize = 64;
+const MAX_WORKFLOW_ARGS: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Workflow {
@@ -75,7 +88,7 @@ pub fn workflows_dir() -> PathBuf {
 pub fn workflow_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![workflows_dir()];
     if let Some(extra) = std::env::var_os("JTERM4_WORKFLOW_DIR") {
-        dirs.extend(std::env::split_paths(&extra));
+        dirs.extend(std::env::split_paths(&extra).take(MAX_WORKFLOW_DIRECTORIES));
     }
     dirs.push(gtk4::glib::user_data_dir().join("jterm4").join("workflows"));
     dirs.extend(
@@ -89,8 +102,9 @@ pub fn workflow_dirs() -> Vec<PathBuf> {
             .join("workflows"),
     );
     let mut unique = Vec::new();
-    for dir in dirs {
-        if !unique.contains(&dir) {
+    let mut seen = HashSet::new();
+    for dir in dirs.into_iter().take(MAX_WORKFLOW_DIRECTORIES) {
+        if seen.insert(dir.clone()) {
             unique.push(dir);
         }
     }
@@ -131,18 +145,20 @@ pub fn load_all_from(dir: &Path) -> Vec<Workflow> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
+    let mut paths: Vec<PathBuf> = entries
+        .take(MAX_DIRECTORY_ENTRIES)
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| workflow_extension(path).is_some())
+        .take(MAX_WORKFLOW_FILES_PER_DIRECTORY)
+        .collect();
+    paths.sort();
     let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let extension = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if !matches!(extension.as_str(), "toml" | "yaml" | "yml") {
+    for path in paths {
+        let Some(extension) = workflow_extension(&path) else {
             continue;
-        }
-        let Ok(contents) = fs::read_to_string(&path) else {
+        };
+        let Ok(contents) = read_bounded_workflow(&path) else {
             continue;
         };
         let workflow = match extension.as_str() {
@@ -151,6 +167,9 @@ pub fn load_all_from(dir: &Path) -> Vec<Workflow> {
         };
         if let Some(wf) = workflow {
             out.push(wf);
+            if out.len() == MAX_WORKFLOW_FILES_PER_DIRECTORY {
+                break;
+            }
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -162,15 +181,57 @@ pub fn load_all_from(dir: &Path) -> Vec<Workflow> {
 pub fn load_all() -> Vec<Workflow> {
     let mut out = Vec::new();
     let mut names = HashSet::new();
-    for dir in workflow_dirs() {
+    'directories: for dir in workflow_dirs().into_iter().take(MAX_WORKFLOW_DIRECTORIES) {
         for workflow in load_all_from(&dir) {
             if names.insert(workflow.name.clone()) {
                 out.push(workflow);
+                if out.len() == MAX_WORKFLOWS {
+                    break 'directories;
+                }
             }
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+fn workflow_extension(path: &Path) -> Option<String> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    matches!(extension.as_str(), "toml" | "yaml" | "yml").then_some(extension)
+}
+
+fn read_bounded_workflow(path: &Path) -> Result<String, String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| format!("read: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect: {error}"))?;
+    if !metadata.is_file() {
+        return Err("source is not a regular file".to_string());
+    }
+    if metadata.len() > MAX_WORKFLOW_FILE_BYTES {
+        return Err(format!(
+            "source exceeds the {MAX_WORKFLOW_FILE_BYTES}-byte limit"
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_WORKFLOW_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read: {error}"))?;
+    if bytes.len() as u64 > MAX_WORKFLOW_FILE_BYTES {
+        return Err(format!(
+            "source exceeds the {MAX_WORKFLOW_FILE_BYTES}-byte limit"
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| format!("source is not UTF-8: {error}"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,37 +258,94 @@ struct YamlWorkflowArg {
 }
 
 fn command_is_reviewable(command: &str, source_path: &Path) -> bool {
+    let source_display =
+        crate::review_input::safe_inline_display(&source_path.to_string_lossy(), 2 * 1024);
+    if command.len() > MAX_WORKFLOW_COMMAND_BYTES {
+        log::warn!(
+            "workflows: skipping {}: command exceeds {MAX_WORKFLOW_COMMAND_BYTES} bytes",
+            source_display
+        );
+        return false;
+    }
     match crate::review_input::validate(command) {
         Ok(_) => true,
         Err(error) => {
             log::warn!(
                 "workflows: skipping {}: command is unsafe for review-only insertion: {error}",
-                source_path.display()
+                source_display
             );
             false
         }
     }
 }
 
+fn validate_display_field(label: &str, value: &str, max_bytes: usize, allow_empty: bool) -> bool {
+    let valid = (allow_empty || !value.trim().is_empty())
+        && value.len() <= max_bytes
+        && !value.chars().any(char::is_control)
+        && !crate::review_input::contains_visual_spoof(value);
+    if !valid {
+        log::warn!("workflows: invalid {label}");
+    }
+    valid
+}
+
+fn validate_workflow(workflow: &Workflow) -> bool {
+    if !validate_display_field("name", &workflow.name, MAX_WORKFLOW_NAME_BYTES, false)
+        || !validate_display_field(
+            "description",
+            &workflow.description,
+            MAX_WORKFLOW_DESCRIPTION_BYTES,
+            true,
+        )
+        || !command_is_reviewable(&workflow.command, &workflow.source_path)
+        || workflow.tags.len() > MAX_WORKFLOW_TAGS
+        || workflow.args.len() > MAX_WORKFLOW_ARGS
+    {
+        return false;
+    }
+    if !workflow
+        .tags
+        .iter()
+        .all(|tag| validate_display_field("tag", tag, MAX_WORKFLOW_FIELD_BYTES, false))
+        || workflow.shell.as_ref().is_some_and(|shell| {
+            !validate_display_field("shell", shell, MAX_WORKFLOW_FIELD_BYTES, false)
+        })
+    {
+        return false;
+    }
+    let mut names = HashSet::new();
+    workflow.args.iter().all(|argument| {
+        validate_display_field(
+            "argument name",
+            &argument.name,
+            MAX_WORKFLOW_FIELD_BYTES,
+            false,
+        ) && names.insert(argument.name.as_str())
+            && validate_display_field(
+                "argument description",
+                &argument.description,
+                MAX_WORKFLOW_DESCRIPTION_BYTES,
+                true,
+            )
+            && argument.default.len() <= MAX_WORKFLOW_COMMAND_BYTES
+            && !argument.default.chars().any(char::is_control)
+            && !crate::review_input::contains_visual_spoof(&argument.default)
+    })
+}
+
 fn parse_yaml_workflow(source: &str, source_path: &Path) -> Option<Workflow> {
     let raw: YamlWorkflow = match serde_yaml::from_str(source) {
         Ok(raw) => raw,
         Err(err) => {
-            log::warn!("workflows: skipping {}: {err}", source_path.display());
+            log::warn!(
+                "workflows: skipping {}: {err}",
+                crate::review_input::safe_inline_display(&source_path.to_string_lossy(), 2 * 1024)
+            );
             return None;
         }
     };
-    if raw.name.trim().is_empty() || raw.command.trim().is_empty() {
-        log::warn!(
-            "workflows: skipping {}: name and command must not be empty",
-            source_path.display()
-        );
-        return None;
-    }
-    if !command_is_reviewable(&raw.command, source_path) {
-        return None;
-    }
-    Some(Workflow {
+    let workflow = Workflow {
         name: raw.name,
         description: raw.description,
         command: raw.command,
@@ -244,16 +362,14 @@ fn parse_yaml_workflow(source: &str, source_path: &Path) -> Option<Workflow> {
             })
             .collect(),
         source_path: source_path.to_path_buf(),
-    })
+    };
+    validate_workflow(&workflow).then_some(workflow)
 }
 
 fn parse_workflow(toml_src: &str, source_path: &Path) -> Option<Workflow> {
     let table: toml::Table = toml::from_str(toml_src).ok()?;
     let name = table.get("name")?.as_str()?.to_string();
     let command = table.get("command")?.as_str()?.to_string();
-    if name.trim().is_empty() || !command_is_reviewable(&command, source_path) {
-        return None;
-    }
     let description = table
         .get("description")
         .and_then(|v| v.as_str())
@@ -302,7 +418,7 @@ fn parse_workflow(toml_src: &str, source_path: &Path) -> Option<Workflow> {
         }
     }
 
-    Some(Workflow {
+    let workflow = Workflow {
         name,
         description,
         command,
@@ -310,7 +426,8 @@ fn parse_workflow(toml_src: &str, source_path: &Path) -> Option<Workflow> {
         shell,
         args,
         source_path: source_path.to_path_buf(),
-    })
+    };
+    validate_workflow(&workflow).then_some(workflow)
 }
 
 /// Substitute `{name}` placeholders in `template` with values from
@@ -318,8 +435,20 @@ fn parse_workflow(toml_src: &str, source_path: &Path) -> Option<Workflow> {
 /// them in the rendered command and can fix the typo). Escape `{{` and
 /// `}}` for literal braces, mirroring `format!` semantics — workflows
 /// occasionally need to emit JSON or shell brace expansions.
-pub fn substitute(template: &str, bindings: &[(String, String)]) -> String {
-    let mut out = String::with_capacity(template.len());
+pub fn substitute(template: &str, bindings: &[(String, String)]) -> Result<String, String> {
+    if template.len() > MAX_WORKFLOW_COMMAND_BYTES || bindings.len() > MAX_WORKFLOW_ARGS {
+        return Err("workflow substitution input exceeds its limit".to_string());
+    }
+    for (name, value) in bindings {
+        if !validate_display_field("binding name", name, MAX_WORKFLOW_FIELD_BYTES, false)
+            || value.len() > MAX_WORKFLOW_COMMAND_BYTES
+            || value.chars().any(char::is_control)
+            || crate::review_input::contains_visual_spoof(value)
+        {
+            return Err(format!("workflow binding '{name}' is unsafe or oversized"));
+        }
+    }
+    let mut out = String::with_capacity(template.len().min(MAX_WORKFLOW_COMMAND_BYTES));
     let bytes = template.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -334,12 +463,12 @@ pub fn substitute(template: &str, bindings: &[(String, String)]) -> String {
                     let close = i + 2 + close_rel;
                     let name = &template[i + 2..close];
                     if let Some((_, value)) = bindings.iter().find(|(key, _)| key == name) {
-                        out.push_str(value);
+                        push_rendered(&mut out, value)?;
                         i = close + 2;
                         continue;
                     }
                 }
-                out.push('{');
+                push_rendered(&mut out, "{")?;
                 i += 2;
                 continue;
             }
@@ -348,32 +477,45 @@ pub fn substitute(template: &str, bindings: &[(String, String)]) -> String {
                 let close = i + 1 + close_rel;
                 let name = &template[i + 1..close];
                 if let Some((_, v)) = bindings.iter().find(|(n, _)| n == name) {
-                    out.push_str(v);
+                    push_rendered(&mut out, v)?;
                 } else {
                     // Unknown placeholder — keep verbatim so the user notices.
-                    out.push_str(&template[i..=close]);
+                    push_rendered(&mut out, &template[i..=close])?;
                 }
                 i = close + 1;
                 continue;
             }
             // Unterminated `{` — emit literally and move on.
-            out.push('{');
+            push_rendered(&mut out, "{")?;
             i += 1;
         } else if b == b'}' && i + 1 < bytes.len() && bytes[i + 1] == b'}' {
-            out.push('}');
+            push_rendered(&mut out, "}")?;
             i += 2;
         } else {
             // Multi-byte UTF-8: push the whole codepoint by reading char_indices.
             let rest = &template[i..];
             if let Some(c) = rest.chars().next() {
-                out.push(c);
+                let mut encoded = [0_u8; 4];
+                push_rendered(&mut out, c.encode_utf8(&mut encoded))?;
                 i += c.len_utf8();
             } else {
                 break;
             }
         }
     }
-    out
+    crate::review_input::validate(&out)
+        .map_err(|error| format!("rendered command is unsafe: {error}"))?;
+    Ok(out)
+}
+
+fn push_rendered(output: &mut String, addition: &str) -> Result<(), String> {
+    if output.len().saturating_add(addition.len()) > MAX_WORKFLOW_COMMAND_BYTES {
+        return Err(format!(
+            "rendered command exceeds {MAX_WORKFLOW_COMMAND_BYTES} bytes"
+        ));
+    }
+    output.push_str(addition);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -438,7 +580,7 @@ args:
         assert_eq!(wf.shell.as_deref(), Some("bash"));
         assert_eq!(wf.args[0].default, "api");
         assert_eq!(
-            substitute(&wf.command, &[("service".into(), "web".into())]),
+            substitute(&wf.command, &[("service".into(), "web".into())]).unwrap(),
             "deploy web"
         );
     }
@@ -448,6 +590,11 @@ args:
         assert!(parse_yaml_workflow(
             "name: Unsafe\ncommand: |\n  echo one\n  echo two\n",
             Path::new("/tmp/unsafe.yaml")
+        )
+        .is_none());
+        assert!(parse_workflow(
+            "name = 'safe\u{202e}txt'\ncommand = 'echo safe'\n",
+            Path::new("/tmp/visual.toml")
         )
         .is_none());
         assert!(parse_workflow(
@@ -470,7 +617,8 @@ args:
                 ("env".into(), "prod".into()),
                 ("target".into(), "api".into()),
             ],
-        );
+        )
+        .unwrap();
         assert_eq!(out, "deploy prod api");
     }
 
@@ -479,27 +627,40 @@ args:
         let out = substitute(
             "hi {name}, your role is {role}",
             &[("name".into(), "Bea".into())],
-        );
+        )
+        .unwrap();
         // {role} unresolved — keep it visible so the user sees the typo.
         assert_eq!(out, "hi Bea, your role is {role}");
     }
 
     #[test]
     fn substitute_double_brace_escape() {
-        let out = substitute("shell brace expansion: {{a,b,c}}", &[]);
+        let out = substitute("shell brace expansion: {{a,b,c}}", &[]).unwrap();
         assert_eq!(out, "shell brace expansion: {a,b,c}");
     }
 
     #[test]
     fn substitute_no_braces_passthrough() {
         let s = "git status --porcelain";
-        assert_eq!(substitute(s, &[]), s);
+        assert_eq!(substitute(s, &[]).unwrap(), s);
     }
 
     #[test]
     fn substitute_handles_utf8_around_braces() {
-        let out = substitute("🚀 deploy {env} 完了", &[("env".into(), "prod".into())]);
+        let out = substitute("🚀 deploy {env} 完了", &[("env".into(), "prod".into())]).unwrap();
         assert_eq!(out, "🚀 deploy prod 完了");
+    }
+
+    #[test]
+    fn substitute_rejects_binding_amplification_and_visual_spoofing() {
+        let template = "{value}".repeat(128);
+        let huge = "x".repeat(1_024);
+        assert!(substitute(&template, &[("value".into(), huge)]).is_err());
+        assert!(substitute(
+            "echo {value}",
+            &[("value".into(), "safe\u{202e}txt".into())]
+        )
+        .is_err());
     }
 
     #[test]
@@ -538,6 +699,44 @@ args:
     fn load_all_from_missing_dir_returns_empty() {
         let wfs = load_all_from(Path::new("/nonexistent/jterm4/workflows/never"));
         assert!(wfs.is_empty());
+    }
+
+    #[test]
+    fn workflow_reader_rejects_oversize_and_symlink_files() {
+        let dir = tempdir();
+        let oversized = dir.path().join("oversized.toml");
+        write_file(
+            &oversized,
+            &format!(
+                "name = 'large'\ncommand = 'echo safe'\n#{}",
+                "x".repeat(MAX_WORKFLOW_FILE_BYTES as usize)
+            ),
+        );
+        assert!(load_all_from(dir.path()).is_empty());
+
+        fs::remove_file(&oversized).unwrap();
+        let target = dir.path().join("target.txt");
+        write_file(&target, "name = 'linked'\ncommand = 'echo unsafe'\n");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, dir.path().join("linked.toml")).unwrap();
+        #[cfg(unix)]
+        assert!(load_all_from(dir.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_reader_rejects_fifo_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempdir();
+        let fifo = dir.path().join("blocked.toml");
+        let path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path is a live NUL-terminated pathname and mode is valid.
+        assert_eq!(unsafe { nix::libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        assert!(load_all_from(dir.path()).is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]

@@ -30,7 +30,12 @@ impl UiState {
                 self.add_named_tab_with_argv("Install jsh", argv);
             }
             Err(error) => {
-                log::warn!("cannot stage the jsh installer: {error}");
+                let error = error.to_string();
+                log::warn!(
+                    "cannot stage the jsh installer: {}",
+                    crate::review_input::safe_inline_display(&error, 4 * 1024)
+                );
+                let error = crate::review_input::safe_multiline_display(&error, 16 * 1024);
                 let dialog = adw::AlertDialog::new(
                     Some("Cannot install jsh"),
                     Some(&format!("Writing the installer script failed: {error}")),
@@ -97,7 +102,7 @@ impl UiState {
             return;
         };
 
-        let (sender, receiver) = std::sync::mpsc::channel();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let _ = sender.send(jsh_install::check_blocking(max_age));
         });
@@ -125,21 +130,29 @@ impl UiState {
 /// cannot work.
 fn apply_jsh_status(bar: &GBox, label: &Label, action: &Button, status: &Status) {
     if let Some(error) = &status.error {
-        log::info!("jsh update check unavailable: {error}");
+        log::info!(
+            "jsh update check unavailable: {}",
+            crate::review_input::safe_inline_display(error, 4 * 1024)
+        );
     }
     if let Some(other) = &status.shadowed_by {
         // Some other binary named jsh, earlier on PATH. Installing does not fix
         // PATH order, so the installer explains it in the tab; here it is only
         // worth a log line.
-        log::warn!("PATH resolves jsh to {other}, which jterm does not manage");
+        log::warn!(
+            "PATH resolves jsh to {}, which jterm does not manage",
+            crate::review_input::safe_inline_display(other, 4 * 1024)
+        );
     }
 
     let Some(prompt) = jsh_install::prompt_for(status) else {
         bar.set_visible(false);
         return;
     };
-    log::info!("jsh notice: {}", prompt.banner_title());
-    label.set_text(&prompt.banner_title());
-    action.set_label(prompt.button_label());
+    let title = crate::review_input::safe_inline_display(&prompt.banner_title(), 4 * 1024);
+    let button = crate::review_input::safe_inline_display(prompt.button_label(), 256);
+    log::info!("jsh notice: {title}");
+    label.set_text(&title);
+    action.set_label(&button);
     bar.set_visible(true);
 }

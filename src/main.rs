@@ -14,14 +14,15 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::config::{choose_shell_argv, config_file_path, load_config, load_safe_config};
+use crate::core_keybindings::{Chord, KeySym, Mods, NamedKey};
 use crate::keybindings::Action;
 use crate::logging::init_logging;
 use crate::state::{
-    finalize_tabs_state, kill_all_terminal_children, load_tabs_state, save_tabs_state,
+    detach_all_pane_leaves, finalize_tabs_state, kill_all_terminal_children, load_tabs_state,
+    save_all_block_histories, save_tabs_state,
 };
 use crate::terminal::terminal_working_directory;
 use crate::ui::{self, UiState};
-use jterm_core::keybindings::{Chord, KeySym, Mods, NamedKey};
 
 /// GApplication receives only a program name. All real launch arguments are
 /// consumed by `cli::handle_early_args` before GTK is initialized.
@@ -872,6 +873,28 @@ pub fn run() -> glib::ExitCode {
             ai_panel_width_restoring: Rc::new(Cell::new(false)),
         });
 
+        // Background persistence failures arrive from a Send-only worker.
+        // Polling a bounded queue keeps GTK objects on the main thread and
+        // turns otherwise invisible fsync/permission failures into one concise
+        // toast per affected operation.
+        let persistence_toasts = toast_overlay.downgrade();
+        let ai_panel_for_persistence = ui.ai_panel.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+            let Some(overlay) = persistence_toasts.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            for failure in crate::persistence::drain_failures() {
+                let toast = adw::Toast::new(&format!("{} failed: {}", failure.operation, failure.error));
+                toast.set_timeout(8);
+                overlay.add_toast(toast);
+            }
+            // A successful asynchronous window save may have compacted the AI
+            // payload. Reflect its durable truncation marker once the worker
+            // publishes the generation-safe in-memory snapshot.
+            ai_panel_for_persistence.sync_persisted_truncation();
+            glib::ControlFlow::Continue
+        });
+
         // Register the dynamic scrollbar CSS provider and apply initial colors
         gtk4::style_context_add_provider_for_display(
             &gtk4::gdk::Display::default().expect("display"),
@@ -1475,7 +1498,13 @@ pub fn run() -> glib::ExitCode {
                 ai_panel_for_close.flush_persisted_conversation();
                 save_tabs_state(&notebook_for_close_request, &session_ids_for_close.borrow());
             }
+            save_all_block_histories(&notebook_for_close_request);
             kill_all_terminal_children(&notebook_for_close_request);
+
+            // Permanently removing a pane must steal its typed controller from
+            // root qdata; otherwise the controller/root ownership cycle keeps
+            // TermView alive and its Drop save never runs.
+            detach_all_pane_leaves(&notebook_for_close_request);
 
             // Explicitly clear all pages to break reference cycles and allow TermView cleanup.
             // This ensures OwnedPty drops, closing PTY master FD and signaling reader threads.
@@ -1493,10 +1522,23 @@ pub fn run() -> glib::ExitCode {
             if !crate::execution_journal::flush(std::time::Duration::from_secs(2)) {
                 log::warn!("execution-journal writer did not flush before shutdown");
             }
-            // Make the final snapshot visible only after this window is fully
-            // quiesced. Any queued auto-save callbacks become no-ops.
+            // Publish after every window save and Block-history snapshot, then
+            // stop accepting work and wait for the single disk worker to drain.
+            // The publication itself is queued, so rename/fsync also stays off
+            // the GTK main thread.
             if session_persistence {
                 finalize_tabs_state();
+            }
+            if let Err(error) =
+                crate::persistence::shutdown(std::time::Duration::from_secs(3))
+            {
+                // Leave `.active` recoverable rather than racing a late write
+                // with an on-thread rename. The next launch reclaims it once
+                // this process is definitely gone.
+                log::warn!("persistence worker did not flush before shutdown: {error}");
+            }
+            for failure in crate::persistence::drain_failures() {
+                log::error!("persistence failure during shutdown: {failure}");
             }
 
             // Directly quit the application
@@ -1585,8 +1627,8 @@ mod tests {
         //! so its GTK-only facts are pinned here: ISO_Left_Tab folding,
         //! keypad exclusion, unicode lowercasing, and F-key naming.
         use super::super::chord_from_gdk;
+        use crate::core_keybindings::parse;
         use gtk4::gdk::{Key, ModifierType};
-        use jterm_core::keybindings::parse;
 
         const CTRL: ModifierType = ModifierType::CONTROL_MASK;
         const CTRL_SHIFT: ModifierType = ModifierType::CONTROL_MASK.union(ModifierType::SHIFT_MASK);

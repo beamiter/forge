@@ -3,18 +3,21 @@ use gtk4::prelude::*;
 use gtk4::{Label, Notebook, Paned};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
-use std::io;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::ffi::{CString, OsString};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use vte4::Terminal;
 use vte4::TerminalExt;
 
-use crate::process::deserialize_restorable_argv;
+use crate::persistence::{self, PersistenceKey};
+use crate::process::deserialize_restorable_argv_bounded;
 use crate::snapshot_file;
 
 use crate::terminal::{
@@ -36,6 +39,16 @@ const READY_STATE_EXTENSION: &str = "state";
 const ACTIVE_STATE_EXTENSION: &str = "active";
 const AI_CONVERSATION_PREFIX: &str = "ai_conversation=";
 const MAX_AI_CONVERSATION_LINE_BYTES: usize = crate::ai::MAX_CONVERSATION_SNAPSHOT_JSON_BYTES * 2;
+const MAX_RESTORED_TABS: usize = 32;
+const MAX_RESTORED_PANES_PER_TAB: usize = 16;
+const MAX_RESTORED_PANES_TOTAL: usize = 64;
+const MAX_RESTORED_TAB_NAME_BYTES: usize = 4 * 1024;
+const MAX_RESTORED_CWD_BYTES: usize = 4 * 1024;
+const MAX_RESTORED_SESSION_ID_BYTES: usize = 96;
+/// A private state directory normally contains only the retained snapshots.
+/// Bound even corrupted/same-user namespaces so startup and shutdown cannot
+/// allocate or stat an attacker-controlled number of entries.
+const MAX_SCANNED_STATE_DIRECTORY_ENTRIES: usize = 4_096;
 
 #[derive(Debug)]
 struct WindowStatePaths {
@@ -46,11 +59,21 @@ struct WindowStatePaths {
 
 static WINDOW_STATE_PATHS: OnceLock<WindowStatePaths> = OnceLock::new();
 static WINDOW_STATE_FINALIZED: AtomicBool = AtomicBool::new(false);
-static AI_CONVERSATION_SNAPSHOT: OnceLock<Mutex<Option<crate::ai::ConversationSnapshot>>> =
-    OnceLock::new();
+static WINDOW_STATE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+struct AiConversationState {
+    generation: u64,
+    snapshot: Option<crate::ai::ConversationSnapshot>,
+}
 
-fn ai_conversation_slot() -> &'static Mutex<Option<crate::ai::ConversationSnapshot>> {
-    AI_CONVERSATION_SNAPSHOT.get_or_init(|| Mutex::new(None))
+static AI_CONVERSATION_SNAPSHOT: OnceLock<Mutex<AiConversationState>> = OnceLock::new();
+
+fn ai_conversation_slot() -> &'static Mutex<AiConversationState> {
+    AI_CONVERSATION_SNAPSHOT.get_or_init(|| {
+        Mutex::new(AiConversationState {
+            generation: 0,
+            snapshot: None,
+        })
+    })
 }
 
 /// Return the complete, bounded AI conversation associated with this process's
@@ -59,42 +82,310 @@ pub(crate) fn get_ai_conversation_snapshot() -> Option<crate::ai::ConversationSn
     ai_conversation_slot()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .snapshot
         .clone()
 }
 
 /// Replace the AI conversation that the next window-state save will embed.
 /// Passing `None` durably removes the entire chat library from the snapshot.
 pub(crate) fn set_ai_conversation_snapshot(snapshot: Option<crate::ai::ConversationSnapshot>) {
-    *ai_conversation_slot()
+    let mut state = ai_conversation_slot()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = snapshot;
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.generation = state.generation.wrapping_add(1);
+    state.snapshot = snapshot;
 }
 
-fn ensure_private_directory(path: &Path) -> io::Result<()> {
+fn versioned_ai_conversation_snapshot() -> (u64, Option<crate::ai::ConversationSnapshot>) {
+    let state = ai_conversation_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    (state.generation, state.snapshot.clone())
+}
+
+/// A slow older write must never replace newer in-memory chat state. Apply the
+/// compacted form only while the UI generation captured by that write is still
+/// current; a later autosave owns any subsequent durable update.
+fn commit_ai_conversation_snapshot(
+    generation: u64,
+    snapshot: Option<crate::ai::ConversationSnapshot>,
+) {
+    let mut state = ai_conversation_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.generation == generation {
+        state.snapshot = snapshot;
+    }
+}
+
+fn ensure_private_directory(path: &Path) -> io::Result<File> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     builder.mode(0o700);
     builder.create(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+
+    // Keep the descriptor across validation and chmod. A path-based chmod
+    // would follow a final symlink if the directory entry were substituted
+    // between the metadata check and the permission change.
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "window-state parent is not a directory",
+        ));
+    }
+    // SAFETY: geteuid has no preconditions and only reads process state.
+    if metadata.uid() != unsafe { nix::libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "window-state parent is not owned by the current user",
+        ));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(directory)
 }
 
 fn make_file_private(path: &Path) -> io::Result<()> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+    let file = open_private_regular_file(path)?;
+    if file.metadata()?.permissions().mode() & 0o077 != 0 {
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Open a private persistence file without following a final symlink or ever
+/// blocking on a FIFO, then validate the opened inode rather than the path.
+fn open_private_regular_file(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "window snapshot path is not a regular file",
+        ));
+    }
+    if metadata.nlink() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "window snapshot must have exactly one hard link",
+        ));
+    }
+    // SAFETY: geteuid has no preconditions and only reads process state.
+    if metadata.uid() != unsafe { nix::libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "window snapshot is not owned by the current user",
+        ));
+    }
+    Ok(file)
 }
 
 /// Durably replace a private state file without ever truncating the last good
 /// snapshot. The shared implementation writes a synced sibling temporary (so the
-/// rename cannot cross filesystems), keeps the file `0600`, syncs the directory
-/// entry, and tightens a snapshot directory an older release left at `0755`.
+/// rename cannot cross filesystems), keeps the file `0600`, and syncs the
+/// directory entry. This app owns its `windows/` parent, so it explicitly
+/// validates and tightens that directory before handing the payload off.
 fn atomic_write_private_file(target: &Path, payload: &[u8]) -> io::Result<()> {
-    snapshot_file::write_atomic_private(target, payload)
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory = ensure_private_directory(parent)?;
+    atomic_write_private_file_in_directory(&directory, target, payload)
+}
+
+fn atomic_write_private_file_in_directory(
+    directory: &File,
+    target: &Path,
+    payload: &[u8],
+) -> io::Result<()> {
+    let target_name = target.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "window snapshot path has no file name",
+        )
+    })?;
+    let target_name_c = CString::new(target_name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "window snapshot name contains NUL",
+        )
+    })?;
+
+    for _ in 0..128 {
+        let sequence = WINDOW_STATE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut temp_name = OsString::from(".");
+        temp_name.push(target_name);
+        temp_name.push(format!(".tmp.{}.{sequence}", std::process::id()));
+        let temp_name_c = CString::new(temp_name.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "window snapshot temporary name contains NUL",
+            )
+        })?;
+
+        // Operate relative to the retained validated directory descriptor.
+        // Swapping the parent pathname after validation cannot redirect the
+        // create, rename, cleanup, or durability sync to another namespace.
+        // SAFETY: both C strings are live and the directory descriptor remains
+        // open through every *at operation.
+        let fd = unsafe {
+            nix::libc::openat(
+                directory.as_raw_fd(),
+                temp_name_c.as_ptr(),
+                nix::libc::O_WRONLY
+                    | nix::libc::O_CREAT
+                    | nix::libc::O_EXCL
+                    | nix::libc::O_NOFOLLOW
+                    | nix::libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                continue;
+            }
+            return Err(error);
+        }
+        // SAFETY: openat returned a new owned descriptor.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let write_result =
+            std::io::Write::write_all(&mut file, payload).and_then(|()| file.sync_all());
+        drop(file);
+        if let Err(error) = write_result {
+            // SAFETY: arguments remain valid; unlinkat retains no pointer.
+            unsafe {
+                nix::libc::unlinkat(directory.as_raw_fd(), temp_name_c.as_ptr(), 0);
+            }
+            return Err(error);
+        }
+        // SAFETY: names are relative to the same retained directory inode.
+        let renamed = unsafe {
+            nix::libc::renameat(
+                directory.as_raw_fd(),
+                temp_name_c.as_ptr(),
+                directory.as_raw_fd(),
+                target_name_c.as_ptr(),
+            )
+        };
+        if renamed != 0 {
+            let error = io::Error::last_os_error();
+            // SAFETY: see unlinkat above.
+            unsafe {
+                nix::libc::unlinkat(directory.as_raw_fd(), temp_name_c.as_ptr(), 0);
+            }
+            return Err(error);
+        }
+        directory.sync_all()?;
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique window snapshot temporary file",
+    ))
 }
 
 fn sync_parent_directory(path: &Path) -> io::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
-    fs::File::open(parent)?.sync_all()
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(parent)?;
+    let metadata = directory.metadata()?;
+    // SAFETY: geteuid has no preconditions and only reads process state.
+    if metadata.uid() != unsafe { nix::libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "window-state parent is not owned by the current user",
+        ));
+    }
+    directory.sync_all()
+}
+
+fn rename_noreplace_between_directories(
+    source_directory: &File,
+    source: &Path,
+    target_directory: &File,
+    target: &Path,
+) -> io::Result<()> {
+    let source_name = source.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "snapshot source has no file name",
+        )
+    })?;
+    let target_name = target.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "snapshot target has no file name",
+        )
+    })?;
+    let source_name = CString::new(source_name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "snapshot name contains NUL"))?;
+    let target_name = CString::new(target_name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "snapshot name contains NUL"))?;
+
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: both names are live and relative to the retained directory
+        // descriptor; renameat2 retains no pointers.
+        let result = unsafe {
+            nix::libc::renameat2(
+                source_directory.as_raw_fd(),
+                source_name.as_ptr(),
+                target_directory.as_raw_fd(),
+                target_name.as_ptr(),
+                nix::libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // The GTK build currently targets Unix/Linux. Keep a conservative
+        // fallback for other Unix builds: refuse an existing destination, then
+        // perform the descriptor-relative rename.
+        if target.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "snapshot destination already exists",
+            ));
+        }
+        // SAFETY: see the Linux branch.
+        let result = unsafe {
+            nix::libc::renameat(
+                source_directory.as_raw_fd(),
+                source_name.as_ptr(),
+                target_directory.as_raw_fd(),
+                target_name.as_ptr(),
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+fn rename_noreplace_in_directory(directory: &File, source: &Path, target: &Path) -> io::Result<()> {
+    rename_noreplace_between_directories(directory, source, directory, target)
 }
 
 fn window_state_directory() -> PathBuf {
@@ -108,7 +399,7 @@ fn legacy_tabs_state_file_path() -> PathBuf {
 fn window_state_paths() -> &'static WindowStatePaths {
     WINDOW_STATE_PATHS.get_or_init(|| {
         let directory = window_state_directory();
-        let id = generate_session_id();
+        let id = generate_window_state_id();
         WindowStatePaths {
             active: directory.join(format!("window-{id}.{ACTIVE_STATE_EXTENSION}")),
             ready: directory.join(format!("window-{id}.{READY_STATE_EXTENSION}")),
@@ -121,7 +412,7 @@ pub(crate) fn tabs_state_file_path() -> PathBuf {
     window_state_paths().active.clone()
 }
 
-/// Generate a unique session ID for jsh session persistence and window-state files.
+/// Generate a unique session ID for jsh session persistence.
 pub(crate) fn generate_session_id() -> String {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -130,12 +421,29 @@ pub(crate) fn generate_session_id() -> String {
     format!("{}-{}", std::process::id(), ts)
 }
 
+/// New window snapshots bind their owner PID to the kernel process start tick.
+/// A PID alone can be recycled while an interrupted `.active` file remains on
+/// disk; the extra token lets the next window distinguish that stale owner
+/// without signalling any unrelated process. Falling back to the legacy shape
+/// is deliberately conservative on systems where `/proc` is unreadable.
+fn generate_window_state_id() -> String {
+    let pid = std::process::id();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    match process_start_ticks_result(pid as i32) {
+        Ok(start_ticks) => format!("{pid}-{start_ticks}-{timestamp}"),
+        Err(_) => format!("{pid}-{timestamp}"),
+    }
+}
+
 fn has_extension(path: &Path, extension: &str) -> bool {
     path.extension().and_then(|value| value.to_str()) == Some(extension)
 }
 
 fn modified_time(path: &Path) -> SystemTime {
-    fs::metadata(path)
+    fs::symlink_metadata(path)
         .and_then(|metadata| metadata.modified())
         .unwrap_or(UNIX_EPOCH)
 }
@@ -144,11 +452,29 @@ fn snapshots_with_extension(directory: &Path, extension: &str) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(directory) else {
         return Vec::new();
     };
-    let mut snapshots: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file() && has_extension(path, extension))
-        .collect();
+    let mut snapshots = Vec::new();
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_SCANNED_STATE_DIRECTORY_ENTRIES {
+            log::warn!(
+                "Stopped scanning window-state directory {} after {} entries",
+                directory.display(),
+                MAX_SCANNED_STATE_DIRECTORY_ENTRIES
+            );
+            break;
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
+        // `file_type` does not follow a final symlink. Unsafe entries never
+        // enter sorting (which would otherwise stat their targets).
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if has_extension(&path, extension) {
+            snapshots.push(path);
+        }
+    }
     snapshots.sort_by(|left, right| {
         modified_time(right)
             .cmp(&modified_time(left))
@@ -171,13 +497,74 @@ fn snapshot_owner_pid(path: &Path) -> Option<i32> {
         .ok()
 }
 
+fn snapshot_owner_start_ticks(path: &Path) -> Option<u64> {
+    let mut fields = path
+        .file_stem()?
+        .to_str()?
+        .strip_prefix("window-")?
+        .split('-');
+    fields.next()?.parse::<i32>().ok()?;
+    let start_ticks = fields.next()?.parse().ok()?;
+    // Legacy names are `pid-wallclock`; new names are
+    // `pid-start_ticks-wallclock`. Extra fields are not trusted as a token.
+    fields.next()?;
+    fields.next().is_none().then_some(start_ticks)
+}
+
+fn parse_process_start_ticks(contents: &str) -> Option<u64> {
+    // `/proc/<pid>/stat` field 2 is parenthesized `comm` and may itself contain
+    // spaces or `)`, so index from its final closing paren. The remaining
+    // sequence begins at field 3; starttime is field 22, hence index 19.
+    let after_comm = contents.get(contents.rfind(')')? + 1..)?;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+fn process_start_ticks_result(pid: i32) -> io::Result<u64> {
+    if pid <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process id must be positive",
+        ));
+    }
+    let contents = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    parse_process_start_ticks(&contents)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed proc stat"))
+}
+
+fn snapshot_owner_is_current(path: &Path) -> bool {
+    let Some(pid) = snapshot_owner_pid(path) else {
+        return false;
+    };
+    let Some(expected_start_ticks) = snapshot_owner_start_ticks(path) else {
+        // Preserve the conservative behavior for every pre-token snapshot.
+        return snapshot_owner_is_running(pid);
+    };
+    match process_start_ticks_result(pid) {
+        Ok(actual_start_ticks) => actual_start_ticks == expected_start_ticks,
+        Err(error) => !matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
+        ),
+    }
+}
+
 fn recover_stale_active_snapshots(directory: &Path) {
+    let Ok(directory_file) = ensure_private_directory(directory) else {
+        return;
+    };
     for active in snapshots_with_extension(directory, ACTIVE_STATE_EXTENSION) {
-        if snapshot_owner_pid(&active).is_some_and(snapshot_owner_is_running) {
+        if snapshot_owner_is_current(&active) {
+            continue;
+        }
+        if let Err(error) = open_private_regular_file(&active) {
+            log::warn!(
+                "Ignoring unsafe interrupted window snapshot {}: {error}",
+                active.display()
+            );
             continue;
         }
         let ready = active.with_extension(READY_STATE_EXTENSION);
-        match fs::rename(&active, &ready) {
+        match rename_noreplace_in_directory(&directory_file, &active, &ready) {
             Ok(()) => {
                 if let Err(error) = make_file_private(&ready) {
                     log::warn!(
@@ -197,8 +584,16 @@ fn recover_stale_active_snapshots(directory: &Path) {
 }
 
 fn claim_ready_snapshot_in(directory: &Path, active: &Path) -> Option<PathBuf> {
+    let directory_file = ensure_private_directory(directory).ok()?;
     for candidate in ready_snapshots_in(directory) {
-        match fs::rename(&candidate, active) {
+        if let Err(error) = open_private_regular_file(&candidate) {
+            log::warn!(
+                "Ignoring unsafe ready window snapshot {}: {error}",
+                candidate.display()
+            );
+            continue;
+        }
+        match rename_noreplace_in_directory(&directory_file, &candidate, active) {
             Ok(()) => return Some(candidate),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => log::debug!(
@@ -240,11 +635,27 @@ fn prune_quarantined_snapshots_in(directory: &Path, keep: usize) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
-    let mut quarantined: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file() && is_quarantined_snapshot(path))
-        .collect();
+    let mut quarantined = Vec::new();
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_SCANNED_STATE_DIRECTORY_ENTRIES {
+            log::warn!(
+                "Stopped scanning quarantined window states in {} after {} entries",
+                directory.display(),
+                MAX_SCANNED_STATE_DIRECTORY_ENTRIES
+            );
+            break;
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if is_quarantined_snapshot(&path) {
+            quarantined.push(path);
+        }
+    }
     quarantined.sort_by(|left, right| {
         modified_time(right)
             .cmp(&modified_time(left))
@@ -285,13 +696,16 @@ fn quarantine_corrupt_snapshot(path: &Path) {
 
 fn prepare_active_tabs_state_path() -> PathBuf {
     let paths = window_state_paths();
-    if let Err(error) = ensure_private_directory(&paths.directory) {
-        log::warn!(
-            "Failed to create window-state directory {}: {error}",
-            paths.directory.display()
-        );
-        return paths.active.clone();
-    }
+    let directory_file = match ensure_private_directory(&paths.directory) {
+        Ok(directory) => directory,
+        Err(error) => {
+            log::warn!(
+                "Failed to create window-state directory {}: {error}",
+                paths.directory.display()
+            );
+            return paths.active.clone();
+        }
+    };
 
     recover_stale_active_snapshots(&paths.directory);
     if paths.active.exists() {
@@ -301,8 +715,27 @@ fn prepare_active_tabs_state_path() -> PathBuf {
     // Upgrade the old single-file format first. Atomic rename means concurrent
     // launches cannot restore the same legacy snapshot.
     let legacy = legacy_tabs_state_file_path();
-    if legacy.exists() {
-        match fs::rename(&legacy, &paths.active) {
+    if let Ok(legacy_file) = open_private_regular_file(&legacy) {
+        let legacy_parent = legacy.parent().unwrap_or_else(|| Path::new("."));
+        match ensure_private_directory(legacy_parent).and_then(|legacy_directory| {
+            let expected = legacy_file.metadata()?;
+            rename_noreplace_between_directories(
+                &legacy_directory,
+                &legacy,
+                &directory_file,
+                &paths.active,
+            )?;
+            let claimed = open_private_regular_file(&paths.active)?;
+            let actual = claimed.metadata()?;
+            if expected.dev() != actual.dev() || expected.ino() != actual.ino() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "legacy snapshot entry changed while it was being claimed",
+                ));
+            }
+            legacy_directory.sync_all()?;
+            directory_file.sync_all()
+        }) {
             Ok(()) => {
                 if let Err(error) = make_file_private(&paths.active) {
                     log::warn!(
@@ -319,6 +752,8 @@ fn prepare_active_tabs_state_path() -> PathBuf {
                 legacy.display()
             ),
         }
+    } else if fs::symlink_metadata(&legacy).is_ok() {
+        log::warn!("Ignoring unsafe legacy tabs snapshot {}", legacy.display());
     }
 
     if let Some(claimed) = claim_ready_snapshot_in(&paths.directory, &paths.active) {
@@ -357,7 +792,7 @@ pub enum PaneLayout {
         #[serde(
             default,
             skip_serializing_if = "Option::is_none",
-            deserialize_with = "deserialize_restorable_argv"
+            deserialize_with = "deserialize_restorable_argv_bounded"
         )]
         cmds: Option<Vec<String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -428,7 +863,8 @@ pub(crate) fn serialize_pane_layout(
         let cmds = pane_leaf
             .as_ref()
             .and_then(PaneLeaf::restorable_command)
-            .or_else(|| get_restorable_commands(&terminal));
+            .or_else(|| get_restorable_commands(&terminal))
+            .and_then(|argv| crate::process::match_restorable_command_bounded(&argv));
 
         // Check if this tab is pinned
         let pinned = unsafe { widget.data::<bool>("pinned").map(|p| *p.as_ref()) };
@@ -539,7 +975,7 @@ fn bounded_window_state_payload(lines: &[String], max_bytes: usize) -> Option<St
 fn rewrite_existing_ai_conversation(
     path: &Path,
     snapshot: Option<&crate::ai::ConversationSnapshot>,
-) -> io::Result<bool> {
+) -> io::Result<(bool, Option<crate::ai::ConversationSnapshot>)> {
     let contents = read_window_state_bounded(path)?;
     let mut lines = Vec::new();
     let mut had_ai_line = false;
@@ -552,7 +988,7 @@ fn rewrite_existing_ai_conversation(
     }
 
     if snapshot.is_none() && !had_ai_line {
-        return Ok(false);
+        return Ok((false, None));
     }
 
     let mut compacted_ai = false;
@@ -595,10 +1031,7 @@ fn rewrite_existing_ai_conversation(
         )
     })?;
     atomic_write_private_file(path, payload.as_bytes())?;
-    if let Some(snapshot) = durable_ai_snapshot {
-        set_ai_conversation_snapshot(Some(snapshot));
-    }
-    Ok(compacted_ai)
+    Ok((compacted_ai, durable_ai_snapshot))
 }
 
 /// Parse the AI payload independently from tabs. Any malformed, duplicated,
@@ -632,11 +1065,108 @@ fn parse_ai_conversation(contents: &str) -> Option<crate::ai::ConversationSnapsh
     parsed
 }
 
+fn normalize_pane_layout_bounded(layout: &mut PaneLayout, limit: usize) -> Option<usize> {
+    let mut pending = vec![layout];
+    let mut leaves = 0usize;
+    while let Some(node) = pending.pop() {
+        match node {
+            PaneLayout::Leaf { dir, sid, cmds, .. } => {
+                leaves = leaves.checked_add(1)?;
+                if leaves > limit {
+                    return None;
+                }
+                if dir.is_empty()
+                    || dir.len() > MAX_RESTORED_CWD_BYTES
+                    || dir.chars().any(char::is_control)
+                {
+                    return None;
+                }
+                if sid.is_empty()
+                    || sid.len() > MAX_RESTORED_SESSION_ID_BYTES
+                    || !sid.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+                {
+                    // Session ids are fed to the shell bootstrap and become
+                    // history filenames. Preserve the tab, but never retain a
+                    // user-edited identifier containing control/shell bytes.
+                    *sid = generate_session_id();
+                }
+                if cmds.as_ref().is_some_and(|argv| {
+                    crate::process::match_restorable_command_bounded(argv).is_none()
+                }) {
+                    *cmds = None;
+                }
+            }
+            PaneLayout::Split {
+                orientation,
+                position,
+                start,
+                end,
+            } => {
+                if !matches!(*orientation, 'h' | 'v') {
+                    return None;
+                }
+                *position = (*position).clamp(0, 1_000_000);
+                pending.push(end);
+                pending.push(start);
+            }
+        }
+    }
+    Some(leaves)
+}
+
+fn pane_layout_leaf_count_bounded(layout: &PaneLayout, limit: usize) -> Option<usize> {
+    let mut pending = vec![layout];
+    let mut leaves = 0usize;
+    while let Some(node) = pending.pop() {
+        match node {
+            PaneLayout::Leaf { .. } => {
+                leaves = leaves.checked_add(1)?;
+                if leaves > limit {
+                    return None;
+                }
+            }
+            PaneLayout::Split { start, end, .. } => {
+                pending.push(end);
+                pending.push(start);
+            }
+        }
+    }
+    Some(leaves)
+}
+
+fn push_restored_tab_bounded(
+    tabs: &mut Vec<(Option<String>, PaneLayout)>,
+    total_panes: &mut usize,
+    name: Option<String>,
+    mut layout: PaneLayout,
+) {
+    if tabs.len() >= MAX_RESTORED_TABS {
+        return;
+    }
+    let Some(panes) = normalize_pane_layout_bounded(&mut layout, MAX_RESTORED_PANES_PER_TAB) else {
+        return;
+    };
+    if total_panes.saturating_add(panes) > MAX_RESTORED_PANES_TOTAL {
+        return;
+    }
+    let name = name.filter(|name| {
+        name.len() <= MAX_RESTORED_TAB_NAME_BYTES && !name.chars().any(char::is_control)
+    });
+    *total_panes += panes;
+    tabs.push((name, layout));
+}
+
 pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, PaneLayout)>) {
     let mut current_page: Option<u32> = None;
     let mut tabs: Vec<(Option<String>, PaneLayout)> = Vec::new();
+    let mut total_panes = 0usize;
 
     for raw_line in contents.lines() {
+        if tabs.len() == MAX_RESTORED_TABS {
+            break;
+        }
         let line = raw_line.trim();
         if line.is_empty() {
             continue;
@@ -658,7 +1188,7 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
                         cmds: None,
                         pinned: None,
                     };
-                    tabs.push((None, layout));
+                    push_restored_tab_bounded(&mut tabs, &mut total_panes, None, layout);
                 }
                 2 => {
                     // New format: name + layout_json OR legacy: name + dir
@@ -667,7 +1197,7 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
 
                     // Try parsing as JSON first (new format)
                     if let Ok(layout) = serde_json::from_str::<PaneLayout>(&data) {
-                        tabs.push((Some(name), layout));
+                        push_restored_tab_bounded(&mut tabs, &mut total_panes, Some(name), layout);
                     } else {
                         // Legacy: treat as directory
                         let layout = PaneLayout::Leaf {
@@ -676,7 +1206,7 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
                             cmds: None,
                             pinned: None,
                         };
-                        tabs.push((Some(name), layout));
+                        push_restored_tab_bounded(&mut tabs, &mut total_panes, Some(name), layout);
                     }
                 }
                 3 => {
@@ -695,7 +1225,7 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
                         cmds: None,
                         pinned: None,
                     };
-                    tabs.push((Some(name), layout));
+                    push_restored_tab_bounded(&mut tabs, &mut total_panes, Some(name), layout);
                 }
                 4 => {
                     // Legacy: name + dir + session_id + commands. The old
@@ -721,7 +1251,7 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
                         cmds: None,
                         pinned: None,
                     };
-                    tabs.push((Some(name), layout));
+                    push_restored_tab_bounded(&mut tabs, &mut total_panes, Some(name), layout);
                 }
                 _ => {}
             }
@@ -739,7 +1269,7 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
             cmds: None,
             pinned: None,
         };
-        tabs.push((None, layout));
+        push_restored_tab_bounded(&mut tabs, &mut total_panes, None, layout);
     }
 
     (current_page, tabs)
@@ -749,7 +1279,36 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
 /// file, a fifo or device at the path, and non-UTF-8 bytes are all rejected
 /// before anything is parsed, and the fifo case cannot block the GTK thread.
 fn read_window_state_bounded(path: &Path) -> io::Result<String> {
-    snapshot_file::read_bounded(path, MAX_WINDOW_STATE_BYTES as u64)
+    let file = open_private_regular_file(path)?;
+    let declared_len = file.metadata()?.len();
+    let max_bytes = MAX_WINDOW_STATE_BYTES as u64;
+    if declared_len > max_bytes {
+        return Err(window_state_oversize_error(path, declared_len));
+    }
+
+    // The descriptor can grow after fstat. Read one byte past the budget so a
+    // concurrent append is rejected instead of silently truncated and parsed.
+    let mut bytes = Vec::with_capacity(declared_len as usize);
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(window_state_oversize_error(path, bytes.len() as u64));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("window snapshot {} is not valid UTF-8", path.display()),
+        )
+    })
+}
+
+fn window_state_oversize_error(path: &Path, actual: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::FileTooLarge,
+        format!(
+            "window snapshot {} is {actual} bytes, over the {MAX_WINDOW_STATE_BYTES}-byte limit",
+            path.display()
+        ),
+    )
 }
 
 pub(crate) fn load_tabs_state() -> (Option<u32>, Vec<(Option<String>, PaneLayout)>) {
@@ -797,31 +1356,36 @@ pub(crate) fn finalize_tabs_state() {
     }
 
     let paths = window_state_paths();
-    if !paths.active.exists() {
-        return;
-    }
-    match fs::rename(&paths.active, &paths.ready) {
-        Ok(()) => {
-            if let Err(error) = make_file_private(&paths.ready) {
-                log::warn!(
-                    "Failed to tighten published snapshot permissions {}: {error}",
-                    paths.ready.display()
-                );
-            }
-            if let Err(error) = sync_parent_directory(&paths.ready) {
-                log::debug!(
-                    "Failed to sync window-state directory {}: {error}",
-                    paths.directory.display()
-                );
-            }
-            prune_ready_snapshots_in(&paths.directory, MAX_READY_WINDOW_STATES);
-            prune_quarantined_snapshots_in(&paths.directory, MAX_QUARANTINED_SNAPSHOTS);
-            log::info!("Published window snapshot {}", paths.ready.display());
+    let active = paths.active.clone();
+    let ready = paths.ready.clone();
+    let directory = paths.directory.clone();
+    let key = PersistenceKey::for_path("window-finalize", &active);
+    if let Err(error) = persistence::enqueue(key, "Publish window session", move || {
+        match open_private_regular_file(&active) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
         }
-        Err(error) => log::error!(
-            "Failed to publish window snapshot {}: {error}",
-            paths.active.display()
-        ),
+        let directory_file = ensure_private_directory(&directory)?;
+        rename_noreplace_in_directory(&directory_file, &active, &ready)?;
+        if let Err(error) = make_file_private(&ready) {
+            log::warn!(
+                "Failed to tighten published snapshot permissions {}: {error}",
+                ready.display()
+            );
+        }
+        if let Err(error) = sync_parent_directory(&ready) {
+            log::debug!(
+                "Failed to sync window-state directory {}: {error}",
+                directory.display()
+            );
+        }
+        prune_ready_snapshots_in(&directory, MAX_READY_WINDOW_STATES);
+        prune_quarantined_snapshots_in(&directory, MAX_QUARANTINED_SNAPSHOTS);
+        log::info!("Published window snapshot {}", ready.display());
+        Ok(())
+    }) {
+        log::error!("Could not queue window snapshot publication: {error}");
     }
 }
 
@@ -885,12 +1449,52 @@ pub(crate) fn kill_all_terminal_children(notebook: &Notebook) {
     }
 }
 
+/// Capture every Block pane before teardown. Exit notification is dispatched
+/// through the GLib loop and may not run before `Application::quit`, while the
+/// pane root intentionally owns its controller through qdata. Relying on either
+/// callback or `Drop` therefore loses the last commands on an ordinary close.
+pub(crate) fn save_all_block_histories(notebook: &Notebook) {
+    for i in 0..notebook.n_pages() {
+        let Some(page_widget) = notebook.nth_page(Some(i)) else {
+            continue;
+        };
+        let Some(node) = PaneNode::from_widget(&page_widget) else {
+            continue;
+        };
+        for leaf in node.leaves() {
+            if let PaneLeaf::Block(view) = leaf {
+                if let Err(error) = view.save_history() {
+                    log::warn!("could not queue Block history before shutdown: {error}");
+                }
+            }
+        }
+    }
+}
+
+/// Break each `root -> PaneLeaf -> controller -> root` qdata cycle before GTK
+/// unparents the notebook pages. Temporary split/zoom reparenting must retain
+/// qdata, but permanent window teardown must release it explicitly.
+pub(crate) fn detach_all_pane_leaves(notebook: &Notebook) {
+    for i in 0..notebook.n_pages() {
+        let Some(page_widget) = notebook.nth_page(Some(i)) else {
+            continue;
+        };
+        let Some(node) = PaneNode::from_widget(&page_widget) else {
+            continue;
+        };
+        for leaf in node.leaves() {
+            let _ = PaneLeaf::detach_from(&leaf.root_widget());
+        }
+    }
+}
+
 /// Conventional-VTE compatibility wrapper. Block panes must use their
 /// `PaneLeaf` probe because their custom PTY is intentionally not VTE-owned.
 pub(crate) fn get_restorable_commands(terminal: &Terminal) -> Option<Vec<String>> {
     let shell_pid = terminal_child_pid(terminal)?;
     let pty_fd = terminal.pty()?.fd().as_raw_fd();
     crate::process::restorable_command(pty_fd, shell_pid)
+        .and_then(|argv| crate::process::match_restorable_command_bounded(&argv))
 }
 
 /// Conventional-VTE compatibility wrapper for tooltip callers.
@@ -898,6 +1502,41 @@ pub(crate) fn get_foreground_process_name(terminal: &Terminal) -> Option<String>
     let shell_pid = terminal_child_pid(terminal)?;
     let pty_fd = terminal.pty()?.fd().as_raw_fd();
     crate::process::foreground_process_name(pty_fd, shell_pid)
+        .map(|name| crate::review_input::safe_inline_display(&name, 256))
+}
+
+fn preserve_existing_workspace_with_ai(
+    path: PathBuf,
+    ai_generation: u64,
+    ai_snapshot: Option<crate::ai::ConversationSnapshot>,
+    reason: &str,
+) {
+    log::error!("Refusing to replace the window snapshot: {reason}");
+    let key = PersistenceKey::for_path("window-state", &path);
+    let path_for_job = path.clone();
+    if let Err(error) = persistence::enqueue(key, "Save window session", move || {
+        match rewrite_existing_ai_conversation(&path_for_job, ai_snapshot.as_ref()) {
+            Ok((compacted, durable_snapshot)) => {
+                commit_ai_conversation_snapshot(ai_generation, durable_snapshot);
+                if compacted {
+                    log::warn!(
+                        "Preserved the previous workspace snapshot and compacted its AI conversation"
+                    );
+                } else {
+                    log::warn!(
+                        "Preserved the previous workspace snapshot and refreshed its AI conversation"
+                    );
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                log::debug!("No previous workspace snapshot exists to refresh")
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }) {
+        log::error!("Could not queue window session preservation: {error}");
+    }
 }
 
 pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, String>) {
@@ -907,36 +1546,70 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
     let path = tabs_state_file_path();
     log::info!("Saving tabs state to: {}", path.display());
 
-    if let Some(parent) = path.parent() {
-        if let Err(err) = ensure_private_directory(parent) {
-            log::error!("Failed to create state dir {}: {err}", parent.display());
-            return;
-        }
-    }
-
     let _home = std::env::var("HOME").ok();
     let n_pages = notebook.n_pages();
     log::info!("Saving {} tabs", n_pages);
+    let (ai_generation, ai_snapshot) = versioned_ai_conversation_snapshot();
+    if n_pages as usize > MAX_RESTORED_TABS {
+        preserve_existing_workspace_with_ai(
+            path,
+            ai_generation,
+            ai_snapshot,
+            "the live tab count exceeds the restore budget",
+        );
+        return;
+    }
     let mut lines: Vec<String> = Vec::with_capacity((n_pages as usize) + 2);
     if let Some(current) = notebook.current_page() {
         lines.push(format!("current_page={current}"));
     }
-    let ai_snapshot = get_ai_conversation_snapshot();
+    let mut total_panes = 0usize;
 
     for i in 0..n_pages {
         let Some(widget) = notebook.nth_page(Some(i)) else {
             continue;
         };
 
-        let label_text =
-            tab_label_text(notebook, &widget).unwrap_or_else(|| format!("Terminal {}", i + 1));
+        let label_text = tab_label_text(notebook, &widget)
+            .filter(|label| {
+                label.len() <= MAX_RESTORED_TAB_NAME_BYTES && !label.chars().any(char::is_control)
+            })
+            .unwrap_or_else(|| format!("Terminal {}", i + 1));
 
         // Serialize the pane layout (supports splits)
-        let layout = serialize_pane_layout(&widget, session_ids);
-        let layout_json = serde_json::to_string(&layout).unwrap_or_else(|e| {
-            log::error!("Failed to serialize layout: {}", e);
-            "{}".to_string()
-        });
+        let mut layout = serialize_pane_layout(&widget, session_ids);
+        let Some(panes) = normalize_pane_layout_bounded(&mut layout, MAX_RESTORED_PANES_PER_TAB)
+        else {
+            preserve_existing_workspace_with_ai(
+                path,
+                ai_generation,
+                ai_snapshot,
+                "a live pane layout contains invalid fields or exceeds the per-tab pane budget",
+            );
+            return;
+        };
+        if total_panes.saturating_add(panes) > MAX_RESTORED_PANES_TOTAL {
+            preserve_existing_workspace_with_ai(
+                path,
+                ai_generation,
+                ai_snapshot,
+                "the live pane count exceeds the total restore budget",
+            );
+            return;
+        }
+        total_panes += panes;
+        let layout_json = match serde_json::to_string(&layout) {
+            Ok(layout) => layout,
+            Err(error) => {
+                preserve_existing_workspace_with_ai(
+                    path,
+                    ai_generation,
+                    ai_snapshot,
+                    &format!("a pane layout could not be serialized: {error}"),
+                );
+                return;
+            }
+        };
 
         let line = format!(
             "tab={}\t{}",
@@ -947,25 +1620,12 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
     }
 
     if window_state_payload_len(&lines).is_none_or(|length| length > MAX_WORKSPACE_STATE_BYTES) {
-        log::error!(
-            "Refusing to save window snapshot because tabs and panes exceed the {} byte limit",
-            MAX_WORKSPACE_STATE_BYTES
+        preserve_existing_workspace_with_ai(
+            path,
+            ai_generation,
+            ai_snapshot,
+            &format!("tabs and panes exceed the {MAX_WORKSPACE_STATE_BYTES}-byte workspace limit"),
         );
-        match rewrite_existing_ai_conversation(&path, ai_snapshot.as_ref()) {
-            Ok(true) => log::warn!(
-                "Preserved the previous workspace snapshot and compacted its AI conversation"
-            ),
-            Ok(false) => log::warn!(
-                "Preserved the previous workspace snapshot and refreshed its AI conversation"
-            ),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                log::debug!("No previous workspace snapshot exists to refresh")
-            }
-            Err(error) => log::error!(
-                "Failed to refresh AI state in previous workspace snapshot {}: {error}",
-                path.display()
-            ),
-        }
         return;
     }
 
@@ -1015,19 +1675,25 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
         return;
     };
 
-    // Write, fsync, atomically replace, then fsync the directory. A failure at
-    // any earlier stage leaves the last good active snapshot untouched.
-    if let Err(err) = atomic_write_private_file(&path, payload.as_bytes()) {
-        log::error!(
-            "Failed to atomically save state file {}: {err}",
-            path.display()
+    // GTK traversal ends here. Directory creation, write, fsync and atomic
+    // replacement run on the single bounded persistence worker. Repeated
+    // autosaves for this window replace an older pending snapshot.
+    let key = PersistenceKey::for_path("window-state", &path);
+    let path_for_job = path.clone();
+    if let Err(error) = persistence::enqueue(key, "Save window session", move || {
+        if let Some(parent) = path_for_job.parent() {
+            ensure_private_directory(parent)?;
+        }
+        atomic_write_private_file(&path_for_job, payload.as_bytes())?;
+        commit_ai_conversation_snapshot(ai_generation, durable_ai_snapshot);
+        log::info!(
+            "Successfully saved tabs state to {}",
+            path_for_job.display()
         );
-        return;
+        Ok(())
+    }) {
+        log::error!("Could not queue window session save: {error}");
     }
-    if let Some(snapshot) = durable_ai_snapshot {
-        set_ai_conversation_snapshot(Some(snapshot));
-    }
-    log::info!("Successfully saved tabs state to {}", path.display());
 }
 
 #[cfg(test)]
@@ -1055,13 +1721,75 @@ mod tests {
         directory
     }
 
+    fn test_leaf(index: usize) -> PaneLayout {
+        PaneLayout::Leaf {
+            dir: format!("/tmp/{index}"),
+            sid: format!("sid-{index}"),
+            cmds: None,
+            pinned: None,
+        }
+    }
+
+    fn deep_test_layout(leaves: usize) -> PaneLayout {
+        let mut layout = test_leaf(0);
+        for index in 1..leaves {
+            layout = PaneLayout::Split {
+                orientation: 'h',
+                position: 100,
+                start: Box::new(layout),
+                end: Box::new(test_leaf(index)),
+            };
+        }
+        layout
+    }
+
+    fn wide_test_layout(start: usize, leaves: usize) -> PaneLayout {
+        if leaves == 1 {
+            return test_leaf(start);
+        }
+        let left = leaves / 2;
+        PaneLayout::Split {
+            orientation: 'v',
+            position: 100,
+            start: Box::new(wide_test_layout(start, left)),
+            end: Box::new(wide_test_layout(start + left, leaves - left)),
+        }
+    }
+
+    fn layout_tab_line(name: &str, layout: &PaneLayout) -> String {
+        format!(
+            "tab={name}\t{}",
+            escape_tab_state(&serde_json::to_string(layout).unwrap())
+        )
+    }
+
     #[test]
     fn parses_snapshot_owner_pid() {
         assert_eq!(
             snapshot_owner_pid(Path::new("window-123-456.active")),
             Some(123)
         );
+        assert_eq!(
+            snapshot_owner_start_ticks(Path::new("window-123-456-789.active")),
+            Some(456)
+        );
+        assert_eq!(
+            snapshot_owner_start_ticks(Path::new("window-123-789.active")),
+            None,
+            "legacy pid-wallclock names have no reuse-proof owner token"
+        );
         assert_eq!(snapshot_owner_pid(Path::new("other.active")), None);
+    }
+
+    #[test]
+    fn parses_process_start_ticks_after_a_tricky_comm_field() {
+        let mut stat = "77 (worker ) name) S".to_string();
+        for _ in 0..18 {
+            stat.push_str(" 0");
+        }
+        stat.push_str(" 4242 0 0");
+        assert_eq!(parse_process_start_ticks(&stat), Some(4242));
+        assert!(process_start_ticks_result(std::process::id() as i32).is_ok());
     }
 
     /// Snapshot recovery reclaims a file only from a window process that is
@@ -1084,6 +1812,38 @@ mod tests {
             !snapshot_owner_is_running(pid),
             "a reaped process must read as gone so its snapshot can be recovered"
         );
+    }
+
+    #[test]
+    fn snapshot_recovery_distinguishes_a_reused_live_pid() {
+        let directory = temporary_state_dir("pid-reuse-owner-token");
+        let pid = std::process::id() as i32;
+        let actual_start = process_start_ticks_result(pid).expect("current process start token");
+        let different_start = actual_start.checked_add(1).unwrap_or(actual_start - 1);
+
+        let current = directory.join(format!("window-{pid}-{actual_start}-1.active"));
+        let reused = directory.join(format!("window-{pid}-{different_start}-2.active"));
+        let legacy = directory.join(format!("window-{pid}-3.active"));
+        fs::write(&current, "current").unwrap();
+        fs::write(&reused, "reused").unwrap();
+        fs::write(&legacy, "legacy").unwrap();
+
+        recover_stale_active_snapshots(&directory);
+
+        assert!(
+            current.exists(),
+            "matching live owner token must be retained"
+        );
+        assert!(
+            legacy.exists(),
+            "legacy live-PID snapshots stay conservative"
+        );
+        assert!(!reused.exists(), "mismatched start token is stale");
+        assert_eq!(
+            fs::read_to_string(reused.with_extension(READY_STATE_EXTENSION)).unwrap(),
+            "reused"
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1116,6 +1876,28 @@ mod tests {
         let destination = directory.join("window-2-2.active");
         assert!(claim_ready_snapshot_in(&directory, &destination).is_none());
         assert!(!destination.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn claiming_and_recovery_never_overwrite_an_existing_destination() {
+        let directory = temporary_state_dir("noreplace-state");
+        let ready = directory.join("window-1-1.state");
+        let active = directory.join("window-2-2.active");
+        fs::write(&ready, "ready-last-good").unwrap();
+        fs::write(&active, "active-current").unwrap();
+
+        assert!(claim_ready_snapshot_in(&directory, &active).is_none());
+        assert_eq!(fs::read_to_string(&ready).unwrap(), "ready-last-good");
+        assert_eq!(fs::read_to_string(&active).unwrap(), "active-current");
+
+        let stale = directory.join(format!("window-{}-9.active", i32::MAX));
+        let collision = stale.with_extension(READY_STATE_EXTENSION);
+        fs::write(&stale, "interrupted").unwrap();
+        fs::write(&collision, "published").unwrap();
+        recover_stale_active_snapshots(&directory);
+        assert_eq!(fs::read_to_string(&stale).unwrap(), "interrupted");
+        assert_eq!(fs::read_to_string(&collision).unwrap(), "published");
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1164,6 +1946,49 @@ mod tests {
         let (current_page, tabs) = parse_tabs_state(&contents);
         assert_eq!(current_page, Some(0));
         assert_eq!(tabs.len(), 1);
+    }
+
+    #[test]
+    fn restore_limits_many_tabs_before_any_spawn() {
+        let contents = (0..(MAX_RESTORED_TABS + 20))
+            .map(|index| format!("/tmp/tab-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let (_, tabs) = parse_tabs_state(&contents);
+        assert_eq!(tabs.len(), MAX_RESTORED_TABS);
+        assert_eq!(
+            tabs.iter()
+                .filter_map(|(_, layout)| pane_layout_leaf_count_bounded(layout, usize::MAX))
+                .sum::<usize>(),
+            MAX_RESTORED_TABS
+        );
+    }
+
+    #[test]
+    fn restore_limits_discard_deep_and_wide_splits_and_cap_total_panes() {
+        let deep = deep_test_layout(MAX_RESTORED_PANES_PER_TAB + 1);
+        let wide = wide_test_layout(100, MAX_RESTORED_PANES_PER_TAB + 1);
+        let full = wide_test_layout(200, MAX_RESTORED_PANES_PER_TAB);
+        let mut lines = vec![
+            layout_tab_line("deep", &deep),
+            layout_tab_line("wide", &wide),
+        ];
+        for index in 0..5 {
+            lines.push(layout_tab_line(&format!("full-{index}"), &full));
+        }
+
+        let (_, tabs) = parse_tabs_state(&lines.join("\n"));
+        assert_eq!(tabs.len(), 4);
+        assert_eq!(
+            tabs.iter()
+                .map(|(_, layout)| pane_layout_leaf_count_bounded(layout, usize::MAX).unwrap())
+                .sum::<usize>(),
+            MAX_RESTORED_PANES_TOTAL
+        );
+        assert!(tabs.iter().all(|(name, _)| name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("full-"))));
     }
 
     #[test]
@@ -1309,9 +2134,27 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// Updated in round 8: the shared bounded reader reports an oversized
-    /// snapshot as `FileTooLarge` (the old local reader said `InvalidData`),
-    /// which keeps "too big" distinct from "not UTF-8" in the logs.
+    #[test]
+    fn held_state_directory_prevents_parent_namespace_redirection() {
+        let root = temporary_state_dir("parent-swap");
+        let live = root.join("live");
+        let displaced = root.join("displaced");
+        let directory = ensure_private_directory(&live).unwrap();
+        let target = live.join("window-1-1.active");
+
+        fs::rename(&live, &displaced).unwrap();
+        ensure_private_directory(&live).unwrap();
+        atomic_write_private_file_in_directory(&directory, &target, b"payload").unwrap();
+
+        assert_eq!(
+            fs::read(displaced.join("window-1-1.active")).unwrap(),
+            b"payload"
+        );
+        assert!(!live.join("window-1-1.active").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Oversized data is kept distinct from malformed UTF-8 in diagnostics.
     #[test]
     fn bounded_reader_rejects_pathological_snapshot_before_parsing() {
         let root = temporary_state_dir("bounded-read");
@@ -1322,6 +2165,65 @@ mod tests {
 
         let error = read_window_state_bounded(&path).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bounded_reader_rejects_symlink_hardlink_and_fifo() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_state_dir("bounded-special-files");
+        let original = root.join("original.state");
+        let linked = root.join("linked.state");
+        let symbolic = root.join("symbolic.state");
+        let fifo = root.join("fifo.state");
+        fs::write(&original, b"tab=/tmp\n").unwrap();
+        fs::hard_link(&original, &linked).unwrap();
+        symlink(&original, &symbolic).unwrap();
+        let fifo_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_path is a live, NUL-terminated path and mkfifo retains
+        // no pointer after returning.
+        assert_eq!(unsafe { nix::libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+
+        assert!(read_window_state_bounded(&original).is_err());
+        assert!(read_window_state_bounded(&linked).is_err());
+        assert!(read_window_state_bounded(&symbolic).is_err());
+        assert!(read_window_state_bounded(&fifo).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_helpers_do_not_follow_file_or_parent_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_state_dir("private-symlinks");
+        let real_parent = root.join("real-parent");
+        fs::create_dir(&real_parent).unwrap();
+        fs::set_permissions(&real_parent, fs::Permissions::from_mode(0o755)).unwrap();
+        let parent_link = root.join("parent-link");
+        symlink(&real_parent, &parent_link).unwrap();
+
+        let result = atomic_write_private_file(&parent_link.join("window.state"), b"state");
+        assert!(result.is_err());
+        assert!(!real_parent.join("window.state").exists());
+        assert_eq!(
+            fs::metadata(&real_parent).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        let target = root.join("target");
+        let file_link = root.join("file-link");
+        fs::write(&target, b"do not touch").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&target, &file_link).unwrap();
+        assert!(make_file_private(&file_link).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"do not touch");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1410,6 +2312,88 @@ mod tests {
             panic!("expected a leaf layout");
         };
         assert_eq!(cmds, None, "a joined string must never be replayed");
+
+        let arbitrary: PaneLayout = serde_json::from_str(
+            r#"{"type":"leaf","dir":"/tmp","sid":"1-2","cmds":["sh","-c","touch /tmp/pwned"]}"#,
+        )
+        .unwrap();
+        let PaneLayout::Leaf { cmds, .. } = arbitrary else {
+            panic!("expected a leaf layout");
+        };
+        assert_eq!(cmds, None, "arbitrary structured argv must be dropped");
+
+        let visually_spoofed: PaneLayout = serde_json::from_str(
+            r#"{"type":"leaf","dir":"/tmp","sid":"1-2","cmds":["ssh","safe\u202etxt"]}"#,
+        )
+        .unwrap();
+        let PaneLayout::Leaf { cmds, .. } = visually_spoofed else {
+            panic!("expected a leaf layout");
+        };
+        assert_eq!(cmds, None, "visually spoofed argv must never be replayed");
+
+        let too_many = std::iter::once("ssh".to_string())
+            .chain(
+                (0..crate::process::MAX_RESTORABLE_ARG_COUNT_LOCAL)
+                    .map(|index| format!("arg-{index}")),
+            )
+            .collect::<Vec<_>>();
+        let encoded = serde_json::json!({
+            "type": "leaf",
+            "dir": "/tmp",
+            "sid": "1-2",
+            "cmds": too_many,
+        })
+        .to_string();
+        let PaneLayout::Leaf { cmds, .. } = serde_json::from_str(&encoded).unwrap() else {
+            panic!("expected a leaf layout");
+        };
+        assert_eq!(
+            cmds, None,
+            "oversized ssh argv must be dropped during parse"
+        );
+    }
+
+    #[test]
+    fn restore_sanitizes_session_ids_and_rejects_oversized_fields() {
+        let invalid_sid = PaneLayout::Leaf {
+            dir: "/tmp".into(),
+            sid: "safe'\nrun-local".into(),
+            cmds: None,
+            pinned: None,
+        };
+        let (_, tabs) = parse_tabs_state(&layout_tab_line("safe", &invalid_sid));
+        let PaneLayout::Leaf { sid, .. } = &tabs[0].1 else {
+            panic!("expected a leaf");
+        };
+        assert_ne!(sid, "safe'\nrun-local");
+        assert!(sid
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-'));
+
+        let oversized_dir = PaneLayout::Leaf {
+            dir: "x".repeat(MAX_RESTORED_CWD_BYTES + 1),
+            sid: "1-2".into(),
+            cmds: None,
+            pinned: None,
+        };
+        let invalid_orientation = PaneLayout::Split {
+            orientation: 'x',
+            position: i32::MAX,
+            start: Box::new(test_leaf(1)),
+            end: Box::new(test_leaf(2)),
+        };
+        let contents = [
+            layout_tab_line("oversized", &oversized_dir),
+            layout_tab_line("invalid split", &invalid_orientation),
+            layout_tab_line(&"n".repeat(MAX_RESTORED_TAB_NAME_BYTES + 1), &test_leaf(3)),
+        ]
+        .join("\n");
+        let (_, tabs) = parse_tabs_state(&contents);
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(
+            tabs[0].0, None,
+            "oversized label is replaced by the UI default"
+        );
     }
 
     #[test]
@@ -1436,12 +2420,17 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!rewrite_existing_ai_conversation(&path, Some(&replacement)).unwrap());
+        let (compacted, durable) =
+            rewrite_existing_ai_conversation(&path, Some(&replacement)).unwrap();
+        assert!(!compacted);
+        assert_eq!(durable, Some(replacement.clone()));
         let replaced = fs::read_to_string(&path).unwrap();
         assert_eq!(parse_ai_conversation(&replaced), Some(replacement));
         assert_eq!(parse_tabs_state(&replaced).1.len(), 1);
 
-        assert!(!rewrite_existing_ai_conversation(&path, None).unwrap());
+        let (compacted, durable) = rewrite_existing_ai_conversation(&path, None).unwrap();
+        assert!(!compacted);
+        assert_eq!(durable, None);
         let cleared = fs::read_to_string(&path).unwrap();
         assert!(parse_ai_conversation(&cleared).is_none());
         assert_eq!(parse_tabs_state(&cleared).1.len(), 1);

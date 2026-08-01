@@ -8,7 +8,7 @@
 //! modifier-mask extraction, keypad handling) is the frontend's job and
 //! lives beside the window key controller in `main.rs`.
 
-use jterm_core::keybindings::{is_unbind_token, parse, Chord};
+use crate::core_keybindings::{is_unbind_token, parse, Chord};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -425,8 +425,9 @@ impl KeybindingMap {
         }
 
         for (config_key, value) in table {
+            let display_key = crate::review_input::safe_inline_display(config_key, 512);
             let Some(&action) = key_to_action.get(config_key.as_str()) else {
-                log::warn!("Unknown keybinding action: {config_key}");
+                log::warn!("Unknown keybinding action: {display_key}");
                 continue;
             };
             // `false` and the shared unbind tokens (empty string, "false",
@@ -438,7 +439,7 @@ impl KeybindingMap {
                 continue;
             }
             let Some(key_str) = value.as_str() else {
-                log::warn!("Keybinding value for {config_key} must be a chord string or false");
+                log::warn!("Keybinding value for {display_key} must be a chord string or false");
                 continue;
             };
             if is_unbind_token(key_str) {
@@ -450,7 +451,8 @@ impl KeybindingMap {
                 Ok(chord) => chord,
                 Err(e) => {
                     // A typo must not silently make the action unreachable.
-                    log::warn!("Invalid keybinding '{key_str}' for {config_key}: {e}");
+                    let display_value = crate::review_input::safe_inline_display(key_str, 512);
+                    log::warn!("Invalid keybinding '{display_value}' for {display_key}: {e}");
                     continue;
                 }
             };
@@ -458,8 +460,9 @@ impl KeybindingMap {
                 if existing != action {
                     // Keep both existing defaults instead of stealing another
                     // action's chord and leaving that action unreachable.
+                    let display_value = crate::review_input::safe_inline_display(key_str, 512);
                     log::warn!(
-                        "Keybinding '{key_str}' for {config_key} conflicts with '{}'",
+                        "Keybinding '{display_value}' for {display_key} conflicts with '{}'",
                         existing.name()
                     );
                     continue;
@@ -585,7 +588,7 @@ mod tests {
     /// what it means locally.
     #[test]
     fn family_default_chord_contract_is_honored() {
-        use jterm_core::keybindings::{CommonAction, DEFAULT_CHORDS};
+        use crate::core_keybindings::{CommonAction, DEFAULT_CHORDS};
 
         fn local(action: CommonAction) -> Action {
             match action {

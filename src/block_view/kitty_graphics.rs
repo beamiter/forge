@@ -37,8 +37,8 @@ use gtk4::gdk;
 use gtk4::glib;
 use gtk4::prelude::Cast;
 
-use jterm_core::kitty_graphics as core;
-use jterm_core::kitty_graphics::{Action, Assembled, Caps, Error, Format, Step};
+use crate::kitty_graphics as core;
+use crate::kitty_graphics::{Action, Assembled, Caps, Error, Format, Step};
 
 /// Memory budget for one block's graphics traffic — the family's block preset.
 const CAPS: Caps = Caps::BLOCK;

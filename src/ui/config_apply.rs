@@ -440,12 +440,14 @@ impl UiState {
             log::debug!("Config reload skipped: file matches the last save");
             return;
         }
-        if path.exists() {
-            let validation = std::fs::read_to_string(&path)
-                .map_err(|err| err.to_string())
-                .and_then(|contents| {
-                    validate_config_contents(&contents).map_err(|err| err.to_string())
-                });
+        let validation = match crate::config_store::read_config_text(&path) {
+            Ok(Some(contents)) => {
+                validate_config_contents(&contents).map_err(|err| err.to_string())
+            }
+            Ok(None) => Ok(Vec::new()),
+            Err(error) => Err(error.to_string()),
+        };
+        {
             match validation {
                 Ok(issues) if issues.iter().any(|issue| issue.is_error()) => {
                     let details = issues
@@ -466,13 +468,12 @@ impl UiState {
                     return;
                 }
                 Err(err) => {
-                    log::error!("Config reload rejected for {}: {err}", path.display());
+                    let path_display =
+                        crate::review_input::safe_inline_display(&path.to_string_lossy(), 2 * 1024);
+                    log::error!("Config reload rejected for {path_display}: {err}");
                     self.show_config_error(
                         "Configuration reload rejected",
-                        &format!(
-                            "The current settings remain active. {}: {err}",
-                            path.display()
-                        ),
+                        &format!("The current settings remain active. {path_display}: {err}"),
                     );
                     return;
                 }

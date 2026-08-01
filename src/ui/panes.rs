@@ -1,6 +1,8 @@
 //! panes — UiState methods extracted from ui (mechanical split, no logic changes)
 use gtk4::prelude::*;
 use gtk4::{Orientation, Paned};
+use libadwaita as adw;
+use std::io;
 use std::rc::Rc;
 
 use super::*;
@@ -78,6 +80,18 @@ fn nearest_directional_index(
         .map(|(index, _)| index)
 }
 
+/// Run all fallible pane preparation before allowing any structural mutation.
+/// Keeping this boundary explicit makes split's no-partial-commit guarantee
+/// independently testable with an injected constructor failure.
+fn prepare_then_commit<T, E>(
+    prepare: impl FnOnce() -> Result<T, E>,
+    commit: impl FnOnce(T),
+) -> Result<(), E> {
+    let prepared = prepare()?;
+    commit(prepared);
+    Ok(())
+}
+
 /// Rebalance every split according to the number of pane slots below it.
 ///
 /// GTK Paned defaults each newly nested split to 50/50. Repeatedly splitting
@@ -124,6 +138,22 @@ fn schedule_pane_rebalance(page: gtk4::Widget) {
 }
 
 impl UiState {
+    /// Preserve the full spawn diagnostic in logs and give the user an immediate
+    /// explanation of the safe recovery chosen by the calling transaction.
+    pub(crate) fn report_block_spawn_error(
+        &self,
+        context: &str,
+        error: &io::Error,
+        recovery: &str,
+    ) {
+        log::error!("Block PTY spawn failed while {context}: {error:?}");
+        let toast = adw::Toast::new(&format!(
+            "Block terminal could not start: {error}. {recovery}"
+        ));
+        toast.set_timeout(8);
+        self.toast_overlay.add_toast(toast);
+    }
+
     /// Create a managed conventional-VTE pane leaf.
     ///
     /// Runtime splits and restored split layouts share this constructor so every
@@ -137,6 +167,7 @@ impl UiState {
         tab_widget_name: Option<String>,
     ) -> PaneLeaf {
         let sid = session_id
+            .filter(|sid| crate::review_input::valid_jsh_id(sid))
             .map(str::to_owned)
             .unwrap_or_else(generate_session_id);
         let shell_argv = self.shell_argv.borrow();
@@ -202,8 +233,9 @@ impl UiState {
         session_id: Option<&str>,
         initial_commands: &[String],
         tab_widget_name: Option<String>,
-    ) -> PaneLeaf {
+    ) -> io::Result<PaneLeaf> {
         let sid = session_id
+            .filter(|sid| crate::review_input::valid_jsh_id(sid))
             .map(str::to_owned)
             .unwrap_or_else(generate_session_id);
         let shell_argv = self.shell_argv.borrow();
@@ -213,8 +245,9 @@ impl UiState {
             working_directory,
             Some(&sid),
             initial_commands,
-        ));
+        )?);
         drop(shell_argv);
+        view.start_history_load();
 
         let terminal = view.vte().clone();
         setup_terminal_click_handler(&terminal);
@@ -235,6 +268,9 @@ impl UiState {
         });
 
         self.connect_block_command_history(&view);
+        // A nested split does not add a Notebook page, so attach the per-pane
+        // correction request epoch here instead of relying solely on page-added.
+        self.attach_command_correction_to_view(view.clone(), false);
 
         let leaf = PaneLeaf::Block(view);
         let root = leaf.root_widget();
@@ -262,7 +298,7 @@ impl UiState {
                 });
             }
         }
-        leaf
+        Ok(leaf)
     }
 
     /// Append finished Block commands to the cross-session command history.
@@ -312,7 +348,7 @@ impl UiState {
         session_id: Option<&str>,
         initial_commands: &[String],
         tab_widget_name: Option<String>,
-    ) -> PaneLeaf {
+    ) -> io::Result<PaneLeaf> {
         match mode {
             crate::config::TerminalMode::Block => self.create_block_leaf(
                 working_directory,
@@ -320,12 +356,12 @@ impl UiState {
                 initial_commands,
                 tab_widget_name,
             ),
-            crate::config::TerminalMode::Vte => self.create_vte_leaf(
+            crate::config::TerminalMode::Vte => Ok(self.create_vte_leaf(
                 working_directory,
                 session_id,
                 initial_commands,
                 tab_widget_name,
-            ),
+            )),
         }
     }
 
@@ -494,73 +530,88 @@ impl UiState {
         } else {
             crate::config::TerminalMode::Vte
         };
-        let new_leaf = self.create_pane_leaf(
-            &split_mode,
-            working_directory.as_deref(),
-            None,
-            &[],
-            tab_widget_name,
-        );
-        let new_widget = new_leaf.root_widget();
+        let split = prepare_then_commit(
+            || {
+                self.create_pane_leaf(
+                    &split_mode,
+                    working_directory.as_deref(),
+                    None,
+                    &[],
+                    tab_widget_name,
+                )
+            },
+            |new_leaf| {
+                let new_widget = new_leaf.root_widget();
 
-        let paned = Paned::new(orientation);
-        paned.set_hexpand(true);
-        paned.set_vexpand(true);
-        paned.set_resize_start_child(true);
-        paned.set_resize_end_child(true);
-        paned.set_shrink_start_child(true);
-        paned.set_shrink_end_child(true);
+                let paned = Paned::new(orientation);
+                paned.set_hexpand(true);
+                paned.set_vexpand(true);
+                paned.set_resize_start_child(true);
+                paned.set_resize_end_child(true);
+                paned.set_shrink_start_child(true);
+                paned.set_shrink_end_child(true);
 
-        let current_extent = if orientation == Orientation::Horizontal {
-            current_widget.width()
-        } else {
-            current_widget.height()
-        };
-        if let Some(position) = balanced_split_position(current_extent, 1, 1) {
-            paned.set_position(position);
-        }
-
-        if let Some(ref parent) = parent {
-            if let Ok(parent_paned) = parent.clone().downcast::<Paned>() {
-                let is_start = parent_paned.start_child().as_ref() == Some(&current_widget);
-                if is_start {
-                    parent_paned.set_start_child(Some(&paned));
+                let current_extent = if orientation == Orientation::Horizontal {
+                    current_widget.width()
                 } else {
-                    parent_paned.set_end_child(Some(&paned));
+                    current_widget.height()
+                };
+                if let Some(position) = balanced_split_position(current_extent, 1, 1) {
+                    paned.set_position(position);
                 }
-                paned.set_start_child(Some(&current_widget));
-                paned.set_end_child(Some(&new_widget));
-            } else {
-                for index in 0..self.notebook.n_pages() {
-                    if let Some(candidate) = self.notebook.nth_page(Some(index)) {
-                        if candidate == current_widget {
-                            paned.set_widget_name(&candidate.widget_name());
-                            let tab_label = self.notebook.tab_label(&candidate);
-                            self.notebook.remove_page(Some(index));
-                            paned.set_start_child(Some(&current_widget));
-                            paned.set_end_child(Some(&new_widget));
-                            let inserted =
-                                self.notebook
-                                    .insert_page(&paned, tab_label.as_ref(), Some(index));
-                            self.notebook.set_tab_reorderable(&paned, true);
-                            self.notebook.set_current_page(Some(inserted));
-                            break;
+
+                if let Some(ref parent) = parent {
+                    if let Ok(parent_paned) = parent.clone().downcast::<Paned>() {
+                        let is_start = parent_paned.start_child().as_ref() == Some(&current_widget);
+                        if is_start {
+                            parent_paned.set_start_child(Some(&paned));
+                        } else {
+                            parent_paned.set_end_child(Some(&paned));
+                        }
+                        paned.set_start_child(Some(&current_widget));
+                        paned.set_end_child(Some(&new_widget));
+                    } else {
+                        for index in 0..self.notebook.n_pages() {
+                            if let Some(candidate) = self.notebook.nth_page(Some(index)) {
+                                if candidate == current_widget {
+                                    paned.set_widget_name(&candidate.widget_name());
+                                    let tab_label = self.notebook.tab_label(&candidate);
+                                    self.notebook.remove_page(Some(index));
+                                    paned.set_start_child(Some(&current_widget));
+                                    paned.set_end_child(Some(&new_widget));
+                                    let inserted = self.notebook.insert_page(
+                                        &paned,
+                                        tab_label.as_ref(),
+                                        Some(index),
+                                    );
+                                    self.notebook.set_tab_reorderable(&paned, true);
+                                    self.notebook.set_current_page(Some(inserted));
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
-            }
-        }
 
-        if let Some(page) = self
-            .notebook
-            .current_page()
-            .and_then(|page| self.notebook.nth_page(Some(page)))
-        {
-            schedule_pane_rebalance(page);
-            // The tab just became split, so every pane's header appears now.
-            self.refresh_pane_headers();
+                if let Some(page) = self
+                    .notebook
+                    .current_page()
+                    .and_then(|page| self.notebook.nth_page(Some(page)))
+                {
+                    schedule_pane_rebalance(page);
+                    // The tab just became split, so every pane's header appears now.
+                    self.refresh_pane_headers();
+                }
+                new_leaf.grab_focus();
+            },
+        );
+        if let Err(error) = split {
+            self.report_block_spawn_error(
+                "splitting a pane",
+                &error,
+                "The existing pane layout was left unchanged.",
+            );
         }
-        new_leaf.grab_focus();
     }
 
     pub(crate) fn cycle_pane_focus(&self, direction: i32) {
@@ -689,8 +740,31 @@ impl UiState {
 
 #[cfg(test)]
 mod tests {
-    use super::{balanced_split_position, nearest_directional_index};
+    use super::{balanced_split_position, nearest_directional_index, prepare_then_commit};
     use crate::keybindings::Direction;
+    use std::cell::Cell;
+
+    #[test]
+    fn failed_pane_preparation_never_commits_a_split() {
+        let committed = Cell::new(false);
+        let result = prepare_then_commit(
+            || -> std::io::Result<()> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "injected PTY spawn failure",
+                ))
+            },
+            |()| committed.set(true),
+        );
+
+        assert_eq!(
+            result
+                .expect_err("injected pane creation should fail")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(!committed.get(), "failed split mutated the pane tree");
+    }
 
     #[test]
     fn balanced_position_allocates_equal_same_axis_slots() {

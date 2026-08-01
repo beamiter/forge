@@ -155,7 +155,7 @@ pub(crate) fn create_terminal(config: &Config) -> Terminal {
 
     // Set regex for hyperlinks
     let regex_pattern = vte4::Regex::for_match(
-        r"[a-z]+://[[:graph:]]+",
+        r"https?://[[:graph:]]+",
         pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
     );
     terminal.match_add_regex(&regex_pattern.unwrap(), 0);
@@ -225,6 +225,7 @@ impl VteTerminalView {
                     .map(|p| p.to_string_lossy().to_string())
                     .filter(|s| !s.is_empty())
                 {
+                    let path = crate::review_input::safe_inline_display(&path, 4 * 1024);
                     for callback in cwd_callbacks_clone.borrow().iter() {
                         callback(&path);
                     }
@@ -265,7 +266,7 @@ impl VteTerminalView {
         let terminal_for_title = terminal.clone();
         terminal.connect_window_title_changed(move |_term| {
             if let Some(title) = terminal_for_title.window_title() {
-                let title_str = title.to_string();
+                let title_str = crate::review_input::safe_inline_display(&title, 512);
                 if !title_str.is_empty() {
                     for callback in title_callbacks_clone.borrow().iter() {
                         callback(&title_str);
@@ -462,13 +463,30 @@ pub struct InitialCommands(Vec<String>);
 
 impl InitialCommands {
     pub(crate) fn from_config(configured: Option<&str>) -> Self {
-        let commands = configured
-            .into_iter()
-            .flat_map(|value| value.split(", "))
+        const MAX_INITIAL_COMMANDS: usize = 128;
+        let Some(configured) = configured.filter(|value| {
+            value.len() <= crate::review_input::MAX_REVIEW_INPUT_BYTES
+                && !value.chars().any(char::is_control)
+                && !crate::review_input::contains_visual_spoof(value)
+        }) else {
+            return Self::default();
+        };
+        let mut commands = Vec::new();
+        for command in configured
+            .split(", ")
             .map(str::trim)
             .filter(|command| !command.is_empty())
-            .map(str::to_string)
-            .collect();
+        {
+            if commands.len() == MAX_INITIAL_COMMANDS
+                || crate::review_input::validate(command).is_err()
+            {
+                log::warn!(
+                    "Skipping startup commands because the configuration exceeds the safe execution contract"
+                );
+                return Self::default();
+            }
+            commands.push(command.to_string());
+        }
         Self(commands)
     }
 
@@ -476,10 +494,20 @@ impl InitialCommands {
     /// for the configured interactive shell. Unsafe argvs and unknown shell
     /// grammars skip replay instead of risking changed argument boundaries.
     pub(crate) fn from_restored_argv(argv: Option<&[String]>, shell_argv: &[String]) -> Self {
-        let command = argv.and_then(|argv| crate::process::shell_quote_argv_for(argv, shell_argv));
+        // Structured argv preserves boundaries, but it does not make an
+        // arbitrary command trustworthy. Re-run the narrow persistence
+        // classifier at the execution boundary so a modified snapshot cannot
+        // turn `sh -c ...` (or any other local command) into startup code.
+        let classified = argv.and_then(crate::process::match_restorable_command_bounded);
+        let command = classified
+            .as_deref()
+            .and_then(|argv| crate::process::shell_quote_argv_for(argv, shell_argv))
+            .filter(|command| {
+                command.len() <= crate::process::MAX_RESTORABLE_QUOTED_COMMAND_BYTES_LOCAL
+            });
         if argv.is_some() && command.is_none() {
             log::warn!(
-                "Skipping session command replay because its argv is unsafe or the configured shell grammar is unsupported"
+                "Skipping session command replay because its argv is not a recognized restorable command, is unsafe, or the configured shell grammar is unsupported"
             );
         }
         Self(command.into_iter().collect())
@@ -499,7 +527,7 @@ pub(crate) fn spawn_shell(
 ) {
     // Append --session <id> to argv when restoring a session (only for jsh)
     let mut argv_vec: Vec<String> = argv_owned.to_vec();
-    if let Some(sid) = session_id {
+    if let Some(sid) = session_id.filter(|sid| crate::review_input::valid_jsh_id(sid)) {
         let is_jsh = argv_vec
             .first()
             .and_then(|s| std::path::Path::new(s).file_name())
@@ -587,9 +615,38 @@ pub(crate) fn spawn_shell(
     );
 }
 
+fn is_safe_external_uri(uri: &str) -> bool {
+    if uri.is_empty()
+        || uri.len() > 16 * 1024
+        || uri.chars().any(char::is_whitespace)
+        || uri.chars().any(char::is_control)
+        || crate::review_input::contains_visual_spoof(uri)
+    {
+        return false;
+    }
+    let Some((scheme, remainder)) = uri.split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return false;
+    }
+    !remainder
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .is_empty()
+}
+
 pub(crate) fn open_uri(uri: &str) {
+    if !is_safe_external_uri(uri) {
+        log::warn!("Refused to open an unsafe or unsupported terminal hyperlink");
+        return;
+    }
     if let Err(err) = gio::AppInfo::launch_default_for_uri(uri, None::<&gio::AppLaunchContext>) {
-        log::warn!("Failed to open URI {uri}: {err}");
+        log::warn!(
+            "Failed to open URI {}: {err}",
+            crate::review_input::safe_inline_display(uri, 2 * 1024)
+        );
     }
 }
 
@@ -618,7 +675,8 @@ pub(crate) fn show_rename_dialog(
             let text = value.text();
             let trimmed = text.trim();
             if !trimmed.is_empty() {
-                label_clone.set_text(trimmed);
+                let title = crate::review_input::safe_inline_display(trimmed, 512);
+                label_clone.set_text(&title);
                 custom_title_clone.set(true);
             }
         }
@@ -654,8 +712,9 @@ pub(crate) fn show_rename_dialog_with_strip(
             let text = value.text();
             let trimmed = text.trim();
             if !trimmed.is_empty() {
-                label_clone.set_text(trimmed);
-                strip_label_clone.set_text(trimmed);
+                let title = crate::review_input::safe_inline_display(trimmed, 512);
+                label_clone.set_text(&title);
+                strip_label_clone.set_text(&title);
                 custom_title_clone.set(true);
             }
         }
@@ -701,6 +760,7 @@ pub(crate) fn default_tab_title(tab_index_1based: u32, working_directory: Option
     } else {
         normalized.to_string()
     };
+    let display_dir = crate::review_input::safe_inline_display(&display_dir, 4 * 1024);
 
     if display_dir == "/" || display_dir == "~" {
         return display_dir;
@@ -743,7 +803,7 @@ pub(crate) fn default_tab_title(tab_index_1based: u32, working_directory: Option
 
     let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
     if parts.len() <= 1 {
-        return format!("{prefix}{rest}");
+        return crate::review_input::safe_inline_display(&format!("{prefix}{rest}"), 512);
     }
 
     let mut out_parts: Vec<String> = Vec::with_capacity(parts.len());
@@ -755,7 +815,7 @@ pub(crate) fn default_tab_title(tab_index_1based: u32, working_directory: Option
         }
     }
 
-    format!("{prefix}{}", out_parts.join("/"))
+    crate::review_input::safe_inline_display(&format!("{prefix}{}", out_parts.join("/")), 512)
 }
 
 pub(crate) fn setup_terminal_click_handler(terminal: &Terminal) {
@@ -864,7 +924,7 @@ pub(crate) fn reattach_terminal_to_tree(
 
 #[cfg(test)]
 mod tests {
-    use super::InitialCommands;
+    use super::{is_safe_external_uri, InitialCommands};
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -878,6 +938,40 @@ mod tests {
             strings(&["cd /tmp", "printf ready"]).as_slice()
         );
         assert!(InitialCommands::from_config(None).as_slice().is_empty());
+    }
+
+    #[test]
+    fn configured_commands_fail_closed_on_hidden_oversized_or_excessive_input() {
+        assert!(InitialCommands::from_config(Some("echo safe\u{202e}fake"))
+            .as_slice()
+            .is_empty());
+        assert!(InitialCommands::from_config(Some("echo one\necho two"))
+            .as_slice()
+            .is_empty());
+        let oversized = "x".repeat(crate::review_input::MAX_REVIEW_INPUT_BYTES + 1);
+        assert!(InitialCommands::from_config(Some(&oversized))
+            .as_slice()
+            .is_empty());
+        let excessive = std::iter::repeat_n("true", 129)
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(InitialCommands::from_config(Some(&excessive))
+            .as_slice()
+            .is_empty());
+    }
+
+    #[test]
+    fn terminal_links_are_bounded_unambiguous_http_urls() {
+        assert!(is_safe_external_uri("https://example.com/a?q=1"));
+        assert!(is_safe_external_uri("HTTP://example.com"));
+        assert!(!is_safe_external_uri("file:///etc/passwd"));
+        assert!(!is_safe_external_uri("custom://run-command"));
+        assert!(!is_safe_external_uri("https:///missing-host"));
+        assert!(!is_safe_external_uri("https://safe.example/\u{202e}fake"));
+        assert!(!is_safe_external_uri(&format!(
+            "https://example.com/{}",
+            "x".repeat(16 * 1024)
+        )));
     }
 
     #[test]
@@ -907,6 +1001,71 @@ mod tests {
         )
         .as_slice()
         .is_empty());
+
+        // An attacker-controlled snapshot must not gain arbitrary local code
+        // execution merely because it preserved argv boundaries.
+        let arbitrary = strings(&["sh", "-c", "touch /tmp/from-snapshot"]);
+        assert!(
+            InitialCommands::from_restored_argv(Some(&arbitrary), &strings(&["bash"]))
+                .as_slice()
+                .is_empty()
+        );
+
+        let too_many = (0..=crate::process::MAX_RESTORABLE_ARG_COUNT_LOCAL)
+            .map(|index| {
+                if index == 0 {
+                    "ssh".to_string()
+                } else {
+                    format!("arg-{index}")
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            InitialCommands::from_restored_argv(Some(&too_many), &strings(&["bash"]))
+                .as_slice()
+                .is_empty()
+        );
+
+        let oversized_field = strings(&[
+            "ssh",
+            &"x".repeat(crate::process::MAX_RESTORABLE_ARG_BYTES_LOCAL + 1),
+        ]);
+        assert!(
+            InitialCommands::from_restored_argv(Some(&oversized_field), &strings(&["bash"]))
+                .as_slice()
+                .is_empty()
+        );
+
+        let chunk = "x".repeat(crate::process::MAX_RESTORABLE_ARG_BYTES_LOCAL);
+        let oversized_total = vec![
+            "ssh".to_string(),
+            chunk.clone(),
+            chunk.clone(),
+            chunk.clone(),
+            chunk,
+        ];
+        assert!(
+            InitialCommands::from_restored_argv(Some(&oversized_total), &strings(&["bash"]))
+                .as_slice()
+                .is_empty()
+        );
+
+        // POSIX quoting expands every embedded apostrophe to several bytes.
+        // Bound the actual PTY line as well as the structured representation.
+        let quote_heavy = vec![
+            "ssh".to_string(),
+            "'".repeat(crate::process::MAX_RESTORABLE_ARG_BYTES_LOCAL),
+            "'".repeat(crate::process::MAX_RESTORABLE_ARG_BYTES_LOCAL),
+            "'".repeat(crate::process::MAX_RESTORABLE_ARG_BYTES_LOCAL),
+        ];
+        assert!(crate::process::restorable_argv_within_local_limits(
+            &quote_heavy
+        ));
+        assert!(
+            InitialCommands::from_restored_argv(Some(&quote_heavy), &strings(&["bash"]))
+                .as_slice()
+                .is_empty()
+        );
     }
 
     #[test]

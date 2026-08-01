@@ -6,6 +6,43 @@ All notable user-visible and operational changes are recorded here.
 
 ### Fixed
 
+- 精确锁定的共享 core 尚未发布本轮安全修复时，jterm4 现在通过可独立构建的本地兼容层
+  先行补齐边界：后台 `curl`/`git`/`sh`/`notify-send` 与 Flatpak bridge 不再从空或
+  相对 `PATH` 执行项目内同名程序；AI、jsh 检查与探测子进程均有输出、超时、进程组
+  终止和继承管道回收上限；凭据、会话快照、命令历史、执行日志及 installer cache
+  统一拒绝软链接、FIFO、设备、硬链接和不可信父目录替换。OSC 标题/cwd/session、
+  Kitty 分块槽位、Notebook fence、快捷键和不可见 Unicode 也在解析前应用明确预算。
+- Block PTY 输入改为容量 64、单消息 256 KiB 的非阻塞有界队列；命令正文与提交回车
+  作为一个原子消息入队，队列饱和或关闭时不会发送可执行前缀，也不会让 Agent、纠错
+  或命令面板误以为命令已成功插入/执行。所有失败只报告字节数，不把命令内容写入日志。
+- Block PTY 创建失败不再触发 panic 或留下半提交的界面状态：首标签在提交
+  session/connection 编号前完成构造，失败时显示 toast 并降级到 VTE；分屏采用
+  prepare/commit 边界；会话恢复先在占位树中准备全部 pane，任一失败便清理临时
+  PTY 并保留可用的单 pane 标签。
+- 旧的 `agent_auto_approve_readonly` 配置与环境变量现仅为兼容而解析，运行时恒为
+  关闭；Shell Agent 的每条命令都必须经过明确人工审批，设置界面会标示该开关已退役。
+- 配置、备份、锁文件与窗口快照现在统一通过有界、非阻塞、禁止跟随软链接的文件
+  描述符读取，并校验 regular file、当前用户属主及单一硬链接；FIFO、设备、超大文件、
+  软/硬链接锁会立即拒绝，不再卡住启动或把无关文件 `chmod 0600`。配置锁同时持有受
+  保护父目录锁，锁文件名被替换也不能绕过；不可读 primary backup 会继续尝试有效的
+  secondary backup，写端也不能发布超过自身读取预算的配置。
+- 窗口恢复在创建任何 PTY 前限制为 32 个标签、每标签 16 个 pane、总计 64 个 pane；
+  标签名、cwd、session id 与可恢复 argv 也分别应用字段、元素数、原始总字节及 shell
+  引用后命令行预算；快照读写、claim、legacy 迁移与发布均绑定到验证后的目录描述符，
+  使用 no-replace rename，父路径被替换也不能重定向写入或覆盖另一个窗口的状态；新的
+  active 文件还记录进程 start-time token，PID 被复用时不会把陈旧快照误判成仍由当前进程持有。
+- Block history 现在严格识别截断/未知 frame，限制单记录、记录数、压缩前后总字节、解码
+  时间和目录扫描量；跨进程保存持有不可被锁文件替换绕过的目录锁，陈旧 writer 只合并新增
+  记录而无权删除并发数据，任何损坏的旧文件都不会被下一次保存覆盖。GTK 线程在复制历史
+  前即执行相同预算，回滚的未显示 pane 不会在 Drop 时写入历史。
+- Shell Agent 快照恢复会先原子排他 claim 并单次消费，两个进程不能恢复并审批同一 proposal；
+  无效快照会保留隔离证据，重复/耗尽 ProposalId、错序 observation 与不一致 approval state
+  均被拒绝。命令纠错的本地探测拥有真实子进程 deadline、取消 kill、输出/PATH/候选预算，
+  且运行在独立进程组，成功、失败、取消与超时都会清理继承 stdout 的后台孙进程并回收 reader；
+  展示卡 generation 只能消费一次，避免迟到结果或双击重复执行。
+- 所有 review-only 命令现在限制为 256 KiB，并拒绝双向/零宽格式字符；Block 历史召回还会
+  剥离终端控制字节，超限或视觉欺骗文本不会连带发出 `Ctrl+U` 清空当前提示符。会话快照中的
+  可恢复 argv 应用相同视觉检查，恶意状态文件不能借隐藏字符伪装将要恢复的 SSH 参数。
 - 顶部栏模式下只剩一个标签页时，右侧的 Agent、新建标签与窗口最小化/最大化/关闭按钮会整体挤到最左边、贴着 ☰ 和标签位置切换按钮，右侧留一片空白。顶部栏靠"某个子控件横向撑开"把这组按钮顶到右边缘，而这个角色由标签条的 `ScrolledWindow` 担任；单标签时标签条按设计隐藏（`sync_tab_bar_visibility`），隐藏控件不参与扩展，偏偏 `apply_tab_placement` 已经因为"顶部栏模式"把备用 spacer 的 `hexpand` 关掉了——两处各自看一半状态，于是没有任何子控件扩展。spacer 的开关改由 `sync_tab_bar_visibility` 独占（它是唯一知道标签条最终可见性的地方），标签条真正可见时才让位。新建/关闭标签、会话恢复与侧栏↔顶部栏切换都经过该函数，因此 1↔多标签来回切换时按钮位置保持钉在右侧。
 
 - 桌面集成安装后应用列表里没有 jterm4 图标：三处成因已分别修复。其一，条目里的 `Exec=jterm4` / `TryExec=jterm4` 依赖 `PATH`，而桌面会话的 `PATH` 在登录时固定，默认安装位置 `~/.local/bin` 常常不在其中——`TryExec` 失败会让条目整个从应用列表里消失；`scripts/install.sh` 与发行包的 `install-release.sh` 现在把这两行改写成二进制绝对路径（`/usr/bin` 等系统 bin 目录仍保持相对形式以便重定位）。其二，安装脚本从不刷新桌面缓存，新条目与新图标要等下次登录才可见，陈旧的 `icon-theme.cache` 甚至会一直盖住刚装进去的图标；现在安装与卸载都会校验条目并刷新 `update-desktop-database` 和 `gtk-update-icon-cache`（`DESTDIR` 打包时跳过，且这些缓存以放宽的 umask 生成，避免 `sudo --prefix /usr` 装出别的用户读不到的 `0600` 缓存）。其三，`StartupWMClass` 写的是 application ID，而 GTK4 的 X11 `WM_CLASS` 取自程序名（实测为 `jterm4`），X11 会话下窗口因此无法与条目关联，dock 里会多出一个没有图标的重复项；现已改为 `jterm4`，Wayland 侧仍按 app_id 匹配不受影响。
@@ -27,7 +64,6 @@ All notable user-visible and operational changes are recorded here.
 - OSC 9 / OSC 777 桌面通知：终端内程序（含 SSH 远端）可通过 `ESC ] 9 ; 正文 BEL` 或 `ESC ] 777 ; notify ; 标题 ; 正文` 请求桌面通知，由 `notify-send` 以 jterm4 身份发出（缺标题时回退为应用名）。文本在共享解析器中去除控制字符并截断至 256 字符，空通知不发；由于序列源自 PTY 内部，进程派生受应用级速率限制——每批至多一条、距上一条不足 2 秒的一律丢弃。
 - 一键安装/更新配套 shell `jsh`：命令面板的 **Install or update jsh** 在独立标签页里运行安装脚本（标签页即进度界面，可 Ctrl+C 中断，结束后等待 Enter 再关闭）；缺少 jsh 或有新版本时顶栏下方出现可忽略的提示条。安装脚本来自 jsh 仓库并随二进制内嵌，校验和、原子替换、回滚与「`PATH` 上的 `jsh` 是同名其他程序」的提示都由它统一处理。更新检查在后台线程进行、从不自动安装，检查频率由 `jsh_update_check`（`startup` / `daily`（默认）/ `never`）控制，缓存与同机其他 jterm 共享。
 
-- Shell Agent 可选的只读命令自动放行（`agent_auto_approve_readonly` / `JTERM4_AGENT_AUTO_APPROVE_READONLY`，默认关闭）：通过严格白名单的单条只读命令免点击执行，写操作、管道/链式/重定向/命令替换、可执行旁路 flag 与危险模式仍逐条人工审批；自动批准留下可见记录、照常消耗回合预算，开启期间 Agent 卡显示 `auto: read-only` chip，开关位于 Settings 与 Agent 卡设置弹窗。
 - Shell Agent 会话进行中可用 **Attach selected Block** 附加或替换当前选中的 finished Block 作为不可信上下文，不再局限于开卡瞬间的一次性捕获。
 - Agent 请求现在附带有界的 git 元数据（branch、dirty、ahead/behind），与 cwd/shell/OS 一样仅作为不可信 user-role 数据发送，帮助模型贴合仓库状态提出命令。
 - Bash、zsh、fish 与 PowerShell 的内置 CLI 补全生成（`--generate-completion`）。
@@ -68,6 +104,7 @@ All notable user-visible and operational changes are recorded here.
   focus/resize layers, browser-style tab digits, symmetric zoom/opacity keys,
   and shell-owned `Ctrl+P` passthrough.
 - Session snapshots and Block history now use owner-only Unix permissions and durable atomic replacement.
+- Session autosave 与 Block history 读写现由有界单 worker 串行处理，同一目标的待写快照采用 latest-wins 合并；后台失败会显示去重提示，关闭窗口前会保存并 detach 全部 pane、发布最终 session snapshot，并有界 flush 队列。
 - Block is now the default terminal backend. New splits inherit the focused pane's backend, so Block and VTE layouts both remain structurally consistent.
 - Repeated same-axis splits rebalance by pane-tree span, keeping three or more panes evenly sized instead of recursively squeezing newer siblings.
 - Directional pane focus now recognizes the complete focused Block/VTE subtree and retains the last active leaf across transient container focus, so all four focus shortcuts work from finished blocks and other pane descendants.

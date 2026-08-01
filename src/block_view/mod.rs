@@ -4,8 +4,10 @@ use gtk4::prelude::*;
 use gtk4::{glib, Orientation, ScrolledWindow};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
+use std::io;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::SystemTime;
 use vte4::Terminal;
 use vte4::TerminalExt;
@@ -234,13 +236,13 @@ fn resolve_submitted_command(
     external_submission: Option<&str>,
 ) -> String {
     if let Some(command) = external_submission {
-        return command.trim().to_string();
+        return bounded_command_text(command.trim());
     }
     let captured = normalize_captured_command(captured, prompt);
     if captured.trim().is_empty() {
-        typed_shadow.trim().to_string()
+        bounded_command_text(typed_shadow.trim())
     } else {
-        captured
+        bounded_command_text(&captured)
     }
 }
 
@@ -249,6 +251,135 @@ fn resolve_submitted_command(
 /// distinct from the "(command capture unavailable)" placeholder: this one is a
 /// bounded-packet outcome, not a capture race.
 const TRUNCATED_COMMAND_PLACEHOLDER: &str = "(command too long for shell integration)";
+const MAX_COMMAND_CAPTURE_BYTES: usize = crate::review_input::MAX_REVIEW_INPUT_BYTES;
+const MAX_TYPED_COMMAND_SHADOW_BYTES: usize = MAX_COMMAND_CAPTURE_BYTES;
+const MAX_PROMPT_CAPTURE_BYTES: usize = 64 * 1024;
+const MAX_SELECTED_CLIPBOARD_BYTES: usize = 32 * 1024 * 1024;
+
+fn bounded_command_text(command: &str) -> String {
+    if command.len() > MAX_COMMAND_CAPTURE_BYTES {
+        TRUNCATED_COMMAND_PLACEHOLDER.to_string()
+    } else {
+        command.to_string()
+    }
+}
+
+fn append_bounded_text_tail(buffer: &mut String, text: &str, max_bytes: usize) {
+    if max_bytes == 0 {
+        buffer.clear();
+        return;
+    }
+    if text.len() >= max_bytes {
+        let mut start = text.len() - max_bytes;
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        buffer.clear();
+        buffer.push_str(&text[start..]);
+        return;
+    }
+    let overflow = buffer
+        .len()
+        .checked_add(text.len())
+        .map(|length| length.saturating_sub(max_bytes))
+        .unwrap_or(buffer.len());
+    if overflow != 0 {
+        let mut start = overflow.min(buffer.len());
+        while !buffer.is_char_boundary(start) {
+            start += 1;
+        }
+        buffer.drain(..start);
+    }
+    buffer.push_str(text);
+}
+
+fn append_typed_command_shadow(buffer: &mut String, text: &str) {
+    if buffer == TRUNCATED_COMMAND_PLACEHOLDER || text.is_empty() {
+        return;
+    }
+    if buffer
+        .len()
+        .checked_add(text.len())
+        .is_some_and(|length| length <= MAX_TYPED_COMMAND_SHADOW_BYTES)
+    {
+        buffer.push_str(text);
+    } else {
+        buffer.clear();
+        buffer.push_str(TRUNCATED_COMMAND_PLACEHOLDER);
+    }
+}
+
+fn pop_typed_command_shadow(buffer: &mut String) {
+    if buffer != TRUNCATED_COMMAND_PLACEHOLDER {
+        buffer.pop();
+    }
+}
+
+#[derive(Debug)]
+enum TypedShadowRollback {
+    Unchanged,
+    Truncate(usize),
+    Restore(String),
+}
+
+impl TypedShadowRollback {
+    fn apply(self, buffer: &mut String) {
+        match self {
+            Self::Unchanged => {}
+            Self::Truncate(length) => buffer.truncate(length),
+            Self::Restore(previous) => *buffer = previous,
+        }
+    }
+}
+
+/// Capture the cheapest exact rollback for a VTE commit. Ordinary typing only
+/// appends, so retaining the previous byte length avoids cloning a potentially
+/// long command on every keystroke. Destructive edits are rare and keep a full
+/// snapshot.
+fn vte_commit_shadow_rollback(buffer: &str, text: &str) -> TypedShadowRollback {
+    if text.chars().all(|ch| !ch.is_control())
+        && buffer != TRUNCATED_COMMAND_PLACEHOLDER
+        && buffer
+            .len()
+            .checked_add(text.len())
+            .is_some_and(|length| length <= MAX_TYPED_COMMAND_SHADOW_BYTES)
+    {
+        return TypedShadowRollback::Truncate(buffer.len());
+    }
+    if text
+        .chars()
+        .all(|ch| ch != '\x7f' && ch != '\x08' && ch.is_control())
+        || buffer == TRUNCATED_COMMAND_PLACEHOLDER
+    {
+        return TypedShadowRollback::Unchanged;
+    }
+    TypedShadowRollback::Restore(buffer.to_string())
+}
+
+fn apply_vte_commit_to_shadow(buffer: &mut String, text: &str) {
+    for ch in text.chars() {
+        if matches!(ch, '\r' | '\n') {
+            // Submitted — PromptEnd clears the shadow for the next prompt.
+        } else if matches!(ch, '\x7f' | '\x08') {
+            pop_typed_command_shadow(buffer);
+        } else if ch.is_control() {
+            // Other terminal control bytes do not belong in command text.
+        } else {
+            let mut encoded = [0_u8; 4];
+            append_typed_command_shadow(buffer, ch.encode_utf8(&mut encoded));
+        }
+    }
+}
+
+fn command_capture_range_is_bounded(start_row: i64, end_row: i64, columns: i64) -> bool {
+    end_row
+        .checked_sub(start_row)
+        .and_then(|rows| rows.checked_add(1))
+        .filter(|rows| *rows > 0)
+        .and_then(|rows| rows.checked_mul(columns.max(1)))
+        .and_then(|cells| usize::try_from(cells).ok())
+        .is_some_and(|cells| cells <= MAX_COMMAND_CAPTURE_BYTES)
+}
 
 /// The shell metadata carried from a command's OSC 133 `C`/`D` marks to the
 /// block that is finalized at the next `PromptStart`.
@@ -268,8 +399,12 @@ pub(crate) struct PendingCommandMeta {
 impl PendingCommandMeta {
     fn from_command_start(meta: &CommandMeta) -> Self {
         Self {
-            id: meta.id.clone(),
-            cwd: meta.cwd.clone(),
+            id: meta
+                .id
+                .as_deref()
+                .filter(|id| crate::review_input::valid_jsh_id(id))
+                .map(str::to_owned),
+            cwd: safe_command_metadata_cwd(meta.cwd.as_deref()),
             duration_ms: meta.duration_ms,
         }
     }
@@ -283,16 +418,30 @@ impl PendingCommandMeta {
     /// would label a `cd /tmp` block with `/tmp` instead of the directory the
     /// command actually ran in.
     fn merge_command_end(&mut self, meta: &CommandMeta) {
-        if meta.id.is_some() {
-            self.id = meta.id.clone();
+        if let Some(id) = meta
+            .id
+            .as_deref()
+            .filter(|id| crate::review_input::valid_jsh_id(id))
+        {
+            self.id = Some(id.to_owned());
         }
         if self.cwd.is_none() {
-            self.cwd = meta.cwd.clone();
+            self.cwd = safe_command_metadata_cwd(meta.cwd.as_deref());
         }
         if meta.duration_ms.is_some() {
             self.duration_ms = meta.duration_ms;
         }
     }
+}
+
+fn safe_command_metadata_cwd(cwd: Option<&str>) -> Option<String> {
+    cwd.filter(|cwd| {
+        !cwd.is_empty()
+            && cwd.len() <= 16 * 1024
+            && !cwd.chars().any(char::is_control)
+            && !crate::review_input::contains_visual_spoof(cwd)
+    })
+    .map(str::to_owned)
 }
 
 /// Desktop notification for a long command.
@@ -301,10 +450,12 @@ impl PendingCommandMeta {
 /// which cannot express "the shell did not say". A status we never learned gets a
 /// plain app notification instead of borrowing either verdict.
 fn notify_long_block(command: &str, exit_code: Option<i32>, duration_ms: u64) {
+    let command =
+        crate::review_input::safe_inline_display(command.lines().next().unwrap_or(command), 1_024);
     match exit_code {
-        Some(code) => crate::notify::long_block_finished(command, code, duration_ms),
+        Some(code) => crate::notify::long_block_finished(&command, code, duration_ms),
         None => crate::notify::app_notification(
-            Some(&format!("? {}", command.lines().next().unwrap_or(command))),
+            Some(&format!("? {command}")),
             &format!("Exit status unknown after {duration_ms} ms"),
         ),
     }
@@ -364,13 +515,19 @@ fn bounded_journal_output(output: &str) -> (String, bool) {
 /// FinalTerm mark with no parameters.
 fn resolve_command_for_block(meta: &CommandMeta, reconstructed: &str) -> String {
     if let Some(command) = meta.command.as_deref().map(str::trim) {
-        if !command.is_empty() {
+        if !command.is_empty()
+            && command.len() <= MAX_COMMAND_CAPTURE_BYTES
+            && !command
+                .chars()
+                .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
+            && !crate::review_input::contains_noncontrol_visual_spoof(command)
+        {
             return command.to_string();
         }
     }
     let reconstructed = reconstructed.trim();
     if !reconstructed.is_empty() {
-        return reconstructed.to_string();
+        return bounded_command_text(reconstructed);
     }
     if meta.command_truncated {
         return TRUNCATED_COMMAND_PLACEHOLDER.to_string();
@@ -401,12 +558,25 @@ fn paste_modes(bracketed_paste: bool) -> PasteModes {
 /// command to whatever the user had already typed, because typed text is not
 /// represented by that flag.
 pub(crate) fn build_command_recall(command: &str, bracketed_paste: bool) -> Paste {
-    pty_input::encode_prompt_insert(
-        command.trim_end_matches(['\r', '\n']),
-        paste_modes(bracketed_paste),
-        PastePolicy::prompt_insert(UNBRACKETED_MULTILINE),
-        true,
-    )
+    let command = command.trim_end_matches(['\r', '\n']);
+    let modes = paste_modes(bracketed_paste);
+    if command.len() > crate::review_input::MAX_REVIEW_INPUT_BYTES
+        || crate::review_input::contains_noncontrol_visual_spoof(command)
+    {
+        // Do not return a bare Ctrl+U for rejected history: that would erase a
+        // pending line even though no replacement text is safe to insert.
+        return pty_input::encode_prompt_insert(
+            "",
+            modes,
+            PastePolicy::prompt_insert(UNBRACKETED_MULTILINE),
+            true,
+        );
+    }
+    let mut policy = PastePolicy::prompt_insert(UNBRACKETED_MULTILINE);
+    // The exact-pinned core revision still defaults prompt recall to preserving
+    // controls. Captured OSC/history is not a trust boundary, so override it.
+    policy.strip_controls = true;
+    pty_input::encode_prompt_insert(command, modes, policy, true)
 }
 
 fn external_input_changes_editor(state: BlockState, data: &[u8]) -> bool {
@@ -456,7 +626,7 @@ fn record_external_input(
     idle_input_dirty.set(true);
 
     if data == b"\x08" || data == b"\x7f" {
-        typed_cmd.borrow_mut().pop();
+        pop_typed_command_shadow(&mut typed_cmd.borrow_mut());
         return true;
     }
     if data == b"\x15" {
@@ -474,8 +644,30 @@ fn record_external_input(
     let normalized = String::from_utf8_lossy(data)
         .replace("\r\n", "\n")
         .replace('\r', "\n");
-    typed_cmd.borrow_mut().push_str(&normalized);
+    append_typed_command_shadow(&mut typed_cmd.borrow_mut(), &normalized);
     true
+}
+
+/// Encode an approval-gated command and its submit key as one PTY queue item.
+/// A bounded queue must never accept Enter after rejecting the command bytes.
+fn approved_command_submission_payload(command: &str) -> Result<Vec<u8>, String> {
+    crate::review_input::validate(command).map_err(|error| {
+        format!("rejected unsafe programmatic command at the PTY boundary: {error}")
+    })?;
+    let capacity = command
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| "command length overflowed the PTY input size".to_string())?;
+    if capacity > crate::pty::MAX_PTY_INPUT_MESSAGE_BYTES {
+        return Err(format!(
+            "command plus Enter exceeds the {}-byte PTY input limit",
+            crate::pty::MAX_PTY_INPUT_MESSAGE_BYTES
+        ));
+    }
+    let mut submission = Vec::with_capacity(capacity);
+    submission.extend_from_slice(command.as_bytes());
+    submission.push(b'\r');
+    Ok(submission)
 }
 
 /// Encode clipboard text for the prompt.
@@ -509,12 +701,65 @@ fn selected_command_text<'a, I>(blocks: I, selected: &HashSet<u64>) -> String
 where
     I: IntoIterator<Item = (u64, &'a str)>,
 {
-    blocks
-        .into_iter()
-        .filter(|(id, command)| selected.contains(id) && !command.trim().is_empty())
-        .map(|(_, command)| command)
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut output = String::new();
+    for (id, command) in blocks {
+        if !selected.contains(&id) || command.trim().is_empty() {
+            continue;
+        }
+        let separator = usize::from(!output.is_empty());
+        let Some(next_len) = output
+            .len()
+            .checked_add(separator)
+            .and_then(|length| length.checked_add(command.len()))
+        else {
+            return String::new();
+        };
+        if next_len > MAX_COMMAND_CAPTURE_BYTES {
+            // Never insert a syntactically partial selection into the shell.
+            return String::new();
+        }
+        if separator != 0 {
+            output.push('\n');
+        }
+        output.push_str(command);
+    }
+    output
+}
+
+fn append_bounded_clipboard_section(output: &mut String, separator: &str, part: &str) -> bool {
+    let Some(next_len) = output
+        .len()
+        .checked_add(separator.len())
+        .and_then(|length| length.checked_add(part.len()))
+    else {
+        return false;
+    };
+    if next_len > MAX_SELECTED_CLIPBOARD_BYTES {
+        return false;
+    }
+    output.push_str(separator);
+    output.push_str(part);
+    true
+}
+
+fn selected_clipboard_text<'a, I, F>(blocks: I, selected: &HashSet<u64>, mut render: F) -> String
+where
+    I: IntoIterator<Item = &'a BlockData>,
+    F: FnMut(&BlockData) -> String,
+{
+    let mut output = String::new();
+    for block in blocks {
+        if !selected.contains(&block.id) {
+            continue;
+        }
+        let part = render(block);
+        let separator = if output.is_empty() { "" } else { "\n\n" };
+        if !append_bounded_clipboard_section(&mut output, separator, &part) {
+            // A partial multi-block copy can silently change its meaning.
+            return String::new();
+        }
+    }
+    output
 }
 
 fn recall_selected_commands_at_prompt(
@@ -553,7 +798,10 @@ pub(crate) fn recall_command_at_prompt(
     }
     // One write: the frame's start, body and end must not be split, and the
     // Ctrl+U rides in front of them (see `build_command_recall`).
-    pty.write_bytes(&paste.bytes);
+    if let Err(error) = pty.write_bytes(&paste.bytes) {
+        pty.report_write_error("could not queue recalled command", error);
+        return false;
+    }
     *typed_cmd.borrow_mut() = paste.echo_text;
     pty_synced.set(true);
     true
@@ -1389,6 +1637,15 @@ pub struct TermView {
     /// per-tab block-history file so concurrent tabs never overwrite each
     /// other's saved history.
     session_id: Option<String>,
+    /// Send-safe handoff for the worker-decoded history and the race between a
+    /// delayed load, live commands, clear, and shutdown save.
+    history_load: Arc<history::HistoryLoadShared>,
+    /// False only for a pane prepared inside a restore transaction which later
+    /// aborted. Such a never-visible pane must not overwrite the real session's
+    /// history merely because its controller is being rolled back.
+    persist_history_on_drop: Cell<bool>,
+    /// Main-thread poll applying a completed history load to GTK widgets.
+    history_load_poll_id: RefCell<Option<glib::SourceId>>,
     /// Per-frame resize tick installed on `active_vte`. Held so it can be removed on
     /// Drop — otherwise the callback runs forever and keeps its Rc captures
     /// (pty/active/vte/vte_box) alive past tab close.
@@ -1408,8 +1665,13 @@ pub struct TermView {
 
 impl Drop for TermView {
     fn drop(&mut self) {
-        if let Err(err) = self.save_history() {
-            log::warn!("save block history on close: {err}");
+        if self.persist_history_on_drop.get() {
+            if let Err(err) = self.save_history() {
+                log::warn!("save block history on close: {err}");
+            }
+        }
+        if let Some(id) = self.history_load_poll_id.borrow_mut().take() {
+            id.remove();
         }
         if let Some(id) = self.resize_tick_id.borrow_mut().take() {
             id.remove();
@@ -1719,7 +1981,11 @@ impl ReaderCtx {
                             let feed_active_vte = match bstate_rc.get() {
                                 BlockState::CollectingPrompt => {
                                     let text = String::from_utf8_lossy(bytes);
-                                    prompt_buf_rc.borrow_mut().push_str(&text);
+                                    append_bounded_text_tail(
+                                        &mut prompt_buf_rc.borrow_mut(),
+                                        &text,
+                                        MAX_PROMPT_CAPTURE_BYTES,
+                                    );
                                     scroll_debouncer.mark_dirty(&block_scroll_rc);
                                     true
                                 }
@@ -2167,12 +2433,11 @@ impl ReaderCtx {
                                             };
                                             let selected = selected_ids_for_copy.borrow();
                                             let blocks = block_data_for_copy.borrow();
-                                            let text = blocks
-                                                .iter()
-                                                .filter(|block| selected.contains(&block.id))
-                                                .map(|block| strip_ansi(&block.output))
-                                                .collect::<Vec<_>>()
-                                                .join("\n\n");
+                                            let text = selected_clipboard_text(
+                                                blocks.iter(),
+                                                &selected,
+                                                |block| strip_ansi(&block.output),
+                                            );
                                             vte_for_action.clipboard().set_text(&text);
                                         });
                                         vbox.append(&item);
@@ -2196,18 +2461,17 @@ impl ReaderCtx {
                                             };
                                             let selected = selected_ids_for_copy.borrow();
                                             let blocks = block_data_for_copy.borrow();
-                                            let text = blocks
-                                                .iter()
-                                                .filter(|block| selected.contains(&block.id))
-                                                .map(|block| {
+                                            let text = selected_clipboard_text(
+                                                blocks.iter(),
+                                                &selected,
+                                                |block| {
                                                     block_clipboard_text(
                                                         &block.cmd,
                                                         &strip_ansi(&block.output),
                                                         false,
                                                     )
-                                                })
-                                                .collect::<Vec<_>>()
-                                                .join("\n\n");
+                                                },
+                                            );
                                             vte_for_action.clipboard().set_text(&text);
                                         });
                                         vbox.append(&item);
@@ -2575,12 +2839,28 @@ impl ReaderCtx {
                             // fallback state as interactive input before writing, so
                             // a fast command cannot outrun command capture.
                             if let Some(cmd) = init_cmds_queue_for_cb.borrow_mut().pop_front() {
-                                *typed_cmd_rc.borrow_mut() = cmd.clone();
+                                let mut typed = typed_cmd_rc.borrow_mut();
+                                typed.clear();
+                                append_typed_command_shadow(&mut typed, &cmd);
+                                drop(typed);
                                 *external_submission_rc.borrow_mut() = Some(cmd.clone());
                                 idle_input_dirty_rc.set(true);
                                 pty_synced_rc.set(true);
                                 let text = format!("{}\r", cmd);
-                                pty_for_init.write_bytes(text.as_bytes());
+                                if let Err(error) = pty_for_init.write_bytes(text.as_bytes()) {
+                                    // The shadow was armed before enqueue so a
+                                    // fast child cannot outrun capture. Roll it
+                                    // back when bounded admission rejects the
+                                    // whole command.
+                                    typed_cmd_rc.borrow_mut().clear();
+                                    external_submission_rc.borrow_mut().take();
+                                    idle_input_dirty_rc.set(false);
+                                    pty_synced_rc.set(false);
+                                    pty_for_init.report_write_error(
+                                        "could not queue initial command",
+                                        error,
+                                    );
+                                }
                             }
 
                             scroll_debouncer.reset_scroll_lock();
@@ -2619,17 +2899,25 @@ impl ReaderCtx {
                             // shell echoes a newline and starts the command).
                             let (cmd_end_col, cmd_end_row) = active_vte.cursor_position();
                             let (start_col, start_row) = prompt_end_pos_rc.get();
-                            let captured = active_vte
-                                .text_range_format(
-                                    vte4::Format::Text,
-                                    start_row,
-                                    start_col,
-                                    cmd_end_row,
-                                    cmd_end_col,
-                                )
-                                .0
-                                .map(|gs| gs.to_string())
-                                .unwrap_or_default();
+                            let captured = if command_capture_range_is_bounded(
+                                start_row,
+                                cmd_end_row,
+                                active_vte.column_count(),
+                            ) {
+                                active_vte
+                                    .text_range_format(
+                                        vte4::Format::Text,
+                                        start_row,
+                                        start_col,
+                                        cmd_end_row,
+                                        cmd_end_col,
+                                    )
+                                    .0
+                                    .map(|gs| bounded_command_text(&gs))
+                                    .unwrap_or_default()
+                            } else {
+                                TRUNCATED_COMMAND_PLACEHOLDER.to_string()
+                            };
                             let prompt_display = prompt_display_rc.borrow().clone();
                             let typed_shadow = typed_cmd_rc.borrow().clone();
                             let external_submission = external_submission_rc.borrow_mut().take();
@@ -2797,7 +3085,12 @@ impl ReaderCtx {
                         }
 
                         ParserEvent::ClipboardQuery => {
-                            pty_for_init.write_bytes(b"\x1b]52;c;\x1b\\");
+                            if let Err(error) = pty_for_init.write_bytes(b"\x1b]52;c;\x1b\\") {
+                                pty_for_init.report_write_error(
+                                    "could not queue clipboard-query reply",
+                                    error,
+                                );
+                            }
                         }
 
                         ParserEvent::ColorQuery(kind) => {
@@ -2806,7 +3099,10 @@ impl ReaderCtx {
                                 dynamic_colors_rc.get(),
                                 *kind,
                             );
-                            pty_for_init.write_bytes(reply.as_bytes());
+                            if let Err(error) = pty_for_init.write_bytes(reply.as_bytes()) {
+                                pty_for_init
+                                    .report_write_error("could not queue color-query reply", error);
+                            }
                         }
 
                         ParserEvent::ColorSet { kind, spec } => {
@@ -2830,12 +3126,19 @@ impl ReaderCtx {
                         ParserEvent::KeyboardProtocolQuery(query) => {
                             let (col, row) = active_vte.cursor_position();
                             let reply = build_keyboard_query_reply(*query, col, row);
-                            pty_for_init.write_bytes(reply.as_bytes());
+                            if let Err(error) = pty_for_init.write_bytes(reply.as_bytes()) {
+                                pty_for_init.report_write_error(
+                                    "could not queue keyboard-query reply",
+                                    error,
+                                );
+                            }
                         }
 
                         ParserEvent::RemoteSessionId(id) => {
-                            for cb in remote_session_cbs.borrow().iter() {
-                                cb(id);
+                            if crate::review_input::valid_jsh_id(id) {
+                                for cb in remote_session_cbs.borrow().iter() {
+                                    cb(id);
+                                }
                             }
                         }
 
@@ -2853,7 +3156,14 @@ impl ReaderCtx {
                                 ok
                             });
                             if allowed {
-                                crate::notify::app_notification(title.as_deref(), body);
+                                let title = title.as_deref().map(|title| {
+                                    crate::review_input::safe_inline_display(title, 1_024)
+                                });
+                                let body =
+                                    crate::review_input::safe_inline_display(body, 4 * 1_024);
+                                if !body.trim().is_empty() {
+                                    crate::notify::app_notification(title.as_deref(), &body);
+                                }
                             }
                         }
 
@@ -2876,7 +3186,12 @@ impl ReaderCtx {
                                 // jterm1 never answers).
                                 if let Some(reply) = kitty_graphics::response_for(payload, &outcome)
                                 {
-                                    pty_for_init.write_bytes(&reply);
+                                    if let Err(error) = pty_for_init.write_bytes(&reply) {
+                                        pty_for_init.report_write_error(
+                                            "could not queue graphics-protocol reply",
+                                            error,
+                                        );
+                                    }
                                 }
                                 if let kitty_graphics::Outcome::Complete(texture) = outcome {
                                     // Rough memory bound: width*height*4 (bytes
@@ -3638,7 +3953,72 @@ impl TermView {
         cwd: Option<&str>,
         session_id: Option<&str>,
         initial_commands: &[String],
-    ) -> Self {
+    ) -> io::Result<Self> {
+        Self::new_with_spawner(
+            config,
+            shell_argv,
+            cwd,
+            session_id,
+            initial_commands,
+            OwnedPty::spawn,
+        )
+    }
+
+    /// Constructor boundary with an injectable PTY spawner.
+    ///
+    /// Spawning happens before any GTK object is allocated. A missing shell or
+    /// exhausted PTY/process resource therefore returns a diagnostic error with
+    /// no half-built widget tree for callers to clean up. Keeping the boundary
+    /// injectable also makes the failure contract testable without a display.
+    fn new_with_spawner<F>(
+        config: &Config,
+        shell_argv: &[String],
+        cwd: Option<&str>,
+        session_id: Option<&str>,
+        initial_commands: &[String],
+        spawn: F,
+    ) -> io::Result<Self>
+    where
+        F: FnOnce(&[&str], Option<&str>, &[(&str, &str)]) -> io::Result<OwnedPty>,
+    {
+        // Detect jsh shell for session_id passing.
+        let is_jsh = shell_argv
+            .first()
+            .and_then(|s| std::path::Path::new(s).file_name())
+            .and_then(|f| f.to_str())
+            .map(|name| name == "jsh")
+            .unwrap_or(false);
+
+        let session_id = session_id.filter(|sid| crate::review_input::valid_jsh_id(sid));
+
+        // Build argv with optional --session for jsh.
+        let mut argv_vec: Vec<String> = shell_argv.to_vec();
+        if let Some(sid) = session_id {
+            if is_jsh {
+                argv_vec.push("--session".to_string());
+                argv_vec.push(sid.to_string());
+            }
+        }
+        let argv: Vec<&str> = argv_vec.iter().map(String::as_str).collect();
+
+        // Only this pane's own variables belong here. `TERM_PROGRAM` (which the
+        // documented `[[ $TERM_PROGRAM == jterm4 ]] && source ...` rc gate reads)
+        // and the `LESS=R` pager default come from `child_env` inside the PTY
+        // spawner, so the fork site and the Flatpak host bridge cannot drift.
+        let mut env_extra: Vec<(&str, &str)> = Vec::new();
+        let session_id_owned = session_id.map(str::to_owned);
+        if let Some(ref sid) = session_id_owned {
+            if is_jsh {
+                env_extra.push(("JSH_SESSION_ID", sid.as_str()));
+            }
+        }
+
+        // Every cwd-shaped failure is absorbed inside `OwnedPty::spawn`: a
+        // restored session pointing at a deleted worktree or unmounted drive
+        // starts in the application directory. Missing executables and resource
+        // exhaustion retain their original io::Error for the transactional UI
+        // caller to log and present instead of panicking the application.
+        let pty = Rc::new(spawn(&argv, cwd, &env_extra)?);
         // ── Build widget tree ──────────────────────────────────────────────
         let root = gtk4::Box::new(Orientation::Vertical, 0);
         root.set_hexpand(true);
@@ -3793,47 +4173,6 @@ impl TermView {
         let unread_count: Rc<Cell<u32>> = Rc::new(Cell::new(0));
 
         // ── PTY ───────────────────────────────────────────────────────────
-        // Detect jsh shell for session_id passing
-        let is_jsh = shell_argv
-            .first()
-            .and_then(|s| std::path::Path::new(s).file_name())
-            .and_then(|f| f.to_str())
-            .map(|name| name == "jsh")
-            .unwrap_or(false);
-
-        // Build argv with optional --session for jsh
-        let mut argv_vec: Vec<String> = shell_argv.to_vec();
-        if let Some(sid) = session_id {
-            if is_jsh {
-                argv_vec.push("--session".to_string());
-                argv_vec.push(sid.to_string());
-            }
-        }
-        let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
-
-        // Only this pane's own variables belong here. `TERM_PROGRAM` (which the
-        // documented `[[ $TERM_PROGRAM == jterm4 ]] && source ...` rc gate reads)
-        // and the `LESS=R` pager default now come from `child_env` inside
-        // `OwnedPty::spawn`, so the fork site and the Flatpak host bridge cannot
-        // drift apart the way two copies of this list did.
-        let mut env_extra: Vec<(&str, &str)> = Vec::new();
-        let session_id_owned = session_id.map(|s| s.to_string());
-        if let Some(ref sid) = session_id_owned {
-            if is_jsh {
-                env_extra.push(("JSH_SESSION_ID", sid.as_str()));
-            }
-        }
-
-        // Every cwd-shaped failure is absorbed inside `OwnedPty::spawn`: a
-        // restored session pointing at a deleted worktree or an unmounted drive
-        // starts in the application directory instead of failing here. What is
-        // left is a missing shell binary or an exhausted fd/pid table, and a
-        // Block pane cannot exist without its PTY — every keystroke, resize and
-        // teardown path dereferences it — so failing loudly beats handing the
-        // user a pane that silently swallows input. `expect` keeps the io::Error
-        // in the message.
-        let pty = Rc::new(OwnedPty::spawn(&argv, cwd, &env_extra).expect("PTY spawn failed"));
-
         // Share the child lifecycle with the live VTE so widget-tree teardown
         // (kill_all_terminal_children, tab close) terminates exactly the same
         // child this pane owns — through the same handle, so a close and this
@@ -4164,8 +4503,10 @@ impl TermView {
                         } else {
                             refresh_repo_strip(&repo_strip_for_cwd, &path);
                         }
+                        let display_path =
+                            crate::review_input::safe_inline_display(&path, 4 * 1024);
                         for cb in cwd_cbs.borrow().iter() {
-                            cb(&path);
+                            cb(&display_path);
                         }
                     }
                 }
@@ -4183,7 +4524,7 @@ impl TermView {
             let title_cbs = title_callbacks.clone();
             active_vte.connect_window_title_changed(move |terminal| {
                 if let Some(title) = terminal.window_title() {
-                    let title_str = title.to_string();
+                    let title_str = crate::review_input::safe_inline_display(&title, 512);
                     if !title_str.is_empty() {
                         for cb in title_cbs.borrow().iter() {
                             cb(&title_str);
@@ -4468,7 +4809,9 @@ impl TermView {
                 // Resume a parked feed first so the ^C echo and the command's
                 // shutdown output are visible immediately.
                 hold_for_stop.flush_now();
-                pty_for_stop.write_bytes(b"\x03");
+                if let Err(error) = pty_for_stop.write_bytes(b"\x03") {
+                    pty_for_stop.report_write_error("could not queue interrupt", error);
+                }
             });
         }
         let sticky_timer_id = {
@@ -4558,7 +4901,8 @@ impl TermView {
                     } else {
                         command
                     };
-                    sticky_label.set_text(&format!("\u{276f}  {}", command));
+                    let command = crate::review_input::safe_inline_display(&command, 512);
+                    sticky_label.set_text(&format!("\u{276f}  {command}"));
                     sticky_label.set_visible(!minimized);
                     sticky_jump_bottom.set_visible(!minimized && long_output);
                     sticky_stop.set_visible(false);
@@ -4592,22 +4936,11 @@ impl TermView {
             let selected_block_id_for_commit = selected_block_id.clone();
             let selection_anchor_id_for_commit = selection_anchor_id.clone();
             active_vte.connect_commit(move |_, text, _size| {
-                // Any real terminal input exits block-selection mode. Otherwise a
-                // later Enter could unexpectedly recall the old selection instead
-                // of submitting the line the user has just started editing.
-                if selected_block_id_for_commit.get().is_some() {
-                    if let Some(finished_blocks_for_commit) = finished_blocks_for_commit.upgrade() {
-                        let finished = finished_blocks_for_commit.borrow();
-                        clear_finished_block_selection(
-                            &finished,
-                            &selected_block_ids_for_commit,
-                            &selected_block_id_for_commit,
-                            &selection_anchor_id_for_commit,
-                        );
-                    }
-                }
-
                 let awaiting_command = bstate_for_commit.get() == BlockState::AwaitingCommand;
+                let shadow_rollback = awaiting_command
+                    .then(|| vte_commit_shadow_rollback(&typed_cmd_for_commit.borrow(), text));
+                let previous_idle_dirty = idle_input_dirty_for_commit.get();
+                let previous_pty_synced = pty_synced_for_commit.get();
                 if awaiting_command {
                     idle_input_dirty_for_commit.set(true);
                     if text.as_bytes().iter().any(|&b| b != b'\r' && b != b'\n') {
@@ -4620,22 +4953,33 @@ impl TermView {
                     // fast shell can echo the line and emit OSC 133;C immediately;
                     // the reader must never observe CommandStart while this shadow
                     // still describes the previous editor state.
-                    let mut cmd = typed_cmd_for_commit.borrow_mut();
-                    for ch in text.chars() {
-                        if ch == '\r' || ch == '\n' {
-                            // Submitted — leave whatever is in the buffer; it
-                            // is cleared at PromptEnd for the next prompt.
-                        } else if ch == '\x7f' || ch == '\x08' {
-                            cmd.pop();
-                        } else if (ch as u32) < 0x20 {
-                            // Control bytes: ignore.
-                        } else {
-                            cmd.push(ch);
-                        }
-                    }
+                    apply_vte_commit_to_shadow(&mut typed_cmd_for_commit.borrow_mut(), text);
                 }
 
-                pty_for_commit.write_bytes(text.as_bytes());
+                if let Err(error) = pty_for_commit.write_bytes(text.as_bytes()) {
+                    if let Some(shadow_rollback) = shadow_rollback {
+                        shadow_rollback.apply(&mut typed_cmd_for_commit.borrow_mut());
+                        idle_input_dirty_for_commit.set(previous_idle_dirty);
+                        pty_synced_for_commit.set(previous_pty_synced);
+                    }
+                    pty_for_commit.report_write_error("could not queue terminal input", error);
+                    return;
+                }
+
+                // Only accepted terminal input exits block-selection mode.
+                // Otherwise a saturated queue would mutate UI/editor state
+                // even though the shell never received the keystroke.
+                if selected_block_id_for_commit.get().is_some() {
+                    if let Some(finished_blocks_for_commit) = finished_blocks_for_commit.upgrade() {
+                        let finished = finished_blocks_for_commit.borrow();
+                        clear_finished_block_selection(
+                            &finished,
+                            &selected_block_ids_for_commit,
+                            &selected_block_id_for_commit,
+                            &selection_anchor_id_for_commit,
+                        );
+                    }
+                }
             });
         }
 
@@ -4658,7 +5002,10 @@ impl TermView {
                 }
 
                 if let Some(bytes) = running_root_control_bytes(keyval, modifiers) {
-                    pty_for_root_key.write_bytes(bytes);
+                    if let Err(error) = pty_for_root_key.write_bytes(bytes) {
+                        pty_for_root_key
+                            .report_write_error("could not queue process-control key", error);
+                    }
                     return glib::Propagation::Stop;
                 }
 
@@ -4787,7 +5134,10 @@ impl TermView {
                     if let Some(bytes) =
                         encode_mouse_wheel(mouse_mode_for_scroll.get(), dy, col, row)
                     {
-                        pty_for_scroll.write_bytes(&bytes);
+                        if let Err(error) = pty_for_scroll.write_bytes(&bytes) {
+                            pty_for_scroll
+                                .report_write_error("could not queue mouse-wheel input", error);
+                        }
                     }
                     return glib::Propagation::Stop;
                 }
@@ -4908,97 +5258,15 @@ impl TermView {
             find_state: Rc::new(RefCell::new(FindState::default())),
             current_cwd: current_cwd.clone(),
             session_id: session_id_owned,
+            history_load: Arc::new(history::HistoryLoadShared::default()),
+            persist_history_on_drop: Cell::new(true),
+            history_load_poll_id: RefCell::new(None),
             resize_tick_id: RefCell::new(None),
             sticky_timer_id: RefCell::new(Some(sticky_timer_id)),
             cross_selection,
             block_finished_callbacks,
             selection_feed_hold,
         };
-
-        // Load history if configured. Persisted ids come from another process,
-        // whose allocator also began at zero, so reserve this process above them
-        // before any new command can finish.
-        if let Err(err) = term_view.load_history() {
-            log::warn!("load block history: {err}");
-        }
-        let repaired_ids = {
-            let mut blocks = term_view.block_data.borrow_mut();
-            normalize_loaded_block_ids(&mut blocks, &BLOCK_ID_COUNTER)
-        };
-        if repaired_ids > 0 {
-            log::warn!("repaired {repaired_ids} duplicate block-history ids");
-        }
-        {
-            let config = term_view.config.borrow();
-            let fallback_cols = term_view.active.borrow().grid_cols() as i64;
-            for block in term_view.block_data.borrow_mut().iter_mut() {
-                let cols = if block.cols > 0 {
-                    block.cols as i64
-                } else {
-                    fallback_cols
-                };
-                block.estimated_height = estimated_finished_block_height_for_text(
-                    &config,
-                    &block.cmd,
-                    &block.output,
-                    cols,
-                );
-            }
-        }
-
-        // Create widgets for loaded blocks. Each block's `cols` is what the live
-        // VTE was wrapping at when the command ran; restoring at the same cols
-        // reproduces the exact line breaks (so `ls` columns don't get split
-        // mid-word). For old saves without a cols field (cols == 0), fall back
-        // to the live VTE's current column count.
-        {
-            let block_data_ref = term_view.block_data.borrow();
-            let config = term_view.config.borrow();
-            let fallback_cols = term_view.active.borrow().grid_cols() as i64;
-            for block in block_data_ref.iter() {
-                let cols = if block.cols > 0 {
-                    block.cols as i64
-                } else {
-                    fallback_cols
-                };
-                let finished = FinishedBlock::new(
-                    block.id,
-                    &block.prompt,
-                    &block.cmd,
-                    block.cmd_markup.as_deref(),
-                    &block.output,
-                    block.exit_code,
-                    &config,
-                    block.duration_ms,
-                    block.end_time_ms,
-                    block.cwd.as_deref(),
-                    cols,
-                );
-                finished.widget().insert_before(
-                    &term_view.block_list,
-                    Some(term_view.active.borrow().widget()),
-                );
-                finished.connect_actions(
-                    &term_view.active_vte,
-                    &term_view.pty,
-                    &pty_synced,
-                    &term_view.active,
-                    &term_view.typed_cmd,
-                    &term_view.bstate,
-                    &term_view.bracketed_paste,
-                );
-                finished.connect_scroll_forwarding(&term_view.block_scroll);
-                install_finished_block_selection(
-                    &finished,
-                    &term_view.active,
-                    &term_view.finished_blocks,
-                    &term_view.selected_block_ids,
-                    &term_view.selected_block_id,
-                    &term_view.selection_anchor_id,
-                );
-                term_view.finished_blocks.borrow_mut().push(finished);
-            }
-        }
 
         // Before the first map GTK has no real page_size. In that case
         // update_viewport leaves the conservative initial range (block 0)
@@ -5118,7 +5386,7 @@ impl TermView {
         // ── Resize handler: sync PTY cols/rows when widget allocation changes ──
         term_view.install_resize_tick();
 
-        term_view
+        Ok(term_view)
     }
 
     /// Keep PTY geometry synchronized with the real pane viewport, independent
@@ -5165,10 +5433,14 @@ impl TermView {
     }
 
     /// Send key bytes into the PTY (user input).
-    pub fn write_input(&self, data: &[u8]) {
+    #[must_use = "terminal input may be rejected by bounded nonblocking backpressure"]
+    pub fn write_input(&self, data: &[u8]) -> Result<(), crate::pty::PtyWriteError> {
         // Input while the feed is parked for a selection reads as a hang;
         // resume before the echo of these bytes would be parked too.
         self.selection_feed_hold.flush_now();
+        let previous_shadow = self.typed_cmd.borrow().clone();
+        let previous_pty_synced = self.pty_synced.get();
+        let previous_idle_dirty = self.idle_input_dirty.get();
         let changed_editor = record_external_input(
             self.bstate.get(),
             data,
@@ -5176,6 +5448,12 @@ impl TermView {
             &self.pty_synced,
             &self.idle_input_dirty,
         );
+        if let Err(error) = self.pty.write_bytes(data) {
+            *self.typed_cmd.borrow_mut() = previous_shadow;
+            self.pty_synced.set(previous_pty_synced);
+            self.idle_input_dirty.set(previous_idle_dirty);
+            return Err(error);
+        }
         if changed_editor && self.selected_block_id.get().is_some() {
             let finished = self.finished_blocks.borrow();
             clear_finished_block_selection(
@@ -5185,7 +5463,7 @@ impl TermView {
                 &self.selection_anchor_id,
             );
         }
-        self.pty.write_bytes(data);
+        Ok(())
     }
 
     /// Submit the current shell edit buffer as if the user pressed Enter.
@@ -5193,18 +5471,23 @@ impl TermView {
     /// A terminal Enter key is carriage return, not line feed. The PTY input
     /// sanitizer deliberately treats LF as insertion-only multiline content,
     /// so programmatic execution paths must use this explicit submission API.
-    pub fn submit_input(&self) {
-        self.write_input(b"\r");
+    pub fn submit_input(&self) -> Result<(), crate::pty::PtyWriteError> {
+        self.write_input(b"\r")
     }
 
     /// Write and submit one already-approved programmatic command.
     ///
     /// Save the exact text before exposing bytes to the PTY so a fast shell
     /// cannot emit CommandStart before the Block command capture is armed.
-    pub fn submit_command(&self, command: &str) {
+    pub fn submit_command(&self, command: &str) -> Result<(), String> {
+        let submission = approved_command_submission_payload(command)?;
+        let previous_submission = self.external_submission.borrow().clone();
         *self.external_submission.borrow_mut() = Some(command.to_string());
-        self.write_input(command.as_bytes());
-        self.submit_input();
+        if let Err(error) = self.write_input(&submission) {
+            *self.external_submission.borrow_mut() = previous_submission;
+            return Err(error.to_string());
+        }
+        Ok(())
     }
 
     /// Insert a transient notice card (e.g. an AI command-correction proposal
@@ -5399,6 +5682,9 @@ impl TermView {
                 log::warn!("removed bracketed-paste markers from a pasted clipboard payload");
             }
 
+            let previous_shadow = typed_cmd.borrow().clone();
+            let previous_pty_synced = pty_synced.get();
+            let previous_idle_dirty = idle_input_dirty.get();
             record_external_input(
                 bstate.get(),
                 paste.echo_text.as_bytes(),
@@ -5406,6 +5692,13 @@ impl TermView {
                 &pty_synced,
                 &idle_input_dirty,
             );
+            if let Err(error) = pty.write_bytes(&paste.bytes) {
+                *typed_cmd.borrow_mut() = previous_shadow;
+                pty_synced.set(previous_pty_synced);
+                idle_input_dirty.set(previous_idle_dirty);
+                pty.report_write_error("could not queue clipboard paste", error);
+                return;
+            }
             if selected_block_id.get().is_some() {
                 let finished = finished_blocks.borrow();
                 clear_finished_block_selection(
@@ -5415,8 +5708,6 @@ impl TermView {
                     &selection_anchor_id,
                 );
             }
-
-            pty.write_bytes(&paste.bytes);
             active.borrow().grab_focus();
         });
     }
@@ -5551,6 +5842,10 @@ impl TermView {
 
     /// Remove every completed block and all block-indexed UI state.
     pub fn clear_blocks(&self) {
+        // A background load that completes after Clear must not resurrect the
+        // just-deleted history, and its shutdown merge must not prepend it to
+        // the empty replacement snapshot.
+        self.history_load.discard();
         self.clear_find();
         self.active_vte.unselect_all();
 
@@ -5586,7 +5881,10 @@ impl TermView {
 
         // Never inject form-feed into a running/full-screen process.
         if self.bstate.get() == BlockState::AwaitingCommand {
-            self.pty.write_bytes(b"\x0c");
+            if let Err(error) = self.pty.write_bytes(b"\x0c") {
+                self.pty
+                    .report_write_error("could not queue terminal clear", error);
+            }
         }
         if let Err(err) = self.save_history() {
             log::warn!("save cleared block history: {err}");
@@ -5894,9 +6192,14 @@ impl TermView {
             None => output,
         };
         Some(crate::ai::BlockContext {
-            cmd: block.cmd_text.clone(),
-            output,
-            cwd: bd.and_then(|b| b.cwd.clone()),
+            cmd: crate::review_input::safe_multiline_display(
+                &block.cmd_text,
+                MAX_COMMAND_CAPTURE_BYTES,
+            ),
+            output: crate::review_input::safe_multiline_display(&output, 128 * 1024),
+            cwd: bd
+                .and_then(|b| b.cwd.as_deref())
+                .map(|cwd| crate::review_input::safe_inline_display(cwd, 16 * 1024)),
             exit_code,
             truncated,
         })
@@ -5906,25 +6209,59 @@ impl TermView {
 #[cfg(test)]
 mod tests {
     use super::{
+        append_bounded_text_tail, apply_vte_commit_to_shadow, approved_command_submission_payload,
         background_output_has_visible_text, bounded_journal_output, build_clipboard_paste,
         build_command_recall, build_keyboard_query_reply, classify_command_prompt_status,
-        coalesce_bytes_events, collapse_repaint_output, compute_viewport_state,
-        format_color_query_reply, history_edge_navigation_available, normalize_captured_command,
-        normalize_loaded_block_ids, notification_allowed, output_has_vertical_repaint,
-        parse_color_spec, record_external_input, resolve_command_for_block,
-        resolve_submitted_command, scroll_delta_to_reveal, selected_command_text,
-        selected_id_range, should_buffer_background_output, stable_visible_indices, strip_ansi,
-        strip_ansi_with_clear_detect, take_background_output, truncate_plain_output_for_height,
-        viewport_page_size_changed, viewport_state_for_scroll, visible_indices_for_viewport,
-        BlockData, BlockState, BoundedByteRing, CommandMeta, CommandPromptStatus, DynamicColors,
-        PendingCommandMeta, ViewportState, MAX_JOURNAL_OUTPUT_BYTES, MAX_RAW_OUTPUT_BYTES,
-        TRUNCATED_COMMAND_PLACEHOLDER,
+        coalesce_bytes_events, collapse_repaint_output, command_capture_range_is_bounded,
+        compute_viewport_state, format_color_query_reply, history_edge_navigation_available,
+        normalize_captured_command, normalize_loaded_block_ids, notification_allowed,
+        output_has_vertical_repaint, parse_color_spec, record_external_input,
+        resolve_command_for_block, resolve_submitted_command, scroll_delta_to_reveal,
+        selected_command_text, selected_id_range, should_buffer_background_output,
+        stable_visible_indices, strip_ansi, strip_ansi_with_clear_detect, take_background_output,
+        truncate_plain_output_for_height, viewport_page_size_changed, viewport_state_for_scroll,
+        visible_indices_for_viewport, vte_commit_shadow_rollback, BlockData, BlockState,
+        BoundedByteRing, CommandMeta, CommandPromptStatus, DynamicColors, PendingCommandMeta,
+        ViewportState, MAX_COMMAND_CAPTURE_BYTES, MAX_JOURNAL_OUTPUT_BYTES,
+        MAX_PROMPT_CAPTURE_BYTES, MAX_RAW_OUTPUT_BYTES, TRUNCATED_COMMAND_PLACEHOLDER,
     };
     use crate::parser::{ColorKind, KeyboardProtocolQuery, ParserEvent};
     use gtk4::gdk::RGBA;
     use std::cell::{Cell, RefCell};
     use std::collections::{HashSet, VecDeque};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn constructor_propagates_injected_spawn_failure_without_panicking() {
+        let config = crate::config::load_safe_config().0;
+        let shell_argv = vec!["injected-shell".to_string()];
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::TermView::new_with_spawner(
+                &config,
+                &shell_argv,
+                None,
+                Some("injected-session"),
+                &[],
+                |_argv, _cwd, _env| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "injected PTY spawn failure",
+                    ))
+                },
+            )
+        }));
+
+        let construction = match attempt {
+            Ok(construction) => construction,
+            Err(_) => panic!("TermView construction panicked on a PTY spawn error"),
+        };
+        let error = match construction {
+            Ok(_) => panic!("injected PTY spawn failure unexpectedly constructed a TermView"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(error.to_string(), "injected PTY spawn failure");
+    }
 
     // ── Dynamic OSC 10/11/12 color tracking ──────────────────────────────
 
@@ -6163,6 +6500,68 @@ mod tests {
     }
 
     #[test]
+    fn command_shadow_fails_closed_after_overflow_and_cannot_be_backspaced_empty() {
+        let typed = RefCell::new("x".repeat(MAX_COMMAND_CAPTURE_BYTES));
+        let synced = Cell::new(false);
+        let dirty = Cell::new(false);
+        assert!(record_external_input(
+            BlockState::AwaitingCommand,
+            b"y",
+            &typed,
+            &synced,
+            &dirty,
+        ));
+        assert_eq!(&*typed.borrow(), TRUNCATED_COMMAND_PLACEHOLDER);
+        assert!(record_external_input(
+            BlockState::AwaitingCommand,
+            b"\x7f",
+            &typed,
+            &synced,
+            &dirty,
+        ));
+        assert_eq!(&*typed.borrow(), TRUNCATED_COMMAND_PLACEHOLDER);
+        assert!(record_external_input(
+            BlockState::AwaitingCommand,
+            b"\x15",
+            &typed,
+            &synced,
+            &dirty,
+        ));
+        assert!(typed.borrow().is_empty());
+    }
+
+    #[test]
+    fn prompt_capture_retains_a_bounded_utf8_tail() {
+        let mut prompt = "old".repeat(MAX_PROMPT_CAPTURE_BYTES);
+        append_bounded_text_tail(&mut prompt, "界-new-prompt", MAX_PROMPT_CAPTURE_BYTES);
+        assert!(prompt.len() <= MAX_PROMPT_CAPTURE_BYTES);
+        assert!(prompt.ends_with("界-new-prompt"));
+        assert!(std::str::from_utf8(prompt.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn command_capture_range_is_rejected_before_a_large_vte_allocation() {
+        assert!(command_capture_range_is_bounded(10, 10, 120));
+        assert!(!command_capture_range_is_bounded(10, 9, 120));
+        assert!(!command_capture_range_is_bounded(
+            0,
+            MAX_COMMAND_CAPTURE_BYTES as i64,
+            120
+        ));
+    }
+
+    #[test]
+    fn selected_command_aggregation_is_atomic_at_the_review_limit() {
+        let selected = HashSet::from([1, 2]);
+        let too_large = "x".repeat(MAX_COMMAND_CAPTURE_BYTES);
+        assert!(selected_command_text([(1, too_large.as_str()), (2, "y")], &selected).is_empty());
+        assert_eq!(
+            selected_command_text([(1, "one"), (2, "two")], &selected),
+            "one\ntwo"
+        );
+    }
+
+    #[test]
     fn clipboard_paste_matches_the_effective_editor_text() {
         let unbracketed = build_clipboard_paste("one\r\ntwo", false);
         assert_eq!(unbracketed.echo_text, "one");
@@ -6297,6 +6696,31 @@ mod tests {
             ..CommandMeta::default()
         });
         assert_eq!(only_end.cwd.as_deref(), Some("/srv"));
+
+        let rejected = PendingCommandMeta::from_command_start(&CommandMeta {
+            id: Some("bad/id".to_string()),
+            cwd: Some("/tmp/safe\u{202e}fake".to_string()),
+            ..CommandMeta::default()
+        });
+        assert_eq!(rejected.id, None);
+        assert_eq!(rejected.cwd, None);
+    }
+
+    #[test]
+    fn unsafe_shell_command_metadata_falls_back_to_the_visible_capture() {
+        let hidden = CommandMeta {
+            command: Some("echo safe\u{202e}fake".to_string()),
+            ..CommandMeta::default()
+        };
+        assert_eq!(
+            resolve_command_for_block(&hidden, "echo visible"),
+            "echo visible"
+        );
+        let oversized = CommandMeta {
+            command: Some("x".repeat(MAX_COMMAND_CAPTURE_BYTES + 1)),
+            ..CommandMeta::default()
+        };
+        assert_eq!(resolve_command_for_block(&oversized, ""), "");
     }
 
     #[test]
@@ -7066,6 +7490,47 @@ mod tests {
     }
 
     #[test]
+    fn approved_command_and_enter_are_one_bounded_transaction() {
+        assert_eq!(
+            approved_command_submission_payload("printf safe").unwrap(),
+            b"printf safe\r"
+        );
+        assert!(approved_command_submission_payload("printf one\nprintf two").is_err());
+        assert!(
+            approved_command_submission_payload(
+                &"x".repeat(crate::pty::MAX_PTY_INPUT_MESSAGE_BYTES)
+            )
+            .is_err(),
+            "the submit byte must fit inside the same bounded queue item"
+        );
+    }
+
+    #[test]
+    fn rejected_vte_enqueue_can_restore_shadow_without_per_key_full_clone() {
+        let mut shadow = "printf 你".to_string();
+        let rollback = vte_commit_shadow_rollback(&shadow, "好");
+        apply_vte_commit_to_shadow(&mut shadow, "好");
+        assert_eq!(shadow, "printf 你好");
+        rollback.apply(&mut shadow);
+        assert_eq!(shadow, "printf 你");
+
+        let previous = "x".repeat(MAX_COMMAND_CAPTURE_BYTES - 1);
+        let mut overflowing = previous.clone();
+        let rollback = vte_commit_shadow_rollback(&overflowing, "界");
+        apply_vte_commit_to_shadow(&mut overflowing, "界");
+        assert_eq!(overflowing, TRUNCATED_COMMAND_PLACEHOLDER);
+        rollback.apply(&mut overflowing);
+        assert_eq!(overflowing, previous);
+    }
+
+    #[test]
+    fn vte_shadow_ignores_c1_controls() {
+        let mut shadow = "echo".to_string();
+        apply_vte_commit_to_shadow(&mut shadow, "\u{0085}\u{009b}");
+        assert_eq!(shadow, "echo");
+    }
+
+    #[test]
     fn selected_commands_preserve_terminal_order_and_skip_background_blocks() {
         let selected = HashSet::from([1_u64, 2, 3]);
         let text = selected_command_text(
@@ -7092,5 +7557,19 @@ mod tests {
         assert_eq!(paste.echo_text, "printf one");
         assert_eq!(paste.bytes, b"\x15printf one".to_vec());
         assert!(paste.risk.truncated_to_first_line);
+    }
+
+    #[test]
+    fn captured_command_recall_strips_controls_and_rejects_visual_spoofing() {
+        let paste = build_command_recall("echo \x1b[31mred", true);
+        assert_eq!(paste.echo_text, "echo [31mred");
+        assert!(paste.risk.had_controls);
+
+        assert!(build_command_recall("echo safe\u{202e}txt", true).is_empty());
+        assert!(build_command_recall(
+            &"x".repeat(crate::review_input::MAX_REVIEW_INPUT_BYTES + 1),
+            true
+        )
+        .is_empty());
     }
 }

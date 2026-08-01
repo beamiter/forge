@@ -320,8 +320,10 @@ impl UiState {
                 Some(u) => format!("{u}@{}", h.host),
                 None => h.host.clone(),
             };
+            let name = crate::review_input::safe_inline_display(&h.name, 256);
+            let target = crate::review_input::safe_inline_display(&target, 512);
             let row = adw::ActionRow::builder()
-                .title(h.name.as_str())
+                .title(name.as_str())
                 .subtitle(target.as_str())
                 .activatable(true)
                 .build();
@@ -1279,13 +1281,13 @@ impl UiState {
         ai_group.add(&agent_enabled_row);
 
         let agent_auto_row = adw::SwitchRow::builder()
-            .title("Auto-run Read-only Agent Proposals")
+            .title("Automatic Agent Execution Retired")
             .subtitle(
-                "Run strictly read-only inspection commands (ls, cat, git status, …) without a per-command click; writes and anything risky still require approval",
+                "Every proposal requires explicit approval; command text cannot prove what aliases, helpers, or flags will execute",
             )
-            .active(config.agent_auto_approve_readonly)
+            .active(false)
             .build();
-        agent_auto_row.set_sensitive(!safe_mode && config.ai_enabled && config.agent_enabled);
+        agent_auto_row.set_sensitive(false);
         ai_group.add(&agent_auto_row);
 
         let correction_enabled_row = adw::SwitchRow::builder()
@@ -1498,7 +1500,6 @@ impl UiState {
             redact_row.clone().upcast(),
         ];
         let agent_turns_for_ai = agent_turns_row.clone();
-        let agent_auto_for_ai = agent_auto_row.clone();
         let agent_enabled_for_ai = agent_enabled_row.clone();
         let ui = self.clone();
         ai_enabled_row.connect_active_notify(move |row| {
@@ -1508,26 +1509,17 @@ impl UiState {
                 dependent.set_sensitive(enabled);
             }
             agent_turns_for_ai.set_sensitive(enabled && agent_enabled_for_ai.is_active());
-            agent_auto_for_ai.set_sensitive(enabled && agent_enabled_for_ai.is_active());
             ui.sync_agent_toggle();
             ui.persist_config();
         });
 
         let turns_for_agent = agent_turns_row.clone();
-        let auto_for_agent = agent_auto_row.clone();
         let ui = self.clone();
         agent_enabled_row.connect_active_notify(move |row| {
             let enabled = row.is_active();
             ui.config.borrow_mut().agent_enabled = enabled;
             turns_for_agent.set_sensitive(enabled);
-            auto_for_agent.set_sensitive(enabled);
             ui.sync_agent_toggle();
-            ui.persist_config();
-        });
-
-        let ui = self.clone();
-        agent_auto_row.connect_active_notify(move |row| {
-            ui.config.borrow_mut().agent_auto_approve_readonly = row.is_active();
             ui.persist_config();
         });
 
@@ -2122,9 +2114,20 @@ impl UiState {
                 .iter()
                 .map(|(n, e)| (n.clone(), e.text().to_string()))
                 .collect();
-            let resolved = crate::workflows::substitute(&template, &bindings);
-            dialog_for_run.force_close();
-            ui_for_run.insert_review_text(&pane_for_run, &resolved);
+            match crate::workflows::substitute(&template, &bindings) {
+                Ok(resolved) => {
+                    dialog_for_run.force_close();
+                    ui_for_run.insert_review_text(&pane_for_run, &resolved);
+                }
+                Err(error) => {
+                    log::warn!("refusing unsafe workflow substitution: {error}");
+                    let alert =
+                        adw::AlertDialog::new(Some("Command was not inserted"), Some(&error));
+                    alert.add_response("ok", "OK");
+                    alert.set_default_response(Some("ok"));
+                    alert.present(Some(&dialog_for_run));
+                }
+            }
         });
 
         // Escape closes; Ctrl+Enter from any field inserts the command for

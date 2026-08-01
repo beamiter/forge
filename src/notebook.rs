@@ -26,15 +26,106 @@ use std::os::unix::process::CommandExt;
 
 /// Maximum combined stdout/stderr retained for one cell run.
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_NOTEBOOK_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_NOTEBOOK_SEGMENTS: usize = 512;
+const MAX_NOTEBOOK_CELLS: usize = 128;
+const MAX_NOTEBOOK_TEXT_BYTES: usize = 256 * 1024;
+const MAX_NOTEBOOK_CELL_SOURCE_BYTES: usize = 256 * 1024;
 const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-pub use jterm_core::notebook_text::{parse_segments, render_text_to_pango, Segment};
+pub use crate::notebook_text::{parse_segments, render_text_to_pango, Segment};
 
 pub fn is_notebook_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.ends_with(".jtnb.md"))
+}
+
+fn read_notebook_bounded(path: &Path) -> std::io::Result<String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "notebook source is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_NOTEBOOK_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!("notebook exceeds the {MAX_NOTEBOOK_FILE_BYTES}-byte limit"),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_NOTEBOOK_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_NOTEBOOK_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!("notebook exceeds the {MAX_NOTEBOOK_FILE_BYTES}-byte limit"),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "notebook source is not valid UTF-8",
+        )
+    })
+}
+
+fn bounded_utf8_prefix(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn safe_notebook_display(value: &str, max_bytes: usize) -> String {
+    let value = bounded_utf8_prefix(value, max_bytes);
+    let mut safe = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\n' | '\t') {
+            safe.push(ch);
+        } else if ch.is_control() || crate::review_input::is_visual_spoof_character(ch) {
+            safe.push('\u{fffd}');
+        } else {
+            safe.push(ch);
+        }
+    }
+    safe
+}
+
+fn safe_notebook_inline(value: &str, max_bytes: usize) -> String {
+    safe_notebook_display(value, max_bytes)
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '\n' | '\t') {
+                '\u{fffd}'
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+fn notebook_cell_source_is_safe(source: &str) -> bool {
+    source.len() <= MAX_NOTEBOOK_CELL_SOURCE_BYTES
+        && !source
+            .chars()
+            .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
+        && !crate::review_input::contains_noncontrol_visual_spoof(source)
 }
 
 #[derive(Debug)]
@@ -446,11 +537,15 @@ impl CellController {
         cwd: &Path,
     ) -> Rc<Self> {
         let argv = shell_argv_for_info(info, configured_shell);
-        let command = argv.map(|argv| CommandSpec {
-            argv,
-            source: source.to_owned(),
-            cwd: cwd.to_path_buf(),
-        });
+        let source_is_safe = notebook_cell_source_is_safe(source);
+        let command = source_is_safe
+            .then_some(argv)
+            .flatten()
+            .map(|argv| CommandSpec {
+                argv,
+                source: source.to_owned(),
+                cwd: cwd.to_path_buf(),
+            });
 
         let frame = gtk4::Frame::new(None);
         frame.add_css_class("card");
@@ -462,11 +557,13 @@ impl CellController {
 
         let toolbar = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         let language = language_name(info);
-        let language_label = gtk4::Label::new(Some(if language.is_empty() {
+        let language = if language.is_empty() {
             "shell"
         } else {
             language
-        }));
+        };
+        let language_display = safe_notebook_display(language, 128);
+        let language_label = gtk4::Label::new(Some(&language_display));
         language_label.set_xalign(0.0);
         language_label.set_hexpand(true);
         language_label.add_css_class("dim-label");
@@ -487,6 +584,11 @@ impl CellController {
         stop_button.set_sensitive(false);
         if command.is_some() {
             run_button.add_css_class("suggested-action");
+        } else if !source_is_safe {
+            run_button.set_sensitive(false);
+            run_button.set_tooltip_text(Some(
+                "Cell execution is disabled because its source is oversized or contains hidden/control text",
+            ));
         } else {
             run_button.set_sensitive(false);
             run_button.set_tooltip_text(Some(
@@ -498,7 +600,10 @@ impl CellController {
         body.append(&toolbar);
 
         let source_buffer = gtk4::TextBuffer::new(None);
-        source_buffer.set_text(source);
+        source_buffer.set_text(&safe_notebook_display(
+            source,
+            MAX_NOTEBOOK_CELL_SOURCE_BYTES,
+        ));
         let source_view = gtk4::TextView::with_buffer(&source_buffer);
         source_view.set_editable(false);
         source_view.set_cursor_visible(false);
@@ -863,11 +968,12 @@ impl NotebookDialog {
         if !is_notebook_path(&path) {
             return Err(NotebookError::InvalidExtension(path));
         }
-        let contents = std::fs::read_to_string(&path).map_err(|source| NotebookError::Read {
+        let contents = read_notebook_bounded(&path).map_err(|source| NotebookError::Read {
             path: path.clone(),
             source,
         })?;
         let segments = parse_segments(&contents);
+        let mut omitted_segments = segments.len().saturating_sub(MAX_NOTEBOOK_SEGMENTS);
         let working_directory = cwd.map(Path::to_path_buf).unwrap_or_else(|| {
             path.parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
@@ -875,10 +981,11 @@ impl NotebookDialog {
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         });
 
-        let title = path
+        let raw_title = path
             .file_name()
             .map(|name| format!("Notebook: {}", name.to_string_lossy()))
             .unwrap_or_else(|| format!("Notebook: {}", path.display()));
+        let title = safe_notebook_inline(&raw_title, 512);
         let dialog = adw::Dialog::builder()
             .title(&title)
             .content_width(900)
@@ -906,12 +1013,15 @@ impl NotebookDialog {
         content.append(&run_all_status);
 
         let mut cells = Vec::new();
-        for segment in segments {
+        for segment in segments.into_iter().take(MAX_NOTEBOOK_SEGMENTS) {
             match segment {
                 Segment::Text(text) => {
                     let label = gtk4::Label::new(None);
                     label.set_use_markup(true);
-                    label.set_markup(&render_text_to_pango(&text));
+                    label.set_markup(&render_text_to_pango(&safe_notebook_display(
+                        &text,
+                        MAX_NOTEBOOK_TEXT_BYTES,
+                    )));
                     label.set_wrap(true);
                     label.set_xalign(0.0);
                     label.set_halign(gtk4::Align::Fill);
@@ -919,6 +1029,10 @@ impl NotebookDialog {
                     content.append(&label);
                 }
                 Segment::Code { lang, src } => {
+                    if cells.len() >= MAX_NOTEBOOK_CELLS {
+                        omitted_segments = omitted_segments.saturating_add(1);
+                        continue;
+                    }
                     let cell = CellController::new(
                         cells.len(),
                         &lang,
@@ -932,14 +1046,26 @@ impl NotebookDialog {
             }
         }
 
+        if omitted_segments > 0 {
+            let warning = gtk4::Label::new(Some(&format!(
+                "{omitted_segments} notebook segment(s) were omitted to keep the UI bounded."
+            )));
+            warning.set_xalign(0.0);
+            warning.set_wrap(true);
+            warning.add_css_class("warning");
+            content.append(&warning);
+        }
+
         let shell_display = if shell_argv.is_empty() {
             "(none)".to_owned()
         } else {
-            shell_argv.join(" ")
+            safe_notebook_inline(&shell_argv.join(" "), 4 * 1024)
         };
+        let working_directory_display =
+            safe_notebook_inline(&working_directory.to_string_lossy(), 4 * 1024);
         let footer = gtk4::Label::new(Some(&format!(
             "Cells run in isolated process groups with cwd {}. `shell` and unlabeled cells use: {}. Source is provided on stdin; active terminals are never modified.",
-            working_directory.display(),
+            working_directory_display,
             shell_display
         )));
         footer.set_wrap(true);
@@ -1086,6 +1212,71 @@ mod tests {
         assert!(is_notebook_path(Path::new("demo.jtnb.md")));
         assert!(!is_notebook_path(Path::new("demo.md")));
         assert!(!is_notebook_path(Path::new("demo.jtnb.md.bak")));
+    }
+
+    #[test]
+    fn notebook_display_and_cell_execution_reject_hidden_text() {
+        assert_eq!(
+            safe_notebook_display("safe\u{202e}\x1btext\nnext", 1_024),
+            "safe��text\nnext"
+        );
+        assert!(notebook_cell_source_is_safe("printf one\nprintf two\n"));
+        assert!(!notebook_cell_source_is_safe("echo safe\u{202e}txt"));
+        assert!(!notebook_cell_source_is_safe("echo \x1b[31mred"));
+        assert!(!notebook_cell_source_is_safe(
+            &"x".repeat(MAX_NOTEBOOK_CELL_SOURCE_BYTES + 1)
+        ));
+    }
+
+    #[test]
+    fn notebook_reader_is_bounded_and_rejects_links() {
+        let root = std::env::temp_dir().join(format!(
+            "jterm4-notebook-reader-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("safe.jtnb.md");
+        std::fs::write(&source, "```sh\ntrue\n```\n").unwrap();
+        assert!(read_notebook_bounded(&source).unwrap().contains("true"));
+
+        let oversized = root.join("large.jtnb.md");
+        std::fs::write(&oversized, vec![b'x'; MAX_NOTEBOOK_FILE_BYTES as usize + 1]).unwrap();
+        assert!(read_notebook_bounded(&oversized).is_err());
+
+        #[cfg(unix)]
+        {
+            let linked = root.join("linked.jtnb.md");
+            std::os::unix::fs::symlink(&source, &linked).unwrap();
+            assert!(read_notebook_bounded(&linked).is_err());
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notebook_reader_rejects_fifo_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let fifo = std::env::temp_dir().join(format!(
+            "jterm4-notebook-fifo-{}-{}.jtnb.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path is a live NUL-terminated pathname and mode is valid.
+        assert_eq!(unsafe { nix::libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        assert!(read_notebook_bounded(&fifo).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let _ = std::fs::remove_file(fifo);
     }
 
     #[test]

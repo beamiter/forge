@@ -454,6 +454,7 @@ impl UiState {
             .get(&tab_num)
             .map(|connection| connection.host.name.clone())
             .unwrap_or_else(|| default_tab_title(tab_num + 1, working_directory.as_deref()));
+        let tab_name = crate::review_input::safe_inline_display(&tab_name, 512);
         let pinned = unsafe {
             page_widget
                 .data::<bool>("pinned")
@@ -775,6 +776,7 @@ impl UiState {
                 .and_then(|node| node.active_leaf())
             {
                 if let Some(cwd) = terminal_working_directory(leaf.terminal()) {
+                    let cwd = crate::review_input::safe_inline_display(&cwd, 4 * 1024);
                     parts.push(format!("Dir: {cwd}"));
                 }
                 if let Some(process) = leaf.foreground_process_name() {
@@ -966,7 +968,11 @@ impl UiState {
         // reconnect session identifiers are observed consistently, matching
         // jterm1 even when local tabs default to conventional VTE.
         let terminal_mode = crate::config::TerminalMode::Block;
-        log::info!("[remote] connecting to {} via {:?}", host.name, argv);
+        log::info!(
+            "[remote] connecting to {} (attempt {})",
+            crate::review_input::safe_inline_display(&host.name, 512),
+            attempt.saturating_add(1)
+        );
         self.add_tab_with_argv(TabLaunch {
             working_directory: None,
             tab_name: Some(host.name.clone()),
@@ -1181,25 +1187,11 @@ impl UiState {
             terminal_mode,
         } = launch;
         let tab_num = self.tab_counter.get();
-        self.tab_counter.set(tab_num + 1);
 
         // Generate or reuse session ID for jsh session persistence
-        let sid = session_id.unwrap_or_else(generate_session_id);
-        self.session_ids.borrow_mut().insert(tab_num, sid.clone());
-
-        // Record the per-tab connection so we can show status and auto-reconnect.
-        if let Some((host, attempt)) = &remote {
-            self.tab_connections.borrow_mut().insert(
-                tab_num,
-                TabConnection {
-                    identity: tab_num,
-                    host: host.clone(),
-                    status: ConnStatus::Connecting,
-                    attempt: *attempt,
-                    spawn_at: std::time::Instant::now(),
-                },
-            );
-        }
+        let sid = session_id
+            .filter(|sid| crate::review_input::valid_jsh_id(sid))
+            .unwrap_or_else(generate_session_id);
 
         let configured_shell = self.shell_argv.borrow();
         let shell_argv: &[String] = argv_override
@@ -1210,15 +1202,40 @@ impl UiState {
         let (view_type, terminal) = {
             match &terminal_mode {
                 crate::config::TerminalMode::Block => {
-                    let term_view = Rc::new(TermView::new(
-                        &self.config.borrow(),
-                        shell_argv,
-                        working_directory.as_deref(),
-                        Some(&sid),
-                        initial_commands.as_slice(),
-                    ));
-                    let terminal = term_view.vte().clone();
-                    (PaneLeaf::Block(term_view), terminal)
+                    let term_view = {
+                        let config = self.config.borrow();
+                        TermView::new(
+                            &config,
+                            shell_argv,
+                            working_directory.as_deref(),
+                            Some(&sid),
+                            initial_commands.as_slice(),
+                        )
+                    };
+                    match term_view {
+                        Ok(term_view) => {
+                            let term_view = Rc::new(term_view);
+                            term_view.start_history_load();
+                            let terminal = term_view.vte().clone();
+                            (PaneLeaf::Block(term_view), terminal)
+                        }
+                        Err(error) => {
+                            self.report_block_spawn_error(
+                                "creating a tab",
+                                &error,
+                                "Opened a conventional terminal instead.",
+                            );
+                            let vte_view = Rc::new(VteTerminalView::new(
+                                self.config.clone(),
+                                shell_argv,
+                                working_directory.as_deref(),
+                                Some(&sid),
+                                initial_commands.as_slice(),
+                            ));
+                            let terminal = vte_view.vte().clone();
+                            (PaneLeaf::Vte(vte_view), terminal)
+                        }
+                    }
                 }
                 crate::config::TerminalMode::Vte => {
                     let vte_view = Rc::new(VteTerminalView::new(
@@ -1233,6 +1250,24 @@ impl UiState {
                 }
             }
         };
+
+        // Commit tab identity and reconnect state only after the terminal view
+        // exists. In particular, a failed Block spawn cannot consume a tab
+        // number or leave orphaned session/connection records.
+        self.tab_counter.set(tab_num + 1);
+        self.session_ids.borrow_mut().insert(tab_num, sid.clone());
+        if let Some((host, attempt)) = &remote {
+            self.tab_connections.borrow_mut().insert(
+                tab_num,
+                TabConnection {
+                    identity: tab_num,
+                    host: host.clone(),
+                    status: ConnStatus::Connecting,
+                    attempt: *attempt,
+                    spawn_at: std::time::Instant::now(),
+                },
+            );
+        }
 
         // Setup click handler for hyperlinks and context menu (uses VTE inside both views)
         setup_terminal_click_handler(&terminal);
@@ -1357,7 +1392,7 @@ impl UiState {
         let (label_text, is_custom) = match tab_name {
             Some(name) => {
                 let custom = name != computed_default_title;
-                (name, custom)
+                (crate::review_input::safe_inline_display(&name, 512), custom)
             }
             None => (computed_default_title, false),
         };
@@ -1608,7 +1643,8 @@ impl UiState {
                         ConnStatus::Connected => "connected",
                         ConnStatus::Disconnected => "disconnected",
                     };
-                    tooltip_parts.push(format!("Remote: {} ({})", conn.host.name, state));
+                    let name = crate::review_input::safe_inline_display(&conn.host.name, 256);
+                    tooltip_parts.push(format!("Remote: {name} ({state})"));
                 }
             }
 
@@ -1619,6 +1655,7 @@ impl UiState {
                 if let Some(leaf) = PaneNode::from_widget(&page).and_then(|node| node.active_leaf())
                 {
                     if let Some(cwd) = terminal_working_directory(leaf.terminal()) {
+                        let cwd = crate::review_input::safe_inline_display(&cwd, 4 * 1024);
                         tooltip_parts.push(format!("Dir: {cwd}"));
                     }
                     if let Some(proc_name) = leaf.foreground_process_name() {
@@ -1906,7 +1943,8 @@ impl UiState {
 
             // Remote connect items
             for h in remote_hosts.iter() {
-                let item = make_item(&format!("Remote: {}", h.name));
+                let name = crate::review_input::safe_inline_display(&h.name, 256);
+                let item = make_item(&format!("Remote: {name}"));
                 let popover_c = popover.clone();
                 let ui_remote = ui_for_ctx.clone();
                 let host = h.clone();

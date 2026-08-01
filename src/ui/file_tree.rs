@@ -10,6 +10,7 @@ use std::cell::Cell;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -17,6 +18,10 @@ use super::*;
 use crate::terminal::terminal_working_directory;
 
 const SCAN_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const MAX_DIRECTORY_ENTRIES: usize = 4_096;
+const MAX_FILE_LABEL_BYTES: usize = 512;
+const MAX_CONCURRENT_SCANS: usize = 8;
+static ACTIVE_SCANS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Debug)]
 struct FileEntry {
@@ -34,12 +39,18 @@ fn sort_entries(entries: &mut [FileEntry]) {
 }
 
 fn scan_dir(dir: &Path) -> io::Result<Vec<FileEntry>> {
-    let mut entries = Vec::new();
-    for entry in std::fs::read_dir(dir)?.flatten() {
+    let mut entries = Vec::with_capacity(256);
+    for entry in std::fs::read_dir(dir)?
+        .take(MAX_DIRECTORY_ENTRIES)
+        .flatten()
+    {
         let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         entries.push(FileEntry {
-            name: entry.file_name().to_string_lossy().into_owned(),
-            is_dir: path.is_dir(),
+            name: safe_file_label(&entry.file_name().to_string_lossy()),
+            is_dir: file_type.is_dir(),
             path,
         });
     }
@@ -47,16 +58,53 @@ fn scan_dir(dir: &Path) -> io::Result<Vec<FileEntry>> {
     Ok(entries)
 }
 
+fn safe_file_label(value: &str) -> String {
+    let mut label = String::with_capacity(value.len().min(MAX_FILE_LABEL_BYTES));
+    for ch in value.chars() {
+        let rendered = if ch.is_control() || crate::review_input::is_visual_spoof_character(ch) {
+            '\u{fffd}'
+        } else {
+            ch
+        };
+        if label.len().saturating_add(rendered.len_utf8()) > MAX_FILE_LABEL_BYTES {
+            if label.len().saturating_add('…'.len_utf8()) <= MAX_FILE_LABEL_BYTES {
+                label.push('…');
+            }
+            break;
+        }
+        label.push(rendered);
+    }
+    label
+}
+
+struct ActiveScan;
+
+impl Drop for ActiveScan {
+    fn drop(&mut self) {
+        ACTIVE_SCANS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn request_dir_scan<F>(dir: PathBuf, apply: F) -> io::Result<()>
 where
     F: FnOnce(io::Result<Vec<FileEntry>>) + 'static,
 {
+    ACTIVE_SCANS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < MAX_CONCURRENT_SCANS).then_some(active + 1)
+        })
+        .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "file-tree scan limit reached"))?;
     let (tx, rx) = mpsc::sync_channel(1);
-    std::thread::Builder::new()
+    if let Err(error) = std::thread::Builder::new()
         .name("jterm4-file-tree-scan".to_string())
         .spawn(move || {
+            let _active = ActiveScan;
             let _ = tx.send(scan_dir(&dir));
-        })?;
+        })
+    {
+        ACTIVE_SCANS.fetch_sub(1, Ordering::AcqRel);
+        return Err(error);
+    }
 
     let mut apply = Some(apply);
     glib::timeout_add_local(SCAN_POLL_INTERVAL, move || match rx.try_recv() {
@@ -245,8 +293,8 @@ pub(crate) fn build_file_tree_widgets() -> (FileTreeModel, ListView) {
             "text-x-generic-symbolic"
         }));
         label.set_text(&entry.name);
-        let path = entry.path.to_string_lossy();
-        label.set_tooltip_text(Some(path.as_ref()));
+        let path = safe_file_label(&entry.path.to_string_lossy());
+        label.set_tooltip_text(Some(&path));
     });
 
     factory.connect_unbind(|_, object| {
@@ -297,8 +345,9 @@ impl UiState {
     pub(crate) fn set_file_tree_root(&self, root: PathBuf) {
         let generation = self.file_tree_model.reset();
         self.file_tree_root_label.set_text(&display_path(&root));
+        let root_tooltip = safe_file_label(&root.to_string_lossy());
         self.file_tree_root_label
-            .set_tooltip_text(Some(&root.to_string_lossy()));
+            .set_tooltip_text(Some(&root_tooltip));
         *self.file_tree_root.borrow_mut() = root.clone();
 
         let model = self.file_tree_model.clone();
@@ -375,9 +424,14 @@ impl UiState {
             }
 
             let file_path = entry.path.to_string_lossy();
-            let snippet = file_insert_snippet(file_path.as_ref());
-            if let Some(pane) = ui.current_pane_leaf() {
-                ui.insert_review_text(&pane, &snippet);
+            if let Some(snippet) = file_insert_snippet(file_path.as_ref()) {
+                if let Some(pane) = ui.current_pane_leaf() {
+                    ui.insert_review_text(&pane, &snippet);
+                }
+            } else {
+                log::warn!("refusing to insert a path with unsafe display text");
+                ui.toast_overlay
+                    .add_toast(adw::Toast::new("Path contains hidden or control text"));
             }
         });
     }
@@ -394,16 +448,16 @@ fn display_path(path: &Path) -> String {
             if relative.as_os_str().is_empty() {
                 return "~".to_string();
             }
-            return format!("~/{}", relative.to_string_lossy());
+            return safe_file_label(&format!("~/{}", relative.to_string_lossy()));
         }
     }
-    path.to_string_lossy().to_string()
+    safe_file_label(&path.to_string_lossy())
 }
 
 /// Shell-quoted path plus the trailing space that separates it from whatever
 /// the user types next. Obviously safe paths stay unquoted for readability.
-fn file_insert_snippet(path: &str) -> String {
-    format!("{} ", crate::process::shell_quote_path(path))
+fn file_insert_snippet(path: &str) -> Option<String> {
+    crate::process::try_shell_quote_path(path).map(|path| format!("{path} "))
 }
 
 #[cfg(test)]
@@ -443,10 +497,40 @@ mod tests {
 
     #[test]
     fn inserted_snippets_quote_unsafe_paths_and_keep_safe_paths_readable() {
-        assert_eq!(file_insert_snippet("a'b c"), "'a'\"'\"'b c' ");
         assert_eq!(
-            file_insert_snippet("/home/u/notes.txt"),
-            "/home/u/notes.txt "
+            file_insert_snippet("a'b c").as_deref(),
+            Some("'a'\"'\"'b c' ")
         );
+        assert_eq!(
+            file_insert_snippet("/home/u/notes.txt").as_deref(),
+            Some("/home/u/notes.txt ")
+        );
+        assert_eq!(file_insert_snippet("left\nright"), None);
+        assert_eq!(file_insert_snippet("left\u{202e}right"), None);
+    }
+
+    #[test]
+    fn file_labels_make_hidden_text_visible_and_stay_bounded() {
+        assert_eq!(safe_file_label("safe\u{202e}\x1btxt"), "safe��txt");
+        assert!(safe_file_label(&"界".repeat(MAX_FILE_LABEL_BYTES)).len() <= MAX_FILE_LABEL_BYTES);
+    }
+
+    #[test]
+    fn directory_scan_has_a_hard_entry_limit() {
+        let root = std::env::temp_dir().join(format!(
+            "jterm4-file-tree-limit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for index in 0..MAX_DIRECTORY_ENTRIES + 8 {
+            std::fs::write(root.join(format!("entry-{index}")), []).unwrap();
+        }
+        let entries = scan_dir(&root).unwrap();
+        assert_eq!(entries.len(), MAX_DIRECTORY_ENTRIES);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

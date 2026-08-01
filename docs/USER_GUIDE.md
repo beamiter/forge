@@ -278,7 +278,7 @@ dashboard 和 Settings 中的 **AI command correction** 开关控制 `command_co
 
 `agent_enabled = false` 可独立关闭 Agent，`agent_max_turns` 限制模型回合数；`ai_enabled = false` 和 safe mode 都会同时阻止打开。Agent 必须被视为有用户权限的命令执行辅助工具，危险模式提示不是完整 shell 安全分析，也不替代逐字审阅。
 
-`agent_auto_approve_readonly = true`（或 `JTERM4_AGENT_AUTO_APPROVE_READONLY=1`，默认关闭）开启后，通过严格只读白名单的 proposal 会跳过逐条点击直接运行：仅限单条简单命令（`ls`、`cat`、`git status` 等固定清单），不含管道、链式、重定向、后台任务、命令替换，也不含 `find -exec`/`-delete`、`fd -x`、`rg --pre`、git 全局 flag 等可执行或可写入的旁路；任何命中危险模式的命令永远回到人工审阅卡。自动放行仍经过同一套单行校验和 prompt-ready 门，每次自动批准都会在 conversation 中留下可见记录，回合预算照常消耗；开启期间 Agent 卡会显示 `auto: read-only` chip。该白名单是保守分类器而非完整 shell 求值器——宁可漏放也不误放，被拒的只读命令只是多一次点击。开关可在 Settings → AI & Agent 或 Agent 卡的设置弹窗中切换。
+`agent_auto_approve_readonly` 与 `JTERM4_AGENT_AUTO_APPROVE_READONLY` 仅作为旧配置兼容键保留，运行时始终归一化为关闭。所有 proposal 都必须逐条批准。原因是命令文本本身无法证明实际执行对象：alias、function、Git helper、工具的写入/执行 flag，以及读取后会发送给模型的敏感文件都跨越了字符串白名单的安全边界。Settings 会明确显示该能力已停用，旧配置为 `true` 时 `--check-config` 会给出迁移警告。
 
 `ai_redact_secrets = true` 默认遮蔽常见密钥格式，并在持久化前重新处理所有 active、non-active、archived chat 及其 draft/context；但脱敏不是秘密保护边界，发送前仍应检查上下文。`--safe-mode` 同时关闭 AI 与 Agent。
 

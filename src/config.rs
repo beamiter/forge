@@ -3,7 +3,17 @@ use gtk4::glib;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use crate::keybindings::KeybindingMap;
 
@@ -74,7 +84,7 @@ impl SidebarView {
 
 /// When to check whether a newer jsh has been published. Shared with the other
 /// terminals so one config vocabulary covers the family.
-pub use jterm_core::jsh_install::UpdateCheck as JshUpdateCheck;
+pub use crate::jsh_install::UpdateCheck as JshUpdateCheck;
 
 // ---------------------------------------------------------------------------
 // Remote host
@@ -105,20 +115,258 @@ pub struct RemoteHost {
     pub multiplex: bool,
 }
 
-/// Directory for ssh ControlMaster sockets. Prefers `$XDG_RUNTIME_DIR`, falls
-/// back to `~/.cache/jterm4`. Created if missing.
-fn control_socket_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
+const MAX_REMOTE_HOSTS: usize = 128;
+const MAX_REMOTE_HOST_FIELD_BYTES: usize = 4 * 1024;
+const MAX_REMOTE_SSH_ARGS: usize = 64;
+const MAX_FONT_DESC_BYTES: usize = 1024;
+const MAX_CONFIG_PATH_BYTES: usize = 16 * 1024;
+const MAX_AI_IDENTIFIER_BYTES: usize = 1024;
+const MAX_AI_BASE_URL_BYTES: usize = 4 * 1024;
+const MAX_STARTUP_COMMANDS_BYTES: usize = crate::review_input::MAX_REVIEW_INPUT_BYTES;
+
+fn remote_field_is_safe(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= MAX_REMOTE_HOST_FIELD_BYTES
+        && !value.chars().any(char::is_control)
+        && !crate::review_input::contains_visual_spoof(value)
+}
+
+fn setting_text_is_safe(value: &str, max_bytes: usize) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= max_bytes
+        && !value.chars().any(char::is_control)
+        && !crate::review_input::contains_visual_spoof(value)
+}
+
+fn ai_base_url_is_safe(value: &str) -> bool {
+    let value = value.trim();
+    if !setting_text_is_safe(value, MAX_AI_BASE_URL_BYTES)
+        || !(value.starts_with("http://") || value.starts_with("https://"))
+        || value.chars().any(char::is_whitespace)
+        || value.contains(['?', '#', '\\'])
+    {
+        return false;
+    }
+    value.split_once("://").is_some_and(|(_, remainder)| {
+        let authority = remainder.split('/').next().unwrap_or_default();
+        !authority.is_empty() && !authority.contains('@')
+    })
+}
+
+fn configured_path_is_safe(value: &str, require_absolute_or_home: bool) -> bool {
+    let value = value.trim();
+    setting_text_is_safe(value, MAX_CONFIG_PATH_BYTES)
+        && (!require_absolute_or_home
+            || value.starts_with('/')
+            || value == "~"
+            || value.starts_with("~/"))
+}
+
+#[cfg(unix)]
+fn open_owned_directory(path: &Path) -> io::Result<fs::File> {
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { nix::libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "directory is not an owned, non-writable namespace",
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn open_trusted_owned_directory(path: &Path) -> io::Result<(PathBuf, fs::File)> {
+    let original = open_owned_directory(path)?;
+    let canonical = fs::canonicalize(path)?;
+    let directory = open_owned_directory(&canonical)?;
+    let original_metadata = original.metadata()?;
+    let canonical_metadata = directory.metadata()?;
+    if original_metadata.dev() != canonical_metadata.dev()
+        || original_metadata.ino() != canonical_metadata.ino()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime namespace changed while it was being validated",
+        ));
+    }
+    for ancestor in canonical.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)?;
+        if !metadata.is_dir() || (metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "runtime namespace has an unsafe writable ancestor",
+            ));
+        }
+    }
+    Ok((canonical, directory))
+}
+
+#[cfg(unix)]
+fn ensure_owned_child_directory(
+    parent: &fs::File,
+    parent_path: &Path,
+    name: &str,
+    tighten_existing: bool,
+) -> io::Result<(PathBuf, fs::File)> {
+    let name_c = CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory name"))?;
+    // SAFETY: `parent` and `name_c` remain alive for the call. EEXIST is
+    // intentionally accepted and the entry is then opened without following a
+    // symlink, so a concurrent creator cannot redirect the namespace.
+    let created = unsafe { nix::libc::mkdirat(parent.as_raw_fd(), name_c.as_ptr(), 0o700) };
+    if created != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    }
+    // SAFETY: openat returns a new descriptor on success; it is immediately
+    // owned by `File` and closed on drop.
+    let fd = unsafe {
+        nix::libc::openat(
+            parent.as_raw_fd(),
+            name_c.as_ptr(),
+            nix::libc::O_RDONLY
+                | nix::libc::O_DIRECTORY
+                | nix::libc::O_NOFOLLOW
+                | nix::libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let directory = unsafe { fs::File::from_raw_fd(fd) };
+    let path = parent_path.join(name);
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { nix::libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not an owned, non-writable directory", path.display()),
+        ));
+    }
+    if tighten_existing || created == 0 {
+        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+    }
+    Ok((path, directory))
+}
+
+#[cfg(unix)]
+fn private_control_socket_dir() -> io::Result<PathBuf> {
+    let mut failures = Vec::new();
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/jterm4")))?;
-    if let Err(err) = fs::create_dir_all(&base) {
+        .filter(|path| path.is_absolute())
+    {
+        match open_trusted_owned_directory(&runtime).and_then(|(runtime, parent)| {
+            ensure_owned_child_directory(&parent, &runtime, "jterm4", true).map(|(path, _)| path)
+        }) {
+            Ok(path) => return Ok(path),
+            Err(error) => failures.push(format!("{}: {error}", runtime.display())),
+        }
+    }
+
+    // A launcher can omit or overwrite XDG_RUNTIME_DIR even though the
+    // systemd-style per-user runtime directory still exists. Validate the
+    // conventional location with the same ownership rules before considering
+    // a cache fallback.
+    let system_runtime = PathBuf::from(format!("/run/user/{}", unsafe { nix::libc::geteuid() }));
+    match open_trusted_owned_directory(&system_runtime).and_then(|(system_runtime, parent)| {
+        ensure_owned_child_directory(&parent, &system_runtime, "jterm4", true).map(|(path, _)| path)
+    }) {
+        Ok(path) => return Ok(path),
+        Err(error) => failures.push(format!("{}: {error}", system_runtime.display())),
+    }
+
+    if let Some(home) = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        let fallback = (|| {
+            let (home, home_directory) = open_trusted_owned_directory(&home)?;
+            let (cache_path, cache_directory) =
+                ensure_owned_child_directory(&home_directory, &home, ".cache", false)?;
+            ensure_owned_child_directory(&cache_directory, &cache_path, "jterm4", true)
+                .map(|(path, _)| path)
+        })();
+        match fallback {
+            Ok(path) => return Ok(path),
+            Err(error) => failures.push(format!("{}: {error}", home.display())),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "no private runtime namespace is available{}",
+            if failures.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", failures.join("; "))
+            }
+        ),
+    ))
+}
+
+#[cfg(not(unix))]
+fn private_control_socket_dir() -> io::Result<PathBuf> {
+    let path = glib::user_cache_dir().join("jterm4");
+    fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
+/// Directory for ssh ControlMaster sockets. It is always an owned private
+/// child namespace; unsafe XDG/HOME overrides disable multiplexing instead of
+/// placing an authentication socket in a writable directory.
+fn control_socket_path_is_safe(path: &Path) -> bool {
+    path.to_str().is_some_and(|path| {
+        path.len() <= MAX_CONFIG_PATH_BYTES
+            && !path.contains('%')
+            && !path.chars().any(char::is_control)
+            && !crate::review_input::contains_visual_spoof(path)
+    })
+}
+
+fn control_socket_dir() -> Option<PathBuf> {
+    let path = match private_control_socket_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            log::warn!(
+                "SSH multiplexing disabled: {}",
+                crate::review_input::safe_inline_display(&error.to_string(), 1024)
+            );
+            return None;
+        }
+    };
+    if !control_socket_path_is_safe(&path) {
         log::warn!(
-            "Failed to create ssh control socket dir {}: {err}",
-            base.display()
+            "SSH multiplexing disabled because its private ControlPath cannot be represented safely"
         );
         return None;
     }
-    Some(base)
+    #[cfg(unix)]
+    {
+        // Linux sockaddr_un paths are short. `%C` expands to a 40-byte hash;
+        // disable multiplexing rather than handing OpenSSH a predictably
+        // unusable or truncated ControlPath.
+        let expanded_len = path.join("cm-").as_os_str().as_bytes().len() + 40;
+        if expanded_len > 100 {
+            log::warn!("SSH multiplexing disabled because its private ControlPath is too long");
+            return None;
+        }
+    }
+    Some(path)
 }
 
 fn wrap_exec_in_login_bash(command: &str) -> String {
@@ -140,12 +388,24 @@ fn wrap_jsh_argv_in_interactive_bash(jsh_path: &str) -> Option<Vec<String>> {
 /// Build the local argv that connects to a remote host via ssh.
 /// Produces e.g. `["ssh", "-t", "-p", "2222", "mm@100.x.x.x", "jsh --session home-main"]`.
 pub(crate) fn build_remote_argv(host: &RemoteHost) -> Vec<String> {
+    let control_dir = host.multiplex.then(control_socket_dir).flatten();
+    build_remote_argv_with_control_dir(host, control_dir.as_deref())
+}
+
+fn build_remote_argv_with_control_dir(
+    host: &RemoteHost,
+    control_dir: Option<&Path>,
+) -> Vec<String> {
     let target = match &host.user {
         Some(u) => format!("{u}@{}", host.host),
         None => host.host.clone(),
     };
     let mut remote_cmd = host.remote_shell.clone();
-    if let Some(sid) = &host.session {
+    if let Some(sid) = host
+        .session
+        .as_deref()
+        .filter(|sid| crate::review_input::valid_jsh_id(sid))
+    {
         remote_cmd.push_str(" --session ");
         remote_cmd.push_str(sid);
     }
@@ -153,19 +413,18 @@ pub(crate) fn build_remote_argv(host: &RemoteHost) -> Vec<String> {
         remote_cmd = wrap_exec_in_login_bash(&remote_cmd);
     }
     let mut argv = vec!["ssh".to_string(), "-t".to_string()];
-    if host.multiplex {
-        if let Some(dir) = control_socket_dir() {
-            // %C is ssh's hash of (local user, host, port, user) — a safe filename.
-            let ctl_path = dir.join("cm-%C");
-            argv.push("-o".to_string());
-            argv.push("ControlMaster=auto".to_string());
-            argv.push("-o".to_string());
-            argv.push("ControlPersist=120".to_string());
-            argv.push("-o".to_string());
-            argv.push(format!("ControlPath={}", ctl_path.display()));
-        }
+    if let Some(dir) = control_dir.filter(|_| host.multiplex) {
+        // %C is ssh's hash of (local user, host, port, user) — a safe filename.
+        let ctl_path = dir.join("cm-%C");
+        argv.push("-o".to_string());
+        argv.push("ControlMaster=auto".to_string());
+        argv.push("-o".to_string());
+        argv.push("ControlPersist=120".to_string());
+        argv.push("-o".to_string());
+        argv.push(format!("ControlPath={}", ctl_path.display()));
     }
     argv.extend(host.ssh_args.iter().cloned());
+    argv.push("--".to_string());
     argv.push(target);
     argv.push(remote_cmd);
     argv
@@ -243,10 +502,10 @@ pub struct Config {
     pub(crate) agent_enabled: bool,
     /// Maximum number of model replies in one Agent session.
     pub(crate) agent_max_turns: u32,
-    /// Opt-in: let the Agent run proposals that pass the strict read-only
-    /// allowlist without a per-command click. Everything else — writes,
-    /// chaining, redirection, flagged danger — still requires explicit
-    /// approval. Off by default.
+    /// Retired compatibility setting. It is still parsed so old configs remain
+    /// readable, but runtime loading always normalizes it to false: command
+    /// text alone cannot prove what aliases, functions, helpers, or flags will
+    /// actually execute.
     pub(crate) agent_auto_approve_readonly: bool,
     /// Offer an editable, review-first correction when a Block command fails
     /// with a narrow typo-shaped error. Nothing is inserted or run
@@ -562,7 +821,7 @@ pub(crate) fn default_ai_api_key_path() -> String {
 }
 
 pub(crate) fn ai_api_key_file_env_override() -> Option<String> {
-    env_string("JTERM4_AI_API_KEY_FILE")
+    env_string("JTERM4_AI_API_KEY_FILE").filter(|path| configured_path_is_safe(path, true))
 }
 
 pub(crate) fn default_command_history_path() -> String {
@@ -706,8 +965,8 @@ fn config_issue(
 ) {
     issues.push(ConfigIssue {
         level,
-        path: path.into(),
-        message: message.into(),
+        path: crate::review_input::safe_inline_display(&path.into(), 512),
+        message: crate::review_input::safe_inline_display(&message.into(), 2 * 1024),
     });
 }
 
@@ -734,12 +993,26 @@ fn validate_remote_host_string(
     };
     if value.trim().is_empty() {
         config_issue(issues, ConfigIssueLevel::Error, path, "must not be empty");
+    } else if value.len() > MAX_REMOTE_HOST_FIELD_BYTES {
+        config_issue(
+            issues,
+            ConfigIssueLevel::Error,
+            path,
+            format!("must not exceed {MAX_REMOTE_HOST_FIELD_BYTES} bytes"),
+        );
     } else if value.chars().any(char::is_control) {
         config_issue(
             issues,
             ConfigIssueLevel::Error,
             path,
             "must not contain control characters",
+        );
+    } else if crate::review_input::contains_visual_spoof(value) {
+        config_issue(
+            issues,
+            ConfigIssueLevel::Error,
+            path,
+            "must not contain invisible or bidirectional formatting characters",
         );
     }
 }
@@ -886,6 +1159,41 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
     warn_int_range(&mut issues, "ai_max_tokens", 64, 32_768);
     warn_int_range(&mut issues, "notify_long_block_threshold_ms", 0, i64::MAX);
 
+    if table
+        .get("agent_auto_approve_readonly")
+        .and_then(toml::Value::as_bool)
+        == Some(true)
+    {
+        config_issue(
+            &mut issues,
+            Warning,
+            "agent_auto_approve_readonly",
+            "retired for safety; every Agent proposal now requires explicit approval",
+        );
+    }
+
+    for (key, max_bytes) in [
+        ("font", MAX_FONT_DESC_BYTES),
+        ("shell", MAX_CONFIG_PATH_BYTES),
+        ("startup_commands", MAX_STARTUP_COMMANDS_BYTES),
+        ("command_history_path", MAX_CONFIG_PATH_BYTES),
+        ("block_history_path", MAX_CONFIG_PATH_BYTES),
+        ("ai_model", MAX_AI_IDENTIFIER_BYTES),
+    ] {
+        if let Some(value) = table.get(key).and_then(toml::Value::as_str) {
+            if !setting_text_is_safe(value, max_bytes) {
+                config_issue(
+                    &mut issues,
+                    Error,
+                    key,
+                    format!(
+                        "must be non-empty, at most {max_bytes} bytes, and contain no control or invisible formatting characters"
+                    ),
+                );
+            }
+        }
+    }
+
     if let Some(mode) = table.get("terminal_mode").and_then(toml::Value::as_str) {
         if !matches!(mode.to_ascii_lowercase().as_str(), "block" | "vte") {
             config_issue(
@@ -914,37 +1222,23 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
             );
         }
     }
-    if let Some(model) = table.get("ai_model").and_then(toml::Value::as_str) {
-        if model.trim().is_empty() {
-            config_issue(&mut issues, Error, "ai_model", "must not be empty");
-        }
-    }
     if let Some(url) = table.get("ai_base_url").and_then(toml::Value::as_str) {
-        let url = url.trim();
-        let valid = (url.starts_with("http://") || url.starts_with("https://"))
-            && url
-                .split_once("://")
-                .is_some_and(|(_, authority)| !authority.is_empty())
-            && !url.chars().any(char::is_whitespace);
-        if !valid {
+        if !ai_base_url_is_safe(url) {
             config_issue(
                 &mut issues,
                 Error,
                 "ai_base_url",
-                "expected an absolute http(s) URL without whitespace",
+                "expected a bounded absolute http(s) URL without whitespace, controls, or invisible formatting",
             );
         }
     }
     if let Some(path) = table.get("ai_api_key_file").and_then(toml::Value::as_str) {
-        let path = path.trim();
-        if path.is_empty() {
-            config_issue(&mut issues, Error, "ai_api_key_file", "must not be empty");
-        } else if !(path.starts_with('/') || path == "~" || path.starts_with("~/")) {
+        if !configured_path_is_safe(path, true) {
             config_issue(
                 &mut issues,
                 Error,
                 "ai_api_key_file",
-                "expected an absolute path or a path beginning with ~/",
+                "expected a bounded absolute path or ~/ path without control or invisible formatting characters",
             );
         }
     }
@@ -1042,7 +1336,7 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
                 .collect();
             // Same parser the runtime override path uses, so a chord that
             // validates here can never fail to load later (and vice versa).
-            let mut chords: HashMap<jterm_core::keybindings::Chord, &str> = HashMap::new();
+            let mut chords: HashMap<crate::core_keybindings::Chord, &str> = HashMap::new();
             for (action, value) in bindings {
                 let path = format!("keybindings.{action}");
                 if !known.contains(action.as_str()) {
@@ -1061,10 +1355,10 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
                     );
                     continue;
                 };
-                if jterm_core::keybindings::is_unbind_token(chord) {
+                if crate::core_keybindings::is_unbind_token(chord) {
                     continue;
                 }
-                match jterm_core::keybindings::parse(chord) {
+                match crate::core_keybindings::parse(chord) {
                     Ok(combo) => {
                         if let Some(previous) = chords.insert(combo, action) {
                             config_issue(
@@ -1085,7 +1379,15 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
 
     if let Some(hosts) = table.get("remote_hosts") {
         if let Some(hosts) = hosts.as_array() {
-            for (index, host) in hosts.iter().enumerate() {
+            if hosts.len() > MAX_REMOTE_HOSTS {
+                config_issue(
+                    &mut issues,
+                    Error,
+                    "remote_hosts",
+                    format!("must not contain more than {MAX_REMOTE_HOSTS} entries"),
+                );
+            }
+            for (index, host) in hosts.iter().take(MAX_REMOTE_HOSTS).enumerate() {
                 let path = format!("remote_hosts[{index}]");
                 let Some(host) = host.as_table() else {
                     config_issue(&mut issues, Error, path, "expected a table");
@@ -1111,10 +1413,52 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
                     let field_path = format!("{path}.{key}");
                     validate_remote_host_string(&mut issues, host.get(key), &field_path, false);
                 }
+                if let Some(session) = host.get("session").and_then(toml::Value::as_str) {
+                    if !crate::review_input::valid_jsh_id(session) {
+                        config_issue(
+                            &mut issues,
+                            Error,
+                            format!("{path}.session"),
+                            "must be 1-128 ASCII letters, digits, '_' or '-'",
+                        );
+                    }
+                }
+                if let Some(target) = host.get("host").and_then(toml::Value::as_str) {
+                    if target.starts_with('-') || target.chars().any(char::is_whitespace) {
+                        config_issue(
+                            &mut issues,
+                            Error,
+                            format!("{path}.host"),
+                            "must not begin with '-' or contain whitespace",
+                        );
+                    }
+                }
+                if let Some(user) = host.get("user").and_then(toml::Value::as_str) {
+                    if user.contains('@') || user.chars().any(char::is_whitespace) {
+                        config_issue(
+                            &mut issues,
+                            Error,
+                            format!("{path}.user"),
+                            "must not contain '@' or whitespace",
+                        );
+                    }
+                }
                 if let Some(args) = host.get("ssh_args") {
                     match args.as_array() {
                         Some(values) => {
-                            for (arg_index, value) in values.iter().enumerate() {
+                            if values.len() > MAX_REMOTE_SSH_ARGS {
+                                config_issue(
+                                    &mut issues,
+                                    Error,
+                                    format!("{path}.ssh_args"),
+                                    format!(
+                                        "must not contain more than {MAX_REMOTE_SSH_ARGS} entries"
+                                    ),
+                                );
+                            }
+                            for (arg_index, value) in
+                                values.iter().take(MAX_REMOTE_SSH_ARGS).enumerate()
+                            {
                                 validate_remote_host_string(
                                     &mut issues,
                                     Some(value),
@@ -1239,9 +1583,9 @@ fn table_u64(table: &toml::Table, key: &str) -> Option<u64> {
 
 fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision>) {
     let path = config_file_path();
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    let bytes = match crate::config_store::read_config_bytes(&path) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
             return (
                 FileConfig {
                     remote_hosts: default_remote_hosts(),
@@ -1251,7 +1595,10 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
             );
         }
         Err(error) => {
-            log::warn!("Failed to read config file {}: {error}", path.display());
+            log::warn!(
+                "Failed to read config file {}: {error}",
+                crate::review_input::safe_inline_display(&path.to_string_lossy(), 2 * 1024)
+            );
             return (
                 FileConfig {
                     remote_hosts: default_remote_hosts(),
@@ -1263,7 +1610,10 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
     };
     let revision = crate::config_store::ConfigRevision::from_bytes(&bytes);
     let Ok(contents) = std::str::from_utf8(&bytes) else {
-        log::warn!("Config file {} is not valid UTF-8", path.display());
+        log::warn!(
+            "Config file {} is not valid UTF-8",
+            crate::review_input::safe_inline_display(&path.to_string_lossy(), 2 * 1024)
+        );
         return (
             FileConfig {
                 remote_hosts: default_remote_hosts(),
@@ -1273,7 +1623,10 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
         );
     };
     let Ok(table) = contents.parse::<toml::Table>() else {
-        log::warn!("Failed to parse config file {}", path.display());
+        log::warn!(
+            "Failed to parse config file {}",
+            crate::review_input::safe_inline_display(&path.to_string_lossy(), 2 * 1024)
+        );
         return (
             FileConfig {
                 remote_hosts: default_remote_hosts(),
@@ -1439,36 +1792,71 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
         return Vec::new();
     };
     arr.iter()
+        .take(MAX_REMOTE_HOSTS)
         .filter_map(|v| v.as_table())
         .filter_map(|t| {
             let host = t.get("host").and_then(|v| v.as_str())?.to_string();
+            if !remote_field_is_safe(&host)
+                || host.starts_with('-')
+                || host.chars().any(char::is_whitespace)
+            {
+                return None;
+            }
             let name = t
                 .get("name")
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
+                .filter(|name| remote_field_is_safe(name))
+                .map(str::to_string)
                 .unwrap_or_else(|| host.clone());
-            let user = t
-                .get("user")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+            let user = match t.get("user") {
+                Some(value) => {
+                    let user = value.as_str()?;
+                    if !remote_field_is_safe(user)
+                        || user.chars().any(char::is_whitespace)
+                        || user.contains('@')
+                    {
+                        return None;
+                    }
+                    Some(user.to_string())
+                }
+                None => None,
+            };
             let remote_shell = t
                 .get("remote_shell")
                 .and_then(|v| v.as_str())
                 .unwrap_or("jsh")
                 .to_string();
-            let session = t
-                .get("session")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let ssh_args = t
-                .get("ssh_args")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
+            if !remote_field_is_safe(&remote_shell) {
+                return None;
+            }
+            let session = match t.get("session") {
+                Some(value) => {
+                    let session = value.as_str()?;
+                    if !crate::review_input::valid_jsh_id(session) {
+                        return None;
+                    }
+                    Some(session.to_string())
+                }
+                None => None,
+            };
+            let ssh_args = match t.get("ssh_args") {
+                Some(value) => {
+                    let values = value.as_array()?;
+                    if values.len() > MAX_REMOTE_SSH_ARGS {
+                        return None;
+                    }
+                    let mut args = Vec::with_capacity(values.len());
+                    for value in values {
+                        let value = value.as_str()?;
+                        if !remote_field_is_safe(value) {
+                            return None;
+                        }
+                        args.push(value.to_string());
+                    }
+                    args
+                }
+                None => Vec::new(),
+            };
             let login_shell = t
                 .get("login_shell")
                 .and_then(|v| v.as_bool())
@@ -1534,6 +1922,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     // Resolve active theme
     let theme_name = env_string("JTERM4_THEME")
         .or(fc.theme)
+        .filter(|value| setting_text_is_safe(value, 256))
         .unwrap_or_else(|| "default".to_string());
     let theme = themes
         .iter()
@@ -1555,6 +1944,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .clamp(0.1, 10.0);
     let font_desc = env_string("JTERM4_FONT")
         .or(fc.font)
+        .filter(|font| setting_text_is_safe(font, MAX_FONT_DESC_BYTES))
         // Use the "Mono" (NFM) Nerd Font variant: the plain "Nerd Font" (NF)
         // variant renders proportionally in VTE (glyphs draw at non-cell widths)
         // even though fontconfig reports it spacing=100, so output never aligns
@@ -1607,15 +1997,16 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let command_history_path = command_history_enabled.then(|| {
         env_string("JTERM4_COMMAND_HISTORY_PATH")
             .or(fc.command_history_path)
+            .filter(|path| configured_path_is_safe(path, false))
             .unwrap_or_else(default_command_history_path)
     });
     let command_history_max_entries = fc
         .command_history_max_entries
         .unwrap_or(10_000)
         .clamp(100, 1_000_000);
-    let block_history_path = std::env::var("JTERM4_HISTORY_PATH")
-        .ok()
-        .or(fc.block_history_path);
+    let block_history_path = env_string("JTERM4_HISTORY_PATH")
+        .or(fc.block_history_path)
+        .filter(|path| configured_path_is_safe(path, false));
     let block_history_compress = fc.block_history_compress.unwrap_or(true);
     let block_compact = match std::env::var("JTERM4_BLOCK_COMPACT").ok().as_deref() {
         Some("1") | Some("true") => Some(true),
@@ -1624,12 +2015,18 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     }
     .or(fc.block_compact)
     .unwrap_or(false);
-    let shell = std::env::var("JTERM4_SHELL").ok().or(fc.shell);
+    let shell = env_string("JTERM4_SHELL")
+        .or(fc.shell)
+        .filter(|shell| setting_text_is_safe(shell, MAX_CONFIG_PATH_BYTES));
+    let startup_commands = fc
+        .startup_commands
+        .filter(|commands| setting_text_is_safe(commands, MAX_STARTUP_COMMANDS_BYTES));
 
     // Block-first like jterm1; VTE remains available for compatibility and
     // safe mode.
     let terminal_mode_str = env_string("JTERM4_MODE")
         .or(fc.terminal_mode)
+        .filter(|value| setting_text_is_safe(value, 64))
         .unwrap_or_else(|| "block".to_string());
     let terminal_mode = match terminal_mode_str.to_ascii_lowercase().as_str() {
         "block" => TerminalMode::Block,
@@ -1643,6 +2040,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let tab_placement = TabPlacement::parse(
         &env_string("JTERM4_TAB_PLACEMENT")
             .or(fc.tab_placement)
+            .filter(|value| setting_text_is_safe(value, 64))
             .unwrap_or_else(|| "sidebar".to_string()),
     );
     let sidebar_visible = resolve_sidebar_visibility(fc.sidebar_visible, tab_placement);
@@ -1657,15 +2055,21 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .or(fc.agent_max_turns)
         .unwrap_or(20)
         .clamp(1, 100);
-    // Auto-execution is a policy change, so it never defaults on.
-    let agent_auto_approve_readonly = env_bool("JTERM4_AGENT_AUTO_APPROVE_READONLY")
+    let requested_agent_auto_approve = env_bool("JTERM4_AGENT_AUTO_APPROVE_READONLY")
         .or(fc.agent_auto_approve_readonly)
         .unwrap_or(false);
+    if requested_agent_auto_approve {
+        log::warn!(
+            "agent_auto_approve_readonly is retired; every Agent proposal requires explicit approval"
+        );
+    }
+    let agent_auto_approve_readonly = false;
     let command_correction_enabled = env_bool("JTERM4_COMMAND_CORRECTION_ENABLED")
         .or(fc.command_correction_enabled)
         .unwrap_or(true);
     let requested_provider = env_string("JTERM4_AI_PROVIDER")
         .or(fc.ai_provider)
+        .filter(|value| setting_text_is_safe(value, 64))
         .unwrap_or_else(|| "anthropic".to_string());
     let ai_provider = match requested_provider.trim().to_ascii_lowercase().as_str() {
         "anthropic" | "claude" => "anthropic",
@@ -1684,15 +2088,17 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     };
     let ai_model = env_string("JTERM4_AI_MODEL")
         .or(fc.ai_model)
-        .filter(|model| !model.trim().is_empty())
+        .filter(|model| setting_text_is_safe(model, MAX_AI_IDENTIFIER_BYTES))
         .unwrap_or_else(|| default_ai_model.to_string());
     let ai_base_url = env_string("JTERM4_AI_BASE_URL")
         .or(fc.ai_base_url)
-        .filter(|url| !url.trim().is_empty())
+        .filter(|url| ai_base_url_is_safe(url))
         .unwrap_or_else(|| default_ai_base_url.to_string())
         .trim_end_matches('/')
         .to_string();
-    let ai_api_key_file_configured = fc.ai_api_key_file.filter(|path| !path.trim().is_empty());
+    let ai_api_key_file_configured = fc
+        .ai_api_key_file
+        .filter(|path| configured_path_is_safe(path, true));
     let ai_api_key_file =
         ai_api_key_file_env_override().or_else(|| ai_api_key_file_configured.clone());
 
@@ -1708,12 +2114,18 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         cursor_foreground,
         palette: theme.palette,
         shell,
-        startup_commands: fc.startup_commands,
+        startup_commands,
         terminal_mode,
         tab_placement,
-        sidebar_view: SidebarView::parse(&fc.sidebar_view.unwrap_or_else(|| "tabs".to_string())),
+        sidebar_view: SidebarView::parse(
+            &fc.sidebar_view
+                .filter(|value| setting_text_is_safe(value, 64))
+                .unwrap_or_else(|| "tabs".to_string()),
+        ),
         jsh_update_check: JshUpdateCheck::parse(
-            &fc.jsh_update_check.unwrap_or_else(|| "daily".to_string()),
+            &fc.jsh_update_check
+                .filter(|value| setting_text_is_safe(value, 64))
+                .unwrap_or_else(|| "daily".to_string()),
         ),
         sidebar_visible,
         sidebar_width: fc.sidebar_width.unwrap_or(220).clamp(120, 800),
@@ -1946,6 +2358,7 @@ mod tests {
             vec![
                 "ssh",
                 "-t",
+                "--",
                 "yj@1.2.3.4",
                 "bash -lc 'exec /home/yj/.cargo/bin/jsh --session cloud-test'",
             ]
@@ -1964,13 +2377,13 @@ mod tests {
     }
 
     #[test]
-    fn single_quotes_in_payload_are_escaped() {
+    fn invalid_session_ids_are_never_interpolated_into_remote_shell_code() {
         let mut h = host();
         h.session = Some("it's".into());
         let argv = build_remote_argv(&h);
         assert_eq!(
             argv.last().unwrap(),
-            r#"bash -lc 'exec /home/yj/.cargo/bin/jsh --session it'"'"'s'"#
+            "bash -lc 'exec /home/yj/.cargo/bin/jsh'"
         );
     }
 
@@ -1986,8 +2399,7 @@ mod tests {
     fn multiplex_injects_controlmaster_flags() {
         let mut h = host();
         h.multiplex = true;
-        std::env::set_var("XDG_RUNTIME_DIR", std::env::temp_dir());
-        let argv = build_remote_argv(&h);
+        let argv = build_remote_argv_with_control_dir(&h, Some(Path::new("/run/user/1000/jterm4")));
         assert!(
             argv.iter().any(|a| a == "ControlMaster=auto"),
             "argv: {argv:?}"
@@ -2004,6 +2416,72 @@ mod tests {
         let target_idx = argv.iter().position(|a| a == "yj@1.2.3.4").unwrap();
         let cm_idx = argv.iter().position(|a| a == "ControlMaster=auto").unwrap();
         assert!(cm_idx < target_idx);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_socket_namespace_is_private_and_never_follows_a_link() {
+        use std::os::unix::fs::{symlink, DirBuilderExt, PermissionsExt};
+
+        let root = std::env::temp_dir().join(format!(
+            "jterm4-control-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let parent = open_owned_directory(&root).unwrap();
+        let (child_path, child) =
+            ensure_owned_child_directory(&parent, &root, "jterm4", true).unwrap();
+        assert_eq!(
+            child.metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        drop(child);
+        fs::remove_dir(&child_path).unwrap();
+        symlink(&root, &child_path).unwrap();
+        assert!(ensure_owned_child_directory(&parent, &root, "jterm4", true).is_err());
+        fs::remove_file(&child_path).unwrap();
+        drop(parent);
+        fs::remove_dir(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_socket_namespace_rejects_nonsticky_writable_ancestors() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let root = std::env::temp_dir().join(format!(
+            "jterm4-control-parent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let shared = root.join("shared");
+        fs::DirBuilder::new().mode(0o700).create(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        let runtime = shared.join("runtime");
+        fs::DirBuilder::new().mode(0o700).create(&runtime).unwrap();
+        assert!(open_trusted_owned_directory(&runtime).is_err());
+        fs::remove_dir(&runtime).unwrap();
+        fs::remove_dir(&shared).unwrap();
+        fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn control_socket_path_rejects_openssh_expansion_and_hidden_text() {
+        assert!(control_socket_path_is_safe(Path::new(
+            "/run/user/1000/jterm4"
+        )));
+        assert!(!control_socket_path_is_safe(Path::new("/tmp/%h/jterm4")));
+        assert!(!control_socket_path_is_safe(Path::new(
+            "/tmp/safe\u{202e}fake"
+        )));
     }
 
     #[test]
@@ -2046,6 +2524,48 @@ unknown_action = "F8"
     }
 
     #[test]
+    fn executable_and_network_settings_reject_hidden_or_unbounded_text() {
+        let oversized_model = "x".repeat(MAX_AI_IDENTIFIER_BYTES + 1);
+        let input = format!(
+            "startup_commands = \"echo safe\\u202efake\"\nshell = \"/bin/sh\\n--bad\"\nai_model = \"{oversized_model}\"\nai_base_url = \"https://example.com/\\uFE0F\"\nai_api_key_file = \"relative.key\"\n"
+        );
+        let issues = validate_config_contents(&input).unwrap();
+        for path in [
+            "startup_commands",
+            "shell",
+            "ai_model",
+            "ai_base_url",
+            "ai_api_key_file",
+        ] {
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.path == path && issue.is_error()),
+                "missing error for {path}: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ai_base_url_rejects_ambiguous_or_credential_bearing_endpoints() {
+        assert!(ai_base_url_is_safe("https://api.example.com/v1"));
+        assert!(ai_base_url_is_safe("http://127.0.0.1:8000/v1"));
+        for value in [
+            "https://user:secret@example.com/v1",
+            "https://example.com/v1?key=secret",
+            "https://example.com/v1#fragment",
+            "https://example.com\\@attacker.invalid/v1",
+            "https:///missing-authority",
+        ] {
+            assert!(!ai_base_url_is_safe(value), "accepted {value:?}");
+        }
+        assert!(!ai_base_url_is_safe(&format!(
+            "https://example.com/{}",
+            "x".repeat(MAX_AI_BASE_URL_BYTES)
+        )));
+    }
+
+    #[test]
     fn disabled_keybinding_is_valid() {
         let issues = validate_config_contents("[keybindings]\ncopy = false\n").unwrap();
         assert!(issues.is_empty(), "{issues:?}");
@@ -2070,7 +2590,7 @@ name = "开发机"
 host = "dev.example.com"
 user = "alice"
 remote_shell = "/opt/tools/jsh --resume"
-session = "开发-main"
+session = "dev-main"
 ssh_args = ["-p", "2222", "-o", "ProxyCommand=ssh bastion -W %h:%p"]
 login_shell = false
 multiplex = true
@@ -2164,6 +2684,35 @@ ssh_args = ["", "ok\u007f"]
     }
 
     #[test]
+    fn remote_host_config_rejects_visual_spoofing_and_unsafe_wire_ids() {
+        let issues = validate_config_contents(
+            r#"
+[[remote_hosts]]
+name = "safe\u202efake"
+host = "-oProxyCommand=bad"
+user = "bad user"
+remote_shell = "jsh\uFE0F"
+session = "bad/session"
+"#,
+        )
+        .unwrap();
+        for path in [
+            "remote_hosts[0].name",
+            "remote_hosts[0].host",
+            "remote_hosts[0].user",
+            "remote_hosts[0].remote_shell",
+            "remote_hosts[0].session",
+        ] {
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.path == path && issue.is_error()),
+                "missing error for {path}: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
     fn command_history_config_is_validated_and_uses_xdg_state_semantics() {
         let issues = validate_config_contents(
             "command_history_enabled = true\ncommand_history_path = '/tmp/history.jsonl'\ncommand_history_max_entries = 99\n",
@@ -2204,10 +2753,17 @@ ssh_args = ["", "ok\u007f"]
     #[test]
     fn ai_and_agent_config_is_semantically_validated() {
         let valid = validate_config_contents(
-            "ai_enabled = true\nagent_enabled = true\nagent_max_turns = 20\nagent_auto_approve_readonly = true\ncommand_correction_enabled = true\nai_provider = 'openai-compatible'\nai_base_url = 'http://localhost:8000/v1'\nai_api_key_file = '~/.config/jterm4/ai.key'\nai_model = 'local-model'\nai_max_tokens = 4096\nai_redact_secrets = true\n",
+            "ai_enabled = true\nagent_enabled = true\nagent_max_turns = 20\nagent_auto_approve_readonly = false\ncommand_correction_enabled = true\nai_provider = 'openai-compatible'\nai_base_url = 'http://localhost:8000/v1'\nai_api_key_file = '~/.config/jterm4/ai.key'\nai_model = 'local-model'\nai_max_tokens = 4096\nai_redact_secrets = true\n",
         )
         .unwrap();
         assert!(valid.is_empty(), "{valid:?}");
+
+        let retired = validate_config_contents("agent_auto_approve_readonly = true\n").unwrap();
+        assert!(retired.iter().any(|issue| {
+            issue.path == "agent_auto_approve_readonly"
+                && issue.level == ConfigIssueLevel::Warning
+                && issue.message.contains("retired")
+        }));
 
         let invalid = validate_config_contents(
             "agent_max_turns = 0\nai_provider = 'mystery'\nai_base_url = 'file:///tmp/model'\nai_api_key_file = 'relative.key'\nai_model = ''\nai_max_tokens = 999999\n",

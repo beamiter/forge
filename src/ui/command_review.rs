@@ -5,11 +5,15 @@
 //! editable one-line command, live risk feedback, copy, secondary actions, and
 //! one clearly labelled primary action.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk4::prelude::*;
 use gtk4::{Box as GBox, Button, Entry, Label, Orientation};
+
+const MAX_REVIEW_LABEL_BYTES: usize = 1024;
+const MAX_REVIEW_DESCRIPTION_BYTES: usize = 16 * 1024;
+const MAX_REVIEW_FEEDBACK_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReviewPresentation {
@@ -54,7 +58,11 @@ pub(super) struct CommandReviewPrimary {
 
 impl CommandReviewPrimary {
     pub(super) fn set(&self, label: &str, executes: bool, command: &str) {
-        self.button.set_label(label);
+        self.button
+            .set_label(&crate::review_input::safe_inline_display(
+                label,
+                MAX_REVIEW_LABEL_BYTES,
+            ));
         self.executes.set(executes);
         sync_risk(&self.risk, &self.button, command, executes);
     }
@@ -107,18 +115,22 @@ impl CommandReviewCard {
         icon.add_css_class("assistant-card-icon");
         header.append(&icon);
 
-        let title = Label::new(Some(&spec.title));
+        let title_text =
+            crate::review_input::safe_inline_display(&spec.title, MAX_REVIEW_LABEL_BYTES);
+        let title = Label::new(Some(&title_text));
         title.add_css_class("assistant-card-title");
         title.set_xalign(0.0);
         title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         header.append(&title);
 
-        let badge = Label::new(Some(&spec.badge));
+        let badge_text =
+            crate::review_input::safe_inline_display(&spec.badge, MAX_REVIEW_LABEL_BYTES);
+        let badge = Label::new(Some(&badge_text));
         badge.add_css_class("assistant-card-badge");
         badge.set_hexpand(true);
         badge.set_halign(gtk4::Align::End);
         badge.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
-        badge.set_tooltip_text(Some(&spec.badge));
+        badge.set_tooltip_text(Some(&badge_text));
         header.append(&badge);
 
         let close = spec.close_button.then(|| {
@@ -138,7 +150,11 @@ impl CommandReviewCard {
         body.set_margin_top(2);
         body.set_margin_bottom(if spec.compact { 7 } else { 11 });
 
-        let description = Label::new(Some(&spec.description));
+        let description_text = crate::review_input::safe_multiline_display(
+            &spec.description,
+            MAX_REVIEW_DESCRIPTION_BYTES,
+        );
+        let description = Label::new(Some(&description_text));
         description.add_css_class("command-review-description");
         description.set_xalign(0.0);
         description.set_wrap(true);
@@ -152,9 +168,10 @@ impl CommandReviewCard {
         risk.set_wrap(true);
         body.append(&risk);
 
+        let (initial_command, initial_command_error) = initial_review_entry_text(&spec.command);
         let entry = Entry::new();
         entry.add_css_class("command-review-entry");
-        entry.set_text(&spec.command);
+        entry.set_text(&initial_command);
         entry.set_hexpand(true);
         entry.update_property(&[gtk4::accessible::Property::Label("Proposed shell command")]);
         body.append(&entry);
@@ -166,6 +183,9 @@ impl CommandReviewCard {
         feedback.set_visible(false);
         feedback.set_accessible_role(gtk4::AccessibleRole::Status);
         body.append(&feedback);
+        if let Some(error) = initial_command_error.as_deref() {
+            set_review_feedback(&feedback, error, true);
+        }
 
         let actions = GBox::new(Orientation::Horizontal, 6);
         actions.add_css_class("command-review-actions");
@@ -174,16 +194,20 @@ impl CommandReviewCard {
         copy.set_tooltip_text(Some("Copy the command without inserting or running it"));
         actions.append(&copy);
         let auxiliary = spec.auxiliary_label.map(|label| {
+            let label = crate::review_input::safe_inline_display(&label, MAX_REVIEW_LABEL_BYTES);
             let button = Button::with_label(&label);
             actions.append(&button);
             button
         });
         let secondary = spec.secondary_label.map(|label| {
+            let label = crate::review_input::safe_inline_display(&label, MAX_REVIEW_LABEL_BYTES);
             let button = Button::with_label(&label);
             actions.append(&button);
             button
         });
-        let primary = Button::with_label(&spec.primary_label);
+        let primary_label =
+            crate::review_input::safe_inline_display(&spec.primary_label, MAX_REVIEW_LABEL_BYTES);
+        let primary = Button::with_label(&primary_label);
         actions.append(&primary);
         body.append(&actions);
         root.append(&body);
@@ -206,9 +230,27 @@ impl CommandReviewCard {
             let primary = primary.clone();
             let executes = primary_executes.clone();
             let feedback = feedback.clone();
+            let last_accepted = Rc::new(RefCell::new(initial_command));
             entry.connect_changed(move |entry| {
+                let current = entry.text();
+                let (accepted, rejected) =
+                    accepted_review_entry_text(&last_accepted.borrow(), &current);
+                if rejected {
+                    // `set_text` emits `changed` synchronously. Let that inner
+                    // callback update the risk state, then restore this
+                    // explicit size-limit advisory before returning.
+                    entry.set_text(&accepted);
+                    entry.set_position(accepted.chars().count() as i32);
+                    feedback.set_text(
+                        "Oversized edit rejected; the prior command was restored (256 KiB limit).",
+                    );
+                    feedback.add_css_class("error");
+                    feedback.set_visible(true);
+                    return;
+                }
+                *last_accepted.borrow_mut() = accepted;
                 feedback.set_visible(false);
-                sync_risk(&risk, &primary, &entry.text(), executes.get());
+                sync_risk(&risk, &primary, &current, executes.get());
             });
         }
 
@@ -232,15 +274,11 @@ impl CommandReviewCard {
     }
 
     pub(super) fn show_error(&self, message: &str) {
-        self.feedback.set_text(message);
-        self.feedback.add_css_class("error");
-        self.feedback.set_visible(true);
+        set_review_feedback(&self.feedback, message, true);
     }
 
     pub(super) fn show_info(&self, message: &str) {
-        self.feedback.set_text(message);
-        self.feedback.remove_css_class("error");
-        self.feedback.set_visible(true);
+        set_review_feedback(&self.feedback, message, false);
     }
 
     pub(super) fn focus(&self) {
@@ -266,6 +304,40 @@ impl CommandReviewCard {
             executes: self.primary_executes.clone(),
         }
     }
+}
+
+fn accepted_review_entry_text(previous: &str, candidate: &str) -> (String, bool) {
+    if candidate.len() <= crate::review_input::MAX_REVIEW_INPUT_BYTES {
+        (candidate.to_string(), false)
+    } else {
+        (previous.to_string(), true)
+    }
+}
+
+fn initial_review_entry_text(text: &str) -> (String, Option<String>) {
+    match crate::review_input::validate(text) {
+        Ok(command) => (command.to_string(), None),
+        Err(error) => (
+            String::new(),
+            Some(format!(
+                "Unsafe proposal withheld from the review field: {error}."
+            )),
+        ),
+    }
+}
+
+fn safe_review_feedback_text(message: &str) -> String {
+    crate::review_input::safe_multiline_display(message, MAX_REVIEW_FEEDBACK_BYTES)
+}
+
+pub(super) fn set_review_feedback(feedback: &Label, message: &str, error: bool) {
+    feedback.set_text(&safe_review_feedback_text(message));
+    if error {
+        feedback.add_css_class("error");
+    } else {
+        feedback.remove_css_class("error");
+    }
+    feedback.set_visible(true);
 }
 
 fn sync_risk(risk: &Label, primary: &Button, command: &str, executes: bool) {
@@ -302,7 +374,9 @@ fn sync_risk(risk: &Label, primary: &Button, command: &str, executes: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::sync_risk;
+    use super::{
+        accepted_review_entry_text, initial_review_entry_text, safe_review_feedback_text, sync_risk,
+    };
     use gtk4::{Button, Label};
 
     // GTK widget construction requires a display in normal unit-test runs, so
@@ -311,5 +385,50 @@ mod tests {
     #[test]
     fn shared_risk_renderer_is_linked() {
         let _renderer: fn(&Label, &Button, &str, bool) = sync_risk;
+    }
+
+    #[test]
+    fn oversized_edit_restores_prior_command_instead_of_running_a_prefix() {
+        let prior = "printf safe";
+        let input = format!(
+            "{}界",
+            "a".repeat(crate::review_input::MAX_REVIEW_INPUT_BYTES - 1)
+        );
+        let (accepted, rejected) = accepted_review_entry_text(prior, &input);
+        assert!(rejected);
+        assert_eq!(accepted, prior);
+
+        let (accepted, rejected) = accepted_review_entry_text(prior, "echo changed");
+        assert!(!rejected);
+        assert_eq!(accepted, "echo changed");
+    }
+
+    #[test]
+    fn feedback_is_bounded_and_cannot_embed_visual_controls() {
+        let feedback = safe_review_feedback_text(&format!(
+            "bad\u{202e}\u{fff0}\u{e0080}{}",
+            "x".repeat(32 * 1024)
+        ));
+        assert!(feedback.len() <= super::MAX_REVIEW_FEEDBACK_BYTES);
+        assert!(!feedback.contains('\u{202e}'));
+        assert!(!feedback.contains('\u{fff0}'));
+        assert!(!feedback.contains('\u{e0080}'));
+    }
+
+    #[test]
+    fn invalid_initial_proposal_is_withheld_instead_of_normalized() {
+        for command in [
+            "echo one\necho two".to_string(),
+            "echo safe\u{202e}txt".to_string(),
+            "x".repeat(crate::review_input::MAX_REVIEW_INPUT_BYTES + 1),
+        ] {
+            let (entry, error) = initial_review_entry_text(&command);
+            assert!(entry.is_empty());
+            assert!(error.is_some());
+        }
+
+        let (entry, error) = initial_review_entry_text("printf '%s' safe");
+        assert_eq!(entry, "printf '%s' safe");
+        assert!(error.is_none());
     }
 }

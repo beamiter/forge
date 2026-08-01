@@ -8,16 +8,25 @@
 //! toggle) stays in a small settings dialog opened from the card header.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use adw::prelude::*;
 use gtk4::{Box as GBox, Button, Entry, Image, Label, Orientation, ProgressBar, Spinner, Switch};
 use libadwaita as adw;
 
-use super::command_review::{CommandReviewCard, CommandReviewSpec, ReviewPresentation};
+use super::command_review::{
+    set_review_feedback, CommandReviewCard, CommandReviewSpec, ReviewPresentation,
+};
 use super::UiState;
 use crate::agent::{AgentSession, AgentState, ModelOutcome, ProposalId, ProposalStatus, Turn};
 use crate::block_view::TermView;
+
+const MAX_AGENT_MESSAGE_DISPLAY_BYTES: usize = 64 * 1024;
+const MAX_AGENT_STATUS_DISPLAY_BYTES: usize = 16 * 1024;
+const MAX_AGENT_INPUT_BYTES: usize = 16 * 1024;
 
 /// Bind the next completed foreground block to the approved proposal.
 ///
@@ -37,6 +46,18 @@ fn take_pending_for_finished_block<T>(
     Some(value)
 }
 
+fn proposal_callback_is_current(
+    alive: bool,
+    current_epoch: u64,
+    captured_epoch: u64,
+    state: AgentState,
+    proposal_id: ProposalId,
+) -> bool {
+    alive
+        && current_epoch == captured_epoch
+        && state == AgentState::AwaitingApproval { proposal_id }
+}
+
 /// The one live Shell Agent session, stored in `UiState::agent_session`.
 /// Closing it cancels the session and removes its inline card.
 pub(crate) struct AgentHandle {
@@ -53,14 +74,14 @@ impl AgentHandle {
     /// shutdown cancels the session.
     pub(crate) fn persist(&self) {
         let path = agent_snapshot_path();
-        match self.runtime.session.borrow().snapshot() {
-            Some(snapshot) => {
-                if let Err(error) = crate::agent::write_snapshot_file(&path, &snapshot) {
-                    log::warn!("agent: could not persist session: {error}");
-                }
+        if let Some(snapshot) = self.runtime.session.borrow().snapshot() {
+            if let Err(error) = write_agent_snapshot_file(&path, &snapshot) {
+                log::warn!("agent: could not persist session: {error}");
             }
-            None => crate::agent::remove_snapshot_file(&path),
         }
+        // This process never removes the shared public path after a restore:
+        // loading consumes its own predecessor through a private claim. A
+        // delete here could erase a checkpoint written by another process.
     }
 }
 
@@ -68,6 +89,758 @@ fn agent_snapshot_path() -> std::path::PathBuf {
     let mut path = crate::config::config_file_path();
     path.set_file_name("agent_session.json");
     path
+}
+
+#[cfg(unix)]
+static AGENT_SNAPSHOT_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A snapshot is renamed away from its public name before it is decoded.  The
+/// retained directory and file descriptors make the claim both single-winner
+/// across processes and immune to a final-component namespace swap while it
+/// is being consumed.
+#[cfg(unix)]
+struct AgentSnapshotClaim {
+    directory: std::fs::File,
+    file: std::fs::File,
+    parent: std::path::PathBuf,
+    original_name: std::ffi::OsString,
+    claimed_name: std::ffi::OsString,
+}
+
+#[cfg(unix)]
+impl AgentSnapshotClaim {
+    fn open_relative(
+        directory: &std::fs::File,
+        name: &std::ffi::OsStr,
+    ) -> std::io::Result<std::fs::File> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "agent snapshot name contains NUL",
+            )
+        })?;
+        // SAFETY: `name` is NUL terminated, the retained directory descriptor
+        // is live, and ownership of a successful descriptor is transferred to
+        // `File` exactly once.
+        let descriptor = unsafe {
+            nix::libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                nix::libc::O_RDONLY
+                    | nix::libc::O_NOFOLLOW
+                    | nix::libc::O_NONBLOCK
+                    | nix::libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            // SAFETY: `descriptor` is newly returned and uniquely owned.
+            Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
+        }
+    }
+
+    fn validate_file(file: &std::fs::File) -> std::io::Result<std::fs::Metadata> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let metadata = file.metadata()?;
+        // SAFETY: geteuid has no preconditions and only reads process state.
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { nix::libc::geteuid() }
+            || metadata.nlink() != 1
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "agent snapshot must be a current-user regular file with one hard link",
+            ));
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "agent snapshot must not be accessible by group or other users",
+            ));
+        }
+        Ok(metadata)
+    }
+
+    fn entry_still_matches(&self) -> std::io::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+
+        let current = Self::open_relative(&self.directory, &self.claimed_name)?;
+        let expected = self.file.metadata()?;
+        let current = current.metadata()?;
+        Ok(expected.dev() == current.dev() && expected.ino() == current.ino())
+    }
+
+    fn read_snapshot(
+        &self,
+    ) -> Result<crate::agent::AgentSessionSnapshot, crate::agent::AgentSnapshotError> {
+        use std::io::Read;
+
+        let metadata = Self::validate_file(&self.file).map_err(|error| {
+            crate::agent::AgentSnapshotError::Decode(format!(
+                "inspect claimed agent snapshot: {error}"
+            ))
+        })?;
+        let limit = crate::agent::MAX_AGENT_SNAPSHOT_JSON_BYTES as u64;
+        if metadata.len() > limit {
+            return Err(crate::agent::AgentSnapshotError::Decode(format!(
+                "claimed agent snapshot exceeds {limit} bytes"
+            )));
+        }
+        let mut reader = self.file.try_clone().map_err(|error| {
+            crate::agent::AgentSnapshotError::Decode(format!(
+                "clone claimed agent snapshot: {error}"
+            ))
+        })?;
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        reader
+            .by_ref()
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| {
+                crate::agent::AgentSnapshotError::Decode(format!(
+                    "read claimed agent snapshot: {error}"
+                ))
+            })?;
+        if bytes.len() as u64 > limit {
+            return Err(crate::agent::AgentSnapshotError::Decode(format!(
+                "claimed agent snapshot exceeds {limit} bytes"
+            )));
+        }
+        let encoded = String::from_utf8(bytes).map_err(|_| {
+            crate::agent::AgentSnapshotError::Decode(
+                "claimed agent snapshot is not valid UTF-8".to_string(),
+            )
+        })?;
+        crate::agent::AgentSessionSnapshot::from_json(&encoded)
+    }
+
+    fn retire(self) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+
+        if !self.entry_still_matches()? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "claimed agent snapshot entry changed before retirement",
+            ));
+        }
+        let name = std::ffi::CString::new(self.claimed_name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "agent snapshot name contains NUL",
+            )
+        })?;
+        // SAFETY: the name is valid for the retained directory descriptor and
+        // unlinkat retains no pointer after returning.
+        if unsafe { nix::libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.directory.sync_all()
+    }
+
+    fn quarantine(self) -> std::io::Result<std::path::PathBuf> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        if !self.entry_still_matches()? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "claimed agent snapshot entry changed before quarantine",
+            ));
+        }
+        let source = std::ffi::CString::new(self.claimed_name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "agent snapshot name contains NUL",
+            )
+        })?;
+        for _ in 0..16 {
+            let nonce = AGENT_SNAPSHOT_CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let mut target = self.original_name.clone().into_vec();
+            target.extend_from_slice(format!(".corrupt-{}-{nonce}", std::process::id()).as_bytes());
+            let target = std::ffi::OsString::from_vec(target);
+            let target_c = std::ffi::CString::new(target.as_bytes()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "agent quarantine name contains NUL",
+                )
+            })?;
+            #[cfg(target_os = "linux")]
+            // SAFETY: both names and the retained descriptor are live for the
+            // duration of the call; renameat2 retains no pointers.
+            let result = unsafe {
+                nix::libc::renameat2(
+                    self.directory.as_raw_fd(),
+                    source.as_ptr(),
+                    self.directory.as_raw_fd(),
+                    target_c.as_ptr(),
+                    nix::libc::RENAME_NOREPLACE,
+                )
+            };
+            #[cfg(not(target_os = "linux"))]
+            let result = unsafe {
+                nix::libc::renameat(
+                    self.directory.as_raw_fd(),
+                    source.as_ptr(),
+                    self.directory.as_raw_fd(),
+                    target_c.as_ptr(),
+                )
+            };
+            if result == 0 {
+                self.directory.sync_all()?;
+                return Ok(self.parent.join(target));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(error);
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate an agent snapshot quarantine name",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn claim_agent_snapshot_file(
+    path: &std::path::Path,
+) -> std::io::Result<Option<AgentSnapshotClaim>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let original_name = path
+        .file_name()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "agent snapshot path has no file name",
+            )
+        })?
+        .to_os_string();
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let directory = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(parent)
+    {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let directory_metadata = directory.metadata()?;
+    // SAFETY: geteuid has no preconditions and only reads process state.
+    if !directory_metadata.is_dir()
+        || directory_metadata.uid() != unsafe { nix::libc::geteuid() }
+        || directory_metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "agent snapshot parent must be current-user owned and not group/world writable",
+        ));
+    }
+    let source = match AgentSnapshotClaim::open_relative(&directory, &original_name) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    // Validate the source descriptor before moving the entry. A second
+    // descriptor opened after the rename is compared below, closing the
+    // remaining check/rename race without following links or blocking on a
+    // FIFO.
+    AgentSnapshotClaim::validate_file(&source)?;
+    let expected = source.metadata()?;
+    let source_c = std::ffi::CString::new(original_name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "agent snapshot name contains NUL",
+        )
+    })?;
+
+    for _ in 0..16 {
+        let nonce = AGENT_SNAPSHOT_CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut claimed_name = std::ffi::OsString::from(".");
+        claimed_name.push(&original_name);
+        claimed_name.push(format!(".claim-{}-{nonce}", std::process::id()));
+        let claimed_c = std::ffi::CString::new(claimed_name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "agent snapshot claim name contains NUL",
+            )
+        })?;
+        #[cfg(target_os = "linux")]
+        // SAFETY: names and descriptor remain live throughout the call and no
+        // pointers are retained.
+        let result = unsafe {
+            nix::libc::renameat2(
+                directory.as_raw_fd(),
+                source_c.as_ptr(),
+                directory.as_raw_fd(),
+                claimed_c.as_ptr(),
+                nix::libc::RENAME_NOREPLACE,
+            )
+        };
+        #[cfg(not(target_os = "linux"))]
+        let result = unsafe {
+            nix::libc::renameat(
+                directory.as_raw_fd(),
+                source_c.as_ptr(),
+                directory.as_raw_fd(),
+                claimed_c.as_ptr(),
+            )
+        };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                continue;
+            }
+            return Err(error);
+        }
+        directory.sync_all()?;
+        let claimed = AgentSnapshotClaim::open_relative(&directory, &claimed_name)?;
+        let actual = AgentSnapshotClaim::validate_file(&claimed)?;
+        if expected.dev() != actual.dev() || expected.ino() != actual.ino() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "agent snapshot entry changed while it was being claimed",
+            ));
+        }
+        return Ok(Some(AgentSnapshotClaim {
+            directory,
+            file: claimed,
+            parent: parent.to_path_buf(),
+            original_name,
+            claimed_name,
+        }));
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate an agent snapshot claim name",
+    ))
+}
+
+fn write_agent_snapshot_file(
+    path: &std::path::Path,
+    snapshot: &crate::agent::AgentSessionSnapshot,
+) -> Result<(), crate::agent::AgentSnapshotError> {
+    let encoded = snapshot.to_json()?;
+    crate::config_store::write_private_bytes(
+        path,
+        encoded.as_bytes(),
+        crate::agent::MAX_AGENT_SNAPSHOT_JSON_BYTES,
+    )
+    .map_err(|error| {
+        crate::agent::AgentSnapshotError::Encode(format!("write {}: {error}", path.display()))
+    })
+}
+
+fn read_agent_snapshot_file(
+    path: &std::path::Path,
+) -> Result<Option<crate::agent::AgentSessionSnapshot>, crate::agent::AgentSnapshotError> {
+    let bytes = crate::config_store::read_private_bytes(
+        path,
+        crate::agent::MAX_AGENT_SNAPSHOT_JSON_BYTES as u64,
+    )
+    .map_err(|error| {
+        crate::agent::AgentSnapshotError::Decode(format!("read {}: {error}", path.display()))
+    })?;
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    let encoded = String::from_utf8(bytes).map_err(|_| {
+        crate::agent::AgentSnapshotError::Decode(format!("{} is not valid UTF-8", path.display()))
+    })?;
+    crate::agent::AgentSessionSnapshot::from_json(&encoded).map(Some)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentSnapshotAudit {
+    version: u32,
+    transcript: Vec<Turn>,
+    transcript_truncated: bool,
+    state: AgentState,
+    turns_used: u32,
+    max_turns: u32,
+    next_proposal_id: u64,
+}
+
+/// Validate proposal identity and lifecycle on the raw transcript, before the
+/// pinned dependency compacts it. Validating only `AgentSession::restore`'s
+/// output is insufficient: prefix compaction can hide a duplicate/older
+/// proposal that `proposal_mut` would otherwise bind to an approval click.
+fn audit_agent_snapshot(encoded: &str) -> Result<(), crate::agent::AgentSnapshotError> {
+    const MAX_RESTORED_TURNS: usize = 128;
+    const PROPOSAL_ID_HEADROOM: u64 = 1_024;
+
+    let audit: AgentSnapshotAudit = serde_json::from_str(encoded)
+        .map_err(|error| crate::agent::AgentSnapshotError::Decode(error.to_string()))?;
+    // These scalar checks mirror the pinned restore contract, but run before
+    // any transcript normalization so later identity checks see exact input.
+    if audit.version != 1
+        || audit.max_turns == 0
+        || audit.max_turns > 1_000
+        || audit.turns_used > audit.max_turns
+        || audit.transcript.is_empty()
+        || audit.transcript.len() > MAX_RESTORED_TURNS
+    {
+        return Err(crate::agent::AgentSnapshotError::Invalid(
+            "snapshot scalar or transcript limit is invalid",
+        ));
+    }
+    if audit.next_proposal_id == 0 || audit.next_proposal_id > u64::MAX - PROPOSAL_ID_HEADROOM {
+        return Err(crate::agent::AgentSnapshotError::Invalid(
+            "proposal identifier counter is invalid or nearly exhausted",
+        ));
+    }
+
+    let mut previous_proposal_id = None;
+    let mut proposal_ids = HashMap::new();
+    let mut pending = Vec::new();
+    let mut observations = HashMap::new();
+    let mut model_actions = 0_u32;
+    let mut protocol_errors = 0_u32;
+    for (index, turn) in audit.transcript.iter().enumerate() {
+        match turn {
+            Turn::AssistantProposed { id, status, .. } => {
+                model_actions = model_actions.saturating_add(1);
+                let value = id.get();
+                if value == 0 || value >= audit.next_proposal_id {
+                    return Err(crate::agent::AgentSnapshotError::Invalid(
+                        "proposal id is zero or not below the next-id counter",
+                    ));
+                }
+                if let Some(previous) = previous_proposal_id {
+                    if value != previous + 1 {
+                        return Err(crate::agent::AgentSnapshotError::Invalid(
+                            "proposal ids are duplicated, reordered, or non-contiguous",
+                        ));
+                    }
+                } else if !audit.transcript_truncated && value != 1 {
+                    return Err(crate::agent::AgentSnapshotError::Invalid(
+                        "untruncated proposal ids do not start at one",
+                    ));
+                }
+                previous_proposal_id = Some(value);
+                if proposal_ids.insert(*id, (*status, index)).is_some() {
+                    return Err(crate::agent::AgentSnapshotError::Invalid(
+                        "duplicate proposal id",
+                    ));
+                }
+                if *status == ProposalStatus::Pending {
+                    pending.push((*id, index));
+                }
+            }
+            Turn::Observation { proposal_id, .. } => {
+                let approved_immediately_before =
+                    proposal_ids
+                        .get(proposal_id)
+                        .is_some_and(|(status, proposal_index)| {
+                            *status == ProposalStatus::Approved && *proposal_index + 1 == index
+                        });
+                if observations.insert(*proposal_id, index).is_some()
+                    || !approved_immediately_before
+                {
+                    return Err(crate::agent::AgentSnapshotError::Invalid(
+                        "observation is duplicate or does not immediately follow its approved proposal",
+                    ));
+                }
+            }
+            Turn::AssistantSay(_) => model_actions = model_actions.saturating_add(1),
+            Turn::ProtocolError(_) => protocol_errors = protocol_errors.saturating_add(1),
+            _ => {}
+        }
+    }
+
+    // Every retained proposal/say consumed one model turn. A ProtocolError may
+    // either be a parse failure (one turn) or a transport failure (no turn),
+    // which gives an exact range while the transcript is untruncated.
+    if audit.turns_used < model_actions
+        || (!audit.transcript_truncated
+            && audit.turns_used > model_actions.saturating_add(protocol_errors))
+    {
+        return Err(crate::agent::AgentSnapshotError::Invalid(
+            "turn counter is inconsistent with the transcript",
+        ));
+    }
+
+    match previous_proposal_id {
+        Some(last) if audit.next_proposal_id != last + 1 => {
+            return Err(crate::agent::AgentSnapshotError::Invalid(
+                "next proposal id does not immediately follow the transcript",
+            ));
+        }
+        None if !audit.transcript_truncated && audit.next_proposal_id != 1 => {
+            return Err(crate::agent::AgentSnapshotError::Invalid(
+                "proposal id counter was reset or advanced without a proposal",
+            ));
+        }
+        _ => {}
+    }
+
+    let final_index = audit.transcript.len() - 1;
+    let final_turn = &audit.transcript[final_index];
+    match audit.state {
+        AgentState::AwaitingApproval { proposal_id }
+            if pending.as_slice() == [(proposal_id, final_index)] => {}
+        AgentState::AwaitingApproval { .. } => {
+            return Err(crate::agent::AgentSnapshotError::Invalid(
+                "approval state does not point to the sole final pending proposal",
+            ));
+        }
+        AgentState::AwaitingObservation { proposal_id } => {
+            if !pending.is_empty()
+                || observations.contains_key(&proposal_id)
+                || proposal_ids.get(&proposal_id) != Some(&(ProposalStatus::Approved, final_index))
+            {
+                return Err(crate::agent::AgentSnapshotError::Invalid(
+                    "observation state does not point to the final approved proposal",
+                ));
+            }
+        }
+        _ if !pending.is_empty() => {
+            return Err(crate::agent::AgentSnapshotError::Invalid(
+                "pending proposal exists outside approval state",
+            ));
+        }
+        _ => {}
+    }
+    let final_state_is_valid = match audit.state {
+        AgentState::Ready => {
+            audit.turns_used < audit.max_turns
+                && matches!(
+                    final_turn,
+                    Turn::AssistantSay(_)
+                        | Turn::ProtocolError(_)
+                        | Turn::AssistantProposed {
+                            status: ProposalStatus::ManualReview,
+                            ..
+                        }
+                )
+        }
+        AgentState::AwaitingModel => {
+            audit.turns_used < audit.max_turns
+                && matches!(
+                    final_turn,
+                    Turn::User(_)
+                        | Turn::ProtocolError(_)
+                        | Turn::Observation { .. }
+                        | Turn::AssistantProposed {
+                            status: ProposalStatus::Rejected,
+                            ..
+                        }
+                )
+        }
+        AgentState::AwaitingApproval { .. } => true,
+        AgentState::AwaitingObservation { .. } => true,
+        AgentState::Completed => matches!(final_turn, Turn::AssistantSay(_)),
+        AgentState::TurnLimitReached => {
+            audit.turns_used == audit.max_turns
+                && matches!(
+                    final_turn,
+                    Turn::AssistantSay(_)
+                        | Turn::ProtocolError(_)
+                        | Turn::Observation { .. }
+                        | Turn::AssistantProposed {
+                            status: ProposalStatus::Rejected | ProposalStatus::ManualReview,
+                            ..
+                        }
+                )
+        }
+        AgentState::Cancelled => false,
+    };
+    if !final_state_is_valid {
+        return Err(crate::agent::AgentSnapshotError::Invalid(
+            "session state does not match the final transcript turn or budget",
+        ));
+    }
+    for (proposal_id, (status, _)) in &proposal_ids {
+        if *status != ProposalStatus::Approved {
+            continue;
+        }
+        let is_current_unobserved = matches!(
+            audit.state,
+            AgentState::AwaitingObservation {
+                proposal_id: current
+            } if current == *proposal_id
+        );
+        if observations.contains_key(proposal_id) == is_current_unobserved {
+            return Err(crate::agent::AgentSnapshotError::Invalid(
+                "approved proposal observation lifecycle is inconsistent",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The pinned Agent dependency predates strict transcript-ID validation. Do it
+/// at the app boundary so a crafted duplicate ProposalId cannot make a visible
+/// approval card authorize a different transcript entry (confused deputy).
+fn restore_agent_snapshot(
+    snapshot: crate::agent::AgentSessionSnapshot,
+) -> Result<AgentSession, crate::agent::AgentSnapshotError> {
+    const MAX_RESTORED_TURNS: usize = 128;
+    const MAX_RESTORED_MESSAGE_BYTES: usize = 16 * 1024;
+    const MAX_RESTORED_THOUGHT_BYTES: usize = 4 * 1024;
+    const MAX_RESTORED_COMMAND_BYTES: usize = 16 * 1024;
+    const MAX_RESTORED_OBSERVATION_BYTES: usize = 4 * 1024;
+    const PROPOSAL_ID_HEADROOM: u64 = 1_024;
+
+    // The pinned jagent release used saturating proposal-ID increments. Keep
+    // enough identifier space for every possible remaining turn so a crafted
+    // near-max counter cannot make two later approval cards share an ID.
+    let encoded = snapshot.to_json()?;
+    audit_agent_snapshot(&encoded)?;
+
+    let session = AgentSession::restore(snapshot)?;
+    if session.transcript().len() > MAX_RESTORED_TURNS {
+        return Err(crate::agent::AgentSnapshotError::Invalid(
+            "transcript has too many turns",
+        ));
+    }
+    let mut proposal_ids = HashMap::new();
+    let mut pending = Vec::new();
+    let mut observation_ids = HashSet::new();
+    for turn in session.transcript() {
+        match turn {
+            Turn::User(message) | Turn::AssistantSay(message) => {
+                if message.len() > MAX_RESTORED_MESSAGE_BYTES {
+                    return Err(crate::agent::AgentSnapshotError::Invalid(
+                        "transcript message exceeds its byte limit",
+                    ));
+                }
+            }
+            Turn::AssistantThought(thought) => {
+                if thought.len() > MAX_RESTORED_THOUGHT_BYTES {
+                    return Err(crate::agent::AgentSnapshotError::Invalid(
+                        "transcript thought exceeds its byte limit",
+                    ));
+                }
+            }
+            Turn::AssistantProposed {
+                id,
+                command,
+                status,
+            } => {
+                if id.get() > u64::MAX - PROPOSAL_ID_HEADROOM {
+                    return Err(crate::agent::AgentSnapshotError::Invalid(
+                        "proposal identifier space is nearly exhausted",
+                    ));
+                }
+                if proposal_ids.insert(*id, *status).is_some() {
+                    return Err(crate::agent::AgentSnapshotError::Invalid(
+                        "duplicate proposal id",
+                    ));
+                }
+                if command.is_empty()
+                    || command.len() > MAX_RESTORED_COMMAND_BYTES
+                    || command.chars().any(char::is_control)
+                    || crate::review_input::contains_visual_spoof(command)
+                {
+                    return Err(crate::agent::AgentSnapshotError::Invalid(
+                        "proposal command is invalid",
+                    ));
+                }
+                if *status == ProposalStatus::Pending {
+                    pending.push(*id);
+                }
+            }
+            Turn::Observation {
+                proposal_id,
+                output_sample,
+                ..
+            } => {
+                if output_sample.len() > MAX_RESTORED_OBSERVATION_BYTES
+                    || !observation_ids.insert(*proposal_id)
+                    || proposal_ids.get(proposal_id) != Some(&ProposalStatus::Approved)
+                {
+                    return Err(crate::agent::AgentSnapshotError::Invalid(
+                        "observation is duplicated, oversized, out of order, or not approved",
+                    ));
+                }
+            }
+            Turn::ProtocolError(message) => {
+                if message.len() > MAX_RESTORED_MESSAGE_BYTES {
+                    return Err(crate::agent::AgentSnapshotError::Invalid(
+                        "protocol error exceeds its byte limit",
+                    ));
+                }
+            }
+        }
+    }
+    match session.state() {
+        AgentState::AwaitingApproval { proposal_id } if pending.as_slice() == [proposal_id] => {}
+        AgentState::AwaitingApproval { .. } => {
+            return Err(crate::agent::AgentSnapshotError::Invalid(
+                "approval state does not identify exactly one pending proposal",
+            ));
+        }
+        _ if !pending.is_empty() => {
+            return Err(crate::agent::AgentSnapshotError::Invalid(
+                "pending proposal exists outside approval state",
+            ));
+        }
+        _ => {}
+    }
+    Ok(session)
+}
+
+#[cfg(unix)]
+fn load_agent_snapshot(path: &std::path::Path) -> Option<AgentSession> {
+    let claim = match claim_agent_snapshot_file(path) {
+        Ok(Some(claim)) => claim,
+        Ok(None) => return None,
+        Err(error) => {
+            log::warn!(
+                "agent: could not exclusively claim saved session {}: {error}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    match claim.read_snapshot().and_then(restore_agent_snapshot) {
+        Ok(session) => {
+            // The public path disappeared at claim time. Retire and sync the
+            // unique claimed entry before exposing the restored proposal to
+            // the UI, so no second process can ever approve the same snapshot.
+            if let Err(error) = claim.retire() {
+                log::warn!("agent: could not retire claimed saved session: {error}");
+                None
+            } else {
+                Some(session)
+            }
+        }
+        Err(error) => {
+            log::warn!("agent: rejecting invalid saved session: {error}");
+            if let Err(quarantine_error) = claim.quarantine() {
+                log::warn!(
+                    "agent: could not quarantine invalid claimed snapshot: {quarantine_error}"
+                );
+            }
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn load_agent_snapshot(path: &std::path::Path) -> Option<AgentSession> {
+    log::warn!(
+        "agent: saved-session restore is disabled without atomic Unix file claims ({})",
+        path.display()
+    );
+    None
 }
 
 struct AgentRuntime {
@@ -86,7 +859,6 @@ struct AgentRuntime {
     context_attach: Button,
     context_card: GBox,
     context_label: Label,
-    auto_chip: Label,
     status: Label,
     status_spinner: Spinner,
     prompt_status: Label,
@@ -94,6 +866,11 @@ struct AgentRuntime {
     turn_label: Label,
     session_action: Button,
     proposal_box: GBox,
+    /// jagent v0.5 resets ProposalId to one for each fresh task. Every UI
+    /// callback therefore carries this app-owned epoch as the other half of
+    /// the identity, preventing a delayed old card/dialog from authorizing a
+    /// new task's same-numbered proposal.
+    task_epoch: Cell<u64>,
     pending_command: RefCell<Option<(ProposalId, String)>>,
     request_cancellation: RefCell<Option<crate::ai::AiCancellationToken>>,
     busy: Cell<bool>,
@@ -122,8 +899,22 @@ impl AgentRuntime {
         self.proposal_box.set_visible(false);
     }
 
+    fn proposal_callback_is_current(&self, epoch: u64, proposal_id: ProposalId) -> bool {
+        proposal_callback_is_current(
+            self.alive.get(),
+            self.task_epoch.get(),
+            epoch,
+            self.session.borrow().state(),
+            proposal_id,
+        )
+    }
+
     fn set_status(&self, message: &str, active: bool) {
-        self.status.set_text(message);
+        self.status
+            .set_text(&crate::review_input::safe_inline_display(
+                message,
+                MAX_AGENT_STATUS_DISPLAY_BYTES,
+            ));
         if active {
             self.status_spinner.start();
         } else {
@@ -155,8 +946,6 @@ impl AgentRuntime {
             self.alive.get() && !self.busy.get() && session.state() == AgentState::Ready;
         self.context_clear.set_sensitive(context_editable);
         self.context_attach.set_sensitive(context_editable);
-        self.auto_chip
-            .set_visible(self.config.borrow().agent_auto_approve_readonly);
         let can_follow_up =
             self.alive.get() && !self.busy.get() && session.can_continue_after_completion();
         let can_start_new = self.alive.get()
@@ -203,6 +992,13 @@ impl AgentRuntime {
         if runtime.busy.get() || !runtime.alive.get() {
             return;
         }
+        let starts_new = !runtime.session.borrow().can_continue_after_completion();
+        if starts_new && runtime.task_epoch.get() == u64::MAX {
+            runtime.render_session_state(Some(
+                "Cannot start another Agent task because its safety epoch is exhausted.",
+            ));
+            return;
+        }
         let result = {
             let mut session = runtime.session.borrow_mut();
             if session.can_continue_after_completion() {
@@ -214,6 +1010,7 @@ impl AgentRuntime {
         match result {
             Ok(started_new) => {
                 if started_new {
+                    runtime.task_epoch.set(runtime.task_epoch.get() + 1);
                     runtime.clear_proposal();
                     runtime.pending_command.borrow_mut().take();
                     runtime.input.set_text("");
@@ -410,7 +1207,7 @@ impl AgentRuntime {
             true,
         );
 
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
             if session_cancellation.is_cancelled() {
                 return;
@@ -443,7 +1240,19 @@ impl AgentRuntime {
                             id,
                             command,
                             danger,
-                        }) => Self::render_proposal(&runtime, id, command, danger),
+                        }) => match crate::review_input::validate(&command) {
+                            Ok(_) => Self::render_proposal(&runtime, id, command, danger),
+                            Err(error) => {
+                                // The exact-pinned jagent revision predates the
+                                // visual-spoof gate. Consume the unsafe pending
+                                // proposal without ever rendering or executing
+                                // its deceptive command text.
+                                let _ = runtime.session.borrow_mut().reject(id);
+                                let message = format!("Agent proposed an unsafe command: {error}");
+                                runtime.append("Protocol error", &message);
+                                runtime.render_session_state(Some(&message));
+                            }
+                        },
                         Ok(ModelOutcome::Said(message)) => {
                             runtime.append("Agent", &message);
                             runtime.render_session_state(None);
@@ -492,27 +1301,10 @@ impl AgentRuntime {
         runtime: &Rc<Self>,
         id: ProposalId,
         command: String,
-        danger: Option<&'static str>,
+        _danger: Option<&'static str>,
     ) {
-        if danger.is_none()
-            && runtime.config.borrow().agent_auto_approve_readonly
-            && crate::agent::is_auto_approvable(&command)
-            && runtime.target.command_prompt_status().is_ready()
-        {
-            runtime.append(
-                "Agent",
-                &format!("Auto-approved read-only proposal (auto-run is on): {command}"),
-            );
-            Self::approve_validated(runtime.clone(), id, command.clone());
-            if matches!(
-                runtime.session.borrow().state(),
-                AgentState::AwaitingObservation { .. }
-            ) {
-                return;
-            }
-            // The approval path re-checked the prompt gate and refused; fall
-            // back to the ordinary review card so the proposal stays visible.
-        }
+        // Auto-execution was retired: command text cannot prove what a user's
+        // shell aliases/functions or configured helpers will actually run.
         Self::render_proposal_card(runtime, id, command);
     }
 
@@ -520,6 +1312,7 @@ impl AgentRuntime {
     /// sessions use this directly so a proposal saved before a restart can
     /// never execute without a fresh explicit click.
     fn render_proposal_card(runtime: &Rc<Self>, id: ProposalId, command: String) {
+        let epoch = runtime.task_epoch.get();
         runtime.clear_proposal();
         runtime.proposal_box.set_visible(true);
         let review = CommandReviewCard::new(CommandReviewSpec {
@@ -544,7 +1337,7 @@ impl AgentRuntime {
         let entry_for_approve = review.entry.clone();
         review.primary.connect_clicked(move |_| {
             if let Some(runtime) = weak.upgrade() {
-                Self::approve(runtime, id, entry_for_approve.text().to_string());
+                Self::approve(runtime, id, entry_for_approve.text().to_string(), epoch);
             }
         });
         // Enter in the command entry approves & runs; dangerous commands
@@ -552,7 +1345,7 @@ impl AgentRuntime {
         let weak = Rc::downgrade(runtime);
         review.entry.connect_activate(move |entry| {
             if let Some(runtime) = weak.upgrade() {
-                Self::approve(runtime, id, entry.text().to_string());
+                Self::approve(runtime, id, entry.text().to_string(), epoch);
             }
         });
         if let Some(insert) = review.auxiliary.as_ref() {
@@ -561,7 +1354,7 @@ impl AgentRuntime {
             let feedback = review.feedback.clone();
             insert.connect_clicked(move |_| {
                 if let Some(runtime) = weak.upgrade() {
-                    Self::insert_for_manual_review(runtime, id, &entry, &feedback);
+                    Self::insert_for_manual_review(runtime, id, &entry, &feedback, epoch);
                 }
             });
         }
@@ -569,7 +1362,7 @@ impl AgentRuntime {
             let weak = Rc::downgrade(runtime);
             reject.connect_clicked(move |_| {
                 if let Some(runtime) = weak.upgrade() {
-                    Self::reject(runtime, id);
+                    Self::reject(runtime, id, epoch);
                 }
             });
         }
@@ -580,23 +1373,32 @@ impl AgentRuntime {
         id: ProposalId,
         entry: &Entry,
         feedback: &Label,
+        epoch: u64,
     ) {
+        if !runtime.proposal_callback_is_current(epoch, id) {
+            log::debug!("ignored stale Agent proposal callback");
+            return;
+        }
         let command = match crate::review_input::validate(&entry.text()) {
             Ok(command) => command.to_string(),
             Err(error) => {
-                feedback.set_text(&format!("Cannot insert: {error}"));
-                feedback.add_css_class("error");
-                feedback.set_visible(true);
+                set_review_feedback(feedback, &format!("Cannot insert: {error}"), true);
                 return;
             }
         };
         let prompt_status = runtime.target.command_prompt_status();
         if !prompt_status.is_ready() {
-            feedback.set_text(prompt_status.blocked_message());
-            feedback.add_css_class("error");
-            feedback.set_visible(true);
+            set_review_feedback(feedback, prompt_status.blocked_message(), true);
             return;
         }
+        let Some(rollback_snapshot) = runtime.session.borrow().snapshot() else {
+            set_review_feedback(
+                feedback,
+                "Cannot preserve the Agent proposal before inserting it.",
+                true,
+            );
+            return;
+        };
         let command = match runtime
             .session
             .borrow_mut()
@@ -604,12 +1406,28 @@ impl AgentRuntime {
         {
             Ok(command) => command,
             Err(error) => {
-                feedback.set_text(&error.to_string());
-                feedback.add_css_class("error");
-                feedback.set_visible(true);
+                set_review_feedback(feedback, &error.to_string(), true);
                 return;
             }
         };
+        if let Err(error) = runtime.target.write_input(command.as_bytes()) {
+            match restore_agent_snapshot(rollback_snapshot) {
+                Ok(session) => *runtime.session.borrow_mut() = session,
+                Err(restore_error) => {
+                    runtime.session.borrow_mut().cancel();
+                    log::error!(
+                        "could not restore Agent proposal after PTY backpressure: {restore_error}"
+                    );
+                }
+            }
+            set_review_feedback(
+                feedback,
+                &format!("Command was not inserted: {error}"),
+                true,
+            );
+            runtime.render_session_state(None);
+            return;
+        }
         runtime.clear_proposal();
         runtime.append(
             "You",
@@ -619,10 +1437,13 @@ impl AgentRuntime {
             "Command inserted for manual review; edit or run it in the normal prompt.",
         ));
         runtime.target.grab_focus();
-        runtime.target.write_input(command.as_bytes());
     }
 
-    fn approve(runtime: Rc<Self>, id: ProposalId, command: String) {
+    fn approve(runtime: Rc<Self>, id: ProposalId, command: String, epoch: u64) {
+        if !runtime.proposal_callback_is_current(epoch, id) {
+            log::debug!("ignored stale Agent proposal callback");
+            return;
+        }
         let command = match crate::review_input::validate(&command) {
             Ok(command) => command.to_string(),
             Err(error) => {
@@ -631,10 +1452,10 @@ impl AgentRuntime {
             }
         };
         if let Some(reason) = crate::agent::is_dangerous(&command) {
-            Self::confirm_dangerous_approval(runtime, id, command, reason);
+            Self::confirm_dangerous_approval(runtime, id, command, reason, epoch);
             return;
         }
-        Self::approve_validated(runtime, id, command);
+        Self::approve_validated(runtime, id, command, epoch);
     }
 
     fn confirm_dangerous_approval(
@@ -642,7 +1463,12 @@ impl AgentRuntime {
         id: ProposalId,
         command: String,
         reason: &'static str,
+        epoch: u64,
     ) {
+        if !runtime.proposal_callback_is_current(epoch, id) {
+            log::debug!("ignored stale Agent proposal callback");
+            return;
+        }
         let dialog = adw::AlertDialog::new(
             Some("Run a potentially destructive command?"),
             Some(&format!(
@@ -663,14 +1489,18 @@ impl AgentRuntime {
         dialog.connect_response(None, move |_, response| {
             if response == "run" {
                 if let Some(runtime) = weak.upgrade() {
-                    Self::approve_validated(runtime, id, command.clone());
+                    Self::approve_validated(runtime, id, command.clone(), epoch);
                 }
             }
         });
         dialog.present(Some(&runtime.proposal_box));
     }
 
-    fn approve_validated(runtime: Rc<Self>, id: ProposalId, command: String) {
+    fn approve_validated(runtime: Rc<Self>, id: ProposalId, command: String, epoch: u64) {
+        if !runtime.proposal_callback_is_current(epoch, id) {
+            log::debug!("ignored stale Agent proposal callback");
+            return;
+        }
         let prompt_status = runtime.target.command_prompt_status();
         if !prompt_status.is_ready() {
             let message = prompt_status.blocked_message();
@@ -678,6 +1508,10 @@ impl AgentRuntime {
             runtime.append("Safety check", message);
             return;
         }
+        let Some(rollback_snapshot) = runtime.session.borrow().snapshot() else {
+            runtime.set_status("Cannot preserve the Agent proposal before approval.", false);
+            return;
+        };
         let approval_result = runtime.session.borrow_mut().edit_and_approve(id, command);
         let approved = match approval_result {
             Ok(approved) => approved,
@@ -686,17 +1520,34 @@ impl AgentRuntime {
                 return;
             }
         };
-        runtime.clear_proposal();
         // No visible "approved" message: the approved command runs immediately
         // and its real finished block lands in the conversation right here.
         *runtime.pending_command.borrow_mut() =
             Some((approved.proposal_id, approved.command.clone()));
         runtime.render_session_state(None);
         runtime.target.grab_focus();
-        runtime.target.submit_command(&approved.command);
+        if let Err(error) = runtime.target.submit_command(&approved.command) {
+            runtime.pending_command.borrow_mut().take();
+            match restore_agent_snapshot(rollback_snapshot) {
+                Ok(session) => *runtime.session.borrow_mut() = session,
+                Err(restore_error) => {
+                    runtime.session.borrow_mut().cancel();
+                    log::error!(
+                        "could not restore Agent approval after PTY backpressure: {restore_error}"
+                    );
+                }
+            }
+            runtime.render_session_state(Some(&format!("Command was not sent: {error}")));
+            return;
+        }
+        runtime.clear_proposal();
     }
 
-    fn reject(runtime: Rc<Self>, id: ProposalId) {
+    fn reject(runtime: Rc<Self>, id: ProposalId, epoch: u64) {
+        if !runtime.proposal_callback_is_current(epoch, id) {
+            log::debug!("ignored stale Agent proposal callback");
+            return;
+        }
         let result = runtime.session.borrow_mut().reject(id);
         match result {
             Ok(()) => {
@@ -813,7 +1664,8 @@ fn build_agent_message_block(speaker: &str, body: &str, compact: bool) -> gtk4::
     title.add_css_class("assistant-card-title");
     title.set_xalign(0.0);
     header.append(&title);
-    let speaker_chip = Label::new(Some(speaker));
+    let speaker = crate::review_input::safe_inline_display(speaker, 256);
+    let speaker_chip = Label::new(Some(&speaker));
     speaker_chip.add_css_class("agent-chip");
     if error_speaker {
         speaker_chip.add_css_class("agent-msg-error");
@@ -823,7 +1675,8 @@ fn build_agent_message_block(speaker: &str, body: &str, compact: bool) -> gtk4::
     header.append(&speaker_chip);
     outer.append(&header);
 
-    let body_label = Label::new(Some(body));
+    let body = agent_message_display_text(body);
+    let body_label = Label::new(Some(&body));
     body_label.add_css_class("agent-msg-body");
     body_label.set_xalign(0.0);
     body_label.set_wrap(true);
@@ -836,6 +1689,22 @@ fn build_agent_message_block(speaker: &str, body: &str, compact: bool) -> gtk4::
     outer.append(&body_label);
 
     outer.upcast()
+}
+
+fn agent_message_display_text(body: &str) -> String {
+    crate::review_input::safe_multiline_display(body, MAX_AGENT_MESSAGE_DISPLAY_BYTES)
+}
+
+fn bounded_agent_input(mut text: String) -> String {
+    if text.len() <= MAX_AGENT_INPUT_BYTES {
+        return text;
+    }
+    let mut end = MAX_AGENT_INPUT_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text
 }
 
 fn agent_block_context_label(context: &crate::ai::BlockContext) -> String {
@@ -852,7 +1721,10 @@ fn agent_block_context_label(context: &crate::ai::BlockContext) -> String {
 }
 
 fn agent_block_context_tooltip(context: &crate::ai::BlockContext) -> String {
-    let cwd = context.cwd.as_deref().unwrap_or("unknown cwd");
+    let cwd = crate::review_input::safe_inline_display(
+        context.cwd.as_deref().unwrap_or("unknown cwd"),
+        4 * 1024,
+    );
     format!(
         "Attached as untrusted context\nexit: {}\noutput: {}\ncwd: {cwd}\ncommand: {}",
         context.exit_code,
@@ -866,6 +1738,7 @@ fn agent_block_context_tooltip(context: &crate::ai::BlockContext) -> String {
 }
 
 fn compact_one_line(text: &str, max_chars: usize) -> String {
+    let text = crate::review_input::safe_inline_display(text, 16 * 1024);
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = collapsed.chars();
     let preview: String = chars.by_ref().take(max_chars).collect();
@@ -882,13 +1755,12 @@ fn compact_one_line(text: &str, max_chars: usize) -> String {
 /// from the inline card's header: identity, provider/shell chips, and the AI
 /// command-correction toggle. Session activity never renders here.
 fn show_agent_settings_dialog(ui: &UiState, cwd: &str, shell: &str) {
-    let (provider, model, correction_enabled, auto_approve_readonly) = {
+    let (provider, model, correction_enabled) = {
         let config = ui.config.borrow();
         (
             config.ai_provider.clone(),
             config.ai_model.clone(),
             config.command_correction_enabled,
-            config.agent_auto_approve_readonly,
         )
     };
 
@@ -909,10 +1781,14 @@ fn show_agent_settings_dialog(ui: &UiState, cwd: &str, shell: &str) {
     let title = Label::new(Some("Approval-gated shell assistant"));
     title.set_xalign(0.0);
     title.add_css_class("title-3");
+    let cwd = crate::review_input::safe_inline_display(cwd, 4 * 1024);
+    let shell = crate::review_input::safe_inline_display(shell, 4 * 1024);
+    let provider = crate::review_input::safe_inline_display(&provider, 256);
+    let model = crate::review_input::safe_inline_display(&model, 512);
     let target_label = Label::new(Some(&format!("Bound to Block pane · {cwd}")));
     target_label.set_xalign(0.0);
     target_label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
-    target_label.set_tooltip_text(Some(cwd));
+    target_label.set_tooltip_text(Some(&cwd));
     target_label.add_css_class("dim-label");
     identity_copy.append(&title);
     identity_copy.append(&target_label);
@@ -933,7 +1809,7 @@ fn show_agent_settings_dialog(ui: &UiState, cwd: &str, shell: &str) {
     let shell_chip = Label::new(Some(&format!("shell: {shell}")));
     shell_chip.set_max_width_chars(26);
     shell_chip.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
-    shell_chip.set_tooltip_text(Some(shell));
+    shell_chip.set_tooltip_text(Some(&shell));
     shell_chip.add_css_class("agent-chip");
     let safety_chip = Label::new(Some("Review required"));
     safety_chip.add_css_class("agent-chip");
@@ -979,12 +1855,12 @@ fn show_agent_settings_dialog(ui: &UiState, cwd: &str, shell: &str) {
     auto_row.add_css_class("agent-setting-card");
     let auto_copy = GBox::new(Orientation::Vertical, 2);
     auto_copy.set_hexpand(true);
-    let auto_title = Label::new(Some("Auto-run read-only proposals"));
+    let auto_title = Label::new(Some("Automatic command execution retired"));
     auto_title.set_xalign(0.0);
     auto_title.add_css_class("heading");
     let auto_hint = Label::new(Some(
-        "Run strictly read-only inspection commands (ls, cat, git status, …) without a \
-         per-command click. Writes, chaining, and anything risky still require approval.",
+        "Every Agent proposal requires explicit approval. Command text cannot prove what \
+         aliases, functions, configured helpers, or tool flags will actually execute.",
     ));
     auto_hint.set_xalign(0.0);
     auto_hint.set_wrap(true);
@@ -992,18 +1868,13 @@ fn show_agent_settings_dialog(ui: &UiState, cwd: &str, shell: &str) {
     auto_copy.append(&auto_title);
     auto_copy.append(&auto_hint);
     let auto_switch = Switch::builder()
-        .active(auto_approve_readonly)
+        .active(false)
         .valign(gtk4::Align::Center)
         .build();
-    auto_switch.set_tooltip_text(Some("Enable auto-approval for read-only proposals"));
+    auto_switch.set_sensitive(false);
+    auto_switch.set_tooltip_text(Some("Automatic execution is disabled for safety"));
     auto_row.append(&auto_copy);
     auto_row.append(&auto_switch);
-
-    let ui_for_auto = ui.clone();
-    auto_switch.connect_active_notify(move |toggle| {
-        ui_for_auto.config.borrow_mut().agent_auto_approve_readonly = toggle.is_active();
-        ui_for_auto.persist_config();
-    });
 
     let body = GBox::new(Orientation::Vertical, 10);
     body.add_css_class("agent-dashboard");
@@ -1127,6 +1998,7 @@ impl UiState {
         title.add_css_class("assistant-card-title");
         title.set_xalign(0.0);
         header.append(&title);
+        let cwd = crate::review_input::safe_inline_display(&cwd, 4 * 1024);
         let binding_label = Label::new(Some(&format!(
             "{cwd} · review required · every command needs approval"
         )));
@@ -1202,13 +2074,6 @@ impl UiState {
         prompt_status.add_css_class("agent-prompt-status");
         prompt_status.add_css_class("agent-prompt-blocked");
         prompt_status.set_accessible_role(gtk4::AccessibleRole::Status);
-        let auto_chip = Label::new(Some("auto: read-only"));
-        auto_chip.add_css_class("agent-chip");
-        auto_chip.set_tooltip_text(Some(
-            "Auto-run is on: strictly read-only proposals run without a per-command click. \
-             Writes and anything risky still require explicit approval.",
-        ));
-        auto_chip.set_visible(false);
         let turn_progress = ProgressBar::new();
         turn_progress.set_hexpand(true);
         turn_progress.set_fraction(0.0);
@@ -1218,7 +2083,6 @@ impl UiState {
         status_top.append(&retry_request);
         status_top.append(&stop_request);
         status_top.append(&session_action);
-        status_top.append(&auto_chip);
         status_top.append(&prompt_status);
         status_top.append(&turn_label);
         let status_card = GBox::new(Orientation::Vertical, 6);
@@ -1279,15 +2143,10 @@ impl UiState {
         outer.append(&body);
 
         let card: gtk4::Widget = outer.clone().upcast();
-        // A snapshot persisted by the previous run is restored one-shot and
-        // rebound to the pane the user opened the Agent on.
-        let restored_session = {
-            let path = agent_snapshot_path();
-            crate::agent::read_snapshot_file(&path).and_then(|snapshot| {
-                crate::agent::remove_snapshot_file(&path);
-                AgentSession::restore(snapshot).ok()
-            })
-        };
+        // A snapshot persisted by the previous run is atomically claimed,
+        // consumed once, and rebound to the pane the user opened the Agent on.
+        // Pending approval state must never be restorable by two processes.
+        let restored_session = load_agent_snapshot(&agent_snapshot_path());
         let was_restored = restored_session.is_some();
         let runtime = Rc::new(AgentRuntime {
             session: RefCell::new(restored_session.unwrap_or_else(|| AgentSession::new(max_turns))),
@@ -1304,7 +2163,6 @@ impl UiState {
             context_attach: context_attach.clone(),
             context_card: context_card.clone(),
             context_label: context_label.clone(),
-            auto_chip,
             status,
             status_spinner,
             prompt_status,
@@ -1312,6 +2170,7 @@ impl UiState {
             turn_label,
             session_action: session_action.clone(),
             proposal_box,
+            task_epoch: Cell::new(0),
             pending_command: RefCell::new(None),
             request_cancellation: RefCell::new(None),
             busy: Cell::new(false),
@@ -1443,6 +2302,14 @@ impl UiState {
         let weak = Rc::downgrade(&runtime);
         input.connect_changed(move |_| {
             if let Some(runtime) = weak.upgrade() {
+                let text = runtime.input.text().to_string();
+                let truncated = text.len() > MAX_AGENT_INPUT_BYTES;
+                let bounded = bounded_agent_input(text);
+                if truncated {
+                    runtime.input.set_text(&bounded);
+                    runtime.input.set_position(-1);
+                    runtime.set_status("Instruction was limited to 16 KiB.", false);
+                }
                 runtime.sync_controls();
             }
         });
@@ -1497,7 +2364,14 @@ impl UiState {
 
 #[cfg(test)]
 mod tests {
-    use super::take_pending_for_finished_block;
+    #[cfg(unix)]
+    use super::claim_agent_snapshot_file;
+    use super::{
+        agent_message_display_text, bounded_agent_input, load_agent_snapshot,
+        proposal_callback_is_current, read_agent_snapshot_file, restore_agent_snapshot,
+        take_pending_for_finished_block, write_agent_snapshot_file, MAX_AGENT_INPUT_BYTES,
+        MAX_AGENT_MESSAGE_DISPLAY_BYTES,
+    };
 
     #[test]
     fn finished_block_consumes_approval_even_when_vte_capture_differs() {
@@ -1512,5 +2386,476 @@ mod tests {
         let mut pending: Option<(u64, String)> = None;
 
         assert_eq!(take_pending_for_finished_block(&mut pending, "ls"), None);
+    }
+
+    #[test]
+    fn task_epoch_and_monotonic_id_reject_stale_callbacks_after_new_task() {
+        let mut session = crate::agent::AgentSession::new(1);
+        session.submit_user("old task").unwrap();
+        let old_id = match session
+            .accept_model_reply(r#"{"action":"run","command":"printf old"}"#)
+            .unwrap()
+        {
+            crate::agent::ModelOutcome::Proposal { id, .. } => id,
+            other => panic!("expected old proposal, got {other:?}"),
+        };
+        assert!(proposal_callback_is_current(
+            true,
+            0,
+            0,
+            session.state(),
+            old_id
+        ));
+
+        session.reject(old_id).unwrap();
+        session.start_new_task().unwrap();
+        session.submit_user("new task").unwrap();
+        let new_id = match session
+            .accept_model_reply(r#"{"action":"run","command":"printf new"}"#)
+            .unwrap()
+        {
+            crate::agent::ModelOutcome::Proposal { id, .. } => id,
+            other => panic!("expected new proposal, got {other:?}"),
+        };
+        assert_ne!(old_id, new_id, "proposal ids remain process-monotonic");
+        assert!(!proposal_callback_is_current(
+            true,
+            1,
+            0,
+            session.state(),
+            new_id
+        ));
+        assert!(!proposal_callback_is_current(
+            true,
+            1,
+            1,
+            session.state(),
+            old_id
+        ));
+        assert!(proposal_callback_is_current(
+            true,
+            1,
+            1,
+            session.state(),
+            new_id
+        ));
+        assert!(!proposal_callback_is_current(
+            false,
+            1,
+            1,
+            session.state(),
+            new_id
+        ));
+    }
+
+    #[test]
+    fn agent_message_display_is_bounded_and_neutralises_format_controls() {
+        let body = format!(
+            "line one\nline two \u{202e}\u{fff0}\u{e0080}{}",
+            "界".repeat(MAX_AGENT_MESSAGE_DISPLAY_BYTES)
+        );
+        let displayed = agent_message_display_text(&body);
+
+        assert!(displayed.len() <= MAX_AGENT_MESSAGE_DISPLAY_BYTES);
+        assert!(displayed.contains("line one\nline two ���"));
+        assert!(!displayed.contains('\u{202e}'));
+        assert!(!displayed.contains('\u{fff0}'));
+        assert!(!displayed.contains('\u{e0080}'));
+    }
+
+    #[test]
+    fn agent_composer_input_is_bounded_on_a_utf8_boundary() {
+        let bounded = bounded_agent_input("界".repeat(MAX_AGENT_INPUT_BYTES / "界".len() + 100));
+
+        assert!(bounded.len() <= MAX_AGENT_INPUT_BYTES);
+        assert!(bounded.chars().all(|ch| ch == '界'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_snapshot_io_is_private_and_never_follows_links() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = std::env::temp_dir().join(format!(
+            "jterm4-agent-snapshot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("agent_session.json");
+        let mut session = crate::agent::AgentSession::new(4);
+        session.submit_user("inspect").unwrap();
+        let snapshot = session.snapshot().unwrap();
+
+        write_agent_snapshot_file(&path, &snapshot).unwrap();
+        assert!(read_agent_snapshot_file(&path).unwrap().is_some());
+        assert!(load_agent_snapshot(&path).is_some());
+        assert!(!path.exists(), "a restored snapshot must be consumed once");
+
+        let target = root.join("target");
+        let linked = root.join("linked.json");
+        std::fs::write(&target, snapshot.to_json().unwrap()).unwrap();
+        symlink(&target, &linked).unwrap();
+        assert!(read_agent_snapshot_file(&linked).is_err());
+        assert_eq!(
+            std::fs::read_to_string(target).unwrap(),
+            snapshot.to_json().unwrap()
+        );
+
+        let malformed = root.join("malformed.json");
+        std::fs::write(&malformed, b"not json").unwrap();
+        std::fs::set_permissions(&malformed, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(load_agent_snapshot(&malformed).is_none());
+        assert!(!malformed.exists());
+        assert!(std::fs::read_dir(&root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("malformed.json.corrupt-")
+        }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_agent_snapshot_restore_has_exactly_one_winner() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::sync::{Arc, Barrier};
+
+        let root = std::env::temp_dir().join(format!(
+            "jterm4-agent-snapshot-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("agent_session.json");
+        let mut session = crate::agent::AgentSession::new(4);
+        session.submit_user("inspect").unwrap();
+        session
+            .accept_model_reply(r#"{"action":"run","command":"ls"}"#)
+            .unwrap();
+        write_agent_snapshot_file(&path, &session.snapshot().unwrap()).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().nlink(), 1);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    load_agent_snapshot(&path).is_some()
+                })
+            })
+            .collect();
+        let winners = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1);
+        assert!(!path.exists());
+        assert!(!std::fs::read_dir(&root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".claim-")
+        }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abandoned_agent_snapshot_claim_is_preserved_but_never_replayed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "jterm4-agent-snapshot-abandon-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("agent_session.json");
+        let mut session = crate::agent::AgentSession::new(4);
+        session.submit_user("inspect").unwrap();
+        let snapshot = session.snapshot().unwrap();
+        write_agent_snapshot_file(&path, &snapshot).unwrap();
+
+        let claim = claim_agent_snapshot_file(&path).unwrap().unwrap();
+        let claimed_path = claim.parent.join(&claim.claimed_name);
+        drop(claim); // Simulate a process dying after rename and before decode.
+
+        assert!(!path.exists());
+        assert!(claimed_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&claimed_path).unwrap(),
+            snapshot.to_json().unwrap()
+        );
+        assert!(load_agent_snapshot(&path).is_none());
+        assert!(claimed_path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn semantically_invalid_claimed_snapshot_is_quarantined() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "jterm4-agent-snapshot-invalid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("agent_session.json");
+        let mut session = crate::agent::AgentSession::new(4);
+        session.submit_user("inspect").unwrap();
+        session
+            .accept_model_reply(r#"{"action":"run","command":"ls"}"#)
+            .unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&session.snapshot().unwrap().to_json().unwrap()).unwrap();
+        let transcript = value["transcript"].as_array_mut().unwrap();
+        let duplicate = transcript
+            .iter()
+            .find(|turn| turn.get("AssistantProposed").is_some())
+            .unwrap()
+            .clone();
+        transcript.push(duplicate);
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(load_agent_snapshot(&path).is_none());
+        assert!(!path.exists());
+        assert!(std::fs::read_dir(&root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("agent_session.json.corrupt-")
+        }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn duplicate_proposal_ids_in_a_snapshot_are_rejected() {
+        let mut session = crate::agent::AgentSession::new(4);
+        session.submit_user("inspect").unwrap();
+        session
+            .accept_model_reply(r#"{"action":"run","command":"ls"}"#)
+            .unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let mut exhausted: serde_json::Value =
+            serde_json::from_str(&snapshot.to_json().unwrap()).unwrap();
+        exhausted["next_proposal_id"] = serde_json::json!(u64::MAX);
+        let exhausted = crate::agent::AgentSessionSnapshot::from_json(
+            &serde_json::to_string(&exhausted).unwrap(),
+        )
+        .unwrap();
+        assert!(restore_agent_snapshot(exhausted).is_err());
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&snapshot.to_json().unwrap()).unwrap();
+        let transcript = value["transcript"].as_array_mut().unwrap();
+        let duplicate = transcript
+            .iter()
+            .find(|turn| turn.get("AssistantProposed").is_some())
+            .unwrap()
+            .clone();
+        transcript.push(duplicate);
+        let malicious =
+            crate::agent::AgentSessionSnapshot::from_json(&serde_json::to_string(&value).unwrap())
+                .unwrap();
+
+        assert!(restore_agent_snapshot(malicious).is_err());
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&snapshot.to_json().unwrap()).unwrap();
+        let proposal = value["transcript"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find_map(|turn| turn.get_mut("AssistantProposed"))
+            .unwrap();
+        proposal["command"] = serde_json::json!("echo safe\u{202e}txt");
+        let spoofed =
+            crate::agent::AgentSessionSnapshot::from_json(&serde_json::to_string(&value).unwrap())
+                .unwrap();
+        assert!(restore_agent_snapshot(spoofed).is_err());
+    }
+
+    #[test]
+    fn snapshot_cannot_rebind_approval_to_hidden_reordered_or_reused_ids() {
+        let mut session = crate::agent::AgentSession::new(6);
+        session.submit_user("inspect").unwrap();
+        let first = match session
+            .accept_model_reply(r#"{"action":"run","command":"printf first"}"#)
+            .unwrap()
+        {
+            crate::agent::ModelOutcome::Proposal { id, .. } => id,
+            other => panic!("expected first proposal, got {other:?}"),
+        };
+        session.reject(first).unwrap();
+        let second = match session
+            .accept_model_reply(r#"{"action":"run","command":"printf second"}"#)
+            .unwrap()
+        {
+            crate::agent::ModelOutcome::Proposal { id, .. } => id,
+            other => panic!("expected second proposal, got {other:?}"),
+        };
+        let base: serde_json::Value =
+            serde_json::from_str(&session.snapshot().unwrap().to_json().unwrap()).unwrap();
+        let decode = |value: serde_json::Value| {
+            crate::agent::AgentSessionSnapshot::from_json(&serde_json::to_string(&value).unwrap())
+                .unwrap()
+        };
+        assert!(restore_agent_snapshot(decode(base.clone())).is_ok());
+
+        // A sole Pending status is insufficient: it must be the final
+        // proposal/turn. Otherwise jagent's first-match lookup can approve a
+        // hidden older command while a newer proposal is displayed.
+        let mut hidden = base.clone();
+        let proposals = hidden["transcript"].as_array_mut().unwrap();
+        let mut seen = 0;
+        for turn in proposals {
+            if let Some(proposal) = turn.get_mut("AssistantProposed") {
+                proposal["status"] =
+                    serde_json::json!(if seen == 0 { "Pending" } else { "Rejected" });
+                seen += 1;
+            }
+        }
+        hidden["state"] =
+            serde_json::to_value(crate::agent::AgentState::AwaitingApproval { proposal_id: first })
+                .unwrap();
+        assert!(restore_agent_snapshot(decode(hidden)).is_err());
+
+        let mut multiple_pending = base.clone();
+        for turn in multiple_pending["transcript"].as_array_mut().unwrap() {
+            if let Some(proposal) = turn.get_mut("AssistantProposed") {
+                proposal["status"] = serde_json::json!("Pending");
+            }
+        }
+        assert!(restore_agent_snapshot(decode(multiple_pending)).is_err());
+
+        let mut reordered = base.clone();
+        reordered["transcript_truncated"] = serde_json::json!(true);
+        let proposals = reordered["transcript"].as_array_mut().unwrap();
+        let mut seen = 0;
+        for turn in proposals {
+            if let Some(proposal) = turn.get_mut("AssistantProposed") {
+                proposal["id"] =
+                    serde_json::json!(if seen == 0 { second.get() } else { first.get() });
+                seen += 1;
+            }
+        }
+        reordered["state"]["AwaitingApproval"]["proposal_id"] = serde_json::json!(first.get());
+        assert!(restore_agent_snapshot(decode(reordered)).is_err());
+
+        let mut reused = base.clone();
+        reused["next_proposal_id"] = serde_json::json!(second.get());
+        assert!(restore_agent_snapshot(decode(reused)).is_err());
+
+        let mut covered = base.clone();
+        covered["transcript"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"ProtocolError": "cover pending proposal"}));
+        assert!(restore_agent_snapshot(decode(covered)).is_err());
+
+        let mut unobserved_approved = base.clone();
+        for turn in unobserved_approved["transcript"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .rev()
+        {
+            if let Some(proposal) = turn.get_mut("AssistantProposed") {
+                proposal["status"] = serde_json::json!("Approved");
+                break;
+            }
+        }
+        unobserved_approved["state"] = serde_json::json!("Ready");
+        assert!(restore_agent_snapshot(decode(unobserved_approved)).is_err());
+
+        let mut rejected_observation = base.clone();
+        rejected_observation["transcript"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "Observation": {
+                    "proposal_id": first.get(),
+                    "exit_code": 0,
+                    "output_sample": "forged"
+                }
+            }));
+        assert!(restore_agent_snapshot(decode(rejected_observation)).is_err());
+
+        let mut gap = base;
+        let proposals = gap["transcript"].as_array_mut().unwrap();
+        for turn in proposals.iter_mut().rev() {
+            if let Some(proposal) = turn.get_mut("AssistantProposed") {
+                proposal["id"] = serde_json::json!(7);
+                break;
+            }
+        }
+        gap["state"]["AwaitingApproval"]["proposal_id"] = serde_json::json!(7);
+        gap["next_proposal_id"] = serde_json::json!(8);
+        assert!(restore_agent_snapshot(decode(gap)).is_err());
+    }
+
+    #[test]
+    fn valid_approved_proposal_lifecycle_restores() {
+        let mut session = crate::agent::AgentSession::new(3);
+        session.submit_user("inspect").unwrap();
+        let proposal_id = match session
+            .accept_model_reply(r#"{"action":"run","command":"printf safe"}"#)
+            .unwrap()
+        {
+            crate::agent::ModelOutcome::Proposal { id, .. } => id,
+            other => panic!("expected proposal, got {other:?}"),
+        };
+        let _approved = session.approve(proposal_id).unwrap();
+        assert!(restore_agent_snapshot(session.snapshot().unwrap()).is_ok());
+
+        session.observe(proposal_id, 0, "safe output").unwrap();
+        let observed = session.snapshot().unwrap().to_json().unwrap();
+        assert!(restore_agent_snapshot(
+            crate::agent::AgentSessionSnapshot::from_json(&observed).unwrap()
+        )
+        .is_ok());
+
+        let mut wrong_state: serde_json::Value = serde_json::from_str(&observed).unwrap();
+        wrong_state["state"] = serde_json::json!("Completed");
+        let wrong_state = crate::agent::AgentSessionSnapshot::from_json(
+            &serde_json::to_string(&wrong_state).unwrap(),
+        )
+        .unwrap();
+        assert!(restore_agent_snapshot(wrong_state).is_err());
+
+        let mut wrong_counter: serde_json::Value = serde_json::from_str(&observed).unwrap();
+        wrong_counter["turns_used"] = serde_json::json!(0);
+        let wrong_counter = crate::agent::AgentSessionSnapshot::from_json(
+            &serde_json::to_string(&wrong_counter).unwrap(),
+        )
+        .unwrap();
+        assert!(restore_agent_snapshot(wrong_counter).is_err());
     }
 }

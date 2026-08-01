@@ -11,6 +11,7 @@ use crate::ai::{
 
 pub(super) const DEFAULT_CHAT_TITLE: &str = "New chat";
 pub(super) const MAX_LIVE_MESSAGE_BYTES: usize = 64 * 1024;
+pub(super) const MAX_LIVE_ASSISTANT_MESSAGE_BYTES: usize = 256 * 1024;
 const MAX_LIVE_TURNS_PER_CHAT: usize = 100;
 const MAX_LIVE_ALL_HISTORY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CHAT_TITLE_BYTES: usize = 256;
@@ -122,7 +123,7 @@ impl ChatRuntime {
             archived,
             history,
             block_context,
-            draft,
+            draft: bounded_live_message(draft),
             history_truncated,
             epoch: 0,
             active_epoch: None,
@@ -186,7 +187,7 @@ impl ChatStore {
                 let mut title = chat.title.clone();
                 let mut history = chat.history.clone();
                 let mut context = durable_context(chat);
-                let mut draft = durable_draft(chat);
+                let (mut draft, draft_truncated) = durable_draft(chat);
                 if redact {
                     title = crate::redact::redact_secrets(&title);
                     draft = crate::redact::redact_secrets(&draft);
@@ -210,7 +211,7 @@ impl ChatStore {
                     context.as_ref(),
                     &draft,
                 )
-                .with_history_truncated(chat.history_truncated)
+                .with_history_truncated(chat.history_truncated || draft_truncated)
             })
             .collect();
         let snapshot = ConversationSnapshot::from_chats(self.active_chat_id, chats)
@@ -295,6 +296,7 @@ impl ChatStore {
     }
 
     pub(super) fn set_active_draft(&mut self, draft: String) -> bool {
+        let draft = bounded_live_message(draft);
         if self.active().draft == draft {
             return false;
         }
@@ -447,6 +449,8 @@ impl ChatStore {
     /// Returns whether the owner chat is still the visible chat.
     pub(super) fn complete_success(&mut self, token: RequestToken, text: String) -> Option<bool> {
         let active_chat_id = self.active_chat_id;
+        let response_truncated = text.len() > MAX_LIVE_ASSISTANT_MESSAGE_BYTES;
+        let text = bounded_live_assistant_message(text);
         let owner_active = {
             let chat = self.chat_mut(token.chat_id)?;
             if chat.active_epoch != Some(token.epoch) {
@@ -460,6 +464,7 @@ impl ChatStore {
                 role: Role::Assistant,
                 text,
             });
+            chat.history_truncated |= response_truncated;
             chat.status = ChatStatus::Idle;
             chat.unread = chat.id != active_chat_id;
             chat.id == active_chat_id
@@ -507,7 +512,12 @@ impl ChatStore {
         if chat.active_epoch != Some(token.epoch) {
             return None;
         }
-        rollback_pending_request(chat);
+        let draft_truncated = rollback_pending_request(chat);
+        let message = if draft_truncated {
+            format!("{message} Some recovered draft text was omitted at the 64 KiB limit.")
+        } else {
+            message
+        };
         chat.status = ChatStatus::Error(message);
         chat.unread = chat.id != active_chat_id;
         Some(chat.id == active_chat_id)
@@ -519,7 +529,12 @@ impl ChatStore {
         if chat.active_epoch != Some(token.epoch) {
             return None;
         }
-        rollback_pending_request(chat);
+        let draft_truncated = rollback_pending_request(chat);
+        let message = if draft_truncated {
+            format!("{message} Some recovered draft text was omitted at the 64 KiB limit.")
+        } else {
+            message
+        };
         chat.status = ChatStatus::Info(message);
         chat.unread = chat.id != active_chat_id;
         Some(chat.id == active_chat_id)
@@ -540,7 +555,9 @@ impl ChatStore {
             return false;
         }
         if !user_text.trim().is_empty() {
-            chat.draft = merge_drafts(user_text, &chat.draft);
+            let (draft, truncated) = merge_drafts_bounded(user_text, &chat.draft);
+            chat.draft = draft;
+            chat.history_truncated |= truncated;
         }
         if let Some(context) = context {
             chat.block_context = Some(context);
@@ -623,7 +640,15 @@ fn next_available_id(chats: &[ChatRuntime]) -> u64 {
 fn normalise_title(title: &str) -> String {
     let cleaned: String = title
         .chars()
-        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .map(|ch| {
+            if ch.is_control() || ch.is_whitespace() {
+                ' '
+            } else if crate::review_input::is_visual_spoof_character(ch) {
+                '\u{fffd}'
+            } else {
+                ch
+            }
+        })
         .collect();
     let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.is_empty() {
@@ -663,6 +688,7 @@ fn chat_preview(chat: &ChatRuntime) -> String {
         .filter(|text| !text.trim().is_empty())
         .or_else(|| (!chat.draft.trim().is_empty()).then_some(chat.draft.as_str()))
         .unwrap_or("Empty conversation");
+    let source = crate::review_input::safe_inline_display(source, 16 * 1024);
     let collapsed = source.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = collapsed.chars();
     let preview: String = chars.by_ref().take(72).collect();
@@ -673,13 +699,13 @@ fn chat_preview(chat: &ChatRuntime) -> String {
     }
 }
 
-fn durable_draft(chat: &ChatRuntime) -> String {
+fn durable_draft(chat: &ChatRuntime) -> (String, bool) {
     if chat.restore_pending_as_draft {
         if let Some(pending_user) = chat.pending_user.as_deref() {
-            return merge_drafts(pending_user, &chat.draft);
+            return merge_drafts_bounded(pending_user, &chat.draft);
         }
     }
-    chat.draft.clone()
+    (chat.draft.clone(), false)
 }
 
 fn durable_context(chat: &ChatRuntime) -> Option<BlockContext> {
@@ -689,7 +715,8 @@ fn durable_context(chat: &ChatRuntime) -> Option<BlockContext> {
         .unwrap_or_else(|| chat.block_context.clone())
 }
 
-fn rollback_pending_request(chat: &mut ChatRuntime) {
+fn rollback_pending_request(chat: &mut ChatRuntime) -> bool {
+    let mut draft_truncated = false;
     chat.active_epoch = None;
     let popped_user = if chat
         .history
@@ -703,13 +730,17 @@ fn rollback_pending_request(chat: &mut ChatRuntime) {
     let pending_user = chat.pending_user.take().or(popped_user);
     if chat.restore_pending_as_draft {
         if let Some(pending_user) = pending_user {
-            chat.draft = merge_drafts(&pending_user, &chat.draft);
+            let (draft, truncated) = merge_drafts_bounded(&pending_user, &chat.draft);
+            chat.draft = draft;
+            chat.history_truncated |= truncated;
+            draft_truncated = truncated;
         }
     }
     chat.restore_pending_as_draft = false;
     if let Some(previous_context) = chat.previous_context.take() {
         chat.block_context = previous_context;
     }
+    draft_truncated
 }
 
 fn has_oldest_complete_pair(chat: &ChatRuntime) -> bool {
@@ -749,14 +780,79 @@ fn live_history_bytes(chats: &[ChatRuntime]) -> usize {
     })
 }
 
-fn merge_drafts(first: &str, second: &str) -> String {
+pub(super) fn bounded_live_message(mut text: String) -> String {
+    if text.len() <= MAX_LIVE_MESSAGE_BYTES {
+        return text;
+    }
+    let mut end = MAX_LIVE_MESSAGE_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text
+}
+
+fn bounded_live_assistant_message(mut text: String) -> String {
+    const NOTICE: &str = "\n\n[Response truncated to the 256 KiB live message limit.]";
+    if text.len() <= MAX_LIVE_ASSISTANT_MESSAGE_BYTES {
+        return text;
+    }
+    let mut end = MAX_LIVE_ASSISTANT_MESSAGE_BYTES.saturating_sub(NOTICE.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str(NOTICE);
+    text
+}
+
+fn append_bounded(target: &mut String, text: &str) {
+    let remaining = MAX_LIVE_MESSAGE_BYTES.saturating_sub(target.len());
+    if remaining == 0 {
+        return;
+    }
+    let mut end = text.len().min(remaining);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    target.push_str(&text[..end]);
+}
+
+fn merge_drafts_bounded(first: &str, second: &str) -> (String, bool) {
+    let full_len = if first.is_empty() || first == second {
+        second.len()
+    } else if second.is_empty() {
+        first.len()
+    } else {
+        first.len().saturating_add(2).saturating_add(second.len())
+    };
     if first.is_empty() || first == second {
-        return second.to_string();
+        let merged = bounded_live_message(second.to_string());
+        return (merged, full_len > MAX_LIVE_MESSAGE_BYTES);
     }
     if second.is_empty() {
-        return first.to_string();
+        let merged = bounded_live_message(first.to_string());
+        return (merged, full_len > MAX_LIVE_MESSAGE_BYTES);
     }
-    format!("{first}\n\n{second}")
+    let capacity = first
+        .len()
+        .saturating_add(2)
+        .saturating_add(second.len())
+        .min(MAX_LIVE_MESSAGE_BYTES);
+    let mut merged = String::with_capacity(capacity);
+    append_bounded(&mut merged, first);
+    let second_budget = MAX_LIVE_MESSAGE_BYTES
+        .saturating_sub(merged.len())
+        .saturating_sub(2);
+    let mut second_end = second.len().min(second_budget);
+    while !second.is_char_boundary(second_end) {
+        second_end -= 1;
+    }
+    if second_end > 0 {
+        merged.push_str("\n\n");
+        merged.push_str(&second[..second_end]);
+    }
+    (merged, full_len > MAX_LIVE_MESSAGE_BYTES)
 }
 
 #[cfg(test)]
@@ -1018,6 +1114,62 @@ mod tests {
         ));
         assert!(store.active_history().is_empty());
         assert!(!store.is_active_busy());
+    }
+
+    #[test]
+    fn oversized_assistant_replies_are_bounded_and_marked() {
+        let mut store = ChatStore::default();
+        let token = start(&mut store, "question");
+        let oversized = "界".repeat(MAX_LIVE_ASSISTANT_MESSAGE_BYTES / "界".len() + 100);
+
+        assert_eq!(store.complete_success(token, oversized), Some(true));
+        let reply = &store.active_history().last().unwrap().text;
+        assert!(reply.len() <= MAX_LIVE_ASSISTANT_MESSAGE_BYTES);
+        assert!(reply.ends_with("[Response truncated to the 256 KiB live message limit.]"));
+        assert!(store.active_history_truncated());
+    }
+
+    #[test]
+    fn live_drafts_are_trimmed_on_a_utf8_boundary() {
+        let mut store = ChatStore::default();
+        let oversized = "界".repeat(MAX_LIVE_MESSAGE_BYTES / "界".len() + 10);
+
+        assert!(store.set_active_draft(oversized));
+        assert!(store.active_draft().len() <= MAX_LIVE_MESSAGE_BYTES);
+        assert!(store.active_draft().chars().all(|ch| ch == '界'));
+        assert!(!store.set_active_draft(store.active_draft().to_string()));
+    }
+
+    #[test]
+    fn retry_draft_merging_never_exceeds_the_live_budget() {
+        let first = "a".repeat(MAX_LIVE_MESSAGE_BYTES - 1);
+        let second = "界".repeat(32);
+        let (merged, truncated) = merge_drafts_bounded(&first, &second);
+
+        assert!(truncated);
+        assert!(merged.len() <= MAX_LIVE_MESSAGE_BYTES);
+        assert!(merged.starts_with(&first));
+        assert!(merged.is_char_boundary(merged.len()));
+    }
+
+    #[test]
+    fn failed_request_reports_when_follow_up_draft_text_is_omitted() {
+        let mut store = ChatStore::default();
+        let request = "a".repeat(MAX_LIVE_MESSAGE_BYTES - 1);
+        let token = start(&mut store, &request);
+        store.set_active_draft("follow-up".into());
+        let (inflight, _) = store.snapshot_for_persistence(false).unwrap();
+        assert!(inflight.active_chat().unwrap().history_truncated());
+
+        assert_eq!(
+            store.complete_error(token, "network failed".into()),
+            Some(true)
+        );
+        assert!(store.active_history_truncated());
+        assert!(matches!(
+            store.active_status(),
+            ChatStatus::Error(message) if message.contains("draft text was omitted")
+        ));
     }
 
     #[test]
@@ -1325,9 +1477,12 @@ mod tests {
     #[test]
     fn runtime_title_matches_persistence_limits() {
         let mut store = ChatStore::default();
-        store.rename_active(&format!("bad\0title {}", "😀".repeat(100)));
+        store.rename_active(&format!("bad\0title\u{202e}\u{fe0f} {}", "😀".repeat(100)));
 
         assert!(!store.active_title().chars().any(char::is_control));
+        assert!(!crate::review_input::contains_visual_spoof(
+            store.active_title()
+        ));
         assert!(store.active_title().len() <= MAX_CHAT_TITLE_BYTES);
         assert!(store.active_title().chars().count() <= MAX_CHAT_TITLE_CHARS);
         let expected = store.active_title().to_string();

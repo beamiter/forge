@@ -243,7 +243,10 @@ pub(crate) fn show_command_palette(
                 // Keep the palette open when filters produce zero matches.
                 return;
             };
-            write_recalled_command(&pty, &cmd, bracketed_paste.get(), false);
+            if let Err(error) = write_recalled_command(&pty, &cmd, bracketed_paste.get(), false) {
+                pty.report_write_error("could not queue command-palette recall", error);
+                return;
+            }
             pty_synced.set(true);
             typed_cmd.borrow_mut().clear();
             popover.popdown();

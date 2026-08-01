@@ -12,10 +12,14 @@ use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::{Rc, Weak};
 
-use super::command_review::{CommandReviewCard, CommandReviewSpec, ReviewPresentation};
+use super::command_review::{
+    set_review_feedback, CommandReviewCard, CommandReviewSpec, ReviewPresentation,
+};
 use super::UiState;
 use crate::block_view::TermView;
 use crate::palette::{Accept, Entry, PaletteMode, Query};
+
+const MAX_PALETTE_QUERY_CHARS: i32 = 16 * 1024;
 
 /// One live review-first natural-language command suggestion. It is kept
 /// separate from the multi-turn Shell Agent state machine, but intentionally
@@ -51,7 +55,11 @@ struct CommandSuggestionRuntime {
 
 impl CommandSuggestionRuntime {
     fn set_status(&self, message: &str, active: bool, error: bool) {
-        self.status.set_text(message);
+        self.status
+            .set_text(&crate::review_input::safe_inline_display(
+                message,
+                16 * 1024,
+            ));
         if error {
             self.status.add_css_class("error");
         } else {
@@ -112,7 +120,7 @@ impl CommandSuggestionRuntime {
         let cwd = runtime.cwd.clone();
         let shell = runtime.shell.clone();
         let block_context = runtime.block_context.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let result = crate::ai::nl_to_command_with_context_blocking_cancellable(
                 &client,
@@ -171,13 +179,24 @@ impl CommandSuggestionRuntime {
 
     fn render_proposal(runtime: &Rc<Self>, command: String, provider: &str) {
         runtime.clear_review();
+        let command = match crate::review_input::validate(&command) {
+            Ok(command) => command.to_string(),
+            Err(error) => {
+                runtime.set_status(
+                    &format!("AI returned an unsafe command: {error}. Regenerate to try again."),
+                    false,
+                    true,
+                );
+                return;
+            }
+        };
         runtime.review_box.set_visible(true);
         let review = CommandReviewCard::new(CommandReviewSpec {
             presentation: ReviewPresentation::Embedded,
             compact: runtime.config.borrow().block_compact,
             icon: "\u{f0eb}", // nf-fa-lightbulb_o
             title: "Command proposal".to_string(),
-            badge: provider.to_string(),
+            badge: crate::review_input::safe_inline_display(provider, 1024),
             description: format!("Generated for: {}", compact_one_line(&runtime.request, 140)),
             command,
             primary_label: "Insert for review".to_string(),
@@ -222,21 +241,24 @@ impl CommandSuggestionRuntime {
         let command = match crate::review_input::validate(&entry.text()) {
             Ok(command) => command.to_string(),
             Err(error) => {
-                feedback.set_text(&format!("Cannot insert: {error}"));
-                feedback.add_css_class("error");
-                feedback.set_visible(true);
+                set_review_feedback(feedback, &format!("Cannot insert: {error}"), true);
                 return;
             }
         };
         let prompt_status = runtime.target.command_prompt_status();
         if !prompt_status.is_ready() {
-            feedback.set_text(prompt_status.blocked_message());
-            feedback.add_css_class("error");
-            feedback.set_visible(true);
+            set_review_feedback(feedback, prompt_status.blocked_message(), true);
             return;
         }
         runtime.target.grab_focus();
-        runtime.target.write_input(command.as_bytes());
+        if let Err(error) = runtime.target.write_input(command.as_bytes()) {
+            set_review_feedback(
+                feedback,
+                &format!("Command was not inserted: {error}"),
+                true,
+            );
+            return;
+        }
         Self::dismiss(runtime);
     }
 
@@ -270,6 +292,7 @@ impl CommandSuggestionRuntime {
 }
 
 fn compact_one_line(text: &str, max_chars: usize) -> String {
+    let text = crate::review_input::safe_inline_display(text, 16 * 1024);
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = collapsed.chars();
     let preview: String = chars.by_ref().take(max_chars).collect();
@@ -289,15 +312,20 @@ fn clear_rows(list: &ListBox) {
 fn render_rows(list: &ListBox, entries: &[Entry]) {
     clear_rows(list);
     for entry in entries {
+        let title = crate::review_input::safe_inline_display(&entry.label, 16 * 1024);
         let row = adw::ActionRow::builder()
-            .title(&entry.label)
+            .title(&title)
             .activatable(true)
             .build();
         if let Some(subtitle) = entry.sublabel.as_deref() {
-            row.set_subtitle(subtitle);
+            row.set_subtitle(&crate::review_input::safe_inline_display(
+                subtitle,
+                16 * 1024,
+            ));
         }
         if let Some(right) = entry.right.as_deref() {
-            let label = Label::new(Some(right));
+            let right = crate::review_input::safe_inline_display(right, 4 * 1024);
+            let label = Label::new(Some(&right));
             label.add_css_class("dim-label");
             row.add_suffix(&label);
         }
@@ -412,6 +440,7 @@ impl UiState {
             cwd if !cwd.is_empty() => cwd,
             _ => ".".to_string(),
         };
+        let cwd_display = crate::review_input::safe_inline_display(&cwd, 4 * 1024);
         let shell = self
             .shell_argv
             .borrow()
@@ -452,12 +481,12 @@ impl UiState {
         title.add_css_class("assistant-card-title");
         title.set_xalign(0.0);
         header.append(&title);
-        let binding = Label::new(Some(&format!("{cwd} · review only")));
+        let binding = Label::new(Some(&format!("{cwd_display} · review only")));
         binding.add_css_class("assistant-card-badge");
         binding.set_hexpand(true);
         binding.set_halign(gtk4::Align::End);
         binding.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
-        binding.set_tooltip_text(Some(&cwd));
+        binding.set_tooltip_text(Some(&cwd_display));
         header.append(&binding);
         let close = Button::with_label("\u{2715}");
         close.add_css_class("flat");
@@ -623,6 +652,12 @@ impl UiState {
             .build();
         let header = adw::HeaderBar::new();
         let filter = SearchEntry::new();
+        if let Some(text) = filter
+            .delegate()
+            .and_then(|delegate| delegate.downcast::<gtk4::Text>().ok())
+        {
+            text.set_max_length(MAX_PALETTE_QUERY_CHARS);
+        }
         filter.set_placeholder_text(Some(
             "Search all · > actions · @ history · : workflows · ? ask AI",
         ));
@@ -726,5 +761,21 @@ impl UiState {
         *self.command_palette_dialog.borrow_mut() = Some(dialog.clone());
         dialog.present(Some(&self.window));
         filter.grab_focus();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compact_one_line;
+
+    #[test]
+    fn palette_previews_neutralise_untrusted_formatting() {
+        let preview = compact_one_line("show\n\u{202e}\u{fff0}\u{e0080}files", 80);
+
+        assert_eq!(preview, "show����files");
+        assert!(!preview.contains('\n'));
+        assert!(!preview.contains('\u{202e}'));
+        assert!(!preview.contains('\u{fff0}'));
+        assert!(!preview.contains('\u{e0080}'));
     }
 }

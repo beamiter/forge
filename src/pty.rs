@@ -3,6 +3,7 @@ use nix::libc;
 use nix::pty::{openpty, OpenptyResult};
 use nix::unistd::{self, ForkResult, Pid};
 use std::ffi::CString;
+use std::fmt;
 use std::fs::File;
 use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -27,7 +28,7 @@ pub struct OwnedPty {
     master: std::sync::Arc<std::sync::Mutex<Option<OwnedFd>>>,
     /// Terminal input is written by a dedicated worker. A full PTY kernel buffer
     /// therefore backpressures that worker rather than GTK's main thread.
-    input_tx: std::sync::Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    input_tx: std::sync::Mutex<Option<mpsc::SyncSender<Vec<u8>>>>,
     /// The forked shell. This process reaps it (`ReapOwner::Ours`), so the
     /// lifecycle — not a raw pid — is the only handle any teardown path holds:
     /// it serializes every signal against its own `waitpid`, refuses to start a
@@ -39,6 +40,9 @@ pub struct OwnedPty {
     /// frames whose start, body and end arrive through separate `write_bytes`
     /// calls. Behind a `Mutex` only because `write_bytes` takes `&self`.
     input_guard: std::sync::Mutex<InputGuard>,
+    /// Coalesce repeated backpressure logs until one later input is accepted.
+    /// Error values contain only byte counts, never terminal content.
+    input_error_reported: AtomicBool,
     /// Mirrors the shell's DECSET/DECRST 2004 state so multiline insertion can
     /// be protected at the central input boundary. Fed by the block parser's
     /// `ParserEvent::DecsetMode` (see [`OwnedPty::set_shell_bracketed_paste`]),
@@ -65,11 +69,51 @@ const G_PRIORITY_DEFAULT_IDLE: i32 = 200;
 /// Bound queued output. Once this queue fills, the reader blocks and the kernel
 /// PTY buffer provides natural backpressure to a runaway producer.
 const PTY_QUEUE_CAPACITY: usize = 8;
+/// Bound queued terminal input without ever blocking GTK. Each write is one
+/// semantic unit (a keystroke sequence, paste frame, or command submission),
+/// so saturation rejects the whole unit instead of enqueueing an executable
+/// prefix. The queue therefore retains at most 16 MiB plus channel overhead.
+const PTY_INPUT_QUEUE_CAPACITY: usize = 64;
+pub const MAX_PTY_INPUT_MESSAGE_BYTES: usize = 256 * 1024;
 /// Smaller chunks cap the amount of VTE feeding performed in one UI callback.
 const PTY_READ_CHUNK_BYTES: usize = 32 * 1024;
 /// Keep a continuously-ready PTY from monopolizing GTK's main loop. The first
 /// chunk is dispatched immediately; queued follow-ups are paced at this rate.
 const PTY_DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
+
+/// A terminal-input write was not admitted to the dedicated writer queue.
+///
+/// The error deliberately carries byte counts only: callers can report
+/// backpressure without copying shell input into logs, dialogs, or telemetry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PtyWriteError {
+    TooLarge { bytes: usize, limit: usize },
+    QueueFull { bytes: usize },
+    Closed { bytes: usize },
+}
+
+impl fmt::Display for PtyWriteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLarge { bytes, limit } => {
+                write!(
+                    formatter,
+                    "PTY input is {bytes} bytes; the limit is {limit} bytes"
+                )
+            }
+            Self::QueueFull { bytes } => write!(
+                formatter,
+                "PTY input queue is full; {bytes}-byte input was not sent"
+            ),
+            Self::Closed { bytes } => write!(
+                formatter,
+                "PTY input queue is closed; {bytes}-byte input was not sent"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PtyWriteError {}
 
 /// Policy for the PTY write boundary.
 ///
@@ -147,8 +191,8 @@ fn write_all_fd(fd: RawFd, mut data: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn spawn_fd_writer(fd: OwnedFd) -> io::Result<mpsc::Sender<Vec<u8>>> {
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+fn spawn_fd_writer(fd: OwnedFd) -> io::Result<mpsc::SyncSender<Vec<u8>>> {
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(PTY_INPUT_QUEUE_CAPACITY);
     std::thread::Builder::new()
         .name("jterm4-pty-writer".to_string())
         .spawn(move || {
@@ -160,6 +204,24 @@ fn spawn_fd_writer(fd: OwnedFd) -> io::Result<mpsc::Sender<Vec<u8>>> {
             }
         })?;
     Ok(tx)
+}
+
+fn try_enqueue_input(
+    sender: &mpsc::SyncSender<Vec<u8>>,
+    data: Vec<u8>,
+) -> Result<(), PtyWriteError> {
+    let bytes = data.len();
+    if bytes > MAX_PTY_INPUT_MESSAGE_BYTES {
+        return Err(PtyWriteError::TooLarge {
+            bytes,
+            limit: MAX_PTY_INPUT_MESSAGE_BYTES,
+        });
+    }
+    match sender.try_send(data) {
+        Ok(()) => Ok(()),
+        Err(mpsc::TrySendError::Full(_)) => Err(PtyWriteError::QueueFull { bytes }),
+        Err(mpsc::TrySendError::Disconnected(_)) => Err(PtyWriteError::Closed { bytes }),
+    }
 }
 
 fn invalid_nul(context: &str) -> io::Error {
@@ -217,7 +279,10 @@ fn open_working_directory(cwd: Option<&str>) -> Option<File> {
     match File::open(directory) {
         Ok(file) => Some(file),
         Err(error) => {
-            log::warn!("Cannot open PTY working directory {directory}: {error}");
+            log::warn!(
+                "Cannot open PTY working directory {}: {error}",
+                crate::review_input::safe_inline_display(directory, 2 * 1024)
+            );
             None
         }
     }
@@ -361,6 +426,7 @@ impl OwnedPty {
                     input_tx: std::sync::Mutex::new(Some(input_tx)),
                     lifecycle,
                     input_guard: std::sync::Mutex::new(InputGuard::new()),
+                    input_error_reported: AtomicBool::new(false),
                     shell_bracketed_paste: AtomicBool::new(false),
                 })
             }
@@ -408,7 +474,14 @@ impl OwnedPty {
         self.shell_bracketed_paste.load(Ordering::Relaxed)
     }
 
-    pub fn write_bytes(&self, data: &[u8]) {
+    #[must_use = "terminal input may be rejected by bounded nonblocking backpressure"]
+    pub fn write_bytes(&self, data: &[u8]) -> Result<(), PtyWriteError> {
+        if data.len() > MAX_PTY_INPUT_MESSAGE_BYTES {
+            return Err(PtyWriteError::TooLarge {
+                bytes: data.len(),
+                limit: MAX_PTY_INPUT_MESSAGE_BYTES,
+            });
+        }
         let modes = PasteModes {
             bracketed: self.shell_bracketed_paste(),
         };
@@ -425,7 +498,13 @@ impl OwnedPty {
         };
 
         if safe_data.is_empty() {
-            return;
+            return Ok(());
+        }
+        if safe_data.len() > MAX_PTY_INPUT_MESSAGE_BYTES {
+            return Err(PtyWriteError::TooLarge {
+                bytes: safe_data.len(),
+                limit: MAX_PTY_INPUT_MESSAGE_BYTES,
+            });
         }
         let input_tx = self
             .input_tx
@@ -433,17 +512,22 @@ impl OwnedPty {
             .ok()
             .and_then(|sender| sender.as_ref().cloned());
         let Some(input_tx) = input_tx else {
-            log::warn!(
-                "PTY input queue is closed; discarded {} byte(s)",
-                safe_data.len()
-            );
-            return;
+            return Err(PtyWriteError::Closed {
+                bytes: safe_data.len(),
+            });
         };
-        if let Err(error) = input_tx.send(safe_data) {
-            log::warn!(
-                "PTY input queue is closed; discarded {} byte(s)",
-                error.0.len()
-            );
+        let result = try_enqueue_input(&input_tx, safe_data);
+        if result.is_ok() {
+            self.input_error_reported.store(false, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Report a rejected write without leaking its contents or flooding logs
+    /// while the same backpressure condition persists.
+    pub fn report_write_error(&self, context: &'static str, error: PtyWriteError) {
+        if !self.input_error_reported.swap(true, Ordering::Relaxed) {
+            log::warn!("{context}: {error}");
         }
     }
 
@@ -765,6 +849,45 @@ mod tests {
         waited < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
     }
 
+    #[test]
+    fn input_queue_rejects_whole_messages_when_full_or_oversized() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        assert_eq!(try_enqueue_input(&sender, b"first".to_vec()), Ok(()));
+        assert_eq!(
+            try_enqueue_input(&sender, b"second-secret".to_vec()),
+            Err(PtyWriteError::QueueFull { bytes: 13 })
+        );
+        assert_eq!(receiver.try_recv().unwrap(), b"first");
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let oversized = vec![b'x'; MAX_PTY_INPUT_MESSAGE_BYTES + 1];
+        assert_eq!(
+            try_enqueue_input(&sender, oversized),
+            Err(PtyWriteError::TooLarge {
+                bytes: MAX_PTY_INPUT_MESSAGE_BYTES + 1,
+                limit: MAX_PTY_INPUT_MESSAGE_BYTES,
+            })
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn input_queue_reports_disconnect_without_exposing_payload() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        let error = try_enqueue_input(&sender, b"private command".to_vec()).unwrap_err();
+        assert_eq!(error, PtyWriteError::Closed { bytes: 15 });
+        let display = error.to_string();
+        assert!(display.contains("15-byte"));
+        assert!(!display.contains("private"));
+    }
+
     fn wait_until(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
@@ -1079,6 +1202,16 @@ mod tests {
     fn shell_supported_multiline_insert_is_automatically_bracketed() {
         assert_eq!(
             guarded(&[b"echo first\necho second"], true),
+            vec![b"\x1b[200~echo first\necho second\x1b[201~".to_vec()]
+        );
+    }
+
+    #[test]
+    fn embedded_marker_cannot_bypass_unframed_multiline_protection() {
+        let hostile = b"echo first\x1b[201~\necho second";
+        assert_eq!(guarded(&[hostile], false), vec![b"echo first".to_vec()]);
+        assert_eq!(
+            guarded(&[hostile], true),
             vec![b"\x1b[200~echo first\necho second\x1b[201~".to_vec()]
         );
     }
