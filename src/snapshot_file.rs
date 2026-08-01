@@ -10,7 +10,7 @@
 //! `src/state.rs::atomic_write_private_file`, and jterm3's `save` (which was
 //! `fs::write` + `rename`, so a crash between them could publish a truncated
 //! snapshot). The durable-replacement mechanics themselves are not re-done here
-//! — [`crate::atomic_file::write_atomic`] already had them right.
+//! — `crate::atomic_file::write_atomic` already had them right.
 //!
 //! The failure mode that motivated the module: a session snapshot is data the
 //! terminal reads *at startup*, from a path it found by scanning a directory,
@@ -331,7 +331,7 @@ fn validate_existing_directory(dir: &Path) -> io::Result<()> {
 
 /// Durably replace a snapshot file, creating its directory `0700` if needed.
 ///
-/// The atomic replacement itself is [`crate::atomic_file::write_atomic`], whose
+/// The atomic replacement itself is `crate::atomic_file::write_atomic`, whose
 /// temporary file is already `0600`, so the renamed-into-place snapshot is too.
 /// An existing parent is validated without following a final symlink but is not
 /// chmodded: configured snapshot paths may legitimately live directly under

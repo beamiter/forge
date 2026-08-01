@@ -33,6 +33,15 @@ After the canonical jsh installer is hardened for mandatory checksums, bounded s
 archive extraction, strict URL/version/target grammar, private atomic cache files,
 and bounded version probing, resync `scripts/install-jsh.sh` and its acceptance tests.
 
+### Keep the Flatpak Cargo source manifest synchronized
+
+Whenever a git dependency revision changes in `Cargo.lock`, rerun the exact pinned
+`flatpak-cargo-generator.py` revision from `.github/workflows/flatpak.yml` with
+network access and commit the resulting `packaging/flatpak/cargo-sources.json`.
+The current dependency repin still needs that regeneration; local execution was
+blocked by unavailable external network access, so the generated manifest was not
+hand-edited or approximated.
+
 ## Release checks
 
 ```text
