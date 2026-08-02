@@ -1757,6 +1757,25 @@ fn table_u64(table: &toml::Table, key: &str) -> Option<u64> {
         .and_then(|value| u64::try_from(value).ok())
 }
 
+/// Why the configuration file was not read, when it was not.
+///
+/// Falling back to the built-in defaults is the right thing to do — a terminal
+/// that refuses to open because of its config is a terminal you cannot fix the
+/// config with — but doing it quietly is not: every setting in the file is
+/// gone and nothing on screen says why.
+static CONFIG_LOAD_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn record_load_error(message: String) {
+    if let Ok(mut slot) = CONFIG_LOAD_ERROR.lock() {
+        *slot = Some(message);
+    }
+}
+
+/// The most recent reason the configuration file could not be read.
+pub(crate) fn load_error() -> Option<String> {
+    CONFIG_LOAD_ERROR.lock().ok().and_then(|slot| slot.clone())
+}
+
 fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision>) {
     let path = config_file_path();
     let bytes = match crate::config_store::read_config_bytes(&path) {
@@ -1771,6 +1790,13 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
             );
         }
         Err(error) => {
+            // A log line is invisible to someone whose theme, keybindings and
+            // remote hosts have all silently reverted to the defaults. Keep
+            // the reason where the window can put it on screen.
+            record_load_error(format!(
+                "{}: {error}",
+                crate::review_input::safe_inline_display(&path.to_string_lossy(), 2 * 1024)
+            ));
             log::warn!(
                 "Failed to read config file {}: {error}",
                 crate::review_input::safe_inline_display(&path.to_string_lossy(), 2 * 1024)

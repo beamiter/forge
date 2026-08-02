@@ -233,7 +233,9 @@ fn existing_parent_directory(path: &Path) -> io::Result<Option<fs::File>> {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "configuration parent must be current-user owned and not group/world writable: {}",
+                "configuration parent must be current-user owned and not \
+                 group/world writable: {} (run: chmod g-w,o-w {})",
+                parent.display(),
                 parent.display()
             ),
         ));

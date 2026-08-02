@@ -6,6 +6,16 @@ All notable user-visible and operational changes are recorded here.
 
 ### Fixed
 
+- 配置文件因为权限被拒绝时不再是一场无声的回退。jterm4 要求配置文件的父目录不能被组或其他人
+  写（umask 0002 下手工建出来的 `~/.config/jterm4` 正好是 775），此前这种情况只写一行
+  `log::warn!` 就退回内置默认值——主题、快捷键、`[[remote_hosts]]` 全部失效，界面上没有任何
+  迹象，`--doctor` 里的 `remote hosts: none configured` 还标着 `(ok)`。现在：窗口启动时弹出
+  一条不自动消失的 toast 说明配置未加载及原因；错误文本直接给出可执行的补救命令
+  （`run: chmod g-w,o-w <目录>`）；`--doctor` 在配置未加载时把远程主机一行标为
+  `unknown: the configuration file was not loaded (warning)`，不再假装配置里什么都没有。
+- `--doctor` 的远程主机检查按 transport 分别判断：ssh 目标看 `ssh`，`docker = true` 的目标看
+  `docker`，此前无论目标是什么都只报告 ssh 是否可用。
+
 - 精确锁定的共享 core 尚未发布本轮安全修复时，jterm4 现在通过可独立构建的本地兼容层
   先行补齐边界：后台 `curl`/`git`/`sh`/`notify-send` 与 Flatpak bridge 不再从空或
   相对 `PATH` 执行项目内同名程序；AI、jsh 检查与探测子进程均有输出、超时、进程组

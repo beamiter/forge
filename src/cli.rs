@@ -898,26 +898,56 @@ fn doctor(format: ReportFormat) -> bool {
         }
     }
 
-    let ssh_available = command_available("ssh", flatpak);
+    // "none configured" is only true when the file was read. With the config
+    // rejected, `config` here is the built-in default and every host in the
+    // file is invisible — reporting that as an untroubled zero is how a
+    // permission problem on the directory stays hidden.
+    let config_was_read = crate::config::load_error().is_none();
+    let containers = config
+        .remote_hosts
+        .iter()
+        .filter(|host| host.docker)
+        .count();
+    let over_ssh = config.remote_hosts.len() - containers;
+    // Each transport is only needed by the hosts that use it.
+    let ssh_available = over_ssh == 0 || command_available("ssh", flatpak);
+    let docker_available = containers == 0 || command_available("docker", flatpak);
     checks.push(DoctorCheck {
         name: "remote hosts",
-        status: if config.remote_hosts.is_empty() || ssh_available {
+        status: if !config_was_read {
+            "warning"
+        } else if ssh_available && docker_available {
             "ok"
         } else {
             "error"
         },
-        detail: if config.remote_hosts.is_empty() {
+        detail: if !config_was_read {
+            "unknown: the configuration file was not loaded".to_string()
+        } else if config.remote_hosts.is_empty() {
             "none configured".to_string()
         } else {
-            format!(
-                "{} configured; ssh {}",
-                config.remote_hosts.len(),
-                if ssh_available {
-                    "available"
-                } else {
-                    "missing"
-                }
-            )
+            let mut detail = format!("{} configured", config.remote_hosts.len());
+            if over_ssh > 0 {
+                detail.push_str(&format!(
+                    "; {over_ssh} over ssh, which is {}",
+                    if ssh_available {
+                        "available"
+                    } else {
+                        "missing"
+                    }
+                ));
+            }
+            if containers > 0 {
+                detail.push_str(&format!(
+                    "; {containers} in containers, and docker is {}",
+                    if docker_available {
+                        "available"
+                    } else {
+                        "missing"
+                    }
+                ));
+            }
+            detail
         },
     });
 

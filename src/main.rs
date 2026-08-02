@@ -873,6 +873,16 @@ pub fn run() -> glib::ExitCode {
             ai_panel_width_restoring: Rc::new(Cell::new(false)),
         });
 
+        // A configuration that could not be read leaves every setting at its
+        // default, which looks exactly like a config file that does nothing.
+        // Say so once, with the reason, rather than only in a log nobody has
+        // enabled.
+        if let Some(reason) = crate::config::load_error() {
+            let toast = adw::Toast::new(&format!("Configuration not loaded: {reason}"));
+            toast.set_timeout(0); // dismissed by hand: it is not a status blip
+            toast_overlay.add_toast(toast);
+        }
+
         // Background persistence failures arrive from a Send-only worker.
         // Polling a bounded queue keeps GTK objects on the main thread and
         // turns otherwise invisible fsync/permission failures into one concise
