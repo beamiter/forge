@@ -225,28 +225,13 @@ user = "devuser"
 deploy = "persist"
 ```
 
-`deploy_artifact` 指定一份本机构建的 jsh 直接推过去，代替去取已发布的 release。没有它时，
-如果本机 jsh 的版本没有对应 release（或者干脆没网），部署会先花几秒钟连不上发布地址，
-然后**静默降级**成 shell 集成——Block、cwd、退出码还在，jsh 的补全和结构化管道没有。
-路径必须是绝对路径（相对路径会相对标签页的启动目录解析），且必须是目标机跑得起来的二进制：
-落地后 launcher 只校验它自报的版本横幅，没人能替你判断它是为哪个 libc 编译的。容器和 ssh
-两种目标通用。构建一份静态 musl jsh：
+**通常不需要配置从哪拿 jsh**：本机装的 jsh 是静态构建时（Linux 安装的默认），launcher
+会直接把它出借给目标——不查 release、不联网，远端跑的就是本机这份的同版本。release
+只是动态链接或跨架构时的回退。
 
-```sh
-cd ~/projects/jsh
-cargo build --release --target x86_64-unknown-linux-musl
-```
-
-```toml
-[[remote_hosts]]
-name = "build容器"
-host = "my-service"
-docker = true
-deploy = "incognito"
-deploy_artifact = "/home/yj/projects/jsh/target/x86_64-unknown-linux-musl/release/jsh"
-```
-
-`--check-config` 会在这个文件不存在、或者写了它却没开 `deploy` 时给出警告。
+`deploy_artifact` 因此只剩一个用途：明确要推**另一份**构建（比如某个分支的产物）而不是
+本机正在用的这份。路径必须是绝对路径，且必须是目标机跑得起来的二进制；`--check-config`
+会在文件不存在、或写了它却没开 `deploy` 时给出警告。
 
 ## 11. AI 与 Agent 安全边界
 
