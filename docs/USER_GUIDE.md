@@ -194,7 +194,7 @@ flatpak run io.github.beamiter.jterm4
 
 文件树需要宿主文件系统权限。AI 密钥可通过可信启动器、显式 Flatpak override 或 sandbox 内可见的 owner-only 独立文件提供。完整权限说明见 `docs/FLATPAK.md`。
 
-## 10. SSH 远程会话
+## 10. 远程会话与容器
 
 jterm4 不预置主机。在配置中显式添加：
 
@@ -211,6 +211,19 @@ multiplex = true
 ```
 
 `Ctrl+Shift+S` 打开主机选择器。连接复用由 OpenSSH ControlMaster 完成，异常断开按上限退避重连；用户正常退出不会重连。
+
+`deploy` 决定目标机器上没有 jsh 时怎么办：`"off"`（默认）直接运行 `remote_shell`，取到什么算什么；`"persist"` 和 `"incognito"` 会把一份 jsh 送过去，前者在对方 `$HOME` 留下 dot-files 和二进制缓存（重连免传输），后者用退出即删的沙箱 HOME。Block、cwd 跟踪和退出码都来自 jsh，所以对端只有 `sh` 时不开 deploy 会静默丢掉这些。
+
+`docker = true` 时 `host` 是**正在运行的**容器名，走 `docker exec` 而不是 ssh，`user` 变成容器内的用户（`-u`）；`ssh_args`、`multiplex`、`login_shell` 对容器无意义，会被忽略。容器默认以 root 运行，而旧版 jsh 在 root 下会把 `/usr/bin/git` 和 `/usr/bin/bash` 判为不可信 helper，于是 git 补全、git 提示符和 `.bashrc` 导入在容器里静默消失。容器标签页请搭配修复过这一点的 jsh（jsh CHANGELOG 中的 “a root shell trusts the system helpers it could write”）。
+
+```toml
+[[remote_hosts]]
+name = "build容器"
+host = "my-service"
+docker = true
+user = "devuser"
+deploy = "persist"
+```
 
 ## 11. AI 与 Agent 安全边界
 

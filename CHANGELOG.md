@@ -52,6 +52,13 @@ All notable user-visible and operational changes are recorded here.
 
 ### Added
 
+- `[[remote_hosts]]` 新增 `docker = true`：`host` 改为一个**正在运行的**容器名，标签页
+  经 `docker exec` 而不是 ssh 连接，`user` 变成容器内用户（`-u` / 部署时的
+  `--docker-user`），`deploy` 照常决定要不要把 jsh 送进去（送进去的一路已端到端验证：
+  补全、菜单、OSC 133 块标记、窗口 resize 与本地一致）。共享库
+  `jterm_core::jsh_remote` 和 `jsh-remote.sh` 早就支持 `--docker`，只有 jterm4 这一侧
+  把它硬编码成了 `false`，因此配置里根本写不出容器目标。`ssh_args`、`multiplex`、
+  `login_shell` 对容器无意义，写了会给出警告并忽略，而不是让主机加载失败。
 - Block 模式运行中命令的体验改进（针对 claude 等长时流式 TUI）：
   - **运行中可框选文本**：在 live 终端面上拖选时，PTY 字节流被暂存（选区期间 + 松手后最多 5 秒宽限，或复制/输入/点击别处即恢复，上限 2 MiB），高频重绘不再瞬间冲掉选区；Shift+拖选在开启鼠标上报的应用里同样受保护。暂存生效时左下角显示 "Output paused — selection" 徽标，消除"卡住了"的错觉。
   - **运行中可回看输出**：滚轮在 live 终端面上优先滚动当前命令自己的回滚缓冲，滚到顶/底才交给外层 Block 历史（此前 VTE 吞掉滚轮且新输出会把视图拽回底部，运行中的早期输出实际不可达）；右侧出现细滚动条（overlay 覆盖式，出现/消失不改变列宽、不触发 SIGWINCH），跳底按钮同时归位内外两层滚动。空闲提示符上的滚轮现在可靠地滚动 Block 历史。

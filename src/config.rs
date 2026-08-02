@@ -97,8 +97,17 @@ pub use crate::jsh_install::UpdateCheck as JshUpdateCheck;
 #[derive(Clone, Debug)]
 pub struct RemoteHost {
     pub name: String,
+    /// The ssh destination, or — when `docker` is set — the name of a running
+    /// container.
     pub host: String,
+    /// The ssh login, or the `docker exec -u` user inside the container.
     pub user: Option<String>,
+    /// Reach `host` with `docker exec` instead of ssh. The container has to be
+    /// running already: this attaches to one, it does not start one.
+    ///
+    /// `ssh_args`, `multiplex` and `login_shell` have no meaning here and are
+    /// ignored, which is also what the shared launcher does with them.
+    pub docker: bool,
     /// Shell to launch on the remote side (default "jsh").
     pub remote_shell: String,
     /// Stable session id passed to the remote jsh for resume-on-reconnect.
@@ -409,6 +418,9 @@ pub(crate) fn build_remote_argv(host: &RemoteHost) -> Vec<String> {
             ),
         }
     }
+    if host.docker {
+        return build_docker_argv(host);
+    }
     let control_dir = host.multiplex.then(control_socket_dir).flatten();
     build_remote_argv_with_control_dir(host, control_dir.as_deref())
 }
@@ -416,20 +428,54 @@ pub(crate) fn build_remote_argv(host: &RemoteHost) -> Vec<String> {
 /// argv for a tab that deploys jsh, given a launcher already on disk. Split out
 /// from [`build_remote_argv`] so it can be asserted without publishing anything.
 fn build_deployed_argv(host: &RemoteHost, script: &std::path::Path) -> Vec<String> {
-    let target = match &host.user {
-        Some(u) => format!("{u}@{}", host.host),
-        None => host.host.clone(),
+    // A container takes its user through `--docker-user`, not through an
+    // `user@host` destination that `docker exec` would read as a container
+    // name nobody has.
+    let target = match (&host.user, host.docker) {
+        (Some(u), false) => format!("{u}@{}", host.host),
+        _ => host.host.clone(),
     };
-    jterm_core::jsh_remote::launch_argv_with_script(
+    let mut argv = jterm_core::jsh_remote::launch_argv_with_script(
         script,
         &jterm_core::jsh_remote::RemoteTarget {
             destination: &target,
-            docker: false,
+            docker: host.docker,
             session: host.session.as_deref(),
             ssh_args: &host.ssh_args,
             deploy: host.deploy,
         },
-    )
+    );
+    if host.docker {
+        if let Some(user) = &host.user {
+            argv.push("--docker-user".to_string());
+            argv.push(user.clone());
+        }
+    }
+    argv
+}
+
+/// argv for a container tab that deploys nothing, for an image that already
+/// carries the shell. The ssh path's counterpart is
+/// [`build_remote_argv_with_control_dir`]; there is no connection to multiplex
+/// and no login shell to wrap, because `docker exec` starts a process rather
+/// than a session.
+fn build_docker_argv(host: &RemoteHost) -> Vec<String> {
+    let mut argv = vec!["docker".to_string(), "exec".to_string(), "-it".to_string()];
+    if let Some(user) = &host.user {
+        argv.push("-u".to_string());
+        argv.push(user.clone());
+    }
+    argv.push(host.host.clone());
+    argv.push(host.remote_shell.clone());
+    if let Some(sid) = host
+        .session
+        .as_deref()
+        .filter(|sid| crate::review_input::valid_jsh_id(sid))
+    {
+        argv.push("--session".to_string());
+        argv.push(sid.to_string());
+    }
+    argv
 }
 
 fn build_remote_argv_with_control_dir(
@@ -996,6 +1042,7 @@ const REMOTE_HOST_CONFIG_KEYS: &[&str] = &[
     "login_shell",
     "multiplex",
     "deploy",
+    "docker",
 ];
 
 fn config_issue(
@@ -1516,7 +1563,7 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
                         ),
                     }
                 }
-                for key in ["login_shell", "multiplex"] {
+                for key in ["login_shell", "multiplex", "docker"] {
                     if host.get(key).is_some_and(|value| !value.is_bool()) {
                         config_issue(
                             &mut issues,
@@ -1524,6 +1571,21 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
                             format!("{path}.{key}"),
                             "expected true or false",
                         );
+                    }
+                }
+                if host.get("docker").and_then(toml::Value::as_bool) == Some(true) {
+                    // Warned about rather than refused: they are inert for a
+                    // container, and a host that was converted from ssh should
+                    // open rather than fail on a leftover key.
+                    for key in ["ssh_args", "multiplex", "login_shell"] {
+                        if host.contains_key(key) {
+                            config_issue(
+                                &mut issues,
+                                Warning,
+                                format!("{path}.{key}"),
+                                "has no effect on a docker host; it will be ignored",
+                            );
+                        }
                     }
                 }
                 if let Some(value) = host.get("deploy") {
@@ -1919,6 +1981,7 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
             let multiplex = t.get("multiplex").and_then(|v| v.as_bool()).unwrap_or(true);
+            let docker = t.get("docker").and_then(|v| v.as_bool()).unwrap_or(false);
             // A spelling this build does not understand rejects the host rather
             // than falling back to `off`. Silently downgrading `incognito` would
             // write jsh's dot-files into an account the user asked to leave
@@ -1943,6 +2006,7 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
                 login_shell,
                 multiplex,
                 deploy,
+                docker,
             })
         })
         .collect()
@@ -1974,6 +2038,11 @@ pub(crate) fn remote_host_to_toml(h: &RemoteHost) -> toml::Value {
     }
     t.insert("login_shell".into(), toml::Value::Boolean(h.login_shell));
     t.insert("multiplex".into(), toml::Value::Boolean(h.multiplex));
+    if h.docker {
+        // Same rule as `deploy`: written only when on, so an ssh host does not
+        // grow the key on a round trip.
+        t.insert("docker".into(), toml::Value::Boolean(true));
+    }
     if h.deploy.is_enabled() {
         // Only written when it is on, so a config file that never asked for
         // deployment does not grow a key after a round trip.
@@ -2414,6 +2483,7 @@ mod tests {
             // Likewise: deployment publishes a script and its path depends on
             // the cache directory. The deploy tests below opt in explicitly.
             deploy: jterm_core::jsh_remote::Deploy::Off,
+            docker: false,
         }
     }
 
@@ -2752,6 +2822,106 @@ host = "backup.example.com"
         )
         .unwrap();
         assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    #[test]
+    fn a_container_tab_runs_docker_exec_rather_than_ssh() {
+        let mut h = host();
+        h.host = "devbox".into();
+        h.user = Some("devuser".into());
+        h.docker = true;
+        // Inert for a container, and set here to prove they stay inert.
+        h.ssh_args = vec!["-p".into(), "2222".into()];
+        h.login_shell = true;
+
+        let argv = build_remote_argv(&h);
+        assert_eq!(
+            argv,
+            [
+                "docker",
+                "exec",
+                "-it",
+                "-u",
+                "devuser",
+                "devbox",
+                "/home/yj/.cargo/bin/jsh",
+                "--session",
+                "cloud-test",
+            ]
+        );
+        assert!(!argv.iter().any(|a| a == "ssh"), "{argv:?}");
+        // `user@host` would be read as a container name nobody has.
+        assert!(!argv.iter().any(|a| a.contains('@')), "{argv:?}");
+    }
+
+    #[test]
+    fn a_deployed_container_tab_names_the_container_and_its_user_separately() {
+        let mut h = host();
+        h.host = "devbox".into();
+        h.user = Some("devuser".into());
+        h.docker = true;
+        h.deploy = jterm_core::jsh_remote::Deploy::Persist;
+
+        let argv = build_deployed_argv(&h, std::path::Path::new("/c/jsh-remote.sh"));
+
+        let container = argv.iter().position(|a| a == "--docker").expect("--docker");
+        assert_eq!(argv[container + 1], "devbox");
+        let user = argv
+            .iter()
+            .position(|a| a == "--docker-user")
+            .expect("--docker-user");
+        assert_eq!(argv[user + 1], "devuser");
+        assert!(!argv.iter().any(|a| a.contains('@')), "{argv:?}");
+        // Deployment is the whole point of this path: the container is not
+        // assumed to have a shell already.
+        assert!(argv.contains(&"--persist".to_string()), "{argv:?}");
+    }
+
+    #[test]
+    fn a_docker_host_round_trips_through_toml_and_ssh_hosts_do_not_grow_the_key() {
+        let mut h = host();
+        h.docker = true;
+        let toml_value = remote_host_to_toml(&h);
+        let table = toml::toml! {
+            remote_hosts = [(toml_value.clone())]
+        };
+        let parsed = parse_remote_hosts(&table);
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].docker);
+
+        let ssh_host = remote_host_to_toml(&host());
+        assert!(
+            ssh_host
+                .as_table()
+                .is_some_and(|t| !t.contains_key("docker")),
+            "{ssh_host:?}"
+        );
+    }
+
+    #[test]
+    fn keys_that_do_nothing_for_a_container_are_flagged_without_refusing_the_host() {
+        let issues = validate_config_contents(
+            r#"
+[[remote_hosts]]
+host = "devbox"
+docker = true
+deploy = "persist"
+ssh_args = ["-p", "2222"]
+multiplex = true
+"#,
+        )
+        .unwrap();
+        for key in ["ssh_args", "multiplex"] {
+            let issue = issues
+                .iter()
+                .find(|i| i.path == format!("remote_hosts[0].{key}"))
+                .unwrap_or_else(|| panic!("no issue for {key}: {issues:?}"));
+            assert_eq!(issue.level, ConfigIssueLevel::Warning, "{issue:?}");
+        }
+        assert!(
+            !issues.iter().any(|i| i.level == ConfigIssueLevel::Error),
+            "{issues:?}"
+        );
     }
 
     #[test]
