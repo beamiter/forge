@@ -225,6 +225,29 @@ user = "devuser"
 deploy = "persist"
 ```
 
+`deploy_artifact` 指定一份本机构建的 jsh 直接推过去，代替去取已发布的 release。没有它时，
+如果本机 jsh 的版本没有对应 release（或者干脆没网），部署会先花几秒钟连不上发布地址，
+然后**静默降级**成 shell 集成——Block、cwd、退出码还在，jsh 的补全和结构化管道没有。
+路径必须是绝对路径（相对路径会相对标签页的启动目录解析），且必须是目标机跑得起来的二进制：
+落地后 launcher 只校验它自报的版本横幅，没人能替你判断它是为哪个 libc 编译的。容器和 ssh
+两种目标通用。构建一份静态 musl jsh：
+
+```sh
+cd ~/projects/jsh
+cargo build --release --target x86_64-unknown-linux-musl
+```
+
+```toml
+[[remote_hosts]]
+name = "build容器"
+host = "my-service"
+docker = true
+deploy = "incognito"
+deploy_artifact = "/home/yj/projects/jsh/target/x86_64-unknown-linux-musl/release/jsh"
+```
+
+`--check-config` 会在这个文件不存在、或者写了它却没开 `deploy` 时给出警告。
+
 ## 11. AI 与 Agent 安全边界
 
 AI 总开关、provider 和 endpoint 由配置控制。支持 Anthropic、OpenAI-compatible 和 Ollama wire protocol。密钥内容不会写入 TOML；环境变量优先。也可直接在 **Settings → AI & Agent → API Key** 输入密钥并按 Apply：jterm4 会将它原子写入 owner-only 的 `~/.config/jterm4/ai.key`，并只把文件路径写入配置。设置面板不会回显已经保存的密钥，再次输入并 Apply 可替换它。

@@ -52,6 +52,11 @@ All notable user-visible and operational changes are recorded here.
 
 ### Added
 
+- `[[remote_hosts]]` 新增 `deploy_artifact`：指定一份本机构建的 jsh 交给 `deploy` 推送，
+  代替去取已发布的 release。这是在"本机 jsh 版本还没发 release"或者离线时唯一能真正部署的
+  方式——否则部署会先连不上发布地址，再静默降级成 shell 集成（Block 还在，jsh 的补全没了）。
+  必须是绝对路径：相对路径会相对标签页启动目录解析，`-` 开头会被 launcher 当成选项，两种都
+  直接拒绝该主机而不是悄悄忽略。`--check-config` 会警告文件不存在、或写了它却没开 `deploy`。
 - `[[remote_hosts]]` 新增 `docker = true`：`host` 改为一个**正在运行的**容器名，标签页
   经 `docker exec` 而不是 ssh 连接，`user` 变成容器内用户（`-u` / 部署时的
   `--docker-user`），`deploy` 照常决定要不要把 jsh 送进去（送进去的一路已端到端验证：

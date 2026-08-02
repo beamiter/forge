@@ -108,6 +108,16 @@ pub struct RemoteHost {
     /// `ssh_args`, `multiplex` and `login_shell` have no meaning here and are
     /// ignored, which is also what the shared launcher does with them.
     pub docker: bool,
+    /// A jsh built on this machine for `deploy` to push, instead of the
+    /// published release it would otherwise fetch. Without it, deployment on a
+    /// machine whose jsh has no release — or with no network — spends a few
+    /// seconds failing to reach the release host and then falls back to shell
+    /// integration, which keeps blocks but none of jsh's own behaviour.
+    ///
+    /// Must be an absolute path, and must be a jsh the destination can run:
+    /// the launcher checks the binary's own version banner after it lands, but
+    /// nothing here can tell whether it was built for that libc.
+    pub deploy_artifact: Option<String>,
     /// Shell to launch on the remote side (default "jsh").
     pub remote_shell: String,
     /// Stable session id passed to the remote jsh for resume-on-reconnect.
@@ -435,23 +445,18 @@ fn build_deployed_argv(host: &RemoteHost, script: &std::path::Path) -> Vec<Strin
         (Some(u), false) => format!("{u}@{}", host.host),
         _ => host.host.clone(),
     };
-    let mut argv = jterm_core::jsh_remote::launch_argv_with_script(
+    jterm_core::jsh_remote::launch_argv_with_script(
         script,
         &jterm_core::jsh_remote::RemoteTarget {
             destination: &target,
             docker: host.docker,
+            docker_user: host.docker.then_some(host.user.as_deref()).flatten(),
+            artifact: host.deploy_artifact.as_deref().map(Path::new),
             session: host.session.as_deref(),
             ssh_args: &host.ssh_args,
             deploy: host.deploy,
         },
-    );
-    if host.docker {
-        if let Some(user) = &host.user {
-            argv.push("--docker-user".to_string());
-            argv.push(user.clone());
-        }
-    }
-    argv
+    )
 }
 
 /// argv for a container tab that deploys nothing, for an image that already
@@ -1043,6 +1048,7 @@ const REMOTE_HOST_CONFIG_KEYS: &[&str] = &[
     "multiplex",
     "deploy",
     "docker",
+    "deploy_artifact",
 ];
 
 fn config_issue(
@@ -1573,6 +1579,57 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
                         );
                     }
                 }
+                if let Some(value) = host.get("deploy_artifact") {
+                    let field_path = format!("{path}.deploy_artifact");
+                    match value.as_str() {
+                        None => config_issue(
+                            &mut issues,
+                            Error,
+                            &field_path,
+                            "expected a path to a jsh binary",
+                        ),
+                        Some(text) if !std::path::Path::new(text).is_absolute() => config_issue(
+                            &mut issues,
+                            Error,
+                            &field_path,
+                            "must be an absolute path; a relative one would \
+                             resolve against whatever directory the tab starts in",
+                        ),
+                        Some(text) => {
+                            validate_remote_host_string(
+                                &mut issues,
+                                Some(value),
+                                &field_path,
+                                true,
+                            );
+                            // Reported rather than refused: the file can appear
+                            // later, and a host that is otherwise fine should
+                            // still open. Left silent, a missing artifact looks
+                            // like deployment simply not working.
+                            if !std::path::Path::new(text).is_file() {
+                                config_issue(
+                                    &mut issues,
+                                    Warning,
+                                    &field_path,
+                                    "no such file; deployment will fall back to fetching a release",
+                                );
+                            }
+                            if !host
+                                .get("deploy")
+                                .and_then(toml::Value::as_str)
+                                .and_then(jterm_core::jsh_remote::Deploy::parse)
+                                .is_some_and(|deploy| deploy.is_enabled())
+                            {
+                                config_issue(
+                                    &mut issues,
+                                    Warning,
+                                    &field_path,
+                                    "has no effect without deploy = \"persist\" or \"incognito\"",
+                                );
+                            }
+                        }
+                    }
+                }
                 if host.get("docker").and_then(toml::Value::as_bool) == Some(true) {
                     // Warned about rather than refused: they are inert for a
                     // container, and a host that was converted from ssh should
@@ -1982,6 +2039,20 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
                 .unwrap_or(true);
             let multiplex = t.get("multiplex").and_then(|v| v.as_bool()).unwrap_or(true);
             let docker = t.get("docker").and_then(|v| v.as_bool()).unwrap_or(false);
+            // Rejected rather than dropped, for the same reason a `deploy`
+            // spelling this build does not understand rejects the host: a path
+            // that is quietly ignored looks exactly like deployment working,
+            // right up until the tab is a bash prompt with none of jsh in it.
+            let deploy_artifact = match t.get("deploy_artifact") {
+                None => None,
+                Some(toml::Value::String(value)) => {
+                    if !remote_field_is_safe(value) || !std::path::Path::new(value).is_absolute() {
+                        return None;
+                    }
+                    Some(value.to_string())
+                }
+                Some(_) => return None,
+            };
             // A spelling this build does not understand rejects the host rather
             // than falling back to `off`. Silently downgrading `incognito` would
             // write jsh's dot-files into an account the user asked to leave
@@ -2007,6 +2078,7 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
                 multiplex,
                 deploy,
                 docker,
+                deploy_artifact,
             })
         })
         .collect()
@@ -2042,6 +2114,12 @@ pub(crate) fn remote_host_to_toml(h: &RemoteHost) -> toml::Value {
         // Same rule as `deploy`: written only when on, so an ssh host does not
         // grow the key on a round trip.
         t.insert("docker".into(), toml::Value::Boolean(true));
+    }
+    if let Some(artifact) = &h.deploy_artifact {
+        t.insert(
+            "deploy_artifact".into(),
+            toml::Value::String(artifact.clone()),
+        );
     }
     if h.deploy.is_enabled() {
         // Only written when it is on, so a config file that never asked for
@@ -2484,6 +2562,7 @@ mod tests {
             // the cache directory. The deploy tests below opt in explicitly.
             deploy: jterm_core::jsh_remote::Deploy::Off,
             docker: false,
+            deploy_artifact: None,
         }
     }
 
@@ -2878,9 +2957,82 @@ host = "backup.example.com"
     }
 
     #[test]
+    fn a_host_can_name_the_jsh_it_deploys() {
+        let mut h = host();
+        h.deploy = jterm_core::jsh_remote::Deploy::Incognito;
+        h.deploy_artifact = Some("/home/yj/projects/jsh/target/release/jsh".into());
+
+        let argv = build_deployed_argv(&h, std::path::Path::new("/c/jsh-remote.sh"));
+
+        let artifact = argv
+            .iter()
+            .position(|a| a == "--artifact")
+            .expect("--artifact");
+        assert_eq!(
+            argv[artifact + 1],
+            "/home/yj/projects/jsh/target/release/jsh"
+        );
+    }
+
+    #[test]
+    fn an_artifact_that_could_be_read_as_an_option_or_a_relative_path_rejects_the_host() {
+        // Silently ignoring it would look exactly like deployment working,
+        // right up to the moment the tab is a bash prompt.
+        for artifact in ["target/release/jsh", "-artifact", ""] {
+            let table = toml::toml! {
+                remote_hosts = [{ host = "h", deploy = "persist", deploy_artifact = (artifact) }]
+            };
+            assert!(
+                parse_remote_hosts(&table).is_empty(),
+                "accepted deploy_artifact {artifact:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_named_artifact_is_reported_when_it_cannot_be_deployed() {
+        let issues = validate_config_contents(
+            r#"
+[[remote_hosts]]
+host = "devbox"
+deploy = "persist"
+deploy_artifact = "/definitely/missing/jsh"
+
+[[remote_hosts]]
+name = "no-deploy"
+host = "other"
+deploy_artifact = "/definitely/missing/jsh"
+"#,
+        )
+        .unwrap();
+        let for_host = |index: usize| {
+            issues
+                .iter()
+                .filter(|i| i.path == format!("remote_hosts[{index}].deploy_artifact"))
+                .map(|i| (i.level, i.message.as_str()))
+                .collect::<Vec<_>>()
+        };
+        let missing = for_host(0);
+        assert_eq!(missing.len(), 1, "{issues:?}");
+        assert_eq!(missing[0].0, ConfigIssueLevel::Warning);
+        assert!(missing[0].1.contains("no such file"), "{issues:?}");
+        // The second host names one *and* never deploys, so it hears about both.
+        assert_eq!(for_host(1).len(), 2, "{issues:?}");
+        assert!(
+            for_host(1).iter().any(|(_, m)| m.contains("no effect")),
+            "{issues:?}"
+        );
+        assert!(
+            !issues.iter().any(|i| i.level == ConfigIssueLevel::Error),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
     fn a_docker_host_round_trips_through_toml_and_ssh_hosts_do_not_grow_the_key() {
         let mut h = host();
         h.docker = true;
+        h.deploy_artifact = Some("/opt/jsh".into());
         let toml_value = remote_host_to_toml(&h);
         let table = toml::toml! {
             remote_hosts = [(toml_value.clone())]
@@ -2888,12 +3040,13 @@ host = "backup.example.com"
         let parsed = parse_remote_hosts(&table);
         assert_eq!(parsed.len(), 1);
         assert!(parsed[0].docker);
+        assert_eq!(parsed[0].deploy_artifact.as_deref(), Some("/opt/jsh"));
 
         let ssh_host = remote_host_to_toml(&host());
         assert!(
-            ssh_host
-                .as_table()
-                .is_some_and(|t| !t.contains_key("docker")),
+            ssh_host.as_table().is_some_and(|t| {
+                !t.contains_key("docker") && !t.contains_key("deploy_artifact")
+            }),
             "{ssh_host:?}"
         );
     }
