@@ -587,7 +587,11 @@ impl UiState {
                 let header = label.clone();
                 let strip = strip_label.clone();
                 let custom = custom_title.clone();
+                let ui_for_bar = UiState::clone(self);
                 view.connect_cwd_changed(move |dir| {
+                    // The bottom bar follows the focused pane's cwd; repaint
+                    // before the tab-title guards, which do not apply to it.
+                    ui_for_bar.refresh_bottom_bar();
                     let Some(identity) = identity.upgrade() else {
                         return;
                     };
@@ -620,7 +624,9 @@ impl UiState {
                 let header = label.clone();
                 let strip = strip_label.clone();
                 let custom = custom_title.clone();
+                let ui_for_bar = UiState::clone(self);
                 view.connect_cwd_changed(move |dir| {
+                    ui_for_bar.refresh_bottom_bar();
                     let Some(identity) = identity.upgrade() else {
                         return;
                     };
@@ -1331,6 +1337,7 @@ impl UiState {
                 // remains governed by block_history_path; this record contains
                 // only command metadata and is safe for palette use.
                 self.connect_block_command_history(term_view);
+                self.connect_bottom_bar_block_status(term_view);
             }
             PaneLeaf::Vte(vte_view) => {
                 let ui_for_exit = UiState::clone(self);
@@ -1431,7 +1438,9 @@ impl UiState {
             PaneLeaf::Block(term_view) => {
                 let identity_for_pwd = view_type.root_widget().downgrade();
                 let expected_name_for_pwd = format!("tab-{tab_num}");
+                let ui_for_bar = UiState::clone(self);
                 term_view.connect_cwd_changed(move |dir| {
+                    ui_for_bar.refresh_bottom_bar();
                     let Some(identity) = identity_for_pwd.upgrade() else {
                         return;
                     };
@@ -1451,7 +1460,9 @@ impl UiState {
             PaneLeaf::Vte(vte_view) => {
                 let identity_for_pwd = view_type.root_widget().downgrade();
                 let expected_name_for_pwd = format!("tab-{tab_num}");
+                let ui_for_bar = UiState::clone(self);
                 vte_view.connect_cwd_changed(move |dir| {
+                    ui_for_bar.refresh_bottom_bar();
                     let Some(identity) = identity_for_pwd.upgrade() else {
                         return;
                     };

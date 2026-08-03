@@ -650,6 +650,10 @@ pub struct Config {
     /// repo's branch, dirty marker, and ahead/behind counts. Hides itself
     /// when cwd isn't inside a git repository.
     pub(crate) show_repo_strip: bool,
+    /// Show the window-global bottom status bar (cwd, git, last command,
+    /// grid size, tab position). Family-wide key from
+    /// `jterm_core::bottom_bar`; every jterm spells it `bottom_bar`.
+    pub(crate) bottom_bar: bool,
     /// Exact disk revision this loaded configuration is allowed to replace.
     /// Clones from one window share the revision and advance it only after a
     /// durable save; independently loaded windows retain their own revisions.
@@ -725,6 +729,7 @@ impl Config {
             notify_long_blocks: false,
             notify_long_block_threshold_ms: 10_000,
             show_repo_strip: false,
+            bottom_bar: true,
             persistence_revision: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -1035,6 +1040,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "notify_long_blocks",
     "notify_long_block_threshold_ms",
     "show_repo_strip",
+    "bottom_bar",
 ];
 
 const REMOTE_HOST_CONFIG_KEYS: &[&str] = &[
@@ -1162,6 +1168,7 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
         "allow_remote_clipboard_write",
         "notify_long_blocks",
         "show_repo_strip",
+        "bottom_bar",
     ];
 
     for key in strings {
@@ -1741,6 +1748,7 @@ struct FileConfig {
     notify_long_blocks: Option<bool>,
     notify_long_block_threshold_ms: Option<u64>,
     show_repo_strip: Option<bool>,
+    bottom_bar: Option<bool>,
 }
 
 fn table_u32(table: &toml::Table, key: &str) -> Option<u32> {
@@ -1984,6 +1992,7 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
         notify_long_blocks: table.get("notify_long_blocks").and_then(|v| v.as_bool()),
         notify_long_block_threshold_ms: table_u64(&table, "notify_long_block_threshold_ms"),
         show_repo_strip: table.get("show_repo_strip").and_then(|v| v.as_bool()),
+        bottom_bar: table.get("bottom_bar").and_then(|v| v.as_bool()),
     };
     (file_config, Some(revision))
 }
@@ -2428,6 +2437,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         notify_long_blocks: fc.notify_long_blocks.unwrap_or(true),
         notify_long_block_threshold_ms: fc.notify_long_block_threshold_ms.unwrap_or(10_000),
         show_repo_strip: fc.show_repo_strip.unwrap_or(true),
+        bottom_bar: fc.bottom_bar.unwrap_or(true),
         persistence_revision: std::sync::Arc::new(std::sync::Mutex::new(persistence_revision)),
     };
 
@@ -3292,6 +3302,7 @@ session = "bad/session"
         config.sidebar_visible = false;
         config.mouse_reporting_enabled = false;
         config.show_repo_strip = true;
+        config.bottom_bar = false;
         config.shell = Some("/custom/shell".into());
         config.startup_commands = Some("touch /tmp/should-not-run".into());
         config.command_history_enabled = true;
@@ -3321,6 +3332,7 @@ session = "bad/session"
         assert!(config.sidebar_visible);
         assert!(config.mouse_reporting_enabled);
         assert!(!config.show_repo_strip);
+        assert!(config.bottom_bar);
         assert!(config.shell.is_none());
         assert!(config.startup_commands.is_none());
         assert!(!config.command_history_enabled);

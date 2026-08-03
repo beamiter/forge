@@ -268,6 +268,7 @@ impl UiState {
         });
 
         self.connect_block_command_history(&view);
+        self.connect_bottom_bar_block_status(&view);
         // A nested split does not add a Notebook page, so attach the per-pane
         // correction request epoch here instead of relying solely on page-added.
         self.attach_command_correction_to_view(view.clone(), false);
@@ -306,7 +307,7 @@ impl UiState {
     pub(crate) fn connect_block_command_history(&self, view: &Rc<TermView>) {
         let config_for_history = self.config.clone();
         let view_for_history = Rc::downgrade(view);
-        view.connect_block_finished(move |command, exit_code, _output_sample| {
+        view.connect_block_finished(move |command, exit_code, _output_sample, _duration_ms| {
             let config = config_for_history.borrow();
             if !config.command_history_enabled {
                 return;
@@ -441,7 +442,7 @@ impl UiState {
     /// A pane's working directory. Block views track it themselves because
     /// their PTY is not owned by the live VTE, so their own record outranks
     /// VTE's OSC 7 / child-pid inspection.
-    fn pane_working_directory(&self, leaf: &PaneLeaf) -> Option<String> {
+    pub(crate) fn pane_working_directory(&self, leaf: &PaneLeaf) -> Option<String> {
         leaf.block_view()
             .map(|view| view.cwd())
             .filter(|cwd| !cwd.is_empty())

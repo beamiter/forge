@@ -1008,6 +1008,7 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         "show_repo_strip".into(),
         toml::Value::Boolean(config.show_repo_strip),
     );
+    table.insert("bottom_bar".into(), toml::Value::Boolean(config.bottom_bar));
 
     // Preserve unknown/user-authored color keys just like other sections.
     let mut colors = table

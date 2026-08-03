@@ -157,6 +157,21 @@ impl UiState {
         let fr = (fg.red() * 255.0) as u8;
         let fg_g = (fg.green() * 255.0) as u8;
         let fb = (fg.blue() * 255.0) as u8;
+        // Bottom-bar tones reuse the terminal palette so the bar agrees with
+        // what the shell itself just printed: ANSI green for success, ANSI
+        // red for failure.
+        let ok = &config.palette[2];
+        let (ok_r, ok_g, ok_b) = (
+            (ok.red() * 255.0) as u8,
+            (ok.green() * 255.0) as u8,
+            (ok.blue() * 255.0) as u8,
+        );
+        let err = &config.palette[1];
+        let (err_r, err_g, err_b) = (
+            (err.red() * 255.0) as u8,
+            (err.green() * 255.0) as u8,
+            (err.blue() * 255.0) as u8,
+        );
         let css = format!(
             ".terminal-box scrollbar {{ background-color: rgb({br},{bg_g},{bb}); }}
              .terminal-box scrollbar trough {{ background-color: rgb({br},{bg_g},{bb}); }}
@@ -373,7 +388,15 @@ impl UiState {
              .agent-input-hint {{
                  color: rgba({fr},{fg_g},{fb},0.58);
                  font-size: 0.82em;
-             }}"
+             }}
+             .bottom-bar {{
+                 background-color: rgb({br},{bg_g},{bb});
+                 color: rgb({fr},{fg_g},{fb});
+             }}
+             .bottom-bar .bb-normal {{ color: rgb({fr},{fg_g},{fb}); }}
+             .bottom-bar .bb-muted {{ color: rgba({fr},{fg_g},{fb},0.55); }}
+             .bottom-bar .bb-ok {{ color: rgb({ok_r},{ok_g},{ok_b}); }}
+             .bottom-bar .bb-err {{ color: rgb({err_r},{err_g},{err_b}); }}"
         );
         self.scrollbar_css.load_from_string(&css);
     }
@@ -509,6 +532,7 @@ impl UiState {
         self.sidebar_view.set(sidebar_view);
         self.apply_tab_placement();
         self.set_sidebar_visible(sidebar_visible, false);
+        self.sync_bottom_bar_visibility();
 
         self.ai_panel_visible.set(ai_visible);
         if ai_visible {

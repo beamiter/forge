@@ -2310,7 +2310,7 @@ impl UiState {
             close_btn.connect_clicked(move |_| close_session());
         }
         let weak: Weak<AgentRuntime> = Rc::downgrade(&runtime);
-        target.connect_block_finished(move |command, exit_code, output| {
+        target.connect_block_finished(move |command, exit_code, output, _duration_ms| {
             if let Some(runtime) = weak.upgrade() {
                 // The freshly finished block was inserted below this card;
                 // re-pin the card so it stays directly above the live prompt.

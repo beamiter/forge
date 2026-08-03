@@ -472,6 +472,7 @@ pub fn run() -> glib::ExitCode {
              .tab-conn-dot.tab-disconnected { color: #ff5555; }
              .tab-strip-search { padding: 4px 8px; margin: 2px 4px; }
              .top-tabs .tab-strip-btn { border-bottom: none; margin-bottom: 0; margin-right: 2px; }
+             .bottom-bar { min-height: 22px; padding: 0 6px; border-top: 1px solid alpha(currentColor, 0.15); font-size: 0.85em; }
              .file-tree-box { border-top: 1px solid alpha(currentColor, 0.15); }
              .file-tree-header { padding: 2px 4px; }
              .file-tree-root { font-size: 0.85em; opacity: 0.7; }
@@ -805,10 +806,13 @@ pub fn run() -> glib::ExitCode {
         content_box.set_shrink_end_child(true);
         content_box.set_position(config.borrow().sidebar_width as i32);
 
-        // Main layout: draggable top bar + content box (vertical)
+        // Main layout: draggable top bar + content box (vertical), with the
+        // status bar spanning the full window width underneath both.
+        let (bottom_bar, bottom_bar_left, bottom_bar_right) = ui::build_bottom_bar();
         let main_box = gtk4::Box::new(Orientation::Vertical, 0);
         main_box.append(&top_bar_handle);
         main_box.append(&content_box);
+        main_box.append(&bottom_bar);
 
         // Shared state
         let font_scale = Rc::new(Cell::new(config.borrow().default_font_scale));
@@ -841,6 +845,10 @@ pub fn run() -> glib::ExitCode {
             sidebar_tab_mirror: sidebar_tab_mirror.clone(),
             sidebar_tab_mirror_scroll: sidebar_tab_mirror_scroll.clone(),
             top_tab_scroll: top_tab_scroll.clone(),
+            bottom_bar: bottom_bar.clone(),
+            bottom_bar_left: bottom_bar_left.clone(),
+            bottom_bar_right: bottom_bar_right.clone(),
+            bottom_bar_content: Rc::new(RefCell::new(Default::default())),
             tab_placement: Rc::new(Cell::new(config.borrow().tab_placement)),
             sidebar_stack: sidebar_stack.clone(),
             sidebar_tabs_btn: sidebar_tabs_btn.clone(),
@@ -913,6 +921,7 @@ pub fn run() -> glib::ExitCode {
         );
         ui.apply_dynamic_css();
         ui.sync_agent_toggle();
+        ui.sync_bottom_bar_visibility();
 
         // jterm prefers jsh as its shell, so it is worth noticing when the
         // machine has no jsh or an old one. The bar builds hidden and reveals
@@ -1386,10 +1395,12 @@ pub fn run() -> glib::ExitCode {
             let tab_name = widget.widget_name();
             ui_for_switch.clear_tab_indicators(tab_name.as_str());
             ui_for_switch.sync_tab_strip_active(Some(page_num));
-            // File tree root follows the active tab's working directory.
+            // File tree root and bottom bar follow the active tab, which the
+            // notebook has not switched to yet while this signal runs.
             let ui_ft = ui_for_switch.clone();
             glib::idle_add_local_once(move || {
                 ui_ft.file_tree_goto_current_cwd();
+                ui_ft.refresh_bottom_bar();
             });
         });
 
@@ -1575,6 +1586,9 @@ pub fn run() -> glib::ExitCode {
             let ui = Rc::clone(&ui);
             glib::timeout_add_seconds_local(1, move || {
                 ui.refresh_pane_headers();
+                // Same poll keeps the bottom bar's running/cwd/grid segments
+                // honest for the focused pane.
+                ui.refresh_bottom_bar();
                 glib::ControlFlow::Continue
             });
         }

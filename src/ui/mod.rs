@@ -14,6 +14,7 @@ mod actions;
 mod agent_panel;
 mod ai_chat_store;
 mod ai_panel;
+mod bottom_bar;
 mod bounded_text;
 mod command_correction;
 mod command_palette;
@@ -38,6 +39,7 @@ mod zoom;
 
 pub(crate) use agent_panel::AgentHandle;
 pub(crate) use ai_panel::AiPanel;
+pub(crate) use bottom_bar::build_bottom_bar;
 pub(crate) use command_palette::CommandSuggestionHandle;
 pub(crate) use file_tree::{build_file_tree_widgets, FileTreeModel};
 pub(crate) use pane_header::{PaneHeader, PANE_HEADER_CSS};
@@ -118,6 +120,16 @@ pub(crate) struct UiState {
     pub(crate) sidebar_tab_mirror_scroll: ScrolledWindow,
     /// Top-bar scroll holder for the (horizontal) tab strip.
     pub(crate) top_tab_scroll: ScrolledWindow,
+    /// Window-global bottom status bar (the `jterm_core::bottom_bar`
+    /// contract), spanning sidebar and content at the very bottom.
+    pub(crate) bottom_bar: gtk4::Box,
+    /// Left-packed segment container inside the bar.
+    pub(crate) bottom_bar_left: gtk4::Box,
+    /// Right-aligned segment container inside the bar.
+    pub(crate) bottom_bar_right: gtk4::Box,
+    /// Last composed bar content, so the 1s poll skips repaints that would
+    /// change nothing.
+    pub(crate) bottom_bar_content: Rc<RefCell<jterm_core::bottom_bar::Content>>,
     /// Current tab placement (sidebar vs top bar).
     pub(crate) tab_placement: Rc<Cell<TabPlacement>>,
     /// Sidebar content stack (one of: tab list, file tree).

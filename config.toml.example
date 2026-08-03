@@ -37,6 +37,10 @@ sidebar_view = "tabs"         # "tabs" 或 "files"
 # sidebar_visible = true
 sidebar_width = 220            # 120 .. 800
 
+# 窗口底部状态栏：cwd、git 分支、上一条命令结果、终端网格、标签页序号。
+# 四个 jterm 使用同一个键名。
+bottom_bar = true
+
 # Block 模式 -----------------------------------------------------------------
 
 max_visible_blocks = 200

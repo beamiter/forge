@@ -1562,7 +1562,8 @@ const MIN_INPUT_ROWS: i32 = 6;
 /// `(command, exit status, output sample)`. The status is `None` when the shell
 /// reported none, so every observer has to decide what that means for it rather
 /// than being handed a 0 that reads as success.
-type BlockFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(String, Option<i32>, String)>>>>;
+type BlockFinishedCallbacks =
+    Rc<RefCell<Vec<Box<dyn Fn(String, Option<i32>, String, Option<u64>)>>>>;
 
 pub struct TermView {
     root: gtk4::Box,
@@ -2285,7 +2286,12 @@ impl ReaderCtx {
                                 if !is_background {
                                     let output_sample = sample_output_for_event(&output_plain);
                                     for cb in block_finished_cbs.borrow().iter() {
-                                        cb(cmd.clone(), exit_code, output_sample.clone());
+                                        cb(
+                                            cmd.clone(),
+                                            exit_code,
+                                            output_sample.clone(),
+                                            duration_ms,
+                                        );
                                     }
                                 }
 
@@ -5738,7 +5744,7 @@ impl TermView {
 
     pub fn connect_block_finished<F>(&self, f: F)
     where
-        F: Fn(String, Option<i32>, String) + 'static,
+        F: Fn(String, Option<i32>, String, Option<u64>) + 'static,
     {
         self.block_finished_callbacks.borrow_mut().push(Box::new(f));
     }
