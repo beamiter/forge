@@ -30,8 +30,6 @@ STATE_HOME="${XDG_STATE_HOME:-${HOME}/.local/state}"
 # interval instead of one per terminal.
 CACHE_FILE="${CACHE_HOME}/jsh/update-check.json"
 ROLLBACK_DIR="${STATE_HOME}/jsh/rollback"
-# glibc floor of the prebuilt gnu artifacts (built on Ubuntu 22.04).
-GNU_GLIBC_MIN="2.35"
 # Ceilings for anything downloaded. A release archive is a few tens of MiB; a
 # manifest or checksum is a few hundred bytes. Without a ceiling a hostile or
 # broken mirror can fill the user's disk while the script waits patiently.
@@ -40,7 +38,9 @@ MAX_METADATA_BYTES=65536
 # Seconds allowed for one `--version` probe of an untrusted binary.
 PROBE_TIMEOUT=5
 
-channel="release"
+# Defaulted after the arguments are parsed: source for an install, release for
+# --stage-dir. Empty means "nothing explicit was asked for".
+channel=""
 bin_dir=""
 prefix=""
 want_version=""
@@ -63,7 +63,10 @@ Options:
   --max-age SECONDS    With --check, reuse a cached result younger than this
   --version VERSION    Install an exact version instead of the latest
   --tag TAG            Same, spelled as a tag (v0.2.0)
-  --channel CHANNEL    release (prebuilt, default) or source (cargo build)
+  --channel CHANNEL    source (cargo build, default) or release (prebuilt).
+                       Staging always uses release. An explicit release that
+                       finds no published release falls back to source and
+                       says so
   --prefix PATH        Install root; binary lands in PATH/bin
   --bin-dir PATH       Install directory for the binary (overrides --prefix)
   --target TRIPLE      Fetch for this target instead of the detected one
@@ -165,6 +168,17 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+# Source is the default channel: it produces the same static musl binary a
+# release would ship and works before the first release exists. Staging keeps
+# the release channel — the staged artifact is for another machine, and a
+# build here would be for this host.
+if [ -z "${channel}" ]; then
+    if [ "${mode}" = "stage" ]; then
+        channel="release"
+    else
+        channel="source"
+    fi
+fi
 case "${channel}" in
     release | source) ;;
     *) die "unknown channel: ${channel} (expected release or source)" ;;
@@ -250,43 +264,6 @@ fi
 
 # --- platform detection ------------------------------------------------------
 
-version_ge() {
-    # version_ge A B -> true when A >= B, comparing dot-separated numbers.
-    [ "$1" = "$2" ] && return 0
-    lo="$(printf '%s\n%s\n' "$1" "$2" | sort -t. -k1,1n -k2,2n -k3,3n | head -1)"
-    [ "${lo}" = "$2" ]
-}
-
-detect_libc() {
-    # musl is the portability fallback: static, no glibc floor, slower malloc.
-    if have getconf && getconf GNU_LIBC_VERSION > /dev/null 2>&1; then
-        glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')"
-    elif have ldd; then
-        first="$(ldd --version 2>&1 | head -1)"
-        case "${first}" in
-            *musl*)
-                printf 'musl\n'
-                return 0
-                ;;
-        esac
-        glibc="$(printf '%s\n' "${first}" | awk '{print $NF}')"
-    else
-        printf 'musl\n'
-        return 0
-    fi
-    case "${glibc}" in
-        '' | *[!0-9.]*)
-            printf 'musl\n'
-            return 0
-            ;;
-    esac
-    if version_ge "${glibc}" "${GNU_GLIBC_MIN}"; then
-        printf 'gnu\n'
-    else
-        printf 'musl\n'
-    fi
-}
-
 detect_target() {
     if [ -n "${JSH_INSTALL_TARGET:-}" ]; then
         printf '%s\n' "${JSH_INSTALL_TARGET}"
@@ -300,7 +277,13 @@ detect_target() {
         *) arch="" ;;
     esac
     if [ "${os}" = "Linux" ] && [ -n "${arch}" ]; then
-        printf '%s-unknown-linux-%s\n' "${arch}" "$(detect_libc)"
+        # Static musl, always. It runs on every distribution and libc, and a
+        # static jsh can lend itself out: entering a container or an ssh host
+        # bind-mounts or pushes the very binary that is running, which a
+        # dynamically linked one cannot do. The gnu artifacts are still
+        # published for anyone who wants glibc's allocator back —
+        # JSH_INSTALL_TARGET=<arch>-unknown-linux-gnu selects one explicitly.
+        printf '%s-unknown-linux-musl\n' "${arch}"
     fi
     return 0
 }
@@ -373,8 +356,19 @@ version_gt() {
 }
 
 # Absolute path of the jsh that PATH resolves to, whatever it turns out to be.
+#
+# A terminal that runs this script clamps PATH to system directories so the
+# tools it executes (curl, mktemp, ...) cannot be hijacked, but the jsh its
+# user would run still lives on the user's own PATH — usually ~/.cargo/bin or
+# ~/.local/bin. JSH_LOOKUP_PATH carries that PATH for *lookup only*: nothing
+# resolved through it is executed except jsh itself, which the terminal
+# already executes as the session shell.
 path_jsh() {
-    resolved="$(command -v jsh 2>/dev/null)" || return 0
+    resolved="$(
+        PATH="${JSH_LOOKUP_PATH:-${PATH}}"
+        export PATH
+        command -v jsh 2>/dev/null
+    )" || return 0
     case "${resolved}" in
         /*) printf '%s\n' "${resolved}" ;;
         *) ;;
@@ -620,7 +614,21 @@ fi
 
 version="${want_version}"
 if [ "${channel}" = "release" ] && [ -z "${version}" ]; then
-    version="$(latest_version)" || die "cannot read the release manifest from ${BASE_URL}"
+    if ! version="$(latest_version)"; then
+        # No manifest means no release to install — the state every repository
+        # is in before its first tag. Staging has no source fallback (the
+        # artifact is for another machine); an install has one, and taking it
+        # automatically is what lets a bare `install-jsh.sh` work against a
+        # repository that has never released. This is a not-found fallback
+        # only: a manifest that resolves but names artifacts that fail their
+        # checksum still dies, because "build something else instead" is not
+        # an answer to failed verification.
+        [ "${mode}" != "stage" ] || die "cannot read the release manifest from ${BASE_URL}"
+        version=""
+        warn "cannot read the release manifest from ${BASE_URL} (no release published yet?)"
+        warn "falling back to --channel source: cargo builds from the repository, which takes a few minutes"
+        channel="source"
+    fi
 fi
 
 if [ -n "${installed_version}" ] && [ "${installed_version}" = "${version}" ] && [ "${force}" -eq 0 ]; then
@@ -635,7 +643,8 @@ fi
 # still honoured, because asking for an older build by name is a real thing to
 # want; what must not happen is a bare `install-jsh.sh` quietly replacing a
 # working shell with an older one.
-if [ -n "${installed_version}" ] && [ -z "${want_version}" ] && [ "${force}" -eq 0 ] \
+if [ -n "${installed_version}" ] && [ -n "${version}" ] && [ -z "${want_version}" ] \
+    && [ "${force}" -eq 0 ] \
     && version_gt "${installed_version}" "${version}"; then
     say "jsh ${installed_version} at ${dest} is newer than the published ${version}"
     say "nothing to do; use --version ${version} to install that build anyway"
@@ -727,16 +736,85 @@ if [ "${channel}" = "release" ]; then
     mv "${unpacked}" "${staged}"
 else
     have cargo || die "channel 'source' needs cargo (https://rustup.rs)"
-    say "building jsh from source; this takes a few minutes"
-    cargo_root="${tmp_dir}/cargo-root"
-    if [ -n "${version}" ]; then
-        cargo install --git "https://github.com/${REPO}" --tag "v${version}" \
-            --locked --root "${cargo_root}" jsh || die "cargo install failed"
-    else
-        cargo install --git "https://github.com/${REPO}" \
-            --locked --root "${cargo_root}" jsh || die "cargo install failed"
+
+    # A source build aims for the same thing the release channel ships: the
+    # static musl binary. Static is not a packaging nicety here — an installed
+    # jsh lends itself out, bind-mounted into containers and pushed onto ssh
+    # hosts, and only a static binary survives arriving in another libc's
+    # userland. The pieces that takes: the musl std (rustup adds it), and a
+    # musl C compiler for the TLS dependency's C sources.
+    #
+    # A missing piece fails the install rather than degrading it. A
+    # host-toolchain build would look installed but be dynamically linked, and
+    # a dynamic jsh cannot lend itself into containers or onto ssh hosts — a
+    # silent downgrade here only surfaces much later, as a remote tab with no
+    # jsh in it. Naming a gnu triple (JSH_INSTALL_TARGET or --target) is how
+    # glibc is asked for on purpose.
+    source_target=""
+    source_cc=""
+    source_arch=""
+    if [ "$(uname -s)" = "Linux" ]; then
+        case "$(uname -m)" in
+            x86_64 | amd64) source_arch="x86_64" ;;
+            aarch64 | arm64) source_arch="aarch64" ;;
+            *) source_arch="" ;;
+        esac
+        if [ -n "${JSH_INSTALL_TARGET:-}" ]; then
+            # The explicit triple wins for source exactly as it does for
+            # release: naming a gnu triple is how glibc is asked for.
+            source_target="${JSH_INSTALL_TARGET}"
+        elif [ -n "${source_arch}" ]; then
+            source_target="${source_arch}-unknown-linux-musl"
+        fi
     fi
+    case "${source_target}" in
+        *-musl)
+            for candidate in "${source_arch}-linux-musl-gcc" musl-gcc; do
+                if have "${candidate}"; then
+                    source_cc="${candidate}"
+                    break
+                fi
+            done
+            if [ -z "${source_cc}" ]; then
+                warn "a dynamically linked jsh cannot lend itself into containers or onto ssh hosts"
+                warn "to build for the host glibc on purpose: JSH_INSTALL_TARGET=${source_arch}-unknown-linux-gnu"
+                die "static build needs a musl C compiler (Debian/Ubuntu: sudo apt install musl-tools)"
+            elif ! have rustup; then
+                die "static build needs rustup to add the ${source_target} std (https://rustup.rs)"
+            elif ! rustup target list --installed 2>/dev/null | grep -qx "${source_target}"; then
+                say "adding the ${source_target} toolchain target"
+                rustup target add "${source_target}" \
+                    || die "cannot add the ${source_target} std with rustup"
+            fi
+            ;;
+    esac
+
+    if [ -n "${source_target}" ]; then
+        say "building jsh from source for ${source_target}; this takes a few minutes"
+    else
+        say "building jsh from source; this takes a few minutes"
+    fi
+    cargo_root="${tmp_dir}/cargo-root"
+    set -- --locked --root "${cargo_root}"
+    [ -z "${version}" ] || set -- "$@" --tag "v${version}"
+    if [ -n "${source_target}" ]; then
+        set -- "$@" --target "${source_target}"
+        # The variable name cc-rs actually reads for a cross target; the same
+        # one the release workflow sets.
+        CC_x86_64_unknown_linux_musl="${source_cc}"
+        CC_aarch64_unknown_linux_musl="${source_cc}"
+        export CC_x86_64_unknown_linux_musl CC_aarch64_unknown_linux_musl
+    fi
+    cargo install --git "https://github.com/${REPO}" "$@" jsh || die "cargo install failed"
     [ -f "${cargo_root}/bin/jsh" ] || die "cargo did not produce a binary"
+    if [ -n "${source_target}" ] && have ldd; then
+        # Confirmation, not enforcement: the triple already decides linkage,
+        # and ldd's wording for a static PIE varies. Worth one line because
+        # static is the entire point of preferring this target.
+        if ldd "${cargo_root}/bin/jsh" 2>&1 | grep -qi "statically\|not a dynamic"; then
+            say "built ${source_target}: statically linked"
+        fi
+    fi
     mv "${cargo_root}/bin/jsh" "${staged}"
 fi
 
@@ -853,4 +931,3 @@ fi
 
 say ""
 say "running shells keep the version they started with; open a new tab to use jsh ${version}"
-
