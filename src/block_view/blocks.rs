@@ -658,6 +658,33 @@ fn fitted_output_rows_for_widget(
     fitted_output_rows_for_viewport(viewport_rows, fallback_rows, output_rows)
 }
 
+/// Columns a finished-block render must assume for row and height math.
+///
+/// A snapshot VTE's grid follows its *allocation*, not `set_size`: once the
+/// pane is narrower than the block's recorded width, VTE re-wraps at the
+/// allocated columns no matter what the render requested. Counting rows at the
+/// recorded width then requests one height while the post-feed settle pass
+/// measures another, and that disagreement is re-applied on every remap — with
+/// virtualization toggling cards at the viewport boundary, the document
+/// geometry ping-pongs between the two heights (the narrow-pane two-frame
+/// flicker). Below the recorded width, follow the allocation; at or above it,
+/// keep the recorded columns so restored output preserves its original line
+/// breaks. Falls back to the recorded columns while the widget has no
+/// allocation yet (first map), where the settle pass corrects any residue.
+fn effective_render_cols(vte: &vte4::Terminal, recorded_cols: i64) -> i64 {
+    clamp_render_cols(recorded_cols, vte.width() as i64, vte.char_width())
+}
+
+/// Pure core of [`effective_render_cols`]: clamp the recorded columns by what
+/// `width_px` can hold at `cell_width_px`, keeping VTE's two-column floor.
+fn clamp_render_cols(recorded_cols: i64, width_px: i64, cell_width_px: i64) -> i64 {
+    let recorded = recorded_cols.max(1);
+    if cell_width_px <= 0 || width_px <= 0 {
+        return recorded;
+    }
+    recorded.min((width_px / cell_width_px).max(2))
+}
+
 fn block_edge_scroll_target(
     current: f64,
     relative_top: f64,
@@ -1289,7 +1316,17 @@ impl FinishedBlock {
                     return;
                 }
                 fed.set(true);
-                w.set_size(cols_for_map, cmd_rows_for_map);
+                // A pane narrower than the recorded width wraps the command
+                // onto more rows; size the grid and the pixel request for the
+                // wrapped count or the settle pass fights the allocation.
+                let eff_cols = effective_render_cols(w, cols_for_map);
+                let cmd_rows_for_map = if eff_cols < cols_for_map {
+                    output_visual_row_count(&String::from_utf8_lossy(&cmd_bytes_for_map), eff_cols)
+                        .max(cmd_rows_for_map)
+                } else {
+                    cmd_rows_for_map
+                };
+                w.set_size(eff_cols, cmd_rows_for_map);
                 w.feed(&cmd_bytes_for_map);
                 let tail = snapshot_settle_tail(&String::from_utf8_lossy(&cmd_bytes_for_map));
                 settle_finished_terminal_after_feed(w, tail.as_deref());
@@ -1314,6 +1351,19 @@ impl FinishedBlock {
         // Tracks whether the user has toggled this block to its complete height.
         // The default cap is recomputed whenever virtualization remaps the card.
         let expanded: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        // (effective cols, fitted cap, expanded, displayed-text generation) of
+        // the snapshot most recently fed into the output VTE. Virtualization
+        // only hides a card's content — the VTE keeps its buffer while
+        // unmapped — so a remap whose geometry is unchanged must not re-feed:
+        // every feed re-requests the estimated height and re-runs the async
+        // settle pass, and that transient height flip moves the outer
+        // document, re-clamps the scroll, and re-toggles boundary cards —
+        // the self-sustaining flicker loop on narrow panes. Cols start at 0
+        // (below any real value) so the first map always renders.
+        let render_stamp: Rc<Cell<(i64, i64, bool, u64)>> = Rc::new(Cell::new((0, 0, false, 0)));
+        // Bumped whenever `displayed_output` is replaced (per-block filter), so
+        // a stale stamp can never suppress rendering fresh text.
+        let displayed_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         {
             let cols_for_map = cols.max(1);
             let fallback_cap_for_map = viewport_cap;
@@ -1322,6 +1372,8 @@ impl FinishedBlock {
             let expanded_for_map = expanded.clone();
             let expand_btn_for_map = expand_btn.downgrade();
             let jump_btn_for_map = jump_bottom_btn.downgrade();
+            let stamp_for_map = render_stamp.clone();
+            let generation_for_map = displayed_generation.clone();
             output_vte.connect_map(move |w| {
                 let (Some(expand_btn_for_map), Some(jump_btn_for_map)) =
                     (expand_btn_for_map.upgrade(), jump_btn_for_map.upgrade())
@@ -1329,10 +1381,20 @@ impl FinishedBlock {
                     return;
                 };
                 let text = displayed_for_map.borrow();
-                let rows = output_visual_row_count(&text, cols_for_map);
+                let eff_cols = effective_render_cols(w, cols_for_map);
+                let rows = output_visual_row_count(&text, eff_cols);
                 let fitted_cap = fitted_output_rows_for_widget(w, fallback_cap_for_map, rows);
                 current_cap_for_map.set(fitted_cap);
                 let manually_expanded = expanded_for_map.get();
+                let stamp = (
+                    eff_cols,
+                    fitted_cap,
+                    manually_expanded,
+                    generation_for_map.get(),
+                );
+                if stamp_for_map.replace(stamp) == stamp {
+                    return;
+                }
                 let cap = finished_output_cap(rows, fitted_cap, manually_expanded);
                 let visible_rows = rows.min(cap).max(1);
                 let fit_to_content = output_fits_viewport(rows, cap);
@@ -1342,7 +1404,7 @@ impl FinishedBlock {
                 render_bytes_into_finished_vte(
                     w,
                     &text,
-                    cols_for_map,
+                    eff_cols,
                     rows,
                     fitted_cap,
                     capture_rows,
@@ -1369,26 +1431,30 @@ impl FinishedBlock {
             let displayed_for_btn = displayed_output.clone();
             let current_cap_for_btn = current_viewport_cap.clone();
             let cols_for_btn = cols.max(1);
+            let stamp_for_btn = render_stamp.clone();
+            let generation_for_btn = displayed_generation.clone();
             expand_btn.connect_clicked(move |btn| {
                 let Some(output_vte_for_btn) = output_vte_for_btn.upgrade() else {
                     return;
                 };
                 let now_expanded = !expand_for_btn.get();
                 expand_for_btn.set(now_expanded);
-                let rows = output_visual_row_count(&displayed_for_btn.borrow(), cols_for_btn);
+                let eff_cols = effective_render_cols(&output_vte_for_btn, cols_for_btn);
+                let rows = output_visual_row_count(&displayed_for_btn.borrow(), eff_cols);
                 let fitted_cap = fitted_output_rows_for_widget(
                     &output_vte_for_btn,
                     current_cap_for_btn.get(),
                     rows,
                 );
                 current_cap_for_btn.set(fitted_cap);
+                stamp_for_btn.set((eff_cols, fitted_cap, now_expanded, generation_for_btn.get()));
                 let cap = finished_output_cap(rows, fitted_cap, now_expanded);
                 let visible_rows = rows.min(cap).max(1);
                 let fit_to_content = output_fits_viewport(rows, cap);
                 render_bytes_into_finished_vte(
                     &output_vte_for_btn,
                     &displayed_for_btn.borrow(),
-                    cols_for_btn,
+                    eff_cols,
                     rows,
                     fitted_cap,
                     capture_rows,
@@ -1425,11 +1491,9 @@ impl FinishedBlock {
             let expand_btn_for_refit = expand_btn.downgrade();
             let jump_btn_for_refit = jump_bottom_btn.downgrade();
             let cols_for_refit = cols.max(1);
-            let command_rows_for_refit = if is_background {
-                0
-            } else {
-                output_visual_row_count(cmd, cols_for_refit).max(1)
-            };
+            let cmd_for_refit = cmd.to_string();
+            let stamp_for_refit = render_stamp.clone();
+            let generation_for_refit = displayed_generation.clone();
             Rc::new(move || {
                 let (Some(output_vte), Some(expand_btn), Some(jump_btn)) = (
                     output_vte.upgrade(),
@@ -1444,10 +1508,15 @@ impl FinishedBlock {
                     return None;
                 }
                 let text = displayed_for_refit.borrow();
-                let rows = output_visual_row_count(&text, cols_for_refit);
+                let eff_cols = effective_render_cols(&output_vte, cols_for_refit);
+                let rows = output_visual_row_count(&text, eff_cols);
                 let fitted_cap =
                     fitted_output_rows_for_widget(&output_vte, current_cap_for_refit.get(), rows);
-                if current_cap_for_refit.replace(fitted_cap) == fitted_cap {
+                let cap_unchanged = current_cap_for_refit.replace(fitted_cap) == fitted_cap;
+                // A width-only resize leaves the cap alone but changes how the
+                // snapshot wraps; both must match for the render to be current.
+                let (last_cols, ..) = stamp_for_refit.get();
+                if cap_unchanged && last_cols == eff_cols {
                     return None;
                 }
                 // Pane sizing is authoritative over a manual expansion: a block
@@ -1456,6 +1525,7 @@ impl FinishedBlock {
                     expand_btn.set_label("\u{f065}");
                     expand_btn.set_tooltip_text(Some("Expand block"));
                 }
+                stamp_for_refit.set((eff_cols, fitted_cap, false, generation_for_refit.get()));
                 let can_expand = rows > fitted_cap;
                 expand_btn.set_visible(can_expand);
                 jump_btn.set_visible(can_expand);
@@ -1465,7 +1535,7 @@ impl FinishedBlock {
                 render_bytes_into_finished_vte(
                     &output_vte,
                     &text,
-                    cols_for_refit,
+                    eff_cols,
                     rows,
                     fitted_cap,
                     capture_rows,
@@ -1476,9 +1546,14 @@ impl FinishedBlock {
                     output_vte
                         .set_height_request(finished_vte_height_px(visible_rows, cell_height));
                 }
+                let command_rows = if is_background {
+                    0
+                } else {
+                    output_visual_row_count(&cmd_for_refit, eff_cols).max(1)
+                };
                 Some(finished_block_height_for_rows(
                     cell_height,
-                    command_rows_for_refit,
+                    command_rows,
                     if has_output { visible_rows } else { 0 },
                 ))
             })
@@ -1717,6 +1792,8 @@ impl FinishedBlock {
                 let expand_btn = expand_btn.downgrade();
                 let expanded = expanded.clone();
                 let current_viewport_cap = current_viewport_cap.clone();
+                let render_stamp = render_stamp.clone();
+                let displayed_generation = displayed_generation.clone();
                 let filter_btn = filter_btn.downgrade();
                 let jump_bottom_btn = jump_bottom_btn.downgrade();
                 let collapsed_summary = collapsed_summary.downgrade();
@@ -1769,7 +1846,8 @@ impl FinishedBlock {
                         Err(_) => (full.to_string(), true),
                     };
                     let shown_rows = output_row_count(&shown);
-                    let shown_visual_rows = output_visual_row_count(&shown, cols);
+                    let eff_cols = effective_render_cols(&output_vte, cols);
+                    let shown_visual_rows = output_visual_row_count(&shown, eff_cols);
                     let fitted_cap = fitted_output_rows_for_widget(
                         &output_vte,
                         current_viewport_cap.get(),
@@ -1784,13 +1862,18 @@ impl FinishedBlock {
                         expand_btn.set_tooltip_text(Some("Expand block"));
                     }
                     let manually_expanded = expanded.get();
+                    // New displayed text: advance the generation so an
+                    // unmap → remap with unchanged geometry still re-feeds it.
+                    let generation = displayed_generation.get().wrapping_add(1);
+                    displayed_generation.set(generation);
+                    render_stamp.set((eff_cols, fitted_cap, manually_expanded, generation));
                     let active_cap =
                         finished_output_cap(shown_visual_rows, fitted_cap, manually_expanded);
                     let fit_to_content = output_fits_viewport(shown_visual_rows, active_cap);
                     render_bytes_into_finished_vte(
                         &output_vte,
                         &shown,
-                        cols,
+                        eff_cols,
                         shown_visual_rows,
                         fitted_cap,
                         capture_rows,
@@ -2640,6 +2723,50 @@ mod tests {
     fn short_output_takes_its_natural_height() {
         assert_eq!(super::finished_output_cap(12, 30, false), 12);
         assert!(super::output_fits_viewport(12, 12));
+    }
+
+    #[test]
+    fn render_cols_follow_a_pane_narrower_than_the_recorded_width() {
+        // Recorded at 46 cols, pane allocates 31 cols' worth of pixels: row
+        // and height math must use 31 or the post-feed settle pass disagrees
+        // with the requested height — the narrow-pane two-frame flicker.
+        assert_eq!(super::clamp_render_cols(46, 31 * 10, 10), 31);
+        // Pane at least as wide as the recorded width keeps the recorded
+        // columns so restored output preserves its original line breaks.
+        assert_eq!(super::clamp_render_cols(46, 80 * 10, 10), 46);
+        assert_eq!(super::clamp_render_cols(46, 46 * 10, 10), 46);
+        // No allocation yet (first map) or no font metrics: fall back to the
+        // recorded columns; the settle pass corrects any residue.
+        assert_eq!(super::clamp_render_cols(46, 0, 10), 46);
+        assert_eq!(super::clamp_render_cols(46, 310, 0), 46);
+        // VTE's grid never drops below two columns.
+        assert_eq!(super::clamp_render_cols(46, 5, 10), 2);
+    }
+
+    #[test]
+    fn narrow_pane_wraps_wide_glyph_rows_like_vte() {
+        // 10 double-width CJK glyphs: terminal width 20 cells. The narrow-pane
+        // flicker reproduced with exactly this kind of content — row math must
+        // count cells, not chars, at the clamped column width.
+        let line = "已最新已最新已最新已";
+        assert_eq!(super::output_visual_row_count(line, 31), 1);
+        assert_eq!(super::output_visual_row_count(line, 12), 2);
+        assert_eq!(super::output_visual_row_count(line, 4), 5);
+    }
+
+    #[test]
+    fn narrowed_render_cols_grow_the_row_count_the_height_must_follow() {
+        // The flicker scenario end to end: a 40-column line recorded at 46
+        // cols fits one row; the same snapshot in a pane allocating 31
+        // columns needs two. Row math must use the clamped columns or the
+        // requested height disagrees with what VTE renders after allocation —
+        // the two frames the oscillation alternated between.
+        let line = "x".repeat(40);
+        let recorded = 46;
+        let clamped = super::clamp_render_cols(recorded, 31 * 10, 10);
+        assert_eq!(clamped, 31);
+        assert_eq!(super::output_visual_row_count(&line, recorded), 1);
+        assert_eq!(super::output_visual_row_count(&line, clamped), 2);
     }
 
     #[test]

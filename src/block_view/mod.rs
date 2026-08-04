@@ -4165,9 +4165,10 @@ impl TermView {
             let last_size_target: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
             // Change detector for the finished-block re-fit. Their cap follows
             // the scroll viewport's pixel height and the cell height (font
-            // zoom), and nothing else — so this runs once per real geometry
-            // change rather than on every contents-changed signal.
-            let last_output_layout: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((-1, -1)));
+            // zoom); their wrap columns follow the viewport's pixel width — so
+            // this runs once per real geometry change rather than on every
+            // contents-changed signal.
+            let last_output_layout: Rc<Cell<(i32, i32, i32)>> = Rc::new(Cell::new((-1, -1, -1)));
             Rc::new(move || {
                 let Some(holder) = holder.upgrade() else {
                     return;
@@ -4210,7 +4211,8 @@ impl TermView {
                 // Blocks that scroll off and back are handled by their own map
                 // pass; this reaches the ones that never unmapped.
                 let page_height = scroll.vadjustment().page_size() as i32;
-                let layout_key = (page_height, cell_h);
+                let page_width = scroll.hadjustment().page_size() as i32;
+                let layout_key = (page_width, page_height, cell_h);
                 if last_output_layout.replace(layout_key) == layout_key {
                     return;
                 }
@@ -4644,6 +4646,20 @@ impl TermView {
             let f = layout_active_surface.clone();
             let last_page = Rc::new(Cell::new(0.0f64));
             block_scroll.vadjustment().connect_changed(move |adj| {
+                let page = adj.page_size();
+                if (page - last_page.get()).abs() > 0.5 {
+                    last_page.set(page);
+                    f();
+                }
+            });
+        }
+        // A width-only resize changes how finished snapshots wrap without
+        // moving the vertical page, so it needs its own trigger for the same
+        // re-fit sweep (the layout key includes the width).
+        {
+            let f = layout_active_surface.clone();
+            let last_page = Rc::new(Cell::new(0.0f64));
+            block_scroll.hadjustment().connect_changed(move |adj| {
                 let page = adj.page_size();
                 if (page - last_page.get()).abs() > 0.5 {
                     last_page.set(page);
