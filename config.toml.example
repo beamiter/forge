@@ -153,17 +153,27 @@ ai_redact_secrets = true
 # 会话导出默认不占用 chord（在命令面板中直接执行）；如需快捷键，可用
 # export_session_markdown / export_session_json 这两个 key 自行绑定。
 
-# SSH 远程主机（可重复；默认不会注入任何个人地址） --------------------------
+# 远程主机（可重复；默认不会注入任何个人地址） ------------------------------
+# 设置面板（Ctrl+Shift+O → Remote Hosts）现在也能添加/删除主机；
+# ssh_args、session、deploy_artifact 等进阶字段仍只能在这里编辑。
 
+# 例一：SSH 主机——用 ssh -t 连接 dev.example.com 并部署 jsh。
 # [[remote_hosts]]
 # name = "dev"
 # host = "dev.example.com"
 # user = "alice"
-# remote_shell = "jsh"
-# session = "dev-main"
-# ssh_args = ["-p", "2222"]
-# login_shell = true
-# multiplex = true
+# ssh_args = ["-p", "22"]
+# deploy = "persist"
+
+# 例二：Docker 容器——host 是**正在运行的**容器名，走 docker exec 而不是 ssh。
+# [[remote_hosts]]
+# name = "build 容器"
+# host = "my-service"
+# docker = true
+# deploy = "persist"
+
+# 其余字段及默认值：remote_shell = "jsh"、session（重连恢复用的稳定 id）、
+# login_shell = true、multiplex = true（ControlMaster 连接复用）。
 #
 # deploy —— 远端没有装 jsh 时怎么办。块、cwd 跟踪、退出码和命令时间线都来自
 # jsh，所以远端只有 bash 的话，这些能力会静默消失。
@@ -175,4 +185,3 @@ ai_redact_secrets = true
 #                  一个字节都不写——共享账号该用这个
 # 两种模式都不修改远端的 .bashrc/.profile/登录 shell，也不需要 root。
 # 开启 deploy 后 remote_shell 会被忽略：选哪个 shell 是启动器的事。
-# deploy = "persist"

@@ -1033,10 +1033,11 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
     );
     table.insert("colors".into(), toml::Value::Table(colors));
 
-    // Do not invent personal network targets on a fresh install.  If hosts
-    // were explicitly loaded, preserve them when another setting first causes
-    // the file to be materialized.
-    if !table.contains_key("remote_hosts") && !config.remote_hosts.is_empty() {
+    // The in-memory list is authoritative once the file has a remote_hosts
+    // key or the list is non-empty, so hosts added or removed in the settings
+    // panel actually reach disk.  A fresh install with no hosts keeps no key:
+    // do not invent personal network targets.
+    if table.contains_key("remote_hosts") || !config.remote_hosts.is_empty() {
         table.insert(
             "remote_hosts".into(),
             toml::Value::Array(
@@ -1771,6 +1772,97 @@ mod tests {
             fs::read_to_string(secondary_backup_path_for(&path)).unwrap(),
             "opacity = 0.5\n"
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn sample_ssh_host() -> config::RemoteHost {
+        config::RemoteHost {
+            name: "dev".into(),
+            host: "dev.example.com".into(),
+            user: Some("alice".into()),
+            docker: false,
+            deploy_artifact: None,
+            remote_shell: "jsh".into(),
+            session: None,
+            ssh_args: vec!["-p".into(), "2222".into()],
+            login_shell: true,
+            multiplex: true,
+            deploy: jterm_core::jsh_remote::Deploy::Persist,
+        }
+    }
+
+    fn sample_docker_host() -> config::RemoteHost {
+        config::RemoteHost {
+            name: "build container".into(),
+            host: "my-service".into(),
+            user: Some("devuser".into()),
+            docker: true,
+            deploy_artifact: None,
+            remote_shell: "jsh".into(),
+            session: None,
+            ssh_args: Vec::new(),
+            login_shell: true,
+            multiplex: true,
+            deploy: jterm_core::jsh_remote::Deploy::Off,
+        }
+    }
+
+    #[test]
+    fn remote_hosts_added_in_memory_reach_a_file_that_had_none() {
+        let directory = temporary_directory("remote-hosts-add");
+        let path = directory.join("config.toml");
+        fs::write(&path, "opacity = 0.5\n").unwrap();
+        let expected = revision_at(&path).unwrap();
+        let mut config = default_config();
+        config.remote_hosts = vec![sample_ssh_host(), sample_docker_host()];
+        save_config_to_path(&path, &config, Some(&expected)).unwrap();
+        let table = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml::Table>()
+            .unwrap();
+        assert_eq!(config::parse_remote_hosts(&table), config.remote_hosts);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn emptied_remote_hosts_list_deletes_the_on_disk_entries() {
+        let directory = temporary_directory("remote-hosts-delete");
+        let path = directory.join("config.toml");
+        fs::write(
+            &path,
+            "[[remote_hosts]]\nname = \"old\"\nhost = \"old.example.com\"\n",
+        )
+        .unwrap();
+        let expected = revision_at(&path).unwrap();
+        let mut config = default_config();
+        config.remote_hosts = Vec::new();
+        save_config_to_path(&path, &config, Some(&expected)).unwrap();
+        let table = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml::Table>()
+            .unwrap();
+        assert_eq!(
+            table
+                .get("remote_hosts")
+                .and_then(toml::Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn fresh_file_with_no_hosts_gains_no_remote_hosts_key() {
+        let directory = temporary_directory("remote-hosts-fresh");
+        let path = directory.join("config.toml");
+        let mut config = default_config();
+        config.remote_hosts = Vec::new();
+        save_config_to_path(&path, &config, Some(&ConfigRevision::missing())).unwrap();
+        let table = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml::Table>()
+            .unwrap();
+        assert!(!table.contains_key("remote_hosts"));
         fs::remove_dir_all(directory).unwrap();
     }
 }

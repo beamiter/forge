@@ -94,7 +94,7 @@ pub use crate::jsh_install::UpdateCheck as JshUpdateCheck;
 /// `ssh -t`, reusing all local PTY/terminal infrastructure. OSC 133 markers
 /// emitted by the remote shell flow through ssh are preserved so session-aware
 /// terminal behavior keeps working for remote tabs.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RemoteHost {
     pub name: String,
     /// The ssh destination, or — when `docker` is set — the name of a running
@@ -142,7 +142,7 @@ pub struct RemoteHost {
     pub deploy: jterm_core::jsh_remote::Deploy,
 }
 
-const MAX_REMOTE_HOSTS: usize = 128;
+pub(crate) const MAX_REMOTE_HOSTS: usize = 128;
 const MAX_REMOTE_HOST_FIELD_BYTES: usize = 4 * 1024;
 const MAX_REMOTE_SSH_ARGS: usize = 64;
 const MAX_FONT_DESC_BYTES: usize = 1024;
@@ -151,7 +151,7 @@ const MAX_AI_IDENTIFIER_BYTES: usize = 1024;
 const MAX_AI_BASE_URL_BYTES: usize = 4 * 1024;
 const MAX_STARTUP_COMMANDS_BYTES: usize = crate::review_input::MAX_REVIEW_INPUT_BYTES;
 
-fn remote_field_is_safe(value: &str) -> bool {
+pub(crate) fn remote_field_is_safe(value: &str) -> bool {
     !value.trim().is_empty()
         && value.len() <= MAX_REMOTE_HOST_FIELD_BYTES
         && !value.chars().any(char::is_control)
@@ -1998,7 +1998,7 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
 }
 
 /// Parse `[[remote_hosts]]` array-of-tables. Entries missing a `host` are skipped.
-fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
+pub(crate) fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
     let Some(arr) = table.get("remote_hosts").and_then(|v| v.as_array()) else {
         return Vec::new();
     };

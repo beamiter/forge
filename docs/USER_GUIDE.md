@@ -196,7 +196,7 @@ flatpak run io.github.beamiter.jterm4
 
 ## 10. 远程会话与容器
 
-jterm4 不预置主机。在配置中显式添加：
+jterm4 不预置主机。设置面板（`Ctrl+Shift+O` → Remote Hosts）可以直接添加/删除主机；进阶字段（`ssh_args`、`session`、`deploy_artifact`）在配置中显式编辑：
 
 ```toml
 [[remote_hosts]]
