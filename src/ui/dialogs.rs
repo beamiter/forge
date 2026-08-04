@@ -1643,8 +1643,9 @@ impl UiState {
         // --- Remote hosts: rows rebuilt from the model after every change ---
         // The populate closure is reachable from handlers it creates (delete
         // confirmations, the add dialog), hence the cell holding it.
+        type PopulateCell = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
         let host_rows: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
-        let populate_cell: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+        let populate_cell: PopulateCell = Rc::new(RefCell::new(None));
         let ui_for_hosts = self.clone();
         let group_for_hosts = remote_group.clone();
         let rows_for_hosts = host_rows.clone();
@@ -1673,8 +1674,11 @@ impl UiState {
                 };
                 let subtitle = format!("{transport} · {target} · deploy {}", host.deploy.as_str());
                 let row = adw::ActionRow::builder()
-                    .title(&crate::review_input::safe_inline_display(&host.name, 1024))
-                    .subtitle(&crate::review_input::safe_inline_display(&subtitle, 4 * 1024))
+                    .title(crate::review_input::safe_inline_display(&host.name, 1024))
+                    .subtitle(crate::review_input::safe_inline_display(
+                        &subtitle,
+                        4 * 1024,
+                    ))
                     .build();
                 row.set_use_markup(false);
                 let delete_btn = gtk4::Button::from_icon_name("user-trash-symbolic");
