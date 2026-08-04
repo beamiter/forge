@@ -1004,10 +1004,6 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         "command_history_max_entries".into(),
         toml::Value::Integer(config.command_history_max_entries as i64),
     );
-    table.insert(
-        "show_repo_strip".into(),
-        toml::Value::Boolean(config.show_repo_strip),
-    );
     table.insert("bottom_bar".into(), toml::Value::Boolean(config.bottom_bar));
 
     // Preserve unknown/user-authored color keys just like other sections.

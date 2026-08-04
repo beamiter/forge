@@ -159,26 +159,6 @@ fn set_jump_fab_label(fab: &gtk4::Button, unread: u32) {
     }
 }
 
-/// Probe the cwd for git metadata and update the strip label. Hides the
-/// label when cwd is empty, missing, or not inside a repo — the user
-/// shouldn't see a stale branch from a previous pane state.
-fn refresh_repo_strip(label: &gtk4::Label, cwd: &str) {
-    if cwd.is_empty() {
-        label.set_visible(false);
-        return;
-    }
-    let path = std::path::Path::new(cwd);
-    match crate::git_meta::read(path) {
-        Some(meta) => {
-            label.set_text(&crate::git_meta::format_strip(&meta));
-            label.set_visible(true);
-        }
-        None => {
-            label.set_visible(false);
-        }
-    }
-}
-
 fn sample_output_for_event(output: &str) -> String {
     const MAX_CHARS: usize = 32 * 1024;
     if output.len() <= MAX_CHARS {
@@ -1754,10 +1734,6 @@ struct ReaderCtx {
     /// Switches the live surface between compact prompt and full-screen layouts.
     /// PTY geometry is deliberately synchronized separately.
     layout_active_surface: Rc<dyn Fn()>,
-    /// Bottom-of-pane repo metadata label. Re-probed every time a block
-    /// finishes (the user may have just run `git commit`, `git pull`,
-    /// or anything else that changes branch/dirty/ahead-behind).
-    repo_strip: gtk4::Label,
     block_finished_cbs: BlockFinishedCallbacks,
     /// Parks incoming PTY chunks while the user drag-selects text on the live
     /// VTE, so streaming repaints can't destroy the selection mid-drag.
@@ -1901,7 +1877,6 @@ impl ReaderCtx {
             cmd_running_rc,
             running_cmd_rc,
             layout_active_surface,
-            repo_strip,
             block_finished_cbs,
             selection_feed_hold,
         } = self;
@@ -2303,12 +2278,6 @@ impl ReaderCtx {
                                                 notify_long_block(&cmd, exit_code, ms);
                                             }
                                         }
-                                    }
-                                    // Re-probe git state — the command that just
-                                    // finished may have changed branch/dirty/upstream.
-                                    if cfg.show_repo_strip {
-                                        let cwd = current_cwd_for_cb.borrow().clone();
-                                        refresh_repo_strip(&repo_strip, &cwd);
                                     }
                                 }
 
@@ -2978,20 +2947,13 @@ impl ReaderCtx {
                                     &visible_indices_rc,
                                     &fullscreen_rc,
                                 );
-                                {
-                                    let config = config_for_cb.borrow();
-                                    let cwd = current_cwd_for_cb.borrow();
-                                    exit_alt_screen_chrome(
-                                        &active_rc,
-                                        &sticky_bar,
-                                        &jump_fab,
-                                        &repo_strip,
-                                        &config,
-                                        cwd.as_str(),
-                                        scroll_debouncer.user_scrolled_up.get(),
-                                        unread_count_rc.get(),
-                                    );
-                                }
+                                exit_alt_screen_chrome(
+                                    &active_rc,
+                                    &sticky_bar,
+                                    &jump_fab,
+                                    scroll_debouncer.user_scrolled_up.get(),
+                                    unread_count_rc.get(),
+                                );
                                 layout_active_surface();
                             }
                             pending_exit_code_rc.set(*exit);
@@ -3011,12 +2973,7 @@ impl ReaderCtx {
                             prev_state_rc.set(from_state);
                             bstate_rc.set(BlockState::AltScreen);
                             active_alt_screen_mode_rc.set(Some(*mode));
-                            enter_alt_screen_chrome(
-                                &active_rc,
-                                &sticky_bar,
-                                &jump_fab,
-                                &repo_strip,
-                            );
+                            enter_alt_screen_chrome(&active_rc, &sticky_bar, &jump_fab);
                             // Hand the viewport to the alt-screen app: hide finished
                             // blocks so the live VTE fills the scroll area.
                             enter_fullscreen(
@@ -3051,20 +3008,13 @@ impl ReaderCtx {
                                 &visible_indices_rc,
                                 &fullscreen_rc,
                             );
-                            {
-                                let config = config_for_cb.borrow();
-                                let cwd = current_cwd_for_cb.borrow();
-                                exit_alt_screen_chrome(
-                                    &active_rc,
-                                    &sticky_bar,
-                                    &jump_fab,
-                                    &repo_strip,
-                                    &config,
-                                    cwd.as_str(),
-                                    scroll_debouncer.user_scrolled_up.get(),
-                                    unread_count_rc.get(),
-                                );
-                            }
+                            exit_alt_screen_chrome(
+                                &active_rc,
+                                &sticky_bar,
+                                &jump_fab,
+                                scroll_debouncer.user_scrolled_up.get(),
+                                unread_count_rc.get(),
+                            );
                             osc133_depth_rc.set(0);
                             bstate_rc.set(prev_state_rc.get());
                             // The primary and alternate screens share the same
@@ -3500,22 +3450,16 @@ fn enter_alt_screen_chrome(
     active: &Rc<RefCell<ActiveBlock>>,
     sticky: &gtk4::Box,
     jump_fab: &gtk4::Button,
-    repo_strip: &gtk4::Label,
 ) {
     active.borrow().widget().add_css_class("block-fullscreen");
     sticky.set_visible(false);
     jump_fab.set_visible(false);
-    repo_strip.set_visible(false);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn exit_alt_screen_chrome(
     active: &Rc<RefCell<ActiveBlock>>,
     sticky: &gtk4::Box,
     jump_fab: &gtk4::Button,
-    repo_strip: &gtk4::Label,
-    config: &Config,
-    cwd: &str,
     user_scrolled: bool,
     unread: u32,
 ) {
@@ -3529,11 +3473,6 @@ fn exit_alt_screen_chrome(
         jump_fab.set_visible(true);
     } else {
         jump_fab.set_visible(false);
-    }
-    if config.show_repo_strip {
-        refresh_repo_strip(repo_strip, cwd);
-    } else {
-        repo_strip.set_visible(false);
     }
 }
 
@@ -4161,21 +4100,6 @@ impl TermView {
         scroll_overlay.add_overlay(&jump_fab);
         root.append(&scroll_overlay);
 
-        // ── Repo-status strip ────────────────────────────────────────────
-        // A thin always-visible label at the bottom showing the current
-        // pane's git branch + dirty marker + ahead/behind. Refreshed on
-        // cwd change and on every finished block (the user may have just
-        // run `git commit` or `git pull`). Hidden when cwd isn't a repo.
-        let repo_strip = gtk4::Label::new(None);
-        repo_strip.set_halign(gtk4::Align::Start);
-        repo_strip.set_xalign(0.0);
-        repo_strip.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        repo_strip.add_css_class("repo-strip");
-        repo_strip.set_visible(false);
-        if config.show_repo_strip {
-            root.append(&repo_strip);
-        }
-
         let unread_count: Rc<Cell<u32>> = Rc::new(Cell::new(0));
 
         // ── PTY ───────────────────────────────────────────────────────────
@@ -4493,8 +4417,6 @@ impl TermView {
         {
             let cwd_cbs = cwd_callbacks.clone();
             let current_cwd_for_signal = current_cwd.clone();
-            let repo_strip_for_cwd = repo_strip.clone();
-            let fullscreen_for_cwd = fullscreen.clone();
             active_vte.connect_current_directory_uri_notify(move |terminal| {
                 if let Some(uri) = terminal.current_directory_uri() {
                     let file = gtk4::gio::File::for_uri(uri.as_str());
@@ -4504,11 +4426,6 @@ impl TermView {
                         .filter(|s| !s.is_empty())
                     {
                         *current_cwd_for_signal.borrow_mut() = path.clone();
-                        if fullscreen_for_cwd.get() {
-                            repo_strip_for_cwd.set_visible(false);
-                        } else {
-                            refresh_repo_strip(&repo_strip_for_cwd, &path);
-                        }
                         let display_path =
                             crate::review_input::safe_inline_display(&path, 4 * 1024);
                         for cb in cwd_cbs.borrow().iter() {
@@ -4519,13 +4436,6 @@ impl TermView {
             });
         }
 
-        // Initial probe so the strip is populated for the starting cwd
-        // before the user has cd'd anywhere (the OSC 7 above only fires
-        // on a change).
-        {
-            let initial_cwd = current_cwd.borrow().clone();
-            refresh_repo_strip(&repo_strip, &initial_cwd);
-        }
         {
             let title_cbs = title_callbacks.clone();
             active_vte.connect_window_title_changed(move |terminal| {
@@ -4633,7 +4543,6 @@ impl TermView {
                 cmd_running_rc: cmd_running.clone(),
                 running_cmd_rc: running_cmd.clone(),
                 layout_active_surface: layout_active_surface.clone(),
-                repo_strip: repo_strip.clone(),
                 block_finished_cbs: block_finished_callbacks.clone(),
                 selection_feed_hold: selection_feed_hold.clone(),
             }

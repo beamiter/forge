@@ -111,10 +111,10 @@ preserve_live_scrollback = false
 
 ### 交互优先
 
-保留默认值；不要盲目增大 `virtual_scroll_margin`。Git 状态条在超大或网络文件系统仓库中仍可能有短暂等待，可关闭：
+保留默认值；不要盲目增大 `virtual_scroll_margin`。底部状态栏的 Git 段在超大或网络文件系统仓库中仍可能有短暂等待，可整条关闭：
 
 ```toml
-show_repo_strip = false
+bottom_bar = false
 ```
 
 ## 已知架构瓶颈

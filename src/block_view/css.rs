@@ -817,14 +817,6 @@ pub(crate) fn install_block_css(config: &Config) {
             padding: 4px 12px;
             box-shadow: 0 4px 14px rgba(0,0,0,0.35);
         }}
-        .repo-strip {{
-            color: rgba({acc_r},{acc_g},{acc_b},0.85);
-            background-color: {block_bg_hex};
-            font-family: "{font_family}";
-            font-size: 0.85em;
-            padding: 3px 14px;
-            border-top: 1px solid rgba({acc_r},{acc_g},{acc_b},0.20);
-        }}
         .command-palette > contents {{
             background-color: {block_bg_hex};
             border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.45);
