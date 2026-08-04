@@ -650,6 +650,10 @@ pub struct Config {
     /// grid size, tab position). Family-wide key from
     /// `jterm_core::bottom_bar`; every jterm spells it `bottom_bar`.
     pub(crate) bottom_bar: bool,
+    /// A plain click in the live prompt places the shell's edit cursor there.
+    /// Family-wide key from `jterm_core::click_cursor`; every jterm spells it
+    /// `click_moves_cursor`.
+    pub(crate) click_moves_cursor: bool,
     /// Exact disk revision this loaded configuration is allowed to replace.
     /// Clones from one window share the revision and advance it only after a
     /// durable save; independently loaded windows retain their own revisions.
@@ -725,6 +729,7 @@ impl Config {
             notify_long_blocks: false,
             notify_long_block_threshold_ms: 10_000,
             bottom_bar: true,
+            click_moves_cursor: jterm_core::click_cursor::ENABLED_BY_DEFAULT,
             persistence_revision: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -1035,6 +1040,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "notify_long_blocks",
     "notify_long_block_threshold_ms",
     "bottom_bar",
+    "click_moves_cursor",
 ];
 
 const REMOTE_HOST_CONFIG_KEYS: &[&str] = &[
@@ -1162,6 +1168,7 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
         "allow_remote_clipboard_write",
         "notify_long_blocks",
         "bottom_bar",
+        "click_moves_cursor",
     ];
 
     for key in strings {
@@ -1741,6 +1748,7 @@ struct FileConfig {
     notify_long_blocks: Option<bool>,
     notify_long_block_threshold_ms: Option<u64>,
     bottom_bar: Option<bool>,
+    click_moves_cursor: Option<bool>,
 }
 
 fn table_u32(table: &toml::Table, key: &str) -> Option<u32> {
@@ -1984,6 +1992,7 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
         notify_long_blocks: table.get("notify_long_blocks").and_then(|v| v.as_bool()),
         notify_long_block_threshold_ms: table_u64(&table, "notify_long_block_threshold_ms"),
         bottom_bar: table.get("bottom_bar").and_then(|v| v.as_bool()),
+        click_moves_cursor: table.get("click_moves_cursor").and_then(|v| v.as_bool()),
     };
     (file_config, Some(revision))
 }
@@ -2428,6 +2437,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         notify_long_blocks: fc.notify_long_blocks.unwrap_or(true),
         notify_long_block_threshold_ms: fc.notify_long_block_threshold_ms.unwrap_or(10_000),
         bottom_bar: fc.bottom_bar.unwrap_or(true),
+        click_moves_cursor: fc
+            .click_moves_cursor
+            .unwrap_or(jterm_core::click_cursor::ENABLED_BY_DEFAULT),
         persistence_revision: std::sync::Arc::new(std::sync::Mutex::new(persistence_revision)),
     };
 

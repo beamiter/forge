@@ -25,6 +25,7 @@ mod alt_screen;
 mod ansi;
 mod blocks;
 mod bounded_bytes;
+mod click_cursor;
 mod cross_selection;
 mod css;
 mod export;
@@ -5007,6 +5008,21 @@ impl TermView {
             });
             active_vte.add_controller(active_click);
         }
+
+        // A plain click in the live prompt places the shell's edit cursor
+        // there, the way an editor would, instead of making the user walk an
+        // arrow key across a long command.
+        click_cursor::install(
+            &active_vte,
+            click_cursor::ClickCursorCtx {
+                enabled: config.click_moves_cursor,
+                pty: Rc::clone(&pty),
+                prompt_end_pos: prompt_end_pos.clone(),
+                bstate: bstate.clone(),
+                mouse_mode: mouse_reporting_mode.clone(),
+                fullscreen: fullscreen.clone(),
+            },
+        );
 
         // Wheel handling inside an alt-screen + mouse-reporting app (less / vim /
         // htop). VTE only synthesizes mouse-wheel CSI sequences when it owns the

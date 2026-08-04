@@ -1005,6 +1005,10 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         toml::Value::Integer(config.command_history_max_entries as i64),
     );
     table.insert("bottom_bar".into(), toml::Value::Boolean(config.bottom_bar));
+    table.insert(
+        "click_moves_cursor".into(),
+        toml::Value::Boolean(config.click_moves_cursor),
+    );
 
     // Preserve unknown/user-authored color keys just like other sections.
     let mut colors = table
