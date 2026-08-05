@@ -1,6 +1,6 @@
-# PowerShell argument completion for jterm4
+# PowerShell argument completion for forge
 
-Register-ArgumentCompleter -Native -CommandName jterm4 -ScriptBlock {
+Register-ArgumentCompleter -Native -CommandName forge -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
 
     $words = @($commandAst.CommandElements | ForEach-Object { $_.Extent.Text })

@@ -1,6 +1,6 @@
 mod common;
 
-use jterm4::state::{escape_tab_state, parse_tabs_state, unescape_tab_state, PaneLayout};
+use forge::state::{escape_tab_state, parse_tabs_state, unescape_tab_state, PaneLayout};
 
 #[test]
 fn test_escape_unescape_roundtrip() {

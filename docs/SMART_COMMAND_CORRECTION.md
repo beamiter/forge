@@ -1,10 +1,10 @@
 # Smart command correction
 
-jterm4 can offer a reviewable correction after a Block-mode command fails with an error that looks like a typo, an unknown executable, an unknown package, an invalid subcommand, or an invalid option.
+forge can offer a reviewable correction after a Block-mode command fails with an error that looks like a typo, an unknown executable, an unknown package, an invalid subcommand, or an invalid option.
 
 The feature can be toggled from the Shell Agent dashboard or Settings and is
 persisted as `command_correction_enabled`. It defaults to `true` when absent
-from older configuration files; `JTERM4_COMMAND_CORRECTION_ENABLED` can
+from older configuration files; `FORGE_COMMAND_CORRECTION_ENABLED` can
 override it for one launch. Turning it off while a correction is being resolved
 also prevents the pending result from opening a dialog.
 
@@ -16,11 +16,11 @@ A correction is never submitted automatically. The confirmation dialog presents 
 - **Insert only** writes the reviewed command into an empty, idle prompt without pressing Enter.
 - **Run corrected command** is an explicit one-command approval. Recognizable destructive commands require a second confirmation.
 
-The candidate remains editable before either action. If the original pane is busy or already contains input by the time the user confirms, jterm4 refuses to overwrite it.
+The candidate remains editable before either action. If the original pane is busy or already contains input by the time the user confirms, forge refuses to overwrite it.
 
 ## Resolution order
 
-jterm4 prefers evidence from the command's actual target over model memory:
+forge prefers evidence from the command's actual target over model memory:
 
 1. A suggestion printed by the failed tool itself, such as Git's `most similar command` output.
 2. For a local `apt`/`apt-get` package error, fuzzy matching against the host's `apt-cache pkgnames` index.
@@ -37,7 +37,7 @@ A future jsh control channel can add remote read-only probes without injecting h
 
 ## Model protocol and safety boundary
 
-The AI fallback must return exactly one strict JSON object with either a single suggestion or no suggestion. Before presenting a model candidate, jterm4 rejects responses that are multiline, unchanged, oversized, or contain terminal control characters. It also rejects candidates that newly add:
+The AI fallback must return exactly one strict JSON object with either a single suggestion or no suggestion. Before presenting a model candidate, forge rejects responses that are multiline, unchanged, oversized, or contain terminal control characters. It also rejects candidates that newly add:
 
 - `sudo`, `doas`, or `su`;
 - `ssh` remote execution;

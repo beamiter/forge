@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Create a privacy-preserving jterm4 support archive without network access.
+# Create a privacy-preserving forge support archive without network access.
 
 set -Eeuo pipefail
 umask 077
@@ -14,30 +14,30 @@ if (( $# > 1 )); then
 fi
 
 OUTPUT_DIR="${1:-.}"
-JTERM4_BIN="${JTERM4_BIN:-jterm4}"
+FORGE_BIN="${FORGE_BIN:-forge}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-if [[ "${JTERM4_BIN}" == "jterm4" ]] \
-    && ! command -v jterm4 >/dev/null 2>&1 \
-    && [[ -x "${SCRIPT_DIR}/jterm4" ]]; then
-    JTERM4_BIN="${SCRIPT_DIR}/jterm4"
+if [[ "${FORGE_BIN}" == "forge" ]] \
+    && ! command -v forge >/dev/null 2>&1 \
+    && [[ -x "${SCRIPT_DIR}/forge" ]]; then
+    FORGE_BIN="${SCRIPT_DIR}/forge"
 fi
-if [[ "${JTERM4_BIN}" == */* ]]; then
-    [[ -x "${JTERM4_BIN}" ]] || {
-        printf 'Error: jterm4 executable is not usable: %s\n' "${JTERM4_BIN}" >&2
+if [[ "${FORGE_BIN}" == */* ]]; then
+    [[ -x "${FORGE_BIN}" ]] || {
+        printf 'Error: forge executable is not usable: %s\n' "${FORGE_BIN}" >&2
         exit 1
     }
-    binary_path="${JTERM4_BIN}"
+    binary_path="${FORGE_BIN}"
 else
-    binary_path="$(command -v -- "${JTERM4_BIN}" 2>/dev/null || true)"
+    binary_path="$(command -v -- "${FORGE_BIN}" 2>/dev/null || true)"
     [[ -n "${binary_path}" && -x "${binary_path}" ]] || {
-        printf 'Error: jterm4 executable not found: %s\n' "${JTERM4_BIN}" >&2
+        printf 'Error: forge executable not found: %s\n' "${FORGE_BIN}" >&2
         exit 1
     }
 fi
 
 mkdir -p -- "${OUTPUT_DIR}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-BUNDLE_NAME="jterm4-support-${STAMP}"
+BUNDLE_NAME="forge-support-${STAMP}"
 WORK_DIR="$(mktemp -d)"
 BUNDLE_DIR="${WORK_DIR}/${BUNDLE_NAME}"
 trap 'rm -rf -- "${WORK_DIR}"' EXIT
@@ -47,17 +47,17 @@ doctor_status=0
 doctor_json_status=0
 config_status=0
 config_json_status=0
-JTERM4_DIAGNOSTICS_REDACT=1 "${binary_path}" --doctor \
+FORGE_DIAGNOSTICS_REDACT=1 "${binary_path}" --doctor \
     >"${BUNDLE_DIR}/doctor.txt" 2>/dev/null || doctor_status=$?
-JTERM4_DIAGNOSTICS_REDACT=1 "${binary_path}" --doctor --json \
+FORGE_DIAGNOSTICS_REDACT=1 "${binary_path}" --doctor --json \
     >"${BUNDLE_DIR}/doctor.json" 2>/dev/null || doctor_json_status=$?
-JTERM4_DIAGNOSTICS_REDACT=1 "${binary_path}" --check-config \
+FORGE_DIAGNOSTICS_REDACT=1 "${binary_path}" --check-config \
     >/dev/null 2>&1 || config_status=$?
-JTERM4_DIAGNOSTICS_REDACT=1 "${binary_path}" --check-config --json \
+FORGE_DIAGNOSTICS_REDACT=1 "${binary_path}" --check-config --json \
     >/dev/null 2>&1 || config_json_status=$?
 
 version="$("${binary_path}" --version 2>/dev/null || true)"
-if [[ ! "${version}" =~ ^jterm4\ [0-9A-Za-z.+_-]+$ ]]; then
+if [[ ! "${version}" =~ ^forge\ [0-9A-Za-z.+_-]+$ ]]; then
     version="unavailable"
 fi
 config_path="$("${binary_path}" --config-path 2>/dev/null || true)"
@@ -111,10 +111,10 @@ metadata() {
     else
         printf 'config: path unavailable\n'
     fi
-    metadata 'default command history' "${state_home}/jterm4/history.jsonl"
-    if [[ -d "${config_home}/jterm4/windows" ]]; then
+    metadata 'default command history' "${state_home}/forge/history.jsonl"
+    if [[ -d "${config_home}/forge/windows" ]]; then
         shopt -s nullglob
-        snapshots=("${config_home}/jterm4/windows"/window-*)
+        snapshots=("${config_home}/forge/windows"/window-*)
         printf 'session snapshot directory: present (%s entries)\n' "${#snapshots[@]}"
         shopt -u nullglob
     else
@@ -124,9 +124,9 @@ metadata() {
 
 {
     for name in \
-        JTERM4_AI_API_KEY JTERM4_AI_API_KEY_FILE ANTHROPIC_API_KEY OPENAI_API_KEY OLLAMA_API_KEY \
-        JTERM4_AI_PROVIDER JTERM4_AI_MODEL JTERM4_AI_BASE_URL \
-        JTERM4_ASSET_DIR JTERM4_WORKFLOW_DIR; do
+        FORGE_AI_API_KEY FORGE_AI_API_KEY_FILE ANTHROPIC_API_KEY OPENAI_API_KEY OLLAMA_API_KEY \
+        FORGE_AI_PROVIDER FORGE_AI_MODEL FORGE_AI_BASE_URL \
+        FORGE_ASSET_DIR FORGE_WORKFLOW_DIR; do
         if [[ -n "${!name:-}" ]]; then
             printf '%s=present\n' "${name}"
         else

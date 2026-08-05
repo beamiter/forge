@@ -296,7 +296,7 @@ fn private_control_socket_dir() -> io::Result<PathBuf> {
         .filter(|path| path.is_absolute())
     {
         match open_trusted_owned_directory(&runtime).and_then(|(runtime, parent)| {
-            ensure_owned_child_directory(&parent, &runtime, "jterm4", true).map(|(path, _)| path)
+            ensure_owned_child_directory(&parent, &runtime, "forge", true).map(|(path, _)| path)
         }) {
             Ok(path) => return Ok(path),
             Err(error) => failures.push(format!("{}: {error}", runtime.display())),
@@ -309,7 +309,7 @@ fn private_control_socket_dir() -> io::Result<PathBuf> {
     // a cache fallback.
     let system_runtime = PathBuf::from(format!("/run/user/{}", unsafe { nix::libc::geteuid() }));
     match open_trusted_owned_directory(&system_runtime).and_then(|(system_runtime, parent)| {
-        ensure_owned_child_directory(&parent, &system_runtime, "jterm4", true).map(|(path, _)| path)
+        ensure_owned_child_directory(&parent, &system_runtime, "forge", true).map(|(path, _)| path)
     }) {
         Ok(path) => return Ok(path),
         Err(error) => failures.push(format!("{}: {error}", system_runtime.display())),
@@ -324,7 +324,7 @@ fn private_control_socket_dir() -> io::Result<PathBuf> {
             let (home, home_directory) = open_trusted_owned_directory(&home)?;
             let (cache_path, cache_directory) =
                 ensure_owned_child_directory(&home_directory, &home, ".cache", false)?;
-            ensure_owned_child_directory(&cache_directory, &cache_path, "jterm4", true)
+            ensure_owned_child_directory(&cache_directory, &cache_path, "forge", true)
                 .map(|(path, _)| path)
         })();
         match fallback {
@@ -348,7 +348,7 @@ fn private_control_socket_dir() -> io::Result<PathBuf> {
 
 #[cfg(not(unix))]
 fn private_control_socket_dir() -> io::Result<PathBuf> {
-    let path = glib::user_cache_dir().join("jterm4");
+    let path = glib::user_cache_dir().join("forge");
     fs::create_dir_all(&path)?;
     Ok(path)
 }
@@ -572,7 +572,7 @@ pub struct Config {
     pub(crate) command_history_max_entries: u32,
     pub(crate) block_history_path: Option<String>,
     pub(crate) block_history_compress: bool,
-    /// Use jterm1/Warp-style denser block spacing.
+    /// Use anvil/Warp-style denser block spacing.
     pub(crate) block_compact: bool,
     /// Saved SSH targets selectable from the context menu.
     pub(crate) remote_hosts: Vec<RemoteHost>,
@@ -663,7 +663,7 @@ pub struct Config {
 
 impl Config {
     /// Replace the complete configuration with an isolated, built-in VTE
-    /// profile. This deliberately ignores both the user's file and JTERM4_*
+    /// profile. This deliberately ignores both the user's file and FORGE_*
     /// appearance/behavior overrides, making safe mode useful for diagnosis.
     #[cfg(test)]
     pub(crate) fn apply_safe_mode(&mut self) {
@@ -902,34 +902,34 @@ fn env_rgba(name: &str) -> Option<RGBA> {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn config_file_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("JTERM4_CONFIG").filter(|p| !p.is_empty()) {
+    if let Some(path) = std::env::var_os("FORGE_CONFIG").filter(|p| !p.is_empty()) {
         return PathBuf::from(path);
     }
-    glib::user_config_dir().join("jterm4").join("config.toml")
+    glib::user_config_dir().join("forge").join("config.toml")
 }
 
 pub(crate) fn default_ai_api_key_path() -> String {
     glib::user_config_dir()
-        .join("jterm4")
+        .join("forge")
         .join("ai.key")
         .to_string_lossy()
         .into_owned()
 }
 
 pub(crate) fn ai_api_key_file_env_override() -> Option<String> {
-    env_string("JTERM4_AI_API_KEY_FILE").filter(|path| configured_path_is_safe(path, true))
+    env_string("FORGE_AI_API_KEY_FILE").filter(|path| configured_path_is_safe(path, true))
 }
 
 pub(crate) fn default_command_history_path() -> String {
     xdg_state_home()
-        .join("jterm4")
+        .join("forge")
         .join("history.jsonl")
         .to_string_lossy()
         .into_owned()
 }
 
 /// GLib only exposes `g_get_user_state_dir()` behind a newer API feature than
-/// jterm4 currently requires, so implement the XDG Base Directory rule
+/// forge currently requires, so implement the XDG Base Directory rule
 /// directly: an absolute `$XDG_STATE_HOME`, otherwise `$HOME/.local/state`.
 fn xdg_state_home() -> PathBuf {
     xdg_state_home_from(
@@ -2220,7 +2220,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let themes = builtin_themes();
 
     // Resolve active theme
-    let theme_name = env_string("JTERM4_THEME")
+    let theme_name = env_string("FORGE_THEME")
         .or(fc.theme)
         .filter(|value| setting_text_is_safe(value, 256))
         .unwrap_or_else(|| "default".to_string());
@@ -2230,19 +2230,19 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .unwrap_or(&themes[0]);
 
     // Priority: env var > config file > theme default
-    let window_opacity = env_f64("JTERM4_OPACITY")
+    let window_opacity = env_f64("FORGE_OPACITY")
         .or(fc.opacity)
         .unwrap_or(0.95)
         .clamp(0.01, 1.0);
-    let terminal_scrollback_lines = env_u32("JTERM4_SCROLLBACK")
+    let terminal_scrollback_lines = env_u32("FORGE_SCROLLBACK")
         .or(fc.scrollback)
         .unwrap_or(5000)
         .min(1_000_000);
-    let default_font_scale = env_f64("JTERM4_FONT_SCALE")
+    let default_font_scale = env_f64("FORGE_FONT_SCALE")
         .or(fc.font_scale)
         .unwrap_or(1.0)
         .clamp(0.1, 10.0);
-    let font_desc = env_string("JTERM4_FONT")
+    let font_desc = env_string("FORGE_FONT")
         .or(fc.font)
         .filter(|font| setting_text_is_safe(font, MAX_FONT_DESC_BYTES))
         // Use the "Mono" (NFM) Nerd Font variant: the plain "Nerd Font" (NF)
@@ -2251,16 +2251,16 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         // like a real terminal. NFM forces single-cell glyphs.
         .unwrap_or_else(|| "SauceCodePro Nerd Font Mono 14".to_string());
 
-    let foreground = env_rgba("JTERM4_FG")
+    let foreground = env_rgba("FORGE_FG")
         .or_else(|| fc.foreground.as_deref().and_then(|v| RGBA::parse(v).ok()))
         .unwrap_or(theme.foreground);
-    let background = env_rgba("JTERM4_BG")
+    let background = env_rgba("FORGE_BG")
         .or_else(|| fc.background.as_deref().and_then(|v| RGBA::parse(v).ok()))
         .unwrap_or(theme.background);
-    let cursor = env_rgba("JTERM4_CURSOR")
+    let cursor = env_rgba("FORGE_CURSOR")
         .or_else(|| fc.cursor.as_deref().and_then(|v| RGBA::parse(v).ok()))
         .unwrap_or(theme.cursor);
-    let cursor_foreground = env_rgba("JTERM4_CURSOR_FG")
+    let cursor_foreground = env_rgba("FORGE_CURSOR_FG")
         .or_else(|| {
             fc.cursor_foreground
                 .as_deref()
@@ -2269,33 +2269,33 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .unwrap_or(theme.cursor_foreground);
 
     // Block view optimization settings
-    let max_visible_blocks = env_u32("JTERM4_MAX_BLOCKS")
+    let max_visible_blocks = env_u32("FORGE_MAX_BLOCKS")
         .or(fc.max_visible_blocks)
         .unwrap_or(200)
         .clamp(1, 100_000);
-    let lazy_load_threshold = env_u32("JTERM4_LAZY_LINES")
+    let lazy_load_threshold = env_u32("FORGE_LAZY_LINES")
         .or(fc.lazy_load_threshold)
         .unwrap_or(1000)
         .clamp(1, 10_000_000);
-    let truncation_threshold_lines = env_u32("JTERM4_TRUNCATION_LINES")
+    let truncation_threshold_lines = env_u32("FORGE_TRUNCATION_LINES")
         .or(fc.truncation_threshold_lines)
         .unwrap_or(50000)
         .clamp(1, 10_000_000);
-    let finished_block_viewport_rows = env_u32("JTERM4_FINISHED_VIEWPORT_ROWS")
+    let finished_block_viewport_rows = env_u32("FORGE_FINISHED_VIEWPORT_ROWS")
         .or(fc.finished_block_viewport_rows)
         .unwrap_or(24)
         .clamp(3, 5_000);
-    let max_collapsed_output_lines = env_u32("JTERM4_MAX_COLLAPSED_LINES")
+    let max_collapsed_output_lines = env_u32("FORGE_MAX_COLLAPSED_LINES")
         .or(fc.max_collapsed_output_lines)
         .unwrap_or(25)
         .clamp(1, 1_000_000);
-    let virtual_scroll_margin = env_u32("JTERM4_VSCROLL_MARGIN")
+    let virtual_scroll_margin = env_u32("FORGE_VSCROLL_MARGIN")
         .or(fc.virtual_scroll_margin)
         .unwrap_or(1)
         .min(10_000);
     let command_history_enabled = fc.command_history_enabled.unwrap_or(true);
     let command_history_path = command_history_enabled.then(|| {
-        env_string("JTERM4_COMMAND_HISTORY_PATH")
+        env_string("FORGE_COMMAND_HISTORY_PATH")
             .or(fc.command_history_path)
             .filter(|path| configured_path_is_safe(path, false))
             .unwrap_or_else(default_command_history_path)
@@ -2304,27 +2304,27 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .command_history_max_entries
         .unwrap_or(10_000)
         .clamp(100, 1_000_000);
-    let block_history_path = env_string("JTERM4_HISTORY_PATH")
+    let block_history_path = env_string("FORGE_HISTORY_PATH")
         .or(fc.block_history_path)
         .filter(|path| configured_path_is_safe(path, false));
     let block_history_compress = fc.block_history_compress.unwrap_or(true);
-    let block_compact = match std::env::var("JTERM4_BLOCK_COMPACT").ok().as_deref() {
+    let block_compact = match std::env::var("FORGE_BLOCK_COMPACT").ok().as_deref() {
         Some("1") | Some("true") => Some(true),
         Some("0") | Some("false") => Some(false),
         _ => None,
     }
     .or(fc.block_compact)
     .unwrap_or(false);
-    let shell = env_string("JTERM4_SHELL")
+    let shell = env_string("FORGE_SHELL")
         .or(fc.shell)
         .filter(|shell| setting_text_is_safe(shell, MAX_CONFIG_PATH_BYTES));
     let startup_commands = fc
         .startup_commands
         .filter(|commands| setting_text_is_safe(commands, MAX_STARTUP_COMMANDS_BYTES));
 
-    // Block-first like jterm1; VTE remains available for compatibility and
+    // Block-first like anvil; VTE remains available for compatibility and
     // safe mode.
-    let terminal_mode_str = env_string("JTERM4_MODE")
+    let terminal_mode_str = env_string("FORGE_MODE")
         .or(fc.terminal_mode)
         .filter(|value| setting_text_is_safe(value, 64))
         .unwrap_or_else(|| "block".to_string());
@@ -2338,24 +2338,24 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     };
 
     let tab_placement = TabPlacement::parse(
-        &env_string("JTERM4_TAB_PLACEMENT")
+        &env_string("FORGE_TAB_PLACEMENT")
             .or(fc.tab_placement)
             .filter(|value| setting_text_is_safe(value, 64))
             .unwrap_or_else(|| "sidebar".to_string()),
     );
     let sidebar_visible = resolve_sidebar_visibility(fc.sidebar_visible, tab_placement);
 
-    let ai_enabled = env_bool("JTERM4_AI_ENABLED")
+    let ai_enabled = env_bool("FORGE_AI_ENABLED")
         .or(fc.ai_enabled)
         .unwrap_or(true);
-    let agent_enabled = env_bool("JTERM4_AGENT_ENABLED")
+    let agent_enabled = env_bool("FORGE_AGENT_ENABLED")
         .or(fc.agent_enabled)
         .unwrap_or(true);
-    let agent_max_turns = env_u32("JTERM4_AGENT_MAX_TURNS")
+    let agent_max_turns = env_u32("FORGE_AGENT_MAX_TURNS")
         .or(fc.agent_max_turns)
         .unwrap_or(20)
         .clamp(1, 100);
-    let requested_agent_auto_approve = env_bool("JTERM4_AGENT_AUTO_APPROVE_READONLY")
+    let requested_agent_auto_approve = env_bool("FORGE_AGENT_AUTO_APPROVE_READONLY")
         .or(fc.agent_auto_approve_readonly)
         .unwrap_or(false);
     if requested_agent_auto_approve {
@@ -2364,10 +2364,10 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         );
     }
     let agent_auto_approve_readonly = false;
-    let command_correction_enabled = env_bool("JTERM4_COMMAND_CORRECTION_ENABLED")
+    let command_correction_enabled = env_bool("FORGE_COMMAND_CORRECTION_ENABLED")
         .or(fc.command_correction_enabled)
         .unwrap_or(true);
-    let requested_provider = env_string("JTERM4_AI_PROVIDER")
+    let requested_provider = env_string("FORGE_AI_PROVIDER")
         .or(fc.ai_provider)
         .filter(|value| setting_text_is_safe(value, 64))
         .unwrap_or_else(|| "anthropic".to_string());
@@ -2386,11 +2386,11 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         "ollama" => ("codellama:7b", "http://localhost:11434"),
         _ => ("claude-sonnet-4-6", "https://api.anthropic.com"),
     };
-    let ai_model = env_string("JTERM4_AI_MODEL")
+    let ai_model = env_string("FORGE_AI_MODEL")
         .or(fc.ai_model)
         .filter(|model| setting_text_is_safe(model, MAX_AI_IDENTIFIER_BYTES))
         .unwrap_or_else(|| default_ai_model.to_string());
-    let ai_base_url = env_string("JTERM4_AI_BASE_URL")
+    let ai_base_url = env_string("FORGE_AI_BASE_URL")
         .or(fc.ai_base_url)
         .filter(|url| ai_base_url_is_safe(url))
         .unwrap_or_else(|| default_ai_base_url.to_string())
@@ -2458,17 +2458,17 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         ai_panel_visible: fc.ai_panel_visible.unwrap_or(false),
         ai_panel_width: fc.ai_panel_width.unwrap_or(360).clamp(240, 1200),
         ai_model,
-        ai_temperature: env_f32("JTERM4_AI_TEMPERATURE")
+        ai_temperature: env_f32("FORGE_AI_TEMPERATURE")
             .or(fc.ai_temperature)
             .filter(|t| t.is_finite() && (0.0..=2.0).contains(t)),
-        ai_max_tokens: env_u32("JTERM4_AI_MAX_TOKENS")
+        ai_max_tokens: env_u32("FORGE_AI_MAX_TOKENS")
             .or(fc.ai_max_tokens)
             .unwrap_or(1024)
             .clamp(64, 32_768),
-        ai_stream: env_bool("JTERM4_AI_STREAM")
+        ai_stream: env_bool("FORGE_AI_STREAM")
             .or(fc.ai_stream)
             .unwrap_or(true),
-        ai_redact_secrets: env_bool("JTERM4_AI_REDACT_SECRETS")
+        ai_redact_secrets: env_bool("FORGE_AI_REDACT_SECRETS")
             .or(fc.ai_redact_secrets)
             .unwrap_or(true),
         allow_remote_clipboard_write: fc.allow_remote_clipboard_write.unwrap_or(false),
@@ -2514,7 +2514,7 @@ pub(crate) fn rgba_to_hex(c: &RGBA) -> String {
 }
 
 pub(crate) fn save_config(config: &Config) -> Result<(), crate::config_store::ConfigWriteError> {
-    if safe_mode_persistence_disabled(std::env::var_os("JTERM4_SAFE_MODE").as_deref()) {
+    if safe_mode_persistence_disabled(std::env::var_os("FORGE_SAFE_MODE").as_deref()) {
         log::debug!("Skipping configuration save in safe mode");
         return Ok(());
     }
@@ -2652,7 +2652,7 @@ mod tests {
         if crate::host::is_flatpak() {
             return;
         }
-        let missing = "/definitely/missing/jterm4-shell";
+        let missing = "/definitely/missing/forge-shell";
         let argv = choose_shell_argv(Some(missing));
         assert!(!argv.is_empty());
         assert_ne!(argv.first().map(String::as_str), Some(missing));
@@ -2775,7 +2775,7 @@ mod tests {
     fn multiplex_injects_controlmaster_flags() {
         let mut h = host();
         h.multiplex = true;
-        let argv = build_remote_argv_with_control_dir(&h, Some(Path::new("/run/user/1000/jterm4")));
+        let argv = build_remote_argv_with_control_dir(&h, Some(Path::new("/run/user/1000/forge")));
         assert!(
             argv.iter().any(|a| a == "ControlMaster=auto"),
             "argv: {argv:?}"
@@ -2800,7 +2800,7 @@ mod tests {
         use std::os::unix::fs::{symlink, DirBuilderExt, PermissionsExt};
 
         let root = std::env::temp_dir().join(format!(
-            "jterm4-control-dir-{}-{}",
+            "forge-control-dir-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2810,7 +2810,7 @@ mod tests {
         fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
         let parent = open_owned_directory(&root).unwrap();
         let (child_path, child) =
-            ensure_owned_child_directory(&parent, &root, "jterm4", true).unwrap();
+            ensure_owned_child_directory(&parent, &root, "forge", true).unwrap();
         assert_eq!(
             child.metadata().unwrap().permissions().mode() & 0o777,
             0o700
@@ -2818,7 +2818,7 @@ mod tests {
         drop(child);
         fs::remove_dir(&child_path).unwrap();
         symlink(&root, &child_path).unwrap();
-        assert!(ensure_owned_child_directory(&parent, &root, "jterm4", true).is_err());
+        assert!(ensure_owned_child_directory(&parent, &root, "forge", true).is_err());
         fs::remove_file(&child_path).unwrap();
         drop(parent);
         fs::remove_dir(&root).unwrap();
@@ -2830,7 +2830,7 @@ mod tests {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
         let root = std::env::temp_dir().join(format!(
-            "jterm4-control-parent-{}-{}",
+            "forge-control-parent-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2852,9 +2852,9 @@ mod tests {
     #[test]
     fn control_socket_path_rejects_openssh_expansion_and_hidden_text() {
         assert!(control_socket_path_is_safe(Path::new(
-            "/run/user/1000/jterm4"
+            "/run/user/1000/forge"
         )));
-        assert!(!control_socket_path_is_safe(Path::new("/tmp/%h/jterm4")));
+        assert!(!control_socket_path_is_safe(Path::new("/tmp/%h/forge")));
         assert!(!control_socket_path_is_safe(Path::new(
             "/tmp/safe\u{202e}fake"
         )));
@@ -3331,7 +3331,7 @@ session = "bad/session"
     #[test]
     fn ai_and_agent_config_is_semantically_validated() {
         let valid = validate_config_contents(
-            "ai_enabled = true\nagent_enabled = true\nagent_max_turns = 20\nagent_auto_approve_readonly = false\ncommand_correction_enabled = true\nai_provider = 'openai-compatible'\nai_base_url = 'http://localhost:8000/v1'\nai_api_key_file = '~/.config/jterm4/ai.key'\nai_model = 'local-model'\nai_max_tokens = 4096\nai_redact_secrets = true\n",
+            "ai_enabled = true\nagent_enabled = true\nagent_max_turns = 20\nagent_auto_approve_readonly = false\ncommand_correction_enabled = true\nai_provider = 'openai-compatible'\nai_base_url = 'http://localhost:8000/v1'\nai_api_key_file = '~/.config/forge/ai.key'\nai_model = 'local-model'\nai_max_tokens = 4096\nai_redact_secrets = true\n",
         )
         .unwrap();
         assert!(valid.is_empty(), "{valid:?}");

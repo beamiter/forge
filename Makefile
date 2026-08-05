@@ -1,10 +1,10 @@
-# jterm4 Makefile
+# forge Makefile
 # Convenience wrapper for common development tasks
 
 .PHONY: help build run test check fmt clippy security verify package support-bundle clean install dev watch benchmark debug
 
 help:
-	@echo "jterm4 Development Commands"
+	@echo "forge Development Commands"
 	@echo "==========================="
 	@echo ""
 	@echo "Build Commands:"
@@ -63,7 +63,7 @@ verify:
 
 package:
 	@cargo build --release --all-features --locked
-	@./scripts/package-release.sh target/release/jterm4
+	@./scripts/package-release.sh target/release/forge
 
 support-bundle:
 	@./scripts/support-bundle.sh

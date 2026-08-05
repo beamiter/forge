@@ -1,5 +1,5 @@
 {
-  description = "jterm4 — a session-aware GTK4 terminal with structured command blocks";
+  description = "forge — a session-aware GTK4 terminal with structured command blocks";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -18,7 +18,7 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
           manifest = builtins.fromTOML (builtins.readFile ./Cargo.toml);
-          appId = "io.github.beamiter.jterm4";
+          appId = "io.github.beamiter.forge";
 
           package = pkgs.rustPlatform.buildRustPackage {
             pname = manifest.package.name;
@@ -68,34 +68,34 @@
               install -Dm644 data/${appId}-256.png \
                 "$out/share/icons/hicolor/256x256/apps/${appId}.png"
               install -Dm644 config.toml.example \
-                "$out/share/doc/jterm4/config.toml.example"
-              install -Dm644 README.md "$out/share/doc/jterm4/README.md"
-              install -Dm644 Cargo.lock "$out/share/doc/jterm4/Cargo.lock"
+                "$out/share/doc/forge/config.toml.example"
+              install -Dm644 README.md "$out/share/doc/forge/README.md"
+              install -Dm644 Cargo.lock "$out/share/doc/forge/Cargo.lock"
               install -Dm755 scripts/support-bundle.sh \
-                "$out/bin/jterm4-support-bundle"
+                "$out/bin/forge-support-bundle"
 
-              install -d "$out/share/jterm4/shell-integration"
+              install -d "$out/share/forge/shell-integration"
               install -m644 scripts/shell-integration/README.md \
-                scripts/shell-integration/jterm4.* \
-                "$out/share/jterm4/shell-integration/"
-              install -d "$out/share/jterm4/workflows"
+                scripts/shell-integration/forge.* \
+                "$out/share/forge/shell-integration/"
+              install -d "$out/share/forge/workflows"
               install -m644 scripts/workflows/*.yaml \
-                "$out/share/jterm4/workflows/"
+                "$out/share/forge/workflows/"
               install -Dm644 scripts/notebooks/welcome.jtnb.md \
-                "$out/share/jterm4/notebooks/welcome.jtnb.md"
+                "$out/share/forge/notebooks/welcome.jtnb.md"
             '';
 
             preFixup = ''
               gappsWrapperArgs+=(
-                --set-default JTERM4_WORKFLOW_DIR "$out/share/jterm4/workflows"
-                --set-default JTERM4_ASSET_DIR "$out/share/jterm4"
+                --set-default FORGE_WORKFLOW_DIR "$out/share/forge/workflows"
+                --set-default FORGE_ASSET_DIR "$out/share/forge"
               )
             '';
 
             meta = with pkgs.lib; {
               description = manifest.package.description;
               homepage = manifest.package.repository;
-              mainProgram = "jterm4";
+              mainProgram = "forge";
               platforms = platforms.linux;
             };
           };
@@ -146,7 +146,7 @@
               export QT_IM_MODULE="''${QT_IM_MODULE:-fcitx}"
               export GTK_PATH="${pkgs.fcitx5-gtk}/lib/gtk-4.0''${GTK_PATH:+:$GTK_PATH}"
               export FCITX5_GTK_PATH="${pkgs.fcitx5-gtk}/lib/gtk-4.0"
-              echo "jterm4 development environment ready. Run 'make verify'."
+              echo "forge development environment ready. Run 'make verify'."
             '';
           };
         }

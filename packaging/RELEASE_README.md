@@ -1,14 +1,14 @@
-# jterm4 relocatable Linux bundle
+# forge relocatable Linux bundle
 
-This archive contains a prebuilt `jterm4` binary plus its desktop metadata,
+This archive contains a prebuilt `forge` binary plus its desktop metadata,
 shell integrations, example workflows, documented configuration, and welcome
 notebook. It installs into the current user's `~/.local` prefix; root access is
 not required, and an existing `config.toml` is never overwritten.
 
 ## License
 
-jterm4 is dual-licensed under `MIT OR Apache-2.0`. The archive includes both
-canonical license texts under `share/doc/jterm4/`.
+forge is dual-licensed under `MIT OR Apache-2.0`. The archive includes both
+canonical license texts under `share/doc/forge/`.
 
 ## Runtime requirements
 
@@ -22,9 +22,9 @@ OpenSSH, Git, and a configured AI provider.
 From the directory containing the archive and checksum:
 
 ```bash
-sha256sum --check jterm4-*.tar.gz.sha256
-tar -xzf jterm4-*.tar.gz
-cd jterm4-*/
+sha256sum --check forge-*.tar.gz.sha256
+tar -xzf forge-*.tar.gz
+cd forge-*/
 ./install.sh
 ```
 
@@ -35,13 +35,13 @@ those user files should also be removed.
 After installation:
 
 ```bash
-jterm4 --doctor
-jterm4 --doctor --json
-jterm4 --check-config
-jterm4 --safe-mode
-jterm4
+forge --doctor
+forge --doctor --json
+forge --check-config
+forge --safe-mode
+forge
 ```
 
-For support, `jterm4-support-bundle [OUTPUT_DIRECTORY]` creates a
+For support, `forge-support-bundle [OUTPUT_DIRECTORY]` creates a
 privacy-preserving archive without network access. Review it before sharing.
 

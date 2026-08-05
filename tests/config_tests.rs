@@ -1,6 +1,6 @@
 mod common;
 
-use jterm4::config::TerminalMode;
+use forge::config::TerminalMode;
 
 #[test]
 fn test_terminal_mode_block() {

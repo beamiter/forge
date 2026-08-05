@@ -1,6 +1,6 @@
 //! alt — VTE builder + small parser helpers for the live terminal.
 //!
-//! jterm4 aligns with Warp's alt-screen model: when an alt-screen app
+//! forge aligns with Warp's alt-screen model: when an alt-screen app
 //! (top/vim/htop/...) sends `?47h`, `?1047h`, or `?1049h`, the live VTE receives
 //! that exact DEC mode and renders full-viewport. The matching leave sequence
 //! discards the alt-screen frame; the block keeps only command metadata.
@@ -12,7 +12,7 @@ use gtk4::prelude::*;
 use vte4::TerminalExt;
 use vte4::{CursorBlinkMode, CursorShape, Format, Terminal};
 
-/// Give dense block output the same breathing room as jterm1. Patched
+/// Give dense block output the same breathing room as anvil. Patched
 /// monospace fonts often paint close to VTE's default cell boundary.
 pub(crate) const BLOCK_CELL_HEIGHT_SCALE: f64 = 1.12;
 
@@ -60,7 +60,7 @@ pub(crate) enum MouseReportingMode {
 /// coordinate.
 ///
 /// VTE 4 normally encodes wheel events itself, but only when it owns the PTY;
-/// jterm4's live VTE is fed by our own reader so we synthesize the bytes here.
+/// forge's live VTE is fed by our own reader so we synthesize the bytes here.
 pub(crate) fn encode_mouse_wheel(
     mode: MouseReportingMode,
     delta_y: f64,

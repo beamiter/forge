@@ -146,7 +146,7 @@ impl PersistenceWorker {
         });
         let worker_shared = Arc::clone(&shared);
         let handle = thread::Builder::new()
-            .name("jterm4-persistence".to_string())
+            .name("forge-persistence".to_string())
             .spawn(move || run_worker(worker_shared))?;
         Ok(Self {
             shared,

@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.github.beamiter.jterm4</id>
+  <id>io.github.beamiter.forge</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT OR Apache-2.0</project_license>
-  <name>jterm4</name>
+  <name>forge</name>
   <summary>Session-aware GTK4 terminal with structured command blocks</summary>
   <description>
     <p>
-      jterm4 defaults to a structured Block terminal that keeps commands,
+      forge defaults to a structured Block terminal that keeps commands,
       output, exit status, duration, and working directory as searchable
       history, while retaining a traditional VTE backend for compatibility.
     </p>
@@ -17,14 +17,14 @@
       <li>SSH sessions, an asynchronous file tree, and optional multi-provider AI assistance</li>
     </ul>
   </description>
-  <launchable type="desktop-id">io.github.beamiter.jterm4.desktop</launchable>
+  <launchable type="desktop-id">io.github.beamiter.forge.desktop</launchable>
   <developer id="io.github.beamiter">
     <name>beamiter</name>
   </developer>
-  <url type="homepage">https://github.com/beamiter/jterm4</url>
-  <url type="bugtracker">https://github.com/beamiter/jterm4/issues</url>
+  <url type="homepage">https://github.com/beamiter/forge</url>
+  <url type="bugtracker">https://github.com/beamiter/forge/issues</url>
   <provides>
-    <binary>jterm4</binary>
+    <binary>forge</binary>
   </provides>
   <recommends>
     <control>keyboard</control>

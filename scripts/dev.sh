@@ -7,12 +7,12 @@ CMD="${1:-run}"
 
 case "$CMD" in
     run)
-        echo "🚀 Running jterm4 in development mode..."
+        echo "🚀 Running forge in development mode..."
         nix develop --command bash -c "cargo run"
         ;;
 
     build)
-        echo "🔨 Building jterm4..."
+        echo "🔨 Building forge..."
         nix develop --command bash -c "cargo build --release"
         ;;
 
@@ -54,7 +54,7 @@ case "$CMD" in
         echo "Usage: $0 {run|build|test|check|fmt|clippy|clean|watch}"
         echo ""
         echo "Commands:"
-        echo "  run     - Run jterm4 in development mode"
+        echo "  run     - Run forge in development mode"
         echo "  build   - Build release version"
         echo "  test    - Run all tests"
         echo "  check   - Check code without building"

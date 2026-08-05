@@ -1,6 +1,6 @@
-# bash completion for jterm4
+# bash completion for forge
 
-_jterm4()
+_forge()
 {
     local current previous
     current="${COMP_WORDS[COMP_CWORD]}"
@@ -63,4 +63,4 @@ _jterm4()
     COMPREPLY=($(compgen -W "${options}" -- "${current}"))
 }
 
-complete -o bashdefault -o default -F _jterm4 jterm4
+complete -o bashdefault -o default -F _forge forge

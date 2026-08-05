@@ -6,7 +6,7 @@ use super::UiState;
 
 impl UiState {
     pub(crate) fn open_notebook(&self, path: &Path) {
-        if std::env::var_os("JTERM4_SAFE_MODE").is_some() {
+        if std::env::var_os("FORGE_SAFE_MODE").is_some() {
             self.show_notebook_error("Executable notebooks are disabled in safe mode.");
             return;
         }
@@ -27,7 +27,7 @@ impl UiState {
         match crate::workflows::welcome_notebook_path() {
             Some(path) => self.open_notebook(&path),
             None => self.show_notebook_error(
-                "The welcome notebook is not installed. Set JTERM4_ASSET_DIR or reinstall jterm4.",
+                "The welcome notebook is not installed. Set FORGE_ASSET_DIR or reinstall forge.",
             ),
         }
     }

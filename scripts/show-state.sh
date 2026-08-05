@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Visualize jterm4 session state
+# Visualize forge session state
 
-STATE_FILE="${HOME}/.config/jterm4/tabs.state"
+STATE_FILE="${HOME}/.config/forge/tabs.state"
 
 if [ ! -f "$STATE_FILE" ]; then
     echo "❌ No state file found at $STATE_FILE"
     exit 1
 fi
 
-echo "📊 jterm4 Session State Visualization"
+echo "📊 forge Session State Visualization"
 echo "======================================"
 echo ""
 

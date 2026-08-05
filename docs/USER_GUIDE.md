@@ -1,15 +1,15 @@
-# jterm4 用户指南
+# forge 用户指南
 
 ## 1. 启动、诊断与恢复
 
-jterm4 默认启动 Block 后端并恢复最近一个可领取的窗口快照：
+forge 默认启动 Block 后端并恢复最近一个可领取的窗口快照：
 
 ```bash
-jterm4
-jterm4 ~/project
-jterm4 --working-directory ~/project
-jterm4 --mode vte --no-restore
-jterm4 --execute bash -lc 'cargo test'
+forge
+forge ~/project
+forge --working-directory ~/project
+forge --mode vte --no-restore
+forge --execute bash -lc 'cargo test'
 ```
 
 `--execute` 后的参数原样作为 argv，不经过额外 shell 拆词。显式 cwd、`--execute`、`--no-restore` 和 `--safe-mode` 都不会意外领取普通恢复快照；execute/safe-mode 窗口也不发布会话快照。单独使用 `--mode` 只覆盖本窗口后端，仍可恢复窗口布局。
@@ -17,34 +17,34 @@ jterm4 --execute bash -lc 'cargo test'
 以下命令在 GTK 初始化前完成，可用于 SSH、TTY 和 CI：
 
 ```bash
-jterm4 --help
-jterm4 --version
-jterm4 --doctor
-jterm4 --doctor --json
-jterm4 --config-path
-jterm4 --init-config
-jterm4 --check-config
-jterm4 --check-config --json
-jterm4 --restore-config-backup
-jterm4 --print-default-config
+forge --help
+forge --version
+forge --doctor
+forge --doctor --json
+forge --config-path
+forge --init-config
+forge --check-config
+forge --check-config --json
+forge --restore-config-backup
+forge --print-default-config
 ```
 
 `--doctor` 报告配置语义与权限、有效轮换备份、配置写锁、显示/input 环境、可选工具、AI provider/密钥存在性、workflow 与欢迎 Notebook 发现结果、远程 SSH 就绪度以及 ready/active 快照数量，但不输出快照中的目录、标签或命令，也不会探测任何网络 endpoint。使用独立配置：
 
 ```bash
-jterm4 --config ~/configs/work.toml
-jterm4 --check-config ~/configs/work.toml
+forge --config ~/configs/work.toml
+forge --check-config ~/configs/work.toml
 ```
 
 安装版还提供隐私保护的支持归档工具：
 
 ```bash
-jterm4-support-bundle ~/Desktop
+forge-support-bundle ~/Desktop
 ```
 
 它通过脱敏诊断模式收集权限/大小元数据、聚合计数、非敏感系统特征和选定环境变量是否存在，不打包配置正文、历史、会话、终端输出、剪贴板、API key、SSH 目标、主机名或本地路径，也不会发起网络请求。归档权限为 `0600`；发送给他人前仍应检查每个文件。
 
-`jterm4 --safe-mode` 完全跳过用户配置及 `JTERM4_*` 外观/行为覆盖，使用内置 VTE 主题和默认快捷键；同时禁用配置重载、恢复、配置/会话持久化、历史、仓库探测、远程主机、通知、AI 和可执行 Notebook。它适合确认故障来自用户配置还是图形/终端环境，不能与 `--mode` 或 `--execute` 同时使用；即使同时给出 `--config`，该文件也不会被读取。
+`forge --safe-mode` 完全跳过用户配置及 `FORGE_*` 外观/行为覆盖，使用内置 VTE 主题和默认快捷键；同时禁用配置重载、恢复、配置/会话持久化、历史、仓库探测、远程主机、通知、AI 和可执行 Notebook。它适合确认故障来自用户配置还是图形/终端环境，不能与 `--mode` 或 `--execute` 同时使用；即使同时给出 `--config`，该文件也不会被读取。
 
 ## 2. Shell 集成
 
@@ -52,19 +52,19 @@ Block 后端可在没有集成脚本时工作，但加载脚本后能通过 OSC 
 
 ```bash
 # ~/.bashrc
-[[ $TERM_PROGRAM == jterm4 ]] && source <(jterm4 --shell-integration bash)
+[[ $TERM_PROGRAM == forge ]] && source <(forge --shell-integration bash)
 
 # ~/.zshrc
-[[ $TERM_PROGRAM == jterm4 ]] && source <(jterm4 --shell-integration zsh)
+[[ $TERM_PROGRAM == forge ]] && source <(forge --shell-integration zsh)
 ```
 
-fish 和 PowerShell 对应 `fish`、`pwsh`。原生安装还会把四种脚本放到 `${prefix}/share/jterm4/shell-integration/`。其他终端会忽略这些 OSC 序列。
+fish 和 PowerShell 对应 `fish`、`pwsh`。原生安装还会把四种脚本放到 `${prefix}/share/forge/shell-integration/`。其他终端会忽略这些 OSC 序列。
 
 Flatpak 的交互 shell 运行在宿主机，宿主 rc 不应直接引用沙箱内的
 `/app/share`。bash/zsh 可在对应 rc 中使用
-`source <(flatpak run io.github.beamiter.jterm4 --shell-integration bash)`；fish
-使用 `flatpak run io.github.beamiter.jterm4 --shell-integration fish | source`。
-两种后端都会在读取 rc 前注入 `TERM_PROGRAM=jterm4`，因此可继续用该变量做条件保护。
+`source <(flatpak run io.github.beamiter.forge --shell-integration bash)`；fish
+使用 `flatpak run io.github.beamiter.forge --shell-integration fish | source`。
+两种后端都会在读取 rc 前注入 `TERM_PROGRAM=forge`，因此可继续用该变量做条件保护。
 
 ## 3. 终端模式与 Pane
 
@@ -88,7 +88,7 @@ terminal_mode = "block"
 | Pane 移到新标签 | `Ctrl+Shift+!` |
 | 关闭当前 Pane 或标签 | `Ctrl+Shift+W` |
 
-关闭 pane、标签、多个选中标签或窗口时，jterm4 会扫描所有后端的真实 PTY 和前台进程；存在运行中任务时先给出统一确认。缩放的 pane 会先恢复 pane tree 再关闭，避免漏掉隐藏 sibling。
+关闭 pane、标签、多个选中标签或窗口时，forge 会扫描所有后端的真实 PTY 和前台进程；存在运行中任务时先给出统一确认。缩放的 pane 会先恢复 pane tree 再关闭，避免漏掉隐藏 sibling。
 
 分屏布局恢复仍建议与命令自身的持久化方案配合使用，尤其是 SSH/TUI 长任务。
 
@@ -120,7 +120,7 @@ terminal_mode = "block"
 | Shell Agent | `Ctrl+Alt+G` |
 | 全选 / 回填 / 清空 | `Ctrl+Shift+A` / `Ctrl+Shift+I` / `Ctrl+Shift+K` |
 
-选择语义与 jterm1 对齐：
+选择语义与 anvil 对齐：
 
 - `Ctrl+Up` 从最新块进入选择；普通 `Up/Down` 移动 active edge，`Shift+Up/Down` 扩展范围。
 - `Enter` 或 `Ctrl+Shift+I` 按终端顺序回填所有选中命令，不自动执行；`Escape` 清除选择。
@@ -141,9 +141,9 @@ terminal_mode = "block"
 | `:` | YAML/TOML workflow | 填参数后写入编辑行，不提交 |
 | `?` | 自然语言命令请求 | 交给 AI 生成候选，先审阅 |
 
-JSONL 历史默认位于 `${XDG_STATE_HOME:-~/.local/state}/jterm4/history.jsonl`，只保存 command、cwd、exit code 和完成时间，不保存终端输出。文件权限为 `0600`，重复命令按最新记录展示，损坏或超限记录会跳过，文件会按上限压缩。
+JSONL 历史默认位于 `${XDG_STATE_HOME:-~/.local/state}/forge/history.jsonl`，只保存 command、cwd、exit code 和完成时间，不保存终端输出。文件权限为 `0600`，重复命令按最新记录展示，损坏或超限记录会跳过，文件会按上限压缩。
 
-用户 workflow 放在 `~/.config/jterm4/workflows/`，支持 `.toml`、`.yaml`、`.yml`；也可用 `JTERM4_WORKFLOW_DIR` 增加以路径列表表示的目录。用户定义优先于已安装示例，同名项不会被示例覆盖。
+用户 workflow 放在 `~/.config/forge/workflows/`，支持 `.toml`、`.yaml`、`.yml`；也可用 `FORGE_WORKFLOW_DIR` 增加以路径列表表示的目录。用户定义优先于已安装示例，同名项不会被示例覆盖。
 
 安装包附带 feature branch、大文件查找、交互式 rebase、SSH 本地端口转发、Docker 日志跟随和端口进程终止示例。所有示例都只生成可编辑的单行命令；选中后不会自动执行，其中会结束进程或建立长连接的模板仍须由用户逐字审阅。
 
@@ -172,12 +172,12 @@ YAML 可使用共享格式的 `{{name}}` placeholder。未提供的必填参数�
 
 - 每个 cell 可单独 Run/Stop，也可 Run All/Stop All。
 - stdout 与 stderr 分开显示，并保留 exit status；单 cell 合计输出有 256 KiB 上限。
-- 显式 shell fence 使用对应解释器；`shell` 和无标签 fence 使用 jterm4 的配置 shell argv。
+- 显式 shell fence 使用对应解释器；`shell` 和无标签 fence 使用 forge 的配置 shell argv。
 - 非 shell fence 只展示，不执行。
 - cell 在独立进程组运行，停止、Stop All 或关闭对话框会清理完整进程组。
 - 命令不会注入当前终端，也不会绕过 Notebook 自己的运行按钮；安全模式禁用执行。
 
-安装资产位于 `${prefix}/share/jterm4/notebooks/`；Flatpak 中是 `/app/share/jterm4/notebooks/`。
+安装资产位于 `${prefix}/share/forge/notebooks/`；Flatpak 中是 `/app/share/forge/notebooks/`。
 
 ## 8. 文件树
 
@@ -185,11 +185,11 @@ YAML 可使用共享格式的 `{{name}}` placeholder。未提供的必填参数�
 
 ## 9. Flatpak 与桌面安装
 
-Flatpak 应用 ID 是 `io.github.beamiter.jterm4`。打包版本通过 `flatpak-spawn --host` 启动宿主 Shell、SSH、Git、curl 和通知工具，避免命令误跑在一次性应用沙箱；因此 jterm4 Flatpak 本身不是命令隔离边界。
+Flatpak 应用 ID 是 `io.github.beamiter.forge`。打包版本通过 `flatpak-spawn --host` 启动宿主 Shell、SSH、Git、curl 和通知工具，避免命令误跑在一次性应用沙箱；因此 forge Flatpak 本身不是命令隔离边界。
 
 ```bash
-flatpak run io.github.beamiter.jterm4 --doctor
-flatpak run io.github.beamiter.jterm4
+flatpak run io.github.beamiter.forge --doctor
+flatpak run io.github.beamiter.forge
 ```
 
 文件树需要宿主文件系统权限。AI 密钥可通过可信启动器、显式 Flatpak override 或 sandbox 内可见的 owner-only 独立文件提供。完整权限说明见 `docs/FLATPAK.md`。
@@ -237,38 +237,38 @@ deploy = "persist"
 
 ## 11. AI 与 Agent 安全边界
 
-AI 总开关、provider 和 endpoint 由配置控制。支持 Anthropic、OpenAI-compatible 和 Ollama wire protocol。密钥内容不会写入 TOML；环境变量优先。也可直接在 **Settings → AI & Agent → API Key** 输入密钥并按 Apply：jterm4 会将它原子写入 owner-only 的 `~/.config/jterm4/ai.key`，并只把文件路径写入配置。设置面板不会回显已经保存的密钥，再次输入并 Apply 可替换它。
+AI 总开关、provider 和 endpoint 由配置控制。支持 Anthropic、OpenAI-compatible 和 Ollama wire protocol。密钥内容不会写入 TOML；环境变量优先。也可直接在 **Settings → AI & Agent → API Key** 输入密钥并按 Apply：forge 会将它原子写入 owner-only 的 `~/.config/forge/ai.key`，并只把文件路径写入配置。设置面板不会回显已经保存的密钥，再次输入并 Apply 可替换它。
 
 也可通过环境变量配置：
 
 ```bash
 export ANTHROPIC_API_KEY='...'
-# 或 OPENAI_API_KEY / OLLAMA_API_KEY / 通用 JTERM4_AI_API_KEY
-jterm4
+# 或 OPENAI_API_KEY / OLLAMA_API_KEY / 通用 FORGE_AI_API_KEY
+forge
 ```
 
 若要手工管理密钥文件，可执行：
 
 ```bash
-mkdir -p ~/.config/jterm4
-install -m 600 /dev/null ~/.config/jterm4/ai.key
-read -rsp 'AI API Key: ' JTERM4_KEY; printf '\n'
-printf '%s\n' "$JTERM4_KEY" > ~/.config/jterm4/ai.key
-unset JTERM4_KEY
-chmod 600 ~/.config/jterm4/ai.key
+mkdir -p ~/.config/forge
+install -m 600 /dev/null ~/.config/forge/ai.key
+read -rsp 'AI API Key: ' FORGE_KEY; printf '\n'
+printf '%s\n' "$FORGE_KEY" > ~/.config/forge/ai.key
+unset FORGE_KEY
+chmod 600 ~/.config/forge/ai.key
 ```
 
 并在 `config.toml` 中设置：
 
 ```toml
-ai_api_key_file = "~/.config/jterm4/ai.key"
+ai_api_key_file = "~/.config/forge/ai.key"
 ```
 
-文件必须是当前用户所有的普通文件，Unix 权限不得向 group/other 开放，最大 16 KiB，且只能包含一行非空密钥。环境 Key 优先于文件；`JTERM4_AI_API_KEY_FILE` 可覆盖文件路径。相关配置为 `ai_enabled`、`ai_provider`、`ai_base_url`、`ai_api_key_file`、`ai_model`、`ai_max_tokens`、`ai_stream` 和 `ai_redact_secrets`。请求通过系统 `curl`/Flatpak host bridge 发送；运行 `--doctor` 可离线检查凭据文件和 curl。右侧聊天面板使用 `Ctrl+Alt+Shift+A`，Block 选择后 `Ctrl+Shift+Q` 可发送命令、退出码、cwd 和截断输出。
+文件必须是当前用户所有的普通文件，Unix 权限不得向 group/other 开放，最大 16 KiB，且只能包含一行非空密钥。环境 Key 优先于文件；`FORGE_AI_API_KEY_FILE` 可覆盖文件路径。相关配置为 `ai_enabled`、`ai_provider`、`ai_base_url`、`ai_api_key_file`、`ai_model`、`ai_max_tokens`、`ai_stream` 和 `ai_redact_secrets`。请求通过系统 `curl`/Flatpak host bridge 发送；运行 `--doctor` 可离线检查凭据文件和 curl。右侧聊天面板使用 `Ctrl+Alt+Shift+A`，Block 选择后 `Ctrl+Shift+Q` 可发送命令、退出码、cwd 和截断输出。
 
 面板可拖动分隔条，实际宽度会在 400 ms 防抖后写回 `ai_panel_width`，并在启动、配置热重载和重新打开面板时恢复。输入框中 `Enter` 与 `Ctrl+Enter` 均发送，`Shift+Enter` 换行；输入法正在选词时，Enter 只确认候选，不会误发。焦点位于输入框时，`Ctrl+Shift+C/V` 也会作用于输入框，而不是后台终端。空会话提供三个快捷提示，它们只填入 composer，绝不会自动发送。
 
-聊天回复默认流式显示（`ai_stream = true` / `JTERM4_AI_STREAM`）：回答在生成过程中逐段出现在会话里，完成时以 provider 返回的完整文本原样落库，与关闭流式时保存的会话完全一致；中途出错时已显示的部分内容保持可见，错误按既有方式提示并可 Retry。流式只用于聊天面板；Agent、命令生成与纠错等严格 JSON 表面始终等待完整回复。关闭 `ai_stream` 则恢复等待完整回复的旧行为。
+聊天回复默认流式显示（`ai_stream = true` / `FORGE_AI_STREAM`）：回答在生成过程中逐段出现在会话里，完成时以 provider 返回的完整文本原样落库，与关闭流式时保存的会话完全一致；中途出错时已显示的部分内容保持可见，错误按既有方式提示并可 Retry。流式只用于聊天面板；Agent、命令生成与纠错等严格 JSON 表面始终等待完整回复。关闭 `ai_stream` 则恢复等待完整回复的旧行为。
 
 发送后状态行提供 **Stop**；它会终止并回收对应 curl（流式时同样中断传输），而不只是隐藏迟到回复。失败或停止后可 **Retry** 原请求，generation 仍绑定原 chat，期间新输入的 draft 不会被覆盖。删除 busy chat 和关闭窗口同样会先取消 transport。选中 Block 的 command/exit 会显示为 composer 上方的 context chip，可在空闲时 **Clear**；Ask Block 失败后，Retry 实际将使用的 pending context 也会明确显示，若输出因行数或字节预算被裁剪，chip 会标出 `output truncated`。关窗前仍留在内存中的 Ask Block retry 会转成该 chat 的可恢复 draft/context。
 
@@ -297,11 +297,11 @@ selected Block、pane cwd 与配置 shell 不再拼进高信任 system prompt。
 5. 已批准命令形成 finished block 后，匹配的 exit code 和有界输出作为 observation 回灌，Agent 才能提出下一步。不相关命令不会被当成该 proposal 的结果。
 6. 模型请求进行中可 **Stop** 当前 turn，并在保留 Agent session 的前提下 **Retry**，不会复制 user turn。模型以 `done` 完成任务后，**Follow up** 会保留 transcript 并重新开放输入；`agent_max_turns` 达到上限后，**New task** 可在同一 pane 清空旧模型上下文并恢复完整回合预算。**Cancel Agent** 或关闭窗口则取消整个会话并等待 transport 回收。已经由用户批准并启动的普通终端命令不会被这些按钮暗中 kill，仍使用标准 pane/tab 关闭确认管理。
 
-dashboard 和 Settings 中的 **AI command correction** 开关控制 `command_correction_enabled`。开启后，Block 命令出现 typo、unknown executable/package、invalid subcommand/option 等窄范围错误时才会提供可编辑纠正；候选不会自动插入或执行。关闭开关会立即阻止新的纠正，也会丢弃仍在解析中的待显示结果。默认开启，可用 `JTERM4_COMMAND_CORRECTION_ENABLED` 临时覆盖；确定性目标提示与本地索引优先，AI 仅为 fallback，完整边界见 `docs/SMART_COMMAND_CORRECTION.md`。
+dashboard 和 Settings 中的 **AI command correction** 开关控制 `command_correction_enabled`。开启后，Block 命令出现 typo、unknown executable/package、invalid subcommand/option 等窄范围错误时才会提供可编辑纠正；候选不会自动插入或执行。关闭开关会立即阻止新的纠正，也会丢弃仍在解析中的待显示结果。默认开启，可用 `FORGE_COMMAND_CORRECTION_ENABLED` 临时覆盖；确定性目标提示与本地索引优先，AI 仅为 fallback，完整边界见 `docs/SMART_COMMAND_CORRECTION.md`。
 
 `agent_enabled = false` 可独立关闭 Agent，`agent_max_turns` 限制模型回合数；`ai_enabled = false` 和 safe mode 都会同时阻止打开。Agent 必须被视为有用户权限的命令执行辅助工具，危险模式提示不是完整 shell 安全分析，也不替代逐字审阅。
 
-`agent_auto_approve_readonly` 与 `JTERM4_AGENT_AUTO_APPROVE_READONLY` 仅作为旧配置兼容键保留，运行时始终归一化为关闭。所有 proposal 都必须逐条批准。原因是命令文本本身无法证明实际执行对象：alias、function、Git helper、工具的写入/执行 flag，以及读取后会发送给模型的敏感文件都跨越了字符串白名单的安全边界。Settings 会明确显示该能力已停用，旧配置为 `true` 时 `--check-config` 会给出迁移警告。
+`agent_auto_approve_readonly` 与 `FORGE_AGENT_AUTO_APPROVE_READONLY` 仅作为旧配置兼容键保留，运行时始终归一化为关闭。所有 proposal 都必须逐条批准。原因是命令文本本身无法证明实际执行对象：alias、function、Git helper、工具的写入/执行 flag，以及读取后会发送给模型的敏感文件都跨越了字符串白名单的安全边界。Settings 会明确显示该能力已停用，旧配置为 `true` 时 `--check-config` 会给出迁移警告。
 
 `ai_redact_secrets = true` 默认遮蔽常见密钥格式，并在持久化前重新处理所有 active、non-active、archived chat 及其 draft/context；但脱敏不是秘密保护边界，发送前仍应检查上下文。`--safe-mode` 同时关闭 AI 与 Agent。
 
@@ -311,7 +311,7 @@ dashboard 和 Settings 中的 **AI command correction** 开关控制 `command_co
 
 完整字段见 `config.toml.example`。保存后自动热重载，`Ctrl+Shift+R` 手动重载。语法或语义错误不会替换当前有效配置。
 
-应用内设置保存还会：获取进程级 advisory lock、检查加载时 revision、拒绝并发编辑冲突、用 owner-only 临时文件 `fsync` 后原子替换，并轮换 `.bak` / `.bak.1` 两份经过验证的备份。恢复前的当前文件另存为 `.before-restore`。冲突、验证拒绝、锁超时和 I/O 错误会在窗口中明确提示；内存中的临时改动仍有效，但磁盘不会被覆盖。发生冲突时先重载配置再重新应用改动；必要时运行 `jterm4 --restore-config-backup`。safe mode 中的设置只影响当前窗口，也会明确提示不会保存。
+应用内设置保存还会：获取进程级 advisory lock、检查加载时 revision、拒绝并发编辑冲突、用 owner-only 临时文件 `fsync` 后原子替换，并轮换 `.bak` / `.bak.1` 两份经过验证的备份。恢复前的当前文件另存为 `.before-restore`。冲突、验证拒绝、锁超时和 I/O 错误会在窗口中明确提示；内存中的临时改动仍有效，但磁盘不会被覆盖。发生冲突时先重载配置再重新应用改动；必要时运行 `forge --restore-config-backup`。safe mode 中的设置只影响当前窗口，也会明确提示不会保存。
 
 覆盖或解除快捷键：
 
@@ -325,31 +325,31 @@ toggle_ai_panel = false
 
 ## 13. 状态与历史位置
 
-- 配置：`~/.config/jterm4/config.toml` 及 `.bak` / `.bak.1`。
-- 窗口快照：`~/.config/jterm4/windows/window-*.active|state`。
-- JSONL 命令历史：`${XDG_STATE_HOME:-~/.local/state}/jterm4/history.jsonl`，可用配置覆盖。
+- 配置：`~/.config/forge/config.toml` 及 `.bak` / `.bak.1`。
+- 窗口快照：`~/.config/forge/windows/window-*.active|state`。
+- JSONL 命令历史：`${XDG_STATE_HOME:-~/.local/state}/forge/history.jsonl`，可用配置覆盖。
 - 可选 Block 全量历史：由 `block_history_path` 指定，可能包含输出。
-- 用户 workflow：`~/.config/jterm4/workflows/*.{toml,yaml,yml}`。
-- 已安装示例与 Notebook：`${prefix}/share/jterm4/`。
+- 用户 workflow：`~/.config/forge/workflows/*.{toml,yaml,yml}`。
+- 已安装示例与 Notebook：`${prefix}/share/forge/`。
 
 配置、快照与历史包含敏感工作信息，备份或分享前应主动检查。
 
 ## 14. 故障排查
 
 ```bash
-jterm4 --doctor
-jterm4 --check-config
-JTERM4_LOG=debug jterm4 --no-restore
-jterm4 --safe-mode
-jterm4-support-bundle .
+forge --doctor
+forge --check-config
+FORGE_LOG=debug forge --no-restore
+forge --safe-mode
+forge-support-bundle .
 ```
 
 - GUI 无法启动：确认 `DISPLAY` 或 `WAYLAND_DISPLAY` 以及 GTK/VTE 动态库。
 - 中文输入无预编辑：检查 `GTK_IM_MODULE`、`XMODIFIERS` 和 fcitx5/ibus GTK4 模块。
 - Block 缺少准确 exit/cwd：加载对应 shell integration。
 - AI 不可用：检查 `ai_enabled`、provider 对应密钥、base URL 和 `curl`。
-- 欢迎 Notebook 找不到：重新安装资产，或设置 `JTERM4_ASSET_DIR=/path/to/share/jterm4`。
-- workflow 示例找不到：检查 `${prefix}/share/jterm4/workflows`；非默认 prefix 可设置 `JTERM4_WORKFLOW_DIR`。
+- 欢迎 Notebook 找不到：重新安装资产，或设置 `FORGE_ASSET_DIR=/path/to/share/forge`。
+- workflow 示例找不到：检查 `${prefix}/share/forge/workflows`；非默认 prefix 可设置 `FORGE_WORKFLOW_DIR`。
 - 长命令无通知：检查 `notify_long_blocks`、阈值、`notify-send` 和通知服务。
 - SSH 无目标：添加 `[[remote_hosts]]` 后按 `Ctrl+Shift+S`。
 - 配置修改没生效：先运行 `--check-config`；并发冲突需要重载后再保存。

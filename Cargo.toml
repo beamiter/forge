@@ -1,9 +1,9 @@
 [package]
-name = "jterm4"
+name = "forge"
 version = "0.2.0"
 edition = "2021"
 description = "A session-aware GTK4 terminal with structured command blocks"
-repository = "https://github.com/beamiter/jterm4"
+repository = "https://github.com/beamiter/forge"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 publish = false
@@ -11,8 +11,8 @@ categories = ["command-line-utilities", "development-tools"]
 autobins = false
 
 [[bin]]
-name = "jterm4"
-path = "src/bin/jterm4.rs"
+name = "forge"
+path = "src/bin/forge.rs"
 test = false
 bench = false
 

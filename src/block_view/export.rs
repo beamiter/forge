@@ -31,7 +31,7 @@ impl SessionExportFormat {
 }
 
 /// `session-<stamp>.<ext>` with a numeric suffix for same-second collisions.
-/// Same shape as jterm1's exports so a user who runs both terminals gets one
+/// Same shape as anvil's exports so a user who runs both terminals gets one
 /// recognizable naming scheme in their data directory.
 fn export_file_name(stamp: &str, extension: &str, attempt: u32) -> String {
     if attempt == 0 {
@@ -42,7 +42,7 @@ fn export_file_name(stamp: &str, extension: &str, attempt: u32) -> String {
 }
 
 fn exports_dir() -> PathBuf {
-    glib::user_data_dir().join("jterm4").join("exports")
+    glib::user_data_dir().join("forge").join("exports")
 }
 
 fn export_stamp() -> String {
@@ -143,7 +143,7 @@ impl TermView {
         session_markdown_document(&sections)
     }
 
-    /// Write this session's blocks to a timestamped file under the jterm4 data
+    /// Write this session's blocks to a timestamped file under the forge data
     /// directory and report where it landed. The path is the caller's only way
     /// to tell the user where the export went, so it is returned rather than
     /// logged here.
@@ -197,7 +197,7 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "jterm4-export-{name}-{}-{unique}",
+                "forge-export-{name}-{}-{unique}",
                 std::process::id()
             ));
             Self(path)

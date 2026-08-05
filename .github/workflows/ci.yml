@@ -208,13 +208,13 @@ jobs:
 
       - name: Build and verify relocatable release bundle
         run: |
-          bash scripts/package-release.sh target/release/jterm4
+          bash scripts/package-release.sh target/release/forge
           (cd target/dist && sha256sum --check *.sha256)
 
       - name: Upload release bundle
         uses: actions/upload-artifact@v7
         with:
-          name: jterm4-${{ github.sha }}
+          name: forge-${{ github.sha }}
           path: target/dist/*
           if-no-files-found: error
           retention-days: 7

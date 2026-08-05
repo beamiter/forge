@@ -1,4 +1,4 @@
-# Welcome to jterm4 notebooks
+# Welcome to forge notebooks
 
 A `.jtnb.md` file is ordinary **Markdown** with executable shell fences.
 Run one cell with *Run*, execute all runnable cells in order with *Run All*, or
@@ -20,7 +20,7 @@ printf 'working directory: %s\n' "$PWD"
 uname -srm
 ```
 
-`shell` and unlabeled fences use the shell argv supplied by jterm4. The source
+`shell` and unlabeled fences use the shell argv supplied by forge. The source
 is sent to that shell on standard input, so configured login/host wrappers are
 preserved without constructing a fragile quoted `-c` command.
 

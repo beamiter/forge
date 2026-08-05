@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-APP_ID="${1:-io.github.beamiter.jterm4}"
+APP_ID="${1:-io.github.beamiter.forge}"
 LOG_DIR="${LOG_DIR:-flatpak-smoke-logs}"
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-$(mktemp -d)}"
 CREATED_RUNTIME=0
@@ -32,7 +32,7 @@ smoke_mode() {
     local mode="$2"
     local log="${LOG_DIR}/${backend}-${mode}.log"
 
-    flatpak run --env="JTERM4_MODE=${mode}" "${APP_ID}" >"${log}" 2>&1 &
+    flatpak run --env="FORGE_MODE=${mode}" "${APP_ID}" >"${log}" 2>&1 &
     local launcher=$!
     sleep 4
     if ! kill -0 "${launcher}" >/dev/null 2>&1; then
@@ -65,7 +65,7 @@ command -v weston >/dev/null 2>&1 || {
     exit 1
 }
 unset DISPLAY
-export WAYLAND_DISPLAY=wayland-jterm4
+export WAYLAND_DISPLAY=wayland-forge
 weston \
     --backend=headless-backend.so \
     --renderer=pixman \

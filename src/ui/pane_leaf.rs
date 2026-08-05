@@ -209,7 +209,7 @@ impl PaneLeaf {
     /// the backend-neutral process teardown path.
     ///
     /// Each backend terminates its own child lifecycle, which knows who reaps
-    /// that child: jterm4 for a Block pane's forked PTY, VTE's glib child
+    /// that child: forge for a Block pane's forked PTY, VTE's glib child
     /// watch for a conventional pane. Repeated calls are no-ops, so a pane
     /// closed explicitly and then dropped tears down only once.
     pub(crate) fn kill(&self) {

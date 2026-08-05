@@ -1,4 +1,4 @@
-# jterm4 性能与可靠性指南
+# forge 性能与可靠性指南
 
 本文只描述当前代码中可验证的机制，不给出与硬件、字体、显示服务器无关的固定性能数字。
 
@@ -41,7 +41,7 @@ Block 历史保存会：
 可选 zstd 压缩：
 
 ```toml
-block_history_path = "~/.local/share/jterm4/block-history.bin"
+block_history_path = "~/.local/share/forge/block-history.bin"
 block_history_compress = true
 ```
 
@@ -82,14 +82,14 @@ cargo build --release --locked
 调试日志：
 
 ```bash
-JTERM4_LOG=debug target/release/jterm4
-JTERM_PROF=1 target/release/jterm4
+FORGE_LOG=debug target/release/forge
+JTERM_PROF=1 target/release/forge
 ```
 
 Linux 上可进一步使用：
 
 ```bash
-perf record -g target/release/jterm4
+perf record -g target/release/forge
 perf report
 ```
 

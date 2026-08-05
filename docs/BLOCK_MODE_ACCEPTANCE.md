@@ -1,4 +1,4 @@
-# jterm4 Block Mode / jterm1 体验对齐验收清单
+# forge Block Mode / anvil 体验对齐验收清单
 
 用于在 X11、Wayland 和不同 shell 下验收 Block 模式。建议先完成 P0，再进行长会话和全屏程序回归。
 
@@ -6,8 +6,8 @@
 
 ```bash
 cargo build
-source <(target/debug/jterm4 --shell-integration bash)
-RUST_LOG=jterm4=debug target/debug/jterm4 --mode block --no-restore
+source <(target/debug/forge --shell-integration bash)
+RUST_LOG=forge=debug target/debug/forge --mode block --no-restore
 ```
 
 依次创建成功、失败、多行、长输出和后台输出：
@@ -95,4 +95,4 @@ read -r value; printf 'value=%s\n' "$value"
 - 批准命令完成后，Agent transcript 显示 exit code/输出并自动进入下一轮；不相关 Block 完成事件不能被误关联。
 - `done` 后 **Follow up** 保留原 transcript 并允许追问；达到 `agent_max_turns` 后 **New task** 在原 pane 清空旧模型上下文、重置回合预算。**Cancel Agent** 和关闭卡片会停止模型回合，取消时的迟到回复不能形成 proposal。已明确批准且已经启动的终端命令仍按普通 Block 任务管理。
 
-问题记录建议包含桌面环境、X11/Wayland、shell 及版本、是否加载 shell integration、复现步骤和 `RUST_LOG=jterm4=debug` 日志。
+问题记录建议包含桌面环境、X11/Wayland、shell 及版本、是否加载 shell integration、复现步骤和 `RUST_LOG=forge=debug` 日志。

@@ -1,6 +1,6 @@
-#compdef jterm4
+#compdef forge
 
-_jterm4()
+_forge()
 {
   _arguments -s -S \
     '(-h --help)'{-h,--help}'[show command help]' \
@@ -24,4 +24,4 @@ _jterm4()
     '*:working directory:_directories'
 }
 
-_jterm4 "$@"
+_forge "$@"

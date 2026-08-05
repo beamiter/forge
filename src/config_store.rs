@@ -474,7 +474,7 @@ fn validate_existing_parent(parent: &Path) -> Result<fs::File, ConfigWriteError>
 
 /// Create a missing configuration parent privately, or validate an existing
 /// final directory entry without following a symlink. Existing shared parents
-/// (for an explicit JTERM4_CONFIG path) are never chmodded.
+/// (for an explicit FORGE_CONFIG path) are never chmodded.
 pub(crate) fn ensure_config_parent(path: &Path) -> Result<(), ConfigWriteError> {
     if path.file_name().is_none() {
         return Err(ConfigWriteError::Io(format!(
@@ -557,7 +557,7 @@ fn try_lock_exclusive(file: &fs::File) -> io::Result<bool> {
 
 #[cfg(not(unix))]
 fn try_lock_exclusive(_file: &fs::File) -> io::Result<bool> {
-    // jterm4's supported GTK targets are Unix.  Keeping this fallback makes
+    // forge's supported GTK targets are Unix.  Keeping this fallback makes
     // the persistence code type-check on other targets without pretending an
     // unsupported platform has a process-safe advisory lock.
     Err(io::Error::new(
@@ -1259,7 +1259,7 @@ mod tests {
     fn temporary_directory(label: &str) -> PathBuf {
         let nonce = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "jterm4-config-store-{label}-{}-{nonce}",
+            "forge-config-store-{label}-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(&path).unwrap();
@@ -1536,7 +1536,7 @@ mod tests {
         let path = directory.join("config.toml");
         let mut config = default_config();
         config.command_history_enabled = true;
-        config.command_history_path = Some("/tmp/jterm4-history.jsonl".into());
+        config.command_history_path = Some("/tmp/forge-history.jsonl".into());
         config.command_history_max_entries = 42_000;
         save_config_to_path(&path, &config, Some(&ConfigRevision::missing())).unwrap();
         let table = fs::read_to_string(&path)
@@ -1553,7 +1553,7 @@ mod tests {
             table
                 .get("command_history_path")
                 .and_then(toml::Value::as_str),
-            Some("/tmp/jterm4-history.jsonl")
+            Some("/tmp/forge-history.jsonl")
         );
         assert_eq!(
             table
@@ -1577,7 +1577,7 @@ mod tests {
         config.ai_provider = "ollama".into();
         config.ai_base_url = "http://localhost:11434".into();
         config.ai_api_key_file = Some("/run/secrets/provider-api-key".into());
-        config.ai_api_key_file_configured = Some("~/.config/jterm4/ai.key".into());
+        config.ai_api_key_file_configured = Some("~/.config/forge/ai.key".into());
         config.ai_model = "qwen2.5-coder:7b".into();
         config.ai_max_tokens = 2048;
         save_config_to_path(&path, &config, Some(&ConfigRevision::missing())).unwrap();
@@ -1611,7 +1611,7 @@ mod tests {
         );
         assert_eq!(
             table.get("ai_api_key_file").and_then(toml::Value::as_str),
-            Some("~/.config/jterm4/ai.key")
+            Some("~/.config/forge/ai.key")
         );
         assert!(!contents.contains("sk-test-secret"));
         fs::remove_dir_all(directory).unwrap();

@@ -71,11 +71,11 @@ pub(crate) fn launch_options() -> &'static LaunchOptions {
     LAUNCH_OPTIONS.get_or_init(LaunchOptions::default)
 }
 
-pub(crate) const HELP: &str = r#"jterm4 — a session-aware GTK4 terminal workspace
+pub(crate) const HELP: &str = r#"forge — a session-aware GTK4 terminal workspace
 
 Usage:
-  jterm4 [OPTIONS] [DIRECTORY]
-  jterm4 [OPTIONS] --execute COMMAND [ARG...]
+  forge [OPTIONS] [DIRECTORY]
+  forge [OPTIONS] --execute COMMAND [ARG...]
 
 Launch options:
   -c, --config PATH           Use an alternate config file
@@ -101,15 +101,15 @@ Utilities:
   -V, --version               Print version
 
 Examples:
-  jterm4 ~/project
-  jterm4 --mode block --no-restore
-  jterm4 --safe-mode
-  jterm4 -d /tmp -e bash -lc 'printf "hello\\n"'
-  source <(jterm4 --shell-integration bash)
-  source <(jterm4 --generate-completion bash)
+  forge ~/project
+  forge --mode block --no-restore
+  forge --safe-mode
+  forge -d /tmp -e bash -lc 'printf "hello\\n"'
+  source <(forge --shell-integration bash)
+  source <(forge --generate-completion bash)
 
-Environment overrides include JTERM4_CONFIG, JTERM4_MODE, JTERM4_THEME,
-JTERM4_FONT, JTERM4_OPACITY, and JTERM4_LOG.
+Environment overrides include FORGE_CONFIG, FORGE_MODE, FORGE_THEME,
+FORGE_FONT, FORGE_OPACITY, and FORGE_LOG.
 "#;
 
 fn set_command(parsed: &mut ParsedArgs, command: EarlyCommand) -> Result<(), String> {
@@ -503,7 +503,7 @@ fn env_presence(name: &str) -> &'static str {
 /// and user-authored values. It is intentionally environment-only and is not
 /// advertised as a general CLI switch.
 fn diagnostics_redacted() -> bool {
-    std::env::var_os("JTERM4_DIAGNOSTICS_REDACT")
+    std::env::var_os("FORGE_DIAGNOSTICS_REDACT")
         .is_some_and(|value| !value.is_empty() && value != "0")
 }
 
@@ -983,7 +983,7 @@ fn doctor(format: ReportFormat) -> bool {
             .expect("doctor report is serializable")
         );
     } else {
-        println!("jterm4 {} doctor", env!("CARGO_PKG_VERSION"));
+        println!("forge {} doctor", env!("CARGO_PKG_VERSION"));
         println!("application id: {}", crate::host::APP_ID);
         for check in &checks {
             println!("{}: {} ({})", check.name, check.detail, check.status);
@@ -1023,11 +1023,11 @@ fn init_config_file() -> Result<(), String> {
 
 fn print_shell_integration(shell: ShellIntegration) {
     let script = match shell {
-        ShellIntegration::Bash => include_str!("../scripts/shell-integration/jterm4.bash"),
-        ShellIntegration::Zsh => include_str!("../scripts/shell-integration/jterm4.zsh"),
-        ShellIntegration::Fish => include_str!("../scripts/shell-integration/jterm4.fish"),
+        ShellIntegration::Bash => include_str!("../scripts/shell-integration/forge.bash"),
+        ShellIntegration::Zsh => include_str!("../scripts/shell-integration/forge.zsh"),
+        ShellIntegration::Fish => include_str!("../scripts/shell-integration/forge.fish"),
         ShellIntegration::PowerShell => {
-            include_str!("../scripts/shell-integration/jterm4.ps1")
+            include_str!("../scripts/shell-integration/forge.ps1")
         }
     };
     print!("{script}");
@@ -1035,10 +1035,10 @@ fn print_shell_integration(shell: ShellIntegration) {
 
 fn print_completion(shell: ShellIntegration) {
     let script = match shell {
-        ShellIntegration::Bash => include_str!("../scripts/completions/jterm4.bash"),
-        ShellIntegration::Zsh => include_str!("../scripts/completions/_jterm4"),
-        ShellIntegration::Fish => include_str!("../scripts/completions/jterm4.fish"),
-        ShellIntegration::PowerShell => include_str!("../scripts/completions/jterm4.ps1"),
+        ShellIntegration::Bash => include_str!("../scripts/completions/forge.bash"),
+        ShellIntegration::Zsh => include_str!("../scripts/completions/_forge"),
+        ShellIntegration::Fish => include_str!("../scripts/completions/forge.fish"),
+        ShellIntegration::PowerShell => include_str!("../scripts/completions/forge.ps1"),
     };
     print!("{script}");
 }
@@ -1073,19 +1073,19 @@ pub(crate) fn handle_early_args() -> Option<glib::ExitCode> {
     let parsed = match parse_args(std::env::args_os().skip(1)) {
         Ok(parsed) => parsed,
         Err(err) => {
-            eprintln!("jterm4: {err}\nTry 'jterm4 --help' for usage.");
+            eprintln!("forge: {err}\nTry 'forge --help' for usage.");
             return Some(glib::ExitCode::new(2));
         }
     };
 
     if let Some(path) = parsed.config {
         // SAFETY: this runs before GTK, worker threads, and any config reads.
-        unsafe { std::env::set_var("JTERM4_CONFIG", path) };
+        unsafe { std::env::set_var("FORGE_CONFIG", path) };
     }
 
     let Some(command) = parsed.command else {
         if let Err(err) = validate_launch_options(&parsed.launch) {
-            eprintln!("jterm4: {err}");
+            eprintln!("forge: {err}");
             return Some(glib::ExitCode::new(2));
         }
         if let Some(mode) = parsed.launch.mode {
@@ -1094,13 +1094,13 @@ pub(crate) fn handle_early_args() -> Option<glib::ExitCode> {
                 Mode::Vte => "vte",
             };
             // SAFETY: no threads or configuration reads exist yet.
-            unsafe { std::env::set_var("JTERM4_MODE", value) };
+            unsafe { std::env::set_var("FORGE_MODE", value) };
         }
         if parsed.launch.safe_mode {
             // SAFETY: consumed during single-threaded application startup.
             unsafe {
-                std::env::set_var("JTERM4_MODE", "vte");
-                std::env::set_var("JTERM4_SAFE_MODE", "1");
+                std::env::set_var("FORGE_MODE", "vte");
+                std::env::set_var("FORGE_SAFE_MODE", "1");
             }
         }
         let _ = LAUNCH_OPTIONS.set(parsed.launch);
@@ -1113,7 +1113,7 @@ pub(crate) fn handle_early_args() -> Option<glib::ExitCode> {
             true
         }
         EarlyCommand::Version => {
-            println!("jterm4 {}", env!("CARGO_PKG_VERSION"));
+            println!("forge {}", env!("CARGO_PKG_VERSION"));
             true
         }
         EarlyCommand::ConfigPath => {
@@ -1131,7 +1131,7 @@ pub(crate) fn handle_early_args() -> Option<glib::ExitCode> {
         EarlyCommand::InitConfig => match init_config_file() {
             Ok(()) => true,
             Err(err) => {
-                eprintln!("jterm4: {err}");
+                eprintln!("forge: {err}");
                 false
             }
         },
@@ -1153,7 +1153,7 @@ pub(crate) fn handle_early_args() -> Option<glib::ExitCode> {
                 true
             }
             Err(err) => {
-                eprintln!("jterm4: {err}");
+                eprintln!("forge: {err}");
                 false
             }
         },
@@ -1230,7 +1230,7 @@ mod tests {
     fn executable_probe_checks_explicit_shell_paths() {
         assert!(executable_available("/bin/sh", false));
         assert!(!executable_available(
-            "/definitely/missing/jterm4-shell",
+            "/definitely/missing/forge-shell",
             false
         ));
     }
@@ -1274,16 +1274,16 @@ mod tests {
     fn bundled_completions_cover_every_shell_and_core_option() {
         for (shell, registration) in [
             (ShellIntegration::Bash, "complete -o"),
-            (ShellIntegration::Zsh, "#compdef jterm4"),
-            (ShellIntegration::Fish, "complete -c jterm4"),
+            (ShellIntegration::Zsh, "#compdef forge"),
+            (ShellIntegration::Fish, "complete -c forge"),
             (ShellIntegration::PowerShell, "Register-ArgumentCompleter"),
         ] {
             let script = match shell {
-                ShellIntegration::Bash => include_str!("../scripts/completions/jterm4.bash"),
-                ShellIntegration::Zsh => include_str!("../scripts/completions/_jterm4"),
-                ShellIntegration::Fish => include_str!("../scripts/completions/jterm4.fish"),
+                ShellIntegration::Bash => include_str!("../scripts/completions/forge.bash"),
+                ShellIntegration::Zsh => include_str!("../scripts/completions/_forge"),
+                ShellIntegration::Fish => include_str!("../scripts/completions/forge.fish"),
                 ShellIntegration::PowerShell => {
-                    include_str!("../scripts/completions/jterm4.ps1")
+                    include_str!("../scripts/completions/forge.ps1")
                 }
             };
             assert!(script.contains(registration));

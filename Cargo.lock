@@ -302,6 +302,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "forge"
+version = "0.2.0"
+dependencies = [
+ "bytecheck",
+ "crossbeam-channel",
+ "dirs",
+ "env_logger",
+ "fuzzy-matcher",
+ "gdk4",
+ "gtk4",
+ "jagent",
+ "jterm_core",
+ "libadwaita",
+ "log",
+ "memchr",
+ "nix",
+ "once_cell",
+ "pcre2-sys",
+ "regex",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "toml",
+ "unicode-width",
+ "vte4",
+ "zstd",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -738,36 +768,6 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "jterm4"
-version = "0.2.0"
-dependencies = [
- "bytecheck",
- "crossbeam-channel",
- "dirs",
- "env_logger",
- "fuzzy-matcher",
- "gdk4",
- "gtk4",
- "jagent",
- "jterm_core",
- "libadwaita",
- "log",
- "memchr",
- "nix",
- "once_cell",
- "pcre2-sys",
- "regex",
- "rkyv",
- "serde",
- "serde_json",
- "serde_yaml",
- "toml",
- "unicode-width",
- "vte4",
- "zstd",
 ]
 
 [[package]]

@@ -44,7 +44,7 @@ fn ai_panel_width_from_geometry(total_width: i32, position: i32) -> Option<u32> 
 impl UiState {
     /// Hotkey path for opacity: apply to the window, write through to the
     /// config (same persistence as the settings dialog, so the value survives
-    /// restarts like it does in jterm2/jterm3), and show toast feedback.
+    /// restarts like it does in ember/frost), and show toast feedback.
     fn apply_opacity(&self, opacity: f64) {
         self.window_opacity.set(opacity);
         self.window.set_opacity(opacity);
@@ -126,7 +126,7 @@ impl UiState {
                 log::debug!("Font increase");
                 let new_scale = (self.font_scale.get() + font_step).min(10.0);
                 // Same apply-and-persist path as the settings dialog, so the
-                // hotkey survives restarts like it does in jterm2/jterm3.
+                // hotkey survives restarts like it does in ember/frost.
                 self.apply_font_scale(new_scale);
             }
             Action::FontDecrease => {

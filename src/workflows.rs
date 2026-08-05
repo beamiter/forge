@@ -1,6 +1,6 @@
 //! workflows — user-saved parameterized command templates.
 //!
-//! A workflow is a small TOML file in `~/.config/jterm4/workflows/`
+//! A workflow is a small TOML file in `~/.config/forge/workflows/`
 //! that names a reusable command with `{placeholder}` slots. The
 //! Ctrl+Shift+M palette lists them; selecting one opens a dialog
 //! asking for each placeholder's value, then writes the substituted
@@ -71,7 +71,7 @@ pub struct WorkflowArg {
     pub default: String,
 }
 
-/// `~/.config/jterm4/workflows/`. Created lazily on first save; we never
+/// `~/.config/forge/workflows/`. Created lazily on first save; we never
 /// `mkdir -p` on read — a missing dir just means "no workflows yet".
 pub fn workflows_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
@@ -80,21 +80,21 @@ pub fn workflows_dir() -> PathBuf {
             let home = std::env::var_os("HOME").unwrap_or_default();
             PathBuf::from(home).join(".config")
         });
-    base.join("jterm4").join("workflows")
+    base.join("forge").join("workflows")
 }
 
 /// Workflow search path in precedence order. User-authored workflows win over
 /// additional, installed and source-tree examples with the same name.
 pub fn workflow_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![workflows_dir()];
-    if let Some(extra) = std::env::var_os("JTERM4_WORKFLOW_DIR") {
+    if let Some(extra) = std::env::var_os("FORGE_WORKFLOW_DIR") {
         dirs.extend(std::env::split_paths(&extra).take(MAX_WORKFLOW_DIRECTORIES));
     }
-    dirs.push(gtk4::glib::user_data_dir().join("jterm4").join("workflows"));
+    dirs.push(gtk4::glib::user_data_dir().join("forge").join("workflows"));
     dirs.extend(
         gtk4::glib::system_data_dirs()
             .into_iter()
-            .map(|dir| dir.join("jterm4").join("workflows")),
+            .map(|dir| dir.join("forge").join("workflows")),
     );
     dirs.push(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -114,19 +114,19 @@ pub fn workflow_dirs() -> Vec<PathBuf> {
 /// Locate the installed or source-tree quick-start notebook.
 pub fn welcome_notebook_path() -> Option<PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(asset_dir) = std::env::var_os("JTERM4_ASSET_DIR") {
+    if let Some(asset_dir) = std::env::var_os("FORGE_ASSET_DIR") {
         candidates.push(PathBuf::from(asset_dir).join("notebooks/welcome.jtnb.md"));
     }
     candidates.push(
         gtk4::glib::user_data_dir()
-            .join("jterm4")
+            .join("forge")
             .join("notebooks")
             .join("welcome.jtnb.md"),
     );
     candidates.extend(
         gtk4::glib::system_data_dirs()
             .into_iter()
-            .map(|dir| dir.join("jterm4").join("notebooks").join("welcome.jtnb.md")),
+            .map(|dir| dir.join("forge").join("notebooks").join("welcome.jtnb.md")),
     );
     candidates.push(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -697,7 +697,7 @@ args:
 
     #[test]
     fn load_all_from_missing_dir_returns_empty() {
-        let wfs = load_all_from(Path::new("/nonexistent/jterm4/workflows/never"));
+        let wfs = load_all_from(Path::new("/nonexistent/forge/workflows/never"));
         assert!(wfs.is_empty());
     }
 
@@ -776,7 +776,7 @@ args:
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let p = std::env::temp_dir().join(format!("jterm4-wf-test-{nanos}"));
+        let p = std::env::temp_dir().join(format!("forge-wf-test-{nanos}"));
         fs::create_dir_all(&p).unwrap();
         TmpDir(p)
     }

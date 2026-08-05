@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Install jterm4 and its Linux desktop integration from a source checkout.
+# Install forge and its Linux desktop integration from a source checkout.
 
 set -Eeuo pipefail
 umask 077
 
-APP_ID="io.github.beamiter.jterm4"
+APP_ID="io.github.beamiter.forge"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 HOME_DIR="${HOME:-}"
@@ -40,7 +40,7 @@ USAGE
 }
 
 die() {
-    printf 'jterm4 install: %s\n' "$*" >&2
+    printf 'forge install: %s\n' "$*" >&2
     exit 1
 }
 
@@ -60,7 +60,7 @@ run() {
 run_optional() {
     print_command "$@"
     if ((DRY_RUN == 0)); then
-        "$@" || printf 'jterm4 install: warning: %s failed (non-fatal)\n' "$1" >&2
+        "$@" || printf 'forge install: warning: %s failed (non-fatal)\n' "$1" >&2
     fi
 }
 
@@ -71,7 +71,7 @@ run_optional_public() {
     print_command "$@"
     if ((DRY_RUN == 0)); then
         (umask 022 && "$@") \
-            || printf 'jterm4 install: warning: %s failed (non-fatal)\n' "$1" >&2
+            || printf 'forge install: warning: %s failed (non-fatal)\n' "$1" >&2
     fi
 }
 
@@ -92,13 +92,13 @@ bin_dir_on_path() {
 }
 
 # A desktop session fixes its PATH at login, so an entry that only says
-# `Exec=jterm4` fails TryExec and is hidden from the launcher whenever the
+# `Exec=forge` fails TryExec and is hidden from the launcher whenever the
 # binary lives in a per-user bin dir that PATH does not list. Point the entry at
 # the real path unless the target is a system bin dir that is always on PATH.
 desktop_exec_path() {
     case "${BIN_DIR}" in
-        /usr/bin | /usr/local/bin | /bin) printf 'jterm4' ;;
-        *) printf '%s/jterm4' "${BIN_DIR}" ;;
+        /usr/bin | /usr/local/bin | /bin) printf 'forge' ;;
+        *) printf '%s/forge' "${BIN_DIR}" ;;
     esac
 }
 
@@ -109,7 +109,7 @@ install_desktop_entry() {
     ((DRY_RUN == 0)) || return 0
     install -d -m 0755 "$(dirname -- "${dest}")"
     awk -v exec_path="${exec_path}" '
-        /^Exec=jterm4([[:space:]]|$)/ || /^TryExec=jterm4([[:space:]]|$)/ {
+        /^Exec=forge([[:space:]]|$)/ || /^TryExec=forge([[:space:]]|$)/ {
             eq = index($0, "=")
             print substr($0, 1, eq) exec_path substr($0, eq + 7)
             next
@@ -237,7 +237,7 @@ if [[ "${TARGET_DIR}" != /* ]]; then
 fi
 export CARGO_TARGET_DIR="${TARGET_DIR}"
 
-printf 'Building jterm4 with %s...\n' "${BACKEND}"
+printf 'Building forge with %s...\n' "${BACKEND}"
 case "${BACKEND}" in
     nix)
         require_command nix
@@ -249,7 +249,7 @@ case "${BACKEND}" in
         ;;
 esac
 
-BINARY="${TARGET_DIR}/release/jterm4"
+BINARY="${TARGET_DIR}/release/forge"
 if ((DRY_RUN == 0)) && [[ ! -x "${BINARY}" ]]; then
     die "release binary was not produced at ${BINARY}"
 fi
@@ -257,23 +257,23 @@ fi
 require_command install
 STAGED_BIN_DIR="${DESTDIR}${BIN_DIR}"
 run install -d -m 0755 "${STAGED_BIN_DIR}"
-run install -m 0755 "${BINARY}" "${STAGED_BIN_DIR}/jterm4"
+run install -m 0755 "${BINARY}" "${STAGED_BIN_DIR}/forge"
 run install -m 0755 \
     "${REPO_ROOT}/scripts/support-bundle.sh" \
-    "${STAGED_BIN_DIR}/jterm4-support-bundle"
+    "${STAGED_BIN_DIR}/forge-support-bundle"
 
 SHARE_DIR="${DESTDIR}${PREFIX}/share"
-ASSET_DIR="${SHARE_DIR}/jterm4"
+ASSET_DIR="${SHARE_DIR}/forge"
 run install -d -m 0755 \
     "${ASSET_DIR}/shell-integration" \
     "${ASSET_DIR}/workflows" \
     "${ASSET_DIR}/notebooks"
 run install -m 0644 \
     "${REPO_ROOT}/scripts/shell-integration/README.md" \
-    "${REPO_ROOT}/scripts/shell-integration/jterm4.bash" \
-    "${REPO_ROOT}/scripts/shell-integration/jterm4.zsh" \
-    "${REPO_ROOT}/scripts/shell-integration/jterm4.fish" \
-    "${REPO_ROOT}/scripts/shell-integration/jterm4.ps1" \
+    "${REPO_ROOT}/scripts/shell-integration/forge.bash" \
+    "${REPO_ROOT}/scripts/shell-integration/forge.zsh" \
+    "${REPO_ROOT}/scripts/shell-integration/forge.fish" \
+    "${REPO_ROOT}/scripts/shell-integration/forge.ps1" \
     "${ASSET_DIR}/shell-integration/"
 run install -m 0644 \
     "${REPO_ROOT}/scripts/workflows/git-feature.yaml" \
@@ -290,6 +290,9 @@ run install -m 0644 \
 if ((INSTALL_DESKTOP == 1)); then
     install_desktop_entry "${REPO_ROOT}/data/${APP_ID}.desktop" \
         "${SHARE_DIR}/applications/${APP_ID}.desktop"
+    # Launcher left by installs from before the jterm4 -> forge rename; left in
+    # place it shows up as a second "jterm4" entry beside the new one.
+    run rm -f -- "${SHARE_DIR}/applications/io.github.beamiter.jterm4.desktop"
     run install -Dm0644 "${REPO_ROOT}/data/${APP_ID}.metainfo.xml" \
         "${SHARE_DIR}/metainfo/${APP_ID}.metainfo.xml"
     run install -Dm0644 "${REPO_ROOT}/data/${APP_ID}.svg" \
@@ -303,7 +306,7 @@ fi
 
 CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME_DIR}/.config}"
 [[ "${CONFIG_HOME}" == /* ]] || die "XDG_CONFIG_HOME must be an absolute path"
-CONFIG_DIR="${CONFIG_HOME}/jterm4"
+CONFIG_DIR="${CONFIG_HOME}/forge"
 STAGED_CONFIG_DIR="${DESTDIR}${CONFIG_DIR}"
 if ((INSTALL_CONFIG == 1)); then
     run install -d -m 0700 "${STAGED_CONFIG_DIR}"
@@ -314,31 +317,31 @@ if ((INSTALL_CONFIG == 1)); then
     fi
 fi
 
-printf 'Installed jterm4 to %s\n' "${BIN_DIR}/jterm4"
-printf 'Installed support tool to %s\n' "${BIN_DIR}/jterm4-support-bundle"
-printf 'Installed runtime assets under %s/share/jterm4\n' "${PREFIX}"
+printf 'Installed forge to %s\n' "${BIN_DIR}/forge"
+printf 'Installed support tool to %s\n' "${BIN_DIR}/forge-support-bundle"
+printf 'Installed runtime assets under %s/share/forge\n' "${PREFIX}"
 if ((INSTALL_DESKTOP == 1)); then
     printf 'Installed desktop integration under %s/share\n' "${PREFIX}"
     printf 'Launcher entry: %s (Exec=%s)\n' \
         "${SHARE_DIR}/applications/${APP_ID}.desktop" "$(desktop_exec_path)"
 fi
 if [[ -n "${DESTDIR}" ]]; then
-    printf 'Staged file: %s\n' "${STAGED_BIN_DIR}/jterm4"
+    printf 'Staged file: %s\n' "${STAGED_BIN_DIR}/forge"
 fi
 if [[ -z "${DESTDIR}" ]]; then
     if ! bin_dir_on_path; then
         printf '\nNote: %s is not in PATH; the launcher entry uses the absolute path,\n' \
             "${BIN_DIR}"
-        printf 'but shells will not find jterm4 until you add it, for example:\n'
+        printf 'but shells will not find forge until you add it, for example:\n'
         printf "  echo 'export PATH=\"%s:\$PATH\"' >>~/.profile\n" "${BIN_DIR}"
     fi
-    SHADOWING_BIN="$(command -v jterm4 2>/dev/null || true)"
-    if [[ -n "${SHADOWING_BIN}" && "${SHADOWING_BIN}" != "${BIN_DIR}/jterm4" ]]; then
+    SHADOWING_BIN="$(command -v forge 2>/dev/null || true)"
+    if [[ -n "${SHADOWING_BIN}" && "${SHADOWING_BIN}" != "${BIN_DIR}/forge" ]]; then
         printf '\nNote: typing %s still runs %s, an older copy earlier in PATH.\n' \
-            'jterm4' "${SHADOWING_BIN}"
+            'forge' "${SHADOWING_BIN}"
         printf 'Remove it, or put %s ahead of it in PATH.\n' "${BIN_DIR}"
         printf 'The launcher entry is unaffected: it runs %s directly.\n' \
-            "${BIN_DIR}/jterm4"
+            "${BIN_DIR}/forge"
     fi
 fi
-printf 'Validate with: %s --doctor\n' "${BIN_DIR}/jterm4"
+printf 'Validate with: %s --doctor\n' "${BIN_DIR}/forge"

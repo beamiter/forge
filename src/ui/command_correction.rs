@@ -37,8 +37,8 @@ use crate::ai::{AiCancellationToken, AiClient, Role, Turn};
 use crate::block_view::TermView;
 use crate::config::Config;
 
-const MONITOR_DATA_KEY: &str = "jterm4-ai-command-correction-monitor";
-const VIEW_DATA_KEY: &str = "jterm4-ai-command-correction-attached";
+const MONITOR_DATA_KEY: &str = "forge-ai-command-correction-monitor";
+const VIEW_DATA_KEY: &str = "forge-ai-command-correction-attached";
 const MAX_COMMAND_BYTES: usize = 16 * 1024;
 const MAX_MESSAGE_BYTES: usize = 2 * 1024;
 const MAX_OUTPUT_BYTES: usize = 8 * 1024;
@@ -417,7 +417,7 @@ fn request_correction(
     let deadline = Instant::now() + CORRECTION_REQUEST_TIMEOUT;
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let worker = std::thread::Builder::new()
-        .name("jterm4-command-correction".to_string())
+        .name("forge-command-correction".to_string())
         .spawn(move || {
             let result = resolve_correction_blocking(
                 &original_for_worker,
@@ -733,7 +733,7 @@ fn run_capture(
         return None;
     };
     let reader = std::thread::Builder::new()
-        .name("jterm4-correction-probe-output".to_string())
+        .name("forge-correction-probe-output".to_string())
         .spawn(move || {
             let mut kept = Vec::with_capacity(MAX_PROBE_BYTES.min(64 * 1024));
             let mut buffer = [0_u8; 16 * 1024];
@@ -812,7 +812,7 @@ fn probe_root_has_exited(pid: i32) -> std::io::Result<bool> {
 fn signal_probe_group(process_group: i32) {
     // The group was created exclusively for this probe. Validate the id before
     // using negative-pid group signalling so an impossible setup failure can
-    // never target jterm4's own group.
+    // never target forge's own group.
     if process_group > 1 && process_group != unsafe { nix::libc::getpgrp() } {
         // SAFETY: `CommandExt::process_group(0)` made the child its own group
         // leader before exec. ESRCH merely means every member already exited.
@@ -1119,7 +1119,7 @@ fn show_correction_card(
 }
 
 fn correction_system_prompt() -> &'static str {
-    "You are jterm4's shell-command correction engine. The user ran a command and it failed. \
+    "You are forge's shell-command correction engine. The user ran a command and it failed. \
 Reply with exactly one JSON object and no markdown or surrounding prose. Allowed shapes, with no extra keys:\n\
 {\"action\":\"suggest\",\"command\":\"one corrected shell command\",\"message\":\"brief reason\"}\n\
 {\"action\":\"none\",\"message\":\"brief reason\"}\n\

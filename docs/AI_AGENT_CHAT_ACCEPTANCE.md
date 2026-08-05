@@ -1,4 +1,4 @@
-# jterm4 AI / Agent / Chat 验收矩阵
+# forge AI / Agent / Chat 验收矩阵
 
 本文定义 AI transport、Chat、selected Block 与 Shell Agent 的发布验收边界。它是测试要求，不是功能完成声明；尚未实现或没有证据的项目应记录为 `FAIL` 或 `N/A`，不能据此写入用户文档或变更日志。
 
@@ -13,8 +13,8 @@ tmp="$(mktemp -d)"
 export XDG_CONFIG_HOME="$tmp/config"
 export XDG_STATE_HOME="$tmp/state"
 cargo build --locked
-source <(target/debug/jterm4 --shell-integration bash)
-RUST_LOG=jterm4=debug target/debug/jterm4 --mode block --no-restore
+source <(target/debug/forge --shell-integration bash)
+RUST_LOG=forge=debug target/debug/forge --mode block --no-restore
 ```
 
 provider 测试使用 loopback mock server 或可记录 argv、环境、stdin 与子进程 PID 的 `curl` stub。至少准备成功、延迟、401、429、500、断连、空内容、非法 JSON、迟到回复和超大响应 fixture。每项记录 `PASS/FAIL/N/A`、X11/Wayland、shell、provider、复现步骤和脱敏日志。

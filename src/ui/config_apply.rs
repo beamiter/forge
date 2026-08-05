@@ -40,7 +40,7 @@ impl UiState {
     /// Persist a UI-originated configuration change and make conflicts,
     /// validation refusal, lock timeouts and I/O failures visible to the user.
     pub(crate) fn persist_config(&self) {
-        if std::env::var_os("JTERM4_SAFE_MODE").is_some() {
+        if std::env::var_os("FORGE_SAFE_MODE").is_some() {
             self.show_config_error(
                 "Temporary safe-mode setting",
                 "This change applies only to the current window and will not be saved.",
@@ -444,7 +444,7 @@ impl UiState {
 
     /// Reload configuration from disk and apply changes.
     pub(crate) fn reload_config(&self) {
-        if std::env::var_os("JTERM4_SAFE_MODE").is_some() {
+        if std::env::var_os("FORGE_SAFE_MODE").is_some() {
             let dialog = adw::AlertDialog::new(
                 Some("Configuration reload disabled"),
                 Some("Safe mode keeps the built-in VTE profile isolated from user configuration."),

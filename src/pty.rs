@@ -46,7 +46,7 @@ pub struct OwnedPty {
     /// Mirrors the shell's DECSET/DECRST 2004 state so multiline insertion can
     /// be protected at the central input boundary. Fed by the block parser's
     /// `ParserEvent::DecsetMode` (see [`OwnedPty::set_shell_bracketed_paste`]),
-    /// which is the single owner of this mode for a jterm4 pane.
+    /// which is the single owner of this mode for a forge pane.
     shell_bracketed_paste: AtomicBool,
 }
 
@@ -117,7 +117,7 @@ impl std::error::Error for PtyWriteError {}
 
 /// Policy for the PTY write boundary.
 ///
-/// `FirstLineOnly` preserves jterm4's behaviour: without DECSET 2004 a
+/// `FirstLineOnly` preserves forge's behaviour: without DECSET 2004 a
 /// multiline payload is cut to its first logical line rather than submitting
 /// every line. Control stripping stays off — this boundary carries keystrokes,
 /// cursor keys and mouse reports, which are control bytes by construction —
@@ -194,7 +194,7 @@ fn write_all_fd(fd: RawFd, mut data: &[u8]) -> io::Result<()> {
 fn spawn_fd_writer(fd: OwnedFd) -> io::Result<mpsc::SyncSender<Vec<u8>>> {
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(PTY_INPUT_QUEUE_CAPACITY);
     std::thread::Builder::new()
-        .name("jterm4-pty-writer".to_string())
+        .name("forge-pty-writer".to_string())
         .spawn(move || {
             for data in rx {
                 if let Err(error) = write_all_fd(fd.as_raw_fd(), &data) {
@@ -234,8 +234,8 @@ fn invalid_nul(context: &str) -> io::Error {
 /// The child's environment, built entirely before `fork`.
 ///
 /// `LESS` is a flag rather than a hardcoded value because the family disagrees:
-/// jterm4 keeps `R` so a short `git log` still opens an interactive pager on the
-/// alternate screen, while jterm2/jterm3 use `FR`. Everything else — `TERM`,
+/// forge keeps `R` so a short `git log` still opens an interactive pager on the
+/// alternate screen, while ember/frost use `FR`. Everything else — `TERM`,
 /// `COLORTERM`, `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`, `VTE_VERSION` — is the
 /// family's shared identity policy. Block mode never lets libvte spawn the
 /// child, so before this these variables (bar `TERM`) never reached the shell
@@ -256,7 +256,7 @@ fn block_mode_child_env() -> crate::child_env::ChildEnv<'static> {
 /// A restored session names the directory the tab last ran in, and that
 /// directory can be gone by the time the tab comes back — a removed git
 /// worktree, an unmounted drive, a cleaned `/tmp` path. Dropping the request
-/// here (as jterm1 does) starts the shell in the application directory
+/// here (as anvil does) starts the shell in the application directory
 /// instead; propagating the failure would cost the user the whole pane.
 fn usable_working_directory(cwd: Option<&str>) -> Option<&str> {
     cwd.filter(|value| !value.is_empty()).filter(|directory| {
@@ -596,7 +596,7 @@ impl OwnedPty {
         let wake_pending = Arc::new(AtomicBool::new(false));
         let eventfd_for_thread = Arc::clone(&eventfd);
         let wake_pending_for_thread = Arc::clone(&wake_pending);
-        spawn_reader_thread(reader_fd, lifecycle, tx, "jterm4-pty-reader", move || {
+        spawn_reader_thread(reader_fd, lifecycle, tx, "forge-pty-reader", move || {
             notify_eventfd_once(&eventfd_for_thread, &wake_pending_for_thread);
         });
 
@@ -656,7 +656,7 @@ impl OwnedPty {
         F: FnMut(Vec<u8>) + 'static,
         E: FnOnce(i32) + 'static,
     {
-        spawn_reader_thread(reader_fd, lifecycle, tx, "jterm4-pty-reader-poll", || {});
+        spawn_reader_thread(reader_fd, lifecycle, tx, "forge-pty-reader-poll", || {});
 
         let on_exit = std::cell::Cell::new(Some(on_exit));
         let rx = std::cell::RefCell::new(rx);
@@ -996,7 +996,7 @@ mod tests {
         let pty = OwnedPty::spawn(
             &["/bin/sh", "-c", "printf '%s|' \"$TERM_PROGRAM\"; pwd"],
             Some("/tmp"),
-            &[("TERM_PROGRAM", "jterm4-test")],
+            &[("TERM_PROGRAM", "forge-test")],
         )
         .expect("spawn PTY child");
         let fd = pty.master_fd_raw();
@@ -1027,8 +1027,8 @@ mod tests {
             if read > 0 {
                 output.extend_from_slice(&buffer[..read as usize]);
                 if output
-                    .windows(b"jterm4-test|/tmp".len())
-                    .any(|window| window == b"jterm4-test|/tmp")
+                    .windows(b"forge-test|/tmp".len())
+                    .any(|window| window == b"forge-test|/tmp")
                 {
                     break;
                 }
@@ -1046,8 +1046,8 @@ mod tests {
 
         assert!(
             output
-                .windows(b"jterm4-test|/tmp".len())
-                .any(|window| window == b"jterm4-test|/tmp"),
+                .windows(b"forge-test|/tmp".len())
+                .any(|window| window == b"forge-test|/tmp"),
             "unexpected PTY output: {:?}",
             String::from_utf8_lossy(&output)
         );
@@ -1064,7 +1064,7 @@ mod tests {
     /// application down with it.
     #[test]
     fn a_vanished_working_directory_falls_back_to_the_application_directory() {
-        let missing = format!("/tmp/jterm4-removed-worktree-{}", std::process::id());
+        let missing = format!("/tmp/forge-removed-worktree-{}", std::process::id());
         assert!(!Path::new(&missing).exists(), "test path must not exist");
         let application_directory = std::env::current_dir().expect("process working directory");
         let expected = application_directory.as_os_str().as_bytes();
@@ -1091,7 +1091,7 @@ mod tests {
             "an ordinary directory must still be handed to fchdir"
         );
         assert!(
-            open_working_directory(Some("/tmp/jterm4-unmounted-drive")).is_none(),
+            open_working_directory(Some("/tmp/forge-unmounted-drive")).is_none(),
             "a path that disappeared after the probe must not fail the spawn"
         );
     }
@@ -1102,7 +1102,7 @@ mod tests {
         assert_eq!(usable_working_directory(Some("")), None);
         assert_eq!(usable_working_directory(Some("/tmp")), Some("/tmp"));
         assert_eq!(
-            usable_working_directory(Some("/tmp/jterm4-removed-worktree")),
+            usable_working_directory(Some("/tmp/forge-removed-worktree")),
             None
         );
     }

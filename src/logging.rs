@@ -1,6 +1,6 @@
 //! Lightweight stderr logging with target-aware `RUST_LOG` directives.
 //!
-//! jterm4 intentionally avoids a larger logging dependency in its startup path,
+//! forge intentionally avoids a larger logging dependency in its startup path,
 //! but still supports the common `target=level` syntax used by Rust tooling.
 
 use log::{LevelFilter, Log, Metadata, Record};
@@ -111,7 +111,7 @@ fn parse_log_filter(input: &str) -> LogFilter {
 }
 
 pub(crate) fn init_logging() {
-    let filter = std::env::var("JTERM4_LOG")
+    let filter = std::env::var("FORGE_LOG")
         .or_else(|_| std::env::var("RUST_LOG"))
         .ok()
         .as_deref()
@@ -136,18 +136,18 @@ mod tests {
     #[test]
     fn parses_plain_log_level() {
         let filter = parse_log_filter("debug");
-        assert_eq!(filter.level_for("jterm4::state"), LevelFilter::Debug);
+        assert_eq!(filter.level_for("forge::state"), LevelFilter::Debug);
         assert_eq!(filter.max_level(), LevelFilter::Debug);
     }
 
     #[test]
     fn most_specific_target_directive_wins() {
-        let filter = parse_log_filter("info,jterm4=debug,jterm4::state=trace");
+        let filter = parse_log_filter("info,forge=debug,forge::state=trace");
         assert_eq!(filter.level_for("dependency"), LevelFilter::Info);
-        assert_eq!(filter.level_for("jterm4::ui"), LevelFilter::Debug);
-        assert_eq!(filter.level_for("jterm4::state"), LevelFilter::Trace);
+        assert_eq!(filter.level_for("forge::ui"), LevelFilter::Debug);
+        assert_eq!(filter.level_for("forge::state"), LevelFilter::Trace);
         assert_eq!(
-            filter.level_for("jterm4::state::restore"),
+            filter.level_for("forge::state::restore"),
             LevelFilter::Trace
         );
         assert_eq!(filter.max_level(), LevelFilter::Trace);
@@ -155,13 +155,13 @@ mod tests {
 
     #[test]
     fn later_duplicate_directive_replaces_earlier_value() {
-        let filter = parse_log_filter("warn,jterm4=info,jterm4=trace");
-        assert_eq!(filter.level_for("jterm4::pty"), LevelFilter::Trace);
+        let filter = parse_log_filter("warn,forge=info,forge=trace");
+        assert_eq!(filter.level_for("forge::pty"), LevelFilter::Trace);
     }
 
     #[test]
     fn invalid_directives_fall_back_to_warn() {
-        let filter = parse_log_filter("jterm4=loud,other=noisy");
-        assert_eq!(filter.level_for("jterm4::state"), LevelFilter::Warn);
+        let filter = parse_log_filter("forge=loud,other=noisy");
+        assert_eq!(filter.level_for("forge::state"), LevelFilter::Warn);
     }
 }

@@ -1,12 +1,12 @@
-# jterm4 Architecture
+# forge Architecture
 
 ## Process entry and headless commands
 
-`src/bin/jterm4.rs` is intentionally tiny and delegates to the library application. `src/cli.rs` handles help, version, human/JSON config validation and diagnostics, config initialization/backup recovery, shell-integration output, and launch overrides before GTK initialization. Headless operations therefore remain usable over SSH and in CI. A normal launch enters `src/main.rs`, which builds the libadwaita application and the shared `UiState`.
+`src/bin/forge.rs` is intentionally tiny and delegates to the library application. `src/cli.rs` handles help, version, human/JSON config validation and diagnostics, config initialization/backup recovery, shell-integration output, and launch overrides before GTK initialization. Headless operations therefore remain usable over SSH and in CI. A normal launch enters `src/main.rs`, which builds the libadwaita application and the shared `UiState`.
 
 ## Terminal models
 
-jterm4 has two explicit terminal models:
+forge has two explicit terminal models:
 
 - **VTE mode** attaches a GTK VTE widget directly to a PTY and supports conventional split panes.
 - **Block mode**, the default, owns its PTY and reader lifecycle in `TermView`, parses shell integration markers, and renders commands and output as searchable finished blocks plus one live terminal.
@@ -43,12 +43,12 @@ notifications through a single `host` module backed by
 `flatpak-spawn --host --watch-bus`. Cwd and selected environment values are
 encoded as argv options before process creation, so VTE and Block PTYs share the
 same explicit host boundary and cleanup rules. The stable application ID is
-`io.github.beamiter.jterm4`.
+`io.github.beamiter.forge`.
 
 The Flatpak is intentionally granted host filesystem and command access because a
 terminal emulator is not a command sandbox. That authority is documented and
 validated rather than hidden behind a package that only works inside its own
-container. Runtime assets live under `/app/share/jterm4`; explicit environment
+container. Runtime assets live under `/app/share/forge`; explicit environment
 paths make them discoverable without copying examples into user data.
 
 ## Configuration and observability

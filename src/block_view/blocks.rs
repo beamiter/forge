@@ -1600,7 +1600,7 @@ impl FinishedBlock {
         let output_widget: gtk4::Widget = output_box.clone().upcast::<gtk4::Widget>();
         content.append(&output_box);
 
-        // Kitty graphics (jterm1 parity): append each decoded texture as a
+        // Kitty graphics (anvil parity): append each decoded texture as a
         // Picture under the text output. Pictures preserve aspect ratio inside
         // a max-height bound so a tall plot doesn't push the next block
         // off-screen; one shared box lets the collapse chevron hide them
@@ -2223,7 +2223,7 @@ pub(crate) struct ActiveBlock {
     /// mid-command must not narrow the grid and SIGWINCH the child.
     pub(crate) live_scrollbar: gtk4::Scrollbar,
     /// Raw output bytes accumulated during CollectingOutput, consumed by the
-    /// finalize path to build the styled finished block (jterm1's `out_buf`).
+    /// finalize path to build the styled finished block (anvil's `out_buf`).
     raw_output: Rc<RefCell<BoundedByteRing>>,
 }
 
@@ -2318,7 +2318,7 @@ impl ActiveBlock {
         (self.active_vte.column_count().max(20)) as usize
     }
 
-    /// Reset the live VTE for the next prompt (jterm1 block.rs:1028-1044). `reset`
+    /// Reset the live VTE for the next prompt (anvil block.rs:1028-1044). `reset`
     /// acts immediately, but already-queued feed() bytes are processed async, so the
     /// in-stream clear (fed after them) wipes stale output in the correct order.
     ///

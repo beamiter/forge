@@ -1,0 +1,123 @@
+app-id: io.github.beamiter.forge
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: forge
+
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=ssh-auth
+  - --device=dri
+  - --filesystem=host
+  - --talk-name=org.freedesktop.Flatpak
+  - --env=FORGE_ASSET_DIR=/app/share/forge
+  - --env=FORGE_WORKFLOW_DIR=/app/share/forge/workflows
+
+cleanup:
+  - /bin/vte-2.91-gtk4
+  - /include
+  - /lib/cmake
+  - /lib/pkgconfig
+  - /share/doc
+  - /share/gir-1.0
+  - /share/gtk-doc
+  - /share/man
+  - /share/pkgconfig
+  - /share/vala
+  - '*.a'
+  - '*.la'
+
+modules:
+  - name: fast_float
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_INSTALL_LIBDIR=lib
+    sources:
+      - type: git
+        url: https://github.com/fastfloat/fast_float.git
+        tag: v8.2.5
+        commit: 05087a303dad9c98768b33c829d398223a649bc6
+        x-checker-data:
+          type: anitya
+          project-id: 214353
+          tag-template: v$version
+
+  - name: simdutf
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_INSTALL_LIBDIR=lib
+    sources:
+      - type: git
+        url: https://github.com/simdutf/simdutf.git
+        tag: v9.0.0
+        commit: ca7acbcea967b5dcbab490066e99e3a6e6925539
+        x-checker-data:
+          type: anitya
+          project-id: 378662
+          tag-template: v$version
+
+  - name: vte
+    buildsystem: meson
+    config-opts:
+      - --buildtype=release
+      - --libdir=lib
+      - -Dgtk3=false
+      - -Dgtk4=true
+      - -Dglade=false
+      - -Dgir=false
+      - -Dvapi=false
+    sources:
+      - type: archive
+        url: https://download.gnome.org/sources/vte/0.84/vte-0.84.0.tar.xz
+        sha256: 0414e31583836aeb7878da25f67c515f7e8879917ecc37c92e26b83e8d8fc3e3
+        x-checker-data:
+          type: gnome
+          version-scheme: odd-minor-is-unstable
+          name: vte
+
+  - name: forge
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/forge/cargo
+        CARGO_NET_OFFLINE: 'true'
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml --verbose
+      - cargo build --offline --release --all-features --locked
+      - install -Dm0755 target/release/forge ${FLATPAK_DEST}/bin/forge
+      - install -Dm0755 scripts/support-bundle.sh ${FLATPAK_DEST}/bin/forge-support-bundle
+      - install -Dm0644 LICENSE-MIT ${FLATPAK_DEST}/share/licenses/io.github.beamiter.forge/LICENSE-MIT
+      - install -Dm0644 LICENSE-APACHE ${FLATPAK_DEST}/share/licenses/io.github.beamiter.forge/LICENSE-APACHE
+      - install -Dm0644 data/io.github.beamiter.forge.desktop ${FLATPAK_DEST}/share/applications/io.github.beamiter.forge.desktop
+      - install -Dm0644 data/io.github.beamiter.forge.metainfo.xml ${FLATPAK_DEST}/share/metainfo/io.github.beamiter.forge.metainfo.xml
+      - install -Dm0644 data/io.github.beamiter.forge.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.github.beamiter.forge.svg
+      - install -Dm0644 data/io.github.beamiter.forge-128.png ${FLATPAK_DEST}/share/icons/hicolor/128x128/apps/io.github.beamiter.forge.png
+      - install -Dm0644 data/io.github.beamiter.forge-256.png ${FLATPAK_DEST}/share/icons/hicolor/256x256/apps/io.github.beamiter.forge.png
+      - install -Dm0644 scripts/shell-integration/README.md ${FLATPAK_DEST}/share/forge/shell-integration/README.md
+      - install -Dm0644 scripts/shell-integration/forge.bash ${FLATPAK_DEST}/share/forge/shell-integration/forge.bash
+      - install -Dm0644 scripts/shell-integration/forge.zsh ${FLATPAK_DEST}/share/forge/shell-integration/forge.zsh
+      - install -Dm0644 scripts/shell-integration/forge.fish ${FLATPAK_DEST}/share/forge/shell-integration/forge.fish
+      - install -Dm0644 scripts/shell-integration/forge.ps1 ${FLATPAK_DEST}/share/forge/shell-integration/forge.ps1
+      - install -Dm0644 scripts/workflows/git-feature.yaml ${FLATPAK_DEST}/share/forge/workflows/git-feature.yaml
+      - install -Dm0644 scripts/workflows/find-large-files.yaml ${FLATPAK_DEST}/share/forge/workflows/find-large-files.yaml
+      - install -Dm0644 scripts/workflows/git-rebase-interactive.yaml ${FLATPAK_DEST}/share/forge/workflows/git-rebase-interactive.yaml
+      - install -Dm0644 scripts/workflows/ssh-tunnel.yaml ${FLATPAK_DEST}/share/forge/workflows/ssh-tunnel.yaml
+      - install -Dm0644 scripts/workflows/docker-tail-logs.yaml ${FLATPAK_DEST}/share/forge/workflows/docker-tail-logs.yaml
+      - install -Dm0644 scripts/workflows/kill-port.yaml ${FLATPAK_DEST}/share/forge/workflows/kill-port.yaml
+      - install -Dm0644 scripts/notebooks/welcome.jtnb.md ${FLATPAK_DEST}/share/forge/notebooks/welcome.jtnb.md
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - .git
+          - .flatpak-builder
+          - flatpak-build
+          - flatpak-repo
+          - target
+      - cargo-sources.json

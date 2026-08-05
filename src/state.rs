@@ -389,11 +389,11 @@ fn rename_noreplace_in_directory(directory: &File, source: &Path, target: &Path)
 }
 
 fn window_state_directory() -> PathBuf {
-    glib::user_config_dir().join("jterm4").join("windows")
+    glib::user_config_dir().join("forge").join("windows")
 }
 
 fn legacy_tabs_state_file_path() -> PathBuf {
-    glib::user_config_dir().join("jterm4").join("tabs.state")
+    glib::user_config_dir().join("forge").join("tabs.state")
 }
 
 fn window_state_paths() -> &'static WindowStatePaths {
@@ -1348,7 +1348,7 @@ pub(crate) fn load_tabs_state() -> (Option<u32>, Vec<(Option<String>, PaneLayout
     (current_page, tabs)
 }
 
-/// Publish this process's active snapshot for a future jterm4 window. Active
+/// Publish this process's active snapshot for a future forge window. Active
 /// snapshots are deliberately invisible to other running instances.
 pub(crate) fn finalize_tabs_state() {
     if WINDOW_STATE_FINALIZED.swap(true, Ordering::AcqRel) {
@@ -1401,7 +1401,7 @@ pub(crate) fn tab_label_text(notebook: &Notebook, widget: &gtk4::Widget) -> Opti
 /// running.
 ///
 /// Deliberately not a [`crate::process::ChildLifecycle`] question: this pid
-/// belongs to another jterm4 window, never to a child of this process, so
+/// belongs to another forge window, never to a child of this process, so
 /// nothing on this path may ever signal it — not even signal 0. A `/proc` probe
 /// answers the only thing snapshot recovery asks, and anything short of a
 /// definitely-vanished process counts as alive so a live window's snapshot is
@@ -1716,7 +1716,7 @@ mod tests {
 
     fn temporary_state_dir(test_name: &str) -> PathBuf {
         let directory =
-            std::env::temp_dir().join(format!("jterm4-{test_name}-{}", generate_session_id()));
+            std::env::temp_dir().join(format!("forge-{test_name}-{}", generate_session_id()));
         fs::create_dir_all(&directory).unwrap();
         directory
     }

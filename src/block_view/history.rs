@@ -805,7 +805,7 @@ fn atomic_write_in_directory(
     }
 
     // Persist the directory entry as well as the file contents. Directory
-    // syncing is supported on the Unix platforms jterm4 targets.
+    // syncing is supported on the Unix platforms forge targets.
     parent_directory.sync_all()
 }
 
@@ -1631,7 +1631,7 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "jterm4-history-{name}-{}-{unique}",
+                "forge-history-{name}-{}-{unique}",
                 std::process::id()
             ));
             fs::create_dir_all(&path).unwrap();
@@ -1920,8 +1920,8 @@ mod tests {
     fn expands_only_home_slash_prefix() {
         let home = Path::new("/home/tester");
         assert_eq!(
-            expand_home_prefix_with("~/.local/share/jterm4/history", Some(home)),
-            home.join(".local/share/jterm4/history")
+            expand_home_prefix_with("~/.local/share/forge/history", Some(home)),
+            home.join(".local/share/forge/history")
         );
         assert_eq!(expand_home_prefix_with("~", Some(home)), PathBuf::from("~"));
         assert_eq!(
@@ -2013,13 +2013,13 @@ mod tests {
     fn per_session_paths_are_distinct_per_tab_and_filename_safe() {
         // Regression: every tab used to save to the configured path verbatim,
         // so concurrent tabs overwrote each other's history on close.
-        let base = Path::new("/state/jterm4/blocks.bin");
+        let base = Path::new("/state/forge/blocks.bin");
         let first = per_session_history_path(base, "747026-1784511309421544366");
         let second = per_session_history_path(base, "747026-1784511391784501255");
         assert_ne!(first, second);
         assert_eq!(
             first,
-            PathBuf::from("/state/jterm4/blocks-747026-1784511309421544366.bin")
+            PathBuf::from("/state/forge/blocks-747026-1784511309421544366.bin")
         );
 
         assert_eq!(
@@ -2029,13 +2029,13 @@ mod tests {
         // Ids round-trip through the user-editable window snapshot.
         assert_eq!(
             per_session_history_path(base, "../../etc/passwd"),
-            PathBuf::from("/state/jterm4/blocks-..~2F..~2Fetc~2Fpasswd.bin")
+            PathBuf::from("/state/forge/blocks-..~2F..~2Fetc~2Fpasswd.bin")
         );
     }
 
     #[test]
     fn session_filename_encoding_avoids_replacement_collisions_and_name_amplification() {
-        let base = Path::new("/state/jterm4/blocks.bin");
+        let base = Path::new("/state/forge/blocks.bin");
         assert_ne!(
             per_session_history_path(base, "a/b"),
             per_session_history_path(base, "a?b")

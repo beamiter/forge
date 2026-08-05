@@ -50,7 +50,7 @@ jobs:
       - name: Build and verify bundle
         run: |
           cargo build --release --all-features --locked
-          bash scripts/package-release.sh target/release/jterm4
+          bash scripts/package-release.sh target/release/forge
           (cd target/dist && sha256sum --check *.sha256)
 
       - name: Publish GitHub release
@@ -65,6 +65,6 @@ jobs:
           else
             gh release create "${GITHUB_REF_NAME}" "${assets[@]}" \
               --verify-tag --generate-notes \
-              --title "jterm4 ${GITHUB_REF_NAME#v}"
+              --title "forge ${GITHUB_REF_NAME#v}"
           fi
 

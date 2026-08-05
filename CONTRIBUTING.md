@@ -1,4 +1,4 @@
-# Contributing to jterm4
+# Contributing to forge
 
 ## Development setup
 
@@ -43,7 +43,7 @@ Never commit tokens, private hostnames, personal paths, captured terminal output
 
 ## Licensing
 
-jterm4 is distributed under the `MIT OR Apache-2.0` dual license. Unless a
+forge is distributed under the `MIT OR Apache-2.0` dual license. Unless a
 contribution is conspicuously marked otherwise before it is accepted, submitting
 it for inclusion means that you license that contribution under the same terms,
 without additional restrictions. Contributors must have the right to submit the

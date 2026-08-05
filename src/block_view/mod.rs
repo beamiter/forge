@@ -102,7 +102,7 @@ impl CommandPromptStatus {
                 "The pinned Block prompt is still initializing. Wait for the shell prompt, then try again."
             }
             Self::ShellIntegrationUnavailable => {
-                "Shell integration is not active, so jterm4 cannot safely verify an idle prompt. Load the jterm4 shell integration and open a new shell."
+                "Shell integration is not active, so forge cannot safely verify an idle prompt. Load the forge shell integration and open a new shell."
             }
         }
     }
@@ -516,9 +516,9 @@ fn resolve_command_for_block(meta: &CommandMeta, reconstructed: &str) -> String 
     String::new()
 }
 
-/// jterm4 truncates a multiline payload to its first line when the shell has not
+/// forge truncates a multiline payload to its first line when the shell has not
 /// advertised DECSET 2004, instead of letting every embedded newline execute a
-/// line. A per-app product choice, not a bug; jterm2/jterm3 send verbatim.
+/// line. A per-app product choice, not a bug; ember/frost send verbatim.
 const UNBRACKETED_MULTILINE: UnbracketedMultiline = UnbracketedMultiline::FirstLineOnly;
 
 fn paste_modes(bracketed_paste: bool) -> PasteModes {
@@ -974,7 +974,7 @@ fn build_keyboard_query_reply(
         KeyboardProtocolQuery::SecondaryDeviceAttributes => "\x1b[>0;0;0c".to_string(),
         KeyboardProtocolQuery::TertiaryDeviceAttributes => "\x1bP!|00000000\x1b\\".to_string(),
         KeyboardProtocolQuery::XtVersion => {
-            format!("\x1bP>|jterm4 {}\x1b\\", env!("CARGO_PKG_VERSION"))
+            format!("\x1bP>|forge {}\x1b\\", env!("CARGO_PKG_VERSION"))
         }
         KeyboardProtocolQuery::DeviceStatus => "\x1b[0n".to_string(),
         KeyboardProtocolQuery::CursorPosition => format!(
@@ -1555,7 +1555,7 @@ pub struct TermView {
     block_list: gtk4::Box,
     jump_fab: gtk4::Button,
     unread_count: Rc<Cell<u32>>,
-    /// The single persistent live VTE (jterm1 model): prompt + typing + output all
+    /// The single persistent live VTE (anvil model): prompt + typing + output all
     /// render here natively; finished commands snapshot into styled blocks above.
     active_vte: Terminal,
     active: Rc<RefCell<ActiveBlock>>,
@@ -1671,7 +1671,7 @@ struct ReaderCtx {
     /// The live VTE — every byte is fed here; alt-screen toggles feed it 1049h/l.
     active_vte: Terminal,
     bstate_rc: Rc<Cell<BlockState>>,
-    /// State to restore when an alt-screen app exits (jterm1 model).
+    /// State to restore when an alt-screen app exits (anvil model).
     prev_state_rc: Rc<Cell<BlockState>>,
     osc133_depth_rc: Rc<Cell<u32>>,
     prompt_buf_rc: Rc<RefCell<String>>,
@@ -2059,7 +2059,7 @@ impl ReaderCtx {
                                         let preserve =
                                             config_for_cb.borrow().preserve_live_scrollback;
                                         active_rc.borrow().reset_active(preserve);
-                                        // Match jterm1's reset_active: half-uploaded
+                                        // Match anvil's reset_active: half-uploaded
                                         // kitty chunks and undisplayed images do not
                                         // survive into the next command.
                                         kitty_assembler_rc.borrow_mut().reset();
@@ -2911,7 +2911,7 @@ impl ReaderCtx {
                             cmd_running_rc.set(true);
                             bstate_rc.set(BlockState::CollectingOutput);
                             typed_cmd_rc.borrow_mut().clear();
-                            // Match jterm1's block-mode runtime model: keep the
+                            // Match anvil's block-mode runtime model: keep the
                             // active VTE as the live surface while the command
                             // runs, then snapshot it into a finished block on the
                             // next prompt. Interactive CLIs such as Codex rely on
@@ -3139,8 +3139,8 @@ impl ReaderCtx {
                                 let outcome = kitty_assembler_rc.borrow_mut().feed(payload);
                                 // Answer before consuming the outcome: clients
                                 // like `kitten icat` block on the `i=`-keyed
-                                // OK/error reply (jterm2's responder semantics;
-                                // jterm1 never answers).
+                                // OK/error reply (ember's responder semantics;
+                                // anvil never answers).
                                 if let Some(reply) = kitty_graphics::response_for(payload, &outcome)
                                 {
                                     if let Err(error) = pty_for_init.write_bytes(&reply) {
@@ -3499,7 +3499,7 @@ fn running_root_control_bytes(
 }
 
 /// Captures the handles the live-VTE key handler needs. With the VTE owning line
-/// editing + IME natively (jterm1 model), this is reduced to a Capture-phase
+/// editing + IME natively (anvil model), this is reduced to a Capture-phase
 /// navigation / copy-paste / block-selection handler; printable keys and editing
 /// fall through to the VTE.
 struct KeyCtx {
@@ -3948,7 +3948,7 @@ impl TermView {
         let argv: Vec<&str> = argv_vec.iter().map(String::as_str).collect();
 
         // Only this pane's own variables belong here. `TERM_PROGRAM` (which the
-        // documented `[[ $TERM_PROGRAM == jterm4 ]] && source ...` rc gate reads)
+        // documented `[[ $TERM_PROGRAM == forge ]] && source ...` rc gate reads)
         // and the `LESS=R` pager default come from `child_env` inside the PTY
         // spawner, so the fork site and the Flatpak host bridge cannot drift.
         let mut env_extra: Vec<(&str, &str)> = Vec::new();
@@ -3994,7 +3994,7 @@ impl TermView {
         block_scroll.set_focusable(false);
 
         // Active block: a single persistent live VTE pinned at the bottom of the
-        // block list. Prompt + typing + output all render here natively (jterm1
+        // block list. Prompt + typing + output all render here natively (anvil
         // model); finished commands snapshot into styled blocks above it.
         let active = Rc::new(RefCell::new(ActiveBlock::new(config)));
         let active_vte = active.borrow().active_vte.clone();
@@ -4108,7 +4108,7 @@ impl TermView {
         // (kill_all_terminal_children, tab close) terminates exactly the same
         // child this pane owns — through the same handle, so a close and this
         // pane's own drop cannot produce two escalations. Unlike a
-        // conventional pane, this child was forked by jterm4 itself and is
+        // conventional pane, this child was forked by forge itself and is
         // reaped here, which the shared lifecycle records.
         crate::terminal::set_terminal_child_lifecycle(&active_vte, pty.lifecycle());
 
@@ -4287,7 +4287,7 @@ impl TermView {
             });
         }
 
-        // State to restore when an alt-screen app exits (jterm1 model).
+        // State to restore when an alt-screen app exits (anvil model).
         let prev_state: Rc<Cell<BlockState>> = Rc::new(Cell::new(BlockState::Idle));
         let osc133_depth: Rc<Cell<u32>> = Rc::new(Cell::new(0));
         let prompt_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
@@ -4852,7 +4852,7 @@ impl TermView {
         // ── VTE is used as a display-only widget (fed via feed() in alt-screen mode)
         //    so we do NOT attach it to the PTY. Our reader thread handles all I/O.
 
-        // ── Live VTE input → PTY (jterm1 model) ───────────────────────────
+        // ── Live VTE input → PTY (anvil model) ───────────────────────────
         // The active VTE has input_enabled(true), so it translates keystrokes and
         // owns IME natively; its `commit` signal carries the bytes to send. We
         // forward them to the PTY and, while awaiting a command, reconstruct the
@@ -5707,7 +5707,7 @@ impl TermView {
     }
 
     pub fn scroll_lines(&self, lines: i32) {
-        // Ctrl+Up enters jterm1/Warp-style block selection at the newest block.
+        // Ctrl+Up enters anvil/Warp-style block selection at the newest block.
         {
             let finished = self.finished_blocks.borrow();
             if (lines < 0 || self.selected_block_id.get().is_some())
@@ -6759,7 +6759,7 @@ mod tests {
 
         let version = build_keyboard_query_reply(KeyboardProtocolQuery::XtVersion, 0, 0);
         assert!(version.contains(env!("CARGO_PKG_VERSION")));
-        assert!(version.starts_with("\x1bP>|jterm4 "));
+        assert!(version.starts_with("\x1bP>|forge "));
         assert!(version.ends_with("\x1b\\"));
     }
 

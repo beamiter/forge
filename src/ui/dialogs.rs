@@ -1225,7 +1225,7 @@ impl UiState {
 
         let block_compact_row = adw::SwitchRow::builder()
             .title("Compact Block Spacing")
-            .subtitle("Use the denser jterm1/Warp-style layout for new Block panes")
+            .subtitle("Use the denser anvil/Warp-style layout for new Block panes")
             .active(config.block_compact)
             .build();
         group.add(&block_compact_row);
@@ -1242,7 +1242,7 @@ impl UiState {
                 crate::config::TerminalMode::Vte => 1,
             })
             .build();
-        let safe_mode = std::env::var_os("JTERM4_SAFE_MODE").is_some();
+        let safe_mode = std::env::var_os("FORGE_SAFE_MODE").is_some();
         terminal_mode_row.set_sensitive(!safe_mode);
         terminal_group.add(&terminal_mode_row);
 
@@ -2203,7 +2203,7 @@ impl UiState {
     }
 
     /// Workflows palette — fuzzy-filterable list of saved command
-    /// templates from `~/.config/jterm4/workflows/`. Enter on a row
+    /// templates from `~/.config/forge/workflows/`. Enter on a row
     /// either writes the command directly (no args) or opens an
     /// args-entry dialog. Same toggle-to-close model as the other
     /// palettes: re-pressing Ctrl+Shift+M with the palette open closes it.

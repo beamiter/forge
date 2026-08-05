@@ -1,14 +1,14 @@
 # Flatpak packaging and host integration
 
-jterm4's Flatpak application ID is `io.github.beamiter.jterm4`. The manifest is
-`packaging/flatpak/io.github.beamiter.jterm4.yml` and targets the GNOME 50
+forge's Flatpak application ID is `io.github.beamiter.forge`. The manifest is
+`packaging/flatpak/io.github.beamiter.forge.yml` and targets the GNOME 50
 runtime. Cargo dependencies are pinned by the committed
 `packaging/flatpak/cargo-sources.json` generated from `Cargo.lock`.
 
 ## Why a host bridge is required
 
 A terminal emulator is useful only when its shell and command-line tools operate
-on the user's host environment. Inside Flatpak, jterm4 therefore launches shells,
+on the user's host environment. Inside Flatpak, forge therefore launches shells,
 SSH, Git metadata probes, `curl`, and `notify-send` through
 `flatpak-spawn --host --watch-bus`. Native installations continue to execute
 those programs directly. Both paths use the same PTY, backpressure, input, and
@@ -28,12 +28,12 @@ The manifest requests:
 - `--talk-name=org.freedesktop.Flatpak` for `flatpak-spawn --host`.
 - SSH agent and network access for remote sessions and the optional AI/Agent UI.
 
-OSC 52 clipboard writes remain disabled by jterm4 unless the user explicitly
+OSC 52 clipboard writes remain disabled by forge unless the user explicitly
 enables them. AI-bound terminal text is still redacted by default.
 
 The package installs shell integration, example workflows, and the welcome
-notebook below `/app/share/jterm4`. `JTERM4_ASSET_DIR` and
-`JTERM4_WORKFLOW_DIR` are fixed to those read-only package paths so built-in
+notebook below `/app/share/forge`. `FORGE_ASSET_DIR` and
+`FORGE_WORKFLOW_DIR` are fixed to those read-only package paths so built-in
 content is available without copying it into the user's writable data area.
 User workflows in the per-app config directory continue to take precedence.
 
@@ -43,13 +43,13 @@ mount namespace. Load the embedded script through the installed application ID
 instead. For bash, add this to the host `~/.bashrc`:
 
 ```bash
-if [[ $TERM_PROGRAM == jterm4 ]]; then
-    source <(flatpak run io.github.beamiter.jterm4 --shell-integration bash)
+if [[ $TERM_PROGRAM == forge ]]; then
+    source <(flatpak run io.github.beamiter.forge --shell-integration bash)
 fi
 ```
 
 Use `zsh` in the command for `~/.zshrc`. Fish can use
-`flatpak run io.github.beamiter.jterm4 --shell-integration fish | source` inside
+`flatpak run io.github.beamiter.forge --shell-integration fish | source` inside
 the equivalent `TERM_PROGRAM` guard. The child environment is set before the rc
 file is read, for both Block and VTE backends.
 
@@ -62,10 +62,10 @@ flatpak remote-add --user --if-not-exists flathub \
   https://dl.flathub.org/repo/flathub.flatpakrepo
 flatpak-builder --user --install-deps-from=flathub --force-clean \
   --disable-rofiles-fuse --repo=flatpak-repo flatpak-build \
-  packaging/flatpak/io.github.beamiter.jterm4.yml
-flatpak build-bundle flatpak-repo io.github.beamiter.jterm4.flatpak \
-  io.github.beamiter.jterm4
-sha256sum io.github.beamiter.jterm4.flatpak
+  packaging/flatpak/io.github.beamiter.forge.yml
+flatpak build-bundle flatpak-repo io.github.beamiter.forge.flatpak \
+  io.github.beamiter.forge
+sha256sum io.github.beamiter.forge.flatpak
 ```
 
 CI regenerates the Cargo source manifest, validates the desktop and AppStream
@@ -75,17 +75,17 @@ and Block modes under headless X11 and Wayland sessions.
 ## Install and diagnose
 
 ```bash
-flatpak --user install ./io.github.beamiter.jterm4.flatpak
-flatpak run io.github.beamiter.jterm4 --doctor
-flatpak run --command=jterm4-support-bundle io.github.beamiter.jterm4 "$PWD"
-flatpak run io.github.beamiter.jterm4
+flatpak --user install ./io.github.beamiter.forge.flatpak
+flatpak run io.github.beamiter.forge --doctor
+flatpak run --command=forge-support-bundle io.github.beamiter.forge "$PWD"
+flatpak run io.github.beamiter.forge
 ```
 
 The support archive command performs no network requests and records neither
 host paths nor terminal/configuration contents. Review its files before sharing.
 
 Flatpak applications do not automatically inherit arbitrary host environment
-variables. To use AI, provide `JTERM4_AI_API_KEY` or the selected provider's
+variables. To use AI, provide `FORGE_AI_API_KEY` or the selected provider's
 `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `OLLAMA_API_KEY` through a trusted
 launcher or an explicit Flatpak override. Alternatively, set
 `ai_api_key_file` to an owner-only file visible inside the sandbox (normally
@@ -106,5 +106,5 @@ and foreground-process inspection can only see the sandbox-side
 process names or current-directory recovery. This does not affect command I/O.
 
 The project is distributed under `MIT OR Apache-2.0`. The Flatpak installs both
-canonical license texts below `/app/share/licenses/io.github.beamiter.jterm4/`,
+canonical license texts below `/app/share/licenses/io.github.beamiter.forge/`,
 and the AppStream `project_license` field uses the same SPDX expression.

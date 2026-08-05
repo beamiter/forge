@@ -26,7 +26,7 @@ use crate::ui::{self, UiState};
 
 /// GApplication receives only a program name. All real launch arguments are
 /// consumed by `cli::handle_early_args` before GTK is initialized.
-const GTK_APPLICATION_ARGV: [&str; 1] = ["jterm4"];
+const GTK_APPLICATION_ARGV: [&str; 1] = ["forge"];
 const TAB_SWITCH_FOCUS_STABLE_FRAMES: u8 = 2;
 const TAB_SWITCH_FOCUS_MAX_FRAMES: u8 = 16;
 
@@ -55,7 +55,7 @@ fn shortcut_modifiers(state: ModifierType) -> ModifierType {
 /// - Only the masked Ctrl/Shift/Alt modifiers participate; Super chords are
 ///   not offered on this frontend.
 /// - Keypad keysyms (`KP_*`) are excluded rather than folded onto the main
-///   row — jterm4 has never matched chords on the numpad, and `KP_Enter`
+///   row — forge has never matched chords on the numpad, and `KP_Enter`
 ///   stays distinct from `Return` (the AI-composer veto above the lookup
 ///   handles both explicitly).
 /// - Letters and symbols go through `Key::to_unicode()` and are lowercased,
@@ -345,7 +345,7 @@ fn init_input_method_env() {
 
 pub fn run() -> glib::ExitCode {
     jterm_core::identity::init(jterm_core::identity::AppIdentity {
-        app_name: "jterm4",
+        app_name: "forge",
         app_id: crate::host::APP_ID,
         // This crate's version, not core's: it is what child shells read as
         // TERM_PROGRAM_VERSION, so a tool feature-gating on the
@@ -389,7 +389,7 @@ pub fn run() -> glib::ExitCode {
             .application(app)
             .default_width(800)
             .default_height(600)
-            .title("jterm4")
+            .title("forge")
             .name("win_name")
             .modal(false)
             .resizable(true)
@@ -763,7 +763,7 @@ pub fn run() -> glib::ExitCode {
         sidebar.append(&sidebar_switcher);
         sidebar.append(&sidebar_stack);
         // Older configs have no explicit visibility key. `load_config` derives
-        // their initial state from tab placement, matching jterm1: top-bar tabs
+        // their initial state from tab placement, matching anvil: top-bar tabs
         // start with the optional file sidebar closed.
         sidebar.set_visible(config.borrow().sidebar_visible);
 
@@ -1037,7 +1037,7 @@ pub fn run() -> glib::ExitCode {
             && launch.execute.is_none();
         // One-shot `--execute` windows and safe mode must not overwrite the
         // user's interactive workspace. `--no-restore` still starts a new
-        // persistable workspace, matching jterm1.
+        // persistable workspace, matching anvil.
         let session_persistence = launch.execute.is_none() && !launch.safe_mode;
 
         // Atomically claim one ready window snapshot only when this launch did
@@ -1635,7 +1635,7 @@ pub fn run() -> glib::ExitCode {
 
     // All user-facing options were parsed and consumed by `handle_early_args`
     // before GTK initialisation.  Passing the process argv to GApplication a
-    // second time makes it reject jterm4-specific launch options such as
+    // second time makes it reject forge-specific launch options such as
     // `--no-restore`, `--safe-mode`, `--mode`, `-d`, and `-e`.  Give GTK only a
     // stable program name; the validated values are already captured above in
     // `launch_options`.
@@ -1699,7 +1699,7 @@ mod tests {
 
         #[test]
         fn keypad_keysyms_are_not_folded_onto_the_main_row() {
-            // jterm4 has never matched chords on the numpad; keep that
+            // forge has never matched chords on the numpad; keep that
             // until the family folds numpad digits at every frontend.
             assert_eq!(chord_from_gdk(Key::KP_1, CTRL), None);
             assert_eq!(chord_from_gdk(Key::KP_Enter, CTRL), None);
@@ -1720,7 +1720,7 @@ mod tests {
         // Keep this assertion beside the GApplication boundary.  Launch
         // options belong exclusively to cli::handle_early_args and must never
         // be forwarded for a second parse.
-        assert_eq!(super::GTK_APPLICATION_ARGV, ["jterm4"]);
+        assert_eq!(super::GTK_APPLICATION_ARGV, ["forge"]);
         assert_eq!(super::GTK_APPLICATION_ARGV.len(), 1);
     }
 

@@ -8,7 +8,7 @@
 
 mod common;
 
-use jterm4::parser::{Parser, ParserConfig, ParserEvent};
+use forge::parser::{Parser, ParserConfig, ParserEvent};
 
 fn feed_all(p: &mut Parser, data: &[u8]) -> Vec<ParserEvent> {
     let mut events = Vec::new();

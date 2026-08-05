@@ -30,7 +30,7 @@ struct TabLaunch {
 }
 
 type TitleChangedCallback = Box<dyn Fn(&str)>;
-const CUSTOM_TITLE_DATA: &str = "jterm4-custom-title";
+const CUSTOM_TITLE_DATA: &str = "forge-custom-title";
 
 fn tab_num_for_widget(widget: &gtk4::Widget) -> Option<u32> {
     widget
@@ -972,7 +972,7 @@ impl UiState {
         let argv = crate::config::build_remote_argv(host);
         // Remote tabs use Block so OSC 7/133/7770 metadata, command results and
         // reconnect session identifiers are observed consistently, matching
-        // jterm1 even when local tabs default to conventional VTE.
+        // anvil even when local tabs default to conventional VTE.
         let terminal_mode = crate::config::TerminalMode::Block;
         log::info!(
             "[remote] connecting to {} (attempt {})",

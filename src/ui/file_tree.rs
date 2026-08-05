@@ -96,7 +96,7 @@ where
         .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "file-tree scan limit reached"))?;
     let (tx, rx) = mpsc::sync_channel(1);
     if let Err(error) = std::thread::Builder::new()
-        .name("jterm4-file-tree-scan".to_string())
+        .name("forge-file-tree-scan".to_string())
         .spawn(move || {
             let _active = ActiveScan;
             let _ = tx.send(scan_dir(&dir));
@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn directory_scan_has_a_hard_entry_limit() {
         let root = std::env::temp_dir().join(format!(
-            "jterm4-file-tree-limit-{}-{}",
+            "forge-file-tree-limit-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

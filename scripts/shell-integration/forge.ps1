@@ -1,17 +1,17 @@
-# jterm4 shell integration for Windows PowerShell 5+ and pwsh 7+.
+# forge shell integration for Windows PowerShell 5+ and pwsh 7+.
 # Source from $PROFILE, for example:
-#   if ($env:TERM_PROGRAM -eq 'jterm4') { . /path/to/jterm4.ps1 }
+#   if ($env:TERM_PROGRAM -eq 'forge') { . /path/to/forge.ps1 }
 
-if ($script:__jterm4_loaded) { return }
-$script:__jterm4_loaded = $true
-$script:__jterm4_in_cmd = $false
-$script:__jterm4_orig_prompt = ${function:prompt}
+if ($script:__forge_loaded) { return }
+$script:__forge_loaded = $true
+$script:__forge_in_cmd = $false
+$script:__forge_orig_prompt = ${function:prompt}
 
-function __jterm4_osc($payload) {
+function __forge_osc($payload) {
     "$([char]27)]${payload}$([char]7)"
 }
 
-function __jterm4_report_cwd_seq {
+function __forge_report_cwd_seq {
     $path = (Get-Location).ProviderPath
     $hostName = if ($env:COMPUTERNAME) {
         $env:COMPUTERNAME
@@ -32,7 +32,7 @@ function __jterm4_report_cwd_seq {
             [void]$sb.AppendFormat('%{0:X2}', $b)
         }
     }
-    __jterm4_osc "7;file://${hostName}$($sb.ToString())"
+    __forge_osc "7;file://${hostName}$($sb.ToString())"
 }
 
 function global:prompt {
@@ -41,22 +41,22 @@ function global:prompt {
     $ec = if ($dollarQ) { 0 } elseif ($lastEC) { $lastEC } else { 1 }
 
     $pre = ''
-    if ($script:__jterm4_in_cmd) {
-        $pre += __jterm4_osc "133;D;$ec"
-        $script:__jterm4_in_cmd = $false
+    if ($script:__forge_in_cmd) {
+        $pre += __forge_osc "133;D;$ec"
+        $script:__forge_in_cmd = $false
     }
-    $pre += __jterm4_report_cwd_seq
-    $pre += __jterm4_osc "133;A"
+    $pre += __forge_report_cwd_seq
+    $pre += __forge_osc "133;A"
     $title = "$($env:USERNAME)@$([System.Net.Dns]::GetHostName()):$(Get-Location)"
     $pre += "$([char]27)]2;${title}$([char]7)"
 
     $orig = ''
     try {
-        $orig = & $script:__jterm4_orig_prompt
+        $orig = & $script:__forge_orig_prompt
     } catch {
         $orig = "PS $(Get-Location)> "
     }
-    $post = __jterm4_osc "133;B"
+    $post = __forge_osc "133;B"
 
     $global:LASTEXITCODE = $lastEC
     if (-not $dollarQ) {
@@ -72,8 +72,8 @@ if (Get-Module -ListAvailable PSReadLine) {
         $cursor = $null
         [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
         if ($line -and $line.Trim().Length -gt 0) {
-            [Console]::Write($(__jterm4_osc "133;C"))
-            $script:__jterm4_in_cmd = $true
+            [Console]::Write($(__forge_osc "133;C"))
+            $script:__forge_in_cmd = $true
         }
         [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine($key, $arg)
     }
@@ -83,11 +83,11 @@ if (Get-Module -ListAvailable PSReadLine) {
         $cursor = $null
         [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
         if ($line -and $line.Trim().Length -gt 0) {
-            [Console]::Write($(__jterm4_osc "133;C"))
-            $script:__jterm4_in_cmd = $true
+            [Console]::Write($(__forge_osc "133;C"))
+            $script:__forge_in_cmd = $true
         }
         [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine($key, $arg)
     }
 }
 
-$env:TERM_PROGRAM = 'jterm4'
+$env:TERM_PROGRAM = 'forge'

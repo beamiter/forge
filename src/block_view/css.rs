@@ -875,7 +875,7 @@ mod tests {
 
     fn test_root(label: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "jterm4-css-{label}-{}-{}",
+            "forge-css-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

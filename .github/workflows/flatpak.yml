@@ -33,7 +33,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  APP_ID: io.github.beamiter.jterm4
+  APP_ID: io.github.beamiter.forge
   CARGO_GENERATOR_COMMIT: 737c0085912f9f7dabf9341d4608e2a77a51a73a
 
 jobs:
@@ -63,8 +63,8 @@ jobs:
 
       - name: Enable full AppStream compose diagnostics
         run: |
-          mkdir -p "${RUNNER_TEMP}/jterm4-ci-bin"
-          cat > "${RUNNER_TEMP}/jterm4-ci-bin/appstreamcli" <<'EOF'
+          mkdir -p "${RUNNER_TEMP}/forge-ci-bin"
+          cat > "${RUNNER_TEMP}/forge-ci-bin/appstreamcli" <<'EOF'
           #!/bin/sh
           if [ "${1:-}" = "compose" ]; then
             shift
@@ -72,8 +72,8 @@ jobs:
           fi
           exec /usr/bin/appstreamcli "$@"
           EOF
-          chmod 0755 "${RUNNER_TEMP}/jterm4-ci-bin/appstreamcli"
-          echo "${RUNNER_TEMP}/jterm4-ci-bin" >> "${GITHUB_PATH}"
+          chmod 0755 "${RUNNER_TEMP}/forge-ci-bin/appstreamcli"
+          echo "${RUNNER_TEMP}/forge-ci-bin" >> "${GITHUB_PATH}"
 
       - name: Verify generated Cargo sources
         id: cargo_sources
@@ -161,10 +161,10 @@ jobs:
           set -o pipefail
           {
             flatpak --user remote-add --if-not-exists --no-gpg-verify \
-              jterm4-ci "file://${PWD}/flatpak-repo"
-            flatpak --user install -y jterm4-ci ${APP_ID}
+              forge-ci "file://${PWD}/flatpak-repo"
+            flatpak --user install -y forge-ci ${APP_ID}
             flatpak run --command=sh ${APP_ID} -c \
-              'test -s /app/share/licenses/io.github.beamiter.jterm4/LICENSE-MIT && test -s /app/share/licenses/io.github.beamiter.jterm4/LICENSE-APACHE'
+              'test -s /app/share/licenses/io.github.beamiter.forge/LICENSE-MIT && test -s /app/share/licenses/io.github.beamiter.forge/LICENSE-APACHE'
             flatpak run ${APP_ID} --version
             # The Flatpak host bridge uses flatpak-spawn over the session bus.
             # Run headless diagnostics inside a bus even when no display exists.
@@ -191,10 +191,10 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: jterm4-flatpak-${{ github.sha }}
+          name: forge-flatpak-${{ github.sha }}
           path: |
-            io.github.beamiter.jterm4.flatpak
-            io.github.beamiter.jterm4.flatpak.sha256
+            io.github.beamiter.forge.flatpak
+            io.github.beamiter.forge.flatpak.sha256
             cargo-sources-verify.log
             flatpak-build.log
             flatpak-install.log

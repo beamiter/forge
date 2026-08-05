@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Debug helper script for jterm4
+# Debug helper script for forge
 
 set -e
 
@@ -7,51 +7,51 @@ CMD="${1:-info}"
 
 case "$CMD" in
     info)
-        echo "🔍 jterm4 Debug Information"
+        echo "🔍 forge Debug Information"
         echo "==========================="
         echo ""
         echo "📂 Paths:"
-        echo "   Config: ~/.config/jterm4/config.toml"
-        echo "   State: ~/.config/jterm4/tabs.state"
-        echo "   Binary: $(which jterm4 2>/dev/null || echo 'Not in PATH')"
+        echo "   Config: ~/.config/forge/config.toml"
+        echo "   State: ~/.config/forge/tabs.state"
+        echo "   Binary: $(which forge 2>/dev/null || echo 'Not in PATH')"
         echo ""
         echo "📊 State File:"
-        if [ -f ~/.config/jterm4/tabs.state ]; then
-            echo "   Size: $(wc -c < ~/.config/jterm4/tabs.state) bytes"
-            echo "   Lines: $(wc -l < ~/.config/jterm4/tabs.state)"
+        if [ -f ~/.config/forge/tabs.state ]; then
+            echo "   Size: $(wc -c < ~/.config/forge/tabs.state) bytes"
+            echo "   Lines: $(wc -l < ~/.config/forge/tabs.state)"
             echo "   Content:"
-            cat ~/.config/jterm4/tabs.state | head -10 | sed 's/^/      /'
+            cat ~/.config/forge/tabs.state | head -10 | sed 's/^/      /'
         else
             echo "   (No state file)"
         fi
         echo ""
         echo "⚙️  Config File:"
-        if [ -f ~/.config/jterm4/config.toml ]; then
+        if [ -f ~/.config/forge/config.toml ]; then
             echo "   Exists: Yes"
-            echo "   Mode: $(grep '^terminal_mode' ~/.config/jterm4/config.toml || echo 'default')"
-            echo "   Theme: $(grep '^theme' ~/.config/jterm4/config.toml || echo 'default')"
+            echo "   Mode: $(grep '^terminal_mode' ~/.config/forge/config.toml || echo 'default')"
+            echo "   Theme: $(grep '^theme' ~/.config/forge/config.toml || echo 'default')"
         else
             echo "   (No config file - using defaults)"
         fi
         echo ""
         echo "🔧 Running Processes:"
-        ps aux | grep jterm4 | grep -v grep || echo "   (No jterm4 processes)"
+        ps aux | grep forge | grep -v grep || echo "   (No forge processes)"
         ;;
 
     logs)
-        echo "📜 Running jterm4 with debug logs..."
-        JTERM4_LOG=debug target/release/jterm4
+        echo "📜 Running forge with debug logs..."
+        FORGE_LOG=debug target/release/forge
         ;;
 
     trace)
-        echo "🔬 Running jterm4 with trace logs..."
-        JTERM4_LOG=trace target/release/jterm4
+        echo "🔬 Running forge with trace logs..."
+        FORGE_LOG=trace target/release/forge
         ;;
 
     state)
         echo "📊 Current State File:"
-        if [ -f ~/.config/jterm4/tabs.state ]; then
-            cat ~/.config/jterm4/tabs.state
+        if [ -f ~/.config/forge/tabs.state ]; then
+            cat ~/.config/forge/tabs.state
         else
             echo "(No state file)"
         fi
@@ -59,8 +59,8 @@ case "$CMD" in
 
     clean-state)
         echo "🧹 Cleaning state file..."
-        if [ -f ~/.config/jterm4/tabs.state ]; then
-            rm ~/.config/jterm4/tabs.state
+        if [ -f ~/.config/forge/tabs.state ]; then
+            rm ~/.config/forge/tabs.state
             echo "✅ State file removed"
         else
             echo "No state file to remove"
@@ -70,7 +70,7 @@ case "$CMD" in
     reset-config)
         echo "🔄 Resetting config to defaults..."
         if [ -f config.toml.example ]; then
-            cp config.toml.example ~/.config/jterm4/config.toml
+            cp config.toml.example ~/.config/forge/config.toml
             echo "✅ Config reset to defaults"
         else
             echo "❌ config.toml.example not found"
@@ -79,13 +79,13 @@ case "$CMD" in
 
     valgrind)
         echo "🔬 Running with valgrind..."
-        valgrind --leak-check=full --show-leak-kinds=all target/release/jterm4
+        valgrind --leak-check=full --show-leak-kinds=all target/release/forge
         ;;
 
     strace)
         echo "🔍 Running with strace..."
-        strace -o /tmp/jterm4-strace.log target/release/jterm4
-        echo "Trace saved to /tmp/jterm4-strace.log"
+        strace -o /tmp/forge-strace.log target/release/forge
+        echo "Trace saved to /tmp/forge-strace.log"
         ;;
 
     *)

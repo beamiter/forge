@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn history_palette_rejects_visual_spoofing_and_bounds_labels() {
         let path = std::env::temp_dir().join(format!(
-            "jterm4-palette-history-{}-{}.jsonl",
+            "forge-palette-history-{}-{}.jsonl",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

@@ -1,7 +1,7 @@
 //! Local compatibility wrapper for the review-input contract in the next
 //! jterm_core release.
 //!
-//! jterm4 exact-pins a published core revision, so keep the size and visual
+//! forge exact-pins a published core revision, so keep the size and visual
 //! spoofing checks here until that release can be advanced without depending on
 //! unpublished workspace state.
 

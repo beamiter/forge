@@ -2533,7 +2533,7 @@ mod tests {
         use std::os::unix::fs::{symlink, PermissionsExt};
 
         let root = std::env::temp_dir().join(format!(
-            "jterm4-agent-snapshot-{}-{}",
+            "forge-agent-snapshot-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2584,7 +2584,7 @@ mod tests {
         use std::sync::{Arc, Barrier};
 
         let root = std::env::temp_dir().join(format!(
-            "jterm4-agent-snapshot-race-{}-{}",
+            "forge-agent-snapshot-race-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2636,7 +2636,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
-            "jterm4-agent-snapshot-abandon-{}-{}",
+            "forge-agent-snapshot-abandon-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2672,7 +2672,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
-            "jterm4-agent-snapshot-invalid-{}-{}",
+            "forge-agent-snapshot-invalid-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

@@ -1,9 +1,9 @@
-//! App-side keybinding table: jterm4's `Action` set and its default
+//! App-side keybinding table: forge's `Action` set and its default
 //! chords.
 //!
 //! The chord type itself — grammar, parsing, display and canonical
 //! spelling — lives in [`jterm_core::keybindings`] and is shared by the
-//! whole jterm family. This module only maps chords to jterm4 actions.
+//! whole jterm family. This module only maps chords to forge actions.
 //! Translating GTK key events into [`Chord`]s (ISO_Left_Tab folding,
 //! modifier-mask extraction, keypad handling) is the frontend's job and
 //! lives beside the window key controller in `main.rs`.
@@ -69,7 +69,7 @@ pub(crate) enum Action {
     JumpToPrevPinned,
     JumpToNextPinned,
     /// Write every block of the active pane's session to a timestamped
-    /// Markdown / JSON file under the jterm4 data directory.
+    /// Markdown / JSON file under the forge data directory.
     ExportSessionMarkdown,
     ExportSessionJson,
     ToggleDebugDashboard,
@@ -543,7 +543,7 @@ mod tests {
             Action::FilterPinnedBlocks,
             Action::JumpToPrevPinned,
             Action::JumpToNextPinned,
-            // jterm1 leaves session export chordless too; both GTK terminals
+            // anvil leaves session export chordless too; both GTK terminals
             // reach it from the command palette only.
             Action::ExportSessionMarkdown,
             Action::ExportSessionJson,
@@ -582,9 +582,9 @@ mod tests {
     }
 
     /// Family contract: every row of `jterm_core`'s DEFAULT_CHORDS that
-    /// maps onto a jterm4 action must be bound to exactly that chord in
+    /// maps onto a forge action must be bound to exactly that chord in
     /// the default map. The mapping is total on purpose — a new
-    /// CommonAction variant fails to compile here until jterm4 decides
+    /// CommonAction variant fails to compile here until forge decides
     /// what it means locally.
     #[test]
     fn family_default_chord_contract_is_honored() {
@@ -596,7 +596,7 @@ mod tests {
                 CommonAction::ClosePaneOrTab => Action::ClosePaneOrTab,
                 CommonAction::Copy => Action::Copy,
                 CommonAction::Paste => Action::Paste,
-                // jterm4 binds both ctrl+tab and ctrl+pagedown to the same
+                // forge binds both ctrl+tab and ctrl+pagedown to the same
                 // local next/prev actions.
                 CommonAction::NextTab | CommonAction::NextTabPage => Action::NextTab,
                 CommonAction::PrevTab | CommonAction::PrevTabPage => Action::PrevTab,
@@ -732,7 +732,7 @@ mod tests {
             ("Ctrl+Shift+L", Action::FilterTabs),
             ("Ctrl+Shift+X", Action::FilterFailedBlocks),
             ("Ctrl+Shift+N", Action::ClearBlockFilter),
-            // jterm1/Warp block actions.
+            // anvil/Warp block actions.
             ("Ctrl+Shift+A", Action::SelectAllBlocks),
             ("Ctrl+Shift+I", Action::ReinputSelectedCommands),
             ("Ctrl+Shift+K", Action::ClearBlocks),
@@ -759,7 +759,7 @@ mod tests {
         }
     }
 
-    /// Shared ergonomic contract used by jterm1..4. Project-specific actions
+    /// Shared ergonomic contract used by anvil..4. Project-specific actions
     /// may add chords, but these common actions must never drift again.
     #[test]
     fn common_default_chord_table() {
@@ -910,7 +910,7 @@ mod tests {
         assert_eq!(map.lookup(&new), Some(Action::ScrollUp));
     }
 
-    /// Session export ships chordless like jterm1's, so the TOML keys are the
+    /// Session export ships chordless like anvil's, so the TOML keys are the
     /// only way a user can put it on a chord — and the command palette is the
     /// only way to reach it otherwise. Both halves are wiring that a rename
     /// could silently break.
@@ -950,7 +950,7 @@ mod tests {
         );
     }
 
-    /// The shared grammar deliberately widens what jterm4 used to accept:
+    /// The shared grammar deliberately widens what forge used to accept:
     /// `control`/`option` modifier aliases and case-insensitive named
     /// symbols all parse now, so overrides written for any jterm work here.
     #[test]
@@ -1009,7 +1009,7 @@ mod tests {
 
     /// All shared unbind tokens work as string values, including the
     /// "unbind" spelling `jterm_core::is_unbind_token` adds on top of the
-    /// historical jterm4 set (empty/"none"/"disabled").
+    /// historical forge set (empty/"none"/"disabled").
     #[test]
     fn string_unbind_tokens_disable_a_binding() {
         for token in ["", "none", "Disabled", "unbind", "false"] {
@@ -1023,7 +1023,7 @@ mod tests {
     }
 
     #[test]
-    fn jterm1_block_action_defaults_are_not_shadowed() {
+    fn anvil_block_action_defaults_are_not_shadowed() {
         let map = KeybindingMap::from_defaults();
         let cases = [
             ("Ctrl+Shift+A", Action::SelectAllBlocks),

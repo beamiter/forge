@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Remove jterm4 while preserving user configuration and state by default.
+# Remove forge while preserving user configuration and state by default.
 
 set -Eeuo pipefail
 
-APP_ID="io.github.beamiter.jterm4"
+APP_ID="io.github.beamiter.forge"
 HOME_DIR="${HOME:-}"
 DESTDIR="${DESTDIR:-}"
 PREFIX="${HOME_DIR}/.local"
@@ -18,7 +18,7 @@ Usage: uninstall.sh [options]
 Options:
   --prefix PATH          Runtime prefix (default: ~/.local)
   --bin-dir PATH         Runtime binary directory (overrides --prefix)
-  --purge-config         Also remove jterm4 config and default XDG state
+  --purge-config         Also remove forge config and default XDG state
   --dry-run              Print commands without changing files
   -h, --help             Show this help
 
@@ -30,7 +30,7 @@ USAGE
 }
 
 die() {
-    printf 'jterm4 uninstall: %s\n' "$*" >&2
+    printf 'forge uninstall: %s\n' "$*" >&2
     exit 1
 }
 
@@ -115,35 +115,41 @@ if [[ -n "${DESTDIR}" ]]; then
     DESTDIR="${DESTDIR%/}"
 fi
 
-remove_file "${DESTDIR}${BIN_DIR}/jterm4"
-remove_file "${DESTDIR}${BIN_DIR}/jterm4-support-bundle"
+remove_file "${DESTDIR}${BIN_DIR}/forge"
+remove_file "${DESTDIR}${BIN_DIR}/forge-support-bundle"
 SHARE_DIR="${DESTDIR}${PREFIX}/share"
 remove_file "${SHARE_DIR}/applications/${APP_ID}.desktop"
 remove_file "${SHARE_DIR}/metainfo/${APP_ID}.metainfo.xml"
 remove_file "${SHARE_DIR}/icons/hicolor/scalable/apps/${APP_ID}.svg"
 remove_file "${SHARE_DIR}/icons/hicolor/128x128/apps/${APP_ID}.png"
 remove_file "${SHARE_DIR}/icons/hicolor/256x256/apps/${APP_ID}.png"
-remove_file "${SHARE_DIR}/jterm4/shell-integration/README.md"
-remove_file "${SHARE_DIR}/jterm4/shell-integration/jterm4.bash"
-remove_file "${SHARE_DIR}/jterm4/shell-integration/jterm4.zsh"
-remove_file "${SHARE_DIR}/jterm4/shell-integration/jterm4.fish"
-remove_file "${SHARE_DIR}/jterm4/shell-integration/jterm4.ps1"
-remove_file "${SHARE_DIR}/jterm4/workflows/git-feature.yaml"
-remove_file "${SHARE_DIR}/jterm4/workflows/find-large-files.yaml"
-remove_file "${SHARE_DIR}/jterm4/workflows/git-rebase-interactive.yaml"
-remove_file "${SHARE_DIR}/jterm4/workflows/ssh-tunnel.yaml"
-remove_file "${SHARE_DIR}/jterm4/workflows/docker-tail-logs.yaml"
-remove_file "${SHARE_DIR}/jterm4/workflows/kill-port.yaml"
-remove_file "${SHARE_DIR}/jterm4/notebooks/welcome.jtnb.md"
-remove_file "${SHARE_DIR}/doc/jterm4/README.md"
-remove_file "${SHARE_DIR}/doc/jterm4/config.toml.example"
-remove_file "${SHARE_DIR}/doc/jterm4/Cargo.lock"
-remove_file "${SHARE_DIR}/doc/jterm4/BUILDINFO"
-remove_dir_if_empty "${SHARE_DIR}/jterm4/shell-integration"
-remove_dir_if_empty "${SHARE_DIR}/jterm4/workflows"
-remove_dir_if_empty "${SHARE_DIR}/jterm4/notebooks"
-remove_dir_if_empty "${SHARE_DIR}/jterm4"
-remove_dir_if_empty "${SHARE_DIR}/doc/jterm4"
+# Desktop integration from before the jterm4 -> forge rename.
+remove_file "${SHARE_DIR}/applications/io.github.beamiter.jterm4.desktop"
+remove_file "${SHARE_DIR}/metainfo/io.github.beamiter.jterm4.metainfo.xml"
+remove_file "${SHARE_DIR}/icons/hicolor/scalable/apps/io.github.beamiter.jterm4.svg"
+remove_file "${SHARE_DIR}/icons/hicolor/128x128/apps/io.github.beamiter.jterm4.png"
+remove_file "${SHARE_DIR}/icons/hicolor/256x256/apps/io.github.beamiter.jterm4.png"
+remove_file "${SHARE_DIR}/forge/shell-integration/README.md"
+remove_file "${SHARE_DIR}/forge/shell-integration/forge.bash"
+remove_file "${SHARE_DIR}/forge/shell-integration/forge.zsh"
+remove_file "${SHARE_DIR}/forge/shell-integration/forge.fish"
+remove_file "${SHARE_DIR}/forge/shell-integration/forge.ps1"
+remove_file "${SHARE_DIR}/forge/workflows/git-feature.yaml"
+remove_file "${SHARE_DIR}/forge/workflows/find-large-files.yaml"
+remove_file "${SHARE_DIR}/forge/workflows/git-rebase-interactive.yaml"
+remove_file "${SHARE_DIR}/forge/workflows/ssh-tunnel.yaml"
+remove_file "${SHARE_DIR}/forge/workflows/docker-tail-logs.yaml"
+remove_file "${SHARE_DIR}/forge/workflows/kill-port.yaml"
+remove_file "${SHARE_DIR}/forge/notebooks/welcome.jtnb.md"
+remove_file "${SHARE_DIR}/doc/forge/README.md"
+remove_file "${SHARE_DIR}/doc/forge/config.toml.example"
+remove_file "${SHARE_DIR}/doc/forge/Cargo.lock"
+remove_file "${SHARE_DIR}/doc/forge/BUILDINFO"
+remove_dir_if_empty "${SHARE_DIR}/forge/shell-integration"
+remove_dir_if_empty "${SHARE_DIR}/forge/workflows"
+remove_dir_if_empty "${SHARE_DIR}/forge/notebooks"
+remove_dir_if_empty "${SHARE_DIR}/forge"
+remove_dir_if_empty "${SHARE_DIR}/doc/forge"
 
 # Without this the launcher keeps offering a dead entry and a cached icon.
 if [[ -z "${DESTDIR}" ]] && ((DRY_RUN == 0)); then
@@ -162,19 +168,19 @@ fi
 if ((PURGE_CONFIG == 1)); then
     CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME_DIR}/.config}"
     [[ "${CONFIG_HOME}" == /* ]] || die "XDG_CONFIG_HOME must be an absolute path"
-    CONFIG_DIR="${DESTDIR}${CONFIG_HOME}/jterm4"
+    CONFIG_DIR="${DESTDIR}${CONFIG_HOME}/forge"
     if [[ -e "${CONFIG_DIR}" ]]; then
         run rm -rf -- "${CONFIG_DIR}"
     else
-        printf 'Config/state directory not present: %s\n' "${CONFIG_HOME}/jterm4"
+        printf 'Config/state directory not present: %s\n' "${CONFIG_HOME}/forge"
     fi
     STATE_HOME="${XDG_STATE_HOME:-${HOME_DIR}/.local/state}"
     [[ "${STATE_HOME}" == /* ]] || die "XDG_STATE_HOME must be an absolute path"
-    STATE_DIR="${DESTDIR}${STATE_HOME}/jterm4"
+    STATE_DIR="${DESTDIR}${STATE_HOME}/forge"
     if [[ -e "${STATE_DIR}" ]]; then
         run rm -rf -- "${STATE_DIR}"
     else
-        printf 'Default state directory not present: %s\n' "${STATE_HOME}/jterm4"
+        printf 'Default state directory not present: %s\n' "${STATE_HOME}/forge"
     fi
 else
     printf 'Preserved config and state. Use --purge-config to remove them.\n'

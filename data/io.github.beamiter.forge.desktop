@@ -1,21 +1,21 @@
 [Desktop Entry]
 Type=Application
-Name=jterm4
+Name=forge
 GenericName=Terminal Emulator
 Comment=Session-aware GTK4 terminal with structured command blocks
-Exec=jterm4
-TryExec=jterm4
-Icon=io.github.beamiter.jterm4
+Exec=forge
+TryExec=forge
+Icon=io.github.beamiter.forge
 Terminal=false
 Categories=System;TerminalEmulator;
 Keywords=terminal;shell;command;developer;ssh;blocks;workflow;notebook;AI;
 StartupNotify=true
-# GTK4 derives the X11 WM_CLASS from the program name, so this is "jterm4" and
+# GTK4 derives the X11 WM_CLASS from the program name, so this is "forge" and
 # not the application ID; on Wayland the app_id already matches this file's name.
-StartupWMClass=jterm4
+StartupWMClass=forge
 X-GNOME-UsesNotifications=true
 Actions=NewWindow;
 
 [Desktop Action NewWindow]
 Name=New Window
-Exec=jterm4
+Exec=forge

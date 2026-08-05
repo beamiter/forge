@@ -1,6 +1,6 @@
-# jterm4
+# forge
 
-jterm4 是一个面向开发工作流的原生 GTK4 终端。它默认使用 Block 后端，把命令、输出、退出状态和工作目录组织成可搜索的结构化块；需要传统终端语义时也可切换到 VTE 后端。
+forge 是一个面向开发工作流的原生 GTK4 终端。它默认使用 Block 后端，把命令、输出、退出状态和工作目录组织成可搜索的结构化块；需要传统终端语义时也可切换到 VTE 后端。
 
 ## 能力概览
 
@@ -57,11 +57,11 @@ cargo build --release --all-features --locked
 ```bash
 ./scripts/install.sh
 ./scripts/install.sh --backend cargo
-./scripts/install.sh --prefix /opt/jterm4 --no-config
+./scripts/install.sh --prefix /opt/forge --no-config
 ./scripts/install.sh --dry-run
 ```
 
-默认安装到 `~/.local/bin/jterm4`，同时安装 `jterm4-support-bundle`，并把 shell 集成、内置 workflow 和欢迎 Notebook 安装到 `~/.local/share/jterm4/`。配置使用 `0600`。脚本支持 `DESTDIR`、`XDG_CONFIG_HOME` 和 `CARGO_TARGET_DIR`；使用非默认 prefix 时可通过 `JTERM4_ASSET_DIR` / `JTERM4_WORKFLOW_DIR` 指向对应的 `share/jterm4` 目录。卸载默认保留用户配置、状态与历史：
+默认安装到 `~/.local/bin/forge`，同时安装 `forge-support-bundle`，并把 shell 集成、内置 workflow 和欢迎 Notebook 安装到 `~/.local/share/forge/`。配置使用 `0600`。脚本支持 `DESTDIR`、`XDG_CONFIG_HOME` 和 `CARGO_TARGET_DIR`；使用非默认 prefix 时可通过 `FORGE_ASSET_DIR` / `FORGE_WORKFLOW_DIR` 指向对应的 `share/forge` 目录。卸载默认保留用户配置、状态与历史：
 
 ```bash
 ./scripts/uninstall.sh
@@ -70,17 +70,17 @@ cargo build --release --all-features --locked
 
 ### 桌面集成（应用列表里的图标）
 
-`./scripts/install.sh` 默认一并安装桌面集成，无需额外步骤，安装后 jterm4 就会出现在
+`./scripts/install.sh` 默认一并安装桌面集成，无需额外步骤，安装后 forge 就会出现在
 GNOME/KDE 的应用列表里，可以搜索、点击启动、固定到 dock：
 
 | 安装内容 | 位置（默认 prefix） |
 | --- | --- |
-| 启动器条目 | `~/.local/share/applications/io.github.beamiter.jterm4.desktop` |
-| 应用图标 | `~/.local/share/icons/hicolor/{scalable,128x128,256x256}/apps/io.github.beamiter.jterm4.*` |
-| AppStream 元数据 | `~/.local/share/metainfo/io.github.beamiter.jterm4.metainfo.xml` |
+| 启动器条目 | `~/.local/share/applications/io.github.beamiter.forge.desktop` |
+| 应用图标 | `~/.local/share/icons/hicolor/{scalable,128x128,256x256}/apps/io.github.beamiter.forge.*` |
+| AppStream 元数据 | `~/.local/share/metainfo/io.github.beamiter.forge.metainfo.xml` |
 
 安装时脚本会把 `Exec=` / `TryExec=` 改写成二进制的绝对路径（系统 prefix 如 `/usr` 除外），
-因为桌面会话的 `PATH` 在登录时就固定了：若 `~/.local/bin` 不在其中，`TryExec=jterm4`
+因为桌面会话的 `PATH` 在登录时就固定了：若 `~/.local/bin` 不在其中，`TryExec=forge`
 会失败并让条目**整个从应用列表中消失**——这是"装好了却找不到图标"最常见的原因。
 随后脚本会校验条目并刷新 `update-desktop-database` 与 `gtk-update-icon-cache`（陈旧的图标
 缓存会盖住刚装进去的图标）；`DESTDIR` 打包场景下跳过刷新，交由包管理器处理。
@@ -89,12 +89,12 @@ GNOME/KDE 的应用列表里，可以搜索、点击启动、固定到 dock：
 自检与手动刷新：
 
 ```bash
-desktop-file-validate ~/.local/share/applications/io.github.beamiter.jterm4.desktop
-gtk-launch io.github.beamiter.jterm4          # 按启动器条目实际启动一次
+desktop-file-validate ~/.local/share/applications/io.github.beamiter.forge.desktop
+gtk-launch io.github.beamiter.forge          # 按启动器条目实际启动一次
 ```
 
 图标若一时没刷新，注销重登（或 X11 下 `Alt+F2` → `r` 重启 GNOME Shell）即可。
-Wayland 下窗口按 app_id 与条目关联，X11 下则依赖 `StartupWMClass=jterm4`——GTK4 的
+Wayland 下窗口按 app_id 与条目关联，X11 下则依赖 `StartupWMClass=forge`——GTK4 的
 X11 `WM_CLASS` 取自程序名而非 application ID，写成 application ID 会导致 dock 里出现
 一个没有图标的重复条目。
 
@@ -104,7 +104,7 @@ X11 `WM_CLASS` 取自程序名而非 application ID，写成 application ID 会�
 
 ```bash
 cargo build --release --all-features --locked
-./scripts/package-release.sh target/release/jterm4
+./scripts/package-release.sh target/release/forge
 (cd target/dist && sha256sum --check *.sha256)
 ```
 
@@ -114,18 +114,18 @@ cargo build --release --all-features --locked
 
 ## Flatpak 与桌面集成
 
-项目使用稳定应用 ID `io.github.beamiter.jterm4`，提供 desktop、AppStream、
+项目使用稳定应用 ID `io.github.beamiter.forge`，提供 desktop、AppStream、
 SVG/PNG 图标以及可复现 Flatpak 清单。Flatpak 中的 Shell、SSH、Git、curl
 和通知命令通过 `flatpak-spawn --host` 运行，因此终端操作的是宿主环境而
 不是一次性沙箱；原生安装路径保持直接执行。内置 shell 集成、workflow 和
-欢迎 Notebook 一并安装在 `/app/share/jterm4/`。
+欢迎 Notebook 一并安装在 `/app/share/forge/`。
 
 ```bash
 flatpak-builder --user --install-deps-from=flathub --force-clean \
   --disable-rofiles-fuse --repo=flatpak-repo flatpak-build \
-  packaging/flatpak/io.github.beamiter.jterm4.yml
-flatpak build-bundle flatpak-repo io.github.beamiter.jterm4.flatpak \
-  io.github.beamiter.jterm4
+  packaging/flatpak/io.github.beamiter.forge.yml
+flatpak build-bundle flatpak-repo io.github.beamiter.forge.flatpak \
+  io.github.beamiter.forge
 ```
 
 权限模型、宿主桥接、安全边界、安装命令与已知限制见
@@ -133,43 +133,43 @@ flatpak build-bundle flatpak-repo io.github.beamiter.jterm4.flatpak \
 
 ## 启动与配置
 
-默认配置路径为 `~/.config/jterm4/config.toml`。从完整示例开始：
+默认配置路径为 `~/.config/forge/config.toml`。从完整示例开始：
 
 ```bash
-jterm4 --init-config
-jterm4 --check-config
+forge --init-config
+forge --check-config
 ```
 
 也可使用独立配置：
 
 ```bash
-jterm4 --config ~/my-jterm4.toml
-jterm4 --check-config ~/my-jterm4.toml
+forge --config ~/my-forge.toml
+forge --check-config ~/my-forge.toml
 ```
 
 常用启动覆盖不会修改配置：
 
 ```bash
-jterm4 ~/project
-jterm4 --mode block --no-restore
-jterm4 -d /tmp --execute bash -lc 'printf "hello\\n"'
-jterm4 --safe-mode
+forge ~/project
+forge --mode block --no-restore
+forge -d /tmp --execute bash -lc 'printf "hello\\n"'
+forge --safe-mode
 ```
 
-`--safe-mode` 不读取指定或默认配置，也不采用 `JTERM4_*` 外观/行为覆盖；它使用内置 VTE 主题与默认快捷键，并禁用配置重载、恢复、持久化、远程主机、历史、仓库探测、AI/Agent 与 Notebook 执行，适合排查损坏配置或启动环境。
+`--safe-mode` 不读取指定或默认配置，也不采用 `FORGE_*` 外观/行为覆盖；它使用内置 VTE 主题与默认快捷键，并禁用配置重载、恢复、持久化、远程主机、历史、仓库探测、AI/Agent 与 Notebook 执行，适合排查损坏配置或启动环境。
 
 诊断命令均可在没有图形显示的 SSH/CI 环境运行：
 
 ```bash
-jterm4 --help
-jterm4 --doctor --json       # 同时报告 ready / active 会话快照数量
-jterm4 --check-config --json
-jterm4 --config-path
-jterm4 --restore-config-backup
-jterm4 --print-default-config
-jterm4 --shell-integration bash
-jterm4 --generate-completion zsh
-jterm4-support-bundle ~/Desktop
+forge --help
+forge --doctor --json       # 同时报告 ready / active 会话快照数量
+forge --check-config --json
+forge --config-path
+forge --restore-config-backup
+forge --print-default-config
+forge --shell-integration bash
+forge --generate-completion zsh
+forge-support-bundle ~/Desktop
 ```
 
 `--doctor` 除配置语义和运行时依赖外，还检查配置权限、有效轮换备份、写锁、AI provider/密钥存在性、workflow 搜索位置、欢迎 Notebook、历史和 SSH 就绪度；不会发起网络请求。support bundle 使用额外的脱敏诊断模式，只收集权限/大小、计数、非敏感系统特征和选定环境变量的“存在/不存在”，不包含配置、命令/输出、会话内容、密钥、主机名或本地路径。分享前仍应逐项检查归档内容。
@@ -179,33 +179,33 @@ jterm4-support-bundle ~/Desktop
 日志支持普通级别和标准 target 指令，并输出进程内相对时间、级别与模块名：
 
 ```bash
-JTERM4_LOG=debug jterm4
-RUST_LOG='warn,jterm4=debug,jterm4::state=trace' jterm4
+FORGE_LOG=debug forge
+RUST_LOG='warn,forge=debug,forge::state=trace' forge
 ```
 
-`JTERM4_LOG` 优先于 `RUST_LOG`；未知指令会被忽略，默认级别保持 `warn`。
+`FORGE_LOG` 优先于 `RUST_LOG`；未知指令会被忽略，默认级别保持 `warn`。
 
 CLI 补全可按需加载，支持 bash、zsh、fish 和 PowerShell，不需要额外运行时依赖：
 
 ```bash
 # bash
-source <(jterm4 --generate-completion bash)
+source <(forge --generate-completion bash)
 
 # zsh
-source <(jterm4 --generate-completion zsh)
+source <(forge --generate-completion zsh)
 
 # fish
-jterm4 --generate-completion fish | source
+forge --generate-completion fish | source
 
 # PowerShell
-jterm4 --generate-completion pwsh | Out-String | Invoke-Expression
+forge --generate-completion pwsh | Out-String | Invoke-Expression
 ```
 
-Block 模式可通过 `finished_block_viewport_rows` 调整长块出现顶部/底部导航控件的行数阈值；`block_compact = true` 可启用更接近 jterm1/Warp 的紧凑块间距。两项配置均保持 GTK4 原生实现，不增加运行时依赖。
+Block 模式可通过 `finished_block_viewport_rows` 调整长块出现顶部/底部导航控件的行数阈值；`block_compact = true` 可启用更接近 anvil/Warp 的紧凑块间距。两项配置均保持 GTK4 原生实现，不增加运行时依赖。
 
 ### 安装与更新 jsh
 
-jterm4 优先使用配套 shell [`jsh`](https://github.com/beamiter/jsh)，找不到时才退回 bash。
+forge 优先使用配套 shell [`jsh`](https://github.com/beamiter/jsh)，找不到时才退回 bash。
 命令面板中的 **Install or update jsh** 会在一个独立标签页里运行安装脚本：标签页本身就是进度界面，
 可以 Ctrl+C 中断，脚本结束后等待 Enter 再关闭，失败原因不会一闪而过。
 
@@ -254,12 +254,12 @@ AI provider、model、endpoint 和 API key 均可在 Settings 的 **AI & Agent**
 若希望 Block 准确记录命令边界、退出码和 cwd，可加载内置 shell 集成：
 
 ```bash
-source <(jterm4 --shell-integration bash)
+source <(forge --shell-integration bash)
 ```
 
-也可从已安装的 `share/jterm4/shell-integration/` 加载 bash、zsh、fish 或 PowerShell 脚本。
+也可从已安装的 `share/forge/shell-integration/` 加载 bash、zsh、fish 或 PowerShell 脚本。
 
-Block 模式与 jterm1 保持相同的选择语义：`Ctrl+Up` 从最新块进入选择，`Shift+Up/Down`
+Block 模式与 anvil 保持相同的选择语义：`Ctrl+Up` 从最新块进入选择，`Shift+Up/Down`
 扩展范围，普通 `Up/Down` 移动 active edge，`Enter` 按终端顺序把所有选中命令回填为
 可编辑文本而不执行，`Escape` 取消选择。右键多选区域可批量复制命令、输出或完整块；长 Block 提供顶部/底部跳转与 sticky header，后台异步输出使用独立 Block 样式。
 
@@ -267,7 +267,7 @@ Block 模式与 jterm1 保持相同的选择语义：`Ctrl+Up` 从最新块进�
 
 ## 许可证
 
-jterm4 以 **MIT OR Apache-2.0** 双许可证发布，使用者可任选其一；完整文本见
+forge 以 **MIT OR Apache-2.0** 双许可证发布，使用者可任选其一；完整文本见
 [`LICENSE-MIT`](LICENSE-MIT) 与 [`LICENSE-APACHE`](LICENSE-APACHE)。向本仓库提交
 贡献即表示贡献者同意按相同的双许可证条款授权该贡献。仓库许可与 crates.io 发布
 是两个独立决定，因此 Cargo 包目前仍保留 `publish = false`。
@@ -282,7 +282,7 @@ jterm4 以 **MIT OR Apache-2.0** 双许可证发布，使用者可任选其一�
 - 命令历史只保存 command、cwd、exit code 和完成时间，不保存输出，并限制单条/总文件大小。
 - 每个窗口使用独立的原子会话快照；并发窗口互不覆盖，崩溃遗留快照会在下次启动回收。
 - 配置、会话快照、JSONL 命令历史和 Block 历史使用 owner-only 权限；关键替换路径使用同步写入与原子 rename，降低信息泄露和断电损坏风险。
-- `jterm4-support-bundle` 不读取或打包上述内容，只报告脱敏诊断与文件元数据，并以 `0600` 创建归档。
+- `forge-support-bundle` 不读取或打包上述内容，只报告脱敏诊断与文件元数据，并以 `0600` 创建归档。
 - 项目采用 `MIT OR Apache-2.0` 双许可证；Cargo 包仍有意保留 `publish = false`，不将仓库许可自动等同于 crates.io 发布。依赖继续由每周 RustSec 审计与 Dependabot 检查。
 
 进一步说明见 [用户指南](docs/USER_GUIDE.md)、[架构说明](docs/ARCHITECTURE.md)、[Block 模式验收清单](docs/BLOCK_MODE_ACCEPTANCE.md)、[AI / Agent / Chat 验收矩阵](docs/AI_AGENT_CHAT_ACCEPTANCE.md)、[性能指南](docs/PERFORMANCE.md)、[发布流程](docs/RELEASING.md) 和 [Tailscale/SSH 配置](docs/tailscale-setup.md)。参与开发前请阅读 [贡献指南](CONTRIBUTING.md)、[安全策略](SECURITY.md) 与 [变更日志](CHANGELOG.md)。

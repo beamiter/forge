@@ -28,9 +28,9 @@
 //! 16 MiB encoded per image, 16 MiB decoded, 16 MiB across all in-flight
 //! uploads, and a 16384-pixel edge. Oversize payloads are dropped.
 //!
-//! Unlike jterm1 (which never answers), commands that carry an `i=`/`I=`
+//! Unlike anvil (which never answers), commands that carry an `i=`/`I=`
 //! identifier receive an `OK`/error reply on the PTY via [`response_for`],
-//! following jterm2 — the family's reference responder. See that function for
+//! following ember — the family's reference responder. See that function for
 //! the deliberate divergences.
 
 use gtk4::gdk;
@@ -189,7 +189,7 @@ fn memory_texture(rgba: Vec<u8>, width: u32, height: u32) -> Result<gdk::Texture
 /// Validate an `a=q` support probe. `kitten icat` (and other well-behaved
 /// clients) transmit a tiny sample image with `a=q` and block until the
 /// terminal answers, so probes must be validated — not silently skipped like
-/// jterm1 does. Nothing is buffered or displayed; chunking (`m=`) is ignored
+/// anvil does. Nothing is buffered or displayed; chunking (`m=`) is ignored
 /// because known clients probe in one APC.
 fn query_outcome(command: &core::Command<'_>) -> Outcome {
     if let Err(error) = command.require_direct_transport() {
@@ -277,14 +277,14 @@ impl ReplyKeys {
 }
 
 /// Build the PTY reply owed for a processed APC G payload, or `None` when the
-/// protocol expects silence. Reply semantics follow jterm2, the family's most
+/// protocol expects silence. Reply semantics follow ember, the family's most
 /// complete responder:
 /// - only commands carrying an `i=`/`I=` identifier are answered (the id is
 ///   the client's correlation key; kitty itself stays silent without one);
 /// - `q=1` suppresses `OK`, `q=2` also suppresses errors;
 /// - a non-zero `p=` placement id is echoed back.
 ///
-/// Deliberate divergences from jterm2, kept small because this responder sits
+/// Deliberate divergences from ember, kept small because this responder sits
 /// on top of the shared structural assembler rather than a full placement
 /// table:
 /// - every unsupported-but-well-formed command answers `ENOTSUP` instead of
@@ -475,7 +475,7 @@ mod tests {
 
     #[test]
     fn format_now_defaults_to_rgba_not_png() {
-        // Pre-hoist jterm4 defaulted f= to PNG; the protocol default is RGBA,
+        // Pre-hoist forge defaulted f= to PNG; the protocol default is RGBA,
         // so an f=-less command now means "raw RGBA, s=/v= required".
         assert!(matches!(
             feed(b"Ga=T,i=5,s=1,v=1;AQIDBA=="),

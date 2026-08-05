@@ -512,7 +512,7 @@ impl UiState {
         self.refresh_sidebar_tab_mirror();
     }
 
-    /// Stable-partition pages so pinned tabs lead, matching jterm1 while
+    /// Stable-partition pages so pinned tabs lead, matching anvil while
     /// preserving the relative order within the pinned and unpinned groups.
     /// Keep the same page active across the GTK reorder operation.
     pub(crate) fn reorder_pinned_first(&self) {

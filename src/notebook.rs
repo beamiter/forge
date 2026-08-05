@@ -1231,7 +1231,7 @@ mod tests {
     #[test]
     fn notebook_reader_is_bounded_and_rejects_links() {
         let root = std::env::temp_dir().join(format!(
-            "jterm4-notebook-reader-{}-{}",
+            "forge-notebook-reader-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1263,7 +1263,7 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let fifo = std::env::temp_dir().join(format!(
-            "jterm4-notebook-fifo-{}-{}.jtnb.md",
+            "forge-notebook-fifo-{}-{}.jtnb.md",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

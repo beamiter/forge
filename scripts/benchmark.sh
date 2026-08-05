@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Performance benchmark script for jterm4
+# Performance benchmark script for forge
 
 set -e
 
-echo "📊 jterm4 Performance Benchmark"
+echo "📊 forge Performance Benchmark"
 echo "================================"
 echo ""
 
@@ -13,7 +13,7 @@ nix develop --command bash -c "cargo build --release --locked"
 
 # Binary size
 echo "📦 Binary Size:"
-ls -lh target/release/jterm4 | awk '{print "   ", $5, $9}'
+ls -lh target/release/forge | awk '{print "   ", $5, $9}'
 echo ""
 
 # Headless CLI startup time. This does not claim to measure GTK first-frame time.
@@ -21,7 +21,7 @@ echo "⚡ Headless CLI Startup (10 runs):"
 total=0
 for i in {1..10}; do
     start=$(date +%s%N)
-    target/release/jterm4 --version &> /dev/null
+    target/release/forge --version &> /dev/null
     end=$(date +%s%N)
     elapsed=$((($end - $start) / 1000000))
     total=$(($total + $elapsed))
@@ -31,12 +31,12 @@ avg=$(($total / 10))
 echo "   Average: ${avg}ms"
 echo ""
 
-# Memory usage (if jterm4 is running)
+# Memory usage (if forge is running)
 echo "💾 Memory Usage:"
-if pgrep -x jterm4 > /dev/null; then
-    ps aux | grep jterm4 | grep -v grep | awk '{print "   RSS:", $6/1024, "MB"}'
+if pgrep -x forge > /dev/null; then
+    ps aux | grep forge | grep -v grep | awk '{print "   RSS:", $6/1024, "MB"}'
 else
-    echo "   (jterm4 not running)"
+    echo "   (forge not running)"
 fi
 echo ""
 
