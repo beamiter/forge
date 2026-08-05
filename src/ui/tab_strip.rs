@@ -44,12 +44,12 @@ impl UiState {
         self.refresh_sidebar_tab_mirror();
     }
 
-    /// Show the top-bar tab strip only when tabs live there and more than one
-    /// tab exists. The sidebar itself stays visible (it always offers the file
-    /// tree); use Ctrl+\ to hide it.
+    /// Show the tab strip wherever the placement says it lives — including a
+    /// lone tab in the top bar, so the bar never changes shape as tabs come
+    /// and go and the current tab's title stays on screen. The sidebar itself
+    /// stays visible (it always offers the file tree); use Ctrl+\ to hide it.
     pub(crate) fn sync_tab_bar_visibility(&self) {
         use crate::config::TabPlacement;
-        let show_strip = self.notebook.n_pages() > 1;
         // The sidebar's Tabs page holds both the strip's holder and the
         // mirror; exactly one is shown, decided by where the strip lives, so
         // the page never renders an empty holder or a duplicate list. The
@@ -62,20 +62,19 @@ impl UiState {
                 false
             }
             TabPlacement::TopBar => {
-                self.top_tab_scroll.set_visible(show_strip);
+                self.top_tab_scroll.set_visible(true);
                 self.tab_strip_scroll.set_visible(false);
                 self.sidebar_tab_mirror_scroll.set_visible(true);
-                show_strip
+                true
             }
         };
         // What pins the trailing actions and window controls to the right edge
         // is whichever top-bar child expands. The tab scroller only does that
-        // job while it is visible, and a hidden widget expands nothing: with a
-        // single tab in the top bar the strip is hidden, so without the spacer
-        // taking over, every control collapses back against the left buttons
-        // and the rest of the bar is empty. This is the one place that knows
-        // the strip's real visibility, so it owns the decision for both
-        // placements rather than sharing it with apply_tab_placement.
+        // job while it is visible, and a hidden widget expands nothing, so the
+        // spacer takes over whenever the strip is not in the top bar. This is
+        // the one place that knows the strip's real visibility, so it owns the
+        // decision for both placements rather than sharing it with
+        // apply_tab_placement.
         self.top_spacer.set_hexpand(!top_strip_visible);
         self.refresh_sidebar_tab_mirror();
     }

@@ -27,7 +27,10 @@ struct MirrorRow {
     /// the text, so OSC title updates need no rebuild.
     title: Label,
     pinned: bool,
-    /// False when the tab filter has hidden this tab.
+    /// False when the tab filter has hidden this tab. This is the button's own
+    /// visibility flag, never `is_visible()`: that one also answers for every
+    /// ancestor, so a strip whose holder happens to be hidden would report all
+    /// of its tabs as filtered out and empty the sidebar list.
     visible: bool,
 }
 
@@ -46,7 +49,7 @@ impl UiState {
                         page_name: button.widget_name().to_string(),
                         title,
                         pinned: button.has_css_class("tab-pinned"),
-                        visible: button.is_visible(),
+                        visible: button.get_visible(),
                     });
                 }
             }
