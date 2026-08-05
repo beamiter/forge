@@ -4,6 +4,20 @@ All notable user-visible and operational changes are recorded here.
 
 ## Unreleased
 
+### Added
+
+- 设置面板的 Remote Hosts 现在能**编辑**已保存的主机，不再只有添加和删除。每行新增
+  铅笔按钮，用同一个对话框打开（标题与按钮变成 Edit / Save），条目就地替换，因此在
+  选择器里的位置不变。对话框没有控件的字段——`ssh_args`、`session`、`remote_shell`、
+  `login_shell`、`multiplex`、`deploy_artifact`——原样保留并在对话框里列出，行的副标题
+  也会显示 `ssh_args`：改个名字顺手把 `-p 2222` 删掉，正是事后没人会去核对的那种改动。
+  改名不再和自己撞重名检查；对话框打开期间配置被重新加载时，按名字重新定位条目，找不到
+  就报错而不是悄悄新增一条。
+- 配置文件里完全没有 `remote_hosts` 键时，默认值从空列表改为两条可照抄的示例（一台
+  ssh、一个容器）。空列表看不出这条语法唯一不肯迁就的两点：端口写在 `ssh_args` 里而不是
+  `host = "box:22"`，登录名写在 `user` 里而不是 `host = "root@box"`。显式写出的列表仍
+  然照办，`remote_hosts = []` 也算，所以在面板里删掉后（面板会把该键写回）不会复活。
+
 ### Fixed
 
 - Block 模式下把窗口/分屏拖窄到小于历史块的记录宽度后，整个面板不再在两帧内容之间

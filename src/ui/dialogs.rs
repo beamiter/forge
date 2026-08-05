@@ -17,6 +17,17 @@ use super::*;
 use crate::keybindings::Action;
 use crate::terminal::open_uri;
 
+/// Rebuilds the Remote Hosts rows from the config after it changes. Held in a
+/// cell because the handlers that need to call it (delete confirmations, the
+/// add/edit dialog) are created by the closure that does the rebuilding.
+type RemoteHostsRefresh = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+
+/// Which saved host the host dialog is about to overwrite: its index, plus the
+/// name it had when the dialog opened. The name is what makes the index safe to
+/// act on — the file can be reloaded behind an open dialog, and writing back to
+/// a stale index would silently edit a different host.
+type RemoteHostEditTarget = (usize, String);
+
 impl UiState {
     pub(crate) async fn confirm_close_with_processes(
         window: &adw::ApplicationWindow,
@@ -1641,11 +1652,8 @@ impl UiState {
         });
 
         // --- Remote hosts: rows rebuilt from the model after every change ---
-        // The populate closure is reachable from handlers it creates (delete
-        // confirmations, the add dialog), hence the cell holding it.
-        type PopulateCell = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
         let host_rows: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
-        let populate_cell: PopulateCell = Rc::new(RefCell::new(None));
+        let populate_cell: RemoteHostsRefresh = Rc::new(RefCell::new(None));
         let ui_for_hosts = self.clone();
         let group_for_hosts = remote_group.clone();
         let rows_for_hosts = host_rows.clone();
@@ -1672,7 +1680,13 @@ impl UiState {
                     Some(user) => format!("{user}@{}", host.host),
                     None => host.host.clone(),
                 };
-                let subtitle = format!("{transport} · {target} · deploy {}", host.deploy.as_str());
+                let mut subtitle =
+                    format!("{transport} · {target} · deploy {}", host.deploy.as_str());
+                // The dialog has no widget for these, so say they are there
+                // rather than let an edit look like it silently dropped them.
+                if !host.ssh_args.is_empty() {
+                    subtitle.push_str(&format!(" · ssh_args {}", host.ssh_args.join(" ")));
+                }
                 let row = adw::ActionRow::builder()
                     .title(crate::review_input::safe_inline_display(&host.name, 1024))
                     .subtitle(crate::review_input::safe_inline_display(
@@ -1681,11 +1695,26 @@ impl UiState {
                     ))
                     .build();
                 row.set_use_markup(false);
+                let edit_btn = gtk4::Button::from_icon_name("document-edit-symbolic");
+                edit_btn.add_css_class("flat");
+                edit_btn.set_valign(gtk4::Align::Center);
+                edit_btn.set_tooltip_text(Some("Edit Host"));
+                row.add_suffix(&edit_btn);
                 let delete_btn = gtk4::Button::from_icon_name("user-trash-symbolic");
                 delete_btn.add_css_class("flat");
                 delete_btn.set_valign(gtk4::Align::Center);
                 delete_btn.set_tooltip_text(Some("Remove Host"));
                 row.add_suffix(&delete_btn);
+
+                let ui_for_edit = ui_for_hosts.clone();
+                let populate_for_edit = populate_for_delete.clone();
+                let edit_name = host.name.clone();
+                edit_btn.connect_clicked(move |_| {
+                    ui_for_edit.present_remote_host_dialog(
+                        Some((index, edit_name.clone())),
+                        populate_for_edit.clone(),
+                    );
+                });
 
                 let ui = ui_for_hosts.clone();
                 let populate_ref = populate_for_delete.clone();
@@ -1738,156 +1767,7 @@ impl UiState {
         let ui_for_add = self.clone();
         let populate_for_add = populate_cell;
         add_host_btn.connect_clicked(move |_| {
-            let add_dialog = adw::Dialog::builder()
-                .title("Add Remote Host")
-                .content_width(420)
-                .build();
-
-            let name_row = adw::EntryRow::new();
-            name_row.set_title("Name (optional)");
-            let host_row = adw::EntryRow::new();
-            host_row.set_title("Host / container");
-            let user_row = adw::EntryRow::new();
-            user_row.set_title("User (optional)");
-            let docker_row = adw::SwitchRow::builder()
-                .title("Docker Container")
-                .subtitle("Attach to a running container with docker exec instead of ssh")
-                .build();
-            let deploy_model = gtk4::StringList::new(&["Off", "Persist", "Incognito"]);
-            let deploy_row = adw::ComboRow::builder()
-                .title("Deploy jsh")
-                .subtitle("Put a jsh on the destination for the life of the session")
-                .model(&deploy_model)
-                .build();
-
-            let list = ListBox::new();
-            list.set_selection_mode(gtk4::SelectionMode::None);
-            list.add_css_class("boxed-list");
-            list.append(&name_row);
-            list.append(&host_row);
-            list.append(&user_row);
-            list.append(&docker_row);
-            list.append(&deploy_row);
-
-            let error_label = Label::new(None);
-            error_label.add_css_class("error");
-            error_label.set_wrap(true);
-            error_label.set_xalign(0.0);
-            error_label.set_visible(false);
-
-            let content = gtk4::Box::new(Orientation::Vertical, 12);
-            content.set_margin_start(12);
-            content.set_margin_end(12);
-            content.set_margin_top(12);
-            content.set_margin_bottom(12);
-            content.append(&list);
-            content.append(&error_label);
-
-            let header = adw::HeaderBar::new();
-            header.set_show_start_title_buttons(false);
-            header.set_show_end_title_buttons(false);
-            let cancel_btn = gtk4::Button::with_label("Cancel");
-            let confirm_btn = gtk4::Button::with_label("Add");
-            confirm_btn.add_css_class("suggested-action");
-            header.pack_start(&cancel_btn);
-            header.pack_end(&confirm_btn);
-
-            let toolbar_view = adw::ToolbarView::new();
-            toolbar_view.add_top_bar(&header);
-            toolbar_view.set_content(Some(&content));
-            add_dialog.set_child(Some(&toolbar_view));
-
-            let dialog_for_cancel = add_dialog.clone();
-            cancel_btn.connect_clicked(move |_| {
-                dialog_for_cancel.close();
-            });
-
-            let ui = ui_for_add.clone();
-            let populate_ref = populate_for_add.clone();
-            let dialog_for_confirm = add_dialog.clone();
-            confirm_btn.connect_clicked(move |_| {
-                let name = name_row.text().trim().to_string();
-                let host = host_row.text().trim().to_string();
-                let user = user_row.text().trim().to_string();
-                // Mirrors parse_remote_hosts so a host accepted here always
-                // survives a reload of the saved file.
-                let result: Result<crate::config::RemoteHost, &'static str> = (|| {
-                    if host.is_empty() {
-                        return Err("Host is required.");
-                    }
-                    if !crate::config::remote_field_is_safe(&host)
-                        || host.starts_with('-')
-                        || host.chars().any(char::is_whitespace)
-                    {
-                        return Err(
-                            "Host must not begin with '-' or contain whitespace or control characters.",
-                        );
-                    }
-                    let user = if user.is_empty() {
-                        None
-                    } else {
-                        if !crate::config::remote_field_is_safe(&user)
-                            || user.contains('@')
-                            || user.chars().any(char::is_whitespace)
-                        {
-                            return Err(
-                                "User must not contain '@', whitespace or control characters.",
-                            );
-                        }
-                        Some(user.clone())
-                    };
-                    if !name.is_empty() && !crate::config::remote_field_is_safe(&name) {
-                        return Err("Name must not contain control characters.");
-                    }
-                    let display = if name.is_empty() {
-                        host.clone()
-                    } else {
-                        name.clone()
-                    };
-                    let config = ui.config.borrow();
-                    if config.remote_hosts.len() >= crate::config::MAX_REMOTE_HOSTS {
-                        return Err("The remote host limit is reached.");
-                    }
-                    if config.remote_hosts.iter().any(|h| h.name == display) {
-                        return Err("A host with this name already exists.");
-                    }
-                    drop(config);
-                    Ok(crate::config::RemoteHost {
-                        name: display,
-                        host: host.clone(),
-                        user,
-                        docker: docker_row.is_active(),
-                        deploy_artifact: None,
-                        remote_shell: "jsh".into(),
-                        session: None,
-                        ssh_args: Vec::new(),
-                        login_shell: true,
-                        multiplex: true,
-                        deploy: match deploy_row.selected() {
-                            1 => jterm_core::jsh_remote::Deploy::Persist,
-                            2 => jterm_core::jsh_remote::Deploy::Incognito,
-                            _ => jterm_core::jsh_remote::Deploy::Off,
-                        },
-                    })
-                })();
-                match result {
-                    Err(message) => {
-                        error_label.set_text(message);
-                        error_label.set_visible(true);
-                    }
-                    Ok(new_host) => {
-                        ui.config.borrow_mut().remote_hosts.push(new_host);
-                        ui.persist_config();
-                        let populate = populate_ref.borrow().clone();
-                        if let Some(populate) = populate {
-                            populate();
-                        }
-                        dialog_for_confirm.close();
-                    }
-                }
-            });
-
-            add_dialog.present(Some(&ui_for_add.window));
+            ui_for_add.present_remote_host_dialog(None, populate_for_add.clone());
         });
 
         // Key controller: Ctrl+Shift+O to close
@@ -1914,6 +1794,262 @@ impl UiState {
         });
 
         *self.settings_dialog.borrow_mut() = Some(dialog.clone());
+        dialog.present(Some(&self.window));
+    }
+
+    /// The Add/Edit Remote Host dialog. One dialog for both so the accepted
+    /// grammar is stated once: a rule enforced on add but not on edit is a rule
+    /// the next config load quietly deletes the host over.
+    ///
+    /// `editing` names the saved host to overwrite; `None` appends a new one.
+    fn present_remote_host_dialog(
+        &self,
+        editing: Option<RemoteHostEditTarget>,
+        populate: RemoteHostsRefresh,
+    ) {
+        // Fields the dialog cannot show — ssh_args, session, remote_shell,
+        // login_shell, multiplex, deploy_artifact — are read here and written
+        // back untouched. Rebuilding an entry from the visible rows alone would
+        // drop a `-p 2222` or a pinned session the moment someone corrected a
+        // typo in the name, and nothing on screen would show it happened.
+        let existing = editing.as_ref().and_then(|(index, name)| {
+            let config = self.config.borrow();
+            let resolved = match config.remote_hosts.get(*index) {
+                Some(host) if &host.name == name => Some(*index),
+                // The file can be reloaded behind an open panel; fall back to
+                // matching the name, exactly as the delete path does.
+                _ => config.remote_hosts.iter().position(|h| &h.name == name),
+            };
+            resolved.map(|index| (index, config.remote_hosts[index].clone()))
+        });
+
+        let dialog = adw::Dialog::builder()
+            .title(if editing.is_some() {
+                "Edit Remote Host"
+            } else {
+                "Add Remote Host"
+            })
+            .content_width(420)
+            .build();
+
+        let name_row = adw::EntryRow::new();
+        name_row.set_title("Name (optional)");
+        let host_row = adw::EntryRow::new();
+        host_row.set_title("Host / container");
+        let user_row = adw::EntryRow::new();
+        user_row.set_title("User (optional)");
+        let docker_row = adw::SwitchRow::builder()
+            .title("Docker Container")
+            .subtitle("Attach to a running container with docker exec instead of ssh")
+            .build();
+        let deploy_model = gtk4::StringList::new(&["Off", "Persist", "Incognito"]);
+        let deploy_row = adw::ComboRow::builder()
+            .title("Deploy jsh")
+            .subtitle("Put a jsh on the destination for the life of the session")
+            .model(&deploy_model)
+            .build();
+
+        if let Some((_, host)) = &existing {
+            name_row.set_text(&host.name);
+            host_row.set_text(&host.host);
+            user_row.set_text(host.user.as_deref().unwrap_or(""));
+            docker_row.set_active(host.docker);
+            deploy_row.set_selected(match host.deploy {
+                jterm_core::jsh_remote::Deploy::Persist => 1,
+                jterm_core::jsh_remote::Deploy::Incognito => 2,
+                _ => 0,
+            });
+        }
+
+        let list = ListBox::new();
+        list.set_selection_mode(gtk4::SelectionMode::None);
+        list.add_css_class("boxed-list");
+        list.append(&name_row);
+        list.append(&host_row);
+        list.append(&user_row);
+        list.append(&docker_row);
+        list.append(&deploy_row);
+
+        let error_label = Label::new(None);
+        error_label.add_css_class("error");
+        error_label.set_wrap(true);
+        error_label.set_xalign(0.0);
+        error_label.set_visible(false);
+
+        let content = gtk4::Box::new(Orientation::Vertical, 12);
+        content.set_margin_start(12);
+        content.set_margin_end(12);
+        content.set_margin_top(12);
+        content.set_margin_bottom(12);
+        content.append(&list);
+
+        // Advanced fields survive an edit, but saying so beats hoping the user
+        // trusts it: this is the panel where they would expect to lose them.
+        if let Some((_, host)) = &existing {
+            let mut kept = Vec::new();
+            if !host.ssh_args.is_empty() {
+                kept.push(format!("ssh_args = {:?}", host.ssh_args));
+            }
+            if let Some(session) = &host.session {
+                kept.push(format!("session = {session:?}"));
+            }
+            if host.remote_shell != "jsh" {
+                kept.push(format!("remote_shell = {:?}", host.remote_shell));
+            }
+            if !host.login_shell {
+                kept.push("login_shell = false".to_string());
+            }
+            if !host.multiplex {
+                kept.push("multiplex = false".to_string());
+            }
+            if let Some(artifact) = &host.deploy_artifact {
+                kept.push(format!("deploy_artifact = {artifact:?}"));
+            }
+            if !kept.is_empty() {
+                let note = Label::new(Some(&crate::review_input::safe_inline_display(
+                    &format!("Kept as configured: {}", kept.join(", ")),
+                    4 * 1024,
+                )));
+                note.add_css_class("dim-label");
+                note.set_wrap(true);
+                note.set_xalign(0.0);
+                content.append(&note);
+            }
+        }
+        content.append(&error_label);
+
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+        let cancel_btn = gtk4::Button::with_label("Cancel");
+        let confirm_btn = gtk4::Button::with_label(if editing.is_some() { "Save" } else { "Add" });
+        confirm_btn.add_css_class("suggested-action");
+        header.pack_start(&cancel_btn);
+        header.pack_end(&confirm_btn);
+
+        let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.add_top_bar(&header);
+        toolbar_view.set_content(Some(&content));
+        dialog.set_child(Some(&toolbar_view));
+
+        let dialog_for_cancel = dialog.clone();
+        cancel_btn.connect_clicked(move |_| {
+            dialog_for_cancel.close();
+        });
+
+        let ui = self.clone();
+        let dialog_for_confirm = dialog.clone();
+        let was_editing = editing.is_some();
+        confirm_btn.connect_clicked(move |_| {
+            let name = name_row.text().trim().to_string();
+            let host = host_row.text().trim().to_string();
+            let user = user_row.text().trim().to_string();
+            // Mirrors parse_remote_hosts so a host accepted here always
+            // survives a reload of the saved file.
+            let result: Result<(Option<usize>, crate::config::RemoteHost), &'static str> = (|| {
+                if was_editing && existing.is_none() {
+                    return Err("This host is no longer in the configuration.");
+                }
+                if host.is_empty() {
+                    return Err("Host is required.");
+                }
+                if !crate::config::remote_field_is_safe(&host)
+                    || host.starts_with('-')
+                    || host.chars().any(char::is_whitespace)
+                {
+                    return Err(
+                        "Host must not begin with '-' or contain whitespace or control characters.",
+                    );
+                }
+                let user = if user.is_empty() {
+                    None
+                } else {
+                    if !crate::config::remote_field_is_safe(&user)
+                        || user.contains('@')
+                        || user.chars().any(char::is_whitespace)
+                    {
+                        return Err("User must not contain '@', whitespace or control characters.");
+                    }
+                    Some(user.clone())
+                };
+                if !name.is_empty() && !crate::config::remote_field_is_safe(&name) {
+                    return Err("Name must not contain control characters.");
+                }
+                let display = if name.is_empty() {
+                    host.clone()
+                } else {
+                    name.clone()
+                };
+                let target = existing.as_ref().map(|(index, _)| *index);
+                let config = ui.config.borrow();
+                if target.is_none() && config.remote_hosts.len() >= crate::config::MAX_REMOTE_HOSTS
+                {
+                    return Err("The remote host limit is reached.");
+                }
+                // The host being edited is not its own duplicate; without the
+                // index test no edit that keeps the name could be saved.
+                if config
+                    .remote_hosts
+                    .iter()
+                    .enumerate()
+                    .any(|(index, h)| h.name == display && Some(index) != target)
+                {
+                    return Err("A host with this name already exists.");
+                }
+                drop(config);
+                let previous = existing.as_ref().map(|(_, host)| host);
+                Ok((
+                    target,
+                    crate::config::RemoteHost {
+                        name: display,
+                        host: host.clone(),
+                        user,
+                        docker: docker_row.is_active(),
+                        deploy_artifact: previous.and_then(|h| h.deploy_artifact.clone()),
+                        remote_shell: previous
+                            .map(|h| h.remote_shell.clone())
+                            .unwrap_or_else(|| "jsh".into()),
+                        session: previous.and_then(|h| h.session.clone()),
+                        ssh_args: previous.map(|h| h.ssh_args.clone()).unwrap_or_default(),
+                        login_shell: previous.is_none_or(|h| h.login_shell),
+                        multiplex: previous.is_none_or(|h| h.multiplex),
+                        deploy: match deploy_row.selected() {
+                            1 => jterm_core::jsh_remote::Deploy::Persist,
+                            2 => jterm_core::jsh_remote::Deploy::Incognito,
+                            _ => jterm_core::jsh_remote::Deploy::Off,
+                        },
+                    },
+                ))
+            })(
+            );
+            match result {
+                Err(message) => {
+                    error_label.set_text(message);
+                    error_label.set_visible(true);
+                }
+                Ok((target, new_host)) => {
+                    {
+                        let mut config = ui.config.borrow_mut();
+                        match target {
+                            // Replaced in place so the host keeps its position
+                            // in the picker; remove-then-push would move it to
+                            // the end on every edit.
+                            Some(index) if index < config.remote_hosts.len() => {
+                                config.remote_hosts[index] = new_host;
+                            }
+                            _ => config.remote_hosts.push(new_host),
+                        }
+                    }
+                    ui.persist_config();
+                    let populate = populate.borrow().clone();
+                    if let Some(populate) = populate {
+                        populate();
+                    }
+                    dialog_for_confirm.close();
+                }
+            }
+        });
+
         dialog.present(Some(&self.window));
     }
 

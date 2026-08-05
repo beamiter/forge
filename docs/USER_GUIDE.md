@@ -196,7 +196,9 @@ flatpak run io.github.beamiter.jterm4
 
 ## 10. 远程会话与容器
 
-jterm4 不预置主机。设置面板（`Ctrl+Shift+O` → Remote Hosts）可以直接添加/删除主机；进阶字段（`ssh_args`、`session`、`deploy_artifact`）在配置中显式编辑：
+配置文件里完全没有 `remote_hosts` 键时，会拿到两条可以照抄的示例（一台 ssh、一个容器）。空列表看不出的正是这条语法唯一不肯迁就的两点：端口写在 `ssh_args` 里，不能写成 `host = "box:22"`；登录名写在 `user` 里，不能写成 `host = "root@box"`。显式写出的列表一律照办，`remote_hosts = []` 也算，所以在设置面板里删掉的主机不会回来。
+
+设置面板（`Ctrl+Shift+O` → Remote Hosts）可以添加/编辑/删除主机：铅笔图标用同一个对话框打开已保存的条目，面板没有控件的进阶字段（`ssh_args`、`session`、`remote_shell`、`login_shell`、`multiplex`、`deploy_artifact`）在编辑时原样保留，要改这些仍然直接编辑配置：
 
 ```toml
 [[remote_hosts]]

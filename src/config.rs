@@ -2167,10 +2167,48 @@ pub(crate) fn remote_host_to_toml(h: &RemoteHost) -> toml::Value {
     toml::Value::Table(t)
 }
 
-/// No network target is assumed on a fresh install. Remote hosts are personal
-/// data and must be explicitly configured by the user.
+/// Two worked entries a new destination can be copied from: one ssh target and
+/// one running container. They exist because the two mistakes the grammar
+/// cannot forgive are invisible in an empty list — the port belongs in
+/// `ssh_args`, never as `host:port`, and the login belongs in `user`, never as
+/// a `user@host` string that ssh would take literally as a hostname.
+///
+/// Only consulted when the file has no `remote_hosts` key at all. An explicit
+/// list — including `remote_hosts = []` — always wins, so deleting these in the
+/// settings dialog (which writes the key back) makes them stay gone.
 fn default_remote_hosts() -> Vec<RemoteHost> {
-    Vec::new()
+    vec![
+        RemoteHost {
+            name: "dev-60".to_string(),
+            host: "10.68.18.60".to_string(),
+            user: Some("root".to_string()),
+            docker: false,
+            deploy_artifact: None,
+            remote_shell: "jsh".to_string(),
+            session: None,
+            // 22 is ssh's default and could be omitted; it is spelled out so a
+            // copied entry has the flag to change rather than one to remember.
+            ssh_args: vec!["-p".to_string(), "22".to_string()],
+            login_shell: true,
+            multiplex: true,
+            deploy: jterm_core::jsh_remote::Deploy::Persist,
+        },
+        RemoteHost {
+            name: "myubuntu".to_string(),
+            host: "myubuntu".to_string(),
+            // The container user is `docker exec -u`; unset means the image's.
+            user: None,
+            docker: true,
+            deploy_artifact: None,
+            remote_shell: "jsh".to_string(),
+            session: None,
+            // Meaningless for docker, and the launcher ignores them.
+            ssh_args: Vec::new(),
+            login_shell: true,
+            multiplex: true,
+            deploy: jterm_core::jsh_remote::Deploy::Persist,
+        },
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -2914,9 +2952,37 @@ unknown_action = "F8"
         assert!(validate_config_contents("opacity = [").is_err());
     }
 
+    /// The defaults are what a user copies, so they have to be spelled the way
+    /// the parser accepts: the port as an `ssh_args` flag and the login in
+    /// `user`, never folded into `host` as `root@10.68.18.60:22`.
     #[test]
-    fn fresh_install_has_no_personal_remote_targets() {
-        assert!(default_remote_hosts().is_empty());
+    fn default_remote_hosts_survive_their_own_round_trip() {
+        let names: Vec<String> = default_remote_hosts()
+            .iter()
+            .map(|h| h.name.clone())
+            .collect();
+        assert_eq!(names, ["dev-60", "myubuntu"]);
+
+        let mut array = toml::value::Array::new();
+        for host in default_remote_hosts() {
+            array.push(remote_host_to_toml(&host));
+        }
+        let mut table = toml::Table::new();
+        table.insert("remote_hosts".into(), toml::Value::Array(array));
+
+        let reparsed = parse_remote_hosts(&table);
+        assert_eq!(
+            reparsed,
+            default_remote_hosts(),
+            "an example the parser drops teaches the wrong shape"
+        );
+
+        let ssh = &reparsed[0];
+        assert_eq!(ssh.host, "10.68.18.60");
+        assert_eq!(ssh.user.as_deref(), Some("root"));
+        assert_eq!(ssh.ssh_args, ["-p", "22"]);
+        assert!(!ssh.docker);
+        assert!(reparsed[1].docker);
     }
 
     #[test]
