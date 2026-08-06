@@ -3498,6 +3498,113 @@ fn running_root_control_bytes(
     }
 }
 
+/// Whether a key press seen while keyboard focus is stranded on a finished
+/// block should hand focus back to the live prompt.
+///
+/// Only typing-shaped keys recover focus. Ctrl/Alt/Super chords stay on their
+/// normal dispatch paths (window shortcuts run in an earlier Capture stage and
+/// never get here, but unbound chords like the Ctrl+C interrupt fallback still
+/// pass through this controller), Tab keeps GTK focus navigation, and
+/// reading/navigation keys keep whatever scroll or selection meaning they have
+/// — cross-block search deliberately lands focus on the picked block so the
+/// user can keep reading there.
+/// The body of `TermView::reveal_live_input`, shared with the stranded-focus
+/// key recovery controller, which is wired up before the `TermView` exists.
+fn reveal_live_input_now(
+    scroll_debouncer: &ScrollDebouncer,
+    unread_count: &Cell<u32>,
+    jump_fab: &gtk4::Button,
+    block_list: &gtk4::Box,
+    block_scroll: &ScrolledWindow,
+) {
+    scroll_debouncer.reset_scroll_lock();
+    unread_count.set(0);
+    set_jump_fab_label(jump_fab, 0);
+    jump_fab.set_visible(false);
+    block_list.queue_allocate();
+    scroll_debouncer.pin_to_bottom_deferred(block_scroll);
+}
+
+fn stranded_focus_key_recovers(keyval: gtk4::gdk::Key, modifiers: gtk4::gdk::ModifierType) -> bool {
+    use gtk4::gdk::Key;
+
+    if modifiers.intersects(
+        gtk4::gdk::ModifierType::CONTROL_MASK
+            | gtk4::gdk::ModifierType::ALT_MASK
+            | gtk4::gdk::ModifierType::SUPER_MASK
+            | gtk4::gdk::ModifierType::META_MASK,
+    ) {
+        return false;
+    }
+
+    !matches!(
+        keyval,
+        // Modifier presses themselves.
+        Key::Shift_L
+            | Key::Shift_R
+            | Key::Control_L
+            | Key::Control_R
+            | Key::Alt_L
+            | Key::Alt_R
+            | Key::Meta_L
+            | Key::Meta_R
+            | Key::Super_L
+            | Key::Super_R
+            | Key::Hyper_L
+            | Key::Hyper_R
+            | Key::Caps_Lock
+            | Key::Num_Lock
+            | Key::Scroll_Lock
+            | Key::ISO_Level3_Shift
+            | Key::ISO_Level5_Shift
+            | Key::Mode_switch
+            // Focus navigation.
+            | Key::Tab
+            | Key::ISO_Left_Tab
+            // Reading/navigation keys.
+            | Key::Up
+            | Key::Down
+            | Key::Left
+            | Key::Right
+            | Key::KP_Up
+            | Key::KP_Down
+            | Key::KP_Left
+            | Key::KP_Right
+            | Key::Page_Up
+            | Key::Page_Down
+            | Key::KP_Page_Up
+            | Key::KP_Page_Down
+            | Key::Home
+            | Key::End
+            | Key::KP_Home
+            | Key::KP_End
+            | Key::Menu
+    )
+}
+
+/// Focused widgets that own their keystrokes even though they live inside the
+/// block pane: text entries (the per-block output filter row, search entries),
+/// popover contents (command correction, context menus), and buttons for their
+/// activation keys.
+fn focused_widget_keeps_key(focused: &gtk4::Widget, keyval: gtk4::gdk::Key) -> bool {
+    use gtk4::gdk::Key;
+
+    if focused.is::<gtk4::Editable>() || focused.is::<gtk4::TextView>() {
+        return true;
+    }
+    if focused.ancestor(gtk4::Popover::static_type()).is_some() {
+        return true;
+    }
+    if matches!(
+        keyval,
+        Key::Return | Key::KP_Enter | Key::ISO_Enter | Key::space
+    ) && (focused.is::<gtk4::Button>() || focused.is::<gtk4::CheckButton>())
+    {
+        return true;
+    }
+    false
+}
+
 /// Captures the handles the live-VTE key handler needs. With the VTE owning line
 /// editing + IME natively (anvil model), this is reduced to a Capture-phase
 /// navigation / copy-paste / block-selection handler; printable keys and editing
@@ -4946,6 +5053,49 @@ impl TermView {
             root.add_controller(root_key);
         }
 
+        // Read-only snapshot VTEs and header buttons inside finished blocks
+        // are click-focusable, so a click into history strands keyboard focus
+        // where typing goes nowhere. A typing-shaped key press hands focus
+        // back to the live prompt and re-pins the view to the bottom. The
+        // triggering keystroke is consumed rather than forwarded: replaying it
+        // into the PTY would bypass the live VTE's input-method context and
+        // corrupt CJK composition.
+        {
+            let active_vte_for_refocus = active_vte.clone();
+            let scroll_debouncer_for_refocus = scroll_debouncer.clone();
+            let block_scroll_for_refocus = block_scroll.clone();
+            let block_list_for_refocus = block_list.clone();
+            let jump_fab_for_refocus = jump_fab.clone();
+            let unread_for_refocus = unread_count.clone();
+            let root_for_refocus = root.clone();
+            let refocus_key = gtk4::EventControllerKey::new();
+            refocus_key.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            refocus_key.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
+                if active_vte_for_refocus.has_focus()
+                    || !stranded_focus_key_recovers(keyval, modifiers)
+                {
+                    return glib::Propagation::Proceed;
+                }
+                let Some(focused) = root_for_refocus.root().and_then(|window| window.focus())
+                else {
+                    return glib::Propagation::Proceed;
+                };
+                if focused_widget_keeps_key(&focused, keyval) {
+                    return glib::Propagation::Proceed;
+                }
+                focus_terminal(&active_vte_for_refocus);
+                reveal_live_input_now(
+                    &scroll_debouncer_for_refocus,
+                    &unread_for_refocus,
+                    &jump_fab_for_refocus,
+                    &block_list_for_refocus,
+                    &block_scroll_for_refocus,
+                );
+                glib::Propagation::Stop
+            });
+            root.add_controller(refocus_key);
+        }
+
         // ── Keyboard navigation / copy-paste (Capture phase) ──────────────
         {
             let pty_for_key = pty.clone();
@@ -5697,13 +5847,13 @@ impl TermView {
     /// all twelve retries before GTK produced another allocation, so a newly
     /// selected tab sometimes stopped above its bottom input block.
     pub(crate) fn reveal_live_input(&self) {
-        self.scroll_debouncer.reset_scroll_lock();
-        self.unread_count.set(0);
-        set_jump_fab_label(&self.jump_fab, 0);
-        self.jump_fab.set_visible(false);
-        self.block_list.queue_allocate();
-        self.scroll_debouncer
-            .pin_to_bottom_deferred(&self.block_scroll);
+        reveal_live_input_now(
+            &self.scroll_debouncer,
+            &self.unread_count,
+            &self.jump_fab,
+            &self.block_list,
+            &self.block_scroll,
+        );
     }
 
     pub fn scroll_lines(&self, lines: i32) {
@@ -7304,6 +7454,39 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn stranded_focus_recovers_on_typing_keys_only() {
+        use gtk4::gdk::{Key, ModifierType};
+
+        let recovers = |keyval, modifiers| super::stranded_focus_key_recovers(keyval, modifiers);
+
+        // Typing-shaped keys pull focus back to the live prompt.
+        assert!(recovers(Key::a, ModifierType::empty()));
+        assert!(recovers(Key::A, ModifierType::SHIFT_MASK));
+        assert!(recovers(Key::space, ModifierType::empty()));
+        assert!(recovers(Key::Return, ModifierType::empty()));
+        assert!(recovers(Key::BackSpace, ModifierType::empty()));
+        assert!(recovers(Key::Escape, ModifierType::empty()));
+
+        // Chords stay on their normal dispatch paths — in particular the
+        // unbound Ctrl+C interrupt fallback in the running-root handler.
+        assert!(!recovers(Key::c, ModifierType::CONTROL_MASK));
+        assert!(!recovers(Key::a, ModifierType::ALT_MASK));
+        assert!(!recovers(Key::t, ModifierType::SUPER_MASK));
+
+        // A modifier press on its own is not typing.
+        assert!(!recovers(Key::Shift_L, ModifierType::empty()));
+        assert!(!recovers(Key::Control_R, ModifierType::CONTROL_MASK));
+
+        // Focus navigation and reading keys keep their meaning; cross-block
+        // search deliberately lands focus on the picked block for reading.
+        assert!(!recovers(Key::Tab, ModifierType::empty()));
+        assert!(!recovers(Key::ISO_Left_Tab, ModifierType::SHIFT_MASK));
+        assert!(!recovers(Key::Up, ModifierType::empty()));
+        assert!(!recovers(Key::Page_Down, ModifierType::empty()));
+        assert!(!recovers(Key::End, ModifierType::empty()));
     }
 
     // ── IME / Chinese input support tests ────────────────────────────────
