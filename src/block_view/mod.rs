@@ -5171,6 +5171,7 @@ impl TermView {
                 bstate: bstate.clone(),
                 mouse_mode: mouse_reporting_mode.clone(),
                 fullscreen: fullscreen.clone(),
+                suggestion_rgb: click_cursor::suggestion_rgb(&config.palette),
             },
         );
 
