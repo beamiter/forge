@@ -2465,9 +2465,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
             .or(fc.ai_max_tokens)
             .unwrap_or(1024)
             .clamp(64, 32_768),
-        ai_stream: env_bool("FORGE_AI_STREAM")
-            .or(fc.ai_stream)
-            .unwrap_or(true),
+        ai_stream: env_bool("FORGE_AI_STREAM").or(fc.ai_stream).unwrap_or(true),
         ai_redact_secrets: env_bool("FORGE_AI_REDACT_SECRETS")
             .or(fc.ai_redact_secrets)
             .unwrap_or(true),
