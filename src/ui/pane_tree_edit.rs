@@ -39,7 +39,8 @@ pub(crate) fn detach_leaf_and_promote(notebook: &Notebook, leaf_root: &Widget) -
     // Resolve the complete destination before detaching either child. A stale
     // or malformed tree is therefore a no-op instead of a half-collapsed split.
     let parent_widget = parent.clone().upcast::<Widget>();
-    let destination = if let Some(grandparent) = parent_widget.parent() {
+    let destination = {
+        let grandparent = parent_widget.parent()?;
         if let Ok(grandparent) = grandparent.downcast::<Paned>() {
             if grandparent.start_child().as_ref() == Some(&parent_widget) {
                 Destination::Start(grandparent)
@@ -56,8 +57,6 @@ pub(crate) fn detach_leaf_and_promote(notebook: &Notebook, leaf_root: &Widget) -
                 label: notebook.tab_label(&parent_widget),
             }
         }
-    } else {
-        return None;
     };
 
     // Clear root focus while both children still belong to GtkPaned. If a
@@ -87,7 +86,6 @@ pub(crate) fn detach_leaf_and_promote(notebook: &Notebook, leaf_root: &Widget) -
     }
     Some(sibling)
 }
-
 enum LeafSplitSlot {
     Start(Paned),
     End(Paned),
