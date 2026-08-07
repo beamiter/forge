@@ -53,8 +53,8 @@ bounded before JSON allocation.
   sentinel remains confined to downstream `i32`-only presentation surfaces and
   is never passed to the classifier.
 - `jterm_core` is pinned to
-  `586d84739c490d74918778a31441040ed7a36a4b` and direct jagent to
-  `f3b9b9a95d494619b0e623bd96afa70311f9ca26`; Cargo, Nix, and the twice-generated
+  `fd25f905aadab9d8ca111a67b9b6422a22ef2d6c` and direct jagent to
+  `3aece307766ca8f3ca33ed0376d2a271cc2322b3`; Cargo, Nix, and the twice-generated
   Flatpak source manifest all describe those exact trees.
 - Agent snapshot restore now decodes once through jagent's allocation-aware
   schema and audits its immutable accessors directly. Forge's stricter

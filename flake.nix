@@ -31,10 +31,10 @@
               # Nix needs an explicit hash per revision. Update these whenever
               # the jagent / jterm_core pins in Cargo.lock change.
               outputHashes = {
-                # jagent rev f3b9b9a95d494619b0e623bd96afa70311f9ca26
-                "jagent-0.6.0" = "sha256-yztDyQzNs6tKiA8a682VJBS5xcftUa4egX44+6Og71Y=";
-                # jterm_core rev 586d84739c490d74918778a31441040ed7a36a4b
-                "jterm_core-0.2.0" = "sha256-BShC1pEaa8t1GiDT9a0bVtXwf5Iy+RXkb2EJ1e23u9Q=";
+                # jagent rev 3aece307766ca8f3ca33ed0376d2a271cc2322b3
+                "jagent-0.6.0" = "sha256-Nx//34CDGQ4Eg9ipMrcEV2g/VJ6Rufzsn/sTaKfAOOM=";
+                # jterm_core rev fd25f905aadab9d8ca111a67b9b6422a22ef2d6c
+                "jterm_core-0.2.0" = "sha256-oC3mkuNxJCrMtdqQXbn0opWZ1MgYBGTQ/HV6ZATIhAA=";
               };
             };
             strictDeps = true;
