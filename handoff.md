@@ -40,7 +40,10 @@ bounded before JSON allocation.
   version/target/base-URL grammars, archive members checked for links,
   traversal, and extra payload before extracting exactly the expected binary,
   private and symlink-safe atomic cache and staging files, and a deadline-bounded
-  `--version` probe that writes to a file rather than a pipe.
+  `--version` probe that writes to a file rather than a pipe. It now matches
+  upstream commit `fd605616b56bd73265a3a6141c814938aa2859f9`: archive checks use
+  explicit branches, and failed self-check rollback reports success only after
+  the private temporary copy is chmodded and atomically renamed into place.
 - Completed block outcomes now delegate to
   `jterm_core::block_contract::classify_completed` only after Forge resolves the
   final command through its metadata/screen fallback. Renderer and persistence
