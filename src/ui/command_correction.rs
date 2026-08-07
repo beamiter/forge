@@ -328,64 +328,66 @@ fn attach_term_view(
     let card_slot: Rc<RefCell<Option<gtk4::Widget>>> = Rc::new(RefCell::new(None));
     let request_state = Rc::new(CorrectionRequestState::default());
     let view_weak = Rc::downgrade(&view);
-    view.connect_block_finished(move |command, exit_code, output, _duration_ms| {
-        let generation = request_state.advance();
-        if let Some(card) = card_slot.borrow_mut().take() {
-            if let Some(view) = view_weak.upgrade() {
-                view.remove_inline_notice(&card);
+    view.connect_block_finished(
+        move |command, exit_code, output, _agent_generation, _duration_ms| {
+            let generation = request_state.advance();
+            if let Some(card) = card_slot.borrow_mut().take() {
+                if let Some(view) = view_weak.upgrade() {
+                    view.remove_inline_notice(&card);
+                }
             }
-        }
 
-        let agent_active = agent_session
-            .upgrade()
-            .is_some_and(|slot| slot.borrow().is_some());
-        let monitor_enabled = {
-            let config = config.borrow();
-            correction_monitor_enabled(
-                config.ai_enabled,
-                config.command_correction_enabled,
-                agent_active,
-            )
-        };
-        if !monitor_enabled {
-            return;
-        }
+            let agent_active = agent_session
+                .upgrade()
+                .is_some_and(|slot| slot.borrow().is_some());
+            let monitor_enabled = {
+                let config = config.borrow();
+                correction_monitor_enabled(
+                    config.ai_enabled,
+                    config.command_correction_enabled,
+                    agent_active,
+                )
+            };
+            if !monitor_enabled {
+                return;
+            }
 
-        // Correction is a response to a *failure*. A shell that reported no exit
-        // status gives no failure signal, and inventing one would put a
-        // "did you mean" card under a command that may well have succeeded.
-        let Some(exit_code) = exit_code else {
-            return;
-        };
-        // Block output can be very large. Classification and the worker own a
-        // bounded head/tail sample, never a clone of the entire scrollback.
-        let output = sample_output(&output);
-        let Some(failure) = classify_failure(&command, exit_code, &output) else {
-            return;
-        };
-        let Some(view) = view_weak.upgrade() else {
-            return;
-        };
+            // Correction is a response to a *failure*. A shell that reported no exit
+            // status gives no failure signal, and inventing one would put a
+            // "did you mean" card under a command that may well have succeeded.
+            let Some(exit_code) = exit_code else {
+                return;
+            };
+            // Block output can be very large. Classification and the worker own a
+            // bounded head/tail sample, never a clone of the entire scrollback.
+            let output = sample_output(&output);
+            let Some(failure) = classify_failure(&command, exit_code, &output) else {
+                return;
+            };
+            let Some(view) = view_weak.upgrade() else {
+                return;
+            };
 
-        request_correction(
-            config.clone(),
-            Rc::downgrade(&view),
-            card_slot.clone(),
-            request_state.clone(),
-            generation,
-            agent_session.clone(),
-            command,
-            exit_code,
-            output,
-            if view.cwd().len() <= MAX_CWD_BYTES {
-                view.cwd()
-            } else {
-                String::new()
-            },
-            failure,
-            remote,
-        );
-    });
+            request_correction(
+                config.clone(),
+                Rc::downgrade(&view),
+                card_slot.clone(),
+                request_state.clone(),
+                generation,
+                agent_session.clone(),
+                command,
+                exit_code,
+                output,
+                if view.cwd().len() <= MAX_CWD_BYTES {
+                    view.cwd()
+                } else {
+                    String::new()
+                },
+                failure,
+                remote,
+            );
+        },
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -7,7 +7,7 @@
 #   curl -fsSL https://github.com/beamiter/jsh/releases/latest/download/install-jsh.sh | sh
 #
 # The script is the single source of truth for "how jsh gets onto a machine":
-# anvil..4 shell out to it instead of each carrying their own installer.
+# All four terminals shell out to it instead of each carrying their own installer.
 #
 # Design notes that are easy to get wrong and expensive to rediscover:
 #   * Every binary this script touches is identified by its `--version` banner,

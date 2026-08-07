@@ -28,35 +28,59 @@ const MAX_AGENT_MESSAGE_DISPLAY_BYTES: usize = 64 * 1024;
 const MAX_AGENT_STATUS_DISPLAY_BYTES: usize = 16 * 1024;
 const MAX_AGENT_INPUT_BYTES: usize = 16 * 1024;
 
-/// Bind the next completed foreground block to the approved proposal.
-///
-/// Approval is only possible while the pinned Block prompt is idle and empty,
-/// after the preceding block has already been finalized. The next foreground
-/// completion is therefore the approved command even when VTE's best-effort
-/// command capture is stale or reflects a shell line-editor redraw.
 /// Correlate one finished block with the approval that armed it.
 ///
-/// The pending entry is one-shot: it is taken whether or not the block matches,
-/// so a second completion can never be attributed to the same approval. The
-/// captured VTE command must match the approved one before an observation is
-/// submitted, though — feeding the model the output of a command the user did
-/// not approve is worse than losing an observation, and once concurrent or
-/// external prompt writes exist a mismatch is exactly how that would happen.
+/// A completion must first carry the exact locally armed generation. A stale,
+/// manual, or unrelated completion leaves the current approval untouched even
+/// if its command text is identical. Once the generation matches, the pending
+/// entry is one-shot and consumed whether or not the secondary command-text
+/// check succeeds, so no later completion can inherit that approval.
+#[derive(Debug, PartialEq, Eq)]
+enum PendingCompletion<T> {
+    Unrelated,
+    Matched(T),
+    CommandMismatch,
+}
+
 fn take_pending_for_finished_block<T>(
     pending: &mut Option<PendingExecution<T>>,
     captured_command: &str,
-) -> Option<T> {
+    completed_generation: Option<u64>,
+) -> PendingCompletion<T> {
+    let Some(expected_generation) = pending.as_ref().map(|pending| pending.generation) else {
+        return PendingCompletion::Unrelated;
+    };
+    if completed_generation != Some(expected_generation) {
+        log::debug!("ignored Block completion that did not carry the pending Agent generation");
+        return PendingCompletion::Unrelated;
+    }
     let PendingExecution {
         value,
         command: approved_command,
         generation: _,
-    } = pending.take()?;
+    } = pending
+        .take()
+        .expect("a matching generation has a pending Agent execution");
     if captured_command.trim() != approved_command.trim() {
         // Do not log either command: command text can contain sensitive data.
         log::debug!("Agent block completed with a differing VTE command capture; not observed");
-        return None;
+        return PendingCompletion::CommandMismatch;
     }
-    Some(value)
+    PendingCompletion::Matched(value)
+}
+
+fn resolve_pending_for_finished_block<T>(
+    session: &mut AgentSession,
+    pending: &mut Option<PendingExecution<T>>,
+    captured_command: &str,
+    completed_generation: Option<u64>,
+) -> PendingCompletion<T> {
+    let completion =
+        take_pending_for_finished_block(pending, captured_command, completed_generation);
+    if matches!(&completion, PendingCompletion::CommandMismatch) {
+        session.cancel();
+    }
+    completion
 }
 
 /// One armed execution: the approval it belongs to, the exact command that was
@@ -1560,7 +1584,10 @@ impl AgentRuntime {
         });
         runtime.render_session_state(None);
         runtime.target.grab_focus();
-        if let Err(error) = runtime.target.submit_command(&approved.command) {
+        if let Err(error) = runtime
+            .target
+            .submit_agent_command(generation, &approved.command)
+        {
             runtime.pending_command.borrow_mut().take();
             match restore_agent_snapshot(rollback_snapshot) {
                 Ok(session) => *runtime.session.borrow_mut() = session,
@@ -1593,13 +1620,35 @@ impl AgentRuntime {
         }
     }
 
-    fn observe(runtime: Rc<Self>, command: String, exit_code: Option<i32>, output: String) {
-        let id = {
+    fn observe(
+        runtime: Rc<Self>,
+        command: String,
+        exit_code: Option<i32>,
+        output: String,
+        agent_generation: Option<u64>,
+    ) {
+        let completion = {
+            let mut session = runtime.session.borrow_mut();
             let mut pending = runtime.pending_command.borrow_mut();
-            take_pending_for_finished_block(&mut pending, &command)
+            resolve_pending_for_finished_block(
+                &mut session,
+                &mut pending,
+                &command,
+                agent_generation,
+            )
         };
-        let Some(id) = id else {
-            return;
+        let id = match completion {
+            PendingCompletion::Matched(id) => id,
+            PendingCompletion::Unrelated => return,
+            PendingCompletion::CommandMismatch => {
+                const MESSAGE: &str =
+                    "Agent stopped because command completion correlation failed.";
+                runtime.clear_proposal();
+                runtime.append("Safety check", MESSAGE);
+                runtime.render_session_state(None);
+                runtime.set_status(MESSAGE, false);
+                return;
+            }
         };
         // The jagent observation turn carries a concrete exit code (frozen
         // API). An unreported status becomes the sentinel plus a note the
@@ -2310,14 +2359,16 @@ impl UiState {
             close_btn.connect_clicked(move |_| close_session());
         }
         let weak: Weak<AgentRuntime> = Rc::downgrade(&runtime);
-        target.connect_block_finished(move |command, exit_code, output, _duration_ms| {
-            if let Some(runtime) = weak.upgrade() {
-                // The freshly finished block was inserted below this card;
-                // re-pin the card so it stays directly above the live prompt.
-                runtime.target.insert_inline_notice(&runtime.card);
-                AgentRuntime::observe(runtime, command, exit_code, output);
-            }
-        });
+        target.connect_block_finished(
+            move |command, exit_code, output, agent_generation, _duration_ms| {
+                if let Some(runtime) = weak.upgrade() {
+                    // The freshly finished block was inserted below this card;
+                    // re-pin the card so it stays directly above the live prompt.
+                    runtime.target.insert_inline_notice(&runtime.card);
+                    AgentRuntime::observe(runtime, command, exit_code, output, agent_generation);
+                }
+            },
+        );
         {
             let close_session = close_session.clone();
             target.connect_exited(move |_| close_session());
@@ -2403,9 +2454,10 @@ mod tests {
     use super::claim_agent_snapshot_file;
     use super::{
         agent_message_display_text, bounded_agent_input, load_agent_snapshot,
-        proposal_callback_is_current, read_agent_snapshot_file, restore_agent_snapshot,
-        take_pending_for_finished_block, write_agent_snapshot_file, PendingExecution,
-        MAX_AGENT_INPUT_BYTES, MAX_AGENT_MESSAGE_DISPLAY_BYTES,
+        proposal_callback_is_current, read_agent_snapshot_file, resolve_pending_for_finished_block,
+        restore_agent_snapshot, take_pending_for_finished_block, write_agent_snapshot_file,
+        PendingCompletion, PendingExecution, MAX_AGENT_INPUT_BYTES,
+        MAX_AGENT_MESSAGE_DISPLAY_BYTES,
     };
 
     fn pending(value: u64, command: &str) -> Option<PendingExecution<u64>> {
@@ -2421,27 +2473,69 @@ mod tests {
         let mut slot = pending(7, "cat monitor_xilem_bar.sh");
 
         assert_eq!(
-            take_pending_for_finished_block(&mut slot, "cat monitor_xilem_bar.sh"),
-            Some(7)
+            take_pending_for_finished_block(&mut slot, "cat monitor_xilem_bar.sh", Some(1)),
+            PendingCompletion::Matched(7)
         );
         assert!(slot.is_none(), "an approval is one-shot");
     }
 
     #[test]
-    fn a_differing_capture_consumes_the_approval_without_observing_it() {
+    fn a_differing_capture_consumes_the_approval_and_cancels_the_session() {
         let mut slot = pending(7, "cat monitor_xilem_bar.sh");
+        let mut session = crate::agent::AgentSession::new(2);
+        session.submit_user("inspect the repository").unwrap();
+        let proposal_id = match session
+            .accept_model_reply(r#"{"action":"run","command":"cat monitor_xilem_bar.sh"}"#)
+            .unwrap()
+        {
+            crate::agent::ModelOutcome::Proposal { id, .. } => id,
+            other => panic!("expected proposal, got {other:?}"),
+        };
+        let _approved = session.approve(proposal_id).unwrap();
+        assert!(matches!(
+            session.state(),
+            crate::agent::AgentState::AwaitingObservation { .. }
+        ));
 
         // Fail closed: the model must not be told that some other command's
-        // output is the result of the command the user approved.
-        assert_eq!(take_pending_for_finished_block(&mut slot, "ls"), None);
+        // output is the result of the command the user approved, and the
+        // protocol must not remain stranded waiting for an observation that
+        // was deliberately discarded.
+        assert_eq!(
+            resolve_pending_for_finished_block(&mut session, &mut slot, "ls", Some(1)),
+            PendingCompletion::CommandMismatch
+        );
         assert!(slot.is_none(), "the approval is still consumed");
+        assert_eq!(session.state(), crate::agent::AgentState::Cancelled);
+    }
+
+    #[test]
+    fn identical_command_with_a_different_generation_is_not_observed() {
+        let mut slot = pending(7, "printf same");
+
+        assert_eq!(
+            take_pending_for_finished_block(&mut slot, "printf same", Some(2)),
+            PendingCompletion::Unrelated
+        );
+        assert!(
+            slot.is_some(),
+            "a stale completion must not consume the current approval"
+        );
+        assert_eq!(
+            take_pending_for_finished_block(&mut slot, "printf same", Some(1)),
+            PendingCompletion::Matched(7)
+        );
+        assert!(slot.is_none());
     }
 
     #[test]
     fn finished_block_without_an_approval_is_ignored() {
         let mut slot: Option<PendingExecution<u64>> = None;
 
-        assert_eq!(take_pending_for_finished_block(&mut slot, "ls"), None);
+        assert_eq!(
+            take_pending_for_finished_block(&mut slot, "ls", None),
+            PendingCompletion::Unrelated
+        );
     }
 
     #[test]

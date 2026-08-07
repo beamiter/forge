@@ -79,15 +79,17 @@ impl UiState {
     pub(crate) fn connect_bottom_bar_block_status(&self, view: &Rc<TermView>) {
         let ui = self.clone();
         let root = view.widget();
-        view.connect_block_finished(move |_command, exit_code, _output, duration_ms| {
-            unsafe {
-                root.set_data::<(Option<i32>, Option<u64>)>(
-                    LAST_BLOCK_STATUS_KEY,
-                    (exit_code, duration_ms),
-                );
-            }
-            ui.refresh_bottom_bar();
-        });
+        view.connect_block_finished(
+            move |_command, exit_code, _output, _agent_generation, duration_ms| {
+                unsafe {
+                    root.set_data::<(Option<i32>, Option<u64>)>(
+                        LAST_BLOCK_STATUS_KEY,
+                        (exit_code, duration_ms),
+                    );
+                }
+                ui.refresh_bottom_bar();
+            },
+        );
     }
 
     /// Re-collect the focused pane's snapshot and repaint the bar. Cheap when

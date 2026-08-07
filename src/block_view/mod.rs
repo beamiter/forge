@@ -1540,11 +1540,13 @@ const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 /// viewport winsize via `pty_grid_size`.
 const MIN_INPUT_ROWS: i32 = 6;
 
-/// `(command, exit status, output sample)`. The status is `None` when the shell
-/// reported none, so every observer has to decide what that means for it rather
-/// than being handed a 0 that reads as success.
+/// `(command, exit status, output sample, Agent generation, duration ms)`. The
+/// status is `None` when the shell reported none, so every observer has to
+/// decide what that means for it rather than being handed a 0 that reads as
+/// success. The Agent generation is armed locally before its reviewed command
+/// enters the PTY.
 type BlockFinishedCallbacks =
-    Rc<RefCell<Vec<Box<dyn Fn(String, Option<i32>, String, Option<u64>)>>>>;
+    Rc<RefCell<Vec<Box<dyn Fn(String, Option<i32>, String, Option<u64>, Option<u64>)>>>>;
 
 pub struct TermView {
     root: gtk4::Box,
@@ -1570,6 +1572,10 @@ pub struct TermView {
     /// consumed at CommandStart before the VTE capture, which may still show a
     /// previous line when submission outruns display rendering.
     external_submission: Rc<RefCell<Option<String>>>,
+    /// One-shot Agent identity paired with `external_submission`. Other
+    /// programmatic submissions leave it `None` and cannot satisfy an Agent
+    /// observation even when their command text happens to be identical.
+    external_submission_generation: Rc<Cell<Option<u64>>>,
     /// Programmatic input and native VTE commits both set this while the current
     /// prompt has been edited. It prevents background output and Agent insertion
     /// from treating a non-empty readline buffer as clean.
@@ -1680,6 +1686,8 @@ struct ReaderCtx {
     typed_cmd_rc: Rc<RefCell<String>>,
     /// Exact command from an approved programmatic submission, if any.
     external_submission_rc: Rc<RefCell<Option<String>>>,
+    /// Agent identity paired with the approved external submission, if any.
+    external_submission_generation_rc: Rc<Cell<Option<u64>>>,
     /// Bytes emitted asynchronously after PromptEnd and before the next PromptStart.
     /// Empty-command blocks are inferred from this separate buffer, so no history
     /// schema change is needed.
@@ -1732,6 +1740,9 @@ struct ReaderCtx {
     bookmarks_for_cb: Rc<RefCell<std::collections::HashSet<u64>>>,
     cmd_running_rc: Rc<Cell<bool>>,
     running_cmd_rc: Rc<RefCell<String>>,
+    /// Agent identity consumed at CommandStart and emitted with this command's
+    /// eventual foreground BlockFinished event.
+    active_agent_generation_rc: Rc<Cell<Option<u64>>>,
     /// Switches the live surface between compact prompt and full-screen layouts.
     /// PTY geometry is deliberately synchronized separately.
     layout_active_surface: Rc<dyn Fn()>,
@@ -1839,6 +1850,7 @@ impl ReaderCtx {
             prompt_buf_rc,
             typed_cmd_rc,
             external_submission_rc,
+            external_submission_generation_rc,
             background_output_rc,
             idle_input_dirty_rc,
             vte_typed_cmd_rc,
@@ -1877,6 +1889,7 @@ impl ReaderCtx {
             bookmarks_for_cb,
             cmd_running_rc,
             running_cmd_rc,
+            active_agent_generation_rc,
             layout_active_surface,
             block_finished_cbs,
             selection_feed_hold,
@@ -2261,11 +2274,13 @@ impl ReaderCtx {
 
                                 if !is_background {
                                     let output_sample = sample_output_for_event(&output_plain);
+                                    let agent_generation = active_agent_generation_rc.take();
                                     for cb in block_finished_cbs.borrow().iter() {
                                         cb(
                                             cmd.clone(),
                                             exit_code,
                                             output_sample.clone(),
+                                            agent_generation,
                                             duration_ms,
                                         );
                                     }
@@ -2794,6 +2809,8 @@ impl ReaderCtx {
                             typed_cmd_rc.borrow_mut().clear();
                             vte_typed_cmd_rc.borrow_mut().clear();
                             external_submission_rc.borrow_mut().take();
+                            external_submission_generation_rc.set(None);
+                            active_agent_generation_rc.set(None);
                             background_output_rc.borrow_mut().clear();
                             idle_input_dirty_rc.set(false);
                             // Snapshot the live VTE cursor at the moment the
@@ -2830,6 +2847,7 @@ impl ReaderCtx {
                                     // whole command.
                                     typed_cmd_rc.borrow_mut().clear();
                                     external_submission_rc.borrow_mut().take();
+                                    external_submission_generation_rc.set(None);
                                     idle_input_dirty_rc.set(false);
                                     pty_synced_rc.set(false);
                                     pty_for_init.report_write_error(
@@ -2897,6 +2915,8 @@ impl ReaderCtx {
                             let prompt_display = prompt_display_rc.borrow().clone();
                             let typed_shadow = typed_cmd_rc.borrow().clone();
                             let external_submission = external_submission_rc.borrow_mut().take();
+                            active_agent_generation_rc
+                                .set(external_submission_generation_rc.take());
                             let submitted_command = resolve_command_for_block(
                                 meta,
                                 &resolve_submitted_command(
@@ -4230,6 +4250,8 @@ impl TermView {
         // a shell-integration anchor cannot be captured.
         let typed_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let external_submission: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let external_submission_generation: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+        let active_agent_generation: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         let background_output: Rc<RefCell<BoundedByteRing>> =
             Rc::new(RefCell::new(BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES)));
         let idle_input_dirty: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -4614,6 +4636,7 @@ impl TermView {
                 prompt_buf_rc,
                 typed_cmd_rc,
                 external_submission_rc: external_submission.clone(),
+                external_submission_generation_rc: external_submission_generation.clone(),
                 background_output_rc: background_output.clone(),
                 idle_input_dirty_rc: idle_input_dirty.clone(),
                 vte_typed_cmd_rc,
@@ -4652,6 +4675,7 @@ impl TermView {
                 bookmarks_for_cb: block_bookmarks.clone(),
                 cmd_running_rc: cmd_running.clone(),
                 running_cmd_rc: running_cmd.clone(),
+                active_agent_generation_rc: active_agent_generation.clone(),
                 layout_active_surface: layout_active_surface.clone(),
                 block_finished_cbs: block_finished_callbacks.clone(),
                 selection_feed_hold: selection_feed_hold.clone(),
@@ -5324,6 +5348,7 @@ impl TermView {
             prompt_buf,
             typed_cmd,
             external_submission,
+            external_submission_generation,
             idle_input_dirty,
             fullscreen,
             user_scrolled_up: user_scrolled_up.clone(),
@@ -5578,11 +5603,29 @@ impl TermView {
     /// Save the exact text before exposing bytes to the PTY so a fast shell
     /// cannot emit CommandStart before the Block command capture is armed.
     pub fn submit_command(&self, command: &str) -> Result<(), String> {
+        self.submit_command_with_agent_generation(command, None)
+    }
+
+    /// Submit one Agent-approved command with its checked, never-reused local
+    /// identity. The identity is armed before the PTY write and follows only
+    /// this command through CommandStart to BlockFinished.
+    pub fn submit_agent_command(&self, generation: u64, command: &str) -> Result<(), String> {
+        self.submit_command_with_agent_generation(command, Some(generation))
+    }
+
+    fn submit_command_with_agent_generation(
+        &self,
+        command: &str,
+        agent_generation: Option<u64>,
+    ) -> Result<(), String> {
         let submission = approved_command_submission_payload(command)?;
         let previous_submission = self.external_submission.borrow().clone();
+        let previous_generation = self.external_submission_generation.get();
         *self.external_submission.borrow_mut() = Some(command.to_string());
+        self.external_submission_generation.set(agent_generation);
         if let Err(error) = self.write_input(&submission) {
             *self.external_submission.borrow_mut() = previous_submission;
+            self.external_submission_generation.set(previous_generation);
             return Err(error.to_string());
         }
         Ok(())
@@ -5836,7 +5879,7 @@ impl TermView {
 
     pub fn connect_block_finished<F>(&self, f: F)
     where
-        F: Fn(String, Option<i32>, String, Option<u64>) + 'static,
+        F: Fn(String, Option<i32>, String, Option<u64>, Option<u64>) + 'static,
     {
         self.block_finished_callbacks.borrow_mut().push(Box::new(f));
     }
