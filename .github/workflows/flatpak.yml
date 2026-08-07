@@ -82,13 +82,18 @@ jobs:
           set -o pipefail
           {
             python3 -m venv /tmp/flatpak-cargo-generator
+            # The generator imports these directly; pin them as part of the
+            # generated-file contract so a formatter release cannot make a
+            # clean Cargo.lock fail this reproducibility gate.
             /tmp/flatpak-cargo-generator/bin/pip install --disable-pip-version-check \
-              aiohttp tomlkit pyyaml
+              aiohttp==3.14.3 tomlkit==0.15.1 pyyaml==6.0.3
             curl --fail --location \
               --output /tmp/flatpak-cargo-generator.py \
               "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/${CARGO_GENERATOR_COMMIT}/cargo/flatpak-cargo-generator.py"
             /tmp/flatpak-cargo-generator/bin/python /tmp/flatpak-cargo-generator.py \
               Cargo.lock -o /tmp/cargo-sources.json
+            # The pinned generator omits the customary final newline.
+            printf '\n' >> /tmp/cargo-sources.json
             diff -u packaging/flatpak/cargo-sources.json /tmp/cargo-sources.json
           } 2>&1 | tee cargo-sources-verify.log
 
