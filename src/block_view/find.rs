@@ -10,7 +10,25 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use vte4::TerminalExt;
 
-use super::{contains_case_insensitive, replace_finished_block_selection, BlockFilters, TermView};
+use super::{
+    contains_case_insensitive, replace_finished_block_selection, BlockFilters, BlockOutcome,
+    TermView,
+};
+
+fn outcome_matches_filters(
+    resolved_command: &str,
+    raw_exit_code: Option<i32>,
+    filters: &BlockFilters,
+) -> bool {
+    let outcome = BlockOutcome::classify(Some(resolved_command), raw_exit_code);
+    if filters
+        .exit_code
+        .is_some_and(|exit_code| outcome.reported_exit_code() != Some(exit_code))
+    {
+        return false;
+    }
+    !filters.failed_only || matches!(outcome, BlockOutcome::Failure(_))
+}
 
 /// One hit from a find-within-blocks pass. With VTE-backed blocks the match
 /// position lives inside the VTE itself (highlighted automatically by
@@ -132,17 +150,10 @@ impl TermView {
                     return false;
                 }
 
-                // Exit code filter. A block whose status the shell never
-                // reported matches no code, not even 0.
-                if let Some(exit_code) = filters.exit_code {
-                    if b.exit_code != Some(exit_code) {
-                        return false;
-                    }
-                }
-
-                // Failed only filter. An unknown status is not a failure — it is
-                // not a success either, so it is simply not this filter's answer.
-                if filters.failed_only && !matches!(b.exit_code, Some(code) if code != 0) {
+                // Both predicates use the completed, resolved-command outcome.
+                // In particular, background output never matches a raw status
+                // attached by a producer, while Unknown matches no exact code.
+                if !outcome_matches_filters(&b.cmd, b.exit_code, filters) {
                     return false;
                 }
 
@@ -547,7 +558,7 @@ impl TermView {
 
 #[cfg(test)]
 mod tests {
-    use super::{duration_matches, snippet};
+    use super::{duration_matches, outcome_matches_filters, snippet};
     use crate::block_view::BlockFilters;
 
     #[test]
@@ -576,6 +587,38 @@ mod tests {
     #[test]
     fn duration_is_irrelevant_without_duration_predicates() {
         assert!(duration_matches(None, &BlockFilters::default()));
+    }
+
+    #[test]
+    fn outcome_filters_ignore_raw_status_on_background_output() {
+        let exact = BlockFilters {
+            exit_code: Some(7),
+            ..Default::default()
+        };
+        let failed = BlockFilters {
+            failed_only: true,
+            ..Default::default()
+        };
+
+        assert!(!outcome_matches_filters("", Some(7), &exact));
+        assert!(!outcome_matches_filters("\t ", Some(7), &failed));
+        assert!(outcome_matches_filters("false", Some(7), &exact));
+        assert!(outcome_matches_filters("false", Some(7), &failed));
+    }
+
+    #[test]
+    fn command_without_a_reported_status_matches_neither_exit_filter() {
+        let exact_success = BlockFilters {
+            exit_code: Some(0),
+            ..Default::default()
+        };
+        let failed = BlockFilters {
+            failed_only: true,
+            ..Default::default()
+        };
+
+        assert!(!outcome_matches_filters("cargo test", None, &exact_success));
+        assert!(!outcome_matches_filters("cargo test", None, &failed));
     }
 
     #[test]

@@ -136,12 +136,25 @@ pub(crate) enum BlockOutcome {
 }
 
 impl BlockOutcome {
-    pub(crate) fn classify(is_background: bool, exit_code: Option<i32>) -> Self {
-        match (is_background, exit_code) {
-            (true, _) => Self::Background,
-            (false, Some(0)) => Self::Success,
-            (false, Some(code)) => Self::Failure(code),
-            (false, None) => Self::Unknown,
+    /// Translate the shared semantic contract into Forge's renderer-owned UI
+    /// enum. `resolved_command` must be the final command after Forge's
+    /// metadata/screen fallback, never the optional field from a raw OSC mark.
+    pub(crate) fn classify(resolved_command: Option<&str>, exit_code: Option<i32>) -> Self {
+        use jterm_core::block_contract::CompletedBlockOutcome;
+
+        match jterm_core::block_contract::classify_completed(resolved_command, exit_code) {
+            CompletedBlockOutcome::Background => Self::Background,
+            CompletedBlockOutcome::Success => Self::Success,
+            CompletedBlockOutcome::Failed(code) => Self::Failure(code),
+            CompletedBlockOutcome::Unknown => Self::Unknown,
+        }
+    }
+
+    pub(crate) const fn reported_exit_code(self) -> Option<i32> {
+        match self {
+            Self::Success => Some(0),
+            Self::Failure(code) => Some(code),
+            Self::Background | Self::Unknown => None,
         }
     }
 
@@ -1079,7 +1092,7 @@ impl FinishedBlock {
         content.set_vexpand(false);
         outer.append(&content);
 
-        let outcome = BlockOutcome::classify(is_background, exit_code);
+        let outcome = BlockOutcome::classify(Some(cmd), exit_code);
         // Status stripe: green on success, red on failure, cyan for idle output,
         // amber when the shell never told us how the command ended.
         outer.add_css_class(outcome.stripe_css_class());
@@ -2438,24 +2451,29 @@ mod tests {
     #[test]
     fn an_unreported_exit_status_is_neither_success_nor_failure() {
         assert_eq!(
-            BlockOutcome::classify(false, None),
+            BlockOutcome::classify(Some("cargo test"), None),
             BlockOutcome::Unknown,
             "an unknown status used to arrive here as Some(0), i.e. as a success"
         );
         assert_eq!(
-            BlockOutcome::classify(false, Some(0)),
+            BlockOutcome::classify(Some("cargo test"), Some(0)),
             BlockOutcome::Success
         );
         assert_eq!(
-            BlockOutcome::classify(false, Some(130)),
+            BlockOutcome::classify(Some("cargo test"), Some(130)),
             BlockOutcome::Failure(130)
         );
         // Background output belongs to no command, so it keeps its own look
         // whatever status is attached.
-        assert_eq!(BlockOutcome::classify(true, None), BlockOutcome::Background);
+        assert_eq!(BlockOutcome::classify(None, None), BlockOutcome::Background);
         assert_eq!(
-            BlockOutcome::classify(true, Some(1)),
+            BlockOutcome::classify(Some(""), Some(1)),
             BlockOutcome::Background
+        );
+        assert_eq!(
+            BlockOutcome::classify(None, Some(127)),
+            BlockOutcome::Background,
+            "a raw non-zero status cannot turn background output into a failure"
         );
     }
 

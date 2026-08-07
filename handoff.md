@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-01
+Updated: 2026-08-08
 
 This baseline exact-pins one shared jagent source through the hardened jterm_core,
 and upgrades Agent approval, bounded AI conversations, PTY queues, persistence,
@@ -39,6 +39,18 @@ hardened canonical copy.
   traversal, and extra payload before extracting exactly the expected binary,
   private and symlink-safe atomic cache and staging files, and a deadline-bounded
   `--version` probe that writes to a file rather than a pipe.
+- Completed block outcomes now delegate to
+  `jterm_core::block_contract::classify_completed` only after Forge resolves the
+  final command through its metadata/screen fallback. Renderer and persistence
+  types stay local; failed-only and exact-exit filters use the same four-way
+  outcome, so commandless background output cannot become a failure merely
+  because a producer attached a raw non-zero status. The `-1` compatibility
+  sentinel remains confined to downstream `i32`-only presentation surfaces and
+  is never passed to the classifier.
+- `jterm_core` is pinned to
+  `9e79a5bf0d905575863def4d0e77f74a1f533638`; the Nix fixed-output hash and the
+  Flatpak Cargo source manifest were regenerated for that exact tree while the
+  direct jagent revision stayed unchanged.
 
 ## Remaining boundaries
 
@@ -63,15 +75,6 @@ execution identity, so the generation stored beside an approval is one-shot but
 not *verified* by the completion. Thread it through the block-finished path —
 this becomes mandatory before supporting concurrent or external prompt writes,
 where the captured command alone can no longer distinguish two executions.
-
-### Keep the Flatpak Cargo source manifest synchronized
-
-Whenever a git dependency revision changes in `Cargo.lock`, rerun the exact pinned
-`flatpak-cargo-generator.py` revision from `.github/workflows/flatpak.yml` with
-network access and commit the resulting `packaging/flatpak/cargo-sources.json`.
-The current dependency repin still needs that regeneration; local execution was
-blocked by unavailable external network access, so the generated manifest was not
-hand-edited or approximated.
 
 ## Release checks
 
