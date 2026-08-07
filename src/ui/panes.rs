@@ -5,12 +5,21 @@ use libadwaita as adw;
 use std::io;
 use std::rc::Rc;
 
+use super::pane_dnd::{
+    split_placement, tab_split_drop_allowed, unique_session_index, SplitAxis, SplitDropZone,
+};
 use super::*;
 use crate::block_view::TermView;
 use crate::keybindings::Direction;
 use crate::state::generate_session_id;
 use crate::terminal::{setup_terminal_click_handler, terminal_working_directory, VteTerminalView};
 use vte4::TerminalExt as _;
+
+#[derive(Clone)]
+struct PaneLocation {
+    page: gtk4::Widget,
+    leaf: PaneLeaf,
+}
 
 /// Number of equal-size pane slots a subtree occupies along one axis.
 ///
@@ -194,6 +203,9 @@ impl UiState {
 
         let leaf = PaneLeaf::Vte(view);
         let root = leaf.root_widget();
+        if let Some(name) = tab_widget_name.as_deref() {
+            root.set_widget_name(name);
+        }
         leaf.attach_to(&root);
         leaf.set_session_id(&sid);
         leaf.set_remote(false);
@@ -275,6 +287,9 @@ impl UiState {
 
         let leaf = PaneLeaf::Block(view);
         let root = leaf.root_widget();
+        if let Some(name) = tab_widget_name.as_deref() {
+            root.set_widget_name(name);
+        }
         leaf.attach_to(&root);
         leaf.set_session_id(&sid);
         leaf.set_remote(false);
@@ -372,7 +387,7 @@ impl UiState {
     ///
     /// Both sides read the pane's live session id at gesture time rather than
     /// capturing it: restore can reassign a leaf's id after construction.
-    fn install_pane_rearrange(&self, leaf: &PaneLeaf) {
+    pub(crate) fn install_pane_rearrange(&self, leaf: &PaneLeaf) {
         let ui = self.clone();
         let target_root = leaf.root_widget().downgrade();
         leaf.install_pane_drag(move |dragged| {
@@ -385,6 +400,201 @@ impl UiState {
             };
             ui.swap_panes_by_session(dragged, &target)
         });
+
+        let ui = self.clone();
+        let target_root = leaf.root_widget().downgrade();
+        leaf.install_tab_split_drop(move |dragged, zone| {
+            let Some(target) = target_root
+                .upgrade()
+                .and_then(|root| PaneLeaf::from_widget(&root))
+                .and_then(|leaf| leaf.session_id())
+            else {
+                return false;
+            };
+            ui.move_plain_tab_to_split(dragged, &target, zone)
+        });
+    }
+
+    fn pane_locations(&self) -> Vec<PaneLocation> {
+        let mut locations = Vec::new();
+        for index in 0..self.notebook.n_pages() {
+            let Some(page) = self.notebook.nth_page(Some(index)) else {
+                continue;
+            };
+            let Some(node) = PaneNode::from_widget(&page) else {
+                continue;
+            };
+            locations.extend(node.leaves().into_iter().map(|leaf| PaneLocation {
+                page: page.clone(),
+                leaf,
+            }));
+        }
+        locations
+    }
+
+    fn pane_location_by_session(&self, session_id: &str) -> Option<PaneLocation> {
+        let locations = self.pane_locations();
+        let index = unique_session_index(
+            locations.iter().map(|location| location.leaf.session_id()),
+            session_id,
+        )?;
+        locations.get(index).cloned()
+    }
+
+    /// Move one existing ordinary tab beside a live target pane.
+    ///
+    /// Every identity, parent slot, page index, and connection-map conflict is
+    /// resolved before the source page is detached. The commit then reparents
+    /// the existing `PaneLeaf` root without touching its controller, PTY, shell,
+    /// scrollback, or session id.
+    pub(crate) fn move_plain_tab_to_split(
+        &self,
+        dragged_session: &str,
+        target_session: &str,
+        zone: SplitDropZone,
+    ) -> bool {
+        // A content drop is a new phase of the gesture even if GTK omitted the
+        // preceding tab-button leave. No delayed hover callback may outlive it.
+        self.invalidate_tab_drag_hover();
+        let Some(source) = self.pane_location_by_session(dragged_session) else {
+            return false;
+        };
+        let Some(target) = self.pane_location_by_session(target_session) else {
+            return false;
+        };
+        let Some(source_node) = PaneNode::from_widget(&source.page) else {
+            return false;
+        };
+
+        let source_name = source.page.widget_name().to_string();
+        let target_name = target.page.widget_name().to_string();
+        let Some(source_tab_num) = source_name
+            .strip_prefix("tab-")
+            .and_then(|number| number.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        let Some(target_tab_num) = target_name
+            .strip_prefix("tab-")
+            .and_then(|number| number.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        let Some(source_page_index) = self.notebook.page_num(&source.page) else {
+            return false;
+        };
+        let Some(plan) =
+            plan_existing_leaf_split(&self.notebook, &target.page, &target.leaf.root_widget())
+        else {
+            return false;
+        };
+        let plan = plan.after_removing_page(source_page_index);
+
+        // A tab can currently represent one reconnecting remote pane. Refuse
+        // the only lossy case: merging two tabs that both own such a record.
+        let source_connection = self.tab_connections.borrow().get(&source_tab_num).cloned();
+        let connection_conflict = source_connection.is_some()
+            && self.tab_connections.borrow().contains_key(&target_tab_num);
+        if !tab_split_drop_allowed(
+            !source_node.is_split() && source.leaf.root_widget() == source.page,
+            dragged_session == target_session,
+            source.page == target.page,
+            self.zoom_state.borrow().is_some(),
+            connection_conflict,
+        ) {
+            return false;
+        }
+
+        let target_pinned = self.tab_page_is_pinned(&target.page);
+        let (axis, incoming_first) = split_placement(zone);
+        let orientation = match axis {
+            SplitAxis::Horizontal => Orientation::Horizontal,
+            SplitAxis::Vertical => Orientation::Vertical,
+        };
+        let source_root = source.leaf.root_widget();
+
+        // Commit. Notebook persistence callbacks defer to idle, so observers
+        // see only the final tree after these synchronous GTK operations.
+        if let Some(root) = source.page.root() {
+            root.set_focus(None::<&gtk4::Widget>);
+        }
+        self.remove_strip_button_for(&source.page);
+        self.selected_tabs
+            .borrow_mut()
+            .retain(|name| name != &source_name);
+        self.session_ids.borrow_mut().remove(&source_tab_num);
+        let moved_connection = self.tab_connections.borrow_mut().remove(&source_tab_num);
+        self.notebook.remove_page(Some(source_page_index));
+
+        source_root.set_widget_name(&target_name);
+        let page = plan.commit(&self.notebook, &source_root, orientation, incoming_first);
+        // A direct target page is now a new `Paned`; normalize both that page
+        // root and every retained/moved leaf before sorting or persistence can
+        // observe the replacement.
+        Self::set_tab_page_pinned(&page, target_pinned);
+        if let Some(connection) = moved_connection {
+            let status = connection.status;
+            self.tab_connections
+                .borrow_mut()
+                .insert(target_tab_num, connection);
+            self.set_tab_conn_status(target_tab_num, status);
+        }
+
+        schedule_pane_rebalance(page.clone());
+        self.notebook
+            .set_current_page(self.notebook.page_num(&page));
+        self.sync_tab_strip_active(self.notebook.page_num(&page));
+        self.sync_tab_bar_visibility();
+        self.refresh_pane_headers_for(&page);
+        source.leaf.grab_focus();
+        if let Some(page_num) = self.notebook.page_num(&page) {
+            self.request_tab_terminal_focus(source.leaf.terminal().clone(), page_num);
+        }
+        // Drag-end normally restores the page that was active before a hover
+        // preview. This transaction is the one exception: its new split page
+        // and moved terminal are now the intentional destination.
+        self.commit_tab_split_drag(dragged_session);
+        true
+    }
+
+    /// Detach exactly one split leaf into a normal tab by stable session id.
+    pub(crate) fn move_pane_to_new_tab_by_session(&self, session_id: &str) -> bool {
+        if self.zoom_state.borrow().is_some() {
+            return false;
+        }
+        let Some(location) = self.pane_location_by_session(session_id) else {
+            return false;
+        };
+        let Some(node) = PaneNode::from_widget(&location.page) else {
+            return false;
+        };
+        if !node.is_split() || location.leaf.root_widget().parent().is_none() {
+            return false;
+        }
+
+        let source_pinned = self.tab_page_is_pinned(&location.page);
+        let working_directory = self.pane_working_directory(&location.leaf);
+        let source_page_name = location.page.widget_name().to_string();
+        let Some(sibling) = detach_leaf_and_promote(&self.notebook, &location.leaf.root_widget())
+        else {
+            return false;
+        };
+        if let Some(source_page) = (0..self.notebook.n_pages()).find_map(|index| {
+            self.notebook
+                .nth_page(Some(index))
+                .filter(|page| page.widget_name().as_str() == source_page_name)
+        }) {
+            Self::set_tab_page_pinned(&source_page, source_pinned);
+            self.refresh_pane_headers_for(&source_page);
+        } else {
+            // Defensive fallback for an embedding tree without a conventional
+            // tab name; the promoted subtree is still internally coherent.
+            Self::set_tab_page_pinned(&sibling, source_pinned);
+            self.refresh_pane_headers_for(&sibling);
+        }
+        Self::set_tab_page_pinned(&location.leaf.root_widget(), source_pinned);
+        self.add_pane_leaf_as_new_tab(location.leaf, working_directory);
+        true
     }
 
     /// Bring the current tab's pane headers up to date: visibility, numbering,
@@ -478,10 +688,8 @@ impl UiState {
         };
         let leaves = node.leaves();
         let find = |session: &str| {
-            leaves
-                .iter()
-                .find(|leaf| leaf.session_id().as_deref() == Some(session))
-                .cloned()
+            let index = unique_session_index(leaves.iter().map(PaneLeaf::session_id), session)?;
+            leaves.get(index).cloned()
         };
         // A drop from another tab would have to move a pane between two page
         // trees and two tab identities; refuse rather than half-apply it.
@@ -523,6 +731,7 @@ impl UiState {
             .filter(|cwd| !cwd.is_empty())
             .or_else(|| terminal_working_directory(&current_term));
         let tab_widget_name = Some(page_widget.widget_name().to_string());
+        let pinned = self.tab_page_is_pinned(&page_widget);
         let current_widget = current_leaf.root_widget();
         let parent = current_widget.parent();
 
@@ -601,11 +810,15 @@ impl UiState {
                     .current_page()
                     .and_then(|page| self.notebook.nth_page(Some(page)))
                 {
+                    Self::set_tab_page_pinned(&page, pinned);
                     schedule_pane_rebalance(page);
                     // The tab just became split, so every pane's header appears now.
                     self.refresh_pane_headers();
                 }
                 new_leaf.grab_focus();
+                if let Some(page_num) = self.notebook.current_page() {
+                    self.request_tab_terminal_focus(new_leaf.terminal().clone(), page_num);
+                }
             },
         );
         if let Err(error) = split {

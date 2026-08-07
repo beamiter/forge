@@ -26,6 +26,40 @@ pub(crate) fn detach_leaf_and_promote(notebook: &Notebook, leaf_root: &Widget) -
         return None;
     };
 
+    enum Destination {
+        Start(Paned),
+        End(Paned),
+        Page {
+            index: u32,
+            name: String,
+            label: Option<Widget>,
+        },
+    }
+
+    // Resolve the complete destination before detaching either child. A stale
+    // or malformed tree is therefore a no-op instead of a half-collapsed split.
+    let parent_widget = parent.clone().upcast::<Widget>();
+    let destination = if let Some(grandparent) = parent_widget.parent() {
+        if let Ok(grandparent) = grandparent.downcast::<Paned>() {
+            if grandparent.start_child().as_ref() == Some(&parent_widget) {
+                Destination::Start(grandparent)
+            } else if grandparent.end_child().as_ref() == Some(&parent_widget) {
+                Destination::End(grandparent)
+            } else {
+                return None;
+            }
+        } else {
+            let index = notebook.page_num(&parent_widget)?;
+            Destination::Page {
+                index,
+                name: parent_widget.widget_name().to_string(),
+                label: notebook.tab_label(&parent_widget),
+            }
+        }
+    } else {
+        return None;
+    };
+
     // Clear root focus while both children still belong to GtkPaned. If a
     // focused child is unparented first, GtkPaned can retain a stale private
     // last-focus pointer and warn while the sibling is detached for promotion.
@@ -36,29 +70,140 @@ pub(crate) fn detach_leaf_and_promote(notebook: &Notebook, leaf_root: &Widget) -
     parent.set_start_child(None::<&Widget>);
     parent.set_end_child(None::<&Widget>);
 
-    let parent_widget = parent.upcast::<Widget>();
-    if let Some(grandparent) = parent_widget.parent() {
-        if let Ok(grandparent) = grandparent.downcast::<Paned>() {
-            if grandparent.start_child().as_ref() == Some(&parent_widget) {
-                grandparent.set_start_child(Some(&sibling));
-            } else if grandparent.end_child().as_ref() == Some(&parent_widget) {
-                grandparent.set_end_child(Some(&sibling));
-            } else {
-                return None;
-            }
-            return Some(sibling);
+    match destination {
+        Destination::Start(grandparent) => {
+            grandparent.set_start_child(Some(&sibling));
+        }
+        Destination::End(grandparent) => {
+            grandparent.set_end_child(Some(&sibling));
+        }
+        Destination::Page { index, name, label } => {
+            notebook.remove_page(Some(index));
+            sibling.set_widget_name(&name);
+            let inserted = notebook.insert_page(&sibling, label.as_ref(), Some(index));
+            notebook.set_tab_reorderable(&sibling, true);
+            notebook.set_current_page(Some(inserted));
         }
     }
-
-    let page_index = notebook.page_num(&parent_widget)?;
-    let page_name = parent_widget.widget_name().to_string();
-    let tab_label = notebook.tab_label(&parent_widget);
-    notebook.remove_page(Some(page_index));
-    sibling.set_widget_name(&page_name);
-    let inserted = notebook.insert_page(&sibling, tab_label.as_ref(), Some(page_index));
-    notebook.set_tab_reorderable(&sibling, true);
-    notebook.set_current_page(Some(inserted));
     Some(sibling)
+}
+
+enum LeafSplitSlot {
+    Start(Paned),
+    End(Paned),
+    Page {
+        index: u32,
+        label: Option<Widget>,
+        name: String,
+    },
+}
+
+/// Fully validated destination for inserting one existing leaf beside another.
+///
+/// Planning holds GTK object identities but changes no parents. Once the source
+/// tab is detached, `commit` contains no lookup or fallible branch and therefore
+/// cannot strand the live terminal between representations.
+pub(crate) struct ExistingLeafSplitPlan {
+    target_page: Widget,
+    target_leaf: Widget,
+    slot: LeafSplitSlot,
+}
+
+impl ExistingLeafSplitPlan {
+    /// Account for removing a source Notebook page before this plan commits.
+    pub(crate) fn after_removing_page(mut self, removed_index: u32) -> Self {
+        if let LeafSplitSlot::Page { index, .. } = &mut self.slot {
+            if removed_index < *index {
+                *index -= 1;
+            }
+        }
+        self
+    }
+
+    /// Replace the target slot with a new split containing both existing roots.
+    pub(crate) fn commit(
+        self,
+        notebook: &Notebook,
+        incoming: &Widget,
+        orientation: gtk4::Orientation,
+        incoming_first: bool,
+    ) -> Widget {
+        let paned = Paned::new(orientation);
+        paned.set_hexpand(true);
+        paned.set_vexpand(true);
+        paned.set_resize_start_child(true);
+        paned.set_resize_end_child(true);
+        paned.set_shrink_start_child(true);
+        paned.set_shrink_end_child(true);
+
+        match &self.slot {
+            LeafSplitSlot::Start(parent) => parent.set_start_child(Some(&paned)),
+            LeafSplitSlot::End(parent) => parent.set_end_child(Some(&paned)),
+            LeafSplitSlot::Page { index, .. } => notebook.remove_page(Some(*index)),
+        }
+
+        if incoming_first {
+            paned.set_start_child(Some(incoming));
+            paned.set_end_child(Some(&self.target_leaf));
+        } else {
+            paned.set_start_child(Some(&self.target_leaf));
+            paned.set_end_child(Some(incoming));
+        }
+
+        match self.slot {
+            LeafSplitSlot::Start(_) | LeafSplitSlot::End(_) => self.target_page,
+            LeafSplitSlot::Page { index, label, name } => {
+                paned.set_widget_name(&name);
+                let inserted = notebook.insert_page(&paned, label.as_ref(), Some(index));
+                notebook.set_tab_reorderable(&paned, true);
+                notebook.set_current_page(Some(inserted));
+                paned.upcast()
+            }
+        }
+    }
+}
+
+/// Validate the exact tree slot that will receive an existing dragged leaf.
+pub(crate) fn plan_existing_leaf_split(
+    notebook: &Notebook,
+    target_page: &Widget,
+    target_leaf: &Widget,
+) -> Option<ExistingLeafSplitPlan> {
+    let slot = if target_page == target_leaf {
+        LeafSplitSlot::Page {
+            index: notebook.page_num(target_page)?,
+            label: notebook.tab_label(target_page),
+            name: target_page.widget_name().to_string(),
+        }
+    } else {
+        let parent = target_leaf.parent()?.downcast::<Paned>().ok()?;
+        let parent_widget = parent.clone().upcast::<Widget>();
+        let mut ancestor = Some(parent_widget);
+        let mut belongs_to_page = false;
+        while let Some(widget) = ancestor {
+            if widget == *target_page {
+                belongs_to_page = true;
+                break;
+            }
+            ancestor = widget.parent();
+        }
+        if !belongs_to_page || notebook.page_num(target_page).is_none() {
+            return None;
+        }
+        if parent.start_child().as_ref() == Some(target_leaf) {
+            LeafSplitSlot::Start(parent)
+        } else if parent.end_child().as_ref() == Some(target_leaf) {
+            LeafSplitSlot::End(parent)
+        } else {
+            return None;
+        }
+    };
+
+    Some(ExistingLeafSplitPlan {
+        target_page: target_page.clone(),
+        target_leaf: target_leaf.clone(),
+        slot,
+    })
 }
 
 /// Notebook-page swap retained while one split leaf is zoomed.

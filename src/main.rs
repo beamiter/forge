@@ -214,6 +214,69 @@ fn next_tab_focus_frame(mapped: bool, has_focus: bool, stable_frames: u8) -> Tab
     }
 }
 
+impl UiState {
+    /// Cancel every frame-clock focus request created before a structural pane
+    /// mutation that may keep the same Notebook page selected.
+    pub(crate) fn invalidate_tab_focus_requests(&self) -> u64 {
+        let generation = self.tab_focus_generation.get().wrapping_add(1);
+        self.tab_focus_generation.set(generation);
+        generation
+    }
+
+    /// Focus one exact live VTE once its (possibly reparented) page is mapped.
+    /// The shared generation lets DnD replace a hover target's request with a
+    /// request for the pane that actually moved, even though the page number did
+    /// not change.
+    pub(crate) fn request_tab_terminal_focus(
+        &self,
+        target_terminal: vte4::Terminal,
+        page_num: u32,
+    ) {
+        let generation = self.invalidate_tab_focus_requests();
+        let notebook_for_focus = self.notebook.clone();
+        let ui_for_focus = self.clone();
+        let focus_generation = self.tab_focus_generation.clone();
+        let frame_count = Cell::new(0u8);
+        let stable_frames = Cell::new(0u8);
+        self.notebook.add_tick_callback(move |_, _| {
+            if !tab_focus_request_is_current(
+                focus_generation.get(),
+                generation,
+                notebook_for_focus.current_page(),
+                page_num,
+            ) {
+                return glib::ControlFlow::Break;
+            }
+
+            if ui_for_focus.search_bar.is_search_mode() {
+                ui_for_focus.search_apply();
+                ui_for_focus.search_entry.grab_focus();
+                return glib::ControlFlow::Break;
+            }
+
+            frame_count.set(frame_count.get() + 1);
+            let focus_frame = next_tab_focus_frame(
+                target_terminal.is_mapped(),
+                target_terminal.has_focus(),
+                stable_frames.get(),
+            );
+            stable_frames.set(focus_frame.stable_frames);
+            if focus_frame.should_grab {
+                target_terminal.grab_focus();
+            }
+            if focus_frame.complete {
+                return glib::ControlFlow::Break;
+            }
+
+            if frame_count.get() >= TAB_SWITCH_FOCUS_MAX_FRAMES {
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
+    }
+}
+
 fn env_is_unset(k: &str) -> bool {
     std::env::var_os(k).is_none_or(|v| v.is_empty())
 }
@@ -859,6 +922,8 @@ pub fn run() -> glib::ExitCode {
             file_tree_root_label: file_tree_root_label.clone(),
             tab_search_entry: tab_search_entry.clone(),
             selected_tabs: Rc::new(RefCell::new(Vec::new())),
+            tab_drag_state: Rc::new(RefCell::new(Default::default())),
+            tab_focus_generation: Rc::new(Cell::new(0)),
             command_palette_dialog: Rc::new(RefCell::new(None)),
             remote_picker_dialog: Rc::new(RefCell::new(None)),
             history_palette_dialog: Rc::new(RefCell::new(None)),
@@ -1010,6 +1075,7 @@ pub fn run() -> glib::ExitCode {
         // (which also restores the persisted sidebar view).
         ui.init_file_tree();
         ui.apply_tab_placement();
+        ui.install_tab_bar_pane_drop();
 
         // Wire "+" button — inherit working directory from current session
         let ui_for_add = ui.clone();
@@ -1325,17 +1391,12 @@ pub fn run() -> glib::ExitCode {
 
         // Focus terminal when switching tabs (split-aware) and sync tab strip
         let ui_for_switch = ui.clone();
-        let notebook_for_switch = notebook.clone();
-        // Invalidates frame-scoped focus work from earlier pages during a rapid
-        // Ctrl+PageUp/PageDown sequence.
-        let tab_focus_generation = Rc::new(Cell::new(0u64));
         notebook.connect_switch_page(move |_, widget, page_num| {
-            let generation = tab_focus_generation.get().wrapping_add(1);
-            tab_focus_generation.set(generation);
             // Headers are only maintained for the visible tab, so the newly
             // selected one has to catch up before it is drawn.
             ui_for_switch.refresh_pane_headers_for(widget);
             if ui_for_switch.search_bar.is_search_mode() {
+                ui_for_switch.invalidate_tab_focus_requests();
                 ui_for_switch.search_apply();
                 ui_for_switch.search_entry.grab_focus();
             } else if let Some(target_terminal) = ui_for_switch.terminal_in_page(widget) {
@@ -1344,52 +1405,12 @@ pub fn run() -> glib::ExitCode {
                 }
 
                 // `switch-page` can run before the selected child has completed
-                // its map/focus reconciliation. Follow the notebook's frame
-                // clock instead of guessing with wall-clock timeouts, and only
-                // finish once the exact live VTE has retained focus across two
-                // frames. Generation and page checks prevent callbacks from an
-                // intermediate tab in a held-key burst stealing focus back.
-                let notebook_for_focus = notebook_for_switch.clone();
-                let ui_for_focus = ui_for_switch.clone();
-                let focus_generation = tab_focus_generation.clone();
-                let frame_count = Cell::new(0u8);
-                let stable_frames = Cell::new(0u8);
-                notebook_for_switch.add_tick_callback(move |_, _| {
-                    if !tab_focus_request_is_current(
-                        focus_generation.get(),
-                        generation,
-                        notebook_for_focus.current_page(),
-                        page_num,
-                    ) {
-                        return glib::ControlFlow::Break;
-                    }
-
-                    if ui_for_focus.search_bar.is_search_mode() {
-                        ui_for_focus.search_apply();
-                        ui_for_focus.search_entry.grab_focus();
-                        return glib::ControlFlow::Break;
-                    }
-
-                    frame_count.set(frame_count.get() + 1);
-                    let focus_frame = next_tab_focus_frame(
-                        target_terminal.is_mapped(),
-                        target_terminal.has_focus(),
-                        stable_frames.get(),
-                    );
-                    stable_frames.set(focus_frame.stable_frames);
-                    if focus_frame.should_grab {
-                        target_terminal.grab_focus();
-                    }
-                    if focus_frame.complete {
-                        return glib::ControlFlow::Break;
-                    }
-
-                    if frame_count.get() >= TAB_SWITCH_FOCUS_MAX_FRAMES {
-                        glib::ControlFlow::Break
-                    } else {
-                        glib::ControlFlow::Continue
-                    }
-                });
+                // its map/focus reconciliation. The shared request generation
+                // also lets topology DnD replace this target if it moves another
+                // live pane into the still-selected page before the next frame.
+                ui_for_switch.request_tab_terminal_focus(target_terminal, page_num);
+            } else {
+                ui_for_switch.invalidate_tab_focus_requests();
             }
             // Clear activity/bell indicators for the tab being switched to
             let tab_name = widget.widget_name();
@@ -1806,5 +1827,25 @@ mod tests {
         assert!(super::tab_focus_request_is_current(9, 9, Some(2), 2));
         assert!(!super::tab_focus_request_is_current(10, 9, Some(2), 2));
         assert!(!super::tab_focus_request_is_current(9, 9, Some(1), 2));
+    }
+
+    #[test]
+    fn topology_focus_request_supersedes_hover_target_on_the_same_page() {
+        let hover_generation = 41;
+        let moved_pane_generation = hover_generation + 1;
+        let selected_page = Some(3);
+
+        assert!(!super::tab_focus_request_is_current(
+            moved_pane_generation,
+            hover_generation,
+            selected_page,
+            3,
+        ));
+        assert!(super::tab_focus_request_is_current(
+            moved_pane_generation,
+            moved_pane_generation,
+            selected_page,
+            3,
+        ));
     }
 }

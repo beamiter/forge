@@ -13,15 +13,9 @@
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 
-/// The dragged pane's session id, wrapped in a private boxed GType.
-///
-/// A plain `String` payload would be `gchararray`, which is exactly what VTE's
-/// own text drop target accepts: dropping a pane over the grid would paste its
-/// session id into the shell instead of rearranging the layout. A type nobody
-/// else declares cannot be claimed by the wrong controller.
-#[derive(Clone, Debug, glib::Boxed)]
-#[boxed_type(name = "JtermPaneDragPayload")]
-pub(crate) struct PaneDragPayload(pub(crate) String);
+use super::pane_dnd::{
+    split_drop_zone, tab_payload_can_split, PaneDragPayload, SplitDropZone, TabDragPayload,
+};
 
 /// Style rules for the header strip, appended to the app's static CSS.
 pub(crate) const PANE_HEADER_CSS: &str = "
@@ -40,6 +34,11 @@ pub(crate) const PANE_HEADER_CSS: &str = "
     .pane-header-cwd { opacity: 0.6; }
     .pane-header-command { color: #8be9fd; }
     .pane-drop-target { outline: 2px solid alpha(currentColor, 0.8); outline-offset: -2px; }
+    .pane-tab-drop-left { box-shadow: inset 10px 0 alpha(currentColor, 0.5); }
+    .pane-tab-drop-right { box-shadow: inset -10px 0 alpha(currentColor, 0.5); }
+    .pane-tab-drop-up { box-shadow: inset 0 10px alpha(currentColor, 0.5); }
+    .pane-tab-drop-down { box-shadow: inset 0 -10px alpha(currentColor, 0.5); }
+    .pane-to-tab-drop-target { outline: 2px solid alpha(currentColor, 0.8); outline-offset: -2px; }
 ";
 
 /// One pane's status strip.
@@ -80,7 +79,9 @@ impl PaneHeader {
         root.append(&cwd);
         root.append(&command);
         root.set_cursor_from_name(Some("grab"));
-        root.set_tooltip_text(Some("Drag onto another pane to swap them"));
+        root.set_tooltip_text(Some(
+            "Drag onto another pane to swap, or onto the tab bar to detach",
+        ));
         root.set_visible(false);
 
         PaneHeader {
@@ -196,6 +197,89 @@ pub(crate) fn install_pane_drop_target(
             Ok(dragged) => on_drop(&dragged.0),
             Err(_) => false,
         }
+    });
+    leaf_root.add_controller(target);
+}
+
+fn clear_tab_split_drop_classes(root: &gtk4::Widget) {
+    for class in [
+        "pane-tab-drop-left",
+        "pane-tab-drop-right",
+        "pane-tab-drop-up",
+        "pane-tab-drop-down",
+    ] {
+        root.remove_css_class(class);
+    }
+}
+
+fn set_tab_split_drop_class(root: &gtk4::Widget, zone: Option<SplitDropZone>) {
+    clear_tab_split_drop_classes(root);
+    let class = match zone {
+        Some(SplitDropZone::Left) => "pane-tab-drop-left",
+        Some(SplitDropZone::Right) => "pane-tab-drop-right",
+        Some(SplitDropZone::Up) => "pane-tab-drop-up",
+        Some(SplitDropZone::Down) => "pane-tab-drop-down",
+        None => return,
+    };
+    root.add_css_class(class);
+}
+
+/// Accept a single-pane tab over the four outer drop zones of one live pane.
+///
+/// The target controller is distinct from the pane-swap controller, and both
+/// payloads are private boxed GTypes, so neither path can be mistaken for a VTE
+/// text drop. The callback performs live identity resolution and the structural
+/// transaction; this layer owns only pointer geometry and transient feedback.
+pub(crate) fn install_tab_split_drop_target(
+    leaf_root: &gtk4::Widget,
+    on_drop: impl Fn(&str, SplitDropZone) -> bool + 'static,
+) {
+    let target = gtk4::DropTarget::new(TabDragPayload::static_type(), gdk::DragAction::MOVE);
+    target.set_preload(true);
+
+    let highlighted = leaf_root.downgrade();
+    target.connect_motion(move |target, x, y| {
+        let eligible = target
+            .value()
+            .and_then(|value| value.get::<TabDragPayload>().ok())
+            .is_some_and(|payload| tab_payload_can_split(&payload));
+        let zone = highlighted.upgrade().and_then(|root| {
+            let zone = eligible
+                .then(|| split_drop_zone(root.width(), root.height(), x, y))
+                .flatten();
+            set_tab_split_drop_class(&root, zone);
+            zone
+        });
+        if zone.is_some() {
+            gdk::DragAction::MOVE
+        } else {
+            gdk::DragAction::empty()
+        }
+    });
+
+    let highlighted = leaf_root.downgrade();
+    target.connect_leave(move |_| {
+        if let Some(root) = highlighted.upgrade() {
+            clear_tab_split_drop_classes(&root);
+        }
+    });
+
+    let highlighted = leaf_root.downgrade();
+    target.connect_drop(move |_, value, x, y| {
+        let Some(root) = highlighted.upgrade() else {
+            return false;
+        };
+        clear_tab_split_drop_classes(&root);
+        let Some(zone) = split_drop_zone(root.width(), root.height(), x, y) else {
+            return false;
+        };
+        let Ok(payload) = value.get::<TabDragPayload>() else {
+            return false;
+        };
+        let Some(session_id) = payload.pane_session_id.as_deref() else {
+            return false;
+        };
+        on_drop(session_id, zone)
     });
     leaf_root.add_controller(target);
 }

@@ -25,6 +25,7 @@ mod file_tree;
 mod jsh;
 mod layout;
 mod notebooks;
+mod pane_dnd;
 mod pane_header;
 mod pane_leaf;
 mod pane_node;
@@ -46,7 +47,8 @@ pub(crate) use pane_header::{PaneHeader, PANE_HEADER_CSS};
 pub(crate) use pane_leaf::PaneLeaf;
 pub(crate) use pane_node::PaneNode;
 pub(crate) use pane_tree_edit::{
-    detach_leaf_and_promote, detach_leaf_for_zoom, restore_zoomed_leaf, ZoomPageSwap,
+    detach_leaf_and_promote, detach_leaf_for_zoom, plan_existing_leaf_split, restore_zoomed_leaf,
+    ZoomPageSwap,
 };
 
 /// Quiet period after the last font-scale step before the config is written.
@@ -143,6 +145,12 @@ pub(crate) struct UiState {
     pub(crate) file_tree_root_label: gtk4::Label,
     pub(crate) tab_search_entry: SearchEntry,
     pub(crate) selected_tabs: Rc<RefCell<Vec<String>>>,
+    /// Global identity/generation for one native tab drag. Delayed hover work
+    /// must be bound to this state rather than to a target button alone.
+    pub(crate) tab_drag_state: Rc<RefCell<pane_dnd::TabDragState>>,
+    /// Invalidates frame-clock focus requests when a layout mutation keeps the
+    /// same Notebook page selected but changes which live pane should own focus.
+    pub(crate) tab_focus_generation: Rc<Cell<u64>>,
     pub(crate) command_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) remote_picker_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) history_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,

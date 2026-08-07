@@ -1546,6 +1546,7 @@ impl UiState {
         view_type.attach_to(&term_wrapper_widget);
         view_type.set_session_id(&sid);
         view_type.set_remote(is_remote);
+        self.install_pane_rearrange(&view_type);
 
         let ui_for_close = UiState::clone(self);
         let page_name_for_close = format!("tab-{tab_num}");

@@ -73,6 +73,17 @@ impl PaneLeaf {
         super::pane_header::install_pane_drop_target(&root, on_drop);
     }
 
+    /// Make the four outer edges of this leaf accept a single-pane tab.
+    ///
+    /// The closure receives only stable identities and a pure direction. It
+    /// resolves both widgets again at drop time before any GTK reparenting.
+    pub(crate) fn install_tab_split_drop(
+        &self,
+        on_drop: impl Fn(&str, super::pane_dnd::SplitDropZone) -> bool + 'static,
+    ) {
+        super::pane_header::install_tab_split_drop_target(&self.root_widget(), on_drop);
+    }
+
     /// Focus the actual live surface rather than the first VTE found in the tree.
     pub(crate) fn grab_focus(&self) {
         self.mark_active();

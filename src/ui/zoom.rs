@@ -2,7 +2,6 @@
 use gtk4::prelude::WidgetExt;
 
 use super::*;
-use crate::terminal::terminal_working_directory;
 
 impl UiState {
     pub(crate) fn toggle_pane_zoom(&self) {
@@ -74,16 +73,9 @@ impl UiState {
         let Some(leaf) = node.active_leaf() else {
             return;
         };
-        let working_directory = terminal_working_directory(leaf.terminal());
-        let leaf_root = leaf.root_widget();
-        let Some(sibling) = detach_leaf_and_promote(&self.notebook, &leaf_root) else {
+        let Some(session_id) = leaf.session_id() else {
             return;
         };
-        if let Some(node) = PaneNode::from_widget(&sibling) {
-            node.grab_focus();
-        }
-        self.add_pane_leaf_as_new_tab(leaf, working_directory);
-        // The source tab lost a pane and may be back to a single one.
-        self.refresh_pane_headers();
+        let _moved = self.move_pane_to_new_tab_by_session(&session_id);
     }
 }
