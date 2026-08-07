@@ -248,7 +248,7 @@ jsh_update_check = "daily"    # "startup" 每次启动联网；"daily" 复用缓
 
 AI provider、model、endpoint 和 API key 均可在 Settings 的 **AI & Agent** 分组配置；面板输入的 key 会原子保存到独立的 owner-only 文件，绝不会写入 `config.toml`，环境变量仍具有最高优先级。AI 面板的分隔条宽度会随配置持久化。**New chat** 会创建并选中一个新会话，旧会话继续保留在可搜索的 **Chats** 会话库中；会话自动取标题，也可 Rename、Archive/Unarchive，Delete 前会要求确认。输入框使用 `Enter` 或 `Ctrl+Enter` 发送，`Shift+Enter` 换行，并保留输入法候选确认语义。请求期间可 **Stop**，失败或停止后可按原 chat/context **Retry**；选中 Block 会显示可清除的 context chip，输出被截断时 chip 会明确提示。空会话也提供只填充、不自动发送的快捷提示。
 
-当前选择、每个 chat 的草稿和实际发送的选中 Block 上下文会跟随各自窗口快照恢复；快速关窗会先强制刷新草稿，发送失败或中途退出的问题也会作为可重试 draft 恢复，Ask selected Block 不会覆盖正在编辑的文字，关窗时其内存重试也会转成可恢复 draft/context。集合最多保存 50 条 chat metadata、每个 chat 最多 100 个 turn，紧凑 JSON 总预算仍为 8 MiB；超出总预算时只裁剪最旧的完整问答对，不会删除在途问题，并在对应会话显示 `truncated`。出站请求另保留最近至多 40 个 turn/256 KiB，单条输入、Block 输出和模型文本分别有 64 KiB、64 KiB、256 KiB 硬上限，可见 AI/Agent activity 各限制为 1 MiB，同时最多运行 4 个 provider 请求。窗口状态另为完整 chat metadata 预留 64 KiB，Pane/Tab 数据挤压空间时也不会静默删除整个 Chats 库。旧版单会话 schema v1 会自动迁移。后台回复始终绑定发起请求的 chat，切换不会串话，已经 Delete 的 chat 收到迟到回复时会直接丢弃。默认脱敏覆盖 active、non-active、archived chat 及其 draft/context；`--safe-mode` 与 `--no-restore` 的隔离和恢复语义保持不变。
+当前选择、每个 chat 的草稿和实际发送的选中 Block 上下文会跟随各自窗口快照恢复；快速关窗会先强制刷新草稿，发送失败或中途退出的问题也会作为可重试 draft 恢复，Ask selected Block 不会覆盖正在编辑的文字，关窗时其内存重试也会转成可恢复 draft/context。集合最多保存 50 条 chat metadata、每个 chat 最多 100 个 turn，紧凑 JSON 总预算仍为 8 MiB；超出总预算时只裁剪最旧的完整问答对，不会删除在途问题，并在对应会话显示 `truncated`。出站请求另保留最近至多 40 个 turn/256 KiB，单条输入、Block 输出和模型文本分别有 64 KiB、64 KiB、256 KiB 硬上限，可见 AI/Agent activity 各限制为 1 MiB，同时最多运行 4 个 provider 请求。非流式成功响应保持 raw bytes，先通过 jagent 的 1 MiB envelope gate 才解码 JSON；非 2xx 响应最多只有前 2 KiB 可进入诊断 JSON 解析器。窗口状态另为完整 chat metadata 预留 64 KiB，Pane/Tab 数据挤压空间时也不会静默删除整个 Chats 库。旧版单会话 schema v1 会自动迁移。后台回复始终绑定发起请求的 chat，切换不会串话，已经 Delete 的 chat 收到迟到回复时会直接丢弃。默认脱敏覆盖 active、non-active、archived chat 及其 draft/context；`--safe-mode` 与 `--no-restore` 的隔离和恢复语义保持不变。
 
 命令面板使用模糊匹配；输入 `>` 只看动作、`@` 只看 JSONL 历史、`:` 只看 workflow、`?` 提交自然语言命令请求。历史和 workflow 只写入当前编辑行；`?` 请求会绑定当前 Block pane，在块流中显示可 Stop/Retry/Regenerate 的审阅卡，并携带可见的 selected Block 不可信上下文。它与命令纠正、Shell Agent proposal 共用可编辑、复制、动态风险提示的审阅逻辑，主操作只会 **Insert for review**，不会执行。所有审阅式插入都拒绝 CR、LF、Tab、NUL 和终端控制字符，避免多行条目越过“不提交”边界。`Ctrl+Alt+G` 或顶部栏的 **Agent** 开关会打开绑定当前 Block pane 的 Shell Agent；若打开时已选中 finished Block，它会作为可见、可移除的不可信上下文附加。Agent 显示目标、provider/model、shell、回合进度、activity 与实时 prompt readiness，可单独 Stop/Retry 当前模型请求，并可切换持久化的 typo-like 命令纠正。严格 JSON proposal 可复制、编辑、Reject、**Insert only** 或逐条 **Approve & Run**；Insert only 只回填普通 shell 编辑行并在 Agent 上下文记录“未执行”，危险命令执行仍需第二次确认。完成块的退出码和截断输出随后回灌到下一轮；`done` 后可用 **Follow up** 保留上下文追问，回合耗尽后可用 **New task** 在同一 pane 重置 Agent transcript 与预算。
 
@@ -279,6 +279,7 @@ forge 以 **MIT OR Apache-2.0** 双许可证发布，使用者可任选其一；
 - OSC 52 远程剪贴板写入默认关闭。
 - AI 会话库默认对常见云密钥、PAT、JWT 和私钥进行脱敏，覆盖 active、non-active、archived chat 以及草稿和 Block 上下文。
 - Agent 只支持显式选中的 Block pane；prompt 忙或已有输入时拒绝提交，危险模式会醒目标注，但最终批准仍由用户负责。
+- Agent snapshot 只通过 jagent 的有预算 decoder 进入内存，Forge 再直接审计该 bounded view 的 proposal 连续性、观察生命周期和状态绑定，不会二次走普通 serde collection 解码。
 - 可执行 Notebook 在独立进程组运行，关闭或停止 cell 会终止其进程组；安全模式完全禁用 Notebook 执行。
 - 命令历史只保存 command、cwd、exit code 和完成时间，不保存输出，并限制单条/总文件大小。
 - 每个窗口使用独立的原子会话快照；并发窗口互不覆盖，崩溃遗留快照会在下次启动回收。

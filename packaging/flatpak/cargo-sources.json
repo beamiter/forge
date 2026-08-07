@@ -2,14 +2,14 @@
     {
         "type": "git",
         "url": "https://github.com/beamiter/jagent",
-        "commit": "e94469b3b0b706100cfda91ea80281dbbfe6fe6b",
-        "dest": "flatpak-cargo/git/jagent-e94469b"
+        "commit": "f3b9b9a95d494619b0e623bd96afa70311f9ca26",
+        "dest": "flatpak-cargo/git/jagent-f3b9b9a"
     },
     {
         "type": "git",
         "url": "https://github.com/beamiter/jterm_core",
-        "commit": "9e79a5bf0d905575863def4d0e77f74a1f533638",
-        "dest": "flatpak-cargo/git/jterm_core-9e79a5b"
+        "commit": "586d84739c490d74918778a31441040ed7a36a4b",
+        "dest": "flatpak-cargo/git/jterm_core-586d847"
     },
     {
         "type": "archive",
@@ -885,12 +885,12 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/jagent-e94469b/.\" \"cargo/vendor/jagent\""
+            "cp -r --reflink=auto \"flatpak-cargo/git/jagent-f3b9b9a/.\" \"cargo/vendor/jagent\""
         ]
     },
     {
         "type": "inline",
-        "contents": "[package]\nname = \"jagent\"\nversion = \"0.5.0\"\nedition = \"2021\"\nrust-version = \"1.86\"\ndescription = \"Review-first terminal AI agent core: pure session state machine, provider-neutral request building, and safety heuristics (sans-IO)\"\nreadme = \"README.md\"\nrepository = \"https://github.com/beamiter/jagent\"\nkeywords = [\"terminal\", \"shell\", \"agent\", \"ai\", \"llm\"]\ncategories = [\"command-line-utilities\"]\nlicense = \"MIT OR Apache-2.0\"\n\n[dependencies]\nregex = \"1\"\nserde_json = \"1\"\n\n[dependencies.serde]\nversion = \"1\"\nfeatures = [\"derive\"]\n",
+        "contents": "[package]\nname = \"jagent\"\nversion = \"0.6.0\"\nedition = \"2021\"\nrust-version = \"1.86\"\ndescription = \"Review-first terminal AI agent core: pure session state machine, provider-neutral request building, and safety heuristics (sans-IO)\"\nreadme = \"README.md\"\nrepository = \"https://github.com/beamiter/jagent\"\nkeywords = [\"terminal\", \"shell\", \"agent\", \"ai\", \"llm\"]\ncategories = [\"command-line-utilities\"]\nlicense = \"MIT OR Apache-2.0\"\n\n[dependencies]\nregex = \"1\"\nserde_json = \"1\"\n\n[dependencies.serde]\nversion = \"1\"\nfeatures = [\"derive\"]\n",
         "dest": "cargo/vendor/jagent",
         "dest-filename": "Cargo.toml"
     },
@@ -955,12 +955,12 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-9e79a5b/.\" \"cargo/vendor/jterm_core\""
+            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-586d847/.\" \"cargo/vendor/jterm_core\""
         ]
     },
     {
         "type": "inline",
-        "contents": "[package]\nname = \"jterm_core\"\nversion = \"0.1.0\"\nedition = \"2021\"\nrust-version = \"1.86\"\ndescription = \"Shared UI-independent core for the jterm family of terminal emulators\"\nreadme = \"README.md\"\nrepository = \"https://github.com/beamiter/jterm_core\"\nlicense = \"MIT\"\nkeywords = [\"terminal\", \"pty\", \"parser\", \"jterm\"]\ncategories = [\"command-line-utilities\", \"development-tools\"]\n\n[dependencies]\ncrossbeam-channel = \"0.5\"\nlibc = \"0.2.189\"\nlog = \"0.4\"\nlru = \"0.18\"\nmemchr = \"2.8.3\"\nonce_cell = \"1.21\"\ndirs = \"6.0\"\nserde_json = \"1.0.151\"\ntoml = \"1.1\"\nunicode-width = \"0.2\"\n\n[dependencies.jagent]\ngit = \"https://github.com/beamiter/jagent.git\"\nrev = \"e94469b3b0b706100cfda91ea80281dbbfe6fe6b\"\n\n[dependencies.serde]\nversion = \"1.0.229\"\nfeatures = [\"derive\"]\n",
+        "contents": "[package]\nname = \"jterm_core\"\nversion = \"0.2.0\"\nedition = \"2021\"\nrust-version = \"1.86\"\ndescription = \"Shared UI-independent core for the jterm family of terminal emulators\"\nreadme = \"README.md\"\nrepository = \"https://github.com/beamiter/jterm_core\"\nlicense = \"MIT\"\nkeywords = [\"terminal\", \"pty\", \"parser\", \"jterm\"]\ncategories = [\"command-line-utilities\", \"development-tools\"]\n\n[dependencies]\ncrossbeam-channel = \"0.5\"\nlibc = \"0.2.189\"\nlog = \"0.4\"\nlru = \"0.18\"\nmemchr = \"2.8.3\"\nonce_cell = \"1.21\"\ndirs = \"6.0\"\nserde_json = \"1.0.151\"\ntoml = \"1.1\"\nunicode-width = \"0.2\"\n[dependencies.jagent]\ngit = \"https://github.com/beamiter/jagent.git\"\nrev = \"f3b9b9a95d494619b0e623bd96afa70311f9ca26\"\n\n[dependencies.serde]\nversion = \"1.0.229\"\nfeatures = [\"derive\"]\n",
         "dest": "cargo/vendor/jterm_core",
         "dest-filename": "Cargo.toml"
     },
@@ -2051,7 +2051,7 @@
     },
     {
         "type": "inline",
-        "contents": "[source.vendored-sources]\ndirectory = \"cargo/vendor\"\n\n[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.\"https://github.com/beamiter/jagent\"]\ngit = \"https://github.com/beamiter/jagent\"\nreplace-with = \"vendored-sources\"\nrev = \"e94469b3b0b706100cfda91ea80281dbbfe6fe6b\"\n\n[source.\"https://github.com/beamiter/jterm_core\"]\ngit = \"https://github.com/beamiter/jterm_core\"\nreplace-with = \"vendored-sources\"\nrev = \"9e79a5bf0d905575863def4d0e77f74a1f533638\"\n",
+        "contents": "[source]\n[source.vendored-sources]\ndirectory = \"cargo/vendor\"\n\n[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.\"https://github.com/beamiter/jagent\"]\ngit = \"https://github.com/beamiter/jagent\"\nreplace-with = \"vendored-sources\"\nrev = \"f3b9b9a95d494619b0e623bd96afa70311f9ca26\"\n\n[source.\"https://github.com/beamiter/jterm_core\"]\ngit = \"https://github.com/beamiter/jterm_core\"\nreplace-with = \"vendored-sources\"\nrev = \"586d84739c490d74918778a31441040ed7a36a4b\"\n",
         "dest": "cargo",
         "dest-filename": "config"
     }

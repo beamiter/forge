@@ -7,7 +7,9 @@ and upgrades Agent approval, bounded AI conversations, PTY queues, persistence,
 history, terminal parsing, notebook workflows, configuration, and UI safety.
 Execution completions are now correlated by a checked one-shot identity and must
 match their captured command, and the vendored jsh installer is resynced from the
-hardened canonical copy.
+hardened canonical copy. The wire generation is jagent 0.6.0 plus jterm_core
+0.2.0: owning transcript types are serialize-only and provider envelopes are
+bounded before JSON allocation.
 
 ## Completed since the previous handoff
 
@@ -48,25 +50,21 @@ hardened canonical copy.
   sentinel remains confined to downstream `i32`-only presentation surfaces and
   is never passed to the classifier.
 - `jterm_core` is pinned to
-  `9e79a5bf0d905575863def4d0e77f74a1f533638`; the Nix fixed-output hash and the
-  Flatpak Cargo source manifest were regenerated for that exact tree while the
-  direct jagent revision stayed unchanged.
+  `586d84739c490d74918778a31441040ed7a36a4b` and direct jagent to
+  `f3b9b9a95d494619b0e623bd96afa70311f9ca26`; Cargo, Nix, and the twice-generated
+  Flatpak source manifest all describe those exact trees.
+- Agent snapshot restore now decodes once through jagent's allocation-aware
+  schema and audits its immutable accessors directly. Forge's stricter
+  contiguous-ID, final-pending, immediate-observation, turn-accounting, state,
+  and anti-rebinding rules remain in front of live session restore; the former
+  `AgentSnapshotAudit` ordinary-serde copy is gone.
+- App-local non-streaming AI transport now keeps successful curl bodies as raw
+  bytes through jagent's canonical 1 MiB response gate. HTTP errors may still
+  be retained as bounded transport evidence, but only the first 2 KiB can enter
+  diagnostic JSON parsing; exact-limit, limit-plus-one, and large-error tests
+  pin those boundaries.
 
 ## Remaining boundaries
-
-### Decode Agent snapshots once, with budgets and semantics together
-
-The file is capped at 256 KiB and production restore performs strict transcript
-and state auditing, but the current path first constructs `AgentSessionSnapshot`
-and then constructs a second audit representation. The upstream jagent now
-decodes snapshots through bounded seeds that stop before turn 129 and charge
-per-field and cumulative bytes while decoding; once the pinned revision is
-advanced, replace both local passes with that single counted decode and audit
-the decoded value directly.
-
-Keep raw `AgentSession` restore private to the hardened wrapper, or make every
-public snapshot reader perform the same audit so future callers cannot bypass
-production semantics.
 
 ### Carry the execution generation into the completion callback
 

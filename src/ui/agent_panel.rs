@@ -511,42 +511,36 @@ fn read_agent_snapshot_file(
     crate::agent::AgentSessionSnapshot::from_json(&encoded).map(Some)
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AgentSnapshotAudit {
-    version: u32,
-    transcript: Vec<Turn>,
-    transcript_truncated: bool,
-    state: AgentState,
-    turns_used: u32,
-    max_turns: u32,
-    next_proposal_id: u64,
-}
-
-/// Validate proposal identity and lifecycle on the raw transcript, before the
-/// pinned dependency compacts it. Validating only `AgentSession::restore`'s
-/// output is insufficient: prefix compaction can hide a duplicate/older
-/// proposal that `proposal_mut` would otherwise bind to an approval click.
-fn audit_agent_snapshot(encoded: &str) -> Result<(), crate::agent::AgentSnapshotError> {
+/// Validate proposal identity and lifecycle on jagent's bounded decoded
+/// transcript, before `AgentSession::restore` compacts it. Validating only the
+/// restored session is insufficient: prefix compaction can hide a
+/// duplicate/older proposal that an approval click could otherwise rebind to.
+fn audit_agent_snapshot(
+    snapshot: &crate::agent::AgentSessionSnapshot,
+) -> Result<(), crate::agent::AgentSnapshotError> {
     const MAX_RESTORED_TURNS: usize = 128;
     const PROPOSAL_ID_HEADROOM: u64 = 1_024;
 
-    let audit: AgentSnapshotAudit = serde_json::from_str(encoded)
-        .map_err(|error| crate::agent::AgentSnapshotError::Decode(error.to_string()))?;
-    // These scalar checks mirror the pinned restore contract, but run before
-    // any transcript normalization so later identity checks see exact input.
-    if audit.version != 1
-        || audit.max_turns == 0
-        || audit.max_turns > 1_000
-        || audit.turns_used > audit.max_turns
-        || audit.transcript.is_empty()
-        || audit.transcript.len() > MAX_RESTORED_TURNS
+    // jagent's sole snapshot wire decoder has already enforced allocation
+    // budgets. Keep Forge's stricter semantic audit on that unmodified view.
+    let transcript = snapshot.transcript();
+    let transcript_truncated = snapshot.transcript_truncated();
+    let state = snapshot.state();
+    let turns_used = snapshot.turns_used();
+    let max_turns = snapshot.max_turns();
+    let next_proposal_id = snapshot.next_proposal_id();
+    if snapshot.version() != 1
+        || max_turns == 0
+        || max_turns > 1_000
+        || turns_used > max_turns
+        || transcript.is_empty()
+        || transcript.len() > MAX_RESTORED_TURNS
     {
         return Err(crate::agent::AgentSnapshotError::Invalid(
             "snapshot scalar or transcript limit is invalid",
         ));
     }
-    if audit.next_proposal_id == 0 || audit.next_proposal_id > u64::MAX - PROPOSAL_ID_HEADROOM {
+    if next_proposal_id == 0 || next_proposal_id > u64::MAX - PROPOSAL_ID_HEADROOM {
         return Err(crate::agent::AgentSnapshotError::Invalid(
             "proposal identifier counter is invalid or nearly exhausted",
         ));
@@ -558,12 +552,12 @@ fn audit_agent_snapshot(encoded: &str) -> Result<(), crate::agent::AgentSnapshot
     let mut observations = HashMap::new();
     let mut model_actions = 0_u32;
     let mut protocol_errors = 0_u32;
-    for (index, turn) in audit.transcript.iter().enumerate() {
+    for (index, turn) in transcript.iter().enumerate() {
         match turn {
             Turn::AssistantProposed { id, status, .. } => {
                 model_actions = model_actions.saturating_add(1);
                 let value = id.get();
-                if value == 0 || value >= audit.next_proposal_id {
+                if value == 0 || value >= next_proposal_id {
                     return Err(crate::agent::AgentSnapshotError::Invalid(
                         "proposal id is zero or not below the next-id counter",
                     ));
@@ -574,7 +568,7 @@ fn audit_agent_snapshot(encoded: &str) -> Result<(), crate::agent::AgentSnapshot
                             "proposal ids are duplicated, reordered, or non-contiguous",
                         ));
                     }
-                } else if !audit.transcript_truncated && value != 1 {
+                } else if !transcript_truncated && value != 1 {
                     return Err(crate::agent::AgentSnapshotError::Invalid(
                         "untruncated proposal ids do not start at one",
                     ));
@@ -613,9 +607,8 @@ fn audit_agent_snapshot(encoded: &str) -> Result<(), crate::agent::AgentSnapshot
     // Every retained proposal/say consumed one model turn. A ProtocolError may
     // either be a parse failure (one turn) or a transport failure (no turn),
     // which gives an exact range while the transcript is untruncated.
-    if audit.turns_used < model_actions
-        || (!audit.transcript_truncated
-            && audit.turns_used > model_actions.saturating_add(protocol_errors))
+    if turns_used < model_actions
+        || (!transcript_truncated && turns_used > model_actions.saturating_add(protocol_errors))
     {
         return Err(crate::agent::AgentSnapshotError::Invalid(
             "turn counter is inconsistent with the transcript",
@@ -623,12 +616,12 @@ fn audit_agent_snapshot(encoded: &str) -> Result<(), crate::agent::AgentSnapshot
     }
 
     match previous_proposal_id {
-        Some(last) if audit.next_proposal_id != last + 1 => {
+        Some(last) if next_proposal_id != last + 1 => {
             return Err(crate::agent::AgentSnapshotError::Invalid(
                 "next proposal id does not immediately follow the transcript",
             ));
         }
-        None if !audit.transcript_truncated && audit.next_proposal_id != 1 => {
+        None if !transcript_truncated && next_proposal_id != 1 => {
             return Err(crate::agent::AgentSnapshotError::Invalid(
                 "proposal id counter was reset or advanced without a proposal",
             ));
@@ -636,9 +629,9 @@ fn audit_agent_snapshot(encoded: &str) -> Result<(), crate::agent::AgentSnapshot
         _ => {}
     }
 
-    let final_index = audit.transcript.len() - 1;
-    let final_turn = &audit.transcript[final_index];
-    match audit.state {
+    let final_index = transcript.len() - 1;
+    let final_turn = &transcript[final_index];
+    match state {
         AgentState::AwaitingApproval { proposal_id }
             if pending.as_slice() == [(proposal_id, final_index)] => {}
         AgentState::AwaitingApproval { .. } => {
@@ -663,9 +656,9 @@ fn audit_agent_snapshot(encoded: &str) -> Result<(), crate::agent::AgentSnapshot
         }
         _ => {}
     }
-    let final_state_is_valid = match audit.state {
+    let final_state_is_valid = match state {
         AgentState::Ready => {
-            audit.turns_used < audit.max_turns
+            turns_used < max_turns
                 && matches!(
                     final_turn,
                     Turn::AssistantSay(_)
@@ -677,7 +670,7 @@ fn audit_agent_snapshot(encoded: &str) -> Result<(), crate::agent::AgentSnapshot
                 )
         }
         AgentState::AwaitingModel => {
-            audit.turns_used < audit.max_turns
+            turns_used < max_turns
                 && matches!(
                     final_turn,
                     Turn::User(_)
@@ -693,7 +686,7 @@ fn audit_agent_snapshot(encoded: &str) -> Result<(), crate::agent::AgentSnapshot
         AgentState::AwaitingObservation { .. } => true,
         AgentState::Completed => matches!(final_turn, Turn::AssistantSay(_)),
         AgentState::TurnLimitReached => {
-            audit.turns_used == audit.max_turns
+            turns_used == max_turns
                 && matches!(
                     final_turn,
                     Turn::AssistantSay(_)
@@ -717,7 +710,7 @@ fn audit_agent_snapshot(encoded: &str) -> Result<(), crate::agent::AgentSnapshot
             continue;
         }
         let is_current_unobserved = matches!(
-            audit.state,
+            state,
             AgentState::AwaitingObservation {
                 proposal_id: current
             } if current == *proposal_id
@@ -731,9 +724,9 @@ fn audit_agent_snapshot(encoded: &str) -> Result<(), crate::agent::AgentSnapshot
     Ok(())
 }
 
-/// The pinned Agent dependency predates strict transcript-ID validation. Do it
-/// at the app boundary so a crafted duplicate ProposalId cannot make a visible
-/// approval card authorize a different transcript entry (confused deputy).
+/// Apply Forge's stricter transcript-ID and proposal-lifecycle contract at the
+/// app boundary so a crafted snapshot cannot make a visible approval card
+/// authorize a different transcript entry (confused deputy).
 fn restore_agent_snapshot(
     snapshot: crate::agent::AgentSessionSnapshot,
 ) -> Result<AgentSession, crate::agent::AgentSnapshotError> {
@@ -744,11 +737,9 @@ fn restore_agent_snapshot(
     const MAX_RESTORED_OBSERVATION_BYTES: usize = 4 * 1024;
     const PROPOSAL_ID_HEADROOM: u64 = 1_024;
 
-    // The pinned jagent release used saturating proposal-ID increments. Keep
-    // enough identifier space for every possible remaining turn so a crafted
-    // near-max counter cannot make two later approval cards share an ID.
-    let encoded = snapshot.to_json()?;
-    audit_agent_snapshot(&encoded)?;
+    // Keep enough identifier space for every possible remaining turn so a
+    // crafted near-max counter cannot exhaust the authorization namespace.
+    audit_agent_snapshot(&snapshot)?;
 
     let session = AgentSession::restore(snapshot)?;
     if session.transcript().len() > MAX_RESTORED_TURNS {
@@ -912,10 +903,10 @@ struct AgentRuntime {
     turn_label: Label,
     session_action: Button,
     proposal_box: GBox,
-    /// jagent v0.5 resets ProposalId to one for each fresh task. Every UI
-    /// callback therefore carries this app-owned epoch as the other half of
-    /// the identity, preventing a delayed old card/dialog from authorizing a
-    /// new task's same-numbered proposal.
+    /// jagent keeps ProposalId monotonic across fresh tasks. Every UI callback
+    /// also carries this app-owned epoch as defense in depth across session
+    /// replacement, preventing a delayed old card/dialog from authorizing a
+    /// proposal in a newer task.
     task_epoch: Cell<u64>,
     pending_command: RefCell<Option<PendingExecution<ProposalId>>>,
     /// Checked, never-reused execution identity. Wrapping it would let a late
@@ -1292,10 +1283,10 @@ impl AgentRuntime {
                         }) => match crate::review_input::validate(&command) {
                             Ok(_) => Self::render_proposal(&runtime, id, command, danger),
                             Err(error) => {
-                                // The exact-pinned jagent revision predates the
-                                // visual-spoof gate. Consume the unsafe pending
-                                // proposal without ever rendering or executing
-                                // its deceptive command text.
+                                // Keep the app boundary fail-closed even though
+                                // jagent also rejects visual spoofing. Consume
+                                // any unsafe pending proposal without rendering
+                                // or executing its deceptive command text.
                                 let _ = runtime.session.borrow_mut().reject(id);
                                 let message = format!("Agent proposed an unsafe command: {error}");
                                 runtime.append("Protocol error", &message);
@@ -2879,9 +2870,10 @@ mod tests {
         };
         assert!(restore_agent_snapshot(decode(base.clone())).is_ok());
 
-        // A sole Pending status is insufficient: it must be the final
-        // proposal/turn. Otherwise jagent's first-match lookup can approve a
-        // hidden older command while a newer proposal is displayed.
+        // A sole Pending status is insufficient: Forge only binds its visible
+        // approval card to the final proposal/turn. Restoring an older pending
+        // command behind a newer proposal would split reviewed UI identity
+        // from the session's authorizable action.
         let mut hidden = base.clone();
         let proposals = hidden["transcript"].as_array_mut().unwrap();
         let mut seen = 0;
