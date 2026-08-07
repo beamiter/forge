@@ -69,13 +69,15 @@ bounded before JSON allocation.
 
 ## Remaining boundaries
 
-### Carry the execution generation into the completion callback
+### Consolidate the app-owned helper runner
 
-`connect_block_finished` still delivers `(command, exit_code, output)` with no
-execution identity, so the generation stored beside an approval is one-shot but
-not *verified* by the completion. Thread it through the block-finished path —
-this becomes mandatory before supporting concurrent or external prompt writes,
-where the captured command alone can no longer distinguish two executions.
+Agent command completion already carries and verifies its one-shot generation
+through `connect_block_finished`; the former handoff item was completed by
+`eb585d1`. The remaining duplicate boundary is subprocess ownership: Forge still
+has app-local trusted-helper, notification, command-correction, and jsh installer
+runners while the shared core now has the stronger WNOWAIT/process-group/deadline
+contract. Migrate only after core exposes an opaque runner rather than a mutable
+raw `Command`, preserving Forge's Flatpak host-namespace rules and tests.
 
 ## Release checks
 
