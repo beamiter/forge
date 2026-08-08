@@ -53,9 +53,17 @@ bounded before JSON allocation.
   sentinel remains confined to downstream `i32`-only presentation surfaces and
   is never passed to the classifier.
 - `jterm_core` is pinned to
-  `fd25f905aadab9d8ca111a67b9b6422a22ef2d6c` and direct jagent to
-  `3aece307766ca8f3ca33ed0376d2a271cc2322b3`; Cargo, Nix, and the twice-generated
+  `48d25f155b960417609ffc85a98b7c9ba44c5772` and direct jagent to
+  `a09fd1563b862f96bed7047834720aeb31c163e2`; Cargo, Nix, and the twice-generated
   Flatpak source manifest all describe those exact trees.
+- App-local AI request assembly now consumes jagent's omission report after its
+  own history pre-bound and fails closed if the canonical builder would omit
+  anything else. Raw and prepared system prompts, the optional separator, and
+  the complete counted omission notice share one exact 64 KiB budget; system
+  instructions are rejected rather than sampled or truncated. Both blocking
+  and streaming paths use the same funnel. Forge's public owning-string `Turn`
+  is serialize-only, and conversation restore remains behind the bounded
+  `ConversationSnapshot::from_json` decoder.
 - Agent snapshot restore now decodes once through jagent's allocation-aware
   schema and audits its immutable accessors directly. Forge's stricter
   contiguous-ID, final-pending, immediate-observation, turn-accounting, state,
@@ -66,6 +74,11 @@ bounded before JSON allocation.
   be retained as bounded transport evidence, but only the first 2 KiB can enter
   diagnostic JSON parsing; exact-limit, limit-plus-one, and large-error tests
   pin those boundaries.
+
+Forge intentionally retains its app-local dirfd/inode-bound session-claim
+transaction. It does not use the newer core typed claim helper because Forge's
+stronger flow validates the claimed inode before retirement; do not weaken or
+describe that boundary as delegated to core.
 
 ## Remaining boundaries
 
@@ -84,5 +97,7 @@ raw `Command`, preserving Forge's Flatpak host-namespace rules and tests.
 ```text
 cargo fmt --all -- --check
 cargo test --locked --all-targets --all-features --no-fail-fast
+cargo test --locked --doc
 cargo clippy --locked --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 ```

@@ -275,6 +275,8 @@ forge 以 **MIT OR Apache-2.0** 双许可证发布，使用者可任选其一；
 
 ## 安全默认值
 
+- 原始与出站脱敏后的 system prompt 都受 64 KiB 硬上限约束；可选分隔符与完整的 history 省略计数 notice 必须同时容纳，否则请求 fail closed，不会截断高信任指令。预先有界的 history 若仍被 jagent 报告省略，请求同样拒绝发送。
+- AI 会话的公开 owning-string `Turn` 只支持序列化；恢复必须通过有预算的 `ConversationSnapshot::from_json` decoder，不提供可绕过该边界的普通 serde 反序列化。
 - 新安装不会写入任何远程主机、用户名、IP 或个人路径。
 - OSC 52 远程剪贴板写入默认关闭。
 - AI 会话库默认对常见云密钥、PAT、JWT 和私钥进行脱敏，覆盖 active、non-active、archived chat 以及草稿和 Block 上下文。
