@@ -281,7 +281,7 @@ impl UiState {
 
         self.connect_block_command_history(&view);
         self.connect_bottom_bar_block_status(&view);
-        self.attach_ascii_organism_to_view(&view);
+        self.attach_ascii_organism_to_view(&view, false);
         // A nested split does not add a Notebook page, so attach the per-pane
         // correction request epoch here instead of relying solely on page-added.
         self.attach_command_correction_to_view(view.clone(), false);

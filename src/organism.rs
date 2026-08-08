@@ -136,8 +136,36 @@ pub(crate) struct NativeOrganism {
 }
 
 impl NativeOrganism {
+    pub(crate) fn from_persisted_state(mut state: LifeState) -> Self {
+        state.clamp();
+        Self {
+            state,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn state(&self) -> LifeState {
         self.state
+    }
+
+    /// Restore the unfinished build streak for the exact repo/day selected by
+    /// the memory layer. Switching repositories calls this again, so failures
+    /// can never leak into another checkout's celebration level.
+    pub(crate) fn restore_build_failures(&mut self, failures: u32) {
+        self.build_failures = failures;
+        self.recovered_build = false;
+    }
+
+    pub(crate) fn restore_repo_context(&mut self, failures: u32, recovered_build: bool) {
+        self.build_failures = failures;
+        self.recovered_build = recovered_build;
+    }
+
+    /// Pull the latest window-shared continuous state into this pane-local
+    /// behavior context before reducing an event.
+    pub(crate) fn sync_state(&mut self, mut state: LifeState) {
+        state.clamp();
+        self.state = state;
     }
 
     pub(crate) fn idle_reaction(&self) -> Reaction {
@@ -435,5 +463,22 @@ mod tests {
             .values()
             .into_iter()
             .all(|value| value.is_finite() && (0.0..=1.0).contains(&value)));
+    }
+
+    #[test]
+    fn persisted_state_and_repo_failure_streak_resume_safely() {
+        let mut organism = NativeOrganism::from_persisted_state(LifeState {
+            energy: f32::NAN,
+            mood: 2.0,
+            ..LifeState::default()
+        });
+        assert_eq!(organism.state().energy, 0.5);
+        assert_eq!(organism.state().mood, 1.0);
+
+        organism.restore_build_failures(3);
+        organism.command_started("cargo test");
+        let reaction = organism.command_finished("cargo test", Some(0), Some(100));
+        assert_eq!(reaction.behavior, Behavior::CelebrateBig);
+        assert_eq!(reaction.speech, Some("终于。"));
     }
 }

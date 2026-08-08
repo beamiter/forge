@@ -31,6 +31,7 @@ pub mod logging;
 pub mod notebook;
 pub mod notebook_text;
 pub(crate) mod organism;
+pub(crate) mod organism_memory;
 mod palette;
 mod persistence;
 pub mod process {

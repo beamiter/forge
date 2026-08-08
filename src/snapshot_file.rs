@@ -119,6 +119,40 @@ fn open_regular(path: &Path) -> io::Result<File> {
 /// declared.
 pub fn read_bounded(path: &Path, max_bytes: u64) -> io::Result<String> {
     let file = open_regular(path)?;
+    read_bounded_file(path, file, max_bytes)
+}
+
+/// Read a bounded snapshot whose contents include private local metadata.
+///
+/// [`read_bounded`] rejects files writable by other users, which is enough for
+/// integrity. Organism memory also contains absolute repository paths, so its
+/// loader requires the stronger confidentiality invariant: no group/other
+/// permission bits at all. The check is made on the same descriptor that is
+/// read, avoiding a path-based check/open race.
+pub(crate) fn read_bounded_private(path: &Path, max_bytes: u64) -> io::Result<String> {
+    let file = open_regular(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let metadata = file.metadata()?;
+        // open_regular already checked ownership and link count; retain the
+        // explicit owner assertion here so this stronger contract stays true
+        // if the shared helper's policy ever changes.
+        // SAFETY: geteuid has no preconditions and only reads process state.
+        if metadata.uid() != unsafe { nix::libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private snapshot must be mode 0600 and owned by the current user",
+            ));
+        }
+    }
+    read_bounded_file(path, file, max_bytes)
+}
+
+fn read_bounded_file(path: &Path, file: File, max_bytes: u64) -> io::Result<String> {
     let declared_len = file.metadata()?.len();
     if declared_len > max_bytes {
         return Err(oversize_error(path, declared_len, max_bytes));

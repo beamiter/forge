@@ -880,6 +880,25 @@ pub fn run() -> glib::ExitCode {
         // Shared state
         let font_scale = Rc::new(Cell::new(config.borrow().default_font_scale));
         let tab_counter = Rc::new(Cell::new(0));
+        // Load once per window even when the body is currently disabled. A
+        // config reload followed by a new Block pane can then opt in without
+        // silently falling back to volatile state. This is a bounded read and
+        // never creates the file.
+        let organism_memory = match crate::organism_memory::OrganismMemory::load_default() {
+            Ok(memory) => Some(memory),
+            Err(error) => {
+                // Fail closed: a corrupt/future/unsafe memory file must not be
+                // replaced by a fresh default at the next command.
+                log::error!("ASCII organism memory disabled: {error}");
+                None
+            }
+        };
+        let organism_life = Rc::new(Cell::new(
+            organism_memory
+                .as_ref()
+                .map(crate::organism_memory::OrganismMemory::life_state)
+                .unwrap_or_default(),
+        ));
 
         // Window-level toast host: transient feedback (e.g. the opacity
         // percentage while Ctrl+Alt+=/- is held) floats over the main layout.
@@ -933,6 +952,8 @@ pub fn run() -> glib::ExitCode {
             debug_dashboard_dialog: Rc::new(RefCell::new(None)),
             agent_session: Rc::new(RefCell::new(None)),
             command_suggestion: Rc::new(RefCell::new(None)),
+            organism_memory: Rc::new(RefCell::new(organism_memory)),
+            organism_life,
             agent_toggle: agent_toggle.clone(),
             config_save_error_visible: Rc::new(Cell::new(false)),
             keybinding_map: Rc::new(RefCell::new(keybinding_map)),
@@ -1570,6 +1591,11 @@ pub fn run() -> glib::ExitCode {
             // the GTK main thread.
             if session_persistence {
                 finalize_tabs_state();
+            }
+            if let Err(error) =
+                crate::organism_memory::flush_pending(std::time::Duration::from_millis(500))
+            {
+                log::warn!("ASCII organism memory could not be queued for shutdown: {error}");
             }
             if let Err(error) =
                 crate::persistence::shutdown(std::time::Duration::from_secs(3))

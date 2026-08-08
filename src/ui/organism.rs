@@ -8,7 +8,10 @@ use std::time::Duration;
 
 use super::UiState;
 use crate::block_view::TermView;
-use crate::organism::{LifeState, NativeOrganism, Reaction, Tone};
+use crate::organism::{
+    classify_command, Behavior, CommandKind, LifeState, NativeOrganism, Reaction, Tone,
+};
+use crate::organism_memory::{MemoryEvent, RepoContext};
 
 const REACTION_HOLD: Duration = Duration::from_millis(8_000);
 const TONE_CLASSES: [&str; 5] = [
@@ -21,16 +24,20 @@ const TONE_CLASSES: [&str; 5] = [
 
 struct OrganismRuntime {
     organism: RefCell<NativeOrganism>,
+    active_memory_kind: Cell<Option<CommandKind>>,
+    active_context_key: RefCell<Option<String>>,
+    active_repo_context: RefCell<Option<RepoContext>>,
     generation: Cell<u64>,
     settle_timer: RefCell<Option<gtk4::glib::SourceId>>,
     card: gtk4::Widget,
     sprite: Label,
+    badge: Label,
     status: Label,
     state: Label,
 }
 
 impl OrganismRuntime {
-    fn new() -> Rc<Self> {
+    fn new(initial_state: LifeState, persistent: bool) -> Rc<Self> {
         let outer = GBox::new(Orientation::Vertical, 0);
         outer.add_css_class("block-finished");
         outer.add_css_class("block-organism");
@@ -64,7 +71,11 @@ impl OrganismRuntime {
         title.add_css_class("organism-title");
         title.set_xalign(0.0);
         header.append(&title);
-        let badge = Label::new(Some("native Block events · no LLM"));
+        let badge = Label::new(Some(if persistent {
+            "repo memory · no LLM"
+        } else {
+            "volatile · no LLM"
+        }));
         badge.add_css_class("organism-badge");
         badge.set_hexpand(true);
         badge.set_halign(gtk4::Align::End);
@@ -91,11 +102,15 @@ impl OrganismRuntime {
         outer.append(&content);
 
         let runtime = Rc::new(Self {
-            organism: RefCell::new(NativeOrganism::default()),
+            organism: RefCell::new(NativeOrganism::from_persisted_state(initial_state)),
+            active_memory_kind: Cell::new(None),
+            active_context_key: RefCell::new(None),
+            active_repo_context: RefCell::new(None),
             generation: Cell::new(0),
             settle_timer: RefCell::new(None),
             card: outer.upcast(),
             sprite,
+            badge,
             status,
             state,
         });
@@ -134,6 +149,13 @@ impl OrganismRuntime {
             Tone::Error => "organism-error",
             Tone::Warning => "organism-warning",
         });
+    }
+
+    fn mark_volatile(&self) {
+        self.badge.set_text("volatile · save failed");
+        self.badge.set_tooltip_text(Some(
+            "Repository memory could not be queued for durable storage",
+        ));
     }
 
     fn settle_later(runtime: &Rc<Self>, view: std::rc::Weak<TermView>, generation: u64) {
@@ -183,23 +205,62 @@ fn percent(value: f32) -> u8 {
 }
 
 impl UiState {
-    pub(crate) fn attach_ascii_organism_to_view(&self, view: &Rc<TermView>) {
-        if !self.config.borrow().ascii_organism_enabled {
+    pub(crate) fn attach_ascii_organism_to_view(&self, view: &Rc<TermView>, remote: bool) {
+        if remote || !self.config.borrow().ascii_organism_enabled {
             return;
         }
 
-        let runtime = OrganismRuntime::new();
+        let initial_state = self.organism_life.get();
+        let persistent = self.organism_memory.borrow().is_some();
+        let runtime = OrganismRuntime::new(initial_state, persistent);
         view.insert_inline_notice(&runtime.card);
 
         {
             let runtime = runtime.clone();
             let view_weak = Rc::downgrade(view);
+            let memory = self.organism_memory.clone();
+            let shared_life = self.organism_life.clone();
             view.connect_command_started(move |event| {
                 runtime.bump_generation();
-                let reaction = runtime
-                    .organism
-                    .borrow_mut()
-                    .command_started(&event.command);
+                let kind = classify_command(&event.command);
+                runtime.active_memory_kind.set(Some(kind));
+                let repo_context =
+                    if matches!(kind, CommandKind::BuildOrTest | CommandKind::GitPush) {
+                        let mut memory = memory.borrow_mut();
+                        memory.as_mut().and_then(|memory| {
+                            if let Err(error) = memory.refresh() {
+                                log::error!("could not refresh ASCII organism memory: {error}");
+                            }
+                            memory.context_now(event.cwd.as_deref())
+                        })
+                    } else {
+                        None
+                    };
+                *runtime.active_repo_context.borrow_mut() = repo_context.clone();
+                let context_key = repo_context
+                    .as_ref()
+                    .map(|context| context.repo.clone())
+                    .or_else(|| event.cwd.clone());
+                let context_changed = *runtime.active_context_key.borrow() != context_key;
+                *runtime.active_context_key.borrow_mut() = context_key;
+                let reaction = {
+                    let mut organism = runtime.organism.borrow_mut();
+                    organism.sync_state(shared_life.get());
+                    if let Some(context) = repo_context {
+                        organism.restore_repo_context(
+                            context.open_failures,
+                            context.recovered_pending_push,
+                        );
+                    } else if context_changed {
+                        // Volatile/non-Git commands retain a streak while they
+                        // stay in the same cwd, but never inherit one after a
+                        // real context switch.
+                        organism.restore_repo_context(0, false);
+                    }
+                    let reaction = organism.command_started(&event.command);
+                    shared_life.set(organism.state());
+                    reaction
+                };
                 runtime.render(&reaction);
                 if let Some(view) = view_weak.upgrade() {
                     view.insert_inline_notice(&runtime.card);
@@ -210,13 +271,84 @@ impl UiState {
         {
             let runtime = runtime.clone();
             let view_weak = Rc::downgrade(view);
+            let memory = self.organism_memory.clone();
+            let shared_life = self.organism_life.clone();
             view.connect_command_finished(move |event| {
                 let generation = runtime.bump_generation();
-                let reaction = runtime.organism.borrow_mut().command_finished(
-                    &event.command,
-                    event.exit_code,
-                    event.duration_ms,
-                );
+                let mut reaction = {
+                    let mut organism = runtime.organism.borrow_mut();
+                    organism.sync_state(shared_life.get());
+                    let reaction = organism.command_finished(
+                        &event.command,
+                        event.exit_code,
+                        event.duration_ms,
+                    );
+                    shared_life.set(organism.state());
+                    reaction
+                };
+                let classified = classify_command(&event.command);
+                let kind = if classified == CommandKind::Other {
+                    runtime.active_memory_kind.take().unwrap_or(classified)
+                } else {
+                    runtime.active_memory_kind.take();
+                    classified
+                };
+                let state = shared_life.get();
+                let repo = runtime
+                    .active_repo_context
+                    .borrow_mut()
+                    .take()
+                    .map(|context| context.repo);
+                let memory_event = MemoryEvent::now_for_repo(kind, event.exit_code, repo, state);
+                if let Some(memory) = memory.borrow_mut().as_mut() {
+                    // Merge transactions completed by other Forge windows as
+                    // late as possible, so a recovery that lands while this
+                    // command runs can still influence the visible reaction.
+                    if let Err(error) = memory.refresh() {
+                        log::error!("could not refresh ASCII organism memory: {error}");
+                    }
+                    let (insight, persist_result) = memory.apply_and_enqueue(memory_event);
+                    if kind == CommandKind::BuildOrTest {
+                        match event.exit_code {
+                            Some(code) if code != 0 && insight.open_failures >= 2 => {
+                                reaction.behavior = Behavior::SitNearError;
+                                reaction.description.push_str(&format!(
+                                    " · repo failure {}",
+                                    insight.open_failures
+                                ));
+                            }
+                            Some(0) if insight.recovered_failures > 0 => {
+                                reaction.behavior = if insight.recovered_failures >= 3 {
+                                    Behavior::CelebrateBig
+                                } else {
+                                    Behavior::Celebrate
+                                };
+                                reaction.speech = Some(if insight.recovered_failures >= 3 {
+                                    "终于。"
+                                } else {
+                                    "好了。"
+                                });
+                                reaction.description.push_str(&format!(
+                                    " · repo recovery after {} failure(s)",
+                                    insight.recovered_failures
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if insight.faster_than_yesterday {
+                        reaction.speech = Some("这次比昨天快。");
+                        reaction.description.push_str(" · remembered this repo");
+                    } else if insight.push_after_recovery && reaction.speech.is_none() {
+                        // The build may have recovered before this window was
+                        // restarted; repo memory still closes the loop.
+                        reaction.speech = Some("收好了。");
+                    }
+                    if let Err(error) = persist_result {
+                        log::error!("could not queue ASCII organism memory: {error}");
+                        runtime.mark_volatile();
+                    }
+                }
                 runtime.render(&reaction);
                 if let Some(view) = view_weak.upgrade() {
                     view.insert_inline_notice(&runtime.card);

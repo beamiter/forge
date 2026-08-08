@@ -933,6 +933,19 @@ pub(crate) fn default_command_history_path() -> String {
         .into_owned()
 }
 
+/// Private, local state used by the experimental native ASCII organism.
+///
+/// This is intentionally not configurable: command metadata must never make
+/// an arbitrary user-selected path writable. Tests and isolated launches can
+/// still redirect it through the standard `XDG_STATE_HOME` environment.
+pub(crate) fn default_ascii_organism_memory_path() -> PathBuf {
+    // Keep the native schema isolated from the standalone prototype, whose
+    // historical `ascii-organism.json` uses an incompatible version-1 shape.
+    xdg_state_home()
+        .join("forge")
+        .join("ascii-organism-native.json")
+}
+
 /// GLib only exposes `g_get_user_state_dir()` behind a newer API feature than
 /// forge currently requires, so implement the XDG Base Directory rule
 /// directly: an absolute `$XDG_STATE_HOME`, otherwise `$HOME/.local/state`.

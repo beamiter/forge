@@ -165,6 +165,13 @@ pub(crate) struct UiState {
     /// The single in-flight or reviewable natural-language command suggestion.
     /// Like the Shell Agent, it is pinned to the Block pane where it started.
     pub(crate) command_suggestion: Rc<RefCell<Option<CommandSuggestionHandle>>>,
+    /// Window-shared, repo/day-scoped memory for every native organism body.
+    /// `None` means persistence failed closed; the visual reducer remains
+    /// usable but must not overwrite the unreadable state file.
+    pub(crate) organism_memory: Rc<RefCell<Option<crate::organism_memory::OrganismMemory>>>,
+    /// Continuous state is shared across pane-local behavior reducers, so the
+    /// last pane to finish cannot overwrite another pane's earlier changes.
+    pub(crate) organism_life: Rc<Cell<crate::organism::LifeState>>,
     /// Visible top-bar control reflecting whether a Shell Agent session is
     /// currently active.
     pub(crate) agent_toggle: ToggleButton,

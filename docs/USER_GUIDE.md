@@ -90,8 +90,16 @@ pane 或重启 Forge。它监听 Forge 从 OSC 133
 边界捕获的真实 command start/finished 事件，在 live prompt 上方的 inline
 widget 中观察 build/test、检查非零退出，并在失败后成功或 `git push` 时作出
 克制反应。该 widget 不进入 PTY、Block 历史或输出采样，不执行任何命令，也
-不发送网络请求；VTE pane 不显示。当前原生切片只保留 pane 生命周期内的状态，
-跨重启/跨日记忆仍由 `prototypes/ascii-organism` 演示，尚未接入原生 widget。
+不发送网络请求；VTE pane 不显示。连续状态与按“本地日期 + 完整 Git 根路径”
+隔离的失败、恢复耗时和 push 统计会私密地保存到
+`${XDG_STATE_HOME:-~/.local/state}/forge/ascii-organism-native.json`。状态文件有大小、
+schema、权限和跨进程事务边界；损坏或未来版本会停用持久化而不会被默认值覆盖。
+只有本机可验证的 Git checkout 会进入记忆，不保存命令文本或输出。若同一 repo
+今天从首次失败到恢复的时间短于昨天，恢复后的 `git push` 会得到一句跨日反应。
+为合并多窗口乱序完成的事件，文件仅保留至多 256 条、每个 repo/day 至多 64 条
+不含命令内容的短期 transition ordering metadata，以及至多 512 个不含 PID/命令的
+不透明去重 token；较旧条目会折叠回统计基线。迟于该有界排序窗口的全新事件仍计入
+单调总数，但不会改写已经折叠的失败/恢复顺序。
 
 两个后端共享输入路由、字体/主题、cwd、进程检查和关闭清理。从 Block pane 发起分屏时，原 Block 会留在 pane tree 中，新 sibling 使用 VTE；VTE sibling 可继续嵌套分屏。这避免隐藏 PTY，同时保留 Block 工作区里的分屏能力。
 
