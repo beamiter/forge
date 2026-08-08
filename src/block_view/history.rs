@@ -1518,8 +1518,19 @@ impl TermView {
             .finished_blocks
             .borrow()
             .first()
-            .map(|block| block.widget().clone())
-            .unwrap_or_else(|| self.active.borrow().widget().clone());
+            .map(|block| block.widget().clone().upcast::<gtk4::Widget>())
+            // Inline notices (including the native organism) may already be
+            // pinned above the live prompt while asynchronous history loads.
+            // Insert restored blocks before the first child so those notices
+            // remain adjacent to the prompt instead of drifting above history.
+            .or_else(|| self.block_list.first_child())
+            .unwrap_or_else(|| {
+                self.active
+                    .borrow()
+                    .widget()
+                    .clone()
+                    .upcast::<gtk4::Widget>()
+            });
         let mut restored_widgets = Vec::with_capacity(restored.len());
         {
             let config = self.config.borrow();

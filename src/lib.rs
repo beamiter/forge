@@ -30,6 +30,7 @@ pub mod kitty_graphics;
 pub mod logging;
 pub mod notebook;
 pub mod notebook_text;
+pub(crate) mod organism;
 mod palette;
 mod persistence;
 pub mod process {

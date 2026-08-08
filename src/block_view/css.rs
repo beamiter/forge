@@ -360,6 +360,49 @@ pub(crate) fn install_block_css(config: &Config) {
             border-left-color: rgba({agent_r},{agent_g},{agent_b},0.85);
             background-color: rgba({agent_r},{agent_g},{agent_b},0.05);
         }}
+        .block-organism {{
+            border-left-color: rgba({agent_r},{agent_g},{agent_b},0.70);
+            background-color: rgba({agent_r},{agent_g},{agent_b},0.035);
+        }}
+        .block-organism.organism-active {{
+            border-left-color: rgba({acc_r},{acc_g},{acc_b},0.90);
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.07);
+        }}
+        .block-organism.organism-success {{
+            border-left-color: {ok_stripe};
+            background-color: rgba({ok_r},{ok_g},{ok_b},0.08);
+        }}
+        .block-organism.organism-error {{
+            border-left-color: {err_stripe};
+            background-color: rgba({err_r},{err_g},{err_b},0.10);
+        }}
+        .block-organism.organism-warning {{
+            border-left-color: {warn_stripe};
+            background-color: rgba({warn_r},{warn_g},{warn_b},0.07);
+        }}
+        .organism-sprite {{
+            color: {agent_hex};
+            font-family: "{font_family}";
+            font-weight: bold;
+        }}
+        .organism-title {{
+            color: {fg_hex};
+            font-weight: bold;
+        }}
+        .organism-badge, .organism-state {{
+            color: {dim_fg};
+            font-family: "{font_family}";
+            font-size: 0.82em;
+        }}
+        .organism-status {{
+            color: {fg_hex};
+        }}
+        .organism-error .organism-status {{
+            color: {err_hex};
+        }}
+        .organism-success .organism-status {{
+            color: {ok_hex};
+        }}
         .agent-card-icon {{
             color: {agent_hex};
             font-family: "{font_family}";

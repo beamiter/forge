@@ -25,6 +25,7 @@ mod file_tree;
 mod jsh;
 mod layout;
 mod notebooks;
+mod organism;
 mod pane_dnd;
 mod pane_header;
 mod pane_leaf;

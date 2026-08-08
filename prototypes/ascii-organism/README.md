@@ -35,6 +35,13 @@ labelled synthetic “yesterday” record so
 the final cross-day memory line is reproducible. It does not write that demo
 record to disk.
 
+The next native phase now lives in Forge itself behind
+`ascii_organism_enabled = true` (or `FORGE_ASCII_ORGANISM_ENABLED=1`). It uses
+real Block command lifecycle events and an inline widget above the live prompt.
+This standalone harness remains useful for deterministic life-state and memory
+experiments; its persistent/cross-day memory is not yet wired into the native
+widget.
+
 Keys inside the TUI:
 
 ```text
@@ -66,7 +73,7 @@ cargo run --offline --manifest-path prototypes/ascii-organism/Cargo.toml \
 `run-in-forge.sh` prefers this checkout's `target/debug/forge`, falls back to an
 installed `forge`, and accepts an explicit `FORGE_BIN` override.
 
-The next integration step is a GTK overlay fed by Forge's existing input,
-`CommandStart`, and completed-block events. The life engine in `src/life.rs`
-has no terminal/toolkit dependency so it can move into that runtime without
-putting organism characters into PTY output or scrollback.
+The next native step is to feed authoritative cwd/repository identity and
+persistent/cross-day memory into the inline widget, then evolve its body from a
+prompt-adjacent card into a freely positioned overlay. The standalone life
+engine in `src/life.rs` remains terminal/toolkit-independent.

@@ -77,6 +77,22 @@ terminal_mode = "block"
 - `block` 把命令保存为独立块，提供退出状态、耗时、筛选、跨块搜索、历史回填和 AI 上下文。
 - `vte` 是传统终端，适合要求完整滚屏语义的 TUI 或兼容性排查。
 
+### 实验性 ASCII organism
+
+Block pane 可以显式启用一个完全本地、无 LLM 的 ASCII organism：
+
+```toml
+ascii_organism_enabled = true
+```
+
+临时试用可设置 `FORGE_ASCII_ORGANISM_ENABLED=1`；修改该键后需新建 Block
+pane 或重启 Forge。它监听 Forge 从 OSC 133
+边界捕获的真实 command start/finished 事件，在 live prompt 上方的 inline
+widget 中观察 build/test、检查非零退出，并在失败后成功或 `git push` 时作出
+克制反应。该 widget 不进入 PTY、Block 历史或输出采样，不执行任何命令，也
+不发送网络请求；VTE pane 不显示。当前原生切片只保留 pane 生命周期内的状态，
+跨重启/跨日记忆仍由 `prototypes/ascii-organism` 演示，尚未接入原生 widget。
+
 两个后端共享输入路由、字体/主题、cwd、进程检查和关闭清理。从 Block pane 发起分屏时，原 Block 会留在 pane tree 中，新 sibling 使用 VTE；VTE sibling 可继续嵌套分屏。这避免隐藏 PTY，同时保留 Block 工作区里的分屏能力。
 
 | 操作 | 快捷键 |

@@ -1338,6 +1338,7 @@ impl UiState {
                 // only command metadata and is safe for palette use.
                 self.connect_block_command_history(term_view);
                 self.connect_bottom_bar_block_status(term_view);
+                self.attach_ascii_organism_to_view(term_view);
             }
             PaneLeaf::Vte(vte_view) => {
                 let ui_for_exit = UiState::clone(self);

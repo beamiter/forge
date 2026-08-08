@@ -1548,6 +1548,39 @@ const MIN_INPUT_ROWS: i32 = 6;
 type BlockFinishedCallbacks =
     Rc<RefCell<Vec<Box<dyn Fn(String, Option<i32>, String, Option<u64>, Option<u64>)>>>>;
 
+/// Authoritative foreground-command lifecycle event emitted at OSC 133 `C`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommandStartedEvent {
+    pub(crate) command: String,
+    pub(crate) cwd: Option<String>,
+}
+
+/// Authoritative foreground-command lifecycle event emitted at OSC 133 `D`.
+/// Unlike `BlockFinishedCallbacks`, this does not wait for the next prompt or
+/// carry a sampled output buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommandFinishedEvent {
+    pub(crate) command: String,
+    pub(crate) cwd: Option<String>,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) duration_ms: Option<u64>,
+}
+
+type CommandStartedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandStartedEvent)>>>>;
+type CommandFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandFinishedEvent)>>>>;
+
+fn emit_command_started(callbacks: &CommandStartedCallbacks, event: CommandStartedEvent) {
+    for callback in callbacks.borrow().iter() {
+        callback(event.clone());
+    }
+}
+
+fn emit_command_finished(callbacks: &CommandFinishedCallbacks, event: CommandFinishedEvent) {
+    for callback in callbacks.borrow().iter() {
+        callback(event.clone());
+    }
+}
+
 pub struct TermView {
     root: gtk4::Box,
     /// Status strip above the block list, shown only while this pane's tab
@@ -1644,6 +1677,8 @@ pub struct TermView {
     /// Tracks per-VTE selections so a drag that crosses block boundaries can be
     /// copied as one contiguous string via Ctrl+Shift+C.
     cross_selection: Rc<CrossSelection>,
+    command_started_callbacks: CommandStartedCallbacks,
+    command_finished_callbacks: CommandFinishedCallbacks,
     block_finished_callbacks: BlockFinishedCallbacks,
     /// Parks PTY output while the user drag-selects on the live VTE; released
     /// on copy/typing/timeout. Kept here so input and copy paths can resume
@@ -1724,6 +1759,7 @@ struct ReaderCtx {
     init_cmds_queue_for_cb: Rc<RefCell<std::collections::VecDeque<String>>>,
     pty_for_init: Rc<OwnedPty>,
     block_start_time_for_cb: Rc<Cell<Option<SystemTime>>>,
+    command_start_instant_for_cb: Rc<Cell<Option<std::time::Instant>>>,
     /// `None` means the shell reported no exit status for the finished command.
     /// It must not read as a successful 0.
     pending_exit_code_rc: Rc<Cell<Option<i32>>>,
@@ -1746,6 +1782,8 @@ struct ReaderCtx {
     /// Switches the live surface between compact prompt and full-screen layouts.
     /// PTY geometry is deliberately synchronized separately.
     layout_active_surface: Rc<dyn Fn()>,
+    command_started_cbs: CommandStartedCallbacks,
+    command_finished_cbs: CommandFinishedCallbacks,
     block_finished_cbs: BlockFinishedCallbacks,
     /// Parks incoming PTY chunks while the user drag-selects text on the live
     /// VTE, so streaming repaints can't destroy the selection mid-drag.
@@ -1876,6 +1914,7 @@ impl ReaderCtx {
             init_cmds_queue_for_cb,
             pty_for_init,
             block_start_time_for_cb,
+            command_start_instant_for_cb,
             pending_exit_code_rc,
             pending_command_meta_rc,
             current_cwd_for_cb,
@@ -1891,6 +1930,8 @@ impl ReaderCtx {
             running_cmd_rc,
             active_agent_generation_rc,
             layout_active_surface,
+            command_started_cbs,
+            command_finished_cbs,
             block_finished_cbs,
             selection_feed_hold,
         } = self;
@@ -2874,8 +2915,13 @@ impl ReaderCtx {
                                 continue;
                             }
                             osc133_depth_rc.set(0);
-                            *pending_command_meta_rc.borrow_mut() =
-                                PendingCommandMeta::from_command_start(meta);
+                            let mut command_meta = PendingCommandMeta::from_command_start(meta);
+                            if command_meta.cwd.is_none() {
+                                command_meta.cwd = safe_command_metadata_cwd(Some(
+                                    current_cwd_for_cb.borrow().as_str(),
+                                ));
+                            }
+                            *pending_command_meta_rc.borrow_mut() = command_meta;
                             // A command start without an intervening PromptStart is
                             // an ambiguous shell-integration edge. Keep those bytes
                             // visible in the live VTE but do not merge them into the
@@ -2883,6 +2929,7 @@ impl ReaderCtx {
                             background_output_rc.borrow_mut().clear();
                             active_rc.borrow().reset_output_buffer();
                             block_start_time_for_cb.set(Some(SystemTime::now()));
+                            command_start_instant_for_cb.set(Some(std::time::Instant::now()));
                             // Read the typed command directly off the live VTE,
                             // not from a shadow keystroke buffer. The VTE shows
                             // what the user actually saw — including history
@@ -2927,10 +2974,18 @@ impl ReaderCtx {
                                 ),
                             );
                             *vte_typed_cmd_rc.borrow_mut() = submitted_command.clone();
-                            *running_cmd_rc.borrow_mut() = submitted_command;
+                            *running_cmd_rc.borrow_mut() = submitted_command.clone();
                             cmd_running_rc.set(true);
                             bstate_rc.set(BlockState::CollectingOutput);
                             typed_cmd_rc.borrow_mut().clear();
+                            let command_cwd = pending_command_meta_rc.borrow().cwd.clone();
+                            emit_command_started(
+                                &command_started_cbs,
+                                CommandStartedEvent {
+                                    command: submitted_command.clone(),
+                                    cwd: command_cwd,
+                                },
+                            );
                             // Match anvil's block-mode runtime model: keep the
                             // active VTE as the live surface while the command
                             // runs, then snapshot it into a finished block on the
@@ -2979,8 +3034,34 @@ impl ReaderCtx {
                             }
                             pending_exit_code_rc.set(*exit);
                             pending_command_meta_rc.borrow_mut().merge_command_end(meta);
+                            let command_started_at = command_start_instant_for_cb.take();
+                            let frontend_duration_ms = command_started_at.and_then(|started| {
+                                u64::try_from(started.elapsed().as_millis()).ok()
+                            });
+                            let (command_cwd, duration_ms) = {
+                                let mut meta = pending_command_meta_rc.borrow_mut();
+                                let duration_ms = meta.duration_ms.or(frontend_duration_ms);
+                                // Reuse the C→D monotonic fallback when the
+                                // next PromptStart builds BlockData. Otherwise
+                                // the card and the visible block would report
+                                // different durations (C→D vs C→A).
+                                meta.duration_ms = duration_ms;
+                                (meta.cwd.clone(), duration_ms)
+                            };
                             cmd_running_rc.set(false);
                             bstate_rc.set(BlockState::PostCommand);
+                            let command = std::mem::take(&mut *running_cmd_rc.borrow_mut());
+                            if command_started_at.is_some() {
+                                emit_command_finished(
+                                    &command_finished_cbs,
+                                    CommandFinishedEvent {
+                                        command,
+                                        cwd: command_cwd,
+                                        exit_code: *exit,
+                                        duration_ms,
+                                    },
+                                );
+                            }
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
 
@@ -4442,6 +4523,8 @@ impl TermView {
         }
         let title_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
         let activity_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
+        let command_started_callbacks: CommandStartedCallbacks = Rc::new(RefCell::new(vec![]));
+        let command_finished_callbacks: CommandFinishedCallbacks = Rc::new(RefCell::new(vec![]));
         let block_finished_callbacks: BlockFinishedCallbacks = Rc::new(RefCell::new(vec![]));
         let mouse_reporting_mode: Rc<Cell<MouseReportingMode>> =
             Rc::new(Cell::new(MouseReportingMode::None));
@@ -4536,6 +4619,7 @@ impl TermView {
         let cmd_running: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let running_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let block_start_time: Rc<Cell<Option<SystemTime>>> = Rc::new(Cell::new(None));
+        let command_start_instant: Rc<Cell<Option<std::time::Instant>>> = Rc::new(Cell::new(None));
         let visible_indices: Rc<RefCell<std::collections::HashSet<usize>>> =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
         // Set once any OSC-133 (FTCS) event is seen, so the view knows shell
@@ -4621,6 +4705,7 @@ impl TermView {
             let init_cmds_queue_for_cb = Rc::clone(&init_cmds_queue);
             let pty_for_init = Rc::clone(&pty);
             let block_start_time_for_cb = block_start_time.clone();
+            let command_start_instant_for_cb = command_start_instant.clone();
             let pending_exit_code_rc = pending_exit_code.clone();
             let pending_command_meta_rc = pending_command_meta.clone();
             let current_cwd_for_cb = current_cwd.clone();
@@ -4662,6 +4747,7 @@ impl TermView {
                 init_cmds_queue_for_cb,
                 pty_for_init,
                 block_start_time_for_cb,
+                command_start_instant_for_cb,
                 pending_exit_code_rc,
                 pending_command_meta_rc,
                 current_cwd_for_cb,
@@ -4677,6 +4763,8 @@ impl TermView {
                 running_cmd_rc: running_cmd.clone(),
                 active_agent_generation_rc: active_agent_generation.clone(),
                 layout_active_surface: layout_active_surface.clone(),
+                command_started_cbs: command_started_callbacks.clone(),
+                command_finished_cbs: command_finished_callbacks.clone(),
                 block_finished_cbs: block_finished_callbacks.clone(),
                 selection_feed_hold: selection_feed_hold.clone(),
             }
@@ -5387,6 +5475,8 @@ impl TermView {
             resize_tick_id: RefCell::new(None),
             sticky_timer_id: RefCell::new(Some(sticky_timer_id)),
             cross_selection,
+            command_started_callbacks,
+            command_finished_callbacks,
             block_finished_callbacks,
             selection_feed_hold,
         };
@@ -5877,6 +5967,28 @@ impl TermView {
         self.activity_callbacks.borrow_mut().push(Box::new(f));
     }
 
+    /// Observe a foreground command after Forge has captured its authoritative
+    /// text and cwd at the shell's CommandStart boundary.
+    pub(crate) fn connect_command_started<F>(&self, f: F)
+    where
+        F: Fn(CommandStartedEvent) + 'static,
+    {
+        self.command_started_callbacks
+            .borrow_mut()
+            .push(Box::new(f));
+    }
+
+    /// Observe the authoritative CommandEnd boundary without waiting for the
+    /// next prompt to finalize output into a visible Block.
+    pub(crate) fn connect_command_finished<F>(&self, f: F)
+    where
+        F: Fn(CommandFinishedEvent) + 'static,
+    {
+        self.command_finished_callbacks
+            .borrow_mut()
+            .push(Box::new(f));
+    }
+
     pub fn connect_block_finished<F>(&self, f: F)
     where
         F: Fn(String, Option<i32>, String, Option<u64>, Option<u64>) + 'static,
@@ -6354,15 +6466,16 @@ mod tests {
         background_output_has_visible_text, bounded_journal_output, build_clipboard_paste,
         build_command_recall, build_keyboard_query_reply, classify_command_prompt_status,
         coalesce_bytes_events, collapse_repaint_output, command_capture_range_is_bounded,
-        compute_viewport_state, format_color_query_reply, history_edge_navigation_available,
-        normalize_captured_command, normalize_loaded_block_ids, notification_allowed,
-        output_has_vertical_repaint, parse_color_spec, record_external_input,
-        resolve_command_for_block, resolve_submitted_command, scroll_delta_to_reveal,
-        selected_command_text, selected_id_range, should_buffer_background_output,
-        stable_visible_indices, strip_ansi, strip_ansi_with_clear_detect, take_background_output,
-        truncate_plain_output_for_height, viewport_page_size_changed, viewport_state_for_scroll,
-        visible_indices_for_viewport, vte_commit_shadow_rollback, BlockData, BlockState,
-        BoundedByteRing, CommandMeta, CommandPromptStatus, DynamicColors, PendingCommandMeta,
+        compute_viewport_state, emit_command_finished, emit_command_started,
+        format_color_query_reply, history_edge_navigation_available, normalize_captured_command,
+        normalize_loaded_block_ids, notification_allowed, output_has_vertical_repaint,
+        parse_color_spec, record_external_input, resolve_command_for_block,
+        resolve_submitted_command, scroll_delta_to_reveal, selected_command_text,
+        selected_id_range, should_buffer_background_output, stable_visible_indices, strip_ansi,
+        strip_ansi_with_clear_detect, take_background_output, truncate_plain_output_for_height,
+        viewport_page_size_changed, viewport_state_for_scroll, visible_indices_for_viewport,
+        vte_commit_shadow_rollback, BlockData, BlockState, BoundedByteRing, CommandFinishedEvent,
+        CommandMeta, CommandPromptStatus, CommandStartedEvent, DynamicColors, PendingCommandMeta,
         ViewportState, MAX_COMMAND_CAPTURE_BYTES, MAX_JOURNAL_OUTPUT_BYTES,
         MAX_PROMPT_CAPTURE_BYTES, MAX_RAW_OUTPUT_BYTES, TRUNCATED_COMMAND_PLACEHOLDER,
     };
@@ -6370,7 +6483,79 @@ mod tests {
     use gtk4::gdk::RGBA;
     use std::cell::{Cell, RefCell};
     use std::collections::{HashSet, VecDeque};
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn authoritative_block_start_notifies_every_observer_once() {
+        let callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn(CommandStartedEvent)>>::new()));
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        for label in ["first", "second"] {
+            let seen = seen.clone();
+            callbacks.borrow_mut().push(Box::new(move |event| {
+                seen.borrow_mut().push((label, event));
+            }));
+        }
+
+        let event = CommandStartedEvent {
+            command: "cargo test".to_string(),
+            cwd: Some("/work/forge".to_string()),
+        };
+        emit_command_started(&callbacks, event.clone());
+        assert_eq!(
+            seen.borrow().as_slice(),
+            &[("first", event.clone()), ("second", event)]
+        );
+    }
+
+    #[test]
+    fn authoritative_finish_events_drive_the_no_llm_reducer_once_each() {
+        use crate::organism::{Behavior, NativeOrganism};
+
+        let callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn(CommandFinishedEvent)>>::new()));
+        let organism = Rc::new(RefCell::new(NativeOrganism::default()));
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        {
+            let organism = organism.clone();
+            let seen = seen.clone();
+            callbacks.borrow_mut().push(Box::new(move |event| {
+                let reaction = organism.borrow_mut().command_finished(
+                    &event.command,
+                    event.exit_code,
+                    event.duration_ms,
+                );
+                seen.borrow_mut().push(reaction.behavior);
+            }));
+        }
+
+        let emit = |command: &str, exit_code| {
+            emit_command_finished(
+                &callbacks,
+                CommandFinishedEvent {
+                    command: command.to_string(),
+                    cwd: Some("/work/forge".to_string()),
+                    exit_code,
+                    duration_ms: Some(250),
+                },
+            );
+        };
+        emit("cargo test", Some(101));
+        emit("cargo test", Some(101));
+        emit("cargo test", Some(0));
+        emit("git push", Some(0));
+        emit("cargo check", None);
+
+        assert_eq!(
+            seen.borrow().as_slice(),
+            &[
+                Behavior::InspectError,
+                Behavior::SitNearError,
+                Behavior::Celebrate,
+                Behavior::RestAfterPush,
+                Behavior::UnknownOutcome,
+            ]
+        );
+    }
 
     #[test]
     fn constructor_propagates_injected_spawn_failure_without_panicking() {

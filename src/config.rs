@@ -586,6 +586,10 @@ pub struct Config {
     /// Disabled by default because finished blocks already own that history;
     /// enabling it deliberately presents both the VTE and structured views.
     pub(crate) preserve_live_scrollback: bool,
+    /// Show the experimental no-LLM ASCII organism in Block panes. The widget
+    /// reacts only to Forge's local command lifecycle events and never runs a
+    /// command or sends terminal contents elsewhere.
+    pub(crate) ascii_organism_enabled: bool,
     /// Master switch for every network-backed AI feature.
     pub(crate) ai_enabled: bool,
     /// Agent mode can be disabled independently while leaving chat and
@@ -709,6 +713,7 @@ impl Config {
             scroll_reporting_enabled: true,
             focus_reporting_enabled: true,
             preserve_live_scrollback: false,
+            ascii_organism_enabled: false,
             ai_enabled: false,
             agent_enabled: false,
             agent_max_turns: 20,
@@ -1021,6 +1026,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "scroll_reporting_enabled",
     "focus_reporting_enabled",
     "preserve_live_scrollback",
+    "ascii_organism_enabled",
     "ai_enabled",
     "agent_enabled",
     "agent_max_turns",
@@ -1157,6 +1163,7 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
         "scroll_reporting_enabled",
         "focus_reporting_enabled",
         "preserve_live_scrollback",
+        "ascii_organism_enabled",
         "sidebar_visible",
         "ai_enabled",
         "agent_enabled",
@@ -1729,6 +1736,7 @@ struct FileConfig {
     scroll_reporting_enabled: Option<bool>,
     focus_reporting_enabled: Option<bool>,
     preserve_live_scrollback: Option<bool>,
+    ascii_organism_enabled: Option<bool>,
     ai_enabled: Option<bool>,
     agent_enabled: Option<bool>,
     agent_max_turns: Option<u32>,
@@ -1951,6 +1959,9 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
             .and_then(|v| v.as_bool()),
         preserve_live_scrollback: table
             .get("preserve_live_scrollback")
+            .and_then(|v| v.as_bool()),
+        ascii_organism_enabled: table
+            .get("ascii_organism_enabled")
             .and_then(|v| v.as_bool()),
         ai_enabled: table.get("ai_enabled").and_then(|v| v.as_bool()),
         agent_enabled: table.get("agent_enabled").and_then(|v| v.as_bool()),
@@ -2367,6 +2378,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let command_correction_enabled = env_bool("FORGE_COMMAND_CORRECTION_ENABLED")
         .or(fc.command_correction_enabled)
         .unwrap_or(true);
+    let ascii_organism_enabled = env_bool("FORGE_ASCII_ORGANISM_ENABLED")
+        .or(fc.ascii_organism_enabled)
+        .unwrap_or(false);
     let requested_provider = env_string("FORGE_AI_PROVIDER")
         .or(fc.ai_provider)
         .filter(|value| setting_text_is_safe(value, 64))
@@ -2446,6 +2460,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         scroll_reporting_enabled: fc.scroll_reporting_enabled.unwrap_or(true),
         focus_reporting_enabled: fc.focus_reporting_enabled.unwrap_or(true),
         preserve_live_scrollback: fc.preserve_live_scrollback.unwrap_or(false),
+        ascii_organism_enabled,
         ai_enabled,
         agent_enabled,
         agent_max_turns,
@@ -2895,6 +2910,17 @@ unknown_action = "F8"
         assert!(issues
             .iter()
             .any(|issue| issue.message.contains("same chord")));
+    }
+
+    #[test]
+    fn ascii_organism_is_a_boolean_opt_in_config_key() {
+        let valid = validate_config_contents("ascii_organism_enabled = true\n").unwrap();
+        assert!(valid.is_empty(), "unexpected issues: {valid:?}");
+
+        let invalid = validate_config_contents("ascii_organism_enabled = 'yes'\n").unwrap();
+        assert!(invalid.iter().any(|issue| {
+            issue.path == "ascii_organism_enabled" && issue.level == ConfigIssueLevel::Error
+        }));
     }
 
     #[test]
