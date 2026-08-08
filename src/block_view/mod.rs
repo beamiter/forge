@@ -16,7 +16,7 @@ use crate::config::Config;
 use crate::parser::{
     ColorKind, CommandMeta, KeyboardProtocolQuery, Parser, ParserConfig, ParserEvent,
 };
-use crate::pty::OwnedPty;
+use crate::pty::{OwnedPty, PtyForeground};
 use crate::pty_input::{self, Paste, PasteModes, PastePolicy, UnbracketedMultiline};
 use crate::terminal::{apply_terminal_theme, focus_terminal};
 use bounded_bytes::BoundedByteRing;
@@ -185,21 +185,15 @@ fn sample_output_for_event(output: &str) -> String {
     )
 }
 
-/// Shell integration normally places PromptEnd after the prompt, so the VTE
-/// range starts at the first command cell. Some prompt integrations emit the
-/// marker early; in that case the captured range includes the rendered prompt.
-/// Finished blocks already represent the prompt with their own chevron/header,
-/// so remove only an exact leading prompt to avoid duplicated, drifting command
-/// rows such as `❯ yj ~ ❯ pwd`.
-fn normalize_captured_command(captured: &str, prompt: &str) -> String {
-    let captured = captured.trim();
-    let prompt = prompt.trim();
-    if !prompt.is_empty() {
-        if let Some(command) = captured.strip_prefix(prompt) {
-            return command.trim_start().to_string();
-        }
-    }
-    captured.to_string()
+/// Normalize the cells captured from the settled PromptEnd anchor.
+///
+/// Never strip a text prefix merely because it equals the visible prompt: a
+/// prompt of `$` followed by `$HOME`, or `git` followed by `git status`, is a
+/// valid command and indistinguishable by text alone. An integration that emits
+/// B before its prompt may therefore show duplicated prompt furniture, which is
+/// safer than silently changing the command identity.
+fn normalize_captured_command(captured: &str, _prompt: &str) -> String {
+    captured.trim().to_string()
 }
 
 /// Resolve the command at CommandStart without trusting VTE feed timing. The PTY
@@ -214,16 +208,135 @@ fn resolve_submitted_command(
     captured: &str,
     prompt: &str,
     typed_shadow: &str,
+    typed_shadow_exact: bool,
     external_submission: Option<&str>,
+    _external_submission_is_agent: bool,
 ) -> String {
-    if let Some(command) = external_submission {
-        return bounded_command_text(command.trim());
-    }
+    let captured_exact = captured;
     let captured = normalize_captured_command(captured, prompt);
+    if let Some(command) = external_submission {
+        if captured_exact == command {
+            return bounded_command_text(command);
+        }
+        // A reviewed payload (Agent, correction, or initial command) is never
+        // allowed to hide a different rendered command. Preserve the exact
+        // capture—including meaningful whitespace—so the downstream identity
+        // check fails closed instead of observing the intended line.
+        return bounded_command_text(captured_exact);
+    }
+    let typed_shadow = typed_shadow.trim();
     if captured.trim().is_empty() {
-        bounded_command_text(typed_shadow.trim())
+        if typed_shadow_exact {
+            bounded_command_text(typed_shadow)
+        } else {
+            UNAVAILABLE_COMMAND_PLACEHOLDER.to_string()
+        }
+    } else if typed_shadow_exact
+        && typed_shadow.len() > captured.len()
+        && typed_shadow.starts_with(&captured)
+    {
+        // A long command can soft-wrap at the right edge while VTE still
+        // reports only the first visual row at OSC 133;C. Plain committed text
+        // gives us an exact append-only shadow in that case. Never apply this
+        // repair after a readline control/edit: then the rendered line remains
+        // authoritative even when it happens to be a prefix of stale input.
+        bounded_command_text(typed_shadow)
     } else {
         bounded_command_text(&captured)
+    }
+}
+
+/// Bind an Agent generation only when the command that reached CommandStart is
+/// byte-for-byte the text the user approved. Display/history normalization is
+/// intentionally downstream of this check: trimming here would turn a real
+/// leading/trailing-space mismatch back into an apparent match.
+fn reviewed_submission_matches(
+    shell_command: Option<&str>,
+    rendered_command: &str,
+    approved_command: &str,
+    identity_feed_tainted: bool,
+) -> bool {
+    if identity_feed_tainted {
+        return false;
+    }
+    if let Some(shell_command) = shell_command {
+        return shell_command == approved_command;
+    }
+    rendered_command == approved_command
+        || rendered_command.strip_suffix('\n') == Some(approved_command)
+}
+
+/// Bytes emitted after Enter but before OSC 133 C are allowed to be terminal
+/// presentation only. Bash/readline normally disables bracketed paste here;
+/// color/style resets are likewise cell-neutral. Any printable byte, cursor
+/// movement, erase or edit control keeps the reviewed identity tainted.
+fn reviewed_pre_command_bytes_are_identity_neutral(mut bytes: &[u8]) -> bool {
+    while let Some((&byte, rest)) = bytes.split_first() {
+        if matches!(byte, b'\r' | b'\n') {
+            bytes = rest;
+            continue;
+        }
+        if !bytes.starts_with(b"\x1b[") {
+            return false;
+        }
+        let Some(final_offset) = bytes[2..]
+            .iter()
+            .position(|byte| (0x40..=0x7e).contains(byte))
+        else {
+            return false;
+        };
+        let final_index = final_offset + 2;
+        let params = &bytes[2..final_index];
+        let final_byte = bytes[final_index];
+        let sgr = final_byte == b'm';
+        let bracketed_paste_mode = params == b"?2004" && matches!(final_byte, b'h' | b'l');
+        if !sgr && !bracketed_paste_mode {
+            return false;
+        }
+        bytes = &bytes[final_index + 1..];
+    }
+    true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TypedShadowFidelity {
+    /// Every byte so far was append-only visible text for the current prompt.
+    ExactOpen,
+    /// The exact current command was submitted. Any later input callback is
+    /// typeahead, even if OSC 133 has not advanced the block state yet.
+    ExactSubmitted,
+    /// A line edit, cursor move, invalid byte, or typeahead made the shadow
+    /// insufficient to override VTE's rendered editor state.
+    Inexact,
+}
+
+impl TypedShadowFidelity {
+    fn can_repair_capture(self) -> bool {
+        self != Self::Inexact
+    }
+
+    fn advance(self, data: &[u8]) -> Self {
+        if self == Self::Inexact {
+            return self;
+        }
+        if self == Self::ExactSubmitted {
+            return if data.is_empty() { self } else { Self::Inexact };
+        }
+        let Ok(text) = std::str::from_utf8(data) else {
+            return Self::Inexact;
+        };
+        let mut state = self;
+        for ch in text.chars() {
+            if matches!(ch, '\r' | '\n') {
+                state = Self::ExactSubmitted;
+            } else if ch.is_control() || state == Self::ExactSubmitted {
+                // `apply_vte_commit_to_shadow` deliberately omits submission
+                // newlines. Text after one would therefore be concatenated
+                // onto the previous command and could not be an exact mirror.
+                return Self::Inexact;
+            }
+        }
+        state
     }
 }
 
@@ -232,10 +345,62 @@ fn resolve_submitted_command(
 /// distinct from the "(command capture unavailable)" placeholder: this one is a
 /// bounded-packet outcome, not a capture race.
 const TRUNCATED_COMMAND_PLACEHOLDER: &str = "(command too long for shell integration)";
+const UNAVAILABLE_COMMAND_PLACEHOLDER: &str = "(command capture unavailable)";
 const MAX_COMMAND_CAPTURE_BYTES: usize = crate::review_input::MAX_REVIEW_INPUT_BYTES;
 const MAX_TYPED_COMMAND_SHADOW_BYTES: usize = MAX_COMMAND_CAPTURE_BYTES;
 const MAX_PROMPT_CAPTURE_BYTES: usize = 64 * 1024;
 const MAX_SELECTED_CLIPBOARD_BYTES: usize = 32 * 1024 * 1024;
+
+fn command_id_uses_shell_token(id: &str, token: &str) -> bool {
+    !token.is_empty()
+        && id
+            .strip_prefix(token)
+            .and_then(|suffix| suffix.strip_prefix('-'))
+            .is_some_and(|sequence| {
+                !sequence.is_empty() && sequence.bytes().all(|byte| byte.is_ascii_digit())
+            })
+}
+
+fn accept_agent_integration_token(
+    state: BlockState,
+    expected: &str,
+    announced: &str,
+    ready: &Cell<bool>,
+) -> bool {
+    if state != BlockState::CollectingPrompt || expected.is_empty() || announced != expected {
+        return false;
+    }
+    ready.set(true);
+    true
+}
+
+fn shell_argv_uses_jsh(argv: &[String]) -> bool {
+    argv.iter().any(|argument| {
+        argument.split_ascii_whitespace().any(|word| {
+            let word = word
+                .trim_matches(|ch: char| matches!(ch, '\'' | '"' | ';' | '(' | ')' | '[' | ']'));
+            std::path::Path::new(word)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some("jsh")
+        })
+    })
+}
+
+fn shell_argv_supports_agent_ids(argv: &[String]) -> bool {
+    let direct_shell = argv
+        .first()
+        .and_then(|argument| std::path::Path::new(argument).file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "bash" | "zsh"));
+    let runs_one_command = argv.iter().skip(1).any(|argument| {
+        argument == "--command"
+            || (argument.starts_with('-')
+                && !argument.starts_with("--")
+                && argument[1..].bytes().any(|byte| byte == b'c'))
+    });
+    direct_shell && !runs_one_command && !shell_argv_uses_jsh(argv)
+}
 
 fn bounded_command_text(command: &str) -> String {
     if command.len() > MAX_COMMAND_CAPTURE_BYTES {
@@ -296,47 +461,6 @@ fn pop_typed_command_shadow(buffer: &mut String) {
     }
 }
 
-#[derive(Debug)]
-enum TypedShadowRollback {
-    Unchanged,
-    Truncate(usize),
-    Restore(String),
-}
-
-impl TypedShadowRollback {
-    fn apply(self, buffer: &mut String) {
-        match self {
-            Self::Unchanged => {}
-            Self::Truncate(length) => buffer.truncate(length),
-            Self::Restore(previous) => *buffer = previous,
-        }
-    }
-}
-
-/// Capture the cheapest exact rollback for a VTE commit. Ordinary typing only
-/// appends, so retaining the previous byte length avoids cloning a potentially
-/// long command on every keystroke. Destructive edits are rare and keep a full
-/// snapshot.
-fn vte_commit_shadow_rollback(buffer: &str, text: &str) -> TypedShadowRollback {
-    if text.chars().all(|ch| !ch.is_control())
-        && buffer != TRUNCATED_COMMAND_PLACEHOLDER
-        && buffer
-            .len()
-            .checked_add(text.len())
-            .is_some_and(|length| length <= MAX_TYPED_COMMAND_SHADOW_BYTES)
-    {
-        return TypedShadowRollback::Truncate(buffer.len());
-    }
-    if text
-        .chars()
-        .all(|ch| ch != '\x7f' && ch != '\x08' && ch.is_control())
-        || buffer == TRUNCATED_COMMAND_PLACEHOLDER
-    {
-        return TypedShadowRollback::Unchanged;
-    }
-    TypedShadowRollback::Restore(buffer.to_string())
-}
-
 fn apply_vte_commit_to_shadow(buffer: &mut String, text: &str) {
     for ch in text.chars() {
         if matches!(ch, '\r' | '\n') {
@@ -373,18 +497,63 @@ fn command_capture_range_is_bounded(start_row: i64, end_row: i64, columns: i64) 
 #[derive(Default)]
 pub(crate) struct PendingCommandMeta {
     id: Option<String>,
+    id_present: bool,
+    id_trusted: bool,
     cwd: Option<String>,
     duration_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandIdCorrelation {
+    Bare,
+    MatchedUntrusted,
+    MatchedTrusted,
+    Mismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentCommandEndDecision {
+    Accept,
+    IgnoreUntilShellOwnsForeground,
+    AcceptWithoutAgentCorrelation,
+}
+
+fn decide_agent_command_end(
+    has_agent_generation: bool,
+    foreground: PtyForeground,
+    pending_typeahead: bool,
+    id_correlation: CommandIdCorrelation,
+) -> AgentCommandEndDecision {
+    if !has_agent_generation {
+        return AgentCommandEndDecision::Accept;
+    }
+    if foreground == PtyForeground::Other && !pending_typeahead {
+        return AgentCommandEndDecision::IgnoreUntilShellOwnsForeground;
+    }
+    if foreground != PtyForeground::Shell || id_correlation != CommandIdCorrelation::MatchedTrusted
+    {
+        return AgentCommandEndDecision::AcceptWithoutAgentCorrelation;
+    }
+    AgentCommandEndDecision::Accept
+}
+
 impl PendingCommandMeta {
     fn from_command_start(meta: &CommandMeta) -> Self {
+        Self::from_command_start_with_token(meta, "")
+    }
+
+    fn from_command_start_with_token(meta: &CommandMeta, token: &str) -> Self {
+        let id = meta
+            .id
+            .as_deref()
+            .filter(|id| crate::review_input::valid_jsh_id(id))
+            .map(str::to_owned);
         Self {
-            id: meta
-                .id
+            id_present: meta.id.is_some(),
+            id_trusted: id
                 .as_deref()
-                .filter(|id| crate::review_input::valid_jsh_id(id))
-                .map(str::to_owned),
+                .is_some_and(|id| command_id_uses_shell_token(id, token)),
+            id,
             cwd: safe_command_metadata_cwd(meta.cwd.as_deref()),
             duration_ms: meta.duration_ms,
         }
@@ -399,19 +568,39 @@ impl PendingCommandMeta {
     /// would label a `cd /tmp` block with `/tmp` instead of the directory the
     /// command actually ran in.
     fn merge_command_end(&mut self, meta: &CommandMeta) {
-        if let Some(id) = meta
-            .id
-            .as_deref()
-            .filter(|id| crate::review_input::valid_jsh_id(id))
-        {
-            self.id = Some(id.to_owned());
-        }
+        // CommandStart owns the id. A D packet may corroborate it, but never
+        // replace it: PTY output can carry forged OSC and the id is a
+        // correlation field, not an authentication secret.
         if self.cwd.is_none() {
             self.cwd = safe_command_metadata_cwd(meta.cwd.as_deref());
         }
         if meta.duration_ms.is_some() {
             self.duration_ms = meta.duration_ms;
         }
+    }
+
+    fn command_end_correlation(&self, meta: &CommandMeta) -> CommandIdCorrelation {
+        let end_present = meta.id.is_some();
+        let end_id = meta
+            .id
+            .as_deref()
+            .filter(|id| crate::review_input::valid_jsh_id(id));
+        match (self.id_present, self.id.as_deref(), end_present, end_id) {
+            (false, None, false, None) => CommandIdCorrelation::Bare,
+            (true, Some(start), true, Some(end)) if start == end && self.id_trusted => {
+                CommandIdCorrelation::MatchedTrusted
+            }
+            (true, Some(start), true, Some(end)) if start == end => {
+                CommandIdCorrelation::MatchedUntrusted
+            }
+            _ => CommandIdCorrelation::Mismatch,
+        }
+    }
+
+    fn journal_execution_id(&self) -> Option<&str> {
+        self.id
+            .as_deref()
+            .filter(|id| !self.id_trusted && id.starts_with("jsh-"))
     }
 }
 
@@ -530,14 +719,11 @@ fn paste_modes(bracketed_paste: bool) -> PasteModes {
 /// Encode a command this app is putting on the shell's prompt — block recall,
 /// palette re-run, an agent suggestion.
 ///
-/// The returned [`Paste`] carries both the bytes for the PTY (`Ctrl+U` first,
-/// framing when the shell can strip it, an embedded `ESC[201~` always removed)
+/// The returned [`Paste`] carries both the bytes for the PTY (framing when the
+/// shell can strip it, an embedded `ESC[201~` always removed)
 /// and `echo_text`, the text to mirror into the editor shadow so the shadow
 /// cannot claim more than the child actually received.
 ///
-/// The `Ctrl+U` is unconditional. Gating it on `pty_synced` appends the recalled
-/// command to whatever the user had already typed, because typed text is not
-/// represented by that flag.
 pub(crate) fn build_command_recall(command: &str, bracketed_paste: bool) -> Paste {
     let command = command.trim_end_matches(['\r', '\n']);
     let modes = paste_modes(bracketed_paste);
@@ -557,11 +743,90 @@ pub(crate) fn build_command_recall(command: &str, bracketed_paste: bool) -> Past
     // The exact-pinned core revision still defaults prompt recall to preserving
     // controls. Captured OSC/history is not a trust boundary, so override it.
     policy.strip_controls = true;
-    pty_input::encode_prompt_insert(command, modes, policy, true)
+    // No readline/zle binding is a portable whole-buffer clear (Ctrl+U is only
+    // kill-to-BOL in common modes). Recall is insertion-only and its caller
+    // marks the capture shadow inexact.
+    pty_input::encode_prompt_insert(command, modes, policy, false)
 }
 
 fn external_input_changes_editor(state: BlockState, data: &[u8]) -> bool {
     state == BlockState::AwaitingCommand && data.iter().any(|byte| !matches!(byte, b'\r' | b'\n'))
+}
+
+fn input_may_survive_into_next_prompt(
+    state: BlockState,
+    submission_pending: bool,
+    data: &[u8],
+) -> bool {
+    if input_is_typeahead_for_existing_submission(state, submission_pending, data) {
+        return true;
+    }
+
+    // A single VTE commit can contain the command, its CR/LF submit boundary,
+    // and typeahead for the next prompt. Treat CRLF (or LFCR) as one submit,
+    // but anything after that pair belongs to a future line.
+    let Some(first) = data.iter().position(|byte| matches!(byte, b'\r' | b'\n')) else {
+        return false;
+    };
+    let mut next = first + 1;
+    if next < data.len() && matches!((data[first], data[next]), (b'\r', b'\n') | (b'\n', b'\r')) {
+        next += 1;
+    }
+    has_effective_input(&data[next..])
+}
+
+fn has_effective_input(data: &[u8]) -> bool {
+    data.iter().any(|byte| !matches!(byte, 0x03 | 0x04))
+}
+
+fn input_is_typeahead_for_existing_submission(
+    state: BlockState,
+    submission_pending: bool,
+    data: &[u8],
+) -> bool {
+    (state != BlockState::AwaitingCommand || submission_pending) && has_effective_input(data)
+}
+
+fn input_submits_line(data: &[u8]) -> bool {
+    data.iter().any(|byte| matches!(byte, b'\r' | b'\n'))
+}
+
+fn record_protocol_reply_input(
+    state: BlockState,
+    typed_cmd_fidelity: &Cell<TypedShadowFidelity>,
+    idle_input_dirty: &Cell<bool>,
+    pty_synced: &Cell<bool>,
+    submission_pending: &Cell<bool>,
+    pending_typeahead: &Cell<bool>,
+    accepted_input_generation: &Cell<u64>,
+) {
+    match state {
+        BlockState::AwaitingCommand => {
+            typed_cmd_fidelity.set(TypedShadowFidelity::Inexact);
+            idle_input_dirty.set(true);
+            pty_synced.set(true);
+            if submission_pending.get() {
+                pending_typeahead.set(true);
+            }
+        }
+        BlockState::Idle
+        | BlockState::CollectingPrompt
+        | BlockState::CollectingOutput
+        | BlockState::PostCommand
+        | BlockState::RawFallback
+        | BlockState::AltScreen => {
+            pending_typeahead.set(true);
+        }
+    }
+    accepted_input_generation.set(accepted_input_generation.get().wrapping_add(1));
+}
+
+fn next_prompt_shadow_state(had_typeahead: bool) -> (TypedShadowFidelity, bool) {
+    if had_typeahead {
+        (TypedShadowFidelity::Inexact, true)
+    } else {
+        (TypedShadowFidelity::ExactOpen, false)
+    }
 }
 
 fn classify_command_prompt_status(
@@ -587,6 +852,96 @@ fn classify_command_prompt_status(
         BlockState::Idle | BlockState::CollectingPrompt => CommandPromptStatus::Initializing,
         BlockState::AltScreen => CommandPromptStatus::Fullscreen,
     }
+}
+
+fn prompt_surface_is_clean(
+    anchor: (i64, i64),
+    cursor: (i64, i64),
+    editable_suffix_chars: Option<i64>,
+) -> bool {
+    cursor == anchor && editable_suffix_chars == Some(0)
+}
+
+fn rebase_prompt_anchor(anchor: (i64, i64), recorded_rows: i64, current_rows: i64) -> (i64, i64) {
+    if recorded_rows <= 0 || current_rows <= 0 {
+        return anchor;
+    }
+    (
+        anchor.0,
+        anchor
+            .1
+            .saturating_add(current_rows.saturating_sub(recorded_rows))
+            .max(0),
+    )
+}
+
+fn visible_editor_text(vte: &Terminal, anchor: (i64, i64)) -> Option<String> {
+    let (end_col, end_row) = vte.cursor_position();
+    let (start_col, start_row) = anchor;
+    if !command_capture_range_is_bounded(start_row, end_row, vte.column_count()) {
+        return None;
+    }
+    if (start_row, start_col) == (end_row, end_col) {
+        return Some(String::new());
+    }
+    vte.text_range_format(vte4::Format::Text, start_row, start_col, end_row, end_col)
+        .0
+        .map(|text| text.to_string())
+}
+
+fn visible_row_prefix(vte: &Terminal, cursor: (i64, i64)) -> Option<String> {
+    let (col, row) = cursor;
+    if col < 0 || row < 0 || col > vte.column_count() {
+        return None;
+    }
+    if col == 0 {
+        return Some(String::new());
+    }
+    vte.text_range_format(vte4::Format::Text, row, 0, row, col)
+        .0
+        .map(|text| text.to_string())
+}
+
+fn current_prompt_anchor(vte: &Terminal, anchor: (i64, i64), recorded_rows: i64) -> (i64, i64) {
+    rebase_prompt_anchor(anchor, recorded_rows, vte.row_count())
+}
+
+fn prompt_layout_reflow_can_reanchor(
+    layout_changed: bool,
+    local_resize_seen: bool,
+    identity_output_seen: bool,
+    anchor: (i64, i64),
+    cursor: (i64, i64),
+    suffix_is_empty: Option<bool>,
+    prompt_prefix_matches: bool,
+) -> bool {
+    anchor != cursor
+        && anchor.0 == cursor.0
+        && suffix_is_empty == Some(true)
+        && ((layout_changed && !identity_output_seen && anchor.1 > cursor.1)
+            || ((layout_changed || local_resize_seen) && prompt_prefix_matches))
+}
+
+fn verified_editor_contains_exact_command(
+    rendered: Option<&str>,
+    verified_suffix_is_empty: Option<bool>,
+    command: &str,
+) -> bool {
+    verified_suffix_is_empty == Some(true) && rendered.is_some_and(|rendered| rendered == command)
+}
+
+fn prompt_anchor_may_settle(
+    state: BlockState,
+    idle_input_dirty: bool,
+    pty_synced: bool,
+    submission_pending: bool,
+    pending_typeahead: bool,
+) -> bool {
+    state == BlockState::AwaitingCommand
+        && !idle_input_dirty
+        && !pty_synced
+        && !submission_pending
+        && !pending_typeahead
 }
 
 /// Mirror input that bypasses VTE's `commit` signal (clipboard, Agent, and other
@@ -629,26 +984,28 @@ fn record_external_input(
     true
 }
 
-/// Encode an approval-gated command and its submit key as one PTY queue item.
-/// A bounded queue must never accept Enter after rejecting the command bytes.
+/// Validate the exact single-line bytes that an approval-gated path may first
+/// insert into a verified-empty prompt. Execution is deliberately a separate
+/// step: Forge reads the rendered editor back from VTE and only then queues
+/// Enter. This avoids relying on shell/keymap-specific "clear line" bindings.
 fn approved_command_submission_payload(command: &str) -> Result<Vec<u8>, String> {
     crate::review_input::validate(command).map_err(|error| {
         format!("rejected unsafe programmatic command at the PTY boundary: {error}")
     })?;
-    let capacity = command
-        .len()
-        .checked_add(1)
-        .ok_or_else(|| "command length overflowed the PTY input size".to_string())?;
+    if command != command.trim() {
+        return Err(
+            "reviewed execution rejects leading or trailing whitespace; insert it for manual review instead"
+                .to_string(),
+        );
+    }
+    let capacity = command.len();
     if capacity > crate::pty::MAX_PTY_INPUT_MESSAGE_BYTES {
         return Err(format!(
-            "command plus Enter exceeds the {}-byte PTY input limit",
+            "command exceeds the {}-byte PTY input limit",
             crate::pty::MAX_PTY_INPUT_MESSAGE_BYTES
         ));
     }
-    let mut submission = Vec::with_capacity(capacity);
-    submission.extend_from_slice(command.as_bytes());
-    submission.push(b'\r');
-    Ok(submission)
+    Ok(command.as_bytes().to_vec())
 }
 
 /// Encode clipboard text for the prompt.
@@ -743,10 +1100,17 @@ where
     output
 }
 
+pub(crate) struct PromptRecallCtx<'a> {
+    pub(crate) pty: &'a OwnedPty,
+    pub(crate) pty_synced: &'a Cell<bool>,
+    pub(crate) typed_cmd: &'a RefCell<String>,
+    pub(crate) typed_cmd_fidelity: &'a Cell<TypedShadowFidelity>,
+    pub(crate) submission_pending: &'a Cell<bool>,
+    pub(crate) pending_typeahead: &'a Cell<bool>,
+}
+
 fn recall_selected_commands_at_prompt(
-    pty: &OwnedPty,
-    pty_synced: &Cell<bool>,
-    typed_cmd: &RefCell<String>,
+    ctx: PromptRecallCtx<'_>,
     state: BlockState,
     finished: &[FinishedBlock],
     selected: &HashSet<u64>,
@@ -758,33 +1122,39 @@ fn recall_selected_commands_at_prompt(
             .map(|block| (block.id, block.cmd_text.as_str())),
         selected,
     );
-    recall_command_at_prompt(pty, pty_synced, typed_cmd, state, &command, bracketed_paste)
+    recall_command_at_prompt(ctx, state, &command, bracketed_paste)
 }
 
-/// Replace the current shell edit buffer without executing the recalled command.
+/// Ask the shell editor to recall text without executing it. `Ctrl+U` is only a
+/// conventional kill-to-BOL binding, not a portable whole-buffer replacement;
+/// the shadow is therefore always inexact and can never override VTE capture.
 pub(crate) fn recall_command_at_prompt(
-    pty: &OwnedPty,
-    pty_synced: &Cell<bool>,
-    typed_cmd: &RefCell<String>,
+    ctx: PromptRecallCtx<'_>,
     state: BlockState,
     command: &str,
     bracketed_paste: bool,
 ) -> bool {
-    if state != BlockState::AwaitingCommand {
+    if state != BlockState::AwaitingCommand
+        || ctx.pty_synced.get()
+        || ctx.submission_pending.get()
+        || ctx.pending_typeahead.get()
+        || ctx.typed_cmd_fidelity.get() == TypedShadowFidelity::ExactSubmitted
+    {
         return false;
     }
     let paste = build_command_recall(command, bracketed_paste);
     if paste.is_empty() {
         return false;
     }
-    // One write: the frame's start, body and end must not be split, and the
-    // Ctrl+U rides in front of them (see `build_command_recall`).
-    if let Err(error) = pty.write_bytes(&paste.bytes) {
-        pty.report_write_error("could not queue recalled command", error);
+    // One write: the frame's start, body and end must not be split.
+    if let Err(error) = ctx.pty.write_bytes(&paste.bytes) {
+        ctx.pty
+            .report_write_error("could not queue recalled command", error);
         return false;
     }
-    *typed_cmd.borrow_mut() = paste.echo_text;
-    pty_synced.set(true);
+    *ctx.typed_cmd.borrow_mut() = paste.echo_text;
+    ctx.typed_cmd_fidelity.set(TypedShadowFidelity::Inexact);
+    ctx.pty_synced.set(true);
     true
 }
 
@@ -1597,6 +1967,32 @@ impl InputOrigin {
 type BlockFinishedCallbacks =
     Rc<RefCell<Vec<Box<dyn Fn(String, Option<i32>, String, Option<u64>, Option<u64>)>>>>;
 
+/// A locally armed Agent execution lost the lifecycle proof needed to bind a
+/// future Block to that approval. Reasons are fixed, non-sensitive strings.
+type AgentExecutionLostCallbacks = Rc<RefCell<Vec<Box<dyn Fn(u64, &'static str)>>>>;
+
+fn emit_agent_execution_lost(
+    callbacks: &AgentExecutionLostCallbacks,
+    generation: u64,
+    reason: &'static str,
+) {
+    for callback in callbacks.borrow().iter() {
+        callback(generation, reason);
+    }
+}
+
+fn take_agent_execution_as_lost(
+    generation: &Cell<Option<u64>>,
+    callbacks: &AgentExecutionLostCallbacks,
+    reason: &'static str,
+) -> bool {
+    let Some(generation) = generation.take() else {
+        return false;
+    };
+    emit_agent_execution_lost(callbacks, generation, reason);
+    true
+}
+
 /// Authoritative foreground-command lifecycle event emitted at OSC 133 `C`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommandStartedEvent {
@@ -1640,6 +2036,239 @@ fn emit_accepted_input(callbacks: &HumanInputCallbacks, origin: InputOrigin) {
     }
 }
 
+const VERIFIED_SUBMISSION_POLL: std::time::Duration = std::time::Duration::from_millis(16);
+const VERIFIED_SUBMISSION_MAX_POLLS: u32 = 120;
+const REVIEWED_COMMAND_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const VERIFIED_SUBMISSION_LOST: &str =
+    "the rendered shell editor did not exactly match the approved command before execution";
+const REVIEWED_COMMAND_START_LOST: &str =
+    "the shell did not report the exact reviewed command starting before the safety deadline";
+
+/// Two-phase programmatic execution boundary. The command is inserted without
+/// Enter, VTE must render the exact text in an otherwise empty editor, and only
+/// then is CR admitted. This does not rely on a portable "clear line" binding
+/// and prevents an unseen prefix or suffix from being submitted. Shell startup
+/// files, hooks and key bindings remain part of the trusted shell boundary.
+#[derive(Clone)]
+struct VerifiedSubmissionCtx {
+    active_vte: Terminal,
+    bstate: Rc<Cell<BlockState>>,
+    pty: Rc<OwnedPty>,
+    typed_cmd: Rc<RefCell<String>>,
+    typed_cmd_fidelity: Rc<Cell<TypedShadowFidelity>>,
+    submission_pending: Rc<Cell<bool>>,
+    pending_typeahead: Rc<Cell<bool>>,
+    external_submission: Rc<RefCell<Option<String>>>,
+    external_submission_generation: Rc<Cell<Option<u64>>>,
+    /// PTY bytes that could have redrawn the editor after the reviewed text was
+    /// verified but before CommandStart make the synchronous VTE capture stale.
+    reviewed_submission_tainted: Rc<Cell<bool>>,
+    idle_input_dirty: Rc<Cell<bool>>,
+    pty_synced: Rc<Cell<bool>>,
+    prompt_end_pos: Rc<Cell<(i64, i64)>>,
+    prompt_anchor_rows: Rc<Cell<i64>>,
+    prompt_anchor_ready: Rc<Cell<bool>>,
+    prompt_anchor_generation: Rc<Cell<u64>>,
+    contents_generation: Rc<Cell<u64>>,
+    accepted_input_generation: Rc<Cell<u64>>,
+    source_id: Rc<RefCell<Option<glib::SourceId>>>,
+    completion: Rc<RefCell<Option<VerifiedSubmissionCompletion>>>,
+    pending_agent_generation: Rc<Cell<Option<u64>>>,
+    agent_execution_lost_callbacks: AgentExecutionLostCallbacks,
+    agent_execution_supported: Rc<Cell<bool>>,
+}
+
+type VerifiedSubmissionCompletion = Box<dyn FnOnce(Result<(), String>)>;
+
+impl VerifiedSubmissionCtx {
+    fn current_anchor(&self) -> (i64, i64) {
+        current_prompt_anchor(
+            &self.active_vte,
+            self.prompt_end_pos.get(),
+            self.prompt_anchor_rows.get(),
+        )
+    }
+
+    fn fail(&self, generation: Option<u64>, reason: &'static str) {
+        self.typed_cmd_fidelity.set(TypedShadowFidelity::Inexact);
+        if let Some(generation) = generation {
+            emit_agent_execution_lost(&self.agent_execution_lost_callbacks, generation, reason);
+        } else {
+            log::warn!("programmatic command could not be verified after insertion: {reason}");
+        }
+        if let Some(completion) = self.completion.borrow_mut().take() {
+            completion(Err(reason.to_string()));
+        }
+    }
+
+    fn command_start_observed(&self, matches_reviewed_text: bool) {
+        if let Some(source) = self.source_id.borrow_mut().take() {
+            source.remove();
+        }
+        if let Some(completion) = self.completion.borrow_mut().take() {
+            if matches_reviewed_text {
+                completion(Ok(()));
+            } else {
+                completion(Err(
+                    "the reviewed command start could not be verified".to_string()
+                ));
+            }
+        } else if !matches_reviewed_text {
+            log::warn!("a reviewed command start could not be verified");
+        }
+    }
+
+    fn arm_command_start_deadline(&self, agent_generation: Option<u64>) {
+        let ctx = self.clone();
+        let source = glib::timeout_add_local_once(REVIEWED_COMMAND_START_TIMEOUT, move || {
+            ctx.source_id.borrow_mut().take();
+            if ctx.external_submission.borrow().is_none()
+                || ctx.external_submission_generation.get() != agent_generation
+            {
+                return;
+            }
+            ctx.external_submission.borrow_mut().take();
+            ctx.external_submission_generation.set(None);
+            ctx.submission_pending.set(false);
+            ctx.fail(agent_generation, REVIEWED_COMMAND_START_LOST);
+        });
+        *self.source_id.borrow_mut() = Some(source);
+    }
+
+    fn begin(
+        &self,
+        command: &str,
+        agent_generation: Option<u64>,
+        suggestion_rgb: [u8; 3],
+    ) -> Result<(), String> {
+        let payload = approved_command_submission_payload(command)?;
+        if agent_generation.is_some() && !self.agent_execution_supported.get() {
+            return Err(
+                "Shell Agent execution requires the bundled token-aware shell integration"
+                    .to_string(),
+            );
+        }
+        if self.source_id.borrow().is_some() {
+            return Err("another reviewed command is still being verified".to_string());
+        }
+        if self.bstate.get() != BlockState::AwaitingCommand
+            || !self.prompt_anchor_ready.get()
+            || self.idle_input_dirty.get()
+            || self.pty_synced.get()
+            || self.submission_pending.get()
+            || self.pending_typeahead.get()
+            || self.external_submission.borrow().is_some()
+            || self.external_submission_generation.get().is_some()
+            || self.pty.foreground_owner() != PtyForeground::Shell
+        {
+            return Err("the shell prompt is no longer verified empty".to_string());
+        }
+        let anchor = self.current_anchor();
+        let cursor = self.active_vte.cursor_position();
+        let suffix_is_empty =
+            click_cursor::verified_suffix_is_empty(&self.active_vte, suggestion_rgb);
+        if cursor != anchor || suffix_is_empty != Some(true) {
+            return Err("the shell prompt visibly contains input".to_string());
+        }
+
+        let contents_before = self.contents_generation.get();
+        let input_generation = self.accepted_input_generation.get();
+        let anchor_generation = self.prompt_anchor_generation.get();
+        self.pty
+            .write_bytes(&payload)
+            .map_err(|error| error.to_string())?;
+        self.reviewed_submission_tainted.set(false);
+        self.pending_agent_generation.set(agent_generation);
+        *self.typed_cmd.borrow_mut() = command.to_string();
+        self.typed_cmd_fidelity.set(TypedShadowFidelity::ExactOpen);
+        self.idle_input_dirty.set(true);
+        self.pty_synced.set(true);
+
+        let ctx = self.clone();
+        let command = command.to_string();
+        let attempts = Rc::new(Cell::new(0u32));
+        let last_observed = Rc::new(Cell::new(None::<(u64, i64, i64)>));
+        let stable_polls = Rc::new(Cell::new(0u8));
+        let source_id = glib::timeout_add_local(VERIFIED_SUBMISSION_POLL, move || {
+            let attempt = attempts.get().saturating_add(1);
+            attempts.set(attempt);
+            let stop = |ctx: &VerifiedSubmissionCtx, reason| {
+                ctx.source_id.borrow_mut().take();
+                ctx.pending_agent_generation.set(None);
+                ctx.fail(agent_generation, reason);
+                glib::ControlFlow::Break
+            };
+
+            if ctx.prompt_anchor_generation.get() != anchor_generation
+                || (agent_generation.is_some()
+                    && ctx.pending_agent_generation.get() != agent_generation)
+                || ctx.accepted_input_generation.get() != input_generation
+                || ctx.bstate.get() != BlockState::AwaitingCommand
+                || !ctx.prompt_anchor_ready.get()
+                || ctx.submission_pending.get()
+                || ctx.pending_typeahead.get()
+                || ctx.pty.foreground_owner() != PtyForeground::Shell
+            {
+                return stop(&ctx, VERIFIED_SUBMISSION_LOST);
+            }
+            if attempt >= VERIFIED_SUBMISSION_MAX_POLLS {
+                return stop(&ctx, VERIFIED_SUBMISSION_LOST);
+            }
+
+            let contents = ctx.contents_generation.get();
+            if contents == contents_before {
+                return glib::ControlFlow::Continue;
+            }
+            let (col, row) = ctx.active_vte.cursor_position();
+            let observed = (contents, col, row);
+            if last_observed.get() == Some(observed) {
+                stable_polls.set(stable_polls.get().saturating_add(1));
+            } else {
+                last_observed.set(Some(observed));
+                stable_polls.set(0);
+                return glib::ControlFlow::Continue;
+            }
+            if stable_polls.get() < 1 {
+                return glib::ControlFlow::Continue;
+            }
+
+            let rendered = visible_editor_text(&ctx.active_vte, ctx.current_anchor());
+            let suffix_is_empty =
+                click_cursor::verified_suffix_is_empty(&ctx.active_vte, suggestion_rgb);
+            if !verified_editor_contains_exact_command(
+                rendered.as_deref(),
+                suffix_is_empty,
+                &command,
+            ) {
+                return stop(&ctx, VERIFIED_SUBMISSION_LOST);
+            }
+
+            *ctx.typed_cmd.borrow_mut() = command.clone();
+            ctx.typed_cmd_fidelity
+                .set(TypedShadowFidelity::ExactSubmitted);
+            *ctx.external_submission.borrow_mut() = Some(command.clone());
+            ctx.external_submission_generation.set(agent_generation);
+            if let Err(error) = ctx.pty.write_bytes(b"\r") {
+                ctx.external_submission.borrow_mut().take();
+                ctx.external_submission_generation.set(None);
+                ctx.source_id.borrow_mut().take();
+                ctx.pending_agent_generation.set(None);
+                ctx.fail(agent_generation, VERIFIED_SUBMISSION_LOST);
+                ctx.pty
+                    .report_write_error("could not submit verified command", error);
+                return glib::ControlFlow::Break;
+            }
+            ctx.submission_pending.set(true);
+            ctx.source_id.borrow_mut().take();
+            ctx.pending_agent_generation.set(None);
+            ctx.arm_command_start_deadline(agent_generation);
+            glib::ControlFlow::Break
+        });
+        *self.source_id.borrow_mut() = Some(source_id);
+        Ok(())
+    }
+}
+
 pub struct TermView {
     root: gtk4::Box,
     /// Status strip above the block list, shown only while this pane's tab
@@ -1656,10 +2285,45 @@ pub struct TermView {
     bstate: Rc<Cell<BlockState>>,
     #[allow(dead_code)]
     prompt_buf: Rc<RefCell<String>>,
+    /// Visible prompt furniture captured at PromptEnd. Besides finished-block
+    /// display it lets readiness distinguish a VTE reflowed prompt from input.
+    prompt_display: Rc<RefCell<String>>,
     /// Keystroke shadow used only as a fallback command capture. The authoritative
     /// finished-command text is read off the live VTE at CommandStart.
     #[allow(dead_code)]
     typed_cmd: Rc<RefCell<String>>,
+    /// Cursor anchor captured at PromptEnd. Agent approval rechecks that the
+    /// shell has not prefilled visible readline input behind Forge's callbacks.
+    prompt_end_pos: Rc<Cell<(i64, i64)>>,
+    prompt_anchor_rows: Rc<Cell<i64>>,
+    /// PTY resize generation captured with the current prompt anchor. Matching
+    /// prompt text alone may not move the trusted editor boundary.
+    prompt_anchor_resize_generation: Rc<Cell<u64>>,
+    /// Incremented whenever Forge publishes a different PTY grid.
+    pty_resize_generation: Rc<Cell<u64>>,
+    /// Exact row-start-to-cursor prompt bytes captured with the settled anchor.
+    /// A local PTY resize may re-anchor only when the redrawn row has the same
+    /// prefix, so arbitrary shell output cannot masquerade as layout movement.
+    prompt_anchor_prefix: Rc<RefCell<String>>,
+    /// VTE applies `feed()` asynchronously. Agent readiness is blocked until a
+    /// frame after PromptEnd captures the settled cursor for this exact prompt.
+    prompt_anchor_ready: Rc<Cell<bool>>,
+    /// Identity-changing PTY bytes observed after B's feed fence. Layout-only
+    /// reflow may re-anchor prompt furniture only while this remains false.
+    prompt_identity_output: Rc<Cell<bool>>,
+    /// Tracks whether `typed_cmd` is an exact append-only mirror, including the
+    /// short submit-before-OSC window. Readline edits and typeahead make it
+    /// inexact so stale text can never override a rendered prefix.
+    typed_cmd_fidelity: Rc<Cell<TypedShadowFidelity>>,
+    /// True after an accepted line delimiter and before the matching
+    /// CommandStart (or a fresh PromptEnd). Kept separate from shadow fidelity:
+    /// an edited/inexact line can still have been submitted.
+    submission_pending: Rc<Cell<bool>>,
+    /// Accepted input sent while a foreground command was still active may be
+    /// consumed by the next readline prompt. Carry this taint across PromptEnd
+    /// so Agent approval cannot mistake unknown buffered text for an empty line.
+    pending_typeahead: Rc<Cell<bool>>,
+    accepted_input_generation: Rc<Cell<u64>>,
     /// Exact command supplied by an execution-approved programmatic path. It is
     /// consumed at CommandStart before the VTE capture, which may still show a
     /// previous line when submission outruns display rendering.
@@ -1744,6 +2408,11 @@ pub struct TermView {
     command_started_callbacks: CommandStartedCallbacks,
     command_finished_callbacks: CommandFinishedCallbacks,
     block_finished_callbacks: BlockFinishedCallbacks,
+    agent_execution_lost_callbacks: AgentExecutionLostCallbacks,
+    verified_submission: VerifiedSubmissionCtx,
+    verified_submission_source_id: Rc<RefCell<Option<glib::SourceId>>>,
+    prompt_anchor_tick_id: Rc<RefCell<Option<gtk4::TickCallbackId>>>,
+    agent_execution_supported: Rc<Cell<bool>>,
     /// Parks PTY output while the user drag-selects on the live VTE; released
     /// on copy/typing/timeout. Kept here so input and copy paths can resume
     /// the feed immediately.
@@ -1766,6 +2435,12 @@ impl Drop for TermView {
         if let Some(id) = self.sticky_timer_id.borrow_mut().take() {
             id.remove();
         }
+        if let Some(id) = self.verified_submission_source_id.borrow_mut().take() {
+            id.remove();
+        }
+        if let Some(id) = self.prompt_anchor_tick_id.borrow_mut().take() {
+            id.remove();
+        }
     }
 }
 
@@ -1783,10 +2458,15 @@ struct ReaderCtx {
     /// Keystroke-shadow input line, used only as a fallback if the VTE-text
     /// capture at CommandStart returns empty.
     typed_cmd_rc: Rc<RefCell<String>>,
+    typed_cmd_fidelity_rc: Rc<Cell<TypedShadowFidelity>>,
+    submission_pending_rc: Rc<Cell<bool>>,
+    pending_typeahead_rc: Rc<Cell<bool>>,
+    accepted_input_generation_rc: Rc<Cell<u64>>,
     /// Exact command from an approved programmatic submission, if any.
     external_submission_rc: Rc<RefCell<Option<String>>>,
     /// Agent identity paired with the approved external submission, if any.
     external_submission_generation_rc: Rc<Cell<Option<u64>>>,
+    reviewed_submission_tainted_rc: Rc<Cell<bool>>,
     /// Bytes emitted asynchronously after PromptEnd and before the next PromptStart.
     /// Empty-command blocks are inferred from this separate buffer, so no history
     /// schema change is needed.
@@ -1800,6 +2480,18 @@ struct ReaderCtx {
     /// VTE cursor position (col, row) captured at PromptEnd; the start anchor
     /// for the text-range read that produces `vte_typed_cmd_rc`.
     prompt_end_pos_rc: Rc<Cell<(i64, i64)>>,
+    prompt_anchor_rows_rc: Rc<Cell<i64>>,
+    prompt_anchor_resize_generation_rc: Rc<Cell<u64>>,
+    pty_resize_generation_rc: Rc<Cell<u64>>,
+    prompt_anchor_prefix_rc: Rc<RefCell<String>>,
+    prompt_anchor_ready_rc: Rc<Cell<bool>>,
+    prompt_identity_output_rc: Rc<Cell<bool>>,
+    prompt_anchor_generation_rc: Rc<Cell<u64>>,
+    prompt_anchor_tick_id_rc: Rc<RefCell<Option<gtk4::TickCallbackId>>>,
+    contents_generation_rc: Rc<Cell<u64>>,
+    prompt_render_generation_rc: Rc<Cell<u64>>,
+    post_prompt_bytes_rc: Rc<RefCell<BoundedByteRing>>,
+    post_prompt_overflow_rc: Rc<Cell<bool>>,
     /// Rendered prompt (last non-empty line) captured at PromptEnd, used by the
     /// finalize path since prompt_buf is cleared once the prompt ends.
     prompt_display_rc: Rc<RefCell<String>>,
@@ -1822,6 +2514,8 @@ struct ReaderCtx {
     ftcs_seen_rc: Rc<Cell<bool>>,
     init_cmds_queue_for_cb: Rc<RefCell<std::collections::VecDeque<String>>>,
     pty_for_init: Rc<OwnedPty>,
+    shell_integration_token: Rc<String>,
+    agent_execution_supported_rc: Rc<Cell<bool>>,
     block_start_time_for_cb: Rc<Cell<Option<SystemTime>>>,
     command_start_instant_for_cb: Rc<Cell<Option<std::time::Instant>>>,
     /// `None` means the shell reported no exit status for the finished command.
@@ -1849,6 +2543,8 @@ struct ReaderCtx {
     command_started_cbs: CommandStartedCallbacks,
     command_finished_cbs: CommandFinishedCallbacks,
     block_finished_cbs: BlockFinishedCallbacks,
+    agent_execution_lost_cbs: AgentExecutionLostCallbacks,
+    verified_submission: VerifiedSubmissionCtx,
     /// Parks incoming PTY chunks while the user drag-selects text on the live
     /// VTE, so streaming repaints can't destroy the selection mid-drag.
     selection_feed_hold: Rc<SelectionFeedHold>,
@@ -1951,12 +2647,29 @@ impl ReaderCtx {
             osc133_depth_rc,
             prompt_buf_rc,
             typed_cmd_rc,
+            typed_cmd_fidelity_rc,
+            submission_pending_rc,
+            pending_typeahead_rc,
+            accepted_input_generation_rc,
             external_submission_rc,
             external_submission_generation_rc,
+            reviewed_submission_tainted_rc,
             background_output_rc,
             idle_input_dirty_rc,
             vte_typed_cmd_rc,
             prompt_end_pos_rc,
+            prompt_anchor_rows_rc,
+            prompt_anchor_resize_generation_rc,
+            pty_resize_generation_rc,
+            prompt_anchor_prefix_rc,
+            prompt_anchor_ready_rc,
+            prompt_identity_output_rc,
+            prompt_anchor_generation_rc,
+            prompt_anchor_tick_id_rc,
+            contents_generation_rc,
+            prompt_render_generation_rc,
+            post_prompt_bytes_rc,
+            post_prompt_overflow_rc,
             prompt_display_rc,
             block_list_rc,
             block_scroll_rc,
@@ -1977,6 +2690,8 @@ impl ReaderCtx {
             ftcs_seen_rc,
             init_cmds_queue_for_cb,
             pty_for_init,
+            shell_integration_token,
+            agent_execution_supported_rc,
             block_start_time_for_cb,
             command_start_instant_for_cb,
             pending_exit_code_rc,
@@ -1997,6 +2712,8 @@ impl ReaderCtx {
             command_started_cbs,
             command_finished_cbs,
             block_finished_cbs,
+            agent_execution_lost_cbs,
+            verified_submission,
             selection_feed_hold,
         } = self;
         let active_alt_screen_mode_rc: Rc<Cell<Option<u32>>> = Rc::new(Cell::new(None));
@@ -2085,18 +2802,66 @@ impl ReaderCtx {
                                     true
                                 }
                                 BlockState::AwaitingCommand => {
-                                    // Warp separates asynchronous output only when it
-                                    // arrives before the user begins editing. Once input
-                                    // is dirty, PTY echo/completion is indistinguishable
-                                    // from a background process and remains inline.
-                                    if should_buffer_background_output(
-                                        idle_input_dirty_rc.get(),
-                                        pty_synced_rc.get(),
-                                    ) {
-                                        background_output_rc.borrow_mut().append(bytes);
+                                    let identity_changing =
+                                        !reviewed_pre_command_bytes_are_identity_neutral(bytes);
+                                    if identity_changing {
+                                        prompt_identity_output_rc.set(true);
                                     }
-                                    scroll_debouncer.mark_dirty(&block_scroll_rc);
-                                    true
+                                    if external_submission_rc.borrow().is_some()
+                                        && identity_changing
+                                    {
+                                        // The reviewed editor was exact before
+                                        // Enter. A redraw between Enter and C
+                                        // (for example an accept-line binding
+                                        // replacing the buffer) can still leave
+                                        // VTE's synchronous text export stale.
+                                        reviewed_submission_tainted_rc.set(true);
+                                    }
+                                    if !prompt_anchor_ready_rc.get() {
+                                        // Establish a real feed fence at OSC B:
+                                        // prompt bytes already queued into VTE
+                                        // settle first, then these post-B bytes
+                                        // (bracketed-paste mode, suggestion
+                                        // repaint, or a shell-side prefill) are
+                                        // replayed against the fixed anchor.
+                                        if post_prompt_overflow_rc.get() {
+                                            active_vte.feed(bytes);
+                                            scroll_debouncer.mark_dirty(&block_scroll_rc);
+                                            false
+                                        } else {
+                                            let would_overflow = post_prompt_bytes_rc
+                                                .borrow()
+                                                .len()
+                                                .saturating_add(bytes.len())
+                                                > MAX_RAW_OUTPUT_BYTES;
+                                            if would_overflow {
+                                                let buffered =
+                                                    post_prompt_bytes_rc.borrow_mut().take_vec();
+                                                if !buffered.is_empty() {
+                                                    active_vte.feed(&buffered);
+                                                }
+                                                active_vte.feed(bytes);
+                                                post_prompt_overflow_rc.set(true);
+                                            } else {
+                                                post_prompt_bytes_rc.borrow_mut().append(bytes);
+                                            }
+                                            scroll_debouncer.mark_dirty(&block_scroll_rc);
+                                            false
+                                        }
+                                    } else {
+                                        // Warp separates asynchronous output only when it
+                                        // arrives before the user begins editing. Once input
+                                        // is dirty, PTY echo/completion is indistinguishable
+                                        // from a background process and remains inline.
+                                        if should_buffer_background_output(
+                                            idle_input_dirty_rc.get(),
+                                            pty_synced_rc.get(),
+                                        ) {
+                                            background_output_rc.borrow_mut().append(bytes);
+                                        }
+                                        scroll_debouncer.mark_dirty(&block_scroll_rc);
+                                        true
+                                    }
                                 }
                                 BlockState::CollectingOutput | BlockState::PostCommand => {
                                     if bstate_rc.get() != BlockState::PostCommand
@@ -2124,12 +2889,70 @@ impl ReaderCtx {
 
                         ParserEvent::PromptStart => {
                             ftcs_seen_rc.set(true);
-                            let state = bstate_rc.get();
+                            prompt_identity_output_rc.set(false);
+                            // Readiness is prompt-scoped. A replacement shell
+                            // cannot inherit a previous integration's ability
+                            // to execute reviewed Agent commands; the bundled
+                            // hook must re-announce the private token between
+                            // this A marker and B for every prompt.
+                            agent_execution_supported_rc.set(false);
+                            let mut state = bstate_rc.get();
                             if state == BlockState::CollectingOutput
                                 || state == BlockState::AltScreen
                             {
-                                continue;
+                                if active_agent_generation_rc.get().is_none()
+                                    || pty_for_init.foreground_owner() == PtyForeground::Other
+                                {
+                                    continue;
+                                }
+                                take_agent_execution_as_lost(
+                                    &active_agent_generation_rc,
+                                    &agent_execution_lost_cbs,
+                                    "the shell returned to a prompt without a command-end marker for the approved command",
+                                );
+                                // Fail closed for Agent correlation while still
+                                // recovering the ordinary Block UI with an
+                                // unknown exit status. Otherwise a missing D
+                                // would leave both the card and terminal stuck.
+                                if state == BlockState::AltScreen {
+                                    let mode =
+                                        active_alt_screen_mode_rc.replace(None).unwrap_or(1049);
+                                    active_vte.feed(format!("\x1b[?{mode}l").as_bytes());
+                                    exit_fullscreen(
+                                        &finished_blocks_for_cb,
+                                        &visible_indices_rc,
+                                        &fullscreen_rc,
+                                    );
+                                    exit_alt_screen_chrome(
+                                        &active_rc,
+                                        &sticky_bar,
+                                        &jump_fab,
+                                        scroll_debouncer.user_scrolled_up.get(),
+                                        unread_count_rc.get(),
+                                    );
+                                    layout_active_surface();
+                                }
+                                osc133_depth_rc.set(0);
+                                pending_exit_code_rc.set(None);
+                                command_start_instant_for_cb.take();
+                                cmd_running_rc.set(false);
+                                bstate_rc.set(BlockState::PostCommand);
+                                state = BlockState::PostCommand;
                             }
+                            if state == BlockState::AwaitingCommand
+                                && external_submission_rc.borrow().is_some()
+                            {
+                                take_agent_execution_as_lost(
+                                    &external_submission_generation_rc,
+                                    &agent_execution_lost_cbs,
+                                    "the shell opened a new prompt before reporting that the approved command started",
+                                );
+                                verified_submission.command_start_observed(false);
+                                external_submission_rc.borrow_mut().take();
+                            }
+                            prompt_render_generation_rc.set(contents_generation_rc.get());
+                            post_prompt_bytes_rc.borrow_mut().clear();
+                            post_prompt_overflow_rc.set(false);
                             let background_output = if state == BlockState::AwaitingCommand {
                                 take_background_output(&background_output_rc)
                             } else {
@@ -2170,7 +2993,7 @@ impl ReaderCtx {
                                         log::warn!(
                                             "finished command text was unavailable; preserving block with placeholder"
                                         );
-                                        cmd = "(command capture unavailable)".to_string();
+                                        cmd = UNAVAILABLE_COMMAND_PLACEHOLDER.to_string();
                                     } else {
                                         // A genuinely empty submission with no output
                                         // is not useful history; reset for the prompt.
@@ -2290,8 +3113,11 @@ impl ReaderCtx {
                                 // command/cwd/exit/duration events; the id it put
                                 // on the OSC 133 mark is the only key that can
                                 // attach our captured output to them.
-                                if let Some(id) = command_meta.id.clone() {
-                                    submit_captured_output_to_journal(id, &block_output);
+                                if let Some(id) = command_meta.journal_execution_id() {
+                                    submit_captured_output_to_journal(
+                                        id.to_string(),
+                                        &block_output,
+                                    );
                                 }
 
                                 let block_data = BlockData {
@@ -2370,6 +3196,9 @@ impl ReaderCtx {
                                     &pty_synced_rc,
                                     &active_rc,
                                     &typed_cmd_rc,
+                                    &typed_cmd_fidelity_rc,
+                                    &submission_pending_rc,
+                                    &pending_typeahead_rc,
                                     &bstate_rc,
                                     &bracketed_paste_rc,
                                 );
@@ -2379,7 +3208,18 @@ impl ReaderCtx {
 
                                 if !is_background {
                                     let output_sample = sample_output_for_event(&output_plain);
-                                    let agent_generation = active_agent_generation_rc.take();
+                                    let mut agent_generation = active_agent_generation_rc.take();
+                                    if agent_generation.is_some()
+                                        && pty_for_init.foreground_owner() != PtyForeground::Shell
+                                    {
+                                        if let Some(generation) = agent_generation.take() {
+                                            emit_agent_execution_lost(
+                                                &agent_execution_lost_cbs,
+                                                generation,
+                                                "the shell did not own the terminal when the approved command block was finalized",
+                                            );
+                                        }
+                                    }
                                     for cb in block_finished_cbs.borrow().iter() {
                                         cb(
                                             cmd.clone(),
@@ -2413,6 +3253,11 @@ impl ReaderCtx {
                                 let bstate_for_rerun_menu = bstate_rc.clone();
                                 let bracketed_paste_for_menu = bracketed_paste_rc.clone();
                                 let typed_cmd_for_rerun_menu = typed_cmd_rc.clone();
+                                let typed_cmd_fidelity_for_rerun_menu =
+                                    typed_cmd_fidelity_rc.clone();
+                                let submission_pending_for_rerun_menu =
+                                    submission_pending_rc.clone();
+                                let pending_typeahead_for_rerun_menu = pending_typeahead_rc.clone();
                                 let selected_ids_for_menu = selected_block_ids_rc.clone();
                                 let selected_for_menu = selected_block_id_rc.clone();
                                 let anchor_for_menu = selection_anchor_id_rc.clone();
@@ -2589,6 +3434,12 @@ impl ReaderCtx {
                                             pty_synced_for_rerun_menu.clone();
                                         let bracketed_for_action = bracketed_paste_for_menu.clone();
                                         let typed_cmd_for_action = typed_cmd_for_rerun_menu.clone();
+                                        let typed_cmd_fidelity_for_action =
+                                            typed_cmd_fidelity_for_rerun_menu.clone();
+                                        let submission_pending_for_action =
+                                            submission_pending_for_rerun_menu.clone();
+                                        let pending_typeahead_for_action =
+                                            pending_typeahead_for_rerun_menu.clone();
                                         let bstate_for_action = bstate_for_rerun_menu.clone();
                                         let active_for_action = active_for_rerun_menu.clone();
                                         item.set_sensitive(command_recall_available(
@@ -2608,9 +3459,17 @@ impl ReaderCtx {
                                             let recalled = {
                                                 let selected = selected_ids_for_rerun.borrow();
                                                 recall_selected_commands_at_prompt(
-                                                    &pty_for_action,
-                                                    &pty_synced_for_action,
-                                                    &typed_cmd_for_action,
+                                                    PromptRecallCtx {
+                                                        pty: &pty_for_action,
+                                                        pty_synced: &pty_synced_for_action,
+                                                        typed_cmd: &typed_cmd_for_action,
+                                                        typed_cmd_fidelity:
+                                                            &typed_cmd_fidelity_for_action,
+                                                        submission_pending:
+                                                            &submission_pending_for_action,
+                                                        pending_typeahead:
+                                                            &pending_typeahead_for_action,
+                                                    },
                                                     bstate_for_action.get(),
                                                     &finished,
                                                     &selected,
@@ -2897,6 +3756,7 @@ impl ReaderCtx {
                             if bstate_rc.get() != BlockState::CollectingPrompt {
                                 continue;
                             }
+                            let prompt_had_bytes = !prompt_buf_rc.borrow().is_empty();
                             // Capture the rendered prompt (last non-empty line) for the
                             // finished block / export.
                             let prompt_line = {
@@ -2911,56 +3771,170 @@ impl ReaderCtx {
                             };
                             *prompt_display_rc.borrow_mut() = prompt_line;
                             prompt_buf_rc.borrow_mut().clear();
+                            let had_typeahead = pending_typeahead_rc.replace(false);
+                            submission_pending_rc.set(false);
+                            let (next_fidelity, prompt_dirty) =
+                                next_prompt_shadow_state(had_typeahead);
                             typed_cmd_rc.borrow_mut().clear();
+                            typed_cmd_fidelity_rc.set(next_fidelity);
                             vte_typed_cmd_rc.borrow_mut().clear();
+                            if external_submission_rc.borrow().is_some() {
+                                verified_submission.command_start_observed(false);
+                            }
                             external_submission_rc.borrow_mut().take();
-                            external_submission_generation_rc.set(None);
-                            active_agent_generation_rc.set(None);
+                            reviewed_submission_tainted_rc.set(false);
+                            if take_agent_execution_as_lost(
+                                &external_submission_generation_rc,
+                                &agent_execution_lost_cbs,
+                                "the approved command was not bound to a shell command-start event",
+                            ) {
+                                external_submission_rc.borrow_mut().take();
+                            }
+                            take_agent_execution_as_lost(
+                                &active_agent_generation_rc,
+                                &agent_execution_lost_cbs,
+                                "the approved command reached a new prompt without a trusted finished block",
+                            );
                             background_output_rc.borrow_mut().clear();
-                            idle_input_dirty_rc.set(false);
-                            // Snapshot the live VTE cursor at the moment the
-                            // prompt finishes drawing — this is where the user's
-                            // command starts. CommandStart will read text from
-                            // here to the cursor's then-position to recover the
-                            // command as it really appeared on screen.
+                            idle_input_dirty_rc.set(prompt_dirty);
+                            // VTE applies feed asynchronously. The provisional
+                            // cursor below is never trusted for approval or
+                            // command capture; a content fence and two stable
+                            // frames below replace it with the settled anchor.
                             let (col, row) = active_vte.cursor_position();
                             prompt_end_pos_rc.set((col, row));
-                            pty_synced_rc.set(false);
+                            prompt_anchor_rows_rc.set(active_vte.row_count());
+                            prompt_anchor_resize_generation_rc.set(pty_resize_generation_rc.get());
+                            prompt_anchor_ready_rc.set(false);
+                            prompt_identity_output_rc.set(false);
+                            let anchor_generation =
+                                prompt_anchor_generation_rc.get().wrapping_add(1);
+                            prompt_anchor_generation_rc.set(anchor_generation);
+                            let anchor_generation_cell = prompt_anchor_generation_rc.clone();
+                            let anchor_ready = prompt_anchor_ready_rc.clone();
+                            let anchor_pos = prompt_end_pos_rc.clone();
+                            let anchor_rows = prompt_anchor_rows_rc.clone();
+                            let anchor_prefix = prompt_anchor_prefix_rc.clone();
+                            let anchor_state = bstate_rc.clone();
+                            let anchor_dirty = idle_input_dirty_rc.clone();
+                            let anchor_synced = pty_synced_rc.clone();
+                            let anchor_submission = submission_pending_rc.clone();
+                            let anchor_typeahead = pending_typeahead_rc.clone();
+                            let contents_generation = contents_generation_rc.clone();
+                            let prompt_render_generation = prompt_render_generation_rc.get();
+                            let post_prompt_bytes = post_prompt_bytes_rc.clone();
+                            let post_prompt_overflow = post_prompt_overflow_rc.clone();
+                            let stage = Rc::new(Cell::new(0u8));
+                            let stage_baseline = Rc::new(Cell::new(prompt_render_generation));
+                            let stage_polls = Rc::new(Cell::new(0u8));
+                            let stage_requires_content = Rc::new(Cell::new(prompt_had_bytes));
+                            let last_observed = Rc::new(Cell::new(None::<(u64, i64, i64)>));
+                            let stable_polls = Rc::new(Cell::new(0u8));
+                            let polls = Rc::new(Cell::new(0u32));
+                            let init_commands = init_cmds_queue_for_cb.clone();
+                            let verified_submission = verified_submission.clone();
+                            let config_for_anchor = config_for_cb.clone();
+                            if let Some(previous) = prompt_anchor_tick_id_rc.borrow_mut().take() {
+                                previous.remove();
+                            }
+                            let anchor_tick_slot = prompt_anchor_tick_id_rc.clone();
+                            let tick_id = active_vte.add_tick_callback(move |vte, _| {
+                                let poll = polls.get().saturating_add(1);
+                                polls.set(poll);
+                                if anchor_generation_cell.get() != anchor_generation
+                                    || post_prompt_overflow.get()
+                                    || !prompt_anchor_may_settle(
+                                        anchor_state.get(),
+                                        anchor_dirty.get(),
+                                        anchor_synced.get(),
+                                        anchor_submission.get(),
+                                        anchor_typeahead.get(),
+                                    )
+                                {
+                                    let deferred = post_prompt_bytes.borrow_mut().take_vec();
+                                    if !deferred.is_empty() {
+                                        vte.feed(&deferred);
+                                    }
+                                    anchor_tick_slot.borrow_mut().take();
+                                    return glib::ControlFlow::Break;
+                                }
+                                if poll >= VERIFIED_SUBMISSION_MAX_POLLS {
+                                    log::warn!("prompt cursor did not settle before the safety deadline");
+                                    let deferred = post_prompt_bytes.borrow_mut().take_vec();
+                                    if !deferred.is_empty() {
+                                        vte.feed(&deferred);
+                                    }
+                                    anchor_tick_slot.borrow_mut().take();
+                                    return glib::ControlFlow::Break;
+                                }
+                                let contents = contents_generation.get();
+                                let after_fence = contents != stage_baseline.get();
+                                stage_polls.set(stage_polls.get().saturating_add(1));
+                                if !after_fence
+                                    && (stage_requires_content.get() || stage_polls.get() < 4)
+                                {
+                                    return glib::ControlFlow::Continue;
+                                }
+                                let (col, row) = vte.cursor_position();
+                                let observed = (contents, col, row);
+                                if last_observed.get() != Some(observed) {
+                                    last_observed.set(Some(observed));
+                                    stable_polls.set(0);
+                                    return glib::ControlFlow::Continue;
+                                }
+                                stable_polls.set(stable_polls.get().saturating_add(1));
+                                if stable_polls.get() < 1 {
+                                    return glib::ControlFlow::Continue;
+                                }
+                                if stage.get() == 0 {
+                                    anchor_pos.set((col, row));
+                                    anchor_rows.set(vte.row_count());
+                                    *anchor_prefix.borrow_mut() =
+                                        visible_row_prefix(vte, (col, row)).unwrap_or_default();
+                                }
+                                // New post-B bytes can arrive while an earlier
+                                // deferred batch is settling. Drain repeatedly;
+                                // Ready is published only at a stable boundary
+                                // where the ring is still empty.
+                                let deferred = post_prompt_bytes.borrow_mut().take_vec();
+                                if !deferred.is_empty() {
+                                    stage.set(1);
+                                    stage_baseline.set(contents);
+                                    stage_polls.set(0);
+                                    stage_requires_content
+                                        .set(background_output_has_visible_text(&deferred));
+                                    last_observed.set(None);
+                                    stable_polls.set(0);
+                                    vte.feed(&deferred);
+                                    return glib::ControlFlow::Continue;
+                                }
+                                anchor_ready.set(true);
+
+                                if let Some(command) = init_commands.borrow_mut().pop_front() {
+                                    let suggestion = click_cursor::suggestion_rgb(
+                                        &config_for_anchor.borrow().palette,
+                                    );
+                                    if let Err(error) = verified_submission.begin(
+                                        &command,
+                                        None,
+                                        suggestion,
+                                    ) {
+                                        log::warn!(
+                                            "initial command was not queued at an unverified prompt: {error}"
+                                        );
+                                    }
+                                }
+                                anchor_tick_slot.borrow_mut().take();
+                                glib::ControlFlow::Break
+                            });
+                            *prompt_anchor_tick_id_rc.borrow_mut() = Some(tick_id);
+                            pty_synced_rc.set(prompt_dirty);
                             bstate_rc.set(BlockState::AwaitingCommand);
                             layout_active_surface();
                             let active_for_focus = active_rc.clone();
                             glib::idle_add_local_once(move || {
                                 active_for_focus.borrow().grab_focus();
                             });
-
-                            // Feed next initial command if any. Seed the same
-                            // fallback state as interactive input before writing, so
-                            // a fast command cannot outrun command capture.
-                            if let Some(cmd) = init_cmds_queue_for_cb.borrow_mut().pop_front() {
-                                let mut typed = typed_cmd_rc.borrow_mut();
-                                typed.clear();
-                                append_typed_command_shadow(&mut typed, &cmd);
-                                drop(typed);
-                                *external_submission_rc.borrow_mut() = Some(cmd.clone());
-                                idle_input_dirty_rc.set(true);
-                                pty_synced_rc.set(true);
-                                let text = format!("{}\r", cmd);
-                                if let Err(error) = pty_for_init.write_bytes(text.as_bytes()) {
-                                    // The shadow was armed before enqueue so a
-                                    // fast child cannot outrun capture. Roll it
-                                    // back when bounded admission rejects the
-                                    // whole command.
-                                    typed_cmd_rc.borrow_mut().clear();
-                                    external_submission_rc.borrow_mut().take();
-                                    external_submission_generation_rc.set(None);
-                                    idle_input_dirty_rc.set(false);
-                                    pty_synced_rc.set(false);
-                                    pty_for_init.report_write_error(
-                                        "could not queue initial command",
-                                        error,
-                                    );
-                                }
-                            }
 
                             scroll_debouncer.reset_scroll_lock();
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
@@ -2972,6 +3946,12 @@ impl ReaderCtx {
                             if state == BlockState::CollectingOutput
                                 || state == BlockState::AltScreen
                             {
+                                if pty_for_init.foreground_owner() != PtyForeground::Shell {
+                                    // A foreground job can print OSC 133 bytes as
+                                    // ordinary output. Do not let its nested C
+                                    // consume the shell's eventual real D.
+                                    continue;
+                                }
                                 osc133_depth_rc.set(osc133_depth_rc.get() + 1);
                                 continue;
                             }
@@ -2979,7 +3959,11 @@ impl ReaderCtx {
                                 continue;
                             }
                             osc133_depth_rc.set(0);
-                            let mut command_meta = PendingCommandMeta::from_command_start(meta);
+                            let mut command_meta =
+                                PendingCommandMeta::from_command_start_with_token(
+                                    meta,
+                                    &shell_integration_token,
+                                );
                             if command_meta.cwd.is_none() {
                                 command_meta.cwd = safe_command_metadata_cwd(Some(
                                     current_cwd_for_cb.borrow().as_str(),
@@ -3003,8 +3987,17 @@ impl ReaderCtx {
                             // the current cursor position (right before the
                             // shell echoes a newline and starts the command).
                             let (cmd_end_col, cmd_end_row) = active_vte.cursor_position();
-                            let (start_col, start_row) = prompt_end_pos_rc.get();
-                            let captured = if command_capture_range_is_bounded(
+                            let current_rows = active_vte.row_count();
+                            let (start_col, start_row) = current_prompt_anchor(
+                                &active_vte,
+                                prompt_end_pos_rc.get(),
+                                prompt_anchor_rows_rc.get(),
+                            );
+                            prompt_end_pos_rc.set((start_col, start_row));
+                            prompt_anchor_rows_rc.set(current_rows);
+                            let captured = if !prompt_anchor_ready_rc.get() {
+                                String::new()
+                            } else if command_capture_range_is_bounded(
                                 start_row,
                                 cmd_end_row,
                                 active_vte.column_count(),
@@ -3023,20 +4016,74 @@ impl ReaderCtx {
                             } else {
                                 TRUNCATED_COMMAND_PLACEHOLDER.to_string()
                             };
+                            let deferred = post_prompt_bytes_rc.borrow_mut().take_vec();
+                            if !deferred.is_empty() {
+                                active_vte.feed(&deferred);
+                            }
                             let prompt_display = prompt_display_rc.borrow().clone();
                             let typed_shadow = typed_cmd_rc.borrow().clone();
                             let external_submission = external_submission_rc.borrow_mut().take();
-                            active_agent_generation_rc
-                                .set(external_submission_generation_rc.take());
-                            let submitted_command = resolve_command_for_block(
-                                meta,
-                                &resolve_submitted_command(
-                                    &captured,
-                                    &prompt_display,
-                                    &typed_shadow,
-                                    external_submission.as_deref(),
-                                ),
-                            );
+                            let mut agent_generation = external_submission_generation_rc.take();
+                            let reviewed_submission_tainted =
+                                reviewed_submission_tainted_rc.replace(false);
+                            let reviewed_identity_matches =
+                                external_submission.as_deref().is_none_or(|approved| {
+                                    reviewed_submission_matches(
+                                        meta.command.as_deref(),
+                                        &captured,
+                                        approved,
+                                        reviewed_submission_tainted,
+                                    )
+                                });
+                            if external_submission.is_some() {
+                                verified_submission
+                                    .command_start_observed(reviewed_identity_matches);
+                            }
+                            if let Some(generation) = agent_generation {
+                                if !reviewed_identity_matches {
+                                    log::warn!(
+                                        "reviewed command identity mismatch: rendered_bytes={} approved_bytes={} shell_metadata={} feed_tainted={}",
+                                        captured.len(),
+                                        external_submission.as_ref().map_or(0, String::len),
+                                        meta.command.is_some(),
+                                        reviewed_submission_tainted,
+                                    );
+                                    emit_agent_execution_lost(
+                                        &agent_execution_lost_cbs,
+                                        generation,
+                                        "the command reported by the shell did not exactly match the approved command",
+                                    );
+                                    agent_generation = None;
+                                }
+                            }
+                            active_agent_generation_rc.set(agent_generation);
+                            let reconstructed_command =
+                                if external_submission.is_some() && !reviewed_identity_matches {
+                                    if reviewed_submission_tainted || captured.is_empty() {
+                                        UNAVAILABLE_COMMAND_PLACEHOLDER.to_string()
+                                    } else {
+                                        bounded_command_text(&captured)
+                                    }
+                                } else {
+                                    resolve_submitted_command(
+                                        &captured,
+                                        &prompt_display,
+                                        &typed_shadow,
+                                        typed_cmd_fidelity_rc.get().can_repair_capture(),
+                                        external_submission.as_deref(),
+                                        agent_generation.is_some(),
+                                    )
+                                };
+                            let mut submitted_command =
+                                resolve_command_for_block(meta, &reconstructed_command);
+                            if !reviewed_identity_matches
+                                && external_submission
+                                    .as_deref()
+                                    .is_some_and(|approved| submitted_command == approved)
+                            {
+                                submitted_command = UNAVAILABLE_COMMAND_PLACEHOLDER.to_string();
+                            }
+                            submission_pending_rc.set(false);
                             *vte_typed_cmd_rc.borrow_mut() = submitted_command.clone();
                             *running_cmd_rc.borrow_mut() = submitted_command.clone();
                             cmd_running_rc.set(true);
@@ -3074,6 +4121,32 @@ impl ReaderCtx {
                             if osc133_depth_rc.get() > 0 {
                                 osc133_depth_rc.set(osc133_depth_rc.get() - 1);
                                 continue;
+                            }
+                            let id_correlation = pending_command_meta_rc
+                                .borrow()
+                                .command_end_correlation(meta);
+                            match decide_agent_command_end(
+                                active_agent_generation_rc.get().is_some(),
+                                pty_for_init.foreground_owner(),
+                                pending_typeahead_rc.get(),
+                                id_correlation,
+                            ) {
+                                AgentCommandEndDecision::Accept => {}
+                                AgentCommandEndDecision::IgnoreUntilShellOwnsForeground => {
+                                    // A foreground job can print D as ordinary
+                                    // output. Wait for the shell's real marker.
+                                    continue;
+                                }
+                                AgentCommandEndDecision::AcceptWithoutAgentCorrelation => {
+                                    take_agent_execution_as_lost(
+                                        &active_agent_generation_rc,
+                                        &agent_execution_lost_cbs,
+                                        "terminal ownership or command identifiers could not verify the approved command completion",
+                                    );
+                                }
+                            }
+                            if id_correlation == CommandIdCorrelation::Mismatch {
+                                pending_command_meta_rc.borrow_mut().id = None;
                             }
                             // Safety net (Warp parity): if the alt-screen app
                             // crashed or exited without rmcup, force the UI back
@@ -3212,6 +4285,16 @@ impl ReaderCtx {
                                     "could not queue clipboard-query reply",
                                     error,
                                 );
+                            } else {
+                                record_protocol_reply_input(
+                                    bstate_rc.get(),
+                                    &typed_cmd_fidelity_rc,
+                                    &idle_input_dirty_rc,
+                                    &pty_synced_rc,
+                                    &submission_pending_rc,
+                                    &pending_typeahead_rc,
+                                    &accepted_input_generation_rc,
+                                );
                             }
                         }
 
@@ -3224,6 +4307,16 @@ impl ReaderCtx {
                             if let Err(error) = pty_for_init.write_bytes(reply.as_bytes()) {
                                 pty_for_init
                                     .report_write_error("could not queue color-query reply", error);
+                            } else {
+                                record_protocol_reply_input(
+                                    bstate_rc.get(),
+                                    &typed_cmd_fidelity_rc,
+                                    &idle_input_dirty_rc,
+                                    &pty_synced_rc,
+                                    &submission_pending_rc,
+                                    &pending_typeahead_rc,
+                                    &accepted_input_generation_rc,
+                                );
                             }
                         }
 
@@ -3253,6 +4346,16 @@ impl ReaderCtx {
                                     "could not queue keyboard-query reply",
                                     error,
                                 );
+                            } else {
+                                record_protocol_reply_input(
+                                    bstate_rc.get(),
+                                    &typed_cmd_fidelity_rc,
+                                    &idle_input_dirty_rc,
+                                    &pty_synced_rc,
+                                    &submission_pending_rc,
+                                    &pending_typeahead_rc,
+                                    &accepted_input_generation_rc,
+                                );
                             }
                         }
 
@@ -3262,6 +4365,15 @@ impl ReaderCtx {
                                     cb(id);
                                 }
                             }
+                        }
+
+                        ParserEvent::AgentIntegrationReady(token) => {
+                            accept_agent_integration_token(
+                                bstate_rc.get(),
+                                &shell_integration_token,
+                                token,
+                                &agent_execution_supported_rc,
+                            );
                         }
 
                         ParserEvent::Notification { title, body } => {
@@ -3312,6 +4424,16 @@ impl ReaderCtx {
                                         pty_for_init.report_write_error(
                                             "could not queue graphics-protocol reply",
                                             error,
+                                        );
+                                    } else {
+                                        record_protocol_reply_input(
+                                            bstate_rc.get(),
+                                            &typed_cmd_fidelity_rc,
+                                            &idle_input_dirty_rc,
+                                            &pty_synced_rc,
+                                            &submission_pending_rc,
+                                            &pending_typeahead_rc,
+                                            &accepted_input_generation_rc,
                                         );
                                     }
                                 }
@@ -3781,6 +4903,9 @@ struct KeyCtx {
     pty_synced_for_key: Rc<Cell<bool>>,
     bracketed_paste_for_key: Rc<Cell<bool>>,
     typed_cmd_for_key: Rc<RefCell<String>>,
+    typed_cmd_fidelity_for_key: Rc<Cell<TypedShadowFidelity>>,
+    submission_pending_for_key: Rc<Cell<bool>>,
+    pending_typeahead_for_key: Rc<Cell<bool>>,
     finished_blocks_for_key: Weak<RefCell<Vec<FinishedBlock>>>,
     block_data_for_key: Rc<RefCell<VecDeque<BlockData>>>,
     block_list_for_key: glib::WeakRef<gtk4::Box>,
@@ -3801,6 +4926,9 @@ impl KeyCtx {
             pty_synced_for_key,
             bracketed_paste_for_key,
             typed_cmd_for_key,
+            typed_cmd_fidelity_for_key,
+            submission_pending_for_key,
+            pending_typeahead_for_key,
             finished_blocks_for_key,
             block_data_for_key,
             block_list_for_key,
@@ -3960,9 +5088,14 @@ impl KeyCtx {
                     let recalled = {
                         let selected = selected_block_ids_for_key.borrow();
                         recall_selected_commands_at_prompt(
-                            &pty_for_key,
-                            &pty_synced_for_key,
-                            &typed_cmd_for_key,
+                            PromptRecallCtx {
+                                pty: &pty_for_key,
+                                pty_synced: &pty_synced_for_key,
+                                typed_cmd: &typed_cmd_for_key,
+                                typed_cmd_fidelity: &typed_cmd_fidelity_for_key,
+                                submission_pending: &submission_pending_for_key,
+                                pending_typeahead: &pending_typeahead_for_key,
+                            },
                             bstate_for_key.get(),
                             &finished,
                             &selected,
@@ -4179,7 +5312,7 @@ impl TermView {
             cwd,
             session_id,
             initial_commands,
-            OwnedPty::spawn,
+            OwnedPty::spawn_with_shell_token,
         )
     }
 
@@ -4198,15 +5331,10 @@ impl TermView {
         spawn: F,
     ) -> io::Result<Self>
     where
-        F: FnOnce(&[&str], Option<&str>, &[(&str, &str)]) -> io::Result<OwnedPty>,
+        F: FnOnce(&[&str], Option<&str>, &[(&str, &str)], bool) -> io::Result<OwnedPty>,
     {
         // Detect jsh shell for session_id passing.
-        let is_jsh = shell_argv
-            .first()
-            .and_then(|s| std::path::Path::new(s).file_name())
-            .and_then(|f| f.to_str())
-            .map(|name| name == "jsh")
-            .unwrap_or(false);
+        let is_jsh = shell_argv_uses_jsh(shell_argv);
 
         let session_id = session_id.filter(|sid| crate::review_input::valid_jsh_id(sid));
 
@@ -4237,7 +5365,17 @@ impl TermView {
         // starts in the application directory. Missing executables and resource
         // exhaustion retain their original io::Error for the transactional UI
         // caller to log and present instead of panicking the application.
-        let pty = Rc::new(spawn(&argv, cwd, &env_extra)?);
+        let request_shell_token = shell_argv_supports_agent_ids(shell_argv);
+        let pty = Rc::new(spawn(&argv, cwd, &env_extra, request_shell_token)?);
+        let shell_integration_token = pty
+            .shell_integration_token()
+            .unwrap_or_default()
+            .to_string();
+        // Issuing a token is not a capability handshake. The bundled script
+        // must consume and close its private fd, then echo OSC 7771 with this
+        // exact token before reviewed commands may be executed.
+        let agent_execution_supported = Rc::new(Cell::new(false));
+        let shell_integration_token = Rc::new(shell_integration_token);
         // ── Build widget tree ──────────────────────────────────────────────
         let root = gtk4::Box::new(Orientation::Vertical, 0);
         root.set_hexpand(true);
@@ -4400,8 +5538,13 @@ impl TermView {
         // off the VTE at CommandStart; this remains a best-effort fallback when
         // a shell-integration anchor cannot be captured.
         let typed_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let typed_cmd_fidelity = Rc::new(Cell::new(TypedShadowFidelity::ExactOpen));
+        let submission_pending = Rc::new(Cell::new(false));
+        let pending_typeahead = Rc::new(Cell::new(false));
+        let accepted_input_generation = Rc::new(Cell::new(0u64));
         let external_submission: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let external_submission_generation: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+        let reviewed_submission_tainted: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let active_agent_generation: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         let background_output: Rc<RefCell<BoundedByteRing>> =
             Rc::new(RefCell::new(BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES)));
@@ -4413,6 +5556,24 @@ impl TermView {
         // VTE cursor position (col, row) right after the prompt finished
         // drawing — anchor for the text-range read at CommandStart.
         let prompt_end_pos: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
+        let prompt_anchor_rows: Rc<Cell<i64>> = Rc::new(Cell::new(0));
+        let prompt_anchor_resize_generation = Rc::new(Cell::new(0u64));
+        let pty_resize_generation = Rc::new(Cell::new(0u64));
+        let prompt_anchor_prefix = Rc::new(RefCell::new(String::new()));
+        let prompt_anchor_ready = Rc::new(Cell::new(false));
+        let prompt_identity_output = Rc::new(Cell::new(false));
+        let prompt_anchor_generation = Rc::new(Cell::new(0u64));
+        let prompt_anchor_tick_id: Rc<RefCell<Option<gtk4::TickCallbackId>>> =
+            Rc::new(RefCell::new(None));
+        let prompt_render_generation = Rc::new(Cell::new(0u64));
+        let post_prompt_bytes = Rc::new(RefCell::new(BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES)));
+        let post_prompt_overflow = Rc::new(Cell::new(false));
+        let contents_generation = Rc::new(Cell::new(0u64));
+        let verified_submission_source_id: Rc<RefCell<Option<glib::SourceId>>> =
+            Rc::new(RefCell::new(None));
+        let verified_submission_completion: Rc<RefCell<Option<VerifiedSubmissionCompletion>>> =
+            Rc::new(RefCell::new(None));
+        let pending_verified_agent_generation: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
 
         // Scroll-lock flags shared across the contents_changed pin, value_changed
         // detector, FAB, and ScrollDebouncer. `user_scrolled_up` suppresses the
@@ -4538,7 +5699,9 @@ impl TermView {
             let user_scrolled = user_scrolled_up.clone();
             let programmatic = programmatic_scroll.clone();
             let pin_pending = pin_pending.clone();
+            let contents_generation = contents_generation.clone();
             active_vte.connect_contents_changed(move |_| {
+                contents_generation.set(contents_generation.get().wrapping_add(1));
                 f();
                 if user_scrolled.get() || pin_pending.get() {
                     return;
@@ -4597,6 +5760,34 @@ impl TermView {
         let command_started_callbacks: CommandStartedCallbacks = Rc::new(RefCell::new(vec![]));
         let command_finished_callbacks: CommandFinishedCallbacks = Rc::new(RefCell::new(vec![]));
         let block_finished_callbacks: BlockFinishedCallbacks = Rc::new(RefCell::new(vec![]));
+        let agent_execution_lost_callbacks: AgentExecutionLostCallbacks =
+            Rc::new(RefCell::new(vec![]));
+        let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let verified_submission = VerifiedSubmissionCtx {
+            active_vte: active_vte.clone(),
+            bstate: bstate.clone(),
+            pty: pty.clone(),
+            typed_cmd: typed_cmd.clone(),
+            typed_cmd_fidelity: typed_cmd_fidelity.clone(),
+            submission_pending: submission_pending.clone(),
+            pending_typeahead: pending_typeahead.clone(),
+            external_submission: external_submission.clone(),
+            external_submission_generation: external_submission_generation.clone(),
+            reviewed_submission_tainted: reviewed_submission_tainted.clone(),
+            idle_input_dirty: idle_input_dirty.clone(),
+            pty_synced: pty_synced.clone(),
+            prompt_end_pos: prompt_end_pos.clone(),
+            prompt_anchor_rows: prompt_anchor_rows.clone(),
+            prompt_anchor_ready: prompt_anchor_ready.clone(),
+            prompt_anchor_generation: prompt_anchor_generation.clone(),
+            contents_generation: contents_generation.clone(),
+            accepted_input_generation: accepted_input_generation.clone(),
+            source_id: verified_submission_source_id.clone(),
+            completion: verified_submission_completion,
+            pending_agent_generation: pending_verified_agent_generation,
+            agent_execution_lost_callbacks: agent_execution_lost_callbacks.clone(),
+            agent_execution_supported: agent_execution_supported.clone(),
+        };
         let mouse_reporting_mode: Rc<Cell<MouseReportingMode>> =
             Rc::new(Cell::new(MouseReportingMode::None));
         // Unlike a regular VTE terminal, block mode owns the shell PTY. Keep
@@ -4611,7 +5802,6 @@ impl TermView {
             Rc::new(RefCell::new(PendingCommandMeta::default()));
 
         let widget_pool: Rc<RefCell<WidgetPool>> = Rc::new(RefCell::new(WidgetPool::new()));
-        let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let selected_block_ids: SelectedBlockIds =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
         let selected_block_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
@@ -4746,8 +5936,17 @@ impl TermView {
             let osc133_depth_rc = osc133_depth.clone();
             let prompt_buf_rc = prompt_buf.clone();
             let typed_cmd_rc = typed_cmd.clone();
+            let typed_cmd_fidelity_rc = typed_cmd_fidelity.clone();
+            let submission_pending_rc = submission_pending.clone();
+            let pending_typeahead_rc = pending_typeahead.clone();
             let vte_typed_cmd_rc = vte_typed_cmd.clone();
             let prompt_end_pos_rc = prompt_end_pos.clone();
+            let prompt_anchor_rows_rc = prompt_anchor_rows.clone();
+            let prompt_anchor_resize_generation_rc = prompt_anchor_resize_generation.clone();
+            let pty_resize_generation_rc = pty_resize_generation.clone();
+            let prompt_anchor_prefix_rc = prompt_anchor_prefix.clone();
+            let prompt_anchor_ready_rc = prompt_anchor_ready.clone();
+            let prompt_anchor_generation_rc = prompt_anchor_generation.clone();
             let prompt_display_rc = prompt_display.clone();
             let block_list_rc = block_list.clone();
             let block_scroll_rc = block_scroll.clone();
@@ -4791,12 +5990,29 @@ impl TermView {
                 osc133_depth_rc,
                 prompt_buf_rc,
                 typed_cmd_rc,
+                typed_cmd_fidelity_rc,
+                submission_pending_rc,
+                pending_typeahead_rc,
+                accepted_input_generation_rc: accepted_input_generation.clone(),
                 external_submission_rc: external_submission.clone(),
                 external_submission_generation_rc: external_submission_generation.clone(),
+                reviewed_submission_tainted_rc: reviewed_submission_tainted,
                 background_output_rc: background_output.clone(),
                 idle_input_dirty_rc: idle_input_dirty.clone(),
                 vte_typed_cmd_rc,
                 prompt_end_pos_rc,
+                prompt_anchor_rows_rc,
+                prompt_anchor_resize_generation_rc,
+                pty_resize_generation_rc,
+                prompt_anchor_prefix_rc,
+                prompt_anchor_ready_rc,
+                prompt_identity_output_rc: prompt_identity_output.clone(),
+                prompt_anchor_generation_rc,
+                prompt_anchor_tick_id_rc: prompt_anchor_tick_id.clone(),
+                contents_generation_rc: contents_generation.clone(),
+                prompt_render_generation_rc: prompt_render_generation.clone(),
+                post_prompt_bytes_rc: post_prompt_bytes,
+                post_prompt_overflow_rc: post_prompt_overflow,
                 prompt_display_rc,
                 block_list_rc,
                 block_scroll_rc,
@@ -4817,6 +6033,8 @@ impl TermView {
                 ftcs_seen_rc,
                 init_cmds_queue_for_cb,
                 pty_for_init,
+                shell_integration_token,
+                agent_execution_supported_rc: agent_execution_supported.clone(),
                 block_start_time_for_cb,
                 command_start_instant_for_cb,
                 pending_exit_code_rc,
@@ -4837,6 +6055,8 @@ impl TermView {
                 command_started_cbs: command_started_callbacks.clone(),
                 command_finished_cbs: command_finished_callbacks.clone(),
                 block_finished_cbs: block_finished_callbacks.clone(),
+                agent_execution_lost_cbs: agent_execution_lost_callbacks.clone(),
+                verified_submission: verified_submission.clone(),
                 selection_feed_hold: selection_feed_hold.clone(),
             }
             .install(&pty);
@@ -5164,6 +6384,10 @@ impl TermView {
             let pty_for_commit = pty.clone();
             let bstate_for_commit = bstate.clone();
             let typed_cmd_for_commit = typed_cmd.clone();
+            let typed_cmd_fidelity_for_commit = typed_cmd_fidelity.clone();
+            let submission_pending_for_commit = submission_pending.clone();
+            let pending_typeahead_for_commit = pending_typeahead.clone();
+            let accepted_input_generation_for_commit = accepted_input_generation.clone();
             let idle_input_dirty_for_commit = idle_input_dirty.clone();
             let pty_synced_for_commit = pty_synced.clone();
             let finished_blocks_for_commit = Rc::downgrade(&finished_blocks_rc);
@@ -5172,36 +6396,59 @@ impl TermView {
             let selection_anchor_id_for_commit = selection_anchor_id.clone();
             let human_input_for_commit = human_input_callbacks.clone();
             active_vte.connect_commit(move |_, text, _size| {
-                let awaiting_command = bstate_for_commit.get() == BlockState::AwaitingCommand;
-                let shadow_rollback = awaiting_command
-                    .then(|| vte_commit_shadow_rollback(&typed_cmd_for_commit.borrow(), text));
-                let previous_idle_dirty = idle_input_dirty_for_commit.get();
-                let previous_pty_synced = pty_synced_for_commit.get();
-                if awaiting_command {
-                    idle_input_dirty_for_commit.set(true);
-                    if text.as_bytes().iter().any(|&b| b != b'\r' && b != b'\n') {
-                        // A later recall must replace this edited readline buffer,
-                        // not append to it. PromptEnd resets the flag for a new line.
-                        pty_synced_for_commit.set(true);
+                let block_state = bstate_for_commit.get();
+                let awaiting_command = block_state == BlockState::AwaitingCommand;
+                let previous_fidelity = typed_cmd_fidelity_for_commit.get();
+                let previous_submission_pending = submission_pending_for_commit.get();
+                let admitted = match pty_for_commit.write_bytes_admitted(text.as_bytes()) {
+                    Ok(admitted) => admitted,
+                    Err(error) => {
+                        pty_for_commit.report_write_error("could not queue terminal input", error);
+                        return;
                     }
-
-                    // Update the fallback before exposing bytes to the PTY. A very
-                    // fast shell can echo the line and emit OSC 133;C immediately;
-                    // the reader must never observe CommandStart while this shadow
-                    // still describes the previous editor state.
-                    apply_vte_commit_to_shadow(&mut typed_cmd_for_commit.borrow_mut(), text);
-                }
-
-                if let Err(error) = pty_for_commit.write_bytes(text.as_bytes()) {
-                    if let Some(shadow_rollback) = shadow_rollback {
-                        shadow_rollback.apply(&mut typed_cmd_for_commit.borrow_mut());
-                        idle_input_dirty_for_commit.set(previous_idle_dirty);
-                        pty_synced_for_commit.set(previous_pty_synced);
-                    }
-                    pty_for_commit.report_write_error("could not queue terminal input", error);
+                };
+                if admitted.wire_bytes == 0 {
                     return;
                 }
 
+                if awaiting_command && admitted.taints_editor() {
+                    idle_input_dirty_for_commit.set(true);
+                    if admitted.had_framing
+                        || admitted
+                            .editor_bytes
+                            .iter()
+                            .any(|&byte| !matches!(byte, b'\r' | b'\n'))
+                    {
+                        // A later recall must not append to an edited readline
+                        // buffer. PromptEnd resets this flag for a new line.
+                        pty_synced_for_commit.set(true);
+                    }
+
+                    let exact = !admitted.had_framing
+                        && admitted.editor_bytes.as_slice() == text.as_bytes();
+                    if exact {
+                        apply_vte_commit_to_shadow(&mut typed_cmd_for_commit.borrow_mut(), text);
+                        typed_cmd_fidelity_for_commit
+                            .set(previous_fidelity.advance(&admitted.editor_bytes));
+                    } else {
+                        // The central boundary framed, truncated, or stripped
+                        // this commit. VTE echo remains authoritative; never let
+                        // the pre-filter text repair command identity.
+                        typed_cmd_fidelity_for_commit.set(TypedShadowFidelity::Inexact);
+                    }
+                }
+
+                if ((block_state != BlockState::AwaitingCommand || previous_submission_pending)
+                    && (admitted.has_effective_editor_input() || admitted.had_framing))
+                    || admitted.input_after_submission
+                {
+                    pending_typeahead_for_commit.set(true);
+                }
+                if admitted.submits_line {
+                    submission_pending_for_commit.set(true);
+                }
+                accepted_input_generation_for_commit
+                    .set(accepted_input_generation_for_commit.get().wrapping_add(1));
                 emit_accepted_input(&human_input_for_commit, InputOrigin::VteCommit);
 
                 // Only accepted terminal input exits block-selection mode.
@@ -5302,6 +6549,9 @@ impl TermView {
         {
             let pty_for_key = pty.clone();
             let typed_cmd_for_key = typed_cmd.clone();
+            let typed_cmd_fidelity_for_key = typed_cmd_fidelity.clone();
+            let submission_pending_for_key = submission_pending.clone();
+            let pending_typeahead_for_key = pending_typeahead.clone();
             let finished_blocks_for_key = Rc::downgrade(&finished_blocks_rc);
             let block_data_for_key = block_data_rc.clone();
             let block_list_for_key = block_list.clone();
@@ -5318,6 +6568,9 @@ impl TermView {
                 pty_synced_for_key: pty_synced.clone(),
                 bracketed_paste_for_key: bracketed_paste.clone(),
                 typed_cmd_for_key,
+                typed_cmd_fidelity_for_key,
+                submission_pending_for_key,
+                pending_typeahead_for_key,
                 finished_blocks_for_key,
                 block_data_for_key,
                 block_list_for_key: block_list_for_key.downgrade(),
@@ -5369,6 +6622,29 @@ impl TermView {
             click_cursor::ClickCursorCtx {
                 enabled: config.click_moves_cursor,
                 pty: Rc::clone(&pty),
+                cursor_move_allowed: {
+                    let typed_cmd_fidelity = typed_cmd_fidelity.clone();
+                    let submission_pending = submission_pending.clone();
+                    let pending_typeahead = pending_typeahead.clone();
+                    Rc::new(move || {
+                        !submission_pending.get()
+                            && !pending_typeahead.get()
+                            && typed_cmd_fidelity.get() != TypedShadowFidelity::ExactSubmitted
+                    })
+                },
+                cursor_move_accepted: {
+                    let typed_cmd_fidelity = typed_cmd_fidelity.clone();
+                    let pty_synced = pty_synced.clone();
+                    let idle_input_dirty = idle_input_dirty.clone();
+                    let accepted_input_generation = accepted_input_generation.clone();
+                    Rc::new(move || {
+                        typed_cmd_fidelity.set(TypedShadowFidelity::Inexact);
+                        pty_synced.set(true);
+                        idle_input_dirty.set(true);
+                        accepted_input_generation
+                            .set(accepted_input_generation.get().wrapping_add(1));
+                    })
+                },
                 prompt_end_pos: prompt_end_pos.clone(),
                 bstate: bstate.clone(),
                 mouse_mode: mouse_reporting_mode.clone(),
@@ -5416,6 +6692,12 @@ impl TermView {
             let pty_for_scroll = pty.clone();
             let pointer_for_scroll = pointer_cell.clone();
             let bstate_for_scroll = bstate.clone();
+            let fidelity_for_scroll = typed_cmd_fidelity.clone();
+            let dirty_for_scroll = idle_input_dirty.clone();
+            let synced_for_scroll = pty_synced.clone();
+            let submitted_for_scroll = submission_pending.clone();
+            let typeahead_for_scroll = pending_typeahead.clone();
+            let input_generation_for_scroll = accepted_input_generation.clone();
             let vte_for_scroll = active_vte.downgrade();
             let outer_for_scroll = block_scroll.downgrade();
             let scroll_ctrl = gtk4::EventControllerScroll::new(
@@ -5434,9 +6716,18 @@ impl TermView {
                     if let Some(bytes) =
                         encode_mouse_wheel(mouse_mode_for_scroll.get(), dy, col, row)
                     {
-                        if let Err(error) = pty_for_scroll.write_bytes(&bytes) {
-                            pty_for_scroll
-                                .report_write_error("could not queue mouse-wheel input", error);
+                        match pty_for_scroll.write_bytes(&bytes) {
+                            Ok(()) => record_protocol_reply_input(
+                                bstate_for_scroll.get(),
+                                &fidelity_for_scroll,
+                                &dirty_for_scroll,
+                                &synced_for_scroll,
+                                &submitted_for_scroll,
+                                &typeahead_for_scroll,
+                                &input_generation_for_scroll,
+                            ),
+                            Err(error) => pty_for_scroll
+                                .report_write_error("could not queue mouse-wheel input", error),
                         }
                     }
                     return glib::Propagation::Stop;
@@ -5524,7 +6815,19 @@ impl TermView {
             active,
             bstate,
             prompt_buf,
+            prompt_display,
             typed_cmd,
+            prompt_end_pos,
+            prompt_anchor_rows,
+            prompt_anchor_resize_generation,
+            pty_resize_generation,
+            prompt_anchor_prefix,
+            prompt_anchor_ready,
+            prompt_identity_output,
+            typed_cmd_fidelity,
+            submission_pending,
+            pending_typeahead,
+            accepted_input_generation,
             external_submission,
             external_submission_generation,
             idle_input_dirty,
@@ -5570,6 +6873,11 @@ impl TermView {
             command_started_callbacks,
             command_finished_callbacks,
             block_finished_callbacks,
+            agent_execution_lost_callbacks,
+            verified_submission,
+            verified_submission_source_id,
+            prompt_anchor_tick_id,
+            agent_execution_supported,
             selection_feed_hold,
         };
 
@@ -5699,6 +7007,7 @@ impl TermView {
     /// push TIOCSWINSZ synchronously so apps never see a stale first layout.
     fn install_resize_tick(&self) {
         let pty_for_resize = self.pty.clone();
+        let resize_generation = self.pty_resize_generation.clone();
         let scroll_for_resize = self.block_scroll.downgrade();
         let last: Rc<Cell<(u16, u16)>> = Rc::new(Cell::new((0, 0)));
         let tick_id = self.active_vte.add_tick_callback(move |vte, _clock| {
@@ -5708,6 +7017,7 @@ impl TermView {
             let (cols, rows) = pty_grid_size(vte, &scroll_for_resize);
             if cols > 0 && rows > 0 && (cols, rows) != last.get() {
                 last.set((cols, rows));
+                resize_generation.set(resize_generation.get().wrapping_add(1));
                 pty_for_resize.resize(cols, rows);
             }
             glib::ControlFlow::Continue
@@ -5809,21 +7119,36 @@ impl TermView {
         // resume before the echo of these bytes would be parked too.
         self.selection_feed_hold.flush_now();
         let previous_shadow = self.typed_cmd.borrow().clone();
+        let previous_fidelity = self.typed_cmd_fidelity.get();
+        let previous_submission_pending = self.submission_pending.get();
         let previous_pty_synced = self.pty_synced.get();
         let previous_idle_dirty = self.idle_input_dirty.get();
+        let block_state = self.bstate.get();
         let changed_editor = record_external_input(
-            self.bstate.get(),
+            block_state,
             data,
             &self.typed_cmd,
             &self.pty_synced,
             &self.idle_input_dirty,
         );
+        if block_state == BlockState::AwaitingCommand {
+            self.typed_cmd_fidelity.set(previous_fidelity.advance(data));
+        }
         if let Err(error) = self.pty.write_bytes(data) {
             *self.typed_cmd.borrow_mut() = previous_shadow;
+            self.typed_cmd_fidelity.set(previous_fidelity);
             self.pty_synced.set(previous_pty_synced);
             self.idle_input_dirty.set(previous_idle_dirty);
             return Err(error);
         }
+        if input_may_survive_into_next_prompt(block_state, previous_submission_pending, data) {
+            self.pending_typeahead.set(true);
+        }
+        if input_submits_line(data) {
+            self.submission_pending.set(true);
+        }
+        self.accepted_input_generation
+            .set(self.accepted_input_generation.get().wrapping_add(1));
         // `write_input` is the shared Agent/correction/palette boundary.  Feed
         // it through the origin gate so future callback refactors cannot make
         // accepted programmatic bytes look like human attention.
@@ -5857,6 +7182,28 @@ impl TermView {
         self.submit_command_with_agent_generation(command, None)
     }
 
+    /// Begin a reviewed submission and report whether read-back ultimately
+    /// admitted Enter. The immediate `Result` covers insertion/admission;
+    /// `completion` covers the asynchronous VTE verification boundary.
+    pub(crate) fn submit_command_tracked<F>(
+        &self,
+        command: &str,
+        completion: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(Result<(), String>) + 'static,
+    {
+        if self.verified_submission.completion.borrow().is_some() {
+            return Err("another reviewed command is still being verified".to_string());
+        }
+        *self.verified_submission.completion.borrow_mut() = Some(Box::new(completion));
+        let result = self.submit_command_with_agent_generation(command, None);
+        if result.is_err() {
+            self.verified_submission.completion.borrow_mut().take();
+        }
+        result
+    }
+
     /// Submit one Agent-approved command with its checked, never-reused local
     /// identity. The identity is armed before the PTY write and follows only
     /// this command through CommandStart to BlockFinished.
@@ -5864,22 +7211,33 @@ impl TermView {
         self.submit_command_with_agent_generation(command, Some(generation))
     }
 
+    /// Disarm a reviewed command that has been inserted for read-back but has
+    /// not yet received Enter. A stale Agent runtime must never be able to fire
+    /// its delayed submission after the user closes or replaces the session.
+    pub(crate) fn cancel_pending_agent_submission(&self, generation: u64) -> bool {
+        if self.verified_submission.pending_agent_generation.get() != Some(generation) {
+            return false;
+        }
+        self.verified_submission.pending_agent_generation.set(None);
+        if let Some(source) = self.verified_submission_source_id.borrow_mut().take() {
+            source.remove();
+        }
+        self.typed_cmd_fidelity.set(TypedShadowFidelity::Inexact);
+        true
+    }
+
     fn submit_command_with_agent_generation(
         &self,
         command: &str,
         agent_generation: Option<u64>,
     ) -> Result<(), String> {
-        let submission = approved_command_submission_payload(command)?;
-        let previous_submission = self.external_submission.borrow().clone();
-        let previous_generation = self.external_submission_generation.get();
-        *self.external_submission.borrow_mut() = Some(command.to_string());
-        self.external_submission_generation.set(agent_generation);
-        if let Err(error) = self.write_input(&submission) {
-            *self.external_submission.borrow_mut() = previous_submission;
-            self.external_submission_generation.set(previous_generation);
-            return Err(error.to_string());
+        let status = self.command_prompt_status();
+        if !status.is_ready() {
+            return Err(status.blocked_message().to_string());
         }
-        Ok(())
+        let suggestion = click_cursor::suggestion_rgb(&self.config.borrow().palette);
+        self.verified_submission
+            .begin(command, agent_generation, suggestion)
     }
 
     /// Insert a transient notice card (e.g. an AI command-correction proposal
@@ -5924,17 +7282,112 @@ impl TermView {
     /// idle shell editor. The status is intentionally diagnostic so callers can
     /// distinguish a running command from stale input or missing integration.
     pub(crate) fn command_prompt_status(&self) -> CommandPromptStatus {
-        classify_command_prompt_status(
+        let status = classify_command_prompt_status(
             self.bstate.get(),
             self.fullscreen.get(),
-            self.idle_input_dirty.get(),
+            self.idle_input_dirty.get()
+                || self.submission_pending.get()
+                || self.pending_typeahead.get(),
             self.pty_synced.get(),
             self.typed_cmd.borrow().trim().is_empty(),
-        )
+        );
+        if status != CommandPromptStatus::Ready {
+            log::debug!(
+                "prompt readiness blocked before surface probe: status={status:?} state={:?} dirty={} submitted={} typeahead={} synced={} shadow_empty={}",
+                self.bstate.get(),
+                self.idle_input_dirty.get(),
+                self.submission_pending.get(),
+                self.pending_typeahead.get(),
+                self.pty_synced.get(),
+                self.typed_cmd.borrow().trim().is_empty(),
+            );
+            return status;
+        }
+        if !self.prompt_anchor_ready.get() {
+            return CommandPromptStatus::Initializing;
+        }
+
+        match self.pty.foreground_owner() {
+            PtyForeground::Other => CommandPromptStatus::Running,
+            PtyForeground::Unknown => CommandPromptStatus::ShellIntegrationUnavailable,
+            PtyForeground::Shell => {
+                // A shell hook can prefill/readline-redraw without passing
+                // through a local VTE commit. Any cursor displacement from the
+                // authoritative PromptEnd anchor is therefore input until the
+                // next clean prompt proves otherwise.
+                let rows = self.active_vte.row_count();
+                let anchor = current_prompt_anchor(
+                    &self.active_vte,
+                    self.prompt_end_pos.get(),
+                    self.prompt_anchor_rows.get(),
+                );
+                let cursor = self.active_vte.cursor_position();
+                let suffix_is_empty = (anchor.0 >= 0 && anchor.1 >= 0)
+                    .then(|| {
+                        let suggestion =
+                            click_cursor::suggestion_rgb(&self.config.borrow().palette);
+                        click_cursor::verified_suffix_is_empty(&self.active_vte, suggestion)
+                    })
+                    .flatten();
+                let anchor_to_cursor = visible_editor_text(&self.active_vte, anchor);
+                let layout_changed = self.prompt_anchor_rows.get() > 0
+                    && rows > 0
+                    && self.prompt_anchor_rows.get() != rows;
+                let local_resize_seen =
+                    self.prompt_anchor_resize_generation.get() != self.pty_resize_generation.get();
+                let current_prefix = visible_row_prefix(&self.active_vte, cursor);
+                let saved_prefix = self.prompt_anchor_prefix.borrow();
+                let prompt_prefix_matches = !saved_prefix.is_empty()
+                    && current_prefix.as_deref() == Some(saved_prefix.as_str());
+                drop(saved_prefix);
+                let prompt_reflowed = prompt_layout_reflow_can_reanchor(
+                    layout_changed,
+                    local_resize_seen,
+                    self.prompt_identity_output.get(),
+                    anchor,
+                    cursor,
+                    suffix_is_empty,
+                    prompt_prefix_matches,
+                );
+                let effective_anchor = if prompt_reflowed { cursor } else { anchor };
+                if cursor == effective_anchor && suffix_is_empty == Some(true) {
+                    self.prompt_end_pos.set(effective_anchor);
+                    self.prompt_anchor_rows.set(rows);
+                    if prompt_reflowed {
+                        // Consume the local-layout proof only after an actual
+                        // redraw moved the anchor. A readiness poll can run
+                        // after TIOCSWINSZ but before bash/readline redraws; an
+                        // unchanged cursor must leave that epoch available.
+                        self.prompt_anchor_resize_generation
+                            .set(self.pty_resize_generation.get());
+                        if let Some(prefix) = current_prefix {
+                            *self.prompt_anchor_prefix.borrow_mut() = prefix;
+                        }
+                    }
+                    CommandPromptStatus::Ready
+                } else {
+                    log::debug!(
+                        "prompt readiness surface mismatch: anchor={anchor:?} cursor={cursor:?} rows={rows} anchor_rows={} local_resize={local_resize_seen} identity_output={} prefix_matches={prompt_prefix_matches} suffix_is_empty={suffix_is_empty:?} exported_between={}",
+                        self.prompt_anchor_rows.get(),
+                        self.prompt_identity_output.get(),
+                        anchor_to_cursor.as_ref().map_or(0, String::len),
+                    );
+                    CommandPromptStatus::HasInput
+                }
+            }
+        }
     }
 
     pub fn can_accept_agent_command(&self) -> bool {
-        self.command_prompt_status().is_ready()
+        self.agent_command_prompt_status().is_ready()
+    }
+
+    pub(crate) fn agent_command_prompt_status(&self) -> CommandPromptStatus {
+        if self.agent_execution_supported.get() {
+            self.command_prompt_status()
+        } else {
+            CommandPromptStatus::ShellIntegrationUnavailable
+        }
     }
 
     /// Resize the PTY.
@@ -6047,6 +7500,10 @@ impl TermView {
         let bracketed_paste = self.bracketed_paste.clone();
         let bstate = self.bstate.clone();
         let typed_cmd = self.typed_cmd.clone();
+        let typed_cmd_fidelity = self.typed_cmd_fidelity.clone();
+        let submission_pending = self.submission_pending.clone();
+        let pending_typeahead = self.pending_typeahead.clone();
+        let accepted_input_generation = self.accepted_input_generation.clone();
         let pty_synced = self.pty_synced.clone();
         let idle_input_dirty = self.idle_input_dirty.clone();
         let finished_blocks = self.finished_blocks.clone();
@@ -6076,22 +7533,48 @@ impl TermView {
             }
 
             let previous_shadow = typed_cmd.borrow().clone();
+            let previous_fidelity = typed_cmd_fidelity.get();
+            let previous_submission_pending = submission_pending.get();
             let previous_pty_synced = pty_synced.get();
             let previous_idle_dirty = idle_input_dirty.get();
-            record_external_input(
-                bstate.get(),
-                paste.echo_text.as_bytes(),
-                &typed_cmd,
-                &pty_synced,
-                &idle_input_dirty,
-            );
+            let block_state = bstate.get();
+            let changed_editor =
+                block_state == BlockState::AwaitingCommand && !paste.echo_text.is_empty();
+            if changed_editor {
+                pty_synced.set(true);
+                idle_input_dirty.set(true);
+                if previous_fidelity != TypedShadowFidelity::ExactSubmitted {
+                    append_typed_command_shadow(&mut typed_cmd.borrow_mut(), &paste.echo_text);
+                }
+                typed_cmd_fidelity.set(
+                    if previous_fidelity == TypedShadowFidelity::ExactOpen
+                        && *typed_cmd.borrow() != TRUNCATED_COMMAND_PLACEHOLDER
+                    {
+                        // Clipboard encoding already sanitized `echo_text`; in
+                        // bracketed-paste mode its newlines are literal editor
+                        // input, not command submissions.
+                        TypedShadowFidelity::ExactOpen
+                    } else {
+                        TypedShadowFidelity::Inexact
+                    },
+                );
+            }
             if let Err(error) = pty.write_bytes(&paste.bytes) {
                 *typed_cmd.borrow_mut() = previous_shadow;
+                typed_cmd_fidelity.set(previous_fidelity);
                 pty_synced.set(previous_pty_synced);
                 idle_input_dirty.set(previous_idle_dirty);
                 pty.report_write_error("could not queue clipboard paste", error);
                 return;
             }
+            if input_is_typeahead_for_existing_submission(
+                block_state,
+                previous_submission_pending,
+                &paste.bytes,
+            ) {
+                pending_typeahead.set(true);
+            }
+            accepted_input_generation.set(accepted_input_generation.get().wrapping_add(1));
             emit_accepted_input(&human_input_callbacks, InputOrigin::Clipboard);
             if selected_block_id.get().is_some() {
                 let finished = finished_blocks.borrow();
@@ -6154,6 +7637,18 @@ impl TermView {
         F: Fn(CommandFinishedEvent) + 'static,
     {
         self.command_finished_callbacks
+            .borrow_mut()
+            .push(Box::new(f));
+    }
+
+    /// Observe a locally armed Agent execution whose terminal lifecycle could
+    /// no longer be correlated safely. The generation is one-shot and contains
+    /// no command/output data.
+    pub(crate) fn connect_agent_execution_lost<F>(&self, f: F)
+    where
+        F: Fn(u64, &'static str) + 'static,
+    {
+        self.agent_execution_lost_callbacks
             .borrow_mut()
             .push(Box::new(f));
     }
@@ -6242,9 +7737,14 @@ impl TermView {
         let recalled = {
             let selected = self.selected_block_ids.borrow();
             recall_selected_commands_at_prompt(
-                &self.pty,
-                &self.pty_synced,
-                &self.typed_cmd,
+                PromptRecallCtx {
+                    pty: &self.pty,
+                    pty_synced: &self.pty_synced,
+                    typed_cmd: &self.typed_cmd,
+                    typed_cmd_fidelity: &self.typed_cmd_fidelity,
+                    submission_pending: &self.submission_pending,
+                    pending_typeahead: &self.pending_typeahead,
+                },
                 self.bstate.get(),
                 &finished,
                 &selected,
@@ -6301,13 +7801,9 @@ impl TermView {
         }
         self.block_list.queue_allocate();
 
-        // Never inject form-feed into a running/full-screen process.
-        if self.bstate.get() == BlockState::AwaitingCommand {
-            if let Err(error) = self.pty.write_bytes(b"\x0c") {
-                self.pty
-                    .report_write_error("could not queue terminal clear", error);
-            }
-        }
+        // This action clears Forge's finished cards only. Injecting Ctrl+L into
+        // readline/zle would redraw the live editor behind the PromptEnd anchor
+        // and make subsequent command capture dependent on shell key bindings.
         if let Err(err) = self.save_history() {
             log::warn!("save cleared block history: {err}");
         }
@@ -6631,25 +8127,33 @@ impl TermView {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_bounded_text_tail, apply_vte_commit_to_shadow, approved_command_submission_payload,
-        background_output_has_visible_text, bounded_journal_output, build_clipboard_paste,
-        build_command_recall, build_keyboard_query_reply, classify_command_prompt_status,
-        coalesce_bytes_events, collapse_repaint_output, command_capture_range_is_bounded,
-        compute_viewport_state, emit_command_finished, emit_command_started,
-        format_color_query_reply, history_edge_navigation_available, normalize_captured_command,
+        accept_agent_integration_token, append_bounded_text_tail, apply_vte_commit_to_shadow,
+        approved_command_submission_payload, background_output_has_visible_text,
+        bounded_journal_output, build_clipboard_paste, build_command_recall,
+        build_keyboard_query_reply, classify_command_prompt_status, coalesce_bytes_events,
+        collapse_repaint_output, command_capture_range_is_bounded, command_id_uses_shell_token,
+        compute_viewport_state, decide_agent_command_end, emit_command_finished,
+        emit_command_started, format_color_query_reply, history_edge_navigation_available,
+        input_is_typeahead_for_existing_submission, input_may_survive_into_next_prompt,
+        input_submits_line, next_prompt_shadow_state, normalize_captured_command,
         normalize_loaded_block_ids, notification_allowed, output_has_vertical_repaint,
-        parse_color_spec, record_external_input, resolve_command_for_block,
-        resolve_submitted_command, scroll_delta_to_reveal, selected_command_text,
-        selected_id_range, should_buffer_background_output, stable_visible_indices, strip_ansi,
-        strip_ansi_with_clear_detect, take_background_output, truncate_plain_output_for_height,
+        parse_color_spec, prompt_anchor_may_settle, prompt_layout_reflow_can_reanchor,
+        prompt_surface_is_clean, rebase_prompt_anchor, record_external_input,
+        record_protocol_reply_input, resolve_command_for_block, resolve_submitted_command,
+        reviewed_pre_command_bytes_are_identity_neutral, reviewed_submission_matches,
+        scroll_delta_to_reveal, selected_command_text, selected_id_range,
+        shell_argv_supports_agent_ids, shell_argv_uses_jsh, should_buffer_background_output,
+        stable_visible_indices, strip_ansi, strip_ansi_with_clear_detect, take_background_output,
+        truncate_plain_output_for_height, verified_editor_contains_exact_command,
         viewport_page_size_changed, viewport_state_for_scroll, visible_indices_for_viewport,
-        vte_commit_shadow_rollback, BlockData, BlockState, BoundedByteRing, CommandFinishedEvent,
-        CommandMeta, CommandPromptStatus, CommandStartedEvent, DynamicColors, HumanInputKind,
-        InputOrigin, PendingCommandMeta, ViewportState, MAX_COMMAND_CAPTURE_BYTES,
-        MAX_JOURNAL_OUTPUT_BYTES, MAX_PROMPT_CAPTURE_BYTES, MAX_RAW_OUTPUT_BYTES,
-        TRUNCATED_COMMAND_PLACEHOLDER,
+        AgentCommandEndDecision, BlockData, BlockState, BoundedByteRing, CommandFinishedEvent,
+        CommandIdCorrelation, CommandMeta, CommandPromptStatus, CommandStartedEvent, DynamicColors,
+        HumanInputKind, InputOrigin, PendingCommandMeta, TypedShadowFidelity, ViewportState,
+        MAX_COMMAND_CAPTURE_BYTES, MAX_JOURNAL_OUTPUT_BYTES, MAX_PROMPT_CAPTURE_BYTES,
+        MAX_RAW_OUTPUT_BYTES, TRUNCATED_COMMAND_PLACEHOLDER, UNAVAILABLE_COMMAND_PLACEHOLDER,
     };
     use crate::parser::{ColorKind, KeyboardProtocolQuery, ParserEvent};
+    use crate::pty::PtyForeground;
     use gtk4::gdk::RGBA;
     use std::cell::{Cell, RefCell};
     use std::collections::{HashSet, VecDeque};
@@ -6738,7 +8242,7 @@ mod tests {
                 None,
                 Some("injected-session"),
                 &[],
-                |_argv, _cwd, _env| {
+                |_argv, _cwd, _env, _enable_shell_token| {
                     Err(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
                         "injected PTY spawn failure",
@@ -6937,6 +8441,107 @@ mod tests {
     }
 
     #[test]
+    fn prompt_surface_rejects_shell_side_prefill_and_uncertain_capture() {
+        let anchor = (12, 40);
+        assert!(prompt_surface_is_clean(anchor, anchor, Some(0)));
+        assert!(!prompt_surface_is_clean(anchor, (13, 40), Some(0)));
+        assert!(!prompt_surface_is_clean(anchor, anchor, Some(2)));
+        assert!(!prompt_surface_is_clean(anchor, anchor, None));
+        assert!(prompt_anchor_may_settle(
+            BlockState::AwaitingCommand,
+            false,
+            false,
+            false,
+            false,
+        ));
+        for guards in [
+            (BlockState::CollectingPrompt, false, false, false, false),
+            (BlockState::AwaitingCommand, true, false, false, false),
+            (BlockState::AwaitingCommand, false, true, false, false),
+            (BlockState::AwaitingCommand, false, false, true, false),
+            (BlockState::AwaitingCommand, false, false, false, true),
+        ] {
+            assert!(!prompt_anchor_may_settle(
+                guards.0, guards.1, guards.2, guards.3, guards.4
+            ));
+        }
+    }
+
+    #[test]
+    fn prompt_anchor_tracks_compact_vte_grid_resizes_from_the_bottom() {
+        assert_eq!(rebase_prompt_anchor((11, 6), 7, 5), (11, 4));
+        assert_eq!(rebase_prompt_anchor((3, 2), 5, 8), (3, 5));
+        assert_eq!(rebase_prompt_anchor((3, 0), 5, 2), (3, 0));
+        assert_eq!(rebase_prompt_anchor((3, 2), 0, 8), (3, 2));
+    }
+
+    #[test]
+    fn accepted_running_typeahead_taints_the_next_agent_prompt() {
+        assert!(input_may_survive_into_next_prompt(
+            BlockState::CollectingOutput,
+            false,
+            b"printf owned; "
+        ));
+        assert!(input_may_survive_into_next_prompt(
+            BlockState::PostCommand,
+            false,
+            b"\r"
+        ));
+        assert!(!input_may_survive_into_next_prompt(
+            BlockState::CollectingOutput,
+            false,
+            b"\x03"
+        ));
+        assert!(input_may_survive_into_next_prompt(
+            BlockState::AltScreen,
+            false,
+            b"vim input"
+        ));
+        assert!(input_may_survive_into_next_prompt(
+            BlockState::AwaitingCommand,
+            true,
+            b"typeahead"
+        ));
+        assert!(!input_may_survive_into_next_prompt(
+            BlockState::AwaitingCommand,
+            false,
+            b"normal edit"
+        ));
+        assert!(input_may_survive_into_next_prompt(
+            BlockState::AwaitingCommand,
+            false,
+            b"first\rsecond"
+        ));
+        assert!(!input_may_survive_into_next_prompt(
+            BlockState::AwaitingCommand,
+            false,
+            b"first\r\n"
+        ));
+        assert!(input_submits_line(b"edited\r"));
+        assert!(!input_submits_line(b"edited"));
+        for state in [
+            BlockState::Idle,
+            BlockState::CollectingPrompt,
+            BlockState::RawFallback,
+        ] {
+            assert!(input_is_typeahead_for_existing_submission(
+                state,
+                false,
+                b"buffered"
+            ));
+        }
+
+        let (fidelity, dirty) = next_prompt_shadow_state(true);
+        assert_eq!(fidelity, TypedShadowFidelity::Inexact);
+        assert!(dirty);
+        assert_eq!(
+            classify_command_prompt_status(BlockState::AwaitingCommand, false, dirty, dirty, true),
+            CommandPromptStatus::HasInput,
+            "Agent approval must stay blocked until a later clean prompt"
+        );
+    }
+
+    #[test]
     fn restored_block_ids_are_unique_and_reserve_the_allocator() {
         let mut blocks = VecDeque::from([
             block_with_height(10),
@@ -7121,8 +8726,16 @@ mod tests {
     }
 
     #[test]
-    fn captured_command_drops_early_prompt_marker_prefix() {
-        assert_eq!(normalize_captured_command("yj ~ ❯ pwd", "yj ~ ❯"), "pwd");
+    fn captured_command_never_guesses_that_a_text_prefix_is_prompt_furniture() {
+        assert_eq!(
+            normalize_captured_command("yj ~ ❯ pwd", "yj ~ ❯"),
+            "yj ~ ❯ pwd"
+        );
+        assert_eq!(normalize_captured_command("$HOME", "$"), "$HOME");
+        assert_eq!(
+            normalize_captured_command("git status", "git"),
+            "git status"
+        );
     }
 
     /// jsh puts the command it parsed on the OSC 133 ;C packet. That beats the
@@ -7175,6 +8788,7 @@ mod tests {
             ..CommandMeta::default()
         });
         pending.merge_command_end(&CommandMeta {
+            id: Some("jsh-7".to_string()),
             duration_ms: Some(1234),
             // jsh's D packet reports the cwd *after* the command; a `cd` must not
             // relabel the block with the directory it moved to.
@@ -7184,6 +8798,41 @@ mod tests {
         assert_eq!(pending.id.as_deref(), Some("jsh-7"));
         assert_eq!(pending.cwd.as_deref(), Some("/tmp/project"));
         assert_eq!(pending.duration_ms, Some(1234));
+        assert_eq!(
+            pending.command_end_correlation(&CommandMeta {
+                id: Some("jsh-7".to_string()),
+                ..CommandMeta::default()
+            }),
+            CommandIdCorrelation::MatchedUntrusted
+        );
+
+        assert_eq!(
+            PendingCommandMeta::default().command_end_correlation(&CommandMeta::default()),
+            CommandIdCorrelation::Bare
+        );
+        assert_eq!(
+            pending.command_end_correlation(&CommandMeta {
+                id: Some("jsh-8".to_string()),
+                ..CommandMeta::default()
+            }),
+            CommandIdCorrelation::Mismatch
+        );
+        assert_eq!(
+            pending.command_end_correlation(&CommandMeta::default()),
+            CommandIdCorrelation::Mismatch
+        );
+        let invalid_start = PendingCommandMeta::from_command_start(&CommandMeta {
+            id: Some("bad/id".to_string()),
+            ..CommandMeta::default()
+        });
+        assert_eq!(
+            invalid_start.command_end_correlation(&CommandMeta {
+                id: Some("also bad/id".to_string()),
+                ..CommandMeta::default()
+            }),
+            CommandIdCorrelation::Mismatch,
+            "invalid raw ids must not collapse into the bare-marker case"
+        );
 
         // A shell that only labels its D mark still gets a cwd.
         let mut only_end = PendingCommandMeta::from_command_start(&CommandMeta::default());
@@ -7200,6 +8849,176 @@ mod tests {
         });
         assert_eq!(rejected.id, None);
         assert_eq!(rejected.cwd, None);
+    }
+
+    #[test]
+    fn private_shell_token_distinguishes_trusted_command_ids() {
+        let token = "0123456789abcdef0123456789abcdef";
+        assert!(command_id_uses_shell_token(
+            "0123456789abcdef0123456789abcdef-7",
+            token
+        ));
+        assert!(!command_id_uses_shell_token(token, token));
+        assert!(!command_id_uses_shell_token("jsh-7", token));
+
+        let start = CommandMeta {
+            id: Some(format!("{token}-7")),
+            ..CommandMeta::default()
+        };
+        let end = CommandMeta {
+            id: start.id.clone(),
+            ..CommandMeta::default()
+        };
+        assert_eq!(
+            PendingCommandMeta::from_command_start_with_token(&start, token)
+                .command_end_correlation(&end),
+            CommandIdCorrelation::MatchedTrusted
+        );
+        assert!(
+            PendingCommandMeta::from_command_start_with_token(&start, token)
+                .journal_execution_id()
+                .is_none(),
+            "private shell tokens must never reach the persistent jsh journal"
+        );
+        assert_eq!(
+            PendingCommandMeta::from_command_start(&start).command_end_correlation(&end),
+            CommandIdCorrelation::MatchedUntrusted
+        );
+        let jsh = PendingCommandMeta::from_command_start(&CommandMeta {
+            id: Some("jsh-session-7".to_string()),
+            ..CommandMeta::default()
+        });
+        assert_eq!(jsh.journal_execution_id(), Some("jsh-session-7"));
+    }
+
+    #[test]
+    fn shell_integration_capability_requires_the_exact_private_handshake() {
+        let ready = Cell::new(false);
+        let token = "0123456789abcdef0123456789abcdef";
+        assert!(!accept_agent_integration_token(
+            BlockState::CollectingPrompt,
+            token,
+            "wrong",
+            &ready
+        ));
+        assert!(!ready.get());
+        assert!(!accept_agent_integration_token(
+            BlockState::CollectingPrompt,
+            "",
+            token,
+            &ready
+        ));
+        assert!(!ready.get());
+        for state in [
+            BlockState::Idle,
+            BlockState::AwaitingCommand,
+            BlockState::CollectingOutput,
+        ] {
+            assert!(!accept_agent_integration_token(state, token, token, &ready));
+            assert!(!ready.get());
+        }
+        assert!(accept_agent_integration_token(
+            BlockState::CollectingPrompt,
+            token,
+            token,
+            &ready
+        ));
+        assert!(ready.get());
+    }
+
+    #[test]
+    fn agent_execution_shell_matrix_is_fail_closed() {
+        let strings = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(shell_argv_supports_agent_ids(&strings(&[
+            "/bin/bash",
+            "-l"
+        ])));
+        assert!(shell_argv_supports_agent_ids(&strings(&[
+            "/bin/bash",
+            "--rcfile",
+            "/tmp/forge-rc",
+            "-i",
+        ])));
+        assert!(shell_argv_supports_agent_ids(&strings(&[
+            "zsh", "--no-rcs"
+        ])));
+        assert!(!shell_argv_supports_agent_ids(&strings(&[
+            "bash", "-lc", "echo ok"
+        ])));
+        assert!(!shell_argv_supports_agent_ids(&strings(&[
+            "zsh",
+            "--command",
+            "echo ok"
+        ])));
+        assert!(!shell_argv_supports_agent_ids(&strings(&["fish"])));
+        assert!(!shell_argv_supports_agent_ids(&strings(&["pwsh"])));
+        assert!(shell_argv_uses_jsh(&strings(&[
+            "bash",
+            "-lc",
+            "exec /usr/bin/jsh"
+        ])));
+        assert!(!shell_argv_supports_agent_ids(&strings(&[
+            "bash",
+            "-lc",
+            "exec /usr/bin/jsh",
+        ])));
+    }
+
+    #[test]
+    fn agent_command_end_requires_shell_ownership_and_consistent_ids() {
+        assert_eq!(
+            decide_agent_command_end(
+                true,
+                PtyForeground::Other,
+                false,
+                CommandIdCorrelation::Bare,
+            ),
+            AgentCommandEndDecision::IgnoreUntilShellOwnsForeground
+        );
+        assert_eq!(
+            decide_agent_command_end(
+                true,
+                PtyForeground::Shell,
+                false,
+                CommandIdCorrelation::Bare,
+            ),
+            AgentCommandEndDecision::AcceptWithoutAgentCorrelation,
+            "Agent observation requires a C/D execution id even when ordinary Block mode accepts bare markers"
+        );
+        for (foreground, typeahead, ids) in [
+            (PtyForeground::Unknown, false, CommandIdCorrelation::Bare),
+            (PtyForeground::Other, true, CommandIdCorrelation::Bare),
+            (PtyForeground::Shell, false, CommandIdCorrelation::Mismatch),
+        ] {
+            assert_eq!(
+                decide_agent_command_end(true, foreground, typeahead, ids),
+                AgentCommandEndDecision::AcceptWithoutAgentCorrelation
+            );
+        }
+        assert_eq!(
+            decide_agent_command_end(
+                true,
+                PtyForeground::Shell,
+                false,
+                CommandIdCorrelation::MatchedTrusted,
+            ),
+            AgentCommandEndDecision::Accept
+        );
+        assert_eq!(
+            decide_agent_command_end(
+                false,
+                PtyForeground::Other,
+                false,
+                CommandIdCorrelation::Mismatch,
+            ),
+            AgentCommandEndDecision::Accept,
+            "ordinary Block mode keeps its compatibility behavior"
+        );
     }
 
     #[test]
@@ -7249,7 +9068,7 @@ mod tests {
     #[test]
     fn submitted_command_falls_back_when_vte_echo_has_not_settled() {
         assert_eq!(
-            resolve_submitted_command("", "yj ~/project ❯", "git status", None),
+            resolve_submitted_command("", "yj ~/project ❯", "git status", true, None, false),
             "git status"
         );
     }
@@ -7257,26 +9076,245 @@ mod tests {
     #[test]
     fn submitted_command_prefers_the_rendered_line_editor_state() {
         assert_eq!(
-            resolve_submitted_command("git diff --stat", "yj ~/project ❯", "git status", None),
+            resolve_submitted_command(
+                "git diff --stat",
+                "yj ~/project ❯",
+                "git status",
+                true,
+                None,
+                false
+            ),
             "git diff --stat"
         );
         assert_eq!(
-            resolve_submitted_command("yj ~/project ❯ cargo test", "yj ~/project ❯", "cargo", None),
-            "cargo test"
+            resolve_submitted_command(
+                "yj ~/project ❯ cargo test",
+                "yj ~/project ❯",
+                "cargo",
+                true,
+                None,
+                false
+            ),
+            "yj ~/project ❯ cargo test",
+            "text alone cannot prove a prefix was prompt furniture"
         );
     }
 
     #[test]
-    fn programmatic_submission_wins_over_stale_vte_capture() {
+    fn exact_shadow_repairs_a_soft_wrapped_vte_prefix_only() {
+        let captured = "bash /tmp/forge-agent-e2e-harness/fixture_helper.sh";
+        let complete = "bash /tmp/forge-agent-e2e-harness/fixture_helper.sh --baad";
+        assert_eq!(
+            resolve_submitted_command(captured, "forge-e2e$", complete, true, None, false),
+            complete
+        );
+        assert_eq!(
+            resolve_submitted_command(captured, "forge-e2e$", complete, false, None, false),
+            captured,
+            "a readline edit makes the rendered line authoritative"
+        );
+        assert_eq!(
+            resolve_submitted_command("", "forge-e2e$", complete, false, None, false),
+            UNAVAILABLE_COMMAND_PLACEHOLDER,
+            "an edited shadow must not impersonate a command when VTE capture races"
+        );
+    }
+
+    #[test]
+    fn typed_shadow_fidelity_tracks_submit_typeahead_and_edits() {
+        let open = TypedShadowFidelity::ExactOpen;
+        assert_eq!(open.advance("echo 世界".as_bytes()), open);
+
+        let submitted = open.advance(b"printf ok\r\n");
+        assert_eq!(submitted, TypedShadowFidelity::ExactSubmitted);
+        assert!(submitted.can_repair_capture());
+        assert_eq!(
+            submitted.advance(b"\n"),
+            TypedShadowFidelity::Inexact,
+            "any later commit is typeahead, even if it is another newline"
+        );
+        assert_eq!(
+            submitted.advance(b"next command"),
+            TypedShadowFidelity::Inexact,
+            "typeahead before PromptEnd must not be joined to the first command"
+        );
+
+        for data in [
+            b"line one\nline two".as_slice(),
+            b"\x7f",
+            b"\x1b[D",
+            &[0xff],
+        ] {
+            let fidelity = open.advance(data);
+            assert_eq!(fidelity, TypedShadowFidelity::Inexact, "accepted {data:?}");
+            assert!(!fidelity.can_repair_capture());
+        }
+    }
+
+    #[test]
+    fn reviewed_submission_does_not_hide_a_different_vte_capture() {
         assert_eq!(
             resolve_submitted_command(
                 "ls",
                 "yj ~/project ❯",
                 "cat monitor_xilem_bar.sh",
-                Some("cat monitor_xilem_bar.sh")
+                true,
+                Some("cat monitor_xilem_bar.sh"),
+                false
             ),
-            "cat monitor_xilem_bar.sh"
+            "ls"
         );
+    }
+
+    #[test]
+    fn agent_submission_never_hides_a_different_rendered_command() {
+        let approved = "printf safe";
+        assert_eq!(
+            resolve_submitted_command("", "forge$", approved, true, Some(approved), true),
+            "",
+            "two-stage submission settles the rendered command before Enter; an empty capture must fail closed"
+        );
+        assert_eq!(
+            resolve_submitted_command("printf sa", "forge$", approved, true, Some(approved), true),
+            "printf sa",
+            "even a plausible prefix mismatch must reach the Agent correlation guard"
+        );
+        assert_eq!(
+            resolve_submitted_command(
+                "printf owned; printf safe",
+                "forge$",
+                approved,
+                true,
+                Some(approved),
+                true,
+            ),
+            "printf owned; printf safe",
+            "a different rendered line must reach the generation+command mismatch guard"
+        );
+    }
+
+    #[test]
+    fn agent_identity_is_byte_exact_before_display_normalization() {
+        let approved = "printf safe";
+        assert!(reviewed_submission_matches(None, approved, approved, false));
+        assert!(reviewed_submission_matches(
+            None,
+            "printf safe\n",
+            approved,
+            false
+        ));
+        assert!(!reviewed_submission_matches(
+            None,
+            "printf safe\n\n",
+            approved,
+            false
+        ));
+        assert!(reviewed_submission_matches(
+            Some(approved),
+            "stale rendered text",
+            approved,
+            false,
+        ));
+        for actual in ["", "printf sa", " printf safe", "printf safe "] {
+            assert!(
+                !reviewed_submission_matches(None, actual, approved, false),
+                "rendered mismatch {actual:?} must not bind the Agent generation"
+            );
+        }
+        assert!(!reviewed_submission_matches(
+            Some("printf safe "),
+            approved,
+            approved,
+            false,
+        ));
+        assert!(!reviewed_submission_matches(None, approved, approved, true));
+    }
+
+    #[test]
+    fn only_presentation_bytes_are_neutral_before_reviewed_command_start() {
+        for bytes in [
+            b"\r\n".as_slice(),
+            b"\x1b[?2004l\r\n",
+            b"\x1b[0m\x1b[?2004l\r\n",
+        ] {
+            assert!(
+                reviewed_pre_command_bytes_are_identity_neutral(bytes),
+                "expected neutral bytes: {bytes:?}"
+            );
+        }
+        for bytes in [
+            b"owned".as_slice(),
+            b"\x08 owned",
+            b"\x1b[2K",
+            b"\x1b[D",
+            b"\x1b[?2004lowned",
+        ] {
+            assert!(
+                !reviewed_pre_command_bytes_are_identity_neutral(bytes),
+                "identity-changing bytes were accepted: {bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_replies_taint_prompt_and_post_submit_state() {
+        let fidelity = Cell::new(TypedShadowFidelity::ExactOpen);
+        let dirty = Cell::new(false);
+        let synced = Cell::new(false);
+        let submitted = Cell::new(true);
+        let typeahead = Cell::new(false);
+        let generation = Cell::new(4);
+        record_protocol_reply_input(
+            BlockState::AwaitingCommand,
+            &fidelity,
+            &dirty,
+            &synced,
+            &submitted,
+            &typeahead,
+            &generation,
+        );
+        assert_eq!(fidelity.get(), TypedShadowFidelity::Inexact);
+        assert!(dirty.get() && synced.get() && typeahead.get());
+        assert_eq!(generation.get(), 5);
+
+        typeahead.set(false);
+        record_protocol_reply_input(
+            BlockState::PostCommand,
+            &fidelity,
+            &dirty,
+            &synced,
+            &Cell::new(false),
+            &typeahead,
+            &generation,
+        );
+        assert!(typeahead.get());
+        assert_eq!(generation.get(), 6);
+    }
+
+    #[test]
+    fn verified_editor_requires_byte_exact_text_and_empty_suffix() {
+        assert!(verified_editor_contains_exact_command(
+            Some("printf safe"),
+            Some(true),
+            "printf safe"
+        ));
+        for rendered in [None, Some("printf sa"), Some("printf safe ")] {
+            assert!(!verified_editor_contains_exact_command(
+                rendered,
+                Some(true),
+                "printf safe"
+            ));
+        }
+        assert!(!verified_editor_contains_exact_command(
+            Some("printf safe"),
+            Some(false),
+            "printf safe"
+        ));
+        assert!(!verified_editor_contains_exact_command(
+            Some("printf safe"),
+            None,
+            "printf safe"
+        ));
     }
 
     #[test]
@@ -8053,37 +10091,97 @@ mod tests {
     }
 
     #[test]
-    fn approved_command_and_enter_are_one_bounded_transaction() {
+    fn approved_command_is_inserted_without_shell_keymap_controls() {
         assert_eq!(
             approved_command_submission_payload("printf safe").unwrap(),
-            b"printf safe\r"
+            b"printf safe"
         );
         assert!(approved_command_submission_payload("printf one\nprintf two").is_err());
-        assert!(
-            approved_command_submission_payload(
-                &"x".repeat(crate::pty::MAX_PTY_INPUT_MESSAGE_BYTES)
-            )
-            .is_err(),
-            "the submit byte must fit inside the same bounded queue item"
-        );
+        assert!(approved_command_submission_payload(" printf safe").is_err());
+        assert!(approved_command_submission_payload("printf safe ").is_err());
+        assert!(approved_command_submission_payload(
+            &"x".repeat(crate::pty::MAX_PTY_INPUT_MESSAGE_BYTES)
+        )
+        .is_ok());
     }
 
     #[test]
-    fn rejected_vte_enqueue_can_restore_shadow_without_per_key_full_clone() {
-        let mut shadow = "printf 你".to_string();
-        let rollback = vte_commit_shadow_rollback(&shadow, "好");
-        apply_vte_commit_to_shadow(&mut shadow, "好");
-        assert_eq!(shadow, "printf 你好");
-        rollback.apply(&mut shadow);
-        assert_eq!(shadow, "printf 你");
+    fn prompt_reflow_requires_a_local_resize_and_exact_prompt_prefix() {
+        // Bash/readline can redraw an empty prompt after Forge changes
+        // TIOCSWINSZ while the VTE remains a compact five-row widget.
+        assert!(prompt_layout_reflow_can_reanchor(
+            false,
+            true,
+            true,
+            (11, 6),
+            (11, 4),
+            Some(true),
+            true,
+        ));
+        // Inline cards can also reflow the compact VTE without changing the
+        // outer PTY grid. That is still local layout evidence, but only an exact
+        // saved prompt prefix may consume it.
+        assert!(prompt_layout_reflow_can_reanchor(
+            true,
+            false,
+            true,
+            (11, 3),
+            (11, 4),
+            Some(true),
+            true,
+        ));
 
-        let previous = "x".repeat(MAX_COMMAND_CAPTURE_BYTES - 1);
-        let mut overflowing = previous.clone();
-        let rollback = vte_commit_shadow_rollback(&overflowing, "界");
-        apply_vte_commit_to_shadow(&mut overflowing, "界");
-        assert_eq!(overflowing, TRUNCATED_COMMAND_PLACEHOLDER);
-        rollback.apply(&mut overflowing);
-        assert_eq!(overflowing, previous);
+        // An exact-looking redraw without a new Forge resize epoch cannot move
+        // the trusted editor boundary; nor can visible prefill, another column,
+        // or a non-empty suffix.
+        assert!(!prompt_layout_reflow_can_reanchor(
+            false,
+            false,
+            true,
+            (11, 3),
+            (11, 4),
+            Some(true),
+            true,
+        ));
+        assert!(!prompt_layout_reflow_can_reanchor(
+            false,
+            true,
+            true,
+            (11, 3),
+            (11, 4),
+            Some(true),
+            false,
+        ));
+        assert!(!prompt_layout_reflow_can_reanchor(
+            false,
+            true,
+            true,
+            (11, 3),
+            (10, 4),
+            Some(true),
+            true,
+        ));
+        assert!(!prompt_layout_reflow_can_reanchor(
+            false,
+            true,
+            true,
+            (11, 3),
+            (11, 4),
+            Some(false),
+            true,
+        ));
+
+        // Pure local VTE row reflow without shell identity output retains the
+        // older compatibility path.
+        assert!(prompt_layout_reflow_can_reanchor(
+            true,
+            false,
+            false,
+            (11, 4),
+            (11, 3),
+            Some(true),
+            false,
+        ));
     }
 
     #[test]
@@ -8112,13 +10210,12 @@ mod tests {
     fn multiline_command_recall_is_bracketed_or_safely_reduced() {
         let paste = build_command_recall("printf one\r\nprintf two", true);
         assert_eq!(paste.echo_text, "printf one\nprintf two");
-        // The unconditional Ctrl+U leads, then the frame.
-        assert!(paste.bytes.starts_with(b"\x15\x1b[200~"));
+        assert!(paste.bytes.starts_with(b"\x1b[200~"));
         assert!(paste.bytes.ends_with(b"\x1b[201~"));
 
         let paste = build_command_recall("printf one\nprintf two", false);
         assert_eq!(paste.echo_text, "printf one");
-        assert_eq!(paste.bytes, b"\x15printf one".to_vec());
+        assert_eq!(paste.bytes, b"printf one".to_vec());
         assert!(paste.risk.truncated_to_first_line);
     }
 

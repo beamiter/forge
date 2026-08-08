@@ -1570,6 +1570,9 @@ impl TermView {
                     &self.pty_synced,
                     &self.active,
                     &self.typed_cmd,
+                    &self.typed_cmd_fidelity,
+                    &self.submission_pending,
+                    &self.pending_typeahead,
                     &self.bstate,
                     &self.bracketed_paste,
                 );

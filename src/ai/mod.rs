@@ -456,6 +456,20 @@ impl AiClient {
         if provider == Provider::Anthropic && api_key.is_none() {
             return Err(AiError::MissingProviderApiKey { provider });
         }
+        // Keep construction, `--doctor`, and the eventual request builder on
+        // the same provider-aware transport contract. In particular,
+        // OpenAI-compatible endpoints never become a seemingly healthy client
+        // over plain HTTP; only loopback Ollama has that exception.
+        ChatConfig {
+            provider: provider.to_jagent(),
+            api_key: api_key.clone(),
+            model: model.clone(),
+            base_url: base_url.clone(),
+            max_tokens,
+            temperature,
+        }
+        .validate()
+        .map_err(AiError::from)?;
         Ok(Self {
             provider,
             api_key,
@@ -3100,6 +3114,38 @@ mod tests {
             true
         )
         .is_err());
+        assert!(matches!(
+            AiClient::new(
+                Provider::OpenAiCompatible,
+                None,
+                "model",
+                "http://127.0.0.1:8000/v1",
+                512,
+                None,
+                true
+            ),
+            Err(AiError::InvalidConfiguration(_))
+        ));
+        assert!(AiClient::new(
+            Provider::OpenAiCompatible,
+            None,
+            "model",
+            "https://localhost:8000/v1",
+            512,
+            None,
+            true
+        )
+        .is_ok());
+        assert!(AiClient::new(
+            Provider::Ollama,
+            None,
+            "model",
+            "http://127.0.0.1:11434",
+            512,
+            None,
+            true
+        )
+        .is_ok());
         assert!(AiClient::new(
             Provider::Ollama,
             None,

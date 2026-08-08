@@ -46,6 +46,10 @@ impl BoundedByteRing {
         self.bytes.is_empty()
     }
 
+    pub(super) fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
     pub(super) fn clear(&mut self) {
         self.bytes.clear();
     }

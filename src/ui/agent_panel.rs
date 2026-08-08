@@ -8,7 +8,7 @@
 //! toggle) stays in a small settings dialog opened from the card header.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::{Rc, Weak};
 #[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,6 +27,110 @@ use crate::block_view::TermView;
 const MAX_AGENT_MESSAGE_DISPLAY_BYTES: usize = 64 * 1024;
 const MAX_AGENT_STATUS_DISPLAY_BYTES: usize = 16 * 1024;
 const MAX_AGENT_INPUT_BYTES: usize = 16 * 1024;
+const MAX_AGENT_ACTIVITY_DISPLAY_BYTES: usize = 1024 * 1024;
+const MAX_AGENT_ACTIVITY_CARDS: usize = 128;
+
+/// Window-lifetime ownership for Agent UI resources that must survive an
+/// individual `AgentRuntime`. Reopening the panel or starting a new task must
+/// not reset either the visible-history budget or TermView event bridges.
+#[derive(Default)]
+pub(crate) struct AgentUiLifetime {
+    activity: RefCell<AgentActivityHistory>,
+    bridged_targets: RefCell<Vec<Weak<TermView>>>,
+}
+
+#[derive(Default)]
+struct AgentActivityHistory {
+    budget: AgentActivityBudget,
+    entries: VecDeque<AgentActivityEntry>,
+}
+
+struct AgentActivityEntry {
+    target: Weak<TermView>,
+    widget: gtk4::Widget,
+}
+
+/// Toolkit-free mirror of the visible activity FIFO. Keeping the accounting
+/// independent makes the two hard bounds straightforward to test without a
+/// display server.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AgentActivityBudget {
+    item_bytes: VecDeque<usize>,
+    total_display_bytes: usize,
+}
+
+impl AgentActivityBudget {
+    /// Record a newest activity card and return how many oldest cards must be
+    /// removed from the GTK block flows to satisfy both hard limits.
+    fn push(&mut self, display_bytes: usize) -> usize {
+        self.item_bytes.push_back(display_bytes);
+        self.total_display_bytes = self.total_display_bytes.saturating_add(display_bytes);
+
+        let mut evicted = 0;
+        while self.item_bytes.len() > MAX_AGENT_ACTIVITY_CARDS
+            || self.total_display_bytes > MAX_AGENT_ACTIVITY_DISPLAY_BYTES
+        {
+            let Some(oldest) = self.item_bytes.pop_front() else {
+                self.total_display_bytes = 0;
+                break;
+            };
+            self.total_display_bytes = self.total_display_bytes.saturating_sub(oldest);
+            evicted += 1;
+        }
+        if self.item_bytes.is_empty() {
+            // Also recovers deterministically from a theoretical usize
+            // saturation in the addition above.
+            self.total_display_bytes = 0;
+        }
+        evicted
+    }
+}
+
+impl AgentUiLifetime {
+    fn insert_activity(&self, target: &Rc<TermView>, widget: &gtk4::Widget, display_bytes: usize) {
+        target.insert_inline_notice(widget);
+
+        let evicted = {
+            let mut history = self.activity.borrow_mut();
+            history.entries.push_back(AgentActivityEntry {
+                target: Rc::downgrade(target),
+                widget: widget.clone(),
+            });
+            let evicted = history.budget.push(display_bytes);
+            debug_assert!(evicted <= history.entries.len());
+            (0..evicted)
+                .filter_map(|_| history.entries.pop_front())
+                .collect::<Vec<_>>()
+        };
+
+        // GTK mutation stays outside the RefCell borrow. The oldest visible
+        // Agent cards are removed globally across every pane in this window.
+        for entry in evicted {
+            if let Some(target) = entry.target.upgrade() {
+                target.remove_inline_notice(&entry.widget);
+            }
+        }
+    }
+
+    /// Claim the one permanent event bridge for this concrete TermView.
+    fn claim_event_bridge(&self, target: &Rc<TermView>) -> bool {
+        let mut targets = self.bridged_targets.borrow_mut();
+        claim_weak_target(&mut targets, target)
+    }
+}
+
+fn claim_weak_target<T>(targets: &mut Vec<Weak<T>>, target: &Rc<T>) -> bool {
+    targets.retain(|candidate| candidate.upgrade().is_some());
+    if targets
+        .iter()
+        .filter_map(Weak::upgrade)
+        .any(|candidate| Rc::ptr_eq(&candidate, target))
+    {
+        return false;
+    }
+    targets.push(Rc::downgrade(target));
+    true
+}
 
 /// Correlate one finished block with the approval that armed it.
 ///
@@ -61,7 +165,7 @@ fn take_pending_for_finished_block<T>(
     } = pending
         .take()
         .expect("a matching generation has a pending Agent execution");
-    if captured_command.trim() != approved_command.trim() {
+    if captured_command != approved_command {
         // Do not log either command: command text can contain sensitive data.
         log::debug!("Agent block completed with a differing VTE command capture; not observed");
         return PendingCompletion::CommandMismatch;
@@ -81,6 +185,16 @@ fn resolve_pending_for_finished_block<T>(
         session.cancel();
     }
     completion
+}
+
+fn take_pending_for_lost_execution<T>(
+    pending: &mut Option<PendingExecution<T>>,
+    generation: u64,
+) -> Option<T> {
+    if pending.as_ref().map(|pending| pending.generation) != Some(generation) {
+        return None;
+    }
+    pending.take().map(|pending| pending.value)
 }
 
 /// One armed execution: the approval it belongs to, the exact command that was
@@ -727,7 +841,7 @@ fn audit_agent_snapshot(
 /// Apply Forge's stricter transcript-ID and proposal-lifecycle contract at the
 /// app boundary so a crafted snapshot cannot make a visible approval card
 /// authorize a different transcript entry (confused deputy).
-fn restore_agent_snapshot(
+fn validate_agent_snapshot(
     snapshot: crate::agent::AgentSessionSnapshot,
 ) -> Result<AgentSession, crate::agent::AgentSnapshotError> {
     const MAX_RESTORED_TURNS: usize = 128;
@@ -834,6 +948,41 @@ fn restore_agent_snapshot(
     Ok(session)
 }
 
+/// Restore a snapshot for a process-local rollback. Unlike the persisted-file
+/// loader below, this must reject an execution checkpoint whose one-shot PTY
+/// generation belongs to a different process lifetime.
+fn restore_agent_snapshot(
+    snapshot: crate::agent::AgentSessionSnapshot,
+) -> Result<AgentSession, crate::agent::AgentSnapshotError> {
+    let awaiting_observation = matches!(snapshot.state(), AgentState::AwaitingObservation { .. });
+    let session = validate_agent_snapshot(snapshot)?;
+    if awaiting_observation {
+        return Err(crate::agent::AgentSnapshotError::Invalid(
+            "an approved command awaiting observation cannot be rebound after restart",
+        ));
+    }
+    Ok(session)
+}
+
+enum AgentSnapshotLoad {
+    Restored(AgentSession),
+    /// The snapshot is internally valid, but its approved execution was tied
+    /// to a process-local PTY generation that cannot be observed after restart.
+    RetireUnresumable,
+}
+
+fn validate_agent_snapshot_for_load(
+    snapshot: crate::agent::AgentSessionSnapshot,
+) -> Result<AgentSnapshotLoad, crate::agent::AgentSnapshotError> {
+    let awaiting_observation = matches!(snapshot.state(), AgentState::AwaitingObservation { .. });
+    let session = validate_agent_snapshot(snapshot)?;
+    Ok(if awaiting_observation {
+        AgentSnapshotLoad::RetireUnresumable
+    } else {
+        AgentSnapshotLoad::Restored(session)
+    })
+}
+
 #[cfg(unix)]
 fn load_agent_snapshot(path: &std::path::Path) -> Option<AgentSession> {
     let claim = match claim_agent_snapshot_file(path) {
@@ -847,8 +996,11 @@ fn load_agent_snapshot(path: &std::path::Path) -> Option<AgentSession> {
             return None;
         }
     };
-    match claim.read_snapshot().and_then(restore_agent_snapshot) {
-        Ok(session) => {
+    match claim
+        .read_snapshot()
+        .and_then(validate_agent_snapshot_for_load)
+    {
+        Ok(AgentSnapshotLoad::Restored(session)) => {
             // The public path disappeared at claim time. Retire and sync the
             // unique claimed entry before exposing the restored proposal to
             // the UI, so no second process can ever approve the same snapshot.
@@ -858,6 +1010,16 @@ fn load_agent_snapshot(path: &std::path::Path) -> Option<AgentSession> {
             } else {
                 Some(session)
             }
+        }
+        Ok(AgentSnapshotLoad::RetireUnresumable) => {
+            // This is not corrupt data. The command may or may not have run,
+            // but its process-local completion identity is gone, so consume
+            // the checkpoint exactly once and reopen with a fresh Ready
+            // session without guessing an observation.
+            if let Err(error) = claim.retire() {
+                log::warn!("agent: could not retire unresumable saved session: {error}");
+            }
+            None
         }
         Err(error) => {
             log::warn!("agent: rejecting invalid saved session: {error}");
@@ -883,6 +1045,7 @@ fn load_agent_snapshot(path: &std::path::Path) -> Option<AgentSession> {
 struct AgentRuntime {
     session: RefCell<AgentSession>,
     target: Rc<TermView>,
+    ui_lifetime: Rc<AgentUiLifetime>,
     config: Rc<RefCell<crate::config::Config>>,
     shell: String,
     block_context: RefCell<Option<crate::ai::BlockContext>>,
@@ -925,7 +1088,11 @@ impl AgentRuntime {
     fn append(&self, speaker: &str, body: &str) {
         let compact = self.config.borrow().block_compact;
         let message = build_agent_message_block(speaker, body, compact);
-        self.target.insert_inline_notice(&message);
+        self.ui_lifetime.insert_activity(
+            &self.target,
+            &message,
+            agent_message_display_bytes(speaker, body),
+        );
         // Keep the session card below the newest message, pinned above the
         // live prompt. (On the intro message this also performs the card's
         // initial insertion.)
@@ -1015,7 +1182,7 @@ impl AgentRuntime {
     }
 
     fn sync_prompt_status(&self) {
-        let prompt_status = self.target.command_prompt_status();
+        let prompt_status = self.target.agent_command_prompt_status();
         self.prompt_status.set_text(prompt_status.short_label());
         self.prompt_status
             .set_tooltip_text(Some(prompt_status.blocked_message()));
@@ -1541,7 +1708,7 @@ impl AgentRuntime {
             log::debug!("ignored stale Agent proposal callback");
             return;
         }
-        let prompt_status = runtime.target.command_prompt_status();
+        let prompt_status = runtime.target.agent_command_prompt_status();
         if !prompt_status.is_ready() {
             let message = prompt_status.blocked_message();
             runtime.set_status(message, false);
@@ -1659,6 +1826,20 @@ impl AgentRuntime {
         Self::request_model(runtime);
     }
 
+    fn execution_lost(runtime: Rc<Self>, generation: u64, reason: &'static str) {
+        if take_pending_for_lost_execution(&mut runtime.pending_command.borrow_mut(), generation)
+            .is_none()
+        {
+            return;
+        }
+        runtime.session.borrow_mut().cancel();
+        runtime.clear_proposal();
+        let message = format!("Agent stopped safely because {reason}.");
+        runtime.append("Safety check", &message);
+        runtime.render_session_state(None);
+        runtime.set_status(&message, false);
+    }
+
     fn cancel(&self) {
         if !self.alive.replace(false) {
             return;
@@ -1670,6 +1851,14 @@ impl AgentRuntime {
             }
         }
         self.session.borrow_mut().cancel();
+        if let Some(generation) = self
+            .pending_command
+            .borrow()
+            .as_ref()
+            .map(|pending| pending.generation)
+        {
+            self.target.cancel_pending_agent_submission(generation);
+        }
         self.pending_command.borrow_mut().take();
         self.busy.set(false);
         self.clear_proposal();
@@ -1697,6 +1886,11 @@ fn build_agent_message_block(speaker: &str, body: &str, compact: bool) -> gtk4::
     outer.add_css_class("block-finished");
     outer.add_css_class("block-assistant");
     outer.add_css_class("block-agent");
+    let accessible_name = format!(
+        "Shell Agent activity: {}",
+        crate::review_input::safe_inline_display(speaker, 256)
+    );
+    outer.update_property(&[gtk4::accessible::Property::Label(&accessible_name)]);
     outer.set_hexpand(true);
     outer.set_vexpand(false);
     if compact {
@@ -1767,6 +1961,18 @@ fn build_agent_message_block(speaker: &str, body: &str, compact: bool) -> gtk4::
 
 fn agent_message_display_text(body: &str) -> String {
     crate::review_input::safe_multiline_display(body, MAX_AGENT_MESSAGE_DISPLAY_BYTES)
+}
+
+fn agent_message_display_bytes(speaker: &str, body: &str) -> usize {
+    let speaker = crate::review_input::safe_inline_display(speaker, 256);
+    let body = agent_message_display_text(body);
+    "Shell Agent"
+        .len()
+        .saturating_add('\u{f007}'.len_utf8())
+        .saturating_add(speaker.len())
+        .saturating_add(body.len())
+        .saturating_add("Shell Agent activity: ".len())
+        .saturating_add(speaker.len())
 }
 
 fn bounded_agent_input(mut text: String) -> String {
@@ -1968,6 +2174,72 @@ fn show_agent_settings_dialog(ui: &UiState, cwd: &str, shell: &str) {
 }
 
 impl UiState {
+    /// Install callbacks once per TermView and route events to whichever Agent
+    /// runtime is current for this window. Session reopen therefore changes
+    /// only the slot contents, never the terminal's callback vector.
+    fn ensure_agent_event_bridge(&self, target: &Rc<TermView>) {
+        if !self.agent_ui_lifetime.claim_event_bridge(target) {
+            return;
+        }
+
+        let target_weak = Rc::downgrade(target);
+        let slot = self.agent_session.clone();
+        target.connect_block_finished(
+            move |command, exit_code, output, agent_generation, _duration_ms| {
+                let Some(target) = target_weak.upgrade() else {
+                    return;
+                };
+                let runtime = slot.borrow().as_ref().and_then(|session| {
+                    Rc::ptr_eq(&session.runtime.target, &target).then(|| session.runtime.clone())
+                });
+                if let Some(runtime) = runtime {
+                    // The freshly finished block was inserted below this card;
+                    // re-pin the current card directly above the live prompt.
+                    runtime.target.insert_inline_notice(&runtime.card);
+                    AgentRuntime::observe(runtime, command, exit_code, output, agent_generation);
+                }
+            },
+        );
+
+        let target_weak = Rc::downgrade(target);
+        let slot = self.agent_session.clone();
+        target.connect_agent_execution_lost(move |generation, reason| {
+            let Some(target) = target_weak.upgrade() else {
+                return;
+            };
+            let runtime = slot.borrow().as_ref().and_then(|session| {
+                Rc::ptr_eq(&session.runtime.target, &target).then(|| session.runtime.clone())
+            });
+            if let Some(runtime) = runtime {
+                AgentRuntime::execution_lost(runtime, generation, reason);
+            }
+        });
+
+        let target_weak = Rc::downgrade(target);
+        let slot = self.agent_session.clone();
+        let toggle = self.agent_toggle.clone();
+        target.connect_exited(move |_| {
+            let Some(target) = target_weak.upgrade() else {
+                return;
+            };
+            let runtime = {
+                let mut slot = slot.borrow_mut();
+                let is_current_target = slot
+                    .as_ref()
+                    .is_some_and(|session| Rc::ptr_eq(&session.runtime.target, &target));
+                if is_current_target {
+                    slot.take().map(|session| session.runtime)
+                } else {
+                    None
+                }
+            };
+            if let Some(runtime) = runtime {
+                toggle.set_active(false);
+                runtime.shutdown();
+            }
+        });
+    }
+
     /// Keep the visible top-bar Agent control aligned with both configuration
     /// availability and the lifetime of the active Agent session.
     pub(crate) fn sync_agent_toggle(&self) {
@@ -2015,11 +2287,31 @@ impl UiState {
         let max_turns = config.agent_max_turns;
         let compact = config.block_compact;
         drop(config);
-        let Some(target) = self.current_term_view() else {
+        if crate::host::is_flatpak() {
+            self.agent_toggle.set_active(false);
+            self.show_ai_error(
+                "Shell Agent execution is unavailable through the Flatpak host bridge because Forge cannot verify host-side foreground command ownership. AI Chat and review-only correction remain available.",
+            );
+            return;
+        }
+        let Some(current_leaf) = self.current_pane_leaf() else {
             self.agent_toggle.set_active(false);
             self.show_ai_error("Agent mode requires an active Block pane.");
             return;
         };
+        if current_leaf.is_remote() {
+            self.agent_toggle.set_active(false);
+            self.show_ai_error(
+                "Shell Agent execution is unavailable in managed remote panes because Forge cannot authenticate remote terminal lifecycle markers.",
+            );
+            return;
+        }
+        let Some(target) = current_leaf.block_view() else {
+            self.agent_toggle.set_active(false);
+            self.show_ai_error("Agent mode requires an active Block pane.");
+            return;
+        };
+        self.ensure_agent_event_bridge(&target);
         let block_context = target.selected_block_context(80);
         let cwd = target.cwd();
         let cwd = if cwd.is_empty() { ".".to_string() } else { cwd };
@@ -2035,6 +2327,7 @@ impl UiState {
         outer.add_css_class("block-finished");
         outer.add_css_class("block-assistant");
         outer.add_css_class("block-agent");
+        outer.update_property(&[gtk4::accessible::Property::Label("Shell Agent session")]);
         outer.set_hexpand(true);
         outer.set_vexpand(false);
         if compact {
@@ -2087,11 +2380,15 @@ impl UiState {
         settings_btn.add_css_class("flat");
         settings_btn.set_focusable(false);
         settings_btn.set_tooltip_text(Some("Shell Agent settings"));
+        settings_btn.update_property(&[gtk4::accessible::Property::Label("Shell Agent settings")]);
         header.append(&settings_btn);
         let close_btn = Button::with_label("\u{2715}");
         close_btn.add_css_class("flat");
         close_btn.set_focusable(false);
         close_btn.set_tooltip_text(Some("Cancel Agent and close this card"));
+        close_btn.update_property(&[gtk4::accessible::Property::Label(
+            "Cancel Shell Agent session",
+        )]);
         header.append(&close_btn);
         outer.append(&header);
 
@@ -2115,6 +2412,9 @@ impl UiState {
         let context_clear = Button::from_icon_name("window-close-symbolic");
         context_clear.add_css_class("flat");
         context_clear.set_tooltip_text(Some("Detach selected Block context"));
+        context_clear.update_property(&[gtk4::accessible::Property::Label(
+            "Detach selected Block context",
+        )]);
         context_card.append(&context_label);
         context_card.append(&context_clear);
         context_card.set_visible(block_context.is_some());
@@ -2225,6 +2525,7 @@ impl UiState {
         let runtime = Rc::new(AgentRuntime {
             session: RefCell::new(restored_session.unwrap_or_else(|| AgentSession::new(max_turns))),
             target: target.clone(),
+            ui_lifetime: self.agent_ui_lifetime.clone(),
             config: self.config.clone(),
             shell: shell.clone(),
             block_context: RefCell::new(block_context.clone()),
@@ -2317,8 +2618,8 @@ impl UiState {
         runtime.render_session_state(None);
 
         // Close this specific session: clear the UiState slot only when it
-        // still holds this runtime (the pane's exited callback outlives the
-        // session and must never tear down a newer one).
+        // still holds this runtime, so delayed widget callbacks can never tear
+        // down a newer session.
         let close_session = {
             let slot = self.agent_session.clone();
             let toggle = self.agent_toggle.clone();
@@ -2348,21 +2649,6 @@ impl UiState {
         {
             let close_session = close_session.clone();
             close_btn.connect_clicked(move |_| close_session());
-        }
-        let weak: Weak<AgentRuntime> = Rc::downgrade(&runtime);
-        target.connect_block_finished(
-            move |command, exit_code, output, agent_generation, _duration_ms| {
-                if let Some(runtime) = weak.upgrade() {
-                    // The freshly finished block was inserted below this card;
-                    // re-pin the card so it stays directly above the live prompt.
-                    runtime.target.insert_inline_notice(&runtime.card);
-                    AgentRuntime::observe(runtime, command, exit_code, output, agent_generation);
-                }
-            },
-        );
-        {
-            let close_session = close_session.clone();
-            target.connect_exited(move |_| close_session());
         }
         let weak = Rc::downgrade(&runtime);
         send.connect_clicked(move |_| {
@@ -2444,10 +2730,12 @@ mod tests {
     #[cfg(unix)]
     use super::claim_agent_snapshot_file;
     use super::{
-        agent_message_display_text, bounded_agent_input, load_agent_snapshot,
-        proposal_callback_is_current, read_agent_snapshot_file, resolve_pending_for_finished_block,
-        restore_agent_snapshot, take_pending_for_finished_block, write_agent_snapshot_file,
-        PendingCompletion, PendingExecution, MAX_AGENT_INPUT_BYTES,
+        agent_message_display_bytes, agent_message_display_text, bounded_agent_input,
+        claim_weak_target, load_agent_snapshot, proposal_callback_is_current,
+        read_agent_snapshot_file, resolve_pending_for_finished_block, restore_agent_snapshot,
+        take_pending_for_finished_block, take_pending_for_lost_execution,
+        write_agent_snapshot_file, AgentActivityBudget, PendingCompletion, PendingExecution,
+        MAX_AGENT_ACTIVITY_CARDS, MAX_AGENT_ACTIVITY_DISPLAY_BYTES, MAX_AGENT_INPUT_BYTES,
         MAX_AGENT_MESSAGE_DISPLAY_BYTES,
     };
 
@@ -2460,6 +2748,85 @@ mod tests {
     }
 
     #[test]
+    fn agent_activity_budget_evicts_oldest_at_the_card_limit() {
+        let mut budget = AgentActivityBudget::default();
+        for bytes in 0..MAX_AGENT_ACTIVITY_CARDS {
+            assert_eq!(budget.push(bytes), 0);
+        }
+
+        assert_eq!(budget.push(7), 1);
+        assert_eq!(budget.item_bytes.len(), MAX_AGENT_ACTIVITY_CARDS);
+        assert_eq!(budget.item_bytes.front(), Some(&1));
+    }
+
+    #[test]
+    fn agent_activity_budget_evicts_fifo_at_one_mib() {
+        let mut budget = AgentActivityBudget::default();
+        let quarter = MAX_AGENT_ACTIVITY_DISPLAY_BYTES / 4;
+        for _ in 0..4 {
+            assert_eq!(budget.push(quarter), 0);
+        }
+        assert_eq!(budget.total_display_bytes, MAX_AGENT_ACTIVITY_DISPLAY_BYTES);
+
+        assert_eq!(budget.push(quarter), 1);
+        assert_eq!(budget.item_bytes.len(), 4);
+        assert_eq!(budget.total_display_bytes, MAX_AGENT_ACTIVITY_DISPLAY_BYTES);
+
+        // A single impossible-to-display entry cannot punch through the cap.
+        assert_eq!(budget.push(MAX_AGENT_ACTIVITY_DISPLAY_BYTES + 1), 5);
+        assert!(budget.item_bytes.is_empty());
+        assert_eq!(budget.total_display_bytes, 0);
+    }
+
+    #[test]
+    fn shared_agent_activity_budget_cannot_be_reset_by_task_batches() {
+        let mut window_budget = AgentActivityBudget::default();
+        for _task_or_reopen in 0..32 {
+            for _message in 0..64 {
+                window_budget.push(8 * 1024);
+            }
+            assert!(window_budget.item_bytes.len() <= MAX_AGENT_ACTIVITY_CARDS);
+            assert!(window_budget.total_display_bytes <= MAX_AGENT_ACTIVITY_DISPLAY_BYTES);
+        }
+        assert_eq!(window_budget.item_bytes.len(), MAX_AGENT_ACTIVITY_CARDS);
+        assert_eq!(
+            window_budget.total_display_bytes,
+            MAX_AGENT_ACTIVITY_DISPLAY_BYTES
+        );
+    }
+
+    #[test]
+    fn agent_activity_accounts_the_exact_bounded_dynamic_labels() {
+        let body = "界".repeat(MAX_AGENT_MESSAGE_DISPLAY_BYTES);
+        let expected = "Shell Agent".len()
+            + '\u{f007}'.len_utf8()
+            + crate::review_input::safe_inline_display("Agent", 256).len()
+            + agent_message_display_text(&body).len()
+            + "Shell Agent activity: ".len()
+            + crate::review_input::safe_inline_display("Agent", 256).len();
+        assert_eq!(agent_message_display_bytes("Agent", &body), expected);
+        assert!(agent_message_display_bytes("Agent", &body) < MAX_AGENT_ACTIVITY_DISPLAY_BYTES);
+    }
+
+    #[test]
+    fn event_bridge_registry_claims_each_live_target_once() {
+        let mut targets = Vec::new();
+        let first = std::rc::Rc::new(());
+        assert!(claim_weak_target(&mut targets, &first));
+        assert!(!claim_weak_target(&mut targets, &first));
+        assert_eq!(targets.len(), 1);
+
+        drop(first);
+        let replacement = std::rc::Rc::new(());
+        assert!(claim_weak_target(&mut targets, &replacement));
+        assert_eq!(
+            targets.len(),
+            1,
+            "dead TermViews are purged before claiming"
+        );
+    }
+
+    #[test]
     fn finished_block_consumes_the_approval_it_matches() {
         let mut slot = pending(7, "cat monitor_xilem_bar.sh");
 
@@ -2468,6 +2835,15 @@ mod tests {
             PendingCompletion::Matched(7)
         );
         assert!(slot.is_none(), "an approval is one-shot");
+    }
+
+    #[test]
+    fn lost_execution_consumes_only_its_exact_generation() {
+        let mut slot = pending(7, "printf safe");
+        assert_eq!(take_pending_for_lost_execution(&mut slot, 2), None);
+        assert!(slot.is_some());
+        assert_eq!(take_pending_for_lost_execution(&mut slot, 1), Some(7));
+        assert!(slot.is_none());
     }
 
     #[test]
@@ -2964,7 +3340,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_approved_proposal_lifecycle_restores() {
+    fn in_flight_approved_proposal_requires_an_observation_before_restore() {
         let mut session = crate::agent::AgentSession::new(3);
         session.submit_user("inspect").unwrap();
         let proposal_id = match session
@@ -2975,7 +3351,13 @@ mod tests {
             other => panic!("expected proposal, got {other:?}"),
         };
         let _approved = session.approve(proposal_id).unwrap();
-        assert!(restore_agent_snapshot(session.snapshot().unwrap()).is_ok());
+        let error = restore_agent_snapshot(session.snapshot().unwrap()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("awaiting observation cannot be rebound after restart"),
+            "unexpected restore error: {error}"
+        );
 
         session.observe(proposal_id, 0, "safe output").unwrap();
         let observed = session.snapshot().unwrap().to_json().unwrap();
@@ -2999,5 +3381,61 @@ mod tests {
         )
         .unwrap();
         assert!(restore_agent_snapshot(wrong_counter).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn valid_in_flight_execution_checkpoint_is_retired_without_quarantine() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "forge-agent-snapshot-in-flight-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("agent_session.json");
+
+        let mut session = crate::agent::AgentSession::new(4);
+        session.submit_user("run the approved check").unwrap();
+        let proposal_id = match session
+            .accept_model_reply(r#"{"action":"run","command":"printf safe"}"#)
+            .unwrap()
+        {
+            crate::agent::ModelOutcome::Proposal { id, .. } => id,
+            other => panic!("expected proposal, got {other:?}"),
+        };
+        let _approved = session.approve(proposal_id).unwrap();
+        write_agent_snapshot_file(&path, &session.snapshot().unwrap()).unwrap();
+
+        let restored = load_agent_snapshot(&path);
+        assert!(
+            restored.is_none(),
+            "a restart must not restore a proposal whose execution identity was lost"
+        );
+        assert!(
+            !path.exists(),
+            "the public checkpoint must be consumed once"
+        );
+        let remaining = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert!(
+            remaining.is_empty(),
+            "a valid but unresumable checkpoint must be retired, not quarantined: {remaining:?}"
+        );
+
+        // This is the same fallback used when building AgentRuntime.  It proves
+        // the rejected checkpoint cannot leave the reopened card permanently
+        // stuck in Running the approved command / AwaitingObservation.
+        let reopened = restored.unwrap_or_else(|| crate::agent::AgentSession::new(4));
+        assert_eq!(reopened.state(), crate::agent::AgentState::Ready);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -251,6 +251,24 @@ fn marker_len_at_end_str(text: &str) -> Option<usize> {
 
 /// Length of a paste-bracket marker at the head of `data`, in either the 7-bit
 /// `ESC [ 2 0 0 ~` or 8-bit `9B 2 0 0 ~` spelling.
+fn opening_marker_len(data: &[u8]) -> Option<usize> {
+    for marker in [PASTE_START, C1_PASTE_START, C1_PASTE_START_UTF8] {
+        if data.starts_with(marker) {
+            return Some(marker.len());
+        }
+    }
+    None
+}
+
+fn closing_marker_len(data: &[u8]) -> Option<usize> {
+    for marker in [PASTE_END, C1_PASTE_END, C1_PASTE_END_UTF8] {
+        if data.starts_with(marker) {
+            return Some(marker.len());
+        }
+    }
+    None
+}
+
 fn marker_len(data: &[u8]) -> Option<usize> {
     for marker in [
         PASTE_START,
@@ -265,6 +283,87 @@ fn marker_len(data: &[u8]) -> Option<usize> {
         }
     }
     None
+}
+
+/// Editor semantics of bytes that actually crossed the PTY admission boundary.
+/// Framing bytes are omitted, and only CR/LF outside a bracketed-paste frame
+/// count as shell submissions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AdmittedInput {
+    pub wire_bytes: usize,
+    pub editor_bytes: Vec<u8>,
+    pub submits_line: bool,
+    pub input_after_submission: bool,
+    pub had_framing: bool,
+}
+
+impl AdmittedInput {
+    pub fn has_effective_editor_input(&self) -> bool {
+        self.editor_bytes
+            .iter()
+            .any(|byte| !matches!(byte, 0x03 | 0x04))
+    }
+
+    /// Even a framing-only write changes readline's bracketed-paste state.
+    /// Keep the prompt fail-closed until the next authoritative PromptEnd;
+    /// otherwise a split opener can leave the shell inside a paste frame while
+    /// Forge still advertises the editor as empty.
+    pub fn taints_editor(&self) -> bool {
+        self.had_framing || !self.editor_bytes.is_empty()
+    }
+}
+
+/// Interpret a sanitized outgoing chunk before it is moved into the PTY writer
+/// queue. `initially_in_frame` is the guard state before filtering this chunk,
+/// so split opener/body/closer writes retain the same semantics as one complete
+/// bracketed-paste write.
+pub(crate) fn admitted_input(data: &[u8], initially_in_frame: bool) -> AdmittedInput {
+    let mut result = AdmittedInput {
+        wire_bytes: data.len(),
+        had_framing: initially_in_frame,
+        ..AdmittedInput::default()
+    };
+    let mut in_frame = initially_in_frame;
+    let mut paired_newline = None;
+    let mut index = 0;
+    while index < data.len() {
+        if let Some(len) = opening_marker_len(&data[index..]) {
+            in_frame = true;
+            result.had_framing = true;
+            index += len;
+            continue;
+        }
+        if let Some(len) = closing_marker_len(&data[index..]) {
+            in_frame = false;
+            result.had_framing = true;
+            index += len;
+            continue;
+        }
+
+        let byte = data[index];
+        result.editor_bytes.push(byte);
+        index += 1;
+        if in_frame || !matches!(byte, b'\r' | b'\n') {
+            if result.submits_line && !matches!(byte, 0x03 | 0x04) {
+                result.input_after_submission = true;
+            }
+            if !matches!(byte, b'\r' | b'\n') {
+                paired_newline = None;
+            }
+            continue;
+        }
+
+        if !result.submits_line {
+            result.submits_line = true;
+            paired_newline = Some(if byte == b'\r' { b'\n' } else { b'\r' });
+        } else if paired_newline == Some(byte) {
+            paired_newline = None;
+        } else {
+            result.input_after_submission = true;
+            paired_newline = Some(if byte == b'\r' { b'\n' } else { b'\r' });
+        }
+    }
+    result
 }
 
 /// Describe a payload without building it, for a pre-flight confirmation.
@@ -405,7 +504,7 @@ pub fn encode_prompt_insert(
 /// emits framing as one unit and [`encode_paste`] returns the whole payload in
 /// one buffer, so the guard never withholds bytes — delaying a partial marker
 /// until a write that may never come would be worse than the injection.
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct InputGuard {
     /// A frame this app opened is still open, so a terminator at the very end
     /// of a chunk is the legitimate close rather than an injection.
@@ -852,6 +951,61 @@ mod tests {
             PasteModes { bracketed: true },
             PastePolicy::clipboard(UnbracketedMultiline::FirstLineOnly),
         )
+    }
+
+    #[test]
+    fn admitted_semantics_ignore_framed_newlines_but_keep_the_editor_body() {
+        let admitted = admitted_input(b"\x1b[200~one\ntwo\x1b[201~", false);
+        assert_eq!(admitted.wire_bytes, 19);
+        assert_eq!(admitted.editor_bytes, b"one\ntwo");
+        assert!(admitted.had_framing);
+        assert!(!admitted.submits_line);
+        assert!(!admitted.input_after_submission);
+
+        let submitted = admitted_input(b"\x1b[200~one\ntwo\x1b[201~\r", false);
+        assert_eq!(submitted.editor_bytes, b"one\ntwo\r");
+        assert!(submitted.submits_line);
+        assert!(!submitted.input_after_submission);
+
+        let body = admitted_input(b"one\ntwo", true);
+        assert_eq!(body.editor_bytes, b"one\ntwo");
+        assert!(body.had_framing);
+        assert!(!body.submits_line);
+    }
+
+    #[test]
+    fn split_framing_alone_taints_the_editor_without_submitting() {
+        let opener = admitted_input(b"\x1b[200~", false);
+        assert_eq!(opener.wire_bytes, 6);
+        assert!(opener.editor_bytes.is_empty());
+        assert!(opener.had_framing);
+        assert!(opener.taints_editor());
+        assert!(!opener.submits_line);
+
+        let closer = admitted_input(b"\x1b[201~", true);
+        assert_eq!(closer.wire_bytes, 6);
+        assert!(closer.editor_bytes.is_empty());
+        assert!(closer.had_framing);
+        assert!(closer.taints_editor());
+        assert!(!closer.submits_line);
+    }
+
+    #[test]
+    fn admitted_semantics_track_only_bytes_after_a_real_submit_as_typeahead() {
+        let one_line = admitted_input(b"one", false);
+        assert_eq!(one_line.editor_bytes, b"one");
+        assert!(!one_line.submits_line);
+
+        let crlf = admitted_input(b"one\r\n", false);
+        assert!(crlf.submits_line);
+        assert!(!crlf.input_after_submission);
+
+        let typeahead = admitted_input(b"one\rtwo", false);
+        assert!(typeahead.submits_line);
+        assert!(typeahead.input_after_submission);
+
+        let filtered_empty = admitted_input(b"", false);
+        assert_eq!(filtered_empty, AdmittedInput::default());
     }
 
     #[test]

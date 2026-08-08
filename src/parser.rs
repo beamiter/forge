@@ -92,6 +92,9 @@ pub enum ParserEvent {
     /// startup. The UI stores it on the tab's RemoteConn so subsequent
     /// reconnects pass `--session <id>` and jsh restores cwd/env/aliases.
     RemoteSessionId(String),
+    /// OSC 7771 — the bundled local shell integration consumed its private
+    /// one-shot token fd and is ready to correlate Agent executions.
+    AgentIntegrationReady(String),
     /// CSI ? 47/1047/1049 h — alt screen entered (vim, less, etc.).
     /// Carries the exact DEC private mode so VTE receives matching semantics.
     AltScreenEnter(u32),
@@ -904,6 +907,16 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
         return;
     }
 
+    // OSC 7771 ; <32-hex-token> — local Forge shell integration readiness.
+    // The token came from a one-shot inherited fd rather than argv/env. Keep
+    // this packet out of VTE and let the pane compare it with its private copy.
+    if let Some(token) = s.strip_prefix("7771;") {
+        if token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            events.push(ParserEvent::AgentIntegrationReady(token.to_string()));
+        }
+        return;
+    }
+
     // OSC 7 (cwd), OSC 0 / 1 / 2 (title/icon), and everything else: pass through
     // unchanged. VTE consumes them natively and fires
     // current-directory-uri-notify / window-title-changed signals, which the
@@ -1494,6 +1507,26 @@ mod tests {
                 meta: CommandMeta::default(),
             }
         );
+    }
+
+    #[test]
+    fn private_agent_integration_ready_marker_is_strict_and_hidden() {
+        let token = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            only_event(format!("\x1b]7771;{token}\x07").as_bytes()),
+            ParserEvent::AgentIntegrationReady(token.to_string())
+        );
+
+        for invalid in [
+            "short",
+            "0123456789abcdef0123456789abcdeg",
+            "0123456789abcdef0123456789abcdef0",
+        ] {
+            let mut parser = Parser::new();
+            let mut events = Vec::new();
+            parser.feed(format!("\x1b]7771;{invalid}\x07").as_bytes(), &mut events);
+            assert!(events.is_empty(), "accepted invalid token {invalid:?}");
+        }
     }
 
     fn only_event(bytes: &[u8]) -> ParserEvent {

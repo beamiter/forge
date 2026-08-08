@@ -148,7 +148,6 @@ const MAX_REMOTE_SSH_ARGS: usize = 64;
 const MAX_FONT_DESC_BYTES: usize = 1024;
 const MAX_CONFIG_PATH_BYTES: usize = 16 * 1024;
 const MAX_AI_IDENTIFIER_BYTES: usize = 1024;
-const MAX_AI_BASE_URL_BYTES: usize = 4 * 1024;
 const MAX_STARTUP_COMMANDS_BYTES: usize = crate::review_input::MAX_REVIEW_INPUT_BYTES;
 
 pub(crate) fn remote_field_is_safe(value: &str) -> bool {
@@ -165,9 +164,9 @@ fn setting_text_is_safe(value: &str, max_bytes: usize) -> bool {
         && !crate::review_input::contains_visual_spoof(value)
 }
 
-fn ai_base_url_is_safe(value: &str) -> bool {
+fn ai_base_url_is_structurally_safe(value: &str) -> bool {
     let value = value.trim();
-    if !setting_text_is_safe(value, MAX_AI_BASE_URL_BYTES)
+    if !setting_text_is_safe(value, jagent::provider::MAX_BASE_URL_BYTES)
         || !(value.starts_with("http://") || value.starts_with("https://"))
         || value.chars().any(char::is_whitespace)
         || value.contains(['?', '#', '\\'])
@@ -178,6 +177,37 @@ fn ai_base_url_is_safe(value: &str) -> bool {
         let authority = remainder.split('/').next().unwrap_or_default();
         !authority.is_empty() && !authority.contains('@')
     })
+}
+
+fn ai_base_url_is_safe(provider: &str, value: &str) -> bool {
+    if !ai_base_url_is_structurally_safe(value) {
+        return false;
+    }
+    let provider = match provider.trim().to_ascii_lowercase().as_str() {
+        "anthropic" | "claude" => jagent::Provider::Anthropic,
+        "openai" | "openai-compatible" | "openai_compatible" => jagent::Provider::OpenAiCompatible,
+        "ollama" => jagent::Provider::Ollama,
+        _ => return false,
+    };
+    let mut contract = jagent::ChatConfig::new(provider);
+    contract.base_url = value.trim().to_string();
+    contract.validate().is_ok()
+}
+
+/// Resolve an optional endpoint without ever redirecting an explicit invalid
+/// destination to a provider's public default. A structurally safe but
+/// transport-invalid value is preserved so the canonical client validator
+/// rejects it before network I/O and Settings can show the value that needs
+/// fixing. Malformed, spoofed, credential-bearing, or unbounded text becomes
+/// an empty endpoint, which is likewise an offline failure.
+fn resolve_ai_base_url(requested: Option<String>, default: &str) -> String {
+    match requested {
+        None => default.to_string(),
+        Some(value) if ai_base_url_is_structurally_safe(&value) => {
+            value.trim().trim_end_matches('/').to_string()
+        }
+        Some(_) => String::new(),
+    }
 }
 
 fn configured_path_is_safe(value: &str, require_absolute_or_home: bool) -> bool {
@@ -1344,12 +1374,16 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
         }
     }
     if let Some(url) = table.get("ai_base_url").and_then(toml::Value::as_str) {
-        if !ai_base_url_is_safe(url) {
+        let provider = table
+            .get("ai_provider")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("anthropic");
+        if !ai_base_url_is_safe(provider, url) {
             config_issue(
                 &mut issues,
                 Error,
                 "ai_base_url",
-                "expected a bounded absolute http(s) URL without whitespace, controls, or invisible formatting",
+                "expected a bounded absolute HTTPS URL without credentials or ambiguous components; plain HTTP is allowed only for a loopback Ollama endpoint",
             );
         }
     }
@@ -2417,12 +2451,10 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .or(fc.ai_model)
         .filter(|model| setting_text_is_safe(model, MAX_AI_IDENTIFIER_BYTES))
         .unwrap_or_else(|| default_ai_model.to_string());
-    let ai_base_url = env_string("FORGE_AI_BASE_URL")
-        .or(fc.ai_base_url)
-        .filter(|url| ai_base_url_is_safe(url))
-        .unwrap_or_else(|| default_ai_base_url.to_string())
-        .trim_end_matches('/')
-        .to_string();
+    let ai_base_url = resolve_ai_base_url(
+        env_string("FORGE_AI_BASE_URL").or(fc.ai_base_url),
+        default_ai_base_url,
+    );
     let ai_api_key_file_configured = fc
         .ai_api_key_file
         .filter(|path| configured_path_is_safe(path, true));
@@ -2960,9 +2992,25 @@ unknown_action = "F8"
     }
 
     #[test]
-    fn ai_base_url_rejects_ambiguous_or_credential_bearing_endpoints() {
-        assert!(ai_base_url_is_safe("https://api.example.com/v1"));
-        assert!(ai_base_url_is_safe("http://127.0.0.1:8000/v1"));
+    fn ai_base_url_matches_the_provider_transport_contract() {
+        assert!(ai_base_url_is_safe(
+            "openai-compatible",
+            "https://api.example.com/v1"
+        ));
+        assert!(ai_base_url_is_safe(
+            "openai-compatible",
+            "https://localhost:8000/v1"
+        ));
+        assert!(!ai_base_url_is_safe(
+            "openai-compatible",
+            "http://127.0.0.1:8000/v1"
+        ));
+        assert!(ai_base_url_is_safe("ollama", "http://127.0.0.1:11434"));
+        assert!(ai_base_url_is_safe("ollama", "http://[::1]:11434"));
+        assert!(!ai_base_url_is_safe(
+            "ollama",
+            "http://models.example.com:11434"
+        ));
         for value in [
             "https://user:secret@example.com/v1",
             "https://example.com/v1?key=secret",
@@ -2970,12 +3018,54 @@ unknown_action = "F8"
             "https://example.com\\@attacker.invalid/v1",
             "https:///missing-authority",
         ] {
-            assert!(!ai_base_url_is_safe(value), "accepted {value:?}");
+            assert!(
+                !ai_base_url_is_safe("openai-compatible", value),
+                "accepted {value:?}"
+            );
         }
-        assert!(!ai_base_url_is_safe(&format!(
-            "https://example.com/{}",
-            "x".repeat(MAX_AI_BASE_URL_BYTES)
-        )));
+        assert!(!ai_base_url_is_safe(
+            "openai-compatible",
+            &format!(
+                "https://example.com/{}",
+                "x".repeat(jagent::provider::MAX_BASE_URL_BYTES)
+            )
+        ));
+    }
+
+    #[test]
+    fn explicit_invalid_ai_endpoint_never_drifts_to_a_public_default() {
+        let insecure_loopback = "http://127.0.0.1:8000/v1";
+        let resolved = resolve_ai_base_url(
+            Some(insecure_loopback.to_string()),
+            "https://api.openai.com/v1",
+        );
+        assert_eq!(
+            resolved, insecure_loopback,
+            "the runtime validator must reject the requested destination itself"
+        );
+        assert!(crate::ai::AiClient::new(
+            crate::ai::Provider::OpenAiCompatible,
+            None,
+            "local-model",
+            resolved,
+            512,
+            None,
+            true,
+        )
+        .is_err());
+        assert_eq!(
+            resolve_ai_base_url(
+                Some("https://user:secret@example.com/v1".to_string()),
+                "https://api.openai.com/v1"
+            ),
+            "",
+            "credential-bearing text must fail closed without being retained"
+        );
+        assert_eq!(
+            resolve_ai_base_url(None, "https://api.openai.com/v1"),
+            "https://api.openai.com/v1",
+            "only an absent endpoint may select the provider default"
+        );
     }
 
     #[test]
@@ -3368,10 +3458,32 @@ session = "bad/session"
     #[test]
     fn ai_and_agent_config_is_semantically_validated() {
         let valid = validate_config_contents(
-            "ai_enabled = true\nagent_enabled = true\nagent_max_turns = 20\nagent_auto_approve_readonly = false\ncommand_correction_enabled = true\nai_provider = 'openai-compatible'\nai_base_url = 'http://localhost:8000/v1'\nai_api_key_file = '~/.config/forge/ai.key'\nai_model = 'local-model'\nai_max_tokens = 4096\nai_redact_secrets = true\n",
+            "ai_enabled = true\nagent_enabled = true\nagent_max_turns = 20\nagent_auto_approve_readonly = false\ncommand_correction_enabled = true\nai_provider = 'openai-compatible'\nai_base_url = 'https://localhost:8000/v1'\nai_api_key_file = '~/.config/forge/ai.key'\nai_model = 'local-model'\nai_max_tokens = 4096\nai_redact_secrets = true\n",
         )
         .unwrap();
         assert!(valid.is_empty(), "{valid:?}");
+
+        let keyless_https_openai = validate_config_contents(
+            "ai_provider = 'openai-compatible'\nai_base_url = 'https://localhost:8000/v1'\n",
+        )
+        .unwrap();
+        assert!(keyless_https_openai.is_empty(), "{keyless_https_openai:?}");
+
+        let insecure_openai = validate_config_contents(
+            "ai_provider = 'openai-compatible'\nai_base_url = 'http://127.0.0.1:8000/v1'\n",
+        )
+        .unwrap();
+        assert!(insecure_openai.iter().any(|issue| {
+            issue.path == "ai_base_url"
+                && issue.level == ConfigIssueLevel::Error
+                && issue.message.contains("HTTPS")
+        }));
+
+        let local_ollama = validate_config_contents(
+            "ai_provider = 'ollama'\nai_base_url = 'http://localhost:11434'\n",
+        )
+        .unwrap();
+        assert!(local_ollama.is_empty(), "{local_ollama:?}");
 
         let retired = validate_config_contents("agent_auto_approve_readonly = true\n").unwrap();
         assert!(retired.iter().any(|issue| {

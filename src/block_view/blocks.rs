@@ -2162,6 +2162,9 @@ impl FinishedBlock {
         pty_synced: &Rc<Cell<bool>>,
         active: &Rc<RefCell<ActiveBlock>>,
         typed_cmd: &Rc<RefCell<String>>,
+        typed_cmd_fidelity: &Rc<Cell<super::TypedShadowFidelity>>,
+        submission_pending: &Rc<Cell<bool>>,
+        pending_typeahead: &Rc<Cell<bool>>,
         bstate: &Rc<Cell<BlockState>>,
         bracketed_paste: &Rc<Cell<bool>>,
     ) {
@@ -2197,14 +2200,22 @@ impl FinishedBlock {
         let pty_synced_for_rerun = pty_synced.clone();
         let active_for_rerun = Rc::downgrade(active);
         let typed_cmd_for_rerun = typed_cmd.clone();
+        let typed_cmd_fidelity_for_rerun = typed_cmd_fidelity.clone();
+        let submission_pending_for_rerun = submission_pending.clone();
+        let pending_typeahead_for_rerun = pending_typeahead.clone();
         let bstate_for_rerun = bstate.clone();
         let bracketed_for_rerun = bracketed_paste.clone();
         let cmd_for_rerun = self.cmd_text.clone();
         self.rerun_btn.connect_clicked(move |btn| {
             if recall_command_at_prompt(
-                &pty_for_rerun,
-                &pty_synced_for_rerun,
-                &typed_cmd_for_rerun,
+                PromptRecallCtx {
+                    pty: &pty_for_rerun,
+                    pty_synced: &pty_synced_for_rerun,
+                    typed_cmd: &typed_cmd_for_rerun,
+                    typed_cmd_fidelity: &typed_cmd_fidelity_for_rerun,
+                    submission_pending: &submission_pending_for_rerun,
+                    pending_typeahead: &pending_typeahead_for_rerun,
+                },
                 bstate_for_rerun.get(),
                 &cmd_for_rerun,
                 bracketed_for_rerun.get(),
@@ -2626,17 +2637,16 @@ mod tests {
         }
     }
 
-    /// Updated in round 8: recall now goes through the shared
-    /// `pty_input::encode_prompt_insert`, whose payload leads with the
-    /// unconditional `Ctrl+U` and frames a multiline body when the shell can
-    /// strip the frame. The old local `recalled_command_text` is gone.
+    /// Recall is insertion-only: no readline/zle binding is a portable
+    /// whole-buffer clear. Multiline text is framed only when the shell can
+    /// strip the bracketed-paste markers.
     #[test]
     fn multiline_recall_uses_full_text_with_bracketed_paste() {
         let paste = super::build_command_recall("printf one\nprintf two\n", true);
         assert_eq!(paste.echo_text, "printf one\nprintf two");
         assert_eq!(
             paste.bytes,
-            b"\x15\x1b[200~printf one\nprintf two\x1b[201~".to_vec()
+            b"\x1b[200~printf one\nprintf two\x1b[201~".to_vec()
         );
         assert!(!paste.risk.truncated_to_first_line);
     }
@@ -2645,7 +2655,7 @@ mod tests {
     fn multiline_recall_falls_back_without_bracketed_paste() {
         let paste = super::build_command_recall("printf one\nprintf two", false);
         assert_eq!(paste.echo_text, "printf one");
-        assert_eq!(paste.bytes, b"\x15printf one".to_vec());
+        assert_eq!(paste.bytes, b"printf one".to_vec());
         assert!(paste.risk.truncated_to_first_line);
     }
 

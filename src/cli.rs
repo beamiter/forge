@@ -877,7 +877,7 @@ fn doctor(format: ReportFormat) -> bool {
                     if client.api_key.is_some() {
                         "present"
                     } else {
-                        "not set (optional for local/compatible endpoints)"
+                        "not set (optional for OpenAI-compatible and Ollama endpoints)"
                     },
                     if curl_available {
                         "available"

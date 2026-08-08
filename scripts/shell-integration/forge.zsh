@@ -8,8 +8,33 @@ __FORGE_ZSH_LOADED=1
 __forge_osc() { printf '\033]%s\007' "$1"; }
 __forge_prompt_start() { __forge_osc "133;A"; }
 __forge_prompt_end() { __forge_osc "133;B"; }
-__forge_command_start() { __forge_osc "133;C"; }
-__forge_command_end() { __forge_osc "133;D;$1"; }
+typeset -g __forge_command_token=
+typeset -g __forge_token_fd=${FORGE_SHELL_INTEGRATION_FD:-}
+unset FORGE_SHELL_INTEGRATION_FD FORGE_SHELL_INTEGRATION_TOKEN
+if [[ $__forge_token_fd == <-> ]]; then
+    IFS= read -r -u "$__forge_token_fd" __forge_command_token || __forge_command_token=
+    # The descriptor number passed the zsh numeric glob above.
+    eval "exec ${__forge_token_fd}<&-"
+fi
+unset __forge_token_fd
+if (( ${#__forge_command_token} == 32 )) \
+    && [[ $__forge_command_token != *[^[:xdigit:]]* ]]; then
+    __forge_agent_ready() { __forge_osc "7771;${__forge_command_token}"; }
+else
+    __forge_command_token=forge-zsh-$$
+    __forge_agent_ready() { :; }
+fi
+typeset -gi __forge_command_seq=0
+typeset -g __forge_command_id=
+__forge_command_start() {
+    ((__forge_command_seq += 1))
+    __forge_command_id="${__forge_command_token}-${__forge_command_seq}"
+    __forge_osc "133;C;id=${__forge_command_id}"
+}
+__forge_command_end() {
+    __forge_osc "133;D;$1;id=${__forge_command_id}"
+    __forge_command_id=
+}
 
 __forge_report_cwd() {
     local host=${HOST:-${HOSTNAME:-localhost}}
@@ -39,6 +64,7 @@ __forge_precmd() {
     fi
     __forge_report_cwd
     __forge_prompt_start
+    __forge_agent_ready
 }
 
 if [[ -z ${__FORGE_PS1_HOOKED:-} ]]; then

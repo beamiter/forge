@@ -19,8 +19,19 @@ end
 
 function __forge_prompt_start  ; __forge_osc "133;A" ; end
 function __forge_prompt_end    ; __forge_osc "133;B" ; end
-function __forge_command_start ; __forge_osc "133;C" ; end
-function __forge_command_end   ; __forge_osc "133;D;$argv[1]" ; end
+set -e FORGE_SHELL_INTEGRATION_FD FORGE_SHELL_INTEGRATION_TOKEN
+set -g __forge_command_token "forge-fish-$fish_pid"
+set -g __forge_command_seq 0
+set -g __forge_command_id ""
+function __forge_command_start
+    set -g __forge_command_seq (math $__forge_command_seq + 1)
+    set -g __forge_command_id "$__forge_command_token-$__forge_command_seq"
+    __forge_osc "133;C;id=$__forge_command_id"
+end
+function __forge_command_end
+    __forge_osc "133;D;$argv[1];id=$__forge_command_id"
+    set -g __forge_command_id ""
+end
 
 function __forge_preexec --on-event fish_preexec
     __forge_command_start

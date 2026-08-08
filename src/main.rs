@@ -951,6 +951,7 @@ pub fn run() -> glib::ExitCode {
             settings_dialog: Rc::new(RefCell::new(None)),
             debug_dashboard_dialog: Rc::new(RefCell::new(None)),
             agent_session: Rc::new(RefCell::new(None)),
+            agent_ui_lifetime: Rc::new(Default::default()),
             command_suggestion: Rc::new(RefCell::new(None)),
             organism_memory: Rc::new(RefCell::new(organism_memory)),
             organism_life,

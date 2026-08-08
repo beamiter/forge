@@ -1062,7 +1062,9 @@ fn show_correction_card(
     }
 
     let feedback = review.feedback.clone();
+    let review_root = review.root.clone();
     let request_state_for_accept = request_state.clone();
+    let remove_card_for_accept = remove_card.clone();
     let accept = Rc::new(move |edited: String| {
         if !request_state_for_accept.is_generation(generation) {
             return;
@@ -1090,22 +1092,51 @@ fn show_correction_card(
             && command == proposed_command
             && crate::agent::is_dangerous(&command).is_none();
         view.grab_focus();
-        let queued = if run {
-            view.submit_command(&command)
-        } else {
-            view.write_input(command.as_bytes())
-                .map_err(|error| error.to_string())
-        };
-        if let Err(error) = queued {
+        if run {
+            let feedback_for_completion = feedback.clone();
+            let root_for_completion = review_root.clone();
+            let request_state_for_completion = request_state_for_accept.clone();
+            let remove_card_for_completion = remove_card_for_accept.clone();
+            let queued = view.submit_command_tracked(&command, move |result| match result {
+                Ok(()) => {
+                    if request_state_for_completion.retire(generation) {
+                        remove_card_for_completion(false);
+                    }
+                }
+                Err(error) => {
+                    root_for_completion.set_sensitive(true);
+                    if request_state_for_completion.is_generation(generation) {
+                        set_review_feedback(
+                            &feedback_for_completion,
+                            &format!(
+                                "Reviewed command could not be verified; it may not have run, or a different command may have started. Inspect the terminal before retrying: {error}"
+                            ),
+                            true,
+                        );
+                    }
+                }
+            });
+            if let Err(error) = queued {
+                show_error(&format!("Command was not sent: {error}"));
+                return;
+            }
+            // Keep the proposal present until CommandStart proves the reviewed
+            // identity. This also prevents a close/edit click from racing VTE
+            // verification or a shell-side redraw after CR admission.
+            review_root.set_sensitive(false);
+            return;
+        }
+
+        if let Err(error) = view.write_input(command.as_bytes()) {
             show_error(&format!("Command was not sent: {error}"));
             return;
         }
-        // This callback runs on GTK's main thread. No generation change can
-        // interleave between the check above, queue admission, and retirement.
+        // Non-executing insertion is complete once the bounded PTY queue owns
+        // the bytes; it intentionally leaves Enter to the user.
         if !request_state_for_accept.retire(generation) {
             log::error!("correction generation changed during synchronous PTY admission");
         }
-        remove_card(false);
+        remove_card_for_accept(false);
     });
 
     {

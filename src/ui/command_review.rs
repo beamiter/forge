@@ -138,6 +138,9 @@ impl CommandReviewCard {
             button.add_css_class("flat");
             button.set_focusable(false);
             button.set_tooltip_text(Some("Dismiss (Esc)"));
+            button.update_property(&[gtk4::accessible::Property::Label(
+                "Dismiss command proposal",
+            )]);
             header.append(&button);
             button
         });

@@ -9,8 +9,33 @@ __forge_integration_source=${BASH_SOURCE[0]}
 __forge_osc() { printf '\033]%s\007' "$1"; }
 __forge_prompt_start() { __forge_osc "133;A"; }
 __forge_prompt_end() { __forge_osc "133;B"; }
-__forge_command_start() { __forge_osc "133;C"; }
-__forge_command_end() { __forge_osc "133;D;$1"; }
+__forge_command_token=
+__forge_token_fd=${FORGE_SHELL_INTEGRATION_FD:-}
+unset FORGE_SHELL_INTEGRATION_FD FORGE_SHELL_INTEGRATION_TOKEN
+if [[ $__forge_token_fd =~ ^[0-9]+$ ]]; then
+    IFS= read -r -u "$__forge_token_fd" __forge_command_token || __forge_command_token=
+    # The descriptor number came from a digits-only check above. Close it
+    # before any user command can inherit the one-shot token channel.
+    eval "exec ${__forge_token_fd}<&-"
+fi
+unset __forge_token_fd
+if [[ $__forge_command_token =~ ^[[:xdigit:]]{32}$ ]]; then
+    __forge_agent_ready() { __forge_osc "7771;${__forge_command_token}"; }
+else
+    __forge_command_token=forge-bash-${BASHPID:-$$}
+    __forge_agent_ready() { :; }
+fi
+__forge_command_seq=0
+__forge_command_id=
+__forge_command_start() {
+    ((__forge_command_seq += 1))
+    __forge_command_id="${__forge_command_token}-${__forge_command_seq}"
+    __forge_osc "133;C;id=${__forge_command_id}"
+}
+__forge_command_end() {
+    __forge_osc "133;D;$1;id=${__forge_command_id}"
+    __forge_command_id=
+}
 
 __forge_report_cwd() {
     local host=${HOSTNAME:-localhost}
@@ -56,6 +81,7 @@ __forge_precmd() {
     fi
     __forge_report_cwd
     __forge_prompt_start
+    __forge_agent_ready
     if [[ -z ${__FORGE_PS1_HOOKED:-} ]]; then
         PS1="${PS1}\[$(__forge_prompt_end)\]"
         __FORGE_PS1_HOOKED=1

@@ -31,6 +31,13 @@ use crate::pty::OwnedPty;
 pub(crate) struct ClickCursorCtx {
     pub(crate) enabled: bool,
     pub(crate) pty: Rc<OwnedPty>,
+    /// The OSC 133 command-start mark can lag behind Enter. During that window,
+    /// arrows would be typeahead for the foreground child rather than edits to
+    /// the visible prompt, so the owner must be able to veto cursor motion.
+    pub(crate) cursor_move_allowed: Rc<dyn Fn() -> bool>,
+    /// Cursor-motion bytes make the append-only command shadow inexact. This
+    /// callback runs only after the PTY queue accepts the synthesized arrows.
+    pub(crate) cursor_move_accepted: Rc<dyn Fn()>,
     /// VTE cursor position captured at OSC 133 `B`, i.e. where the user's
     /// command starts. It bounds how far left a click may walk.
     pub(crate) prompt_end_pos: Rc<Cell<(i64, i64)>>,
@@ -60,20 +67,21 @@ pub(crate) fn suggestion_rgb(palette: &[gtk4::gdk::RGBA; 16]) -> [u8; 3] {
 fn phase_of(state: BlockState) -> core_click::ShellPhase {
     match state {
         BlockState::AwaitingCommand => core_click::ShellPhase::Editing,
-        BlockState::CollectingOutput | BlockState::AltScreen => core_click::ShellPhase::Running,
-        // `RawFallback` is a shell with no OSC 133 integration at all. Staying
-        // `Unknown` keeps the feature working there.
         BlockState::Idle
         | BlockState::CollectingPrompt
+        | BlockState::CollectingOutput
         | BlockState::PostCommand
-        | BlockState::RawFallback => core_click::ShellPhase::Unknown,
+        | BlockState::AltScreen => core_click::ShellPhase::Running,
+        // `RawFallback` is a shell with no OSC 133 integration at all. Staying
+        // `Unknown` keeps the feature working there.
+        BlockState::RawFallback => core_click::ShellPhase::Unknown,
     }
 }
 
 impl ClickCursorCtx {
     fn guards(&self) -> core_click::Guards {
         core_click::Guards {
-            enabled: self.enabled,
+            enabled: self.enabled && (self.cursor_move_allowed)(),
             mouse_reporting: self.mouse_mode.get() != MouseReportingMode::None,
             alt_screen: self.fullscreen.get(),
             // Click and cursor are both read in absolute ring coordinates, so
@@ -290,6 +298,64 @@ fn adjustment_rebase_offset(vte: &Terminal, cursor: core_click::Cell) -> i64 {
     rebase_offset(cursor.row, upper)
 }
 
+/// Characters to the right of the live cursor that belong to the shell's
+/// editable buffer, excluding suggestion-coloured ghost text, right-aligned
+/// prompt furniture, and rows below the input. Agent prompt verification uses
+/// the same conservative model as click-to-place so the two safety gates cannot
+/// disagree about whether a suffix is real input.
+pub(crate) fn editable_suffix_chars_checked(vte: &Terminal, suggestion: [u8; 3]) -> Option<i64> {
+    let (cursor_col, cursor_row) = vte.cursor_position();
+    let cursor = core_click::Cell::new(cursor_row, cursor_col);
+    let bottom = core_click::Cell::new(cursor.row + vte.row_count().max(1), vte.column_count());
+    if let Some(html) = html_between(vte, cursor, bottom) {
+        return Some(absorbable_chars(
+            &painted_chars(&html),
+            suggestion,
+            vte.column_count(),
+            cursor.col,
+        ));
+    }
+    vte.text_range_format(
+        vte4::Format::Text,
+        cursor.row,
+        cursor.col,
+        bottom.row,
+        bottom.col,
+    )
+    .0
+    .map(|text| text.trim_end().chars().count() as i64)
+}
+
+pub(crate) fn editable_suffix_chars(vte: &Terminal, suggestion: [u8; 3]) -> i64 {
+    // Click-to-place errs toward fewer arrows when VTE cannot export its live
+    // range. Security-sensitive callers use the checked variant and fail
+    // closed instead of treating an unreadable range as an empty editor.
+    editable_suffix_chars_checked(vte, suggestion).unwrap_or(0)
+}
+
+/// Strict reviewed-execution check for everything to the right of the cursor.
+/// Unlike click placement, visual colour/geometry cannot make a suffix trusted:
+/// real editable text can imitate a ghost suggestion or right prompt exactly.
+pub(crate) fn verified_suffix_is_empty(vte: &Terminal, _suggestion: [u8; 3]) -> Option<bool> {
+    let (cursor_col, cursor_row) = vte.cursor_position();
+    let cursor = core_click::Cell::new(cursor_row, cursor_col);
+    let bottom = core_click::Cell::new(cursor.row + vte.row_count().max(1), vte.column_count());
+    // Security-sensitive read-back intentionally does not reuse
+    // `absorbable_chars`: even whitespace after the cursor can change shell
+    // parsing (notably after a trailing backslash). VTE emits CR/LF separators
+    // for structurally empty rows, so those alone are allowed; a real space or
+    // tab cell is not.
+    vte.text_range_format(
+        vte4::Format::Text,
+        cursor.row,
+        cursor.col,
+        bottom.row,
+        bottom.col,
+    )
+    .0
+    .map(|text| text.bytes().all(|byte| matches!(byte, b'\r' | b'\n')))
+}
+
 /// The arithmetic of [`adjustment_rebase_offset`], kept free of the widget so
 /// the anchoring rule stays pinned by tests.
 fn rebase_offset(cursor_row: i64, adjustment_upper: i64) -> i64 {
@@ -325,16 +391,7 @@ fn move_for_click(vte: &Terminal, ctx: &ClickCursorCtx, click: core_click::Cell)
     // below the input. Every arrow past that end is one jsh spends accepting
     // the suggestion. Colour-blind counting is the fallback when the HTML
     // export is unavailable; it at least trims trailing blanks.
-    let bottom = core_click::Cell::new(cursor.row + vte.row_count().max(1), vte.column_count());
-    let max_right = match html_between(vte, cursor, bottom) {
-        Some(html) => absorbable_chars(
-            &painted_chars(&html),
-            ctx.suggestion_rgb,
-            vte.column_count(),
-            cursor.col,
-        ),
-        None => text_between(vte, cursor, bottom).trim_end().chars().count() as i64,
-    };
+    let max_right = editable_suffix_chars(vte, ctx.suggestion_rgb);
 
     let steps = core_click::clamp_steps(steps, max_left, max_right);
     // VTE owns the terminal state, so DECCKM is not observable from here. The
@@ -405,6 +462,8 @@ pub(crate) fn install(vte: &Terminal, ctx: ClickCursorCtx) {
             if !bytes.is_empty() {
                 if let Err(error) = ctx.pty.write_bytes(&bytes) {
                     log::warn!("click-to-place-cursor could not reach the shell: {error}");
+                } else {
+                    (ctx.cursor_move_accepted)();
                 }
             }
             // Never consume the release: VTE still has to finish its own
@@ -526,23 +585,25 @@ mod tests {
     }
 
     #[test]
-    fn only_a_foreground_program_blocks_the_click() {
-        // A shell with no OSC 133 integration never leaves `RawFallback`, and
-        // refusing there would remove the feature from plain bash.
-        for state in [
-            BlockState::Idle,
-            BlockState::CollectingPrompt,
-            BlockState::PostCommand,
-            BlockState::RawFallback,
-        ] {
-            assert_eq!(phase_of(state), core_click::ShellPhase::Unknown);
-        }
+    fn only_a_verified_editing_prompt_allows_the_click() {
+        // Transition phases fail closed: cursor bytes written while a prompt
+        // or command boundary is unsettled can survive into the next editor.
         assert_eq!(
             phase_of(BlockState::AwaitingCommand),
             core_click::ShellPhase::Editing
         );
-        for state in [BlockState::CollectingOutput, BlockState::AltScreen] {
+        for state in [
+            BlockState::Idle,
+            BlockState::CollectingPrompt,
+            BlockState::CollectingOutput,
+            BlockState::AltScreen,
+            BlockState::PostCommand,
+        ] {
             assert_eq!(phase_of(state), core_click::ShellPhase::Running);
         }
+        assert_eq!(
+            phase_of(BlockState::RawFallback),
+            core_click::ShellPhase::Unknown
+        );
     }
 }

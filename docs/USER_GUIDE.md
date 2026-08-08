@@ -269,7 +269,9 @@ deploy = "persist"
 
 ## 11. AI 与 Agent 安全边界
 
-AI 总开关、provider 和 endpoint 由配置控制。支持 Anthropic、OpenAI-compatible 和 Ollama wire protocol。密钥内容不会写入 TOML；环境变量优先。也可直接在 **Settings → AI & Agent → API Key** 输入密钥并按 Apply：forge 会将它原子写入 owner-only 的 `~/.config/forge/ai.key`，并只把文件路径写入配置。设置面板不会回显已经保存的密钥，再次输入并 Apply 可替换它。
+AI 总开关、provider 和 endpoint 由配置控制。支持 Anthropic、OpenAI-compatible 和 Ollama wire protocol。Anthropic 与 OpenAI-compatible 的 `ai_base_url` 必须是绝对 HTTPS URL，包括指向本机的兼容服务；HTTPS loopback 服务若明确无需鉴权，仍可不配置 Key。明文 HTTP 只对 loopback Ollama 例外开放（`localhost`、IPv4 loopback 或 `[::1]`，可带数字端口），远程 Ollama endpoint 也必须使用 HTTPS。密钥内容不会写入 TOML；环境变量优先。也可直接在 **Settings → AI & Agent → API Key** 输入密钥并按 Apply：forge 会将它原子写入 owner-only 的 `~/.config/forge/ai.key`，并只把文件路径写入配置。设置面板不会回显已经保存的密钥，再次输入并 Apply 可替换它。
+
+测试本机 OpenAI-compatible mock 时，应为 `localhost`/loopback SAN 签发测试证书，并让系统 `curl` 信任对应测试 CA（例如在隔离测试进程设置 `CURL_CA_BUNDLE`）；Forge 不会为 loopback 降级 TLS 或跳过证书校验。`--check-config` 会在联网前拒绝 OpenAI-compatible HTTP URL。
 
 也可通过环境变量配置：
 
@@ -320,14 +322,20 @@ selected Block、pane cwd 与配置 shell 不再拼进高信任 system prompt。
 
 `Ctrl+Alt+G` 或顶部栏的 **Agent** 开关在当前 active Block pane 打开原生 **Shell Agent**；开关保持选中时表示 Agent 会话正在激活。Agent 卡显示固定目标 cwd、安全状态、回合进度、实时 prompt readiness 和 proposal 审阅区，活动消息以普通块留在同一条 conversation flow 中；设置按钮显示 provider/model、shell、命令纠正开关和只读自动放行开关。readiness 会区分空闲、已有输入、命令运行中、全屏程序、prompt 初始化和缺少 shell integration，审批失败时给出对应恢复步骤。打开 Agent 时若已有 selected finished Block，它会作为可见的“不可信上下文”chip 附加，也可移除；会话空闲（Ready）时可用 **Attach selected Block** 把当前选中的 finished Block 附加或替换为新的上下文。请求还会附带有界的 git 元数据（branch、dirty、ahead/behind），与 cwd/shell/OS 一样只作为不可信 user-role 数据发送。Agent 在打开时固定目标 pane，切换标签不会悄悄改变执行目标。VTE pane 不提供 Agent。
 
+**Approve & Run 的当前执行边界**是本机 native Block pane、直接启动的交互式 bash/zsh，以及本版本自带且已在当前 prompt 完成私有握手的 shell integration。Forge 通过一次性私有 FD 把关联 token 交给启动 shell，脚本读取后立即关闭并清除 FD 变量；token 不进入命令 argv、普通环境快照或 jsh execution journal。managed remote pane、Flatpak host bridge、jsh、fish、PowerShell、未知 shell 和 `-c`/一次性 wrapper 不提供 Agent 自动提交；这些环境仍可使用 **Insert only**、普通 AI Chat 和只插入不回车的纠正建议。
+
+审核执行分两阶段：先只插入文本，等 VTE 证明当前编辑器从 prompt anchor 到光标逐字等于审核文本、光标右侧严格为空，再单独发送 Enter；CommandStart 还必须带当前 prompt 私有握手对应的 C/D ID，且上报/渲染的命令身份逐字匹配。leading/trailing whitespace、右提示符、可见 autosuggestion、未闭合引号/heredoc 等无法在时限内形成可信 CommandStart 的情况会 fail closed；若 Enter 已发送但身份随后无法证明，UI 会要求先检查终端再重试，而不会声称“肯定没执行”。需要保留这些 shell UI 特性时使用 **Insert only**。
+
+这个边界把普通前台子进程伪造的 OSC 生命周期与 Agent observation 隔开，但不把交互 shell 本身当成敌对沙箱：用户加载的 shell rc、函数、hooks 和键位绑定仍属于可信 shell 配置，同一 shell 内代码可读取 shell 私有状态。私有 token 是关联与误绑定防护，不是针对恶意 shell 配置的密码学认证。
+
 一次 Agent 会话的安全流程是：
 
 1. 输入任务后，模型回复必须是严格 JSON `say`、`run` 或 `done`；夹杂 prose、未知字段、错误类型、过期 proposal 或非法控制字符都会 fail closed，不能退化为可运行命令。用户任务也有 16 KiB 上限。
 2. `run` 只能包含一条可见单行命令，CR、LF、Tab、NUL、ESC 等控制字符无论来自模型还是编辑结果都会被拒绝。proposal 卡可复制和编辑；风险提示会随编辑实时重算。
 3. 每张卡片可 **Reject**、**Insert only** 或显式 **Approve & Run**。Reject 会进入 transcript 并要求模型换方案；Insert only 把最后编辑值写入普通 shell 编辑行供手动处理，不发送 Enter，并把“未执行”写入 Agent transcript；批准执行的是用户最后编辑后的精确文本。识别到顶层 `rm -rf`、`mkfs`、提权、强制 Git 改写、下载后 pipe 到 shell 等模式时，除醒目提示外还必须在显示精确命令的第二个确认框中再次批准。
-4. 批准前再次检查固定 Block prompt：正在运行任务或已有未提交输入时拒绝写入，待 prompt 空闲且清空后才能重试。
+4. 批准前再次检查固定 Block prompt：正在运行任务、已有未提交输入、可见右提示/建议或当前 shell 未完成受支持的私有握手时拒绝写入，待 prompt 空闲且严格清空后才能重试。
 5. 已批准命令形成 finished block 后，匹配的 exit code 和有界输出作为 observation 回灌，Agent 才能提出下一步。不相关命令不会被当成该 proposal 的结果。
-6. 模型请求进行中可 **Stop** 当前 turn，并在保留 Agent session 的前提下 **Retry**，不会复制 user turn。模型以 `done` 完成任务后，**Follow up** 会保留 transcript 并重新开放输入；`agent_max_turns` 达到上限后，**New task** 可在同一 pane 清空旧模型上下文并恢复完整回合预算。**Cancel Agent** 或关闭窗口则取消整个会话并等待 transport 回收。已经由用户批准并启动的普通终端命令不会被这些按钮暗中 kill，仍使用标准 pane/tab 关闭确认管理。
+6. 模型请求进行中可 **Stop** 当前 turn，并在保留 Agent session 的前提下 **Retry**，不会复制 user turn。模型以 `done` 完成任务后，**Follow up** 会保留 transcript 并重新开放输入；`agent_max_turns` 达到上限后，**New task** 可在同一 pane 清空旧模型上下文并恢复完整回合预算。**Cancel Agent** 或关闭窗口则取消整个会话并等待 transport 回收。已经由用户批准并启动的普通终端命令不会被这些按钮暗中 kill，仍使用标准 pane/tab 关闭确认管理。若窗口在已批准命令的 finished-block observation 回灌前关闭，重启不会猜测结果或把旧执行绑定到新 PTY；该有效但无法续接的 checkpoint 会被安全废弃，Agent 从新的 Ready 会话开始。
 
 dashboard 和 Settings 中的 **AI command correction** 开关控制 `command_correction_enabled`。开启后，Block 命令出现 typo、unknown executable/package、invalid subcommand/option 等窄范围错误时才会提供可编辑纠正；候选不会自动插入或执行。关闭开关会立即阻止新的纠正，也会丢弃仍在解析中的待显示结果。默认开启，可用 `FORGE_COMMAND_CORRECTION_ENABLED` 临时覆盖；确定性目标提示与本地索引优先，AI 仅为 fallback，完整边界见 `docs/SMART_COMMAND_CORRECTION.md`。
 

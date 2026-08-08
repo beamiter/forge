@@ -5,19 +5,42 @@ use nix::unistd::{self, ForkResult, Pid};
 use std::ffi::CString;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Read as _};
+use std::io::{self, Read as _, Write as _};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use crate::process::{ChildLifecycle, ReapOwner};
-use crate::pty_input::{InputGuard, PasteModes, PastePolicy, UnbracketedMultiline};
+use crate::pty_input::{AdmittedInput, InputGuard, PasteModes, PastePolicy, UnbracketedMultiline};
 use crate::terminal::TERMINAL_ESCALATION;
 
 enum PtyMsg {
     Data(Vec<u8>),
     Exit(i32),
+}
+
+/// Which process group currently owns the PTY foreground.
+///
+/// OSC command markers travel through the same byte stream as untrusted command
+/// output. A marker is authoritative only after the interactive shell has
+/// regained the terminal; an external foreground job can print identical bytes
+/// but necessarily owns a different process group while it is still running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PtyForeground {
+    Shell,
+    Other,
+    Unknown,
+}
+
+fn classify_foreground(shell_group: libc::pid_t, foreground_group: libc::pid_t) -> PtyForeground {
+    if shell_group <= 0 || foreground_group <= 0 {
+        PtyForeground::Unknown
+    } else if shell_group == foreground_group {
+        PtyForeground::Shell
+    } else {
+        PtyForeground::Other
+    }
 }
 
 /// How often the reader thread asks the lifecycle for the child's status once
@@ -48,6 +71,60 @@ pub struct OwnedPty {
     /// `ParserEvent::DecsetMode` (see [`OwnedPty::set_shell_bracketed_paste`]),
     /// which is the single owner of this mode for a forge pane.
     shell_bracketed_paste: AtomicBool,
+    /// One-shot secret delivered to the interactive shell through an inherited
+    /// pipe fd (never argv/environment). Updated bundled integrations close the
+    /// fd before launching user commands and bind C/D ids to this value.
+    shell_integration_token: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+fn shell_token_channel() -> io::Result<Option<(String, OwnedFd, OwnedFd)>> {
+    let mut random = [0u8; 16];
+    // SAFETY: `random` is writable for exactly the supplied length.
+    let read = unsafe {
+        libc::getrandom(
+            random.as_mut_ptr().cast(),
+            random.len(),
+            libc::GRND_NONBLOCK,
+        )
+    };
+    if read != random.len() as isize {
+        return Ok(None);
+    }
+    let mut token = String::with_capacity(random.len() * 2);
+    for byte in random {
+        use std::fmt::Write as _;
+        let _ = write!(token, "{byte:02x}");
+    }
+    let mut fds = [-1; 2];
+    // SAFETY: `fds` points to two writable integers. CLOEXEC is cleared only
+    // for the read end in the post-fork child immediately before exec.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: pipe2 returned two fresh owned descriptors.
+    let read_fd = move_fd_above_stdio(unsafe { OwnedFd::from_raw_fd(fds[0]) })?;
+    let write_fd = move_fd_above_stdio(unsafe { OwnedFd::from_raw_fd(fds[1]) })?;
+    Ok(Some((token, read_fd, write_fd)))
+}
+
+#[cfg(target_os = "linux")]
+fn move_fd_above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
+    if fd.as_raw_fd() > libc::STDERR_FILENO {
+        return Ok(fd);
+    }
+    // SAFETY: F_DUPFD_CLOEXEC duplicates this valid owned descriptor and
+    // chooses the first free number >= 3. The original closes on return.
+    let duplicated = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicated < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn shell_token_channel() -> io::Result<Option<(String, OwnedFd, OwnedFd)>> {
+    Ok(None)
 }
 
 // Raw GLib FFI for g_unix_fd_add_full (not exposed by glib-rs 0.22)
@@ -224,6 +301,48 @@ fn try_enqueue_input(
     }
 }
 
+fn filter_and_enqueue_input(
+    guard: &mut InputGuard,
+    sender: &mpsc::SyncSender<Vec<u8>>,
+    data: &[u8],
+    modes: PasteModes,
+) -> Result<(), PtyWriteError> {
+    filter_and_enqueue_input_with(guard, sender, data, modes, |_, _| ())
+}
+
+fn filter_and_enqueue_input_with<T>(
+    guard: &mut InputGuard,
+    sender: &mpsc::SyncSender<Vec<u8>>,
+    data: &[u8],
+    modes: PasteModes,
+    observe: impl FnOnce(&[u8], bool) -> T,
+) -> Result<T, PtyWriteError> {
+    let before = *guard;
+    let safe_data = guard
+        .filter(data, modes, boundary_paste_policy())
+        .into_owned();
+    if safe_data.is_empty() {
+        // No bytes crossed the boundary, so no frame transition did either.
+        *guard = before;
+        return Ok(observe(&[], before.in_frame()));
+    }
+    if safe_data.len() > MAX_PTY_INPUT_MESSAGE_BYTES {
+        *guard = before;
+        return Err(PtyWriteError::TooLarge {
+            bytes: safe_data.len(),
+            limit: MAX_PTY_INPUT_MESSAGE_BYTES,
+        });
+    }
+    let observed = observe(&safe_data, before.in_frame());
+    let result = try_enqueue_input(sender, safe_data);
+    if result.is_err() {
+        // Queue admission is the commit point. A rejected opener/closer must
+        // not alter how the next independent write is sanitized.
+        *guard = before;
+    }
+    result.map(|()| observed)
+}
+
 fn invalid_nul(context: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
@@ -296,6 +415,27 @@ impl OwnedPty {
     }
 
     pub fn spawn(argv: &[&str], cwd: Option<&str>, env_extra: &[(&str, &str)]) -> io::Result<Self> {
+        Self::spawn_inner(argv, cwd, env_extra, false)
+    }
+
+    /// Spawn an interactive shell and, when requested, give its startup
+    /// integration a one-shot private token pipe. Ordinary PTY users never
+    /// inherit that descriptor.
+    pub(crate) fn spawn_with_shell_token(
+        argv: &[&str],
+        cwd: Option<&str>,
+        env_extra: &[(&str, &str)],
+        enable_shell_token: bool,
+    ) -> io::Result<Self> {
+        Self::spawn_inner(argv, cwd, env_extra, enable_shell_token)
+    }
+
+    fn spawn_inner(
+        argv: &[&str],
+        cwd: Option<&str>,
+        env_extra: &[(&str, &str)],
+        enable_shell_token: bool,
+    ) -> io::Result<Self> {
         let argv_owned: Vec<String> = argv.iter().map(|value| (*value).to_string()).collect();
         let host_bridge = crate::host::is_flatpak();
         // Decide the directory once, before it is baked into the host-bridge
@@ -343,7 +483,27 @@ impl OwnedPty {
         shell_fallback_ptrs.push(executable_c.as_ptr());
         shell_fallback_ptrs.extend(c_argv.iter().skip(1).map(|argument| argument.as_ptr()));
         shell_fallback_ptrs.push(std::ptr::null());
-        let c_environment = child_environment(env_extra)?;
+        let mut c_environment = child_environment(env_extra)?;
+        let token_channel = if host_bridge || !enable_shell_token {
+            None
+        } else {
+            shell_token_channel()?
+        };
+        c_environment.retain(|entry| {
+            !entry.as_bytes().starts_with(b"FORGE_SHELL_INTEGRATION_FD=")
+                && !entry
+                    .as_bytes()
+                    .starts_with(b"FORGE_SHELL_INTEGRATION_TOKEN=")
+        });
+        if let Some((_, read_fd, _)) = token_channel.as_ref() {
+            c_environment.push(
+                CString::new(format!(
+                    "FORGE_SHELL_INTEGRATION_FD={}",
+                    read_fd.as_raw_fd()
+                ))
+                .map_err(|_| invalid_nul("shell integration fd environment"))?,
+            );
+        }
         let mut environment_ptrs: Vec<*const libc::c_char> =
             c_environment.iter().map(|entry| entry.as_ptr()).collect();
         environment_ptrs.push(std::ptr::null());
@@ -353,6 +513,14 @@ impl OwnedPty {
             open_working_directory(effective_cwd)
         };
         let cwd_fd = cwd_file.as_ref().map(AsRawFd::as_raw_fd).unwrap_or(-1);
+        let token_read_fd = token_channel
+            .as_ref()
+            .map(|(_, fd, _)| fd.as_raw_fd())
+            .unwrap_or(-1);
+        let token_write_fd = token_channel
+            .as_ref()
+            .map(|(_, _, fd)| fd.as_raw_fd())
+            .unwrap_or(-1);
 
         let initial_size = nix::pty::Winsize {
             ws_row: 24,
@@ -368,6 +536,9 @@ impl OwnedPty {
         match unsafe { unistd::fork() } {
             Ok(ForkResult::Child) => unsafe {
                 libc::close(master_fd);
+                if token_write_fd >= 0 {
+                    libc::close(token_write_fd);
+                }
                 if libc::setsid() < 0 || libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
                     libc::_exit(126);
                 }
@@ -388,6 +559,9 @@ impl OwnedPty {
                 if slave_fd > libc::STDERR_FILENO {
                     libc::close(slave_fd);
                 }
+                if token_read_fd >= 0 && libc::fcntl(token_read_fd, libc::F_SETFD, 0) < 0 {
+                    libc::_exit(126);
+                }
                 libc::execve(
                     executable_c.as_ptr(),
                     argv_ptrs.as_ptr(),
@@ -405,6 +579,25 @@ impl OwnedPty {
                 libc::_exit(if exec_error == libc::ENOENT { 127 } else { 126 });
             },
             Ok(ForkResult::Parent { child }) => {
+                let shell_integration_token =
+                    if let Some((token, read_fd, write_fd)) = token_channel {
+                        drop(read_fd);
+                        let mut writer = File::from(write_fd);
+                        if writer
+                            .write_all(format!("{token}\n").as_bytes())
+                            .and_then(|()| writer.flush())
+                            .is_err()
+                        {
+                            kill_and_reap_unreferenced(child);
+                            return Err(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "could not deliver the shell integration token",
+                            ));
+                        }
+                        Some(token)
+                    } else {
+                        None
+                    };
                 drop(slave);
                 let lifecycle = match ChildLifecycle::new(child.as_raw(), ReapOwner::Ours) {
                     Ok(lifecycle) => lifecycle,
@@ -428,6 +621,7 @@ impl OwnedPty {
                     input_guard: std::sync::Mutex::new(InputGuard::new()),
                     input_error_reported: AtomicBool::new(false),
                     shell_bracketed_paste: AtomicBool::new(false),
+                    shell_integration_token,
                 })
             }
             Err(error) => Err(io::Error::other(error)),
@@ -436,6 +630,10 @@ impl OwnedPty {
 
     pub fn pid_i32(&self) -> i32 {
         self.lifecycle.pid()
+    }
+
+    pub(crate) fn shell_integration_token(&self) -> Option<&str> {
+        self.shell_integration_token.as_deref()
     }
 
     /// Share this PTY's child lifecycle with a widget-tree teardown path.
@@ -459,6 +657,22 @@ impl OwnedPty {
             .unwrap_or(-1)
     }
 
+    /// Probe whether the interactive shell, rather than one of its foreground
+    /// jobs, currently owns this PTY. Syscall failures remain distinct from a
+    /// positive shell match so approval/observation paths can fail closed.
+    pub(crate) fn foreground_owner(&self) -> PtyForeground {
+        let fd = self.master_fd_raw();
+        let shell_pid = self.pid_i32();
+        if fd < 0 || shell_pid <= 0 {
+            return PtyForeground::Unknown;
+        }
+        // SAFETY: both calls are read-only probes. `fd` may be closed by a
+        // concurrent teardown; that race simply returns -1 and maps to Unknown.
+        let foreground_group = unsafe { libc::tcgetpgrp(fd) };
+        let shell_group = unsafe { libc::getpgid(shell_pid) };
+        classify_foreground(shell_group, foreground_group)
+    }
+
     /// Record the shell's DECSET/DECRST 2004 state.
     ///
     /// The block parser is the single owner of this mode: it is a real CSI state
@@ -476,6 +690,23 @@ impl OwnedPty {
 
     #[must_use = "terminal input may be rejected by bounded nonblocking backpressure"]
     pub fn write_bytes(&self, data: &[u8]) -> Result<(), PtyWriteError> {
+        self.write_bytes_with(data, |_, _| ())
+    }
+
+    /// Queue bytes and report the editor semantics that actually crossed the
+    /// central PTY filter. Native VTE commits use this so multiline truncation,
+    /// automatic paste framing, and marker removal cannot leave their local
+    /// command shadow ahead of the shell.
+    #[must_use = "terminal input may be rejected by bounded nonblocking backpressure"]
+    pub(crate) fn write_bytes_admitted(&self, data: &[u8]) -> Result<AdmittedInput, PtyWriteError> {
+        self.write_bytes_with(data, crate::pty_input::admitted_input)
+    }
+
+    fn write_bytes_with<T>(
+        &self,
+        data: &[u8],
+        observe: impl FnOnce(&[u8], bool) -> T,
+    ) -> Result<T, PtyWriteError> {
         if data.len() > MAX_PTY_INPUT_MESSAGE_BYTES {
             return Err(PtyWriteError::TooLarge {
                 bytes: data.len(),
@@ -485,38 +716,22 @@ impl OwnedPty {
         let modes = PasteModes {
             bracketed: self.shell_bracketed_paste(),
         };
-        // A poisoned guard would mean another thread panicked mid-filter; keep
-        // the choke point rather than letting writes bypass it.
-        let safe_data = {
-            let mut guard = self
-                .input_guard
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard
-                .filter(data, modes, boundary_paste_policy())
-                .into_owned()
-        };
-
-        if safe_data.is_empty() {
-            return Ok(());
-        }
-        if safe_data.len() > MAX_PTY_INPUT_MESSAGE_BYTES {
-            return Err(PtyWriteError::TooLarge {
-                bytes: safe_data.len(),
-                limit: MAX_PTY_INPUT_MESSAGE_BYTES,
-            });
-        }
         let input_tx = self
             .input_tx
             .lock()
             .ok()
             .and_then(|sender| sender.as_ref().cloned());
         let Some(input_tx) = input_tx else {
-            return Err(PtyWriteError::Closed {
-                bytes: safe_data.len(),
-            });
+            return Err(PtyWriteError::Closed { bytes: data.len() });
         };
-        let result = try_enqueue_input(&input_tx, safe_data);
+        // A poisoned guard would mean another thread panicked mid-filter; keep
+        // the choke point rather than letting writes bypass it. Hold it through
+        // queue admission so the frame state commits atomically with the bytes.
+        let mut guard = self
+            .input_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let result = filter_and_enqueue_input_with(&mut guard, &input_tx, data, modes, observe);
         if result.is_ok() {
             self.input_error_reported.store(false, Ordering::Relaxed);
         }
@@ -840,6 +1055,92 @@ mod tests {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn foreground_owner_never_conflates_probe_failure_with_the_shell() {
+        assert_eq!(classify_foreground(42, 42), PtyForeground::Shell);
+        assert_eq!(classify_foreground(42, 43), PtyForeground::Other);
+        assert_eq!(classify_foreground(-1, 42), PtyForeground::Unknown);
+        assert_eq!(classify_foreground(42, -1), PtyForeground::Unknown);
+        assert_eq!(classify_foreground(0, 0), PtyForeground::Unknown);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn token_pipe_is_private_bounded_and_above_standard_io() {
+        let (token, read_fd, write_fd) = shell_token_channel()
+            .expect("create token pipe")
+            .expect("Linux provides getrandom and pipe2");
+        assert_eq!(token.len(), 32);
+        assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(read_fd.as_raw_fd() > libc::STDERR_FILENO);
+        assert!(write_fd.as_raw_fd() > libc::STDERR_FILENO);
+
+        let mut writer = File::from(write_fd);
+        writer.write_all(format!("{token}\n").as_bytes()).unwrap();
+        drop(writer);
+        let mut reader = File::from(read_fd);
+        let mut delivered = String::new();
+        reader.read_to_string(&mut delivered).unwrap();
+        assert_eq!(delivered, format!("{token}\n"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bundled_bash_consumes_fd_and_announces_the_matching_token() {
+        let integration = format!(
+            "{}/scripts/shell-integration/forge.bash",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let pty = OwnedPty::spawn_with_shell_token(
+            &[
+                "/bin/bash",
+                "--noprofile",
+                "--rcfile",
+                integration.as_str(),
+                "-i",
+            ],
+            None,
+            &[("PS1", "forge-fd-test$ ")],
+            true,
+        )
+        .expect("spawn token-aware bash");
+        let token = pty
+            .shell_integration_token()
+            .expect("token was issued")
+            .to_string();
+        let ready = format!("\x1b]7771;{token}\x07");
+        let output = read_until(
+            pty.master_fd_raw(),
+            ready.as_bytes(),
+            Duration::from_secs(5),
+        );
+        assert!(
+            output
+                .windows(ready.len())
+                .any(|window| window == ready.as_bytes()),
+            "integration did not announce the issued token: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+
+        pty.write_bytes(
+            b"env | grep -Eq '^FORGE_SHELL_INTEGRATION_(FD|TOKEN)=' && echo FORGE_TOKEN_LEAK || echo FORGE_TOKEN_CLEAN\r",
+        )
+        .expect("queue environment check");
+        let output = read_until(
+            pty.master_fd_raw(),
+            b"FORGE_TOKEN_CLEAN",
+            Duration::from_secs(5),
+        );
+        assert!(
+            output
+                .windows(b"FORGE_TOKEN_CLEAN".len())
+                .any(|window| window == b"FORGE_TOKEN_CLEAN"),
+            "integration token metadata leaked into commands: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        pty.kill();
+    }
+
     /// True once `pid` is no longer a reapable child of this process, i.e. it
     /// left no zombie behind.
     fn is_fully_reaped(pid: i32) -> bool {
@@ -871,6 +1172,108 @@ mod tests {
                 limit: MAX_PTY_INPUT_MESSAGE_BYTES,
             })
         );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn rejected_paste_frame_transition_rolls_back_before_the_next_write() {
+        let modes = PasteModes { bracketed: false };
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.try_send(b"occupied".to_vec()).unwrap();
+        let mut guard = InputGuard::new();
+
+        assert!(matches!(
+            filter_and_enqueue_input(&mut guard, &sender, b"\x1b[200~", modes),
+            Err(PtyWriteError::QueueFull { .. })
+        ));
+        assert!(!guard.in_frame());
+        assert_eq!(receiver.try_recv().unwrap(), b"occupied");
+
+        filter_and_enqueue_input(&mut guard, &sender, b"one\ntwo", modes).unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), b"one");
+        assert!(!guard.in_frame());
+
+        drop(receiver);
+        assert!(matches!(
+            filter_and_enqueue_input(&mut guard, &sender, b"\x1b[200~", modes),
+            Err(PtyWriteError::Closed { .. })
+        ));
+        assert!(!guard.in_frame());
+    }
+
+    #[test]
+    fn observed_admission_matches_the_bytes_that_crossed_the_filter() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut guard = InputGuard::new();
+
+        let unframed = filter_and_enqueue_input_with(
+            &mut guard,
+            &sender,
+            b"one\rtwo",
+            PasteModes { bracketed: false },
+            crate::pty_input::admitted_input,
+        )
+        .unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), b"one");
+        assert_eq!(unframed.editor_bytes, b"one");
+        assert!(!unframed.submits_line);
+
+        let bracketed = filter_and_enqueue_input_with(
+            &mut guard,
+            &sender,
+            b"one\ntwo",
+            PasteModes { bracketed: true },
+            crate::pty_input::admitted_input,
+        )
+        .unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), b"\x1b[200~one\ntwo\x1b[201~");
+        assert_eq!(bracketed.editor_bytes, b"one\ntwo");
+        assert!(bracketed.had_framing);
+        assert!(!bracketed.submits_line);
+
+        let opener = filter_and_enqueue_input_with(
+            &mut guard,
+            &sender,
+            b"\x1b[200~",
+            PasteModes { bracketed: true },
+            crate::pty_input::admitted_input,
+        )
+        .unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), b"\x1b[200~");
+        assert!(opener.editor_bytes.is_empty());
+        let framed_body = filter_and_enqueue_input_with(
+            &mut guard,
+            &sender,
+            b"three\nfour",
+            PasteModes { bracketed: true },
+            crate::pty_input::admitted_input,
+        )
+        .unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), b"three\nfour");
+        assert_eq!(framed_body.editor_bytes, b"three\nfour");
+        assert!(framed_body.had_framing);
+        assert!(!framed_body.submits_line);
+        filter_and_enqueue_input(
+            &mut guard,
+            &sender,
+            b"\x1b[201~",
+            PasteModes { bracketed: true },
+        )
+        .unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), b"\x1b[201~");
+
+        let filtered_empty = filter_and_enqueue_input_with(
+            &mut guard,
+            &sender,
+            b"\x1b[201~",
+            PasteModes { bracketed: false },
+            crate::pty_input::admitted_input,
+        )
+        .unwrap();
+        assert_eq!(filtered_empty, AdmittedInput::default());
         assert!(matches!(
             receiver.try_recv(),
             Err(mpsc::TryRecvError::Empty)

@@ -39,7 +39,7 @@ mod tab_strip;
 mod tabs;
 mod zoom;
 
-pub(crate) use agent_panel::AgentHandle;
+pub(crate) use agent_panel::{AgentHandle, AgentUiLifetime};
 pub(crate) use ai_panel::AiPanel;
 pub(crate) use bottom_bar::build_bottom_bar;
 pub(crate) use command_palette::CommandSuggestionHandle;
@@ -162,6 +162,9 @@ pub(crate) struct UiState {
     /// The single active Shell Agent session, rendered as an inline card in
     /// its bound Block pane's conversation (not a dialog).
     pub(crate) agent_session: Rc<RefCell<Option<AgentHandle>>>,
+    /// Window-lifetime bounded Agent activity and one-shot TermView bridges.
+    /// This deliberately outlives individual Agent sessions and fresh tasks.
+    pub(crate) agent_ui_lifetime: Rc<AgentUiLifetime>,
     /// The single in-flight or reviewable natural-language command suggestion.
     /// Like the Shell Agent, it is pinned to the Block pane where it started.
     pub(crate) command_suggestion: Rc<RefCell<Option<CommandSuggestionHandle>>>,

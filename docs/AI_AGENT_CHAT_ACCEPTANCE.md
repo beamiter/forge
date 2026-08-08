@@ -17,7 +17,7 @@ source <(target/debug/forge --shell-integration bash)
 RUST_LOG=forge=debug target/debug/forge --mode block --no-restore
 ```
 
-provider 测试使用 loopback mock server 或可记录 argv、环境、stdin 与子进程 PID 的 `curl` stub。至少准备成功、延迟、401、429、500、断连、空内容、非法 JSON、迟到回复和超大响应 fixture。每项记录 `PASS/FAIL/N/A`、X11/Wayland、shell、provider、复现步骤和脱敏日志。
+provider 测试使用 loopback mock server 或可记录 argv、环境、stdin 与子进程 PID 的 `curl` stub。OpenAI-compatible loopback mock 必须启用 HTTPS：证书应包含实际使用的 `localhost`/loopback SAN，并仅在隔离测试进程通过 `CURL_CA_BUNDLE` 等 curl 信任配置加载测试 CA；不得使用 `-k` 或把 endpoint 降为 HTTP。至少准备成功、延迟、401、429、500、断连、空内容、非法 JSON、迟到回复和超大响应 fixture。每项记录 `PASS/FAIL/N/A`、X11/Wayland、shell、provider、复现步骤和脱敏日志。
 
 selected Block fixture：
 
@@ -47,7 +47,7 @@ python3 -c 'print("x" * 1000000)'
 | 编号 | 场景 | 通过标准 | 建议层级 |
 |---|---|---|---|
 | T-1 | Anthropic | endpoint、`x-api-key`、version header、system/history 与 token limit 符合协议；缺少密钥时离线失败并给出可操作提示。 | mock integration |
-| T-2 | OpenAI-compatible | endpoint、Bearer 可选鉴权、system/history 与 response shape 正确；无鉴权 loopback 服务可工作。 | mock integration |
+| T-2 | OpenAI-compatible | endpoint 必须为 HTTPS（loopback 也不例外）；Bearer 保持可选，HTTPS 无鉴权 loopback 服务可工作；system/history 与 response shape 正确。 | TLS mock integration |
 | T-3 | Ollama | `/api/chat`、`stream`/options、system/history 与 response shape 正确；无需密钥的本地服务可工作。 | mock integration |
 | T-4 | HTTP/协议错误 | 401、429、5xx、空内容、非法 JSON、断连和超时均转为有界、可复制且不含 secret 的错误；Retry 不重复提交旧 generation。 | mock integration |
 | T-5 | 凭据与进程 | API key、请求 body 与 URL 不出现在进程 argv、继承环境或普通日志；host bridge 与本机路径使用相同边界。 | process integration |
@@ -80,6 +80,10 @@ python3 -c 'print("x" * 1000000)'
 | A-10 | 禁止自动执行 | 旧 `agent_auto_approve_readonly` 配置仍可解析但始终归一化为关闭，并产生迁移警告；alias、function、Git helper、写入/执行 flag 或敏感读取均不得凭字符串分类跳过人工批准。每个 proposal 都必须呈现普通审阅卡，恢复会话同样不得自动运行。 | unit + PTY GUI |
 | A-11 | 会话中附加 Block | **Attach selected Block** 只在 Ready 且非 busy 时可用，只附加当前固定 pane 中明确选中的 finished block，可替换旧上下文并更新可见 chip；无选中块时给出可恢复提示且不改变已附加上下文。附加内容与开卡附加走同一 untrusted user-role 边界。 | unit + GUI |
 | A-12 | Git 环境元数据 | Agent 请求中的 branch/dirty/ahead/behind 经有界采样后与 cwd/shell/OS 一起作为 untrusted user-role JSON 发送，绝不进入 system prompt；probe 有超时且失败时请求照常发出（`git` 字段为 null）。 | unit |
+| A-13 | 执行能力握手 | **Approve & Run** 只在本机 native Block、直接交互式 bash/zsh 和当前 prompt 的 bundled private-FD handshake 同时成立时可用。remote、Flatpak host bridge、jsh/fish/pwsh/未知 shell 与 `-c` wrapper 必须 fail closed，但仍保留 Insert only。token 不得进入 argv、普通环境快照、日志或 execution journal。 | PTY + GUI |
+| A-14 | 两阶段逐字验证 | 审核命令先无 Enter 插入；VTE 必须证明 anchor→cursor 与审核文本逐字相等且严格无 suffix，之后才能单独提交 Enter。C 前可见 redraw、C 身份不匹配、无 C 超时、leading/trailing whitespace、右提示/autosuggestion 均不得伪装成成功；Enter 已发送后的不确定状态必须提示“另一命令可能已启动，请先检查终端”。 | unit + adversarial PTY GUI |
+
+Agent 自动执行把用户选择的 shell rc、functions、hooks 与 key bindings 视为可信配置；private-FD token 用于阻断普通外部子进程输出的误关联，不宣称能对抗同一交互 shell 中主动读取/伪造私有状态的恶意代码。发布结果必须注明实际验收 shell；当前严格 GUI/PTY 主链以 bundled bash integration 为基线，zsh 需独立 smoke，其他 shell 只能计 Insert-only。
 
 ### Privacy、accessibility 与性能
 
