@@ -2230,11 +2230,20 @@ impl FinishedBlock {
 pub(crate) struct ActiveBlock {
     pub(crate) widget: gtk4::Box,
     pub(crate) active_vte: Terminal,
+    /// Pass-through, non-measuring surface for small live widgets that should
+    /// inhabit the running terminal without changing its grid.  The live VTE
+    /// remains the overlay's measured child, and the scrollbar is stacked
+    /// above this surface so an organism can never make it unreachable.
+    pub(crate) live_organism_surface: gtk4::Fixed,
     /// Slim overlay scrollbar bound to the live VTE's own adjustment, so the
     /// still-running command's scrollback is visibly navigable. An overlay —
     /// not a sibling like the finished-block scrollbar — because appearing
     /// mid-command must not narrow the grid and SIGWINCH the child.
     pub(crate) live_scrollbar: gtk4::Scrollbar,
+    /// The feature-level visibility requested by the organism runtime.  Alt
+    /// screen temporarily overrides it without losing the requested state.
+    live_organism_visible: Cell<bool>,
+    live_organism_alt_screen: Cell<bool>,
     /// Raw output bytes accumulated during CollectingOutput, consumed by the
     /// finalize path to build the styled finished block (anvil's `out_buf`).
     raw_output: Rc<RefCell<BoundedByteRing>>,
@@ -2264,12 +2273,27 @@ impl ActiveBlock {
         vte_overlay.set_hexpand(true);
         vte_overlay.set_vexpand(false);
         vte_overlay.set_child(Some(&active_vte));
+
+        let live_organism_surface = gtk4::Fixed::new();
+        live_organism_surface.set_hexpand(true);
+        live_organism_surface.set_vexpand(true);
+        live_organism_surface.set_halign(gtk4::Align::Fill);
+        live_organism_surface.set_valign(gtk4::Align::Fill);
+        live_organism_surface.set_overflow(gtk4::Overflow::Hidden);
+        live_organism_surface.set_can_target(false);
+        live_organism_surface.set_focusable(false);
+        live_organism_surface.set_visible(false);
+        vte_overlay.add_overlay(&live_organism_surface);
+        vte_overlay.set_measure_overlay(&live_organism_surface, false);
+        vte_overlay.set_clip_overlay(&live_organism_surface, true);
+
         let live_scrollbar =
             gtk4::Scrollbar::new(Orientation::Vertical, active_vte.vadjustment().as_ref());
         live_scrollbar.add_css_class("block-output-scrollbar");
         live_scrollbar.set_tooltip_text(Some("Scroll within the running output"));
         live_scrollbar.set_halign(gtk4::Align::End);
         live_scrollbar.set_visible(false);
+        // Add the scrollbar last: GTK paints later overlays above earlier ones.
         vte_overlay.add_overlay(&live_scrollbar);
         widget.append(&vte_overlay);
         // Same adjustment-driven visibility as the finished-block scrollbar:
@@ -2298,7 +2322,10 @@ impl ActiveBlock {
         ActiveBlock {
             widget,
             active_vte,
+            live_organism_surface,
             live_scrollbar,
+            live_organism_visible: Cell::new(false),
+            live_organism_alt_screen: Cell::new(false),
             raw_output: Rc::new(RefCell::new(BoundedByteRing::new(
                 super::MAX_RAW_OUTPUT_BYTES,
             ))),
@@ -2356,6 +2383,25 @@ impl ActiveBlock {
 
     pub(crate) fn grab_focus(&self) {
         self.active_vte.grab_focus();
+    }
+
+    pub(crate) fn set_live_organism_visible(&self, visible: bool) {
+        self.live_organism_visible.set(visible);
+        self.sync_live_organism_visibility();
+    }
+
+    pub(crate) fn set_live_organism_alt_screen(&self, alt_screen: bool) {
+        self.live_organism_alt_screen.set(alt_screen);
+        self.sync_live_organism_visibility();
+    }
+
+    pub(crate) fn live_organism_alt_screen(&self) -> bool {
+        self.live_organism_alt_screen.get()
+    }
+
+    fn sync_live_organism_visibility(&self) {
+        self.live_organism_surface
+            .set_visible(self.live_organism_visible.get() && !self.live_organism_alt_screen.get());
     }
 }
 

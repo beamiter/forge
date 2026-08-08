@@ -87,10 +87,18 @@ ascii_organism_enabled = true
 
 临时试用可设置 `FORGE_ASCII_ORGANISM_ENABLED=1`；修改该键后需新建 Block
 pane 或重启 Forge。它监听 Forge 从 OSC 133
-边界捕获的真实 command start/finished 事件，在 live prompt 上方的 inline
-widget 中观察 build/test、检查非零退出，并在失败后成功或 `git push` 时作出
-克制反应。该 widget 不进入 PTY、Block 历史或输出采样，不执行任何命令，也
-不发送网络请求；VTE pane 不显示。连续状态与按“本地日期 + 完整 Git 根路径”
+边界捕获的真实 command start/finished 事件。生命体平时沿 live terminal surface
+缓慢移动，命令运行时靠近输出区观察；用户上滚查看历史时，它缩成 sticky header
+里的单行形态。PTY 真正接收键入、粘贴或进程控制键后，它会暂时退到 prompt
+之外；Agent、纠错和命令面板的程序化写入不会伪装成真人输入。alternate screen
+和放不下完整 sprite 的窄小 surface 会直接隐藏空间身体，结果仍保留在 prompt
+上方的 inline widget。图层不参与 GTK 测量、不改变 PTY 行列、不可点击，也不向
+PTY 注入 ANSI；VTE pane 不显示。
+
+感知只在内存中保留“不含内容”的 accepted-input/output-activity 脉冲，不记录
+按键、剪贴板或输出文本。它会观察 build/test、检查非零退出，并在失败后成功或
+`git push` 时作出克制反应；不执行任何命令，也不发送网络请求。连续状态与按
+“本地日期 + 完整 Git 根路径”
 隔离的失败、恢复耗时和 push 统计会私密地保存到
 `${XDG_STATE_HOME:-~/.local/state}/forge/ascii-organism-native.json`。状态文件有大小、
 schema、权限和跨进程事务边界；损坏或未来版本会停用持久化而不会被默认值覆盖。

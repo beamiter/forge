@@ -385,6 +385,41 @@ pub(crate) fn install_block_css(config: &Config) {
             font-family: "{font_family}";
             font-weight: bold;
         }}
+        .organism-live-body {{
+            color: {agent_hex};
+            background-color: rgba({bg_r},{bg_g},{bg_b},0.80);
+            border: 1px solid rgba({agent_r},{agent_g},{agent_b},0.32);
+            border-radius: 6px;
+            padding: 3px 6px;
+            font-family: "{font_family}";
+            font-size: {font_size};
+            font-weight: bold;
+        }}
+        .organism-live-body.organism-active {{
+            color: {accent};
+            border-color: rgba({acc_r},{acc_g},{acc_b},0.50);
+        }}
+        .organism-live-body.organism-success {{
+            color: {ok_hex};
+            border-color: rgba({ok_r},{ok_g},{ok_b},0.50);
+        }}
+        .organism-live-body.organism-error {{
+            color: {err_hex};
+            border-color: rgba({err_r},{err_g},{err_b},0.55);
+        }}
+        .organism-live-body.organism-warning {{
+            color: {warn_hex};
+            border-color: rgba({warn_r},{warn_g},{warn_b},0.50);
+        }}
+        .organism-sticky-avatar {{
+            color: {agent_hex};
+            font-family: "{font_family}";
+            font-weight: bold;
+            margin-right: 6px;
+        }}
+        .organism-sticky-avatar.organism-error {{ color: {err_hex}; }}
+        .organism-sticky-avatar.organism-success {{ color: {ok_hex}; }}
+        .organism-sticky-avatar.organism-warning {{ color: {warn_hex}; }}
         .organism-title {{
             color: {fg_hex};
             font-weight: bold;

@@ -1540,6 +1540,55 @@ const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 /// viewport winsize via `pty_grid_size`.
 const MIN_INPUT_ROWS: i32 = 6;
 
+/// Keep moving bodies clear of the live output scrollbar.  The overlay itself
+/// remains full-width so clipping is exact; callers subtract this from the
+/// reported width when choosing an x coordinate.
+const LIVE_ORGANISM_RIGHT_GUTTER: i32 = 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LiveOrganismSurfaceMetrics {
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+    pub(crate) cell_width: i32,
+    pub(crate) cell_height: i32,
+    pub(crate) right_gutter: i32,
+    pub(crate) alt_screen: bool,
+}
+
+/// Accepted direct-human input, intentionally containing no typed bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HumanInputKind {
+    Keyboard,
+    Clipboard,
+    ProcessControl,
+    StickyStop,
+}
+
+/// Every PTY-writing UI path is classified at its origin.  Only direct-human
+/// origins cross the organism callback boundary; Agent, correction, command
+/// palette and other callers all share `TermView::write_input` and therefore
+/// remain programmatic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputOrigin {
+    VteCommit,
+    Clipboard,
+    RunningControl,
+    StickyStop,
+    Programmatic,
+}
+
+impl InputOrigin {
+    fn human_kind(self) -> Option<HumanInputKind> {
+        match self {
+            Self::VteCommit => Some(HumanInputKind::Keyboard),
+            Self::Clipboard => Some(HumanInputKind::Clipboard),
+            Self::RunningControl => Some(HumanInputKind::ProcessControl),
+            Self::StickyStop => Some(HumanInputKind::StickyStop),
+            Self::Programmatic => None,
+        }
+    }
+}
+
 /// `(command, exit status, output sample, Agent generation, duration ms)`. The
 /// status is `None` when the shell reported none, so every observer has to
 /// decide what that means for it rather than being handed a 0 that reads as
@@ -1568,6 +1617,7 @@ pub(crate) struct CommandFinishedEvent {
 
 type CommandStartedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandStartedEvent)>>>>;
 type CommandFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandFinishedEvent)>>>>;
+type HumanInputCallbacks = Rc<RefCell<Vec<Box<dyn Fn(HumanInputKind)>>>>;
 
 fn emit_command_started(callbacks: &CommandStartedCallbacks, event: CommandStartedEvent) {
     for callback in callbacks.borrow().iter() {
@@ -1578,6 +1628,15 @@ fn emit_command_started(callbacks: &CommandStartedCallbacks, event: CommandStart
 fn emit_command_finished(callbacks: &CommandFinishedCallbacks, event: CommandFinishedEvent) {
     for callback in callbacks.borrow().iter() {
         callback(event.clone());
+    }
+}
+
+fn emit_accepted_input(callbacks: &HumanInputCallbacks, origin: InputOrigin) {
+    let Some(kind) = origin.human_kind() else {
+        return;
+    };
+    for callback in callbacks.borrow().iter() {
+        callback(kind);
     }
 }
 
@@ -1635,6 +1694,7 @@ pub struct TermView {
     bell_callbacks: VoidCallbacks,
     title_callbacks: StrCallbacks,
     activity_callbacks: VoidCallbacks,
+    human_input_callbacks: HumanInputCallbacks,
     mouse_reporting_mode: Rc<Cell<MouseReportingMode>>,
     /// Whether the shell has enabled DECSET 2004. Clipboard input is written
     /// directly to our PTY, so block mode must apply this wrapper itself.
@@ -1674,6 +1734,10 @@ pub struct TermView {
     /// Periodic sticky-header refresh. Remove it explicitly on tab close so its
     /// GTK captures cannot retain a detached block tree.
     sticky_timer_id: RefCell<Option<glib::SourceId>>,
+    /// Optional compact avatar owned by the organism runtime.  The sticky
+    /// refresh makes this slot visible only for a running command while the
+    /// user is reading history.
+    sticky_organism_slot: gtk4::Box,
     /// Tracks per-VTE selections so a drag that crosses block boundaries can be
     /// copied as one contiguous string via Ctrl+Shift+C.
     cross_selection: Rc<CrossSelection>,
@@ -3553,7 +3617,9 @@ fn enter_alt_screen_chrome(
     sticky: &gtk4::Box,
     jump_fab: &gtk4::Button,
 ) {
-    active.borrow().widget().add_css_class("block-fullscreen");
+    let active = active.borrow();
+    active.widget().add_css_class("block-fullscreen");
+    active.set_live_organism_alt_screen(true);
     sticky.set_visible(false);
     jump_fab.set_visible(false);
 }
@@ -3565,10 +3631,9 @@ fn exit_alt_screen_chrome(
     user_scrolled: bool,
     unread: u32,
 ) {
-    active
-        .borrow()
-        .widget()
-        .remove_css_class("block-fullscreen");
+    let active = active.borrow();
+    active.widget().remove_css_class("block-fullscreen");
+    active.set_live_organism_alt_screen(false);
     sticky.set_visible(false);
     if user_scrolled {
         set_jump_fab_label(jump_fab, unread);
@@ -4259,8 +4324,13 @@ impl TermView {
         sticky_stop_btn.add_css_class("flat");
         sticky_stop_btn.set_focusable(false);
         sticky_stop_btn.set_visible(false);
+        let sticky_organism_slot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        sticky_organism_slot.set_can_target(false);
+        sticky_organism_slot.set_focusable(false);
+        sticky_organism_slot.set_visible(false);
         let sticky_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         sticky_bar.add_css_class("sticky-running-header");
+        sticky_bar.append(&sticky_organism_slot);
         sticky_bar.append(&sticky_label);
         sticky_bar.append(&sticky_stop_btn);
         sticky_bar.append(&sticky_jump_bottom_btn);
@@ -4523,6 +4593,7 @@ impl TermView {
         }
         let title_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
         let activity_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
+        let human_input_callbacks: HumanInputCallbacks = Rc::new(RefCell::new(vec![]));
         let command_started_callbacks: CommandStartedCallbacks = Rc::new(RefCell::new(vec![]));
         let command_finished_callbacks: CommandFinishedCallbacks = Rc::new(RefCell::new(vec![]));
         let block_finished_callbacks: BlockFinishedCallbacks = Rc::new(RefCell::new(vec![]));
@@ -4956,12 +5027,15 @@ impl TermView {
         {
             let pty_for_stop = pty.clone();
             let hold_for_stop = selection_feed_hold.clone();
+            let human_input_for_stop = human_input_callbacks.clone();
             sticky_stop_btn.connect_clicked(move |_| {
                 // Resume a parked feed first so the ^C echo and the command's
                 // shutdown output are visible immediately.
                 hold_for_stop.flush_now();
                 if let Err(error) = pty_for_stop.write_bytes(b"\x03") {
                     pty_for_stop.report_write_error("could not queue interrupt", error);
+                } else {
+                    emit_accepted_input(&human_input_for_stop, InputOrigin::StickyStop);
                 }
             });
         }
@@ -4970,6 +5044,7 @@ impl TermView {
             let sticky_label = sticky_label.clone();
             let sticky_jump_bottom = sticky_jump_bottom_btn.clone();
             let sticky_stop = sticky_stop_btn.clone();
+            let sticky_organism = sticky_organism_slot.clone();
             let sticky_target = sticky_target_id.clone();
             let sticky_minimized = sticky_minimized.clone();
             let cmd_running = cmd_running.clone();
@@ -4988,6 +5063,7 @@ impl TermView {
                     sticky_target.set(None);
                     sticky_jump_bottom.set_visible(false);
                     sticky_stop.set_visible(false);
+                    sticky_organism.set_visible(false);
                     sticky.set_visible(false);
                     return glib::ControlFlow::Continue;
                 }
@@ -4995,6 +5071,7 @@ impl TermView {
                     sticky_target.set(None);
                     sticky_jump_bottom.set_visible(false);
                     sticky_stop.set_visible(false);
+                    sticky_organism.set_visible(false);
                     sticky.set_visible(false);
                     return glib::ControlFlow::Continue;
                 }
@@ -5002,6 +5079,11 @@ impl TermView {
                     sticky_target.set(None);
                     sticky_jump_bottom.set_visible(false);
                     sticky_stop.set_visible(!minimized);
+                    sticky_organism.set_visible(
+                        sticky_organism
+                            .first_child()
+                            .is_some_and(|child| child.is_visible()),
+                    );
                     let cmd = running_cmd.borrow();
                     let cmd_disp = cmd.trim();
                     let elapsed = block_start_time
@@ -5047,6 +5129,7 @@ impl TermView {
                 });
                 if let Some((id, command, long_output)) = candidate {
                     sticky_target.set(Some(id));
+                    sticky_organism.set_visible(false);
                     let command = if command.is_empty() {
                         "Background output".to_string()
                     } else {
@@ -5062,6 +5145,7 @@ impl TermView {
                     sticky_target.set(None);
                     sticky_jump_bottom.set_visible(false);
                     sticky_stop.set_visible(false);
+                    sticky_organism.set_visible(false);
                     sticky.set_visible(false);
                 }
                 glib::ControlFlow::Continue
@@ -5086,6 +5170,7 @@ impl TermView {
             let selected_block_ids_for_commit = selected_block_ids.clone();
             let selected_block_id_for_commit = selected_block_id.clone();
             let selection_anchor_id_for_commit = selection_anchor_id.clone();
+            let human_input_for_commit = human_input_callbacks.clone();
             active_vte.connect_commit(move |_, text, _size| {
                 let awaiting_command = bstate_for_commit.get() == BlockState::AwaitingCommand;
                 let shadow_rollback = awaiting_command
@@ -5117,6 +5202,8 @@ impl TermView {
                     return;
                 }
 
+                emit_accepted_input(&human_input_for_commit, InputOrigin::VteCommit);
+
                 // Only accepted terminal input exits block-selection mode.
                 // Otherwise a saturated queue would mutate UI/editor state
                 // even though the shell never received the keystroke.
@@ -5142,6 +5229,7 @@ impl TermView {
         {
             let pty_for_root_key = pty.clone();
             let bstate_for_root_key = bstate.clone();
+            let human_input_for_root_key = human_input_callbacks.clone();
             let root_key = gtk4::EventControllerKey::new();
             root_key.set_propagation_phase(gtk4::PropagationPhase::Capture);
             root_key.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
@@ -5156,6 +5244,8 @@ impl TermView {
                     if let Err(error) = pty_for_root_key.write_bytes(bytes) {
                         pty_for_root_key
                             .report_write_error("could not queue process-control key", error);
+                    } else {
+                        emit_accepted_input(&human_input_for_root_key, InputOrigin::RunningControl);
                     }
                     return glib::Propagation::Stop;
                 }
@@ -5450,6 +5540,7 @@ impl TermView {
             bell_callbacks,
             title_callbacks,
             activity_callbacks,
+            human_input_callbacks,
             mouse_reporting_mode,
             bracketed_paste,
             config: Rc::new(RefCell::new(config.clone())),
@@ -5474,6 +5565,7 @@ impl TermView {
             history_load_poll_id: RefCell::new(None),
             resize_tick_id: RefCell::new(None),
             sticky_timer_id: RefCell::new(Some(sticky_timer_id)),
+            sticky_organism_slot,
             cross_selection,
             command_started_callbacks,
             command_finished_callbacks,
@@ -5632,6 +5724,71 @@ impl TermView {
         self.root.clone().upcast()
     }
 
+    /// Attach a pass-through body to the live VTE overlay.  Repeating this for
+    /// the same body acts as a move; a widget owned by another container is
+    /// rejected instead of being silently reparented.
+    pub(crate) fn put_live_organism_body(&self, body: &gtk4::Widget, x: f64, y: f64) -> bool {
+        if !x.is_finite() || !y.is_finite() {
+            return false;
+        }
+        let surface = self.active.borrow().live_organism_surface.clone();
+        let surface_widget: gtk4::Widget = surface.clone().upcast();
+        match body.parent() {
+            None => surface.put(body, x, y),
+            Some(parent) if parent == surface_widget => surface.move_(body, x, y),
+            Some(_) => return false,
+        }
+        true
+    }
+
+    /// Move an already-attached body without changing terminal layout.
+    pub(crate) fn move_live_organism_body(&self, body: &gtk4::Widget, x: f64, y: f64) -> bool {
+        if !x.is_finite() || !y.is_finite() {
+            return false;
+        }
+        let surface = self.active.borrow().live_organism_surface.clone();
+        let surface_widget: gtk4::Widget = surface.clone().upcast();
+        if body.parent().as_ref() != Some(&surface_widget) {
+            return false;
+        }
+        surface.move_(body, x, y);
+        true
+    }
+
+    /// Request body visibility.  An alternate-screen app always wins while it
+    /// owns the pane; leaving it restores this requested value.
+    pub(crate) fn set_live_organism_visible(&self, visible: bool) {
+        self.active.borrow().set_live_organism_visible(visible);
+    }
+
+    pub(crate) fn live_organism_surface_metrics(&self) -> LiveOrganismSurfaceMetrics {
+        let active = self.active.borrow();
+        LiveOrganismSurfaceMetrics {
+            // The surface starts hidden, so GTK may not allocate it yet.  The
+            // always-allocated VTE is the overlay's measured child and has the
+            // same clipped coordinate space once the surface is shown.
+            width: active.active_vte.width().max(0),
+            height: active.active_vte.height().max(0),
+            cell_width: (active.active_vte.char_width() as i32).max(1),
+            cell_height: (active.active_vte.char_height() as i32).max(1),
+            right_gutter: LIVE_ORGANISM_RIGHT_GUTTER,
+            alt_screen: active.live_organism_alt_screen(),
+        }
+    }
+
+    /// Attach a separate compact avatar to the sticky running-command header.
+    /// Its slot is shown only when that header represents a running command,
+    /// never for a pinned finished block.
+    pub(crate) fn put_sticky_organism_avatar(&self, avatar: &gtk4::Widget) -> bool {
+        let slot_widget: gtk4::Widget = self.sticky_organism_slot.clone().upcast();
+        match avatar.parent() {
+            None => self.sticky_organism_slot.append(avatar),
+            Some(parent) if parent == slot_widget => {}
+            Some(_) => return false,
+        }
+        true
+    }
+
     fn clear_block_selection_for_input(&self) {
         if self.selected_block_id.get().is_none() {
             return;
@@ -5667,6 +5824,10 @@ impl TermView {
             self.idle_input_dirty.set(previous_idle_dirty);
             return Err(error);
         }
+        // `write_input` is the shared Agent/correction/palette boundary.  Feed
+        // it through the origin gate so future callback refactors cannot make
+        // accepted programmatic bytes look like human attention.
+        emit_accepted_input(&self.human_input_callbacks, InputOrigin::Programmatic);
         if changed_editor && self.selected_block_id.get().is_some() {
             let finished = self.finished_blocks.borrow();
             clear_finished_block_selection(
@@ -5893,6 +6054,7 @@ impl TermView {
         let selected_block_id = self.selected_block_id.clone();
         let selection_anchor_id = self.selection_anchor_id.clone();
         let active = self.active.clone();
+        let human_input_callbacks = self.human_input_callbacks.clone();
         clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
             let Ok(Some(text)) = result else {
                 return;
@@ -5930,6 +6092,7 @@ impl TermView {
                 pty.report_write_error("could not queue clipboard paste", error);
                 return;
             }
+            emit_accepted_input(&human_input_callbacks, InputOrigin::Clipboard);
             if selected_block_id.get().is_some() {
                 let finished = finished_blocks.borrow();
                 clear_finished_block_selection(
@@ -5965,6 +6128,12 @@ impl TermView {
 
     pub fn connect_activity<F: Fn() + 'static>(&self, f: F) {
         self.activity_callbacks.borrow_mut().push(Box::new(f));
+    }
+
+    /// Observe accepted direct-human PTY input without exposing its contents.
+    /// Programmatic `write_input`/Agent/correction paths are origin-gated out.
+    pub(crate) fn connect_human_input<F: Fn(HumanInputKind) + 'static>(&self, f: F) {
+        self.human_input_callbacks.borrow_mut().push(Box::new(f));
     }
 
     /// Observe a foreground command after Forge has captured its authoritative
@@ -6475,9 +6644,10 @@ mod tests {
         strip_ansi_with_clear_detect, take_background_output, truncate_plain_output_for_height,
         viewport_page_size_changed, viewport_state_for_scroll, visible_indices_for_viewport,
         vte_commit_shadow_rollback, BlockData, BlockState, BoundedByteRing, CommandFinishedEvent,
-        CommandMeta, CommandPromptStatus, CommandStartedEvent, DynamicColors, PendingCommandMeta,
-        ViewportState, MAX_COMMAND_CAPTURE_BYTES, MAX_JOURNAL_OUTPUT_BYTES,
-        MAX_PROMPT_CAPTURE_BYTES, MAX_RAW_OUTPUT_BYTES, TRUNCATED_COMMAND_PLACEHOLDER,
+        CommandMeta, CommandPromptStatus, CommandStartedEvent, DynamicColors, HumanInputKind,
+        InputOrigin, PendingCommandMeta, ViewportState, MAX_COMMAND_CAPTURE_BYTES,
+        MAX_JOURNAL_OUTPUT_BYTES, MAX_PROMPT_CAPTURE_BYTES, MAX_RAW_OUTPUT_BYTES,
+        TRUNCATED_COMMAND_PLACEHOLDER,
     };
     use crate::parser::{ColorKind, KeyboardProtocolQuery, ParserEvent};
     use gtk4::gdk::RGBA;
@@ -7683,6 +7853,40 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn input_origin_gate_exposes_only_direct_human_sources() {
+        assert_eq!(
+            InputOrigin::VteCommit.human_kind(),
+            Some(HumanInputKind::Keyboard)
+        );
+        assert_eq!(
+            InputOrigin::Clipboard.human_kind(),
+            Some(HumanInputKind::Clipboard)
+        );
+        assert_eq!(
+            InputOrigin::RunningControl.human_kind(),
+            Some(HumanInputKind::ProcessControl)
+        );
+        assert_eq!(
+            InputOrigin::StickyStop.human_kind(),
+            Some(HumanInputKind::StickyStop)
+        );
+        assert_eq!(InputOrigin::Programmatic.human_kind(), None);
+
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let callbacks: super::HumanInputCallbacks = Rc::new(RefCell::new(Vec::new()));
+        {
+            let seen = seen.clone();
+            callbacks
+                .borrow_mut()
+                .push(Box::new(move |kind| seen.borrow_mut().push(kind)));
+        }
+        super::emit_accepted_input(&callbacks, InputOrigin::Programmatic);
+        assert!(seen.borrow().is_empty());
+        super::emit_accepted_input(&callbacks, InputOrigin::VteCommit);
+        assert_eq!(*seen.borrow(), vec![HumanInputKind::Keyboard]);
     }
 
     #[test]
