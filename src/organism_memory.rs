@@ -22,6 +22,9 @@ const MAX_MEMORY_BYTES: u64 = 512 * 1024;
 const MAX_DAILY_RECORDS: usize = 64;
 const MAX_OBSERVATIONS: usize = 256;
 const MAX_OBSERVATIONS_PER_RECORD: usize = 64;
+/// Individual build durations are capped before aggregation so a clock jump
+/// or pathological command can never distort the per-repo baseline.
+const MAX_TRACKED_BUILD_MS: u64 = 21_600_000;
 const MAX_RECENT_EVENT_IDS: usize = 512;
 const MAX_EVENT_ID_BYTES: usize = 96;
 const MAX_PENDING_MEMORY_EVENTS: usize = 256;
@@ -126,6 +129,14 @@ struct DailyStats {
     baseline: Option<StatsBaseline>,
     #[serde(default)]
     observations: Vec<Observation>,
+    /// Saturating aggregates of successful build/test wall times — scalars
+    /// only, never command text. Accumulated directly by `apply_event` and
+    /// deliberately outside the observation replay, mirroring how late
+    /// compacted events only bump monotonic counters.
+    #[serde(default)]
+    build_duration_sum_ms: u64,
+    #[serde(default)]
+    build_duration_count: u32,
 }
 
 impl DailyStats {
@@ -142,6 +153,8 @@ impl DailyStats {
             recovered_pending_push: false,
             baseline: None,
             observations: Vec::new(),
+            build_duration_sum_ms: 0,
+            build_duration_count: 0,
         }
     }
 
@@ -290,6 +303,13 @@ impl DiskMemory {
                     "ASCII organism memory has an inconsistent recovery marker",
                 ));
             }
+            if stats.build_duration_sum_ms
+                > u64::from(stats.build_duration_count).saturating_mul(MAX_TRACKED_BUILD_MS)
+            {
+                return Err(invalid(
+                    "ASCII organism memory has an inconsistent build-duration aggregate",
+                ));
+            }
             if stats.observations.len() > MAX_OBSERVATIONS_PER_RECORD
                 || (!stats.observations.is_empty() && stats.baseline.is_none())
             {
@@ -430,6 +450,10 @@ pub(crate) struct MemoryEvent {
     repo: Option<String>,
     kind: CommandKind,
     exit_code: Option<i32>,
+    /// Wall time of the finished command; a content-free scalar feeding the
+    /// per-repo build-duration baseline. Never persisted as an event — only
+    /// the bounded aggregates reach disk.
+    duration_ms: Option<u64>,
     life: LifeSnapshot,
 }
 
@@ -439,6 +463,7 @@ impl MemoryEvent {
         exit_code: Option<i32>,
         repo: Option<String>,
         life: LifeState,
+        duration_ms: Option<u64>,
     ) -> Self {
         let at_ms = unix_ms();
         Self {
@@ -448,6 +473,7 @@ impl MemoryEvent {
             repo,
             kind,
             exit_code,
+            duration_ms,
             life: LifeSnapshot::from_state(life),
         }
     }
@@ -468,8 +494,15 @@ impl MemoryEvent {
             repo: repo.map(str::to_owned),
             kind,
             exit_code,
+            duration_ms: None,
             life: LifeSnapshot::from_state(life),
         }
+    }
+
+    #[cfg(test)]
+    fn with_duration(mut self, duration_ms: Option<u64>) -> Self {
+        self.duration_ms = duration_ms;
+        self
     }
 }
 
@@ -480,6 +513,9 @@ pub(crate) struct MemoryInsight {
     pub(crate) push_after_recovery: bool,
     pub(crate) faster_than_yesterday: bool,
     pub(crate) repo_remembered: bool,
+    /// Mean successful build/test wall time across every remembered day of
+    /// this repo, once at least three samples exist.
+    pub(crate) typical_build_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -634,6 +670,22 @@ fn apply_event(memory: &mut DiskMemory, event: &MemoryEvent) -> MemoryInsight {
     if memory.has_event_id(&event.id) {
         return insight;
     }
+    // Duration aggregates live outside the replayed observation window: they
+    // are bounded monotone scalars, accumulated exactly once per event id.
+    if kind == ObservationKind::BuildSuccess {
+        if let Some(duration) = event.duration_ms {
+            let stats = memory.stats_mut(event.day, repo);
+            // Once the count saturates the pair must stop moving together,
+            // or the sum could outgrow the count*cap validation invariant
+            // and wedge persistence fail-closed.
+            if stats.build_duration_count < u32::MAX {
+                stats.build_duration_sum_ms = stats
+                    .build_duration_sum_ms
+                    .saturating_add(duration.min(MAX_TRACKED_BUILD_MS));
+                stats.build_duration_count = stats.build_duration_count.saturating_add(1);
+            }
+        }
+    }
 
     let replay = {
         let stats = memory.stats_mut(event.day, repo);
@@ -696,6 +748,19 @@ fn apply_event(memory: &mut DiskMemory, event: &MemoryEvent) -> MemoryInsight {
     }
     insight.faster_than_yesterday =
         insight.push_after_recovery && faster_than_previous_day(memory, event.day, repo);
+    let (duration_sum, duration_count) = memory
+        .days
+        .iter()
+        .filter(|stats| stats.repo == repo)
+        .fold((0u64, 0u32), |(sum, count), stats| {
+            (
+                sum.saturating_add(stats.build_duration_sum_ms),
+                count.saturating_add(stats.build_duration_count),
+            )
+        });
+    if duration_count >= 3 {
+        insight.typical_build_ms = Some(duration_sum / u64::from(duration_count));
+    }
     insight
 }
 
@@ -1541,6 +1606,73 @@ mod tests {
     }
 
     #[test]
+    fn build_durations_aggregate_once_per_event_and_yield_a_baseline() {
+        let repo = "/work/forge";
+        let day = 60_000;
+        let mut memory = DiskMemory::default();
+        let success = |at_ms: u64, duration: Option<u64>| {
+            MemoryEvent::fixed(
+                at_ms,
+                day,
+                Some(repo),
+                CommandKind::BuildOrTest,
+                Some(0),
+                LifeState::default(),
+            )
+            .with_duration(duration)
+        };
+
+        let first = success(1_000, Some(30_000));
+        let one = apply_event(&mut memory, &first);
+        assert_eq!(one.typical_build_ms, None, "needs three samples");
+        // An ambiguous retry of the same event id is a byte-for-byte no-op.
+        apply_event(&mut memory, &first);
+        apply_event(&mut memory, &success(2_000, Some(60_000)));
+        let insight = apply_event(&mut memory, &success(3_000, Some(90_000)));
+        assert_eq!(insight.typical_build_ms, Some(60_000));
+
+        let stats = memory.stats(day, repo).unwrap();
+        assert_eq!(stats.build_duration_sum_ms, 180_000);
+        assert_eq!(stats.build_duration_count, 3);
+        memory.validate().unwrap();
+
+        // Failures and duration-less successes never touch the aggregate,
+        // and a pathological duration is capped before it lands.
+        apply_event(
+            &mut memory,
+            &MemoryEvent::fixed(
+                4_000,
+                day,
+                Some(repo),
+                CommandKind::BuildOrTest,
+                Some(1),
+                LifeState::default(),
+            )
+            .with_duration(Some(500_000)),
+        );
+        apply_event(&mut memory, &success(5_000, None));
+        apply_event(&mut memory, &success(6_000, Some(u64::MAX)));
+        let stats = memory.stats(day, repo).unwrap();
+        assert_eq!(stats.build_duration_count, 4);
+        assert_eq!(stats.build_duration_sum_ms, 180_000 + MAX_TRACKED_BUILD_MS);
+        memory.validate().unwrap();
+
+        // The aggregate survives observation compaction untouched.
+        let sum_before = memory.stats(day, repo).unwrap().build_duration_sum_ms;
+        compact_oldest_observations(memory.stats_mut(day, repo));
+        assert_eq!(
+            memory.stats(day, repo).unwrap().build_duration_sum_ms,
+            sum_before
+        );
+
+        // An inconsistent aggregate is rejected on load.
+        let mut poisoned = memory.clone();
+        poisoned.days[0].build_duration_sum_ms =
+            u64::from(poisoned.days[0].build_duration_count) * MAX_TRACKED_BUILD_MS + 1;
+        assert!(poisoned.validate().is_err());
+    }
+
+    #[test]
     fn yesterday_comparison_is_exact_and_repo_local() {
         let repo = "/work/forge";
         let other = "/work/other";
@@ -1989,6 +2121,9 @@ mod tests {
                 recovered_pending_push: false,
                 baseline: Some(StatsBaseline::default()),
                 observations,
+                // Widest valid encodings the duration aggregate can reach.
+                build_duration_sum_ms: u64::from(u32::MAX) * MAX_TRACKED_BUILD_MS,
+                build_duration_count: u32::MAX,
             });
         }
         memory.validate().unwrap();

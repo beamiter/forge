@@ -39,6 +39,9 @@ pub(crate) enum Behavior {
     /// Crouched a little apart, watching the Shell Agent work — distinct from
     /// WatchCommand so the body shows whose command is running.
     WatchAgent,
+    /// Settled in for a long command: still watching, but lying down with
+    /// half-closed eyes — a vigil, not a nap.
+    WatchSettled,
 }
 
 // ── Live-body frame sets ────────────────────────────────────────────────
@@ -66,6 +69,7 @@ const SLEEP_FRAMES: [&str; 2] = [" /\\_/\\\n( -_- )zZ\n (___) ", " /\\_/\\\n( -_
 const EXPLORE_FRAMES: [&str; 2] = [" /\\_/\\\n( o.o)?\n > ^ <", " /\\_/\\\n?(o.o )\n > ^ <"];
 const APPROACH_FRAMES: [&str; 2] = [" /\\_/\\\n( ^.^ )\n > ^ <", " /\\_/\\\n( ^.^ )\n >~^ <"];
 const WATCH_AGENT_FRAMES: [&str; 2] = [" /\\_/\\\n( -.o )\n (___) ", " /\\_/\\\n( o.- )\n (___) "];
+const WATCH_SETTLED_FRAMES: [&str; 2] = [" /\\_/\\\n( -.- )\n (___) ", " /\\_/\\\n( -.o )\n (___) "];
 
 impl Behavior {
     /// Canonical single pose: the first frame of each behavior's set. Used by
@@ -84,6 +88,7 @@ impl Behavior {
             Self::Explore => EXPLORE_FRAMES[0],
             Self::Approach => APPROACH_FRAMES[0],
             Self::WatchAgent => WATCH_AGENT_FRAMES[0],
+            Self::WatchSettled => WATCH_SETTLED_FRAMES[0],
         }
     }
 
@@ -104,6 +109,7 @@ impl Behavior {
             Self::Explore => ["~\\_/~", "/\\_/\\"],
             Self::Approach => ["/\\^/\\", "/\\_/\\"],
             Self::WatchAgent => ["/\\./\\", "/\\_/\\"],
+            Self::WatchSettled => ["/\\-/\\", "/\\_/\\"],
         }
     }
 }
@@ -163,6 +169,7 @@ pub(crate) fn sprite_frame(
         Behavior::Explore => EXPLORE_FRAMES[alt],
         Behavior::Approach => APPROACH_FRAMES[alt],
         Behavior::WatchAgent => WATCH_AGENT_FRAMES[alt],
+        Behavior::WatchSettled => WATCH_SETTLED_FRAMES[alt],
         Behavior::InspectError | Behavior::UnknownOutcome => behavior.sprite(),
     }
 }
@@ -1322,6 +1329,7 @@ mod tests {
             Behavior::Explore,
             Behavior::Approach,
             Behavior::WatchAgent,
+            Behavior::WatchSettled,
         ] {
             for frame in [0, 4, 5, 54, 55, 59, u64::MAX] {
                 for drowsy in [false, true] {
@@ -1397,6 +1405,7 @@ mod tests {
             Behavior::Explore,
             Behavior::Approach,
             Behavior::WatchAgent,
+            Behavior::WatchSettled,
         ] {
             let reference = bounding_box_of(behavior.sprite());
             for language in languages {

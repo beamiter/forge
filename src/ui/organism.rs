@@ -25,6 +25,10 @@ const SURFACE_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 /// routine dispatch latency is still simulated instead of clipped away.
 const DORMANT_FRAME_INTERVAL: Duration = Duration::from_millis(900);
 const SURFACE_MARGIN: i32 = 8;
+/// After this long watching one command, the body settles into its vigil.
+const SETTLED_WATCH_ONSET: Duration = Duration::from_secs(60);
+/// Elapsed time only appears on the card once a command stops being quick.
+const ACCOMPANY_LABEL_ONSET: Duration = Duration::from_secs(10);
 const TONE_CLASSES: [&str; 5] = [
     "organism-quiet",
     "organism-active",
@@ -116,6 +120,37 @@ fn surface_mode(
         SurfaceMode::Idle
     } else {
         SurfaceMode::Reacting
+    }
+}
+
+/// Which watching pose fits: the Agent's commands get the crouch-apart pose,
+/// a long human command earns the settled vigil, everything else the alert
+/// watch.
+fn watching_behavior(agent_watching: bool, elapsed: Option<Duration>) -> Behavior {
+    if agent_watching {
+        Behavior::WatchAgent
+    } else if elapsed.is_some_and(|elapsed| elapsed >= SETTLED_WATCH_ONSET) {
+        Behavior::WatchSettled
+    } else {
+        Behavior::WatchCommand
+    }
+}
+
+/// Human-readable elapsed time for the accompaniment label: "40s",
+/// "2m 30s", "1h 05m". Sub-hour times are quantized to ten-second steps so
+/// the status label — an accessible live region — changes at most every ten
+/// seconds instead of narrating every second of a long build.
+fn elapsed_label(elapsed: Duration) -> String {
+    let total = elapsed.as_secs();
+    if total < 3_600 {
+        let total = total / 10 * 10;
+        if total < 60 {
+            format!("{total}s")
+        } else {
+            format!("{}m {:02}s", total / 60, total % 60)
+        }
+    } else {
+        format!("{}h {:02}m", total / 3_600, (total % 3_600) / 60)
     }
 }
 
@@ -497,6 +532,12 @@ struct OrganismRuntime {
     surface_behavior: Cell<Behavior>,
     last_surface_mode: Cell<Option<SurfaceMode>>,
     command_running: Cell<bool>,
+    /// When the running command started, for the accompaniment label and the
+    /// settled vigil pose.
+    command_started_at: Cell<Option<Instant>>,
+    /// The base status text rendered at the last reaction, so the elapsed
+    /// suffix can be appended without accumulating.
+    status_base: RefCell<String>,
     /// The running command is the Agent's; the watching pose crouches apart.
     agent_watching: Cell<bool>,
     last_human_input: Cell<Option<Instant>>,
@@ -627,6 +668,8 @@ impl OrganismRuntime {
             surface_behavior: Cell::new(Behavior::Idle),
             last_surface_mode: Cell::new(None),
             command_running: Cell::new(false),
+            command_started_at: Cell::new(None),
+            status_base: RefCell::new(String::new()),
             agent_watching: Cell::new(false),
             last_human_input: Cell::new(None),
             output_activity: Cell::new(false),
@@ -661,6 +704,7 @@ impl OrganismRuntime {
         };
         self.status.set_text(&status);
         self.status.set_tooltip_text(Some(&status));
+        *self.status_base.borrow_mut() = status;
         self.state
             .set_text(&state_summary(self.organism.borrow().state()));
 
@@ -710,8 +754,13 @@ impl OrganismRuntime {
         let display_behavior = match mode {
             SurfaceMode::Idle if in_transit => Behavior::Idle,
             SurfaceMode::Idle => ambient.display(),
-            SurfaceMode::Watching if self.agent_watching.get() => Behavior::WatchAgent,
-            SurfaceMode::Typing | SurfaceMode::Watching => Behavior::WatchCommand,
+            SurfaceMode::Watching => watching_behavior(
+                self.agent_watching.get(),
+                self.command_started_at
+                    .get()
+                    .map(|started| now.saturating_duration_since(started)),
+            ),
+            SurfaceMode::Typing => Behavior::WatchCommand,
             SurfaceMode::Reacting => behavior,
         };
         // The continuous state shows through the ambient poses as body
@@ -899,6 +948,27 @@ impl OrganismRuntime {
                 .surface_frame
                 .set(runtime.surface_frame.get().wrapping_add(1 + pulse));
             runtime.refresh_surface(&view, now);
+            // Accompaniment: a long-running command's card counts the time
+            // spent watching together. Text only — no pose escalation, no
+            // interruption, and short commands never show it.
+            if runtime.command_running.get() {
+                if let Some(started) = runtime.command_started_at.get() {
+                    let elapsed = now.saturating_duration_since(started);
+                    if elapsed >= ACCOMPANY_LABEL_ONSET {
+                        let status = format!(
+                            "{} · {} in",
+                            runtime.status_base.borrow(),
+                            elapsed_label(elapsed)
+                        );
+                        if runtime.status.text().as_str() != status {
+                            runtime.status.set_text(&status);
+                            // Keep hover text in step: a narrow card may
+                            // ellipsize the suffix out of the label itself.
+                            runtime.status.set_tooltip_text(Some(&status));
+                        }
+                    }
+                }
+            }
             let next = if runtime.motion == OrganismMotion::Static
                 || runtime.activity.resting(now)
             {
@@ -1069,6 +1139,7 @@ impl UiState {
                 if !runtime.command_running.replace(true) {
                     runtime.activity.command_started(Instant::now());
                 }
+                runtime.command_started_at.set(Some(Instant::now()));
                 // Identity-verified at CommandStart: content-free fact only.
                 let agent_driven = view_weak
                     .upgrade()
@@ -1174,6 +1245,7 @@ impl UiState {
                 if runtime.command_running.replace(false) {
                     runtime.activity.command_finished(Instant::now());
                 }
+                runtime.command_started_at.set(None);
                 let agent_driven = runtime.agent_watching.replace(false);
                 // Show the authoritative result for the complete hold window.
                 // Any genuinely new prompt input will immediately replace this
@@ -1203,7 +1275,13 @@ impl UiState {
                     .borrow_mut()
                     .take()
                     .map(|context| context.repo);
-                let memory_event = MemoryEvent::now_for_repo(kind, event.exit_code, repo, state);
+                let memory_event = MemoryEvent::now_for_repo(
+                    kind,
+                    event.exit_code,
+                    repo,
+                    state,
+                    event.duration_ms,
+                );
                 if let Some(memory) = memory.borrow_mut().as_mut() {
                     // Merge transactions completed by other Forge windows as
                     // late as possible, so a recovery that lands while this
@@ -1244,6 +1322,23 @@ impl UiState {
                                 ));
                             }
                             _ => {}
+                        }
+                    }
+                    // A successful build measured against this repo's own
+                    // baseline: one quiet sentence, no pose change.
+                    if kind == CommandKind::BuildOrTest && event.exit_code == Some(0) {
+                        if let (Some(typical), Some(duration)) =
+                            (insight.typical_build_ms, event.duration_ms)
+                        {
+                            if duration >= typical.saturating_mul(2)
+                                && duration >= typical.saturating_add(10_000)
+                            {
+                                reaction.description.push_str(" · slower than usual here");
+                            } else if duration.saturating_mul(2) <= typical
+                                && typical >= duration.saturating_add(10_000)
+                            {
+                                reaction.description.push_str(" · quicker than usual here");
+                            }
                         }
                     }
                     if insight.faster_than_yesterday && !agent_driven {
@@ -1312,6 +1407,7 @@ impl UiState {
                     if runtime.command_running.replace(false) {
                         runtime.activity.command_finished(Instant::now());
                     }
+                    runtime.command_started_at.set(None);
                     runtime.agent_watching.set(false);
                     let generation = runtime.bump_generation();
                     let reaction = {
@@ -1606,6 +1702,29 @@ mod tests {
         let explore = pose(AmbientBehavior::Explore, 300);
         let calm_sit = pose(AmbientBehavior::Idle, 300);
         assert!(explore.x > calm_sit.x);
+    }
+
+    #[test]
+    fn a_long_watch_settles_and_the_elapsed_label_reads_naturally() {
+        assert_eq!(watching_behavior(false, None), Behavior::WatchCommand);
+        assert_eq!(
+            watching_behavior(false, Some(Duration::from_secs(59))),
+            Behavior::WatchCommand
+        );
+        assert_eq!(
+            watching_behavior(false, Some(Duration::from_secs(60))),
+            Behavior::WatchSettled
+        );
+        // The Agent's crouch outranks settling in.
+        assert_eq!(
+            watching_behavior(true, Some(Duration::from_secs(600))),
+            Behavior::WatchAgent
+        );
+
+        assert_eq!(elapsed_label(Duration::from_secs(42)), "40s");
+        assert_eq!(elapsed_label(Duration::from_secs(150)), "2m 30s");
+        assert_eq!(elapsed_label(Duration::from_secs(155)), "2m 30s");
+        assert_eq!(elapsed_label(Duration::from_secs(3_905)), "1h 05m");
     }
 
     #[test]
