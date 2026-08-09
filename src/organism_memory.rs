@@ -488,6 +488,14 @@ pub(crate) struct RepoContext {
     pub(crate) repo: String,
     pub(crate) open_failures: u32,
     pub(crate) recovered_pending_push: bool,
+    /// Today's build/test successes in this repo, for habituated reactions.
+    pub(crate) successes_today: u32,
+    /// Today's build/test failures in this repo, for sensitized reactions.
+    pub(crate) failures_today: u32,
+    /// Distinct remembered day records for this repo. Derived on read from the
+    /// bounded `days` window — never persisted separately. Zero means the
+    /// organism has no memory of ever working in this checkout.
+    pub(crate) familiarity_days: u32,
 }
 
 pub(crate) struct OrganismMemory {
@@ -531,16 +539,32 @@ impl OrganismMemory {
         // bound. This path runs only for build/test/push lifecycle events.
         let repo = git_repo_root_for(cwd)?;
         let day = local_day_at_ms(unix_ms());
-        let (open_failures, recovered_pending_push) = self
+        let (open_failures, recovered_pending_push, successes_today, failures_today) = self
             .memory
             .stats(day, &repo)
-            .map(|stats| (stats.open_failures, stats.recovered_pending_push))
-            .unwrap_or((0, false));
+            .map(|stats| {
+                (
+                    stats.open_failures,
+                    stats.recovered_pending_push,
+                    stats.build_successes,
+                    stats.build_failures,
+                )
+            })
+            .unwrap_or((0, false, 0, 0));
+        let familiarity_days = self
+            .memory
+            .days
+            .iter()
+            .filter(|stats| stats.repo == repo)
+            .count() as u32;
         Some(RepoContext {
             day,
             repo,
             open_failures,
             recovered_pending_push,
+            successes_today,
+            failures_today,
+            familiarity_days,
         })
     }
 
@@ -1185,7 +1209,7 @@ fn unlock(file: &File) {
 #[cfg(not(unix))]
 fn unlock(_file: &File) {}
 
-fn unix_ms() -> u64 {
+pub(crate) fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1223,7 +1247,7 @@ fn next_event_id() -> String {
     )
 }
 
-fn local_day_at_ms(at_ms: u64) -> i64 {
+pub(crate) fn local_day_at_ms(at_ms: u64) -> i64 {
     let unix_seconds = i64::try_from(at_ms / 1_000).unwrap_or(i64::MAX);
     #[cfg(unix)]
     {

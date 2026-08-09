@@ -44,6 +44,7 @@ pub(crate) use ai_panel::AiPanel;
 pub(crate) use bottom_bar::build_bottom_bar;
 pub(crate) use command_palette::CommandSuggestionHandle;
 pub(crate) use file_tree::{build_file_tree_widgets, FileTreeModel};
+pub(crate) use organism::{pane_token, OrganismCorrectionSignal};
 pub(crate) use pane_header::{PaneHeader, PANE_HEADER_CSS};
 pub(crate) use pane_leaf::PaneLeaf;
 pub(crate) use pane_node::PaneNode;
@@ -175,6 +176,9 @@ pub(crate) struct UiState {
     /// Continuous state is shared across pane-local behavior reducers, so the
     /// last pane to finish cannot overwrite another pane's earlier changes.
     pub(crate) organism_life: Rc<Cell<crate::organism::LifeState>>,
+    /// Content-free accept/dismiss pulses from the command-correction card,
+    /// shared window-wide like the life state they feed.
+    pub(crate) organism_correction: Rc<OrganismCorrectionSignal>,
     /// Visible top-bar control reflecting whether a Shell Agent session is
     /// currently active.
     pub(crate) agent_toggle: ToggleButton,

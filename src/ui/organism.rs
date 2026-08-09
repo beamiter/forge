@@ -9,11 +9,14 @@ use std::time::{Duration, Instant};
 use super::UiState;
 use crate::block_view::TermView;
 use crate::organism::{
-    classify_command, Behavior, CommandKind, LifeState, NativeOrganism, Reaction, Tone,
+    classify_command, sticky_glyph, Behavior, CommandKind, LifeState, NativeOrganism, Reaction,
+    RepoArrival, Tone,
 };
-use crate::organism_memory::{MemoryEvent, RepoContext};
+use crate::organism_memory::{local_day_at_ms, unix_ms, MemoryEvent, RepoContext};
 
 const REACTION_HOLD: Duration = Duration::from_millis(8_000);
+/// An accepted correction only vouches for a command that starts promptly.
+const CORRECTION_ASSIST_WINDOW: Duration = Duration::from_secs(30);
 const HUMAN_INPUT_RETREAT: Duration = Duration::from_millis(900);
 const SURFACE_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 const SURFACE_MARGIN: i32 = 8;
@@ -173,11 +176,96 @@ fn align_up(value: i32, cell: i32) -> i32 {
         .saturating_mul(cell)
 }
 
+/// Opaque identity of the Block pane hosting a correction card. Pointer
+/// identity only — it carries no path, command, or content data.
+pub(crate) fn pane_token(view: &Rc<TermView>) -> usize {
+    Rc::as_ptr(view) as usize
+}
+
+/// Window-shared, content-free pulses from the command-correction card. The
+/// organism learns only the accept/dismiss fact — never the failed command,
+/// the proposed correction, or any output text.
+pub(crate) struct OrganismCorrectionSignal {
+    life: Rc<Cell<LifeState>>,
+    accepted: Cell<Option<(usize, Instant)>>,
+    dismiss_streak: Cell<u32>,
+}
+
+impl OrganismCorrectionSignal {
+    pub(crate) fn new(life: Rc<Cell<LifeState>>) -> Rc<Self> {
+        Rc::new(Self {
+            life,
+            accepted: Cell::new(None),
+            dismiss_streak: Cell::new(0),
+        })
+    }
+
+    /// `pane` scopes the acceptance to the Block pane hosting the card, so a
+    /// command starting in any other pane can never claim the assist.
+    pub(crate) fn note_accepted(&self, pane: usize) {
+        self.dismiss_streak.set(0);
+        self.accepted.set(Some((pane, Instant::now())));
+        self.life
+            .set(crate::organism::correction_accepted(self.life.get()));
+    }
+
+    /// Drop a pending acceptance whose command demonstrably did not run.
+    pub(crate) fn revoke_accept(&self, pane: usize) {
+        if self.accepted.get().is_some_and(|(id, _)| id == pane) {
+            self.accepted.set(None);
+        }
+    }
+
+    pub(crate) fn note_dismissed(&self) {
+        let streak = self.dismiss_streak.get().saturating_add(1);
+        self.dismiss_streak.set(streak);
+        self.life
+            .set(crate::organism::correction_dismissed(self.life.get(), streak));
+    }
+
+    /// Consume a fresh acceptance for the command that is about to start in
+    /// the accepting pane, so one card vouches for at most one command there.
+    fn take_recent_accept(&self, pane: usize, now: Instant) -> bool {
+        match self.accepted.get() {
+            Some((id, at)) if id == pane => {
+                self.accepted.set(None);
+                now.saturating_duration_since(at) < CORRECTION_ASSIST_WINDOW
+            }
+            _ => false,
+        }
+    }
+}
+
+/// True when `cwd` is `root` itself or a path strictly inside it.
+fn cwd_within(cwd: &str, root: &str) -> bool {
+    cwd.strip_prefix(root)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Decide whether a volatile (non-build) command is still working inside the
+/// last known checkout: either its cwd sits under the canonical repo root, or
+/// it equals the exact raw cwd that last resolved to that root. A different
+/// subdirectory of a symlinked checkout matches neither arm and conservatively
+/// falls back to a context reset.
+fn same_checkout(root: Option<&str>, repo_cwd: Option<&str>, cwd: Option<&str>) -> bool {
+    let Some(cwd) = cwd else {
+        return false;
+    };
+    root.is_some_and(|root| cwd_within(cwd, root))
+        || repo_cwd.is_some_and(|known| known == cwd)
+}
+
 struct OrganismRuntime {
     organism: RefCell<NativeOrganism>,
     active_memory_kind: Cell<Option<CommandKind>>,
     active_context_key: RefCell<Option<String>>,
     active_repo_context: RefCell<Option<RepoContext>>,
+    /// Canonical root of the last resolved repository, plus the raw cwd that
+    /// resolved to it. Greeting/shyness keys on this identity, never on the
+    /// mixed root/cwd context key.
+    last_repo_root: RefCell<Option<String>>,
+    last_repo_cwd: RefCell<Option<String>>,
+    last_local_day: Cell<Option<i64>>,
     generation: Cell<u64>,
     settle_timer: RefCell<Option<gtk4::glib::SourceId>>,
     surface_tick: RefCell<Option<gtk4::TickCallbackId>>,
@@ -274,6 +362,9 @@ impl OrganismRuntime {
         live_body.set_accessible_role(gtk4::AccessibleRole::Presentation);
 
         let sticky_avatar = Label::new(Some("/\\_/\\"));
+        // Micro-poses are all five ASCII characters; pinning the width keeps
+        // the sticky header steady even under a proportional fallback font.
+        sticky_avatar.set_width_chars(5);
         sticky_avatar.set_widget_name("ascii-organism-sticky-avatar");
         sticky_avatar.add_css_class("organism-sticky-avatar");
         sticky_avatar.add_css_class("organism-active");
@@ -287,6 +378,9 @@ impl OrganismRuntime {
             active_memory_kind: Cell::new(None),
             active_context_key: RefCell::new(None),
             active_repo_context: RefCell::new(None),
+            last_repo_root: RefCell::new(None),
+            last_repo_cwd: RefCell::new(None),
+            last_local_day: Cell::new(None),
             generation: Cell::new(0),
             settle_timer: RefCell::new(None),
             surface_tick: RefCell::new(None),
@@ -373,6 +467,12 @@ impl OrganismRuntime {
         let sprite = display_behavior.sprite();
         if self.live_body.text().as_str() != sprite {
             self.live_body.set_text(sprite);
+        }
+        // The sticky one-line form mirrors the same displayed behavior with a
+        // fixed-width micro-pose, so scrollback readers see the mood too.
+        let glyph = sticky_glyph(display_behavior, self.surface_frame.get());
+        if self.sticky_avatar.text().as_str() != glyph {
+            self.sticky_avatar.set_text(glyph);
         }
 
         let metrics = view.live_organism_surface_metrics();
@@ -549,6 +649,8 @@ impl UiState {
             let view_weak = Rc::downgrade(view);
             let memory = self.organism_memory.clone();
             let shared_life = self.organism_life.clone();
+            let correction = self.organism_correction.clone();
+            let pane = pane_token(view);
             view.connect_command_started(move |event| {
                 runtime.bump_generation();
                 runtime.command_running.set(true);
@@ -571,25 +673,64 @@ impl UiState {
                         None
                     };
                 *runtime.active_repo_context.borrow_mut() = repo_context.clone();
+                // The context key is the canonical repo root for build/push
+                // commands. Volatile commands still inside the same checkout
+                // reuse that root instead of their raw cwd, so interleaved
+                // `ls`/`git status` from a subdirectory can never flap the key
+                // and fake a context switch.
                 let context_key = repo_context
                     .as_ref()
                     .map(|context| context.repo.clone())
-                    .or_else(|| event.cwd.clone());
+                    .or_else(|| {
+                        if same_checkout(
+                            runtime.last_repo_root.borrow().as_deref(),
+                            runtime.last_repo_cwd.borrow().as_deref(),
+                            event.cwd.as_deref(),
+                        ) {
+                            runtime.last_repo_root.borrow().clone()
+                        } else {
+                            event.cwd.clone()
+                        }
+                    });
                 let context_changed = *runtime.active_context_key.borrow() != context_key;
                 *runtime.active_context_key.borrow_mut() = context_key;
                 let reaction = {
                     let mut organism = runtime.organism.borrow_mut();
                     organism.sync_state(shared_life.get());
+                    let today = local_day_at_ms(unix_ms());
+                    if runtime.last_local_day.get().is_some_and(|day| day != today) {
+                        // Volatile contexts otherwise never notice midnight.
+                        organism.roll_over_day();
+                    }
+                    runtime.last_local_day.set(Some(today));
                     if let Some(context) = repo_context {
+                        // Greeting/shyness keys on the resolved repository
+                        // identity; the mixed root/cwd key cannot re-fire it.
+                        let entered_new_repo = runtime.last_repo_root.borrow().as_deref()
+                            != Some(context.repo.as_str());
                         organism.restore_repo_context(
                             context.open_failures,
                             context.recovered_pending_push,
+                            context.successes_today,
+                            context.failures_today,
                         );
+                        if entered_new_repo {
+                            organism.note_repo_arrival(RepoArrival::from_familiarity(
+                                context.familiarity_days,
+                            ));
+                        }
+                        *runtime.last_repo_root.borrow_mut() = Some(context.repo.clone());
+                        *runtime.last_repo_cwd.borrow_mut() = event.cwd.clone();
                     } else if context_changed {
-                        // Volatile/non-Git commands retain a streak while they
-                        // stay in the same cwd, but never inherit one after a
-                        // real context switch.
-                        organism.restore_repo_context(0, false);
+                        // A volatile/non-Git command genuinely left the last
+                        // known checkout; never inherit a streak across a real
+                        // context switch.
+                        organism.restore_repo_context(0, false, 0, 0);
+                        *runtime.last_repo_root.borrow_mut() = None;
+                        *runtime.last_repo_cwd.borrow_mut() = None;
+                    }
+                    if correction.take_recent_accept(pane, Instant::now()) {
+                        organism.note_assisted_command();
                     }
                     let reaction = organism.command_started(&event.command);
                     shared_life.set(organism.state());
@@ -823,6 +964,61 @@ mod tests {
             surface_mode(Behavior::Celebrate, false, None),
             SurfaceMode::Reacting
         );
+    }
+
+    #[test]
+    fn correction_accept_pulse_is_pane_scoped_single_use_and_expires() {
+        let life = Rc::new(Cell::new(LifeState::default()));
+        let signal = OrganismCorrectionSignal::new(life);
+        let now = Instant::now();
+
+        signal.note_accepted(7);
+        assert!(!signal.take_recent_accept(9, now));
+        assert!(signal.take_recent_accept(7, now));
+        assert!(!signal.take_recent_accept(7, now));
+
+        signal.note_accepted(7);
+        assert!(!signal.take_recent_accept(7, now + CORRECTION_ASSIST_WINDOW * 2));
+
+        signal.note_accepted(3);
+        signal.revoke_accept(4);
+        assert!(signal.take_recent_accept(3, Instant::now()));
+        signal.note_accepted(3);
+        signal.revoke_accept(3);
+        assert!(!signal.take_recent_accept(3, Instant::now()));
+    }
+
+    #[test]
+    fn dismissal_streak_resets_on_acceptance() {
+        let life = Rc::new(Cell::new(LifeState::default()));
+        let signal = OrganismCorrectionSignal::new(life);
+        signal.note_dismissed();
+        signal.note_dismissed();
+        assert_eq!(signal.dismiss_streak.get(), 2);
+        signal.note_accepted(1);
+        assert_eq!(signal.dismiss_streak.get(), 0);
+    }
+
+    #[test]
+    fn volatile_commands_inside_the_known_checkout_keep_their_context() {
+        assert!(cwd_within("/repo", "/repo"));
+        assert!(cwd_within("/repo/sub/dir", "/repo"));
+        assert!(!cwd_within("/repository", "/repo"));
+        assert!(!cwd_within("/tmp", "/repo"));
+
+        assert!(same_checkout(Some("/repo"), None, Some("/repo/sub")));
+        assert!(same_checkout(
+            None,
+            Some("/home/u/link"),
+            Some("/home/u/link")
+        ));
+        assert!(!same_checkout(
+            Some("/repo"),
+            Some("/home/u/link"),
+            Some("/tmp")
+        ));
+        assert!(!same_checkout(None, None, Some("/tmp")));
+        assert!(!same_checkout(Some("/repo"), None, None));
     }
 
     #[test]

@@ -32,7 +32,7 @@ use serde_json::json;
 use super::command_review::{
     set_review_feedback, CommandReviewCard, CommandReviewSpec, ReviewPresentation,
 };
-use super::{PaneNode, UiState};
+use super::{pane_token, OrganismCorrectionSignal, PaneNode, UiState};
 use crate::ai::{AiCancellationToken, AiClient, Role, Turn};
 use crate::block_view::TermView;
 use crate::config::Config;
@@ -260,9 +260,10 @@ impl UiState {
         }
 
         let agent_session = Rc::downgrade(&self.agent_session);
+        let organism_signal = self.organism_correction.clone();
         for index in 0..self.notebook.n_pages() {
             if let Some(page) = self.notebook.nth_page(Some(index)) {
-                attach_page(&page, &self.config, &agent_session);
+                attach_page(&page, &self.config, &agent_session, &organism_signal);
             }
         }
 
@@ -274,8 +275,9 @@ impl UiState {
                 let page = page.clone();
                 let config = config.clone();
                 let agent_session = agent_session.clone();
+                let organism_signal = organism_signal.clone();
                 glib::idle_add_local_once(move || {
-                    attach_page(&page, &config, &agent_session);
+                    attach_page(&page, &config, &agent_session, &organism_signal);
                 });
             });
     }
@@ -288,6 +290,7 @@ impl UiState {
             view,
             self.config.clone(),
             Rc::downgrade(&self.agent_session),
+            self.organism_correction.clone(),
             remote,
         );
     }
@@ -297,6 +300,7 @@ fn attach_page(
     page: &gtk4::Widget,
     config: &Rc<RefCell<Config>>,
     agent_session: &std::rc::Weak<RefCell<Option<super::AgentHandle>>>,
+    organism_signal: &Rc<OrganismCorrectionSignal>,
 ) {
     let Some(node) = PaneNode::from_widget(page) else {
         return;
@@ -304,7 +308,13 @@ fn attach_page(
     for leaf in node.leaves() {
         let remote = leaf.is_remote();
         if let Some(view) = leaf.block_view() {
-            attach_term_view(view, config.clone(), agent_session.clone(), remote);
+            attach_term_view(
+                view,
+                config.clone(),
+                agent_session.clone(),
+                organism_signal.clone(),
+                remote,
+            );
         }
     }
 }
@@ -313,6 +323,7 @@ fn attach_term_view(
     view: Rc<TermView>,
     config: Rc<RefCell<Config>>,
     agent_session: std::rc::Weak<RefCell<Option<super::AgentHandle>>>,
+    organism_signal: Rc<OrganismCorrectionSignal>,
     remote: bool,
 ) {
     let root = view.widget();
@@ -375,6 +386,7 @@ fn attach_term_view(
                 request_state.clone(),
                 generation,
                 agent_session.clone(),
+                organism_signal.clone(),
                 command,
                 exit_code,
                 output,
@@ -398,6 +410,7 @@ fn request_correction(
     request_state: Rc<CorrectionRequestState>,
     generation: u64,
     agent_session: std::rc::Weak<RefCell<Option<super::AgentHandle>>>,
+    organism_signal: Rc<OrganismCorrectionSignal>,
     original_command: String,
     exit_code: i32,
     output: String,
@@ -488,6 +501,7 @@ fn request_correction(
                     request_state.clone(),
                     generation,
                     &config,
+                    &organism_signal,
                     &original_command,
                     correction,
                 );
@@ -936,12 +950,14 @@ fn edit_distance(left: &str, right: &str) -> usize {
 /// block, so reviewing, editing, accepting, or dismissing the proposal reads
 /// like part of the normal Block-mode command dialogue instead of a modal
 /// window. A later finished command removes it and advances the pane epoch.
+#[allow(clippy::too_many_arguments)]
 fn show_correction_card(
     view: &Rc<TermView>,
     card_slot: &Rc<RefCell<Option<gtk4::Widget>>>,
     request_state: Rc<CorrectionRequestState>,
     generation: u64,
     config: &Rc<RefCell<Config>>,
+    organism_signal: &Rc<OrganismCorrectionSignal>,
     original_command: &str,
     correction: CommandCorrection,
 ) {
@@ -1006,8 +1022,11 @@ fn show_correction_card(
     let dismiss = {
         let request_state = request_state.clone();
         let remove_card = remove_card.clone();
+        let organism_signal = organism_signal.clone();
         Rc::new(move |refocus_terminal: bool| {
             if request_state.retire(generation) {
+                // Content-free pulse: only the fact of the dismissal.
+                organism_signal.note_dismissed();
                 remove_card(refocus_terminal);
             }
         })
@@ -1065,6 +1084,7 @@ fn show_correction_card(
     let review_root = review.root.clone();
     let request_state_for_accept = request_state.clone();
     let remove_card_for_accept = remove_card.clone();
+    let organism_signal_for_accept = organism_signal.clone();
     let accept = Rc::new(move |edited: String| {
         if !request_state_for_accept.is_generation(generation) {
             return;
@@ -1091,12 +1111,14 @@ fn show_correction_card(
         let run = evidence.is_verified()
             && command == proposed_command
             && crate::agent::is_dangerous(&command).is_none();
+        let pane = pane_token(&view);
         view.grab_focus();
         if run {
             let feedback_for_completion = feedback.clone();
             let root_for_completion = review_root.clone();
             let request_state_for_completion = request_state_for_accept.clone();
             let remove_card_for_completion = remove_card_for_accept.clone();
+            let organism_for_completion = organism_signal_for_accept.clone();
             let queued = view.submit_command_tracked(&command, move |result| match result {
                 Ok(()) => {
                     if request_state_for_completion.retire(generation) {
@@ -1104,6 +1126,9 @@ fn show_correction_card(
                     }
                 }
                 Err(error) => {
+                    // The reviewed command may never have run; a pending
+                    // assist pulse must not attach to whatever runs next.
+                    organism_for_completion.revoke_accept(pane);
                     root_for_completion.set_sensitive(true);
                     if request_state_for_completion.is_generation(generation) {
                         set_review_feedback(
@@ -1120,6 +1145,8 @@ fn show_correction_card(
                 show_error(&format!("Command was not sent: {error}"));
                 return;
             }
+            // Content-free pulse: the help was accepted and is about to run.
+            organism_signal_for_accept.note_accepted(pane);
             // Keep the proposal present until CommandStart proves the reviewed
             // identity. This also prevents a close/edit click from racing VTE
             // verification or a shell-side redraw after CR admission.
@@ -1131,6 +1158,8 @@ fn show_correction_card(
             show_error(&format!("Command was not sent: {error}"));
             return;
         }
+        // Content-free pulse: the insertion was accepted for review.
+        organism_signal_for_accept.note_accepted(pane);
         // Non-executing insertion is complete once the bounded PTY queue owns
         // the bytes; it intentionally leaves Enter to the user.
         if !request_state_for_accept.retire(generation) {
