@@ -1,96 +1,126 @@
 # Engineering handoff
 
-Updated: 2026-08-08
+Updated: 2026-08-09
 
-This baseline exact-pins one shared jagent source through the hardened jterm_core,
-and upgrades Agent approval, bounded AI conversations, PTY queues, persistence,
-history, terminal parsing, notebook workflows, configuration, and UI safety.
-Execution completions are now correlated by a checked one-shot identity and must
-match their captured command, and the vendored jsh installer is resynced from the
-hardened canonical copy. The wire generation is jagent 0.6.0 plus jterm_core
-0.2.0: owning transcript types are serialize-only and provider envelopes are
-bounded before JSON allocation.
+This baseline lands the nine-round "Evolve ASCII organism" series
+(`d6fb8b4..00a099e`): the experimental Block-pane organism grew from an
+event reflex into a continuous life simulation with utility-selected
+behavior, agent attribution, interpolated spatial motion, motion restraint,
+and a persistent per-repo build-duration baseline. Every round followed the
+same loop — implement, unit-test, sync `docs/USER_GUIDE.md`, run a
+three-agent adversarial verification workflow, fix confirmed findings,
+commit, push. The verification pass caught one to two real defects almost
+every round (attribution races, a Drop panic on a fired glib source, a
+saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
 
-- `[[remote_hosts]]` gained `deploy` ("off" by default, "persist", or
-  "incognito"). With it on, a remote tab runs `jterm_core::jsh_remote`'s vendored
-  `jsh-remote.sh`, which places a verified static jsh on the destination for the
-  life of the session and removes it afterwards — so blocks, cwd tracking, exit
-  codes and the Commands timeline work on a machine nobody prepared, without
-  anything being installed there, without root, and without touching the
-  destination's `.bashrc`, `.profile`, or login shell. `remote_shell` is ignored
-  in that mode. An unrecognised spelling rejects the host and is reported by
-  config validation; it deliberately does not fall back to "off", because the
-  difference between the modes is whether the destination's `$HOME` is written
-  to. `build_remote_argv` splits into `build_deployed_argv` (pure, given a
-  launcher path) and the publish step, so the argument order is asserted in
-  tests without writing into the real cache directory, and a failure to publish
-  degrades to plain ssh rather than refusing the tab.
+Nine organism evolution rounds, in order:
 
-- `pending_command` carries a `PendingExecution { proposal_id, command,
-  generation }`. The generation is checked and never reused, and a finished
-  block whose captured VTE command differs from the approved one now consumes
-  the approval *without* submitting an observation. Feeding the model the output
-  of a command the user did not approve is worse than losing an observation,
-  and that mismatch is exactly how a concurrent or external prompt write would
-  surface.
-- `scripts/install-jsh.sh` is resynced from the hardened canonical jsh copy:
-  mandatory format-checked SHA-256, byte-bounded HTTPS-only downloads, validated
-  version/target/base-URL grammars, archive members checked for links,
-  traversal, and extra payload before extracting exactly the expected binary,
-  private and symlink-safe atomic cache and staging files, and a deadline-bounded
-  `--version` probe that writes to a file rather than a pipe. It now matches
-  upstream commit `fd605616b56bd73265a3a6141c814938aa2859f9`: archive checks use
-  explicit branches, and failed self-check rollback reports success only after
-  the private temporary copy is chmodded and atomically renamed into place.
-- Completed block outcomes now delegate to
-  `jterm_core::block_contract::classify_completed` only after Forge resolves the
-  final command through its metadata/screen fallback. Renderer and persistence
-  types stay local; failed-only and exact-exit filters use the same four-way
-  outcome, so commandless background output cannot become a failure merely
-  because a producer attached a raw non-zero status. The `-1` compatibility
-  sentinel remains confined to downstream `i32`-only presentation surfaces and
-  is never passed to the classifier.
-- `jterm_core` is pinned to
-  `48d25f155b960417609ffc85a98b7c9ba44c5772` and direct jagent to
-  `a09fd1563b862f96bed7047834720aeb31c163e2`; Cargo, Nix, and the twice-generated
-  Flatpak source manifest all describe those exact trees.
-- App-local AI request assembly now consumes jagent's omission report after its
-  own history pre-bound and fails closed if the canonical builder would omit
-  anything else. Raw and prepared system prompts, the optional separator, and
-  the complete counted omission notice share one exact 64 KiB budget; system
-  instructions are rejected rather than sampled or truncated. Both blocking
-  and streaming paths use the same funnel. Forge's public owning-string `Turn`
-  is serialize-only, and conversation restore remains behind the bounded
-  `ConversationSnapshot::from_json` decoder.
-- Agent snapshot restore now decodes once through jagent's allocation-aware
-  schema and audits its immutable accessors directly. Forge's stricter
-  contiguous-ID, final-pending, immediate-observation, turn-accounting, state,
-  and anti-rebinding rules remain in front of live session restore; the former
-  `AgentSnapshotAudit` ordinary-serde copy is gone.
-- App-local non-streaming AI transport now keeps successful curl bodies as raw
-  bytes through jagent's canonical 1 MiB response gate. HTTP errors may still
-  be retained as bounded transport evidence, but only the first 2 KiB can enter
-  diagnostic JSON parsing; exact-limit, limit-plus-one, and large-error tests
-  pin those boundaries.
+- **Inner life** (`d6fb8b4`): habituation (the Nth clean pass of the day
+  celebrates at `1/(1+prior/4)` strength) and sensitization (first crack
+  after ≥5 clean runs stings more); repo familiarity gradient
+  (`RepoArrival` from remembered day records — shy in unknown checkouts,
+  「回来了。」in well-known ones, keyed on resolved repo identity so a
+  root/cwd key flap cannot re-fire it); session-local any-command rough
+  streak (≥3 consecutive non-zero exits → silent `SitNearError`);
+  pane-scoped content-free accept/dismiss pulses from the correction card;
+  fixed-width sticky-header micro-poses.
+- **Continuous life** (`14ef832`): the prototype's `LifeState::tick`
+  homeostasis ported into the native reducer, driven by a window-shared
+  `OrganismActivity` aggregate and tick clock that hands each wall-clock
+  slice out exactly once however many pane bodies exist; forced micro-rest
+  below 0.15 energy keeps exhaustion self-limiting; the agent-lost recovery
+  path returns its running-command slot.
+- **Body language** (`36d0bd5`): multi-frame sprite sets (gait, tail
+  flicks, sparkle blinks, dozing) with per-set stable bounding boxes so the
+  fail-closed fit check never flaps; `BodyLanguage` quantizes the
+  continuous state (drowsy/tense/listless) into ambient poses and wander
+  tempo; `Calm` tempo reproduces the original 80-second cycle frame for
+  frame.
+- **Autonomous mind** (`5cde9fc`): utility-scored ambient dispositions
+  (Sleep/Explore/Approach/Idle) with incumbent inertia, per-body xorshift
+  jitter, and hold timers; sleeping feeds rest back into the tick — gated
+  on no command running anywhere so one sleeping body cannot recharge the
+  shared mind mid-build.
+- **Agent awareness** (`74991f2`): `TermView::agent_command_active()`
+  exposes the identity-verified agent generation as one bool;
+  agent-driven commands get the crouched `WatchAgent` pose and quiet
+  half-strength nods — `CelebrateBig`, speech, and the human's confidence
+  stay reserved for commands the human typed; coarse `AgentPulse` phases
+  feed social need/attachment (giving Approach its niche);
+  correlation-loss events resolve one main-loop turn later so an
+  authoritative finish always wins with attribution intact.
+- **Spatial continuity** (`853b9a9`): `approach()` interpolation — the
+  body walks to its next pose in whole-cell steps (quarter of remaining
+  distance per frame) instead of teleporting; every hide path (typing
+  retreat, alt-screen, fail-closed, resize/font reflow via a surface
+  signature) forgets the standing spot so reappearance snaps — it never
+  walks while invisible; the watching pose perches above the output growth
+  edge, following `cursor_row` (a content-free geometry scalar) down.
+- **Motion restraint** (`4339e77`): `ascii_organism_motion =
+  "full"|"calm"|"static"` defaulting to the desktop animation preference;
+  the frame driver moved off the GTK frame clock (a tick callback forces it
+  to run at full rate forever) onto a self-rescheduling glib timeout — ≤10
+  wakes/s active, a 0.9s heartbeat after a minute of window rest, full
+  cadence within one beat of any input. The fired-source slot is cleared
+  before every other guard: a runtime outliving its pane must never let
+  `Drop` remove a dead source (glib panics).
+- **Long-command companionship** (`00a099e`): a command past ten seconds
+  counts accompaniment time on its card ("· 2m 30s in", ten-second steps
+  so the accessible status region is not narrated every second); past a
+  minute the watcher settles into a lying vigil (`WatchSettled`).
+  Successful build wall times accumulate into two saturating per-repo/day
+  scalars (`build_duration_sum_ms`/`build_duration_count`) over the
+  established `#[serde(default)]` migration path — capped at six hours per
+  sample, exactly-once per event id, deliberately outside the observation
+  replay so compaction cannot touch them; after three samples a build 2×
+  off its repo baseline (and >10s off) earns one quiet sentence.
 
-Forge intentionally retains its app-local dirfd/inode-bound session-claim
-transaction. It does not use the newer core typed claim helper because Forge's
-stronger flow validates the claimed inode before retirement; do not weaken or
-describe that boundary as delegated to core.
+Hard lines the series preserved, verified every round: perception only
+ever widens by enums, counters, or geometry scalars — command text, output,
+and keystrokes never cross the organism boundary; the disk schema stays
+version 1 with `#[serde(default)]` incremental migration (old files load;
+newer files fail closed in older binaries, matching the
+baseline/observations precedent); the three rendering invariants (O(1)
+typing retreat, immediate alt-screen yield, fail-closed sizing) are
+untouched; reaction intensity is a function of history, not of the
+stimulus; big celebrations and speech belong to the human's own commands.
 
 ## Remaining boundaries
 
+### Organism roadmap (long-term, design settled in review)
+
+- **Flaky-test insight**: derive a same-day failure→success flip count in
+  `replay_observations`; one `#[serde(default)]` saturating counter each on
+  `DailyStats` and `StatsBaseline` so compaction stays correct. ≥3 flips
+  with open-failure depth ≤1 reads as flaky: one Quiet sentence on success,
+  no pose escalation — the human should suspect the test, not themselves.
+- **Circadian clock**: 8×3-hour `u16 activity_buckets` per `DailyStats`
+  (count-only, accumulated in `apply_event` outside the replay, validated
+  and re-proven against the 512 KiB budget); infer habitual working hours
+  from recent day records; lower the tick's energy target outside them,
+  greet the first in-hours command with「早。」.
+- **Growth stages**: `days_seen` and `lifetime_recoveries` saturating
+  `u32`s on `DiskMemory` — the `days` window truncates at 64 records, so
+  the organism structurally has no past older than 64 days without them.
+  Derive juvenile (<7 days) / adult / seasoned (≥60 days + recovery
+  threshold) stages: sprite scale and ever-terser speech (a seasoned
+  `CelebrateBig` says only「嗯。」). Value accrues over months.
+- **Single presence across panes**: only the focused pane shows the full
+  body; unfocused panes keep at most the sticky micro-form; focus changes
+  (content-free pulses from the pane-focus flow) drive walk-out/walk-in
+  frames over the existing interpolator; a background pane's failure earns
+  a `GlanceAside` from the focused body —「隔壁那格红了」— never a popup,
+  never a focus grab. Largest remaining item; depends on nothing else.
+
 ### Consolidate the app-owned helper runner
 
-Agent command completion already carries and verifies its one-shot generation
-through `connect_block_finished`; the former handoff item was completed by
-`eb585d1`. The remaining duplicate boundary is subprocess ownership: Forge still
-has app-local trusted-helper, notification, command-correction, and jsh installer
-runners while the shared core now has the stronger WNOWAIT/process-group/deadline
-contract. Migrate only after core exposes an opaque runner rather than a mutable
-raw `Command`, preserving Forge's Flatpak host-namespace rules and tests.
+Carried forward unchanged: Forge still has app-local trusted-helper,
+notification, command-correction, and jsh installer runners while the
+shared core has the stronger WNOWAIT/process-group/deadline contract.
+Migrate only after core exposes an opaque runner rather than a mutable raw
+`Command`, preserving Forge's Flatpak host-namespace rules and tests.
 
 ## Release checks
 
