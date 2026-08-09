@@ -991,6 +991,18 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         toml::Value::Boolean(config.block_compact),
     );
     table.insert(
+        "ascii_organism_enabled".into(),
+        toml::Value::Boolean(config.ascii_organism_enabled),
+    );
+    if let Some(motion) = config.ascii_organism_motion {
+        table.insert(
+            "ascii_organism_motion".into(),
+            toml::Value::String(motion.as_str().to_string()),
+        );
+    } else {
+        table.remove("ascii_organism_motion");
+    }
+    table.insert(
         "command_history_enabled".into(),
         toml::Value::Boolean(config.command_history_enabled),
     );
@@ -1561,6 +1573,44 @@ mod tests {
                 .and_then(toml::Value::as_integer),
             Some(42_000)
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ascii_organism_settings_are_written_transactionally() {
+        let directory = temporary_directory("ascii-organism");
+        let path = directory.join("config.toml");
+        let mut config = default_config();
+        config.ascii_organism_enabled = true;
+        config.ascii_organism_motion = Some(config::OrganismMotion::Calm);
+
+        let mut revision =
+            save_config_to_path(&path, &config, Some(&ConfigRevision::missing())).unwrap();
+        let table = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml::Table>()
+            .unwrap();
+        assert_eq!(
+            table
+                .get("ascii_organism_enabled")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            table
+                .get("ascii_organism_motion")
+                .and_then(toml::Value::as_str),
+            Some("calm")
+        );
+
+        config.ascii_organism_motion = None;
+        revision = save_config_to_path(&path, &config, Some(&revision)).unwrap();
+        let table = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml::Table>()
+            .unwrap();
+        assert!(!table.contains_key("ascii_organism_motion"));
+        assert_eq!(revision, revision_at(&path).unwrap());
         fs::remove_dir_all(directory).unwrap();
     }
 

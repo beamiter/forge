@@ -69,6 +69,14 @@ pub enum OrganismMotion {
 }
 
 impl OrganismMotion {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Calm => "calm",
+            Self::Static => "static",
+        }
+    }
+
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "full" => Some(Self::Full),
@@ -3013,6 +3021,9 @@ unknown_action = "F8"
         assert_eq!(OrganismMotion::parse("Calm"), Some(OrganismMotion::Calm));
         assert_eq!(OrganismMotion::parse("STATIC"), Some(OrganismMotion::Static));
         assert_eq!(OrganismMotion::parse("off"), None);
+        assert_eq!(OrganismMotion::Full.as_str(), "full");
+        assert_eq!(OrganismMotion::Calm.as_str(), "calm");
+        assert_eq!(OrganismMotion::Static.as_str(), "static");
 
         let valid = validate_config_contents("ascii_organism_motion = 'calm'\n").unwrap();
         assert!(valid.iter().all(|issue| issue.path != "ascii_organism_motion"));

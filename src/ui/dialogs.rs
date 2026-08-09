@@ -1254,6 +1254,30 @@ impl UiState {
         command_history_row.set_sensitive(!safe_mode);
         terminal_group.add(&command_history_row);
 
+        let ascii_organism_row = adw::SwitchRow::builder()
+            .title("ASCII Organism")
+            .subtitle("Show the local, no-LLM organism in new Block panes")
+            .active(config.ascii_organism_enabled)
+            .build();
+        ascii_organism_row.set_sensitive(!safe_mode);
+        terminal_group.add(&ascii_organism_row);
+
+        let ascii_organism_motion_model =
+            gtk4::StringList::new(&["Automatic", "Full", "Calm", "Static"]);
+        let ascii_organism_motion_row = adw::ComboRow::builder()
+            .title("Organism Motion")
+            .subtitle("Automatic follows the desktop animation preference")
+            .model(&ascii_organism_motion_model)
+            .selected(match config.ascii_organism_motion {
+                None => 0,
+                Some(crate::config::OrganismMotion::Full) => 1,
+                Some(crate::config::OrganismMotion::Calm) => 2,
+                Some(crate::config::OrganismMotion::Static) => 3,
+            })
+            .build();
+        ascii_organism_motion_row.set_sensitive(!safe_mode && config.ascii_organism_enabled);
+        terminal_group.add(&ascii_organism_motion_row);
+
         let privacy_group = adw::PreferencesGroup::new();
         privacy_group.set_title("Features & Privacy");
         let notifications_row = adw::SwitchRow::builder()
@@ -1495,6 +1519,26 @@ impl UiState {
             }
             drop(config);
             ui.sync_block_configs();
+            ui.persist_config();
+        });
+
+        let motion_for_enabled = ascii_organism_motion_row.clone();
+        let ui = self.clone();
+        ascii_organism_row.connect_active_notify(move |row| {
+            let enabled = row.is_active();
+            ui.config.borrow_mut().ascii_organism_enabled = enabled;
+            motion_for_enabled.set_sensitive(enabled);
+            ui.persist_config();
+        });
+
+        let ui = self.clone();
+        ascii_organism_motion_row.connect_selected_notify(move |row| {
+            ui.config.borrow_mut().ascii_organism_motion = match row.selected() {
+                1 => Some(crate::config::OrganismMotion::Full),
+                2 => Some(crate::config::OrganismMotion::Calm),
+                3 => Some(crate::config::OrganismMotion::Static),
+                _ => None,
+            };
             ui.persist_config();
         });
 
