@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use super::UiState;
 use crate::block_view::TermView;
 use crate::organism::{
-    classify_command, sticky_glyph, Behavior, CommandKind, LifeState, NativeOrganism, Reaction,
-    RepoArrival, Tone,
+    classify_command, sprite_frame, sticky_glyph, Behavior, BodyLanguage, CommandKind, LifeState,
+    NativeOrganism, Reaction, RepoArrival, Tone,
 };
 use crate::organism_memory::{local_day_at_ms, unix_ms, MemoryEvent, RepoContext};
 
@@ -53,6 +53,48 @@ struct SurfacePoint {
     y: f64,
 }
 
+/// How eagerly the idle body wanders its 80-second cycle, derived from body
+/// language: a drowsy mind stays put, a listless one paces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WanderTempo {
+    Drowsy,
+    Calm,
+    Restless,
+}
+
+fn wander_tempo(language: BodyLanguage) -> WanderTempo {
+    if language.drowsy {
+        WanderTempo::Drowsy
+    } else if language.listless {
+        WanderTempo::Restless
+    } else {
+        WanderTempo::Calm
+    }
+}
+
+/// Position within the 800-frame wander cycle as `(step in 0..=40 cells,
+/// currently_walking)`: sit at one edge, walk across, sit at the other, walk
+/// back. The tempo resizes the walk legs; `Calm` reproduces the original
+/// 40-frame legs exactly.
+fn wander_phase(frame: u64, tempo: WanderTempo) -> (i32, bool) {
+    let walk = match tempo {
+        WanderTempo::Drowsy => return (0, false),
+        WanderTempo::Calm => 40,
+        WanderTempo::Restless => 120,
+    };
+    let phase = (frame % 800) as i32;
+    let sit = (800 - 2 * walk) / 2;
+    if phase < sit {
+        (0, false)
+    } else if phase < sit + walk {
+        ((phase - sit) * 40 / walk, true)
+    } else if phase < sit + walk + sit {
+        (40, false)
+    } else {
+        (40 - (phase - sit - walk - sit) * 40 / walk, true)
+    }
+}
+
 fn surface_mode(
     behavior: Behavior,
     command_running: bool,
@@ -72,7 +114,12 @@ fn surface_mode(
 /// Pick a point inside the live VTE without changing its allocation. The
 /// right gutter is owned by the live scrollbar, so every pose stays left of
 /// it. A surface that cannot fit the complete sprite fails closed.
-fn surface_point(surface: SurfaceBox, mode: SurfaceMode, frame: u64) -> Option<SurfacePoint> {
+fn surface_point(
+    surface: SurfaceBox,
+    mode: SurfaceMode,
+    tempo: WanderTempo,
+    frame: u64,
+) -> Option<SurfacePoint> {
     let cell_width = surface.cell_width.max(1);
     let cell_height = surface.cell_height.max(1);
     let margin_x = SURFACE_MARGIN.max(cell_width);
@@ -115,17 +162,12 @@ fn surface_point(surface: SurfaceBox, mode: SurfaceMode, frame: u64) -> Option<S
 
     let (x, y) = match mode {
         SurfaceMode::Idle => {
-            // Spend 90% of the 80-second cycle quietly sitting at an edge and
-            // only 10% walking between them. It feels alive without turning
+            // Mostly sit at an edge, occasionally walk between them — the
+            // walk share follows the wander tempo, so a listless mind paces
+            // while a drowsy one lies still. It feels alive without turning
             // ordinary terminal work into a perpetual desktop-pet animation.
             let span = max_x.saturating_sub(min_x);
-            let phase = (frame % 800) as i32;
-            let step = match phase {
-                0..=359 => 0,
-                360..=399 => phase - 360,
-                400..=759 => 40,
-                _ => 800 - phase,
-            };
+            let (step, _) = wander_phase(frame, tempo);
             let x = align_down(
                 min_x.saturating_add(span.saturating_mul(step) / 40),
                 cell_width,
@@ -552,13 +594,19 @@ impl OrganismRuntime {
             SurfaceMode::Typing | SurfaceMode::Watching => Behavior::WatchCommand,
             SurfaceMode::Reacting => behavior,
         };
-        let sprite = display_behavior.sprite();
+        // The continuous state shows through the ambient poses as body
+        // language; reaction poses stay canonical.
+        let frame = self.surface_frame.get();
+        let language = BodyLanguage::from_state(self.shared_life.get());
+        let tempo = wander_tempo(language);
+        let walking = mode == SurfaceMode::Idle && wander_phase(frame, tempo).1;
+        let sprite = sprite_frame(display_behavior, language, walking, frame);
         if self.live_body.text().as_str() != sprite {
             self.live_body.set_text(sprite);
         }
         // The sticky one-line form mirrors the same displayed behavior with a
         // fixed-width micro-pose, so scrollback readers see the mood too.
-        let glyph = sticky_glyph(display_behavior, self.surface_frame.get());
+        let glyph = sticky_glyph(display_behavior, language, frame);
         if self.sticky_avatar.text().as_str() != glyph {
             self.sticky_avatar.set_text(glyph);
         }
@@ -588,7 +636,8 @@ impl OrganismRuntime {
                 body_height,
             },
             mode,
-            self.surface_frame.get(),
+            tempo,
+            frame,
         );
 
         if let Some(point) = point {
@@ -1031,8 +1080,8 @@ mod tests {
             height: 63,
             ..tiny_width
         };
-        assert_eq!(surface_point(tiny_width, SurfaceMode::Idle, 0), None);
-        assert_eq!(surface_point(tiny_height, SurfaceMode::Watching, 0), None);
+        assert_eq!(surface_point(tiny_width, SurfaceMode::Idle, WanderTempo::Calm, 0), None);
+        assert_eq!(surface_point(tiny_height, SurfaceMode::Watching, WanderTempo::Calm, 0), None);
 
         let unaligned_near_boundary = SurfaceBox {
             width: 64 + 20 + 16,
@@ -1044,7 +1093,7 @@ mod tests {
             body_height: 48,
         };
         assert_eq!(
-            surface_point(unaligned_near_boundary, SurfaceMode::Typing, 0),
+            surface_point(unaligned_near_boundary, SurfaceMode::Typing, WanderTempo::Calm, 0),
             None
         );
     }
@@ -1067,7 +1116,7 @@ mod tests {
             SurfaceMode::Reacting,
         ] {
             for frame in [0, 1, 359, 360, 399, 400, 759, 799, u64::MAX] {
-                let point = surface_point(surface, mode, frame).expect("body fits");
+                let point = surface_point(surface, mode, WanderTempo::Calm, frame).expect("body fits");
                 assert!(point.x >= f64::from(SURFACE_MARGIN));
                 assert!(point.y >= f64::from(SURFACE_MARGIN));
                 assert_eq!(point.x as i32 % surface.cell_width, 0);
@@ -1209,6 +1258,25 @@ mod tests {
     }
 
     #[test]
+    fn wander_tempo_reshapes_the_cycle_and_calm_matches_the_original() {
+        for (frame, expected) in [(0, 0), (359, 0), (380, 20), (400, 40), (759, 40), (799, 1)] {
+            let (step, _) = wander_phase(frame, WanderTempo::Calm);
+            assert_eq!(step, expected, "frame {frame}");
+        }
+        for frame in 0..1_600 {
+            assert_eq!(wander_phase(frame, WanderTempo::Drowsy), (0, false));
+            for tempo in [WanderTempo::Calm, WanderTempo::Restless] {
+                let (step, _) = wander_phase(frame, tempo);
+                assert!((0..=40).contains(&step));
+            }
+        }
+        let walking_frames =
+            |tempo| (0..800).filter(|frame| wander_phase(*frame, tempo).1).count();
+        assert_eq!(walking_frames(WanderTempo::Calm), 80);
+        assert_eq!(walking_frames(WanderTempo::Restless), 240);
+    }
+
+    #[test]
     fn idle_body_wanders_but_typing_uses_the_safe_upper_corner() {
         let surface = SurfaceBox {
             width: 360,
@@ -1219,10 +1287,10 @@ mod tests {
             body_width: 88,
             body_height: 48,
         };
-        let idle_left = surface_point(surface, SurfaceMode::Idle, 0).unwrap();
-        let idle_still = surface_point(surface, SurfaceMode::Idle, 359).unwrap();
-        let idle_right = surface_point(surface, SurfaceMode::Idle, 400).unwrap();
-        let typing = surface_point(surface, SurfaceMode::Typing, 0).unwrap();
+        let idle_left = surface_point(surface, SurfaceMode::Idle, WanderTempo::Calm, 0).unwrap();
+        let idle_still = surface_point(surface, SurfaceMode::Idle, WanderTempo::Calm, 359).unwrap();
+        let idle_right = surface_point(surface, SurfaceMode::Idle, WanderTempo::Calm, 400).unwrap();
+        let typing = surface_point(surface, SurfaceMode::Typing, WanderTempo::Calm, 0).unwrap();
         assert_eq!(idle_still, idle_left);
         assert!(idle_right.x > idle_left.x);
         assert_eq!(typing.x, idle_right.x);

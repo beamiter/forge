@@ -33,17 +33,41 @@ pub(crate) enum Behavior {
     UnknownOutcome,
 }
 
+// ── Live-body frame sets ────────────────────────────────────────────────
+// Every frame within one visual set shares its bounding box (identical line
+// count and maximum line width), so the overlay's measured size — and with it
+// the fail-closed fit check in `surface_point` — never flaps between frames.
+const IDLE_FRAMES: [&str; 2] = [" /\\_/\\\n( -.- )\n > ^ <", " /\\_/\\\n( -.- )\n >~^ <"];
+const IDLE_TENSE: &str = " =\\_/=\n( -.- )\n > ^ <";
+const YAWN_FRAME: &str = " /\\_/\\\n( >o< )\n > ^ <";
+const DOZE_FRAMES: [&str; 2] = [" /\\_/\\\n( =.= )\n  zzZ ", " /\\_/\\\n( =.= )\n   zZ "];
+const GAIT_FRAMES: [&str; 2] = [" /\\_/\\\n( o.o )\n >/ \\<", " /\\_/\\\n( o.o )\n >\\ /<"];
+const GAIT_TENSE_FRAMES: [&str; 2] = [" =\\_/=\n( o.o )\n >/ \\<", " =\\_/=\n( o.o )\n >\\ /<"];
+const WATCH_FRAMES: [&str; 2] = [" /\\_/\\\n( o.o )\n > ^ <", " /\\_/\\\n( o.o )\n >~^ <"];
+const WATCH_TENSE_FRAMES: [&str; 2] = [" =\\_/=\n( o.o )\n > ^ <", " =\\_/=\n( o.o )\n >~^ <"];
+const INSPECT_FRAME: &str = " /\\_/\\  ->\n( o_o )\n /|_|\\";
+const SIT_FRAMES: [&str; 2] = [" /\\_/\\\n( ._. )  !\n /|_|\\", " /\\_/\\\n( ._. )   \n /|_|\\"];
+const CELE_FRAMES: [&str; 2] = [" \\(^.^)/\n  /| |\\\n   / \\", " \\(^o^)/\n  /| |\\\n   / \\"];
+const BIG_FRAMES: [&str; 2] = [
+    " * \\(^o^)/ *\n    /| |\\\n     / \\",
+    "   \\(^o^)/  \n    /| |\\\n     / \\",
+];
+const REST_FRAMES: [&str; 2] = [" /\\_/\\\n( ^.^ )  ok\n > ^ <", " /\\_/\\\n( ^.^ )  ok\n >~^ <"];
+const UNKNOWN_FRAME: &str = " /\\_/\\\n( ?.? )\n > ^ <";
+
 impl Behavior {
+    /// Canonical single pose: the first frame of each behavior's set. Used by
+    /// the inline card, which records events rather than animating.
     pub(crate) const fn sprite(self) -> &'static str {
         match self {
-            Self::Idle => " /\\_/\\\n( -.- )\n > ^ <",
-            Self::WatchCommand => " /\\_/\\\n( o.o )\n > ^ <",
-            Self::InspectError => " /\\_/\\  ->\n( o_o )\n /|_|\\",
-            Self::SitNearError => " /\\_/\\\n( ._. )  !\n /|_|\\",
-            Self::Celebrate => " \\(^.^)/\n  /| |\\\n   / \\",
-            Self::CelebrateBig => " * \\(^o^)/ *\n    /| |\\\n     / \\",
-            Self::RestAfterPush => " /\\_/\\\n( ^.^ )  ok\n > ^ <",
-            Self::UnknownOutcome => " /\\_/\\\n( ?.? )\n > ^ <",
+            Self::Idle => IDLE_FRAMES[0],
+            Self::WatchCommand => WATCH_FRAMES[0],
+            Self::InspectError => INSPECT_FRAME,
+            Self::SitNearError => SIT_FRAMES[0],
+            Self::Celebrate => CELE_FRAMES[0],
+            Self::CelebrateBig => BIG_FRAMES[0],
+            Self::RestAfterPush => REST_FRAMES[0],
+            Self::UnknownOutcome => UNKNOWN_FRAME,
         }
     }
 
@@ -64,13 +88,71 @@ impl Behavior {
     }
 }
 
+/// Quantized, content-free body language derived from the continuous life
+/// state. Only ambient poses (Idle/WatchCommand) let it show through —
+/// reaction poses stay canonical so event records remain unambiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct BodyLanguage {
+    /// Low energy: lie down and doze instead of sitting, stop wandering.
+    pub(crate) drowsy: bool,
+    /// High stress: ears pressed flat while idling or watching.
+    pub(crate) tense: bool,
+    /// Boredom at the ceiling: occasional yawns, restless wandering.
+    pub(crate) listless: bool,
+}
+
+impl BodyLanguage {
+    pub(crate) fn from_state(state: LifeState) -> Self {
+        let drowsy = state.energy < 0.25;
+        Self {
+            drowsy,
+            tense: state.stress > 0.60,
+            listless: !drowsy && state.boredom > 0.85,
+        }
+    }
+}
+
+/// Pick the live-body sprite for this animation frame, on the same
+/// half-second beat the sticky header uses; rare flourishes (tail flick,
+/// yawn) sit on their own longer cadences. Output-activity pulses advance
+/// `frame` faster, so a busy command visibly quickens the tail.
+pub(crate) fn sprite_frame(
+    behavior: Behavior,
+    language: BodyLanguage,
+    walking: bool,
+    frame: u64,
+) -> &'static str {
+    let beat = frame / 5;
+    let alt = usize::from(beat % 2 == 1);
+    match behavior {
+        Behavior::Idle if language.drowsy => DOZE_FRAMES[alt],
+        Behavior::Idle if walking && language.tense => GAIT_TENSE_FRAMES[alt],
+        Behavior::Idle if walking => GAIT_FRAMES[alt],
+        Behavior::Idle if language.listless && beat % 12 == 11 => YAWN_FRAME,
+        Behavior::Idle if language.tense => IDLE_TENSE,
+        Behavior::Idle => IDLE_FRAMES[usize::from(beat % 8 == 7)],
+        Behavior::WatchCommand if language.tense => WATCH_TENSE_FRAMES[alt],
+        Behavior::WatchCommand => WATCH_FRAMES[alt],
+        Behavior::SitNearError => SIT_FRAMES[alt],
+        Behavior::Celebrate => CELE_FRAMES[alt],
+        Behavior::CelebrateBig => BIG_FRAMES[alt],
+        Behavior::RestAfterPush => REST_FRAMES[alt],
+        Behavior::InspectError | Behavior::UnknownOutcome => behavior.sprite(),
+    }
+}
+
 /// Select the sticky-header micro-pose for the current animation frame. The
 /// cadence is deliberately slow: reacting poses alternate every half second
 /// (five 100ms frames), while the idle pose only flicks its tail on one beat
-/// in twelve so a quiet header stays quiet.
-pub(crate) fn sticky_glyph(behavior: Behavior, frame: u64) -> &'static str {
-    let frames = behavior.sticky_frames();
+/// in twelve so a quiet header stays quiet. A drowsy mind dozes in the header
+/// too.
+pub(crate) fn sticky_glyph(behavior: Behavior, language: BodyLanguage, frame: u64) -> &'static str {
     let beat = frame / 5;
+    // Flat-eared doze, distinct from RestAfterPush's perked-ear rest glyph.
+    if behavior == Behavior::Idle && language.drowsy {
+        return if beat % 2 == 1 { "=\\_/=" } else { "=\\z/=" };
+    }
+    let frames = behavior.sticky_frames();
     let alternate = match behavior {
         Behavior::Idle => beat % 12 == 11,
         _ => beat % 2 == 1,
@@ -959,24 +1041,156 @@ mod tests {
             Behavior::UnknownOutcome,
         ] {
             for frame in [0, 4, 5, 54, 55, 59, u64::MAX] {
-                let glyph = sticky_glyph(behavior, frame);
-                assert_eq!(glyph.chars().count(), 5);
-                assert!(glyph.is_ascii());
+                for drowsy in [false, true] {
+                    let language = BodyLanguage {
+                        drowsy,
+                        ..Default::default()
+                    };
+                    let glyph = sticky_glyph(behavior, language, frame);
+                    assert_eq!(glyph.chars().count(), 5);
+                    assert!(glyph.is_ascii());
+                }
             }
         }
         // Watching alternates every five frames; idle almost never moves.
+        let calm = BodyLanguage::default();
         assert_ne!(
-            sticky_glyph(Behavior::WatchCommand, 0),
-            sticky_glyph(Behavior::WatchCommand, 5)
+            sticky_glyph(Behavior::WatchCommand, calm, 0),
+            sticky_glyph(Behavior::WatchCommand, calm, 5)
         );
         assert_eq!(
-            sticky_glyph(Behavior::Idle, 0),
-            sticky_glyph(Behavior::Idle, 5)
+            sticky_glyph(Behavior::Idle, calm, 0),
+            sticky_glyph(Behavior::Idle, calm, 5)
         );
         assert_ne!(
-            sticky_glyph(Behavior::Idle, 55),
-            sticky_glyph(Behavior::Idle, 0)
+            sticky_glyph(Behavior::Idle, calm, 55),
+            sticky_glyph(Behavior::Idle, calm, 0)
         );
+    }
+
+    fn bounding_box_of(sprite: &str) -> (usize, usize) {
+        (
+            sprite.lines().count(),
+            sprite
+                .lines()
+                .map(|line| line.chars().count())
+                .max()
+                .unwrap_or(0),
+        )
+    }
+
+    #[test]
+    fn every_sprite_frame_keeps_its_behaviors_bounding_box_stable() {
+        let languages = [
+            BodyLanguage::default(),
+            BodyLanguage {
+                drowsy: true,
+                ..Default::default()
+            },
+            BodyLanguage {
+                tense: true,
+                ..Default::default()
+            },
+            BodyLanguage {
+                listless: true,
+                ..Default::default()
+            },
+            BodyLanguage {
+                drowsy: true,
+                tense: true,
+                listless: true,
+            },
+        ];
+        for behavior in [
+            Behavior::Idle,
+            Behavior::WatchCommand,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::RestAfterPush,
+            Behavior::UnknownOutcome,
+        ] {
+            let reference = bounding_box_of(behavior.sprite());
+            for language in languages {
+                for walking in [false, true] {
+                    for frame in 0..130 {
+                        let frame_box =
+                            bounding_box_of(sprite_frame(behavior, language, walking, frame));
+                        assert_eq!(
+                            frame_box, reference,
+                            "{behavior:?} {language:?} walking={walking} frame={frame}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn body_language_quantizes_the_continuous_state() {
+        assert_eq!(
+            BodyLanguage::from_state(LifeState::default()),
+            BodyLanguage::default()
+        );
+
+        let exhausted = BodyLanguage::from_state(LifeState {
+            energy: 0.10,
+            boredom: 0.95,
+            ..LifeState::default()
+        });
+        assert!(exhausted.drowsy);
+        assert!(!exhausted.listless);
+
+        let wired = BodyLanguage::from_state(LifeState {
+            stress: 0.70,
+            boredom: 0.90,
+            ..LifeState::default()
+        });
+        assert!(wired.tense);
+        assert!(wired.listless);
+        assert!(!wired.drowsy);
+    }
+
+    #[test]
+    fn drowsiness_overrides_walking_and_shows_in_the_sticky_header() {
+        let drowsy = BodyLanguage {
+            drowsy: true,
+            ..Default::default()
+        };
+        for frame in 0..130 {
+            let sprite = sprite_frame(Behavior::Idle, drowsy, true, frame);
+            assert!(sprite.contains("zZ"), "dozing cat must not walk");
+        }
+        assert_eq!(sticky_glyph(Behavior::Idle, drowsy, 0), "=\\z/=");
+        assert_ne!(
+            sticky_glyph(Behavior::Idle, drowsy, 0),
+            sticky_glyph(Behavior::RestAfterPush, BodyLanguage::default(), 0)
+        );
+        assert_eq!(
+            sticky_glyph(Behavior::Idle, BodyLanguage::default(), 0),
+            "/\\_/\\"
+        );
+    }
+
+    #[test]
+    fn a_listless_cat_yawns_rarely_and_a_tense_cat_flattens_its_ears() {
+        let listless = BodyLanguage {
+            listless: true,
+            ..Default::default()
+        };
+        let yawns = (0..600)
+            .filter(|frame| sprite_frame(Behavior::Idle, listless, false, *frame) == YAWN_FRAME)
+            .count();
+        assert!(yawns > 0);
+        assert!(yawns * 8 < 600);
+
+        let tense = BodyLanguage {
+            tense: true,
+            ..Default::default()
+        };
+        assert!(sprite_frame(Behavior::WatchCommand, tense, false, 0).starts_with(" =\\_/="));
+        assert!(sprite_frame(Behavior::Idle, tense, false, 0).starts_with(" =\\_/="));
     }
 
     #[test]
