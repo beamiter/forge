@@ -2409,6 +2409,9 @@ pub struct TermView {
     command_finished_callbacks: CommandFinishedCallbacks,
     block_finished_callbacks: BlockFinishedCallbacks,
     agent_execution_lost_callbacks: AgentExecutionLostCallbacks,
+    /// Verified Agent generation of the running command, set at CommandStart.
+    /// Exposed read-only so the organism can tell whose command is running.
+    active_agent_generation: Rc<Cell<Option<u64>>>,
     verified_submission: VerifiedSubmissionCtx,
     verified_submission_source_id: Rc<RefCell<Option<glib::SourceId>>>,
     prompt_anchor_tick_id: Rc<RefCell<Option<gtk4::TickCallbackId>>>,
@@ -6874,6 +6877,7 @@ impl TermView {
             command_finished_callbacks,
             block_finished_callbacks,
             agent_execution_lost_callbacks,
+            active_agent_generation: active_agent_generation.clone(),
             verified_submission,
             verified_submission_source_id,
             prompt_anchor_tick_id,
@@ -7644,6 +7648,13 @@ impl TermView {
     /// Observe a locally armed Agent execution whose terminal lifecycle could
     /// no longer be correlated safely. The generation is one-shot and contains
     /// no command/output data.
+    /// Whether the currently running foreground command was submitted by the
+    /// Shell Agent (identity-verified at CommandStart). Content-free: exposes
+    /// only the fact, never the generation's proposal or command.
+    pub(crate) fn agent_command_active(&self) -> bool {
+        self.active_agent_generation.get().is_some()
+    }
+
     pub(crate) fn connect_agent_execution_lost<F>(&self, f: F)
     where
         F: Fn(u64, &'static str) + 'static,

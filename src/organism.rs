@@ -36,6 +36,9 @@ pub(crate) enum Behavior {
     Sleep,
     Explore,
     Approach,
+    /// Crouched a little apart, watching the Shell Agent work — distinct from
+    /// WatchCommand so the body shows whose command is running.
+    WatchAgent,
 }
 
 // ── Live-body frame sets ────────────────────────────────────────────────
@@ -62,6 +65,7 @@ const UNKNOWN_FRAME: &str = " /\\_/\\\n( ?.? )\n > ^ <";
 const SLEEP_FRAMES: [&str; 2] = [" /\\_/\\\n( -_- )zZ\n (___) ", " /\\_/\\\n( -_- )Z \n (___) "];
 const EXPLORE_FRAMES: [&str; 2] = [" /\\_/\\\n( o.o)?\n > ^ <", " /\\_/\\\n?(o.o )\n > ^ <"];
 const APPROACH_FRAMES: [&str; 2] = [" /\\_/\\\n( ^.^ )\n > ^ <", " /\\_/\\\n( ^.^ )\n >~^ <"];
+const WATCH_AGENT_FRAMES: [&str; 2] = [" /\\_/\\\n( -.o )\n (___) ", " /\\_/\\\n( o.- )\n (___) "];
 
 impl Behavior {
     /// Canonical single pose: the first frame of each behavior's set. Used by
@@ -79,6 +83,7 @@ impl Behavior {
             Self::Sleep => SLEEP_FRAMES[0],
             Self::Explore => EXPLORE_FRAMES[0],
             Self::Approach => APPROACH_FRAMES[0],
+            Self::WatchAgent => WATCH_AGENT_FRAMES[0],
         }
     }
 
@@ -98,6 +103,7 @@ impl Behavior {
             Self::Sleep => ["=\\z/=", "=\\_/="],
             Self::Explore => ["~\\_/~", "/\\_/\\"],
             Self::Approach => ["/\\^/\\", "/\\_/\\"],
+            Self::WatchAgent => ["/\\./\\", "/\\_/\\"],
         }
     }
 }
@@ -156,6 +162,7 @@ pub(crate) fn sprite_frame(
         Behavior::Explore if walking => GAIT_FRAMES[alt],
         Behavior::Explore => EXPLORE_FRAMES[alt],
         Behavior::Approach => APPROACH_FRAMES[alt],
+        Behavior::WatchAgent => WATCH_AGENT_FRAMES[alt],
         Behavior::InspectError | Behavior::UnknownOutcome => behavior.sprite(),
     }
 }
@@ -312,6 +319,48 @@ pub(crate) fn sticky_glyph(behavior: Behavior, language: BodyLanguage, frame: u6
         _ => beat % 2 == 1,
     };
     frames[usize::from(alternate)]
+}
+
+/// Coarse, content-free phases of the Shell Agent lifecycle. Only the phase
+/// kind ever crosses the organism boundary — never proposals, commands,
+/// model output, or error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentPulse {
+    /// The session is thinking or running an approved command.
+    Working,
+    /// A proposal is waiting for the human's review.
+    AskingReview,
+    /// The task completed (or hit its turn limit).
+    Finished,
+    /// The session was cancelled or went away.
+    Gone,
+}
+
+/// Fold one Agent lifecycle phase into the shared life state. The Agent
+/// occupying the human's attention slowly feeds the organism's social need,
+/// which is what finally gives the Approach disposition a genuine niche:
+/// when the Agent leaves, the cat comes looking for its human.
+pub(crate) fn agent_pulse(mut state: LifeState, pulse: AgentPulse) -> LifeState {
+    match pulse {
+        AgentPulse::Working => {
+            state.curiosity += 0.03;
+            state.social_need += 0.015;
+        }
+        AgentPulse::AskingReview => {
+            state.curiosity += 0.04;
+            state.social_need += 0.02;
+        }
+        AgentPulse::Finished => {
+            state.mood += 0.04;
+            state.attachment += 0.02;
+            state.social_need += 0.03;
+        }
+        AgentPulse::Gone => {
+            state.social_need += 0.05;
+        }
+    }
+    state.clamp();
+    state
 }
 
 /// Content-free pulse from the command-correction card: the user accepted the
@@ -501,6 +550,9 @@ pub(crate) struct NativeOrganism {
     pending_arrival: Option<RepoArrival>,
     /// The active command directly followed an accepted correction card.
     assisted: bool,
+    /// The active command was submitted by the Shell Agent, not typed by the
+    /// human. Content-free: only the fact, never the proposal or command.
+    agent_driven: bool,
 }
 
 impl NativeOrganism {
@@ -549,6 +601,32 @@ impl NativeOrganism {
         self.assisted = true;
     }
 
+    /// Record whether the active command was submitted by the Shell Agent.
+    /// Set unconditionally at every command start (so a stale flag can never
+    /// outlive a lost command), consumed by the next `command_finished`
+    /// reduction: the organism watches from a little apart and keeps its big
+    /// celebrations — and its debugging empathy — for commands the human
+    /// typed themself.
+    pub(crate) fn set_agent_command(&mut self, agent_driven: bool) {
+        self.agent_driven = agent_driven;
+    }
+
+    /// The Agent's approved command ended without its authoritative end
+    /// marker. React with restrained caution, never with celebration.
+    pub(crate) fn agent_execution_lost(&mut self) -> Reaction {
+        self.agent_driven = false;
+        self.active_kind = None;
+        self.state.curiosity += 0.04;
+        self.state.stress += 0.05;
+        self.state.clamp();
+        Reaction {
+            behavior: Behavior::UnknownOutcome,
+            tone: Tone::Warning,
+            description: "the Agent's command ended without its end marker".to_string(),
+            speech: None,
+        }
+    }
+
     /// A local calendar boundary passed while this pane stayed alive. Today's
     /// habituation/sensitization counters restart; repo-backed contexts are
     /// re-seeded from the day-scoped memory on the next build anyway.
@@ -583,6 +661,19 @@ impl NativeOrganism {
             0.04
         };
         self.state.boredom -= 0.08;
+
+        if self.agent_driven {
+            // Crouch a little apart: the Agent is working, not the human. A
+            // pending repo greeting stays queued for the human's own first
+            // command instead of being spent on the Agent's.
+            self.state.clamp();
+            return Reaction {
+                behavior: Behavior::WatchAgent,
+                tone: Tone::Quiet,
+                description: format!("watching the Agent run a {} command", kind.label()),
+                speech: None,
+            };
+        }
 
         let arrival = self.pending_arrival.take();
         match arrival {
@@ -639,6 +730,7 @@ impl NativeOrganism {
         };
         self.active_kind = None;
         let assisted = std::mem::take(&mut self.assisted);
+        let agent_driven = std::mem::take(&mut self.agent_driven);
 
         let duration = duration_label(duration_ms);
         let Some(exit_code) = exit_code else {
@@ -655,13 +747,24 @@ impl NativeOrganism {
         if exit_code != 0 {
             self.rough_streak = self.rough_streak.saturating_add(1);
             // The first crack after a clean run of passes stings more than one
-            // more failure in an already rough day.
-            let sensitized = kind == CommandKind::BuildOrTest
+            // more failure in an already rough day. An Agent's failure is the
+            // Agent's problem: softer stress, and the human's confidence and
+            // clean-run pride are untouched.
+            let sensitized = !agent_driven
+                && kind == CommandKind::BuildOrTest
                 && self.failures_today == 0
                 && self.successes_today >= SENSITIZATION_CLEAN_RUNS;
-            self.state.mood -= 0.08;
-            self.state.stress += if sensitized { 0.20 } else { 0.12 };
-            self.state.confidence -= if sensitized { 0.06 } else { 0.04 };
+            self.state.mood -= if agent_driven { 0.04 } else { 0.08 };
+            self.state.stress += if agent_driven {
+                0.06
+            } else if sensitized {
+                0.20
+            } else {
+                0.12
+            };
+            if !agent_driven {
+                self.state.confidence -= if sensitized { 0.06 } else { 0.04 };
+            }
             self.state.curiosity += 0.05;
             self.state.clamp();
 
@@ -674,6 +777,24 @@ impl NativeOrganism {
                 0
             };
             let rough = failures == 0 && self.rough_streak >= ROUGH_STREAK_THRESHOLD;
+            let mut description = if sensitized {
+                format!(
+                    "exit {exit_code}{duration} · first crack after {} clean run(s)",
+                    self.successes_today
+                )
+            } else if rough {
+                format!(
+                    "exit {exit_code}{duration} · {} rough commands in a row",
+                    self.rough_streak
+                )
+            } else if failures == 0 {
+                format!("exit {exit_code}{duration} · inspecting the finished Block")
+            } else {
+                format!("exit {exit_code}{duration} · build failure {failures}")
+            };
+            if agent_driven {
+                description.push_str(" · agent-driven");
+            }
             return Reaction {
                 behavior: if failures >= 2 || rough {
                     Behavior::SitNearError
@@ -681,22 +802,11 @@ impl NativeOrganism {
                     Behavior::InspectError
                 },
                 tone: Tone::Error,
-                description: if sensitized {
-                    format!(
-                        "exit {exit_code}{duration} · first crack after {} clean run(s)",
-                        self.successes_today
-                    )
-                } else if rough {
-                    format!(
-                        "exit {exit_code}{duration} · {} rough commands in a row",
-                        self.rough_streak
-                    )
-                } else if failures == 0 {
-                    format!("exit {exit_code}{duration} · inspecting the finished Block")
-                } else {
-                    format!("exit {exit_code}{duration} · build failure {failures}")
-                },
-                speech: if failures > 0 {
+                description,
+                speech: if agent_driven {
+                    // The human is not debugging yet; pointing would nag.
+                    None
+                } else if failures > 0 {
                     (failures <= 1).then_some("这里。")
                 } else {
                     // Speak up on the first stumble; a continuing rough streak
@@ -723,12 +833,19 @@ impl NativeOrganism {
                 let habituation = if failures == 0 { self.successes_today } else { 0 };
                 let damp = 1.0 / (1.0 + habituation as f32 / 4.0);
                 self.successes_today = self.successes_today.saturating_add(1);
-                self.state.mood += (0.10 + failures.min(5) as f32 * 0.025) * damp;
+                // An Agent-driven pass earns half the glow and none of the
+                // human's confidence — they didn't type it.
+                let ownership = if agent_driven { 0.5 } else { 1.0 };
+                self.state.mood += (0.10 + failures.min(5) as f32 * 0.025) * damp * ownership;
                 self.state.stress -= 0.12;
-                self.state.confidence += 0.08 * damp;
+                self.state.confidence += 0.08 * damp * ownership;
                 self.state.attachment += 0.025;
                 self.state.clamp();
-                let (behavior, tone, speech) = if failures == 0 {
+                let (behavior, tone, speech) = if agent_driven {
+                    // A quiet nod: big celebrations and words stay reserved
+                    // for commands the human typed themself.
+                    (Behavior::Celebrate, Tone::Success, None)
+                } else if failures == 0 {
                     match habituation {
                         0..=2 => (Behavior::Celebrate, Tone::Success, Some("过了。")),
                         3..=5 => (Behavior::Celebrate, Tone::Success, None),
@@ -739,17 +856,21 @@ impl NativeOrganism {
                 } else {
                     (Behavior::CelebrateBig, Tone::Success, Some("终于。"))
                 };
+                let mut description = if failures == 0 && habituation >= 3 {
+                    format!(
+                        "build/test passed{duration} · pass {} today",
+                        habituation.saturating_add(1)
+                    )
+                } else {
+                    format!("build/test passed after {failures} failure(s){duration}")
+                };
+                if agent_driven {
+                    description.push_str(" · agent-driven");
+                }
                 Reaction {
                     behavior,
                     tone,
-                    description: if failures == 0 && habituation >= 3 {
-                        format!(
-                            "build/test passed{duration} · pass {} today",
-                            habituation.saturating_add(1)
-                        )
-                    } else {
-                        format!("build/test passed after {failures} failure(s){duration}")
-                    },
+                    description,
                     speech,
                 }
             }
@@ -757,14 +878,18 @@ impl NativeOrganism {
                 self.state.energy -= 0.02;
                 self.state.mood += 0.06;
                 self.state.stress -= 0.08;
-                self.state.attachment += 0.04;
+                self.state.attachment += if agent_driven { 0.02 } else { 0.04 };
                 self.state.clamp();
                 let recovered = std::mem::take(&mut self.recovered_build);
                 Reaction {
                     behavior: Behavior::RestAfterPush,
                     tone: Tone::Success,
-                    description: format!("git push completed{duration}"),
-                    speech: recovered.then_some("收好了。"),
+                    description: if agent_driven {
+                        format!("git push completed{duration} · agent-driven")
+                    } else {
+                        format!("git push completed{duration}")
+                    },
+                    speech: (recovered && !agent_driven).then_some("收好了。"),
                 }
             }
             CommandKind::Other => {
@@ -1196,6 +1321,7 @@ mod tests {
             Behavior::Sleep,
             Behavior::Explore,
             Behavior::Approach,
+            Behavior::WatchAgent,
         ] {
             for frame in [0, 4, 5, 54, 55, 59, u64::MAX] {
                 for drowsy in [false, true] {
@@ -1270,6 +1396,7 @@ mod tests {
             Behavior::Sleep,
             Behavior::Explore,
             Behavior::Approach,
+            Behavior::WatchAgent,
         ] {
             let reference = bounding_box_of(behavior.sprite());
             for language in languages {
@@ -1448,6 +1575,106 @@ mod tests {
         let calm = BodyLanguage::default();
         assert!(sprite_frame(Behavior::Explore, calm, false, 0).contains("> ^ <"));
         assert!(sprite_frame(Behavior::Explore, calm, true, 0).contains(">/ \\<"));
+    }
+
+    #[test]
+    fn agent_commands_get_quiet_nods_and_the_big_celebrations_stay_human() {
+        let mut organism = NativeOrganism::default();
+        organism.set_agent_command(true);
+        let started = organism.command_started("cargo test");
+        assert_eq!(started.behavior, Behavior::WatchAgent);
+        assert_eq!(started.tone, Tone::Quiet);
+
+        // Even a big recovery earns only a small, wordless celebration.
+        organism.restore_repo_context(3, false, 0, 3);
+        organism.set_agent_command(true);
+        let recovery = organism.command_finished("cargo test", Some(0), None);
+        assert_eq!(recovery.behavior, Behavior::Celebrate);
+        assert_eq!(recovery.speech, None);
+        assert!(recovery.description.contains("agent-driven"));
+
+        // The same recovery typed by the human celebrates at full strength.
+        let mut human = NativeOrganism::default();
+        human.restore_repo_context(3, false, 0, 3);
+        let big = human.command_finished("cargo test", Some(0), None);
+        assert_eq!(big.behavior, Behavior::CelebrateBig);
+        assert_eq!(big.speech, Some("终于。"));
+    }
+
+    #[test]
+    fn a_repo_greeting_waits_for_the_humans_own_command() {
+        let mut organism = NativeOrganism::default();
+        organism.note_repo_arrival(RepoArrival::Home);
+        organism.set_agent_command(true);
+        let agent_start = organism.command_started("cargo build");
+        assert_eq!(agent_start.behavior, Behavior::WatchAgent);
+        assert_eq!(agent_start.speech, None);
+        organism.command_finished("cargo build", Some(0), None);
+
+        organism.set_agent_command(false);
+        let human_start = organism.command_started("cargo build");
+        assert_eq!(human_start.speech, Some("回来了。"));
+    }
+
+    #[test]
+    fn agent_failures_spare_the_humans_confidence_and_stay_silent() {
+        let mut organism = NativeOrganism::default();
+        let confidence_before = organism.state().confidence;
+        organism.set_agent_command(true);
+        let failure = organism.command_finished("cargo test", Some(101), None);
+        assert_eq!(failure.speech, None);
+        assert!(failure.description.contains("agent-driven"));
+        assert_eq!(organism.state().confidence, confidence_before);
+
+        // A sensitized first crack never triggers for the Agent's failure.
+        let mut proud = NativeOrganism::default();
+        proud.restore_repo_context(0, false, 9, 0);
+        proud.set_agent_command(true);
+        let crack = proud.command_finished("cargo test", Some(101), None);
+        assert!(!crack.description.contains("first crack"));
+
+        // An agent push never claims the human's follow-through phrase.
+        let mut push = NativeOrganism::default();
+        push.restore_repo_context(1, false, 0, 1);
+        push.command_finished("cargo test", Some(0), None);
+        push.set_agent_command(true);
+        let pushed = push.command_finished("git push", Some(0), None);
+        assert_eq!(pushed.speech, None);
+    }
+
+    #[test]
+    fn agent_execution_lost_reacts_with_restrained_caution() {
+        let mut organism = NativeOrganism::default();
+        organism.set_agent_command(true);
+        organism.command_started("cargo test");
+        let lost = organism.agent_execution_lost();
+        assert_eq!(lost.behavior, Behavior::UnknownOutcome);
+        assert_eq!(lost.tone, Tone::Warning);
+        assert_eq!(lost.speech, None);
+
+        // The stale flag is gone: the next human command is fully owned.
+        let success = organism.command_finished("cargo test", Some(0), None);
+        assert!(!success.description.contains("agent-driven"));
+        assert_eq!(success.speech, Some("过了。"));
+    }
+
+    #[test]
+    fn agent_pulses_feed_social_need_and_stay_bounded() {
+        let mut state = LifeState::default();
+        let social_before = state.social_need;
+        state = agent_pulse(state, AgentPulse::Working);
+        state = agent_pulse(state, AgentPulse::AskingReview);
+        state = agent_pulse(state, AgentPulse::Finished);
+        state = agent_pulse(state, AgentPulse::Gone);
+        assert!(state.social_need > social_before);
+
+        for _ in 0..10_000 {
+            state = agent_pulse(state, AgentPulse::Gone);
+        }
+        assert!(state
+            .values()
+            .into_iter()
+            .all(|value| (0.0..=1.0).contains(&value)));
     }
 
     #[test]

@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use super::UiState;
 use crate::block_view::TermView;
 use crate::organism::{
-    classify_command, sprite_frame, sticky_glyph, AmbientBehavior, AmbientMind, Behavior,
-    BodyLanguage, CommandKind, LifeState, NativeOrganism, Reaction, RepoArrival, Tone,
+    classify_command, sprite_frame, sticky_glyph, AgentPulse, AmbientBehavior, AmbientMind,
+    Behavior, BodyLanguage, CommandKind, LifeState, NativeOrganism, Reaction, RepoArrival, Tone,
 };
 use crate::organism_memory::{local_day_at_ms, unix_ms, MemoryEvent, RepoContext};
 
@@ -386,6 +386,32 @@ impl OrganismActivity {
     }
 }
 
+/// Window-shared, content-free pulses from the Shell Agent lifecycle. Only
+/// coarse [`AgentPulse`] phases reach the life state — never proposals,
+/// commands, model output, or error text. Repeated renders of the same phase
+/// are deduplicated so status refreshes cannot pump the state.
+pub(crate) struct OrganismAgentSignal {
+    life: Rc<Cell<LifeState>>,
+    last: Cell<Option<AgentPulse>>,
+}
+
+impl OrganismAgentSignal {
+    pub(crate) fn new(life: Rc<Cell<LifeState>>) -> Rc<Self> {
+        Rc::new(Self {
+            life,
+            last: Cell::new(None),
+        })
+    }
+
+    pub(crate) fn note_phase(&self, pulse: AgentPulse) {
+        if self.last.replace(Some(pulse)) == Some(pulse) {
+            return;
+        }
+        self.life
+            .set(crate::organism::agent_pulse(self.life.get(), pulse));
+    }
+}
+
 /// True when `cwd` is `root` itself or a path strictly inside it.
 fn cwd_within(cwd: &str, root: &str) -> bool {
     cwd.strip_prefix(root)
@@ -430,6 +456,8 @@ struct OrganismRuntime {
     surface_behavior: Cell<Behavior>,
     last_surface_mode: Cell<Option<SurfaceMode>>,
     command_running: Cell<bool>,
+    /// The running command is the Agent's; the watching pose crouches apart.
+    agent_watching: Cell<bool>,
     last_human_input: Cell<Option<Instant>>,
     output_activity: Cell<bool>,
     card: gtk4::Widget,
@@ -553,6 +581,7 @@ impl OrganismRuntime {
             surface_behavior: Cell::new(Behavior::Idle),
             last_surface_mode: Cell::new(None),
             command_running: Cell::new(false),
+            agent_watching: Cell::new(false),
             last_human_input: Cell::new(None),
             output_activity: Cell::new(false),
             card: outer.upcast(),
@@ -626,6 +655,7 @@ impl OrganismRuntime {
         let ambient = self.ambient_display.get();
         let display_behavior = match mode {
             SurfaceMode::Idle => ambient.display(),
+            SurfaceMode::Watching if self.agent_watching.get() => Behavior::WatchAgent,
             SurfaceMode::Typing | SurfaceMode::Watching => Behavior::WatchCommand,
             SurfaceMode::Reacting => behavior,
         };
@@ -903,6 +933,11 @@ impl UiState {
                 if !runtime.command_running.replace(true) {
                     runtime.activity.command_started(Instant::now());
                 }
+                // Identity-verified at CommandStart: content-free fact only.
+                let agent_driven = view_weak
+                    .upgrade()
+                    .is_some_and(|view| view.agent_command_active());
+                runtime.agent_watching.set(agent_driven);
                 // Enter's retreat protected the editable prompt; once OSC C
                 // establishes a running command, the dedicated watching pose
                 // is already anchored away from that line.
@@ -981,6 +1016,7 @@ impl UiState {
                     if correction.take_recent_accept(pane, Instant::now()) {
                         organism.note_assisted_command();
                     }
+                    organism.set_agent_command(agent_driven);
                     let reaction = organism.command_started(&event.command);
                     shared_life.set(organism.state());
                     reaction
@@ -1002,6 +1038,7 @@ impl UiState {
                 if runtime.command_running.replace(false) {
                     runtime.activity.command_finished(Instant::now());
                 }
+                let agent_driven = runtime.agent_watching.replace(false);
                 // Show the authoritative result for the complete hold window.
                 // Any genuinely new prompt input will immediately replace this
                 // with a fresh sliding retreat.
@@ -1049,16 +1086,22 @@ impl UiState {
                                 ));
                             }
                             Some(0) if insight.recovered_failures > 0 => {
-                                reaction.behavior = if insight.recovered_failures >= 3 {
+                                // Big celebrations and words stay reserved for
+                                // recoveries the human typed themself.
+                                reaction.behavior = if insight.recovered_failures >= 3
+                                    && !agent_driven
+                                {
                                     Behavior::CelebrateBig
                                 } else {
                                     Behavior::Celebrate
                                 };
-                                reaction.speech = Some(if insight.recovered_failures >= 3 {
-                                    "终于。"
-                                } else {
-                                    "好了。"
-                                });
+                                if !agent_driven {
+                                    reaction.speech = Some(if insight.recovered_failures >= 3 {
+                                        "终于。"
+                                    } else {
+                                        "好了。"
+                                    });
+                                }
                                 reaction.description.push_str(&format!(
                                     " · repo recovery after {} failure(s)",
                                     insight.recovered_failures
@@ -1067,10 +1110,13 @@ impl UiState {
                             _ => {}
                         }
                     }
-                    if insight.faster_than_yesterday {
+                    if insight.faster_than_yesterday && !agent_driven {
                         reaction.speech = Some("这次比昨天快。");
                         reaction.description.push_str(" · remembered this repo");
-                    } else if insight.push_after_recovery && reaction.speech.is_none() {
+                    } else if insight.push_after_recovery
+                        && reaction.speech.is_none()
+                        && !agent_driven
+                    {
                         // The build may have recovered before this window was
                         // restarted; repo memory still closes the loop.
                         reaction.speech = Some("收好了。");
@@ -1089,14 +1135,62 @@ impl UiState {
         }
 
         {
-            // The agent-lost recovery path restores the prompt without ever
-            // emitting CommandFinished; return this pane's running slot so a
-            // command that silently ended cannot keep the mind awake forever.
+            // Correlation loss arrives in several flavors: before any command
+            // started, at CommandEnd right before an authoritative
+            // CommandFinished in the same parser turn, after a verified
+            // finish at the next prompt, or on the recovery path where no
+            // finish will ever come. Only the last one is the organism's to
+            // handle, so defer one main-loop turn and let an arriving finish
+            // win — it carries the verified outcome and, because nothing is
+            // cleared here, the correct agent attribution.
             let runtime = runtime.clone();
+            let view_weak = Rc::downgrade(view);
+            let shared_life = self.organism_life.clone();
             view.connect_agent_execution_lost(move |_generation, _reason| {
-                if runtime.command_running.replace(false) {
-                    runtime.activity.command_finished(Instant::now());
+                if !runtime.command_running.get() {
+                    // Nothing is running: either nothing ever started, or the
+                    // finish was already consumed with correct attribution.
+                    return;
                 }
+                if !runtime.agent_watching.get() {
+                    // The running command is not agent-attributed (e.g. the
+                    // human pressed Enter on an inserted reviewed command and
+                    // the verification poll aborted afterwards): the agent's
+                    // command never ran, and the human's live command must
+                    // keep its slot and its outcome.
+                    return;
+                }
+                let runtime = runtime.clone();
+                let view_weak = view_weak.clone();
+                let shared_life = shared_life.clone();
+                let observed_generation = runtime.generation.get();
+                gtk4::glib::idle_add_local_once(move || {
+                    // A finish (or a fresh start) in the meantime owns the
+                    // outcome; only a still-unresolved running command falls
+                    // to this restrained warning.
+                    if runtime.generation.get() != observed_generation
+                        || !runtime.command_running.get()
+                    {
+                        return;
+                    }
+                    if runtime.command_running.replace(false) {
+                        runtime.activity.command_finished(Instant::now());
+                    }
+                    runtime.agent_watching.set(false);
+                    let generation = runtime.bump_generation();
+                    let reaction = {
+                        let mut organism = runtime.organism.borrow_mut();
+                        organism.sync_state(shared_life.get());
+                        let reaction = organism.agent_execution_lost();
+                        shared_life.set(organism.state());
+                        reaction
+                    };
+                    runtime.render(&reaction);
+                    if let Some(view) = view_weak.upgrade() {
+                        view.insert_inline_notice(&runtime.card);
+                    }
+                    OrganismRuntime::settle_later(&runtime, view_weak, generation);
+                });
             });
         }
 
@@ -1250,6 +1344,20 @@ mod tests {
         signal.note_accepted(3);
         signal.revoke_accept(3);
         assert!(!signal.take_recent_accept(3, Instant::now()));
+    }
+
+    #[test]
+    fn agent_signal_deduplicates_repeated_phase_renders() {
+        let life = Rc::new(Cell::new(LifeState::default()));
+        let signal = OrganismAgentSignal::new(life.clone());
+        let before = life.get().social_need;
+        signal.note_phase(AgentPulse::Working);
+        let after_first = life.get().social_need;
+        assert!(after_first > before);
+        signal.note_phase(AgentPulse::Working);
+        assert_eq!(life.get().social_need, after_first);
+        signal.note_phase(AgentPulse::Gone);
+        assert!(life.get().social_need > after_first);
     }
 
     #[test]

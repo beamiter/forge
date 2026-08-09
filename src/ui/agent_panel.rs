@@ -1078,6 +1078,9 @@ struct AgentRuntime {
     request_cancellation: RefCell<Option<crate::ai::AiCancellationToken>>,
     busy: Cell<bool>,
     alive: Cell<bool>,
+    /// Content-free lifecycle phases for the ASCII organism: only coarse
+    /// state kinds cross, never proposals, commands, or model output.
+    organism_agent: Rc<super::OrganismAgentSignal>,
 }
 
 impl AgentRuntime {
@@ -1239,12 +1242,31 @@ impl AgentRuntime {
     fn render_session_state(&self, ready_status: Option<&str>) {
         self.sync_controls();
         if self.busy.get() {
+            self.organism_agent
+                .note_phase(crate::organism::AgentPulse::Working);
             if let Some(message) = ready_status {
                 self.set_status(message, true);
             }
             return;
         }
         let state = self.session.borrow().state();
+        let pulse = match state {
+            // An idle session awaiting instruction is not "working"; staying
+            // silent here also keeps panel open/close toggles from pumping
+            // alternating phases past the dedup.
+            AgentState::Ready => None,
+            AgentState::AwaitingModel | AgentState::AwaitingObservation { .. } => {
+                Some(crate::organism::AgentPulse::Working)
+            }
+            AgentState::AwaitingApproval { .. } => Some(crate::organism::AgentPulse::AskingReview),
+            AgentState::Completed | AgentState::TurnLimitReached => {
+                Some(crate::organism::AgentPulse::Finished)
+            }
+            AgentState::Cancelled => Some(crate::organism::AgentPulse::Gone),
+        };
+        if let Some(pulse) = pulse {
+            self.organism_agent.note_phase(pulse);
+        }
         match state {
             AgentState::Ready => {
                 self.set_status(
@@ -2551,6 +2573,7 @@ impl UiState {
             request_cancellation: RefCell::new(None),
             busy: Cell::new(false),
             alive: Cell::new(true),
+            organism_agent: self.organism_agent.clone(),
         });
         let intro = if block_context.is_some() {
             "Bound to this Block pane with the selected finished Block attached as untrusted context. I can propose commands, but cannot run one without your explicit approval."
