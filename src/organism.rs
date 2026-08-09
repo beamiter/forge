@@ -31,6 +31,11 @@ pub(crate) enum Behavior {
     CelebrateBig,
     RestAfterPush,
     UnknownOutcome,
+    // Ambient dispositions chosen by the utility mind, never by event
+    // reactions: they only ever reach the display through AmbientBehavior.
+    Sleep,
+    Explore,
+    Approach,
 }
 
 // ── Live-body frame sets ────────────────────────────────────────────────
@@ -54,6 +59,9 @@ const BIG_FRAMES: [&str; 2] = [
 ];
 const REST_FRAMES: [&str; 2] = [" /\\_/\\\n( ^.^ )  ok\n > ^ <", " /\\_/\\\n( ^.^ )  ok\n >~^ <"];
 const UNKNOWN_FRAME: &str = " /\\_/\\\n( ?.? )\n > ^ <";
+const SLEEP_FRAMES: [&str; 2] = [" /\\_/\\\n( -_- )zZ\n (___) ", " /\\_/\\\n( -_- )Z \n (___) "];
+const EXPLORE_FRAMES: [&str; 2] = [" /\\_/\\\n( o.o)?\n > ^ <", " /\\_/\\\n?(o.o )\n > ^ <"];
+const APPROACH_FRAMES: [&str; 2] = [" /\\_/\\\n( ^.^ )\n > ^ <", " /\\_/\\\n( ^.^ )\n >~^ <"];
 
 impl Behavior {
     /// Canonical single pose: the first frame of each behavior's set. Used by
@@ -68,6 +76,9 @@ impl Behavior {
             Self::CelebrateBig => BIG_FRAMES[0],
             Self::RestAfterPush => REST_FRAMES[0],
             Self::UnknownOutcome => UNKNOWN_FRAME,
+            Self::Sleep => SLEEP_FRAMES[0],
+            Self::Explore => EXPLORE_FRAMES[0],
+            Self::Approach => APPROACH_FRAMES[0],
         }
     }
 
@@ -84,6 +95,9 @@ impl Behavior {
             Self::CelebrateBig => ["*\\o/*", "*\\_/*"],
             Self::RestAfterPush => ["/\\z/\\", "/\\_/\\"],
             Self::UnknownOutcome => ["/\\?/\\", "/\\?/\\"],
+            Self::Sleep => ["=\\z/=", "=\\_/="],
+            Self::Explore => ["~\\_/~", "/\\_/\\"],
+            Self::Approach => ["/\\^/\\", "/\\_/\\"],
         }
     }
 }
@@ -137,7 +151,147 @@ pub(crate) fn sprite_frame(
         Behavior::Celebrate => CELE_FRAMES[alt],
         Behavior::CelebrateBig => BIG_FRAMES[alt],
         Behavior::RestAfterPush => REST_FRAMES[alt],
+        Behavior::Sleep => SLEEP_FRAMES[alt],
+        // Step only while actually moving; scanning happens while seated.
+        Behavior::Explore if walking => GAIT_FRAMES[alt],
+        Behavior::Explore => EXPLORE_FRAMES[alt],
+        Behavior::Approach => APPROACH_FRAMES[alt],
         Behavior::InspectError | Behavior::UnknownOutcome => behavior.sprite(),
+    }
+}
+
+/// Ambient disposition of a genuinely idle body — no command, no reaction
+/// hold, no recent typing. Chosen by [`AmbientMind`], never by event
+/// reactions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AmbientBehavior {
+    Idle,
+    Sleep,
+    Explore,
+    Approach,
+}
+
+impl AmbientBehavior {
+    pub(crate) const fn display(self) -> Behavior {
+        match self {
+            Self::Idle => Behavior::Idle,
+            Self::Sleep => Behavior::Sleep,
+            Self::Explore => Behavior::Explore,
+            Self::Approach => Behavior::Approach,
+        }
+    }
+
+    /// Once chosen, a disposition is held before rescoring so behavior does
+    /// not reroll every frame — the prototype's behavior_hold_for timers.
+    const fn hold_secs(self) -> f32 {
+        match self {
+            Self::Sleep => 2.5,
+            Self::Explore => 1.4,
+            Self::Approach => 1.8,
+            Self::Idle => 1.0,
+        }
+    }
+}
+
+/// Utility-scored ambient behavior selection, ported from the prototype's
+/// `choose_utility_behavior`: candidates are scored from the continuous
+/// state, the incumbent gets a small inertia bonus, deterministic xorshift
+/// jitter keeps ties from freezing, and the winner is held for its own
+/// timer. Exhaustion below [`FORCED_REST_ENERGY`] overrides the scores, so
+/// the sleep-regenerate loop closes: a drained mind curls up, energy climbs,
+/// and another disposition eventually outscores sleep.
+#[derive(Debug)]
+pub(crate) struct AmbientMind {
+    current: AmbientBehavior,
+    hold_for: f32,
+    seed: u64,
+}
+
+impl Default for AmbientMind {
+    fn default() -> Self {
+        Self {
+            current: AmbientBehavior::Idle,
+            hold_for: 0.0,
+            seed: 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+}
+
+impl AmbientMind {
+    /// A per-body seed so split-window bodies do not nap and pace in perfect
+    /// lockstep. Any seed works; zero is displaced so xorshift never sticks.
+    pub(crate) fn seeded(seed: u64) -> Self {
+        Self {
+            seed: (seed | 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn current(&self) -> AmbientBehavior {
+        self.current
+    }
+
+    /// Reset to plain idle when the body leaves ambient display (typing,
+    /// watching, reacting), so a stale disposition never resumes later.
+    pub(crate) fn interrupt(&mut self) {
+        self.current = AmbientBehavior::Idle;
+        self.hold_for = 0.0;
+    }
+
+    /// Advance the hold timer by `dt` seconds and rescore once it expires.
+    /// `idle_for` is how long the terminal has been completely quiet.
+    pub(crate) fn step(&mut self, state: LifeState, idle_for: f32, dt: f32) -> AmbientBehavior {
+        let dt = if dt.is_finite() { dt.clamp(0.0, 1.0) } else { 0.0 };
+        self.hold_for -= dt;
+        if self.hold_for > 0.0 {
+            return self.current;
+        }
+        if state.energy < FORCED_REST_ENERGY {
+            self.current = AmbientBehavior::Sleep;
+        } else {
+            let idle_for = if idle_for.is_finite() {
+                idle_for.max(0.0)
+            } else {
+                0.0
+            };
+            let candidates = [
+                (AmbientBehavior::Idle, 0.30 + state.mood * 0.10),
+                (
+                    AmbientBehavior::Sleep,
+                    (1.0 - state.energy) * 1.15 + idle_for.min(60.0) / 180.0,
+                ),
+                (
+                    AmbientBehavior::Explore,
+                    state.boredom * 0.72 + state.curiosity * 0.30,
+                ),
+                (
+                    AmbientBehavior::Approach,
+                    state.social_need * 0.72 + state.attachment * 0.12,
+                ),
+            ];
+            let mut best = (AmbientBehavior::Idle, f32::MIN);
+            for (candidate, base) in candidates {
+                let inertia = if candidate == self.current { 0.08 } else { 0.0 };
+                let score = base + inertia + self.jitter();
+                if score > best.1 {
+                    best = (candidate, score);
+                }
+            }
+            self.current = best.0;
+        }
+        self.hold_for = self.current.hold_secs();
+        self.current
+    }
+
+    /// Deterministic xorshift64* noise in [0, 0.08).
+    fn jitter(&mut self) -> f32 {
+        let mut x = self.seed;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.seed = x;
+        let unit = (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32 / (1u64 << 24) as f32;
+        unit * 0.08
     }
 }
 
@@ -1039,6 +1193,9 @@ mod tests {
             Behavior::CelebrateBig,
             Behavior::RestAfterPush,
             Behavior::UnknownOutcome,
+            Behavior::Sleep,
+            Behavior::Explore,
+            Behavior::Approach,
         ] {
             for frame in [0, 4, 5, 54, 55, 59, u64::MAX] {
                 for drowsy in [false, true] {
@@ -1110,6 +1267,9 @@ mod tests {
             Behavior::CelebrateBig,
             Behavior::RestAfterPush,
             Behavior::UnknownOutcome,
+            Behavior::Sleep,
+            Behavior::Explore,
+            Behavior::Approach,
         ] {
             let reference = bounding_box_of(behavior.sprite());
             for language in languages {
@@ -1191,6 +1351,111 @@ mod tests {
         };
         assert!(sprite_frame(Behavior::WatchCommand, tense, false, 0).starts_with(" =\\_/="));
         assert!(sprite_frame(Behavior::Idle, tense, false, 0).starts_with(" =\\_/="));
+    }
+
+    #[test]
+    fn utility_scores_pick_the_disposition_the_state_calls_for() {
+        // Clear margins (> inertia + jitter) so outcomes are deterministic.
+        let rested = LifeState {
+            energy: 0.9,
+            mood: 0.8,
+            boredom: 0.1,
+            curiosity: 0.2,
+            social_need: 0.2,
+            attachment: 0.3,
+            ..LifeState::default()
+        };
+        assert_eq!(
+            AmbientMind::default().step(rested, 0.0, 0.0),
+            AmbientBehavior::Idle
+        );
+
+        let bored = LifeState {
+            energy: 0.8,
+            boredom: 1.0,
+            curiosity: 1.0,
+            social_need: 0.1,
+            ..LifeState::default()
+        };
+        assert_eq!(
+            AmbientMind::default().step(bored, 0.0, 0.0),
+            AmbientBehavior::Explore
+        );
+
+        let lonely = LifeState {
+            energy: 0.9,
+            boredom: 0.0,
+            curiosity: 0.0,
+            social_need: 1.0,
+            attachment: 1.0,
+            ..LifeState::default()
+        };
+        assert_eq!(
+            AmbientMind::default().step(lonely, 0.0, 0.0),
+            AmbientBehavior::Approach
+        );
+
+        // A long quiet stretch tilts a merely tired mind toward sleep.
+        let tired = LifeState {
+            energy: 0.5,
+            boredom: 0.3,
+            curiosity: 0.2,
+            social_need: 0.2,
+            attachment: 0.2,
+            ..LifeState::default()
+        };
+        assert_eq!(
+            AmbientMind::default().step(tired, 60.0, 0.0),
+            AmbientBehavior::Sleep
+        );
+    }
+
+    #[test]
+    fn exhaustion_overrides_scoring_and_dispositions_hold_before_rescoring() {
+        let mut mind = AmbientMind::default();
+        let exhausted = LifeState {
+            energy: 0.1,
+            boredom: 1.0,
+            curiosity: 1.0,
+            ..LifeState::default()
+        };
+        assert_eq!(mind.step(exhausted, 0.0, 0.0), AmbientBehavior::Sleep);
+
+        // Held for 2.5s even when the state now argues for something else.
+        let recovered = LifeState {
+            energy: 0.9,
+            boredom: 1.0,
+            curiosity: 1.0,
+            social_need: 0.1,
+            ..LifeState::default()
+        };
+        assert_eq!(mind.step(recovered, 0.0, 1.0), AmbientBehavior::Sleep);
+        assert_eq!(mind.step(recovered, 0.0, 1.0), AmbientBehavior::Sleep);
+        assert_eq!(mind.step(recovered, 0.0, 1.0), AmbientBehavior::Explore);
+
+        mind.interrupt();
+        assert_eq!(mind.current(), AmbientBehavior::Idle);
+
+        // Hostile inputs never panic and always yield a valid disposition.
+        let mut hostile = AmbientMind::default();
+        for dt in [f32::NAN, f32::INFINITY, -3.0, 1e30] {
+            hostile.step(LifeState::default(), f32::NAN, dt);
+        }
+    }
+
+    #[test]
+    fn an_exploring_cat_only_steps_while_actually_moving() {
+        let calm = BodyLanguage::default();
+        assert!(sprite_frame(Behavior::Explore, calm, false, 0).contains("> ^ <"));
+        assert!(sprite_frame(Behavior::Explore, calm, true, 0).contains(">/ \\<"));
+    }
+
+    #[test]
+    fn ambient_dispositions_map_to_their_display_behaviors() {
+        assert_eq!(AmbientBehavior::Idle.display(), Behavior::Idle);
+        assert_eq!(AmbientBehavior::Sleep.display(), Behavior::Sleep);
+        assert_eq!(AmbientBehavior::Explore.display(), Behavior::Explore);
+        assert_eq!(AmbientBehavior::Approach.display(), Behavior::Approach);
     }
 
     #[test]

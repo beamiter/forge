@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use super::UiState;
 use crate::block_view::TermView;
 use crate::organism::{
-    classify_command, sprite_frame, sticky_glyph, Behavior, BodyLanguage, CommandKind, LifeState,
-    NativeOrganism, Reaction, RepoArrival, Tone,
+    classify_command, sprite_frame, sticky_glyph, AmbientBehavior, AmbientMind, Behavior,
+    BodyLanguage, CommandKind, LifeState, NativeOrganism, Reaction, RepoArrival, Tone,
 };
 use crate::organism_memory::{local_day_at_ms, unix_ms, MemoryEvent, RepoContext};
 
@@ -118,6 +118,7 @@ fn surface_point(
     surface: SurfaceBox,
     mode: SurfaceMode,
     tempo: WanderTempo,
+    ambient: AmbientBehavior,
     frame: u64,
 ) -> Option<SurfacePoint> {
     let cell_width = surface.cell_width.max(1);
@@ -162,17 +163,29 @@ fn surface_point(
 
     let (x, y) = match mode {
         SurfaceMode::Idle => {
-            // Mostly sit at an edge, occasionally walk between them — the
-            // walk share follows the wander tempo, so a listless mind paces
-            // while a drowsy one lies still. It feels alive without turning
-            // ordinary terminal work into a perpetual desktop-pet animation.
             let span = max_x.saturating_sub(min_x);
-            let (step, _) = wander_phase(frame, tempo);
-            let x = align_down(
-                min_x.saturating_add(span.saturating_mul(step) / 40),
-                cell_width,
-            );
-            (x, max_y)
+            let wander_x = |step: i32| {
+                align_down(
+                    min_x.saturating_add(span.saturating_mul(step) / 40),
+                    cell_width,
+                )
+            };
+            match ambient {
+                // Curl up in the bottom-left corner, unmoved by the frame.
+                AmbientBehavior::Sleep => (min_x, max_y),
+                // Sit by the prompt edge, where the human works.
+                AmbientBehavior::Approach => (max_x, max_y),
+                // Pace the restless cycle regardless of the idle tempo.
+                AmbientBehavior::Explore => {
+                    (wander_x(wander_phase(frame, WanderTempo::Restless).0), max_y)
+                }
+                // Mostly sit at an edge, occasionally walk between them — the
+                // walk share follows the wander tempo, so a listless mind
+                // paces while a drowsy one lies still. It feels alive without
+                // turning ordinary terminal work into a perpetual desktop-pet
+                // animation.
+                AmbientBehavior::Idle => (wander_x(wander_phase(frame, tempo).0), max_y),
+            }
         }
         // Accepted human input moves it away from the prompt edge. The window
         // slides on every accepted write, so sustained typing keeps it there.
@@ -342,6 +355,21 @@ impl OrganismActivity {
                 .is_some_and(|at| now.saturating_duration_since(at) >= REST_ONSET)
     }
 
+    /// No command is running in any organism pane of this window. Gates the
+    /// sleep-regeneration path the way the prototype's build guard did.
+    fn no_commands_running(&self) -> bool {
+        self.commands_running.get() == 0
+    }
+
+    /// Seconds since the window was last active at all, feeding the ambient
+    /// mind's sleep utility.
+    fn idle_for_secs(&self, now: Instant) -> f32 {
+        self.active_at
+            .get()
+            .map(|at| now.saturating_duration_since(at).as_secs_f32())
+            .unwrap_or(0.0)
+    }
+
     /// Claim the wall-clock slice since the previous claim, in seconds. The
     /// clock is shared: with several organism panes ticking, every slice is
     /// consumed exactly once, so simulated time tracks wall time no matter
@@ -381,6 +409,10 @@ struct OrganismRuntime {
     organism: RefCell<NativeOrganism>,
     shared_life: Rc<Cell<LifeState>>,
     activity: Rc<OrganismActivity>,
+    /// Pane-local utility disposition; stepped only while this body is
+    /// genuinely idle, interrupted the moment anything else claims it.
+    ambient: RefCell<AmbientMind>,
+    ambient_display: Cell<AmbientBehavior>,
     active_memory_kind: Cell<Option<CommandKind>>,
     active_context_key: RefCell<Option<String>>,
     active_repo_context: RefCell<Option<RepoContext>>,
@@ -505,6 +537,8 @@ impl OrganismRuntime {
             organism: RefCell::new(NativeOrganism::from_persisted_state(shared_life.get())),
             shared_life,
             activity,
+            ambient: RefCell::new(AmbientMind::default()),
+            ambient_display: Cell::new(AmbientBehavior::Idle),
             active_memory_kind: Cell::new(None),
             active_context_key: RefCell::new(None),
             active_repo_context: RefCell::new(None),
@@ -589,8 +623,9 @@ impl OrganismRuntime {
             log::trace!("ASCII organism live-surface mode: {mode:?}");
             self.last_surface_mode.set(Some(mode));
         }
+        let ambient = self.ambient_display.get();
         let display_behavior = match mode {
-            SurfaceMode::Idle => Behavior::Idle,
+            SurfaceMode::Idle => ambient.display(),
             SurfaceMode::Typing | SurfaceMode::Watching => Behavior::WatchCommand,
             SurfaceMode::Reacting => behavior,
         };
@@ -599,7 +634,12 @@ impl OrganismRuntime {
         let frame = self.surface_frame.get();
         let language = BodyLanguage::from_state(self.shared_life.get());
         let tempo = wander_tempo(language);
-        let walking = mode == SurfaceMode::Idle && wander_phase(frame, tempo).1;
+        let walking = mode == SurfaceMode::Idle
+            && match ambient {
+                AmbientBehavior::Idle => wander_phase(frame, tempo).1,
+                AmbientBehavior::Explore => wander_phase(frame, WanderTempo::Restless).1,
+                AmbientBehavior::Sleep | AmbientBehavior::Approach => false,
+            };
         let sprite = sprite_frame(display_behavior, language, walking, frame);
         if self.live_body.text().as_str() != sprite {
             self.live_body.set_text(sprite);
@@ -637,6 +677,7 @@ impl OrganismRuntime {
             },
             mode,
             tempo,
+            ambient,
             frame,
         );
 
@@ -659,31 +700,59 @@ impl OrganismRuntime {
                 return gtk4::glib::ControlFlow::Break;
             };
             let now = Instant::now();
-            if runtime
-                .surface_last_frame
-                .get()
+            let previous_frame = runtime.surface_last_frame.get();
+            if previous_frame
                 .is_some_and(|last| now.saturating_duration_since(last) < SURFACE_FRAME_INTERVAL)
             {
                 return gtk4::glib::ControlFlow::Continue;
             }
             runtime.surface_last_frame.set(Some(now));
+            let mode = surface_mode(
+                runtime.surface_behavior.get(),
+                runtime.command_running.get(),
+                runtime.human_input_age(now),
+            );
             // Continuous homeostasis: claim this pane's slice of the shared
             // clock and evolve the one shared mind. Persistence is untouched —
             // the evolved state only reaches disk with the next lifecycle
             // event, exactly as before.
             let dt = runtime.activity.tick_slice(now);
             if dt > 0.0 {
+                // A body that chose to curl up regenerates like external
+                // rest — but never while any pane of the window still runs a
+                // command, mirroring the prototype's build guard, so one
+                // sleeping body cannot recharge the shared mind mid-build.
+                let sleeping = mode == SurfaceMode::Idle
+                    && runtime.ambient_display.get() == AmbientBehavior::Sleep
+                    && runtime.activity.no_commands_running();
                 let mut life = runtime.shared_life.get();
                 life.tick(
                     dt,
                     runtime.activity.user_active(now),
-                    runtime.activity.resting(now),
+                    runtime.activity.resting(now) || sleeping,
                 );
                 runtime.shared_life.set(life);
                 let summary = state_summary(life);
                 if runtime.state.text().as_str() != summary {
                     runtime.state.set_text(&summary);
                 }
+            }
+            // The ambient mind runs on this pane's own frame cadence, so its
+            // hold timers follow wall time however many panes share the tick
+            // clock above.
+            if mode == SurfaceMode::Idle {
+                let pane_dt = previous_frame
+                    .map(|last| now.saturating_duration_since(last).as_secs_f32())
+                    .unwrap_or(0.0);
+                let ambient = runtime.ambient.borrow_mut().step(
+                    runtime.shared_life.get(),
+                    runtime.activity.idle_for_secs(now),
+                    pane_dt,
+                );
+                runtime.ambient_display.set(ambient);
+            } else {
+                runtime.ambient.borrow_mut().interrupt();
+                runtime.ambient_display.set(AmbientBehavior::Idle);
             }
             let pulse = u64::from(runtime.output_activity.replace(false));
             runtime
@@ -781,6 +850,9 @@ impl UiState {
         if !view.put_sticky_organism_avatar(runtime.sticky_avatar.upcast_ref()) {
             log::warn!("could not attach ASCII organism to the sticky running header");
         }
+        // Per-body seeding keeps split-window bodies from napping and pacing
+        // in perfect lockstep.
+        *runtime.ambient.borrow_mut() = AmbientMind::seeded(pane_token(view) as u64);
         runtime.refresh_surface(view, Instant::now());
         OrganismRuntime::start_surface_tick(&runtime, view);
 
@@ -1080,8 +1152,8 @@ mod tests {
             height: 63,
             ..tiny_width
         };
-        assert_eq!(surface_point(tiny_width, SurfaceMode::Idle, WanderTempo::Calm, 0), None);
-        assert_eq!(surface_point(tiny_height, SurfaceMode::Watching, WanderTempo::Calm, 0), None);
+        assert_eq!(surface_point(tiny_width, SurfaceMode::Idle, WanderTempo::Calm, AmbientBehavior::Idle, 0), None);
+        assert_eq!(surface_point(tiny_height, SurfaceMode::Watching, WanderTempo::Calm, AmbientBehavior::Idle, 0), None);
 
         let unaligned_near_boundary = SurfaceBox {
             width: 64 + 20 + 16,
@@ -1093,7 +1165,7 @@ mod tests {
             body_height: 48,
         };
         assert_eq!(
-            surface_point(unaligned_near_boundary, SurfaceMode::Typing, WanderTempo::Calm, 0),
+            surface_point(unaligned_near_boundary, SurfaceMode::Typing, WanderTempo::Calm, AmbientBehavior::Idle, 0),
             None
         );
     }
@@ -1116,7 +1188,8 @@ mod tests {
             SurfaceMode::Reacting,
         ] {
             for frame in [0, 1, 359, 360, 399, 400, 759, 799, u64::MAX] {
-                let point = surface_point(surface, mode, WanderTempo::Calm, frame).expect("body fits");
+                let point = surface_point(surface, mode, WanderTempo::Calm, AmbientBehavior::Idle, frame)
+                    .expect("body fits");
                 assert!(point.x >= f64::from(SURFACE_MARGIN));
                 assert!(point.y >= f64::from(SURFACE_MARGIN));
                 assert_eq!(point.x as i32 % surface.cell_width, 0);
@@ -1258,6 +1331,36 @@ mod tests {
     }
 
     #[test]
+    fn ambient_dispositions_take_their_own_poses() {
+        let surface = SurfaceBox {
+            width: 360,
+            height: 200,
+            right_gutter: 20,
+            cell_width: 8,
+            cell_height: 16,
+            body_width: 88,
+            body_height: 48,
+        };
+        let pose = |ambient, frame| {
+            surface_point(surface, SurfaceMode::Idle, WanderTempo::Calm, ambient, frame).unwrap()
+        };
+        let idle_home = pose(AmbientBehavior::Idle, 0);
+        let idle_far = pose(AmbientBehavior::Idle, 400);
+        // Sleep curls at the bottom-left corner regardless of the frame.
+        assert_eq!(pose(AmbientBehavior::Sleep, 0), idle_home);
+        assert_eq!(pose(AmbientBehavior::Sleep, 400), idle_home);
+        assert!(idle_far.x > idle_home.x);
+        // Approach sits at the prompt-side edge, on the bottom row.
+        let approach = pose(AmbientBehavior::Approach, 0);
+        assert!(approach.x > idle_home.x);
+        assert_eq!(approach.y, idle_home.y);
+        // Explore walks at frames where a calm idle would still be sitting.
+        let explore = pose(AmbientBehavior::Explore, 300);
+        let calm_sit = pose(AmbientBehavior::Idle, 300);
+        assert!(explore.x > calm_sit.x);
+    }
+
+    #[test]
     fn wander_tempo_reshapes_the_cycle_and_calm_matches_the_original() {
         for (frame, expected) in [(0, 0), (359, 0), (380, 20), (400, 40), (759, 40), (799, 1)] {
             let (step, _) = wander_phase(frame, WanderTempo::Calm);
@@ -1287,10 +1390,10 @@ mod tests {
             body_width: 88,
             body_height: 48,
         };
-        let idle_left = surface_point(surface, SurfaceMode::Idle, WanderTempo::Calm, 0).unwrap();
-        let idle_still = surface_point(surface, SurfaceMode::Idle, WanderTempo::Calm, 359).unwrap();
-        let idle_right = surface_point(surface, SurfaceMode::Idle, WanderTempo::Calm, 400).unwrap();
-        let typing = surface_point(surface, SurfaceMode::Typing, WanderTempo::Calm, 0).unwrap();
+        let idle_left = surface_point(surface, SurfaceMode::Idle, WanderTempo::Calm, AmbientBehavior::Idle, 0).unwrap();
+        let idle_still = surface_point(surface, SurfaceMode::Idle, WanderTempo::Calm, AmbientBehavior::Idle, 359).unwrap();
+        let idle_right = surface_point(surface, SurfaceMode::Idle, WanderTempo::Calm, AmbientBehavior::Idle, 400).unwrap();
+        let typing = surface_point(surface, SurfaceMode::Typing, WanderTempo::Calm, AmbientBehavior::Idle, 0).unwrap();
         assert_eq!(idle_still, idle_left);
         assert!(idle_right.x > idle_left.x);
         assert_eq!(typing.x, idle_right.x);
