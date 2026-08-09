@@ -45,6 +45,9 @@ struct SurfaceBox {
     cell_height: i32,
     body_width: i32,
     body_height: i32,
+    /// On-screen grid row of the cursor: the output growth edge the watching
+    /// pose perches above.
+    cursor_row: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -196,9 +199,16 @@ fn surface_point(
             } else {
                 cell_height
             };
+            // Perch just above the output growth edge and follow it down as
+            // lines arrive; a cursor near the top clamps to the safe margin.
+            let above_cursor = surface
+                .cursor_row
+                .saturating_sub(1)
+                .saturating_mul(cell_height)
+                .saturating_sub(surface.body_height);
             (
                 max_x,
-                align_down(min_y.saturating_add(bob).min(max_y), cell_height),
+                align_down(above_cursor.saturating_add(bob), cell_height).clamp(min_y, max_y),
             )
         }
         SurfaceMode::Reacting => (
@@ -217,6 +227,21 @@ fn surface_point(
         x: f64::from(x.clamp(min_x, max_x)),
         y: f64::from(y.clamp(min_y, max_y)),
     })
+}
+
+/// Advance one axis toward its target in whole-cell steps: a quarter of the
+/// remaining distance per frame (minimum one cell), so long trips start brisk
+/// and ease out on arrival — roughly a second across a full pane at the 100ms
+/// frame cadence. Never overshoots; within half a cell it snaps home.
+fn approach(current: f64, target: f64, cell: f64) -> f64 {
+    let cell = cell.max(1.0);
+    let distance = target - current;
+    if distance.abs() < cell * 0.5 {
+        return target;
+    }
+    let remaining_cells = (distance.abs() / cell).ceil();
+    let step_cells = (remaining_cells / 4.0).ceil().max(1.0);
+    current + distance.signum() * step_cells * cell
 }
 
 fn align_down(value: i32, cell: i32) -> i32 {
@@ -453,6 +478,16 @@ struct OrganismRuntime {
     surface_tick: RefCell<Option<gtk4::TickCallbackId>>,
     surface_last_frame: Cell<Option<Instant>>,
     surface_frame: Cell<u64>,
+    /// Where the body currently stands on the live surface; `None` while
+    /// hidden, so every reappearance snaps into place and the cat only ever
+    /// walks where it can be seen.
+    body_position: Cell<Option<(f64, f64)>>,
+    /// The body moved last frame — drives gait frames during transit.
+    body_in_transit: Cell<bool>,
+    /// Surface geometry the standing spot was computed against. A resize or
+    /// font change reflows everything anyway, so the body snaps to its new
+    /// clamped pose instead of walking from an out-of-band stale position.
+    surface_signature: Cell<(i32, i32, i32, i32)>,
     surface_behavior: Cell<Behavior>,
     last_surface_mode: Cell<Option<SurfaceMode>>,
     command_running: Cell<bool>,
@@ -578,6 +613,9 @@ impl OrganismRuntime {
             surface_tick: RefCell::new(None),
             surface_last_frame: Cell::new(None),
             surface_frame: Cell::new(0),
+            body_position: Cell::new(None),
+            body_in_transit: Cell::new(false),
+            surface_signature: Cell::new((0, 0, 0, 0)),
             surface_behavior: Cell::new(Behavior::Idle),
             last_surface_mode: Cell::new(None),
             command_running: Cell::new(false),
@@ -653,23 +691,30 @@ impl OrganismRuntime {
             self.last_surface_mode.set(Some(mode));
         }
         let ambient = self.ambient_display.get();
+        // A body still under way to its next pose walks there openly instead
+        // of sliding in a seated (or curled) form.
+        let in_transit = self.body_in_transit.get();
         let display_behavior = match mode {
+            SurfaceMode::Idle if in_transit => Behavior::Idle,
             SurfaceMode::Idle => ambient.display(),
             SurfaceMode::Watching if self.agent_watching.get() => Behavior::WatchAgent,
             SurfaceMode::Typing | SurfaceMode::Watching => Behavior::WatchCommand,
             SurfaceMode::Reacting => behavior,
         };
         // The continuous state shows through the ambient poses as body
-        // language; reaction poses stay canonical.
+        // language; reaction poses stay canonical. Gait runs while the body
+        // is genuinely under way OR a wander leg is in progress — the leg
+        // advances its target slower than once per frame, so transit alone
+        // would stutter the walk animation.
         let frame = self.surface_frame.get();
         let language = BodyLanguage::from_state(self.shared_life.get());
         let tempo = wander_tempo(language);
-        let walking = mode == SurfaceMode::Idle
-            && match ambient {
-                AmbientBehavior::Idle => wander_phase(frame, tempo).1,
-                AmbientBehavior::Explore => wander_phase(frame, WanderTempo::Restless).1,
-                AmbientBehavior::Sleep | AmbientBehavior::Approach => false,
-            };
+        let wander_walking = match ambient {
+            AmbientBehavior::Idle => wander_phase(frame, tempo).1,
+            AmbientBehavior::Explore => wander_phase(frame, WanderTempo::Restless).1,
+            AmbientBehavior::Sleep | AmbientBehavior::Approach => false,
+        };
+        let walking = mode == SurfaceMode::Idle && (in_transit || wander_walking);
         let sprite = sprite_frame(display_behavior, language, walking, frame);
         if self.live_body.text().as_str() != sprite {
             self.live_body.set_text(sprite);
@@ -686,8 +731,26 @@ impl OrganismRuntime {
             // ActiveBlock owns the temporary alt-screen override. Preserve the
             // geometry-derived desired visibility so rmcup restores it in the
             // same parser turn instead of waiting for another animation tick.
+            // Forget the standing spot so the return snaps instead of walking
+            // across a surface the body was never seen leaving.
+            self.body_position.set(None);
+            self.body_in_transit.set(false);
             self.sticky_avatar.set_visible(false);
             return;
+        }
+        // A resize or font change invalidates the stored standing spot: the
+        // whole surface reflows in the same moment, so snapping to the fresh
+        // clamped pose is invisible, while walking from the stale (possibly
+        // out-of-band) position would cross the protected gutter.
+        let signature = (
+            metrics.width,
+            metrics.height,
+            metrics.cell_width,
+            metrics.cell_height,
+        );
+        if self.surface_signature.replace(signature) != signature {
+            self.body_position.set(None);
+            self.body_in_transit.set(false);
         }
         // Keep the child measurable while the non-measuring overlay is hidden.
         // GTK reports zero requisition for an explicitly invisible Label,
@@ -704,6 +767,7 @@ impl OrganismRuntime {
                 cell_height: metrics.cell_height,
                 body_width,
                 body_height,
+                cursor_row: metrics.cursor_row,
             },
             mode,
             tempo,
@@ -711,10 +775,24 @@ impl OrganismRuntime {
             frame,
         );
 
-        if let Some(point) = point {
+        if let Some(target) = point {
+            let previous = self.body_position.get();
+            let (x, y) = match previous {
+                // Hidden or first placement: appear directly at the target.
+                None => (target.x, target.y),
+                Some((x, y)) => (
+                    approach(x, target.x, f64::from(metrics.cell_width.max(1))),
+                    approach(y, target.y, f64::from(metrics.cell_height.max(1))),
+                ),
+            };
+            self.body_in_transit
+                .set(matches!(previous, Some(prev) if prev != (x, y)));
+            self.body_position.set(Some((x, y)));
             view.set_live_organism_visible(true);
-            view.move_live_organism_body(self.live_body.upcast_ref(), point.x, point.y);
+            view.move_live_organism_body(self.live_body.upcast_ref(), x, y);
         } else {
+            self.body_position.set(None);
+            self.body_in_transit.set(false);
             view.set_live_organism_visible(false);
         }
         // The Block layer decides whether the sticky running header is active;
@@ -900,6 +978,10 @@ impl UiState {
                     // Keep the accepted-input hot path O(1): hide once, then
                     // let the single frame callback measure and move it to the
                     // upper cell-aligned pose. Repeated keys only extend time.
+                    // Forgetting the standing spot makes that reappearance a
+                    // snap — the body never walks while it cannot be seen.
+                    runtime.body_position.set(None);
+                    runtime.body_in_transit.set(false);
                     if let Some(view) = view_weak.upgrade() {
                         // AltScreen already owns an immediate hide override;
                         // do not replace the desired post-rmcup visibility.
@@ -1240,6 +1322,7 @@ mod tests {
             cell_height: 16,
             body_width: 64,
             body_height: 48,
+            cursor_row: 8,
         };
         let tiny_height = SurfaceBox {
             width: 300,
@@ -1257,6 +1340,7 @@ mod tests {
             cell_height: 16,
             body_width: 64,
             body_height: 48,
+            cursor_row: 8,
         };
         assert_eq!(
             surface_point(unaligned_near_boundary, SurfaceMode::Typing, WanderTempo::Calm, AmbientBehavior::Idle, 0),
@@ -1274,6 +1358,7 @@ mod tests {
             cell_height: 16,
             body_width: 88,
             body_height: 48,
+            cursor_row: 8,
         };
         for mode in [
             SurfaceMode::Idle,
@@ -1448,6 +1533,7 @@ mod tests {
             cell_height: 16,
             body_width: 88,
             body_height: 48,
+            cursor_row: 8,
         };
         let pose = |ambient, frame| {
             surface_point(surface, SurfaceMode::Idle, WanderTempo::Calm, ambient, frame).unwrap()
@@ -1466,6 +1552,83 @@ mod tests {
         let explore = pose(AmbientBehavior::Explore, 300);
         let calm_sit = pose(AmbientBehavior::Idle, 300);
         assert!(explore.x > calm_sit.x);
+    }
+
+    #[test]
+    fn approach_eases_out_arrives_exactly_and_never_overshoots() {
+        let cell = 8.0;
+        // Long trip: brisk start, easing steps, exact arrival.
+        let mut position = 0.0;
+        let target = 40.0 * cell;
+        let mut steps = 0;
+        while position != target {
+            let next = approach(position, target, cell);
+            assert!(next > position && next <= target);
+            assert_eq!((next - position) as i32 % cell as i32, 0);
+            position = next;
+            steps += 1;
+            assert!(steps < 40, "must converge quickly");
+        }
+        assert!(steps <= 16, "a full pane crosses in ~a second");
+
+        // One-cell trip snaps home; sub-half-cell noise snaps home.
+        assert_eq!(approach(0.0, cell, cell), cell);
+        assert_eq!(approach(cell - 2.0, cell, cell), cell);
+        // Works in both directions.
+        assert!(approach(target, 0.0, cell) < target);
+        // Hostile cell size clamps to one pixel and still makes progress.
+        let hostile = approach(0.0, 5.0, 0.0);
+        assert!(hostile > 0.0 && hostile <= 5.0);
+    }
+
+    #[test]
+    fn watching_pose_follows_the_output_growth_edge() {
+        let surface = SurfaceBox {
+            width: 360,
+            height: 400,
+            right_gutter: 20,
+            cell_width: 8,
+            cell_height: 16,
+            body_width: 88,
+            body_height: 48,
+            cursor_row: 20,
+        };
+        let deep = surface_point(
+            surface,
+            SurfaceMode::Watching,
+            WanderTempo::Calm,
+            AmbientBehavior::Idle,
+            0,
+        )
+        .unwrap();
+        let shallow = surface_point(
+            SurfaceBox {
+                cursor_row: 6,
+                ..surface
+            },
+            SurfaceMode::Watching,
+            WanderTempo::Calm,
+            AmbientBehavior::Idle,
+            0,
+        )
+        .unwrap();
+        let top = surface_point(
+            SurfaceBox {
+                cursor_row: 0,
+                ..surface
+            },
+            SurfaceMode::Watching,
+            WanderTempo::Calm,
+            AmbientBehavior::Idle,
+            0,
+        )
+        .unwrap();
+        // Deeper output pulls the watcher further down; both stay above the
+        // cursor line and inside the clamped band.
+        assert!(deep.y > shallow.y);
+        assert!(deep.y + 48.0 <= f64::from(20 * 16));
+        assert_eq!(top.y, shallow.y.min(top.y));
+        assert!(top.y >= f64::from(SURFACE_MARGIN));
     }
 
     #[test]
@@ -1497,6 +1660,7 @@ mod tests {
             cell_height: 16,
             body_width: 88,
             body_height: 48,
+            cursor_row: 8,
         };
         let idle_left = surface_point(surface, SurfaceMode::Idle, WanderTempo::Calm, AmbientBehavior::Idle, 0).unwrap();
         let idle_still = surface_point(surface, SurfaceMode::Idle, WanderTempo::Calm, AmbientBehavior::Idle, 359).unwrap();

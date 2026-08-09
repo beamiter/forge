@@ -1923,6 +1923,9 @@ pub(crate) struct LiveOrganismSurfaceMetrics {
     pub(crate) cell_height: i32,
     pub(crate) right_gutter: i32,
     pub(crate) alt_screen: bool,
+    /// On-screen grid row of the cursor — the live output's growth edge.
+    /// Pure geometry clamped into the visible grid; carries no text.
+    pub(crate) cursor_row: i32,
 }
 
 /// Accepted direct-human input, intentionally containing no typed bytes.
@@ -7087,6 +7090,16 @@ impl TermView {
             cell_height: (active.active_vte.char_height() as i32).max(1),
             right_gutter: LIVE_ORGANISM_RIGHT_GUTTER,
             alt_screen: active.live_organism_alt_screen(),
+            cursor_row: {
+                let (_, cursor_row) = active.active_vte.cursor_position();
+                let top_row = gtk4::prelude::ScrollableExt::vadjustment(&active.active_vte)
+                    .map(|adjustment| adjustment.value().floor() as i64)
+                    .unwrap_or(0);
+                let visible_rows = active.active_vte.row_count().max(1);
+                cursor_row
+                    .saturating_sub(top_row)
+                    .clamp(0, visible_rows.saturating_sub(1)) as i32
+            },
         }
     }
 
