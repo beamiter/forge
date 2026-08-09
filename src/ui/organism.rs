@@ -236,6 +236,86 @@ impl OrganismCorrectionSignal {
     }
 }
 
+/// How long the window must stay completely quiet (no accepted input, no
+/// running command, no output) before the shared mind starts resting and
+/// energy recovers.
+const REST_ONSET: Duration = Duration::from_secs(60);
+
+/// Window-shared, content-free activity aggregate driving the continuous
+/// life tick: whether a human recently typed into any organism pane, how many
+/// commands are running, when the window was last active at all, and a shared
+/// tick clock so several pane bodies never multiply the homeostasis rates of
+/// their one shared mind.
+pub(crate) struct OrganismActivity {
+    input_at: Cell<Option<Instant>>,
+    commands_running: Cell<u32>,
+    active_at: Cell<Option<Instant>>,
+    ticked_at: Cell<Option<Instant>>,
+}
+
+impl OrganismActivity {
+    pub(crate) fn new() -> Rc<Self> {
+        // A fresh window counts as activity: rest only begins after a real
+        // quiet stretch, never at attach time.
+        Rc::new(Self {
+            input_at: Cell::new(None),
+            commands_running: Cell::new(0),
+            active_at: Cell::new(Some(Instant::now())),
+            ticked_at: Cell::new(None),
+        })
+    }
+
+    fn note_input(&self, now: Instant) {
+        self.input_at.set(Some(now));
+        self.active_at.set(Some(now));
+    }
+
+    fn note_output(&self, now: Instant) {
+        self.active_at.set(Some(now));
+    }
+
+    fn command_started(&self, now: Instant) {
+        self.commands_running
+            .set(self.commands_running.get().saturating_add(1));
+        self.active_at.set(Some(now));
+    }
+
+    fn command_finished(&self, now: Instant) {
+        self.commands_running
+            .set(self.commands_running.get().saturating_sub(1));
+        self.active_at.set(Some(now));
+    }
+
+    fn user_active(&self, now: Instant) -> bool {
+        self.input_at
+            .get()
+            .is_some_and(|at| now.saturating_duration_since(at) < HUMAN_INPUT_RETREAT)
+    }
+
+    fn resting(&self, now: Instant) -> bool {
+        self.commands_running.get() == 0
+            && self
+                .active_at
+                .get()
+                .is_some_and(|at| now.saturating_duration_since(at) >= REST_ONSET)
+    }
+
+    /// Claim the wall-clock slice since the previous claim, in seconds. The
+    /// clock is shared: with several organism panes ticking, every slice is
+    /// consumed exactly once, so simulated time tracks wall time no matter
+    /// how many bodies the mind wears — while at least one body's frame clock
+    /// runs. A long gap (hidden window, suspend) is claimed whole, and the
+    /// reducer then simulates at most one second of it.
+    fn tick_slice(&self, now: Instant) -> f32 {
+        let dt = match self.ticked_at.get() {
+            Some(previous) => now.saturating_duration_since(previous).as_secs_f32(),
+            None => 0.0,
+        };
+        self.ticked_at.set(Some(now));
+        dt
+    }
+}
+
 /// True when `cwd` is `root` itself or a path strictly inside it.
 fn cwd_within(cwd: &str, root: &str) -> bool {
     cwd.strip_prefix(root)
@@ -257,6 +337,8 @@ fn same_checkout(root: Option<&str>, repo_cwd: Option<&str>, cwd: Option<&str>) 
 
 struct OrganismRuntime {
     organism: RefCell<NativeOrganism>,
+    shared_life: Rc<Cell<LifeState>>,
+    activity: Rc<OrganismActivity>,
     active_memory_kind: Cell<Option<CommandKind>>,
     active_context_key: RefCell<Option<String>>,
     active_repo_context: RefCell<Option<RepoContext>>,
@@ -286,7 +368,11 @@ struct OrganismRuntime {
 }
 
 impl OrganismRuntime {
-    fn new(initial_state: LifeState, persistent: bool) -> Rc<Self> {
+    fn new(
+        shared_life: Rc<Cell<LifeState>>,
+        activity: Rc<OrganismActivity>,
+        persistent: bool,
+    ) -> Rc<Self> {
         let outer = GBox::new(Orientation::Vertical, 0);
         outer.add_css_class("block-finished");
         outer.add_css_class("block-organism");
@@ -374,7 +460,9 @@ impl OrganismRuntime {
         sticky_avatar.set_accessible_role(gtk4::AccessibleRole::Presentation);
 
         let runtime = Rc::new(Self {
-            organism: RefCell::new(NativeOrganism::from_persisted_state(initial_state)),
+            organism: RefCell::new(NativeOrganism::from_persisted_state(shared_life.get())),
+            shared_life,
+            activity,
             active_memory_kind: Cell::new(None),
             active_context_key: RefCell::new(None),
             active_repo_context: RefCell::new(None),
@@ -530,6 +618,24 @@ impl OrganismRuntime {
                 return gtk4::glib::ControlFlow::Continue;
             }
             runtime.surface_last_frame.set(Some(now));
+            // Continuous homeostasis: claim this pane's slice of the shared
+            // clock and evolve the one shared mind. Persistence is untouched —
+            // the evolved state only reaches disk with the next lifecycle
+            // event, exactly as before.
+            let dt = runtime.activity.tick_slice(now);
+            if dt > 0.0 {
+                let mut life = runtime.shared_life.get();
+                life.tick(
+                    dt,
+                    runtime.activity.user_active(now),
+                    runtime.activity.resting(now),
+                );
+                runtime.shared_life.set(life);
+                let summary = state_summary(life);
+                if runtime.state.text().as_str() != summary {
+                    runtime.state.set_text(&summary);
+                }
+            }
             let pulse = u64::from(runtime.output_activity.replace(false));
             runtime
                 .surface_frame
@@ -557,7 +663,13 @@ impl OrganismRuntime {
             if runtime.generation.get() != generation {
                 return;
             }
-            let idle = runtime.organism.borrow().idle_reaction();
+            let idle = {
+                let mut organism = runtime.organism.borrow_mut();
+                // Settle must not jump the state line back to the finish-time
+                // snapshot; pull the tick-evolved shared state first.
+                organism.sync_state(runtime.shared_life.get());
+                organism.idle_reaction()
+            };
             runtime.render(&idle);
             if let Some(view) = view.upgrade() {
                 view.insert_inline_notice(&runtime.card);
@@ -569,6 +681,11 @@ impl OrganismRuntime {
 
 impl Drop for OrganismRuntime {
     fn drop(&mut self) {
+        // A pane closed mid-command must return its slot in the shared
+        // running-command count, or the mind could never rest again.
+        if self.command_running.get() {
+            self.activity.command_finished(Instant::now());
+        }
         if let Some(source) = self.settle_timer.get_mut().take() {
             source.remove();
         }
@@ -602,9 +719,12 @@ impl UiState {
             return;
         }
 
-        let initial_state = self.organism_life.get();
         let persistent = self.organism_memory.borrow().is_some();
-        let runtime = OrganismRuntime::new(initial_state, persistent);
+        let runtime = OrganismRuntime::new(
+            self.organism_life.clone(),
+            self.organism_activity.clone(),
+            persistent,
+        );
         view.insert_inline_notice(&runtime.card);
         if !view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0) {
             log::warn!("could not attach ASCII organism to the live terminal surface");
@@ -624,6 +744,7 @@ impl UiState {
                     .human_input_age(now)
                     .is_none_or(|age| age >= HUMAN_INPUT_RETREAT);
                 runtime.last_human_input.set(Some(now));
+                runtime.activity.note_input(now);
                 if entering_retreat {
                     // Keep the accepted-input hot path O(1): hide once, then
                     // let the single frame callback measure and move it to the
@@ -641,7 +762,10 @@ impl UiState {
 
         {
             let runtime = runtime.clone();
-            view.connect_activity(move || runtime.output_activity.set(true));
+            view.connect_activity(move || {
+                runtime.output_activity.set(true);
+                runtime.activity.note_output(Instant::now());
+            });
         }
 
         {
@@ -653,7 +777,11 @@ impl UiState {
             let pane = pane_token(view);
             view.connect_command_started(move |event| {
                 runtime.bump_generation();
-                runtime.command_running.set(true);
+                // Transition-guarded so a repeated start can never over-count
+                // the shared running total.
+                if !runtime.command_running.replace(true) {
+                    runtime.activity.command_started(Instant::now());
+                }
                 // Enter's retreat protected the editable prompt; once OSC C
                 // establishes a running command, the dedicated watching pose
                 // is already anchored away from that line.
@@ -750,7 +878,9 @@ impl UiState {
             let shared_life = self.organism_life.clone();
             view.connect_command_finished(move |event| {
                 let generation = runtime.bump_generation();
-                runtime.command_running.set(false);
+                if runtime.command_running.replace(false) {
+                    runtime.activity.command_finished(Instant::now());
+                }
                 // Show the authoritative result for the complete hold window.
                 // Any genuinely new prompt input will immediately replace this
                 // with a fresh sliding retreat.
@@ -834,6 +964,18 @@ impl UiState {
                     view.insert_inline_notice(&runtime.card);
                 }
                 OrganismRuntime::settle_later(&runtime, view_weak.clone(), generation);
+            });
+        }
+
+        {
+            // The agent-lost recovery path restores the prompt without ever
+            // emitting CommandFinished; return this pane's running slot so a
+            // command that silently ended cannot keep the mind awake forever.
+            let runtime = runtime.clone();
+            view.connect_agent_execution_lost(move |_generation, _reason| {
+                if runtime.command_running.replace(false) {
+                    runtime.activity.command_finished(Instant::now());
+                }
             });
         }
 
@@ -997,6 +1139,51 @@ mod tests {
         assert_eq!(signal.dismiss_streak.get(), 2);
         signal.note_accepted(1);
         assert_eq!(signal.dismiss_streak.get(), 0);
+    }
+
+    #[test]
+    fn shared_activity_clock_hands_out_each_slice_exactly_once() {
+        let activity = OrganismActivity::new();
+        let start = Instant::now();
+        assert_eq!(activity.tick_slice(start), 0.0);
+        let later = start + Duration::from_millis(250);
+        let slice = activity.tick_slice(later);
+        assert!((slice - 0.25).abs() < 0.005);
+        // A second body asking at the same instant gets nothing: the mind
+        // never lives the same moment twice.
+        assert_eq!(activity.tick_slice(later), 0.0);
+    }
+
+    #[test]
+    fn rest_needs_a_long_quiet_stretch_with_no_running_command() {
+        let activity = OrganismActivity::new();
+        let now = Instant::now();
+        assert!(!activity.resting(now));
+        let quiet = now + REST_ONSET + Duration::from_secs(1);
+        assert!(activity.resting(quiet));
+
+        activity.command_started(quiet);
+        assert!(!activity.resting(quiet + REST_ONSET * 2));
+        activity.command_finished(quiet + REST_ONSET * 2);
+        assert!(!activity.resting(quiet + REST_ONSET * 2 + Duration::from_secs(1)));
+        assert!(activity.resting(quiet + REST_ONSET * 3 + Duration::from_secs(1)));
+
+        // A pane dying mid-command can never wedge the counter below zero.
+        activity.command_finished(quiet);
+        activity.command_finished(quiet);
+        assert_eq!(activity.commands_running.get(), 0);
+    }
+
+    #[test]
+    fn typing_window_marks_the_user_active_briefly() {
+        let activity = OrganismActivity::new();
+        let now = Instant::now();
+        assert!(!activity.user_active(now));
+        activity.note_input(now);
+        assert!(activity.user_active(now + Duration::from_millis(500)));
+        assert!(!activity.user_active(now + Duration::from_millis(1000)));
+        activity.note_output(now + Duration::from_secs(5));
+        assert!(!activity.resting(now + REST_ONSET));
     }
 
     #[test]

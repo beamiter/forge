@@ -955,6 +955,7 @@ pub fn run() -> glib::ExitCode {
             command_suggestion: Rc::new(RefCell::new(None)),
             organism_memory: Rc::new(RefCell::new(organism_memory)),
             organism_correction: ui::OrganismCorrectionSignal::new(organism_life.clone()),
+            organism_activity: ui::OrganismActivity::new(),
             organism_life,
             agent_toggle: agent_toggle.clone(),
             config_save_error_visible: Rc::new(Cell::new(false)),

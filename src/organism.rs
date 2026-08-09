@@ -166,6 +166,43 @@ impl Default for LifeState {
 }
 
 impl LifeState {
+    /// Continuous homeostasis between semantic events, ported from the
+    /// prototype life engine (`prototypes/ascii-organism/src/life.rs`). `dt`
+    /// is seconds; slices are clamped to [0, 1] and non-finite time is
+    /// ignored. `resting` is the native stand-in for the prototype's sleep: a
+    /// terminal left quiet long enough lets energy recover, while waking work
+    /// slowly drains it. Drives nothing by itself — behavior still reacts
+    /// only to authoritative command lifecycle events.
+    pub(crate) fn tick(&mut self, dt: f32, user_active: bool, resting: bool) {
+        let dt = if dt.is_finite() { dt.clamp(0.0, 1.0) } else { 0.0 };
+
+        // Exhaustion forces micro-rest even in a busy terminal, mirroring the
+        // prototype's forced sleep below this energy level: the mind
+        // self-regulates near the floor instead of pinning at zero while it
+        // watches a long-lived command.
+        let resting = resting || self.energy < FORCED_REST_ENERGY;
+
+        if resting {
+            self.energy += 0.030 * dt;
+        } else {
+            self.energy -= 0.002 * dt;
+        }
+
+        if user_active {
+            self.boredom -= 0.010 * dt;
+            self.curiosity += 0.003 * dt;
+            self.social_need -= 0.006 * dt;
+        } else {
+            self.boredom += 0.004 * dt;
+            self.social_need += 0.001 * dt;
+        }
+
+        self.stress -= 0.003 * dt;
+        let target_mood = (self.energy + self.confidence) * 0.5 - self.stress * 0.35;
+        self.mood += (target_mood - self.mood) * 0.08 * dt;
+        self.clamp();
+    }
+
     fn clamp(&mut self) {
         self.energy = bounded(self.energy);
         self.mood = bounded(self.mood);
@@ -200,6 +237,9 @@ fn bounded(value: f32) -> f32 {
     }
 }
 
+/// Below this energy the tick rests regardless of terminal activity — the
+/// prototype's forced-sleep threshold, keeping exhaustion self-limiting.
+const FORCED_REST_ENERGY: f32 = 0.15;
 /// First failure after this many clean passes today reads as a broken streak
 /// and reacts with amplified stress instead of the routine inspection.
 const SENSITIZATION_CLEAN_RUNS: u32 = 5;
@@ -675,6 +715,82 @@ mod tests {
         }
         assert!(organism
             .state()
+            .values()
+            .into_iter()
+            .all(|value| value.is_finite() && (0.0..=1.0).contains(&value)));
+    }
+
+    #[test]
+    fn tick_drains_waking_energy_and_restores_it_at_rest() {
+        let mut waking = LifeState::default();
+        let mut resting = LifeState::default();
+        for _ in 0..120 {
+            waking.tick(1.0, false, false);
+            resting.tick(1.0, false, true);
+        }
+        assert!(waking.energy < LifeState::default().energy);
+        assert!(resting.energy > waking.energy);
+        assert_eq!(resting.energy, 1.0);
+    }
+
+    #[test]
+    fn exhaustion_forces_micro_rest_so_energy_never_pins_at_zero() {
+        let mut state = LifeState::default();
+        for _ in 0..3_600 {
+            state.tick(1.0, false, false);
+        }
+        assert!(state.energy > 0.10);
+        assert!(state.energy < 0.30);
+    }
+
+    #[test]
+    fn a_single_time_slice_simulates_at_most_one_second() {
+        let mut long_slice = LifeState::default();
+        let mut capped = LifeState::default();
+        long_slice.tick(3600.0, true, false);
+        capped.tick(1.0, true, false);
+        assert_eq!(long_slice.values(), capped.values());
+    }
+
+    #[test]
+    fn tick_moves_boredom_and_social_need_with_user_activity() {
+        let mut engaged = LifeState::default();
+        let mut ignored = LifeState::default();
+        for _ in 0..60 {
+            engaged.tick(1.0, true, false);
+            ignored.tick(1.0, false, false);
+        }
+        assert!(engaged.boredom < ignored.boredom);
+        assert!(engaged.social_need < ignored.social_need);
+        assert!(engaged.curiosity > ignored.curiosity);
+    }
+
+    #[test]
+    fn tick_eases_mood_toward_its_homeostatic_target() {
+        let mut stressed = LifeState {
+            stress: 1.0,
+            mood: 0.9,
+            ..LifeState::default()
+        };
+        let before = stressed.mood;
+        for _ in 0..30 {
+            stressed.tick(1.0, false, false);
+        }
+        assert!(stressed.mood < before);
+    }
+
+    #[test]
+    fn tick_survives_hostile_time_slices_and_stays_bounded() {
+        let mut state = LifeState::default();
+        for (index, dt) in [f32::NAN, f32::INFINITY, -5.0, 3600.0, 0.1]
+            .into_iter()
+            .cycle()
+            .take(10_000)
+            .enumerate()
+        {
+            state.tick(dt, index % 2 == 0, index % 3 == 0);
+        }
+        assert!(state
             .values()
             .into_iter()
             .all(|value| value.is_finite() && (0.0..=1.0).contains(&value)));
