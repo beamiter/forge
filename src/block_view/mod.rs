@@ -2018,6 +2018,12 @@ type CommandStartedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandStartedEvent)>>>
 type CommandFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandFinishedEvent)>>>>;
 type HumanInputCallbacks = Rc<RefCell<Vec<Box<dyn Fn(HumanInputKind)>>>>;
 
+fn emit_activity(callbacks: &VoidCallbacks) {
+    for callback in callbacks.borrow().iter() {
+        callback();
+    }
+}
+
 fn emit_command_started(callbacks: &CommandStartedCallbacks, event: CommandStartedEvent) {
     for callback in callbacks.borrow().iter() {
         callback(event.clone());
@@ -2875,9 +2881,7 @@ impl ReaderCtx {
                                     {
                                         active_rc.borrow().accumulate_output(bytes);
                                     }
-                                    for cb in activity_cbs.borrow().iter() {
-                                        cb();
-                                    }
+                                    emit_activity(&activity_cbs);
                                     true
                                 }
                                 BlockState::AltScreen => {
@@ -4219,6 +4223,14 @@ impl ReaderCtx {
                             bstate_rc.set(BlockState::AltScreen);
                             active_alt_screen_mode_rc.set(Some(*mode));
                             enter_alt_screen_chrome(&active_rc, &sticky_bar, &jump_fab);
+                            // The control sequence may be the only event in
+                            // this parser turn, so ordinary output bytes cannot
+                            // be relied on to revoke live organism state. The
+                            // existing content-free activity route clears its
+                            // cue, sleep claim and remembered body position
+                            // synchronously, after Block has cleared desired
+                            // visibility and installed the alt-screen override.
+                            emit_activity(&activity_cbs);
                             // Hand the viewport to the alt-screen app: hide finished
                             // blocks so the live VTE fills the scroll area.
                             enter_fullscreen(
@@ -4747,6 +4759,11 @@ fn enter_alt_screen_chrome(
 ) {
     let active = active.borrow();
     active.widget().add_css_class("block-fullscreen");
+    // Clear both actual and desired visibility. The alternate-screen
+    // override alone would restore the old pre-TUI coordinates synchronously
+    // on rmcup; the organism heartbeat must remeasure the primary screen
+    // before it chooses to show the body again.
+    active.set_live_organism_visible(false);
     active.set_live_organism_alt_screen(true);
     sticky.set_visible(false);
     jump_fab.set_visible(false);
@@ -7072,8 +7089,9 @@ impl TermView {
         true
     }
 
-    /// Request body visibility.  An alternate-screen app always wins while it
-    /// owns the pane; leaving it restores this requested value.
+    /// Request body visibility. An alternate-screen app always wins and clears
+    /// the request; leaving it stays hidden until the organism remeasures the
+    /// primary screen and explicitly opts in again.
     pub(crate) fn set_live_organism_visible(&self, visible: bool) {
         self.active.borrow().set_live_organism_visible(visible);
     }
@@ -8156,7 +8174,7 @@ mod tests {
         bounded_journal_output, build_clipboard_paste, build_command_recall,
         build_keyboard_query_reply, classify_command_prompt_status, coalesce_bytes_events,
         collapse_repaint_output, command_capture_range_is_bounded, command_id_uses_shell_token,
-        compute_viewport_state, decide_agent_command_end, emit_command_finished,
+        compute_viewport_state, decide_agent_command_end, emit_activity, emit_command_finished,
         emit_command_started, format_color_query_reply, history_edge_navigation_available,
         input_is_typeahead_for_existing_submission, input_may_survive_into_next_prompt,
         input_submits_line, next_prompt_shadow_state, normalize_captured_command,
@@ -8185,6 +8203,21 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
+    fn content_free_activity_notifies_every_observer_synchronously() {
+        let callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn()>>::new()));
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        for label in ["tab", "organism"] {
+            let seen = seen.clone();
+            callbacks
+                .borrow_mut()
+                .push(Box::new(move || seen.borrow_mut().push(label)));
+        }
+
+        emit_activity(&callbacks);
+        assert_eq!(seen.borrow().as_slice(), &["tab", "organism"]);
+    }
+
+    #[test]
     fn authoritative_block_start_notifies_every_observer_once() {
         let callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn(CommandStartedEvent)>>::new()));
         let seen = Rc::new(RefCell::new(Vec::new()));
@@ -8208,7 +8241,7 @@ mod tests {
 
     #[test]
     fn authoritative_finish_events_drive_the_no_llm_reducer_once_each() {
-        use crate::organism::{Behavior, NativeOrganism};
+        use crate::organism::{classify_command, Behavior, NativeOrganism};
 
         let callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn(CommandFinishedEvent)>>::new()));
         let organism = Rc::new(RefCell::new(NativeOrganism::default()));
@@ -8218,7 +8251,7 @@ mod tests {
             let seen = seen.clone();
             callbacks.borrow_mut().push(Box::new(move |event| {
                 let reaction = organism.borrow_mut().command_finished(
-                    &event.command,
+                    classify_command(&event.command),
                     event.exit_code,
                     event.duration_ms,
                 );

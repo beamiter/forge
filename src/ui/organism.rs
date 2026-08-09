@@ -6,16 +6,19 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use super::UiState;
+use super::{PaneNode, UiState};
 use crate::block_view::TermView;
+use crate::config::OrganismMotion;
 use crate::organism::{
     classify_command, sprite_frame, sticky_glyph, AgentPulse, AmbientBehavior, AmbientMind,
-    Behavior, BodyLanguage, CommandKind, LifeState, NativeOrganism, Reaction, RepoArrival, Tone,
+    Behavior, BodyLanguage, CircadianPhase, CommandKind, LifeState, NativeOrganism, Reaction,
+    RepoArrival, Tone,
 };
-use crate::config::OrganismMotion;
-use crate::organism_memory::{local_day_at_ms, unix_ms, MemoryEvent, RepoContext};
+use crate::organism_memory::{
+    local_circadian_time_at_ms, unix_ms, CircadianProfile, GrowthProgress, GrowthStage,
+    LocalCircadianTime, MemoryEvent, RepoContext,
+};
 
-const REACTION_HOLD: Duration = Duration::from_millis(8_000);
 /// An accepted correction only vouches for a command that starts promptly.
 const CORRECTION_ASSIST_WINDOW: Duration = Duration::from_secs(30);
 const HUMAN_INPUT_RETREAT: Duration = Duration::from_millis(900);
@@ -24,11 +27,16 @@ const SURFACE_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 /// process barely wakes. Kept just under the tick's one-second dt clamp so
 /// routine dispatch latency is still simulated instead of clipped away.
 const DORMANT_FRAME_INTERVAL: Duration = Duration::from_millis(900);
+/// A cross-pane failure is a brief orienting glance, not a queued reaction.
+const GLANCE_ASIDE_HOLD: Duration = Duration::from_millis(1_400);
 const SURFACE_MARGIN: i32 = 8;
 /// After this long watching one command, the body settles into its vigil.
 const SETTLED_WATCH_ONSET: Duration = Duration::from_secs(60);
 /// Elapsed time only appears on the card once a command stops being quick.
 const ACCOMPANY_LABEL_ONSET: Duration = Duration::from_secs(10);
+/// Widest canonical inline pose (`CelebrateBig`); reserving the slot keeps the
+/// title/status column still when reactions change silhouette.
+const INLINE_SPRITE_SLOT_CHARS: i32 = 12;
 const TONE_CLASSES: [&str; 5] = [
     "organism-quiet",
     "organism-active",
@@ -37,12 +45,79 @@ const TONE_CLASSES: [&str; 5] = [
     "organism-warning",
 ];
 
+fn surface_frame_delay(
+    motion: OrganismMotion,
+    owner: bool,
+    alt_screen: bool,
+    resting: bool,
+) -> Duration {
+    if motion == OrganismMotion::Full && owner && !alt_screen && !resting {
+        SURFACE_FRAME_INTERVAL
+    } else {
+        DORMANT_FRAME_INTERVAL
+    }
+}
+
+/// A focus transfer may replace an already-pending source, but must not start
+/// a second source after the fired callback has taken its id from the slot.
+/// That callback observes the new owner at its tail and schedules the right
+/// cadence itself.
+fn focus_transfer_rearm_delay(
+    motion: OrganismMotion,
+    owner: bool,
+    alt_screen: bool,
+    timer_pending: bool,
+) -> Option<Duration> {
+    timer_pending.then(|| surface_frame_delay(motion, owner, alt_screen, false))
+}
+
+fn reaction_hold(reaction: &Reaction) -> Duration {
+    let millis = match reaction.behavior {
+        // Ordinary/quiet passes acknowledge the event without occupying the
+        // output centre for the old fixed eight seconds.
+        Behavior::Idle => 1_500,
+        Behavior::Celebrate if reaction.tone == Tone::Quiet => 1_800,
+        Behavior::Celebrate => 2_500,
+        // Errors need time to be noticed; a repeated streak deliberately sits
+        // longer, but the next input still interrupts it immediately.
+        Behavior::InspectError => 5_000,
+        Behavior::SitNearError => 10_000,
+        Behavior::CelebrateBig => 7_000,
+        Behavior::RestAfterPush => 5_000,
+        Behavior::UnknownOutcome => 4_500,
+        // GlanceAside is live-only and uses its own timer. Keep this arm for
+        // exhaustive safety if a future caller ever wraps it in a Reaction.
+        Behavior::GlanceAside => 1_400,
+        Behavior::WatchCommand
+        | Behavior::Sleep
+        | Behavior::Explore
+        | Behavior::Approach
+        | Behavior::WatchAgent
+        | Behavior::WatchSettled => 2_500,
+    };
+    Duration::from_millis(millis)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SurfaceMode {
     Idle,
     Typing,
     Watching,
     Reacting,
+}
+
+/// The only fact allowed to cross from one pane into another. Source command,
+/// cwd, output, status code, and repository identity never enter this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresenceSignal {
+    BackgroundCommandFailed,
+}
+
+/// Ephemeral state of the one live spatial body. This is deliberately
+/// separate from pane-local reducer reactions and inline/sticky history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresenceCue {
+    GlanceAside,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,9 +129,46 @@ struct SurfaceBox {
     cell_height: i32,
     body_width: i32,
     body_height: i32,
-    /// On-screen grid row of the cursor: the output growth edge the watching
-    /// pose perches above.
+    /// On-screen grid row of the cursor: the output growth edge after which a
+    /// watching/reaction pose may use only fully clear rows.
     cursor_row: i32,
+}
+
+type SurfaceSignature = (i32, i32, i32, i32, i32, i32, i32);
+
+fn surface_signature(surface: SurfaceBox) -> SurfaceSignature {
+    (
+        surface.width,
+        surface.height,
+        surface.right_gutter,
+        surface.cell_width,
+        surface.cell_height,
+        surface.body_width,
+        surface.body_height,
+    )
+}
+
+fn below_output_y(surface: SurfaceBox) -> Option<i32> {
+    if surface.body_height <= 0 {
+        return None;
+    }
+    let cell_height = surface.cell_height.max(1);
+    let margin_y = SURFACE_MARGIN.max(cell_height);
+    let min_y = align_up(margin_y, cell_height);
+    let max_y = align_down(
+        surface
+            .height
+            .saturating_sub(surface.body_height)
+            .saturating_sub(margin_y),
+        cell_height,
+    );
+    let cursor_bottom = surface
+        .cursor_row
+        .max(0)
+        .saturating_add(1)
+        .saturating_mul(cell_height);
+    let clear_y = align_up(cursor_bottom.max(min_y), cell_height);
+    (clear_y <= max_y).then_some(clear_y)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -123,6 +235,80 @@ fn surface_mode(
     }
 }
 
+fn visible_sleeping(
+    owner: bool,
+    motion: OrganismMotion,
+    alt_screen: bool,
+    body_visible: bool,
+    cue_active: bool,
+    mode: SurfaceMode,
+    ambient: AmbientBehavior,
+) -> bool {
+    owner
+        && motion != OrganismMotion::Static
+        && !alt_screen
+        && body_visible
+        && !cue_active
+        && mode == SurfaceMode::Idle
+        && ambient == AmbientBehavior::Sleep
+}
+
+fn can_show_presence_cue(
+    owner: bool,
+    motion: OrganismMotion,
+    alt_screen: bool,
+    body_visible: bool,
+    mode: SurfaceMode,
+) -> bool {
+    owner
+        && motion != OrganismMotion::Static
+        && !alt_screen
+        && body_visible
+        && mode == SurfaceMode::Idle
+}
+
+fn live_display_behavior(
+    baseline: Behavior,
+    mode: SurfaceMode,
+    cue: Option<PresenceCue>,
+) -> Behavior {
+    if mode == SurfaceMode::Idle && cue == Some(PresenceCue::GlanceAside) {
+        Behavior::GlanceAside
+    } else {
+        baseline
+    }
+}
+
+/// Event reactions and cross-pane cues own a local animation epoch, so their
+/// first immediate render is always the canonical signature frame instead of
+/// inheriting whichever half of the window-global beat happened to be live.
+/// Ambient wandering keeps the global frame and therefore stays continuous.
+fn animation_frames(
+    global: u64,
+    behavior_origin: u64,
+    cue_origin: u64,
+    mode: SurfaceMode,
+    cue: Option<PresenceCue>,
+) -> (u64, u64) {
+    let baseline = if matches!(mode, SurfaceMode::Watching | SurfaceMode::Reacting) {
+        global.wrapping_sub(behavior_origin)
+    } else {
+        global
+    };
+    let live = if cue.is_some() {
+        global.wrapping_sub(cue_origin)
+    } else {
+        baseline
+    };
+    (baseline, live)
+}
+
+fn presence_signal_for_exit(exit_code: Option<i32>) -> Option<PresenceSignal> {
+    exit_code
+        .is_some_and(|code| code != 0)
+        .then_some(PresenceSignal::BackgroundCommandFailed)
+}
+
 /// Which watching pose fits: the Agent's commands get the crouch-apart pose,
 /// a long human command earns the settled vigil, everything else the alert
 /// watch.
@@ -151,6 +337,88 @@ fn elapsed_label(elapsed: Duration) -> String {
         }
     } else {
         format!("{}h {:02}m", total / 3_600, (total % 3_600) / 60)
+    }
+}
+
+fn mark_likely_flaky(reaction: &mut Reaction, agent_driven: bool) {
+    // A repeated one-run recovery points at an intermittent test, not at the
+    // human. Preserve the reducer's ordinary success pose and only quiet the
+    // tone and wording; Agent-owned commands remain speechless.
+    if reaction.behavior == Behavior::CelebrateBig {
+        reaction.behavior = Behavior::Celebrate;
+    }
+    reaction.tone = Tone::Quiet;
+    reaction.speech = (!agent_driven).then_some("像是偶发的。");
+    if let Some(rest) = reaction
+        .description
+        .strip_prefix("build/test passed after ")
+    {
+        if let Some((_, suffix)) = rest.split_once(" failure(s)") {
+            reaction.description = format!("build/test passed after 1 failure(s){suffix}");
+        }
+    }
+    reaction
+        .description
+        .push_str(" · repeated one-run recovery looks intermittent");
+}
+
+fn mark_circadian_greeting(reaction: &mut Reaction, bucket: u8) {
+    // The greeting is a once-per-window/session acknowledgement, not a
+    // stronger stimulus. A more specific repo-home line wins, and evening
+    // or night-shift sessions avoid calling 21:00 "morning".
+    if reaction.speech.is_none() {
+        reaction.speech = Some(if bucket < 4 { "早。" } else { "来了。" });
+    }
+    reaction.description.push_str(" · habitual working hours");
+}
+
+fn apply_growth_voice(
+    reaction: &mut Reaction,
+    stage: GrowthStage,
+    recovered_failures: u32,
+    agent_driven: bool,
+) {
+    // Age changes expression, never stimulus strength. An organism seasoned
+    // by months and many debugging episodes keeps the same full recovery pose
+    // and state transition, but no longer needs the exuberant sentence.
+    if stage == GrowthStage::Seasoned
+        && recovered_failures >= 3
+        && !agent_driven
+        && reaction.behavior == Behavior::CelebrateBig
+    {
+        reaction.speech = Some("嗯。");
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemoryBadgeState {
+    Persistent,
+    Volatile,
+    SaveFailed,
+}
+
+fn growth_badge(stage: GrowthStage, memory: MemoryBadgeState) -> &'static str {
+    match (stage, memory) {
+        (GrowthStage::Juvenile, MemoryBadgeState::Persistent) => "juvenile · repo memory · no LLM",
+        (GrowthStage::Adult, MemoryBadgeState::Persistent) => "adult · repo memory · no LLM",
+        (GrowthStage::Seasoned, MemoryBadgeState::Persistent) => "seasoned · repo memory · no LLM",
+        (_, MemoryBadgeState::Volatile) => "volatile · no LLM",
+        (GrowthStage::Juvenile, MemoryBadgeState::SaveFailed) => "juvenile · save failed · no LLM",
+        (GrowthStage::Adult, MemoryBadgeState::SaveFailed) => "adult · save failed · no LLM",
+        (GrowthStage::Seasoned, MemoryBadgeState::SaveFailed) => "seasoned · save failed · no LLM",
+    }
+}
+
+fn unusual_build_pace(typical_ms: Option<u64>, duration_ms: Option<u64>) -> Option<&'static str> {
+    let (Some(typical), Some(duration)) = (typical_ms, duration_ms) else {
+        return None;
+    };
+    if duration >= typical.saturating_mul(2) && duration >= typical.saturating_add(10_000) {
+        Some("slower than usual here")
+    } else if duration.saturating_mul(2) <= typical && typical >= duration.saturating_add(10_000) {
+        Some("quicker than usual here")
+    } else {
+        None
     }
 }
 
@@ -203,6 +471,14 @@ fn surface_point(
     if max_x < min_x || max_y < min_y {
         return None;
     }
+    let output_clear_y = if matches!(mode, SurfaceMode::Watching | SurfaceMode::Reacting) {
+        // With no complete sprite row below the latest output, the inline card
+        // carries the reaction instead. Overlaying terminal text is never the
+        // fallback.
+        below_output_y(surface)?
+    } else {
+        min_y
+    };
 
     let (x, y) = match mode {
         SurfaceMode::Idle => {
@@ -219,9 +495,10 @@ fn surface_point(
                 // Sit by the prompt edge, where the human works.
                 AmbientBehavior::Approach => (max_x, max_y),
                 // Pace the restless cycle regardless of the idle tempo.
-                AmbientBehavior::Explore => {
-                    (wander_x(wander_phase(frame, WanderTempo::Restless).0), max_y)
-                }
+                AmbientBehavior::Explore => (
+                    wander_x(wander_phase(frame, WanderTempo::Restless).0),
+                    max_y,
+                ),
                 // Mostly sit at an edge, occasionally walk between them — the
                 // walk share follows the wander tempo, so a listless mind
                 // paces while a drowsy one lies still. It feels alive without
@@ -233,33 +510,20 @@ fn surface_point(
         // Accepted human input moves it away from the prompt edge. The window
         // slides on every accepted write, so sustained typing keeps it there.
         SurfaceMode::Typing => (max_x, min_y),
-        SurfaceMode::Watching => {
-            let bob = if (frame / 3).is_multiple_of(2) {
-                0
-            } else {
-                cell_height
-            };
-            // Perch just above the output growth edge and follow it down as
-            // lines arrive; a cursor near the top clamps to the safe margin.
-            let above_cursor = surface
-                .cursor_row
-                .saturating_sub(1)
-                .saturating_mul(cell_height)
-                .saturating_sub(surface.body_height);
-            (
-                max_x,
-                align_down(above_cursor.saturating_add(bob), cell_height).clamp(min_y, max_y),
-            )
-        }
+        // Watching holds the output edge steadily. Real output pulses still
+        // advance the tail animation faster; a content-free global timer no
+        // longer makes the whole body jump one terminal row every 300 ms.
+        SurfaceMode::Watching => (max_x, output_clear_y),
         SurfaceMode::Reacting => (
             align_down(
                 min_x.saturating_add(max_x.saturating_sub(min_x) / 2),
                 cell_width,
             ),
             align_down(
-                min_y.saturating_add(max_y.saturating_sub(min_y) / 2),
+                output_clear_y.saturating_add(max_y.saturating_sub(output_clear_y) / 2),
                 cell_height,
-            ),
+            )
+            .clamp(output_clear_y, max_y),
         ),
     };
 
@@ -339,8 +603,10 @@ impl OrganismCorrectionSignal {
     pub(crate) fn note_dismissed(&self) {
         let streak = self.dismiss_streak.get().saturating_add(1);
         self.dismiss_streak.set(streak);
-        self.life
-            .set(crate::organism::correction_dismissed(self.life.get(), streak));
+        self.life.set(crate::organism::correction_dismissed(
+            self.life.get(),
+            streak,
+        ));
     }
 
     /// Consume a fresh acceptance for the command that is about to start in
@@ -371,10 +637,25 @@ pub(crate) struct OrganismActivity {
     commands_running: Cell<u32>,
     active_at: Cell<Option<Instant>>,
     ticked_at: Cell<Option<Instant>>,
+    sleeping_bodies: Cell<u32>,
+    circadian_profile: Cell<Option<CircadianProfile>>,
+    circadian_profile_day: Cell<Option<i64>>,
+    morning_greeted_session: Cell<Option<i64>>,
+    growth: Cell<GrowthProgress>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CircadianRefresh {
+    NotAttempted,
+    Succeeded(i64),
+    Failed,
 }
 
 impl OrganismActivity {
-    pub(crate) fn new() -> Rc<Self> {
+    pub(crate) fn new(
+        circadian_profile: Option<CircadianProfile>,
+        growth: GrowthProgress,
+    ) -> Rc<Self> {
         // A fresh window counts as activity: rest only begins after a real
         // quiet stretch, never at attach time.
         Rc::new(Self {
@@ -382,7 +663,58 @@ impl OrganismActivity {
             commands_running: Cell::new(0),
             active_at: Cell::new(Some(Instant::now())),
             ticked_at: Cell::new(None),
+            sleeping_bodies: Cell::new(0),
+            circadian_profile: Cell::new(circadian_profile),
+            // Force one fresh cross-window read at the first command, then at
+            // most once per civil day for non-semantic commands.
+            circadian_profile_day: Cell::new(None),
+            morning_greeted_session: Cell::new(None),
+            growth: Cell::new(growth),
         })
+    }
+
+    fn set_growth(&self, growth: GrowthProgress) {
+        self.growth.set(growth);
+    }
+
+    fn growth(&self) -> GrowthProgress {
+        self.growth.get()
+    }
+
+    fn set_circadian_profile(&self, profile: Option<CircadianProfile>, refresh: CircadianRefresh) {
+        self.circadian_profile.set(profile);
+        match refresh {
+            CircadianRefresh::NotAttempted => {}
+            CircadianRefresh::Succeeded(day) => self.circadian_profile_day.set(Some(day)),
+            CircadianRefresh::Failed => self.circadian_profile_day.set(None),
+        }
+    }
+
+    fn circadian_profile_needs_refresh(&self, day: i64) -> bool {
+        self.circadian_profile_day.get() != Some(day)
+    }
+
+    fn circadian_phase(&self, bucket: u8) -> CircadianPhase {
+        match self.circadian_profile.get() {
+            None => CircadianPhase::Unlearned,
+            Some(profile) if profile.contains(bucket) => CircadianPhase::InHours,
+            Some(_) => CircadianPhase::OffHours,
+        }
+    }
+
+    fn take_morning_greeting(&self, local: LocalCircadianTime, human_owned: bool) -> bool {
+        let Some(profile) = self.circadian_profile.get() else {
+            return false;
+        };
+        if !human_owned || !profile.contains(local.bucket) {
+            return false;
+        }
+        let session = profile.session_day(local);
+        if self.morning_greeted_session.get() == Some(session) {
+            return false;
+        }
+        self.morning_greeted_session.set(Some(session));
+        true
     }
 
     fn note_input(&self, now: Instant) {
@@ -426,6 +758,23 @@ impl OrganismActivity {
         self.commands_running.get() == 0
     }
 
+    fn body_started_sleeping(&self) {
+        self.sleeping_bodies
+            .set(self.sleeping_bodies.get().saturating_add(1));
+    }
+
+    fn body_stopped_sleeping(&self) {
+        self.sleeping_bodies
+            .set(self.sleeping_bodies.get().saturating_sub(1));
+    }
+
+    /// Any pane-local mind is visibly curled up, and no command in the
+    /// window is running. This aggregate keeps shared-life regeneration
+    /// independent of which pane happens to claim the next timer slice.
+    fn sleeping_rest(&self) -> bool {
+        self.sleeping_bodies.get() > 0 && self.no_commands_running()
+    }
+
     /// Seconds since the window was last active at all, feeding the ambient
     /// mind's sleep utility.
     fn idle_for_secs(&self, now: Instant) -> f32 {
@@ -448,6 +797,196 @@ impl OrganismActivity {
         };
         self.ticked_at.set(Some(now));
         dt
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct OrganismPaneToken(u64);
+
+#[derive(Default)]
+struct PresenceLedger {
+    next: u64,
+    registered: Vec<OrganismPaneToken>,
+    owner: Option<OrganismPaneToken>,
+}
+
+impl PresenceLedger {
+    fn reserve(&mut self) -> OrganismPaneToken {
+        self.next = self
+            .next
+            .checked_add(1)
+            .expect("ASCII organism pane tokens are never exhausted");
+        OrganismPaneToken(self.next)
+    }
+
+    fn bind(&mut self, token: OrganismPaneToken) {
+        if !self.registered.contains(&token) {
+            self.registered.push(token);
+        }
+    }
+
+    fn claim(&mut self, token: Option<OrganismPaneToken>) {
+        self.owner = token.filter(|token| self.registered.contains(token));
+    }
+
+    fn unregister(&mut self, token: OrganismPaneToken) {
+        self.registered.retain(|registered| *registered != token);
+        if self.owner == Some(token) {
+            self.owner = None;
+        }
+    }
+
+    fn is_owner(&self, token: OrganismPaneToken) -> bool {
+        self.owner == Some(token)
+    }
+
+    fn signal_target(&self, source: OrganismPaneToken) -> Option<OrganismPaneToken> {
+        if !self.registered.contains(&source) {
+            return None;
+        }
+        self.owner.filter(|owner| *owner != source)
+    }
+}
+
+struct PresenceEntry {
+    token: OrganismPaneToken,
+    view: std::rc::Weak<TermView>,
+    runtime: std::rc::Weak<OrganismRuntime>,
+}
+
+#[derive(Default)]
+struct PresenceState {
+    ledger: PresenceLedger,
+    entries: Vec<PresenceEntry>,
+}
+
+/// Window-shared arbiter for the one spatial body. Every pane keeps its own
+/// reducer and inline/sticky representations, but only the genuinely focused
+/// local Block pane may opt its live overlay into visibility.
+pub(crate) struct OrganismPresence {
+    state: RefCell<PresenceState>,
+}
+
+impl OrganismPresence {
+    pub(crate) fn new() -> Rc<Self> {
+        Rc::new(Self {
+            state: RefCell::new(PresenceState::default()),
+        })
+    }
+
+    fn reserve(&self) -> OrganismPaneToken {
+        self.state.borrow_mut().ledger.reserve()
+    }
+
+    fn bind(&self, token: OrganismPaneToken, view: &Rc<TermView>, runtime: &Rc<OrganismRuntime>) {
+        let mut state = self.state.borrow_mut();
+        state.ledger.bind(token);
+        state.entries.push(PresenceEntry {
+            token,
+            view: Rc::downgrade(view),
+            runtime: Rc::downgrade(runtime),
+        });
+    }
+
+    fn focus_view(&self, focused: Option<&Rc<TermView>>) {
+        let (changed, new_owner, live_entries) = {
+            let mut state = self.state.borrow_mut();
+            state
+                .entries
+                .retain(|entry| entry.view.strong_count() > 0 && entry.runtime.strong_count() > 0);
+            let live_tokens: Vec<_> = state.entries.iter().map(|entry| entry.token).collect();
+            state
+                .ledger
+                .registered
+                .retain(|token| live_tokens.contains(token));
+            if state
+                .ledger
+                .owner
+                .is_some_and(|owner| !live_tokens.contains(&owner))
+            {
+                state.ledger.owner = None;
+            }
+
+            let new_owner = focused.and_then(|focused| {
+                state.entries.iter().find_map(|entry| {
+                    let view = entry.view.upgrade()?;
+                    Rc::ptr_eq(&view, focused).then_some(entry.token)
+                })
+            });
+            let changed = state.ledger.owner != new_owner;
+            if changed {
+                // Phase one is visible immediately after the borrow is
+                // released: no old and new body may overlap during transfer.
+                state.ledger.claim(None);
+            }
+            let live_entries = state
+                .entries
+                .iter()
+                .filter_map(|entry| {
+                    Some((entry.token, entry.view.upgrade()?, entry.runtime.upgrade()?))
+                })
+                .collect::<Vec<_>>();
+            (changed, new_owner, live_entries)
+        };
+        if !changed {
+            return;
+        }
+
+        for (_, view, runtime) in &live_entries {
+            runtime.hide_live_body(view);
+        }
+
+        {
+            let mut state = self.state.borrow_mut();
+            state.ledger.claim(new_owner);
+        }
+        for (token, view, runtime) in &live_entries {
+            if Some(*token) == new_owner {
+                runtime.refresh_surface(view, Instant::now());
+            }
+            OrganismRuntime::rearm_surface_tick_for_focus(runtime, view);
+        }
+    }
+
+    fn unregister(&self, token: OrganismPaneToken) {
+        let view = {
+            let mut state = self.state.borrow_mut();
+            let view = state
+                .entries
+                .iter()
+                .find(|entry| entry.token == token)
+                .and_then(|entry| entry.view.upgrade());
+            state.entries.retain(|entry| entry.token != token);
+            state.ledger.unregister(token);
+            view
+        };
+        if let Some(view) = view {
+            view.set_live_organism_visible(false);
+        }
+    }
+
+    fn is_owner(&self, token: OrganismPaneToken) -> bool {
+        self.state.borrow().ledger.is_owner(token)
+    }
+
+    fn signal_from(&self, source: OrganismPaneToken, signal: PresenceSignal) {
+        let target = {
+            let state = self.state.borrow();
+            let Some(target) = state.ledger.signal_target(source) else {
+                return;
+            };
+            state.entries.iter().find_map(|entry| {
+                if entry.token != target {
+                    return None;
+                }
+                Some((entry.view.upgrade()?, entry.runtime.upgrade()?))
+            })
+        };
+        // Never hold the coordinator's RefCell borrow across GTK/runtime work:
+        // a cue may synchronously hide itself if geometry has gone stale.
+        if let Some((view, runtime)) = target {
+            OrganismRuntime::receive_presence_signal(&runtime, &view, signal, Instant::now());
+        }
     }
 }
 
@@ -492,19 +1031,27 @@ fn same_checkout(root: Option<&str>, repo_cwd: Option<&str>, cwd: Option<&str>) 
     let Some(cwd) = cwd else {
         return false;
     };
-    root.is_some_and(|root| cwd_within(cwd, root))
-        || repo_cwd.is_some_and(|known| known == cwd)
+    root.is_some_and(|root| cwd_within(cwd, root)) || repo_cwd.is_some_and(|known| known == cwd)
 }
 
 struct OrganismRuntime {
     organism: RefCell<NativeOrganism>,
     motion: OrganismMotion,
+    memory_badge: Cell<MemoryBadgeState>,
     shared_life: Rc<Cell<LifeState>>,
     activity: Rc<OrganismActivity>,
+    presence: Rc<OrganismPresence>,
+    presence_token: OrganismPaneToken,
+    /// Live-only cross-pane orienting cue. It never enters the reducer, card,
+    /// sticky header, or inline history.
+    presence_cue: Cell<Option<PresenceCue>>,
+    presence_cue_frame_origin: Cell<u64>,
+    presence_cue_timer: RefCell<Option<gtk4::glib::SourceId>>,
     /// Pane-local utility disposition; stepped only while this body is
     /// genuinely idle, interrupted the moment anything else claims it.
     ambient: RefCell<AmbientMind>,
     ambient_display: Cell<AmbientBehavior>,
+    sleeping: Cell<bool>,
     active_memory_kind: Cell<Option<CommandKind>>,
     active_context_key: RefCell<Option<String>>,
     active_repo_context: RefCell<Option<RepoContext>>,
@@ -519,16 +1066,17 @@ struct OrganismRuntime {
     surface_timer: RefCell<Option<gtk4::glib::SourceId>>,
     surface_last_frame: Cell<Option<Instant>>,
     surface_frame: Cell<u64>,
+    surface_behavior_frame_origin: Cell<u64>,
     /// Where the body currently stands on the live surface; `None` while
     /// hidden, so every reappearance snaps into place and the cat only ever
     /// walks where it can be seen.
     body_position: Cell<Option<(f64, f64)>>,
     /// The body moved last frame — drives gait frames during transit.
     body_in_transit: Cell<bool>,
-    /// Surface geometry the standing spot was computed against. A resize or
-    /// font change reflows everything anyway, so the body snaps to its new
-    /// clamped pose instead of walking from an out-of-band stale position.
-    surface_signature: Cell<(i32, i32, i32, i32)>,
+    /// Surface/body geometry the standing spot was computed against. A resize,
+    /// font/scrollbar change, or differently sized pose snaps to its fresh
+    /// clamped point instead of interpolating from an out-of-band position.
+    surface_signature: Cell<SurfaceSignature>,
     surface_behavior: Cell<Behavior>,
     last_surface_mode: Cell<Option<SurfaceMode>>,
     command_running: Cell<bool>,
@@ -555,6 +1103,8 @@ impl OrganismRuntime {
     fn new(
         shared_life: Rc<Cell<LifeState>>,
         activity: Rc<OrganismActivity>,
+        presence: Rc<OrganismPresence>,
+        presence_token: OrganismPaneToken,
         motion: OrganismMotion,
         persistent: bool,
     ) -> Rc<Self> {
@@ -579,6 +1129,7 @@ impl OrganismRuntime {
 
         let sprite = Label::new(None);
         sprite.add_css_class("organism-sprite");
+        sprite.set_width_chars(INLINE_SPRITE_SLOT_CHARS);
         sprite.set_xalign(0.0);
         sprite.set_yalign(0.5);
         sprite.set_selectable(false);
@@ -647,10 +1198,21 @@ impl OrganismRuntime {
         let runtime = Rc::new(Self {
             organism: RefCell::new(NativeOrganism::from_persisted_state(shared_life.get())),
             motion,
+            memory_badge: Cell::new(if persistent {
+                MemoryBadgeState::Persistent
+            } else {
+                MemoryBadgeState::Volatile
+            }),
             shared_life,
             activity,
+            presence,
+            presence_token,
+            presence_cue: Cell::new(None),
+            presence_cue_frame_origin: Cell::new(0),
+            presence_cue_timer: RefCell::new(None),
             ambient: RefCell::new(AmbientMind::default()),
             ambient_display: Cell::new(AmbientBehavior::Idle),
+            sleeping: Cell::new(false),
             active_memory_kind: Cell::new(None),
             active_context_key: RefCell::new(None),
             active_repo_context: RefCell::new(None),
@@ -662,9 +1224,10 @@ impl OrganismRuntime {
             surface_timer: RefCell::new(None),
             surface_last_frame: Cell::new(None),
             surface_frame: Cell::new(0),
+            surface_behavior_frame_origin: Cell::new(0),
             body_position: Cell::new(None),
             body_in_transit: Cell::new(false),
-            surface_signature: Cell::new((0, 0, 0, 0)),
+            surface_signature: Cell::new((0, 0, 0, 0, 0, 0, 0)),
             surface_behavior: Cell::new(Behavior::Idle),
             last_surface_mode: Cell::new(None),
             command_running: Cell::new(false),
@@ -686,7 +1249,106 @@ impl OrganismRuntime {
         runtime
     }
 
+    fn set_sleeping(&self, sleeping: bool) {
+        if self.sleeping.replace(sleeping) == sleeping {
+            return;
+        }
+        if sleeping {
+            self.activity.body_started_sleeping();
+        } else {
+            self.activity.body_stopped_sleeping();
+        }
+    }
+
+    fn clear_presence_cue(&self) {
+        self.presence_cue.set(None);
+        if let Some(source) = self.presence_cue_timer.borrow_mut().take() {
+            source.remove();
+        }
+    }
+
+    fn receive_presence_signal(
+        runtime: &Rc<Self>,
+        view: &Rc<TermView>,
+        signal: PresenceSignal,
+        now: Instant,
+    ) {
+        let mode = surface_mode(
+            runtime.surface_behavior.get(),
+            runtime.command_running.get(),
+            runtime.human_input_age(now),
+        );
+        let alt_screen = view.live_organism_surface_metrics().alt_screen;
+        if !can_show_presence_cue(
+            runtime.presence.is_owner(runtime.presence_token),
+            runtime.motion,
+            alt_screen,
+            runtime.body_position.get().is_some(),
+            mode,
+        ) {
+            return;
+        }
+
+        runtime.clear_presence_cue();
+        let cue = match signal {
+            PresenceSignal::BackgroundCommandFailed => PresenceCue::GlanceAside,
+        };
+        runtime.presence_cue.set(Some(cue));
+        runtime
+            .presence_cue_frame_origin
+            .set(runtime.surface_frame.get());
+        runtime.set_sleeping(false);
+        runtime.refresh_surface(view, now);
+        // A concurrent geometry/alternate-screen check may have failed closed
+        // during refresh. Never leave a timer for a cue that was not shown.
+        if runtime.presence_cue.get() != Some(cue) {
+            return;
+        }
+
+        let runtime_weak = Rc::downgrade(runtime);
+        let view_weak = Rc::downgrade(view);
+        let source = gtk4::glib::timeout_add_local_once(GLANCE_ASIDE_HOLD, move || {
+            let Some(runtime) = runtime_weak.upgrade() else {
+                return;
+            };
+            // Clear before refresh: if refresh fails closed, hide_live_body
+            // must not try to remove the source that is currently firing.
+            runtime.presence_cue_timer.borrow_mut().take();
+            runtime.presence_cue.set(None);
+            let Some(view) = view_weak.upgrade() else {
+                return;
+            };
+            let now = Instant::now();
+            runtime.refresh_surface(&view, now);
+            let mode = surface_mode(
+                runtime.surface_behavior.get(),
+                runtime.command_running.get(),
+                runtime.human_input_age(now),
+            );
+            let alt_screen = view.live_organism_surface_metrics().alt_screen;
+            runtime.set_sleeping(visible_sleeping(
+                runtime.presence.is_owner(runtime.presence_token),
+                runtime.motion,
+                alt_screen,
+                runtime.body_position.get().is_some(),
+                runtime.presence_cue.get().is_some(),
+                mode,
+                runtime.ambient_display.get(),
+            ));
+        });
+        *runtime.presence_cue_timer.borrow_mut() = Some(source);
+    }
+
+    fn hide_live_body(&self, view: &TermView) {
+        self.clear_presence_cue();
+        self.set_sleeping(false);
+        self.body_position.set(None);
+        self.body_in_transit.set(false);
+        view.set_live_organism_visible(false);
+    }
+
     fn bump_generation(&self) -> u64 {
+        self.clear_presence_cue();
         if let Some(source) = self.settle_timer.borrow_mut().take() {
             source.remove();
         }
@@ -697,7 +1359,10 @@ impl OrganismRuntime {
 
     fn render(&self, reaction: &Reaction) {
         self.sprite.set_text(reaction.behavior.sprite());
+        self.surface_behavior_frame_origin
+            .set(self.surface_frame.get());
         self.surface_behavior.set(reaction.behavior);
+        self.refresh_growth_badge();
         let status = match reaction.speech {
             Some(speech) => format!("{speech}  {}", reaction.description),
             None => reaction.description.clone(),
@@ -705,8 +1370,7 @@ impl OrganismRuntime {
         self.status.set_text(&status);
         self.status.set_tooltip_text(Some(&status));
         *self.status_base.borrow_mut() = status;
-        self.state
-            .set_text(&state_summary(self.organism.borrow().state()));
+        self.refresh_state(self.organism.borrow().state());
 
         for class in TONE_CLASSES {
             self.card.remove_css_class(class);
@@ -725,6 +1389,39 @@ impl OrganismRuntime {
         self.sticky_avatar.add_css_class(tone_class);
     }
 
+    fn refresh_growth_badge(&self) {
+        let growth = self.activity.growth();
+        let memory = self.memory_badge.get();
+        let badge = growth_badge(growth.stage(), memory);
+        if self.badge.text().as_str() != badge {
+            self.badge.set_text(badge);
+        }
+        let tooltip = match memory {
+            MemoryBadgeState::Persistent => format!(
+                "{} remembered work day(s) · {} recovery episode(s)",
+                growth.days_seen, growth.lifetime_recoveries
+            ),
+            MemoryBadgeState::Volatile => {
+                "Growth is unavailable because repository memory could not be loaded".to_string()
+            }
+            MemoryBadgeState::SaveFailed => {
+                "Repository memory could not be queued for durable storage".to_string()
+            }
+        };
+        self.badge.set_tooltip_text(Some(&tooltip));
+    }
+
+    fn refresh_state(&self, state: LifeState) {
+        let words = state_words(state);
+        if self.state.text().as_str() != words {
+            self.state.set_text(&words);
+        }
+        let detail = state_summary(state);
+        if self.state.tooltip_text().as_deref() != Some(detail.as_str()) {
+            self.state.set_tooltip_text(Some(&detail));
+        }
+    }
+
     fn human_input_age(&self, now: Instant) -> Option<Duration> {
         self.last_human_input
             .get()
@@ -732,6 +1429,10 @@ impl OrganismRuntime {
     }
 
     fn refresh_surface(&self, view: &TermView, now: Instant) {
+        // Growth is window-shared. Even static or unfocused bodies refresh
+        // their badge on the low-frequency heartbeat after another pane ages
+        // the organism into its next stage.
+        self.refresh_growth_badge();
         if self.motion == OrganismMotion::Static {
             // The inline card is the whole visual surface; the live body and
             // sticky avatar were never attached.
@@ -751,7 +1452,7 @@ impl OrganismRuntime {
         // A body still under way to its next pose walks there openly instead
         // of sliding in a seated (or curled) form.
         let in_transit = self.body_in_transit.get();
-        let display_behavior = match mode {
+        let baseline_behavior = match mode {
             SurfaceMode::Idle if in_transit => Behavior::Idle,
             SurfaceMode::Idle => ambient.display(),
             SurfaceMode::Watching => watching_behavior(
@@ -763,61 +1464,66 @@ impl OrganismRuntime {
             SurfaceMode::Typing => Behavior::WatchCommand,
             SurfaceMode::Reacting => behavior,
         };
+        let display_behavior =
+            live_display_behavior(baseline_behavior, mode, self.presence_cue.get());
         // The continuous state shows through the ambient poses as body
         // language; reaction poses stay canonical. Gait runs while the body
         // is genuinely under way OR a wander leg is in progress — the leg
         // advances its target slower than once per frame, so transit alone
         // would stutter the walk animation. Calm motion freezes the frame at
         // zero: first frames only, no wandering, no bob, no flourishes.
-        let frame = if self.motion == OrganismMotion::Full {
-            self.surface_frame.get()
+        let (geometry_frame, baseline_frame, live_frame) = if self.motion == OrganismMotion::Full {
+            let global = self.surface_frame.get();
+            let (baseline, live) = animation_frames(
+                global,
+                self.surface_behavior_frame_origin.get(),
+                self.presence_cue_frame_origin.get(),
+                mode,
+                self.presence_cue.get(),
+            );
+            (global, baseline, live)
         } else {
-            0
+            (0, 0, 0)
         };
         let language = BodyLanguage::from_state(self.shared_life.get());
         let tempo = wander_tempo(language);
         let wander_walking = match ambient {
-            AmbientBehavior::Idle => wander_phase(frame, tempo).1,
-            AmbientBehavior::Explore => wander_phase(frame, WanderTempo::Restless).1,
+            AmbientBehavior::Idle => wander_phase(geometry_frame, tempo).1,
+            AmbientBehavior::Explore => wander_phase(geometry_frame, WanderTempo::Restless).1,
             AmbientBehavior::Sleep | AmbientBehavior::Approach => false,
         };
         let walking = mode == SurfaceMode::Idle && (in_transit || wander_walking);
-        let sprite = sprite_frame(display_behavior, language, walking, frame);
+        let sprite = sprite_frame(display_behavior, language, walking, live_frame);
         if self.live_body.text().as_str() != sprite {
             self.live_body.set_text(sprite);
         }
         // The sticky one-line form mirrors the same displayed behavior with a
         // fixed-width micro-pose, so scrollback readers see the mood too.
-        let glyph = sticky_glyph(display_behavior, language, frame);
+        // Cross-pane cues belong only to the one spatial body. The focused
+        // pane's sticky and inline forms retain their own local semantics.
+        let glyph = sticky_glyph(baseline_behavior, language, baseline_frame);
         if self.sticky_avatar.text().as_str() != glyph {
             self.sticky_avatar.set_text(glyph);
         }
 
-        let metrics = view.live_organism_surface_metrics();
-        if metrics.alt_screen {
-            // ActiveBlock owns the temporary alt-screen override. Preserve the
-            // geometry-derived desired visibility so rmcup restores it in the
-            // same parser turn instead of waiting for another animation tick.
-            // Forget the standing spot so the return snaps instead of walking
-            // across a surface the body was never seen leaving.
-            self.body_position.set(None);
-            self.body_in_transit.set(false);
-            self.sticky_avatar.set_visible(false);
+        if !self.presence.is_owner(self.presence_token) {
+            self.hide_live_body(view);
+            // Sticky and inline forms remain pane-local evidence; only the
+            // spatial overlay participates in one-body focus arbitration.
+            self.sticky_avatar.set_visible(mode != SurfaceMode::Typing);
             return;
         }
-        // A resize or font change invalidates the stored standing spot: the
-        // whole surface reflows in the same moment, so snapping to the fresh
-        // clamped pose is invisible, while walking from the stale (possibly
-        // out-of-band) position would cross the protected gutter.
-        let signature = (
-            metrics.width,
-            metrics.height,
-            metrics.cell_width,
-            metrics.cell_height,
-        );
-        if self.surface_signature.replace(signature) != signature {
-            self.body_position.set(None);
-            self.body_in_transit.set(false);
+
+        let metrics = view.live_organism_surface_metrics();
+        if metrics.alt_screen {
+            // ActiveBlock owns the override and cleared desired visibility on
+            // smcup. Keep it cleared through rmcup; a later heartbeat must
+            // remeasure the primary screen before showing anything. Forget the
+            // standing spot so that safe return snaps rather than walking
+            // across a surface the body was never seen leaving.
+            self.hide_live_body(view);
+            self.sticky_avatar.set_visible(false);
+            return;
         }
         // Keep the child measurable while the non-measuring overlay is hidden.
         // GTK reports zero requisition for an explicitly invisible Label,
@@ -825,22 +1531,25 @@ impl OrganismRuntime {
         self.live_body.set_visible(true);
         let (_, body_width, _, _) = self.live_body.measure(Orientation::Horizontal, -1);
         let (_, body_height, _, _) = self.live_body.measure(Orientation::Vertical, body_width);
-        let point = surface_point(
-            SurfaceBox {
-                width: metrics.width,
-                height: metrics.height,
-                right_gutter: metrics.right_gutter,
-                cell_width: metrics.cell_width,
-                cell_height: metrics.cell_height,
-                body_width,
-                body_height,
-                cursor_row: metrics.cursor_row,
-            },
-            mode,
-            tempo,
-            ambient,
-            frame,
-        );
+        // A size change can tighten the legal x/y band even when the terminal
+        // itself did not resize. Snap before interpolating so a wider reaction
+        // pose never spends intermediate frames inside the scrollbar gutter.
+        let surface = SurfaceBox {
+            width: metrics.width,
+            height: metrics.height,
+            right_gutter: metrics.right_gutter,
+            cell_width: metrics.cell_width,
+            cell_height: metrics.cell_height,
+            body_width,
+            body_height,
+            cursor_row: metrics.cursor_row,
+        };
+        let signature = surface_signature(surface);
+        if self.surface_signature.replace(signature) != signature {
+            self.body_position.set(None);
+            self.body_in_transit.set(false);
+        }
+        let point = surface_point(surface, mode, tempo, ambient, geometry_frame);
 
         if let Some(target) = point {
             let previous = self.body_position.get();
@@ -852,18 +1561,29 @@ impl OrganismRuntime {
                 Some(_) if self.motion != OrganismMotion::Full => (target.x, target.y, false),
                 Some((px, py)) => {
                     let x = approach(px, target.x, f64::from(metrics.cell_width.max(1)));
-                    let y = approach(py, target.y, f64::from(metrics.cell_height.max(1)));
+                    let mut y = approach(py, target.y, f64::from(metrics.cell_height.max(1)));
+                    if matches!(mode, SurfaceMode::Watching | SurfaceMode::Reacting) {
+                        // Never animate through the output band on the way to
+                        // a safe below-output target. Horizontal travel may
+                        // stay smooth while the safety-critical axis snaps.
+                        if let Some(clear_y) = below_output_y(surface) {
+                            y = y.max(f64::from(clear_y));
+                        }
+                    }
                     (x, y, (px, py) != (x, y))
                 }
             };
-            self.body_in_transit.set(moved);
-            self.body_position.set(Some((x, y)));
-            view.set_live_organism_visible(true);
-            view.move_live_organism_body(self.live_body.upcast_ref(), x, y);
+            if view.move_live_organism_body(self.live_body.upcast_ref(), x, y) {
+                self.body_in_transit.set(moved);
+                self.body_position.set(Some((x, y)));
+                view.set_live_organism_visible(true);
+            } else {
+                // A detached/reparenting surface is not a place the body can
+                // visibly sleep. Fail closed until the next measured frame.
+                self.hide_live_body(view);
+            }
         } else {
-            self.body_position.set(None);
-            self.body_in_transit.set(false);
-            view.set_live_organism_visible(false);
+            self.hide_live_body(view);
         }
         // The Block layer decides whether the sticky running header is active;
         // this child only follows the same accepted-input retreat window.
@@ -871,15 +1591,48 @@ impl OrganismRuntime {
     }
 
     fn start_surface_tick(runtime: &Rc<Self>, view: &Rc<TermView>) {
-        Self::schedule_surface_frame(runtime, view, SURFACE_FRAME_INTERVAL);
+        let owner = runtime.presence.is_owner(runtime.presence_token);
+        let alt_screen = view.live_organism_surface_metrics().alt_screen;
+        Self::schedule_surface_frame(
+            runtime,
+            view,
+            surface_frame_delay(runtime.motion, owner, alt_screen, false),
+        );
+    }
+
+    fn rearm_surface_tick_for_focus(runtime: &Rc<Self>, view: &Rc<TermView>) {
+        let owner = runtime.presence.is_owner(runtime.presence_token);
+        let alt_screen = view.live_organism_surface_metrics().alt_screen;
+        let (source, delay) = {
+            let mut slot = runtime.surface_timer.borrow_mut();
+            let Some(delay) =
+                focus_transfer_rearm_delay(runtime.motion, owner, alt_screen, slot.is_some())
+            else {
+                // A fired callback takes the id before doing any work. It will
+                // see the new owner and choose its next delay at the tail; a
+                // second source here would otherwise escape the single slot.
+                return;
+            };
+            (
+                slot.take()
+                    .expect("a pending surface timer keeps its source id in the slot"),
+                delay,
+            )
+        };
+        source.remove();
+        Self::schedule_surface_frame(runtime, view, delay);
     }
 
     /// Self-rescheduling frame driver. A glib timeout wakes at most ten times
     /// a second — unlike a frame-clock tick callback it never forces the
     /// window's frame clock to run at full rate — and it drops to a
-    /// one-second heartbeat while the mind rests or the body is static, so an
-    /// untouched terminal costs almost nothing.
+    /// one-second heartbeat while the mind rests, the body is static, or this
+    /// pane does not own the one live presence.
     fn schedule_surface_frame(runtime: &Rc<Self>, view: &Rc<TermView>, delay: Duration) {
+        debug_assert!(
+            runtime.surface_timer.borrow().is_none(),
+            "a surface runtime must never own two pending frame sources"
+        );
         let runtime_weak = Rc::downgrade(runtime);
         let view_weak = Rc::downgrade(view);
         let source = gtk4::glib::timeout_add_local_once(delay, move || {
@@ -901,30 +1654,35 @@ impl OrganismRuntime {
                 runtime.command_running.get(),
                 runtime.human_input_age(now),
             );
+            let alt_screen = view.live_organism_surface_metrics().alt_screen;
+            // Publish this pane's currently visible sleep state before the
+            // shared slice is claimed. Regeneration then depends on the
+            // window aggregate, never on which body's callback runs first.
+            runtime.set_sleeping(visible_sleeping(
+                runtime.presence.is_owner(runtime.presence_token),
+                runtime.motion,
+                alt_screen,
+                runtime.body_position.get().is_some(),
+                runtime.presence_cue.get().is_some(),
+                mode,
+                runtime.ambient_display.get(),
+            ));
             // Continuous homeostasis: claim this pane's slice of the shared
             // clock and evolve the one shared mind. Persistence is untouched —
             // the evolved state only reaches disk with the next lifecycle
             // event, exactly as before.
             let dt = runtime.activity.tick_slice(now);
             if dt > 0.0 {
-                // A body that chose to curl up regenerates like external
-                // rest — but never while any pane of the window still runs a
-                // command, mirroring the prototype's build guard, so one
-                // sleeping body cannot recharge the shared mind mid-build.
-                let sleeping = mode == SurfaceMode::Idle
-                    && runtime.ambient_display.get() == AmbientBehavior::Sleep
-                    && runtime.activity.no_commands_running();
                 let mut life = runtime.shared_life.get();
+                let local = local_circadian_time_at_ms(unix_ms());
                 life.tick(
                     dt,
                     runtime.activity.user_active(now),
-                    runtime.activity.resting(now) || sleeping,
+                    runtime.activity.resting(now) || runtime.activity.sleeping_rest(),
+                    runtime.activity.circadian_phase(local.bucket),
                 );
                 runtime.shared_life.set(life);
-                let summary = state_summary(life);
-                if runtime.state.text().as_str() != summary {
-                    runtime.state.set_text(&summary);
-                }
+                runtime.refresh_state(life);
             }
             // The ambient mind runs on this pane's own frame cadence, so its
             // hold timers follow wall time however many panes share the tick
@@ -948,6 +1706,15 @@ impl OrganismRuntime {
                 .surface_frame
                 .set(runtime.surface_frame.get().wrapping_add(1 + pulse));
             runtime.refresh_surface(&view, now);
+            runtime.set_sleeping(visible_sleeping(
+                runtime.presence.is_owner(runtime.presence_token),
+                runtime.motion,
+                alt_screen,
+                runtime.body_position.get().is_some(),
+                runtime.presence_cue.get().is_some(),
+                mode,
+                runtime.ambient_display.get(),
+            ));
             // Accompaniment: a long-running command's card counts the time
             // spent watching together. Text only — no pose escalation, no
             // interruption, and short commands never show it.
@@ -969,28 +1736,30 @@ impl OrganismRuntime {
                     }
                 }
             }
-            let next = if runtime.motion == OrganismMotion::Static
-                || runtime.activity.resting(now)
-            {
-                DORMANT_FRAME_INTERVAL
-            } else {
-                SURFACE_FRAME_INTERVAL
-            };
+            let next = surface_frame_delay(
+                runtime.motion,
+                runtime.presence.is_owner(runtime.presence_token),
+                alt_screen,
+                runtime.activity.resting(now),
+            );
             Self::schedule_surface_frame(&runtime, &view, next);
         });
         *runtime.surface_timer.borrow_mut() = Some(source);
     }
 
     fn mark_volatile(&self) {
-        self.badge.set_text("volatile · save failed");
-        self.badge.set_tooltip_text(Some(
-            "Repository memory could not be queued for durable storage",
-        ));
+        self.memory_badge.set(MemoryBadgeState::SaveFailed);
+        self.refresh_growth_badge();
     }
 
-    fn settle_later(runtime: &Rc<Self>, view: std::rc::Weak<TermView>, generation: u64) {
+    fn settle_later(
+        runtime: &Rc<Self>,
+        view: std::rc::Weak<TermView>,
+        generation: u64,
+        hold: Duration,
+    ) {
         let runtime_weak = Rc::downgrade(runtime);
-        let source = gtk4::glib::timeout_add_local_once(REACTION_HOLD, move || {
+        let source = gtk4::glib::timeout_add_local_once(hold, move || {
             let Some(runtime) = runtime_weak.upgrade() else {
                 return;
             };
@@ -1007,6 +1776,7 @@ impl OrganismRuntime {
             };
             runtime.render(&idle);
             if let Some(view) = view.upgrade() {
+                runtime.refresh_surface(&view, Instant::now());
                 view.insert_inline_notice(&runtime.card);
             }
         });
@@ -1016,6 +1786,9 @@ impl OrganismRuntime {
 
 impl Drop for OrganismRuntime {
     fn drop(&mut self) {
+        self.clear_presence_cue();
+        self.presence.unregister(self.presence_token);
+        self.set_sleeping(false);
         // A pane closed mid-command must return its slot in the shared
         // running-command count, or the mind could never rest again.
         if self.command_running.get() {
@@ -1044,11 +1817,70 @@ fn state_summary(state: LifeState) -> String {
     )
 }
 
+fn state_words(state: LifeState) -> String {
+    let mut words = Vec::with_capacity(3);
+    if state.energy < 0.30 {
+        words.push("sleepy");
+    }
+    if state.stress > 0.60 {
+        words.push("tense");
+    }
+    if state.mood > 0.72 {
+        words.push("bright");
+    } else if state.mood < 0.30 {
+        words.push("subdued");
+    }
+    if state.curiosity > 0.70 {
+        words.push("curious");
+    }
+    if state.boredom > 0.75 {
+        words.push("restless");
+    }
+    if state.social_need > 0.70 {
+        words.push("lonely");
+    }
+    if state.attachment > 0.75 {
+        words.push("close");
+    }
+    if state.confidence < 0.35 {
+        words.push("unsure");
+    } else if state.confidence > 0.75 {
+        words.push("assured");
+    }
+    words.truncate(3);
+    if words.is_empty() {
+        "steady".to_string()
+    } else {
+        words.join(" · ")
+    }
+}
+
 fn percent(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 100.0).round() as u8
 }
 
 impl UiState {
+    /// Revoke synchronously when Notebook announces a page transition. GTK's
+    /// selected-page property still names the old page inside `switch-page`,
+    /// so resolution is intentionally deferred, but old ownership must end
+    /// before any timeout/IO source can run between the signal and that idle.
+    pub(crate) fn revoke_organism_presence(&self) {
+        self.organism_presence.focus_view(None);
+    }
+
+    pub(crate) fn sync_organism_presence(&self) {
+        let focused = self.window.is_active().then(|| {
+            self.notebook
+                .current_page()
+                .and_then(|page| self.notebook.nth_page(Some(page)))
+                .and_then(|widget| PaneNode::from_widget(&widget))
+                .and_then(|node| node.focused_leaf())
+                .and_then(|leaf| leaf.block_view())
+        });
+        self.organism_presence
+            .focus_view(focused.flatten().as_ref());
+    }
+
     pub(crate) fn attach_ascii_organism_to_view(&self, view: &Rc<TermView>, remote: bool) {
         if remote || !self.config.borrow().ascii_organism_enabled {
             return;
@@ -1057,22 +1889,30 @@ impl UiState {
         let persistent = self.organism_memory.borrow().is_some();
         // An explicit config level wins; otherwise follow the desktop's
         // animation preference — a reduced-motion desktop gets a calm body.
-        let motion = self.config.borrow().ascii_organism_motion.unwrap_or_else(|| {
-            let animations = gtk4::Settings::default()
-                .map(|settings| settings.is_gtk_enable_animations())
-                .unwrap_or(true);
-            if animations {
-                OrganismMotion::Full
-            } else {
-                OrganismMotion::Calm
-            }
-        });
+        let motion = self
+            .config
+            .borrow()
+            .ascii_organism_motion
+            .unwrap_or_else(|| {
+                let animations = gtk4::Settings::default()
+                    .map(|settings| settings.is_gtk_enable_animations())
+                    .unwrap_or(true);
+                if animations {
+                    OrganismMotion::Full
+                } else {
+                    OrganismMotion::Calm
+                }
+            });
+        let presence_token = self.organism_presence.reserve();
         let runtime = OrganismRuntime::new(
             self.organism_life.clone(),
             self.organism_activity.clone(),
+            self.organism_presence.clone(),
+            presence_token,
             motion,
             persistent,
         );
+        self.organism_presence.bind(presence_token, view, &runtime);
         view.insert_inline_notice(&runtime.card);
         if motion != OrganismMotion::Static {
             if !view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0) {
@@ -1098,6 +1938,8 @@ impl UiState {
                     .is_none_or(|age| age >= HUMAN_INPUT_RETREAT);
                 runtime.last_human_input.set(Some(now));
                 runtime.activity.note_input(now);
+                runtime.clear_presence_cue();
+                runtime.set_sleeping(false);
                 if entering_retreat {
                     // Keep the accepted-input hot path O(1): hide once, then
                     // let the single frame callback measure and move it to the
@@ -1107,11 +1949,10 @@ impl UiState {
                     runtime.body_position.set(None);
                     runtime.body_in_transit.set(false);
                     if let Some(view) = view_weak.upgrade() {
-                        // AltScreen already owns an immediate hide override;
-                        // do not replace the desired post-rmcup visibility.
-                        if !view.live_organism_surface_metrics().alt_screen {
-                            view.set_live_organism_visible(false);
-                        }
+                        // Clear desired visibility even behind the alternate-
+                        // screen override, so rmcup cannot briefly restore a
+                        // stale pre-input position before the next frame.
+                        view.set_live_organism_visible(false);
                     }
                 }
             });
@@ -1119,9 +1960,20 @@ impl UiState {
 
         {
             let runtime = runtime.clone();
+            let view_weak = Rc::downgrade(view);
             view.connect_activity(move || {
                 runtime.output_activity.set(true);
                 runtime.activity.note_output(Instant::now());
+                runtime.clear_presence_cue();
+                runtime.set_sleeping(false);
+                // Output is reported just before the bytes update terminal
+                // geometry. Hide in O(1) now; the coalesced frame remeasures
+                // and restores the body below the new cursor edge.
+                runtime.body_position.set(None);
+                runtime.body_in_transit.set(false);
+                if let Some(view) = view_weak.upgrade() {
+                    view.set_live_organism_visible(false);
+                }
             });
         }
 
@@ -1134,6 +1986,7 @@ impl UiState {
             let pane = pane_token(view);
             view.connect_command_started(move |event| {
                 runtime.bump_generation();
+                runtime.set_sleeping(false);
                 // Transition-guarded so a repeated start can never over-count
                 // the shared running total.
                 if !runtime.command_running.replace(true) {
@@ -1151,18 +2004,50 @@ impl UiState {
                 runtime.last_human_input.set(None);
                 let kind = classify_command(&event.command);
                 runtime.active_memory_kind.set(Some(kind));
-                let repo_context =
-                    if matches!(kind, CommandKind::BuildOrTest | CommandKind::GitPush) {
-                        let mut memory = memory.borrow_mut();
-                        memory.as_mut().and_then(|memory| {
-                            if let Err(error) = memory.refresh() {
-                                log::error!("could not refresh ASCII organism memory: {error}");
+                let now_ms = unix_ms();
+                let local = local_circadian_time_at_ms(now_ms);
+                let (repo_context, circadian_profile, circadian_refresh, growth) = {
+                    let mut memory_slot = memory.borrow_mut();
+                    if let Some(memory) = memory_slot.as_mut() {
+                        let semantic =
+                            matches!(kind, CommandKind::BuildOrTest | CommandKind::GitPush);
+                        let refresh_requested =
+                            semantic || runtime.activity.circadian_profile_needs_refresh(local.day);
+                        let circadian_refresh = if refresh_requested {
+                            match memory.refresh() {
+                                Ok(()) => CircadianRefresh::Succeeded(local.day),
+                                Err(error) => {
+                                    log::error!("could not refresh ASCII organism memory: {error}");
+                                    // Keep the last usable profile, but leave
+                                    // this civil day unacknowledged so the next
+                                    // command retries a transient read failure.
+                                    CircadianRefresh::Failed
+                                }
                             }
+                        } else {
+                            CircadianRefresh::NotAttempted
+                        };
+                        let repo_context = if semantic {
                             memory.context_now(event.cwd.as_deref())
-                        })
+                        } else {
+                            None
+                        };
+                        (
+                            repo_context,
+                            memory.circadian_profile_at(now_ms),
+                            circadian_refresh,
+                            Some(memory.growth_progress()),
+                        )
                     } else {
-                        None
-                    };
+                        (None, None, CircadianRefresh::NotAttempted, None)
+                    }
+                };
+                runtime
+                    .activity
+                    .set_circadian_profile(circadian_profile, circadian_refresh);
+                if let Some(growth) = growth {
+                    runtime.activity.set_growth(growth);
+                }
                 *runtime.active_repo_context.borrow_mut() = repo_context.clone();
                 // The context key is the canonical repo root for build/push
                 // commands. Volatile commands still inside the same checkout
@@ -1185,10 +2070,11 @@ impl UiState {
                     });
                 let context_changed = *runtime.active_context_key.borrow() != context_key;
                 *runtime.active_context_key.borrow_mut() = context_key;
-                let reaction = {
+                let morning = runtime.activity.take_morning_greeting(local, !agent_driven);
+                let mut reaction = {
                     let mut organism = runtime.organism.borrow_mut();
                     organism.sync_state(shared_life.get());
-                    let today = local_day_at_ms(unix_ms());
+                    let today = local.day;
                     if runtime.last_local_day.get().is_some_and(|day| day != today) {
                         // Volatile contexts otherwise never notice midnight.
                         organism.roll_over_day();
@@ -1215,8 +2101,10 @@ impl UiState {
                     } else if context_changed {
                         // A volatile/non-Git command genuinely left the last
                         // known checkout; never inherit a streak across a real
-                        // context switch.
+                        // context switch or spend a queued repo greeting in
+                        // the unrelated directory.
                         organism.restore_repo_context(0, false, 0, 0);
+                        organism.clear_repo_arrival();
                         *runtime.last_repo_root.borrow_mut() = None;
                         *runtime.last_repo_cwd.borrow_mut() = None;
                     }
@@ -1224,12 +2112,16 @@ impl UiState {
                         organism.note_assisted_command();
                     }
                     organism.set_agent_command(agent_driven);
-                    let reaction = organism.command_started(&event.command);
+                    let reaction = organism.command_started(kind);
                     shared_life.set(organism.state());
                     reaction
                 };
+                if morning {
+                    mark_circadian_greeting(&mut reaction, local.bucket);
+                }
                 runtime.render(&reaction);
                 if let Some(view) = view_weak.upgrade() {
+                    runtime.refresh_surface(&view, Instant::now());
                     view.insert_inline_notice(&runtime.card);
                 }
             });
@@ -1251,18 +2143,15 @@ impl UiState {
                 // Any genuinely new prompt input will immediately replace this
                 // with a fresh sliding retreat.
                 runtime.last_human_input.set(None);
+                let classified = classify_command(&event.command);
                 let mut reaction = {
                     let mut organism = runtime.organism.borrow_mut();
                     organism.sync_state(shared_life.get());
-                    let reaction = organism.command_finished(
-                        &event.command,
-                        event.exit_code,
-                        event.duration_ms,
-                    );
+                    let reaction =
+                        organism.command_finished(classified, event.exit_code, event.duration_ms);
                     shared_life.set(organism.state());
                     reaction
                 };
-                let classified = classify_command(&event.command);
                 let kind = if classified == CommandKind::Other {
                     runtime.active_memory_kind.take().unwrap_or(classified)
                 } else {
@@ -1286,10 +2175,26 @@ impl UiState {
                     // Merge transactions completed by other Forge windows as
                     // late as possible, so a recovery that lands while this
                     // command runs can still influence the visible reaction.
-                    if let Err(error) = memory.refresh() {
-                        log::error!("could not refresh ASCII organism memory: {error}");
-                    }
+                    let refreshed = match memory.refresh() {
+                        Ok(()) => true,
+                        Err(error) => {
+                            log::error!("could not refresh ASCII organism memory: {error}");
+                            false
+                        }
+                    };
                     let (insight, persist_result) = memory.apply_and_enqueue(memory_event);
+                    runtime.activity.set_growth(memory.growth_progress());
+                    let profile_at_ms = unix_ms();
+                    runtime.activity.set_circadian_profile(
+                        memory.circadian_profile_at(profile_at_ms),
+                        if refreshed {
+                            CircadianRefresh::Succeeded(
+                                local_circadian_time_at_ms(profile_at_ms).day,
+                            )
+                        } else {
+                            CircadianRefresh::Failed
+                        },
+                    );
                     if kind == CommandKind::BuildOrTest {
                         match event.exit_code {
                             Some(code) if code != 0 && insight.open_failures >= 2 => {
@@ -1299,16 +2204,18 @@ impl UiState {
                                     insight.open_failures
                                 ));
                             }
+                            Some(0) if insight.likely_flaky => {
+                                mark_likely_flaky(&mut reaction, agent_driven);
+                            }
                             Some(0) if insight.recovered_failures > 0 => {
                                 // Big celebrations and words stay reserved for
                                 // recoveries the human typed themself.
-                                reaction.behavior = if insight.recovered_failures >= 3
-                                    && !agent_driven
-                                {
-                                    Behavior::CelebrateBig
-                                } else {
-                                    Behavior::Celebrate
-                                };
+                                reaction.behavior =
+                                    if insight.recovered_failures >= 3 && !agent_driven {
+                                        Behavior::CelebrateBig
+                                    } else {
+                                        Behavior::Celebrate
+                                    };
                                 if !agent_driven {
                                     reaction.speech = Some(if insight.recovered_failures >= 3 {
                                         "终于。"
@@ -1327,18 +2234,11 @@ impl UiState {
                     // A successful build measured against this repo's own
                     // baseline: one quiet sentence, no pose change.
                     if kind == CommandKind::BuildOrTest && event.exit_code == Some(0) {
-                        if let (Some(typical), Some(duration)) =
-                            (insight.typical_build_ms, event.duration_ms)
+                        if let Some(pace) =
+                            unusual_build_pace(insight.typical_build_ms, event.duration_ms)
                         {
-                            if duration >= typical.saturating_mul(2)
-                                && duration >= typical.saturating_add(10_000)
-                            {
-                                reaction.description.push_str(" · slower than usual here");
-                            } else if duration.saturating_mul(2) <= typical
-                                && typical >= duration.saturating_add(10_000)
-                            {
-                                reaction.description.push_str(" · quicker than usual here");
-                            }
+                            reaction.description.push_str(" · ");
+                            reaction.description.push_str(pace);
                         }
                     }
                     if insight.faster_than_yesterday && !agent_driven {
@@ -1352,6 +2252,12 @@ impl UiState {
                         // restarted; repo memory still closes the loop.
                         reaction.speech = Some("收好了。");
                     }
+                    apply_growth_voice(
+                        &mut reaction,
+                        runtime.activity.growth().stage(),
+                        insight.recovered_failures,
+                        agent_driven,
+                    );
                     if let Err(error) = persist_result {
                         log::error!("could not queue ASCII organism memory: {error}");
                         runtime.mark_volatile();
@@ -1359,9 +2265,21 @@ impl UiState {
                 }
                 runtime.render(&reaction);
                 if let Some(view) = view_weak.upgrade() {
+                    runtime.refresh_surface(&view, Instant::now());
                     view.insert_inline_notice(&runtime.card);
                 }
-                OrganismRuntime::settle_later(&runtime, view_weak.clone(), generation);
+                OrganismRuntime::settle_later(
+                    &runtime,
+                    view_weak.clone(),
+                    generation,
+                    reaction_hold(&reaction),
+                );
+                // Dispatch last, after this pane has committed its own
+                // reducer/memory/render work. Only the typed failure fact
+                // crosses panes; the coordinator suppresses owner-local ends.
+                if let Some(signal) = presence_signal_for_exit(event.exit_code) {
+                    runtime.presence.signal_from(runtime.presence_token, signal);
+                }
             });
         }
 
@@ -1419,9 +2337,15 @@ impl UiState {
                     };
                     runtime.render(&reaction);
                     if let Some(view) = view_weak.upgrade() {
+                        runtime.refresh_surface(&view, Instant::now());
                         view.insert_inline_notice(&runtime.card);
                     }
-                    OrganismRuntime::settle_later(&runtime, view_weak, generation);
+                    OrganismRuntime::settle_later(
+                        &runtime,
+                        view_weak,
+                        generation,
+                        reaction_hold(&reaction),
+                    );
                 });
             });
         }
@@ -1440,6 +2364,7 @@ impl UiState {
                 },
             );
         }
+        self.sync_organism_presence();
     }
 }
 
@@ -1463,6 +2388,140 @@ mod tests {
     }
 
     #[test]
+    fn visible_state_uses_a_few_character_words_and_keeps_raw_detail_separate() {
+        let state = LifeState {
+            energy: 0.10,
+            mood: 0.20,
+            curiosity: 0.90,
+            boredom: 0.95,
+            stress: 0.80,
+            social_need: 0.90,
+            attachment: 0.90,
+            confidence: 0.10,
+        };
+        assert_eq!(state_words(state), "sleepy · tense · subdued");
+        assert!(state_summary(state).starts_with("E10 M20 C90"));
+        assert_eq!(state_words(LifeState::default()), "steady");
+    }
+
+    #[test]
+    fn every_inline_pose_fits_the_fixed_sprite_slot() {
+        for behavior in [
+            Behavior::Idle,
+            Behavior::WatchCommand,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::RestAfterPush,
+            Behavior::UnknownOutcome,
+            Behavior::Sleep,
+            Behavior::Explore,
+            Behavior::Approach,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+        ] {
+            let width = behavior
+                .sprite()
+                .lines()
+                .map(str::chars)
+                .map(Iterator::count)
+                .max()
+                .unwrap_or(0);
+            assert!(
+                width <= INLINE_SPRITE_SLOT_CHARS as usize,
+                "{behavior:?} needs {width} columns"
+            );
+        }
+    }
+
+    #[test]
+    fn flaky_hint_quiets_words_without_escalating_the_success_pose() {
+        let mut human = Reaction {
+            // A stale pane-local streak must not leak a big pose past the
+            // freshly replayed repo-level flaky classification.
+            behavior: Behavior::CelebrateBig,
+            tone: Tone::Success,
+            description: "build/test passed after 3 failure(s) · 20s".to_string(),
+            speech: Some("好了。"),
+        };
+        mark_likely_flaky(&mut human, false);
+        assert_eq!(human.behavior, Behavior::Celebrate);
+        assert_eq!(human.tone, Tone::Quiet);
+        assert_eq!(human.speech, Some("像是偶发的。"));
+        assert!(human.description.contains("after 1 failure(s) · 20s"));
+        assert!(!human.description.contains("after 3 failure(s)"));
+        assert!(human.description.contains("looks intermittent"));
+
+        let mut agent = human.clone();
+        mark_likely_flaky(&mut agent, true);
+        assert_eq!(agent.behavior, Behavior::Celebrate);
+        assert_eq!(agent.tone, Tone::Quiet);
+        assert_eq!(agent.speech, None);
+    }
+
+    #[test]
+    fn seasoned_recovery_gets_terser_without_changing_its_strength() {
+        let original = Reaction {
+            behavior: Behavior::CelebrateBig,
+            tone: Tone::Success,
+            description: "build/test passed · repo recovery after 3 failure(s)".to_string(),
+            speech: Some("终于。"),
+        };
+        let mut seasoned = original.clone();
+        apply_growth_voice(&mut seasoned, GrowthStage::Seasoned, 3, false);
+        assert_eq!(seasoned.behavior, original.behavior);
+        assert_eq!(seasoned.tone, original.tone);
+        assert_eq!(seasoned.description, original.description);
+        assert_eq!(seasoned.speech, Some("嗯。"));
+
+        let mut adult = original.clone();
+        apply_growth_voice(&mut adult, GrowthStage::Adult, 3, false);
+        assert_eq!(adult.speech, original.speech);
+
+        let mut agent = original;
+        apply_growth_voice(&mut agent, GrowthStage::Seasoned, 3, true);
+        assert_eq!(agent.speech, Some("终于。"));
+    }
+
+    #[test]
+    fn growth_badges_name_every_stage_without_exceeding_the_slot() {
+        for (stage, name) in [
+            (GrowthStage::Juvenile, "juvenile"),
+            (GrowthStage::Adult, "adult"),
+            (GrowthStage::Seasoned, "seasoned"),
+        ] {
+            let badge = growth_badge(stage, MemoryBadgeState::Persistent);
+            assert!(badge.starts_with(name));
+            assert!(badge.chars().count() <= 32);
+        }
+        assert_eq!(
+            growth_badge(GrowthStage::Seasoned, MemoryBadgeState::Volatile),
+            "volatile · no LLM"
+        );
+        assert_eq!(
+            growth_badge(GrowthStage::Seasoned, MemoryBadgeState::SaveFailed),
+            "seasoned · save failed · no LLM"
+        );
+    }
+
+    #[test]
+    fn unusual_build_pace_uses_the_prior_baseline_and_absolute_guard() {
+        assert_eq!(
+            unusual_build_pace(Some(60_000), Some(120_000)),
+            Some("slower than usual here")
+        );
+        assert_eq!(
+            unusual_build_pace(Some(120_000), Some(60_000)),
+            Some("quicker than usual here")
+        );
+        // A twofold change measured in milliseconds is noise, not insight.
+        assert_eq!(unusual_build_pace(Some(5_000), Some(10_000)), None);
+        assert_eq!(unusual_build_pace(None, Some(120_000)), None);
+        assert_eq!(unusual_build_pace(Some(60_000), None), None);
+    }
+
+    #[test]
     fn live_surface_fails_closed_when_the_complete_body_does_not_fit() {
         let tiny_width = SurfaceBox {
             width: 99,
@@ -1479,8 +2538,26 @@ mod tests {
             height: 63,
             ..tiny_width
         };
-        assert_eq!(surface_point(tiny_width, SurfaceMode::Idle, WanderTempo::Calm, AmbientBehavior::Idle, 0), None);
-        assert_eq!(surface_point(tiny_height, SurfaceMode::Watching, WanderTempo::Calm, AmbientBehavior::Idle, 0), None);
+        assert_eq!(
+            surface_point(
+                tiny_width,
+                SurfaceMode::Idle,
+                WanderTempo::Calm,
+                AmbientBehavior::Idle,
+                0
+            ),
+            None
+        );
+        assert_eq!(
+            surface_point(
+                tiny_height,
+                SurfaceMode::Watching,
+                WanderTempo::Calm,
+                AmbientBehavior::Idle,
+                0
+            ),
+            None
+        );
 
         let unaligned_near_boundary = SurfaceBox {
             width: 64 + 20 + 16,
@@ -1493,8 +2570,68 @@ mod tests {
             cursor_row: 8,
         };
         assert_eq!(
-            surface_point(unaligned_near_boundary, SurfaceMode::Typing, WanderTempo::Calm, AmbientBehavior::Idle, 0),
+            surface_point(
+                unaligned_near_boundary,
+                SurfaceMode::Typing,
+                WanderTempo::Calm,
+                AmbientBehavior::Idle,
+                0
+            ),
             None
+        );
+    }
+
+    #[test]
+    fn geometry_signature_invalidates_stale_positions_when_pose_bounds_change() {
+        let surface = SurfaceBox {
+            width: 320,
+            height: 180,
+            right_gutter: 20,
+            cell_width: 8,
+            cell_height: 16,
+            body_width: 56,
+            body_height: 48,
+            cursor_row: 4,
+        };
+        let original = surface_signature(surface);
+        let old = surface_point(
+            surface,
+            SurfaceMode::Typing,
+            WanderTempo::Calm,
+            AmbientBehavior::Idle,
+            0,
+        )
+        .unwrap();
+        let wider = SurfaceBox {
+            body_width: 96,
+            ..surface
+        };
+        let safe_right = wider.width - wider.right_gutter - SURFACE_MARGIN.max(wider.cell_width);
+        assert!(old.x + f64::from(wider.body_width) > f64::from(safe_right));
+        assert_ne!(original, surface_signature(wider));
+        let fresh = surface_point(
+            wider,
+            SurfaceMode::Typing,
+            WanderTempo::Calm,
+            AmbientBehavior::Idle,
+            0,
+        )
+        .unwrap();
+        assert!(fresh.x + f64::from(wider.body_width) <= f64::from(safe_right));
+        assert_ne!(
+            original,
+            surface_signature(SurfaceBox {
+                right_gutter: 28,
+                ..surface
+            })
+        );
+        // Cursor motion is an intended walk, not a stale-geometry snap.
+        assert_eq!(
+            original,
+            surface_signature(SurfaceBox {
+                cursor_row: 12,
+                ..surface
+            })
         );
     }
 
@@ -1508,7 +2645,7 @@ mod tests {
             cell_height: 16,
             body_width: 88,
             body_height: 48,
-            cursor_row: 8,
+            cursor_row: 1,
         };
         for mode in [
             SurfaceMode::Idle,
@@ -1517,8 +2654,14 @@ mod tests {
             SurfaceMode::Reacting,
         ] {
             for frame in [0, 1, 359, 360, 399, 400, 759, 799, u64::MAX] {
-                let point = surface_point(surface, mode, WanderTempo::Calm, AmbientBehavior::Idle, frame)
-                    .expect("body fits");
+                let point = surface_point(
+                    surface,
+                    mode,
+                    WanderTempo::Calm,
+                    AmbientBehavior::Idle,
+                    frame,
+                )
+                .expect("body fits");
                 assert!(point.x >= f64::from(SURFACE_MARGIN));
                 assert!(point.y >= f64::from(SURFACE_MARGIN));
                 assert_eq!(point.x as i32 % surface.cell_width, 0);
@@ -1608,7 +2751,7 @@ mod tests {
 
     #[test]
     fn shared_activity_clock_hands_out_each_slice_exactly_once() {
-        let activity = OrganismActivity::new();
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
         let start = Instant::now();
         assert_eq!(activity.tick_slice(start), 0.0);
         let later = start + Duration::from_millis(250);
@@ -1620,8 +2763,306 @@ mod tests {
     }
 
     #[test]
+    fn presence_tokens_are_monotonic_and_have_at_most_one_owner() {
+        let mut ledger = PresenceLedger::default();
+        let first = ledger.reserve();
+        let second = ledger.reserve();
+        assert_ne!(first, second);
+        ledger.bind(first);
+        ledger.bind(second);
+
+        ledger.claim(Some(first));
+        assert!(ledger.is_owner(first));
+        assert!(!ledger.is_owner(second));
+        ledger.claim(Some(second));
+        assert!(!ledger.is_owner(first));
+        assert!(ledger.is_owner(second));
+
+        ledger.unregister(second);
+        assert!(!ledger.is_owner(second));
+        let third = ledger.reserve();
+        assert_ne!(third, second);
+        ledger.claim(Some(third));
+        assert!(
+            !ledger.is_owner(third),
+            "an unbound token cannot own presence"
+        );
+    }
+
+    #[test]
+    fn presence_signals_route_only_from_a_registered_background_pane() {
+        let mut ledger = PresenceLedger::default();
+        let owner = ledger.reserve();
+        let background = ledger.reserve();
+        let unbound = ledger.reserve();
+        ledger.bind(owner);
+        ledger.bind(background);
+
+        assert_eq!(ledger.signal_target(background), None);
+        ledger.claim(Some(owner));
+        assert_eq!(ledger.signal_target(background), Some(owner));
+        assert_eq!(
+            ledger.signal_target(owner),
+            None,
+            "owner-local failure stays local"
+        );
+        assert_eq!(ledger.signal_target(unbound), None);
+
+        // Notebook page switching revokes synchronously before its idle can
+        // resolve the new page. Nothing routes through the old owner in that
+        // interval; claiming the new token restores routing afterwards.
+        ledger.claim(None);
+        assert_eq!(ledger.signal_target(background), None);
+        assert!(!ledger.is_owner(owner));
+        ledger.claim(Some(background));
+        assert_eq!(ledger.signal_target(owner), Some(background));
+
+        ledger.unregister(background);
+        assert_eq!(ledger.signal_target(owner), None);
+    }
+
+    #[test]
+    fn only_nonzero_authoritative_status_becomes_a_content_free_signal() {
+        assert_eq!(presence_signal_for_exit(Some(0)), None);
+        assert_eq!(presence_signal_for_exit(None), None);
+        assert_eq!(
+            presence_signal_for_exit(Some(1)),
+            Some(PresenceSignal::BackgroundCommandFailed)
+        );
+        assert_eq!(
+            presence_signal_for_exit(Some(137)),
+            Some(PresenceSignal::BackgroundCommandFailed)
+        );
+    }
+
+    #[test]
+    fn glance_aside_is_live_only_and_never_overrides_owner_work() {
+        let cue = Some(PresenceCue::GlanceAside);
+        assert!(can_show_presence_cue(
+            true,
+            OrganismMotion::Full,
+            false,
+            true,
+            SurfaceMode::Idle,
+        ));
+        for (owner, motion, alt_screen, visible, mode) in [
+            (false, OrganismMotion::Full, false, true, SurfaceMode::Idle),
+            (true, OrganismMotion::Static, false, true, SurfaceMode::Idle),
+            (true, OrganismMotion::Full, true, true, SurfaceMode::Idle),
+            (true, OrganismMotion::Full, false, false, SurfaceMode::Idle),
+            (true, OrganismMotion::Full, false, true, SurfaceMode::Typing),
+            (
+                true,
+                OrganismMotion::Full,
+                false,
+                true,
+                SurfaceMode::Watching,
+            ),
+            (
+                true,
+                OrganismMotion::Full,
+                false,
+                true,
+                SurfaceMode::Reacting,
+            ),
+        ] {
+            assert!(!can_show_presence_cue(
+                owner, motion, alt_screen, visible, mode,
+            ));
+        }
+
+        assert_eq!(
+            live_display_behavior(Behavior::Sleep, SurfaceMode::Idle, cue),
+            Behavior::GlanceAside
+        );
+        assert_eq!(
+            live_display_behavior(Behavior::WatchCommand, SurfaceMode::Watching, cue),
+            Behavior::WatchCommand
+        );
+        assert_eq!(
+            live_display_behavior(Behavior::InspectError, SurfaceMode::Reacting, cue),
+            Behavior::InspectError
+        );
+        assert_eq!(
+            live_display_behavior(Behavior::Idle, SurfaceMode::Idle, None),
+            Behavior::Idle
+        );
+    }
+
+    #[test]
+    fn reactions_and_presence_cues_start_on_their_canonical_frame() {
+        let global = 57;
+        let (baseline, live) = animation_frames(global, global, 0, SurfaceMode::Reacting, None);
+        assert_eq!((baseline, live), (0, 0));
+        assert_eq!(
+            sprite_frame(Behavior::Celebrate, BodyLanguage::default(), false, live),
+            Behavior::Celebrate.sprite()
+        );
+        assert_ne!(
+            sprite_frame(Behavior::Celebrate, BodyLanguage::default(), false, global,),
+            Behavior::Celebrate.sprite(),
+            "the regression setup must begin on the alternate global frame"
+        );
+
+        let (baseline, live) = animation_frames(
+            global,
+            0,
+            global,
+            SurfaceMode::Idle,
+            Some(PresenceCue::GlanceAside),
+        );
+        assert_eq!((baseline, live), (global, 0));
+        // Event epochs remain correct across the global wrapping counter.
+        assert_eq!(
+            animation_frames(1, u64::MAX, 0, SurfaceMode::Watching, None),
+            (2, 2)
+        );
+    }
+
+    #[test]
+    fn shared_sleep_rest_is_independent_of_the_timer_claiming_pane() {
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        activity.body_started_sleeping();
+        activity.body_started_sleeping();
+        assert!(activity.sleeping_rest());
+
+        // One awake body cannot erase another body's sleep, while any
+        // running command gates regeneration for the whole window.
+        activity.body_stopped_sleeping();
+        assert!(activity.sleeping_rest());
+        activity.command_started(Instant::now());
+        assert!(!activity.sleeping_rest());
+        activity.command_finished(Instant::now());
+        assert!(activity.sleeping_rest());
+
+        activity.body_stopped_sleeping();
+        assert!(!activity.sleeping_rest());
+    }
+
+    #[test]
+    fn only_the_visible_presence_can_regenerate_by_sleeping() {
+        let sleeping = |owner, motion, alt_screen| {
+            visible_sleeping(
+                owner,
+                motion,
+                alt_screen,
+                true,
+                false,
+                SurfaceMode::Idle,
+                AmbientBehavior::Sleep,
+            )
+        };
+        assert!(sleeping(true, OrganismMotion::Full, false));
+        assert!(!sleeping(false, OrganismMotion::Full, false));
+        assert!(!sleeping(true, OrganismMotion::Static, false));
+        assert!(!sleeping(true, OrganismMotion::Full, true));
+        assert!(!visible_sleeping(
+            true,
+            OrganismMotion::Full,
+            false,
+            true,
+            false,
+            SurfaceMode::Typing,
+            AmbientBehavior::Sleep,
+        ));
+        assert!(!visible_sleeping(
+            true,
+            OrganismMotion::Full,
+            false,
+            false,
+            false,
+            SurfaceMode::Idle,
+            AmbientBehavior::Sleep,
+        ));
+        assert!(!visible_sleeping(
+            true,
+            OrganismMotion::Full,
+            false,
+            true,
+            true,
+            SurfaceMode::Idle,
+            AmbientBehavior::Sleep,
+        ));
+    }
+
+    #[test]
+    fn morning_greeting_is_human_owned_once_per_work_session() {
+        let daytime = CircadianProfile::from_mask(0b0001_1100); // buckets 2, 3, 4
+        let activity = OrganismActivity::new(Some(daytime), GrowthProgress::default());
+        assert!(activity.circadian_profile_needs_refresh(10));
+        activity.set_circadian_profile(Some(daytime), CircadianRefresh::Succeeded(10));
+        assert!(!activity.circadian_profile_needs_refresh(10));
+        assert!(activity.circadian_profile_needs_refresh(11));
+        assert_eq!(activity.circadian_phase(3), CircadianPhase::InHours);
+        assert_eq!(activity.circadian_phase(6), CircadianPhase::OffHours);
+
+        let outside = LocalCircadianTime { day: 10, bucket: 6 };
+        assert!(!activity.take_morning_greeting(outside, true));
+        let inside = LocalCircadianTime { day: 10, bucket: 2 };
+        assert!(!activity.take_morning_greeting(inside, false));
+        assert!(activity.take_morning_greeting(inside, true));
+        assert!(!activity.take_morning_greeting(inside, true));
+        assert!(activity.take_morning_greeting(LocalCircadianTime { day: 11, bucket: 3 }, true));
+
+        activity.set_circadian_profile(None, CircadianRefresh::Succeeded(11));
+        assert_eq!(activity.circadian_phase(3), CircadianPhase::Unlearned);
+        assert!(!activity.take_morning_greeting(LocalCircadianTime { day: 12, bucket: 3 }, true));
+    }
+
+    #[test]
+    fn failed_circadian_refresh_is_retried() {
+        let daytime = CircadianProfile::from_mask(0b0001_1100);
+        let activity = OrganismActivity::new(Some(daytime), GrowthProgress::default());
+
+        // Updating from the still-usable cache must not acknowledge the day
+        // when the disk refresh that preceded it failed.
+        activity.set_circadian_profile(Some(daytime), CircadianRefresh::Failed);
+        assert!(activity.circadian_profile_needs_refresh(10));
+
+        activity.set_circadian_profile(Some(daytime), CircadianRefresh::Succeeded(10));
+        assert!(!activity.circadian_profile_needs_refresh(10));
+        activity.set_circadian_profile(Some(daytime), CircadianRefresh::Failed);
+        assert!(activity.circadian_profile_needs_refresh(10));
+
+        // A same-day command that deliberately skipped I/O keeps the last
+        // successful refresh marker intact.
+        activity.set_circadian_profile(Some(daytime), CircadianRefresh::Succeeded(10));
+        activity.set_circadian_profile(Some(daytime), CircadianRefresh::NotAttempted);
+        assert!(!activity.circadian_profile_needs_refresh(10));
+    }
+
+    #[test]
+    fn wrapped_night_shift_does_not_greet_twice_across_midnight() {
+        let night = CircadianProfile::from_mask(0b1000_0011); // buckets 7, 0, 1
+        let activity = OrganismActivity::new(Some(night), GrowthProgress::default());
+        assert!(activity.take_morning_greeting(LocalCircadianTime { day: 20, bucket: 7 }, true));
+        assert!(!activity.take_morning_greeting(LocalCircadianTime { day: 21, bucket: 0 }, true));
+        assert!(!activity.take_morning_greeting(LocalCircadianTime { day: 21, bucket: 1 }, true));
+        assert!(activity.take_morning_greeting(LocalCircadianTime { day: 21, bucket: 7 }, true));
+    }
+
+    #[test]
+    fn circadian_words_preserve_a_more_specific_repo_greeting() {
+        let mut reaction = Reaction {
+            behavior: Behavior::WatchCommand,
+            tone: Tone::Active,
+            description: "watching real build/test event · well-known repo".to_string(),
+            speech: Some("回来了。"),
+        };
+        mark_circadian_greeting(&mut reaction, 2);
+        assert_eq!(reaction.behavior, Behavior::WatchCommand);
+        assert_eq!(reaction.tone, Tone::Active);
+        assert_eq!(reaction.speech, Some("回来了。"));
+        assert!(reaction.description.contains("habitual working hours"));
+
+        reaction.speech = None;
+        mark_circadian_greeting(&mut reaction, 7);
+        assert_eq!(reaction.speech, Some("来了。"));
+    }
+
+    #[test]
     fn rest_needs_a_long_quiet_stretch_with_no_running_command() {
-        let activity = OrganismActivity::new();
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
         let now = Instant::now();
         assert!(!activity.resting(now));
         let quiet = now + REST_ONSET + Duration::from_secs(1);
@@ -1641,7 +3082,7 @@ mod tests {
 
     #[test]
     fn typing_window_marks_the_user_active_briefly() {
-        let activity = OrganismActivity::new();
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
         let now = Instant::now();
         assert!(!activity.user_active(now));
         activity.note_input(now);
@@ -1686,7 +3127,14 @@ mod tests {
             cursor_row: 8,
         };
         let pose = |ambient, frame| {
-            surface_point(surface, SurfaceMode::Idle, WanderTempo::Calm, ambient, frame).unwrap()
+            surface_point(
+                surface,
+                SurfaceMode::Idle,
+                WanderTempo::Calm,
+                ambient,
+                frame,
+            )
+            .unwrap()
         };
         let idle_home = pose(AmbientBehavior::Idle, 0);
         let idle_far = pose(AmbientBehavior::Idle, 400);
@@ -1728,6 +3176,82 @@ mod tests {
     }
 
     #[test]
+    fn reaction_holds_follow_semantic_weight_instead_of_one_fixed_timeout() {
+        let reaction = |behavior, tone| Reaction {
+            behavior,
+            tone,
+            description: String::new(),
+            speech: None,
+        };
+        let quiet_pass = reaction(Behavior::Celebrate, Tone::Quiet);
+        let ordinary_pass = reaction(Behavior::Celebrate, Tone::Success);
+        let first_error = reaction(Behavior::InspectError, Tone::Error);
+        let repeated_error = reaction(Behavior::SitNearError, Tone::Error);
+        let big_recovery = reaction(Behavior::CelebrateBig, Tone::Success);
+
+        assert!(reaction_hold(&quiet_pass) < reaction_hold(&ordinary_pass));
+        assert!(reaction_hold(&ordinary_pass) < reaction_hold(&first_error));
+        assert!(reaction_hold(&first_error) < reaction_hold(&big_recovery));
+        assert!(reaction_hold(&big_recovery) < reaction_hold(&repeated_error));
+        assert_eq!(reaction_hold(&repeated_error), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn only_an_active_full_motion_owner_uses_the_fast_frame_cadence() {
+        assert_eq!(
+            surface_frame_delay(OrganismMotion::Full, true, false, false),
+            SURFACE_FRAME_INTERVAL
+        );
+        assert_eq!(
+            surface_frame_delay(OrganismMotion::Full, true, false, true),
+            DORMANT_FRAME_INTERVAL
+        );
+        assert_eq!(
+            surface_frame_delay(OrganismMotion::Full, true, true, false),
+            DORMANT_FRAME_INTERVAL,
+            "an alternate-screen owner has no visible live surface to animate"
+        );
+        assert_eq!(
+            surface_frame_delay(OrganismMotion::Full, false, false, false),
+            DORMANT_FRAME_INTERVAL
+        );
+        assert_eq!(
+            surface_frame_delay(OrganismMotion::Calm, true, false, false),
+            DORMANT_FRAME_INTERVAL
+        );
+        assert_eq!(
+            surface_frame_delay(OrganismMotion::Static, true, false, false),
+            DORMANT_FRAME_INTERVAL
+        );
+    }
+
+    #[test]
+    fn focus_transfer_rearms_only_a_still_pending_timer() {
+        assert_eq!(
+            focus_transfer_rearm_delay(OrganismMotion::Full, true, false, true),
+            Some(SURFACE_FRAME_INTERVAL)
+        );
+        assert_eq!(
+            focus_transfer_rearm_delay(OrganismMotion::Full, true, true, true),
+            Some(DORMANT_FRAME_INTERVAL),
+            "focus cannot make an alternate-screen surface visible"
+        );
+        assert_eq!(
+            focus_transfer_rearm_delay(OrganismMotion::Full, false, false, true),
+            Some(DORMANT_FRAME_INTERVAL)
+        );
+        assert_eq!(
+            focus_transfer_rearm_delay(OrganismMotion::Calm, true, false, true),
+            Some(DORMANT_FRAME_INTERVAL)
+        );
+        assert_eq!(
+            focus_transfer_rearm_delay(OrganismMotion::Full, true, false, false),
+            None,
+            "a fired callback owns the vacant slot and will reschedule itself"
+        );
+    }
+
+    #[test]
     fn approach_eases_out_arrives_exactly_and_never_overshoots() {
         let cell = 8.0;
         // Long trip: brisk start, easing steps, exact arrival.
@@ -1755,7 +3279,7 @@ mod tests {
     }
 
     #[test]
-    fn watching_pose_follows_the_output_growth_edge() {
+    fn watching_and_reacting_stay_below_output_or_hide() {
         let surface = SurfaceBox {
             width: 360,
             height: 400,
@@ -1764,9 +3288,53 @@ mod tests {
             cell_height: 16,
             body_width: 88,
             body_height: 48,
-            cursor_row: 20,
+            cursor_row: 6,
         };
-        let deep = surface_point(
+        let clear_floor = f64::from((surface.cursor_row + 1) * surface.cell_height);
+        for mode in [SurfaceMode::Watching, SurfaceMode::Reacting] {
+            for frame in [0, 3] {
+                let point = surface_point(
+                    surface,
+                    mode,
+                    WanderTempo::Calm,
+                    AmbientBehavior::Idle,
+                    frame,
+                )
+                .unwrap();
+                assert!(point.y >= clear_floor);
+                assert!(point.y + f64::from(surface.body_height) <= 384.0);
+            }
+        }
+        assert_eq!(
+            surface_point(
+                surface,
+                SurfaceMode::Watching,
+                WanderTempo::Calm,
+                AmbientBehavior::Idle,
+                0,
+            ),
+            surface_point(
+                surface,
+                SurfaceMode::Watching,
+                WanderTempo::Calm,
+                AmbientBehavior::Idle,
+                3,
+            ),
+            "watching stays spatially still between real output pulses"
+        );
+
+        // Full-motion interpolation from the old upper typing corner would
+        // cross the output band. The runtime projects it directly to the safe
+        // target floor while horizontal motion remains free to interpolate.
+        let typing = surface_point(
+            surface,
+            SurfaceMode::Typing,
+            WanderTempo::Calm,
+            AmbientBehavior::Idle,
+            0,
+        )
+        .unwrap();
+        let watching = surface_point(
             surface,
             SurfaceMode::Watching,
             WanderTempo::Calm,
@@ -1774,34 +3342,50 @@ mod tests {
             0,
         )
         .unwrap();
-        let shallow = surface_point(
-            SurfaceBox {
-                cursor_row: 6,
-                ..surface
-            },
-            SurfaceMode::Watching,
+        let raw = approach(typing.y, watching.y, f64::from(surface.cell_height));
+        assert!(raw < clear_floor);
+        assert!(raw.max(f64::from(below_output_y(surface).unwrap())) >= clear_floor);
+
+        // Once already inside the clear band, a reaction keeps the ordinary
+        // eased walk instead of teleporting to its centered target.
+        let reacting = surface_point(
+            surface,
+            SurfaceMode::Reacting,
             WanderTempo::Calm,
             AmbientBehavior::Idle,
             0,
         )
         .unwrap();
-        let top = surface_point(
-            SurfaceBox {
-                cursor_row: 0,
-                ..surface
-            },
-            SurfaceMode::Watching,
-            WanderTempo::Calm,
-            AmbientBehavior::Idle,
-            0,
-        )
-        .unwrap();
-        // Deeper output pulls the watcher further down; both stay above the
-        // cursor line and inside the clamped band.
-        assert!(deep.y > shallow.y);
-        assert!(deep.y + 48.0 <= f64::from(20 * 16));
-        assert_eq!(top.y, shallow.y.min(top.y));
-        assert!(top.y >= f64::from(SURFACE_MARGIN));
+        let eased = approach(watching.y, reacting.y, f64::from(surface.cell_height));
+        let projected = eased.max(f64::from(below_output_y(surface).unwrap()));
+        assert!(projected > watching.y);
+        assert!(projected < reacting.y);
+
+        let full_output = SurfaceBox {
+            height: 200,
+            cursor_row: 10,
+            ..surface
+        };
+        assert_eq!(
+            surface_point(
+                full_output,
+                SurfaceMode::Watching,
+                WanderTempo::Calm,
+                AmbientBehavior::Idle,
+                0,
+            ),
+            None
+        );
+        assert_eq!(
+            surface_point(
+                full_output,
+                SurfaceMode::Reacting,
+                WanderTempo::Calm,
+                AmbientBehavior::Idle,
+                0,
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1817,8 +3401,11 @@ mod tests {
                 assert!((0..=40).contains(&step));
             }
         }
-        let walking_frames =
-            |tempo| (0..800).filter(|frame| wander_phase(*frame, tempo).1).count();
+        let walking_frames = |tempo| {
+            (0..800)
+                .filter(|frame| wander_phase(*frame, tempo).1)
+                .count()
+        };
         assert_eq!(walking_frames(WanderTempo::Calm), 80);
         assert_eq!(walking_frames(WanderTempo::Restless), 240);
     }
@@ -1835,10 +3422,38 @@ mod tests {
             body_height: 48,
             cursor_row: 8,
         };
-        let idle_left = surface_point(surface, SurfaceMode::Idle, WanderTempo::Calm, AmbientBehavior::Idle, 0).unwrap();
-        let idle_still = surface_point(surface, SurfaceMode::Idle, WanderTempo::Calm, AmbientBehavior::Idle, 359).unwrap();
-        let idle_right = surface_point(surface, SurfaceMode::Idle, WanderTempo::Calm, AmbientBehavior::Idle, 400).unwrap();
-        let typing = surface_point(surface, SurfaceMode::Typing, WanderTempo::Calm, AmbientBehavior::Idle, 0).unwrap();
+        let idle_left = surface_point(
+            surface,
+            SurfaceMode::Idle,
+            WanderTempo::Calm,
+            AmbientBehavior::Idle,
+            0,
+        )
+        .unwrap();
+        let idle_still = surface_point(
+            surface,
+            SurfaceMode::Idle,
+            WanderTempo::Calm,
+            AmbientBehavior::Idle,
+            359,
+        )
+        .unwrap();
+        let idle_right = surface_point(
+            surface,
+            SurfaceMode::Idle,
+            WanderTempo::Calm,
+            AmbientBehavior::Idle,
+            400,
+        )
+        .unwrap();
+        let typing = surface_point(
+            surface,
+            SurfaceMode::Typing,
+            WanderTempo::Calm,
+            AmbientBehavior::Idle,
+            0,
+        )
+        .unwrap();
         assert_eq!(idle_still, idle_left);
         assert!(idle_right.x > idle_left.x);
         assert_eq!(typing.x, idle_right.x);

@@ -34,6 +34,97 @@ const MAX_GIT_POINTER_BYTES: u64 = 16 * 1024;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const LOCK_POLL: Duration = Duration::from_millis(20);
 const LIFE_SCALE: f32 = 1_000.0;
+const CIRCADIAN_BUCKET_COUNT: usize = 8;
+const CIRCADIAN_LOOKBACK_DAYS: i64 = 28;
+const MIN_CIRCADIAN_ACTIVE_DAYS: usize = 3;
+const MIN_CIRCADIAN_SAMPLES: u64 = 6;
+const MAX_RECENT_GROWTH_DAYS: usize = 64;
+const ADULT_MIN_DAYS: u32 = 7;
+const SEASONED_MIN_DAYS: u32 = 60;
+const SEASONED_MIN_RECOVERIES: u32 = 12;
+
+/// One local wall-clock instant reduced to the only two scalars the organism
+/// needs. The bucket is one of eight three-hour spans beginning at midnight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LocalCircadianTime {
+    pub(crate) day: i64,
+    pub(crate) bucket: u8,
+}
+
+/// A learned nine-hour working window. The mask always contains one winning
+/// three-hour bucket and its two circular neighbours, so night-shift windows
+/// can naturally wrap across midnight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CircadianProfile {
+    mask: u8,
+}
+
+impl CircadianProfile {
+    pub(crate) fn contains(self, bucket: u8) -> bool {
+        bucket < CIRCADIAN_BUCKET_COUNT as u8 && self.mask & (1_u8 << bucket) != 0
+    }
+
+    /// Returns a stable local-day key for the learned work session containing
+    /// `local`. A window that begins before midnight and wraps into the next
+    /// civil day therefore keeps one key across all three of its buckets.
+    pub(crate) fn session_day(self, local: LocalCircadianTime) -> i64 {
+        let start_bucket = (0..CIRCADIAN_BUCKET_COUNT as u8)
+            .find(|&bucket| {
+                let previous =
+                    (bucket + CIRCADIAN_BUCKET_COUNT as u8 - 1) % CIRCADIAN_BUCKET_COUNT as u8;
+                self.contains(bucket) && !self.contains(previous)
+            })
+            .expect("a circadian profile always has one window start");
+
+        if start_bucket > local.bucket {
+            local.day.saturating_sub(1)
+        } else {
+            local.day
+        }
+    }
+
+    #[cfg(test)]
+    const fn mask(self) -> u8 {
+        self.mask
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn from_mask(mask: u8) -> Self {
+        Self { mask }
+    }
+}
+
+/// A coarse lifetime stage derived only from bounded, content-free counters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GrowthStage {
+    Juvenile,
+    Adult,
+    Seasoned,
+}
+
+impl GrowthStage {
+    pub(crate) const fn from_counts(days_seen: u32, lifetime_recoveries: u32) -> Self {
+        if days_seen < ADULT_MIN_DAYS {
+            Self::Juvenile
+        } else if days_seen >= SEASONED_MIN_DAYS && lifetime_recoveries >= SEASONED_MIN_RECOVERIES {
+            Self::Seasoned
+        } else {
+            Self::Adult
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GrowthProgress {
+    pub(crate) days_seen: u32,
+    pub(crate) lifetime_recoveries: u32,
+}
+
+impl GrowthProgress {
+    pub(crate) const fn stage(self) -> GrowthStage {
+        GrowthStage::from_counts(self.days_seen, self.lifetime_recoveries)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -110,6 +201,244 @@ fn dequantize(value: u16) -> f32 {
     f32::from(value.min(LIFE_SCALE as u16)) / LIFE_SCALE
 }
 
+/// A v1 scalar that remembers whether it was decoded from disk or supplied by
+/// `#[serde(default)]`. New files always serialize a plain integer; the bit is
+/// only an in-memory migration aid for older v1 records whose ordered suffix
+/// can still reconstruct the newly introduced aggregate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MigratingCounter {
+    value: u32,
+    present: bool,
+}
+
+impl MigratingCounter {
+    const fn new(value: u32) -> Self {
+        Self {
+            value,
+            present: true,
+        }
+    }
+
+    fn saturating_increment(&mut self) {
+        self.value = self.value.saturating_add(1);
+        self.present = true;
+    }
+
+    fn saturating_add(&mut self, amount: u32) {
+        self.value = self.value.saturating_add(amount);
+        self.present = true;
+    }
+
+    fn mark_present(&mut self) {
+        self.present = true;
+    }
+}
+
+impl Serialize for MigratingCounter {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u32(self.value)
+    }
+}
+
+impl<'de> Deserialize<'de> for MigratingCounter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        u32::deserialize(deserializer).map(Self::new)
+    }
+}
+
+/// The bounded exact set behind `days_seen`. Once a day falls at or before
+/// `compacted_through` (or below the oldest entry of a full window), later
+/// events for it remain valid memory events but are deliberately growth-neutral.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct GrowthDayLedger {
+    compacted_through: Option<i64>,
+    recent: Vec<i64>,
+}
+
+impl<'de> Deserialize<'de> for GrowthDayLedger {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &["compacted_through", "recent"];
+
+        struct LedgerVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for LedgerVisitor {
+            type Value = GrowthDayLedger;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a complete growth-day ledger")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                // The outer option is field presence; the inner option is the
+                // explicit JSON null used before the first compaction.
+                let mut compacted_through: Option<Option<i64>> = None;
+                let mut recent = None;
+                while let Some(field) = map.next_key::<String>()? {
+                    match field.as_str() {
+                        "compacted_through" => {
+                            if compacted_through.is_some() {
+                                return Err(serde::de::Error::duplicate_field("compacted_through"));
+                            }
+                            compacted_through = Some(map.next_value()?);
+                        }
+                        "recent" => {
+                            if recent.is_some() {
+                                return Err(serde::de::Error::duplicate_field("recent"));
+                            }
+                            recent = Some(map.next_value()?);
+                        }
+                        _ => return Err(serde::de::Error::unknown_field(&field, FIELDS)),
+                    }
+                }
+
+                Ok(GrowthDayLedger {
+                    compacted_through: compacted_through
+                        .ok_or_else(|| serde::de::Error::missing_field("compacted_through"))?,
+                    recent: recent.ok_or_else(|| serde::de::Error::missing_field("recent"))?,
+                })
+            }
+        }
+
+        // `Option<T>` normally treats an absent field exactly like an explicit
+        // `null`. This hand-written visitor keeps those two cases distinct.
+        deserializer.deserialize_struct("GrowthDayLedger", FIELDS, LedgerVisitor)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GrowthDayObservation {
+    New,
+    Seen,
+    Closed,
+}
+
+impl GrowthDayObservation {
+    const fn is_open(self) -> bool {
+        !matches!(self, Self::Closed)
+    }
+}
+
+impl GrowthDayLedger {
+    fn observe(&mut self, day: i64) -> GrowthDayObservation {
+        match self.recent.binary_search(&day) {
+            Ok(_) => return GrowthDayObservation::Seen,
+            Err(_) if self.is_closed(day) => return GrowthDayObservation::Closed,
+            Err(index) => self.recent.insert(index, day),
+        }
+
+        if self.recent.len() > MAX_RECENT_GROWTH_DAYS {
+            let compacted = self.recent.remove(0);
+            self.compacted_through = Some(
+                self.compacted_through
+                    .map_or(compacted, |prior| prior.max(compacted)),
+            );
+        }
+        GrowthDayObservation::New
+    }
+
+    fn contains(&self, day: i64) -> bool {
+        self.recent.binary_search(&day).is_ok()
+    }
+
+    fn is_closed(&self, day: i64) -> bool {
+        self.compacted_through
+            .is_some_and(|compacted| day <= compacted)
+            || (self.recent.len() == MAX_RECENT_GROWTH_DAYS
+                && self.recent.first().is_some_and(|oldest| day < *oldest))
+    }
+
+    /// Forget exact ordering for `day` and every earlier day. Daily records
+    /// are bounded independently from the distinct-day ledger, so evicting a
+    /// record with build history also loses the evidence needed to merge a
+    /// later out-of-order recovery with the already-counted episode. Closing
+    /// the prefix keeps those late events valid but growth-neutral.
+    fn close_through(&mut self, day: i64) {
+        let compacted = self
+            .compacted_through
+            .map_or(day, |previous| previous.max(day));
+        self.compacted_through = Some(compacted);
+        let first_open = self.recent.partition_point(|recent| *recent <= compacted);
+        self.recent.drain(..first_open);
+    }
+
+    fn validate(&self, days_seen: u32) -> bool {
+        let retained = self.recent.len() as u32;
+        let shape_valid = self.recent.len() <= MAX_RECENT_GROWTH_DAYS
+            && self.recent.windows(2).all(|days| days[0] < days[1])
+            && self
+                .compacted_through
+                .is_none_or(|compacted| self.recent.iter().all(|day| *day > compacted));
+        let history_valid = if days_seen < retained {
+            false
+        } else if days_seen == retained && self.recent.is_empty() {
+            self.compacted_through.is_none()
+        } else if days_seen == retained {
+            // With no known evictions, this is either a fresh ledger or the
+            // conservative v1 migration boundary immediately before the
+            // oldest retained semantic day. A wider gap would incorrectly
+            // close unseen days that a future out-of-order event could prove.
+            self.compacted_through.is_none()
+                || self.compacted_through == self.recent.first().and_then(|day| day.checked_sub(1))
+        } else {
+            // Exact days may also be discarded before this set reaches 64:
+            // the independently bounded repo/day window can evict one repo's
+            // build ordering while newer days remain exact. Such a compressed
+            // prefix must always carry a cursor; `shape_valid` proves every
+            // retained day lies strictly after it.
+            self.compacted_through.is_some()
+        };
+        shape_valid && history_valid
+    }
+}
+
+/// Like `MigratingCounter`, this serializes only the value; `present` exists
+/// solely to distinguish an old v1 file from a partially written new shape.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct MigratingGrowthDayLedger {
+    value: GrowthDayLedger,
+    present: bool,
+}
+
+impl MigratingGrowthDayLedger {
+    fn new(value: GrowthDayLedger) -> Self {
+        Self {
+            value,
+            present: true,
+        }
+    }
+}
+
+impl Serialize for MigratingGrowthDayLedger {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.value.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MigratingGrowthDayLedger {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        GrowthDayLedger::deserialize(deserializer).map(Self::new)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct DailyStats {
@@ -122,6 +451,11 @@ struct DailyStats {
     open_failure_at_ms: Option<u64>,
     last_recovery_duration_ms: Option<u64>,
     recovered_pending_push: bool,
+    /// Same-day failure-to-success transitions. A repeated one-failure flip
+    /// is a content-free hint that a build/test may be intermittent rather
+    /// than evidence that the human is stuck.
+    #[serde(default)]
+    failure_success_flips: MigratingCounter,
     /// Snapshot before the first retained observation. Version 1 was never
     /// shipped without these fields, but defaults let development fixtures and
     /// the standalone seed format migrate without weakening strict decoding.
@@ -137,6 +471,11 @@ struct DailyStats {
     build_duration_sum_ms: u64,
     #[serde(default)]
     build_duration_count: u32,
+    /// Counts of repo-scoped build/test and push completions in eight local
+    /// three-hour wall-clock buckets. This monotone aggregate deliberately
+    /// lives outside observation replay and contains no command content.
+    #[serde(default)]
+    activity_buckets: [u16; CIRCADIAN_BUCKET_COUNT],
 }
 
 impl DailyStats {
@@ -151,10 +490,12 @@ impl DailyStats {
             open_failure_at_ms: None,
             last_recovery_duration_ms: None,
             recovered_pending_push: false,
+            failure_success_flips: MigratingCounter::new(0),
             baseline: None,
             observations: Vec::new(),
             build_duration_sum_ms: 0,
             build_duration_count: 0,
+            activity_buckets: [0; CIRCADIAN_BUCKET_COUNT],
         }
     }
 
@@ -167,6 +508,7 @@ impl DailyStats {
             open_failure_at_ms: self.open_failure_at_ms,
             last_recovery_duration_ms: self.last_recovery_duration_ms,
             recovered_pending_push: self.recovered_pending_push,
+            failure_success_flips: self.failure_success_flips,
             compacted_through: self
                 .baseline
                 .as_ref()
@@ -185,6 +527,8 @@ struct StatsBaseline {
     open_failure_at_ms: Option<u64>,
     last_recovery_duration_ms: Option<u64>,
     recovered_pending_push: bool,
+    #[serde(default)]
+    failure_success_flips: MigratingCounter,
     /// Events at or before this total-order cursor were folded into the
     /// aggregate prefix. A pathologically late writer is ignored instead of
     /// being replayed on the wrong side of a compacted success or push.
@@ -223,6 +567,16 @@ struct DiskMemory {
     life_updated_at_ms: u64,
     #[serde(default)]
     life_updated_event_id: String,
+    /// Global lifetime growth counters. They remain outside the bounded
+    /// repo/day window so record eviction can never make the organism younger.
+    #[serde(default)]
+    days_seen: MigratingCounter,
+    #[serde(default)]
+    lifetime_recoveries: MigratingCounter,
+    /// Exact recent distinct-day membership, independent of how many repos
+    /// happen to occupy the 64 bounded `DailyStats` records.
+    #[serde(default)]
+    growth_days: MigratingGrowthDayLedger,
     /// Bounded durable idempotence tokens. They contain no command data or PID
     /// and outlive observation compaction long enough to cover every
     /// in-process pending/retry window.
@@ -238,6 +592,9 @@ impl Default for DiskMemory {
             life: LifeSnapshot::default(),
             life_updated_at_ms: 0,
             life_updated_event_id: String::new(),
+            days_seen: MigratingCounter::new(0),
+            lifetime_recoveries: MigratingCounter::new(0),
+            growth_days: MigratingGrowthDayLedger::new(GrowthDayLedger::default()),
             recent_event_ids: Vec::new(),
             days: Vec::new(),
         }
@@ -260,8 +617,59 @@ impl DiskMemory {
                 "ASCII organism memory has an invalid life-state cursor",
             ));
         }
+        if !self.days_seen.present || !self.lifetime_recoveries.present || !self.growth_days.present
+        {
+            return Err(invalid(
+                "ASCII organism memory has an incomplete growth ledger",
+            ));
+        }
+        if !self.growth_days.value.validate(self.days_seen.value) {
+            return Err(invalid(
+                "ASCII organism memory has an invalid growth ledger",
+            ));
+        }
+        if self.days_seen.value == 0 && self.lifetime_recoveries.value != 0 {
+            return Err(invalid(
+                "ASCII organism memory has recoveries without a work day",
+            ));
+        }
         if self.days.len() > MAX_DAILY_RECORDS {
             return Err(invalid("ASCII organism memory has too many daily records"));
+        }
+        if self.days_seen.value > self.growth_days.value.recent.len() as u32
+            && self.days.len() != MAX_DAILY_RECORDS
+        {
+            return Err(invalid(
+                "ASCII organism memory has a compressed growth ledger without a full daily window",
+            ));
+        }
+        if self
+            .growth_days
+            .value
+            .compacted_through
+            .is_some_and(|cursor| {
+                self.days
+                    .iter()
+                    .map(|stats| stats.day)
+                    .max()
+                    .is_none_or(|latest| cursor > latest)
+            })
+        {
+            return Err(invalid(
+                "ASCII organism memory has a growth cursor beyond retained daily history",
+            ));
+        }
+        if self.days.len() < MAX_DAILY_RECORDS
+            && self.growth_days.value.recent.iter().any(|day| {
+                !self
+                    .days
+                    .iter()
+                    .any(|stats| stats.day == *day && daily_stats_has_semantic_activity(stats))
+            })
+        {
+            return Err(invalid(
+                "ASCII organism memory has a recent growth day without semantic evidence",
+            ));
         }
         if self.recent_event_ids.len() > MAX_RECENT_EVENT_IDS {
             return Err(invalid(
@@ -278,6 +686,7 @@ impl DiskMemory {
         }
 
         let mut seen = HashSet::with_capacity(self.days.len());
+        let mut open_recoveries = 0_u64;
         let mut observation_ids = HashSet::new();
         let mut observation_count = 0usize;
         for stats in &self.days {
@@ -291,20 +700,56 @@ impl DiskMemory {
                     "ASCII organism memory has duplicate day/repository records",
                 ));
             }
-            if stats.open_failures > stats.build_failures
-                || (stats.open_failures == 0) != stats.open_failure_at_ms.is_none()
-            {
+            if daily_stats_has_semantic_activity(stats) {
+                let tracked = self.growth_days.value.contains(stats.day);
+                if !tracked && !self.growth_days.value.is_closed(stats.day) {
+                    return Err(invalid("ASCII organism memory has an untracked growth day"));
+                }
+            }
+            if !failure_state_valid(
+                stats.build_failures,
+                stats.open_failures,
+                stats.open_failure_at_ms,
+                stats.recovered_pending_push,
+                stats.last_recovery_duration_ms,
+            ) {
                 return Err(invalid(
                     "ASCII organism memory has an inconsistent failure streak",
                 ));
             }
-            if stats.recovered_pending_push && stats.last_recovery_duration_ms.is_none() {
+            if stats.baseline.as_ref().is_some_and(|baseline| {
+                !failure_state_valid(
+                    baseline.build_failures,
+                    baseline.open_failures,
+                    baseline.open_failure_at_ms,
+                    baseline.recovered_pending_push,
+                    baseline.last_recovery_duration_ms,
+                )
+            }) {
                 return Err(invalid(
-                    "ASCII organism memory has an inconsistent recovery marker",
+                    "ASCII organism memory has an inconsistent baseline failure state",
                 ));
             }
-            if stats.build_duration_sum_ms
-                > u64::from(stats.build_duration_count).saturating_mul(MAX_TRACKED_BUILD_MS)
+            if !stats.failure_success_flips.present
+                || stats.failure_success_flips.value > stats.build_failures
+                || stats.failure_success_flips.value > stats.build_successes
+            {
+                return Err(invalid(
+                    "ASCII organism memory has an inconsistent failure-success flip count",
+                ));
+            }
+            if stats.baseline.as_ref().is_some_and(|baseline| {
+                !baseline.failure_success_flips.present
+                    || baseline.failure_success_flips.value > baseline.build_failures
+                    || baseline.failure_success_flips.value > baseline.build_successes
+            }) {
+                return Err(invalid(
+                    "ASCII organism memory has an inconsistent baseline flip count",
+                ));
+            }
+            if stats.build_duration_count > stats.build_successes
+                || stats.build_duration_sum_ms
+                    > u64::from(stats.build_duration_count).saturating_mul(MAX_TRACKED_BUILD_MS)
             {
                 return Err(invalid(
                     "ASCII organism memory has an inconsistent build-duration aggregate",
@@ -324,10 +769,21 @@ impl DiskMemory {
                 .baseline
                 .as_ref()
                 .and_then(|baseline| baseline.compacted_through.as_ref());
-            if compacted_through.is_some_and(|cursor| !valid_event_id(&cursor.id)) {
-                return Err(invalid(
-                    "ASCII organism memory has an invalid compaction cursor",
-                ));
+            if let Some(cursor) = compacted_through {
+                let baseline = stats
+                    .baseline
+                    .as_ref()
+                    .expect("a compaction cursor belongs to a baseline");
+                if !valid_event_id(&cursor.id)
+                    || !observation_ids.insert(cursor.id.as_str())
+                    || (baseline.build_failures == 0
+                        && baseline.build_successes == 0
+                        && baseline.git_pushes == 0)
+                {
+                    return Err(invalid(
+                        "ASCII organism memory has an invalid compaction cursor",
+                    ));
+                }
             }
             for observation in &stats.observations {
                 let cursor = ObservationCursor {
@@ -343,15 +799,24 @@ impl DiskMemory {
                     ));
                 }
             }
-            if !stats.observations.is_empty() && !summary_matches_observations(stats) {
+            if stats.baseline.is_some() && !summary_matches_observations(stats) {
                 return Err(invalid(
                     "ASCII organism memory counters do not match their observation log",
                 ));
+            }
+            if self.growth_days.value.contains(stats.day) {
+                open_recoveries =
+                    open_recoveries.saturating_add(u64::from(stats.failure_success_flips.value));
             }
         }
         if observation_count > MAX_OBSERVATIONS {
             return Err(invalid(
                 "ASCII organism memory has too many retained observations",
+            ));
+        }
+        if u64::from(self.lifetime_recoveries.value) < open_recoveries.min(u64::from(u32::MAX)) {
+            return Err(invalid(
+                "ASCII organism memory has an inconsistent lifetime recovery count",
             ));
         }
         Ok(())
@@ -367,9 +832,14 @@ impl DiskMemory {
         self.recent_event_ids.iter().any(|recent| recent == id)
             || self.days.iter().any(|stats| {
                 stats
-                    .observations
-                    .iter()
-                    .any(|observation| observation.id == id)
+                    .baseline
+                    .as_ref()
+                    .and_then(|baseline| baseline.compacted_through.as_ref())
+                    .is_some_and(|cursor| cursor.id == id)
+                    || stats
+                        .observations
+                        .iter()
+                        .any(|observation| observation.id == id)
             })
     }
 
@@ -382,6 +852,14 @@ impl DiskMemory {
             let overflow = self.recent_event_ids.len() - MAX_RECENT_EVENT_IDS;
             self.recent_event_ids.drain(..overflow);
         }
+    }
+
+    fn observe_growth_day(&mut self, day: i64) -> GrowthDayObservation {
+        let observation = self.growth_days.value.observe(day);
+        if observation == GrowthDayObservation::New {
+            self.days_seen.saturating_increment();
+        }
+        observation
     }
 
     fn stats_mut(&mut self, day: i64, repo: &str) -> &mut DailyStats {
@@ -418,8 +896,18 @@ impl DiskMemory {
             .position(|stats| stats.day == inserted_day && stats.repo == inserted_repo)
             .expect("inserted organism record exists before pruning");
         let remove = if inserted == 0 { 1 } else { 0 };
-        self.days.remove(remove);
+        let evicted = self.days.remove(remove);
+        if evicted.build_failures > 0 || evicted.build_successes > 0 {
+            self.growth_days.value.close_through(evicted.day);
+        }
     }
+}
+
+fn daily_stats_has_semantic_activity(stats: &DailyStats) -> bool {
+    stats.build_failures > 0
+        || stats.build_successes > 0
+        || stats.git_pushes > 0
+        || stats.activity_buckets.iter().any(|count| *count > 0)
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -442,11 +930,27 @@ fn valid_event_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+fn failure_state_valid(
+    build_failures: u32,
+    open_failures: u32,
+    open_failure_at_ms: Option<u64>,
+    recovered_pending_push: bool,
+    last_recovery_duration_ms: Option<u64>,
+) -> bool {
+    open_failures <= build_failures
+        && (open_failures == 0) == open_failure_at_ms.is_none()
+        && (open_failures == 0 || !recovered_pending_push)
+        && (!recovered_pending_push || last_recovery_duration_ms.is_some())
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct MemoryEvent {
     id: String,
     at_ms: u64,
     day: i64,
+    /// Frozen with `day` when the event is created, so a queued transaction is
+    /// never reinterpreted after a timezone or DST transition.
+    activity_bucket: u8,
     repo: Option<String>,
     kind: CommandKind,
     exit_code: Option<i32>,
@@ -466,10 +970,12 @@ impl MemoryEvent {
         duration_ms: Option<u64>,
     ) -> Self {
         let at_ms = unix_ms();
+        let local = local_circadian_time_at_ms(at_ms);
         Self {
             id: next_event_id(),
             at_ms,
-            day: local_day_at_ms(at_ms),
+            day: local.day,
+            activity_bucket: local.bucket,
             repo,
             kind,
             exit_code,
@@ -487,10 +993,12 @@ impl MemoryEvent {
         exit_code: Option<i32>,
         life: LifeState,
     ) -> Self {
+        let local = local_circadian_time_at_ms(at_ms);
         Self {
             id: next_event_id(),
             at_ms,
             day,
+            activity_bucket: local.bucket,
             repo: repo.map(str::to_owned),
             kind,
             exit_code,
@@ -504,6 +1012,13 @@ impl MemoryEvent {
         self.duration_ms = duration_ms;
         self
     }
+
+    #[cfg(test)]
+    fn with_activity_bucket(mut self, bucket: u8) -> Self {
+        assert!(bucket < CIRCADIAN_BUCKET_COUNT as u8);
+        self.activity_bucket = bucket;
+        self
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -512,6 +1027,9 @@ pub(crate) struct MemoryInsight {
     pub(crate) recovered_failures: u32,
     pub(crate) push_after_recovery: bool,
     pub(crate) faster_than_yesterday: bool,
+    /// This success was at least the third same-day failure-to-success flip,
+    /// and only one failure was open immediately before it.
+    pub(crate) likely_flaky: bool,
     pub(crate) repo_remembered: bool,
     /// Mean successful build/test wall time across every remembered day of
     /// this repo, once at least three samples exist.
@@ -555,6 +1073,21 @@ impl OrganismMemory {
 
     pub(crate) fn life_state(&self) -> LifeState {
         self.memory.life.state()
+    }
+
+    pub(crate) fn growth_progress(&self) -> GrowthProgress {
+        GrowthProgress {
+            days_seen: self.memory.days_seen.value,
+            lifetime_recoveries: self.memory.lifetime_recoveries.value,
+        }
+    }
+
+    /// Infer one global working-hours profile from completed recent days in
+    /// every remembered repository. Keeping this window-global matches the
+    /// shared life/tick clock; a pane-local schedule would make the simulation
+    /// depend on which pane happened to claim a wall-clock slice.
+    pub(crate) fn circadian_profile_at(&self, at_ms: u64) -> Option<CircadianProfile> {
+        infer_circadian_profile(&self.memory, local_circadian_time_at_ms(at_ms).day)
     }
 
     pub(crate) fn refresh(&mut self) -> io::Result<()> {
@@ -655,6 +1188,49 @@ fn apply_event(memory: &mut DiskMemory, event: &MemoryEvent) -> MemoryInsight {
         ..MemoryInsight::default()
     };
 
+    // Activity is deliberately narrower than arbitrary shell usage: only the
+    // two repo-scoped semantic command kinds already admitted by the organism
+    // can teach its working-hours rhythm.
+    if !matches!(event.kind, CommandKind::BuildOrTest | CommandKind::GitPush) {
+        return insight;
+    }
+    // This check precedes every capacity mutation. It also covers meaningful
+    // commands without an ordered observation (unknown build outcome or failed
+    // push), whose activity bucket must remain exactly-once across retries.
+    if memory.has_event_id(&event.id) {
+        return insight;
+    }
+    let recoveries_before = memory
+        .stats(event.day, repo)
+        .map(|stats| stats.failure_success_flips.value)
+        .unwrap_or(0);
+    let growth_day = memory.observe_growth_day(event.day);
+    // Snapshot repo duration history before the activity aggregate creates a
+    // new day record. At the 64-record bound, `stats_mut` may evict the oldest
+    // record; the current command must still compare against history that was
+    // present when it arrived.
+    let (duration_sum, duration_count) = memory
+        .days
+        .iter()
+        .filter(|stats| stats.repo == repo)
+        .fold((0u64, 0u64), |(sum, count), stats| {
+            (
+                sum.saturating_add(stats.build_duration_sum_ms),
+                count.saturating_add(u64::from(stats.build_duration_count)),
+            )
+        });
+    if duration_count >= 3 {
+        insight.typical_build_ms = Some(duration_sum / duration_count);
+    }
+    {
+        let stats = memory.stats_mut(event.day, repo);
+        let bucket = stats
+            .activity_buckets
+            .get_mut(usize::from(event.activity_bucket))
+            .expect("a local circadian bucket is always in 0..8");
+        *bucket = bucket.saturating_add(1);
+    }
+
     let observation_kind = match (event.kind, event.exit_code) {
         (CommandKind::BuildOrTest, Some(code)) if code != 0 => Some(ObservationKind::BuildFailure),
         (CommandKind::BuildOrTest, Some(0)) => Some(ObservationKind::BuildSuccess),
@@ -662,14 +1238,9 @@ fn apply_event(memory: &mut DiskMemory, event: &MemoryEvent) -> MemoryInsight {
         _ => None,
     };
     let Some(kind) = observation_kind else {
+        memory.remember_event_id(&event.id);
         return insight;
     };
-    // This check precedes every capacity mutation. An ambiguous atomic-write
-    // retry must be a byte-for-byte logical no-op even after its observation
-    // id has been folded out of the ordering window.
-    if memory.has_event_id(&event.id) {
-        return insight;
-    }
     // Duration aggregates live outside the replayed observation window: they
     // are bounded monotone scalars, accumulated exactly once per event id.
     if kind == ObservationKind::BuildSuccess {
@@ -739,29 +1310,86 @@ fn apply_event(memory: &mut DiskMemory, event: &MemoryEvent) -> MemoryInsight {
             Some(replay)
         }
     };
+    if growth_day.is_open() {
+        let recoveries_after = memory
+            .stats(event.day, repo)
+            .map(|stats| stats.failure_success_flips.value)
+            .unwrap_or(recoveries_before);
+        memory
+            .lifetime_recoveries
+            .saturating_add(recoveries_after.saturating_sub(recoveries_before));
+    }
     memory.remember_event_id(&event.id);
     compact_global_observations(memory);
     if let Some(replay) = replay {
         insight.recovered_failures = replay.recovered_failures;
         insight.open_failures = replay.open_failures;
         insight.push_after_recovery = replay.push_after_recovery;
+        insight.likely_flaky = replay.likely_flaky;
     }
     insight.faster_than_yesterday =
         insight.push_after_recovery && faster_than_previous_day(memory, event.day, repo);
-    let (duration_sum, duration_count) = memory
-        .days
-        .iter()
-        .filter(|stats| stats.repo == repo)
-        .fold((0u64, 0u32), |(sum, count), stats| {
-            (
-                sum.saturating_add(stats.build_duration_sum_ms),
-                count.saturating_add(stats.build_duration_count),
-            )
-        });
-    if duration_count >= 3 {
-        insight.typical_build_ms = Some(duration_sum / u64::from(duration_count));
-    }
     insight
+}
+
+fn infer_circadian_profile(memory: &DiskMemory, today: i64) -> Option<CircadianProfile> {
+    let oldest_day = today.saturating_sub(CIRCADIAN_LOOKBACK_DAYS);
+    let mut counts = [0_u64; CIRCADIAN_BUCKET_COUNT];
+    let mut active_days = HashSet::new();
+
+    for stats in &memory.days {
+        // Today is deliberately excluded: a learned schedule remains stable
+        // throughout the day instead of being pulled toward each new command.
+        // Future records (clock corrections/timezone changes) also cannot teach
+        // the current profile until local time catches up with them.
+        if stats.day < oldest_day || stats.day >= today {
+            continue;
+        }
+        let mut record_total = 0_u64;
+        for (total, count) in counts.iter_mut().zip(stats.activity_buckets) {
+            *total = total.saturating_add(u64::from(count));
+            record_total = record_total.saturating_add(u64::from(count));
+        }
+        if record_total > 0 {
+            active_days.insert(stats.day);
+        }
+    }
+
+    let total = counts.iter().copied().fold(0_u64, u64::saturating_add);
+    if active_days.len() < MIN_CIRCADIAN_ACTIVE_DAYS || total < MIN_CIRCADIAN_SAMPLES {
+        return None;
+    }
+
+    // Score every circular nine-hour window as the candidate centre plus its
+    // immediate neighbours. Prefer the busier centre on an equal window sum;
+    // a complete tie keeps the lower centre for deterministic reconstruction.
+    let mut best_center = 0_usize;
+    let mut best_window = 0_u64;
+    let mut best_centre_count = 0_u64;
+    for center in 0..CIRCADIAN_BUCKET_COUNT {
+        let previous = (center + CIRCADIAN_BUCKET_COUNT - 1) % CIRCADIAN_BUCKET_COUNT;
+        let next = (center + 1) % CIRCADIAN_BUCKET_COUNT;
+        let window = counts[previous]
+            .saturating_add(counts[center])
+            .saturating_add(counts[next]);
+        if window > best_window || (window == best_window && counts[center] > best_centre_count) {
+            best_center = center;
+            best_window = window;
+            best_centre_count = counts[center];
+        }
+    }
+
+    // A near-uniform or heavily fragmented rhythm has no honest habitual
+    // window. Fail neutral instead of manufacturing one from the tie-breaker.
+    if best_window.saturating_mul(2) <= total {
+        return None;
+    }
+
+    let previous = (best_center + CIRCADIAN_BUCKET_COUNT - 1) % CIRCADIAN_BUCKET_COUNT;
+    let next = (best_center + 1) % CIRCADIAN_BUCKET_COUNT;
+    Some(CircadianProfile {
+        mask: (1_u8 << previous) | (1_u8 << best_center) | (1_u8 << next),
+    })
 }
 
 fn compact_global_observations(memory: &mut DiskMemory) {
@@ -780,11 +1408,21 @@ fn compact_global_observations(memory: &mut DiskMemory) {
             .min_by(|(_, left), (_, right)| {
                 let left = left
                     .observations
-                    .first()
+                    .iter()
+                    .min_by(|left, right| {
+                        left.at_ms
+                            .cmp(&right.at_ms)
+                            .then_with(|| left.id.cmp(&right.id))
+                    })
                     .map(|event| (event.at_ms, &event.id));
                 let right = right
                     .observations
-                    .first()
+                    .iter()
+                    .min_by(|left, right| {
+                        left.at_ms
+                            .cmp(&right.at_ms)
+                            .then_with(|| left.id.cmp(&right.id))
+                    })
                     .map(|event| (event.at_ms, &event.id));
                 left.cmp(&right)
             })
@@ -831,6 +1469,7 @@ struct ReplayInsight {
     open_failures: u32,
     recovered_failures: u32,
     push_after_recovery: bool,
+    likely_flaky: bool,
 }
 
 fn replay_observations(stats: &mut DailyStats, target_id: Option<&str>) -> ReplayInsight {
@@ -847,6 +1486,7 @@ fn replay_observations(stats: &mut DailyStats, target_id: Option<&str>) -> Repla
     stats.open_failure_at_ms = baseline.open_failure_at_ms;
     stats.last_recovery_duration_ms = baseline.last_recovery_duration_ms;
     stats.recovered_pending_push = baseline.recovered_pending_push;
+    stats.failure_success_flips = baseline.failure_success_flips;
 
     let mut insight = ReplayInsight::default();
     for observation in &stats.observations {
@@ -863,6 +1503,9 @@ fn replay_observations(stats: &mut DailyStats, target_id: Option<&str>) -> Repla
             ObservationKind::BuildSuccess => {
                 stats.build_successes = stats.build_successes.saturating_add(1);
                 let recovered_failures = stats.open_failures;
+                if recovered_failures > 0 {
+                    stats.failure_success_flips.saturating_increment();
+                }
                 if let Some(started) = stats.open_failure_at_ms.take() {
                     stats.last_recovery_duration_ms = observation.at_ms.checked_sub(started);
                     stats.recovered_pending_push = stats.last_recovery_duration_ms.is_some();
@@ -870,6 +1513,8 @@ fn replay_observations(stats: &mut DailyStats, target_id: Option<&str>) -> Repla
                 stats.open_failures = 0;
                 if target_id == Some(observation.id.as_str()) {
                     insight.recovered_failures = recovered_failures;
+                    insight.likely_flaky =
+                        recovered_failures == 1 && stats.failure_success_flips.value >= 3;
                 }
             }
             ObservationKind::GitPush => {
@@ -918,8 +1563,161 @@ fn read_memory(path: &Path) -> io::Result<DiskMemory> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(DiskMemory::default()),
         Err(error) => return Err(error),
     };
-    let memory: DiskMemory = serde_json::from_str(&json)
+    // Decode the typed form first. In particular, serde's struct decoder
+    // rejects duplicate security-sensitive fields; routing through Value
+    // first would collapse duplicates with last-one-wins semantics.
+    let mut memory: DiskMemory = serde_json::from_str(&json)
         .map_err(|error| invalid(format!("invalid ASCII organism memory: {error}")))?;
+    // These two legacy-defaulted scalars form one aggregate. Decode the
+    // strict typed form first (above), then inspect field presence separately:
+    // a released writer always emits both, while an old seed emits neither.
+    // In particular this keeps a real zero-duration sample `(0, 1)` from
+    // being silently changed to `(0, 0)` by deleting only its count field.
+    let raw: serde_json::Value = serde_json::from_str(&json)
+        .map_err(|error| invalid(format!("invalid ASCII organism memory: {error}")))?;
+    let raw_days = raw
+        .get("days")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| invalid("ASCII organism memory has an invalid daily-record array"))?;
+    if raw_days.len() != memory.days.len() {
+        return Err(invalid(
+            "ASCII organism memory has an inconsistent daily-record array",
+        ));
+    }
+    let mut duration_generation = None;
+    let mut activity_generation = None;
+    for day in raw_days {
+        let day = day
+            .as_object()
+            .ok_or_else(|| invalid("ASCII organism memory has an invalid daily record"))?;
+        let sum_present = day.contains_key("build_duration_sum_ms");
+        let count_present = day.contains_key("build_duration_count");
+        if sum_present != count_present {
+            return Err(invalid(
+                "ASCII organism memory has an incomplete build-duration aggregate",
+            ));
+        }
+        if duration_generation
+            .replace(sum_present)
+            .is_some_and(|current| current != sum_present)
+        {
+            return Err(invalid(
+                "ASCII organism memory mixes build-duration aggregate generations",
+            ));
+        }
+        let activity_present = day.contains_key("activity_buckets");
+        if activity_generation
+            .replace(activity_present)
+            .is_some_and(|current| current != activity_present)
+        {
+            return Err(invalid(
+                "ASCII organism memory mixes activity-bucket generations",
+            ));
+        }
+    }
+    let flip_generation = memory
+        .days
+        .iter()
+        .map(|stats| {
+            let daily_present = stats.failure_success_flips.present;
+            let baseline_present = stats
+                .baseline
+                .as_ref()
+                .map(|baseline| baseline.failure_success_flips.present);
+            match (daily_present, baseline_present) {
+                (false, Some(false)) | (false, None) => Ok(false),
+                (true, Some(true)) | (true, None) => Ok(true),
+                // A released writer always emits both counters together.
+                // Mixed presence inside one record is truncation/tampering.
+                _ => Err(invalid(
+                    "ASCII organism memory has an incomplete failure-success flip counter",
+                )),
+            }
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let has_legacy_flip_record = flip_generation.iter().any(|current| !current);
+    let has_current_flip_record = flip_generation.iter().any(|current| *current);
+    if has_legacy_flip_record && has_current_flip_record {
+        // Migration is a whole-file generation. A released writer rewrites
+        // every DailyStats field, so per-record old/new mixtures can only be
+        // a partial edit that would otherwise erase compacted flip history.
+        return Err(invalid(
+            "ASCII organism memory mixes failure-success counter generations",
+        ));
+    }
+    let growth_generation = match (
+        memory.days_seen.present,
+        memory.lifetime_recoveries.present,
+        memory.growth_days.present,
+    ) {
+        (false, false, false) => false,
+        (true, true, true) => true,
+        _ => {
+            return Err(invalid(
+                "ASCII organism memory has an incomplete growth ledger",
+            ));
+        }
+    };
+    if !memory.days.is_empty() {
+        let duration_generation =
+            duration_generation.expect("a non-empty daily array has a duration generation");
+        let activity_generation =
+            activity_generation.expect("a non-empty daily array has an activity generation");
+        if has_current_flip_record != activity_generation
+            || has_current_flip_record != growth_generation
+            || (has_current_flip_record && !duration_generation)
+        {
+            return Err(invalid(
+                "ASCII organism memory has incoherent schema generations",
+            ));
+        }
+    }
+    if has_legacy_flip_record {
+        for stats in &mut memory.days {
+            // Compacted history predating this field cannot be recovered; its
+            // default baseline is zero. Retained ordered observations can and
+            // should be replayed so the next shallow recovery sees them. Do
+            // that on a clone and copy only the new scalar: replaying in place
+            // before validation would silently repair corrupt legacy summary
+            // fields that must continue to fail closed.
+            let mut rebuilt = stats.clone();
+            if let Some(baseline) = rebuilt.baseline.as_mut() {
+                baseline.failure_success_flips.mark_present();
+            }
+            replay_observations(&mut rebuilt, None);
+            if let Some(baseline) = stats.baseline.as_mut() {
+                baseline.failure_success_flips.mark_present();
+            }
+            stats.failure_success_flips =
+                MigratingCounter::new(rebuilt.failure_success_flips.value);
+        }
+    }
+
+    if !growth_generation {
+        // Old v1 files cannot reveal records already evicted from their
+        // bounded repo/day window. Reconstruct a conservative lower bound
+        // from retained semantic evidence and close all older dates so a
+        // late retry cannot make the migrated organism grow twice.
+        let mut recent: Vec<_> = memory
+            .days
+            .iter()
+            .filter(|stats| daily_stats_has_semantic_activity(stats))
+            .map(|stats| stats.day)
+            .collect();
+        recent.sort_unstable();
+        recent.dedup();
+        let compacted_through = recent.first().and_then(|day| day.checked_sub(1));
+        let recoveries = memory.days.iter().fold(0_u64, |total, stats| {
+            total.saturating_add(u64::from(stats.failure_success_flips.value))
+        });
+        memory.days_seen = MigratingCounter::new(u32::try_from(recent.len()).unwrap_or(u32::MAX));
+        memory.lifetime_recoveries =
+            MigratingCounter::new(u32::try_from(recoveries).unwrap_or(u32::MAX));
+        memory.growth_days = MigratingGrowthDayLedger::new(GrowthDayLedger {
+            compacted_through,
+            recent,
+        });
+    }
     memory.validate()?;
     Ok(memory)
 }
@@ -1252,7 +2050,7 @@ fn lock_with_timeout(file: &File, timeout: Duration, label: &str) -> io::Result<
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     format!("timed out waiting for {label}"),
-                ))
+                ));
             }
         }
     }
@@ -1312,24 +2110,41 @@ fn next_event_id() -> String {
     )
 }
 
-pub(crate) fn local_day_at_ms(at_ms: u64) -> i64 {
+pub(crate) fn local_circadian_time_at_ms(at_ms: u64) -> LocalCircadianTime {
     let unix_seconds = i64::try_from(at_ms / 1_000).unwrap_or(i64::MAX);
     #[cfg(unix)]
     {
         let seconds: nix::libc::time_t = unix_seconds;
         let mut local: nix::libc::tm = unsafe { std::mem::zeroed() };
         // SAFETY: both pointers refer to live, correctly aligned values.
-        if unsafe { nix::libc::localtime_r(&seconds, &mut local) }.is_null() {
-            return unix_seconds.div_euclid(86_400);
+        if !unsafe { nix::libc::localtime_r(&seconds, &mut local) }.is_null()
+            && (0..12).contains(&local.tm_mon)
+            && (1..=31).contains(&local.tm_mday)
+            && (0..24).contains(&local.tm_hour)
+        {
+            return LocalCircadianTime {
+                day: days_from_civil(
+                    i64::from(local.tm_year) + 1900,
+                    u32::try_from(local.tm_mon + 1).unwrap_or(1),
+                    u32::try_from(local.tm_mday).unwrap_or(1),
+                ),
+                bucket: u8::try_from(local.tm_hour / 3).unwrap_or(0),
+            };
         }
-        days_from_civil(
-            i64::from(local.tm_year) + 1900,
-            u32::try_from(local.tm_mon + 1).unwrap_or(1),
-            u32::try_from(local.tm_mday).unwrap_or(1),
-        )
     }
-    #[cfg(not(unix))]
-    unix_seconds.div_euclid(86_400)
+    utc_circadian_time(unix_seconds)
+}
+
+pub(crate) fn local_day_at_ms(at_ms: u64) -> i64 {
+    local_circadian_time_at_ms(at_ms).day
+}
+
+fn utc_circadian_time(unix_seconds: i64) -> LocalCircadianTime {
+    let seconds_in_day = unix_seconds.rem_euclid(86_400);
+    LocalCircadianTime {
+        day: unix_seconds.div_euclid(86_400),
+        bucket: u8::try_from(seconds_in_day / (3 * 60 * 60)).unwrap_or(0),
+    }
 }
 
 /// Gregorian civil date to days since 1970-01-01 (Howard Hinnant).
@@ -1489,6 +2304,33 @@ mod tests {
         )
     }
 
+    /// Shape emitted by the last released v1 writer: duration aggregates were
+    /// present, while flaky/circadian/growth landed together in this series.
+    fn strip_current_organism_families(value: &mut serde_json::Value) {
+        for day in value["days"].as_array_mut().unwrap() {
+            let day = day.as_object_mut().unwrap();
+            day.remove("failure_success_flips");
+            day.remove("activity_buckets");
+            if let Some(baseline) = day
+                .get_mut("baseline")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                baseline.remove("failure_success_flips");
+            }
+        }
+        for field in ["days_seen", "lifetime_recoveries", "growth_days"] {
+            value.as_object_mut().unwrap().remove(field);
+        }
+    }
+
+    fn strip_duration_aggregates(value: &mut serde_json::Value) {
+        for day in value["days"].as_array_mut().unwrap() {
+            let day = day.as_object_mut().unwrap();
+            day.remove("build_duration_sum_ms");
+            day.remove("build_duration_count");
+        }
+    }
+
     #[test]
     fn civil_day_index_has_exact_gregorian_boundaries() {
         assert_eq!(days_from_civil(1970, 1, 1), 0);
@@ -1505,6 +2347,88 @@ mod tests {
             days_from_civil(2100, 2, 28) + 1,
             days_from_civil(2100, 3, 1)
         );
+    }
+
+    #[test]
+    fn utc_circadian_fallback_has_euclidean_day_boundaries() {
+        assert_eq!(
+            utc_circadian_time(-1),
+            LocalCircadianTime { day: -1, bucket: 7 }
+        );
+        assert_eq!(
+            utc_circadian_time(0),
+            LocalCircadianTime { day: 0, bucket: 0 }
+        );
+        assert_eq!(
+            utc_circadian_time(86_399),
+            LocalCircadianTime { day: 0, bucket: 7 }
+        );
+        assert_eq!(
+            utc_circadian_time(86_400),
+            LocalCircadianTime { day: 1, bucket: 0 }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn circadian_dst_timezone_helper() {
+        if std::env::var_os("FORGE_ORGANISM_DST_TEST").is_none() {
+            return;
+        }
+        let utc_ms = |year, month, day, hour, minute| {
+            let seconds = days_from_civil(year, month, day)
+                .saturating_mul(86_400)
+                .saturating_add(i64::from(hour) * 3_600)
+                .saturating_add(i64::from(minute) * 60);
+            u64::try_from(seconds).unwrap().saturating_mul(1_000)
+        };
+
+        let spring_day = days_from_civil(2024, 3, 10);
+        assert_eq!(
+            local_circadian_time_at_ms(utc_ms(2024, 3, 10, 6, 59)),
+            LocalCircadianTime {
+                day: spring_day,
+                bucket: 0,
+            }
+        );
+        // 02:00 does not exist on this local day: the next minute is 03:00.
+        assert_eq!(
+            local_circadian_time_at_ms(utc_ms(2024, 3, 10, 7, 0)),
+            LocalCircadianTime {
+                day: spring_day,
+                bucket: 1,
+            }
+        );
+
+        let fall_day = days_from_civil(2024, 11, 3);
+        // The two instances of 01:30 share one wall-clock bucket.
+        for hour in [5, 6] {
+            assert_eq!(
+                local_circadian_time_at_ms(utc_ms(2024, 11, 3, hour, 30)),
+                LocalCircadianTime {
+                    day: fall_day,
+                    bucket: 0,
+                }
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_circadian_time_follows_wall_clock_dst_without_mutating_test_process_tz() {
+        if std::env::var_os("FORGE_ORGANISM_DST_TEST").is_some() {
+            return;
+        }
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("organism_memory::tests::circadian_dst_timezone_helper")
+            .arg("--nocapture")
+            // A self-contained POSIX rule avoids depending on the host's tzdata.
+            .env("TZ", "EST5EDT,M3.2.0/2,M11.1.0/2")
+            .env("FORGE_ORGANISM_DST_TEST", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[test]
@@ -1606,6 +2530,352 @@ mod tests {
     }
 
     #[test]
+    fn repeated_shallow_recoveries_are_recognized_as_likely_flaky() {
+        let repo = "/work/flaky";
+        let day = 59_000;
+        let mut memory = DiskMemory::default();
+        let build = |at_ms: u64, exit_code: i32| {
+            MemoryEvent::fixed(
+                at_ms,
+                day,
+                Some(repo),
+                CommandKind::BuildOrTest,
+                Some(exit_code),
+                LifeState::default(),
+            )
+        };
+
+        for cycle in 0..3u64 {
+            apply_event(&mut memory, &build(cycle * 2 + 1, 1));
+            let success = build(cycle * 2 + 2, 0);
+            let insight = apply_event(&mut memory, &success);
+            assert_eq!(insight.likely_flaky, cycle == 2);
+
+            // An ambiguous retry cannot advance either the aggregate or the
+            // visible threshold a second time.
+            let retry = apply_event(&mut memory, &success);
+            assert!(!retry.likely_flaky);
+        }
+
+        let stats = memory.stats(day, repo).unwrap();
+        assert_eq!(stats.failure_success_flips.value, 3);
+        assert_eq!(stats.open_failures, 0);
+
+        // A deep recovery is real debugging even after the repo has shown a
+        // flaky rhythm; only one-open-failure recoveries get the quiet hint.
+        apply_event(&mut memory, &build(10, 1));
+        apply_event(&mut memory, &build(11, 1));
+        let deep = apply_event(&mut memory, &build(12, 0));
+        assert_eq!(deep.recovered_failures, 2);
+        assert!(!deep.likely_flaky);
+        assert_eq!(
+            memory.stats(day, repo).unwrap().failure_success_flips.value,
+            4
+        );
+        memory.validate().unwrap();
+    }
+
+    #[test]
+    fn flaky_flip_count_follows_event_time_and_survives_compaction() {
+        let repo = "/work/ordered-flaky";
+        let day = 59_001;
+        let mut memory = DiskMemory::default();
+        let mut first_events = Vec::new();
+        for cycle in 0..3u64 {
+            for (offset, exit_code) in [(0, 1), (1, 0)] {
+                first_events.push(MemoryEvent::fixed(
+                    100 + cycle * 2 + offset,
+                    day,
+                    Some(repo),
+                    CommandKind::BuildOrTest,
+                    Some(exit_code),
+                    LifeState::default(),
+                ));
+            }
+        }
+        // Every event remains inside the ordering window, so writer lock
+        // order cannot change the derived flip count.
+        for event in first_events.iter().rev() {
+            apply_event(&mut memory, event);
+        }
+        assert_eq!(
+            memory.stats(day, repo).unwrap().failure_success_flips.value,
+            3
+        );
+
+        // Continue chronologically past the per-record observation bound.
+        for cycle in 3..40u64 {
+            apply_event(
+                &mut memory,
+                &MemoryEvent::fixed(
+                    100 + cycle * 2,
+                    day,
+                    Some(repo),
+                    CommandKind::BuildOrTest,
+                    Some(1),
+                    LifeState::default(),
+                ),
+            );
+            apply_event(
+                &mut memory,
+                &MemoryEvent::fixed(
+                    101 + cycle * 2,
+                    day,
+                    Some(repo),
+                    CommandKind::BuildOrTest,
+                    Some(0),
+                    LifeState::default(),
+                ),
+            );
+        }
+        let stats = memory.stats(day, repo).unwrap();
+        assert_eq!(stats.failure_success_flips.value, 40);
+        assert!(stats.baseline.as_ref().unwrap().failure_success_flips.value > 0);
+        assert!(stats.observations.len() <= MAX_OBSERVATIONS_PER_RECORD);
+        memory.validate().unwrap();
+    }
+
+    #[test]
+    fn version_one_memory_without_flip_counters_migrates_from_retained_events() {
+        let root = TestDir::new("flaky-counter-migration");
+        let path = root.memory_path();
+        let repo = root.0.join("repo");
+        let repo = repo.to_str().unwrap();
+        let day = 59_002;
+        let mut memory = DiskMemory::default();
+        for cycle in 0..2u64 {
+            for (offset, exit_code) in [(0, 1), (1, 0)] {
+                apply_event(
+                    &mut memory,
+                    &MemoryEvent::fixed(
+                        200 + cycle * 2 + offset,
+                        day,
+                        Some(repo),
+                        CommandKind::BuildOrTest,
+                        Some(exit_code),
+                        LifeState::default(),
+                    ),
+                );
+            }
+        }
+        let mut legacy = serde_json::to_value(&memory).unwrap();
+        strip_current_organism_families(&mut legacy);
+        let mut bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+        bytes.push(b'\n');
+        crate::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
+        crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+
+        let migrated = read_memory(&path).unwrap();
+        assert_eq!(
+            migrated
+                .stats(day, repo)
+                .unwrap()
+                .failure_success_flips
+                .value,
+            2
+        );
+        migrated.validate().unwrap();
+    }
+
+    #[test]
+    fn flip_counter_migration_does_not_repair_corrupt_legacy_summaries() {
+        let root = TestDir::new("flaky-counter-fail-closed");
+        let path = root.memory_path();
+        let repo = root.0.join("repo");
+        let repo = repo.to_str().unwrap();
+        let mut memory = DiskMemory::default();
+        apply_event(
+            &mut memory,
+            &MemoryEvent::fixed(
+                1,
+                59_003,
+                Some(repo),
+                CommandKind::BuildOrTest,
+                Some(1),
+                LifeState::default(),
+            ),
+        );
+        let mut legacy = serde_json::to_value(&memory).unwrap();
+        strip_current_organism_families(&mut legacy);
+        let day_value = legacy["days"][0].as_object_mut().unwrap();
+        day_value.insert("build_failures".to_string(), serde_json::json!(2));
+        let mut bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+        bytes.push(b'\n');
+        crate::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
+        crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+
+        let error = read_memory(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("counters do not match"));
+    }
+
+    #[test]
+    fn partially_missing_flip_counters_are_not_mistaken_for_legacy_files() {
+        let root = TestDir::new("partial-flip-counter");
+        let repo = root.0.join("repo");
+        let repo = repo.to_str().unwrap();
+        let mut memory = DiskMemory::default();
+        apply_event(
+            &mut memory,
+            &MemoryEvent::fixed(
+                1,
+                59_004,
+                Some(repo),
+                CommandKind::BuildOrTest,
+                Some(1),
+                LifeState::default(),
+            ),
+        );
+
+        for remove_baseline in [false, true] {
+            let mut partial = serde_json::to_value(&memory).unwrap();
+            let day = partial["days"][0].as_object_mut().unwrap();
+            if remove_baseline {
+                day["baseline"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("failure_success_flips");
+            } else {
+                day.remove("failure_success_flips");
+            }
+            let path = root.0.join(format!("partial-{remove_baseline}.json"));
+            let mut bytes = serde_json::to_vec_pretty(&partial).unwrap();
+            bytes.push(b'\n');
+            crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+            let error = read_memory(&path).unwrap_err();
+            assert!(error.to_string().contains("incomplete"));
+        }
+    }
+
+    #[test]
+    fn flip_counter_migration_is_whole_file_not_per_record() {
+        let root = TestDir::new("mixed-flip-generations");
+        let path = root.memory_path();
+        let mut memory = DiskMemory::default();
+        for day in [59_005, 59_006] {
+            apply_event(
+                &mut memory,
+                &MemoryEvent::fixed(
+                    day as u64,
+                    day,
+                    Some(&format!("/work/mixed-generation-{day}")),
+                    CommandKind::BuildOrTest,
+                    Some(1),
+                    LifeState::default(),
+                ),
+            );
+        }
+
+        let mut mixed = serde_json::to_value(&memory).unwrap();
+        let legacy_record = mixed["days"][0].as_object_mut().unwrap();
+        legacy_record.remove("failure_success_flips");
+        legacy_record["baseline"]
+            .as_object_mut()
+            .unwrap()
+            .remove("failure_success_flips");
+        let mut bytes = serde_json::to_vec_pretty(&mixed).unwrap();
+        bytes.push(b'\n');
+        crate::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
+        crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+
+        let error = read_memory(&path).unwrap_err();
+        assert!(error.to_string().contains("mixes failure-success"));
+    }
+
+    #[test]
+    fn impossible_baseline_flip_count_is_rejected() {
+        let mut memory = DiskMemory::default();
+        apply_event(
+            &mut memory,
+            &MemoryEvent::fixed(
+                1,
+                59_005,
+                Some("/work/impossible-flips"),
+                CommandKind::BuildOrTest,
+                Some(1),
+                LifeState::default(),
+            ),
+        );
+        let baseline = memory.days[0].baseline.as_mut().unwrap();
+        baseline.failure_success_flips = MigratingCounter::new(1);
+        assert!(memory
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("baseline flip"));
+    }
+
+    #[test]
+    fn migration_presence_scan_does_not_weaken_duplicate_field_rejection() {
+        let root = TestDir::new("duplicate-field");
+        let path = root.memory_path();
+        let encoded = serde_json::to_string_pretty(&DiskMemory::default()).unwrap();
+        let duplicate = encoded.replacen('{', "{\n  \"version\": 1,", 1);
+        crate::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
+        crate::snapshot_file::write_atomic_private(&path, duplicate.as_bytes()).unwrap();
+
+        let error = read_memory(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("duplicate field"));
+    }
+
+    #[test]
+    fn nested_schema_fields_reject_duplicates_before_the_presence_scan() {
+        let root = TestDir::new("nested-duplicate-fields");
+        crate::snapshot_file::ensure_private_directory(&root.0).unwrap();
+
+        let mut memory = DiskMemory::default();
+        let mut stats = DailyStats::new(60_000, "/work/nested-duplicates".to_string());
+        stats.baseline = Some(StatsBaseline::default());
+        memory.days.push(stats);
+        let encoded = serde_json::to_string(&memory).unwrap();
+
+        let cases = [
+            (
+                "daily-duration",
+                "\"build_duration_sum_ms\":0",
+                "\"build_duration_sum_ms\":0,\"build_duration_sum_ms\":0",
+                "build_duration_sum_ms",
+            ),
+            (
+                "daily-activity",
+                "\"activity_buckets\":[0,0,0,0,0,0,0,0]",
+                "\"activity_buckets\":[0,0,0,0,0,0,0,0],\"activity_buckets\":[0,0,0,0,0,0,0,0]",
+                "activity_buckets",
+            ),
+            (
+                "baseline",
+                "\"baseline\":{\"build_failures\":0",
+                "\"baseline\":{\"build_failures\":0,\"build_failures\":0",
+                "build_failures",
+            ),
+            (
+                "growth-ledger",
+                "\"growth_days\":{\"compacted_through\":null",
+                "\"growth_days\":{\"compacted_through\":null,\"compacted_through\":null",
+                "compacted_through",
+            ),
+        ];
+
+        for (label, needle, replacement, field) in cases {
+            assert_eq!(
+                encoded.matches(needle).count(),
+                1,
+                "fixture must identify exactly one {label} field"
+            );
+            let duplicate = encoded.replacen(needle, replacement, 1);
+            let path = root.0.join(format!("{label}.json"));
+            crate::snapshot_file::write_atomic_private(&path, duplicate.as_bytes()).unwrap();
+
+            let error = read_memory(&path).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            let message = error.to_string();
+            assert!(message.contains("duplicate field"), "{label}: {message}");
+            assert!(message.contains(field), "{label}: {message}");
+        }
+    }
+
+    #[test]
     fn build_durations_aggregate_once_per_event_and_yield_a_baseline() {
         let repo = "/work/forge";
         let day = 60_000;
@@ -1628,12 +2898,17 @@ mod tests {
         // An ambiguous retry of the same event id is a byte-for-byte no-op.
         apply_event(&mut memory, &first);
         apply_event(&mut memory, &success(2_000, Some(60_000)));
-        let insight = apply_event(&mut memory, &success(3_000, Some(90_000)));
-        assert_eq!(insight.typical_build_ms, Some(60_000));
+        let third = apply_event(&mut memory, &success(3_000, Some(90_000)));
+        assert_eq!(
+            third.typical_build_ms, None,
+            "the current run is not history"
+        );
+        let fourth = apply_event(&mut memory, &success(4_000, Some(120_000)));
+        assert_eq!(fourth.typical_build_ms, Some(60_000));
 
         let stats = memory.stats(day, repo).unwrap();
-        assert_eq!(stats.build_duration_sum_ms, 180_000);
-        assert_eq!(stats.build_duration_count, 3);
+        assert_eq!(stats.build_duration_sum_ms, 300_000);
+        assert_eq!(stats.build_duration_count, 4);
         memory.validate().unwrap();
 
         // Failures and duration-less successes never touch the aggregate,
@@ -1641,7 +2916,7 @@ mod tests {
         apply_event(
             &mut memory,
             &MemoryEvent::fixed(
-                4_000,
+                5_000,
                 day,
                 Some(repo),
                 CommandKind::BuildOrTest,
@@ -1650,11 +2925,11 @@ mod tests {
             )
             .with_duration(Some(500_000)),
         );
-        apply_event(&mut memory, &success(5_000, None));
-        apply_event(&mut memory, &success(6_000, Some(u64::MAX)));
+        apply_event(&mut memory, &success(6_000, None));
+        apply_event(&mut memory, &success(7_000, Some(u64::MAX)));
         let stats = memory.stats(day, repo).unwrap();
-        assert_eq!(stats.build_duration_count, 4);
-        assert_eq!(stats.build_duration_sum_ms, 180_000 + MAX_TRACKED_BUILD_MS);
+        assert_eq!(stats.build_duration_count, 5);
+        assert_eq!(stats.build_duration_sum_ms, 300_000 + MAX_TRACKED_BUILD_MS);
         memory.validate().unwrap();
 
         // The aggregate survives observation compaction untouched.
@@ -1670,6 +2945,1353 @@ mod tests {
         poisoned.days[0].build_duration_sum_ms =
             u64::from(poisoned.days[0].build_duration_count) * MAX_TRACKED_BUILD_MS + 1;
         assert!(poisoned.validate().is_err());
+
+        let mut impossible_count = memory;
+        impossible_count.days[0].build_duration_count =
+            impossible_count.days[0].build_successes.saturating_add(1);
+        impossible_count.days[0].build_duration_sum_ms = 0;
+        assert!(impossible_count.validate().is_err());
+    }
+
+    #[test]
+    fn build_duration_aggregate_fields_migrate_atomically() {
+        let root = TestDir::new("duration-presence");
+        let mut memory = DiskMemory::default();
+        apply_event(
+            &mut memory,
+            &MemoryEvent::fixed(
+                1,
+                60_001,
+                Some("/work/zero-duration"),
+                CommandKind::BuildOrTest,
+                Some(0),
+                LifeState::default(),
+            )
+            .with_duration(Some(0)),
+        );
+        assert_eq!(memory.days[0].build_duration_sum_ms, 0);
+        assert_eq!(memory.days[0].build_duration_count, 1);
+
+        for missing in ["build_duration_sum_ms", "build_duration_count"] {
+            let mut partial = serde_json::to_value(&memory).unwrap();
+            partial["days"][0].as_object_mut().unwrap().remove(missing);
+            let path = root.0.join(format!("partial-{missing}.json"));
+            let mut bytes = serde_json::to_vec_pretty(&partial).unwrap();
+            bytes.push(b'\n');
+            crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+            assert!(read_memory(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete build-duration"));
+        }
+
+        let mut legacy = serde_json::to_value(&memory).unwrap();
+        strip_current_organism_families(&mut legacy);
+        strip_duration_aggregates(&mut legacy);
+        let path = root.0.join("legacy.json");
+        let mut bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+        bytes.push(b'\n');
+        crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+        let migrated = read_memory(&path).unwrap();
+        assert_eq!(migrated.days[0].build_duration_sum_ms, 0);
+        assert_eq!(migrated.days[0].build_duration_count, 0);
+    }
+
+    #[test]
+    fn schema_family_generations_follow_the_released_v1_lineage() {
+        let root = TestDir::new("schema-lineage");
+        let mut memory = DiskMemory::default();
+        for day in [60_010, 60_011] {
+            apply_event(
+                &mut memory,
+                &MemoryEvent::fixed(
+                    day as u64,
+                    day,
+                    Some(&format!("/work/schema-lineage-{day}")),
+                    CommandKind::GitPush,
+                    Some(0),
+                    LifeState::default(),
+                ),
+            );
+        }
+        let current = serde_json::to_value(&memory).unwrap();
+
+        for missing_family in ["flip", "activity", "growth", "duration"] {
+            let mut tampered = current.clone();
+            match missing_family {
+                "flip" => {
+                    for day in tampered["days"].as_array_mut().unwrap() {
+                        let day = day.as_object_mut().unwrap();
+                        day.remove("failure_success_flips");
+                        day["baseline"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("failure_success_flips");
+                    }
+                }
+                "activity" => {
+                    for day in tampered["days"].as_array_mut().unwrap() {
+                        day.as_object_mut().unwrap().remove("activity_buckets");
+                    }
+                }
+                "growth" => {
+                    for field in ["days_seen", "lifetime_recoveries", "growth_days"] {
+                        tampered.as_object_mut().unwrap().remove(field);
+                    }
+                }
+                "duration" => strip_duration_aggregates(&mut tampered),
+                _ => unreachable!(),
+            }
+            let path = root.0.join(format!("missing-{missing_family}.json"));
+            let mut bytes = serde_json::to_vec_pretty(&tampered).unwrap();
+            bytes.push(b'\n');
+            crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+            assert!(read_memory(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("incoherent schema generations"));
+        }
+
+        // The last released v1 writer already emitted duration aggregates,
+        // but none of this series' flaky/circadian/growth cohort.
+        let mut released_head = current.clone();
+        strip_current_organism_families(&mut released_head);
+        let head_path = root.0.join("released-head.json");
+        let mut bytes = serde_json::to_vec_pretty(&released_head).unwrap();
+        bytes.push(b'\n');
+        crate::snapshot_file::write_atomic_private(&head_path, &bytes).unwrap();
+        read_memory(&head_path).unwrap().validate().unwrap();
+
+        // Older seed/development files may predate the duration pair too.
+        strip_duration_aggregates(&mut released_head);
+        let seed_path = root.0.join("pre-duration-seed.json");
+        let mut bytes = serde_json::to_vec_pretty(&released_head).unwrap();
+        bytes.push(b'\n');
+        crate::snapshot_file::write_atomic_private(&seed_path, &bytes).unwrap();
+        read_memory(&seed_path).unwrap().validate().unwrap();
+    }
+
+    #[test]
+    fn an_empty_observation_suffix_cannot_disagree_with_its_baseline() {
+        let day = 77;
+        let repo = "/tmp/empty-suffix";
+        let mut memory = DiskMemory::default();
+        assert_eq!(memory.observe_growth_day(day), GrowthDayObservation::New);
+        let mut stats = DailyStats::new(day, repo.to_string());
+        stats.build_failures = 1;
+        stats.open_failures = 1;
+        stats.open_failure_at_ms = Some(9_000);
+        stats.baseline = Some(stats.baseline());
+        memory.days.push(stats);
+        memory.validate().unwrap();
+
+        // A compacted record may legitimately retain no suffix, but its daily
+        // summary is then exactly the baseline—not an unchecked second truth.
+        memory.days[0].build_failures = 2;
+        assert!(memory.validate().is_err());
+    }
+
+    #[test]
+    fn a_replayable_suffix_cannot_hide_an_impossible_baseline_failure_state() {
+        let build = |day: i64, baseline: StatsBaseline, observations: Vec<Observation>| {
+            let mut stats = DailyStats::new(day, format!("/tmp/baseline-{day}"));
+            stats.baseline = Some(baseline);
+            stats.observations = observations;
+            replay_observations(&mut stats, None);
+            assert!(failure_state_valid(
+                stats.build_failures,
+                stats.open_failures,
+                stats.open_failure_at_ms,
+                stats.recovered_pending_push,
+                stats.last_recovery_duration_ms,
+            ));
+            let mut memory = DiskMemory::default();
+            assert_eq!(memory.observe_growth_day(day), GrowthDayObservation::New);
+            memory.days.push(stats);
+            memory
+        };
+
+        let bad_depth = build(
+            81,
+            StatsBaseline {
+                build_failures: 0,
+                open_failures: 1,
+                open_failure_at_ms: Some(100),
+                failure_success_flips: MigratingCounter::new(0),
+                ..StatsBaseline::default()
+            },
+            vec![
+                Observation {
+                    id: "baseline-depth-failure".to_string(),
+                    at_ms: 150,
+                    kind: ObservationKind::BuildFailure,
+                },
+                Observation {
+                    id: "baseline-depth-success".to_string(),
+                    at_ms: 200,
+                    kind: ObservationKind::BuildSuccess,
+                },
+            ],
+        );
+        assert!(bad_depth.validate().is_err());
+
+        let bad_cursor = build(
+            82,
+            StatsBaseline {
+                failure_success_flips: MigratingCounter::new(0),
+                compacted_through: Some(ObservationCursor {
+                    at_ms: 100,
+                    id: "baseline-empty-cursor".to_string(),
+                }),
+                ..StatsBaseline::default()
+            },
+            Vec::new(),
+        );
+        assert!(bad_cursor.validate().is_err());
+
+        let bad_recovery = build(
+            83,
+            StatsBaseline {
+                recovered_pending_push: true,
+                failure_success_flips: MigratingCounter::new(0),
+                ..StatsBaseline::default()
+            },
+            vec![Observation {
+                id: "baseline-recovery-push".to_string(),
+                at_ms: 150,
+                kind: ObservationKind::GitPush,
+            }],
+        );
+        assert!(bad_recovery.validate().is_err());
+
+        let overlapping_streak_and_recovery = build(
+            84,
+            StatsBaseline {
+                build_failures: 1,
+                open_failures: 1,
+                open_failure_at_ms: Some(100),
+                last_recovery_duration_ms: Some(50),
+                recovered_pending_push: true,
+                failure_success_flips: MigratingCounter::new(0),
+                ..StatsBaseline::default()
+            },
+            vec![Observation {
+                id: "baseline-overlap-push".to_string(),
+                at_ms: 150,
+                kind: ObservationKind::GitPush,
+            }],
+        );
+        assert!(overlapping_streak_and_recovery.validate().is_err());
+    }
+
+    #[test]
+    fn an_open_failure_streak_cannot_also_be_pending_push() {
+        let day = 85;
+        let mut memory = DiskMemory::default();
+        assert_eq!(memory.observe_growth_day(day), GrowthDayObservation::New);
+        let mut stats = DailyStats::new(day, "/tmp/overlapping-states".to_string());
+        stats.build_failures = 1;
+        stats.open_failures = 1;
+        stats.open_failure_at_ms = Some(100);
+        stats.last_recovery_duration_ms = Some(50);
+        stats.recovered_pending_push = true;
+        memory.days.push(stats);
+
+        assert!(memory.validate().is_err());
+    }
+
+    #[test]
+    fn compaction_cursor_event_ids_are_globally_unique() {
+        let compacted_stats = |day: i64, repo: &str, id: &str| {
+            let mut stats = DailyStats::new(day, repo.to_string());
+            stats.build_successes = 1;
+            stats.baseline = Some(StatsBaseline {
+                build_successes: 1,
+                failure_success_flips: MigratingCounter::new(0),
+                compacted_through: Some(ObservationCursor {
+                    at_ms: 100,
+                    id: id.to_string(),
+                }),
+                ..StatsBaseline::default()
+            });
+            stats
+        };
+
+        let mut duplicate_cursors = DiskMemory::default();
+        for (day, repo) in [(90, "/tmp/cursor-a"), (91, "/tmp/cursor-b")] {
+            assert_eq!(
+                duplicate_cursors.observe_growth_day(day),
+                GrowthDayObservation::New
+            );
+            duplicate_cursors
+                .days
+                .push(compacted_stats(day, repo, "shared-cursor-id"));
+        }
+        assert!(duplicate_cursors.validate().is_err());
+
+        let day = 92;
+        let mut cursor_and_suffix = DiskMemory::default();
+        assert_eq!(
+            cursor_and_suffix.observe_growth_day(day),
+            GrowthDayObservation::New
+        );
+        let mut stats = compacted_stats(day, "/tmp/cursor-suffix", "reused-event-id");
+        stats.observations.push(Observation {
+            id: "reused-event-id".to_string(),
+            at_ms: 200,
+            kind: ObservationKind::BuildSuccess,
+        });
+        replay_observations(&mut stats, None);
+        cursor_and_suffix.days.push(stats);
+        assert!(cursor_and_suffix.validate().is_err());
+    }
+
+    #[test]
+    fn duration_baseline_is_snapshotted_before_day_record_eviction() {
+        let repo = "/work/evicted-baseline";
+        let mut memory = DiskMemory::default();
+        let oldest = memory.stats_mut(0, repo);
+        oldest.build_duration_sum_ms = 90_000;
+        oldest.build_duration_count = 3;
+        for day in 1..MAX_DAILY_RECORDS as i64 {
+            memory.stats_mut(day, &format!("/work/filler-{day}"));
+        }
+        assert_eq!(memory.days.len(), MAX_DAILY_RECORDS);
+
+        let insight = apply_event(
+            &mut memory,
+            &MemoryEvent::fixed(
+                100_000,
+                MAX_DAILY_RECORDS as i64,
+                Some(repo),
+                CommandKind::BuildOrTest,
+                Some(0),
+                LifeState::default(),
+            )
+            .with_duration(Some(120_000))
+            .with_activity_bucket(3),
+        );
+        assert_eq!(insight.typical_build_ms, Some(30_000));
+        assert!(memory.stats(0, repo).is_none(), "oldest record was pruned");
+        memory.validate().unwrap();
+    }
+
+    #[test]
+    fn growth_stage_boundaries_are_explicit_and_saturating() {
+        assert_eq!(GrowthProgress::default().stage(), GrowthStage::Juvenile);
+        assert_eq!(GrowthStage::from_counts(6, u32::MAX), GrowthStage::Juvenile);
+        assert_eq!(GrowthStage::from_counts(7, 0), GrowthStage::Adult);
+        assert_eq!(GrowthStage::from_counts(59, u32::MAX), GrowthStage::Adult);
+        assert_eq!(GrowthStage::from_counts(60, 11), GrowthStage::Adult);
+        assert_eq!(GrowthStage::from_counts(60, 12), GrowthStage::Seasoned);
+        assert_eq!(
+            GrowthStage::from_counts(u32::MAX, u32::MAX),
+            GrowthStage::Seasoned
+        );
+    }
+
+    #[test]
+    fn growth_days_are_global_across_repos_and_idempotent_under_reordering() {
+        let mut memory = DiskMemory::default();
+        let first = MemoryEvent::fixed(
+            1_000,
+            100,
+            Some("/work/a"),
+            CommandKind::BuildOrTest,
+            None,
+            LifeState::default(),
+        );
+        apply_event(&mut memory, &first);
+        apply_event(&mut memory, &first);
+        apply_event(
+            &mut memory,
+            &MemoryEvent::fixed(
+                2_000,
+                100,
+                Some("/work/b"),
+                CommandKind::GitPush,
+                Some(1),
+                LifeState::default(),
+            ),
+        );
+        for day in [102, 101] {
+            apply_event(
+                &mut memory,
+                &MemoryEvent::fixed(
+                    3_000 + day as u64,
+                    day,
+                    Some("/work/a"),
+                    CommandKind::BuildOrTest,
+                    None,
+                    LifeState::default(),
+                ),
+            );
+        }
+        // Neither an arbitrary command nor an unscoped semantic command is a
+        // remembered workday.
+        apply_event(
+            &mut memory,
+            &MemoryEvent::fixed(
+                9_000,
+                103,
+                Some("/work/a"),
+                CommandKind::Other,
+                Some(0),
+                LifeState::default(),
+            ),
+        );
+        apply_event(
+            &mut memory,
+            &MemoryEvent::fixed(
+                10_000,
+                103,
+                None,
+                CommandKind::BuildOrTest,
+                Some(0),
+                LifeState::default(),
+            ),
+        );
+
+        assert_eq!(memory.days_seen.value, 3);
+        assert_eq!(memory.growth_days.value.recent, [100, 101, 102]);
+        assert_eq!(memory.lifetime_recoveries.value, 0);
+        memory.validate().unwrap();
+
+        for day in 103..=106 {
+            apply_event(
+                &mut memory,
+                &MemoryEvent::fixed(
+                    20_000 + day as u64,
+                    day,
+                    Some("/work/a"),
+                    CommandKind::BuildOrTest,
+                    None,
+                    LifeState::default(),
+                ),
+            );
+        }
+        assert_eq!(memory.days_seen.value, 7);
+        assert_eq!(
+            GrowthStage::from_counts(memory.days_seen.value, memory.lifetime_recoveries.value),
+            GrowthStage::Adult
+        );
+    }
+
+    #[test]
+    fn compressed_growth_ledger_shapes_keep_a_proven_closed_prefix() {
+        let mut ledger = GrowthDayLedger::default();
+        assert_eq!(ledger.observe(500), GrowthDayObservation::New);
+        ledger.close_through(500);
+        assert_eq!(ledger.compacted_through, Some(500));
+        assert!(ledger.recent.is_empty());
+        assert!(ledger.validate(1));
+        assert_eq!(ledger.observe(500), GrowthDayObservation::Closed);
+
+        assert_eq!(ledger.observe(502), GrowthDayObservation::New);
+        assert_eq!(ledger.recent, [502]);
+        assert!(ledger.validate(2));
+
+        let no_cursor = GrowthDayLedger {
+            compacted_through: None,
+            recent: vec![502],
+        };
+        assert!(!no_cursor.validate(2));
+        let no_history = GrowthDayLedger {
+            compacted_through: Some(500),
+            recent: Vec::new(),
+        };
+        assert!(!no_history.validate(0));
+        let overlapping = GrowthDayLedger {
+            compacted_through: Some(500),
+            recent: vec![500],
+        };
+        assert!(!overlapping.validate(2));
+    }
+
+    #[test]
+    fn lifetime_recoveries_follow_ordered_flip_deltas_not_arrival_order() {
+        let repo = "/work/growth-order";
+        let day = 500;
+        let events = [
+            MemoryEvent::fixed(
+                10,
+                day,
+                Some(repo),
+                CommandKind::BuildOrTest,
+                Some(1),
+                LifeState::default(),
+            ),
+            MemoryEvent::fixed(
+                20,
+                day,
+                Some(repo),
+                CommandKind::BuildOrTest,
+                Some(1),
+                LifeState::default(),
+            ),
+            MemoryEvent::fixed(
+                30,
+                day,
+                Some(repo),
+                CommandKind::BuildOrTest,
+                Some(0),
+                LifeState::default(),
+            ),
+            MemoryEvent::fixed(
+                40,
+                day,
+                Some(repo),
+                CommandKind::BuildOrTest,
+                Some(1),
+                LifeState::default(),
+            ),
+            MemoryEvent::fixed(
+                50,
+                day,
+                Some(repo),
+                CommandKind::BuildOrTest,
+                Some(0),
+                LifeState::default(),
+            ),
+        ];
+        let mut forward = DiskMemory::default();
+        for event in &events {
+            apply_event(&mut forward, event);
+        }
+        let mut reverse = DiskMemory::default();
+        for event in events.iter().rev() {
+            apply_event(&mut reverse, event);
+        }
+
+        assert_eq!(forward.lifetime_recoveries.value, 2);
+        assert_eq!(reverse.lifetime_recoveries.value, 2);
+        assert_eq!(
+            forward
+                .stats(day, repo)
+                .unwrap()
+                .failure_success_flips
+                .value,
+            2
+        );
+        assert_eq!(
+            reverse
+                .stats(day, repo)
+                .unwrap()
+                .failure_success_flips
+                .value,
+            2
+        );
+
+        // A second repository contributes another episode, never another day.
+        for (at_ms, code) in [(60, 1), (70, 0)] {
+            apply_event(
+                &mut reverse,
+                &MemoryEvent::fixed(
+                    at_ms,
+                    day,
+                    Some("/work/growth-other"),
+                    CommandKind::BuildOrTest,
+                    Some(code),
+                    LifeState::default(),
+                ),
+            );
+        }
+        assert_eq!(reverse.days_seen.value, 1);
+        assert_eq!(reverse.lifetime_recoveries.value, 3);
+        let before = reverse.lifetime_recoveries.value;
+        apply_event(&mut reverse, &events[4]);
+        assert_eq!(reverse.lifetime_recoveries.value, before);
+        forward.validate().unwrap();
+        reverse.validate().unwrap();
+    }
+
+    #[test]
+    fn evicted_build_order_closes_late_recoveries_but_new_days_still_grow() {
+        let day = 500;
+        let repo = "/work/evicted-recovery-order";
+        let mut memory = DiskMemory::default();
+        for (at_ms, code) in [(200, 1), (300, 0)] {
+            apply_event(
+                &mut memory,
+                &MemoryEvent::fixed(
+                    at_ms,
+                    day,
+                    Some(repo),
+                    CommandKind::BuildOrTest,
+                    Some(code),
+                    LifeState::default(),
+                ),
+            );
+        }
+        assert_eq!(memory.days_seen.value, 1);
+        assert_eq!(memory.lifetime_recoveries.value, 1);
+
+        // More repo/day records can evict this build history while its day is
+        // still far below the distinct-day ledger's own 64-day capacity.
+        // Pure-push records carry no recovery ordering and must not close the
+        // prefix when one of them is later displaced.
+        for index in 0..MAX_DAILY_RECORDS {
+            apply_event(
+                &mut memory,
+                &MemoryEvent::fixed(
+                    1_000 + index as u64,
+                    day + 1,
+                    Some(&format!("/work/push-filler-{index:02}")),
+                    CommandKind::GitPush,
+                    Some(0),
+                    LifeState::default(),
+                ),
+            );
+        }
+        assert!(memory.stats(day, repo).is_none());
+        assert_eq!(memory.days_seen.value, 2);
+        assert_eq!(memory.growth_days.value.compacted_through, Some(day));
+        assert_eq!(memory.growth_days.value.recent, [day + 1]);
+
+        // In the complete order F100,F200,S250,S300 is one episode. Replaying
+        // only the late pair after record eviction must not count it again.
+        for (at_ms, code) in [(100, 1), (250, 0)] {
+            apply_event(
+                &mut memory,
+                &MemoryEvent::fixed(
+                    at_ms,
+                    day,
+                    Some(repo),
+                    CommandKind::BuildOrTest,
+                    Some(code),
+                    LifeState::default(),
+                ),
+            );
+        }
+        assert_eq!(
+            memory.stats(day, repo).unwrap().failure_success_flips.value,
+            1
+        );
+        assert_eq!(memory.lifetime_recoveries.value, 1);
+        assert_eq!(memory.growth_days.value.compacted_through, Some(day));
+        assert_eq!(memory.growth_days.value.recent, [day + 1]);
+
+        for (at_ms, code) in [(2_000, 1), (2_100, 0)] {
+            apply_event(
+                &mut memory,
+                &MemoryEvent::fixed(
+                    at_ms,
+                    day + 2,
+                    Some("/work/new-recovery-day"),
+                    CommandKind::BuildOrTest,
+                    Some(code),
+                    LifeState::default(),
+                ),
+            );
+        }
+        assert_eq!(memory.days_seen.value, 3);
+        assert_eq!(memory.lifetime_recoveries.value, 2);
+        assert_eq!(memory.growth_days.value.recent, [day + 1, day + 2]);
+        memory.validate().unwrap();
+    }
+
+    #[test]
+    fn lifetime_recoveries_require_at_least_one_work_day() {
+        let memory = DiskMemory {
+            lifetime_recoveries: MigratingCounter::new(1),
+            ..DiskMemory::default()
+        };
+
+        assert!(memory
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("recoveries without a work day"));
+    }
+
+    #[test]
+    fn compressed_growth_requires_a_writer_reachable_daily_window() {
+        let memory = DiskMemory {
+            days_seen: MigratingCounter::new(1),
+            growth_days: MigratingGrowthDayLedger::new(GrowthDayLedger {
+                compacted_through: Some(i64::MAX),
+                recent: Vec::new(),
+            }),
+            ..DiskMemory::default()
+        };
+
+        assert!(memory
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("compressed growth ledger without a full daily window"));
+
+        let mut forged = memory;
+        for index in 0..MAX_DAILY_RECORDS {
+            forged
+                .days
+                .push(DailyStats::new(0, format!("/tmp/empty-{index}")));
+        }
+        assert!(forged
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("growth cursor beyond retained daily history"));
+    }
+
+    #[test]
+    fn recent_growth_days_require_retained_semantic_evidence_below_capacity() {
+        let empty = DiskMemory {
+            days_seen: MigratingCounter::new(1),
+            growth_days: MigratingGrowthDayLedger::new(GrowthDayLedger {
+                compacted_through: None,
+                recent: vec![5],
+            }),
+            ..DiskMemory::default()
+        };
+        assert!(empty
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("recent growth day without semantic evidence"));
+
+        let mut missing_one = DiskMemory::default();
+        for day in [5, 6] {
+            apply_event(
+                &mut missing_one,
+                &MemoryEvent::fixed(
+                    day as u64,
+                    day,
+                    Some("/work/growth-provenance"),
+                    CommandKind::GitPush,
+                    Some(0),
+                    LifeState::default(),
+                ),
+            );
+        }
+        missing_one.days.retain(|stats| stats.day != 6);
+        assert_eq!(missing_one.days.len(), 1);
+        assert_eq!(missing_one.growth_days.value.recent, [5, 6]);
+        assert!(missing_one
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("recent growth day without semantic evidence"));
+    }
+
+    #[test]
+    fn closed_growth_days_stay_persistable_at_capacity_and_after_migration() {
+        let root = TestDir::new("closed-growth-day");
+        let path = root.memory_path();
+        let mut memory = DiskMemory::default();
+        for offset in 0..MAX_RECENT_GROWTH_DAYS as i64 {
+            apply_event(
+                &mut memory,
+                &MemoryEvent::fixed(
+                    1_000 + offset as u64,
+                    100 + offset,
+                    Some("/work/full-growth-window"),
+                    CommandKind::GitPush,
+                    Some(0),
+                    LifeState::default(),
+                ),
+            );
+        }
+        assert_eq!(memory.days_seen.value, MAX_RECENT_GROWTH_DAYS as u32);
+        assert_eq!(memory.growth_days.value.compacted_through, None);
+        let mut bytes = serde_json::to_vec_pretty(&memory).unwrap();
+        bytes.push(b'\n');
+        crate::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
+        crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+
+        let late = MemoryEvent::fixed(
+            10_000,
+            99,
+            Some("/work/late-at-capacity"),
+            CommandKind::BuildOrTest,
+            Some(1),
+            LifeState::default(),
+        );
+        transact(&path, &late).unwrap();
+        let persisted = read_memory(&path).unwrap();
+        assert_eq!(persisted.days_seen.value, MAX_RECENT_GROWTH_DAYS as u32);
+        assert!(persisted.stats(99, "/work/late-at-capacity").is_some());
+        persisted.validate().unwrap();
+
+        let migrated_root = TestDir::new("closed-growth-migration");
+        let migrated_path = migrated_root.memory_path();
+        let mut retained = DiskMemory::default();
+        apply_event(
+            &mut retained,
+            &MemoryEvent::fixed(
+                20_000,
+                500,
+                Some("/work/migrated-growth"),
+                CommandKind::GitPush,
+                Some(0),
+                LifeState::default(),
+            ),
+        );
+        let mut legacy = serde_json::to_value(&retained).unwrap();
+        strip_current_organism_families(&mut legacy);
+        let mut bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+        bytes.push(b'\n');
+        crate::snapshot_file::ensure_private_directory(migrated_path.parent().unwrap()).unwrap();
+        crate::snapshot_file::write_atomic_private(&migrated_path, &bytes).unwrap();
+
+        let late = MemoryEvent::fixed(
+            20_001,
+            499,
+            Some("/work/migrated-late"),
+            CommandKind::BuildOrTest,
+            Some(1),
+            LifeState::default(),
+        );
+        transact(&migrated_path, &late).unwrap();
+        let persisted = read_memory(&migrated_path).unwrap();
+        assert_eq!(persisted.days_seen.value, 1);
+        assert_eq!(persisted.growth_days.value.compacted_through, Some(499));
+        assert!(persisted.stats(499, "/work/migrated-late").is_some());
+        persisted.validate().unwrap();
+    }
+
+    #[test]
+    fn growth_survives_observation_and_daily_compaction_and_closes_late_days() {
+        let repo = "/work/growth-compaction";
+        let day = 700;
+        let mut memory = DiskMemory::default();
+        for cycle in 0..80_u64 {
+            for (offset, code) in [(0, 1), (1, 0)] {
+                apply_event(
+                    &mut memory,
+                    &MemoryEvent::fixed(
+                        1_000 + cycle * 2 + offset,
+                        day,
+                        Some(repo),
+                        CommandKind::BuildOrTest,
+                        Some(code),
+                        LifeState::default(),
+                    ),
+                );
+            }
+        }
+        assert_eq!(memory.days_seen.value, 1);
+        assert_eq!(memory.lifetime_recoveries.value, 80);
+        let stats = memory.stats(day, repo).unwrap();
+        assert_eq!(stats.failure_success_flips.value, 80);
+        assert!(stats.baseline.is_some());
+        assert!(stats.observations.len() <= MAX_OBSERVATIONS_PER_RECORD);
+        for (at_ms, code) in [(1, 1), (2, 0)] {
+            apply_event(
+                &mut memory,
+                &MemoryEvent::fixed(
+                    at_ms,
+                    day,
+                    Some(repo),
+                    CommandKind::BuildOrTest,
+                    Some(code),
+                    LifeState::default(),
+                ),
+            );
+        }
+        assert_eq!(memory.lifetime_recoveries.value, 80);
+        assert_eq!(
+            memory.stats(day, repo).unwrap().failure_success_flips.value,
+            80
+        );
+
+        let mut bounded = DiskMemory::default();
+        for offset in 0..=MAX_RECENT_GROWTH_DAYS as i64 {
+            apply_event(
+                &mut bounded,
+                &MemoryEvent::fixed(
+                    10_000 + offset as u64,
+                    1_000 + offset,
+                    Some("/work/growth-days"),
+                    CommandKind::BuildOrTest,
+                    None,
+                    LifeState::default(),
+                ),
+            );
+        }
+        assert_eq!(bounded.days_seen.value, 65);
+        assert_eq!(bounded.days.len(), MAX_DAILY_RECORDS);
+        assert_eq!(
+            bounded.growth_days.value.recent.len(),
+            MAX_RECENT_GROWTH_DAYS
+        );
+        assert_eq!(bounded.growth_days.value.compacted_through, Some(1_000));
+
+        // A genuinely new pair on a closed old day may still update its
+        // repo/day summary, but can never manufacture more lifetime growth.
+        for (at_ms, code) in [(90_000, 1), (90_001, 0)] {
+            apply_event(
+                &mut bounded,
+                &MemoryEvent::fixed(
+                    at_ms,
+                    1_000,
+                    Some("/work/late-growth"),
+                    CommandKind::BuildOrTest,
+                    Some(code),
+                    LifeState::default(),
+                ),
+            );
+        }
+        assert_eq!(bounded.days_seen.value, 65);
+        assert_eq!(bounded.lifetime_recoveries.value, 0);
+
+        for (at_ms, code) in [(91_000, 1), (91_001, 0)] {
+            apply_event(
+                &mut bounded,
+                &MemoryEvent::fixed(
+                    at_ms,
+                    1_064,
+                    Some("/work/open-growth"),
+                    CommandKind::BuildOrTest,
+                    Some(code),
+                    LifeState::default(),
+                ),
+            );
+        }
+        assert_eq!(bounded.lifetime_recoveries.value, 1);
+
+        bounded.days_seen = MigratingCounter::new(u32::MAX);
+        bounded.lifetime_recoveries = MigratingCounter::new(u32::MAX);
+        apply_event(
+            &mut bounded,
+            &MemoryEvent::fixed(
+                92_000,
+                1_065,
+                Some("/work/saturated-growth"),
+                CommandKind::BuildOrTest,
+                None,
+                LifeState::default(),
+            ),
+        );
+        for (at_ms, code) in [(92_001, 1), (92_002, 0)] {
+            apply_event(
+                &mut bounded,
+                &MemoryEvent::fixed(
+                    at_ms,
+                    1_065,
+                    Some("/work/saturated-growth"),
+                    CommandKind::BuildOrTest,
+                    Some(code),
+                    LifeState::default(),
+                ),
+            );
+        }
+        assert_eq!(bounded.days_seen.value, u32::MAX);
+        assert_eq!(bounded.lifetime_recoveries.value, u32::MAX);
+        memory.validate().unwrap();
+        bounded.validate().unwrap();
+    }
+
+    #[test]
+    fn activity_buckets_count_every_repo_semantic_finish_exactly_once() {
+        let repo = "/work/circadian";
+        let day = 60_100;
+        let mut memory = DiskMemory::default();
+
+        let unknown_build = MemoryEvent::fixed(
+            1_000,
+            day,
+            Some(repo),
+            CommandKind::BuildOrTest,
+            None,
+            LifeState::default(),
+        )
+        .with_activity_bucket(2);
+        apply_event(&mut memory, &unknown_build);
+        apply_event(&mut memory, &unknown_build);
+
+        let failed_push = MemoryEvent::fixed(
+            2_000,
+            day,
+            Some(repo),
+            CommandKind::GitPush,
+            Some(1),
+            LifeState::default(),
+        )
+        .with_activity_bucket(5);
+        apply_event(&mut memory, &failed_push);
+        apply_event(&mut memory, &failed_push);
+
+        // Even an explicitly supplied repo cannot make an arbitrary command
+        // teach the circadian profile.
+        apply_event(
+            &mut memory,
+            &MemoryEvent::fixed(
+                3_000,
+                day,
+                Some(repo),
+                CommandKind::Other,
+                Some(0),
+                LifeState::default(),
+            )
+            .with_activity_bucket(7),
+        );
+
+        let stats = memory.stats(day, repo).unwrap();
+        assert_eq!(stats.activity_buckets, [0, 0, 1, 0, 0, 1, 0, 0]);
+        assert!(memory.has_event_id(&unknown_build.id));
+        assert!(memory.has_event_id(&failed_push.id));
+        assert!(stats.observations.is_empty());
+
+        // Saturation does not make a new event retryable: its id is retained
+        // even though the monotone scalar can no longer move.
+        memory.stats_mut(day, repo).activity_buckets[2] = u16::MAX;
+        let saturated = MemoryEvent::fixed(
+            4_000,
+            day,
+            Some(repo),
+            CommandKind::BuildOrTest,
+            Some(1),
+            LifeState::default(),
+        )
+        .with_activity_bucket(2);
+        apply_event(&mut memory, &saturated);
+        apply_event(&mut memory, &saturated);
+        assert_eq!(
+            memory.stats(day, repo).unwrap().activity_buckets[2],
+            u16::MAX
+        );
+        assert!(memory.has_event_id(&saturated.id));
+        memory.validate().unwrap();
+    }
+
+    #[test]
+    fn activity_buckets_are_commutative_and_survive_observation_compaction() {
+        let repo = "/work/circadian-order";
+        let day = 60_101;
+        let events: Vec<_> = (0..(MAX_OBSERVATIONS_PER_RECORD + 17))
+            .map(|index| {
+                MemoryEvent::fixed(
+                    10_000 + index as u64,
+                    day,
+                    Some(repo),
+                    CommandKind::BuildOrTest,
+                    Some(i32::from(index.is_multiple_of(3))),
+                    LifeState::default(),
+                )
+                .with_activity_bucket((index % CIRCADIAN_BUCKET_COUNT) as u8)
+            })
+            .collect();
+        let mut forward = DiskMemory::default();
+        for event in &events {
+            apply_event(&mut forward, event);
+        }
+        let mut reverse = DiskMemory::default();
+        for event in events.iter().rev() {
+            apply_event(&mut reverse, event);
+        }
+
+        let forward_stats = forward.stats(day, repo).unwrap();
+        let reverse_stats = reverse.stats(day, repo).unwrap();
+        assert_eq!(
+            forward_stats.activity_buckets,
+            reverse_stats.activity_buckets
+        );
+        assert_eq!(
+            forward_stats
+                .activity_buckets
+                .iter()
+                .map(|count| usize::from(*count))
+                .sum::<usize>(),
+            events.len()
+        );
+        assert!(forward_stats.baseline.is_some());
+        assert!(forward_stats.observations.len() <= MAX_OBSERVATIONS_PER_RECORD);
+
+        let before = forward_stats.activity_buckets;
+        compact_oldest_observations(forward.stats_mut(day, repo));
+        assert_eq!(forward.stats(day, repo).unwrap().activity_buckets, before);
+        forward.validate().unwrap();
+        reverse.validate().unwrap();
+    }
+
+    #[test]
+    fn circadian_profile_needs_three_completed_days_and_a_concentrated_window() {
+        let today = 10_000;
+        let mut memory = DiskMemory::default();
+        let set = |memory: &mut DiskMemory, day, repo: &str, buckets| {
+            memory.stats_mut(day, repo).activity_buckets = buckets;
+        };
+
+        let mut early = [0_u16; CIRCADIAN_BUCKET_COUNT];
+        early[3] = 2;
+        let mut middle = [0_u16; CIRCADIAN_BUCKET_COUNT];
+        middle[4] = 2;
+        let mut late = [0_u16; CIRCADIAN_BUCKET_COUNT];
+        late[5] = 2;
+        set(&mut memory, today - 3, "/work/a", early);
+        set(&mut memory, today - 2, "/work/b", middle);
+        // A second repo on an existing day adds weight, not another active day.
+        set(
+            &mut memory,
+            today - 2,
+            "/work/c",
+            [0; CIRCADIAN_BUCKET_COUNT],
+        );
+        assert_eq!(infer_circadian_profile(&memory, today), None);
+
+        set(&mut memory, today - 1, "/work/d", late);
+        let profile = infer_circadian_profile(&memory, today).unwrap();
+        assert_eq!(profile.mask(), 0b0011_1000);
+        for bucket in [3, 4, 5] {
+            assert!(profile.contains(bucket));
+        }
+        assert!(!profile.contains(2));
+        assert!(!profile.contains(6));
+
+        // Current, future, and stale records are excluded and cannot pull the
+        // already learned completed-day profile toward another time of day.
+        let mut noise = [0_u16; CIRCADIAN_BUCKET_COUNT];
+        noise[0] = 1_000;
+        set(&mut memory, today, "/work/today", noise);
+        set(&mut memory, today + 1, "/work/future", noise);
+        set(
+            &mut memory,
+            today - CIRCADIAN_LOOKBACK_DAYS - 1,
+            "/work/stale",
+            noise,
+        );
+        assert_eq!(infer_circadian_profile(&memory, today), Some(profile));
+
+        let mut uniform = DiskMemory::default();
+        for offset in 1..=3 {
+            set(
+                &mut uniform,
+                today - offset,
+                &format!("/work/uniform-{offset}"),
+                [1; CIRCADIAN_BUCKET_COUNT],
+            );
+        }
+        assert_eq!(infer_circadian_profile(&uniform, today), None);
+
+        // Two equally strong but disjoint clusters do not establish one
+        // habitual window: concentration must be a strict majority.
+        let mut bimodal = DiskMemory::default();
+        for offset in 1..=3 {
+            let mut buckets = [0_u16; CIRCADIAN_BUCKET_COUNT];
+            buckets[0] = 2;
+            buckets[4] = 2;
+            set(
+                &mut bimodal,
+                today - offset,
+                &format!("/work/bimodal-{offset}"),
+                buckets,
+            );
+        }
+        assert_eq!(infer_circadian_profile(&bimodal, today), None);
+    }
+
+    #[test]
+    fn circadian_profile_wraps_a_night_shift_across_midnight() {
+        let today = 11_000;
+        let mut memory = DiskMemory::default();
+        for (offset, bucket) in [(1, 7), (2, 0), (3, 1)] {
+            let mut buckets = [0_u16; CIRCADIAN_BUCKET_COUNT];
+            buckets[bucket] = 2;
+            memory
+                .stats_mut(today - offset, &format!("/work/night-{offset}"))
+                .activity_buckets = buckets;
+        }
+        let profile = infer_circadian_profile(&memory, today).unwrap();
+        assert_eq!(profile.mask(), 0b1000_0011);
+        assert!(profile.contains(7));
+        assert!(profile.contains(0));
+        assert!(profile.contains(1));
+        assert!(!profile.contains(CIRCADIAN_BUCKET_COUNT as u8));
+        assert_eq!(
+            profile.session_day(LocalCircadianTime {
+                day: today - 1,
+                bucket: 7,
+            }),
+            today - 1
+        );
+        assert_eq!(
+            profile.session_day(LocalCircadianTime {
+                day: today,
+                bucket: 0,
+            }),
+            today - 1
+        );
+        assert_eq!(
+            profile.session_day(LocalCircadianTime {
+                day: today,
+                bucket: 1,
+            }),
+            today - 1
+        );
+    }
+
+    #[test]
+    fn old_v1_growth_fields_migrate_to_a_conservative_lower_bound() {
+        let root = TestDir::new("growth-migration");
+        let path = root.memory_path();
+        let repo = root.0.join("repo");
+        let repo = repo.to_str().unwrap();
+        let mut memory = DiskMemory::default();
+        for (at_ms, code) in [(1_000, 1), (2_000, 0)] {
+            apply_event(
+                &mut memory,
+                &MemoryEvent::fixed(
+                    at_ms,
+                    12_000,
+                    Some(repo),
+                    CommandKind::BuildOrTest,
+                    Some(code),
+                    LifeState::default(),
+                ),
+            );
+        }
+        apply_event(
+            &mut memory,
+            &MemoryEvent::fixed(
+                3_000,
+                12_002,
+                Some("/work/other"),
+                CommandKind::GitPush,
+                Some(1),
+                LifeState::default(),
+            ),
+        );
+        // A structurally valid but evidence-free legacy record is not a day
+        // the organism can honestly claim to have seen.
+        memory.stats_mut(11_999, "/work/empty");
+
+        let current = serde_json::to_value(&memory).unwrap();
+        let mut legacy = current.clone();
+        strip_current_organism_families(&mut legacy);
+        let mut bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+        bytes.push(b'\n');
+        crate::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
+        crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+
+        let migrated = read_memory(&path).unwrap();
+        // The failed push day was visible only through the new activity
+        // buckets. A released-HEAD file had neither field, so migration keeps
+        // the provable build/recovery day and does not invent the second.
+        assert_eq!(migrated.days_seen.value, 1);
+        assert_eq!(migrated.lifetime_recoveries.value, 1);
+        assert_eq!(migrated.growth_days.value.recent, [12_000]);
+        assert_eq!(migrated.growth_days.value.compacted_through, Some(11_999));
+        migrated.validate().unwrap();
+
+        // These three fields are one atomic schema addition. A released
+        // writer emits all three, so any partial absence is corruption rather
+        // than a legacy file.
+        for missing in ["days_seen", "lifetime_recoveries", "growth_days"] {
+            let mut partial = current.clone();
+            partial.as_object_mut().unwrap().remove(missing);
+            let partial_path = root.0.join(format!("partial-{missing}.json"));
+            let mut bytes = serde_json::to_vec_pretty(&partial).unwrap();
+            bytes.push(b'\n');
+            crate::snapshot_file::write_atomic_private(&partial_path, &bytes).unwrap();
+            assert!(read_memory(&partial_path)
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete growth ledger"));
+        }
+
+        let mut invalid = memory.clone();
+        invalid.days_seen = MigratingCounter::new(u32::MAX);
+        invalid.growth_days = MigratingGrowthDayLedger::new(GrowthDayLedger::default());
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = memory.clone();
+        invalid.growth_days.value.compacted_through = Some(i64::MAX);
+        invalid.growth_days.value.recent.clear();
+        invalid.days_seen = MigratingCounter::new(0);
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = migrated.clone();
+        invalid.growth_days.value.recent.remove(0);
+        invalid.growth_days.value.compacted_through = None;
+        invalid.days_seen = MigratingCounter::new(1);
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = migrated.clone();
+        invalid.growth_days.value.compacted_through = Some(11_998);
+        assert!(invalid.validate().is_err());
+
+        for missing_nested in ["compacted_through", "recent"] {
+            let mut malformed = current.clone();
+            malformed["growth_days"]
+                .as_object_mut()
+                .unwrap()
+                .remove(missing_nested);
+            assert!(
+                serde_json::from_value::<DiskMemory>(malformed).is_err(),
+                "missing nested growth field was accepted: {missing_nested}"
+            );
+        }
+    }
+
+    #[test]
+    fn old_activity_schema_defaults_to_unlearned_and_malformed_arrays_fail_strictly() {
+        let root = TestDir::new("circadian-migration");
+        let path = root.memory_path();
+        let repo = root.0.join("repo");
+        let repo = repo.to_str().unwrap();
+        let mut memory = DiskMemory::default();
+        apply_event(
+            &mut memory,
+            &MemoryEvent::fixed(
+                1_000,
+                12_000,
+                Some(repo),
+                CommandKind::BuildOrTest,
+                Some(0),
+                LifeState::default(),
+            )
+            .with_activity_bucket(4),
+        );
+        apply_event(
+            &mut memory,
+            &MemoryEvent::fixed(
+                2_000,
+                12_001,
+                Some(repo),
+                CommandKind::GitPush,
+                Some(0),
+                LifeState::default(),
+            )
+            .with_activity_bucket(5),
+        );
+
+        let mut legacy = serde_json::to_value(&memory).unwrap();
+        strip_current_organism_families(&mut legacy);
+        let mut bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+        bytes.push(b'\n');
+        crate::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
+        crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+        let migrated = read_memory(&path).unwrap();
+        assert_eq!(
+            migrated.stats(12_000, repo).unwrap().activity_buckets,
+            [0; CIRCADIAN_BUCKET_COUNT]
+        );
+        assert_eq!(infer_circadian_profile(&migrated, 12_001), None);
+
+        let mut mixed = serde_json::to_value(&memory).unwrap();
+        mixed["days"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("activity_buckets");
+        let mixed_path = root.0.join("mixed.json");
+        let mut bytes = serde_json::to_vec_pretty(&mixed).unwrap();
+        bytes.push(b'\n');
+        crate::snapshot_file::write_atomic_private(&mixed_path, &bytes).unwrap();
+        assert!(read_memory(&mixed_path)
+            .unwrap_err()
+            .to_string()
+            .contains("mixes activity-bucket"));
+
+        for invalid in [
+            serde_json::json!([0, 0, 0, 0, 0, 0, 0]),
+            serde_json::json!([0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            serde_json::json!([0, 0, 0, 0, 0, 0, 0, 65_536]),
+        ] {
+            let mut value = serde_json::to_value(&memory).unwrap();
+            value["days"][0]["activity_buckets"] = invalid;
+            assert!(serde_json::from_value::<DiskMemory>(value).is_err());
+        }
     }
 
     #[test]
@@ -1983,6 +4605,46 @@ mod tests {
     }
 
     #[test]
+    fn compaction_boundary_id_remains_exact_after_recent_token_eviction() {
+        let repo = "/work/cursor-idempotent";
+        let mut memory = DiskMemory::default();
+        let events: Vec<_> = (0..=MAX_OBSERVATIONS_PER_RECORD)
+            .map(|index| {
+                MemoryEvent::fixed(
+                    3_000 + index as u64,
+                    103,
+                    Some(repo),
+                    CommandKind::BuildOrTest,
+                    Some(1),
+                    LifeState::default(),
+                )
+            })
+            .collect();
+        for event in &events {
+            apply_event(&mut memory, event);
+        }
+        let cursor_id = memory
+            .stats(103, repo)
+            .unwrap()
+            .baseline
+            .as_ref()
+            .unwrap()
+            .compacted_through
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        let cursor_event = events.iter().find(|event| event.id == cursor_id).unwrap();
+        memory.recent_event_ids.retain(|id| id != &cursor_id);
+        assert!(memory.has_event_id(&cursor_id));
+
+        let before = memory.stats(103, repo).unwrap().build_failures;
+        apply_event(&mut memory, cursor_event);
+        assert_eq!(memory.stats(103, repo).unwrap().build_failures, before);
+        memory.validate().unwrap();
+    }
+
+    #[test]
     fn a_retried_compacted_transaction_is_idempotent_on_disk() {
         let root = TestDir::new("ambiguous-retry");
         let path = root.memory_path();
@@ -2055,6 +4717,66 @@ mod tests {
             before
         );
 
+        // Disk order is not semantic. A valid file may place its true oldest
+        // observation later in the array; global compaction must still choose
+        // that record, not whichever record happens to expose the smallest
+        // first element.
+        let mut reordered = memory.clone();
+        {
+            let stats = reordered.stats_mut(200, &repos[0]);
+            for (index, observation) in stats.observations.iter_mut().enumerate() {
+                observation.at_ms = if index == 0 { 1 } else { 1_000 + index as u64 };
+            }
+            replay_observations(stats, None);
+            stats.observations.rotate_left(1);
+        }
+        {
+            let stats = reordered.stats_mut(201, &repos[1]);
+            for (index, observation) in stats.observations.iter_mut().enumerate() {
+                observation.at_ms = 100 + index as u64;
+            }
+            replay_observations(stats, None);
+        }
+        reordered.validate().unwrap();
+        let root = TestDir::new("unordered-global-compaction");
+        let path = root.memory_path();
+        let mut bytes = serde_json::to_vec_pretty(&reordered).unwrap();
+        bytes.push(b'\n');
+        crate::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
+        crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+        let mut reordered = read_memory(&path).unwrap();
+        assert_eq!(
+            reordered.stats(200, &repos[0]).unwrap().observations[0].at_ms,
+            1_001
+        );
+        apply_event(
+            &mut reordered,
+            &MemoryEvent::fixed(
+                99_001,
+                204,
+                Some(&repos[4]),
+                CommandKind::BuildOrTest,
+                Some(1),
+                LifeState::default(),
+            ),
+        );
+        assert!(reordered
+            .stats(200, &repos[0])
+            .unwrap()
+            .baseline
+            .as_ref()
+            .unwrap()
+            .compacted_through
+            .is_some());
+        assert!(reordered
+            .stats(201, &repos[1])
+            .unwrap()
+            .baseline
+            .as_ref()
+            .unwrap()
+            .compacted_through
+            .is_none());
+
         apply_event(
             &mut memory,
             &MemoryEvent::fixed(
@@ -2093,6 +4815,14 @@ mod tests {
             .collect();
         let mut memory = DiskMemory {
             recent_event_ids: ids.clone(),
+            days_seen: MigratingCounter::new(u32::MAX),
+            lifetime_recoveries: MigratingCounter::new(u32::MAX),
+            growth_days: MigratingGrowthDayLedger::new(GrowthDayLedger {
+                compacted_through: Some(i64::MIN),
+                recent: (0..MAX_RECENT_GROWTH_DAYS)
+                    .map(|record| i64::MIN + 1 + record as i64)
+                    .collect(),
+            }),
             ..DiskMemory::default()
         };
         for record in 0..MAX_DAILY_RECORDS {
@@ -2105,25 +4835,40 @@ mod tests {
             let observations: Vec<_> = (0..4)
                 .map(|offset| Observation {
                     id: ids[record * 4 + offset].clone(),
-                    at_ms: 1_000 + offset as u64,
+                    at_ms: u64::MAX,
                     kind: ObservationKind::BuildFailure,
                 })
                 .collect();
             memory.days.push(DailyStats {
-                day: record as i64,
+                day: i64::MIN + 1 + record as i64,
                 repo,
-                build_failures: 4,
-                build_successes: 0,
-                git_pushes: 0,
-                open_failures: 4,
-                open_failure_at_ms: Some(1_000),
-                last_recovery_duration_ms: None,
+                build_failures: u32::MAX,
+                build_successes: u32::MAX,
+                git_pushes: u32::MAX,
+                open_failures: u32::MAX,
+                open_failure_at_ms: Some(u64::MAX),
+                last_recovery_duration_ms: Some(u64::MAX),
                 recovered_pending_push: false,
-                baseline: Some(StatsBaseline::default()),
+                failure_success_flips: MigratingCounter::new(u32::MAX),
+                baseline: Some(StatsBaseline {
+                    build_failures: u32::MAX,
+                    build_successes: u32::MAX,
+                    git_pushes: u32::MAX,
+                    open_failures: u32::MAX,
+                    open_failure_at_ms: Some(u64::MAX),
+                    last_recovery_duration_ms: Some(u64::MAX),
+                    failure_success_flips: MigratingCounter::new(u32::MAX),
+                    compacted_through: Some(ObservationCursor {
+                        at_ms: u64::MAX,
+                        id: format!("c{record:095}"),
+                    }),
+                    ..StatsBaseline::default()
+                }),
                 observations,
                 // Widest valid encodings the duration aggregate can reach.
                 build_duration_sum_ms: u64::from(u32::MAX) * MAX_TRACKED_BUILD_MS,
                 build_duration_count: u32::MAX,
+                activity_buckets: [u16::MAX; CIRCADIAN_BUCKET_COUNT],
             });
         }
         memory.validate().unwrap();
@@ -2317,6 +5062,17 @@ mod tests {
         let stats = memory.stats(70_000, repo.to_str().unwrap()).unwrap();
         assert_eq!(stats.build_failures, 40);
         assert_eq!(stats.open_failures, 40);
+        assert_eq!(memory.days_seen.value, 1);
+        assert_eq!(memory.lifetime_recoveries.value, 0);
+        assert_eq!(memory.growth_days.value.recent, [70_000]);
+        assert_eq!(
+            stats
+                .activity_buckets
+                .iter()
+                .map(|count| u32::from(*count))
+                .sum::<u32>(),
+            40
+        );
         assert_eq!(memory.days.len(), 1);
     }
 }

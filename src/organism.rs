@@ -31,6 +31,9 @@ pub(crate) enum Behavior {
     CelebrateBig,
     RestAfterPush,
     UnknownOutcome,
+    /// A live-only orienting cue: another local pane reported a failure. It
+    /// never comes from the reducer and carries no command or output content.
+    GlanceAside,
     // Ambient dispositions chosen by the utility mind, never by event
     // reactions: they only ever reach the display through AmbientBehavior.
     Sleep,
@@ -57,19 +60,36 @@ const GAIT_TENSE_FRAMES: [&str; 2] = [" =\\_/=\n( o.o )\n >/ \\<", " =\\_/=\n( o
 const WATCH_FRAMES: [&str; 2] = [" /\\_/\\\n( o.o )\n > ^ <", " /\\_/\\\n( o.o )\n >~^ <"];
 const WATCH_TENSE_FRAMES: [&str; 2] = [" =\\_/=\n( o.o )\n > ^ <", " =\\_/=\n( o.o )\n >~^ <"];
 const INSPECT_FRAME: &str = " /\\_/\\  ->\n( o_o )\n /|_|\\";
-const SIT_FRAMES: [&str; 2] = [" /\\_/\\\n( ._. )  !\n /|_|\\", " /\\_/\\\n( ._. )   \n /|_|\\"];
-const CELE_FRAMES: [&str; 2] = [" \\(^.^)/\n  /| |\\\n   / \\", " \\(^o^)/\n  /| |\\\n   / \\"];
-const BIG_FRAMES: [&str; 2] = [
-    " * \\(^o^)/ *\n    /| |\\\n     / \\",
-    "   \\(^o^)/  \n    /| |\\\n     / \\",
+const SIT_FRAMES: [&str; 2] = [
+    " /\\_/\\\n( ._. )  !\n /|_|\\",
+    " /\\_/\\\n( ._. )   \n /|_|\\",
 ];
-const REST_FRAMES: [&str; 2] = [" /\\_/\\\n( ^.^ )  ok\n > ^ <", " /\\_/\\\n( ^.^ )  ok\n >~^ <"];
+// Celebration keeps the same cat silhouette as every other behavior; the
+// old raised-arm human figure made a successful build look like a different
+// character had replaced the organism.
+const CELE_FRAMES: [&str; 2] = [
+    " /\\_/\\\n<( ^.^ )>\n  > ^ <",
+    " /\\_/\\\n<( ^o^ )>\n  > ^ <",
+];
+const BIG_FRAMES: [&str; 2] = [
+    "* /\\_/\\ *\n<( ^o^ )>\n* > ^ < *",
+    "  /\\_/\\  \n<( ^o^ )>\n  > ^ <  ",
+];
+const REST_FRAMES: [&str; 2] = [
+    " /\\_/\\\n( ^.^ )  ok\n > ^ <",
+    " /\\_/\\\n( ^.^ )  ok\n >~^ <",
+];
 const UNKNOWN_FRAME: &str = " /\\_/\\\n( ?.? )\n > ^ <";
-const SLEEP_FRAMES: [&str; 2] = [" /\\_/\\\n( -_- )zZ\n (___) ", " /\\_/\\\n( -_- )Z \n (___) "];
+const GLANCE_ASIDE_FRAMES: [&str; 2] = [" /\\_/\\\n( <.< )\n > ^ <", " /\\_/\\\n( <.< )\n >~^ <"];
+const SLEEP_FRAMES: [&str; 2] = [
+    " /\\_/\\\n( -_- )zZ\n (___) ",
+    " /\\_/\\\n( -_- )Z \n (___) ",
+];
 const EXPLORE_FRAMES: [&str; 2] = [" /\\_/\\\n( o.o)?\n > ^ <", " /\\_/\\\n?(o.o )\n > ^ <"];
 const APPROACH_FRAMES: [&str; 2] = [" /\\_/\\\n( ^.^ )\n > ^ <", " /\\_/\\\n( ^.^ )\n >~^ <"];
 const WATCH_AGENT_FRAMES: [&str; 2] = [" /\\_/\\\n( -.o )\n (___) ", " /\\_/\\\n( o.- )\n (___) "];
-const WATCH_SETTLED_FRAMES: [&str; 2] = [" /\\_/\\\n( -.- )\n (___) ", " /\\_/\\\n( -.o )\n (___) "];
+const WATCH_SETTLED_FRAMES: [&str; 2] =
+    [" /\\_/\\\n( -.- )\n (___) ", " /\\_/\\\n( -.o )\n (___) "];
 
 impl Behavior {
     /// Canonical single pose: the first frame of each behavior's set. Used by
@@ -84,6 +104,7 @@ impl Behavior {
             Self::CelebrateBig => BIG_FRAMES[0],
             Self::RestAfterPush => REST_FRAMES[0],
             Self::UnknownOutcome => UNKNOWN_FRAME,
+            Self::GlanceAside => GLANCE_ASIDE_FRAMES[0],
             Self::Sleep => SLEEP_FRAMES[0],
             Self::Explore => EXPLORE_FRAMES[0],
             Self::Approach => APPROACH_FRAMES[0],
@@ -105,6 +126,7 @@ impl Behavior {
             Self::CelebrateBig => ["*\\o/*", "*\\_/*"],
             Self::RestAfterPush => ["/\\z/\\", "/\\_/\\"],
             Self::UnknownOutcome => ["/\\?/\\", "/\\?/\\"],
+            Self::GlanceAside => ["/\\</\\", "/\\</\\"],
             Self::Sleep => ["=\\z/=", "=\\_/="],
             Self::Explore => ["~\\_/~", "/\\_/\\"],
             Self::Approach => ["/\\^/\\", "/\\_/\\"],
@@ -163,6 +185,7 @@ pub(crate) fn sprite_frame(
         Behavior::Celebrate => CELE_FRAMES[alt],
         Behavior::CelebrateBig => BIG_FRAMES[alt],
         Behavior::RestAfterPush => REST_FRAMES[alt],
+        Behavior::GlanceAside => GLANCE_ASIDE_FRAMES[alt],
         Behavior::Sleep => SLEEP_FRAMES[alt],
         // Step only while actually moving; scanning happens while seated.
         Behavior::Explore if walking => GAIT_FRAMES[alt],
@@ -255,7 +278,11 @@ impl AmbientMind {
     /// Advance the hold timer by `dt` seconds and rescore once it expires.
     /// `idle_for` is how long the terminal has been completely quiet.
     pub(crate) fn step(&mut self, state: LifeState, idle_for: f32, dt: f32) -> AmbientBehavior {
-        let dt = if dt.is_finite() { dt.clamp(0.0, 1.0) } else { 0.0 };
+        let dt = if dt.is_finite() {
+            dt.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         self.hold_for -= dt;
         if self.hold_for > 0.0 {
             return self.current;
@@ -442,6 +469,17 @@ pub(crate) struct LifeState {
     pub(crate) confidence: f32,
 }
 
+/// Coarse, content-free relation between local wall time and the organism's
+/// learned working-hours profile. `Unlearned` preserves the original energy
+/// drift exactly until enough prior days exist to infer a stable rhythm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum CircadianPhase {
+    #[default]
+    Unlearned,
+    InHours,
+    OffHours,
+}
+
 impl Default for LifeState {
     fn default() -> Self {
         Self {
@@ -462,11 +500,22 @@ impl LifeState {
     /// prototype life engine (`prototypes/ascii-organism/src/life.rs`). `dt`
     /// is seconds; slices are clamped to [0, 1] and non-finite time is
     /// ignored. `resting` is the native stand-in for the prototype's sleep: a
-    /// terminal left quiet long enough lets energy recover, while waking work
-    /// slowly drains it. Drives nothing by itself — behavior still reacts
-    /// only to authoritative command lifecycle events.
-    pub(crate) fn tick(&mut self, dt: f32, user_active: bool, resting: bool) {
-        let dt = if dt.is_finite() { dt.clamp(0.0, 1.0) } else { 0.0 };
+    /// terminal left quiet long enough lets energy recover. Before a rhythm is
+    /// learned, waking work keeps the original slow drain; afterwards energy
+    /// eases toward a higher in-hours target and a lower off-hours target.
+    /// Drives nothing by itself — event reactions remain authoritative.
+    pub(crate) fn tick(
+        &mut self,
+        dt: f32,
+        user_active: bool,
+        resting: bool,
+        circadian: CircadianPhase,
+    ) {
+        let dt = if dt.is_finite() {
+            dt.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
 
         // Exhaustion forces micro-rest even in a busy terminal, mirroring the
         // prototype's forced sleep below this energy level: the mind
@@ -477,7 +526,15 @@ impl LifeState {
         if resting {
             self.energy += 0.030 * dt;
         } else {
-            self.energy -= 0.002 * dt;
+            match circadian {
+                CircadianPhase::Unlearned => self.energy -= 0.002 * dt,
+                CircadianPhase::InHours => {
+                    self.energy = move_toward(self.energy, 0.65, 0.002 * dt);
+                }
+                CircadianPhase::OffHours => {
+                    self.energy = move_toward(self.energy, 0.35, 0.002 * dt);
+                }
+            }
         }
 
         if user_active {
@@ -518,6 +575,18 @@ impl LifeState {
             self.attachment,
             self.confidence,
         ]
+    }
+}
+
+fn move_toward(current: f32, target: f32, max_step: f32) -> f32 {
+    if !current.is_finite() || !target.is_finite() || !max_step.is_finite() {
+        return 0.5;
+    }
+    let step = max_step.max(0.0);
+    if current < target {
+        (current + step).min(target)
+    } else {
+        (current - step).max(target)
     }
 }
 
@@ -602,6 +671,13 @@ impl NativeOrganism {
         self.pending_arrival = Some(arrival);
     }
 
+    /// The pane genuinely left the repository before a queued human greeting
+    /// could be consumed (for example, an Agent entered it first). Never let
+    /// that repo-specific attachment leak into an unrelated cwd.
+    pub(crate) fn clear_repo_arrival(&mut self) {
+        self.pending_arrival = None;
+    }
+
     /// Note that the active command directly followed an accepted correction
     /// card. Consumed by the next `command_finished` reduction.
     pub(crate) fn note_assisted_command(&mut self) {
@@ -658,8 +734,7 @@ impl NativeOrganism {
         }
     }
 
-    pub(crate) fn command_started(&mut self, command: &str) -> Reaction {
-        let kind = classify_command(command);
+    pub(crate) fn command_started(&mut self, kind: CommandKind) -> Reaction {
         self.active_kind = Some(kind);
         self.state.energy -= 0.01;
         self.state.curiosity += if kind == CommandKind::BuildOrTest {
@@ -705,7 +780,10 @@ impl NativeOrganism {
             Some(RepoArrival::Unfamiliar) => Reaction {
                 behavior: Behavior::WatchCommand,
                 tone: Tone::Quiet,
-                description: format!("watching real {} event · first day in this repo", kind.label()),
+                description: format!(
+                    "watching real {} event · first day in this repo",
+                    kind.label()
+                ),
                 speech: None,
             },
             Some(RepoArrival::Home) => Reaction {
@@ -725,11 +803,10 @@ impl NativeOrganism {
 
     pub(crate) fn command_finished(
         &mut self,
-        command: &str,
+        classified: CommandKind,
         exit_code: Option<i32>,
         duration_ms: Option<u64>,
     ) -> Reaction {
-        let classified = classify_command(command);
         let kind = if classified == CommandKind::Other {
             self.active_kind.unwrap_or(classified)
         } else {
@@ -837,7 +914,11 @@ impl NativeOrganism {
                 // day's first pass lands at full strength. Recoveries always
                 // keep full strength — big celebrations stay reserved for
                 // genuinely rare moments.
-                let habituation = if failures == 0 { self.successes_today } else { 0 };
+                let habituation = if failures == 0 {
+                    self.successes_today
+                } else {
+                    0
+                };
                 let damp = 1.0 / (1.0 + habituation as f32 / 4.0);
                 self.successes_today = self.successes_today.saturating_add(1);
                 // An Agent-driven pass earns half the glow and none of the
@@ -1038,14 +1119,14 @@ mod tests {
     #[test]
     fn repeated_real_failures_escalate_then_success_celebrates() {
         let mut organism = NativeOrganism::default();
-        organism.command_started("cargo test");
-        let first = organism.command_finished("cargo test", Some(101), Some(900));
-        organism.command_started("cargo test");
-        let second = organism.command_finished("cargo test", Some(101), Some(800));
-        organism.command_started("cargo test");
-        let third = organism.command_finished("cargo test", Some(101), Some(700));
-        organism.command_started("cargo test");
-        let success = organism.command_finished("cargo test", Some(0), Some(600));
+        organism.command_started(CommandKind::BuildOrTest);
+        let first = organism.command_finished(CommandKind::BuildOrTest, Some(101), Some(900));
+        organism.command_started(CommandKind::BuildOrTest);
+        let second = organism.command_finished(CommandKind::BuildOrTest, Some(101), Some(800));
+        organism.command_started(CommandKind::BuildOrTest);
+        let third = organism.command_finished(CommandKind::BuildOrTest, Some(101), Some(700));
+        organism.command_started(CommandKind::BuildOrTest);
+        let success = organism.command_finished(CommandKind::BuildOrTest, Some(0), Some(600));
 
         assert_eq!(first.behavior, Behavior::InspectError);
         assert_eq!(second.behavior, Behavior::SitNearError);
@@ -1057,8 +1138,8 @@ mod tests {
     #[test]
     fn unknown_exit_status_is_never_presented_as_success() {
         let mut organism = NativeOrganism::default();
-        organism.command_started("cargo build");
-        let reaction = organism.command_finished("cargo build", None, None);
+        organism.command_started(CommandKind::BuildOrTest);
+        let reaction = organism.command_finished(CommandKind::BuildOrTest, None, None);
         assert_eq!(reaction.behavior, Behavior::UnknownOutcome);
         assert_eq!(reaction.tone, Tone::Warning);
         assert_eq!(reaction.speech, None);
@@ -1067,9 +1148,9 @@ mod tests {
     #[test]
     fn unrelated_success_does_not_erase_a_build_debugging_streak() {
         let mut organism = NativeOrganism::default();
-        organism.command_finished("cargo test", Some(1), None);
-        organism.command_finished("printf fixed", Some(0), None);
-        let success = organism.command_finished("cargo test", Some(0), None);
+        organism.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        organism.command_finished(CommandKind::Other, Some(0), None);
+        let success = organism.command_finished(CommandKind::BuildOrTest, Some(0), None);
         assert_eq!(success.speech, Some("好了。"));
     }
 
@@ -1077,9 +1158,9 @@ mod tests {
     fn every_state_dimension_stays_finite_and_bounded() {
         let mut organism = NativeOrganism::default();
         for index in 0..10_000 {
-            organism.command_started("cargo test");
+            organism.command_started(CommandKind::BuildOrTest);
             let status = if index % 3 == 0 { 0 } else { 101 };
-            organism.command_finished("cargo test", Some(status), Some(index));
+            organism.command_finished(CommandKind::BuildOrTest, Some(status), Some(index));
         }
         assert!(organism
             .state()
@@ -1093,8 +1174,8 @@ mod tests {
         let mut waking = LifeState::default();
         let mut resting = LifeState::default();
         for _ in 0..120 {
-            waking.tick(1.0, false, false);
-            resting.tick(1.0, false, true);
+            waking.tick(1.0, false, false, CircadianPhase::Unlearned);
+            resting.tick(1.0, false, true, CircadianPhase::Unlearned);
         }
         assert!(waking.energy < LifeState::default().energy);
         assert!(resting.energy > waking.energy);
@@ -1102,10 +1183,48 @@ mod tests {
     }
 
     #[test]
+    fn learned_hours_shape_energy_without_jumping_at_boundaries() {
+        let mut in_hours = LifeState {
+            energy: 0.50,
+            ..LifeState::default()
+        };
+        let mut off_hours = in_hours;
+        in_hours.tick(1.0, false, false, CircadianPhase::InHours);
+        off_hours.tick(1.0, false, false, CircadianPhase::OffHours);
+        assert_eq!(in_hours.energy.to_bits(), 0.502_f32.to_bits());
+        assert_eq!(off_hours.energy.to_bits(), 0.498_f32.to_bits());
+
+        for _ in 0..500 {
+            in_hours.tick(1.0, false, false, CircadianPhase::InHours);
+            off_hours.tick(1.0, false, false, CircadianPhase::OffHours);
+        }
+        assert_eq!(in_hours.energy, 0.65);
+        assert_eq!(off_hours.energy, 0.35);
+
+        let mut resting_in = LifeState {
+            energy: 0.50,
+            ..LifeState::default()
+        };
+        let mut resting_off = resting_in;
+        resting_in.tick(1.0, false, true, CircadianPhase::InHours);
+        resting_off.tick(1.0, false, true, CircadianPhase::OffHours);
+        assert_eq!(resting_in.energy, resting_off.energy);
+        assert!(resting_in.energy > 0.50);
+    }
+
+    #[test]
+    fn unlearned_circadian_phase_preserves_the_original_energy_drift() {
+        let mut state = LifeState::default();
+        let before = state.energy;
+        state.tick(1.0, false, false, CircadianPhase::Unlearned);
+        assert_eq!(state.energy.to_bits(), (before - 0.002).to_bits());
+    }
+
+    #[test]
     fn exhaustion_forces_micro_rest_so_energy_never_pins_at_zero() {
         let mut state = LifeState::default();
         for _ in 0..3_600 {
-            state.tick(1.0, false, false);
+            state.tick(1.0, false, false, CircadianPhase::Unlearned);
         }
         assert!(state.energy > 0.10);
         assert!(state.energy < 0.30);
@@ -1115,8 +1234,8 @@ mod tests {
     fn a_single_time_slice_simulates_at_most_one_second() {
         let mut long_slice = LifeState::default();
         let mut capped = LifeState::default();
-        long_slice.tick(3600.0, true, false);
-        capped.tick(1.0, true, false);
+        long_slice.tick(3600.0, true, false, CircadianPhase::Unlearned);
+        capped.tick(1.0, true, false, CircadianPhase::Unlearned);
         assert_eq!(long_slice.values(), capped.values());
     }
 
@@ -1125,8 +1244,8 @@ mod tests {
         let mut engaged = LifeState::default();
         let mut ignored = LifeState::default();
         for _ in 0..60 {
-            engaged.tick(1.0, true, false);
-            ignored.tick(1.0, false, false);
+            engaged.tick(1.0, true, false, CircadianPhase::Unlearned);
+            ignored.tick(1.0, false, false, CircadianPhase::Unlearned);
         }
         assert!(engaged.boredom < ignored.boredom);
         assert!(engaged.social_need < ignored.social_need);
@@ -1142,7 +1261,7 @@ mod tests {
         };
         let before = stressed.mood;
         for _ in 0..30 {
-            stressed.tick(1.0, false, false);
+            stressed.tick(1.0, false, false, CircadianPhase::Unlearned);
         }
         assert!(stressed.mood < before);
     }
@@ -1156,7 +1275,12 @@ mod tests {
             .take(10_000)
             .enumerate()
         {
-            state.tick(dt, index % 2 == 0, index % 3 == 0);
+            state.tick(
+                dt,
+                index % 2 == 0,
+                index % 3 == 0,
+                CircadianPhase::Unlearned,
+            );
         }
         assert!(state
             .values()
@@ -1167,17 +1291,17 @@ mod tests {
     #[test]
     fn clean_passes_habituate_but_recoveries_celebrate_at_full_strength() {
         let mut organism = NativeOrganism::default();
-        let first = organism.command_finished("cargo test", Some(0), None);
+        let first = organism.command_finished(CommandKind::BuildOrTest, Some(0), None);
         assert_eq!(first.speech, Some("过了。"));
         assert_eq!(first.tone, Tone::Success);
 
         organism.restore_repo_context(0, false, 4, 0);
-        let fifth = organism.command_finished("cargo test", Some(0), None);
+        let fifth = organism.command_finished(CommandKind::BuildOrTest, Some(0), None);
         assert_eq!(fifth.speech, None);
         assert_eq!(fifth.tone, Tone::Success);
 
         organism.restore_repo_context(0, false, 9, 0);
-        let tenth = organism.command_finished("cargo test", Some(0), None);
+        let tenth = organism.command_finished(CommandKind::BuildOrTest, Some(0), None);
         assert_eq!(tenth.behavior, Behavior::Celebrate);
         assert_eq!(tenth.tone, Tone::Quiet);
         assert_eq!(tenth.speech, None);
@@ -1185,7 +1309,7 @@ mod tests {
 
         // A recovery after real failures is never dampened by today's count.
         organism.restore_repo_context(3, false, 9, 3);
-        let recovery = organism.command_finished("cargo test", Some(0), None);
+        let recovery = organism.command_finished(CommandKind::BuildOrTest, Some(0), None);
         assert_eq!(recovery.behavior, Behavior::CelebrateBig);
         assert_eq!(recovery.speech, Some("终于。"));
     }
@@ -1194,13 +1318,13 @@ mod tests {
     fn state_increments_shrink_as_the_day_of_passes_grows() {
         let mut fresh = NativeOrganism::default();
         let fresh_before = fresh.state().mood;
-        fresh.command_finished("cargo test", Some(0), None);
+        fresh.command_finished(CommandKind::BuildOrTest, Some(0), None);
         let fresh_delta = fresh.state().mood - fresh_before;
 
         let mut jaded = NativeOrganism::default();
         jaded.restore_repo_context(0, false, 8, 0);
         let jaded_before = jaded.state().mood;
-        jaded.command_finished("cargo test", Some(0), None);
+        jaded.command_finished(CommandKind::BuildOrTest, Some(0), None);
         let jaded_delta = jaded.state().mood - jaded_before;
         assert!(jaded_delta < fresh_delta);
     }
@@ -1210,33 +1334,33 @@ mod tests {
         let mut organism = NativeOrganism::default();
         organism.restore_repo_context(0, false, 5, 0);
         let stress_before = organism.state().stress;
-        let reaction = organism.command_finished("cargo test", Some(101), None);
+        let reaction = organism.command_finished(CommandKind::BuildOrTest, Some(101), None);
         assert!(reaction
             .description
             .contains("first crack after 5 clean run(s)"));
         assert_eq!(reaction.speech, Some("这里。"));
         assert!(organism.state().stress - stress_before > 0.15);
 
-        let ordinary = organism.command_finished("cargo test", Some(101), None);
+        let ordinary = organism.command_finished(CommandKind::BuildOrTest, Some(101), None);
         assert!(!ordinary.description.contains("first crack"));
     }
 
     #[test]
     fn any_command_streak_wearies_and_any_success_clears_it() {
         let mut organism = NativeOrganism::default();
-        let first = organism.command_finished("ssh remote true", Some(255), None);
+        let first = organism.command_finished(CommandKind::Other, Some(255), None);
         assert_eq!(first.behavior, Behavior::InspectError);
         assert_eq!(first.speech, Some("这里。"));
-        let second = organism.command_finished("ssh remote true", Some(255), None);
+        let second = organism.command_finished(CommandKind::Other, Some(255), None);
         assert_eq!(second.behavior, Behavior::InspectError);
         assert_eq!(second.speech, None);
-        let third = organism.command_finished("ssh remote true", Some(255), None);
+        let third = organism.command_finished(CommandKind::Other, Some(255), None);
         assert_eq!(third.behavior, Behavior::SitNearError);
         assert!(third.description.contains("3 rough commands in a row"));
         assert_eq!(third.speech, None);
 
-        organism.command_finished("printf ok", Some(0), None);
-        let after_reset = organism.command_finished("ssh remote true", Some(255), None);
+        organism.command_finished(CommandKind::Other, Some(0), None);
+        let after_reset = organism.command_finished(CommandKind::Other, Some(255), None);
         assert_eq!(after_reset.behavior, Behavior::InspectError);
         assert_eq!(after_reset.speech, Some("这里。"));
     }
@@ -1244,10 +1368,10 @@ mod tests {
     #[test]
     fn unknown_exit_neither_extends_nor_clears_the_rough_streak() {
         let mut organism = NativeOrganism::default();
-        organism.command_finished("ssh remote true", Some(255), None);
-        organism.command_finished("ssh remote true", Some(255), None);
-        organism.command_finished("mystery", None, None);
-        let third = organism.command_finished("ssh remote true", Some(255), None);
+        organism.command_finished(CommandKind::Other, Some(255), None);
+        organism.command_finished(CommandKind::Other, Some(255), None);
+        organism.command_finished(CommandKind::Other, None, None);
+        let third = organism.command_finished(CommandKind::Other, Some(255), None);
         assert_eq!(third.behavior, Behavior::SitNearError);
         assert!(third.description.contains("3 rough commands in a row"));
     }
@@ -1257,13 +1381,13 @@ mod tests {
         let mut organism = NativeOrganism::default();
         organism.restore_repo_context(0, false, 9, 2);
         organism.restore_repo_context(0, false, 0, 0);
-        let pass = organism.command_finished("cargo test", Some(0), None);
+        let pass = organism.command_finished(CommandKind::BuildOrTest, Some(0), None);
         assert_eq!(pass.speech, Some("过了。"));
 
         let mut overnight = NativeOrganism::default();
         overnight.restore_repo_context(0, false, 9, 2);
         overnight.roll_over_day();
-        let fresh = overnight.command_finished("cargo test", Some(0), None);
+        let fresh = overnight.command_finished(CommandKind::BuildOrTest, Some(0), None);
         assert_eq!(fresh.speech, Some("过了。"));
         assert_eq!(fresh.tone, Tone::Success);
     }
@@ -1277,18 +1401,18 @@ mod tests {
         let mut organism = NativeOrganism::default();
         organism.note_repo_arrival(RepoArrival::Unfamiliar);
         let confidence_before = organism.state().confidence;
-        let shy = organism.command_started("cargo build");
+        let shy = organism.command_started(CommandKind::BuildOrTest);
         assert_eq!(shy.tone, Tone::Quiet);
         assert!(shy.description.contains("first day in this repo"));
         assert_eq!(shy.speech, None);
         assert!(organism.state().confidence < confidence_before);
 
-        let plain = organism.command_started("cargo build");
+        let plain = organism.command_started(CommandKind::BuildOrTest);
         assert_eq!(plain.tone, Tone::Active);
         assert!(!plain.description.contains("first day"));
 
         organism.note_repo_arrival(RepoArrival::Home);
-        let home = organism.command_started("cargo build");
+        let home = organism.command_started(CommandKind::BuildOrTest);
         assert_eq!(home.speech, Some("回来了。"));
     }
 
@@ -1296,21 +1420,21 @@ mod tests {
     fn accepted_correction_gets_a_small_nod_on_the_next_success_only() {
         let mut organism = NativeOrganism::default();
         organism.note_assisted_command();
-        let success = organism.command_finished("git status", Some(0), None);
+        let success = organism.command_finished(CommandKind::Other, Some(0), None);
         assert_eq!(success.behavior, Behavior::Celebrate);
         assert_eq!(success.tone, Tone::Success);
         assert!(success.description.contains("corrected command worked"));
         assert_eq!(success.speech, None);
 
-        let ordinary = organism.command_finished("git status", Some(0), None);
+        let ordinary = organism.command_finished(CommandKind::Other, Some(0), None);
         assert_eq!(ordinary.behavior, Behavior::Idle);
 
         // A failed assisted command earns no celebration, and the assist does
         // not carry over to the next command.
         organism.note_assisted_command();
-        let failed = organism.command_finished("git statsu", Some(1), None);
+        let failed = organism.command_finished(CommandKind::Other, Some(1), None);
         assert_eq!(failed.behavior, Behavior::InspectError);
-        let following = organism.command_finished("git status", Some(0), None);
+        let following = organism.command_finished(CommandKind::Other, Some(0), None);
         assert_eq!(following.behavior, Behavior::Idle);
     }
 
@@ -1325,6 +1449,7 @@ mod tests {
             Behavior::CelebrateBig,
             Behavior::RestAfterPush,
             Behavior::UnknownOutcome,
+            Behavior::GlanceAside,
             Behavior::Sleep,
             Behavior::Explore,
             Behavior::Approach,
@@ -1401,6 +1526,7 @@ mod tests {
             Behavior::CelebrateBig,
             Behavior::RestAfterPush,
             Behavior::UnknownOutcome,
+            Behavior::GlanceAside,
             Behavior::Sleep,
             Behavior::Explore,
             Behavior::Approach,
@@ -1419,6 +1545,19 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn celebrations_keep_the_organisms_cat_silhouette() {
+        for behavior in [Behavior::Celebrate, Behavior::CelebrateBig] {
+            for frame in 0..10 {
+                assert!(
+                    sprite_frame(behavior, BodyLanguage::default(), false, frame)
+                        .contains("/\\_/\\"),
+                    "{behavior:?} frame {frame} lost its ears"
+                );
             }
         }
     }
@@ -1590,14 +1729,14 @@ mod tests {
     fn agent_commands_get_quiet_nods_and_the_big_celebrations_stay_human() {
         let mut organism = NativeOrganism::default();
         organism.set_agent_command(true);
-        let started = organism.command_started("cargo test");
+        let started = organism.command_started(CommandKind::BuildOrTest);
         assert_eq!(started.behavior, Behavior::WatchAgent);
         assert_eq!(started.tone, Tone::Quiet);
 
         // Even a big recovery earns only a small, wordless celebration.
         organism.restore_repo_context(3, false, 0, 3);
         organism.set_agent_command(true);
-        let recovery = organism.command_finished("cargo test", Some(0), None);
+        let recovery = organism.command_finished(CommandKind::BuildOrTest, Some(0), None);
         assert_eq!(recovery.behavior, Behavior::Celebrate);
         assert_eq!(recovery.speech, None);
         assert!(recovery.description.contains("agent-driven"));
@@ -1605,7 +1744,7 @@ mod tests {
         // The same recovery typed by the human celebrates at full strength.
         let mut human = NativeOrganism::default();
         human.restore_repo_context(3, false, 0, 3);
-        let big = human.command_finished("cargo test", Some(0), None);
+        let big = human.command_finished(CommandKind::BuildOrTest, Some(0), None);
         assert_eq!(big.behavior, Behavior::CelebrateBig);
         assert_eq!(big.speech, Some("终于。"));
     }
@@ -1615,14 +1754,29 @@ mod tests {
         let mut organism = NativeOrganism::default();
         organism.note_repo_arrival(RepoArrival::Home);
         organism.set_agent_command(true);
-        let agent_start = organism.command_started("cargo build");
+        let agent_start = organism.command_started(CommandKind::BuildOrTest);
         assert_eq!(agent_start.behavior, Behavior::WatchAgent);
         assert_eq!(agent_start.speech, None);
-        organism.command_finished("cargo build", Some(0), None);
+        organism.command_finished(CommandKind::BuildOrTest, Some(0), None);
 
         organism.set_agent_command(false);
-        let human_start = organism.command_started("cargo build");
+        let human_start = organism.command_started(CommandKind::BuildOrTest);
         assert_eq!(human_start.speech, Some("回来了。"));
+    }
+
+    #[test]
+    fn leaving_a_repo_cancels_its_queued_human_greeting() {
+        let mut organism = NativeOrganism::default();
+        organism.note_repo_arrival(RepoArrival::Home);
+        organism.set_agent_command(true);
+        organism.command_started(CommandKind::BuildOrTest);
+        organism.command_finished(CommandKind::BuildOrTest, Some(0), None);
+
+        organism.clear_repo_arrival();
+        organism.set_agent_command(false);
+        let elsewhere = organism.command_started(CommandKind::Other);
+        assert_eq!(elsewhere.speech, None);
+        assert!(!elsewhere.description.contains("well-known repo"));
     }
 
     #[test]
@@ -1630,7 +1784,7 @@ mod tests {
         let mut organism = NativeOrganism::default();
         let confidence_before = organism.state().confidence;
         organism.set_agent_command(true);
-        let failure = organism.command_finished("cargo test", Some(101), None);
+        let failure = organism.command_finished(CommandKind::BuildOrTest, Some(101), None);
         assert_eq!(failure.speech, None);
         assert!(failure.description.contains("agent-driven"));
         assert_eq!(organism.state().confidence, confidence_before);
@@ -1639,15 +1793,15 @@ mod tests {
         let mut proud = NativeOrganism::default();
         proud.restore_repo_context(0, false, 9, 0);
         proud.set_agent_command(true);
-        let crack = proud.command_finished("cargo test", Some(101), None);
+        let crack = proud.command_finished(CommandKind::BuildOrTest, Some(101), None);
         assert!(!crack.description.contains("first crack"));
 
         // An agent push never claims the human's follow-through phrase.
         let mut push = NativeOrganism::default();
         push.restore_repo_context(1, false, 0, 1);
-        push.command_finished("cargo test", Some(0), None);
+        push.command_finished(CommandKind::BuildOrTest, Some(0), None);
         push.set_agent_command(true);
-        let pushed = push.command_finished("git push", Some(0), None);
+        let pushed = push.command_finished(CommandKind::GitPush, Some(0), None);
         assert_eq!(pushed.speech, None);
     }
 
@@ -1655,14 +1809,14 @@ mod tests {
     fn agent_execution_lost_reacts_with_restrained_caution() {
         let mut organism = NativeOrganism::default();
         organism.set_agent_command(true);
-        organism.command_started("cargo test");
+        organism.command_started(CommandKind::BuildOrTest);
         let lost = organism.agent_execution_lost();
         assert_eq!(lost.behavior, Behavior::UnknownOutcome);
         assert_eq!(lost.tone, Tone::Warning);
         assert_eq!(lost.speech, None);
 
         // The stale flag is gone: the next human command is fully owned.
-        let success = organism.command_finished("cargo test", Some(0), None);
+        let success = organism.command_finished(CommandKind::BuildOrTest, Some(0), None);
         assert!(!success.description.contains("agent-driven"));
         assert_eq!(success.speech, Some("过了。"));
     }
@@ -1725,8 +1879,8 @@ mod tests {
         assert_eq!(organism.state().mood, 1.0);
 
         organism.restore_build_failures(3);
-        organism.command_started("cargo test");
-        let reaction = organism.command_finished("cargo test", Some(0), Some(100));
+        organism.command_started(CommandKind::BuildOrTest);
+        let reaction = organism.command_finished(CommandKind::BuildOrTest, Some(0), Some(100));
         assert_eq!(reaction.behavior, Behavior::CelebrateBig);
         assert_eq!(reaction.speech, Some("终于。"));
     }

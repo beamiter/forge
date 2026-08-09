@@ -1461,7 +1461,10 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
             );
         }
     }
-    if let Some(value) = table.get("ascii_organism_motion").and_then(toml::Value::as_str) {
+    if let Some(value) = table
+        .get("ascii_organism_motion")
+        .and_then(toml::Value::as_str)
+    {
         if OrganismMotion::parse(value).is_none() {
             config_issue(
                 &mut issues,
@@ -3019,14 +3022,19 @@ unknown_action = "F8"
     fn ascii_organism_motion_accepts_only_the_three_levels() {
         assert_eq!(OrganismMotion::parse("full"), Some(OrganismMotion::Full));
         assert_eq!(OrganismMotion::parse("Calm"), Some(OrganismMotion::Calm));
-        assert_eq!(OrganismMotion::parse("STATIC"), Some(OrganismMotion::Static));
+        assert_eq!(
+            OrganismMotion::parse("STATIC"),
+            Some(OrganismMotion::Static)
+        );
         assert_eq!(OrganismMotion::parse("off"), None);
         assert_eq!(OrganismMotion::Full.as_str(), "full");
         assert_eq!(OrganismMotion::Calm.as_str(), "calm");
         assert_eq!(OrganismMotion::Static.as_str(), "static");
 
         let valid = validate_config_contents("ascii_organism_motion = 'calm'\n").unwrap();
-        assert!(valid.iter().all(|issue| issue.path != "ascii_organism_motion"));
+        assert!(valid
+            .iter()
+            .all(|issue| issue.path != "ascii_organism_motion"));
         let invalid = validate_config_contents("ascii_organism_motion = 'sleepy'\n").unwrap();
         assert!(invalid.iter().any(|issue| {
             issue.path == "ascii_organism_motion" && issue.level == ConfigIssueLevel::Error

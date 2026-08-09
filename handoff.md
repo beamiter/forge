@@ -1,8 +1,9 @@
 # Engineering handoff
 
-Updated: 2026-08-09
+Updated: 2026-08-10
 
-This baseline lands the nine-round "Evolve ASCII organism" series
+This baseline lands the nine-round "Evolve ASCII organism" series plus a
+continued evolution pass
 (`d6fb8b4..00a099e`): the experimental Block-pane organism grew from an
 event reflex into a continuous life simulation with utility-selected
 behavior, agent attribution, interpolated spatial motion, motion restraint,
@@ -77,10 +78,75 @@ Nine organism evolution rounds, in order:
   replay so compaction cannot touch them; after three samples a build 2×
   off its repo baseline (and >10s off) earns one quiet sentence.
 
+The continued pass adds five more coherent layers:
+
+- **Flaky-test memory**: replay derives same-day failure→success flips across
+  retained and compacted observations. Once the day has at least three flips,
+  a current one-failure recovery says only「像是偶发的。」and explicitly normalizes a
+  stale cross-window `CelebrateBig` to the ordinary celebration. The new
+  daily/baseline counter has strict legacy-presence migration, duplicate-field
+  rejection, bounded validation, and never repairs other corrupt summaries.
+- **Safer perception and space**: native reducer entry points now accept only
+  `CommandKind`; command strings stop at the UI classifier. Build pace compares
+  against history snapshotted before the current event and before record
+  eviction. Watching/reacting bodies prefer the blank band below the output
+  cursor and hide if a complete sprite cannot fit; pose dimensions join the
+  surface signature so interpolation cannot cross the scrollbar gutter after
+  a width change. Inline pose width is fixed, and calm/static run on the low
+  frequency heartbeat even while active. Reaction holds are semantic rather
+  than one fixed eight seconds (quiet pass 1.8s through repeated-error sit
+  10s), while any new lifecycle event still interrupts immediately. Command
+  reactions and live-only cross-pane cues each reset to their canonical first
+  frame without disturbing the continuous ambient wander phase.
+- **Learned circadian rhythm**: each repo/day stores eight bounded three-hour
+  completion buckets with event-time local day/bucket frozen together. The
+  window-shared mind infers one concentrated circular nine-hour work session
+  from the previous 28 days (minimum three active days/six samples, strict
+  majority) and eases waking energy toward different in-hours/off-hours
+  targets. Unlearned behavior is exactly the old drift. The first human command
+  in each window-local work session gets a time-appropriate quiet greeting
+  (daytime「早。」, evening「来了。」), unless a more specific repo-home line
+  already exists; night sessions spanning midnight greet once, Agent/outside
+  commands do not consume it, and failed cross-window refreshes retry instead
+  of blessing stale state.
+- **Lifetime growth**: top-level `days_seen` and `lifetime_recoveries` counters
+  sit outside the evicting repo/day records. A 64-day sorted ledger plus a
+  compaction cursor deduplicates work days across repos and makes late closed
+  history growth-neutral; recovery episodes advance from replayed flip-count
+  deltas, so out-of-order insertion remains correct while its daily ordering
+  is retained. Evicting a record with build history closes that date prefix;
+  later events there stay valid but cannot count the same lifetime episode
+  twice. Legacy v1 data rebuilds a strict lower bound only when all three
+  fields are absent. The shared badge
+  names juvenile (<7 days), adult, and seasoned (≥60 days and ≥12 recoveries);
+  a seasoned human `CelebrateBig` keeps its behavior/tone and says only「嗯。」.
+  Celebration frames also retain the cat's ears instead of switching to the
+  old human-shaped figure.
+- **Single focused presence**: pane reducers, inline cards, and sticky forms
+  remain local, but a window-shared monotonic-token/weak-registration arbiter
+  lets only the genuinely focused local Block pane own the spatial body. It
+  resolves the current page with `focused_leaf()` (never fallback
+  `active_leaf()`), gates on window activity, hides every old desired surface
+  before refreshing a new owner, and registers Static panes so they can revoke
+  a prior body without rendering one. Notebook switching synchronously revokes
+  the old owner inside the pre-commit signal, then lets the tab idle resolve
+  the new page; focus-widget/window signals, post-switch reconciliation, and
+  the existing one-second pane poll keep close/zoom/tab
+  topology self-healing without strong-reference cycles. A non-zero
+  authoritative finish in a registered background pane now sends only a typed,
+  content-free failure pulse to that owner: an actually visible idle body
+  briefly `GlanceAside`s without changing either pane's reducer/card/sticky
+  state. Busy, hidden, Static, alternate-screen, owner-local, unknown, and
+  successful outcomes drop the pulse rather than queueing stale attention.
+  Only an active, primary-screen Full owner keeps the 100 ms animation
+  cadence; non-owner, alternate-screen, Calm, Static, and resting runtimes use
+  the 900 ms heartbeat. Focus transfer safely rearms the new owner without
+  ever creating a second pending GLib source.
+
 Hard lines the series preserved, verified every round: perception only
 ever widens by enums, counters, or geometry scalars — command text, output,
-and keystrokes never cross the organism boundary; the disk schema stays
-version 1 with `#[serde(default)]` incremental migration (old files load;
+and keystrokes never cross the reducer or persistence boundary; the disk schema
+stays version 1 with `#[serde(default)]` incremental migration (old files load;
 newer files fail closed in older binaries, matching the
 baseline/observations precedent); the three rendering invariants (O(1)
 typing retreat, immediate alt-screen yield, fail-closed sizing) are
@@ -88,31 +154,6 @@ untouched; reaction intensity is a function of history, not of the
 stimulus; big celebrations and speech belong to the human's own commands.
 
 ## Remaining boundaries
-
-### Organism roadmap (long-term, design settled in review)
-
-- **Flaky-test insight**: derive a same-day failure→success flip count in
-  `replay_observations`; one `#[serde(default)]` saturating counter each on
-  `DailyStats` and `StatsBaseline` so compaction stays correct. ≥3 flips
-  with open-failure depth ≤1 reads as flaky: one Quiet sentence on success,
-  no pose escalation — the human should suspect the test, not themselves.
-- **Circadian clock**: 8×3-hour `u16 activity_buckets` per `DailyStats`
-  (count-only, accumulated in `apply_event` outside the replay, validated
-  and re-proven against the 512 KiB budget); infer habitual working hours
-  from recent day records; lower the tick's energy target outside them,
-  greet the first in-hours command with「早。」.
-- **Growth stages**: `days_seen` and `lifetime_recoveries` saturating
-  `u32`s on `DiskMemory` — the `days` window truncates at 64 records, so
-  the organism structurally has no past older than 64 days without them.
-  Derive juvenile (<7 days) / adult / seasoned (≥60 days + recovery
-  threshold) stages: sprite scale and ever-terser speech (a seasoned
-  `CelebrateBig` says only「嗯。」). Value accrues over months.
-- **Single presence across panes**: only the focused pane shows the full
-  body; unfocused panes keep at most the sticky micro-form; focus changes
-  (content-free pulses from the pane-focus flow) drive walk-out/walk-in
-  frames over the existing interpolator; a background pane's failure earns
-  a `GlanceAside` from the focused body —「隔壁那格红了」— never a popup,
-  never a focus grab. Largest remaining item; depends on nothing else.
 
 ### Consolidate the app-owned helper runner
 

@@ -899,6 +899,13 @@ pub fn run() -> glib::ExitCode {
                 .map(crate::organism_memory::OrganismMemory::life_state)
                 .unwrap_or_default(),
         ));
+        let organism_circadian = organism_memory
+            .as_ref()
+            .and_then(|memory| memory.circadian_profile_at(crate::organism_memory::unix_ms()));
+        let organism_growth = organism_memory
+            .as_ref()
+            .map(crate::organism_memory::OrganismMemory::growth_progress)
+            .unwrap_or_default();
 
         // Window-level toast host: transient feedback (e.g. the opacity
         // percentage while Ctrl+Alt+=/- is held) floats over the main layout.
@@ -955,7 +962,8 @@ pub fn run() -> glib::ExitCode {
             command_suggestion: Rc::new(RefCell::new(None)),
             organism_memory: Rc::new(RefCell::new(organism_memory)),
             organism_correction: ui::OrganismCorrectionSignal::new(organism_life.clone()),
-            organism_activity: ui::OrganismActivity::new(),
+            organism_activity: ui::OrganismActivity::new(organism_circadian, organism_growth),
+            organism_presence: ui::OrganismPresence::new(),
             organism_agent: ui::OrganismAgentSignal::new(organism_life.clone()),
             organism_life,
             agent_toggle: agent_toggle.clone(),
@@ -1343,10 +1351,16 @@ pub fn run() -> glib::ExitCode {
         });
 
         let pending_for_deactivate = pending_focus_shortcut.clone();
+        let ui_for_window_presence = ui.clone();
         window.connect_is_active_notify(move |window| {
             if !window.is_active() {
                 pending_for_deactivate.borrow_mut().take();
             }
+            ui_for_window_presence.sync_organism_presence();
+        });
+        let ui_for_focus_presence = ui.clone();
+        window.connect_focus_widget_notify(move |_| {
+            ui_for_focus_presence.sync_organism_presence();
         });
 
         // Enter/Shift+Enter are handled by the capture-phase key controller
@@ -1417,6 +1431,10 @@ pub fn run() -> glib::ExitCode {
         // Focus terminal when switching tabs (split-aware) and sync tab strip
         let ui_for_switch = ui.clone();
         notebook.connect_switch_page(move |_, widget, page_num| {
+            // `current_page` still names the old tab inside this signal.
+            // Revoke its spatial body synchronously; the idle below resolves
+            // and claims the newly selected page after GTK commits the switch.
+            ui_for_switch.revoke_organism_presence();
             // Headers are only maintained for the visible tab, so the newly
             // selected one has to catch up before it is drawn.
             ui_for_switch.refresh_pane_headers_for(widget);
@@ -1447,6 +1465,7 @@ pub fn run() -> glib::ExitCode {
             glib::idle_add_local_once(move || {
                 ui_ft.file_tree_goto_current_cwd();
                 ui_ft.refresh_bottom_bar();
+                ui_ft.sync_organism_presence();
             });
         });
 
@@ -1640,12 +1659,14 @@ pub fn run() -> glib::ExitCode {
                 // Same poll keeps the bottom bar's running/cwd/grid segments
                 // honest for the focused pane.
                 ui.refresh_bottom_bar();
+                ui.sync_organism_presence();
                 glib::ControlFlow::Continue
             });
         }
 
         // Focus the active terminal after window is shown
         ui.focus_current_terminal();
+        ui.sync_organism_presence();
 
         // Safe mode deliberately ignores later config-file changes.
         if !launch.safe_mode {

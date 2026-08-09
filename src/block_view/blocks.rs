@@ -2402,6 +2402,9 @@ impl ActiveBlock {
     }
 
     pub(crate) fn set_live_organism_alt_screen(&self, alt_screen: bool) {
+        let (desired, alt_screen) =
+            live_organism_alt_transition(self.live_organism_visible.get(), alt_screen);
+        self.live_organism_visible.set(desired);
         self.live_organism_alt_screen.set(alt_screen);
         self.sync_live_organism_visibility();
     }
@@ -2412,8 +2415,25 @@ impl ActiveBlock {
 
     fn sync_live_organism_visibility(&self) {
         self.live_organism_surface
-            .set_visible(self.live_organism_visible.get() && !self.live_organism_alt_screen.get());
+            .set_visible(live_organism_is_visible(
+                self.live_organism_visible.get(),
+                self.live_organism_alt_screen.get(),
+            ));
     }
+}
+
+fn live_organism_alt_transition(desired: bool, entering: bool) -> (bool, bool) {
+    if entering {
+        // Never let rmcup synchronously resurrect pre-TUI coordinates. Exit
+        // only removes the override; a later measured heartbeat opts in again.
+        (false, true)
+    } else {
+        (desired, false)
+    }
+}
+
+fn live_organism_is_visible(desired: bool, alt_screen: bool) -> bool {
+    desired && !alt_screen
 }
 
 // ─── TermView state machine ───────────────────────────────────────────────────
@@ -2481,9 +2501,24 @@ pub(crate) fn write_recalled_command(
 mod tests {
     use super::{
         block_clipboard_text, collapsed_output_summary, command_recall_available,
-        exit_code_for_shared_surface, filter_output_lines, terminalize_line_breaks, BlockData,
-        BlockOutcome, BlockState, UNKNOWN_EXIT_NOTE, UNKNOWN_EXIT_SENTINEL,
+        exit_code_for_shared_surface, filter_output_lines, live_organism_alt_transition,
+        live_organism_is_visible, terminalize_line_breaks, BlockData, BlockOutcome, BlockState,
+        UNKNOWN_EXIT_NOTE, UNKNOWN_EXIT_SENTINEL,
     };
+
+    #[test]
+    fn alt_screen_exit_never_restores_stale_organism_visibility() {
+        let entered = live_organism_alt_transition(true, true);
+        assert_eq!(entered, (false, true));
+        assert!(!live_organism_is_visible(entered.0, entered.1));
+
+        let exited = live_organism_alt_transition(entered.0, false);
+        assert_eq!(exited, (false, false));
+        assert!(!live_organism_is_visible(exited.0, exited.1));
+
+        // A post-rmcup geometry pass may explicitly opt in again.
+        assert!(live_organism_is_visible(true, exited.1));
+    }
 
     fn block_with_exit(exit_code: Option<i32>) -> BlockData {
         BlockData {

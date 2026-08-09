@@ -45,7 +45,7 @@ pub(crate) use bottom_bar::build_bottom_bar;
 pub(crate) use command_palette::CommandSuggestionHandle;
 pub(crate) use file_tree::{build_file_tree_widgets, FileTreeModel};
 pub(crate) use organism::{
-    pane_token, OrganismActivity, OrganismAgentSignal, OrganismCorrectionSignal,
+    pane_token, OrganismActivity, OrganismAgentSignal, OrganismCorrectionSignal, OrganismPresence,
 };
 pub(crate) use pane_header::{PaneHeader, PANE_HEADER_CSS};
 pub(crate) use pane_leaf::PaneLeaf;
@@ -184,6 +184,9 @@ pub(crate) struct UiState {
     /// Window-shared activity aggregate and tick clock for the continuous
     /// life simulation: one mind, one clock, however many pane bodies.
     pub(crate) organism_activity: Rc<OrganismActivity>,
+    /// Focus-backed visibility arbiter: pane-local inline/sticky forms remain,
+    /// but at most one local Block pane owns the spatial live body.
+    pub(crate) organism_presence: Rc<OrganismPresence>,
     /// Content-free Shell Agent lifecycle phases feeding the shared mind.
     pub(crate) organism_agent: Rc<OrganismAgentSignal>,
     /// Visible top-bar control reflecting whether a Shell Agent session is
