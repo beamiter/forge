@@ -12,6 +12,7 @@ use crate::organism::{
     classify_command, sprite_frame, sticky_glyph, AgentPulse, AmbientBehavior, AmbientMind,
     Behavior, BodyLanguage, CommandKind, LifeState, NativeOrganism, Reaction, RepoArrival, Tone,
 };
+use crate::config::OrganismMotion;
 use crate::organism_memory::{local_day_at_ms, unix_ms, MemoryEvent, RepoContext};
 
 const REACTION_HOLD: Duration = Duration::from_millis(8_000);
@@ -19,6 +20,10 @@ const REACTION_HOLD: Duration = Duration::from_millis(8_000);
 const CORRECTION_ASSIST_WINDOW: Duration = Duration::from_secs(30);
 const HUMAN_INPUT_RETREAT: Duration = Duration::from_millis(900);
 const SURFACE_FRAME_INTERVAL: Duration = Duration::from_millis(100);
+/// Heartbeat while the mind rests or the body is static: life goes on, the
+/// process barely wakes. Kept just under the tick's one-second dt clamp so
+/// routine dispatch latency is still simulated instead of clipped away.
+const DORMANT_FRAME_INTERVAL: Duration = Duration::from_millis(900);
 const SURFACE_MARGIN: i32 = 8;
 const TONE_CLASSES: [&str; 5] = [
     "organism-quiet",
@@ -458,6 +463,7 @@ fn same_checkout(root: Option<&str>, repo_cwd: Option<&str>, cwd: Option<&str>) 
 
 struct OrganismRuntime {
     organism: RefCell<NativeOrganism>,
+    motion: OrganismMotion,
     shared_life: Rc<Cell<LifeState>>,
     activity: Rc<OrganismActivity>,
     /// Pane-local utility disposition; stepped only while this body is
@@ -475,7 +481,7 @@ struct OrganismRuntime {
     last_local_day: Cell<Option<i64>>,
     generation: Cell<u64>,
     settle_timer: RefCell<Option<gtk4::glib::SourceId>>,
-    surface_tick: RefCell<Option<gtk4::TickCallbackId>>,
+    surface_timer: RefCell<Option<gtk4::glib::SourceId>>,
     surface_last_frame: Cell<Option<Instant>>,
     surface_frame: Cell<u64>,
     /// Where the body currently stands on the live surface; `None` while
@@ -508,6 +514,7 @@ impl OrganismRuntime {
     fn new(
         shared_life: Rc<Cell<LifeState>>,
         activity: Rc<OrganismActivity>,
+        motion: OrganismMotion,
         persistent: bool,
     ) -> Rc<Self> {
         let outer = GBox::new(Orientation::Vertical, 0);
@@ -598,6 +605,7 @@ impl OrganismRuntime {
 
         let runtime = Rc::new(Self {
             organism: RefCell::new(NativeOrganism::from_persisted_state(shared_life.get())),
+            motion,
             shared_life,
             activity,
             ambient: RefCell::new(AmbientMind::default()),
@@ -610,7 +618,7 @@ impl OrganismRuntime {
             last_local_day: Cell::new(None),
             generation: Cell::new(0),
             settle_timer: RefCell::new(None),
-            surface_tick: RefCell::new(None),
+            surface_timer: RefCell::new(None),
             surface_last_frame: Cell::new(None),
             surface_frame: Cell::new(0),
             body_position: Cell::new(None),
@@ -680,6 +688,11 @@ impl OrganismRuntime {
     }
 
     fn refresh_surface(&self, view: &TermView, now: Instant) {
+        if self.motion == OrganismMotion::Static {
+            // The inline card is the whole visual surface; the live body and
+            // sticky avatar were never attached.
+            return;
+        }
         let behavior = self.surface_behavior.get();
         let mode = surface_mode(
             behavior,
@@ -705,8 +718,13 @@ impl OrganismRuntime {
         // language; reaction poses stay canonical. Gait runs while the body
         // is genuinely under way OR a wander leg is in progress — the leg
         // advances its target slower than once per frame, so transit alone
-        // would stutter the walk animation.
-        let frame = self.surface_frame.get();
+        // would stutter the walk animation. Calm motion freezes the frame at
+        // zero: first frames only, no wandering, no bob, no flourishes.
+        let frame = if self.motion == OrganismMotion::Full {
+            self.surface_frame.get()
+        } else {
+            0
+        };
         let language = BodyLanguage::from_state(self.shared_life.get());
         let tempo = wander_tempo(language);
         let wander_walking = match ambient {
@@ -777,16 +795,19 @@ impl OrganismRuntime {
 
         if let Some(target) = point {
             let previous = self.body_position.get();
-            let (x, y) = match previous {
+            let (x, y, moved) = match previous {
                 // Hidden or first placement: appear directly at the target.
-                None => (target.x, target.y),
-                Some((x, y)) => (
-                    approach(x, target.x, f64::from(metrics.cell_width.max(1))),
-                    approach(y, target.y, f64::from(metrics.cell_height.max(1))),
-                ),
+                None => (target.x, target.y, false),
+                // Calm motion never animates a walk; poses snap, and a snap
+                // is not a walk — no transit gait afterwards.
+                Some(_) if self.motion != OrganismMotion::Full => (target.x, target.y, false),
+                Some((px, py)) => {
+                    let x = approach(px, target.x, f64::from(metrics.cell_width.max(1)));
+                    let y = approach(py, target.y, f64::from(metrics.cell_height.max(1)));
+                    (x, y, (px, py) != (x, y))
+                }
             };
-            self.body_in_transit
-                .set(matches!(previous, Some(prev) if prev != (x, y)));
+            self.body_in_transit.set(moved);
             self.body_position.set(Some((x, y)));
             view.set_live_organism_visible(true);
             view.move_live_organism_body(self.live_body.upcast_ref(), x, y);
@@ -801,20 +822,31 @@ impl OrganismRuntime {
     }
 
     fn start_surface_tick(runtime: &Rc<Self>, view: &Rc<TermView>) {
+        Self::schedule_surface_frame(runtime, view, SURFACE_FRAME_INTERVAL);
+    }
+
+    /// Self-rescheduling frame driver. A glib timeout wakes at most ten times
+    /// a second — unlike a frame-clock tick callback it never forces the
+    /// window's frame clock to run at full rate — and it drops to a
+    /// one-second heartbeat while the mind rests or the body is static, so an
+    /// untouched terminal costs almost nothing.
+    fn schedule_surface_frame(runtime: &Rc<Self>, view: &Rc<TermView>, delay: Duration) {
         let runtime_weak = Rc::downgrade(runtime);
         let view_weak = Rc::downgrade(view);
-        let tick = view.vte().add_tick_callback(move |_, _| {
-            let (Some(runtime), Some(view)) = (runtime_weak.upgrade(), view_weak.upgrade()) else {
-                return gtk4::glib::ControlFlow::Break;
+        let source = gtk4::glib::timeout_add_local_once(delay, move || {
+            let Some(runtime) = runtime_weak.upgrade() else {
+                return;
+            };
+            // Cleared before ANY other guard: a runtime kept alive past its
+            // view (agent-lost idle closures, parser-owned callback vectors)
+            // must never leave this fired source's id behind for Drop to
+            // remove — glib panics on removing a dead source.
+            runtime.surface_timer.borrow_mut().take();
+            let Some(view) = view_weak.upgrade() else {
+                return;
             };
             let now = Instant::now();
-            let previous_frame = runtime.surface_last_frame.get();
-            if previous_frame
-                .is_some_and(|last| now.saturating_duration_since(last) < SURFACE_FRAME_INTERVAL)
-            {
-                return gtk4::glib::ControlFlow::Continue;
-            }
-            runtime.surface_last_frame.set(Some(now));
+            let previous_frame = runtime.surface_last_frame.replace(Some(now));
             let mode = surface_mode(
                 runtime.surface_behavior.get(),
                 runtime.command_running.get(),
@@ -867,9 +899,16 @@ impl OrganismRuntime {
                 .surface_frame
                 .set(runtime.surface_frame.get().wrapping_add(1 + pulse));
             runtime.refresh_surface(&view, now);
-            gtk4::glib::ControlFlow::Continue
+            let next = if runtime.motion == OrganismMotion::Static
+                || runtime.activity.resting(now)
+            {
+                DORMANT_FRAME_INTERVAL
+            } else {
+                SURFACE_FRAME_INTERVAL
+            };
+            Self::schedule_surface_frame(&runtime, &view, next);
         });
-        *runtime.surface_tick.borrow_mut() = Some(tick);
+        *runtime.surface_timer.borrow_mut() = Some(source);
     }
 
     fn mark_volatile(&self) {
@@ -915,8 +954,8 @@ impl Drop for OrganismRuntime {
         if let Some(source) = self.settle_timer.get_mut().take() {
             source.remove();
         }
-        if let Some(tick) = self.surface_tick.get_mut().take() {
-            tick.remove();
+        if let Some(source) = self.surface_timer.get_mut().take() {
+            source.remove();
         }
     }
 }
@@ -946,17 +985,32 @@ impl UiState {
         }
 
         let persistent = self.organism_memory.borrow().is_some();
+        // An explicit config level wins; otherwise follow the desktop's
+        // animation preference — a reduced-motion desktop gets a calm body.
+        let motion = self.config.borrow().ascii_organism_motion.unwrap_or_else(|| {
+            let animations = gtk4::Settings::default()
+                .map(|settings| settings.is_gtk_enable_animations())
+                .unwrap_or(true);
+            if animations {
+                OrganismMotion::Full
+            } else {
+                OrganismMotion::Calm
+            }
+        });
         let runtime = OrganismRuntime::new(
             self.organism_life.clone(),
             self.organism_activity.clone(),
+            motion,
             persistent,
         );
         view.insert_inline_notice(&runtime.card);
-        if !view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0) {
-            log::warn!("could not attach ASCII organism to the live terminal surface");
-        }
-        if !view.put_sticky_organism_avatar(runtime.sticky_avatar.upcast_ref()) {
-            log::warn!("could not attach ASCII organism to the sticky running header");
+        if motion != OrganismMotion::Static {
+            if !view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0) {
+                log::warn!("could not attach ASCII organism to the live terminal surface");
+            }
+            if !view.put_sticky_organism_avatar(runtime.sticky_avatar.upcast_ref()) {
+                log::warn!("could not attach ASCII organism to the sticky running header");
+            }
         }
         // Per-body seeding keeps split-window bodies from napping and pacing
         // in perfect lockstep.

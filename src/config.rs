@@ -55,6 +55,30 @@ impl TabPlacement {
     }
 }
 
+/// Motion level for the ASCII organism's visual body. `None` in the config
+/// means "auto": follow the desktop's animation preference at attach time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrganismMotion {
+    /// Animated frames, wandering, walking transitions.
+    Full,
+    /// Poses still change at behavior boundaries, but nothing animates:
+    /// no wandering, no bobbing, no frame alternation, snap movement.
+    Calm,
+    /// Inline card only; no live surface body, no sticky avatar.
+    Static,
+}
+
+impl OrganismMotion {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "full" => Some(Self::Full),
+            "calm" => Some(Self::Calm),
+            "static" => Some(Self::Static),
+            _ => None,
+        }
+    }
+}
+
 fn resolve_sidebar_visibility(explicit: Option<bool>, placement: TabPlacement) -> bool {
     explicit.unwrap_or(placement == TabPlacement::Sidebar)
 }
@@ -620,6 +644,9 @@ pub struct Config {
     /// reacts only to Forge's local command lifecycle events and never runs a
     /// command or sends terminal contents elsewhere.
     pub(crate) ascii_organism_enabled: bool,
+    /// Explicit motion level for the organism body; `None` follows the
+    /// desktop animation preference.
+    pub(crate) ascii_organism_motion: Option<OrganismMotion>,
     /// Master switch for every network-backed AI feature.
     pub(crate) ai_enabled: bool,
     /// Agent mode can be disabled independently while leaving chat and
@@ -744,6 +771,7 @@ impl Config {
             focus_reporting_enabled: true,
             preserve_live_scrollback: false,
             ascii_organism_enabled: false,
+            ascii_organism_motion: None,
             ai_enabled: false,
             agent_enabled: false,
             agent_max_turns: 20,
@@ -1070,6 +1098,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "focus_reporting_enabled",
     "preserve_live_scrollback",
     "ascii_organism_enabled",
+    "ascii_organism_motion",
     "ai_enabled",
     "agent_enabled",
     "agent_max_turns",
@@ -1175,6 +1204,7 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
         "terminal_mode",
         "tab_placement",
         "sidebar_view",
+        "ascii_organism_motion",
         "jsh_update_check",
         "command_history_path",
         "block_history_path",
@@ -1420,6 +1450,16 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
                 Error,
                 "sidebar_view",
                 "expected 'tabs' or 'files'",
+            );
+        }
+    }
+    if let Some(value) = table.get("ascii_organism_motion").and_then(toml::Value::as_str) {
+        if OrganismMotion::parse(value).is_none() {
+            config_issue(
+                &mut issues,
+                Error,
+                "ascii_organism_motion",
+                "expected 'full', 'calm', or 'static'",
             );
         }
     }
@@ -1784,6 +1824,7 @@ struct FileConfig {
     focus_reporting_enabled: Option<bool>,
     preserve_live_scrollback: Option<bool>,
     ascii_organism_enabled: Option<bool>,
+    ascii_organism_motion: Option<String>,
     ai_enabled: Option<bool>,
     agent_enabled: Option<bool>,
     agent_max_turns: Option<u32>,
@@ -2010,6 +2051,10 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
         ascii_organism_enabled: table
             .get("ascii_organism_enabled")
             .and_then(|v| v.as_bool()),
+        ascii_organism_motion: table
+            .get("ascii_organism_motion")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         ai_enabled: table.get("ai_enabled").and_then(|v| v.as_bool()),
         agent_enabled: table.get("agent_enabled").and_then(|v| v.as_bool()),
         agent_max_turns: table_u32(&table, "agent_max_turns"),
@@ -2428,6 +2473,10 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let ascii_organism_enabled = env_bool("FORGE_ASCII_ORGANISM_ENABLED")
         .or(fc.ascii_organism_enabled)
         .unwrap_or(false);
+    let ascii_organism_motion = env_string("FORGE_ASCII_ORGANISM_MOTION")
+        .or(fc.ascii_organism_motion)
+        .as_deref()
+        .and_then(OrganismMotion::parse);
     let requested_provider = env_string("FORGE_AI_PROVIDER")
         .or(fc.ai_provider)
         .filter(|value| setting_text_is_safe(value, 64))
@@ -2506,6 +2555,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         focus_reporting_enabled: fc.focus_reporting_enabled.unwrap_or(true),
         preserve_live_scrollback: fc.preserve_live_scrollback.unwrap_or(false),
         ascii_organism_enabled,
+        ascii_organism_motion,
         ai_enabled,
         agent_enabled,
         agent_max_turns,
@@ -2955,6 +3005,21 @@ unknown_action = "F8"
         assert!(issues
             .iter()
             .any(|issue| issue.message.contains("same chord")));
+    }
+
+    #[test]
+    fn ascii_organism_motion_accepts_only_the_three_levels() {
+        assert_eq!(OrganismMotion::parse("full"), Some(OrganismMotion::Full));
+        assert_eq!(OrganismMotion::parse("Calm"), Some(OrganismMotion::Calm));
+        assert_eq!(OrganismMotion::parse("STATIC"), Some(OrganismMotion::Static));
+        assert_eq!(OrganismMotion::parse("off"), None);
+
+        let valid = validate_config_contents("ascii_organism_motion = 'calm'\n").unwrap();
+        assert!(valid.iter().all(|issue| issue.path != "ascii_organism_motion"));
+        let invalid = validate_config_contents("ascii_organism_motion = 'sleepy'\n").unwrap();
+        assert!(invalid.iter().any(|issue| {
+            issue.path == "ascii_organism_motion" && issue.level == ConfigIssueLevel::Error
+        }));
     }
 
     #[test]

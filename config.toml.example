@@ -55,6 +55,10 @@ block_compact = false
 # 修改后请新建 pane 或重启 Forge。临时覆盖：FORGE_ASCII_ORGANISM_ENABLED=1。
 # 连续状态与 repo/day 统计保存到 XDG state 目录；不保存命令或输出。
 ascii_organism_enabled = false
+# 身体动效等级："full"（动画+游走+行走过渡）、"calm"（只在行为边界换姿，
+# 无游走/摆动/帧交替）、"static"（只保留 prompt 上方的 inline 卡片）。
+# 未设置时跟随桌面动画偏好（gtk-enable-animations 关闭时自动 calm）。
+# ascii_organism_motion = "full"
 
 # 可选持久化历史。路径支持开头的 ~/，父目录会自动创建。
 # block_history_path = "~/.local/share/forge/block-history.bin"
