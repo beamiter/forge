@@ -35,12 +35,12 @@ labelled synthetic “yesterday” record so
 the final cross-day memory line is reproducible. It does not write that demo
 record to disk.
 
-The next native phase now lives in Forge itself behind
+The production organism now lives in Forge itself behind
 `ascii_organism_enabled = true` (or `FORGE_ASCII_ORGANISM_ENABLED=1`). It uses
-real Block command lifecycle events and an inline widget above the live prompt.
-This standalone harness remains useful for deterministic life-state and memory
-experiments; its persistent/cross-day memory is not yet wired into the native
-widget.
+real Block command lifecycle events, private repo memory, an inline widget, and
+one focus-owned spatial overlay. This standalone harness remains useful as a
+deterministic historical life-state experiment, but it is no longer a parity
+implementation of the substantially evolved native reducer.
 
 Keys inside the TUI:
 
@@ -73,7 +73,8 @@ cargo run --offline --manifest-path prototypes/ascii-organism/Cargo.toml \
 `run-in-forge.sh` prefers this checkout's `target/debug/forge`, falls back to an
 installed `forge`, and accepts an explicit `FORGE_BIN` override.
 
-The next native step is to feed authoritative cwd/repository identity and
-persistent/cross-day memory into the inline widget, then evolve its body from a
-prompt-adjacent card into a freely positioned overlay. The standalone life
-engine in `src/life.rs` remains terminal/toolkit-independent.
+Authoritative cwd/repository identity, persistent cross-day memory, and the
+freely positioned native overlay have all moved into Forge. New production
+behavior should be implemented and tested in `src/organism.rs`,
+`src/organism_memory.rs`, and `src/ui/organism.rs`; the standalone life engine
+in `src/life.rs` remains terminal/toolkit-independent reference material.

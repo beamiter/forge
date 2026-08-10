@@ -12,11 +12,11 @@ use crate::config::OrganismMotion;
 use crate::organism::{
     classify_command, sprite_frame, sticky_glyph, AgentPulse, AmbientBehavior, AmbientMind,
     Behavior, BodyLanguage, CircadianPhase, CommandKind, LifeState, NativeOrganism, Reaction,
-    RepoArrival, Tone,
+    RepoArrival, RepoVigil, RepoWorkState, Tone,
 };
 use crate::organism_memory::{
     local_circadian_time_at_ms, unix_ms, CircadianProfile, GrowthProgress, GrowthStage,
-    LocalCircadianTime, MemoryEvent, RepoContext,
+    LocalCircadianTime, MemoryEvent, MemoryInsight, RepoContext,
 };
 
 /// An accepted correction only vouches for a command that starts promptly.
@@ -93,7 +93,11 @@ fn reaction_hold(reaction: &Reaction) -> Duration {
         | Behavior::Explore
         | Behavior::Approach
         | Behavior::WatchAgent
-        | Behavior::WatchSettled => 2_500,
+        | Behavior::WatchSettled
+        | Behavior::GuardFailure
+        | Behavior::GuardStuck
+        | Behavior::GuardRecovery
+        | Behavior::GuardCautious => 2_500,
     };
     Duration::from_millis(millis)
 }
@@ -228,11 +232,15 @@ fn surface_mode(
         SurfaceMode::Typing
     } else if command_running {
         SurfaceMode::Watching
-    } else if behavior == Behavior::Idle {
+    } else if behavior == Behavior::Idle || behavior.is_repo_vigil() {
         SurfaceMode::Idle
     } else {
         SurfaceMode::Reacting
     }
+}
+
+fn suppress_live_body_for_focus(mode: SurfaceMode) -> bool {
+    mode == SurfaceMode::Typing
 }
 
 fn visible_sleeping(
@@ -253,18 +261,55 @@ fn visible_sleeping(
         && ambient == AmbientBehavior::Sleep
 }
 
+/// A durable vigil must be able to finish its forced-rest hysteresis even in
+/// Static mode or when geometry hides the live sprite. Presence ownership and
+/// the shared activity counter keep this one logical claim window-scoped;
+/// ordinary non-vigil sleep retains the visible-body rule above.
+fn repo_vigil_sleep_claim(
+    owner: bool,
+    mode: SurfaceMode,
+    ambient: AmbientBehavior,
+    vigil: RepoVigil,
+) -> bool {
+    owner && mode == SurfaceMode::Idle && ambient == AmbientBehavior::Sleep && vigil.is_active()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sleeping_claim(
+    owner: bool,
+    motion: OrganismMotion,
+    alt_screen: bool,
+    body_visible: bool,
+    cue_active: bool,
+    mode: SurfaceMode,
+    ambient: AmbientBehavior,
+    vigil: RepoVigil,
+) -> bool {
+    visible_sleeping(
+        owner,
+        motion,
+        alt_screen,
+        body_visible,
+        cue_active,
+        mode,
+        ambient,
+    ) || repo_vigil_sleep_claim(owner, mode, ambient, vigil)
+}
+
 fn can_show_presence_cue(
     owner: bool,
     motion: OrganismMotion,
     alt_screen: bool,
     body_visible: bool,
     mode: SurfaceMode,
+    repo_vigil_active: bool,
 ) -> bool {
     owner
         && motion != OrganismMotion::Static
         && !alt_screen
         && body_visible
         && mode == SurfaceMode::Idle
+        && !repo_vigil_active
 }
 
 fn live_display_behavior(
@@ -362,6 +407,148 @@ fn mark_likely_flaky(reaction: &mut Reaction, agent_driven: bool) {
         .push_str(" · repeated one-run recovery looks intermittent");
 }
 
+fn reaction_duration_label(duration_ms: Option<u64>) -> String {
+    match duration_ms {
+        Some(ms) if ms >= 1_000 => format!(" · {:.1}s", ms as f64 / 1_000.0),
+        Some(ms) => format!(" · {ms}ms"),
+        None => String::new(),
+    }
+}
+
+fn append_reaction_detail(reaction: &mut Reaction, detail: &str) {
+    if !reaction.description.contains(detail) {
+        reaction.description.push_str(" · ");
+        reaction.description.push_str(detail);
+    }
+}
+
+/// Event-position replay owns the immediate pose and depth. A compacted late
+/// event has no reconstructible position, so it deliberately falls back to a
+/// restrained factual reaction instead of preserving arrival-order drama.
+fn normalize_replayed_event(
+    reaction: &mut Reaction,
+    kind: CommandKind,
+    exit_code: Option<i32>,
+    duration_ms: Option<u64>,
+    insight: &MemoryInsight,
+    agent_driven: bool,
+) {
+    let duration = reaction_duration_label(duration_ms);
+    match (kind, exit_code) {
+        (CommandKind::BuildOrTest, Some(code)) if code != 0 => {
+            if insight.event_order_exact {
+                let failures = insight.open_failures.max(1);
+                reaction.behavior = if failures >= 2 {
+                    Behavior::SitNearError
+                } else {
+                    Behavior::InspectError
+                };
+                reaction.tone = Tone::Error;
+                reaction.speech = (!agent_driven && failures == 1).then_some("这里。");
+                reaction.description = format!("exit {code}{duration} · build failure {failures}");
+            } else {
+                reaction.behavior = Behavior::InspectError;
+                reaction.tone = Tone::Error;
+                reaction.speech = None;
+                reaction.description =
+                    format!("exit {code}{duration} · older repo event order unavailable");
+            }
+            if agent_driven {
+                append_reaction_detail(reaction, "agent-driven");
+            }
+        }
+        (CommandKind::BuildOrTest, Some(0)) => {
+            if insight.event_order_exact {
+                let recovered = insight.recovered_failures;
+                if recovered > 0 {
+                    reaction.behavior = if recovered >= 3 && !agent_driven {
+                        Behavior::CelebrateBig
+                    } else {
+                        Behavior::Celebrate
+                    };
+                    reaction.tone = Tone::Success;
+                    reaction.speech = if agent_driven {
+                        None
+                    } else if recovered >= 3 {
+                        Some("终于。")
+                    } else {
+                        Some("好了。")
+                    };
+                    reaction.description =
+                        format!("build/test passed after {recovered} failure(s){duration}");
+                } else {
+                    // A stale final-state context can make a clean event look
+                    // like a recovery or carry a different window's pass
+                    // ordinal. The replay does not expose that ordinal, so use
+                    // a factual clean-pass line instead of preserving either
+                    // stale recovery or habituation wording.
+                    if reaction.behavior == Behavior::CelebrateBig {
+                        reaction.behavior = Behavior::Celebrate;
+                    }
+                    if matches!(reaction.speech, Some("好了。" | "终于。")) {
+                        reaction.speech = None;
+                    }
+                    reaction.description = format!("build/test passed{duration}");
+                }
+            } else {
+                reaction.behavior = Behavior::Celebrate;
+                reaction.tone = Tone::Quiet;
+                reaction.speech = None;
+                reaction.description =
+                    format!("build/test passed{duration} · older repo event order unavailable");
+            }
+            if agent_driven {
+                append_reaction_detail(reaction, "agent-driven");
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Post-replay work may contain observations newer than this event. It owns
+/// whether any wording may claim the whole debugging loop is now closed; the
+/// immediate success/error fact and the eventual vigil remain distinct.
+fn normalize_replayed_closure(
+    reaction: &mut Reaction,
+    kind: CommandKind,
+    exit_code: Option<i32>,
+    insight: &MemoryInsight,
+) {
+    match (kind, exit_code) {
+        (CommandKind::BuildOrTest, Some(0)) if insight.current_work.open_failures > 0 => {
+            reaction.speech = None;
+            append_reaction_detail(reaction, "later repo failure remains open");
+        }
+        (CommandKind::BuildOrTest, Some(code))
+            if code != 0 && insight.current_work.open_failures == 0 =>
+        {
+            append_reaction_detail(
+                reaction,
+                if insight.current_work.recovered_pending_push {
+                    "ordered replay already contains a later recovery"
+                } else {
+                    "ordered repo history already contains a later closure"
+                },
+            );
+        }
+        (CommandKind::GitPush, Some(0)) => {
+            let closed_current_loop = insight.event_order_exact
+                && insight.push_after_recovery
+                && insight.current_work.open_failures == 0
+                && !insight.current_work.recovered_pending_push;
+            if !closed_current_loop {
+                reaction.speech = None;
+            }
+            if insight.current_work.open_failures > 0 {
+                append_reaction_detail(reaction, "later repo failure remains open");
+            } else if insight.current_work.recovered_pending_push {
+                append_reaction_detail(reaction, "newer recovered work still awaits push");
+            }
+        }
+        _ => {}
+    }
+}
+
 fn mark_circadian_greeting(reaction: &mut Reaction, bucket: u8) {
     // The greeting is a once-per-window/session acknowledgement, not a
     // stronger stimulus. A more specific repo-home line wins, and evening
@@ -422,14 +609,39 @@ fn unusual_build_pace(typical_ms: Option<u64>, duration_ms: Option<u64>) -> Opti
     }
 }
 
+/// Watching/reaction poses and unresolved-work vigils may only occupy a full
+/// blank body-height band below the latest terminal cursor edge. Recovery
+/// vigils belong beside the prompt and use the ordinary idle safe band.
+fn needs_output_clearance(mode: SurfaceMode, ambient: AmbientBehavior, vigil: RepoVigil) -> bool {
+    matches!(mode, SurfaceMode::Watching | SurfaceMode::Reacting)
+        || (mode == SurfaceMode::Idle
+            && (matches!(vigil, RepoVigil::Failure | RepoVigil::Stuck)
+                || matches!(
+                    ambient,
+                    AmbientBehavior::GuardFailure | AmbientBehavior::GuardStuck
+                )))
+}
+
 /// Pick a point inside the live VTE without changing its allocation. The
 /// right gutter is owned by the live scrollbar, so every pose stays left of
 /// it. A surface that cannot fit the complete sprite fails closed.
+#[cfg(test)]
 fn surface_point(
     surface: SurfaceBox,
     mode: SurfaceMode,
     tempo: WanderTempo,
     ambient: AmbientBehavior,
+    frame: u64,
+) -> Option<SurfacePoint> {
+    surface_point_for_vigil(surface, mode, tempo, ambient, RepoVigil::None, frame)
+}
+
+fn surface_point_for_vigil(
+    surface: SurfaceBox,
+    mode: SurfaceMode,
+    tempo: WanderTempo,
+    ambient: AmbientBehavior,
+    vigil: RepoVigil,
     frame: u64,
 ) -> Option<SurfacePoint> {
     let cell_width = surface.cell_width.max(1);
@@ -471,7 +683,7 @@ fn surface_point(
     if max_x < min_x || max_y < min_y {
         return None;
     }
-    let output_clear_y = if matches!(mode, SurfaceMode::Watching | SurfaceMode::Reacting) {
+    let output_clear_y = if needs_output_clearance(mode, ambient, vigil) {
         // With no complete sprite row below the latest output, the inline card
         // carries the reaction instead. Overlaying terminal text is never the
         // fallback.
@@ -489,26 +701,48 @@ fn surface_point(
                     cell_width,
                 )
             };
-            match ambient {
-                // Curl up in the bottom-left corner, unmoved by the frame.
-                AmbientBehavior::Sleep => (min_x, max_y),
-                // Sit by the prompt edge, where the human works.
-                AmbientBehavior::Approach => (max_x, max_y),
-                // Pace the restless cycle regardless of the idle tempo.
-                AmbientBehavior::Explore => (
-                    wander_x(wander_phase(frame, WanderTempo::Restless).0),
-                    max_y,
-                ),
-                // Mostly sit at an edge, occasionally walk between them — the
-                // walk share follows the wander tempo, so a listless mind
-                // paces while a drowsy one lies still. It feels alive without
-                // turning ordinary terminal work into a perpetual desktop-pet
-                // animation.
-                AmbientBehavior::Idle => (wander_x(wander_phase(frame, tempo).0), max_y),
+            let unresolved_vigil = matches!(vigil, RepoVigil::Failure | RepoVigil::Stuck);
+            if unresolved_vigil {
+                // Exhaustion may curl the body up, but cannot erase the
+                // unresolved work's output boundary or reintroduce overlap.
+                if ambient == AmbientBehavior::Sleep {
+                    (min_x, output_clear_y)
+                } else {
+                    (max_x, output_clear_y)
+                }
+            } else {
+                match ambient {
+                    // Curl up in the bottom-left corner, unmoved by the frame.
+                    AmbientBehavior::Sleep => (min_x, max_y),
+                    // Sit by the prompt edge, where the human works.
+                    AmbientBehavior::Approach => (max_x, max_y),
+                    // Unresolved work stays at the completed output edge. If no
+                    // whole blank band exists below it, `below_output_y` above has
+                    // already failed closed and the inline card carries the vigil.
+                    AmbientBehavior::GuardFailure | AmbientBehavior::GuardStuck => {
+                        (max_x, output_clear_y)
+                    }
+                    // A recovered build waiting for push is a quiet intention:
+                    // stay beside the prompt instead of resuming random wandering.
+                    AmbientBehavior::GuardRecovery | AmbientBehavior::GuardCautious => {
+                        (max_x, max_y)
+                    }
+                    // Pace the restless cycle regardless of the idle tempo.
+                    AmbientBehavior::Explore => (
+                        wander_x(wander_phase(frame, WanderTempo::Restless).0),
+                        max_y,
+                    ),
+                    // Mostly sit at an edge, occasionally walk between them — the
+                    // walk share follows the wander tempo, so a listless mind
+                    // paces while a drowsy one lies still. It feels alive without
+                    // turning ordinary terminal work into a perpetual desktop-pet
+                    // animation.
+                    AmbientBehavior::Idle => (wander_x(wander_phase(frame, tempo).0), max_y),
+                }
             }
         }
-        // Accepted human input moves it away from the prompt edge. The window
-        // slides on every accepted write, so sustained typing keeps it there.
+        // The runtime hides accepted input before geometry; retain a defensive
+        // safe coordinate if a future non-live caller asks for this mode.
         SurfaceMode::Typing => (max_x, min_y),
         // Watching holds the output edge steadily. Real output pulses still
         // advance the tail animation faster; a content-free global timer no
@@ -942,7 +1176,9 @@ impl OrganismPresence {
         }
         for (token, view, runtime) in &live_entries {
             if Some(*token) == new_owner {
-                runtime.refresh_surface(view, Instant::now());
+                let now = Instant::now();
+                runtime.refresh_surface(view, now);
+                runtime.reconcile_sleeping_claim(view, now);
             }
             OrganismRuntime::rearm_surface_tick_for_focus(runtime, view);
         }
@@ -988,6 +1224,33 @@ impl OrganismPresence {
             OrganismRuntime::receive_presence_signal(&runtime, &view, signal, Instant::now());
         }
     }
+
+    /// Reconcile every pane in this window that is already known to represent
+    /// the same repo/day. The repository path is used only for coordinator-side
+    /// routing; each reducer receives one content-free work snapshot.
+    fn sync_repo_work(&self, repo: &str, day: i64, work: RepoWorkState) {
+        let entries = {
+            let state = self.state.borrow();
+            state
+                .entries
+                .iter()
+                .filter_map(|entry| Some((entry.view.upgrade()?, entry.runtime.upgrade()?)))
+                .collect::<Vec<_>>()
+        };
+        for (view, runtime) in entries {
+            let cwd = view.cwd();
+            if repo_work_scope_matches(
+                repo,
+                day,
+                runtime.last_repo_root.borrow().as_deref(),
+                runtime.last_local_day.get(),
+                runtime.last_repo_cwd.borrow().as_deref(),
+                Some(&cwd),
+            ) {
+                OrganismRuntime::receive_repo_work_sync(&runtime, &view, work, Instant::now());
+            }
+        }
+    }
 }
 
 /// Window-shared, content-free pulses from the Shell Agent lifecycle. Only
@@ -1018,6 +1281,9 @@ impl OrganismAgentSignal {
 
 /// True when `cwd` is `root` itself or a path strictly inside it.
 fn cwd_within(cwd: &str, root: &str) -> bool {
+    if root == "/" {
+        return cwd.starts_with('/');
+    }
     cwd.strip_prefix(root)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
@@ -1032,6 +1298,23 @@ fn same_checkout(root: Option<&str>, repo_cwd: Option<&str>, cwd: Option<&str>) 
         return false;
     };
     root.is_some_and(|root| cwd_within(cwd, root)) || repo_cwd.is_some_and(|known| known == cwd)
+}
+
+/// A window-shared work-state update targets only panes already resolved to
+/// the exact same repo on the exact same local day. Repository identity stays
+/// in this UI coordinator; the reducer receives only the content-free typed
+/// snapshot.
+fn repo_work_scope_matches(
+    repo: &str,
+    day: i64,
+    pane_repo: Option<&str>,
+    pane_day: Option<i64>,
+    pane_repo_cwd: Option<&str>,
+    pane_cwd: Option<&str>,
+) -> bool {
+    pane_repo == Some(repo)
+        && pane_day == Some(day)
+        && same_checkout(pane_repo, pane_repo_cwd, pane_cwd)
 }
 
 struct OrganismRuntime {
@@ -1260,6 +1543,32 @@ impl OrganismRuntime {
         }
     }
 
+    /// Publish both visible sleep and the geometry-independent vigil-rest
+    /// claim from one snapshot. Non-frame callbacks use this too, so clearing
+    /// or acquiring a durable vigil cannot leave the window-wide rest counter
+    /// stale until the next (possibly one-second) heartbeat.
+    fn reconcile_sleeping_claim(&self, view: &TermView, now: Instant) {
+        let mode = surface_mode(
+            self.surface_behavior.get(),
+            self.command_running.get(),
+            self.human_input_age(now),
+        );
+        let alt_screen = view.live_organism_surface_metrics().alt_screen;
+        let owner = self.presence.is_owner(self.presence_token);
+        let ambient = self.ambient_display.get();
+        let vigil = self.organism.borrow().repo_vigil();
+        self.set_sleeping(sleeping_claim(
+            owner,
+            self.motion,
+            alt_screen,
+            self.body_position.get().is_some(),
+            self.presence_cue.get().is_some(),
+            mode,
+            ambient,
+            vigil,
+        ));
+    }
+
     fn clear_presence_cue(&self) {
         self.presence_cue.set(None);
         if let Some(source) = self.presence_cue_timer.borrow_mut().take() {
@@ -1285,6 +1594,7 @@ impl OrganismRuntime {
             alt_screen,
             runtime.body_position.get().is_some(),
             mode,
+            runtime.organism.borrow().repo_vigil().is_active(),
         ) {
             return;
         }
@@ -1320,23 +1630,59 @@ impl OrganismRuntime {
             };
             let now = Instant::now();
             runtime.refresh_surface(&view, now);
-            let mode = surface_mode(
-                runtime.surface_behavior.get(),
-                runtime.command_running.get(),
-                runtime.human_input_age(now),
-            );
-            let alt_screen = view.live_organism_surface_metrics().alt_screen;
-            runtime.set_sleeping(visible_sleeping(
-                runtime.presence.is_owner(runtime.presence_token),
-                runtime.motion,
-                alt_screen,
-                runtime.body_position.get().is_some(),
-                runtime.presence_cue.get().is_some(),
-                mode,
-                runtime.ambient_display.get(),
-            ));
+            runtime.reconcile_sleeping_claim(&view, now);
         });
         *runtime.presence_cue_timer.borrow_mut() = Some(source);
+    }
+
+    /// Fold the memory layer's post-replay repo/day truth back into a pane.
+    /// Active reactions are never interrupted; an already-idle card changes
+    /// immediately so another pane's failure/recovery/push cannot leave a
+    /// stale vigil or the wrong escalation tier.
+    fn receive_repo_work_sync(
+        runtime: &Rc<Self>,
+        view: &Rc<TermView>,
+        work: RepoWorkState,
+        now: Instant,
+    ) {
+        let changed = runtime.organism.borrow_mut().sync_repo_work_state(work);
+        if !changed {
+            return;
+        }
+        // A durable work intention always outranks a live-only glance that
+        // may have begun a few milliseconds before this sync arrived.
+        runtime.clear_presence_cue();
+        // Revocation must be immediate even when an active command/reaction
+        // makes the visual update wait. Such modes never own a sleep claim.
+        runtime.set_sleeping(false);
+        if runtime.command_running.get() {
+            return;
+        }
+        let surface_behavior = runtime.surface_behavior.get();
+        if surface_behavior != Behavior::Idle && !surface_behavior.is_repo_vigil() {
+            return;
+        }
+
+        // Derive from the reducer after its defensive normalization instead
+        // of trusting a future internal caller to construct the snapshot.
+        let vigil = runtime.organism.borrow().repo_vigil();
+        let ambient = if vigil.is_active() {
+            runtime.ambient.borrow_mut().step(
+                runtime.shared_life.get(),
+                runtime.activity.idle_for_secs(now),
+                0.0,
+                vigil,
+            )
+        } else {
+            runtime.ambient.borrow_mut().interrupt();
+            AmbientBehavior::Idle
+        };
+        runtime.ambient_display.set(ambient);
+        let idle = runtime.organism.borrow().idle_reaction();
+        runtime.render(&idle);
+        runtime.refresh_surface(view, now);
+        runtime.reconcile_sleeping_claim(view, now);
+        view.insert_inline_notice(&runtime.card);
     }
 
     fn hide_live_body(&self, view: &TermView) {
@@ -1428,6 +1774,69 @@ impl OrganismRuntime {
             .map(|at| now.saturating_duration_since(at))
     }
 
+    /// Day-scoped repo work and habituation state must expire even if a pane
+    /// remains open and no new command arrives around midnight. Returns true
+    /// only on a real boundary, never on first observation of the local day.
+    fn roll_over_local_day(&self, day: i64) -> bool {
+        let previous = self.last_local_day.replace(Some(day));
+        if previous.is_none_or(|previous| previous == day) {
+            return false;
+        }
+        let mut organism = self.organism.borrow_mut();
+        organism.sync_state(self.shared_life.get());
+        organism.roll_over_day();
+        self.ambient.borrow_mut().interrupt();
+        self.ambient_display.set(AmbientBehavior::Idle);
+        self.set_sleeping(false);
+        true
+    }
+
+    /// Retire a pane's repo binding once authoritative cwd tracking shows that
+    /// it left that checkout. This runs even before a vigil exists so a
+    /// later same-window broadcast cannot target a stale binding. The return
+    /// value says whether a currently visible guard was actually released.
+    fn clear_repo_work_after_leave(&self, cwd: &str) -> bool {
+        let had_repo_context =
+            self.last_repo_root.borrow().is_some() || self.last_repo_cwd.borrow().is_some();
+        if !had_repo_context
+            || same_checkout(
+                self.last_repo_root.borrow().as_deref(),
+                self.last_repo_cwd.borrow().as_deref(),
+                Some(cwd),
+            )
+        {
+            return false;
+        }
+
+        let released_vigil = self.organism.borrow().repo_vigil().is_active();
+        {
+            let mut organism = self.organism.borrow_mut();
+            organism.sync_state(self.shared_life.get());
+            organism.restore_repo_context(0, false, 0, 0);
+            organism.clear_repo_arrival();
+        }
+        *self.last_repo_root.borrow_mut() = None;
+        *self.last_repo_cwd.borrow_mut() = None;
+        *self.active_context_key.borrow_mut() = None;
+        if released_vigil {
+            self.ambient.borrow_mut().interrupt();
+            self.ambient_display.set(AmbientBehavior::Idle);
+            self.set_sleeping(false);
+        }
+        released_vigil
+    }
+
+    /// If an asynchronous boundary clears the currently displayed guard,
+    /// replace only that idle-like card. Active command reactions keep their
+    /// semantic hold and will settle to ordinary idle in due course.
+    fn render_released_vigil(&self) {
+        if self.command_running.get() || !self.surface_behavior.get().is_repo_vigil() {
+            return;
+        }
+        let idle = self.organism.borrow().idle_reaction();
+        self.render(&idle);
+    }
+
     fn refresh_surface(&self, view: &TermView, now: Instant) {
         // Growth is window-shared. Even static or unfocused bodies refresh
         // their badge on the low-frequency heartbeat after another pane ages
@@ -1490,7 +1899,12 @@ impl OrganismRuntime {
         let wander_walking = match ambient {
             AmbientBehavior::Idle => wander_phase(geometry_frame, tempo).1,
             AmbientBehavior::Explore => wander_phase(geometry_frame, WanderTempo::Restless).1,
-            AmbientBehavior::Sleep | AmbientBehavior::Approach => false,
+            AmbientBehavior::Sleep
+            | AmbientBehavior::Approach
+            | AmbientBehavior::GuardFailure
+            | AmbientBehavior::GuardStuck
+            | AmbientBehavior::GuardRecovery
+            | AmbientBehavior::GuardCautious => false,
         };
         let walking = mode == SurfaceMode::Idle && (in_transit || wander_walking);
         let sprite = sprite_frame(display_behavior, language, walking, live_frame);
@@ -1511,6 +1925,15 @@ impl OrganismRuntime {
             // Sticky and inline forms remain pane-local evidence; only the
             // spatial overlay participates in one-body focus arbitration.
             self.sticky_avatar.set_visible(mode != SurfaceMode::Typing);
+            return;
+        }
+
+        if suppress_live_body_for_focus(mode) {
+            // Accepted human input owns the prompt completely. Hiding also
+            // forgets the old position, so the body returns by snapping after
+            // the retreat window instead of visibly running back into view.
+            self.hide_live_body(view);
+            self.sticky_avatar.set_visible(false);
             return;
         }
 
@@ -1549,7 +1972,8 @@ impl OrganismRuntime {
             self.body_position.set(None);
             self.body_in_transit.set(false);
         }
-        let point = surface_point(surface, mode, tempo, ambient, geometry_frame);
+        let vigil = self.organism.borrow().repo_vigil();
+        let point = surface_point_for_vigil(surface, mode, tempo, ambient, vigil, geometry_frame);
 
         if let Some(target) = point {
             let previous = self.body_position.get();
@@ -1562,7 +1986,7 @@ impl OrganismRuntime {
                 Some((px, py)) => {
                     let x = approach(px, target.x, f64::from(metrics.cell_width.max(1)));
                     let mut y = approach(py, target.y, f64::from(metrics.cell_height.max(1)));
-                    if matches!(mode, SurfaceMode::Watching | SurfaceMode::Reacting) {
+                    if needs_output_clearance(mode, ambient, vigil) {
                         // Never animate through the output band on the way to
                         // a safe below-output target. Horizontal travel may
                         // stay smooth while the safety-critical axis snaps.
@@ -1655,18 +2079,20 @@ impl OrganismRuntime {
                 runtime.human_input_age(now),
             );
             let alt_screen = view.live_organism_surface_metrics().alt_screen;
+            // Day rollover is pane-local even though physiology is shared.
+            // Every runtime must retire its own repo/day vigil at midnight;
+            // tying this to the one pane that wins the shared tick slice would
+            // leave the other panes visibly guarding yesterday's work.
+            let local = local_circadian_time_at_ms(unix_ms());
+            if runtime.roll_over_local_day(local.day) {
+                runtime.render_released_vigil();
+            }
+
             // Publish this pane's currently visible sleep state before the
             // shared slice is claimed. Regeneration then depends on the
             // window aggregate, never on which body's callback runs first.
-            runtime.set_sleeping(visible_sleeping(
-                runtime.presence.is_owner(runtime.presence_token),
-                runtime.motion,
-                alt_screen,
-                runtime.body_position.get().is_some(),
-                runtime.presence_cue.get().is_some(),
-                mode,
-                runtime.ambient_display.get(),
-            ));
+            runtime.reconcile_sleeping_claim(&view, now);
+
             // Continuous homeostasis: claim this pane's slice of the shared
             // clock and evolve the one shared mind. Persistence is untouched —
             // the evolved state only reaches disk with the next lifecycle
@@ -1674,7 +2100,6 @@ impl OrganismRuntime {
             let dt = runtime.activity.tick_slice(now);
             if dt > 0.0 {
                 let mut life = runtime.shared_life.get();
-                let local = local_circadian_time_at_ms(unix_ms());
                 life.tick(
                     dt,
                     runtime.activity.user_active(now),
@@ -1695,6 +2120,7 @@ impl OrganismRuntime {
                     runtime.shared_life.get(),
                     runtime.activity.idle_for_secs(now),
                     pane_dt,
+                    runtime.organism.borrow().repo_vigil(),
                 );
                 runtime.ambient_display.set(ambient);
             } else {
@@ -1706,15 +2132,7 @@ impl OrganismRuntime {
                 .surface_frame
                 .set(runtime.surface_frame.get().wrapping_add(1 + pulse));
             runtime.refresh_surface(&view, now);
-            runtime.set_sleeping(visible_sleeping(
-                runtime.presence.is_owner(runtime.presence_token),
-                runtime.motion,
-                alt_screen,
-                runtime.body_position.get().is_some(),
-                runtime.presence_cue.get().is_some(),
-                mode,
-                runtime.ambient_display.get(),
-            ));
+            runtime.reconcile_sleeping_claim(&view, now);
             // Accompaniment: a long-running command's card counts the time
             // spent watching together. Text only — no pose escalation, no
             // interruption, and short commands never show it.
@@ -1767,16 +2185,32 @@ impl OrganismRuntime {
             if runtime.generation.get() != generation {
                 return;
             }
-            let idle = {
+            let view = view.upgrade();
+            if let Some(view) = view.as_ref() {
+                runtime.clear_repo_work_after_leave(&view.cwd());
+            }
+            let (idle, vigil) = {
                 let mut organism = runtime.organism.borrow_mut();
                 // Settle must not jump the state line back to the finish-time
                 // snapshot; pull the tick-evolved shared state first.
                 organism.sync_state(runtime.shared_life.get());
-                organism.idle_reaction()
+                (organism.idle_reaction(), organism.repo_vigil())
             };
+            // Do not leave a one-heartbeat flash of generic idle between the
+            // reaction and its durable repo intention, especially in Calm or
+            // Static mode where that heartbeat is deliberately slow.
+            let ambient = runtime.ambient.borrow_mut().step(
+                runtime.shared_life.get(),
+                runtime.activity.idle_for_secs(Instant::now()),
+                0.0,
+                vigil,
+            );
+            runtime.ambient_display.set(ambient);
             runtime.render(&idle);
-            if let Some(view) = view.upgrade() {
-                runtime.refresh_surface(&view, Instant::now());
+            if let Some(view) = view {
+                let now = Instant::now();
+                runtime.refresh_surface(&view, now);
+                runtime.reconcile_sleeping_claim(&view, now);
                 view.insert_inline_notice(&runtime.card);
             }
         });
@@ -1942,10 +2376,10 @@ impl UiState {
                 runtime.set_sleeping(false);
                 if entering_retreat {
                     // Keep the accepted-input hot path O(1): hide once, then
-                    // let the single frame callback measure and move it to the
-                    // upper cell-aligned pose. Repeated keys only extend time.
-                    // Forgetting the standing spot makes that reappearance a
-                    // snap — the body never walks while it cannot be seen.
+                    // keep the single frame callback suppressed for the whole
+                    // retreat window. Repeated keys only extend time. Forgetting
+                    // the standing spot makes the later reappearance a snap —
+                    // no typing-triggered run competes with the prompt.
                     runtime.body_position.set(None);
                     runtime.body_in_transit.set(false);
                     if let Some(view) = view_weak.upgrade() {
@@ -1980,6 +2414,28 @@ impl UiState {
         {
             let runtime = runtime.clone();
             let view_weak = Rc::downgrade(view);
+            view.connect_cwd_changed(move |_display_cwd| {
+                // A running command still owns its start-time repo context for
+                // the authoritative finish. Its settle path rechecks the cwd;
+                // idle cwd changes can release the guard immediately. The
+                // callback argument is display-sanitized; identity must use the
+                // raw cwd that TermView stored before notifying observers.
+                if runtime.command_running.get() {
+                    return;
+                }
+                let Some(view) = view_weak.upgrade() else {
+                    return;
+                };
+                if runtime.clear_repo_work_after_leave(&view.cwd()) {
+                    runtime.render_released_vigil();
+                    runtime.refresh_surface(&view, Instant::now());
+                }
+            });
+        }
+
+        {
+            let runtime = runtime.clone();
+            let view_weak = Rc::downgrade(view);
             let memory = self.organism_memory.clone();
             let shared_life = self.organism_life.clone();
             let correction = self.organism_correction.clone();
@@ -2003,14 +2459,13 @@ impl UiState {
                 // is already anchored away from that line.
                 runtime.last_human_input.set(None);
                 let kind = classify_command(&event.command);
+                let semantic = matches!(kind, CommandKind::BuildOrTest | CommandKind::GitPush);
                 runtime.active_memory_kind.set(Some(kind));
                 let now_ms = unix_ms();
                 let local = local_circadian_time_at_ms(now_ms);
                 let (repo_context, circadian_profile, circadian_refresh, growth) = {
                     let mut memory_slot = memory.borrow_mut();
                     if let Some(memory) = memory_slot.as_mut() {
-                        let semantic =
-                            matches!(kind, CommandKind::BuildOrTest | CommandKind::GitPush);
                         let refresh_requested =
                             semantic || runtime.activity.circadian_profile_needs_refresh(local.day);
                         let circadian_refresh = if refresh_requested {
@@ -2028,7 +2483,7 @@ impl UiState {
                             CircadianRefresh::NotAttempted
                         };
                         let repo_context = if semantic {
-                            memory.context_now(event.cwd.as_deref())
+                            memory.context_for_day(event.cwd.as_deref(), local.day)
                         } else {
                             None
                         };
@@ -2070,24 +2525,20 @@ impl UiState {
                     });
                 let context_changed = *runtime.active_context_key.borrow() != context_key;
                 *runtime.active_context_key.borrow_mut() = context_key;
+                let has_repo_context = repo_context.is_some();
                 let morning = runtime.activity.take_morning_greeting(local, !agent_driven);
+                runtime.roll_over_local_day(local.day);
                 let mut reaction = {
                     let mut organism = runtime.organism.borrow_mut();
                     organism.sync_state(shared_life.get());
-                    let today = local.day;
-                    if runtime.last_local_day.get().is_some_and(|day| day != today) {
-                        // Volatile contexts otherwise never notice midnight.
-                        organism.roll_over_day();
-                    }
-                    runtime.last_local_day.set(Some(today));
                     if let Some(context) = repo_context {
+                        debug_assert_eq!(context.day, local.day);
                         // Greeting/shyness keys on the resolved repository
                         // identity; the mixed root/cwd key cannot re-fire it.
                         let entered_new_repo = runtime.last_repo_root.borrow().as_deref()
                             != Some(context.repo.as_str());
-                        organism.restore_repo_context(
-                            context.open_failures,
-                            context.recovered_pending_push,
+                        organism.restore_repo_work_context(
+                            context.work,
                             context.successes_today,
                             context.failures_today,
                         );
@@ -2107,6 +2558,13 @@ impl UiState {
                         organism.clear_repo_arrival();
                         *runtime.last_repo_root.borrow_mut() = None;
                         *runtime.last_repo_cwd.borrow_mut() = None;
+                    }
+                    if !has_repo_context && semantic {
+                        // A non-Git or temporarily memory-less build still
+                        // gets a pane-local vigil, scoped conservatively to
+                        // the exact raw cwd so `cd` can release it immediately.
+                        *runtime.last_repo_root.borrow_mut() = None;
+                        *runtime.last_repo_cwd.borrow_mut() = event.cwd.clone();
                     }
                     if correction.take_recent_accept(pane, Instant::now()) {
                         organism.note_assisted_command();
@@ -2144,92 +2602,108 @@ impl UiState {
                 // with a fresh sliding retreat.
                 runtime.last_human_input.set(None);
                 let classified = classify_command(&event.command);
-                let mut reaction = {
-                    let mut organism = runtime.organism.borrow_mut();
-                    organism.sync_state(shared_life.get());
-                    let reaction =
-                        organism.command_finished(classified, event.exit_code, event.duration_ms);
-                    shared_life.set(organism.state());
-                    reaction
-                };
                 let kind = if classified == CommandKind::Other {
                     runtime.active_memory_kind.take().unwrap_or(classified)
                 } else {
                     runtime.active_memory_kind.take();
                     classified
                 };
-                let state = shared_life.get();
                 let repo = runtime
                     .active_repo_context
                     .borrow_mut()
                     .take()
                     .map(|context| context.repo);
-                let memory_event = MemoryEvent::now_for_repo(
+                let work_repo = repo.clone();
+                // Refresh first, then timestamp this observation. Every event
+                // incorporated by a potentially blocking refresh is therefore
+                // an ordered predecessor of the context used by the reducer,
+                // never a future event folded into an earlier timestamp.
+                let refreshed = {
+                    let mut memory_slot = memory.borrow_mut();
+                    if let Some(memory) = memory_slot.as_mut() {
+                        match memory.refresh() {
+                            Ok(()) => true,
+                            Err(error) => {
+                                log::error!("could not refresh ASCII organism memory: {error}");
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    }
+                };
+                // Freeze one wall-clock sample for every remaining completion
+                // decision. A command may span midnight while a dormant/static
+                // pane misses the boundary heartbeat; yesterday's open failures
+                // must not turn today's clean build into a false recovery, and
+                // the persisted event must use this exact same day and bucket.
+                let finished_at_ms = unix_ms();
+                let finished_local = local_circadian_time_at_ms(finished_at_ms);
+                runtime.roll_over_local_day(finished_local.day);
+                // Rebuild pane-local counters from the canonical key captured
+                // at start so habituation, sensitization, and physiology see
+                // work completed by other windows during this command.
+                let latest_repo_context = memory.borrow().as_ref().and_then(|memory| {
+                    repo.as_deref()
+                        .map(|repo| memory.context_for_repo_day(repo, finished_local.day))
+                });
+                let mut reaction = {
+                    let mut organism = runtime.organism.borrow_mut();
+                    organism.sync_state(shared_life.get());
+                    if let Some(context) = latest_repo_context {
+                        debug_assert_eq!(context.day, finished_local.day);
+                        organism.restore_repo_work_context(
+                            context.work,
+                            context.successes_today,
+                            context.failures_today,
+                        );
+                    }
+                    let reaction =
+                        organism.command_finished(classified, event.exit_code, event.duration_ms);
+                    shared_life.set(organism.state());
+                    reaction
+                };
+                let state = shared_life.get();
+                let memory_event = MemoryEvent::at_ms_for_repo(
+                    finished_at_ms,
                     kind,
                     event.exit_code,
                     repo,
                     state,
                     event.duration_ms,
                 );
+                let work_day = memory_event.day();
+                debug_assert_eq!(work_day, finished_local.day);
+                let mut work_sync = None;
                 if let Some(memory) = memory.borrow_mut().as_mut() {
-                    // Merge transactions completed by other Forge windows as
-                    // late as possible, so a recovery that lands while this
-                    // command runs can still influence the visible reaction.
-                    let refreshed = match memory.refresh() {
-                        Ok(()) => true,
-                        Err(error) => {
-                            log::error!("could not refresh ASCII organism memory: {error}");
-                            false
-                        }
-                    };
-                    let (insight, persist_result) = memory.apply_and_enqueue(memory_event);
+                    let (insight, persist_result, retained) =
+                        memory.apply_and_enqueue(memory_event);
+                    if let Some(repo) = work_repo {
+                        work_sync = Some((repo, work_day, insight.current_work, retained));
+                    }
                     runtime.activity.set_growth(memory.growth_progress());
-                    let profile_at_ms = unix_ms();
                     runtime.activity.set_circadian_profile(
-                        memory.circadian_profile_at(profile_at_ms),
+                        memory.circadian_profile_at(finished_at_ms),
                         if refreshed {
-                            CircadianRefresh::Succeeded(
-                                local_circadian_time_at_ms(profile_at_ms).day,
-                            )
+                            CircadianRefresh::Succeeded(finished_local.day)
                         } else {
                             CircadianRefresh::Failed
                         },
                     );
-                    if kind == CommandKind::BuildOrTest {
-                        match event.exit_code {
-                            Some(code) if code != 0 && insight.open_failures >= 2 => {
-                                reaction.behavior = Behavior::SitNearError;
-                                reaction.description.push_str(&format!(
-                                    " · repo failure {}",
-                                    insight.open_failures
-                                ));
-                            }
-                            Some(0) if insight.likely_flaky => {
-                                mark_likely_flaky(&mut reaction, agent_driven);
-                            }
-                            Some(0) if insight.recovered_failures > 0 => {
-                                // Big celebrations and words stay reserved for
-                                // recoveries the human typed themself.
-                                reaction.behavior =
-                                    if insight.recovered_failures >= 3 && !agent_driven {
-                                        Behavior::CelebrateBig
-                                    } else {
-                                        Behavior::Celebrate
-                                    };
-                                if !agent_driven {
-                                    reaction.speech = Some(if insight.recovered_failures >= 3 {
-                                        "终于。"
-                                    } else {
-                                        "好了。"
-                                    });
-                                }
-                                reaction.description.push_str(&format!(
-                                    " · repo recovery after {} failure(s)",
-                                    insight.recovered_failures
-                                ));
-                            }
-                            _ => {}
-                        }
+                    normalize_replayed_event(
+                        &mut reaction,
+                        kind,
+                        event.exit_code,
+                        event.duration_ms,
+                        &insight,
+                        agent_driven,
+                    );
+                    if kind == CommandKind::BuildOrTest
+                        && event.exit_code == Some(0)
+                        && insight.event_order_exact
+                        && insight.likely_flaky
+                    {
+                        mark_likely_flaky(&mut reaction, agent_driven);
                     }
                     // A successful build measured against this repo's own
                     // baseline: one quiet sentence, no pose change.
@@ -2258,10 +2732,39 @@ impl UiState {
                         insight.recovered_failures,
                         agent_driven,
                     );
+                    // Run last: no later voice decorator may resurrect a
+                    // closure claim that the final ordered work disproves.
+                    normalize_replayed_closure(&mut reaction, kind, event.exit_code, &insight);
                     if let Err(error) = persist_result {
                         log::error!("could not queue ASCII organism memory: {error}");
                         runtime.mark_volatile();
                     }
+                }
+                if let Some((repo, day, work, retained)) = work_sync {
+                    // The pane-local reducer handled completion in arrival
+                    // order, while memory just replayed this repo/day in its
+                    // stable total order. Fold that authoritative truth back
+                    // before rendering, then reconcile other already-resolved
+                    // panes without holding the memory RefCell borrow.
+                    runtime.organism.borrow_mut().sync_repo_work_state(work);
+                    // A rejected preview is useful to the source reducer but is
+                    // not authoritative for sibling panes: it cannot survive a
+                    // refresh because it reached neither disk nor retry queue.
+                    if retained {
+                        runtime.presence.sync_repo_work(&repo, day, work);
+                    }
+                }
+                if matches!(kind, CommandKind::BuildOrTest | CommandKind::GitPush)
+                    && runtime.last_repo_root.borrow().is_none()
+                    && runtime.last_repo_cwd.borrow().is_none()
+                {
+                    // With neither a canonical repo nor a raw cwd there is no
+                    // honest boundary for a durable loop. Keep the immediate
+                    // reaction, but do not let it leak into another context.
+                    runtime
+                        .organism
+                        .borrow_mut()
+                        .sync_repo_work_state(RepoWorkState::default());
                 }
                 runtime.render(&reaction);
                 if let Some(view) = view_weak.upgrade() {
@@ -2420,6 +2923,10 @@ mod tests {
             Behavior::Approach,
             Behavior::WatchAgent,
             Behavior::WatchSettled,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
         ] {
             let width = behavior
                 .sprite()
@@ -2458,6 +2965,250 @@ mod tests {
         assert_eq!(agent.behavior, Behavior::Celebrate);
         assert_eq!(agent.tone, Tone::Quiet);
         assert_eq!(agent.speech, None);
+    }
+
+    #[test]
+    fn ordered_replay_can_downgrade_stale_failure_and_recovery_reactions() {
+        let mut failure = Reaction {
+            behavior: Behavior::SitNearError,
+            tone: Tone::Error,
+            description: "exit 1 · first crack after 5 clean run(s)".to_string(),
+            speech: None,
+        };
+        let first_failure = MemoryInsight {
+            event_order_exact: true,
+            open_failures: 1,
+            current_work: RepoWorkState::new(1, false, 0),
+            ..MemoryInsight::default()
+        };
+        normalize_replayed_event(
+            &mut failure,
+            CommandKind::BuildOrTest,
+            Some(1),
+            Some(1_250),
+            &first_failure,
+            false,
+        );
+        assert_eq!(failure.behavior, Behavior::InspectError);
+        assert_eq!(failure.speech, Some("这里。"));
+        assert!(failure.description.contains("build failure 1"));
+        assert!(failure.description.contains("1.2s"));
+        assert!(!failure.description.contains("first crack"));
+
+        let mut late_success = Reaction {
+            behavior: Behavior::CelebrateBig,
+            tone: Tone::Success,
+            description: "build/test passed after 3 failure(s) · 20s".to_string(),
+            speech: Some("终于。"),
+        };
+        let still_open = MemoryInsight {
+            event_order_exact: true,
+            current_work: RepoWorkState::new(1, false, 0),
+            ..MemoryInsight::default()
+        };
+        normalize_replayed_event(
+            &mut late_success,
+            CommandKind::BuildOrTest,
+            Some(0),
+            Some(20_000),
+            &still_open,
+            false,
+        );
+        normalize_replayed_closure(
+            &mut late_success,
+            CommandKind::BuildOrTest,
+            Some(0),
+            &still_open,
+        );
+        assert_eq!(late_success.behavior, Behavior::Celebrate);
+        assert_eq!(late_success.speech, None);
+        assert_eq!(
+            late_success.description,
+            "build/test passed · 20.0s · later repo failure remains open"
+        );
+        assert!(late_success
+            .description
+            .contains("later repo failure remains open"));
+    }
+
+    #[test]
+    fn compacted_order_is_neutral_and_final_work_vetoes_closure_words() {
+        let mut compacted = Reaction {
+            behavior: Behavior::CelebrateBig,
+            tone: Tone::Success,
+            description: "build/test passed after 8 failure(s)".to_string(),
+            speech: Some("终于。"),
+        };
+        let unknown_order = MemoryInsight {
+            current_work: RepoWorkState::new(1, false, 4),
+            ..MemoryInsight::default()
+        };
+        normalize_replayed_event(
+            &mut compacted,
+            CommandKind::BuildOrTest,
+            Some(0),
+            None,
+            &unknown_order,
+            false,
+        );
+        normalize_replayed_closure(
+            &mut compacted,
+            CommandKind::BuildOrTest,
+            Some(0),
+            &unknown_order,
+        );
+        assert_eq!(compacted.behavior, Behavior::Celebrate);
+        assert_eq!(compacted.tone, Tone::Quiet);
+        assert_eq!(compacted.speech, None);
+        assert!(compacted
+            .description
+            .contains("older repo event order unavailable"));
+        assert!(!compacted.description.contains("after 8"));
+
+        let mut push = Reaction {
+            behavior: Behavior::RestAfterPush,
+            tone: Tone::Success,
+            description: "git push completed".to_string(),
+            speech: Some("收好了。"),
+        };
+        let newer_recovery = MemoryInsight {
+            event_order_exact: true,
+            push_after_recovery: true,
+            current_work: RepoWorkState::new(0, true, 3),
+            ..MemoryInsight::default()
+        };
+        normalize_replayed_closure(&mut push, CommandKind::GitPush, Some(0), &newer_recovery);
+        normalize_replayed_closure(&mut push, CommandKind::GitPush, Some(0), &newer_recovery);
+        assert_eq!(push.speech, None);
+        assert_eq!(
+            push.description
+                .matches("newer recovered work still awaits push")
+                .count(),
+            1
+        );
+
+        let mut exact_push = Reaction {
+            description: "git push completed".to_string(),
+            speech: Some("收好了。"),
+            ..push
+        };
+        let closed = MemoryInsight {
+            event_order_exact: true,
+            push_after_recovery: true,
+            current_work: RepoWorkState::default(),
+            ..MemoryInsight::default()
+        };
+        normalize_replayed_closure(&mut exact_push, CommandKind::GitPush, Some(0), &closed);
+        assert_eq!(exact_push.speech, Some("收好了。"));
+    }
+
+    #[test]
+    fn final_ordered_work_owns_every_failure_and_push_closure_branch() {
+        let base_failure = Reaction {
+            behavior: Behavior::InspectError,
+            tone: Tone::Error,
+            description: "exit 1 · build failure 1".to_string(),
+            speech: Some("这里。"),
+        };
+        let mut later_recovery = base_failure.clone();
+        normalize_replayed_closure(
+            &mut later_recovery,
+            CommandKind::BuildOrTest,
+            Some(1),
+            &MemoryInsight {
+                current_work: RepoWorkState::new(0, true, 1),
+                ..MemoryInsight::default()
+            },
+        );
+        assert!(later_recovery
+            .description
+            .contains("ordered replay already contains a later recovery"));
+
+        let mut later_push = base_failure;
+        normalize_replayed_closure(
+            &mut later_push,
+            CommandKind::BuildOrTest,
+            Some(1),
+            &MemoryInsight::default(),
+        );
+        assert!(later_push
+            .description
+            .contains("ordered repo history already contains a later closure"));
+
+        let base_push = Reaction {
+            behavior: Behavior::RestAfterPush,
+            tone: Tone::Success,
+            description: "git push completed".to_string(),
+            speech: Some("收好了。"),
+        };
+        let mut later_failure = base_push.clone();
+        normalize_replayed_closure(
+            &mut later_failure,
+            CommandKind::GitPush,
+            Some(0),
+            &MemoryInsight {
+                event_order_exact: true,
+                push_after_recovery: true,
+                current_work: RepoWorkState::new(2, false, 1),
+                ..MemoryInsight::default()
+            },
+        );
+        assert_eq!(later_failure.speech, None);
+        assert!(later_failure
+            .description
+            .contains("later repo failure remains open"));
+
+        for insight in [
+            MemoryInsight {
+                event_order_exact: true,
+                ..MemoryInsight::default()
+            },
+            MemoryInsight::default(),
+        ] {
+            let mut ordinary_or_inexact = base_push.clone();
+            normalize_replayed_closure(
+                &mut ordinary_or_inexact,
+                CommandKind::GitPush,
+                Some(0),
+                &insight,
+            );
+            assert_eq!(ordinary_or_inexact.speech, None);
+        }
+
+        // Voice decorators intentionally run before this final veto in the
+        // lifecycle callback. Even a freshly produced flaky/growth line may
+        // not claim closure when ordered replay ends with another failure.
+        let still_open = MemoryInsight {
+            event_order_exact: true,
+            recovered_failures: 1,
+            likely_flaky: true,
+            current_work: RepoWorkState::new(1, false, 3),
+            ..MemoryInsight::default()
+        };
+        let mut decorated = Reaction {
+            behavior: Behavior::CelebrateBig,
+            tone: Tone::Success,
+            description: String::new(),
+            speech: None,
+        };
+        normalize_replayed_event(
+            &mut decorated,
+            CommandKind::BuildOrTest,
+            Some(0),
+            None,
+            &still_open,
+            false,
+        );
+        mark_likely_flaky(&mut decorated, false);
+        apply_growth_voice(&mut decorated, GrowthStage::Seasoned, 1, false);
+        assert!(decorated.speech.is_some());
+        normalize_replayed_closure(
+            &mut decorated,
+            CommandKind::BuildOrTest,
+            Some(0),
+            &still_open,
+        );
+        assert_eq!(decorated.speech, None);
     }
 
     #[test]
@@ -2679,7 +3430,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_typing_slides_the_body_away_then_expires() {
+    fn accepted_typing_owns_a_brief_live_body_hide_window() {
         assert_eq!(
             surface_mode(
                 Behavior::Idle,
@@ -2688,6 +3439,8 @@ mod tests {
             ),
             SurfaceMode::Typing
         );
+        assert!(suppress_live_body_for_focus(SurfaceMode::Typing));
+        assert!(!suppress_live_body_for_focus(SurfaceMode::Idle));
         assert_eq!(
             surface_mode(Behavior::Idle, false, Some(HUMAN_INPUT_RETREAT)),
             SurfaceMode::Idle
@@ -2700,6 +3453,18 @@ mod tests {
             surface_mode(Behavior::Celebrate, false, None),
             SurfaceMode::Reacting
         );
+        assert_eq!(
+            surface_mode(Behavior::GuardRecovery, false, None),
+            SurfaceMode::Idle,
+            "the durable guard is an ambient intention, not an endless reaction"
+        );
+        for vigil in [
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardCautious,
+        ] {
+            assert_eq!(surface_mode(vigil, false, None), SurfaceMode::Idle);
+        }
     }
 
     #[test]
@@ -2844,6 +3609,7 @@ mod tests {
             false,
             true,
             SurfaceMode::Idle,
+            false,
         ));
         for (owner, motion, alt_screen, visible, mode) in [
             (false, OrganismMotion::Full, false, true, SurfaceMode::Idle),
@@ -2867,9 +3633,17 @@ mod tests {
             ),
         ] {
             assert!(!can_show_presence_cue(
-                owner, motion, alt_screen, visible, mode,
+                owner, motion, alt_screen, visible, mode, false,
             ));
         }
+        assert!(!can_show_presence_cue(
+            true,
+            OrganismMotion::Full,
+            false,
+            true,
+            SurfaceMode::Idle,
+            true,
+        ));
 
         assert_eq!(
             live_display_behavior(Behavior::Sleep, SurfaceMode::Idle, cue),
@@ -2940,7 +3714,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_visible_presence_can_regenerate_by_sleeping() {
+    fn ordinary_sleep_regeneration_requires_the_visible_presence() {
         let sleeping = |owner, motion, alt_screen| {
             visible_sleeping(
                 owner,
@@ -2983,6 +3757,100 @@ mod tests {
             SurfaceMode::Idle,
             AmbientBehavior::Sleep,
         ));
+    }
+
+    #[test]
+    fn durable_vigil_rest_is_owner_scoped_and_geometry_independent() {
+        for vigil in [
+            RepoVigil::Failure,
+            RepoVigil::Stuck,
+            RepoVigil::Recovery,
+            RepoVigil::CautiousRecovery,
+        ] {
+            assert!(repo_vigil_sleep_claim(
+                true,
+                SurfaceMode::Idle,
+                AmbientBehavior::Sleep,
+                vigil,
+            ));
+        }
+        assert!(!repo_vigil_sleep_claim(
+            false,
+            SurfaceMode::Idle,
+            AmbientBehavior::Sleep,
+            RepoVigil::Failure,
+        ));
+        assert!(!repo_vigil_sleep_claim(
+            true,
+            SurfaceMode::Typing,
+            AmbientBehavior::Sleep,
+            RepoVigil::Failure,
+        ));
+        assert!(!repo_vigil_sleep_claim(
+            true,
+            SurfaceMode::Idle,
+            AmbientBehavior::GuardFailure,
+            RepoVigil::Failure,
+        ));
+        assert!(!repo_vigil_sleep_claim(
+            true,
+            SurfaceMode::Idle,
+            AmbientBehavior::Sleep,
+            RepoVigil::None,
+        ));
+
+        // The non-frame reconciler uses this same pure snapshot: acquiring a
+        // hidden vigil establishes rest immediately, and clearing it revokes
+        // the claim without waiting for geometry or a heartbeat.
+        assert!(sleeping_claim(
+            true,
+            OrganismMotion::Static,
+            true,
+            false,
+            false,
+            SurfaceMode::Idle,
+            AmbientBehavior::Sleep,
+            RepoVigil::Failure,
+        ));
+        assert!(!sleeping_claim(
+            true,
+            OrganismMotion::Static,
+            true,
+            false,
+            false,
+            SurfaceMode::Idle,
+            AmbientBehavior::Idle,
+            RepoVigil::None,
+        ));
+
+        // Static/fail-closed geometry makes ordinary visible sleep false, but
+        // the logical owner claim still closes the 0.15→0.25 wake hysteresis.
+        assert!(!visible_sleeping(
+            true,
+            OrganismMotion::Static,
+            true,
+            false,
+            false,
+            SurfaceMode::Idle,
+            AmbientBehavior::Sleep,
+        ));
+        let mut state = LifeState {
+            energy: 0.10,
+            ..LifeState::default()
+        };
+        let mut mind = AmbientMind::default();
+        assert_eq!(
+            mind.step(state, 120.0, 0.0, RepoVigil::Failure),
+            AmbientBehavior::Sleep
+        );
+        for _ in 0..120 {
+            state.tick(1.0, false, true, CircadianPhase::Unlearned);
+        }
+        assert!(state.energy >= 0.25);
+        assert_eq!(
+            mind.step(state, 120.0, 1.0, RepoVigil::Failure),
+            AmbientBehavior::GuardFailure
+        );
     }
 
     #[test]
@@ -3094,6 +3962,8 @@ mod tests {
 
     #[test]
     fn volatile_commands_inside_the_known_checkout_keep_their_context() {
+        assert!(cwd_within("/", "/"));
+        assert!(cwd_within("/repo/sub", "/"));
         assert!(cwd_within("/repo", "/repo"));
         assert!(cwd_within("/repo/sub/dir", "/repo"));
         assert!(!cwd_within("/repository", "/repo"));
@@ -3106,12 +3976,72 @@ mod tests {
             Some("/home/u/link")
         ));
         assert!(!same_checkout(
+            None,
+            Some("/work/non-git-a"),
+            Some("/work/non-git-b")
+        ));
+        assert!(!same_checkout(
             Some("/repo"),
             Some("/home/u/link"),
             Some("/tmp")
         ));
         assert!(!same_checkout(None, None, Some("/tmp")));
         assert!(!same_checkout(Some("/repo"), None, None));
+    }
+
+    #[test]
+    fn work_state_broadcasts_are_scoped_to_exact_repo_and_local_day() {
+        assert!(repo_work_scope_matches(
+            "/repo/a",
+            20,
+            Some("/repo/a"),
+            Some(20),
+            Some("/repo/a"),
+            Some("/repo/a/sub")
+        ));
+        assert!(!repo_work_scope_matches(
+            "/repo/a",
+            20,
+            Some("/repo/b"),
+            Some(20),
+            Some("/repo/b"),
+            Some("/repo/b")
+        ));
+        assert!(!repo_work_scope_matches(
+            "/repo/a",
+            20,
+            Some("/repo/a"),
+            Some(19),
+            Some("/repo/a"),
+            Some("/repo/a")
+        ));
+        assert!(!repo_work_scope_matches(
+            "/repo/a",
+            20,
+            Some("/repo/a"),
+            Some(20),
+            Some("/repo/a"),
+            Some("/tmp")
+        ));
+        assert!(!repo_work_scope_matches(
+            "/repo/a",
+            20,
+            None,
+            Some(20),
+            None,
+            Some("/repo/a")
+        ));
+    }
+
+    #[test]
+    fn checkout_identity_requires_the_raw_cwd_not_its_bounded_display_copy() {
+        let root = format!("/repo/{}", "r".repeat(5_000));
+        let raw_cwd = format!("{root}/nested");
+        let display_cwd = crate::review_input::safe_inline_display(&raw_cwd, 4 * 1_024);
+
+        assert_ne!(display_cwd, raw_cwd);
+        assert!(!same_checkout(Some(&root), Some(&root), Some(&display_cwd)));
+        assert!(same_checkout(Some(&root), Some(&root), Some(&raw_cwd)));
     }
 
     #[test]
@@ -3146,6 +4076,14 @@ mod tests {
         let approach = pose(AmbientBehavior::Approach, 0);
         assert!(approach.x > idle_home.x);
         assert_eq!(approach.y, idle_home.y);
+        assert_eq!(
+            pose(AmbientBehavior::GuardRecovery, 0),
+            approach,
+            "recovered work is guarded beside the prompt"
+        );
+        assert_eq!(pose(AmbientBehavior::GuardRecovery, 400), approach);
+        assert_eq!(pose(AmbientBehavior::GuardCautious, 0), approach);
+        assert_eq!(pose(AmbientBehavior::GuardCautious, 400), approach);
         // Explore walks at frames where a calm idle would still be sitting.
         let explore = pose(AmbientBehavior::Explore, 300);
         let calm_sit = pose(AmbientBehavior::Idle, 300);
@@ -3323,6 +4261,46 @@ mod tests {
             "watching stays spatially still between real output pulses"
         );
 
+        // Failure/stuck are idle intentions, but spatially remain at the
+        // completed output edge. Recovery moves to the prompt-side bottom.
+        let failure = surface_point(
+            surface,
+            SurfaceMode::Idle,
+            WanderTempo::Calm,
+            AmbientBehavior::GuardFailure,
+            0,
+        )
+        .unwrap();
+        let stuck = surface_point(
+            surface,
+            SurfaceMode::Idle,
+            WanderTempo::Calm,
+            AmbientBehavior::GuardStuck,
+            400,
+        )
+        .unwrap();
+        assert_eq!(failure, stuck);
+        assert_eq!(failure.y, f64::from(below_output_y(surface).unwrap()));
+        let recovery = surface_point(
+            surface,
+            SurfaceMode::Idle,
+            WanderTempo::Calm,
+            AmbientBehavior::GuardRecovery,
+            0,
+        )
+        .unwrap();
+        assert!(recovery.y > failure.y);
+        let sleeping_failure = surface_point_for_vigil(
+            surface,
+            SurfaceMode::Idle,
+            WanderTempo::Drowsy,
+            AmbientBehavior::Sleep,
+            RepoVigil::Failure,
+            0,
+        )
+        .unwrap();
+        assert_eq!(sleeping_failure.y, failure.y);
+
         // Full-motion interpolation from the old upper typing corner would
         // cross the output band. The runtime projects it directly to the safe
         // target floor while horizontal motion remains free to interpolate.
@@ -3386,6 +4364,33 @@ mod tests {
             ),
             None
         );
+        for vigil in [AmbientBehavior::GuardFailure, AmbientBehavior::GuardStuck] {
+            assert_eq!(
+                surface_point(full_output, SurfaceMode::Idle, WanderTempo::Calm, vigil, 0,),
+                None,
+                "an unresolved-work vigil must never fall back over output"
+            );
+        }
+        assert_eq!(
+            surface_point_for_vigil(
+                full_output,
+                SurfaceMode::Idle,
+                WanderTempo::Drowsy,
+                AmbientBehavior::Sleep,
+                RepoVigil::Stuck,
+                0,
+            ),
+            None,
+            "forced rest must retain the unresolved-work output boundary"
+        );
+        assert!(surface_point(
+            full_output,
+            SurfaceMode::Idle,
+            WanderTempo::Calm,
+            AmbientBehavior::GuardRecovery,
+            0,
+        )
+        .is_some());
     }
 
     #[test]
@@ -3411,7 +4416,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_body_wanders_but_typing_uses_the_safe_upper_corner() {
+    fn idle_body_wanders_and_the_hidden_typing_fallback_is_geometrically_safe() {
         let surface = SurfaceBox {
             width: 360,
             height: 200,

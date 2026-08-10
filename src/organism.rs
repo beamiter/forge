@@ -21,6 +21,70 @@ impl CommandKind {
     }
 }
 
+/// Content-free, repo/day-scoped work facts shared between memory, reducers,
+/// and the window coordinator. Repository identity never enters this value;
+/// the UI uses it only to route the snapshot to the matching pane bodies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RepoWorkState {
+    pub(crate) open_failures: u32,
+    pub(crate) recovered_pending_push: bool,
+    pub(crate) failure_success_flips: u32,
+}
+
+impl RepoWorkState {
+    pub(crate) const fn new(
+        open_failures: u32,
+        recovered_pending_push: bool,
+        failure_success_flips: u32,
+    ) -> Self {
+        Self {
+            open_failures,
+            // Ordered replay never leaves recovered and failed work open at
+            // once. Normalize hostile/runtime callers to the safer failure
+            // interpretation instead of creating an ambiguous visible state.
+            recovered_pending_push: recovered_pending_push && open_failures == 0,
+            failure_success_flips,
+        }
+    }
+
+    pub(crate) const fn vigil(self) -> RepoVigil {
+        if self.open_failures >= STUCK_OPEN_FAILURES {
+            RepoVigil::Stuck
+        } else if self.open_failures > 0 {
+            RepoVigil::Failure
+        } else if self.recovered_pending_push
+            && self.failure_success_flips >= CAUTIOUS_RECOVERY_FLIPS
+        {
+            RepoVigil::CautiousRecovery
+        } else if self.recovered_pending_push {
+            RepoVigil::Recovery
+        } else {
+            RepoVigil::None
+        }
+    }
+}
+
+/// Visible phase of the current repo/day work loop. It is always derived from
+/// [`RepoWorkState`], never persisted as a second source of truth.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum RepoVigil {
+    #[default]
+    None,
+    Failure,
+    Stuck,
+    Recovery,
+    CautiousRecovery,
+}
+
+impl RepoVigil {
+    pub(crate) const fn is_active(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+const STUCK_OPEN_FAILURES: u32 = 3;
+const CAUTIOUS_RECOVERY_FLIPS: u32 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Behavior {
     Idle,
@@ -45,6 +109,18 @@ pub(crate) enum Behavior {
     /// Settled in for a long command: still watching, but lying down with
     /// half-closed eyes — a vigil, not a nap.
     WatchSettled,
+    /// A failed build is still open in this repo/day. It stays with the work
+    /// after the immediate error reaction has settled.
+    GuardFailure,
+    /// Three or more failures remain open. The lower, quieter posture records
+    /// that the loop is stubborn without escalating speech or stimulus.
+    GuardStuck,
+    /// A recovered build has not been pushed yet. Between real events the cat
+    /// stays beside that finished work instead of forgetting it at settle.
+    GuardRecovery,
+    /// Repeated same-day failure/success flips make the recovery worth checking
+    /// again before push; this is caution, not a claim that a test is flaky.
+    GuardCautious,
 }
 
 // ── Live-body frame sets ────────────────────────────────────────────────
@@ -90,6 +166,22 @@ const APPROACH_FRAMES: [&str; 2] = [" /\\_/\\\n( ^.^ )\n > ^ <", " /\\_/\\\n( ^.
 const WATCH_AGENT_FRAMES: [&str; 2] = [" /\\_/\\\n( -.o )\n (___) ", " /\\_/\\\n( o.- )\n (___) "];
 const WATCH_SETTLED_FRAMES: [&str; 2] =
     [" /\\_/\\\n( -.- )\n (___) ", " /\\_/\\\n( -.o )\n (___) "];
+const GUARD_FAILURE_FRAMES: [&str; 2] = [
+    " /\\_/\\\n( o_o ) [!]\n /|_|\\",
+    " /\\_/\\\n( o.o ) [!]\n /|_|\\",
+];
+const GUARD_STUCK_FRAMES: [&str; 2] = [
+    " =\\_/=\n( ._. ) [!!]\n /|_|\\",
+    " =\\_/=\n( -.- ) [!!]\n /|_|\\",
+];
+const GUARD_RECOVERY_FRAMES: [&str; 2] = [
+    " /\\_/\\\n( -.- ) [ok]\n /|_|\\",
+    " /\\_/\\\n( -.o ) [ok]\n /|_|\\",
+];
+const GUARD_CAUTIOUS_FRAMES: [&str; 2] = [
+    " /\\_/\\\n( ?.? ) [?]\n /|_|\\",
+    " /\\_/\\\n( ?.o ) [?]\n /|_|\\",
+];
 
 impl Behavior {
     /// Canonical single pose: the first frame of each behavior's set. Used by
@@ -110,7 +202,18 @@ impl Behavior {
             Self::Approach => APPROACH_FRAMES[0],
             Self::WatchAgent => WATCH_AGENT_FRAMES[0],
             Self::WatchSettled => WATCH_SETTLED_FRAMES[0],
+            Self::GuardFailure => GUARD_FAILURE_FRAMES[0],
+            Self::GuardStuck => GUARD_STUCK_FRAMES[0],
+            Self::GuardRecovery => GUARD_RECOVERY_FRAMES[0],
+            Self::GuardCautious => GUARD_CAUTIOUS_FRAMES[0],
         }
+    }
+
+    pub(crate) const fn is_repo_vigil(self) -> bool {
+        matches!(
+            self,
+            Self::GuardFailure | Self::GuardStuck | Self::GuardRecovery | Self::GuardCautious
+        )
     }
 
     /// One-line micro-poses for the sticky scrollback header. Every glyph is
@@ -132,6 +235,10 @@ impl Behavior {
             Self::Approach => ["/\\^/\\", "/\\_/\\"],
             Self::WatchAgent => ["/\\./\\", "/\\_/\\"],
             Self::WatchSettled => ["/\\-/\\", "/\\_/\\"],
+            Self::GuardFailure => ["/\\!/\\", "/\\o/\\"],
+            Self::GuardStuck => ["=\\!/=", "=\\_/="],
+            Self::GuardRecovery => ["/\\+/\\", "/\\o/\\"],
+            Self::GuardCautious => ["/\\?/\\", "/\\o/\\"],
         }
     }
 }
@@ -193,19 +300,33 @@ pub(crate) fn sprite_frame(
         Behavior::Approach => APPROACH_FRAMES[alt],
         Behavior::WatchAgent => WATCH_AGENT_FRAMES[alt],
         Behavior::WatchSettled => WATCH_SETTLED_FRAMES[alt],
+        Behavior::GuardFailure => GUARD_FAILURE_FRAMES[alt],
+        Behavior::GuardStuck => GUARD_STUCK_FRAMES[alt],
+        Behavior::GuardRecovery => GUARD_RECOVERY_FRAMES[alt],
+        Behavior::GuardCautious => GUARD_CAUTIOUS_FRAMES[alt],
         Behavior::InspectError | Behavior::UnknownOutcome => behavior.sprite(),
     }
 }
 
 /// Ambient disposition of a genuinely idle body — no command, no reaction
-/// hold, no recent typing. Chosen by [`AmbientMind`], never by event
-/// reactions.
+/// hold, no recent typing. Usually utility-selected by [`AmbientMind`]; repo
+/// vigils are durable work intentions supplied by the reducer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AmbientBehavior {
     Idle,
     Sleep,
     Explore,
     Approach,
+    /// One or two unresolved build failures: keep the work in sight without
+    /// turning a completed error reaction into permanent alarm.
+    GuardFailure,
+    /// Three or more unresolved failures: a lower, quieter debugging vigil.
+    GuardStuck,
+    /// A durable, repo-scoped intention supplied by the reducer rather than a
+    /// random utility candidate: keep the recovered work company until push.
+    GuardRecovery,
+    /// Repeated failure/success flips make this recovery worth one more check.
+    GuardCautious,
 }
 
 impl AmbientBehavior {
@@ -215,6 +336,10 @@ impl AmbientBehavior {
             Self::Sleep => Behavior::Sleep,
             Self::Explore => Behavior::Explore,
             Self::Approach => Behavior::Approach,
+            Self::GuardFailure => Behavior::GuardFailure,
+            Self::GuardStuck => Behavior::GuardStuck,
+            Self::GuardRecovery => Behavior::GuardRecovery,
+            Self::GuardCautious => Behavior::GuardCautious,
         }
     }
 
@@ -225,8 +350,18 @@ impl AmbientBehavior {
             Self::Sleep => 2.5,
             Self::Explore => 1.4,
             Self::Approach => 1.8,
+            Self::GuardFailure | Self::GuardStuck | Self::GuardRecovery | Self::GuardCautious => {
+                2.0
+            }
             Self::Idle => 1.0,
         }
+    }
+
+    const fn is_repo_vigil(self) -> bool {
+        matches!(
+            self,
+            Self::GuardFailure | Self::GuardStuck | Self::GuardRecovery | Self::GuardCautious
+        )
     }
 }
 
@@ -277,12 +412,49 @@ impl AmbientMind {
 
     /// Advance the hold timer by `dt` seconds and rescore once it expires.
     /// `idle_for` is how long the terminal has been completely quiet.
-    pub(crate) fn step(&mut self, state: LifeState, idle_for: f32, dt: f32) -> AmbientBehavior {
+    pub(crate) fn step(
+        &mut self,
+        state: LifeState,
+        idle_for: f32,
+        dt: f32,
+        vigil: RepoVigil,
+    ) -> AmbientBehavior {
         let dt = if dt.is_finite() {
             dt.clamp(0.0, 1.0)
         } else {
             0.0
         };
+
+        // An unfinished repo loop is an intention, not another noisy utility
+        // roll. Its phase picks a stable guard immediately, while genuine
+        // exhaustion still wins so the homeostatic sleep loop can close.
+        if vigil.is_active() {
+            let guard = match vigil {
+                RepoVigil::Failure => AmbientBehavior::GuardFailure,
+                RepoVigil::Stuck => AmbientBehavior::GuardStuck,
+                RepoVigil::Recovery => AmbientBehavior::GuardRecovery,
+                RepoVigil::CautiousRecovery => AmbientBehavior::GuardCautious,
+                RepoVigil::None => unreachable!("an active vigil has a guard pose"),
+            };
+            let sleeping_through_vigil =
+                self.current == AmbientBehavior::Sleep && state.energy < REPO_VIGIL_WAKE_ENERGY;
+            let next = if state.energy < FORCED_REST_ENERGY || sleeping_through_vigil {
+                AmbientBehavior::Sleep
+            } else {
+                guard
+            };
+            if self.current != next {
+                self.current = next;
+                self.hold_for = self.current.hold_secs();
+            } else {
+                self.hold_for = (self.hold_for - dt).max(0.0);
+            }
+            return self.current;
+        }
+        if self.current.is_repo_vigil() {
+            self.current = AmbientBehavior::Idle;
+            self.hold_for = 0.0;
+        }
         self.hold_for -= dt;
         if self.hold_for > 0.0 {
             return self.current;
@@ -601,6 +773,10 @@ fn bounded(value: f32) -> f32 {
 /// Below this energy the tick rests regardless of terminal activity — the
 /// prototype's forced-sleep threshold, keeping exhaustion self-limiting.
 const FORCED_REST_ENERGY: f32 = 0.15;
+/// Once a repo vigil has actually fallen asleep, let it refill beyond the
+/// forced-rest edge before resuming. This hysteresis prevents a one-frame
+/// sleep/guard oscillation around [`FORCED_REST_ENERGY`].
+const REPO_VIGIL_WAKE_ENERGY: f32 = 0.25;
 /// First failure after this many clean passes today reads as a broken streak
 /// and reacts with amplified stress instead of the routine inspection.
 const SENSITIZATION_CLEAN_RUNS: u32 = 5;
@@ -613,6 +789,10 @@ pub(crate) struct NativeOrganism {
     build_failures: u32,
     active_kind: Option<CommandKind>,
     recovered_build: bool,
+    /// Same-day failure→success episodes remembered for this repo. It does not
+    /// claim a particular test is flaky; the third flip only makes a pending
+    /// recovery visibly cautious until push.
+    failure_success_flips: u32,
     /// Today's build/test successes in the active repo context. Habituation:
     /// each additional clean pass lands with 1/(1+prior/4) of the excitement,
     /// where `prior` is this count before the pass is recorded.
@@ -644,12 +824,49 @@ impl NativeOrganism {
         self.state
     }
 
+    /// Whether this repo/day has a recovered build that memory has not yet
+    /// seen followed by a successful push. This is a content-free intention:
+    /// it carries neither the command nor repository identity.
+    pub(crate) fn guarding_recovery(&self) -> bool {
+        self.recovered_build
+    }
+
+    pub(crate) fn repo_work_state(&self) -> RepoWorkState {
+        RepoWorkState::new(
+            self.build_failures,
+            self.recovered_build,
+            self.failure_success_flips,
+        )
+    }
+
+    pub(crate) fn repo_vigil(&self) -> RepoVigil {
+        self.repo_work_state().vigil()
+    }
+
+    /// Reconcile the pane-local intention with the memory layer's ordered
+    /// repo/day replay. Returns whether any visible work fact changed.
+    pub(crate) fn sync_repo_work_state(&mut self, work: RepoWorkState) -> bool {
+        let work = RepoWorkState::new(
+            work.open_failures,
+            work.recovered_pending_push,
+            work.failure_success_flips,
+        );
+        if self.repo_work_state() == work {
+            return false;
+        }
+        self.build_failures = work.open_failures;
+        self.recovered_build = work.recovered_pending_push;
+        self.failure_success_flips = work.failure_success_flips;
+        true
+    }
+
     /// Restore the unfinished build streak for the exact repo/day selected by
     /// the memory layer. Switching repositories calls this again, so failures
     /// can never leak into another checkout's celebration level.
     pub(crate) fn restore_build_failures(&mut self, failures: u32) {
         self.build_failures = failures;
         self.recovered_build = false;
+        self.failure_success_flips = 0;
     }
 
     pub(crate) fn restore_repo_context(
@@ -659,8 +876,20 @@ impl NativeOrganism {
         successes_today: u32,
         failures_today: u32,
     ) {
-        self.build_failures = failures;
-        self.recovered_build = recovered_build;
+        self.restore_repo_work_context(
+            RepoWorkState::new(failures, recovered_build, 0),
+            successes_today,
+            failures_today,
+        );
+    }
+
+    pub(crate) fn restore_repo_work_context(
+        &mut self,
+        work: RepoWorkState,
+        successes_today: u32,
+        failures_today: u32,
+    ) {
+        self.sync_repo_work_state(work);
         self.successes_today = successes_today;
         self.failures_today = failures_today;
     }
@@ -711,9 +940,13 @@ impl NativeOrganism {
     }
 
     /// A local calendar boundary passed while this pane stayed alive. Today's
-    /// habituation/sensitization counters restart; repo-backed contexts are
-    /// re-seeded from the day-scoped memory on the next build anyway.
+    /// habituation/sensitization counters and unfinished repo intentions
+    /// restart; repo-backed contexts are re-seeded from the day-scoped memory
+    /// on the next build anyway.
     pub(crate) fn roll_over_day(&mut self) {
+        self.build_failures = 0;
+        self.recovered_build = false;
+        self.failure_success_flips = 0;
         self.successes_today = 0;
         self.failures_today = 0;
     }
@@ -726,11 +959,47 @@ impl NativeOrganism {
     }
 
     pub(crate) fn idle_reaction(&self) -> Reaction {
-        Reaction {
-            behavior: Behavior::Idle,
-            tone: Tone::Quiet,
-            description: "quiet · waiting for a real Block event".to_string(),
-            speech: None,
+        match self.repo_vigil() {
+            RepoVigil::Failure => Reaction {
+                behavior: Behavior::GuardFailure,
+                tone: Tone::Quiet,
+                description: format!(
+                    "keeping build failure {} in sight · waiting for another build/test",
+                    self.build_failures
+                ),
+                speech: None,
+            },
+            RepoVigil::Stuck => Reaction {
+                behavior: Behavior::GuardStuck,
+                // More failures lower the posture; they do not make the
+                // durable card louder than the first unresolved failure.
+                tone: Tone::Quiet,
+                description: format!(
+                    "quiet beside {} unresolved build failures · waiting without nagging",
+                    self.build_failures
+                ),
+                speech: None,
+            },
+            RepoVigil::Recovery => Reaction {
+                behavior: Behavior::GuardRecovery,
+                tone: Tone::Quiet,
+                description: "keeping watch over recovered work · waiting for git push".to_string(),
+                speech: None,
+            },
+            RepoVigil::CautiousRecovery => Reaction {
+                behavior: Behavior::GuardCautious,
+                tone: Tone::Warning,
+                description:
+                    "recovered work has flipped repeatedly today · checking once more before git push"
+                        .to_string(),
+                speech: None,
+            },
+            RepoVigil::None => Reaction {
+                behavior: Behavior::Idle,
+                tone: Tone::Quiet,
+                description: "quiet · waiting for a real Block event".to_string(),
+                speech: None,
+            },
         }
     }
 
@@ -908,7 +1177,13 @@ impl NativeOrganism {
         match kind {
             CommandKind::BuildOrTest => {
                 let failures = std::mem::take(&mut self.build_failures);
-                self.recovered_build = failures > 0;
+                if failures > 0 {
+                    self.failure_success_flips = self.failure_success_flips.saturating_add(1);
+                }
+                // A later clean build must not forget an earlier recovery that
+                // is still waiting for push. Memory preserves this flag until
+                // a new build failure or a successful push; mirror it here.
+                self.recovered_build |= failures > 0;
                 // Habituation: excitement scales by 1/(1+prior/4), where
                 // `prior` counts the clean passes already seen today, so the
                 // day's first pass lands at full strength. Recoveries always
@@ -1016,10 +1291,21 @@ fn duration_label(duration_ms: Option<u64>) -> String {
 }
 
 pub(crate) fn classify_command(command: &str) -> CommandKind {
-    let mut tokens = command
-        .split_whitespace()
-        .take(16)
+    const MAX_CLASSIFIER_TOKENS: usize = 16;
+    const MAX_WRAPPER_DEPTH: usize = 8;
+
+    let mut raw_tokens = command.split_whitespace();
+    let bounded_tokens = raw_tokens
+        .by_ref()
+        .take(MAX_CLASSIFIER_TOKENS)
         .map(normalize_token)
+        .collect::<Vec<_>>();
+    // Classification stays bounded, but a truncated push can hide a trailing
+    // `--dry-run`. Such a command must fail closed instead of publishing the
+    // recovery intention on incomplete evidence.
+    let truncated = raw_tokens.next().is_some();
+    let mut tokens = bounded_tokens
+        .into_iter()
         .filter(|token| !token.is_empty())
         .peekable();
 
@@ -1031,33 +1317,64 @@ pub(crate) fn classify_command(command: &str) -> CommandKind {
     }
 
     let mut program = tokens.next().unwrap_or_default();
-    if matches!(program.as_str(), "command" | "builtin" | "exec") {
-        program = tokens.next().unwrap_or_default();
-    }
-    if program == "env" {
-        while tokens
-            .peek()
-            .is_some_and(|token| token.starts_with('-') || is_environment_assignment(token))
-        {
-            tokens.next();
-        }
-        program = tokens.next().unwrap_or_default();
-    }
-    if program == "sudo" {
-        while tokens.peek().is_some_and(|token| token.starts_with('-')) {
-            tokens.next();
+    for _ in 0..MAX_WRAPPER_DEPTH {
+        let wrapper = program.rsplit('/').next().unwrap_or(program.as_str());
+        match wrapper {
+            "command" | "builtin" => skip_wrapper_options(&mut tokens, &[]),
+            "exec" => skip_wrapper_options(&mut tokens, &["-a", "--argv0"]),
+            "env" => {
+                skip_wrapper_options(
+                    &mut tokens,
+                    &["-u", "--unset", "-c", "--chdir", "-s", "--split-string"],
+                );
+                while tokens
+                    .peek()
+                    .is_some_and(|token| is_environment_assignment(token))
+                {
+                    tokens.next();
+                }
+            }
+            "sudo" => skip_wrapper_options(
+                &mut tokens,
+                &[
+                    "-u",
+                    "--user",
+                    "-g",
+                    "--group",
+                    "-h",
+                    "--host",
+                    "-p",
+                    "--prompt",
+                    "-c",
+                    "--close-from",
+                    "-r",
+                    "--chroot",
+                    "-t",
+                    "--command-timeout",
+                    "--role",
+                    "--type",
+                ],
+            ),
+            "time" => skip_wrapper_options(&mut tokens, &["-f", "--format", "-o", "--output"]),
+            "nohup" => skip_wrapper_options(&mut tokens, &[]),
+            _ => break,
         }
         program = tokens.next().unwrap_or_default();
     }
 
     let program = program.rsplit('/').next().unwrap_or(program.as_str());
-    let args: Vec<String> = tokens.take(4).collect();
+    let args: Vec<String> = tokens.collect();
     match program {
-        "git" if args.first().is_some_and(|arg| arg == "push") => CommandKind::GitPush,
+        "git"
+            if git_push_args(&args)
+                .is_some_and(|push_args| !truncated && !git_push_is_dry_run(push_args)) =>
+        {
+            CommandKind::GitPush
+        }
         "cargo"
             if args.first().is_some_and(|arg| {
                 matches!(arg.as_str(), "build" | "check" | "clippy" | "test")
-            }) =>
+            }) || matches!(args.as_slice(), [nextest, run, ..] if nextest == "nextest" && run == "run") =>
         {
             CommandKind::BuildOrTest
         }
@@ -1076,13 +1393,95 @@ pub(crate) fn classify_command(command: &str) -> CommandKind {
     }
 }
 
+/// Find a real `push` after a bounded, identity-preserving Git global-option
+/// prefix. Options such as `-C`, `--git-dir`, and `--work-tree` deliberately
+/// fail closed: the UI resolved repo identity from the terminal cwd, so a Git
+/// invocation that redirects discovery must not close that repo's work loop.
+fn git_push_args(args: &[String]) -> Option<&[String]> {
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        match argument.as_str() {
+            "push" => return Some(&args[index..]),
+            "--no-pager"
+            | "--paginate"
+            | "-p"
+            | "--no-replace-objects"
+            | "--no-optional-locks"
+            | "--no-lazy-fetch"
+            | "--literal-pathspecs"
+            | "--glob-pathspecs"
+            | "--noglob-pathspecs"
+            | "--icase-pathspecs" => index += 1,
+            "-c" | "--config-env" => {
+                args.get(index + 1)?;
+                index += 2;
+            }
+            argument
+                if (argument.starts_with("-c") && argument.len() > 2)
+                    || argument.starts_with("--config-env=") =>
+            {
+                index += 1;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Consume one wrapper's bounded option prefix. Exact options in
+/// `takes_value` consume the following token; attached/`--name=value` forms
+/// are already self-contained. `--` ends wrapper option parsing.
+fn skip_wrapper_options<I>(tokens: &mut std::iter::Peekable<I>, takes_value: &[&str])
+where
+    I: Iterator<Item = String>,
+{
+    while let Some(option) = tokens.peek() {
+        if option == "--" {
+            tokens.next();
+            break;
+        }
+        if option == "-" || !option.starts_with('-') {
+            break;
+        }
+        let consumes_value = takes_value.contains(&option.as_str());
+        tokens.next();
+        if consumes_value {
+            tokens.next();
+        }
+    }
+}
+
+/// A dry-run proves reachability but does not close a recovered-work loop.
+/// Parse only the bounded normalized argument prefix and stop recognizing
+/// options after `--`, matching Git's usual option boundary.
+fn git_push_is_dry_run(args: &[String]) -> bool {
+    let mut options = true;
+    for argument in args.iter().skip(1) {
+        if argument == "--" {
+            options = false;
+            continue;
+        }
+        if !options {
+            continue;
+        }
+        if argument == "--dry-run"
+            || argument.starts_with("--dry-run=")
+            || (argument.starts_with('-')
+                && !argument.starts_with("--")
+                && argument[1..].contains('n'))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn normalize_token(token: &str) -> String {
     token
         .trim_matches(|character| matches!(character, '\'' | '"'))
         .chars()
         .take(96)
-        .collect::<String>()
-        .to_ascii_lowercase()
+        .collect()
 }
 
 fn is_environment_assignment(token: &str) -> bool {
@@ -1112,6 +1511,78 @@ mod tests {
         assert_eq!(
             classify_command("sudo -n /usr/bin/git push"),
             CommandKind::GitPush
+        );
+        for command in [
+            "git --no-pager push",
+            "git -c color.ui=false push",
+            "git -ccolor.ui=false push",
+        ] {
+            assert_eq!(
+                classify_command(command),
+                CommandKind::GitPush,
+                "{command} keeps cwd-derived repo identity"
+            );
+        }
+        for command in [
+            "git --no-pager push --dry-run",
+            "git -C /tmp push",
+            "git -C/tmp push",
+            "git --git-dir=/tmp/repo.git push",
+            "git --work-tree /tmp push",
+        ] {
+            assert_eq!(
+                classify_command(command),
+                CommandKind::Other,
+                "{command} must not close cwd-derived recovered work"
+            );
+        }
+        assert_eq!(
+            classify_command("time -p cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nohup cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("time sudo -n cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nohup env FORGE_TEST=1 cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("env -u OLD sudo -u root time -p cargo check"),
+            CommandKind::BuildOrTest
+        );
+        for command in [
+            "git push --dry-run",
+            "git push origin main -n",
+            "git push -vn origin main",
+        ] {
+            assert_eq!(
+                classify_command(command),
+                CommandKind::Other,
+                "{command} must not claim to have published recovered work"
+            );
+        }
+        assert_eq!(
+            classify_command("git push -- --dry-run"),
+            CommandKind::GitPush,
+            "an option-shaped refspec after -- is not a dry-run flag"
+        );
+        let hidden_dry_run = format!(
+            "git push {} --dry-run",
+            (0..14)
+                .map(|index| format!("--push-option=guard-{index}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        assert_eq!(
+            classify_command(&hidden_dry_run),
+            CommandKind::Other,
+            "a bounded classifier must not publish when later options were truncated"
         );
         assert_eq!(classify_command("printf done"), CommandKind::Other);
     }
@@ -1393,6 +1864,110 @@ mod tests {
     }
 
     #[test]
+    fn recovered_work_is_guarded_until_successful_push_or_context_boundary() {
+        let mut organism = NativeOrganism::default();
+        organism.restore_repo_context(2, false, 0, 2);
+        organism.command_finished(CommandKind::BuildOrTest, Some(0), None);
+        assert!(organism.guarding_recovery());
+        assert_eq!(organism.idle_reaction().behavior, Behavior::GuardRecovery);
+
+        // Rechecking green work and unrelated commands do not erase the open
+        // loop. A failed push does not close it either.
+        organism.command_finished(CommandKind::BuildOrTest, Some(0), None);
+        organism.command_finished(CommandKind::Other, Some(0), None);
+        organism.command_finished(CommandKind::GitPush, Some(1), None);
+        assert!(organism.guarding_recovery());
+
+        let pushed = organism.command_finished(CommandKind::GitPush, Some(0), None);
+        assert_eq!(pushed.speech, Some("收好了。"));
+        assert!(!organism.guarding_recovery());
+        assert_eq!(organism.idle_reaction().behavior, Behavior::Idle);
+
+        organism.restore_repo_context(0, true, 1, 1);
+        organism.roll_over_day();
+        assert!(!organism.guarding_recovery());
+        organism.restore_repo_context(0, true, 1, 1);
+        organism.restore_repo_context(0, false, 0, 0);
+        assert!(!organism.guarding_recovery());
+    }
+
+    #[test]
+    fn unresolved_builds_progress_from_failure_to_stuck_then_recovery() {
+        let mut organism = NativeOrganism::default();
+
+        for expected in [Behavior::GuardFailure, Behavior::GuardFailure] {
+            organism.command_finished(CommandKind::BuildOrTest, Some(1), None);
+            assert_eq!(organism.idle_reaction().behavior, expected);
+        }
+        organism.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        let stuck = organism.idle_reaction();
+        assert_eq!(stuck.behavior, Behavior::GuardStuck);
+        assert_eq!(stuck.tone, Tone::Quiet);
+
+        // Unknown outcomes, unrelated commands, and a failed push cannot
+        // erase a repo/day debugging loop they did not resolve.
+        organism.command_finished(CommandKind::BuildOrTest, None, None);
+        organism.command_finished(CommandKind::Other, Some(0), None);
+        organism.command_finished(CommandKind::GitPush, Some(1), None);
+        assert_eq!(organism.idle_reaction().behavior, Behavior::GuardStuck);
+
+        organism.command_finished(CommandKind::BuildOrTest, Some(0), None);
+        assert_eq!(organism.idle_reaction().behavior, Behavior::GuardRecovery);
+
+        // A relapse starts a fresh open streak; the day's flip count does not
+        // falsely make one unresolved failure look like the fourth failure.
+        organism.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        assert_eq!(organism.idle_reaction().behavior, Behavior::GuardFailure);
+    }
+
+    #[test]
+    fn authoritative_work_state_normalizes_and_can_downgrade_a_stale_pane() {
+        assert_eq!(
+            RepoWorkState::new(1, true, u32::MAX),
+            RepoWorkState {
+                open_failures: 1,
+                recovered_pending_push: false,
+                failure_success_flips: u32::MAX,
+            }
+        );
+
+        let mut organism = NativeOrganism::default();
+        organism.restore_repo_context(3, false, 0, 3);
+        assert_eq!(organism.repo_vigil(), RepoVigil::Stuck);
+        assert!(organism.sync_repo_work_state(RepoWorkState::new(1, false, 0)));
+        assert_eq!(organism.repo_vigil(), RepoVigil::Failure);
+        assert!(!organism.sync_repo_work_state(RepoWorkState::new(1, false, 0)));
+    }
+
+    #[test]
+    fn the_third_same_day_flip_makes_pending_recovery_cautious_until_push() {
+        let mut organism = NativeOrganism::default();
+        organism.restore_repo_work_context(RepoWorkState::new(1, false, 2), 2, 3);
+
+        organism.command_finished(CommandKind::BuildOrTest, Some(0), None);
+        assert_eq!(organism.repo_vigil(), RepoVigil::CautiousRecovery);
+        let guard = organism.idle_reaction();
+        assert_eq!(guard.behavior, Behavior::GuardCautious);
+        assert!(!guard.description.contains("flaky"));
+
+        organism.command_finished(CommandKind::GitPush, Some(0), None);
+        assert_eq!(organism.repo_vigil(), RepoVigil::None);
+    }
+
+    #[test]
+    fn a_successful_push_dry_run_never_closes_recovered_work() {
+        let mut organism = NativeOrganism::default();
+        organism.restore_repo_context(0, true, 1, 1);
+        let kind = classify_command("git push --dry-run origin main");
+        organism.command_started(kind);
+        let reaction = organism.command_finished(kind, Some(0), None);
+        assert_eq!(reaction.behavior, Behavior::Idle);
+        assert_eq!(reaction.speech, None);
+        assert!(organism.guarding_recovery());
+        assert_eq!(organism.idle_reaction().behavior, Behavior::GuardRecovery);
+    }
+
+    #[test]
     fn repo_arrival_shapes_the_next_command_start_only() {
         assert_eq!(RepoArrival::from_familiarity(0), RepoArrival::Unfamiliar);
         assert_eq!(RepoArrival::from_familiarity(3), RepoArrival::Known);
@@ -1455,6 +2030,10 @@ mod tests {
             Behavior::Approach,
             Behavior::WatchAgent,
             Behavior::WatchSettled,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
         ] {
             for frame in [0, 4, 5, 54, 55, 59, u64::MAX] {
                 for drowsy in [false, true] {
@@ -1532,6 +2111,10 @@ mod tests {
             Behavior::Approach,
             Behavior::WatchAgent,
             Behavior::WatchSettled,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
         ] {
             let reference = bounding_box_of(behavior.sprite());
             for language in languages {
@@ -1641,7 +2224,7 @@ mod tests {
             ..LifeState::default()
         };
         assert_eq!(
-            AmbientMind::default().step(rested, 0.0, 0.0),
+            AmbientMind::default().step(rested, 0.0, 0.0, RepoVigil::None),
             AmbientBehavior::Idle
         );
 
@@ -1653,7 +2236,7 @@ mod tests {
             ..LifeState::default()
         };
         assert_eq!(
-            AmbientMind::default().step(bored, 0.0, 0.0),
+            AmbientMind::default().step(bored, 0.0, 0.0, RepoVigil::None),
             AmbientBehavior::Explore
         );
 
@@ -1666,7 +2249,7 @@ mod tests {
             ..LifeState::default()
         };
         assert_eq!(
-            AmbientMind::default().step(lonely, 0.0, 0.0),
+            AmbientMind::default().step(lonely, 0.0, 0.0, RepoVigil::None),
             AmbientBehavior::Approach
         );
 
@@ -1680,7 +2263,7 @@ mod tests {
             ..LifeState::default()
         };
         assert_eq!(
-            AmbientMind::default().step(tired, 60.0, 0.0),
+            AmbientMind::default().step(tired, 60.0, 0.0, RepoVigil::None),
             AmbientBehavior::Sleep
         );
     }
@@ -1694,7 +2277,10 @@ mod tests {
             curiosity: 1.0,
             ..LifeState::default()
         };
-        assert_eq!(mind.step(exhausted, 0.0, 0.0), AmbientBehavior::Sleep);
+        assert_eq!(
+            mind.step(exhausted, 0.0, 0.0, RepoVigil::None),
+            AmbientBehavior::Sleep
+        );
 
         // Held for 2.5s even when the state now argues for something else.
         let recovered = LifeState {
@@ -1704,9 +2290,18 @@ mod tests {
             social_need: 0.1,
             ..LifeState::default()
         };
-        assert_eq!(mind.step(recovered, 0.0, 1.0), AmbientBehavior::Sleep);
-        assert_eq!(mind.step(recovered, 0.0, 1.0), AmbientBehavior::Sleep);
-        assert_eq!(mind.step(recovered, 0.0, 1.0), AmbientBehavior::Explore);
+        assert_eq!(
+            mind.step(recovered, 0.0, 1.0, RepoVigil::None),
+            AmbientBehavior::Sleep
+        );
+        assert_eq!(
+            mind.step(recovered, 0.0, 1.0, RepoVigil::None),
+            AmbientBehavior::Sleep
+        );
+        assert_eq!(
+            mind.step(recovered, 0.0, 1.0, RepoVigil::None),
+            AmbientBehavior::Explore
+        );
 
         mind.interrupt();
         assert_eq!(mind.current(), AmbientBehavior::Idle);
@@ -1714,8 +2309,66 @@ mod tests {
         // Hostile inputs never panic and always yield a valid disposition.
         let mut hostile = AmbientMind::default();
         for dt in [f32::NAN, f32::INFINITY, -3.0, 1e30] {
-            hostile.step(LifeState::default(), f32::NAN, dt);
+            hostile.step(LifeState::default(), f32::NAN, dt, RepoVigil::None);
         }
+    }
+
+    #[test]
+    fn repo_vigils_keep_distinct_watch_but_never_override_exhaustion() {
+        let mut mind = AmbientMind::default();
+        let restless = LifeState {
+            energy: 0.8,
+            boredom: 1.0,
+            curiosity: 1.0,
+            ..LifeState::default()
+        };
+        for (vigil, expected) in [
+            (RepoVigil::Failure, AmbientBehavior::GuardFailure),
+            (RepoVigil::Stuck, AmbientBehavior::GuardStuck),
+            (RepoVigil::Recovery, AmbientBehavior::GuardRecovery),
+            (RepoVigil::CautiousRecovery, AmbientBehavior::GuardCautious),
+        ] {
+            let mut mapped = AmbientMind::default();
+            assert_eq!(mapped.step(restless, 60.0, 0.0, vigil), expected);
+        }
+        assert_eq!(
+            mind.step(restless, 60.0, 0.0, RepoVigil::Recovery),
+            AmbientBehavior::GuardRecovery
+        );
+        assert_eq!(mind.current(), AmbientBehavior::GuardRecovery);
+
+        let exhausted = LifeState {
+            energy: 0.1,
+            ..restless
+        };
+        assert_eq!(
+            mind.step(exhausted, 60.0, 0.0, RepoVigil::Recovery),
+            AmbientBehavior::Sleep
+        );
+
+        let barely_recovered = LifeState {
+            energy: FORCED_REST_ENERGY + 0.01,
+            ..restless
+        };
+        assert_eq!(
+            mind.step(barely_recovered, 60.0, 1.0, RepoVigil::Recovery),
+            AmbientBehavior::Sleep,
+            "crossing the force-rest edge must not flutter awake"
+        );
+        let awake = LifeState {
+            energy: REPO_VIGIL_WAKE_ENERGY,
+            ..restless
+        };
+        assert_eq!(
+            mind.step(awake, 60.0, 1.0, RepoVigil::Recovery),
+            AmbientBehavior::GuardRecovery
+        );
+
+        assert_ne!(
+            mind.step(restless, 0.0, 0.0, RepoVigil::None),
+            AmbientBehavior::GuardRecovery,
+            "clearing the durable intention must release its forced pose"
+        );
     }
 
     #[test]
@@ -1846,6 +2499,19 @@ mod tests {
         assert_eq!(AmbientBehavior::Sleep.display(), Behavior::Sleep);
         assert_eq!(AmbientBehavior::Explore.display(), Behavior::Explore);
         assert_eq!(AmbientBehavior::Approach.display(), Behavior::Approach);
+        assert_eq!(
+            AmbientBehavior::GuardFailure.display(),
+            Behavior::GuardFailure
+        );
+        assert_eq!(AmbientBehavior::GuardStuck.display(), Behavior::GuardStuck);
+        assert_eq!(
+            AmbientBehavior::GuardRecovery.display(),
+            Behavior::GuardRecovery
+        );
+        assert_eq!(
+            AmbientBehavior::GuardCautious.display(),
+            Behavior::GuardCautious
+        );
     }
 
     #[test]

@@ -2,12 +2,13 @@
 
 Updated: 2026-08-10
 
-This baseline lands the nine-round "Evolve ASCII organism" series plus a
-continued evolution pass
-(`d6fb8b4..00a099e`): the experimental Block-pane organism grew from an
-event reflex into a continuous life simulation with utility-selected
-behavior, agent attribution, interpolated spatial motion, motion restraint,
-and a persistent per-repo build-duration baseline. Every round followed the
+This working tree contains the nine-round "Evolve ASCII organism" series
+(`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
+layer, and the current five-round debugging-vigil evolution: the experimental
+Block-pane organism grew from an event reflex into a continuous life
+simulation with utility-selected behavior, agent attribution, interpolated
+spatial motion, motion restraint, and a persistent per-repo build-duration
+baseline. Every historical round followed the
 same loop — implement, unit-test, sync `docs/USER_GUIDE.md`, run a
 three-agent adversarial verification workflow, fix confirmed findings,
 commit, push. The verification pass caught one to two real defects almost
@@ -78,7 +79,7 @@ Nine organism evolution rounds, in order:
   replay so compaction cannot touch them; after three samples a build 2×
   off its repo baseline (and >10s off) earns one quiet sentence.
 
-The continued pass adds five more coherent layers:
+The continued pass adds six more coherent layers:
 
 - **Flaky-test memory**: replay derives same-day failure→success flips across
   retained and compacted observations. Once the day has at least three flips,
@@ -142,6 +143,59 @@ The continued pass adds five more coherent layers:
   cadence; non-owner, alternate-screen, Calm, Static, and resting runtimes use
   the 900 ms heartbeat. Focus transfer safely rearms the new owner without
   ever creating a second pending GLib source.
+- **Recovery vigil**: the existing day/repo `recovered_pending_push` fact now
+  remains a visible intention after the celebration settles. The body guards
+  a fixed-width `[ok]` pose beside the prompt (with matching inline/sticky
+  forms) until a successful push closes the loop; clean builds, unrelated
+  commands, failed pushes, and push dry-runs preserve it, while a new build
+  failure or local-day rollover clears it. Leaving the checkout releases the
+  pane-local pose without erasing memory, so same-day re-entry can restore it;
+  raw cwd signals handle ordinary path exits immediately, while nested-repo
+  identity is resolved at the next semantic command. The reducer mirrors
+  memory's preserve-until-push semantics, then reconciles the memory layer's
+  post-replay truth and broadcasts it only to same-window panes already bound
+  to the exact repo/day. The low-frequency frame clock notices midnight even
+  without another command. Exhaustion still overrides the intention with real
+  sleep and a separate wake threshold prevents boundary flutter. Command
+  classification unwraps a bounded chain of common wrappers; a push whose
+  option tail was truncated fails closed instead of hiding a late dry-run.
+  No schema field was added.
+- **Five-round debugging vigil (current working tree)**: recovery now has its
+  missing front half. One or two unresolved repo/day build failures settle to
+  a fixed-width `[!]` `GuardFailure`; three or more settle to the lower,
+  silent `[!!]` `GuardStuck`. These idle intentions anchor only in a complete
+  blank band below the terminal output edge and fail closed to the inline card
+  when the sprite cannot fit; recovery/cautious recovery stay beside the
+  prompt. A third same-day failure→success flip turns pending recovery into
+  `[?]` `GuardCautious` without claiming the current test is flaky. A typed
+  `RepoWorkState { open_failures, recovered_pending_push,
+  failure_success_flips }` is the content-free post-replay truth shared with
+  exact same-repo/day panes; `MemoryInsight.open_failures` deliberately
+  remains the event-position depth used by the immediate reaction when
+  `event_order_exact` is true; compacted-prefix late events are explicitly
+  fail-neutral. Duplicate, unknown, failed-push, late, and out-of-order paths
+  all return the final work snapshot; visible replay descriptions are rebuilt
+  from that event position instead of retaining stale sensitization or count
+  text, and final open work vetoes stale recovery/push closure speech. The
+  source pane reconciles even a
+  queue-rejected preview, but only an event admitted to disk/retry ownership
+  broadcasts to siblings; admission is decided under the queue lock and can no
+  longer race a fast worker acknowledgement. Start and finish each freeze one
+  wall-clock sample for context, reducer, day, bucket, and event construction;
+  finish refreshes first so every context event is an ordered predecessor of
+  that sample.
+  Every pane performs its own midnight retirement even though only one pane
+  advances shared physiology. A durable vigil cancels an already-running
+  cross-pane `GlanceAside`; forced vigil sleep retains output clearance and an
+  owner-only logical rest claim lets Static/fail-closed bodies cross the wake
+  hysteresis without multiplying recovery; sync, context exit, midnight, and
+  focus transfer reconcile that claim immediately. Non-Git loops are
+  conservatively scoped to exact raw cwd. Identity-preserving Git global
+  options such as `--no-pager` and `-c` can still reach a real push, while
+  `-C`/`--git-dir` and bounded-parser truncation fail closed. Accepted human
+  input now hides the live body for the
+  whole 900 ms retreat window and returns by snap, so typing never triggers a
+  distracting run. No schema field or content-bearing perception was added.
 
 Hard lines the series preserved, verified every round: perception only
 ever widens by enums, counters, or geometry scalars — command text, output,

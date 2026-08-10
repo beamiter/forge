@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::organism::{CommandKind, LifeState};
+use crate::organism::{CommandKind, LifeState, RepoWorkState};
 
 const SCHEMA_VERSION: u32 = 1;
 const MAX_MEMORY_BYTES: u64 = 512 * 1024;
@@ -962,14 +962,17 @@ pub(crate) struct MemoryEvent {
 }
 
 impl MemoryEvent {
-    pub(crate) fn now_for_repo(
+    /// Freeze one lifecycle completion to the caller's single wall-clock
+    /// sample. Day and activity bucket are always derived from that same
+    /// millisecond, so neither can cross midnight independently of reduction.
+    pub(crate) fn at_ms_for_repo(
+        at_ms: u64,
         kind: CommandKind,
         exit_code: Option<i32>,
         repo: Option<String>,
         life: LifeState,
         duration_ms: Option<u64>,
     ) -> Self {
-        let at_ms = unix_ms();
         let local = local_circadian_time_at_ms(at_ms);
         Self {
             id: next_event_id(),
@@ -982,6 +985,10 @@ impl MemoryEvent {
             duration_ms,
             life: LifeSnapshot::from_state(life),
         }
+    }
+
+    pub(crate) const fn day(&self) -> i64 {
+        self.day
     }
 
     #[cfg(test)]
@@ -1023,6 +1030,14 @@ impl MemoryEvent {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MemoryInsight {
+    /// Whether the incoming observation still lies inside the retained suffix
+    /// whose exact total-order position can be reconstructed. Event-local
+    /// fields below must be treated as unknown when this is false.
+    pub(crate) event_order_exact: bool,
+    /// Event-position failure depth used to shape the immediate reaction when
+    /// `event_order_exact` is true. This is deliberately distinct from
+    /// `current_work`, which describes the final repo/day state after every
+    /// retained observation has been replayed.
     pub(crate) open_failures: u32,
     pub(crate) recovered_failures: u32,
     pub(crate) push_after_recovery: bool,
@@ -1030,6 +1045,10 @@ pub(crate) struct MemoryInsight {
     /// This success was at least the third same-day failure-to-success flip,
     /// and only one failure was open immediately before it.
     pub(crate) likely_flaky: bool,
+    /// Authoritative post-replay repo/day state after this transaction. Every
+    /// semantic return path fills it, including duplicate, unknown-outcome,
+    /// failed-push, out-of-order, and compacted-prefix cases.
+    pub(crate) current_work: RepoWorkState,
     pub(crate) repo_remembered: bool,
     /// Mean successful build/test wall time across every remembered day of
     /// this repo, once at least three samples exist.
@@ -1040,8 +1059,7 @@ pub(crate) struct MemoryInsight {
 pub(crate) struct RepoContext {
     pub(crate) day: i64,
     pub(crate) repo: String,
-    pub(crate) open_failures: u32,
-    pub(crate) recovered_pending_push: bool,
+    pub(crate) work: RepoWorkState,
     /// Today's build/test successes in this repo, for habituated reactions.
     pub(crate) successes_today: u32,
     /// Today's build/test failures in this repo, for sensitized reactions.
@@ -1100,41 +1118,52 @@ impl OrganismMemory {
         Ok(())
     }
 
-    pub(crate) fn context_now(&mut self, cwd: Option<&str>) -> Option<RepoContext> {
+    /// Resolve the repository against the caller's already-frozen local day.
+    /// A lifecycle callback must not read the wall clock twice across midnight.
+    pub(crate) fn context_for_day(&mut self, cwd: Option<&str>, day: i64) -> Option<RepoContext> {
         let cwd = cwd?;
         // Repository identity is deliberately resolved afresh. A permanent
         // cwd cache goes stale across `git init`/worktree removal and lets
         // attacker-controlled OSC cwd strings grow process memory without a
         // bound. This path runs only for build/test/push lifecycle events.
         let repo = git_repo_root_for(cwd)?;
-        let day = local_day_at_ms(unix_ms());
-        let (open_failures, recovered_pending_push, successes_today, failures_today) = self
+        Some(self.context_for_repo_day(&repo, day))
+    }
+
+    /// Rebuild a command's reducer context from an already-resolved repo key.
+    /// Finish callbacks use this after refreshing memory, avoiding a second
+    /// Git lookup while still incorporating work completed by other windows
+    /// during the command.
+    pub(crate) fn context_for_repo_day(&self, repo: &str, day: i64) -> RepoContext {
+        let (work, successes_today, failures_today) = self
             .memory
-            .stats(day, &repo)
+            .stats(day, repo)
             .map(|stats| {
                 (
-                    stats.open_failures,
-                    stats.recovered_pending_push,
+                    RepoWorkState::new(
+                        stats.open_failures,
+                        stats.recovered_pending_push,
+                        stats.failure_success_flips.value,
+                    ),
                     stats.build_successes,
                     stats.build_failures,
                 )
             })
-            .unwrap_or((0, false, 0, 0));
+            .unwrap_or((RepoWorkState::default(), 0, 0));
         let familiarity_days = self
             .memory
             .days
             .iter()
             .filter(|stats| stats.repo == repo)
             .count() as u32;
-        Some(RepoContext {
+        RepoContext {
             day,
-            repo,
-            open_failures,
-            recovered_pending_push,
+            repo: repo.to_owned(),
+            work,
             successes_today,
             failures_today,
             familiarity_days,
-        })
+        }
     }
 
     fn apply_local(&mut self, event: &MemoryEvent) -> MemoryInsight {
@@ -1153,14 +1182,22 @@ impl OrganismMemory {
     pub(crate) fn apply_and_enqueue(
         &mut self,
         event: MemoryEvent,
-    ) -> (MemoryInsight, io::Result<()>) {
-        let result = enqueue_event(self.path.clone(), event.clone());
-        let retained = result.is_ok() || event_is_queued(&self.path, &event.id);
-        if retained {
-            (self.apply_local(&event), result)
-        } else {
-            let mut preview = self.memory.clone();
-            (apply_event(&mut preview, &event), result)
+    ) -> (MemoryInsight, io::Result<()>, bool) {
+        let outcome = enqueue_event(self.path.clone(), event.clone());
+        self.apply_enqueue_outcome(event, outcome)
+    }
+
+    fn apply_enqueue_outcome(
+        &mut self,
+        event: MemoryEvent,
+        outcome: EventEnqueue,
+    ) -> (MemoryInsight, io::Result<()>, bool) {
+        match outcome {
+            EventEnqueue::Retained(result) => (self.apply_local(&event), result, true),
+            EventEnqueue::Rejected(error) => {
+                let mut preview = self.memory.clone();
+                (apply_event(&mut preview, &event), Err(error), false)
+            }
         }
     }
 
@@ -1194,6 +1231,7 @@ fn apply_event(memory: &mut DiskMemory, event: &MemoryEvent) -> MemoryInsight {
     if !matches!(event.kind, CommandKind::BuildOrTest | CommandKind::GitPush) {
         return insight;
     }
+    insight.current_work = repo_work_state(memory, event.day, repo);
     // This check precedes every capacity mutation. It also covers meaningful
     // commands without an ordered observation (unknown build outcome or failed
     // push), whose activity bucket must remain exactly-once across retries.
@@ -1322,6 +1360,7 @@ fn apply_event(memory: &mut DiskMemory, event: &MemoryEvent) -> MemoryInsight {
     memory.remember_event_id(&event.id);
     compact_global_observations(memory);
     if let Some(replay) = replay {
+        insight.event_order_exact = true;
         insight.recovered_failures = replay.recovered_failures;
         insight.open_failures = replay.open_failures;
         insight.push_after_recovery = replay.push_after_recovery;
@@ -1329,7 +1368,21 @@ fn apply_event(memory: &mut DiskMemory, event: &MemoryEvent) -> MemoryInsight {
     }
     insight.faster_than_yesterday =
         insight.push_after_recovery && faster_than_previous_day(memory, event.day, repo);
+    insight.current_work = repo_work_state(memory, event.day, repo);
     insight
+}
+
+fn repo_work_state(memory: &DiskMemory, day: i64, repo: &str) -> RepoWorkState {
+    memory
+        .stats(day, repo)
+        .map(|stats| {
+            RepoWorkState::new(
+                stats.open_failures,
+                stats.recovered_pending_push,
+                stats.failure_success_flips.value,
+            )
+        })
+        .unwrap_or_default()
 }
 
 fn infer_circadian_profile(memory: &DiskMemory, today: i64) -> Option<CircadianProfile> {
@@ -1722,26 +1775,41 @@ fn read_memory(path: &Path) -> io::Result<DiskMemory> {
     Ok(memory)
 }
 
-fn enqueue_event(path: PathBuf, event: MemoryEvent) -> io::Result<()> {
+/// Admission and scheduling are separate facts. Once an event has entered the
+/// per-path queue, a scheduler error (or a worker racing ahead and removing
+/// the event) can never turn that retained admission into a rejection.
+enum EventEnqueue {
+    Retained(io::Result<()>),
+    Rejected(io::Error),
+}
+
+fn enqueue_event(path: PathBuf, event: MemoryEvent) -> EventEnqueue {
+    enqueue_event_with_scheduler(path, event, schedule_queued_events)
+}
+
+fn enqueue_event_with_scheduler<F>(path: PathBuf, event: MemoryEvent, schedule: F) -> EventEnqueue
+where
+    F: FnOnce(PathBuf) -> io::Result<()>,
+{
     let queues = event_queues();
     {
         let mut queues = queues
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let queue = queues.entry(path.clone()).or_default();
-        if queue.iter().any(|queued| queued.id == event.id) {
-            return schedule_queued_events(path);
-        }
-        if queue.len() >= MAX_PENDING_MEMORY_EVENTS {
-            return Err(io::Error::new(
+        let already_retained = queue.iter().any(|queued| queued.id == event.id);
+        if !already_retained && queue.len() >= MAX_PENDING_MEMORY_EVENTS {
+            return EventEnqueue::Rejected(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "ASCII organism memory queue is full",
             ));
         }
-        queue.push_back(event);
+        if !already_retained {
+            queue.push_back(event);
+        }
     }
 
-    schedule_queued_events(path)
+    EventEnqueue::Retained(schedule(path))
 }
 
 fn schedule_queued_events(path: PathBuf) -> io::Result<()> {
@@ -1818,14 +1886,6 @@ pub(crate) fn flush_pending(timeout: Duration) -> io::Result<()> {
 fn event_queues() -> &'static Mutex<HashMap<PathBuf, VecDeque<MemoryEvent>>> {
     static QUEUES: OnceLock<Mutex<HashMap<PathBuf, VecDeque<MemoryEvent>>>> = OnceLock::new();
     QUEUES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn event_is_queued(path: &Path, id: &str) -> bool {
-    event_queues()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(path)
-        .is_some_and(|events| events.iter().any(|event| event.id == id))
 }
 
 fn acknowledged_events() -> &'static Mutex<HashMap<PathBuf, VecDeque<String>>> {
@@ -2462,6 +2522,71 @@ mod tests {
     }
 
     #[test]
+    fn context_lookup_uses_the_callers_frozen_day() {
+        let root = TestDir::new("context-day");
+        let path = root.memory_path();
+        let repo = root.0.join("repo");
+        let nested = repo.join("nested");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::create_dir(&nested).unwrap();
+        let repo_text = repo.to_str().unwrap();
+
+        let mut memory = OrganismMemory::load(path).unwrap();
+        memory.apply_local(&MemoryEvent::fixed(
+            1_000,
+            70,
+            Some(repo_text),
+            CommandKind::BuildOrTest,
+            Some(1),
+            LifeState::default(),
+        ));
+        memory.apply_local(&MemoryEvent::fixed(
+            2_000,
+            71,
+            Some(repo_text),
+            CommandKind::BuildOrTest,
+            Some(0),
+            LifeState::default(),
+        ));
+
+        let first = memory
+            .context_for_day(nested.to_str(), 70)
+            .expect("day 70 context");
+        assert_eq!(first.day, 70);
+        assert_eq!(first.work, RepoWorkState::new(1, false, 0));
+        assert_eq!(first.failures_today, 1);
+
+        let finish_refresh = memory.context_for_repo_day(repo_text, 70);
+        assert_eq!(finish_refresh, first);
+
+        let second = memory
+            .context_for_day(nested.to_str(), 71)
+            .expect("day 71 context");
+        assert_eq!(second.day, 71);
+        assert_eq!(second.work, RepoWorkState::default());
+        assert_eq!(second.successes_today, 1);
+    }
+
+    #[test]
+    fn memory_event_day_and_bucket_share_one_frozen_millisecond() {
+        for at_ms in [0, 1, 86_399_999, 86_400_000, u64::MAX / 2] {
+            let local = local_circadian_time_at_ms(at_ms);
+            let event = MemoryEvent::at_ms_for_repo(
+                at_ms,
+                CommandKind::BuildOrTest,
+                Some(0),
+                None,
+                LifeState::default(),
+                None,
+            );
+            assert_eq!(event.at_ms, at_ms);
+            assert_eq!(event.day, local.day);
+            assert_eq!(event.activity_bucket, local.bucket);
+        }
+    }
+
+    #[test]
     fn restart_round_trip_is_repo_and_day_scoped_and_private() {
         let root = TestDir::new("restart");
         let path = root.memory_path();
@@ -2550,11 +2675,16 @@ mod tests {
             let success = build(cycle * 2 + 2, 0);
             let insight = apply_event(&mut memory, &success);
             assert_eq!(insight.likely_flaky, cycle == 2);
+            assert_eq!(
+                insight.current_work,
+                RepoWorkState::new(0, true, u32::try_from(cycle + 1).unwrap())
+            );
 
             // An ambiguous retry cannot advance either the aggregate or the
             // visible threshold a second time.
             let retry = apply_event(&mut memory, &success);
             assert!(!retry.likely_flaky);
+            assert_eq!(retry.current_work, insight.current_work);
         }
 
         let stats = memory.stats(day, repo).unwrap();
@@ -4448,6 +4578,125 @@ mod tests {
     }
 
     #[test]
+    fn every_semantic_insight_reports_the_post_replay_repo_work_state() {
+        let repo = "/work/guard-replay";
+        let day = 43;
+        let mut memory = DiskMemory::default();
+        let success = MemoryEvent::fixed(
+            5_000,
+            day,
+            Some(repo),
+            CommandKind::BuildOrTest,
+            Some(0),
+            LifeState::default(),
+        );
+        let late_failure = MemoryEvent::fixed(
+            1_000,
+            day,
+            Some(repo),
+            CommandKind::BuildOrTest,
+            Some(1),
+            LifeState::default(),
+        );
+        let failed_push = MemoryEvent::fixed(
+            6_000,
+            day,
+            Some(repo),
+            CommandKind::GitPush,
+            Some(1),
+            LifeState::default(),
+        );
+        let pushed = MemoryEvent::fixed(
+            7_000,
+            day,
+            Some(repo),
+            CommandKind::GitPush,
+            Some(0),
+            LifeState::default(),
+        );
+
+        let first_success = apply_event(&mut memory, &success);
+        assert!(first_success.event_order_exact);
+        assert_eq!(first_success.current_work, RepoWorkState::default());
+        let replayed = apply_event(&mut memory, &late_failure);
+        assert!(replayed.event_order_exact);
+        assert_eq!(
+            replayed.open_failures, 1,
+            "the event itself opened one failure"
+        );
+        assert_eq!(
+            replayed.current_work,
+            RepoWorkState::new(0, true, 1),
+            "ordered replay turns the earlier success into a finished recovery"
+        );
+        let failed = apply_event(&mut memory, &failed_push);
+        assert!(!failed.event_order_exact);
+        assert_eq!(failed.current_work, RepoWorkState::new(0, true, 1));
+        let closed = apply_event(&mut memory, &pushed);
+        assert!(closed.event_order_exact);
+        assert_eq!(closed.current_work, RepoWorkState::new(0, false, 1));
+    }
+
+    #[test]
+    fn duplicate_unknown_and_failed_push_keep_the_current_open_failure() {
+        let repo = "/work/open-state";
+        let day = 44;
+        let mut memory = DiskMemory::default();
+        let failure = MemoryEvent::fixed(
+            5_000,
+            day,
+            Some(repo),
+            CommandKind::BuildOrTest,
+            Some(1),
+            LifeState::default(),
+        );
+        let unknown = MemoryEvent::fixed(
+            6_000,
+            day,
+            Some(repo),
+            CommandKind::BuildOrTest,
+            None,
+            LifeState::default(),
+        );
+        let failed_push = MemoryEvent::fixed(
+            7_000,
+            day,
+            Some(repo),
+            CommandKind::GitPush,
+            Some(1),
+            LifeState::default(),
+        );
+
+        let open = RepoWorkState::new(1, false, 0);
+        let first = apply_event(&mut memory, &failure);
+        assert!(first.event_order_exact);
+        assert_eq!(first.current_work, open);
+        let duplicate = apply_event(&mut memory, &failure);
+        assert!(!duplicate.event_order_exact);
+        assert_eq!(duplicate.current_work, open);
+        let unknown = apply_event(&mut memory, &unknown);
+        assert!(!unknown.event_order_exact);
+        assert_eq!(unknown.current_work, open);
+        let failed_push = apply_event(&mut memory, &failed_push);
+        assert!(!failed_push.event_order_exact);
+        assert_eq!(failed_push.current_work, open);
+
+        // This success belongs before the retained failure. Its event-local
+        // depth is clear, but the post-replay snapshot must remain failed.
+        let late_success = MemoryEvent::fixed(
+            1_000,
+            day,
+            Some(repo),
+            CommandKind::BuildOrTest,
+            Some(0),
+            LifeState::default(),
+        );
+        let insight = apply_event(&mut memory, &late_success);
+        assert_eq!(insight.recovered_failures, 0);
+        assert_eq!(insight.current_work, open);
+    }
+
+    #[test]
     fn observation_window_compacts_without_losing_aggregate_state() {
         let repo = "/work/hot-repo";
         let mut memory = DiskMemory::default();
@@ -4504,7 +4753,7 @@ mod tests {
             .and_then(|baseline| baseline.compacted_through.as_ref())
             .unwrap()
             .at_ms;
-        apply_event(
+        let compacted_late = apply_event(
             &mut memory,
             &MemoryEvent::fixed(
                 watermark.saturating_sub(1),
@@ -4515,6 +4764,8 @@ mod tests {
                 LifeState::default(),
             ),
         );
+        assert!(!compacted_late.event_order_exact);
+        assert_eq!(compacted_late.current_work, RepoWorkState::new(0, false, 1));
         let stats = memory.stats(99, repo).unwrap();
         assert_eq!(stats.build_failures, failures as u32 + 1);
         assert_eq!(stats.build_successes, 1);
@@ -4938,13 +5189,70 @@ mod tests {
 
         let mut memory = OrganismMemory::load(path.clone()).unwrap();
         let rejected = event(50_000, 321, &repo, CommandKind::BuildOrTest, Some(1));
-        let (preview, result) = memory.apply_and_enqueue(rejected);
+        let (preview, result, retained) = memory.apply_and_enqueue(rejected);
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert!(!retained);
         assert_eq!(preview.open_failures, 1);
+        assert_eq!(preview.current_work, RepoWorkState::new(1, false, 0));
         assert!(memory.memory().stats(321, repo.to_str().unwrap()).is_none());
         assert!(memory.session_events.is_empty());
 
         event_queues().lock().unwrap().remove(&path);
+    }
+
+    #[test]
+    fn admitted_event_stays_retained_when_a_worker_wins_before_schedule_error() {
+        let root = TestDir::new("queue-admission-race");
+        let path = root.memory_path();
+        let repo = root.0.join("repo");
+        let admitted = event(60_000, 322, &repo, CommandKind::BuildOrTest, Some(1));
+        let admitted_id = admitted.id.clone();
+
+        let outcome = enqueue_event_with_scheduler(path.clone(), admitted, |scheduled_path| {
+            // Taking the same mutex proves enqueue released it before calling
+            // the scheduler. Removing the event models a running worker that
+            // durably acknowledged it before scheduling reported an error.
+            let mut queues = event_queues().lock().unwrap();
+            let queue = queues.get_mut(&scheduled_path).unwrap();
+            queue.retain(|event| event.id != admitted_id);
+            if queue.is_empty() {
+                queues.remove(&scheduled_path);
+            }
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "synthetic scheduler saturation",
+            ))
+        });
+
+        match outcome {
+            EventEnqueue::Retained(Err(error)) => {
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            }
+            _ => panic!("an admitted event must remain retained"),
+        }
+        assert!(!event_queues().lock().unwrap().contains_key(&path));
+
+        let mut memory = OrganismMemory::load(path).unwrap();
+        let retained_event = event(60_001, 322, &repo, CommandKind::BuildOrTest, Some(1));
+        let (insight, result, retained) = memory.apply_enqueue_outcome(
+            retained_event,
+            EventEnqueue::Retained(Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "synthetic scheduling failure after admission",
+            ))),
+        );
+        assert!(retained);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(insight.current_work, RepoWorkState::new(1, false, 0));
+        assert_eq!(memory.session_events.len(), 1);
+        assert_eq!(
+            memory
+                .memory()
+                .stats(322, repo.to_str().unwrap())
+                .unwrap()
+                .open_failures,
+            1
+        );
     }
 
     #[test]
