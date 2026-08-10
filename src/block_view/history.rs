@@ -301,18 +301,18 @@ fn refresh_loaded_block_ids(blocks: &mut VecDeque<BlockData>) {
     }
 }
 
-/// Expand the shell-style `~/` prefix used in configuration, but leave every
-/// other tilde form alone (`~`, `~user/...`, and embedded tildes are literal).
-fn expand_home_prefix_with(path: &str, home: Option<&Path>) -> PathBuf {
-    match (path.strip_prefix("~/"), home) {
-        (Some(rest), Some(home)) => home.join(rest),
-        _ => PathBuf::from(path),
+/// Config loading owns path validation and `~/` expansion. Keep this final
+/// consumer boundary fail-closed so a future in-memory caller cannot silently
+/// reintroduce cwd-relative Block history.
+fn absolute_history_path(path: &str) -> io::Result<PathBuf> {
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Block history path must be normalized to an absolute path",
+        ));
     }
-}
-
-fn history_path(path: &str) -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    expand_home_prefix_with(path, home.as_deref())
+    Ok(path)
 }
 
 /// Session-history files older than this are removed opportunistically after a
@@ -1345,7 +1345,7 @@ impl TermView {
             return Ok(());
         }
 
-        let base = history_path(&path_opt.unwrap());
+        let base = absolute_history_path(&path_opt.unwrap())?;
         let session_id = self.session_id.clone();
         let path = match session_id.as_deref() {
             Some(sid) => per_session_history_path(&base, sid),
@@ -1424,12 +1424,18 @@ impl TermView {
         let Some(path) = path_opt else {
             return;
         };
+        let base = match absolute_history_path(&path) {
+            Ok(path) => path,
+            Err(error) => {
+                log::warn!("refusing invalid Block history path: {error}");
+                return;
+            }
+        };
 
         if let Some(source) = self.history_load_poll_id.borrow_mut().take() {
             source.remove();
         }
         self.history_load.begin();
-        let base = history_path(&path);
         let session_id = self.session_id.clone();
         let target = session_id
             .as_deref()
@@ -1619,8 +1625,8 @@ impl TermView {
 #[cfg(test)]
 mod tests {
     use super::{
-        atomic_write, choose_load_path, decode_block_record, decode_zstd_bounded,
-        encode_history_frames_bounded, expand_home_prefix_with, history_load_limit,
+        absolute_history_path, atomic_write, choose_load_path, decode_block_record,
+        decode_zstd_bounded, encode_history_frames_bounded, history_load_limit,
         loaded_prefix_for_live, lock_file_name, per_session_history_path,
         prune_stale_session_histories, push_bounded_back, read_history_records,
         read_history_snapshot, refresh_loaded_block_ids, snapshot_live_blocks_bounded,
@@ -1931,25 +1937,13 @@ mod tests {
     }
 
     #[test]
-    fn expands_only_home_slash_prefix() {
-        let home = Path::new("/home/tester");
+    fn runtime_block_history_requires_a_normalized_absolute_path() {
         assert_eq!(
-            expand_home_prefix_with("~/.local/share/forge/history", Some(home)),
-            home.join(".local/share/forge/history")
+            absolute_history_path("/tmp/forge-block-history.bin").unwrap(),
+            PathBuf::from("/tmp/forge-block-history.bin")
         );
-        assert_eq!(expand_home_prefix_with("~", Some(home)), PathBuf::from("~"));
-        assert_eq!(
-            expand_home_prefix_with("~other/history", Some(home)),
-            PathBuf::from("~other/history")
-        );
-        assert_eq!(
-            expand_home_prefix_with("cache/~/history", Some(home)),
-            PathBuf::from("cache/~/history")
-        );
-        assert_eq!(
-            expand_home_prefix_with("~/history", None),
-            PathBuf::from("~/history")
-        );
+        assert!(absolute_history_path("forge-block-history.bin").is_err());
+        assert!(absolute_history_path("~/forge-block-history.bin").is_err());
     }
 
     #[test]

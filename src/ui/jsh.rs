@@ -20,11 +20,23 @@ use crate::jsh_install::{self, Status};
 /// How often the pending check result is polled from the worker thread.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+fn jsh_install_guard(safe_mode: bool) -> Result<(), &'static str> {
+    if safe_mode {
+        Err("jsh installation is unavailable in safe mode.")
+    } else {
+        Ok(())
+    }
+}
+
 impl UiState {
     /// Run the installer in its own tab. The script narrates what it does, so
     /// the tab is the progress UI — no bespoke dialog, and the user can read
     /// the failure or interrupt it with Ctrl+C like any other command.
     pub(crate) fn install_or_update_jsh(&self) {
+        if let Err(message) = jsh_install_guard(std::env::var_os("FORGE_SAFE_MODE").is_some()) {
+            self.toast_overlay.add_toast(adw::Toast::new(message));
+            return;
+        }
         match jsh_install::install_argv() {
             Ok(argv) => {
                 self.add_named_tab_with_argv("Install jsh", argv);
@@ -155,4 +167,18 @@ fn apply_jsh_status(bar: &GBox, label: &Label, action: &Button, status: &Status)
     label.set_text(&title);
     action.set_label(&button);
     bar.set_visible(true);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::jsh_install_guard;
+
+    #[test]
+    fn safe_mode_rejects_explicit_jsh_installation() {
+        assert!(jsh_install_guard(false).is_ok());
+        assert_eq!(
+            jsh_install_guard(true),
+            Err("jsh installation is unavailable in safe mode.")
+        );
+    }
 }

@@ -5,9 +5,8 @@
 
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use crate::command_history;
 use crate::keybindings::{Action, KeybindingMap};
 use crate::workflows::Workflow;
 
@@ -60,6 +59,26 @@ pub(crate) enum Accept {
     RunWorkflow(PathBuf),
 }
 
+/// One immutable history row captured when the palette opens. Keeping this
+/// separate from the JSONL wire record lets live Block history represent an
+/// unreported status without inventing a successful exit code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HistoryEntry {
+    pub(crate) command: String,
+    pub(crate) cwd: Option<String>,
+    pub(crate) exit_code: Option<i32>,
+}
+
+impl From<crate::command_history::CommandHistoryRecord> for HistoryEntry {
+    fn from(record: crate::command_history::CommandHistoryRecord) -> Self {
+        Self {
+            command: record.command,
+            cwd: record.cwd,
+            exit_code: Some(record.exit_code),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Entry {
     pub(crate) tier: u8,
@@ -73,7 +92,7 @@ pub(crate) struct Entry {
 pub(crate) fn gather(
     query: &Query,
     keybindings: &KeybindingMap,
-    history_path: Option<&Path>,
+    history: &[HistoryEntry],
     workflows: &[Workflow],
     limit: usize,
 ) -> Vec<Entry> {
@@ -163,46 +182,43 @@ pub(crate) fn gather(
     }
 
     if matches!(query.mode, PaletteMode::All | PaletteMode::History) {
-        if let Some(path) = history_path {
-            let history = command_history::read_recent(path, 2_000).unwrap_or_default();
-            let count = history.len();
-            for (index, item) in history.into_iter().enumerate() {
-                if crate::review_input::validate(&item.command).is_err() {
-                    continue;
-                }
-                let cwd = item
-                    .cwd
-                    .as_deref()
-                    .filter(|cwd| {
-                        cwd.len() <= 16 * 1024
-                            && !cwd.chars().any(char::is_control)
-                            && !crate::review_input::contains_visual_spoof(cwd)
-                    })
-                    .map(|cwd| bounded_label(cwd, 256))
-                    .unwrap_or_default();
-                let status = if item.exit_code == 0 {
-                    "success".to_string()
-                } else {
-                    format!("exit {}", item.exit_code)
-                };
-                push_if_match(
-                    &matcher,
-                    &query.text,
-                    Entry {
-                        tier: 2,
-                        score: (count - index) as i64,
-                        label: bounded_label(&item.command, 512),
-                        sublabel: Some(if cwd.is_empty() {
-                            status
-                        } else {
-                            format!("{status} · {cwd}")
-                        }),
-                        right: None,
-                        accept: Accept::TypeCommand(item.command),
-                    },
-                    &mut entries,
-                );
+        let count = history.len();
+        for (index, item) in history.iter().enumerate() {
+            if crate::review_input::validate(&item.command).is_err() {
+                continue;
             }
+            let cwd = item
+                .cwd
+                .as_deref()
+                .filter(|cwd| {
+                    cwd.len() <= 16 * 1024
+                        && !cwd.chars().any(char::is_control)
+                        && !crate::review_input::contains_visual_spoof(cwd)
+                })
+                .map(|cwd| bounded_label(cwd, 256))
+                .unwrap_or_default();
+            let status = match item.exit_code {
+                Some(0) => "success".to_string(),
+                Some(exit_code) => format!("exit {exit_code}"),
+                None => "status unreported".to_string(),
+            };
+            push_if_match(
+                &matcher,
+                &query.text,
+                Entry {
+                    tier: 2,
+                    score: (count - index) as i64,
+                    label: bounded_label(&item.command, 512),
+                    sublabel: Some(if cwd.is_empty() {
+                        status
+                    } else {
+                        format!("{status} · {cwd}")
+                    }),
+                    right: None,
+                    accept: Accept::TypeCommand(item.command.clone()),
+                },
+                &mut entries,
+            );
         }
     }
 
@@ -251,6 +267,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn block_recovery_and_failed_navigation_actions_reach_palette_dispatch() {
+        let bindings = KeybindingMap::from_defaults();
+        for action in [
+            Action::UndoClearBlocks,
+            Action::JumpToPrevFailed,
+            Action::JumpToNextFailed,
+        ] {
+            let entries = gather(
+                &Query {
+                    mode: PaletteMode::Commands,
+                    text: action.name().to_string(),
+                },
+                &bindings,
+                &[],
+                &[],
+                100,
+            );
+            assert!(entries
+                .iter()
+                .any(|entry| matches!(&entry.accept, Accept::Action(found) if *found == action)));
+        }
+    }
+
+    #[test]
+    fn indexed_remote_actions_are_visible_in_the_command_palette() {
+        let bindings = KeybindingMap::from_defaults();
+        for action in [Action::ConnectRemote(0), Action::ConnectRemote(8)] {
+            let entries = gather(
+                &Query {
+                    mode: PaletteMode::Commands,
+                    text: action.name().to_string(),
+                },
+                &bindings,
+                &[],
+                &[],
+                100,
+            );
+            assert!(entries
+                .iter()
+                .any(|entry| matches!(&entry.accept, Accept::Action(found) if *found == action)));
+        }
+    }
+
+    #[test]
     fn prefixes_select_sources() {
         assert_eq!(
             Query::parse("  @ cargo", PaletteMode::All),
@@ -278,7 +338,7 @@ mod tests {
         let entries = gather(
             &Query::parse("> newtab", PaletteMode::All),
             &KeybindingMap::from_defaults(),
-            None,
+            &[],
             &[],
             5,
         );
@@ -292,7 +352,7 @@ mod tests {
         let entries = gather(
             &Query::parse("? list large files", PaletteMode::All),
             &KeybindingMap::from_defaults(),
-            None,
+            &[],
             &[],
             10,
         );
@@ -305,7 +365,7 @@ mod tests {
         let entries = gather(
             &Query::parse(&format!("? {request}"), PaletteMode::All),
             &KeybindingMap::from_defaults(),
-            None,
+            &[],
             &[],
             10,
         );
@@ -320,7 +380,7 @@ mod tests {
             mode: PaletteMode::Ai,
             text: "x".repeat(MAX_AI_QUERY_BYTES + 1),
         };
-        let entries = gather(&query, &KeybindingMap::from_defaults(), None, &[], 10);
+        let entries = gather(&query, &KeybindingMap::from_defaults(), &[], &[], 10);
 
         assert!(entries[0].label.contains("too large"));
         assert!(matches!(&entries[0].accept, Accept::TypeCommand(text) if text.is_empty()));
@@ -349,10 +409,15 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
 
+        let history: Vec<HistoryEntry> = crate::command_history::read_recent(&path, 10)
+            .unwrap()
+            .into_iter()
+            .map(HistoryEntry::from)
+            .collect();
         let entries = gather(
             &Query::parse("@", PaletteMode::All),
             &KeybindingMap::from_defaults(),
-            Some(&path),
+            &history,
             &[],
             10,
         );

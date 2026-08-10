@@ -9,7 +9,6 @@ use gtk4::{
 };
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
-use std::path::Path;
 use std::rc::{Rc, Weak};
 
 use super::command_review::{
@@ -17,7 +16,7 @@ use super::command_review::{
 };
 use super::UiState;
 use crate::block_view::TermView;
-use crate::palette::{Accept, Entry, PaletteMode, Query};
+use crate::palette::{Accept, Entry, HistoryEntry, PaletteMode, Query};
 
 const MAX_PALETTE_QUERY_CHARS: i32 = 16 * 1024;
 
@@ -336,6 +335,69 @@ fn render_rows(list: &ListBox, entries: &[Entry]) {
     }
 }
 
+struct PaletteSnapshot {
+    history: Vec<HistoryEntry>,
+    workflows: Vec<crate::workflows::Workflow>,
+}
+
+/// Merge newest-first live Block commands with the newest-first JSONL tail.
+/// Live commands win duplicate identity because they are the UI's freshest
+/// observation; persisted metadata remains available for older commands.
+fn merge_palette_history(
+    live: Vec<String>,
+    persisted: Vec<crate::command_history::CommandHistoryRecord>,
+    limit: usize,
+) -> Vec<HistoryEntry> {
+    let mut seen = std::collections::HashSet::new();
+    let mut merged = Vec::with_capacity(limit.min(live.len().saturating_add(persisted.len())));
+    for entry in live
+        .into_iter()
+        .map(|command| HistoryEntry {
+            command,
+            cwd: None,
+            exit_code: None,
+        })
+        .chain(persisted.into_iter().map(HistoryEntry::from))
+    {
+        if merged.len() == limit {
+            break;
+        }
+        if crate::review_input::validate(&entry.command).is_ok()
+            && seen.insert(entry.command.clone())
+        {
+            merged.push(entry);
+        }
+    }
+    merged
+}
+
+fn palette_title(mode: PaletteMode) -> &'static str {
+    match mode {
+        PaletteMode::History => "Command History",
+        PaletteMode::Workflows => "Workflows",
+        _ => "Command Palette",
+    }
+}
+
+fn palette_placeholder(mode: PaletteMode) -> &'static str {
+    match mode {
+        PaletteMode::History => "Filter history · > actions · : workflows · ? ask AI",
+        PaletteMode::Workflows => "Filter workflows · > actions · @ history · ? ask AI",
+        _ => "Search all · > actions · @ history · : workflows · ? ask AI",
+    }
+}
+
+fn palette_toggle_key(mode: PaletteMode, key: Key, state: ModifierType) -> bool {
+    if !state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK) {
+        return false;
+    }
+    match mode {
+        PaletteMode::History => matches!(key, Key::H | Key::h),
+        PaletteMode::Workflows => matches!(key, Key::M | Key::m),
+        _ => matches!(key, Key::P | Key::p),
+    }
+}
+
 impl UiState {
     /// The single UI boundary for review-only shell insertion. Every caller
     /// gets the same control-character rejection and visible failure instead
@@ -362,20 +424,52 @@ impl UiState {
         }
     }
 
-    fn gather_palette_entries(&self, raw_query: &str) -> Vec<Entry> {
-        let workflows = crate::workflows::load_all();
-        let history_path = {
+    fn palette_snapshot(&self) -> PaletteSnapshot {
+        const MAX_PALETTE_HISTORY: usize = 2_000;
+        let live = self
+            .current_term_view()
+            .map(|view| view.command_history_bounded(MAX_PALETTE_HISTORY))
+            .unwrap_or_default();
+        let persisted = {
             let config = self.config.borrow();
-            config
-                .command_history_enabled
-                .then(|| config.command_history_path.clone())
-                .flatten()
+            if config.command_history_enabled {
+                config
+                    .command_history_path
+                    .as_deref()
+                    .map(std::path::Path::new)
+                    .and_then(|path| {
+                        crate::command_history::read_recent(
+                            path,
+                            (config.command_history_max_entries as usize).min(MAX_PALETTE_HISTORY),
+                        )
+                        .map_err(|error| {
+                            log::warn!("command palette history snapshot: {error}");
+                            error
+                        })
+                        .ok()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
         };
+        PaletteSnapshot {
+            history: merge_palette_history(live, persisted, MAX_PALETTE_HISTORY),
+            workflows: crate::workflows::load_all(),
+        }
+    }
+
+    fn gather_palette_entries(
+        &self,
+        raw_query: &str,
+        default_mode: PaletteMode,
+        snapshot: &PaletteSnapshot,
+    ) -> Vec<Entry> {
         crate::palette::gather(
-            &Query::parse(raw_query, PaletteMode::All),
+            &Query::parse(raw_query, default_mode),
             &self.keybinding_map.borrow(),
-            history_path.as_deref().map(Path::new),
-            &workflows,
+            &snapshot.history,
+            &snapshot.workflows,
             100,
         )
     }
@@ -637,6 +731,10 @@ impl UiState {
     }
 
     pub(crate) fn toggle_unified_command_palette(&self) {
+        self.show_unified_command_palette(PaletteMode::All);
+    }
+
+    pub(crate) fn show_unified_command_palette(&self, initial_mode: PaletteMode) {
         // `force_close` emits `closed` synchronously; release this borrow first
         // so its callback can clear the slot without a RefCell re-entry panic.
         let dialog_to_close = self.command_palette_dialog.borrow_mut().take();
@@ -645,8 +743,11 @@ impl UiState {
             return;
         }
 
+        // All disk/config-backed sources are captured once at open. Search
+        // changes below are pure in-memory filtering and never do per-key I/O.
+        let snapshot = Rc::new(self.palette_snapshot());
         let dialog = adw::Dialog::builder()
-            .title("Command Palette")
+            .title(palette_title(initial_mode))
             .content_width(620)
             .content_height(520)
             .build();
@@ -658,9 +759,7 @@ impl UiState {
         {
             text.set_max_length(MAX_PALETTE_QUERY_CHARS);
         }
-        filter.set_placeholder_text(Some(
-            "Search all · > actions · @ history · : workflows · ? ask AI",
-        ));
+        filter.set_placeholder_text(Some(palette_placeholder(initial_mode)));
         filter.set_hexpand(true);
 
         let list = ListBox::new();
@@ -669,7 +768,11 @@ impl UiState {
         list.set_margin_start(12);
         list.set_margin_end(12);
         list.set_margin_bottom(12);
-        let entries = Rc::new(RefCell::new(self.gather_palette_entries("")));
+        let entries = Rc::new(RefCell::new(self.gather_palette_entries(
+            "",
+            initial_mode,
+            &snapshot,
+        )));
         render_rows(&list, &entries.borrow());
 
         let scrolled = ScrolledWindow::builder()
@@ -693,8 +796,9 @@ impl UiState {
             let ui = self.clone();
             let list = list.clone();
             let entries = entries.clone();
+            let snapshot = snapshot.clone();
             filter.connect_search_changed(move |entry| {
-                let next = ui.gather_palette_entries(&entry.text());
+                let next = ui.gather_palette_entries(&entry.text(), initial_mode, &snapshot);
                 render_rows(&list, &next);
                 *entries.borrow_mut() = next;
             });
@@ -725,10 +829,7 @@ impl UiState {
             let dialog_slot = self.command_palette_dialog.clone();
             let activate = activate.clone();
             keys.connect_key_pressed(move |_, key, _, state| {
-                if key == Key::Escape
-                    || (matches!(key, Key::P | Key::p)
-                        && state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK))
-                {
+                if key == Key::Escape || palette_toggle_key(initial_mode, key, state) {
                     dialog_slot.borrow_mut().take();
                     dialog.force_close();
                     return true.into();
@@ -766,7 +867,9 @@ impl UiState {
 
 #[cfg(test)]
 mod tests {
-    use super::compact_one_line;
+    use super::{compact_one_line, merge_palette_history, palette_toggle_key};
+    use crate::palette::PaletteMode;
+    use gtk4::gdk::{Key, ModifierType};
 
     #[test]
     fn palette_previews_neutralise_untrusted_formatting() {
@@ -777,5 +880,55 @@ mod tests {
         assert!(!preview.contains('\u{202e}'));
         assert!(!preview.contains('\u{fff0}'));
         assert!(!preview.contains('\u{e0080}'));
+    }
+
+    #[test]
+    fn palette_history_snapshot_is_recent_first_and_deduplicated_across_sources() {
+        let persisted = vec![
+            crate::command_history::CommandHistoryRecord {
+                command: "cargo test".into(),
+                cwd: Some("/repo".into()),
+                exit_code: 0,
+                end_time_ms: Some(20),
+            },
+            crate::command_history::CommandHistoryRecord {
+                command: "git status".into(),
+                cwd: Some("/repo".into()),
+                exit_code: 1,
+                end_time_ms: Some(10),
+            },
+        ];
+        let merged = merge_palette_history(
+            vec!["cargo fmt".into(), "cargo test".into()],
+            persisted,
+            100,
+        );
+
+        assert_eq!(
+            merged
+                .iter()
+                .map(|entry| entry.command.as_str())
+                .collect::<Vec<_>>(),
+            ["cargo fmt", "cargo test", "git status"]
+        );
+        assert_eq!(merged[1].exit_code, None, "live history wins duplicates");
+        assert_eq!(merged[2].exit_code, Some(1));
+    }
+
+    #[test]
+    fn initial_palette_modes_keep_their_own_toggle_shortcut() {
+        let ctrl_shift = ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK;
+        assert!(palette_toggle_key(PaletteMode::All, Key::p, ctrl_shift));
+        assert!(palette_toggle_key(PaletteMode::History, Key::h, ctrl_shift));
+        assert!(palette_toggle_key(
+            PaletteMode::Workflows,
+            Key::m,
+            ctrl_shift
+        ));
+        assert!(!palette_toggle_key(
+            PaletteMode::History,
+            Key::p,
+            ctrl_shift
+        ));
     }
 }

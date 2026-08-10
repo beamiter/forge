@@ -30,7 +30,6 @@ struct TabLaunch {
 }
 
 type TitleChangedCallback = Box<dyn Fn(&str)>;
-const CUSTOM_TITLE_DATA: &str = "forge-custom-title";
 
 fn tab_num_for_widget(widget: &gtk4::Widget) -> Option<u32> {
     widget
@@ -65,10 +64,7 @@ pub(super) fn notebook_page_named(notebook: &gtk4::Notebook, name: &str) -> Opti
 }
 
 fn custom_tab_title(notebook: &gtk4::Notebook, page: &gtk4::Widget) -> Option<String> {
-    let is_custom = unsafe {
-        page.data::<Rc<Cell<bool>>>(CUSTOM_TITLE_DATA)
-            .is_some_and(|flag| flag.as_ref().get())
-    };
+    let is_custom = tab_custom_title_cell(page).is_some_and(|flag| flag.get());
     is_custom
         .then(|| crate::state::tab_label_text(notebook, page))
         .flatten()
@@ -556,9 +552,7 @@ impl UiState {
         // Remote tabs intentionally keep their host label instead of allowing
         // OSC title/cwd updates to replace it, matching ordinary remote tabs.
         let custom_title = Rc::new(Cell::new(leaf.is_remote()));
-        unsafe {
-            page_widget.set_data::<Rc<Cell<bool>>>(CUSTOM_TITLE_DATA, custom_title.clone());
-        }
+        attach_tab_custom_title_cell(&page_widget, custom_title.clone());
         let rename_header = GestureClick::new();
         rename_header.set_button(GDK_BUTTON_PRIMARY as u32);
         let window_for_rename = self.window.clone();
@@ -879,6 +873,7 @@ impl UiState {
         });
         button.add_controller(context);
         self.install_tab_drag_drop(&button);
+        self.install_tab_width_resize(&button);
 
         // Match the strip index to the Notebook insertion index.
         let mut sibling = self.tab_strip.first_child();
@@ -969,6 +964,28 @@ impl UiState {
         host: &crate::config::RemoteHost,
         attempt: u32,
     ) -> Terminal {
+        self.launch_remote(host, attempt, None, Some(host.name.clone()))
+    }
+
+    /// Restore a managed remote through the same direct-argv path as a fresh
+    /// connection. This recreates the connection badge and reconnect record;
+    /// feeding ssh through a local shell as an initial command would do neither.
+    pub(crate) fn add_restored_remote_tab(
+        &self,
+        host: &crate::config::RemoteHost,
+        session_id: String,
+        tab_name: Option<String>,
+    ) -> Terminal {
+        self.launch_remote(host, 0, Some(session_id), tab_name)
+    }
+
+    fn launch_remote(
+        &self,
+        host: &crate::config::RemoteHost,
+        attempt: u32,
+        session_id: Option<String>,
+        tab_name: Option<String>,
+    ) -> Terminal {
         let argv = crate::config::build_remote_argv(host);
         // Remote tabs use Block so OSC 7/133/7770 metadata, command results and
         // reconnect session identifiers are observed consistently, matching
@@ -981,8 +998,8 @@ impl UiState {
         );
         self.add_tab_with_argv(TabLaunch {
             working_directory: None,
-            tab_name: Some(host.name.clone()),
-            session_id: None,
+            tab_name,
+            session_id,
             initial_commands: crate::terminal::InitialCommands::default(),
             argv_override: Some(argv),
             remote: Some((host.clone(), attempt)),
@@ -1331,12 +1348,19 @@ impl UiState {
                     if let Some(conn) = conns_for_session.borrow_mut().get_mut(&current_tab_num) {
                         conn.host.session = Some(id.to_string());
                     }
+                    if crate::review_input::valid_jsh_id(id) {
+                        if let Some(leaf) = PaneLeaf::from_widget(&root) {
+                            leaf.set_managed_remote_session_id(id);
+                        }
+                    }
                 });
 
                 // Keep a lightweight cross-session index. Full block output
                 // remains governed by block_history_path; this record contains
                 // only command metadata and is safe for palette use.
                 self.connect_block_command_history(term_view);
+                self.connect_block_ai_action(term_view);
+                self.connect_block_tab_attention(term_view, term_view.widget().upcast_ref());
                 self.connect_bottom_bar_block_status(term_view);
                 self.attach_ascii_organism_to_view(term_view, is_remote);
             }
@@ -1541,12 +1565,20 @@ impl UiState {
         let term_wrapper_for_name = term_wrapper.clone();
         term_wrapper_for_name.set_widget_name(&format!("tab-{}", tab_num));
         let term_wrapper_widget = term_wrapper.clone().upcast::<gtk4::Widget>();
-        unsafe {
-            term_wrapper_widget.set_data::<Rc<Cell<bool>>>(CUSTOM_TITLE_DATA, custom_title.clone());
-        }
+        attach_tab_custom_title_cell(&term_wrapper_widget, custom_title.clone());
         view_type.attach_to(&term_wrapper_widget);
         view_type.set_session_id(&sid);
         view_type.set_remote(is_remote);
+        if let Some((host, _)) = remote.as_ref() {
+            view_type.set_managed_remote_name(&host.name);
+            if let Some(session_id) = host
+                .session
+                .as_deref()
+                .filter(|session_id| crate::review_input::valid_jsh_id(session_id))
+            {
+                view_type.set_managed_remote_session_id(session_id);
+            }
+        }
         self.install_pane_rearrange(&view_type);
 
         let ui_for_close = UiState::clone(self);
@@ -2096,6 +2128,7 @@ impl UiState {
         });
 
         self.install_tab_drag_drop(&strip_btn);
+        self.install_tab_width_resize(&strip_btn);
 
         // Insert strip button at the correct position
         if page_num as i32 >= self.tab_strip.observe_children().n_items() as i32 {

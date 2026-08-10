@@ -28,6 +28,16 @@ type RemoteHostsRefresh = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 /// a stale index would silently edit a different host.
 type RemoteHostEditTarget = (usize, String);
 
+fn remote_picker_guard(safe_mode: bool, host_count: usize) -> Result<(), &'static str> {
+    if safe_mode {
+        Err("Remote connections are disabled in safe mode.")
+    } else if host_count == 0 {
+        Err("No remote hosts are configured. Add one in Settings → Remote Hosts.")
+    } else {
+        Ok(())
+    }
+}
+
 impl UiState {
     pub(crate) async fn confirm_close_with_processes(
         window: &adw::ApplicationWindow,
@@ -289,8 +299,11 @@ impl UiState {
 
         let hosts: Rc<Vec<crate::config::RemoteHost>> =
             Rc::new(self.config.borrow().remote_hosts.clone());
-        if hosts.is_empty() {
-            log::warn!("[remote] no remote_hosts configured; nothing to pick");
+        if let Err(message) =
+            remote_picker_guard(std::env::var_os("FORGE_SAFE_MODE").is_some(), hosts.len())
+        {
+            log::warn!("[remote] {message}");
+            self.toast_overlay.add_toast(adw::Toast::new(message));
             return;
         }
 
@@ -1223,19 +1236,12 @@ impl UiState {
         scrollback_row.set_title("Scrollback Lines");
         group.add(&scrollback_row);
 
-        let block_compact_row = adw::SwitchRow::builder()
-            .title("Compact Block Spacing")
-            .subtitle("Use the denser anvil/Warp-style layout for new Block panes")
-            .active(config.block_compact)
-            .build();
-        group.add(&block_compact_row);
-
         let terminal_group = adw::PreferencesGroup::new();
         terminal_group.set_title("Terminal & Blocks");
         let terminal_mode_model = gtk4::StringList::new(&["Block", "VTE compatibility"]);
         let terminal_mode_row = adw::ComboRow::builder()
             .title("Terminal Backend")
-            .subtitle("Applies to new local tabs; splits beside Block use VTE")
+            .subtitle("Applies to new and restored local panes")
             .model(&terminal_mode_model)
             .selected(match config.terminal_mode {
                 crate::config::TerminalMode::Block => 0,
@@ -1245,6 +1251,14 @@ impl UiState {
         let safe_mode = std::env::var_os("FORGE_SAFE_MODE").is_some();
         terminal_mode_row.set_sensitive(!safe_mode);
         terminal_group.add(&terminal_mode_row);
+
+        let block_compact_row = adw::SwitchRow::builder()
+            .title("Compact Block Layout")
+            .subtitle("Use denser spacing in new Block panes")
+            .active(config.block_compact)
+            .build();
+        block_compact_row.set_sensitive(!safe_mode);
+        terminal_group.add(&block_compact_row);
 
         let command_history_row = adw::SwitchRow::builder()
             .title("Command History Index")
@@ -1306,6 +1320,21 @@ impl UiState {
             .build();
         ai_enabled_row.set_sensitive(!safe_mode);
         ai_group.add(&ai_enabled_row);
+
+        let ai_panel_visible_row = adw::SwitchRow::builder()
+            .title("Show AI Chats at Startup")
+            .subtitle("Keep the persistent right-side chat panel open")
+            .active(config.ai_panel_visible)
+            .build();
+        ai_panel_visible_row.set_sensitive(!safe_mode && config.ai_enabled);
+        ai_group.add(&ai_panel_visible_row);
+
+        let ai_panel_width_adj =
+            Adjustment::new(config.ai_panel_width as f64, 240.0, 1200.0, 10.0, 50.0, 0.0);
+        let ai_panel_width_row = adw::SpinRow::new(Some(&ai_panel_width_adj), 10.0, 0);
+        ai_panel_width_row.set_title("AI Chats Width");
+        ai_panel_width_row.set_sensitive(!safe_mode && config.ai_enabled);
+        ai_group.add(&ai_panel_width_row);
 
         let agent_enabled_row = adw::SwitchRow::builder()
             .title("Enable Approval-gated Agent")
@@ -1557,6 +1586,8 @@ impl UiState {
         });
 
         let dependent_rows: Vec<gtk4::Widget> = vec![
+            ai_panel_visible_row.clone().upcast(),
+            ai_panel_width_row.clone().upcast(),
             agent_enabled_row.clone().upcast(),
             correction_enabled_row.clone().upcast(),
             provider_row.clone().upcast(),
@@ -1569,16 +1600,40 @@ impl UiState {
         ];
         let agent_turns_for_ai = agent_turns_row.clone();
         let agent_enabled_for_ai = agent_enabled_row.clone();
+        let ai_panel_visible_for_ai = ai_panel_visible_row.clone();
         let ui = self.clone();
         ai_enabled_row.connect_active_notify(move |row| {
             let enabled = row.is_active();
             ui.config.borrow_mut().ai_enabled = enabled;
             for dependent in &dependent_rows {
-                dependent.set_sensitive(enabled);
+                dependent.set_sensitive(!safe_mode && enabled);
             }
-            agent_turns_for_ai.set_sensitive(enabled && agent_enabled_for_ai.is_active());
+            agent_turns_for_ai
+                .set_sensitive(!safe_mode && enabled && agent_enabled_for_ai.is_active());
+            if !enabled {
+                ai_panel_visible_for_ai.set_active(false);
+                ui.set_ai_panel_visible(false, false);
+            }
             ui.sync_agent_toggle();
             ui.persist_config();
+        });
+
+        let ui = self.clone();
+        ai_panel_visible_row.connect_active_notify(move |row| {
+            ui.set_ai_panel_visible(row.is_active(), true);
+        });
+
+        let ui = self.clone();
+        ai_panel_width_row.connect_value_notify(move |row| {
+            let width = (row.value().round() as u32).clamp(240, 1200);
+            let changed = ui.config.borrow().ai_panel_width != width;
+            ui.config.borrow_mut().ai_panel_width = width;
+            if ui.ai_panel_visible.get() {
+                ui.restore_ai_panel_width();
+            }
+            if changed {
+                ui.persist_config();
+            }
         });
 
         let turns_for_agent = agent_turns_row.clone();
@@ -2595,5 +2650,23 @@ impl UiState {
         dialog.add_controller(key_controller);
 
         dialog.present(Some(&self.window));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remote_picker_guard;
+
+    #[test]
+    fn remote_picker_reports_safe_mode_and_empty_config() {
+        assert_eq!(
+            remote_picker_guard(true, 1),
+            Err("Remote connections are disabled in safe mode.")
+        );
+        assert_eq!(
+            remote_picker_guard(false, 0),
+            Err("No remote hosts are configured. Add one in Settings → Remote Hosts.")
+        );
+        assert!(remote_picker_guard(false, 1).is_ok());
     }
 }

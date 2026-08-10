@@ -628,12 +628,18 @@ const FINISHED_BLOCK_NON_OUTPUT_ROWS: i64 = 3;
 /// at once. Anything longer keeps a bounded viewport plus its own visible
 /// scrollbar, which is what makes long output workable with a mouse: the card
 /// stays anchored under the pointer while the wheel or the slider walks its
-/// content, instead of the whole history sliding past. Manual expansion opts a
-/// single block back into full-height document flow.
-fn finished_output_cap(output_rows: i64, fitted_cap: i64, manually_expanded: bool) -> i64 {
+/// content, instead of the whole history sliding past. Manual expansion grows
+/// one block only as far as the configured expanded-row ceiling; exceptionally
+/// large snapshots remain usable through the same inner scrollbar.
+fn finished_output_cap(
+    output_rows: i64,
+    fitted_cap: i64,
+    manually_expanded: bool,
+    max_expanded_cap: i64,
+) -> i64 {
     let output_rows = output_rows.max(1);
     if manually_expanded {
-        output_rows
+        max_expanded_cap.max(fitted_cap).max(1).min(output_rows)
     } else {
         fitted_cap.max(1).min(output_rows)
     }
@@ -836,7 +842,12 @@ pub(crate) fn estimated_finished_block_height_for_text(
     let visible_output_rows = if output_rows == 0 {
         0
     } else {
-        finished_output_cap(output_rows, fallback_cap, false)
+        finished_output_cap(
+            output_rows,
+            fallback_cap,
+            false,
+            config.finished_block_max_expanded_rows as i64,
+        )
     };
     finished_block_height_for_rows(
         estimated_cell_height_px(config),
@@ -1037,6 +1048,9 @@ impl FinishedBlock {
         let fallback_viewport_cap = (config.finished_block_viewport_rows as i64).max(3);
         let viewport_cap =
             fitted_output_rows_for_viewport(None, fallback_viewport_cap, output_rows);
+        let max_expanded_cap = (config.finished_block_max_expanded_rows as i64)
+            .max(fallback_viewport_cap)
+            .max(3);
         let current_viewport_cap = Rc::new(Cell::new(viewport_cap));
         let long_output = output_rows > viewport_cap;
         let virtualized_height = Rc::new(Cell::new(estimated_finished_block_height_for_text(
@@ -1387,6 +1401,7 @@ impl FinishedBlock {
             let jump_btn_for_map = jump_bottom_btn.downgrade();
             let stamp_for_map = render_stamp.clone();
             let generation_for_map = displayed_generation.clone();
+            let max_expanded_cap_for_map = max_expanded_cap;
             output_vte.connect_map(move |w| {
                 let (Some(expand_btn_for_map), Some(jump_btn_for_map)) =
                     (expand_btn_for_map.upgrade(), jump_btn_for_map.upgrade())
@@ -1408,7 +1423,12 @@ impl FinishedBlock {
                 if stamp_for_map.replace(stamp) == stamp {
                     return;
                 }
-                let cap = finished_output_cap(rows, fitted_cap, manually_expanded);
+                let cap = finished_output_cap(
+                    rows,
+                    fitted_cap,
+                    manually_expanded,
+                    max_expanded_cap_for_map,
+                );
                 let visible_rows = rows.min(cap).max(1);
                 let fit_to_content = output_fits_viewport(rows, cap);
                 let can_expand = rows > fitted_cap;
@@ -1419,7 +1439,7 @@ impl FinishedBlock {
                     &text,
                     eff_cols,
                     rows,
-                    fitted_cap,
+                    cap,
                     capture_rows,
                     fit_to_content,
                 );
@@ -1446,6 +1466,7 @@ impl FinishedBlock {
             let cols_for_btn = cols.max(1);
             let stamp_for_btn = render_stamp.clone();
             let generation_for_btn = displayed_generation.clone();
+            let max_expanded_cap_for_btn = max_expanded_cap;
             expand_btn.connect_clicked(move |btn| {
                 let Some(output_vte_for_btn) = output_vte_for_btn.upgrade() else {
                     return;
@@ -1461,7 +1482,8 @@ impl FinishedBlock {
                 );
                 current_cap_for_btn.set(fitted_cap);
                 stamp_for_btn.set((eff_cols, fitted_cap, now_expanded, generation_for_btn.get()));
-                let cap = finished_output_cap(rows, fitted_cap, now_expanded);
+                let cap =
+                    finished_output_cap(rows, fitted_cap, now_expanded, max_expanded_cap_for_btn);
                 let visible_rows = rows.min(cap).max(1);
                 let fit_to_content = output_fits_viewport(rows, cap);
                 render_bytes_into_finished_vte(
@@ -1469,7 +1491,7 @@ impl FinishedBlock {
                     &displayed_for_btn.borrow(),
                     eff_cols,
                     rows,
-                    fitted_cap,
+                    cap,
                     capture_rows,
                     fit_to_content,
                 );
@@ -1507,6 +1529,7 @@ impl FinishedBlock {
             let cmd_for_refit = cmd.to_string();
             let stamp_for_refit = render_stamp.clone();
             let generation_for_refit = displayed_generation.clone();
+            let max_expanded_cap_for_refit = max_expanded_cap;
             Rc::new(move || {
                 let (Some(output_vte), Some(expand_btn), Some(jump_btn)) = (
                     output_vte.upgrade(),
@@ -1542,7 +1565,7 @@ impl FinishedBlock {
                 let can_expand = rows > fitted_cap;
                 expand_btn.set_visible(can_expand);
                 jump_btn.set_visible(can_expand);
-                let cap = finished_output_cap(rows, fitted_cap, false);
+                let cap = finished_output_cap(rows, fitted_cap, false, max_expanded_cap_for_refit);
                 let visible_rows = rows.min(cap).max(1);
                 let fit_to_content = output_fits_viewport(rows, cap);
                 render_bytes_into_finished_vte(
@@ -1550,7 +1573,7 @@ impl FinishedBlock {
                     &text,
                     eff_cols,
                     rows,
-                    fitted_cap,
+                    cap,
                     capture_rows,
                     fit_to_content,
                 );
@@ -1810,6 +1833,7 @@ impl FinishedBlock {
                 let filter_btn = filter_btn.downgrade();
                 let jump_bottom_btn = jump_bottom_btn.downgrade();
                 let collapsed_summary = collapsed_summary.downgrade();
+                let max_expanded_cap_for_filter = max_expanded_cap;
                 move || {
                     let (
                         Some(output_vte),
@@ -1880,15 +1904,19 @@ impl FinishedBlock {
                     let generation = displayed_generation.get().wrapping_add(1);
                     displayed_generation.set(generation);
                     render_stamp.set((eff_cols, fitted_cap, manually_expanded, generation));
-                    let active_cap =
-                        finished_output_cap(shown_visual_rows, fitted_cap, manually_expanded);
+                    let active_cap = finished_output_cap(
+                        shown_visual_rows,
+                        fitted_cap,
+                        manually_expanded,
+                        max_expanded_cap_for_filter,
+                    );
                     let fit_to_content = output_fits_viewport(shown_visual_rows, active_cap);
                     render_bytes_into_finished_vte(
                         &output_vte,
                         &shown,
                         eff_cols,
                         shown_visual_rows,
-                        fitted_cap,
+                        active_cap,
                         capture_rows,
                         fit_to_content,
                     );
@@ -2781,11 +2809,15 @@ mod tests {
     #[test]
     fn long_output_scrolls_inside_its_own_block() {
         // Taller than the pane: capped, so the block keeps a private scrollbar.
-        assert_eq!(super::finished_output_cap(200, 30, false), 30);
+        assert_eq!(super::finished_output_cap(200, 30, false, 5_000), 30);
         assert!(!super::output_fits_viewport(200, 30));
-        // Expanding opts one block back into full-height document flow.
-        assert_eq!(super::finished_output_cap(200, 30, true), 200);
+        // A normal expansion can still show the complete snapshot.
+        assert_eq!(super::finished_output_cap(200, 30, true, 5_000), 200);
         assert!(super::output_fits_viewport(200, 200));
+        // Extremely long snapshots stop at the configured expanded ceiling and
+        // keep their private scrollbar instead of creating an unbounded card.
+        assert_eq!(super::finished_output_cap(20_000, 30, true, 5_000), 5_000);
+        assert!(!super::output_fits_viewport(20_000, 5_000));
     }
 
     #[test]
@@ -2830,7 +2862,7 @@ mod tests {
 
     #[test]
     fn short_output_takes_its_natural_height() {
-        assert_eq!(super::finished_output_cap(12, 30, false), 12);
+        assert_eq!(super::finished_output_cap(12, 30, false, 5_000), 12);
         assert!(super::output_fits_viewport(12, 12));
     }
 

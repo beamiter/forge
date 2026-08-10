@@ -1,3 +1,4 @@
+use gtk4::glib::prelude::ObjectExt;
 use gtk4::Notebook;
 use gtk4::{CssProvider, ScrolledWindow, SearchBar, SearchEntry, Stack, ToggleButton};
 use libadwaita as adw;
@@ -88,6 +89,34 @@ pub(crate) struct TabConnection {
     /// failed handshake (grow backoff) from a long-lived session that dropped
     /// (reset backoff).
     pub(crate) spawn_at: std::time::Instant,
+}
+
+/// GTK object-data key shared by tab construction, split-page replacement and
+/// window snapshotting.  The `Rc<Cell<_>>` is also captured by rename/title
+/// callbacks, so replacement page widgets must carry the same cell rather than
+/// a copied boolean.
+pub(crate) const CUSTOM_TITLE_DATA: &str = "forge-custom-title";
+
+pub(crate) fn tab_custom_title_cell(widget: &gtk4::Widget) -> Option<Rc<Cell<bool>>> {
+    unsafe {
+        widget
+            .data::<Rc<Cell<bool>>>(CUSTOM_TITLE_DATA)
+            .map(|value| value.as_ref().clone())
+    }
+}
+
+pub(crate) fn attach_tab_custom_title_cell(widget: &gtk4::Widget, value: Rc<Cell<bool>>) {
+    unsafe {
+        widget.set_data::<Rc<Cell<bool>>>(CUSTOM_TITLE_DATA, value);
+    }
+}
+
+pub(crate) fn set_tab_custom_title(widget: &gtk4::Widget, value: bool) {
+    if let Some(cell) = tab_custom_title_cell(widget) {
+        cell.set(value);
+    } else {
+        attach_tab_custom_title_cell(widget, Rc::new(Cell::new(value)));
+    }
 }
 
 #[derive(Clone)]

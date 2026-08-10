@@ -360,13 +360,30 @@ fn print_issues(issues: &[ConfigIssue]) {
 #[derive(Serialize)]
 struct JsonIssue<'a> {
     level: &'static str,
+    severity: &'static str,
     path: &'a str,
+    key: &'a str,
     message: &'a str,
+}
+
+fn json_issue(issue: &ConfigIssue) -> JsonIssue<'_> {
+    let level = match issue.level {
+        ConfigIssueLevel::Warning => "warning",
+        ConfigIssueLevel::Error => "error",
+    };
+    JsonIssue {
+        level,
+        severity: level,
+        path: &issue.path,
+        key: &issue.path,
+        message: &issue.message,
+    }
 }
 
 #[derive(Serialize)]
 struct ConfigReport<'a> {
     path: String,
+    exists: bool,
     valid: bool,
     errors: usize,
     warnings: usize,
@@ -383,10 +400,14 @@ fn check_config(path: &Path, format: ReportFormat) -> bool {
                     "{}",
                     serde_json::json!({
                         "path": path.display().to_string(),
+                        "exists": false,
                         "valid": false,
                         "errors": 1,
                         "warnings": 0,
-                        "issues": [{"level":"error", "path":"$", "message":err.to_string()}]
+                        "issues": [{
+                            "level":"error", "severity":"error",
+                            "path":"$", "key":"$", "message":err.to_string()
+                        }]
                     })
                 );
             } else {
@@ -400,10 +421,14 @@ fn check_config(path: &Path, format: ReportFormat) -> bool {
                     "{}",
                     serde_json::json!({
                         "path": path.display().to_string(),
+                        "exists": path.try_exists().unwrap_or(false),
                         "valid": false,
                         "errors": 1,
                         "warnings": 0,
-                        "issues": [{"level":"error", "path":"$", "message":err.to_string()}]
+                        "issues": [{
+                            "level":"error", "severity":"error",
+                            "path":"$", "key":"$", "message":err.to_string()
+                        }]
                     })
                 );
             } else {
@@ -417,21 +442,12 @@ fn check_config(path: &Path, format: ReportFormat) -> bool {
             let errors = issues.iter().filter(|issue| issue.is_error()).count();
             let warnings = issues.len() - errors;
             if format == ReportFormat::Json {
-                let json_issues = issues
-                    .iter()
-                    .map(|issue| JsonIssue {
-                        level: match issue.level {
-                            ConfigIssueLevel::Warning => "warning",
-                            ConfigIssueLevel::Error => "error",
-                        },
-                        path: &issue.path,
-                        message: &issue.message,
-                    })
-                    .collect();
+                let json_issues = issues.iter().map(json_issue).collect();
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&ConfigReport {
                         path: path.display().to_string(),
+                        exists: true,
                         valid: errors == 0,
                         errors,
                         warnings,
@@ -467,10 +483,14 @@ fn check_config(path: &Path, format: ReportFormat) -> bool {
                     "{}",
                     serde_json::json!({
                         "path": path.display().to_string(),
+                        "exists": true,
                         "valid": false,
                         "errors": 1,
                         "warnings": 0,
-                        "issues": [{"level":"error", "path":"$", "message":"invalid TOML"}]
+                        "issues": [{
+                            "level":"error", "severity":"error",
+                            "path":"$", "key":"$", "message":"invalid TOML"
+                        }]
                     })
                 );
             } else {
@@ -1223,6 +1243,34 @@ mod tests {
             );
             assert_eq!(parsed.launch, LaunchOptions::default());
         }
+    }
+
+    #[test]
+    fn config_json_report_is_anvil_compatible_without_dropping_forge_fields() {
+        let issue = ConfigIssue {
+            level: ConfigIssueLevel::Warning,
+            path: "tab_width".to_string(),
+            message: "outside recommended range".to_string(),
+        };
+        let report = ConfigReport {
+            path: "/tmp/config.toml".to_string(),
+            exists: true,
+            valid: true,
+            errors: 0,
+            warnings: 1,
+            issues: vec![json_issue(&issue)],
+        };
+        let json = serde_json::to_value(report).unwrap();
+
+        assert_eq!(json["exists"], true);
+        assert_eq!(json["valid"], true);
+        assert_eq!(json["errors"], 0);
+        assert_eq!(json["warnings"], 1);
+        assert_eq!(json["issues"][0]["level"], "warning");
+        assert_eq!(json["issues"][0]["severity"], "warning");
+        assert_eq!(json["issues"][0]["path"], "tab_width");
+        assert_eq!(json["issues"][0]["key"], "tab_width");
+        assert_eq!(json["issues"][0]["message"], "outside recommended range");
     }
 
     #[cfg(unix)]

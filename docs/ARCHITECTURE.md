@@ -11,7 +11,7 @@ forge has two explicit terminal models:
 - **VTE mode** attaches a GTK VTE widget directly to a PTY and supports conventional split panes.
 - **Block mode**, the default, owns its PTY and reader lifecycle in `TermView`, parses shell integration markers, and renders commands and output as searchable finished blocks plus one live terminal.
 
-`PaneLeaf` is the backend-neutral ownership boundary. It exposes the visible root, live input surface, PTY/shell process probe, cwd/restorable command, focus, and teardown without discovering an arbitrary nested VTE widget. Splitting a Block leaf retains that Block controller and creates a conventional VTE sibling; nested VTE splits use the same pane tree. Close paths scan every leaf, restore zoomed trees before mutation, confirm foreground work, and terminate the corresponding process group.
+`PaneLeaf` is the backend-neutral ownership boundary. It exposes the visible root, live input surface, PTY/shell process probe, cwd/restorable command, focus, and teardown without discovering an arbitrary nested VTE widget. A split inherits the focused leaf's backend: Block creates a Block sibling and VTE creates a VTE sibling; both can be nested in the same pane tree. Close paths scan every leaf, restore zoomed trees before mutation, confirm foreground work, and terminate the corresponding process group.
 
 ## UI composition
 

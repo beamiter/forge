@@ -192,6 +192,15 @@ impl SelectionFeedHold {
         }
     }
 
+    /// Run an irreversible follow-up only after parked bytes have re-entered
+    /// the normal parser/VTE pipeline. PTY exit and direct process-control
+    /// writes use this boundary so neither teardown nor new input can overtake
+    /// the tail that was held for a selection.
+    pub(crate) fn flush_then(&self, action: impl FnOnce()) {
+        self.flush_now();
+        action();
+    }
+
     fn schedule_grace(self: &Rc<Self>) {
         self.cancel_grace();
         let weak = Rc::downgrade(self);
@@ -330,5 +339,20 @@ mod tests {
         hold.flush_now();
         assert!(log.borrow().is_empty());
         assert!(!hold.try_buffer(b"live"));
+    }
+
+    #[test]
+    fn flush_then_orders_replay_before_exit_or_control_action() {
+        let hold = SelectionFeedHold::new();
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let replay_order = order.clone();
+        hold.set_flush(move |_| replay_order.borrow_mut().push("replay"));
+        hold.begin_drag();
+        assert!(hold.try_buffer(b"tail"));
+
+        let action_order = order.clone();
+        hold.flush_then(move || action_order.borrow_mut().push("exit-or-control"));
+
+        assert_eq!(order.borrow().as_slice(), ["replay", "exit-or-control"]);
     }
 }

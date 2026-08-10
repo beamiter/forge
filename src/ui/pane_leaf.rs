@@ -19,6 +19,8 @@ use crate::terminal::{focus_terminal, VteTerminalView};
 const PANE_LEAF_DATA_KEY: &str = "terminal-view-type";
 const PANE_SESSION_ID_DATA_KEY: &str = "terminal-session-id";
 const PANE_REMOTE_DATA_KEY: &str = "terminal-remote-pane";
+const PANE_REMOTE_NAME_DATA_KEY: &str = "terminal-managed-remote-name";
+const PANE_REMOTE_SESSION_ID_DATA_KEY: &str = "terminal-managed-remote-session-id";
 const PANE_FOCUS_SERIAL_DATA_KEY: &str = "terminal-pane-focus-serial";
 static NEXT_PANE_FOCUS_SERIAL: AtomicU64 = AtomicU64::new(1);
 
@@ -202,6 +204,42 @@ impl PaneLeaf {
             self.root_widget()
                 .data::<bool>(PANE_REMOTE_DATA_KEY)
                 .is_some_and(|value| *value.as_ref())
+        }
+    }
+
+    /// Record the stable configuration identifier for a managed remote pane.
+    /// Window snapshots persist this name instead of the mutable ssh/docker
+    /// argv, then resolve it against the current validated configuration.
+    pub(crate) fn set_managed_remote_name(&self, name: &str) {
+        unsafe {
+            self.root_widget()
+                .set_data::<String>(PANE_REMOTE_NAME_DATA_KEY, name.to_owned());
+        }
+    }
+
+    pub(crate) fn managed_remote_name(&self) -> Option<String> {
+        unsafe {
+            self.root_widget()
+                .data::<String>(PANE_REMOTE_NAME_DATA_KEY)
+                .map(|value| value.as_ref().clone())
+        }
+    }
+
+    /// The remote jsh can publish a newer resumable session id after launch.
+    /// Keep it on the concrete pane so later tab moves do not sever it from the
+    /// remote profile metadata used by snapshotting.
+    pub(crate) fn set_managed_remote_session_id(&self, session_id: &str) {
+        unsafe {
+            self.root_widget()
+                .set_data::<String>(PANE_REMOTE_SESSION_ID_DATA_KEY, session_id.to_owned());
+        }
+    }
+
+    pub(crate) fn managed_remote_session_id(&self) -> Option<String> {
+        unsafe {
+            self.root_widget()
+                .data::<String>(PANE_REMOTE_SESSION_ID_DATA_KEY)
+                .map(|value| value.as_ref().clone())
         }
     }
 

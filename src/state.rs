@@ -786,6 +786,18 @@ pub enum PaneLayout {
     Leaf {
         dir: String,
         sid: String,
+        /// True when `dir` belongs to an ssh/docker namespace and must never be
+        /// supplied as a local process working directory during restore.
+        #[serde(default)]
+        cwd_external: bool,
+        /// Stable name of a managed remote profile. The mutable connection argv
+        /// is deliberately omitted and rebuilt from current validated config.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote_name: Option<String>,
+        /// Explicit tab-title ownership. Older snapshots omit this and retain
+        /// the historical inference behavior during restore.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custom_title: Option<bool>,
         /// Restorable command argv to replay on restore (e.g. `["ssh", "host"]`).
         /// Keeping it structured prevents shell metacharacters inside one
         /// argument from becoming a different local command after a restart.
@@ -811,6 +823,15 @@ pub(crate) fn serialize_pane_layout(
     widget: &gtk4::Widget,
     session_ids: &HashMap<u32, String>,
 ) -> PaneLayout {
+    let custom_title = crate::ui::tab_custom_title_cell(widget).map(|flag| flag.get());
+    serialize_pane_layout_with_custom_title(widget, session_ids, custom_title)
+}
+
+fn serialize_pane_layout_with_custom_title(
+    widget: &gtk4::Widget,
+    session_ids: &HashMap<u32, String>,
+    custom_title: Option<bool>,
+) -> PaneLayout {
     if let Some(paned) = widget.downcast_ref::<Paned>() {
         let orientation = match paned.orientation() {
             gtk4::Orientation::Horizontal => 'h',
@@ -824,8 +845,16 @@ pub(crate) fn serialize_pane_layout(
         PaneLayout::Split {
             orientation,
             position: paned.position(),
-            start: Box::new(serialize_pane_layout(&start, session_ids)),
-            end: Box::new(serialize_pane_layout(&end, session_ids)),
+            start: Box::new(serialize_pane_layout_with_custom_title(
+                &start,
+                session_ids,
+                custom_title,
+            )),
+            end: Box::new(serialize_pane_layout_with_custom_title(
+                &end,
+                session_ids,
+                custom_title,
+            )),
         }
     } else {
         // Leaf terminal
@@ -844,7 +873,8 @@ pub(crate) fn serialize_pane_layout(
         let widget_name = widget.widget_name();
         let sid = pane_leaf
             .as_ref()
-            .and_then(PaneLeaf::session_id)
+            .and_then(PaneLeaf::managed_remote_session_id)
+            .or_else(|| pane_leaf.as_ref().and_then(PaneLeaf::session_id))
             .unwrap_or_else(|| {
                 if let Some(tab_str) = widget_name.to_string().strip_prefix("tab-") {
                     if let Ok(tab_num) = tab_str.parse::<u32>() {
@@ -860,11 +890,21 @@ pub(crate) fn serialize_pane_layout(
                 }
             });
 
-        let cmds = pane_leaf
-            .as_ref()
-            .and_then(PaneLeaf::restorable_command)
-            .or_else(|| get_restorable_commands(&terminal))
-            .and_then(|argv| crate::process::match_restorable_command_bounded(&argv));
+        let remote_name = pane_leaf.as_ref().and_then(PaneLeaf::managed_remote_name);
+        let cmds = remote_name
+            .is_none()
+            .then(|| {
+                pane_leaf
+                    .as_ref()
+                    .and_then(PaneLeaf::restorable_command)
+                    .or_else(|| get_restorable_commands(&terminal))
+                    .and_then(|argv| crate::process::match_restorable_command_bounded(&argv))
+            })
+            .flatten();
+        let cwd_external = pane_leaf.as_ref().is_some_and(PaneLeaf::is_remote)
+            || cmds
+                .as_deref()
+                .is_some_and(jterm_core::process::command_uses_external_cwd);
 
         // Check if this tab is pinned
         let pinned = unsafe { widget.data::<bool>("pinned").map(|p| *p.as_ref()) };
@@ -872,6 +912,9 @@ pub(crate) fn serialize_pane_layout(
         PaneLayout::Leaf {
             dir,
             sid,
+            cwd_external,
+            remote_name,
+            custom_title,
             cmds,
             pinned,
         }
@@ -1068,9 +1111,17 @@ fn parse_ai_conversation(contents: &str) -> Option<crate::ai::ConversationSnapsh
 fn normalize_pane_layout_bounded(layout: &mut PaneLayout, limit: usize) -> Option<usize> {
     let mut pending = vec![layout];
     let mut leaves = 0usize;
+    let mut managed_remote_seen = false;
     while let Some(node) = pending.pop() {
         match node {
-            PaneLayout::Leaf { dir, sid, cmds, .. } => {
+            PaneLayout::Leaf {
+                dir,
+                sid,
+                cwd_external,
+                remote_name,
+                cmds,
+                ..
+            } => {
                 leaves = leaves.checked_add(1)?;
                 if leaves > limit {
                     return None;
@@ -1096,6 +1147,28 @@ fn normalize_pane_layout_bounded(layout: &mut PaneLayout, limit: usize) -> Optio
                     crate::process::match_restorable_command_bounded(argv).is_none()
                 }) {
                     *cmds = None;
+                }
+                if cmds
+                    .as_deref()
+                    .is_some_and(jterm_core::process::command_uses_external_cwd)
+                {
+                    *cwd_external = true;
+                }
+                if let Some(name) = remote_name.as_deref() {
+                    let valid = !name.trim().is_empty()
+                        && name.len() <= MAX_RESTORED_TAB_NAME_BYTES
+                        && !name.chars().any(char::is_control)
+                        && !crate::review_input::contains_visual_spoof(name);
+                    // One tab owns at most one reconnect controller. A modified
+                    // snapshot must not smuggle a second managed argv into a
+                    // local shell when that invariant cannot be represented.
+                    *cmds = None;
+                    *cwd_external = true;
+                    if !valid || managed_remote_seen {
+                        *remote_name = None;
+                    } else {
+                        managed_remote_seen = true;
+                    }
                 }
             }
             PaneLayout::Split {
@@ -1185,6 +1258,9 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
                     let layout = PaneLayout::Leaf {
                         dir,
                         sid: generate_session_id(),
+                        cwd_external: false,
+                        remote_name: None,
+                        custom_title: None,
                         cmds: None,
                         pinned: None,
                     };
@@ -1203,6 +1279,9 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
                         let layout = PaneLayout::Leaf {
                             dir: data,
                             sid: generate_session_id(),
+                            cwd_external: false,
+                            remote_name: None,
+                            custom_title: None,
                             cmds: None,
                             pinned: None,
                         };
@@ -1222,6 +1301,9 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
                     let layout = PaneLayout::Leaf {
                         dir,
                         sid: effective_sid,
+                        cwd_external: false,
+                        remote_name: None,
+                        custom_title: None,
                         cmds: None,
                         pinned: None,
                     };
@@ -1248,6 +1330,9 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
                     let layout = PaneLayout::Leaf {
                         dir,
                         sid: effective_sid,
+                        cwd_external: false,
+                        remote_name: None,
+                        custom_title: None,
                         cmds: None,
                         pinned: None,
                     };
@@ -1266,6 +1351,9 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
         let layout = PaneLayout::Leaf {
             dir: line.to_string(),
             sid: generate_session_id(),
+            cwd_external: false,
+            remote_name: None,
+            custom_title: None,
             cmds: None,
             pinned: None,
         };
@@ -1725,6 +1813,9 @@ mod tests {
         PaneLayout::Leaf {
             dir: format!("/tmp/{index}"),
             sid: format!("sid-{index}"),
+            cwd_external: false,
+            remote_name: None,
+            custom_title: None,
             cmds: None,
             pinned: None,
         }
@@ -2354,10 +2445,64 @@ mod tests {
     }
 
     #[test]
+    fn pane_snapshot_schema_keeps_legacy_defaults_and_managed_remote_metadata() {
+        let legacy: PaneLayout =
+            serde_json::from_str(r#"{"type":"leaf","dir":"/tmp","sid":"legacy-1","pinned":true}"#)
+                .unwrap();
+        let PaneLayout::Leaf {
+            cwd_external,
+            remote_name,
+            custom_title,
+            ..
+        } = legacy
+        else {
+            panic!("expected a leaf layout");
+        };
+        assert!(!cwd_external);
+        assert_eq!(remote_name, None);
+        assert_eq!(custom_title, None);
+
+        let managed = PaneLayout::Leaf {
+            dir: "/srv/remote".into(),
+            sid: "resume-42".into(),
+            cwd_external: false,
+            remote_name: Some("production".into()),
+            custom_title: Some(false),
+            // A modified/older producer may include an argv. Normalization
+            // must still prefer the stable profile identity and discard it.
+            cmds: Some(vec!["ssh".into(), "stale.example".into()]),
+            pinned: Some(true),
+        };
+        let (_, tabs) = parse_tabs_state(&layout_tab_line("prod", &managed));
+        let PaneLayout::Leaf {
+            cwd_external,
+            remote_name,
+            custom_title,
+            cmds,
+            pinned,
+            ..
+        } = &tabs[0].1
+        else {
+            panic!("expected a leaf layout");
+        };
+        assert!(*cwd_external, "a remote cwd must never become a local cwd");
+        assert_eq!(remote_name.as_deref(), Some("production"));
+        assert_eq!(*custom_title, Some(false));
+        assert_eq!(*pinned, Some(true));
+        assert!(
+            cmds.is_none(),
+            "managed argv is rebuilt from current config"
+        );
+    }
+
+    #[test]
     fn restore_sanitizes_session_ids_and_rejects_oversized_fields() {
         let invalid_sid = PaneLayout::Leaf {
             dir: "/tmp".into(),
             sid: "safe'\nrun-local".into(),
+            cwd_external: false,
+            remote_name: None,
+            custom_title: None,
             cmds: None,
             pinned: None,
         };
@@ -2373,6 +2518,9 @@ mod tests {
         let oversized_dir = PaneLayout::Leaf {
             dir: "x".repeat(MAX_RESTORED_CWD_BYTES + 1),
             sid: "1-2".into(),
+            cwd_external: false,
+            remote_name: None,
+            custom_title: None,
             cmds: None,
             pinned: None,
         };

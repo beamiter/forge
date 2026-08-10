@@ -43,6 +43,12 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static HISTORY_WRITER: OnceLock<Result<mpsc::SyncSender<WriterMessage>, String>> = OnceLock::new();
 
 fn validate_history_path(path: &Path) -> io::Result<()> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "command-history path must be normalized to an absolute path",
+        ));
+    }
     if path.file_name().is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -943,10 +949,12 @@ mod tests {
 
     #[test]
     fn history_paths_are_bounded_before_entering_the_writer_queue() {
-        assert!(validate_history_path(Path::new("history.jsonl")).is_ok());
-        assert!(validate_history_path(Path::new("bad\nname.jsonl")).is_err());
-        assert!(validate_history_path(Path::new("bad\u{202e}name.jsonl")).is_err());
-        let oversized = PathBuf::from("x".repeat(MAX_HISTORY_PATH_BYTES + 1));
+        assert!(validate_history_path(Path::new("/tmp/history.jsonl")).is_ok());
+        assert!(validate_history_path(Path::new("history.jsonl")).is_err());
+        assert!(validate_history_path(Path::new("~/history.jsonl")).is_err());
+        assert!(validate_history_path(Path::new("/tmp/bad\nname.jsonl")).is_err());
+        assert!(validate_history_path(Path::new("/tmp/bad\u{202e}name.jsonl")).is_err());
+        let oversized = PathBuf::from(format!("/tmp/{}", "x".repeat(MAX_HISTORY_PATH_BYTES + 1)));
         assert!(validate_history_path(&oversized).is_err());
     }
 

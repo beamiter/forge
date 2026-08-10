@@ -41,6 +41,21 @@ fn ai_panel_width_from_geometry(total_width: i32, position: i32) -> Option<u32> 
     Some((total_width - position).clamp(MIN_AI_PANEL_WIDTH, MAX_AI_PANEL_WIDTH) as u32)
 }
 
+fn remote_host_index_for_action(
+    index: u8,
+    host_count: usize,
+    safe_mode: bool,
+) -> Result<usize, &'static str> {
+    if safe_mode {
+        return Err("Remote connections are disabled in safe mode.");
+    }
+    let index = usize::from(index);
+    if index >= host_count {
+        return Err("That remote host is no longer configured.");
+    }
+    Ok(index)
+}
+
 impl UiState {
     /// Hotkey path for opacity: apply to the window, write through to the
     /// config (same persistence as the settings dialog, so the value survives
@@ -232,6 +247,16 @@ impl UiState {
                     self.notebook.set_current_page(Some(target));
                 }
             }
+            Action::ConnectRemote(index) => {
+                let safe_mode = std::env::var_os("FORGE_SAFE_MODE").is_some();
+                let hosts = self.config.borrow().remote_hosts.clone();
+                match remote_host_index_for_action(index, hosts.len(), safe_mode) {
+                    Ok(index) => {
+                        self.connect_remote(&hosts[index]);
+                    }
+                    Err(message) => self.toast_overlay.add_toast(adw::Toast::new(message)),
+                }
+            }
             Action::ShowRemotePicker => {
                 self.show_remote_picker();
             }
@@ -316,7 +341,27 @@ impl UiState {
             Action::ClearBlocks => {
                 log::info!("Clear finished blocks");
                 if let Some(term_view) = self.current_term_view() {
-                    term_view.clear_blocks();
+                    let count = term_view.clear_blocks();
+                    if count > 0 {
+                        let plural = if count == 1 { "" } else { "s" };
+                        let message = format!(
+                            "Cleared {count} block{plural} — \"Undo clear blocks\" restores them."
+                        );
+                        self.toast_overlay.add_toast(adw::Toast::new(&message));
+                    }
+                }
+            }
+            Action::UndoClearBlocks => {
+                log::info!("Undo clear finished blocks");
+                if let Some(term_view) = self.current_term_view() {
+                    let count = term_view.undo_clear_blocks();
+                    let message = if count == 0 {
+                        "No cleared blocks to restore.".to_string()
+                    } else {
+                        let plural = if count == 1 { "" } else { "s" };
+                        format!("Restored {count} cleared block{plural}.")
+                    };
+                    self.toast_overlay.add_toast(adw::Toast::new(&message));
                 }
             }
             Action::ReinputSelectedCommands => {
@@ -335,6 +380,16 @@ impl UiState {
                     term_view.jump_to_pinned(1);
                 }
             }
+            Action::JumpToPrevFailed => {
+                if let Some(term_view) = self.current_term_view() {
+                    term_view.jump_to_failed(-1);
+                }
+            }
+            Action::JumpToNextFailed => {
+                if let Some(term_view) = self.current_term_view() {
+                    term_view.jump_to_failed(1);
+                }
+            }
             Action::ExportSessionMarkdown => {
                 self.export_current_session(SessionExportFormat::Markdown);
             }
@@ -349,6 +404,10 @@ impl UiState {
                 log::debug!("Toggle AI panel");
                 self.toggle_ai_panel();
             }
+            Action::OpenAiPanel => {
+                log::debug!("Open AI panel");
+                self.open_ai_panel();
+            }
             Action::AskAiAboutSelectedBlock => {
                 log::debug!("Ask AI about selected block");
                 self.ask_ai_about_selected_block();
@@ -356,7 +415,7 @@ impl UiState {
             Action::OpenAgent => self.toggle_agent_panel(),
             Action::HistoryPalette => {
                 log::debug!("Show history palette");
-                self.show_history_palette();
+                self.show_unified_command_palette(crate::palette::PaletteMode::History);
             }
             Action::CrossBlockSearch => {
                 log::debug!("Show cross-block search palette");
@@ -364,13 +423,48 @@ impl UiState {
             }
             Action::WorkflowsPalette => {
                 log::debug!("Show workflows palette");
-                self.show_workflows_palette();
+                self.show_unified_command_palette(crate::palette::PaletteMode::Workflows);
             }
             Action::OpenWelcome => self.open_welcome_notebook(),
             Action::InstallJsh => {
                 log::info!("Install or update jsh");
                 self.install_or_update_jsh();
             }
+        }
+    }
+
+    /// Apply the right-side AI chat panel preference. Settings uses this path
+    /// too, so changing "Show AI Chats at Startup" updates the live GTK
+    /// layout instead of only changing the next-launch state.
+    pub(crate) fn set_ai_panel_visible(&self, visible: bool, persist: bool) {
+        let visible = visible && self.config.borrow().ai_enabled;
+        let attached = self.ai_paned.end_child().is_some();
+        let config_changed = self.config.borrow().ai_panel_visible != visible;
+        if self.ai_panel_visible.get() == visible && attached == visible {
+            self.config.borrow_mut().ai_panel_visible = visible;
+            if visible {
+                self.restore_ai_panel_width();
+            }
+            if persist && config_changed {
+                self.persist_config();
+            }
+            return;
+        }
+        if !visible {
+            // Capture the divider before detaching the end child; once hidden,
+            // Paned no longer exposes the panel's allocated width.
+            self.capture_ai_panel_width();
+        }
+        self.ai_panel_visible.set(visible);
+        if visible {
+            self.ai_paned.set_end_child(Some(&self.ai_panel.root));
+            self.restore_ai_panel_width();
+        } else {
+            self.ai_paned.set_end_child(None::<&gtk4::Widget>);
+        }
+        self.config.borrow_mut().ai_panel_visible = visible;
+        if persist {
+            self.persist_config();
         }
     }
 
@@ -382,22 +476,24 @@ impl UiState {
             self.show_ai_error("AI features are disabled in Settings or safe mode.");
             return;
         }
-        if !next {
-            // Capture the divider before detaching the end child; once hidden,
-            // Paned no longer exposes the panel's allocated width.
-            self.capture_ai_panel_width();
-        }
-        self.ai_panel_visible.set(next);
-        if next {
-            self.ai_paned.set_end_child(Some(&self.ai_panel.root));
-            self.restore_ai_panel_width();
+        self.set_ai_panel_visible(next, true);
+        if self.ai_panel_visible.get() {
             self.ai_panel.focus_input();
         } else {
-            self.ai_paned.set_end_child(None::<&gtk4::Widget>);
             self.focus_current_terminal();
         }
-        self.config.borrow_mut().ai_panel_visible = next;
-        self.persist_config();
+    }
+
+    /// Backward-compatible one-way AI panel action. Repeating its shortcut
+    /// keeps the panel open (and focuses its composer); only the canonical
+    /// `toggle_ai_panel` action is allowed to close it.
+    pub(crate) fn open_ai_panel(&self) {
+        if !self.config.borrow().ai_enabled {
+            self.show_ai_error("AI features are disabled in Settings or safe mode.");
+            return;
+        }
+        self.set_ai_panel_visible(true, true);
+        self.ai_panel.focus_input();
     }
 
     /// Restore the configured end-child width after GTK has allocated the
@@ -464,6 +560,21 @@ impl UiState {
             );
             return;
         };
+        self.ask_ai_about_block_context(ctx);
+    }
+
+    pub(crate) fn connect_block_ai_action(&self, term_view: &Rc<TermView>) {
+        let ui = self.clone();
+        term_view.connect_ask_ai_about_block(move |context| {
+            ui.ask_ai_about_block_context(context);
+        });
+    }
+
+    fn ask_ai_about_block_context(&self, ctx: crate::ai::BlockContext) {
+        if !self.config.borrow().ai_enabled {
+            self.show_ai_error("AI features are disabled in Settings or safe mode.");
+            return;
+        }
         if !self.ai_panel_visible.get() {
             self.toggle_ai_panel();
         }
@@ -571,7 +682,9 @@ impl UiState {
 
 #[cfg(test)]
 mod tests {
-    use super::{ai_panel_width_from_geometry, restored_ai_panel_position};
+    use super::{
+        ai_panel_width_from_geometry, remote_host_index_for_action, restored_ai_panel_position,
+    };
 
     #[test]
     fn ai_panel_geometry_preserves_workspace_and_clamps_configured_limits() {
@@ -583,5 +696,18 @@ mod tests {
         assert_eq!(ai_panel_width_from_geometry(800, 440), Some(360));
         assert_eq!(ai_panel_width_from_geometry(2000, 100), Some(1200));
         assert_eq!(ai_panel_width_from_geometry(800, 800), None);
+    }
+
+    #[test]
+    fn indexed_remote_actions_fail_closed_for_safe_mode_and_missing_hosts() {
+        assert_eq!(remote_host_index_for_action(0, 1, false), Ok(0));
+        assert_eq!(
+            remote_host_index_for_action(1, 1, false),
+            Err("That remote host is no longer configured.")
+        );
+        assert_eq!(
+            remote_host_index_for_action(0, 1, true),
+            Err("Remote connections are disabled in safe mode.")
+        );
     }
 }

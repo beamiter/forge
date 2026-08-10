@@ -908,6 +908,10 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         "sidebar_width".into(),
         toml::Value::Integer(config.sidebar_width as i64),
     );
+    table.insert(
+        "tab_width".into(),
+        toml::Value::Integer(config.tab_width as i64),
+    );
     table.insert("ai_enabled".into(), toml::Value::Boolean(config.ai_enabled));
     table.insert(
         "agent_enabled".into(),
@@ -985,6 +989,10 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
     table.insert(
         "finished_block_viewport_rows".into(),
         toml::Value::Integer(config.finished_block_viewport_rows as i64),
+    );
+    table.insert(
+        "finished_block_max_expanded_rows".into(),
+        toml::Value::Integer(config.finished_block_max_expanded_rows as i64),
     );
     table.insert(
         "block_compact".into(),
@@ -1577,6 +1585,31 @@ mod tests {
     }
 
     #[test]
+    fn tab_width_and_finished_block_expansion_limit_are_persisted() {
+        let directory = temporary_directory("tab-and-block-sizing");
+        let path = directory.join("config.toml");
+        let mut config = default_config();
+        config.tab_width = 264;
+        config.finished_block_max_expanded_rows = 1_234;
+        save_config_to_path(&path, &config, Some(&ConfigRevision::missing())).unwrap();
+        let table = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml::Table>()
+            .unwrap();
+        assert_eq!(
+            table.get("tab_width").and_then(toml::Value::as_integer),
+            Some(264)
+        );
+        assert_eq!(
+            table
+                .get("finished_block_max_expanded_rows")
+                .and_then(toml::Value::as_integer),
+            Some(1_234)
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn ascii_organism_settings_are_written_transactionally() {
         let directory = temporary_directory("ascii-organism");
         let path = directory.join("config.toml");
@@ -1624,6 +1657,8 @@ mod tests {
         config.agent_max_turns = 17;
         config.agent_auto_approve_readonly = true;
         config.command_correction_enabled = false;
+        config.ai_panel_visible = true;
+        config.ai_panel_width = 840;
         config.ai_provider = "ollama".into();
         config.ai_base_url = "http://localhost:11434".into();
         config.ai_api_key_file = Some("/run/secrets/provider-api-key".into());
@@ -1654,6 +1689,16 @@ mod tests {
                 .get("command_correction_enabled")
                 .and_then(toml::Value::as_bool),
             Some(false)
+        );
+        assert_eq!(
+            table.get("ai_panel_visible").and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            table
+                .get("ai_panel_width")
+                .and_then(toml::Value::as_integer),
+            Some(840)
         );
         assert_eq!(
             table.get("ai_base_url").and_then(toml::Value::as_str),

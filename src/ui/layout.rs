@@ -76,11 +76,19 @@ impl UiState {
     }
 
     /// Size a single strip button for the active placement: fill width in the
-    /// sidebar, hug content in the top bar.
+    /// sidebar, use the persisted draggable width in the top bar.
     pub(crate) fn apply_strip_btn_placement(&self, btn: &ToggleButton) {
         match self.tab_placement.get() {
-            TabPlacement::Sidebar => btn.set_hexpand(true),
-            TabPlacement::TopBar => btn.set_hexpand(false),
+            TabPlacement::Sidebar => {
+                btn.set_hexpand(true);
+                btn.set_width_request(-1);
+                self.set_tab_width_handle_visible(btn, false);
+            }
+            TabPlacement::TopBar => {
+                btn.set_hexpand(false);
+                btn.set_width_request(self.config.borrow().tab_width as i32);
+                self.set_tab_width_handle_visible(btn, true);
+            }
         }
     }
 

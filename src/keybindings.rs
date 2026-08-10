@@ -37,6 +37,9 @@ pub(crate) enum Action {
     CyclePaneFocusForward,
     CyclePaneFocusBackward,
     QuickSwitchTab(u8),
+    /// Connect directly to the zero-based remote-host slot. Config keys expose
+    /// the human-facing one-based form `connect_remote_1` … `_9`.
+    ConnectRemote(u8),
     ShowRemotePicker,
     ResizePaneLeft,
     ResizePaneRight,
@@ -64,10 +67,14 @@ pub(crate) enum Action {
     SelectAllBlocks,
     /// Remove every finished block from the active block-mode pane.
     ClearBlocks,
+    /// Restore the most recently cleared set of finished blocks.
+    UndoClearBlocks,
     /// Put selected commands back into the live editor in terminal order.
     ReinputSelectedCommands,
     JumpToPrevPinned,
     JumpToNextPinned,
+    JumpToPrevFailed,
+    JumpToNextFailed,
     /// Write every block of the active pane's session to a timestamped
     /// Markdown / JSON file under the forge data directory.
     ExportSessionMarkdown,
@@ -75,6 +82,10 @@ pub(crate) enum Action {
     ToggleDebugDashboard,
     /// Show/hide the right-side AI chat panel.
     ToggleAiPanel,
+    /// Compatibility-only one-way opener used by older/sibling configs.
+    /// Deliberately omitted from the command palette; Forge's canonical public
+    /// action remains `toggle_ai_panel`.
+    OpenAiPanel,
     /// Send the currently selected finished block (cmd + output + exit) to the
     /// AI panel as a fresh "explain this" question.
     AskAiAboutSelectedBlock,
@@ -134,6 +145,17 @@ impl Action {
                 8 => "Switch to tab 9",
                 _ => "Switch to last tab",
             },
+            Action::ConnectRemote(n) => match n {
+                0 => "Connect to remote host 1",
+                1 => "Connect to remote host 2",
+                2 => "Connect to remote host 3",
+                3 => "Connect to remote host 4",
+                4 => "Connect to remote host 5",
+                5 => "Connect to remote host 6",
+                6 => "Connect to remote host 7",
+                7 => "Connect to remote host 8",
+                _ => "Connect to remote host 9",
+            },
             Action::ShowRemotePicker => "Connect to remote host…",
             Action::ResizePaneLeft => "Resize pane left",
             Action::ResizePaneRight => "Resize pane right",
@@ -159,13 +181,17 @@ impl Action {
             Action::ClearBlockFilter => "Jump to oldest block",
             Action::SelectAllBlocks => "Select all blocks",
             Action::ClearBlocks => "Clear blocks",
+            Action::UndoClearBlocks => "Undo clear blocks",
             Action::ReinputSelectedCommands => "Reinput selected commands",
             Action::JumpToPrevPinned => "Jump to previous bookmarked block",
             Action::JumpToNextPinned => "Jump to next bookmarked block",
+            Action::JumpToPrevFailed => "Jump to previous failed block",
+            Action::JumpToNextFailed => "Jump to next failed block",
             Action::ExportSessionMarkdown => "Export session as Markdown file",
             Action::ExportSessionJson => "Export session as JSON file",
             Action::ToggleDebugDashboard => "Toggle debug dashboard",
             Action::ToggleAiPanel => "Toggle AI panel",
+            Action::OpenAiPanel => "Open AI panel",
             Action::AskAiAboutSelectedBlock => "Ask AI about selected block",
             Action::OpenAgent => "Open shell Agent",
             Action::HistoryPalette => "Command history palette",
@@ -202,6 +228,18 @@ impl Action {
             Action::CyclePaneFocusForward => Some("cycle_pane_focus_forward"),
             Action::CyclePaneFocusBackward => Some("cycle_pane_focus_backward"),
             Action::QuickSwitchTab(_) => None,
+            Action::ConnectRemote(n) => match n {
+                0 => Some("connect_remote_1"),
+                1 => Some("connect_remote_2"),
+                2 => Some("connect_remote_3"),
+                3 => Some("connect_remote_4"),
+                4 => Some("connect_remote_5"),
+                5 => Some("connect_remote_6"),
+                6 => Some("connect_remote_7"),
+                7 => Some("connect_remote_8"),
+                8 => Some("connect_remote_9"),
+                _ => None,
+            },
             Action::ShowRemotePicker => Some("show_remote_picker"),
             Action::ResizePaneLeft => Some("resize_pane_left"),
             Action::ResizePaneRight => Some("resize_pane_right"),
@@ -227,13 +265,17 @@ impl Action {
             Action::ClearBlockFilter => Some("clear_block_filter"),
             Action::SelectAllBlocks => Some("select_all_blocks"),
             Action::ClearBlocks => Some("clear_blocks"),
+            Action::UndoClearBlocks => Some("undo_clear_blocks"),
             Action::ReinputSelectedCommands => Some("reinput_selected_commands"),
             Action::JumpToPrevPinned => Some("jump_to_prev_pinned"),
             Action::JumpToNextPinned => Some("jump_to_next_pinned"),
+            Action::JumpToPrevFailed => Some("jump_to_prev_failed"),
+            Action::JumpToNextFailed => Some("jump_to_next_failed"),
             Action::ExportSessionMarkdown => Some("export_session_markdown"),
             Action::ExportSessionJson => Some("export_session_json"),
             Action::ToggleDebugDashboard => Some("toggle_debug_dashboard"),
             Action::ToggleAiPanel => Some("toggle_ai_panel"),
+            Action::OpenAiPanel => None,
             Action::AskAiAboutSelectedBlock => Some("ask_ai_about_selected_block"),
             Action::OpenAgent => Some("open_agent"),
             Action::HistoryPalette => Some("history_palette"),
@@ -270,6 +312,15 @@ impl Action {
             Action::ScrollDown,
             Action::CyclePaneFocusForward,
             Action::CyclePaneFocusBackward,
+            Action::ConnectRemote(0),
+            Action::ConnectRemote(1),
+            Action::ConnectRemote(2),
+            Action::ConnectRemote(3),
+            Action::ConnectRemote(4),
+            Action::ConnectRemote(5),
+            Action::ConnectRemote(6),
+            Action::ConnectRemote(7),
+            Action::ConnectRemote(8),
             Action::ShowRemotePicker,
             Action::ResizePaneLeft,
             Action::ResizePaneRight,
@@ -295,9 +346,12 @@ impl Action {
             Action::ClearBlockFilter,
             Action::SelectAllBlocks,
             Action::ClearBlocks,
+            Action::UndoClearBlocks,
             Action::ReinputSelectedCommands,
             Action::JumpToPrevPinned,
             Action::JumpToNextPinned,
+            Action::JumpToPrevFailed,
+            Action::JumpToNextFailed,
             Action::ExportSessionMarkdown,
             Action::ExportSessionJson,
             Action::ToggleDebugDashboard,
@@ -310,6 +364,24 @@ impl Action {
             Action::OpenWelcome,
             Action::InstallJsh,
         ]
+    }
+
+    /// Resolve both Forge's canonical config keys and compatibility aliases
+    /// used by sibling jterm frontends. Canonical keys remain the values
+    /// returned by [`Self::config_key`].
+    pub(crate) fn from_config_key(key: &str) -> Option<Action> {
+        let alias = match key {
+            "open_ai_panel" => Some(Action::OpenAiPanel),
+            "open_history_palette" => Some(Action::HistoryPalette),
+            "open_workflows" => Some(Action::WorkflowsPalette),
+            "open_palette" => Some(Action::ToggleCommandPalette),
+            _ => None,
+        };
+        alias.or_else(|| {
+            Self::all_actions()
+                .into_iter()
+                .find(|action| action.config_key() == Some(key))
+        })
     }
 }
 
@@ -416,17 +488,9 @@ impl KeybindingMap {
     }
 
     pub(crate) fn apply_user_overrides(&mut self, table: &toml::Table) {
-        // Build reverse map: config_key -> Action
-        let mut key_to_action: HashMap<&str, Action> = HashMap::new();
-        for action in Action::all_actions() {
-            if let Some(key) = action.config_key() {
-                key_to_action.insert(key, action);
-            }
-        }
-
         for (config_key, value) in table {
             let display_key = crate::review_input::safe_inline_display(config_key, 512);
-            let Some(&action) = key_to_action.get(config_key.as_str()) else {
+            let Some(action) = Action::from_config_key(config_key) else {
                 log::warn!("Unknown keybinding action: {display_key}");
                 continue;
             };
@@ -532,6 +596,15 @@ mod tests {
             Action::CloseTab,
             Action::CyclePaneFocusForward,
             Action::CyclePaneFocusBackward,
+            Action::ConnectRemote(0),
+            Action::ConnectRemote(1),
+            Action::ConnectRemote(2),
+            Action::ConnectRemote(3),
+            Action::ConnectRemote(4),
+            Action::ConnectRemote(5),
+            Action::ConnectRemote(6),
+            Action::ConnectRemote(7),
+            Action::ConnectRemote(8),
             Action::CloseSelectedTabs,
             Action::MoveTabLeft,
             Action::MoveTabRight,
@@ -543,6 +616,9 @@ mod tests {
             Action::FilterPinnedBlocks,
             Action::JumpToPrevPinned,
             Action::JumpToNextPinned,
+            Action::UndoClearBlocks,
+            Action::JumpToPrevFailed,
+            Action::JumpToNextFailed,
             // anvil leaves session export chordless too; both GTK terminals
             // reach it from the command palette only.
             Action::ExportSessionMarkdown,
@@ -892,6 +968,86 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sibling_config_aliases_resolve_without_replacing_canonical_keys() {
+        assert_eq!(
+            Action::from_config_key("open_ai_panel"),
+            Some(Action::OpenAiPanel)
+        );
+        assert_eq!(
+            Action::from_config_key("toggle_ai_panel"),
+            Some(Action::ToggleAiPanel)
+        );
+        assert_ne!(Action::OpenAiPanel, Action::ToggleAiPanel);
+        assert_eq!(Action::OpenAiPanel.config_key(), None);
+
+        for (alias, canonical, action) in [
+            (
+                "open_history_palette",
+                "history_palette",
+                Action::HistoryPalette,
+            ),
+            (
+                "open_workflows",
+                "workflows_palette",
+                Action::WorkflowsPalette,
+            ),
+            (
+                "open_palette",
+                "toggle_command_palette",
+                Action::ToggleCommandPalette,
+            ),
+        ] {
+            assert_eq!(Action::from_config_key(alias), Some(action));
+            assert_eq!(Action::from_config_key(canonical), Some(action));
+            assert_eq!(action.config_key(), Some(canonical));
+        }
+    }
+
+    #[test]
+    fn sibling_config_alias_can_rebind_its_forge_action() {
+        let mut map = KeybindingMap::from_defaults();
+        let chord = parse("F10").unwrap();
+        let table = "open_history_palette = 'F10'"
+            .parse::<toml::Table>()
+            .unwrap();
+        map.apply_user_overrides(&table);
+        assert_eq!(map.lookup(&chord), Some(Action::HistoryPalette));
+        assert!(map.binding_display(&Action::HistoryPalette).contains("F10"));
+    }
+
+    #[test]
+    fn indexed_remote_actions_use_one_based_config_keys_and_are_bindable() {
+        for (index, key) in [
+            "connect_remote_1",
+            "connect_remote_2",
+            "connect_remote_3",
+            "connect_remote_4",
+            "connect_remote_5",
+            "connect_remote_6",
+            "connect_remote_7",
+            "connect_remote_8",
+            "connect_remote_9",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let action = Action::ConnectRemote(index as u8);
+            assert_eq!(action.config_key(), Some(key));
+            assert_eq!(Action::from_config_key(key), Some(action));
+        }
+        assert_eq!(Action::ConnectRemote(9).config_key(), None);
+        assert_eq!(Action::from_config_key("connect_remote_10"), None);
+
+        let mut map = KeybindingMap::from_defaults();
+        let table = "connect_remote_1 = 'F4'".parse::<toml::Table>().unwrap();
+        map.apply_user_overrides(&table);
+        assert_eq!(
+            map.lookup(&parse("F4").unwrap()),
+            Some(Action::ConnectRemote(0))
+        );
+    }
+
     /// User-override path: applying a one-entry table drops the old
     /// binding and installs the new one. Guards against the rebind path
     /// losing its "drop old binding" step.
@@ -940,6 +1096,39 @@ mod tests {
 
         assert_eq!(map.lookup(&markdown), Some(Action::ExportSessionMarkdown));
         assert_eq!(map.lookup(&json), Some(Action::ExportSessionJson));
+    }
+
+    #[test]
+    fn undo_clear_and_failed_navigation_are_palette_only_but_bindable() {
+        let mut map = KeybindingMap::from_defaults();
+        for action in [
+            Action::UndoClearBlocks,
+            Action::JumpToPrevFailed,
+            Action::JumpToNextFailed,
+        ] {
+            assert!(map.binding_display(&action).is_empty());
+        }
+
+        let table = r#"
+undo_clear_blocks = "F5"
+jump_to_prev_failed = "F6"
+jump_to_next_failed = "F7"
+"#
+        .parse::<toml::Table>()
+        .unwrap();
+        map.apply_user_overrides(&table);
+        assert_eq!(
+            map.lookup(&parse("F5").unwrap()),
+            Some(Action::UndoClearBlocks)
+        );
+        assert_eq!(
+            map.lookup(&parse("F6").unwrap()),
+            Some(Action::JumpToPrevFailed)
+        );
+        assert_eq!(
+            map.lookup(&parse("F7").unwrap()),
+            Some(Action::JumpToNextFailed)
+        );
     }
 
     #[test]

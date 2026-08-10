@@ -243,12 +243,38 @@ fn resolve_ai_base_url(requested: Option<String>, default: &str) -> String {
 }
 
 fn configured_path_is_safe(value: &str, require_absolute_or_home: bool) -> bool {
-    let value = value.trim();
     setting_text_is_safe(value, MAX_CONFIG_PATH_BYTES)
         && (!require_absolute_or_home
-            || value.starts_with('/')
-            || value == "~"
-            || value.starts_with("~/"))
+            || Path::new(value).is_absolute()
+            || (value.starts_with("~/") && !value.starts_with("~//")))
+}
+
+/// Normalize a user-configurable history path before it reaches any reader or
+/// writer. Only the shell-style `~/` prefix is expanded; a missing, empty, or
+/// relative HOME makes that spelling unusable instead of leaving a literal
+/// relative path for a later subsystem to interpret differently.
+fn expand_configured_path_with(value: &str, home: Option<&Path>) -> Option<String> {
+    if !configured_path_is_safe(value, true) {
+        return None;
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        let home = home.filter(|home| home.is_absolute())?;
+        let expanded = home.join(rest).into_os_string().into_string().ok()?;
+        return configured_path_is_safe(&expanded, true).then_some(expanded);
+    }
+    Some(value.to_string())
+}
+
+fn normalize_history_path(value: Option<String>, setting: &str) -> Option<String> {
+    let path = value?;
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from);
+    let expanded = expand_configured_path_with(&path, home.as_deref());
+    if expanded.is_none() {
+        log::warn!("{setting} is not a safe absolute or ~/ path; ignoring it");
+    }
+    expanded
 }
 
 #[cfg(unix)]
@@ -587,6 +613,10 @@ fn build_remote_argv_with_control_dir(
 // Config
 // ---------------------------------------------------------------------------
 
+pub(crate) const MIN_TAB_WIDTH: u32 = 80;
+pub(crate) const MAX_TAB_WIDTH: u32 = 480;
+pub(crate) const DEFAULT_TAB_WIDTH: u32 = 180;
+
 #[derive(Clone)]
 pub struct Config {
     pub(crate) window_opacity: f64,
@@ -617,6 +647,8 @@ pub struct Config {
     pub(crate) sidebar_visible: bool,
     /// Sidebar width in pixels (resizable divider position).
     pub(crate) sidebar_width: u32,
+    /// Width of each tab in the horizontal top tab strip, in pixels.
+    pub(crate) tab_width: u32,
     // Block view optimizations
     pub(crate) max_visible_blocks: u32,
     pub(crate) lazy_load_threshold: u32,
@@ -624,14 +656,19 @@ pub struct Config {
     /// Output rows shown before a finished block is considered long and gains
     /// top/bottom navigation controls.
     pub(crate) finished_block_viewport_rows: u32,
+    /// Maximum rows allocated when a long finished block is expanded. Output
+    /// beyond this remains reachable through the block's inner scrollbar.
+    pub(crate) finished_block_max_expanded_rows: u32,
     #[allow(dead_code)]
     pub(crate) max_collapsed_output_lines: u32,
     pub(crate) virtual_scroll_margin: u32,
     /// Lightweight JSONL command index. Unlike block snapshots this stores no
     /// terminal output, only command metadata used by history/palette UIs.
     pub(crate) command_history_enabled: bool,
+    /// Absolute after configuration loading; `~/` never reaches consumers.
     pub(crate) command_history_path: Option<String>,
     pub(crate) command_history_max_entries: u32,
+    /// Absolute after configuration loading; `~/` never reaches consumers.
     pub(crate) block_history_path: Option<String>,
     pub(crate) block_history_compress: bool,
     /// Use anvil/Warp-style denser block spacing.
@@ -758,13 +795,16 @@ impl Config {
             terminal_mode: TerminalMode::Vte,
             tab_placement: TabPlacement::Sidebar,
             sidebar_view: SidebarView::Tabs,
-            jsh_update_check: JshUpdateCheck::Daily,
+            // Recovery mode must never initiate update/network work.
+            jsh_update_check: JshUpdateCheck::Never,
             sidebar_visible: true,
             sidebar_width: 220,
+            tab_width: DEFAULT_TAB_WIDTH,
             max_visible_blocks: 200,
             lazy_load_threshold: 1_000,
             truncation_threshold_lines: 50_000,
             finished_block_viewport_rows: 24,
+            finished_block_max_expanded_rows: 5_000,
             max_collapsed_output_lines: 25,
             virtual_scroll_margin: 1,
             command_history_enabled: false,
@@ -1088,10 +1128,12 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "jsh_update_check",
     "sidebar_visible",
     "sidebar_width",
+    "tab_width",
     "max_visible_blocks",
     "lazy_load_threshold",
     "truncation_threshold_lines",
     "finished_block_viewport_rows",
+    "finished_block_max_expanded_rows",
     "max_collapsed_output_lines",
     "virtual_scroll_margin",
     "command_history_enabled",
@@ -1224,10 +1266,12 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
     let integers = [
         "scrollback",
         "sidebar_width",
+        "tab_width",
         "max_visible_blocks",
         "lazy_load_threshold",
         "truncation_threshold_lines",
         "finished_block_viewport_rows",
+        "finished_block_max_expanded_rows",
         "max_collapsed_output_lines",
         "virtual_scroll_margin",
         "command_history_max_entries",
@@ -1336,10 +1380,34 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
     warn_float_range(&mut issues, "font_scale", 0.1, 10.0);
     warn_int_range(&mut issues, "scrollback", 0, 1_000_000);
     warn_int_range(&mut issues, "sidebar_width", 120, 800);
+    warn_int_range(
+        &mut issues,
+        "tab_width",
+        MIN_TAB_WIDTH as i64,
+        MAX_TAB_WIDTH as i64,
+    );
     warn_int_range(&mut issues, "max_visible_blocks", 1, 100_000);
     warn_int_range(&mut issues, "lazy_load_threshold", 1, 10_000_000);
     warn_int_range(&mut issues, "truncation_threshold_lines", 1, 10_000_000);
     warn_int_range(&mut issues, "finished_block_viewport_rows", 3, 5_000);
+    warn_int_range(&mut issues, "finished_block_max_expanded_rows", 3, 5_000);
+    if let (Some(viewport), Some(expanded)) = (
+        table
+            .get("finished_block_viewport_rows")
+            .and_then(toml::Value::as_integer),
+        table
+            .get("finished_block_max_expanded_rows")
+            .and_then(toml::Value::as_integer),
+    ) {
+        if expanded < viewport {
+            config_issue(
+                &mut issues,
+                Warning,
+                "finished_block_max_expanded_rows",
+                "must be at least finished_block_viewport_rows; it will be clamped",
+            );
+        }
+    }
     warn_int_range(&mut issues, "max_collapsed_output_lines", 1, 1_000_000);
     warn_int_range(&mut issues, "virtual_scroll_margin", 0, 10_000);
     warn_int_range(&mut issues, "command_history_max_entries", 100, 1_000_000);
@@ -1365,8 +1433,6 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
         ("font", MAX_FONT_DESC_BYTES),
         ("shell", MAX_CONFIG_PATH_BYTES),
         ("startup_commands", MAX_STARTUP_COMMANDS_BYTES),
-        ("command_history_path", MAX_CONFIG_PATH_BYTES),
-        ("block_history_path", MAX_CONFIG_PATH_BYTES),
         ("ai_model", MAX_AI_IDENTIFIER_BYTES),
     ] {
         if let Some(value) = table.get(key).and_then(toml::Value::as_str) {
@@ -1377,6 +1443,21 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
                     key,
                     format!(
                         "must be non-empty, at most {max_bytes} bytes, and contain no control or invisible formatting characters"
+                    ),
+                );
+            }
+        }
+    }
+
+    for key in ["command_history_path", "block_history_path"] {
+        if let Some(value) = table.get(key).and_then(toml::Value::as_str) {
+            if !configured_path_is_safe(value, true) {
+                config_issue(
+                    &mut issues,
+                    Error,
+                    key,
+                    format!(
+                        "must be an absolute or ~/ path, at most {MAX_CONFIG_PATH_BYTES} bytes, and contain no control or invisible formatting characters"
                     ),
                 );
             }
@@ -1536,16 +1617,12 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
 
     if let Some(bindings) = table.get("keybindings") {
         if let Some(bindings) = bindings.as_table() {
-            let known: std::collections::HashSet<&str> = crate::keybindings::Action::all_actions()
-                .into_iter()
-                .filter_map(|action| action.config_key())
-                .collect();
             // Same parser the runtime override path uses, so a chord that
             // validates here can never fail to load later (and vice versa).
             let mut chords: HashMap<crate::core_keybindings::Chord, &str> = HashMap::new();
             for (action, value) in bindings {
                 let path = format!("keybindings.{action}");
-                if !known.contains(action.as_str()) {
+                if crate::keybindings::Action::from_config_key(action).is_none() {
                     config_issue(&mut issues, Error, &path, "unknown action");
                     continue;
                 }
@@ -1816,11 +1893,13 @@ struct FileConfig {
     jsh_update_check: Option<String>,
     sidebar_visible: Option<bool>,
     sidebar_width: Option<u32>,
+    tab_width: Option<u32>,
     // Block view optimizations
     max_visible_blocks: Option<u32>,
     lazy_load_threshold: Option<u32>,
     truncation_threshold_lines: Option<u32>,
     finished_block_viewport_rows: Option<u32>,
+    finished_block_max_expanded_rows: Option<u32>,
     max_collapsed_output_lines: Option<u32>,
     virtual_scroll_margin: Option<u32>,
     command_history_enabled: Option<bool>,
@@ -2024,10 +2103,12 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
             .map(|s| s.to_string()),
         sidebar_visible: table.get("sidebar_visible").and_then(|v| v.as_bool()),
         sidebar_width: table_u32(&table, "sidebar_width"),
+        tab_width: table_u32(&table, "tab_width"),
         max_visible_blocks: table_u32(&table, "max_visible_blocks"),
         lazy_load_threshold: table_u32(&table, "lazy_load_threshold"),
         truncation_threshold_lines: table_u32(&table, "truncation_threshold_lines"),
         finished_block_viewport_rows: table_u32(&table, "finished_block_viewport_rows"),
+        finished_block_max_expanded_rows: table_u32(&table, "finished_block_max_expanded_rows"),
         max_collapsed_output_lines: table_u32(&table, "max_collapsed_output_lines"),
         virtual_scroll_margin: table_u32(&table, "virtual_scroll_margin"),
         command_history_enabled: table
@@ -2399,6 +2480,10 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .or(fc.finished_block_viewport_rows)
         .unwrap_or(24)
         .clamp(3, 5_000);
+    let finished_block_max_expanded_rows = env_u32("FORGE_FINISHED_MAX_EXPANDED_ROWS")
+        .or(fc.finished_block_max_expanded_rows)
+        .unwrap_or(5_000)
+        .clamp(finished_block_viewport_rows, 5_000);
     let max_collapsed_output_lines = env_u32("FORGE_MAX_COLLAPSED_LINES")
         .or(fc.max_collapsed_output_lines)
         .unwrap_or(25)
@@ -2408,19 +2493,22 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .unwrap_or(1)
         .min(10_000);
     let command_history_enabled = fc.command_history_enabled.unwrap_or(true);
-    let command_history_path = command_history_enabled.then(|| {
-        env_string("FORGE_COMMAND_HISTORY_PATH")
+    let command_history_path = if command_history_enabled {
+        let requested = env_string("FORGE_COMMAND_HISTORY_PATH")
             .or(fc.command_history_path)
-            .filter(|path| configured_path_is_safe(path, false))
-            .unwrap_or_else(default_command_history_path)
-    });
+            .unwrap_or_else(default_command_history_path);
+        normalize_history_path(Some(requested), "command_history_path")
+    } else {
+        None
+    };
     let command_history_max_entries = fc
         .command_history_max_entries
         .unwrap_or(10_000)
         .clamp(100, 1_000_000);
-    let block_history_path = env_string("FORGE_HISTORY_PATH")
-        .or(fc.block_history_path)
-        .filter(|path| configured_path_is_safe(path, false));
+    let block_history_path = normalize_history_path(
+        env_string("FORGE_HISTORY_PATH").or(fc.block_history_path),
+        "block_history_path",
+    );
     let block_history_compress = fc.block_history_compress.unwrap_or(true);
     let block_compact = match std::env::var("FORGE_BLOCK_COMPACT").ok().as_deref() {
         Some("1") | Some("true") => Some(true),
@@ -2548,10 +2636,15 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         ),
         sidebar_visible,
         sidebar_width: fc.sidebar_width.unwrap_or(220).clamp(120, 800),
+        tab_width: fc
+            .tab_width
+            .unwrap_or(DEFAULT_TAB_WIDTH)
+            .clamp(MIN_TAB_WIDTH, MAX_TAB_WIDTH),
         max_visible_blocks,
         lazy_load_threshold,
         truncation_threshold_lines,
         finished_block_viewport_rows,
+        finished_block_max_expanded_rows,
         max_collapsed_output_lines,
         virtual_scroll_margin,
         command_history_enabled,
@@ -3016,6 +3109,66 @@ unknown_action = "F8"
         assert!(issues
             .iter()
             .any(|issue| issue.message.contains("same chord")));
+    }
+
+    #[test]
+    fn config_validator_accepts_sibling_keybinding_aliases() {
+        let input = r#"
+[keybindings]
+open_ai_panel = "F5"
+open_history_palette = "F6"
+open_workflows = "F7"
+open_palette = "F8"
+"#;
+        let issues = validate_config_contents(input).unwrap();
+        assert!(issues.is_empty(), "unexpected issues: {issues:?}");
+    }
+
+    #[test]
+    fn config_validator_accepts_indexed_remote_keybindings() {
+        let issues = validate_config_contents(
+            "[keybindings]\nconnect_remote_1 = 'F4'\nconnect_remote_9 = 'F11'\n",
+        )
+        .unwrap();
+        assert!(issues.is_empty(), "unexpected issues: {issues:?}");
+    }
+
+    #[test]
+    fn tab_and_finished_block_height_limits_are_validated() {
+        let issues = validate_config_contents(
+            "tab_width = 79\nfinished_block_viewport_rows = 40\nfinished_block_max_expanded_rows = 30\n",
+        )
+        .unwrap();
+        assert!(issues.iter().any(|issue| issue.path == "tab_width"));
+        assert!(issues.iter().any(|issue| {
+            issue.path == "finished_block_max_expanded_rows"
+                && issue.message.contains("finished_block_viewport_rows")
+        }));
+
+        let (config, _, _) = load_safe_config();
+        assert_eq!(config.tab_width, DEFAULT_TAB_WIDTH);
+        assert_eq!(config.finished_block_max_expanded_rows, 5_000);
+    }
+
+    #[test]
+    fn ai_panel_settings_have_stable_defaults_and_width_limits() {
+        for width in [239, 1201] {
+            let issues = validate_config_contents(&format!("ai_panel_width = {width}\n")).unwrap();
+            assert!(issues.iter().any(|issue| {
+                issue.path == "ai_panel_width" && issue.level == ConfigIssueLevel::Warning
+            }));
+        }
+        for width in [240, 1200] {
+            let issues = validate_config_contents(&format!("ai_panel_width = {width}\n")).unwrap();
+            assert!(
+                issues.iter().all(|issue| issue.path != "ai_panel_width"),
+                "unexpected issues for {width}: {issues:?}"
+            );
+        }
+
+        let (config, _, _) = load_safe_config();
+        assert!(!config.ai_panel_visible);
+        assert_eq!(config.ai_panel_width, 360);
     }
 
     #[test]
@@ -3540,6 +3693,64 @@ session = "bad/session"
     }
 
     #[test]
+    fn history_paths_require_absolute_or_home_relative_safe_text() {
+        for value in ["/tmp/history.jsonl", "~/.local/state/forge/history.jsonl"] {
+            let input =
+                format!("command_history_path = {value:?}\nblock_history_path = {value:?}\n");
+            let issues = validate_config_contents(&input).unwrap();
+            assert!(
+                issues.iter().all(|issue| !issue.is_error()),
+                "rejected {value:?}: {issues:?}"
+            );
+        }
+
+        let exact_limit = format!("/{}", "x".repeat(MAX_CONFIG_PATH_BYTES - 1));
+        assert_eq!(exact_limit.len(), MAX_CONFIG_PATH_BYTES);
+        assert!(configured_path_is_safe(&exact_limit, true));
+        let oversized = format!("/tmp/{}", "x".repeat(MAX_CONFIG_PATH_BYTES));
+        let invalid = [
+            "history.jsonl".to_string(),
+            "~".to_string(),
+            "~//etc/passwd".to_string(),
+            "/tmp/bad\nname".to_string(),
+            "/tmp/visual\u{202e}spoof".to_string(),
+            oversized,
+        ];
+        for key in ["command_history_path", "block_history_path"] {
+            for value in &invalid {
+                assert!(!configured_path_is_safe(value, true), "accepted {value:?}");
+                let mut table = toml::Table::new();
+                table.insert(key.to_string(), toml::Value::String(value.clone()));
+                let issues = validate_config_table(&table);
+                assert!(
+                    issues.iter().any(|issue| {
+                        issue.path == key && issue.level == ConfigIssueLevel::Error
+                    }),
+                    "validator accepted {key}={value:?}: {issues:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn history_paths_expand_once_and_missing_home_fails_closed() {
+        let home = Path::new("/home/tester");
+        assert_eq!(
+            expand_configured_path_with("/tmp/history.jsonl", None),
+            Some("/tmp/history.jsonl".to_string())
+        );
+        assert_eq!(
+            expand_configured_path_with("~/.local/state/forge/history.jsonl", Some(home)),
+            Some("/home/tester/.local/state/forge/history.jsonl".to_string())
+        );
+        assert!(expand_configured_path_with("~/history", None).is_none());
+        assert!(expand_configured_path_with("~/history", Some(Path::new("relative"))).is_none());
+        assert!(
+            expand_configured_path_with("~/history", Some(Path::new("/home/bad\nname"))).is_none()
+        );
+    }
+
+    #[test]
     fn ai_and_agent_config_is_semantically_validated() {
         let valid = validate_config_contents(
             "ai_enabled = true\nagent_enabled = true\nagent_max_turns = 20\nagent_auto_approve_readonly = false\ncommand_correction_enabled = true\nai_provider = 'openai-compatible'\nai_base_url = 'https://localhost:8000/v1'\nai_api_key_file = '~/.config/forge/ai.key'\nai_model = 'local-model'\nai_max_tokens = 4096\nai_redact_secrets = true\n",
@@ -3644,6 +3855,7 @@ session = "bad/session"
         assert!(!config.agent_auto_approve_readonly);
         assert!(!config.command_correction_enabled);
         assert!(!config.ai_panel_visible);
+        assert_eq!(config.jsh_update_check, JshUpdateCheck::Never);
         assert!(!config.notify_long_blocks);
         assert!(!config.allow_remote_clipboard_write);
         assert!(config.remote_hosts.is_empty());

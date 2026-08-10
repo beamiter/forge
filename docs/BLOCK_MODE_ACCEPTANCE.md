@@ -56,7 +56,7 @@ read -r value; printf 'value=%s\n' "$value"
 
 ## P1 分屏、进程检查与关闭
 
-- 在 Block pane 按 `Ctrl+Shift+E` / `Ctrl+Shift+D`，当前 Block 保持可见，新建 VTE sibling，没有隐藏或孤儿 PTY。
+- 在 Block pane 按 `Ctrl+Shift+E` / `Ctrl+Shift+D`，当前 Block 保持可见并新建 Block sibling；在 VTE pane 执行相同操作则新建 VTE sibling。两种后端都没有隐藏或孤儿 PTY。
 - 在 sibling 中继续嵌套分屏，方向聚焦、resize、zoom/unzoom 和关闭当前 pane 正常。
 - 对普通 sibling、原始 primary 和 remote pane 分别执行 **Move pane to new tab**，重复移动后旧/新 tab 的 close、Pin、tooltip、进程状态和 session id 仍指向各自可见 pane。
 - 让 remote 异常退出并进入重连倒计时：直接移动 dead pane 后重连应跟随新 tab；倒计时期间新建 split 或 zoom 时只移除 dead remote leaf，不能关闭或 kill 仍存活的 local sibling；手动关闭 dead leaf 也应取消 timer 并立即 collapse。

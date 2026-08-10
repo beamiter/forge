@@ -145,6 +145,52 @@ fn normalize_loaded_block_ids(blocks: &mut VecDeque<BlockData>, counter: &Atomic
     repaired
 }
 
+/// Approximate each failed command's vertical position on the complete history
+/// track. Keep only the newest marks so an unusually long retained session
+/// cannot turn one tiny Cairo overlay into unbounded draw work.
+fn failed_block_marker_fractions(blocks: &VecDeque<BlockData>) -> Vec<f64> {
+    const MAX_FAILURE_MARKERS: usize = 1_024;
+
+    let total_height = blocks.iter().fold(0_u64, |total, block| {
+        total.saturating_add(block.estimated_height.max(1) as u64)
+    });
+    if total_height == 0 {
+        return Vec::new();
+    }
+
+    let mut top = 0_u64;
+    let mut markers = VecDeque::new();
+    for block in blocks {
+        if jterm_core::block_contract::classify_completed(Some(&block.cmd), block.exit_code)
+            .is_failed()
+        {
+            if markers.len() == MAX_FAILURE_MARKERS {
+                markers.pop_front();
+            }
+            markers.push_back((top as f64 / total_height as f64).clamp(0.0, 1.0));
+        }
+        top = top.saturating_add(block.estimated_height.max(1) as u64);
+    }
+    markers.into()
+}
+
+type FailureMarkerRedraw = Rc<dyn Fn()>;
+
+/// Release the metadata borrow before asking GTK to redraw: the draw callback
+/// reads the same RefCell and future synchronous redraw paths must stay safe.
+fn mutate_block_data_and_redraw<R>(
+    block_data: &RefCell<VecDeque<BlockData>>,
+    redraw: &dyn Fn(),
+    mutate: impl FnOnce(&mut VecDeque<BlockData>) -> R,
+) -> R {
+    let result = {
+        let mut block_data = block_data.borrow_mut();
+        mutate(&mut block_data)
+    };
+    redraw();
+    result
+}
+
 /// Update the jump-to-bottom FAB's label to show an unread-block badge: just the
 /// chevron when nothing is pending, chevron + count (clamped to "99+") otherwise.
 fn set_jump_fab_label(fab: &gtk4::Button, unread: u32) {
@@ -1100,6 +1146,86 @@ where
     output
 }
 
+/// Markdown for all selected blocks in terminal order. The clicked block is a
+/// defensive fallback for the instant before a context-click selection is
+/// reflected in the shared set.
+fn selected_blocks_markdown<'a, I>(blocks: I, selected: &HashSet<u64>, clicked_id: u64) -> String
+where
+    I: IntoIterator<Item = &'a BlockData>,
+{
+    let mut output = String::new();
+    let mut selected_count = 0usize;
+    let mut clicked_part = None;
+    for block in blocks {
+        if block.id != clicked_id && !selected.contains(&block.id) {
+            continue;
+        }
+        let part = block.to_markdown();
+        if block.id == clicked_id {
+            clicked_part = Some(part.clone());
+        }
+        if selected.contains(&block.id) {
+            selected_count += 1;
+            let separator = if output.is_empty() { "" } else { "---\n\n" };
+            if !append_bounded_clipboard_section(&mut output, separator, &part) {
+                return String::new();
+            }
+        }
+    }
+    if selected_count == 0 {
+        clicked_part
+            .filter(|part| part.len() <= MAX_SELECTED_CLIPBOARD_BYTES)
+            .unwrap_or_default()
+    } else {
+        output
+    }
+}
+
+/// A clear operation only replaces the single-level undo slot when it actually
+/// removed blocks. Thus an accidental second Clear on an already-empty pane
+/// cannot destroy the useful undo state.
+fn replace_nonempty_stash<T>(stash: &mut Vec<T>, cleared: Vec<T>) -> usize {
+    let count = cleared.len();
+    if count > 0 {
+        *stash = cleared;
+    }
+    count
+}
+
+/// Alt-screen applications own the pane. Refusing the operation must leave the
+/// stash intact so Undo still works after the application exits.
+fn take_stash_for_undo<T>(stash: &mut Vec<T>, fullscreen: bool) -> Vec<T> {
+    if fullscreen {
+        Vec::new()
+    } else {
+        std::mem::take(stash)
+    }
+}
+
+fn prepend_in_order<T>(current: &mut VecDeque<T>, older: Vec<T>) {
+    for item in older.into_iter().rev() {
+        current.push_front(item);
+    }
+}
+
+/// Step through sorted marked block indices, wrapping at both ends.
+fn step_marked_indices(marked: &[usize], current: Option<usize>, direction: i32) -> Option<usize> {
+    if direction < 0 {
+        marked
+            .iter()
+            .rev()
+            .find(|&&index| current.map(|value| index < value).unwrap_or(true))
+            .copied()
+            .or_else(|| marked.last().copied())
+    } else {
+        marked
+            .iter()
+            .find(|&&index| current.map(|value| index > value).unwrap_or(true))
+            .copied()
+            .or_else(|| marked.first().copied())
+    }
+}
+
 pub(crate) struct PromptRecallCtx<'a> {
     pub(crate) pty: &'a OwnedPty,
     pub(crate) pty_synced: &'a Cell<bool>,
@@ -1746,6 +1872,13 @@ fn scroll_selected_finished_block_edge(
     true
 }
 
+struct BlockRemovalRefs<'a> {
+    selection: BlockSelectionRefs<'a>,
+    bookmarks: &'a Rc<RefCell<std::collections::HashSet<u64>>>,
+    visible_indices: &'a Rc<RefCell<std::collections::HashSet<usize>>>,
+    failure_marker_redraw: &'a dyn Fn(),
+}
+
 /// Remove one block and all of its parallel state. Keeping the GTK widgets,
 /// serializable history, selection, and bookmarks in lockstep prevents deleted
 /// blocks from reappearing in history/search or leaving stale keyboard targets.
@@ -1755,9 +1888,7 @@ fn remove_finished_block(
     finished_blocks: &Rc<RefCell<Vec<FinishedBlock>>>,
     block_data: &Rc<RefCell<VecDeque<BlockData>>>,
     block_list: &gtk4::Box,
-    selection: BlockSelectionRefs<'_>,
-    bookmarks: &Rc<RefCell<std::collections::HashSet<u64>>>,
-    visible_indices: &Rc<RefCell<std::collections::HashSet<usize>>>,
+    refs: BlockRemovalRefs<'_>,
 ) -> Option<u64> {
     let removed = {
         let mut finished = finished_blocks.borrow_mut();
@@ -1769,11 +1900,13 @@ fn remove_finished_block(
     let (removed_pos, block) = removed?;
 
     block_list.remove(block.widget());
-    block_data.borrow_mut().retain(|b| b.id != block_id);
-    bookmarks.borrow_mut().remove(&block_id);
+    mutate_block_data_and_redraw(block_data, refs.failure_marker_redraw, |blocks| {
+        blocks.retain(|block| block.id != block_id);
+    });
+    refs.bookmarks.borrow_mut().remove(&block_id);
     // Virtual-scroll visibility is index-based, so shift every surviving index
     // above the removed position down by one.
-    let mut visible = visible_indices.borrow_mut();
+    let mut visible = refs.visible_indices.borrow_mut();
     let shifted = visible
         .iter()
         .filter_map(|&i| {
@@ -1790,9 +1923,9 @@ fn remove_finished_block(
     let finished = finished_blocks.borrow();
     remove_finished_block_from_selection(
         &finished,
-        selection.ids,
-        selection.active,
-        selection.anchor,
+        refs.selection.ids,
+        refs.selection.active,
+        refs.selection.anchor,
         block_id,
     );
     finished
@@ -2017,6 +2150,40 @@ pub(crate) struct CommandFinishedEvent {
 type CommandStartedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandStartedEvent)>>>>;
 type CommandFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandFinishedEvent)>>>>;
 type HumanInputCallbacks = Rc<RefCell<Vec<Box<dyn Fn(HumanInputKind)>>>>;
+type AskAiCallbacks = Rc<RefCell<Vec<Box<dyn Fn(crate::ai::BlockContext)>>>>;
+
+fn block_context_for_id(
+    finished: &[FinishedBlock],
+    data: &VecDeque<BlockData>,
+    block_id: u64,
+    lines_per_side: usize,
+) -> Option<crate::ai::BlockContext> {
+    let block = finished.iter().find(|block| block.id == block_id)?;
+    let block_data = data.iter().find(|block| block.id == block_id);
+    let (output, truncated) = block.with_stripped_output(|raw| {
+        let output = crate::ai::truncate_for_context(raw, lines_per_side);
+        let truncated = output != raw;
+        (output, truncated)
+    });
+    let (exit_code, unknown_note) =
+        exit_code_for_shared_surface(block_data.and_then(|block| block.exit_code));
+    let output = match unknown_note {
+        Some(note) => format!("{note}\n{output}"),
+        None => output,
+    };
+    Some(crate::ai::BlockContext {
+        cmd: crate::review_input::safe_multiline_display(
+            &block.cmd_text,
+            MAX_COMMAND_CAPTURE_BYTES,
+        ),
+        output: crate::review_input::safe_multiline_display(&output, 128 * 1024),
+        cwd: block_data
+            .and_then(|block| block.cwd.as_deref())
+            .map(|cwd| crate::review_input::safe_inline_display(cwd, 16 * 1024)),
+        exit_code,
+        truncated,
+    })
+}
 
 fn emit_activity(callbacks: &VoidCallbacks) {
     for callback in callbacks.borrow().iter() {
@@ -2374,7 +2541,15 @@ pub struct TermView {
     bracketed_paste: Rc<Cell<bool>>,
     config: Rc<RefCell<Config>>,
     block_data: Rc<RefCell<VecDeque<BlockData>>>,
+    /// Queues the scrollbar-track failure overlay after history metadata or
+    /// theme geometry changes.
+    failure_marker_redraw: FailureMarkerRedraw,
+    /// One in-memory generation removed by Clear. Persisted history follows
+    /// whichever side (cleared or restored) is currently visible.
+    cleared_blocks: RefCell<Vec<BlockData>>,
     finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
+    /// Current OSC 10/11/12 overrides, also applied to restored snapshots.
+    dynamic_colors: Rc<Cell<DynamicColors>>,
     widget_pool: Rc<RefCell<WidgetPool>>,
     viewport: Rc<RefCell<ViewportState>>,
     visible_indices: Rc<RefCell<std::collections::HashSet<usize>>>,
@@ -2417,6 +2592,7 @@ pub struct TermView {
     command_started_callbacks: CommandStartedCallbacks,
     command_finished_callbacks: CommandFinishedCallbacks,
     block_finished_callbacks: BlockFinishedCallbacks,
+    ask_ai_callbacks: AskAiCallbacks,
     agent_execution_lost_callbacks: AgentExecutionLostCallbacks,
     /// Verified Agent generation of the running command, set at CommandStart.
     /// Exposed read-only so the organism can tell whose command is running.
@@ -2515,8 +2691,10 @@ struct ReaderCtx {
     mouse_reporting_rc: Rc<Cell<MouseReportingMode>>,
     bracketed_paste_rc: Rc<Cell<bool>>,
     config_for_cb: Rc<RefCell<Config>>,
+    dynamic_colors_rc: Rc<Cell<DynamicColors>>,
     parser: Rc<RefCell<Parser>>,
     block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
+    failure_marker_redraw: FailureMarkerRedraw,
     finished_blocks_for_cb: Rc<RefCell<Vec<FinishedBlock>>>,
     scroll_debouncer: ScrollDebouncer,
     widget_pool_for_cb: Rc<RefCell<WidgetPool>>,
@@ -2555,6 +2733,7 @@ struct ReaderCtx {
     command_started_cbs: CommandStartedCallbacks,
     command_finished_cbs: CommandFinishedCallbacks,
     block_finished_cbs: BlockFinishedCallbacks,
+    ask_ai_cbs: AskAiCallbacks,
     agent_execution_lost_cbs: AgentExecutionLostCallbacks,
     verified_submission: VerifiedSubmissionCtx,
     /// Parks incoming PTY chunks while the user drag-selects text on the live
@@ -2691,8 +2870,10 @@ impl ReaderCtx {
             mouse_reporting_rc,
             bracketed_paste_rc,
             config_for_cb,
+            dynamic_colors_rc,
             parser,
             block_data_for_cb,
+            failure_marker_redraw,
             finished_blocks_for_cb,
             scroll_debouncer,
             widget_pool_for_cb,
@@ -2724,6 +2905,7 @@ impl ReaderCtx {
             command_started_cbs,
             command_finished_cbs,
             block_finished_cbs,
+            ask_ai_cbs,
             agent_execution_lost_cbs,
             verified_submission,
             selection_feed_hold,
@@ -2738,12 +2920,7 @@ impl ReaderCtx {
         let kitty_pending_images_rc: Rc<RefCell<Vec<gtk4::gdk::Texture>>> =
             Rc::new(RefCell::new(Vec::new()));
         let kitty_pending_bytes_rc: Rc<Cell<usize>> = Rc::new(Cell::new(0));
-        // Dynamic OSC 10/11/12 colors: the set/reset bytes pass through to the
-        // persistent live VTE, which recolors itself natively; this cell only
-        // remembers the override so ColorQuery replies (and freshly created
-        // finished-block snapshots) match what the app actually set.
-        let dynamic_colors_rc: Rc<Cell<DynamicColors>> =
-            Rc::new(Cell::new(DynamicColors::default()));
+        let dynamic_colors_for_pipeline = dynamic_colors_rc;
         // Selection-hold triggers that live on the VTE itself (selection
         // cleared, user typed). Wired before the pipeline closure below takes
         // ownership of `active_vte`.
@@ -3146,7 +3323,11 @@ impl ReaderCtx {
                                     cols: cols.clamp(1, u16::MAX as i64) as u16,
                                 };
 
-                                block_data_for_cb.borrow_mut().push_back(block_data);
+                                mutate_block_data_and_redraw(
+                                    &block_data_for_cb,
+                                    failure_marker_redraw.as_ref(),
+                                    |blocks| blocks.push_back(block_data),
+                                );
 
                                 // Drain the kitty-graphics images decoded during
                                 // this command so the finished block mounts them
@@ -3178,7 +3359,7 @@ impl ReaderCtx {
                                 // colors next to the recolored live VTE.
                                 apply_dynamic_colors_to_finished(
                                     &finished,
-                                    dynamic_colors_rc.get(),
+                                    dynamic_colors_for_pipeline.get(),
                                 );
                                 finished.widget().insert_before(
                                     &block_list_rc,
@@ -3273,6 +3454,8 @@ impl ReaderCtx {
                                 let anchor_for_menu = selection_anchor_id_rc.clone();
                                 let bookmarks_for_menu = bookmarks_for_cb.clone();
                                 let visible_for_menu = visible_indices_rc.clone();
+                                let failure_marker_redraw_for_menu = failure_marker_redraw.clone();
+                                let ask_ai_cbs_for_menu = ask_ai_cbs.clone();
                                 let block_id = finished_clone.id;
 
                                 let right_click = gtk4::GestureClick::new();
@@ -3367,6 +3550,32 @@ impl ReaderCtx {
                                     }
 
                                     {
+                                        let item = make_item("Ask AI About Block");
+                                        let popover_c = popover.downgrade();
+                                        let finished_for_ai = Rc::downgrade(&finished_blocks);
+                                        let block_data_for_ai = block_data_for_export.clone();
+                                        let callbacks_for_ai = ask_ai_cbs_for_menu.clone();
+                                        item.connect_clicked(move |_| {
+                                            popdown_if_alive(&popover_c);
+                                            let Some(finished_for_ai) = finished_for_ai.upgrade()
+                                            else {
+                                                return;
+                                            };
+                                            let finished = finished_for_ai.borrow();
+                                            let data = block_data_for_ai.borrow();
+                                            let Some(context) = block_context_for_id(
+                                                &finished, &data, block_id, 80,
+                                            ) else {
+                                                return;
+                                            };
+                                            for callback in callbacks_for_ai.borrow().iter() {
+                                                callback(context.clone());
+                                            }
+                                        });
+                                        vbox.append(&item);
+                                    }
+
+                                    {
                                         let item = make_item(if selected_count > 1 {
                                             "Copy Outputs"
                                         } else {
@@ -3422,6 +3631,34 @@ impl ReaderCtx {
                                                         false,
                                                     )
                                                 },
+                                            );
+                                            vte_for_action.clipboard().set_text(&text);
+                                        });
+                                        vbox.append(&item);
+                                    }
+
+                                    {
+                                        let item = make_item(if selected_count > 1 {
+                                            "Copy Blocks as Markdown"
+                                        } else {
+                                            "Copy Block as Markdown"
+                                        });
+                                        let popover_c = popover.downgrade();
+                                        let block_data_for_copy = block_data_for_export.clone();
+                                        let selected_ids_for_copy = selected_ids_for_menu.clone();
+                                        let vte_for_action = vte_for_copy.downgrade();
+                                        item.connect_clicked(move |_| {
+                                            popdown_if_alive(&popover_c);
+                                            let Some(vte_for_action) = vte_for_action.upgrade()
+                                            else {
+                                                return;
+                                            };
+                                            let selected = selected_ids_for_copy.borrow();
+                                            let blocks = block_data_for_copy.borrow();
+                                            let text = selected_blocks_markdown(
+                                                blocks.iter(),
+                                                &selected,
+                                                block_id,
                                             );
                                             vte_for_action.clipboard().set_text(&text);
                                         });
@@ -3662,6 +3899,8 @@ impl ReaderCtx {
                                         let anchor_for_delete = anchor_for_menu.clone();
                                         let bookmarks_for_delete = bookmarks_for_menu.clone();
                                         let visible_for_delete = visible_for_menu.clone();
+                                        let failure_marker_redraw_for_delete =
+                                            failure_marker_redraw_for_menu.clone();
                                         let block_id_del = block_id;
                                         item.connect_clicked(move |_| {
                                             popdown_if_alive(&popover_c);
@@ -3680,13 +3919,17 @@ impl ReaderCtx {
                                                 &finished_blocks_for_delete,
                                                 &block_data_for_delete,
                                                 &block_list_for_delete,
-                                                BlockSelectionRefs {
-                                                    ids: &selected_ids_for_delete,
-                                                    active: &selected_for_delete,
-                                                    anchor: &anchor_for_delete,
+                                                BlockRemovalRefs {
+                                                    selection: BlockSelectionRefs {
+                                                        ids: &selected_ids_for_delete,
+                                                        active: &selected_for_delete,
+                                                        anchor: &anchor_for_delete,
+                                                    },
+                                                    bookmarks: &bookmarks_for_delete,
+                                                    visible_indices: &visible_for_delete,
+                                                    failure_marker_redraw:
+                                                        failure_marker_redraw_for_delete.as_ref(),
                                                 },
-                                                &bookmarks_for_delete,
-                                                &visible_for_delete,
                                             );
                                         });
                                         vbox.append(&item);
@@ -3732,8 +3975,16 @@ impl ReaderCtx {
                                     widget_pool_for_cb.borrow_mut().release(widget_to_release);
                                 }
 
-                                while block_data_for_cb.borrow().len() > max_blocks {
-                                    block_data_for_cb.borrow_mut().pop_front();
+                                if block_data_for_cb.borrow().len() > max_blocks {
+                                    mutate_block_data_and_redraw(
+                                        &block_data_for_cb,
+                                        failure_marker_redraw.as_ref(),
+                                        |blocks| {
+                                            while blocks.len() > max_blocks {
+                                                blocks.pop_front();
+                                            }
+                                        },
+                                    );
                                 }
 
                                 let preserve = config_for_cb.borrow().preserve_live_scrollback;
@@ -4319,7 +4570,7 @@ impl ReaderCtx {
                         ParserEvent::ColorQuery(kind) => {
                             let reply = build_color_query_reply(
                                 &config_for_cb.borrow(),
-                                dynamic_colors_rc.get(),
+                                dynamic_colors_for_pipeline.get(),
                                 *kind,
                             );
                             if let Err(error) = pty_for_init.write_bytes(reply.as_bytes()) {
@@ -4343,17 +4594,17 @@ impl ReaderCtx {
                             // passed through to the live VTE (native recolor);
                             // only the tracker updates here so the next
                             // ColorQuery reports the live color, not the theme.
-                            let mut dynamic = dynamic_colors_rc.get();
+                            let mut dynamic = dynamic_colors_for_pipeline.get();
                             dynamic.set(*kind, spec);
-                            dynamic_colors_rc.set(dynamic);
+                            dynamic_colors_for_pipeline.set(dynamic);
                         }
 
                         ParserEvent::ColorReset(kind) => {
                             // OSC 110/111/112: bytes also passed through;
                             // queries fall back to the static theme again.
-                            let mut dynamic = dynamic_colors_rc.get();
+                            let mut dynamic = dynamic_colors_for_pipeline.get();
                             dynamic.reset(*kind);
-                            dynamic_colors_rc.set(dynamic);
+                            dynamic_colors_for_pipeline.set(dynamic);
                         }
 
                         ParserEvent::KeyboardProtocolQuery(query) => {
@@ -4498,6 +4749,7 @@ impl ReaderCtx {
         });
 
         let hold_for_reader = selection_feed_hold.clone();
+        let hold_for_exit = selection_feed_hold.clone();
         pty.start_reader(
             move |data: Vec<u8>| {
                 if hold_for_reader.try_buffer(&data) {
@@ -4506,10 +4758,12 @@ impl ReaderCtx {
                 (process_chunk.borrow_mut())(data);
             },
             move |exit_code| {
-                log::debug!("Shell exited with code {}", exit_code);
-                for cb in exited_cbs.borrow().iter() {
-                    cb(exit_code);
-                }
+                hold_for_exit.flush_then(|| {
+                    log::debug!("Shell exited with code {}", exit_code);
+                    for cb in exited_cbs.borrow().iter() {
+                        cb(exit_code);
+                    }
+                });
             },
         );
     }
@@ -4938,6 +5192,7 @@ struct KeyCtx {
     block_scroll_for_key: glib::WeakRef<ScrolledWindow>,
     bookmarks_for_key: Rc<RefCell<std::collections::HashSet<u64>>>,
     visible_indices_for_key: Rc<RefCell<std::collections::HashSet<usize>>>,
+    failure_marker_redraw_for_key: FailureMarkerRedraw,
     bstate_for_key: Rc<Cell<BlockState>>,
 }
 
@@ -4961,6 +5216,7 @@ impl KeyCtx {
             block_scroll_for_key,
             bookmarks_for_key,
             visible_indices_for_key,
+            failure_marker_redraw_for_key,
             bstate_for_key,
         } = self;
         key_ctrl.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
@@ -5148,13 +5404,16 @@ impl KeyCtx {
                         &finished_blocks_for_key,
                         &block_data_for_key,
                         &block_list_for_key,
-                        BlockSelectionRefs {
-                            ids: &selected_block_ids_for_key,
-                            active: &selected_block_id_for_key,
-                            anchor: &selection_anchor_id_for_key,
+                        BlockRemovalRefs {
+                            selection: BlockSelectionRefs {
+                                ids: &selected_block_ids_for_key,
+                                active: &selected_block_id_for_key,
+                                anchor: &selection_anchor_id_for_key,
+                            },
+                            bookmarks: &bookmarks_for_key,
+                            visible_indices: &visible_indices_for_key,
+                            failure_marker_redraw: failure_marker_redraw_for_key.as_ref(),
                         },
-                        &bookmarks_for_key,
-                        &visible_indices_for_key,
                     );
                     let finished = finished_blocks_for_key.borrow();
                     if selected_block_ids_for_key.borrow().is_empty() {
@@ -5614,6 +5873,63 @@ impl TermView {
             Rc::new(RefCell::new(VecDeque::new()));
         let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
 
+        // Failed commands are marked against the full-history scrollbar track,
+        // independent of the current viewport. The overlay is deliberately not
+        // targetable: pointer clicks and drags continue to reach GTK's native
+        // scrollbar underneath it.
+        let failure_markers = gtk4::DrawingArea::new();
+        failure_markers.add_css_class("block-failure-markers");
+        failure_markers.set_content_width(10);
+        failure_markers.set_hexpand(false);
+        failure_markers.set_vexpand(true);
+        failure_markers.set_halign(gtk4::Align::End);
+        failure_markers.set_valign(gtk4::Align::Fill);
+        failure_markers.set_can_target(false);
+        {
+            let block_data = block_data_rc.clone();
+            let scroll = block_scroll.downgrade();
+            failure_markers.set_draw_func(move |area, cr, width, height| {
+                let Some(scroll) = scroll.upgrade() else {
+                    return;
+                };
+                let adjustment = scroll.vadjustment();
+                if width <= 0 || height <= 0 || adjustment.upper() <= adjustment.page_size() + 0.5 {
+                    return;
+                }
+
+                let color = area.color();
+                cr.set_source_rgba(
+                    color.red() as f64,
+                    color.green() as f64,
+                    color.blue() as f64,
+                    color.alpha() as f64,
+                );
+                const MARKER_HEIGHT: f64 = 3.0;
+                let span = (f64::from(height) - MARKER_HEIGHT).max(0.0);
+                let marker_width = f64::from(width.min(8));
+                let marker_x = f64::from(width) - marker_width;
+                for fraction in failed_block_marker_fractions(&block_data.borrow()) {
+                    cr.rectangle(marker_x, fraction * span, marker_width, MARKER_HEIGHT);
+                }
+                let _ = cr.fill();
+            });
+        }
+        scroll_overlay.add_overlay(&failure_markers);
+        let failure_marker_redraw: FailureMarkerRedraw = {
+            let failure_markers = failure_markers.downgrade();
+            Rc::new(move || {
+                if let Some(failure_markers) = failure_markers.upgrade() {
+                    failure_markers.queue_draw();
+                }
+            })
+        };
+        {
+            let redraw = failure_marker_redraw.clone();
+            block_scroll
+                .vadjustment()
+                .connect_changed(move |_| redraw());
+        }
+
         // ── Hybrid live-surface layout ─────────────────────────────────────
         // Idle prompts use a compact visual cell so completed output exists only
         // once, in blocks above. Running commands and terminal apps receive the
@@ -5627,6 +5943,7 @@ impl TermView {
             let typed_cmd = typed_cmd.clone();
             let finished_for_layout = finished_blocks_rc.clone();
             let block_data_for_layout = block_data_rc.clone();
+            let failure_marker_redraw_for_layout = failure_marker_redraw.clone();
             let last_size_target: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
             // Change detector for the finished-block re-fit. Their cap follows
             // the scroll viewport's pixel height and the cell height (font
@@ -5695,12 +6012,17 @@ impl TermView {
                 if resized.is_empty() {
                     return;
                 }
-                let mut block_data = block_data_for_layout.borrow_mut();
-                for (id, height) in resized {
-                    if let Some(data) = block_data.iter_mut().find(|data| data.id == id) {
-                        data.estimated_height = height;
-                    }
-                }
+                mutate_block_data_and_redraw(
+                    &block_data_for_layout,
+                    failure_marker_redraw_for_layout.as_ref(),
+                    |block_data| {
+                        for (id, height) in resized {
+                            if let Some(data) = block_data.iter_mut().find(|data| data.id == id) {
+                                data.estimated_height = height;
+                            }
+                        }
+                    },
+                );
             })
         };
         // Coalesces follow-bottom pins so a burst of contents-changed signals
@@ -5783,6 +6105,7 @@ impl TermView {
         let command_started_callbacks: CommandStartedCallbacks = Rc::new(RefCell::new(vec![]));
         let command_finished_callbacks: CommandFinishedCallbacks = Rc::new(RefCell::new(vec![]));
         let block_finished_callbacks: BlockFinishedCallbacks = Rc::new(RefCell::new(vec![]));
+        let ask_ai_callbacks: AskAiCallbacks = Rc::new(RefCell::new(vec![]));
         let agent_execution_lost_callbacks: AgentExecutionLostCallbacks =
             Rc::new(RefCell::new(vec![]));
         let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -5823,6 +6146,10 @@ impl TermView {
         let pending_exit_code: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(None));
         let pending_command_meta: Rc<RefCell<PendingCommandMeta>> =
             Rc::new(RefCell::new(PendingCommandMeta::default()));
+
+        // Dynamic OSC 10/11/12 colors: the reader updates this shared state and
+        // Undo uses it when recreating snapshot VTEs.
+        let dynamic_colors: Rc<Cell<DynamicColors>> = Rc::new(Cell::new(DynamicColors::default()));
 
         let widget_pool: Rc<RefCell<WidgetPool>> = Rc::new(RefCell::new(WidgetPool::new()));
         let selected_block_ids: SelectedBlockIds =
@@ -6045,8 +6372,10 @@ impl TermView {
                 mouse_reporting_rc,
                 bracketed_paste_rc,
                 config_for_cb,
+                dynamic_colors_rc: dynamic_colors.clone(),
                 parser,
                 block_data_for_cb,
+                failure_marker_redraw: failure_marker_redraw.clone(),
                 finished_blocks_for_cb,
                 scroll_debouncer: scroll_debouncer.clone(),
                 widget_pool_for_cb,
@@ -6078,6 +6407,7 @@ impl TermView {
                 command_started_cbs: command_started_callbacks.clone(),
                 command_finished_cbs: command_finished_callbacks.clone(),
                 block_finished_cbs: block_finished_callbacks.clone(),
+                ask_ai_cbs: ask_ai_callbacks.clone(),
                 agent_execution_lost_cbs: agent_execution_lost_callbacks.clone(),
                 verified_submission: verified_submission.clone(),
                 selection_feed_hold: selection_feed_hold.clone(),
@@ -6127,7 +6457,6 @@ impl TermView {
                     let unread = unread.clone();
                     let scroll = scroll.clone();
                     let holder = holder.clone();
-                    let fab = fab.clone();
                     let fullscreen = fullscreen.clone();
                     let check_pending = check_pending.clone();
                     let pending_programmatic_only = pending_programmatic_only.clone();
@@ -6500,6 +6829,7 @@ impl TermView {
             let pty_for_root_key = pty.clone();
             let bstate_for_root_key = bstate.clone();
             let human_input_for_root_key = human_input_callbacks.clone();
+            let hold_for_root_key = selection_feed_hold.clone();
             let root_key = gtk4::EventControllerKey::new();
             root_key.set_propagation_phase(gtk4::PropagationPhase::Capture);
             root_key.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
@@ -6511,12 +6841,17 @@ impl TermView {
                 }
 
                 if let Some(bytes) = running_root_control_bytes(keyval, modifiers) {
-                    if let Err(error) = pty_for_root_key.write_bytes(bytes) {
-                        pty_for_root_key
-                            .report_write_error("could not queue process-control key", error);
-                    } else {
-                        emit_accepted_input(&human_input_for_root_key, InputOrigin::RunningControl);
-                    }
+                    hold_for_root_key.flush_then(|| {
+                        if let Err(error) = pty_for_root_key.write_bytes(bytes) {
+                            pty_for_root_key
+                                .report_write_error("could not queue process-control key", error);
+                        } else {
+                            emit_accepted_input(
+                                &human_input_for_root_key,
+                                InputOrigin::RunningControl,
+                            );
+                        }
+                    });
                     return glib::Propagation::Stop;
                 }
 
@@ -6603,6 +6938,7 @@ impl TermView {
                 block_scroll_for_key: block_scroll_for_key.downgrade(),
                 bookmarks_for_key: block_bookmarks.clone(),
                 visible_indices_for_key: visible_indices.clone(),
+                failure_marker_redraw_for_key: failure_marker_redraw.clone(),
                 bstate_for_key: bstate.clone(),
             }
             .connect(&key_ctrl);
@@ -6871,7 +7207,10 @@ impl TermView {
             bracketed_paste,
             config: Rc::new(RefCell::new(config.clone())),
             block_data: block_data_rc,
+            failure_marker_redraw,
+            cleared_blocks: RefCell::new(Vec::new()),
             finished_blocks: finished_blocks_rc,
+            dynamic_colors,
             widget_pool: widget_pool.clone(),
             viewport: Rc::new(RefCell::new(ViewportState {
                 first_visible: 0,
@@ -6896,6 +7235,7 @@ impl TermView {
             command_started_callbacks,
             command_finished_callbacks,
             block_finished_callbacks,
+            ask_ai_callbacks,
             agent_execution_lost_callbacks,
             active_agent_generation: active_agent_generation.clone(),
             verified_submission,
@@ -6925,6 +7265,7 @@ impl TermView {
             let finished_blocks = Rc::downgrade(&term_view.finished_blocks);
             let visible_indices = term_view.visible_indices.clone();
             let fullscreen = term_view.fullscreen.clone();
+            let failure_marker_redraw = term_view.failure_marker_redraw.clone();
             let visibility_update_pending = Rc::new(Cell::new(false));
             let block_scroll_weak = block_scroll.downgrade();
             let last_page_size = Rc::new(Cell::new(None::<f64>));
@@ -6951,6 +7292,7 @@ impl TermView {
                 let config = config.clone();
                 let visible = visible_indices.clone();
                 let fullscreen = fullscreen.clone();
+                let failure_marker_redraw = failure_marker_redraw.clone();
                 let pending = visibility_update_pending.clone();
                 glib::idle_add_local_once(move || {
                     pending.set(false);
@@ -6990,13 +7332,18 @@ impl TermView {
                     *vp.borrow_mut() = next_viewport;
 
                     let finished_ref = finished.borrow();
-                    let mut block_data_ref = block_data.borrow_mut();
                     let mut visible_ref = visible.borrow_mut();
-                    apply_visible_indices(
-                        &finished_ref,
-                        &mut block_data_ref,
-                        &mut visible_ref,
-                        new_visible,
+                    mutate_block_data_and_redraw(
+                        &block_data,
+                        failure_marker_redraw.as_ref(),
+                        |block_data| {
+                            apply_visible_indices(
+                                &finished_ref,
+                                block_data,
+                                &mut visible_ref,
+                                new_visible,
+                            );
+                        },
                     );
                 });
             });
@@ -7702,6 +8049,13 @@ impl TermView {
         self.block_finished_callbacks.borrow_mut().push(Box::new(f));
     }
 
+    pub(crate) fn connect_ask_ai_about_block<F>(&self, f: F)
+    where
+        F: Fn(crate::ai::BlockContext) + 'static,
+    {
+        self.ask_ai_callbacks.borrow_mut().push(Box::new(f));
+    }
+
     /// Reveal the live input when its tab becomes active.
     ///
     /// This deliberately reuses the same frame-spaced, generation-aware bottom
@@ -7805,7 +8159,7 @@ impl TermView {
     }
 
     /// Remove every completed block and all block-indexed UI state.
-    pub fn clear_blocks(&self) {
+    pub fn clear_blocks(&self) -> usize {
         // A background load that completes after Clear must not resurrect the
         // just-deleted history, and its shutdown merge must not prepend it to
         // the empty replacement snapshot.
@@ -7826,7 +8180,12 @@ impl TermView {
         }
         drop(pool);
 
-        self.block_data.borrow_mut().clear();
+        let cleared: Vec<BlockData> = mutate_block_data_and_redraw(
+            &self.block_data,
+            self.failure_marker_redraw.as_ref(),
+            |blocks| blocks.drain(..).collect(),
+        );
+        let cleared_count = replace_nonempty_stash(&mut self.cleared_blocks.borrow_mut(), cleared);
         self.bookmarks.borrow_mut().clear();
         self.visible_indices.borrow_mut().clear();
         self.selected_block_ids.borrow_mut().clear();
@@ -7849,6 +8208,126 @@ impl TermView {
         if let Err(err) = self.save_history() {
             log::warn!("save cleared block history: {err}");
         }
+        cleared_count
+    }
+
+    /// Restore the most recently cleared generation before blocks created
+    /// since Clear. The slot is intentionally single-level.
+    pub fn undo_clear_blocks(&self) -> usize {
+        let mut restored =
+            take_stash_for_undo(&mut self.cleared_blocks.borrow_mut(), self.fullscreen.get());
+        if restored.is_empty() {
+            return 0;
+        }
+
+        let fallback_cols = self.active.borrow().grid_cols() as i64;
+        {
+            let config = self.config.borrow();
+            for block in &mut restored {
+                let cols = if block.cols > 0 {
+                    block.cols as i64
+                } else {
+                    fallback_cols
+                };
+                block.estimated_height = estimated_finished_block_height_for_text(
+                    &config,
+                    &block.cmd,
+                    &block.output,
+                    cols,
+                );
+            }
+        }
+
+        let sibling = self
+            .finished_blocks
+            .borrow()
+            .first()
+            .map(|block| block.widget().clone().upcast::<gtk4::Widget>())
+            .or_else(|| self.block_list.first_child())
+            .unwrap_or_else(|| {
+                self.active
+                    .borrow()
+                    .widget()
+                    .clone()
+                    .upcast::<gtk4::Widget>()
+            });
+        let mut restored_widgets = Vec::with_capacity(restored.len());
+        {
+            let config = self.config.borrow();
+            for block in &restored {
+                let cols = if block.cols > 0 {
+                    block.cols as i64
+                } else {
+                    fallback_cols
+                };
+                let finished = FinishedBlock::new(
+                    block.id,
+                    &block.prompt,
+                    &block.cmd,
+                    block.cmd_markup.as_deref(),
+                    &block.output,
+                    block.exit_code,
+                    &config,
+                    block.duration_ms,
+                    block.end_time_ms,
+                    block.cwd.as_deref(),
+                    cols,
+                );
+                apply_dynamic_colors_to_finished(&finished, self.dynamic_colors.get());
+                finished
+                    .widget()
+                    .insert_before(&self.block_list, Some(&sibling));
+                finished.connect_actions(
+                    &self.active_vte,
+                    &self.pty,
+                    &self.pty_synced,
+                    &self.active,
+                    &self.typed_cmd,
+                    &self.typed_cmd_fidelity,
+                    &self.submission_pending,
+                    &self.pending_typeahead,
+                    &self.bstate,
+                    &self.bracketed_paste,
+                );
+                finished.connect_scroll_forwarding(&self.block_scroll);
+                install_finished_block_selection(
+                    &finished,
+                    &self.active,
+                    &self.finished_blocks,
+                    &self.selected_block_ids,
+                    &self.selected_block_id,
+                    &self.selection_anchor_id,
+                );
+                restored_widgets.push(finished);
+            }
+        }
+
+        let restored_len = restored.len();
+        mutate_block_data_and_redraw(
+            &self.block_data,
+            self.failure_marker_redraw.as_ref(),
+            |blocks| prepend_in_order(blocks, restored),
+        );
+        self.finished_blocks
+            .borrow_mut()
+            .splice(0..0, restored_widgets);
+        let shifted = self
+            .visible_indices
+            .borrow()
+            .iter()
+            .map(|index| index.saturating_add(restored_len))
+            .collect();
+        *self.visible_indices.borrow_mut() = shifted;
+        self.update_viewport();
+        self.update_block_visibility();
+        self.block_list.queue_allocate();
+        if !self.user_scrolled_up.get() {
+            self.reveal_live_input();
+        }
+        if let Err(err) = self.save_history() {
+            log::warn!("save restored block history: {err}");
+        }
+        restored_len
     }
 
     pub fn apply_failed_filter(&self) {
@@ -7900,24 +8379,28 @@ impl TermView {
             .selected_block_id
             .get()
             .and_then(|id| finished.iter().position(|block| block.id == id));
-        let target = if direction < 0 {
-            marked
-                .iter()
-                .rev()
-                .find(|&&idx| cur.map(|c| idx < c).unwrap_or(true))
-                .copied()
-                .or_else(|| marked.last().copied())
-        } else {
-            marked
-                .iter()
-                .find(|&&idx| cur.map(|c| idx > c).unwrap_or(true))
-                .copied()
-                .or_else(|| marked.first().copied())
-        };
+        let target = step_marked_indices(&marked, cur, direction);
         drop(bookmarks);
         drop(finished);
         if let Some(idx) = target {
             self.scroll_to_block(idx);
+        }
+    }
+
+    pub fn jump_to_failed(&self, direction: i32) {
+        let failed = self.get_failed_blocks();
+        if failed.is_empty() {
+            return;
+        }
+        let finished = self.finished_blocks.borrow();
+        let current = self
+            .selected_block_id
+            .get()
+            .and_then(|id| finished.iter().position(|block| block.id == id));
+        let target = step_marked_indices(&failed, current, direction);
+        drop(finished);
+        if let Some(index) = target {
+            self.scroll_to_block(index);
         }
     }
 
@@ -7930,6 +8413,7 @@ impl TermView {
             apply_snapshot_theme_to_vte(&block.output_vte, &config);
         }
         install_block_css(&config);
+        (self.failure_marker_redraw)();
     }
 
     /// Update font for VTE terminal and block view CSS.
@@ -7980,9 +8464,12 @@ impl TermView {
         let new_visible = visible_indices_for_viewport(&vp);
 
         let finished = self.finished_blocks.borrow();
-        let mut block_data = self.block_data.borrow_mut();
         let mut visible = self.visible_indices.borrow_mut();
-        apply_visible_indices(&finished, &mut block_data, &mut visible, new_visible);
+        mutate_block_data_and_redraw(
+            &self.block_data,
+            self.failure_marker_redraw.as_ref(),
+            |block_data| apply_visible_indices(&finished, block_data, &mut visible, new_visible),
+        );
     }
 
     /// Collect a snapshot of internal runtime state for the debug dashboard.
@@ -8098,13 +8585,16 @@ impl TermView {
             &self.finished_blocks,
             &self.block_data,
             &self.block_list,
-            BlockSelectionRefs {
-                ids: &self.selected_block_ids,
-                active: &self.selected_block_id,
-                anchor: &self.selection_anchor_id,
+            BlockRemovalRefs {
+                selection: BlockSelectionRefs {
+                    ids: &self.selected_block_ids,
+                    active: &self.selected_block_id,
+                    anchor: &self.selection_anchor_id,
+                },
+                bookmarks: &self.bookmarks,
+                visible_indices: &self.visible_indices,
+                failure_marker_redraw: self.failure_marker_redraw.as_ref(),
             },
-            &self.bookmarks,
-            &self.visible_indices,
         );
     }
 
@@ -8112,9 +8602,19 @@ impl TermView {
     /// Used to populate the Ctrl+Shift+H history palette. The first entry is
     /// the most recent unique command; whitespace-only commands are dropped.
     pub fn command_history(&self) -> Vec<String> {
+        self.command_history_bounded(usize::MAX)
+    }
+
+    /// Newest-first, exact-command history for palette snapshots, bounded
+    /// before cloning so a very long retained Block session cannot make one
+    /// palette open allocate the whole command corpus.
+    pub fn command_history_bounded(&self, limit: usize) -> Vec<String> {
+        if limit == 0 {
+            return Vec::new();
+        }
         let finished = self.finished_blocks.borrow();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut out: Vec<String> = Vec::new();
+        let mut out: Vec<String> = Vec::with_capacity(limit.min(finished.len()));
         for block in finished.iter().rev() {
             let cmd = block.cmd_text.trim();
             if cmd.is_empty() {
@@ -8122,6 +8622,9 @@ impl TermView {
             }
             if seen.insert(cmd.to_string()) {
                 out.push(cmd.to_string());
+                if out.len() == limit {
+                    break;
+                }
             }
         }
         out
@@ -8134,35 +8637,8 @@ impl TermView {
     pub fn selected_block_context(&self, lines_per_side: usize) -> Option<crate::ai::BlockContext> {
         let id = self.selected_block_id.get()?;
         let finished = self.finished_blocks.borrow();
-        let block = finished.iter().find(|b| b.id == id)?;
         let data = self.block_data.borrow();
-        let bd = data.iter().find(|b| b.id == id);
-
-        let (output, truncated) = block.with_stripped_output(|raw| {
-            let output = crate::ai::truncate_for_context(raw, lines_per_side);
-            let truncated = output != raw;
-            (output, truncated)
-        });
-        // A block with no BlockData row (history not loaded) is not the same as
-        // one whose shell reported no status, but neither is a success: both go
-        // to the model as the sentinel plus the note it can actually read.
-        let (exit_code, unknown_note) = exit_code_for_shared_surface(bd.and_then(|b| b.exit_code));
-        let output = match unknown_note {
-            Some(note) => format!("{note}\n{output}"),
-            None => output,
-        };
-        Some(crate::ai::BlockContext {
-            cmd: crate::review_input::safe_multiline_display(
-                &block.cmd_text,
-                MAX_COMMAND_CAPTURE_BYTES,
-            ),
-            output: crate::review_input::safe_multiline_display(&output, 128 * 1024),
-            cwd: bd
-                .and_then(|b| b.cwd.as_deref())
-                .map(|cwd| crate::review_input::safe_inline_display(cwd, 16 * 1024)),
-            exit_code,
-            truncated,
-        })
+        block_context_for_id(&finished, &data, id, lines_per_side)
     }
 }
 
@@ -8175,22 +8651,24 @@ mod tests {
         build_keyboard_query_reply, classify_command_prompt_status, coalesce_bytes_events,
         collapse_repaint_output, command_capture_range_is_bounded, command_id_uses_shell_token,
         compute_viewport_state, decide_agent_command_end, emit_activity, emit_command_finished,
-        emit_command_started, format_color_query_reply, history_edge_navigation_available,
-        input_is_typeahead_for_existing_submission, input_may_survive_into_next_prompt,
-        input_submits_line, next_prompt_shadow_state, normalize_captured_command,
-        normalize_loaded_block_ids, notification_allowed, output_has_vertical_repaint,
-        parse_color_spec, prompt_anchor_may_settle, prompt_layout_reflow_can_reanchor,
-        prompt_surface_is_clean, rebase_prompt_anchor, record_external_input,
-        record_protocol_reply_input, resolve_command_for_block, resolve_submitted_command,
+        emit_command_started, failed_block_marker_fractions, format_color_query_reply,
+        history_edge_navigation_available, input_is_typeahead_for_existing_submission,
+        input_may_survive_into_next_prompt, input_submits_line, mutate_block_data_and_redraw,
+        next_prompt_shadow_state, normalize_captured_command, normalize_loaded_block_ids,
+        notification_allowed, output_has_vertical_repaint, parse_color_spec, prepend_in_order,
+        prompt_anchor_may_settle, prompt_layout_reflow_can_reanchor, prompt_surface_is_clean,
+        rebase_prompt_anchor, record_external_input, record_protocol_reply_input,
+        replace_nonempty_stash, resolve_command_for_block, resolve_submitted_command,
         reviewed_pre_command_bytes_are_identity_neutral, reviewed_submission_matches,
-        scroll_delta_to_reveal, selected_command_text, selected_id_range,
+        scroll_delta_to_reveal, selected_blocks_markdown, selected_command_text, selected_id_range,
         shell_argv_supports_agent_ids, shell_argv_uses_jsh, should_buffer_background_output,
-        stable_visible_indices, strip_ansi, strip_ansi_with_clear_detect, take_background_output,
-        truncate_plain_output_for_height, verified_editor_contains_exact_command,
-        viewport_page_size_changed, viewport_state_for_scroll, visible_indices_for_viewport,
-        AgentCommandEndDecision, BlockData, BlockState, BoundedByteRing, CommandFinishedEvent,
-        CommandIdCorrelation, CommandMeta, CommandPromptStatus, CommandStartedEvent, DynamicColors,
-        HumanInputKind, InputOrigin, PendingCommandMeta, TypedShadowFidelity, ViewportState,
+        stable_visible_indices, step_marked_indices, strip_ansi, strip_ansi_with_clear_detect,
+        take_background_output, take_stash_for_undo, truncate_plain_output_for_height,
+        verified_editor_contains_exact_command, viewport_page_size_changed,
+        viewport_state_for_scroll, visible_indices_for_viewport, AgentCommandEndDecision,
+        BlockData, BlockState, BoundedByteRing, CommandFinishedEvent, CommandIdCorrelation,
+        CommandMeta, CommandPromptStatus, CommandStartedEvent, DynamicColors, HumanInputKind,
+        InputOrigin, PendingCommandMeta, TypedShadowFidelity, ViewportState,
         MAX_COMMAND_CAPTURE_BYTES, MAX_JOURNAL_OUTPUT_BYTES, MAX_PROMPT_CAPTURE_BYTES,
         MAX_RAW_OUTPUT_BYTES, TRUNCATED_COMMAND_PLACEHOLDER, UNAVAILABLE_COMMAND_PLACEHOLDER,
     };
@@ -8717,6 +9195,44 @@ mod tests {
             selected_command_text([(1, "one"), (2, "two")], &selected),
             "one\ntwo"
         );
+    }
+
+    #[test]
+    fn clear_stash_is_single_level_and_survives_empty_clear_and_fullscreen_undo() {
+        let mut stash = vec![1, 2];
+        assert_eq!(replace_nonempty_stash(&mut stash, Vec::<i32>::new()), 0);
+        assert_eq!(stash, [1, 2], "empty Clear must preserve the undo slot");
+
+        assert!(take_stash_for_undo(&mut stash, true).is_empty());
+        assert_eq!(stash, [1, 2], "alt-screen Undo must not consume the slot");
+
+        assert_eq!(replace_nonempty_stash(&mut stash, vec![3]), 1);
+        assert_eq!(
+            stash,
+            [3],
+            "a non-empty Clear replaces the older generation"
+        );
+        assert_eq!(take_stash_for_undo(&mut stash, false), [3]);
+        assert!(stash.is_empty());
+    }
+
+    #[test]
+    fn restored_blocks_precede_blocks_created_after_clear() {
+        let mut current = VecDeque::from([30, 40]);
+        prepend_in_order(&mut current, vec![10, 20]);
+        assert_eq!(current, VecDeque::from([10, 20, 30, 40]));
+    }
+
+    #[test]
+    fn marked_block_navigation_wraps_in_both_directions() {
+        let marked = [2, 5, 9];
+        assert_eq!(step_marked_indices(&marked, None, 1), Some(2));
+        assert_eq!(step_marked_indices(&marked, None, -1), Some(9));
+        assert_eq!(step_marked_indices(&marked, Some(5), 1), Some(9));
+        assert_eq!(step_marked_indices(&marked, Some(5), -1), Some(2));
+        assert_eq!(step_marked_indices(&marked, Some(9), 1), Some(2));
+        assert_eq!(step_marked_indices(&marked, Some(2), -1), Some(9));
+        assert_eq!(step_marked_indices(&[], Some(2), 1), None);
     }
 
     #[test]
@@ -9423,6 +9939,88 @@ mod tests {
             cwd: None,
             cols: 0,
         }
+    }
+
+    #[test]
+    fn failure_markers_follow_weighted_history_positions() {
+        let mut blocks = VecDeque::from([
+            block_with_height(10),
+            block_with_height(30),
+            block_with_height(60),
+        ]);
+        blocks[0].cmd = "true".into();
+        blocks[1].cmd = "cargo test".into();
+        blocks[1].exit_code = Some(101);
+        blocks[2].cmd = "false".into();
+        blocks[2].exit_code = Some(1);
+
+        assert_eq!(failed_block_marker_fractions(&blocks), vec![0.1, 0.4]);
+    }
+
+    #[test]
+    fn failure_markers_share_status_rules_and_keep_a_bounded_tail() {
+        let mut background = block_with_height(1);
+        background.exit_code = Some(1);
+        let mut unknown = block_with_height(1);
+        unknown.cmd = "status-unreported".into();
+        unknown.exit_code = None;
+        assert!(failed_block_marker_fractions(&VecDeque::from([background, unknown])).is_empty());
+
+        let failures: VecDeque<_> = (0..1_025)
+            .map(|id| {
+                let mut block = block_with_height(1);
+                block.id = id;
+                block.cmd = "false".into();
+                block.exit_code = Some(1);
+                block
+            })
+            .collect();
+        let markers = failed_block_marker_fractions(&failures);
+        assert_eq!(markers.len(), 1_024);
+        assert!((markers[0] - 1.0 / 1_025.0).abs() < f64::EPSILON);
+        assert!((markers[1_023] - 1_024.0 / 1_025.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn block_data_mutation_redraws_after_releasing_the_borrow() {
+        let blocks = RefCell::new(VecDeque::new());
+        let observed_len = Cell::new(0);
+        let redraw = || observed_len.set(blocks.borrow().len());
+
+        mutate_block_data_and_redraw(&blocks, &redraw, |blocks| {
+            let mut failed = block_with_height(1);
+            failed.cmd = "false".into();
+            failed.exit_code = Some(1);
+            blocks.push_back(failed);
+        });
+
+        assert_eq!(observed_len.get(), 1);
+    }
+
+    #[test]
+    fn selected_markdown_copy_preserves_terminal_order() {
+        let mut first = block_with_height(10);
+        first.id = 1;
+        first.prompt = "$".into();
+        first.cmd = "printf one".into();
+        first.output = "one".into();
+        let mut second = block_with_height(10);
+        second.id = 2;
+        second.cmd = "printf two".into();
+        second.output = "two".into();
+        let ignored = block_with_height(10);
+        let selected = HashSet::from([1, 2]);
+
+        let markdown = selected_blocks_markdown([&first, &second, &ignored], &selected, 2);
+        let first_pos = markdown.find("printf one").unwrap();
+        let second_pos = markdown.find("printf two").unwrap();
+        assert!(first_pos < second_pos);
+        assert_eq!(markdown.matches("## Command Block").count(), 2);
+        assert!(markdown.contains("\n\n---\n\n"));
+
+        let fallback = selected_blocks_markdown([&first, &second], &HashSet::new(), second.id);
+        assert!(!fallback.contains("printf one"));
+        assert!(fallback.contains("printf two"));
     }
 
     #[test]

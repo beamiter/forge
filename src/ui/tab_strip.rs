@@ -8,6 +8,24 @@ use super::pane_dnd::{tab_payload_can_split, PaneDragPayload, TabDragPayload};
 use super::tabs::notebook_page_named;
 use super::*;
 
+const TAB_WIDTH_HANDLE_DATA: &str = "tab-width-resize-handle";
+
+fn tab_width_after_drag(start_width: u32, offset_x: f64) -> u32 {
+    let delta = if offset_x.is_finite() {
+        offset_x.round() as i64
+    } else {
+        0
+    };
+    (i64::from(start_width) + delta).clamp(
+        i64::from(crate::config::MIN_TAB_WIDTH),
+        i64::from(crate::config::MAX_TAB_WIDTH),
+    ) as u32
+}
+
+fn command_finish_needs_failure_attention(exit_code: Option<i32>) -> bool {
+    exit_code.is_some_and(|code| code != 0)
+}
+
 /// Translate a before/after drop on a target in the original ordering into
 /// the destination index expected after removing the source item.
 fn dropped_tab_index(source: u32, target: u32, after: bool) -> u32 {
@@ -139,6 +157,120 @@ fn widget_pinned(widget: &gtk4::Widget) -> bool {
 }
 
 impl UiState {
+    /// Route authoritative Block completion to the existing inactive-tab
+    /// attention styles. A reported non-zero status is bell-strength; success
+    /// and unreported status are ordinary activity, so unknown never masquerades
+    /// as a failure or success.
+    pub(crate) fn connect_block_tab_attention(
+        &self,
+        view: &Rc<crate::block_view::TermView>,
+        root: &gtk4::Widget,
+    ) {
+        let ui = self.clone();
+        let root = root.downgrade();
+        view.connect_block_finished(move |_command, exit_code, _, _, _| {
+            let Some(root) = root.upgrade() else {
+                return;
+            };
+            if command_finish_needs_failure_attention(exit_code) {
+                ui.mark_tab_bell(&root.widget_name());
+            } else {
+                ui.mark_tab_activity(&root.widget_name());
+            }
+        });
+    }
+
+    fn tab_width_handle(button: &ToggleButton) -> Option<gtk4::Box> {
+        unsafe {
+            button
+                .data::<gtk4::Box>(TAB_WIDTH_HANDLE_DATA)
+                .map(|handle| handle.as_ref().clone())
+        }
+    }
+
+    /// Preview one width across the native horizontal strip while the pointer
+    /// is moving. The config write is deferred until drag end so a smooth drag
+    /// does not rewrite the file for every motion event.
+    fn preview_tab_width(&self, width: u32) {
+        let width = width.clamp(crate::config::MIN_TAB_WIDTH, crate::config::MAX_TAB_WIDTH) as i32;
+        let mut child = self.tab_strip.first_child();
+        while let Some(widget) = child {
+            if let Ok(button) = widget.clone().downcast::<ToggleButton>() {
+                if self.tab_placement.get() == crate::config::TabPlacement::TopBar {
+                    button.set_width_request(width);
+                }
+            }
+            child = widget.next_sibling();
+        }
+    }
+
+    fn commit_tab_width(&self, width: u32) {
+        let width = width.clamp(crate::config::MIN_TAB_WIDTH, crate::config::MAX_TAB_WIDTH);
+        self.preview_tab_width(width);
+        if self.config.borrow().tab_width == width {
+            return;
+        }
+        self.config.borrow_mut().tab_width = width;
+        self.persist_config();
+    }
+
+    pub(crate) fn set_tab_width_handle_visible(&self, button: &ToggleButton, visible: bool) {
+        if let Some(handle) = Self::tab_width_handle(button) {
+            handle.set_visible(visible);
+        }
+    }
+
+    /// Add a narrow native GTK drag target at the trailing edge of a tab. It
+    /// deliberately lives inside the button so it travels with tab reorders,
+    /// while claiming its own gesture prevents a resize from becoming a tab
+    /// drag or activation click.
+    pub(crate) fn install_tab_width_resize(&self, button: &ToggleButton) {
+        if Self::tab_width_handle(button).is_some() {
+            return;
+        }
+        let Some(content) = button
+            .child()
+            .and_then(|child| child.downcast::<gtk4::Box>().ok())
+        else {
+            return;
+        };
+
+        let handle = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        handle.add_css_class("tab-resize-handle");
+        handle.set_width_request(8);
+        handle.set_vexpand(true);
+        handle.set_cursor_from_name(Some("col-resize"));
+        handle.set_tooltip_text(Some("Drag to resize tabs"));
+        handle.update_property(&[gtk4::accessible::Property::Label("Resize tabs")]);
+        content.append(&handle);
+        unsafe {
+            button.set_data::<gtk4::Box>(TAB_WIDTH_HANDLE_DATA, handle.clone());
+        }
+
+        let start_width = Rc::new(Cell::new(self.config.borrow().tab_width));
+        let drag = gtk4::GestureDrag::new();
+        drag.set_button(gtk4::gdk::BUTTON_PRIMARY);
+        drag.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let config_for_begin = self.config.clone();
+        let start_for_begin = start_width.clone();
+        drag.connect_drag_begin(move |gesture, _, _| {
+            start_for_begin.set(config_for_begin.borrow().tab_width);
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+        });
+        let ui_for_update = self.clone();
+        let start_for_update = start_width.clone();
+        drag.connect_drag_update(move |gesture, offset_x, _| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            ui_for_update.preview_tab_width(tab_width_after_drag(start_for_update.get(), offset_x));
+        });
+        let ui_for_end = self.clone();
+        drag.connect_drag_end(move |gesture, offset_x, _| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            ui_for_end.commit_tab_width(tab_width_after_drag(start_width.get(), offset_x));
+        });
+        handle.add_controller(drag);
+    }
+
     fn begin_tab_drag(&self, payload: TabDragPayload) {
         self.clear_tab_drag_feedback();
         let origin_tab_name = self
@@ -988,9 +1120,26 @@ fn find_pin_icon(btn: &ToggleButton) -> Option<gtk4::Image> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dropped_tab_index, dropped_tab_index_in_pinned_partition, resolved_tab_pinned,
-        tab_drag_drop_target_preload, tab_title_matches,
+        command_finish_needs_failure_attention, dropped_tab_index,
+        dropped_tab_index_in_pinned_partition, resolved_tab_pinned, tab_drag_drop_target_preload,
+        tab_title_matches, tab_width_after_drag,
     };
+
+    #[test]
+    fn inactive_tab_failure_attention_requires_a_reported_nonzero_status() {
+        assert!(!command_finish_needs_failure_attention(Some(0)));
+        assert!(!command_finish_needs_failure_attention(None));
+        assert!(command_finish_needs_failure_attention(Some(1)));
+        assert!(command_finish_needs_failure_attention(Some(-1)));
+    }
+
+    #[test]
+    fn tab_width_drag_uses_persisted_start_and_clamps_bounds() {
+        assert_eq!(tab_width_after_drag(180, 40.4), 220);
+        assert_eq!(tab_width_after_drag(180, -200.0), 80);
+        assert_eq!(tab_width_after_drag(470, 100.0), 480);
+        assert_eq!(tab_width_after_drag(180, f64::NAN), 180);
+    }
 
     #[test]
     fn drop_before_and_after_adjust_for_source_removal() {

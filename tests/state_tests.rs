@@ -24,6 +24,9 @@ fn test_pane_layout_leaf_serialization() {
     let layout = PaneLayout::Leaf {
         dir: "/tmp".to_string(),
         sid: "123-456".to_string(),
+        cwd_external: false,
+        remote_name: None,
+        custom_title: None,
         cmds: None,
         pinned: None,
     };
@@ -46,6 +49,9 @@ fn test_pane_layout_leaf_with_commands() {
     let layout = PaneLayout::Leaf {
         dir: "/home".to_string(),
         sid: "789-012".to_string(),
+        cwd_external: false,
+        remote_name: None,
+        custom_title: None,
         cmds: Some(vec!["nix".to_string(), "develop".to_string()]),
         pinned: None,
     };
@@ -75,6 +81,9 @@ fn restorable_command_argv_round_trips_without_losing_boundaries() {
     let layout = PaneLayout::Leaf {
         dir: "/tmp".to_string(),
         sid: "123-456".to_string(),
+        cwd_external: false,
+        remote_name: None,
+        custom_title: None,
         cmds: Some(argv.clone()),
         pinned: None,
     };
@@ -94,9 +103,20 @@ fn legacy_joined_restore_command_is_loaded_but_not_replayed() {
     )
     .expect("legacy snapshot must still load");
     match legacy {
-        PaneLayout::Leaf { dir, sid, cmds, .. } => {
+        PaneLayout::Leaf {
+            dir,
+            sid,
+            cwd_external,
+            remote_name,
+            custom_title,
+            cmds,
+            ..
+        } => {
             assert_eq!(dir, "/tmp");
             assert_eq!(sid, "1-2");
+            assert!(!cwd_external);
+            assert_eq!(remote_name, None);
+            assert_eq!(custom_title, None);
             assert_eq!(cmds, None, "joined command strings must never replay");
         }
         _ => panic!("Expected Leaf layout"),
@@ -111,12 +131,18 @@ fn test_pane_layout_split_serialization() {
         start: Box::new(PaneLayout::Leaf {
             dir: "/tmp".to_string(),
             sid: "123-456".to_string(),
+            cwd_external: false,
+            remote_name: None,
+            custom_title: None,
             cmds: None,
             pinned: None,
         }),
         end: Box::new(PaneLayout::Leaf {
             dir: "/home".to_string(),
             sid: "789-012".to_string(),
+            cwd_external: false,
+            remote_name: None,
+            custom_title: None,
             cmds: Some(vec!["nix".to_string(), "develop".to_string()]),
             pinned: None,
         }),
@@ -171,6 +197,9 @@ fn test_pane_layout_nested_splits() {
         start: Box::new(PaneLayout::Leaf {
             dir: "/tmp".to_string(),
             sid: "123-456".to_string(),
+            cwd_external: false,
+            remote_name: None,
+            custom_title: None,
             cmds: None,
             pinned: None,
         }),
@@ -180,12 +209,18 @@ fn test_pane_layout_nested_splits() {
             start: Box::new(PaneLayout::Leaf {
                 dir: "/home".to_string(),
                 sid: "789-012".to_string(),
+                cwd_external: false,
+                remote_name: None,
+                custom_title: None,
                 cmds: None,
                 pinned: None,
             }),
             end: Box::new(PaneLayout::Leaf {
                 dir: "/var".to_string(),
                 sid: "345-678".to_string(),
+                cwd_external: false,
+                remote_name: None,
+                custom_title: None,
                 cmds: None,
                 pinned: None,
             }),

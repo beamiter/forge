@@ -280,6 +280,7 @@ impl UiState {
         });
 
         self.connect_block_command_history(&view);
+        self.connect_block_ai_action(&view);
         self.connect_bottom_bar_block_status(&view);
         self.attach_ascii_organism_to_view(&view, false);
         // A nested split does not add a Notebook page, so attach the per-pane
@@ -297,6 +298,7 @@ impl UiState {
         self.install_pane_rearrange(&leaf);
         if tab_widget_name.is_some() {
             if let PaneLeaf::Block(view) = &leaf {
+                self.connect_block_tab_attention(view, &root);
                 let ui_for_bell = self.clone();
                 let root_for_bell = root.downgrade();
                 view.connect_bell(move || {
@@ -507,6 +509,7 @@ impl UiState {
         }
 
         let target_pinned = self.tab_page_is_pinned(&target.page);
+        let target_custom_title = tab_custom_title_cell(&target.page);
         let (axis, incoming_first) = split_placement(zone);
         let orientation = match axis {
             SplitAxis::Horizontal => Orientation::Horizontal,
@@ -533,6 +536,9 @@ impl UiState {
         // root and every retained/moved leaf before sorting or persistence can
         // observe the replacement.
         Self::set_tab_page_pinned(&page, target_pinned);
+        if let Some(custom_title) = target_custom_title {
+            attach_tab_custom_title_cell(&page, custom_title);
+        }
         if let Some(connection) = moved_connection {
             let status = connection.status;
             self.tab_connections
@@ -733,6 +739,7 @@ impl UiState {
             .or_else(|| terminal_working_directory(&current_term));
         let tab_widget_name = Some(page_widget.widget_name().to_string());
         let pinned = self.tab_page_is_pinned(&page_widget);
+        let custom_title = tab_custom_title_cell(&page_widget);
         let current_widget = current_leaf.root_widget();
         let parent = current_widget.parent();
 
@@ -788,6 +795,12 @@ impl UiState {
                             if let Some(candidate) = self.notebook.nth_page(Some(index)) {
                                 if candidate == current_widget {
                                     paned.set_widget_name(&candidate.widget_name());
+                                    if let Some(custom_title) = custom_title.clone() {
+                                        attach_tab_custom_title_cell(
+                                            &paned.clone().upcast(),
+                                            custom_title,
+                                        );
+                                    }
                                     let tab_label = self.notebook.tab_label(&candidate);
                                     self.notebook.remove_page(Some(index));
                                     paned.set_start_child(Some(&current_widget));
