@@ -17,8 +17,8 @@ use gtk4::prelude::*;
 use vte4::TerminalExt;
 
 use super::{
-    clear_finished_block_selection, feed_hold_eligible, BlockState, FinishedBlock,
-    MouseReportingMode, SelectedBlockIds, SelectionFeedHold,
+    clear_finished_block_selection, feed_hold_eligible, BlockState, BoundedClipboardAccumulator,
+    ClipboardTextTooLarge, FinishedBlock, MouseReportingMode, SelectedBlockIds, SelectionFeedHold,
 };
 
 pub(crate) struct CrossSelection {
@@ -263,21 +263,22 @@ impl CrossSelection {
 
     /// Collect every visible selected VTE in document order. This handles both a
     /// native single-surface selection and a cross-widget drag.
-    pub(crate) fn copy_text(&self) -> Option<String> {
-        let mut parts = Vec::new();
+    pub(crate) fn copy_text(&self) -> Result<Option<String>, ClipboardTextTooLarge> {
+        let mut output = BoundedClipboardAccumulator::new();
+        let mut copied = false;
         for vte in self.ordered_vtes() {
             if !vte.has_selection() {
                 continue;
             }
             if let Some(text) = vte.text_selected(vte4::Format::Text) {
-                let text = text.to_string();
                 if !text.is_empty() {
-                    parts.push(text);
+                    output.append_section("\n", |output| output.append(text.as_str()))?;
+                    copied = true;
                 }
             }
         }
 
-        (!parts.is_empty()).then(|| parts.join("\n"))
+        Ok(copied.then(|| output.into_string()))
     }
 }
 

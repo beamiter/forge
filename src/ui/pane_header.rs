@@ -32,7 +32,7 @@ pub(crate) const PANE_HEADER_CSS: &str = "
     .pane-header-index { font-weight: bold; opacity: 0.9; }
     .pane-header-title { font-weight: bold; }
     .pane-header-cwd { opacity: 0.6; }
-    .pane-header-command { color: #8be9fd; }
+    .pane-header-command { font-weight: 600; }
     .pane-drop-target { outline: 2px solid alpha(currentColor, 0.8); outline-offset: -2px; }
     .pane-tab-drop-left { box-shadow: inset 10px 0 alpha(currentColor, 0.5); }
     .pane-tab-drop-right { box-shadow: inset -10px 0 alpha(currentColor, 0.5); }

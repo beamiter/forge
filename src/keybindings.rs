@@ -94,7 +94,7 @@ pub(crate) enum Action {
     /// Open a fuzzy palette over this tab's finished-block command history.
     /// Enter pastes the selected command into the live input cell.
     HistoryPalette,
-    /// Cross-block ripgrep palette — flat list of every line that matches
+    /// Cross-block search palette — flat list of every line that matches
     /// the query across all finished blocks; Enter jumps to that hit.
     CrossBlockSearch,
     /// Workflows palette — fuzzy list of saved command templates; Enter
@@ -195,7 +195,7 @@ impl Action {
             Action::AskAiAboutSelectedBlock => "Ask AI about selected block",
             Action::OpenAgent => "Open shell Agent",
             Action::HistoryPalette => "Command history palette",
-            Action::CrossBlockSearch => "Search across blocks (ripgrep)",
+            Action::CrossBlockSearch => "Search blocks (substring/regex)",
             Action::WorkflowsPalette => "Workflows palette",
             Action::OpenWelcome => "Open welcome & quick start notebook",
             Action::InstallJsh => "Install or update jsh (jterm's shell)",
@@ -478,8 +478,9 @@ impl KeybindingMap {
         // Ctrl+R is consumed by bash readline in the live VTE, so the chord
         // for our block-history palette is Ctrl+Shift+H ("history").
         bind("Ctrl+Shift+H", Action::HistoryPalette);
-        // Ctrl+Shift+G — "grep" — cross-block ripgrep palette. Ctrl+Shift+F
-        // already drives the within-block VTE highlighter (different UX).
+        // Ctrl+Shift+G — "grep" muscle memory — opens the cross-block search
+        // palette. Ctrl+Shift+F already drives the within-block VTE
+        // highlighter (different UX).
         bind("Ctrl+Shift+G", Action::CrossBlockSearch);
         // Ctrl+Shift+M — "macros" / workflows palette over saved command
         // templates. (Ctrl+Shift+W is ClosePaneOrTab in browser muscle memory.)
@@ -818,7 +819,7 @@ mod tests {
             ("Ctrl+Alt+G", Action::OpenAgent),
             // Block-history palette (Ctrl+R is bash readline, so we use Ctrl+Shift+H).
             ("Ctrl+Shift+H", Action::HistoryPalette),
-            // Cross-block ripgrep palette.
+            // Cross-block search palette.
             ("Ctrl+Shift+G", Action::CrossBlockSearch),
             // Workflows palette (parameterized templates).
             ("Ctrl+Shift+M", Action::WorkflowsPalette),
@@ -833,6 +834,14 @@ mod tests {
                 None => panic!("{chord} is unbound in the default map"),
             }
         }
+    }
+
+    #[test]
+    fn cross_block_search_action_copy_describes_built_in_search() {
+        assert_eq!(
+            Action::CrossBlockSearch.name(),
+            "Search blocks (substring/regex)"
+        );
     }
 
     /// Shared ergonomic contract used by anvil..4. Project-specific actions

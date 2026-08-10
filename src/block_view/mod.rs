@@ -192,7 +192,7 @@ fn mutate_block_data_and_redraw<R>(
 }
 
 /// Update the jump-to-bottom FAB's label to show an unread-block badge: just the
-/// chevron when nothing is pending, chevron + count (clamped to "99+") otherwise.
+/// arrow when nothing is pending, arrow + count (clamped to "99+") otherwise.
 fn set_jump_fab_label(fab: &gtk4::Button, unread: u32) {
     if unread > 0 {
         let n = if unread > 99 {
@@ -200,9 +200,13 @@ fn set_jump_fab_label(fab: &gtk4::Button, unread: u32) {
         } else {
             unread.to_string()
         };
-        fab.set_label(&format!("\u{f078}  {}", n));
+        fab.set_label(&format!("↓  {n}"));
+        fab.update_property(&[gtk4::accessible::Property::Label(&format!(
+            "Jump to latest; {n} unread blocks"
+        ))]);
     } else {
-        fab.set_label("\u{f078}");
+        fab.set_label("↓");
+        fab.update_property(&[gtk4::accessible::Property::Label("Jump to latest")]);
     }
 }
 
@@ -396,6 +400,83 @@ const MAX_COMMAND_CAPTURE_BYTES: usize = crate::review_input::MAX_REVIEW_INPUT_B
 const MAX_TYPED_COMMAND_SHADOW_BYTES: usize = MAX_COMMAND_CAPTURE_BYTES;
 const MAX_PROMPT_CAPTURE_BYTES: usize = 64 * 1024;
 const MAX_SELECTED_CLIPBOARD_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClipboardTextTooLarge {
+    bytes: usize,
+    limit: usize,
+}
+
+impl std::fmt::Display for ClipboardTextTooLarge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "clipboard text is {} bytes; the limit is {} bytes",
+            self.bytes, self.limit
+        )
+    }
+}
+
+/// Build one clipboard payload without ever retaining an over-limit prefix.
+///
+/// Sections are atomic: if a later chunk would cross the limit, its separator
+/// and every chunk already appended for that section are rolled back. Callers
+/// can therefore reject the whole copy instead of publishing a syntactically
+/// partial block or Markdown document.
+pub(crate) struct BoundedClipboardAccumulator {
+    text: String,
+    limit: usize,
+}
+
+impl BoundedClipboardAccumulator {
+    pub(crate) fn new() -> Self {
+        Self::with_limit(MAX_SELECTED_CLIPBOARD_BYTES)
+    }
+
+    const fn with_limit(limit: usize) -> Self {
+        Self {
+            text: String::new(),
+            limit,
+        }
+    }
+
+    pub(crate) fn append(&mut self, value: &str) -> Result<(), ClipboardTextTooLarge> {
+        let bytes = self.text.len().saturating_add(value.len());
+        if bytes > self.limit {
+            return Err(ClipboardTextTooLarge {
+                bytes,
+                limit: self.limit,
+            });
+        }
+        self.text.push_str(value);
+        Ok(())
+    }
+
+    pub(crate) fn append_section<F>(
+        &mut self,
+        separator: &str,
+        append: F,
+    ) -> Result<(), ClipboardTextTooLarge>
+    where
+        F: FnOnce(&mut Self) -> Result<(), ClipboardTextTooLarge>,
+    {
+        let previous_len = self.text.len();
+        let result = (|| {
+            if previous_len != 0 {
+                self.append(separator)?;
+            }
+            append(self)
+        })();
+        if result.is_err() {
+            self.text.truncate(previous_len);
+        }
+        result
+    }
+
+    pub(crate) fn into_string(self) -> String {
+        self.text
+    }
+}
 
 fn command_id_uses_shell_token(id: &str, token: &str) -> bool {
     !token.is_empty()
@@ -1068,6 +1149,58 @@ fn build_clipboard_paste(text: &str, bracketed_paste: bool) -> Paste {
     )
 }
 
+/// Reject a clipboard value before `pty_input` normalizes and copies it into
+/// its body, echo shadow, and wire buffer. Normalization and control stripping
+/// never increase the byte length, so raw UTF-8 bytes plus framing are a safe
+/// upper bound on the single PTY message that encoding can produce.
+fn preflight_clipboard_paste(
+    text: &str,
+    bracketed_paste: bool,
+) -> Result<(), crate::pty::PtyWriteError> {
+    let framing_bytes = if bracketed_paste && !text.is_empty() {
+        pty_input::PASTE_START.len() + pty_input::PASTE_END.len()
+    } else {
+        0
+    };
+    let bytes = text.len().saturating_add(framing_bytes);
+    if bytes > crate::pty::MAX_PTY_INPUT_MESSAGE_BYTES {
+        return Err(crate::pty::PtyWriteError::TooLarge {
+            bytes,
+            limit: crate::pty::MAX_PTY_INPUT_MESSAGE_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn show_clipboard_failure(parent: &impl IsA<gtk4::Widget>, heading: &str, detail: &str) {
+    let dialog = gtk4::AlertDialog::builder()
+        .modal(true)
+        .message(heading)
+        .detail(detail)
+        .build();
+    dialog.set_buttons(&["OK"]);
+    dialog.set_default_button(0);
+    dialog.set_cancel_button(0);
+    let parent = parent
+        .root()
+        .and_then(|root| root.downcast::<gtk4::Window>().ok());
+    dialog.show(parent.as_ref());
+}
+
+fn publish_bounded_clipboard(terminal: &Terminal, text: Result<String, ClipboardTextTooLarge>) {
+    match text {
+        Ok(text) => terminal.clipboard().set_text(&text),
+        Err(error) => {
+            log::warn!("refused oversized Block clipboard copy: {error}");
+            show_clipboard_failure(
+                terminal,
+                "Copy failed",
+                &format!("{error}. Nothing was copied."),
+            );
+        }
+    }
+}
+
 fn history_edge_navigation_available(state: BlockState, editor_dirty: bool) -> bool {
     !editor_dirty
         && !matches!(
@@ -1110,75 +1243,112 @@ where
     output
 }
 
-fn append_bounded_clipboard_section(output: &mut String, separator: &str, part: &str) -> bool {
-    let Some(next_len) = output
-        .len()
-        .checked_add(separator.len())
-        .and_then(|length| length.checked_add(part.len()))
-    else {
-        return false;
-    };
-    if next_len > MAX_SELECTED_CLIPBOARD_BYTES {
-        return false;
+fn append_block_clipboard_text(
+    output: &mut BoundedClipboardAccumulator,
+    command: &str,
+    block_output: &str,
+    output_only: bool,
+) -> Result<(), ClipboardTextTooLarge> {
+    if output_only || command.trim().is_empty() {
+        output.append(block_output)
+    } else if block_output.trim().is_empty() {
+        output.append(command)
+    } else {
+        output.append(command)?;
+        output.append("\n")?;
+        output.append(block_output)
     }
-    output.push_str(separator);
-    output.push_str(part);
-    true
 }
 
-fn selected_clipboard_text<'a, I, F>(blocks: I, selected: &HashSet<u64>, mut render: F) -> String
+fn selected_clipboard_text<'a, I, F>(
+    blocks: I,
+    selected: &HashSet<u64>,
+    mut render: F,
+) -> Result<String, ClipboardTextTooLarge>
 where
     I: IntoIterator<Item = &'a BlockData>,
-    F: FnMut(&BlockData) -> String,
+    F: FnMut(&BlockData, &mut BoundedClipboardAccumulator) -> Result<(), ClipboardTextTooLarge>,
 {
-    let mut output = String::new();
+    let mut output = BoundedClipboardAccumulator::new();
     for block in blocks {
         if !selected.contains(&block.id) {
             continue;
         }
-        let part = render(block);
-        let separator = if output.is_empty() { "" } else { "\n\n" };
-        if !append_bounded_clipboard_section(&mut output, separator, &part) {
-            // A partial multi-block copy can silently change its meaning.
-            return String::new();
+        output.append_section("\n\n", |output| render(block, output))?;
+    }
+    Ok(output.into_string())
+}
+
+fn append_block_markdown(
+    output: &mut BoundedClipboardAccumulator,
+    block: &BlockData,
+) -> Result<(), ClipboardTextTooLarge> {
+    if block.is_background() {
+        output.append("## Background Output\n\n")?;
+    } else {
+        output.append("## Command Block\n\n")?;
+        if !block.prompt.is_empty() {
+            output.append("**Prompt:** `")?;
+            output.append(&block.prompt)?;
+            output.append("`\n\n")?;
+        }
+        output.append("**Command:**\n```bash\n")?;
+        output.append(&block.cmd)?;
+        output.append("\n```\n\n")?;
+    }
+
+    if !block.output.is_empty() {
+        output.append("**Output:**\n```\n")?;
+        output.append(&block.output)?;
+        output.append("\n```\n\n")?;
+    }
+
+    if !block.is_background() {
+        match block.exit_code {
+            Some(code) => output.append(&format!("**Exit Code:** {code}\n\n"))?,
+            None => output.append("**Exit Code:** unknown (the shell reported none)\n\n")?,
         }
     }
-    output
+
+    if let Some(duration_ms) = block.duration_ms {
+        output.append(&format!(
+            "**Duration:** {:.3}s\n\n",
+            duration_ms as f64 / 1000.0
+        ))?;
+    }
+    Ok(())
+}
+
+fn block_markdown(block: &BlockData) -> Result<String, ClipboardTextTooLarge> {
+    let mut output = BoundedClipboardAccumulator::new();
+    append_block_markdown(&mut output, block)?;
+    Ok(output.into_string())
 }
 
 /// Markdown for all selected blocks in terminal order. The clicked block is a
 /// defensive fallback for the instant before a context-click selection is
 /// reflected in the shared set.
-fn selected_blocks_markdown<'a, I>(blocks: I, selected: &HashSet<u64>, clicked_id: u64) -> String
+fn selected_blocks_markdown<'a, I>(
+    blocks: I,
+    selected: &HashSet<u64>,
+    clicked_id: u64,
+) -> Result<String, ClipboardTextTooLarge>
 where
     I: IntoIterator<Item = &'a BlockData>,
 {
-    let mut output = String::new();
-    let mut selected_count = 0usize;
-    let mut clicked_part = None;
+    let mut output = BoundedClipboardAccumulator::new();
     for block in blocks {
-        if block.id != clicked_id && !selected.contains(&block.id) {
+        let include = if selected.is_empty() {
+            block.id == clicked_id
+        } else {
+            selected.contains(&block.id)
+        };
+        if !include {
             continue;
         }
-        let part = block.to_markdown();
-        if block.id == clicked_id {
-            clicked_part = Some(part.clone());
-        }
-        if selected.contains(&block.id) {
-            selected_count += 1;
-            let separator = if output.is_empty() { "" } else { "---\n\n" };
-            if !append_bounded_clipboard_section(&mut output, separator, &part) {
-                return String::new();
-            }
-        }
+        output.append_section("---\n\n", |output| append_block_markdown(output, block))?;
     }
-    if selected_count == 0 {
-        clicked_part
-            .filter(|part| part.len() <= MAX_SELECTED_CLIPBOARD_BYTES)
-            .unwrap_or_default()
-    } else {
-        output
-    }
+    Ok(output.into_string())
 }
 
 /// A clear operation only replaces the single-level undo slot when it actually
@@ -1675,11 +1845,32 @@ fn remove_finished_block_from_selection(
     selection_anchor_id: &Rc<Cell<Option<u64>>>,
     removed_id: u64,
 ) {
-    selected_block_ids.borrow_mut().remove(&removed_id);
+    remove_finished_blocks_from_selection(
+        finished,
+        selected_block_ids,
+        selected_block_id,
+        selection_anchor_id,
+        &[removed_id],
+    );
+}
+
+fn remove_finished_blocks_from_selection(
+    finished: &[FinishedBlock],
+    selected_block_ids: &SelectedBlockIds,
+    selected_block_id: &Rc<Cell<Option<u64>>>,
+    selection_anchor_id: &Rc<Cell<Option<u64>>>,
+    removed_ids: &[u64],
+) {
+    {
+        let mut selected = selected_block_ids.borrow_mut();
+        for id in removed_ids {
+            selected.remove(id);
+        }
+    }
     let active_missing = selected_block_id
         .get()
         .is_some_and(|active| !selected_block_ids.borrow().contains(&active));
-    if selected_block_id.get() == Some(removed_id) || active_missing {
+    if active_missing {
         let fallback = {
             let selected = selected_block_ids.borrow();
             finished
@@ -1693,7 +1884,7 @@ fn remove_finished_block_from_selection(
     let anchor_missing = selection_anchor_id
         .get()
         .is_some_and(|anchor| !selected_block_ids.borrow().contains(&anchor));
-    if selection_anchor_id.get() == Some(removed_id) || anchor_missing {
+    if anchor_missing {
         selection_anchor_id.set(selected_block_id.get());
     }
     sync_finished_block_selection(finished, selected_block_ids, selected_block_id);
@@ -3596,9 +3787,9 @@ impl ReaderCtx {
                                             let text = selected_clipboard_text(
                                                 blocks.iter(),
                                                 &selected,
-                                                |block| strip_ansi(&block.output),
+                                                |block, output| output.append(&block.output),
                                             );
-                                            vte_for_action.clipboard().set_text(&text);
+                                            publish_bounded_clipboard(&vte_for_action, text);
                                         });
                                         vbox.append(&item);
                                     }
@@ -3624,15 +3815,16 @@ impl ReaderCtx {
                                             let text = selected_clipboard_text(
                                                 blocks.iter(),
                                                 &selected,
-                                                |block| {
-                                                    block_clipboard_text(
+                                                |block, output| {
+                                                    append_block_clipboard_text(
+                                                        output,
                                                         &block.cmd,
-                                                        &strip_ansi(&block.output),
+                                                        &block.output,
                                                         false,
                                                     )
                                                 },
                                             );
-                                            vte_for_action.clipboard().set_text(&text);
+                                            publish_bounded_clipboard(&vte_for_action, text);
                                         });
                                         vbox.append(&item);
                                     }
@@ -3660,7 +3852,7 @@ impl ReaderCtx {
                                                 &selected,
                                                 block_id,
                                             );
-                                            vte_for_action.clipboard().set_text(&text);
+                                            publish_bounded_clipboard(&vte_for_action, text);
                                         });
                                         vbox.append(&item);
                                     }
@@ -3880,8 +4072,10 @@ impl ReaderCtx {
                                             if let Some(block) =
                                                 blocks.iter().find(|b| b.id == block_id_md)
                                             {
-                                                let markdown = block.to_markdown();
-                                                vte_for_md.clipboard().set_text(&markdown);
+                                                publish_bounded_clipboard(
+                                                    &vte_for_md,
+                                                    block_markdown(block),
+                                                );
                                             }
                                         });
                                         vbox.append(&item);
@@ -3952,27 +4146,45 @@ impl ReaderCtx {
                                     &selection_anchor_id_rc,
                                 );
 
-                                while finished_blocks_for_cb.borrow().len() > max_blocks {
-                                    let oldest = finished_blocks_for_cb.borrow_mut().remove(0);
-                                    remove_finished_block_from_selection(
+                                let excess = finished_blocks_for_cb
+                                    .borrow()
+                                    .len()
+                                    .saturating_sub(max_blocks);
+                                if excess > 0 {
+                                    // One Vec shift, one selection/CSS pass, and
+                                    // one visible-index remap even when a config
+                                    // reduction evicts thousands of old blocks.
+                                    let evicted: Vec<_> = finished_blocks_for_cb
+                                        .borrow_mut()
+                                        .drain(..excess)
+                                        .collect();
+                                    let evicted_ids: Vec<_> =
+                                        evicted.iter().map(|block| block.id).collect();
+                                    remove_finished_blocks_from_selection(
                                         &finished_blocks_for_cb.borrow(),
                                         &selected_block_ids_rc,
                                         &selected_block_id_rc,
                                         &selection_anchor_id_rc,
-                                        oldest.id,
+                                        &evicted_ids,
                                     );
-                                    bookmarks_for_cb.borrow_mut().remove(&oldest.id);
+                                    {
+                                        let mut bookmarks = bookmarks_for_cb.borrow_mut();
+                                        for id in &evicted_ids {
+                                            bookmarks.remove(id);
+                                        }
+                                    }
                                     {
                                         let mut visible = visible_indices_rc.borrow_mut();
-                                        let shifted = visible
+                                        *visible = visible
                                             .iter()
-                                            .filter_map(|&i| i.checked_sub(1))
+                                            .filter_map(|&index| index.checked_sub(excess))
                                             .collect();
-                                        *visible = shifted;
                                     }
-                                    let widget_to_release = oldest.widget().clone();
-                                    block_list_rc.remove(&widget_to_release);
-                                    widget_pool_for_cb.borrow_mut().release(widget_to_release);
+                                    for oldest in evicted {
+                                        let widget_to_release = oldest.widget().clone();
+                                        block_list_rc.remove(&widget_to_release);
+                                        widget_pool_for_cb.borrow_mut().release(widget_to_release);
+                                    }
                                 }
 
                                 if block_data_for_cb.borrow().len() > max_blocks {
@@ -5706,14 +5918,15 @@ impl TermView {
         let jump_fab = gtk4::Button::new();
         jump_fab.add_css_class("jump-bottom-fab");
         jump_fab.add_css_class("flat");
-        jump_fab.set_label("\u{f078}"); // nf-fa-chevron_down
+        jump_fab.set_label("↓");
         jump_fab.set_tooltip_text(Some("Jump to latest"));
+        jump_fab.update_property(&[gtk4::accessible::Property::Label("Jump to latest")]);
         jump_fab.set_halign(gtk4::Align::End);
         jump_fab.set_valign(gtk4::Align::End);
         jump_fab.set_margin_end(18);
         jump_fab.set_margin_bottom(18);
         jump_fab.set_visible(false);
-        jump_fab.set_can_focus(false);
+        jump_fab.set_focusable(true);
 
         // ── Sticky running-command header ─────────────────────────────────
         // When a command is running and the user has scrolled up into history,
@@ -5724,25 +5937,34 @@ impl TermView {
         sticky_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         sticky_label.set_hexpand(true);
         sticky_label.add_css_class("sticky-running-label");
-        let sticky_jump_bottom_btn = gtk4::Button::with_label("\u{f103}");
+        let sticky_jump_bottom_btn = gtk4::Button::from_icon_name("go-bottom-symbolic");
         sticky_jump_bottom_btn.set_tooltip_text(Some("Jump to bottom of this block"));
+        sticky_jump_bottom_btn.update_property(&[gtk4::accessible::Property::Label(
+            "Jump to bottom of this block",
+        )]);
         sticky_jump_bottom_btn.add_css_class("sticky-header-control");
         sticky_jump_bottom_btn.add_css_class("flat");
-        sticky_jump_bottom_btn.set_focusable(false);
+        sticky_jump_bottom_btn.set_focusable(true);
         sticky_jump_bottom_btn.set_visible(false);
-        let sticky_minimize_btn = gtk4::Button::with_label("\u{f077}");
+        let sticky_minimize_btn = gtk4::Button::from_icon_name("pan-up-symbolic");
         sticky_minimize_btn.set_tooltip_text(Some("Minimize sticky command header"));
+        sticky_minimize_btn.update_property(&[gtk4::accessible::Property::Label(
+            "Minimize sticky command header",
+        )]);
         sticky_minimize_btn.add_css_class("sticky-header-control");
         sticky_minimize_btn.add_css_class("flat");
-        sticky_minimize_btn.set_focusable(false);
+        sticky_minimize_btn.set_focusable(true);
         // Interrupt without hunting for terminal focus: while reading history
         // above a running command, one click sends Ctrl+C. Wired to the PTY
         // further down, once it exists.
-        let sticky_stop_btn = gtk4::Button::with_label("\u{f04d}");
+        let sticky_stop_btn = gtk4::Button::from_icon_name("process-stop-symbolic");
         sticky_stop_btn.set_tooltip_text(Some("Interrupt the running command (Ctrl+C)"));
+        sticky_stop_btn.update_property(&[gtk4::accessible::Property::Label(
+            "Interrupt the running command",
+        )]);
         sticky_stop_btn.add_css_class("sticky-header-control");
         sticky_stop_btn.add_css_class("flat");
-        sticky_stop_btn.set_focusable(false);
+        sticky_stop_btn.set_focusable(true);
         sticky_stop_btn.set_visible(false);
         let sticky_organism_slot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         sticky_organism_slot.set_can_target(false);
@@ -5758,7 +5980,9 @@ impl TermView {
         sticky_bar.set_halign(gtk4::Align::Fill);
         sticky_bar.set_valign(gtk4::Align::Start);
         sticky_bar.set_visible(false);
-        sticky_bar.set_can_focus(false);
+        // The container itself is not a focus stop, but its visible action
+        // buttons remain in the keyboard focus chain.
+        sticky_bar.set_focusable(false);
         let sticky_target_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         let sticky_minimized: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         {
@@ -5783,12 +6007,18 @@ impl TermView {
                 }
                 if now {
                     bar.add_css_class("sticky-minimized");
-                    button.set_label("\u{f078}");
+                    button.set_icon_name("pan-down-symbolic");
                     button.set_tooltip_text(Some("Expand sticky command header"));
+                    button.update_property(&[gtk4::accessible::Property::Label(
+                        "Expand sticky command header",
+                    )]);
                 } else {
                     bar.remove_css_class("sticky-minimized");
-                    button.set_label("\u{f077}");
+                    button.set_icon_name("pan-up-symbolic");
                     button.set_tooltip_text(Some("Minimize sticky command header"));
+                    button.update_property(&[gtk4::accessible::Property::Label(
+                        "Minimize sticky command header",
+                    )]);
                 }
             });
         }
@@ -6205,8 +6435,9 @@ impl TermView {
         // appears only once bytes are actually parked (a plain click on the
         // live surface must not flash it) and disappears on flush.
         {
-            let hold_badge = gtk4::Label::new(Some("\u{f04c}  Output paused — selection"));
+            let hold_badge = gtk4::Label::new(Some("Ⅱ  Output paused — selection"));
             hold_badge.add_css_class("feed-hold-badge");
+            hold_badge.set_accessible_role(gtk4::AccessibleRole::Status);
             hold_badge.set_tooltip_text(Some(
                 "Streaming output is held so your selection survives. Copy it, \
                  click elsewhere, or wait a few seconds to resume.",
@@ -6216,7 +6447,7 @@ impl TermView {
             hold_badge.set_margin_start(14);
             hold_badge.set_margin_bottom(14);
             hold_badge.set_visible(false);
-            hold_badge.set_can_focus(false);
+            hold_badge.set_focusable(false);
             scroll_overlay.add_overlay(&hold_badge);
             let badge = hold_badge.downgrade();
             selection_feed_hold.set_state_listener(move |parked| {
@@ -7481,19 +7712,6 @@ impl TermView {
         true
     }
 
-    fn clear_block_selection_for_input(&self) {
-        if self.selected_block_id.get().is_none() {
-            return;
-        }
-        let finished = self.finished_blocks.borrow();
-        clear_finished_block_selection(
-            &finished,
-            &self.selected_block_ids,
-            &self.selected_block_id,
-            &self.selection_anchor_id,
-        );
-    }
-
     /// Send key bytes into the PTY (user input).
     #[must_use = "terminal input may be rejected by bounded nonblocking backpressure"]
     pub fn write_input(&self, data: &[u8]) -> Result<(), crate::pty::PtyWriteError> {
@@ -7822,16 +8040,29 @@ impl TermView {
 
         // Native and cross-block text selections are collected in document order:
         // command VTE, output VTE, then the live input surface.
-        if let Some(text) = self.cross_selection.copy_text() {
-            log::debug!(
-                ">>> TermView copy: got {} chars from visible text selection",
-                text.len()
-            );
-            self.active_vte.clipboard().set_text(&text);
-            // The selection is captured; resume any feed parked to keep it
-            // alive while the command kept streaming.
-            self.selection_feed_hold.flush_now();
-            return;
+        match self.cross_selection.copy_text() {
+            Ok(Some(text)) => {
+                log::debug!(
+                    ">>> TermView copy: got {} chars from visible text selection",
+                    text.len()
+                );
+                self.active_vte.clipboard().set_text(&text);
+                // The selection is captured; resume any feed parked to keep it
+                // alive while the command kept streaming.
+                self.selection_feed_hold.flush_now();
+                return;
+            }
+            Err(error) => {
+                log::warn!("refused oversized cross-VTE clipboard copy: {error}");
+                show_clipboard_failure(
+                    &self.active_vte,
+                    "Copy failed",
+                    &format!("{error}. Nothing was copied."),
+                );
+                self.selection_feed_hold.flush_now();
+                return;
+            }
+            Ok(None) => {}
         }
 
         // Whole-block selection (Warp's CopyBlock; +Alt -> output only).
@@ -7840,16 +8071,28 @@ impl TermView {
             let selected = self.selected_block_ids.borrow();
             if !selected.is_empty() {
                 let data = self.block_data.borrow();
-                let parts: Vec<String> = data
-                    .iter()
-                    .filter(|block| selected.contains(&block.id))
-                    .map(|block| block_clipboard_text(&block.cmd, &block.output, alt_held))
-                    .collect();
-                if !parts.is_empty() {
-                    let text = parts.join("\n\n");
+                let mut text = BoundedClipboardAccumulator::new();
+                let mut count = 0usize;
+                for block in data.iter().filter(|block| selected.contains(&block.id)) {
+                    let result = text.append_section("\n\n", |text| {
+                        append_block_clipboard_text(text, &block.cmd, &block.output, alt_held)
+                    });
+                    if let Err(error) = result {
+                        log::warn!("refused oversized whole-Block clipboard copy: {error}");
+                        show_clipboard_failure(
+                            &self.active_vte,
+                            "Copy failed",
+                            &format!("{error}. Nothing was copied."),
+                        );
+                        return;
+                    }
+                    count += 1;
+                }
+                if count != 0 {
+                    let text = text.into_string();
                     log::debug!(
                         ">>> TermView copy: copied {} selected blocks ({} chars)",
-                        parts.len(),
+                        count,
                         text.len()
                     );
                     self.active_vte.clipboard().set_text(&text);
@@ -7870,13 +8113,6 @@ impl TermView {
     /// the clipboard ourselves, update the shared editor guards, and preserve
     /// bracketed-paste framing in one queued PTY write.
     pub fn paste_from_clipboard(&self) {
-        // Pasting is an explicit return to the live editor. Without clearing the
-        // card selection, the next Enter is intercepted as “recall selected
-        // command” instead of submitting the pasted text.
-        self.selection_feed_hold.flush_now();
-        self.clear_block_selection_for_input();
-        self.active.borrow().grab_focus();
-
         let clipboard = self.active_vte.clipboard();
         let pty = self.pty.clone();
         let bracketed_paste = self.bracketed_paste.clone();
@@ -7893,17 +8129,31 @@ impl TermView {
         let selected_block_id = self.selected_block_id.clone();
         let selection_anchor_id = self.selection_anchor_id.clone();
         let active = self.active.clone();
+        let active_vte = self.active_vte.downgrade();
+        let selection_feed_hold = self.selection_feed_hold.clone();
         let human_input_callbacks = self.human_input_callbacks.clone();
         clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
             let Ok(Some(text)) = result else {
                 return;
             };
-            let text = text.to_string();
             if text.is_empty() {
                 return;
             }
 
-            let paste = build_clipboard_paste(&text, bracketed_paste.get());
+            let bracketed_paste = bracketed_paste.get();
+            if let Err(error) = preflight_clipboard_paste(text.as_str(), bracketed_paste) {
+                log::warn!("refused oversized clipboard paste: {error}");
+                if let Some(active_vte) = active_vte.upgrade() {
+                    show_clipboard_failure(
+                        &active_vte,
+                        "Paste failed",
+                        &format!("{error}. Nothing was pasted."),
+                    );
+                }
+                return;
+            }
+
+            let paste = build_clipboard_paste(text.as_str(), bracketed_paste);
             if paste.is_empty() {
                 return;
             }
@@ -7958,6 +8208,10 @@ impl TermView {
             }
             accepted_input_generation.set(accepted_input_generation.get().wrapping_add(1));
             emit_accepted_input(&human_input_callbacks, InputOrigin::Clipboard);
+            // Queue admission is the paste commit point. Only now may the
+            // operation leave a selected Block and resume a parked live feed;
+            // rejected/oversized clipboard input must not mutate UI state.
+            selection_feed_hold.flush_now();
             if selected_block_id.get().is_some() {
                 let finished = finished_blocks.borrow();
                 clear_finished_block_selection(
@@ -8655,10 +8909,11 @@ mod tests {
         history_edge_navigation_available, input_is_typeahead_for_existing_submission,
         input_may_survive_into_next_prompt, input_submits_line, mutate_block_data_and_redraw,
         next_prompt_shadow_state, normalize_captured_command, normalize_loaded_block_ids,
-        notification_allowed, output_has_vertical_repaint, parse_color_spec, prepend_in_order,
-        prompt_anchor_may_settle, prompt_layout_reflow_can_reanchor, prompt_surface_is_clean,
-        rebase_prompt_anchor, record_external_input, record_protocol_reply_input,
-        replace_nonempty_stash, resolve_command_for_block, resolve_submitted_command,
+        notification_allowed, output_has_vertical_repaint, parse_color_spec,
+        preflight_clipboard_paste, prepend_in_order, prompt_anchor_may_settle,
+        prompt_layout_reflow_can_reanchor, prompt_surface_is_clean, rebase_prompt_anchor,
+        record_external_input, record_protocol_reply_input, replace_nonempty_stash,
+        resolve_command_for_block, resolve_submitted_command,
         reviewed_pre_command_bytes_are_identity_neutral, reviewed_submission_matches,
         scroll_delta_to_reveal, selected_blocks_markdown, selected_command_text, selected_id_range,
         shell_argv_supports_agent_ids, shell_argv_uses_jsh, should_buffer_background_output,
@@ -8666,11 +8921,12 @@ mod tests {
         take_background_output, take_stash_for_undo, truncate_plain_output_for_height,
         verified_editor_contains_exact_command, viewport_page_size_changed,
         viewport_state_for_scroll, visible_indices_for_viewport, AgentCommandEndDecision,
-        BlockData, BlockState, BoundedByteRing, CommandFinishedEvent, CommandIdCorrelation,
-        CommandMeta, CommandPromptStatus, CommandStartedEvent, DynamicColors, HumanInputKind,
-        InputOrigin, PendingCommandMeta, TypedShadowFidelity, ViewportState,
+        BlockData, BlockState, BoundedByteRing, BoundedClipboardAccumulator, CommandFinishedEvent,
+        CommandIdCorrelation, CommandMeta, CommandPromptStatus, CommandStartedEvent, DynamicColors,
+        HumanInputKind, InputOrigin, PendingCommandMeta, TypedShadowFidelity, ViewportState,
         MAX_COMMAND_CAPTURE_BYTES, MAX_JOURNAL_OUTPUT_BYTES, MAX_PROMPT_CAPTURE_BYTES,
-        MAX_RAW_OUTPUT_BYTES, TRUNCATED_COMMAND_PLACEHOLDER, UNAVAILABLE_COMMAND_PLACEHOLDER,
+        MAX_RAW_OUTPUT_BYTES, MAX_SELECTED_CLIPBOARD_BYTES, TRUNCATED_COMMAND_PLACEHOLDER,
+        UNAVAILABLE_COMMAND_PLACEHOLDER,
     };
     use crate::parser::{ColorKind, KeyboardProtocolQuery, ParserEvent};
     use crate::pty::PtyForeground;
@@ -10011,14 +10267,15 @@ mod tests {
         let ignored = block_with_height(10);
         let selected = HashSet::from([1, 2]);
 
-        let markdown = selected_blocks_markdown([&first, &second, &ignored], &selected, 2);
+        let markdown = selected_blocks_markdown([&first, &second, &ignored], &selected, 2).unwrap();
         let first_pos = markdown.find("printf one").unwrap();
         let second_pos = markdown.find("printf two").unwrap();
         assert!(first_pos < second_pos);
         assert_eq!(markdown.matches("## Command Block").count(), 2);
         assert!(markdown.contains("\n\n---\n\n"));
 
-        let fallback = selected_blocks_markdown([&first, &second], &HashSet::new(), second.id);
+        let fallback =
+            selected_blocks_markdown([&first, &second], &HashSet::new(), second.id).unwrap();
         assert!(!fallback.contains("printf one"));
         assert!(fallback.contains("printf two"));
     }
@@ -10743,6 +11000,70 @@ mod tests {
             build_clipboard_paste("one\ntwo", true).bytes.as_slice(),
             b"\x1b[200~one\ntwo\x1b[201~"
         );
+    }
+
+    #[test]
+    fn clipboard_paste_preflight_accepts_the_exact_pty_limit_and_rejects_limit_plus_one() {
+        let limit = crate::pty::MAX_PTY_INPUT_MESSAGE_BYTES;
+        let exact = "x".repeat(limit);
+        assert_eq!(preflight_clipboard_paste(&exact, false), Ok(()));
+
+        let over = "x".repeat(limit + 1);
+        assert_eq!(
+            preflight_clipboard_paste(&over, false),
+            Err(crate::pty::PtyWriteError::TooLarge {
+                bytes: limit + 1,
+                limit,
+            })
+        );
+    }
+
+    #[test]
+    fn clipboard_paste_preflight_counts_framing_and_utf8_bytes() {
+        let limit = crate::pty::MAX_PTY_INPUT_MESSAGE_BYTES;
+        let framing = crate::pty_input::PASTE_START.len() + crate::pty_input::PASTE_END.len();
+        let body_limit = limit - framing;
+        let mut exact = "界".repeat(body_limit / "界".len());
+        exact.push_str(&"x".repeat(body_limit - exact.len()));
+        assert_eq!(exact.len(), body_limit);
+        assert_eq!(preflight_clipboard_paste(&exact, true), Ok(()));
+
+        exact.push('界');
+        assert_eq!(
+            preflight_clipboard_paste(&exact, true),
+            Err(crate::pty::PtyWriteError::TooLarge {
+                bytes: limit + "界".len(),
+                limit,
+            })
+        );
+    }
+
+    #[test]
+    fn bounded_clipboard_accepts_exact_limit_and_rejects_limit_plus_one() {
+        let limit = MAX_SELECTED_CLIPBOARD_BYTES;
+        let source = "x".repeat(limit + 1);
+        let mut clipboard = BoundedClipboardAccumulator::new();
+        clipboard.append(&source[..limit]).unwrap();
+        let error = clipboard.append("x").unwrap_err();
+        assert_eq!(error.bytes, limit + 1);
+        assert_eq!(error.limit, limit);
+        assert_eq!(clipboard.into_string().len(), limit);
+    }
+
+    #[test]
+    fn bounded_clipboard_keeps_multiblock_sections_atomic_at_utf8_boundary() {
+        let expected = "界\n\n好";
+        let mut clipboard = BoundedClipboardAccumulator::with_limit(expected.len());
+        clipboard
+            .append_section("\n\n", |clipboard| clipboard.append("界"))
+            .unwrap();
+        clipboard
+            .append_section("\n\n", |clipboard| clipboard.append("好"))
+            .unwrap();
+        assert!(clipboard
+            .append_section("\n\n", |clipboard| clipboard.append("x"))
+            .is_err());
+        assert_eq!(clipboard.into_string(), expected);
     }
 
     #[test]

@@ -782,7 +782,7 @@ impl Config {
         Self {
             window_opacity: 0.95,
             terminal_scrollback_lines: 5_000,
-            font_desc: "SauceCodePro Nerd Font Mono 14".to_string(),
+            font_desc: "Monospace 14".to_string(),
             default_font_scale: 1.0,
             theme_name: theme.name.clone(),
             foreground: theme.foreground,
@@ -971,6 +971,124 @@ pub(crate) fn builtin_themes() -> Vec<Theme> {
     ];
     CACHED.with(|c| *c.borrow_mut() = Some(themes.clone()));
     themes
+}
+
+/// WCAG contrast target for ordinary UI text. ANSI colors inside the terminal
+/// remain byte-for-byte theme colors; this applies only when those hues are
+/// reused as labels, badges, and status indicators on Forge chrome.
+pub(crate) const UI_TEXT_MIN_CONTRAST: f64 = 4.5;
+
+fn relative_luminance(color: &RGBA) -> f64 {
+    fn linear(channel: f32) -> f64 {
+        let channel = f64::from(channel.clamp(0.0, 1.0));
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    0.2126 * linear(color.red()) + 0.7152 * linear(color.green()) + 0.0722 * linear(color.blue())
+}
+
+pub(crate) fn contrast_ratio(first: &RGBA, second: &RGBA) -> f64 {
+    let first = relative_luminance(first);
+    let second = relative_luminance(second);
+    let (lighter, darker) = if first >= second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+fn mix_color(from: &RGBA, to: &RGBA, amount: f32) -> RGBA {
+    let amount = amount.clamp(0.0, 1.0);
+    let mix = |start: f32, end: f32| start + (end - start) * amount;
+    RGBA::new(
+        mix(from.red(), to.red()),
+        mix(from.green(), to.green()),
+        mix(from.blue(), to.blue()),
+        1.0,
+    )
+}
+
+/// Preserve a preferred semantic hue when it is readable, otherwise move the
+/// smallest sampled distance toward the theme foreground. A black/white
+/// fallback guarantees a result even for a user-supplied foreground that is
+/// itself indistinguishable from the background.
+pub(crate) fn accessible_text_color(
+    preferred: &RGBA,
+    background: &RGBA,
+    foreground: &RGBA,
+) -> RGBA {
+    if contrast_ratio(preferred, background) >= UI_TEXT_MIN_CONTRAST {
+        return RGBA::new(preferred.red(), preferred.green(), preferred.blue(), 1.0);
+    }
+
+    let black = RGBA::new(0.0, 0.0, 0.0, 1.0);
+    let white = RGBA::new(1.0, 1.0, 1.0, 1.0);
+    let fallback = if contrast_ratio(foreground, background) >= UI_TEXT_MIN_CONTRAST {
+        RGBA::new(foreground.red(), foreground.green(), foreground.blue(), 1.0)
+    } else if contrast_ratio(&black, background) >= contrast_ratio(&white, background) {
+        black
+    } else {
+        white
+    };
+
+    // Sampling is deterministic, cheap (five colors on a theme change), and
+    // does not assume luminance is monotonic when two colored endpoints have
+    // channels moving in opposite directions.
+    for step in 1..=512 {
+        let candidate = mix_color(preferred, &fallback, step as f32 / 512.0);
+        if contrast_ratio(&candidate, background) >= UI_TEXT_MIN_CONTRAST {
+            return candidate;
+        }
+    }
+    fallback
+}
+
+/// Derive a visually quieter foreground without using alpha transparency.
+///
+/// Alpha-blending ordinary text into the background makes contrast depend on
+/// the surface underneath it and caused several light themes to fall well
+/// below the WCAG target. Instead, walk an opaque readable foreground toward
+/// the background and keep the most-muted sampled color that still passes.
+pub(crate) fn accessible_muted_text_color(foreground: &RGBA, background: &RGBA) -> RGBA {
+    let readable = accessible_text_color(foreground, background, foreground);
+    let mut muted = readable;
+    for step in 1..=512 {
+        let candidate = mix_color(&readable, background, step as f32 / 512.0);
+        if contrast_ratio(&candidate, background) >= UI_TEXT_MIN_CONTRAST {
+            muted = candidate;
+        }
+    }
+    muted
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SemanticColors {
+    pub(crate) foreground: RGBA,
+    pub(crate) muted: RGBA,
+    pub(crate) success: RGBA,
+    pub(crate) error: RGBA,
+    pub(crate) warning: RGBA,
+    pub(crate) accent: RGBA,
+    pub(crate) info: RGBA,
+}
+
+impl Config {
+    pub(crate) fn semantic_colors(&self) -> SemanticColors {
+        SemanticColors {
+            foreground: accessible_text_color(&self.foreground, &self.background, &self.foreground),
+            muted: accessible_muted_text_color(&self.foreground, &self.background),
+            success: accessible_text_color(&self.palette[2], &self.background, &self.foreground),
+            error: accessible_text_color(&self.palette[1], &self.background, &self.foreground),
+            warning: accessible_text_color(&self.palette[3], &self.background, &self.foreground),
+            accent: accessible_text_color(&self.palette[6], &self.background, &self.foreground),
+            info: accessible_text_color(&self.palette[4], &self.background, &self.foreground),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1871,6 +1989,49 @@ pub fn validate_config_contents(contents: &str) -> Result<Vec<ConfigIssue>, toml
     Ok(validate_config_table(&table))
 }
 
+/// A content-free TOML syntax diagnostic suitable for CLI output, logs, and
+/// toast notifications. `toml::de::Error`'s Display implementation may embed a
+/// source excerpt; keep only its parser message and derive line/column from the
+/// byte span ourselves so diagnostics never echo configuration values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConfigSyntaxDiagnostic {
+    pub(crate) line: Option<usize>,
+    pub(crate) column: Option<usize>,
+    pub(crate) message: String,
+}
+
+impl std::fmt::Display for ConfigSyntaxDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.line, self.column) {
+            (Some(line), Some(column)) => {
+                write!(formatter, "line {line}, column {column}: {}", self.message)
+            }
+            _ => formatter.write_str(&self.message),
+        }
+    }
+}
+
+pub(crate) fn config_syntax_diagnostic(
+    contents: &str,
+    error: &toml::de::Error,
+) -> ConfigSyntaxDiagnostic {
+    let location = error.span().map(|span| {
+        let mut offset = span.start.min(contents.len());
+        while offset > 0 && !contents.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        let prefix = &contents[..offset];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let column = prefix.rsplit_once('\n').map_or(prefix, |(_, tail)| tail);
+        (line, column.chars().count() + 1)
+    });
+    ConfigSyntaxDiagnostic {
+        line: location.map(|(line, _)| line),
+        column: location.map(|(_, column)| column),
+        message: crate::review_input::safe_inline_display(error.message(), 512),
+    }
+}
+
 /// Parsed TOML config file structure.
 #[derive(Default)]
 struct FileConfig {
@@ -1965,21 +2126,27 @@ fn record_load_error(message: String) {
     }
 }
 
+fn clear_load_error() {
+    if let Ok(mut slot) = CONFIG_LOAD_ERROR.lock() {
+        *slot = None;
+    }
+}
+
 /// The most recent reason the configuration file could not be read.
 pub(crate) fn load_error() -> Option<String> {
     CONFIG_LOAD_ERROR.lock().ok().and_then(|slot| slot.clone())
 }
 
 fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision>) {
+    clear_load_error();
     let path = config_file_path();
+    let display_path =
+        || crate::review_input::safe_inline_display(&path.to_string_lossy(), 2 * 1024);
     let bytes = match crate::config_store::read_config_bytes(&path) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
             return (
-                FileConfig {
-                    remote_hosts: default_remote_hosts(),
-                    ..Default::default()
-                },
+                FileConfig::default(),
                 Some(crate::config_store::ConfigRevision::missing()),
             );
         }
@@ -1987,66 +2154,68 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
             // A log line is invisible to someone whose theme, keybindings and
             // remote hosts have all silently reverted to the defaults. Keep
             // the reason where the window can put it on screen.
-            record_load_error(format!(
-                "{}: {error}",
-                crate::review_input::safe_inline_display(&path.to_string_lossy(), 2 * 1024)
-            ));
-            log::warn!(
-                "Failed to read config file {}: {error}",
-                crate::review_input::safe_inline_display(&path.to_string_lossy(), 2 * 1024)
-            );
-            return (
-                FileConfig {
-                    remote_hosts: default_remote_hosts(),
-                    ..Default::default()
-                },
-                None,
-            );
+            record_load_error(format!("{}: {error}", display_path()));
+            log::warn!("Failed to read config file {}: {error}", display_path());
+            return (FileConfig::default(), None);
         }
     };
     let revision = crate::config_store::ConfigRevision::from_bytes(&bytes);
     let Ok(contents) = std::str::from_utf8(&bytes) else {
-        log::warn!(
-            "Config file {} is not valid UTF-8",
-            crate::review_input::safe_inline_display(&path.to_string_lossy(), 2 * 1024)
+        let reason = format!(
+            "{}: not valid UTF-8; run: forge --check-config",
+            display_path()
         );
-        return (
-            FileConfig {
-                remote_hosts: default_remote_hosts(),
-                ..Default::default()
-            },
-            Some(revision),
-        );
+        record_load_error(reason);
+        log::warn!("Config file {} is not valid UTF-8", display_path());
+        return (FileConfig::default(), Some(revision));
     };
-    let Ok(table) = contents.parse::<toml::Table>() else {
-        log::warn!(
-            "Failed to parse config file {}",
-            crate::review_input::safe_inline_display(&path.to_string_lossy(), 2 * 1024)
-        );
-        return (
-            FileConfig {
-                remote_hosts: default_remote_hosts(),
-                ..Default::default()
-            },
-            Some(revision),
-        );
+    let table = match contents.parse::<toml::Table>() {
+        Ok(table) => table,
+        Err(error) => {
+            let diagnostic = config_syntax_diagnostic(contents, &error);
+            record_load_error(format!(
+                "{}: {diagnostic}; run: forge --check-config",
+                display_path()
+            ));
+            log::warn!(
+                "Failed to parse config file {}: {diagnostic}",
+                display_path()
+            );
+            return (FileConfig::default(), Some(revision));
+        }
     };
-    for issue in validate_config_table(&table) {
+    let issues = validate_config_table(&table);
+    for issue in &issues {
         match issue.level {
             ConfigIssueLevel::Warning => log::warn!("Config {issue}"),
             ConfigIssueLevel::Error => log::error!("Config {issue}"),
         }
     }
+    let error_count = issues.iter().filter(|issue| issue.is_error()).count();
+    if error_count > 0 {
+        let first_path = issues
+            .iter()
+            .find(|issue| issue.is_error())
+            .map(|issue| issue.path.as_str())
+            .unwrap_or("unknown setting");
+        record_load_error(format!(
+            "{}: {error_count} configuration error{} (first at {}); run: forge --check-config",
+            display_path(),
+            if error_count == 1 { "" } else { "s" },
+            crate::review_input::safe_inline_display(first_path, 512)
+        ));
+        log::warn!(
+            "Ignoring semantically invalid config file {} ({error_count} errors)",
+            display_path()
+        );
+        return (FileConfig::default(), Some(revision));
+    }
 
     let colors = table.get("colors").and_then(|v| v.as_table());
-    // Fall back to built-in defaults when the section is entirely absent (e.g. a
-    // config file first created to persist some other setting). An explicit,
-    // possibly empty, [[remote_hosts]] array is respected as-is.
-    let remote_hosts = if table.contains_key("remote_hosts") {
-        parse_remote_hosts(&table)
-    } else {
-        default_remote_hosts()
-    };
+    // Remote targets are always opt-in. A missing section, an unreadable
+    // configuration, and an invalid configuration must all resolve to an empty
+    // list; silently inventing a network destination is not a safe fallback.
+    let remote_hosts = parse_remote_hosts(&table);
 
     let file_config = FileConfig {
         opacity: table.get("opacity").and_then(|v| v.as_float()),
@@ -2362,50 +2531,6 @@ pub(crate) fn remote_host_to_toml(h: &RemoteHost) -> toml::Value {
     toml::Value::Table(t)
 }
 
-/// Two worked entries a new destination can be copied from: one ssh target and
-/// one running container. They exist because the two mistakes the grammar
-/// cannot forgive are invisible in an empty list — the port belongs in
-/// `ssh_args`, never as `host:port`, and the login belongs in `user`, never as
-/// a `user@host` string that ssh would take literally as a hostname.
-///
-/// Only consulted when the file has no `remote_hosts` key at all. An explicit
-/// list — including `remote_hosts = []` — always wins, so deleting these in the
-/// settings dialog (which writes the key back) makes them stay gone.
-fn default_remote_hosts() -> Vec<RemoteHost> {
-    vec![
-        RemoteHost {
-            name: "dev-60".to_string(),
-            host: "10.68.18.60".to_string(),
-            user: Some("root".to_string()),
-            docker: false,
-            deploy_artifact: None,
-            remote_shell: "jsh".to_string(),
-            session: None,
-            // 22 is ssh's default and could be omitted; it is spelled out so a
-            // copied entry has the flag to change rather than one to remember.
-            ssh_args: vec!["-p".to_string(), "22".to_string()],
-            login_shell: true,
-            multiplex: true,
-            deploy: jterm_core::jsh_remote::Deploy::Persist,
-        },
-        RemoteHost {
-            name: "myubuntu".to_string(),
-            host: "myubuntu".to_string(),
-            // The container user is `docker exec -u`; unset means the image's.
-            user: None,
-            docker: true,
-            deploy_artifact: None,
-            remote_shell: "jsh".to_string(),
-            session: None,
-            // Meaningless for docker, and the launcher ignores them.
-            ssh_args: Vec::new(),
-            login_shell: true,
-            multiplex: true,
-            deploy: jterm_core::jsh_remote::Deploy::Persist,
-        },
-    ]
-}
-
 // ---------------------------------------------------------------------------
 // load_config
 // ---------------------------------------------------------------------------
@@ -2440,11 +2565,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let font_desc = env_string("FORGE_FONT")
         .or(fc.font)
         .filter(|font| setting_text_is_safe(font, MAX_FONT_DESC_BYTES))
-        // Use the "Mono" (NFM) Nerd Font variant: the plain "Nerd Font" (NF)
-        // variant renders proportionally in VTE (glyphs draw at non-cell widths)
-        // even though fontconfig reports it spacing=100, so output never aligns
-        // like a real terminal. NFM forces single-cell glyphs.
-        .unwrap_or_else(|| "SauceCodePro Nerd Font Mono 14".to_string());
+        .unwrap_or_else(|| "Monospace 14".to_string());
 
     let foreground = env_rgba("FORGE_FG")
         .or_else(|| fc.foreground.as_deref().and_then(|v| RGBA::parse(v).ok()))
@@ -2838,8 +2959,8 @@ mod tests {
         RemoteHost {
             name: "h".into(),
             host: "1.2.3.4".into(),
-            user: Some("yj".into()),
-            remote_shell: "/home/yj/.cargo/bin/jsh".into(),
+            user: Some("alice".into()),
+            remote_shell: "/home/tester/.cargo/bin/jsh".into(),
             session: Some("cloud-test".into()),
             ssh_args: Vec::new(),
             login_shell: true,
@@ -2947,8 +3068,8 @@ mod tests {
                 "ssh",
                 "-t",
                 "--",
-                "yj@1.2.3.4",
-                "bash -lc 'exec /home/yj/.cargo/bin/jsh --session cloud-test'",
+                "alice@1.2.3.4",
+                "bash -lc 'exec /home/tester/.cargo/bin/jsh --session cloud-test'",
             ]
         );
     }
@@ -2960,7 +3081,7 @@ mod tests {
         let argv = build_remote_argv(&h);
         assert_eq!(
             argv.last().unwrap(),
-            "/home/yj/.cargo/bin/jsh --session cloud-test"
+            "/home/tester/.cargo/bin/jsh --session cloud-test"
         );
     }
 
@@ -2971,16 +3092,16 @@ mod tests {
         let argv = build_remote_argv(&h);
         assert_eq!(
             argv.last().unwrap(),
-            "bash -lc 'exec /home/yj/.cargo/bin/jsh'"
+            "bash -lc 'exec /home/tester/.cargo/bin/jsh'"
         );
     }
 
     #[test]
     fn local_jsh_is_wrapped_in_interactive_bash() {
-        let argv = wrap_jsh_argv_in_interactive_bash("/home/yj/.cargo/bin/jsh")
+        let argv = wrap_jsh_argv_in_interactive_bash("/home/tester/.cargo/bin/jsh")
             .expect("bash should be available on the test runner");
         assert_eq!(argv[1], "-ic");
-        assert_eq!(argv[2], "exec '/home/yj/.cargo/bin/jsh'");
+        assert_eq!(argv[2], "exec '/home/tester/.cargo/bin/jsh'");
     }
 
     #[test]
@@ -3001,7 +3122,7 @@ mod tests {
             "argv: {argv:?}"
         );
         // ControlMaster flags must precede the target.
-        let target_idx = argv.iter().position(|a| a == "yj@1.2.3.4").unwrap();
+        let target_idx = argv.iter().position(|a| a == "alice@1.2.3.4").unwrap();
         let cm_idx = argv.iter().position(|a| a == "ControlMaster=auto").unwrap();
         assert!(cm_idx < target_idx);
     }
@@ -3316,37 +3437,79 @@ open_palette = "F8"
         assert!(validate_config_contents("opacity = [").is_err());
     }
 
-    /// The defaults are what a user copies, so they have to be spelled the way
-    /// the parser accepts: the port as an `ssh_args` flag and the login in
-    /// `user`, never folded into `host` as `root@10.68.18.60:22`.
     #[test]
-    fn default_remote_hosts_survive_their_own_round_trip() {
-        let names: Vec<String> = default_remote_hosts()
-            .iter()
-            .map(|h| h.name.clone())
-            .collect();
-        assert_eq!(names, ["dev-60", "myubuntu"]);
+    fn syntax_diagnostic_reports_location_without_source_excerpt() {
+        let contents = "theme = 'private-value'\nopacity = [\n";
+        let error = contents.parse::<toml::Table>().unwrap_err();
+        let diagnostic = config_syntax_diagnostic(contents, &error);
 
-        let mut array = toml::value::Array::new();
-        for host in default_remote_hosts() {
-            array.push(remote_host_to_toml(&host));
+        assert_eq!(diagnostic.line, Some(2));
+        assert!(diagnostic.column.is_some());
+        assert!(!diagnostic.message.contains("private-value"));
+        assert!(!diagnostic.message.contains('\n'));
+        assert!(diagnostic.message.len() <= 512);
+    }
+
+    #[test]
+    fn semantic_ui_colors_meet_text_contrast_in_every_builtin_theme() {
+        for theme in builtin_themes() {
+            let chrome_foreground =
+                accessible_text_color(&theme.foreground, &theme.background, &theme.foreground);
+            assert!(
+                contrast_ratio(&chrome_foreground, &theme.background) + f64::EPSILON
+                    >= UI_TEXT_MIN_CONTRAST,
+                "{} chrome foreground is not readable",
+                theme.name
+            );
+            let muted = accessible_muted_text_color(&theme.foreground, &theme.background);
+            assert!(
+                contrast_ratio(&muted, &theme.background) + f64::EPSILON >= UI_TEXT_MIN_CONTRAST,
+                "{} muted foreground is not readable",
+                theme.name
+            );
+            for (name, index) in [
+                ("error", 1usize),
+                ("success", 2),
+                ("warning", 3),
+                ("info", 4),
+                ("accent", 6),
+            ] {
+                let adjusted = accessible_text_color(
+                    &theme.palette[index],
+                    &theme.background,
+                    &theme.foreground,
+                );
+                let ratio = contrast_ratio(&adjusted, &theme.background);
+                assert!(
+                    ratio + f64::EPSILON >= UI_TEXT_MIN_CONTRAST,
+                    "{} {name} contrast is only {ratio:.3}",
+                    theme.name
+                );
+            }
         }
-        let mut table = toml::Table::new();
-        table.insert("remote_hosts".into(), toml::Value::Array(array));
 
-        let reparsed = parse_remote_hosts(&table);
-        assert_eq!(
-            reparsed,
-            default_remote_hosts(),
-            "an example the parser drops teaches the wrong shape"
+        let light = builtin_themes()
+            .into_iter()
+            .find(|theme| theme.name == "light")
+            .unwrap();
+        assert!(
+            contrast_ratio(&light.palette[2], &light.background) < UI_TEXT_MIN_CONTRAST,
+            "the regression fixture should exercise an actual adjustment"
         );
+    }
 
-        let ssh = &reparsed[0];
-        assert_eq!(ssh.host, "10.68.18.60");
-        assert_eq!(ssh.user.as_deref(), Some("root"));
-        assert_eq!(ssh.ssh_args, ["-p", "22"]);
-        assert!(!ssh.docker);
-        assert!(reparsed[1].docker);
+    #[test]
+    fn remote_hosts_are_strictly_opt_in() {
+        assert!(FileConfig::default().remote_hosts.is_empty());
+        assert!(parse_remote_hosts(&toml::Table::new()).is_empty());
+
+        let unrelated = "opacity = 0.9\ntheme = 'default'"
+            .parse::<toml::Table>()
+            .unwrap();
+        assert!(
+            parse_remote_hosts(&unrelated).is_empty(),
+            "an unrelated or partial config must not invent a network target"
+        );
     }
 
     #[test]
@@ -3391,7 +3554,7 @@ host = "backup.example.com"
                 "-u",
                 "devuser",
                 "devbox",
-                "/home/yj/.cargo/bin/jsh",
+                "/home/tester/.cargo/bin/jsh",
                 "--session",
                 "cloud-test",
             ]
@@ -3428,7 +3591,7 @@ host = "backup.example.com"
     fn a_host_can_name_the_jsh_it_deploys() {
         let mut h = host();
         h.deploy = jterm_core::jsh_remote::Deploy::Incognito;
-        h.deploy_artifact = Some("/home/yj/projects/jsh/target/release/jsh".into());
+        h.deploy_artifact = Some("/home/tester/projects/jsh/target/release/jsh".into());
 
         let argv = build_deployed_argv(&h, std::path::Path::new("/c/jsh-remote.sh"));
 
@@ -3438,7 +3601,7 @@ host = "backup.example.com"
             .expect("--artifact");
         assert_eq!(
             argv[artifact + 1],
-            "/home/yj/projects/jsh/target/release/jsh"
+            "/home/tester/projects/jsh/target/release/jsh"
         );
     }
 
@@ -3835,7 +3998,7 @@ session = "bad/session"
         assert!(matches!(config.terminal_mode, TerminalMode::Vte));
         assert_eq!(config.window_opacity, 0.95);
         assert_eq!(config.terminal_scrollback_lines, 5_000);
-        assert_eq!(config.font_desc, "SauceCodePro Nerd Font Mono 14");
+        assert_eq!(config.font_desc, "Monospace 14");
         assert_eq!(config.default_font_scale, 1.0);
         assert_eq!(config.theme_name, "default");
         assert_eq!(config.tab_placement, TabPlacement::Sidebar);
@@ -3873,6 +4036,21 @@ session = "bad/session"
         assert!(!safe_mode_persistence_disabled(Some(std::ffi::OsStr::new(
             "0"
         ))));
+    }
+
+    #[test]
+    fn example_config_mentions_every_supported_top_level_key() {
+        let example = include_str!("../config.toml.example");
+        for key in KNOWN_CONFIG_KEYS {
+            let assignment = format!("{key} =");
+            let table = format!("[{key}]");
+            let array_table = format!("[[{key}]]");
+            let present = example.lines().any(|line| {
+                let line = line.trim_start().trim_start_matches('#').trim_start();
+                line.starts_with(&assignment) || line == table || line == array_table
+            });
+            assert!(present, "config.toml.example is missing `{key}`");
+        }
     }
 
     #[test]

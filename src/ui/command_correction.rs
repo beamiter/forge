@@ -974,7 +974,7 @@ fn show_correction_card(
     let review = CommandReviewCard::new(CommandReviewSpec {
         presentation: ReviewPresentation::Standalone,
         compact,
-        icon: "\u{f0eb}", // nf-fa-lightbulb_o
+        icon: "dialog-information-symbolic",
         title: title.to_string(),
         badge: correction.evidence.label().to_string(),
         description: format!("{} (for `{original_command}`)", correction.message),

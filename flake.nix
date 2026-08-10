@@ -54,8 +54,9 @@
 
             FCITX5_GTK_PATH = "${pkgs.fcitx5-gtk}/lib/gtk-4.0";
 
-            # GTK behavior is tested under a real display in CI. Running the
-            # suite in the Nix build sandbox would produce display failures.
+            # Display-backed GTK regressions run in a dedicated Xvfb CI job.
+            # Running the suite in the Nix build sandbox would still fail for
+            # lack of a real display server.
             doCheck = false;
 
             postInstall = ''
@@ -104,9 +105,11 @@
         in
         {
           packages.default = package;
-          apps.default = flake-utils.lib.mkApp { drv = package; };
+          apps.default = (flake-utils.lib.mkApp { drv = package; }) // {
+            inherit (package) meta;
+          };
           checks.package = package;
-          formatter = pkgs.nixfmt-rfc-style;
+          formatter = pkgs.nixfmt;
 
           devShells.default = pkgs.mkShell {
             inputsFrom = [ package ];
@@ -116,6 +119,7 @@
               rustfmt
               clippy
               cargo-audit
+              cargo-deny
               cargo-watch
               shellcheck
 

@@ -11,25 +11,24 @@ cargo run
 
 A native Cargo build also works after installing GTK4, libadwaita, VTE GTK4, PCRE2, and `pkg-config` development packages. The repository toolchain file installs stable Rust with rustfmt and Clippy.
 
-`jagent` and `jterm_core` are Git dependencies, and Cargo.lock carries no checksum for those. When you repin either revision, update the matching entry in `cargoLock.outputHashes` in `flake.nix` as well, otherwise `nix develop` and `nix build` fail to evaluate. Set the entry to `pkgs.lib.fakeHash`, run `nix build .#default`, and copy the `got:` hash from the mismatch error.
+`jagent` and `jterm_core` are pinned Git dependencies with an explicit crate `version` plus an exact `rev`. Keep those in sync with `Cargo.lock`, `deny.toml`, and the matching `cargoLock.outputHashes` entry in `flake.nix`; otherwise `cargo deny check`, `nix develop`, and `nix build` will fail. When repinning either revision, temporarily set the corresponding output hash to `pkgs.lib.fakeHash`, run `nix build .#default`, and copy the `got:` hash from the mismatch error.
 
 ## Required checks
 
 Run the same gates as CI before opening a pull request:
 
 ```bash
-cargo fmt --all -- --check
-cargo test --all-features --locked
-cargo clippy --all-targets --all-features --locked -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
-cargo build --release --all-features --locked
-bash -n scripts/*.sh packaging/*.sh
-shellcheck scripts/*.sh packaging/*.sh
-cargo audit
+make verify
+make security
 ```
 
-`make verify` runs the Rust/build/syntax gates, and `make security` runs the
-locked dependency audit, duplicate-dependency report, and ShellCheck policy.
+`make verify` runs formatting, tests, strict Clippy, Rustdoc, the release build,
+shell syntax checks, and the tracked-text privacy guard. `make security` runs the
+locked dependency audit, `cargo deny` source/license policy, duplicate-dependency
+report, and ShellCheck policy; it requires `cargo-audit`, `cargo-deny`, and
+`shellcheck`. Run `make privacy` alone for the fast privacy check. It rejects
+only known personal identifiers; neutral placeholders and RFC 5737 documentation
+addresses remain valid examples.
 
 For packaging changes, also run `desktop-file-validate`, `appstreamcli validate --no-net`, regenerate `packaging/flatpak/cargo-sources.json`, build the Flatpak manifest, execute `scripts/smoke-flatpak.sh` inside a D-Bus session, and verify the archive produced by `make package` with its SHA-256 file.
 

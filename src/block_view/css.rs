@@ -150,21 +150,17 @@ pub(crate) fn chrono_local_offset_secs() -> i64 {
 // ─── CSS ──────────────────────────────────────────────────────────────────────
 
 pub(crate) fn install_block_css(config: &Config) {
-    let fg = &config.foreground;
     let bg = &config.background;
+    let semantic = config.semantic_colors();
+    let fg = &semantic.foreground;
     let bg_hex = rgba_to_hex(bg);
     let fg_hex = rgba_to_hex(fg);
-    let dim_fg = format!(
-        "rgba({},{},{},0.55)",
-        (fg.red() * 255.0) as u8,
-        (fg.green() * 255.0) as u8,
-        (fg.blue() * 255.0) as u8,
-    );
-    // Accent color for active chevron (use palette color 2 = green-ish)
-    let accent = rgba_to_hex(&config.palette[2]);
-    // Error color for bad exit codes — use the theme's red (palette 1) so it
-    // matches what VTE would render, instead of a hard-coded swatch.
-    let err = &config.palette[1];
+    let dim_fg = rgba_to_hex(&semantic.muted);
+    // ANSI colors inside VTE remain exact. When the same hues become ordinary
+    // UI text, adjust them just enough to remain readable on the theme's
+    // background (especially the three light themes).
+    let accent = rgba_to_hex(&semantic.accent);
+    let err = &semantic.error;
     let err_hex = rgba_to_hex(err);
     let err_bg = format!(
         "rgba({},{},{},0.18)",
@@ -176,7 +172,7 @@ pub(crate) fn install_block_css(config: &Config) {
     // Status-stripe colors derived from the theme palette: green (palette 2) for
     // success, red (palette 1) for failure. Kept semi-transparent so the stripe
     // reads as an accent rather than a hard bar.
-    let ok = &config.palette[2];
+    let ok = &semantic.success;
     let ok_stripe = format!(
         "rgba({},{},{},0.55)",
         (ok.red() * 255.0) as u8,
@@ -199,9 +195,7 @@ pub(crate) fn install_block_css(config: &Config) {
     let err_r = (err.red() * 255.0) as u8;
     let err_g = (err.green() * 255.0) as u8;
     let err_b = (err.blue() * 255.0) as u8;
-    // Accent == palette[2] (same green as success); reused for the active-card
-    // focus ring and prompt chevron.
-    let acc = &config.palette[2];
+    let acc = &semantic.accent;
     let acc_r = (acc.red() * 255.0) as u8;
     let acc_g = (acc.green() * 255.0) as u8;
     let acc_b = (acc.blue() * 255.0) as u8;
@@ -214,7 +208,7 @@ pub(crate) fn install_block_css(config: &Config) {
     // exit status the shell never reported is neither the green of a success nor
     // the red of a failure, and borrowing either colour would state something the
     // terminal does not know.
-    let warn = &config.palette[3];
+    let warn = &semantic.warning;
     let warn_hex = rgba_to_hex(warn);
     let warn_r = (warn.red() * 255.0) as u8;
     let warn_g = (warn.green() * 255.0) as u8;
@@ -223,7 +217,7 @@ pub(crate) fn install_block_css(config: &Config) {
 
     // Shell Agent inline cards use the theme's blue (palette 4) so they read
     // distinctly from success/correction accents (palette 2).
-    let agent = &config.palette[4];
+    let agent = &semantic.info;
     let agent_hex = rgba_to_hex(agent);
     let agent_r = (agent.red() * 255.0) as u8;
     let agent_g = (agent.green() * 255.0) as u8;
@@ -241,7 +235,7 @@ pub(crate) fn install_block_css(config: &Config) {
     );
 
     // Parse font description to extract font family and size
-    // Format: "FontName Style Size" e.g. "SauceCodePro Nerd Font Mono 14"
+    // Format: "FontName Style Size" e.g. "Monospace 14"
     let parts: Vec<&str> = config.font_desc.split_whitespace().collect();
     let (font_family, base_size) = if parts.len() >= 2 {
         // Last part is usually the size. Pango allows float sizes ("Fira Code 12.5"),
@@ -271,7 +265,7 @@ pub(crate) fn install_block_css(config: &Config) {
             background-color: {bg_hex};
         }}
         .block-failure-markers {{
-            color: rgba({err_r},{err_g},{err_b},0.90);
+            color: {err_hex};
         }}
         .block-list {{
             background-color: {bg_hex};
@@ -325,14 +319,14 @@ pub(crate) fn install_block_css(config: &Config) {
             border-left-color: rgba({acc_r},{acc_g},{acc_b},0.72);
         }}
         .block-background-chip {{
-            color: rgba({acc_r},{acc_g},{acc_b},0.92);
+            color: {accent};
             background-color: rgba({acc_r},{acc_g},{acc_b},0.10);
             border-radius: 999px;
             padding: 1px 7px;
             font-size: 0.88em;
         }}
         .block-status-background {{
-            color: rgba({acc_r},{acc_g},{acc_b},0.92);
+            color: {accent};
         }}
         .block-status-unknown {{
             color: {warn_hex};
@@ -625,13 +619,13 @@ pub(crate) fn install_block_css(config: &Config) {
             padding: 1px 9px;
         }}
         .block-bookmark-star {{
-            color: #e5c07b;
+            color: {warn_hex};
             font-family: "{font_family}";
             font-size: 0.82em;
             margin-right: 2px;
         }}
         .block-bookmarked {{
-            box-shadow: inset 3px 0 0 0 #e5c07b;
+            box-shadow: inset 3px 0 0 0 {warn_hex};
         }}
         .block-chip-git {{
             color: {accent};
@@ -716,7 +710,7 @@ pub(crate) fn install_block_css(config: &Config) {
             font-size: 0.85em;
         }}
         .block-selection-hint {{
-            color: rgba({acc_r},{acc_g},{acc_b},0.92);
+            color: {accent};
             font-family: "{font_family}";
             font-size: 0.76em;
             padding: 0 4px;
@@ -877,7 +871,7 @@ pub(crate) fn install_block_css(config: &Config) {
             min-height: 22px;
             padding: 0 5px;
             border-radius: 5px;
-            color: rgba({fg_r},{fg_g},{fg_b},0.78);
+            color: {dim_fg};
         }}
         .sticky-header-control:hover {{
             color: {accent};

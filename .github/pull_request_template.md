@@ -4,10 +4,8 @@
 
 ## Validation
 
-- [ ] `cargo fmt --all -- --check`
-- [ ] `cargo test --all-features --locked`
-- [ ] `cargo clippy --all-targets --all-features --locked -- -D warnings`
-- [ ] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked`
+- [ ] `make verify`
+- [ ] `make security` (or explain why an environment-dependent check was not run)
 - [ ] Relevant Wayland/X11 and VTE/Block smoke checks completed
 
 ## Safety and compatibility

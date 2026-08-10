@@ -167,13 +167,22 @@ impl BlockOutcome {
         }
     }
 
-    /// Nerd-font glyphs: spinner, check, cross, question mark.
+    /// Status glyphs available in ordinary system UI fonts.
     fn status_glyph(self) -> &'static str {
         match self {
-            Self::Background => "\u{f110}",
-            Self::Success => "\u{f00c}",
-            Self::Failure(_) => "\u{f00d}",
-            Self::Unknown => "\u{f128}",
+            Self::Background => "↻",
+            Self::Success => "✓",
+            Self::Failure(_) => "✕",
+            Self::Unknown => "?",
+        }
+    }
+
+    fn accessible_label(self) -> &'static str {
+        match self {
+            Self::Background => "Background output",
+            Self::Success => "Command succeeded",
+            Self::Failure(_) => "Command failed",
+            Self::Unknown => "Command exit status unavailable",
         }
     }
 
@@ -856,14 +865,16 @@ pub(crate) fn estimated_finished_block_height_for_text(
     )
 }
 
-fn flash_button_label(btn: &gtk4::Button, label: &'static str, tooltip: &'static str) {
-    let old_label = btn.label().map(|s| s.to_string()).unwrap_or_default();
+fn flash_button_icon(btn: &gtk4::Button, icon_name: &'static str, tooltip: &'static str) {
+    let old_icon_name = btn.icon_name().map(|name| name.to_string());
     let old_tooltip = btn.tooltip_text().map(|s| s.to_string());
-    btn.set_label(label);
+    btn.set_icon_name(icon_name);
     btn.set_tooltip_text(Some(tooltip));
     let btn_for_restore = btn.clone();
     glib::timeout_add_local_once(std::time::Duration::from_millis(900), move || {
-        btn_for_restore.set_label(&old_label);
+        if let Some(icon_name) = old_icon_name {
+            btn_for_restore.set_icon_name(&icon_name);
+        }
         btn_for_restore.set_tooltip_text(old_tooltip.as_deref());
     });
 }
@@ -1136,16 +1147,21 @@ impl FinishedBlock {
             header_row.set_margin_bottom(2);
         }
 
-        // Bookmark star (gutter marker), hidden until the block is bookmarked.
-        let bookmark_star = gtk4::Label::new(Some("\u{f02e}")); // nf-fa-bookmark
+        // Bookmark marker, hidden until the block is bookmarked. Use a normal
+        // Unicode glyph so the default UI does not depend on a Nerd Font.
+        let bookmark_star = gtk4::Label::new(Some("★"));
         bookmark_star.add_css_class("block-bookmark-star");
         bookmark_star.set_halign(gtk4::Align::Start);
         bookmark_star.set_visible(false);
+        bookmark_star.update_property(&[gtk4::accessible::Property::Label("Bookmarked block")]);
         header_row.append(&bookmark_star);
 
         // Status icon: success, failure, unknown, or asynchronous/background output.
         let status_icon = gtk4::Label::new(Some(outcome.status_glyph()));
         status_icon.add_css_class(outcome.status_css_class());
+        status_icon.update_property(&[gtk4::accessible::Property::Label(
+            outcome.accessible_label(),
+        )]);
         if outcome == BlockOutcome::Unknown {
             status_icon.set_tooltip_text(Some(UNKNOWN_EXIT_TOOLTIP));
         }
@@ -1161,17 +1177,15 @@ impl FinishedBlock {
         // Context chips (Warp-style): cwd pill + git-branch pill.
         if let Some(cwd_path) = cwd {
             let shortened = crate::review_input::safe_inline_display(&shorten_path(cwd_path), 512);
-            // nf-fa-folder () prefix
-            let cwd_chip = gtk4::Label::new(Some(&format!("\u{f07b} {}", shortened)));
+            let cwd_chip = gtk4::Label::new(Some(&format!("cwd · {shortened}")));
             cwd_chip.add_css_class("block-chip");
             cwd_chip.set_halign(gtk4::Align::Start);
             cwd_chip.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
             cwd_chip.set_max_width_chars(40);
             header_row.append(&cwd_chip);
 
-            // git-branch chip (nf-dev-git-branch )
             if let Some(branch) = git_branch_for(cwd_path) {
-                let git_chip = gtk4::Label::new(Some(&format!("\u{e725} {}", branch)));
+                let git_chip = gtk4::Label::new(Some(&format!("git · {branch}")));
                 git_chip.add_css_class("block-chip-git");
                 git_chip.set_halign(gtk4::Align::Start);
                 git_chip.set_ellipsize(gtk4::pango::EllipsizeMode::End);
@@ -1251,23 +1265,33 @@ impl FinishedBlock {
         // right and the action button group, so they read as separate units
         // rather than one undifferentiated cluster.
         action_box.set_margin_start(6);
-        let copy_cmd_btn = gtk4::Button::with_label("\u{f0c5}"); // nf-fa-copy  copy command
+        let copy_cmd_btn = gtk4::Button::from_icon_name("edit-copy-symbolic");
         copy_cmd_btn.set_tooltip_text(Some("Copy command"));
-        let copy_output_btn = gtk4::Button::with_label("\u{f0ea}"); // nf-fa-clipboard  copy output
+        copy_cmd_btn.update_property(&[gtk4::accessible::Property::Label("Copy command")]);
+        let copy_output_btn = gtk4::Button::from_icon_name("edit-copy-symbolic");
         copy_output_btn.set_tooltip_text(Some("Copy output"));
-        let rerun_btn = gtk4::Button::with_label("\u{f021}"); // nf-fa-refresh  re-run
+        copy_output_btn.update_property(&[gtk4::accessible::Property::Label("Copy output")]);
+        let rerun_btn = gtk4::Button::from_icon_name("edit-redo-symbolic");
         rerun_btn.set_tooltip_text(Some("Insert command at prompt"));
+        rerun_btn.update_property(&[gtk4::accessible::Property::Label(
+            "Insert command at prompt",
+        )]);
         copy_cmd_btn.set_visible(!is_background);
         rerun_btn.set_visible(!is_background);
-        let filter_btn = gtk4::Button::with_label("\u{f0b0}"); // nf-fa-filter  filter output
+        let filter_btn = gtk4::Button::from_icon_name("edit-find-symbolic");
         filter_btn.set_tooltip_text(Some("Filter output"));
-        let jump_bottom_btn = gtk4::Button::with_label("\u{f103}");
+        filter_btn.update_property(&[gtk4::accessible::Property::Label("Filter output")]);
+        let jump_bottom_btn = gtk4::Button::from_icon_name("go-bottom-symbolic");
         jump_bottom_btn.set_tooltip_text(Some("Jump to bottom of this block"));
+        jump_bottom_btn.update_property(&[gtk4::accessible::Property::Label(
+            "Jump to bottom of this block",
+        )]);
         jump_bottom_btn.set_visible(long_output);
         // Expand button: kept for the capped-height path. Full-height finished
         // blocks hide it because their viewport already contains every row.
-        let expand_btn = gtk4::Button::with_label("\u{f065}"); // nf-fa-expand
+        let expand_btn = gtk4::Button::from_icon_name("view-fullscreen-symbolic");
         expand_btn.set_tooltip_text(Some("Expand block"));
+        expand_btn.update_property(&[gtk4::accessible::Property::Label("Expand block")]);
         for btn in [
             &copy_cmd_btn,
             &copy_output_btn,
@@ -1310,9 +1334,10 @@ impl FinishedBlock {
         outer.add_controller(hover_ctrl);
 
         // Collapse toggle button
-        let collapse_btn = gtk4::Button::with_label("\u{f078}"); // nf-fa-chevron_down
+        let collapse_btn = gtk4::Button::from_icon_name("pan-down-symbolic");
         collapse_btn.add_css_class("block-collapse-btn");
         collapse_btn.add_css_class("flat");
+        collapse_btn.update_property(&[gtk4::accessible::Property::Label("Hide output")]);
         header_row.append(&collapse_btn);
 
         content.append(&header_row);
@@ -1502,12 +1527,21 @@ impl FinishedBlock {
                             .set_height_request(finished_vte_height_px(visible_rows, ch));
                     }
                 }
-                btn.set_label(if now_expanded { "\u{f066}" } else { "\u{f065}" });
+                btn.set_icon_name(if now_expanded {
+                    "view-restore-symbolic"
+                } else {
+                    "view-fullscreen-symbolic"
+                });
                 btn.set_tooltip_text(Some(if now_expanded {
                     "Collapse to viewport height"
                 } else {
                     "Expand block"
                 }));
+                btn.update_property(&[gtk4::accessible::Property::Label(if now_expanded {
+                    "Collapse to viewport height"
+                } else {
+                    "Expand block"
+                })]);
             });
         }
 
@@ -1558,8 +1592,10 @@ impl FinishedBlock {
                 // Pane sizing is authoritative over a manual expansion: a block
                 // expanded for the old geometry must not outlive it.
                 if expanded_for_refit.replace(false) {
-                    expand_btn.set_label("\u{f065}");
+                    expand_btn.set_icon_name("view-fullscreen-symbolic");
                     expand_btn.set_tooltip_text(Some("Expand block"));
+                    expand_btn
+                        .update_property(&[gtk4::accessible::Property::Label("Expand block")]);
                 }
                 stamp_for_refit.set((eff_cols, fitted_cap, false, generation_for_refit.get()));
                 let can_expand = rows > fitted_cap;
@@ -1747,12 +1783,21 @@ impl FinishedBlock {
                     ib.set_visible(!collapsed);
                 }
                 collapsed_summary.set_visible(collapsed);
-                collapse_btn.set_label(if collapsed { "\u{f054}" } else { "\u{f078}" });
+                collapse_btn.set_icon_name(if collapsed {
+                    "pan-end-symbolic"
+                } else {
+                    "pan-down-symbolic"
+                });
                 collapse_btn.set_tooltip_text(Some(if collapsed {
                     "Show output"
                 } else {
                     "Hide output"
                 }));
+                collapse_btn.update_property(&[gtk4::accessible::Property::Label(if collapsed {
+                    "Show output"
+                } else {
+                    "Hide output"
+                })]);
             })
         };
         {
@@ -1895,8 +1940,10 @@ impl FinishedBlock {
                     // A narrow filter result must not leave the block logically
                     // expanded; clearing the query should return to its default mode.
                     if !can_expand && expanded.replace(false) {
-                        expand_btn.set_label("\u{f065}");
+                        expand_btn.set_icon_name("view-fullscreen-symbolic");
                         expand_btn.set_tooltip_text(Some("Expand block"));
+                        expand_btn
+                            .update_property(&[gtk4::accessible::Property::Label("Expand block")]);
                     }
                     let manually_expanded = expanded.get();
                     // New displayed text: advance the generation so an
@@ -2203,7 +2250,7 @@ impl FinishedBlock {
                 return;
             };
             vte_for_cmd.clipboard().set_text(&cmd_for_copy);
-            flash_button_label(btn, "\u{f00c}", "Command copied");
+            flash_button_icon(btn, "object-select-symbolic", "Command copied");
         });
 
         let vte_for_out = vte.downgrade();
@@ -2221,7 +2268,7 @@ impl FinishedBlock {
                 |s| s.to_string(),
             );
             vte_for_out.clipboard().set_text(&text);
-            flash_button_label(btn, "\u{f00c}", "Output copied");
+            flash_button_icon(btn, "object-select-symbolic", "Output copied");
         });
 
         let pty_for_rerun = Rc::clone(pty);
@@ -2251,9 +2298,13 @@ impl FinishedBlock {
                 if let Some(active_for_rerun) = active_for_rerun.upgrade() {
                     active_for_rerun.borrow().grab_focus();
                 }
-                flash_button_label(btn, "\u{f00c}", "Command inserted");
+                flash_button_icon(btn, "object-select-symbolic", "Command inserted");
             } else {
-                flash_button_label(btn, "\u{f071}", "Wait for an editable prompt");
+                flash_button_icon(
+                    btn,
+                    "dialog-warning-symbolic",
+                    "Wait for an editable prompt",
+                );
             }
         });
     }
@@ -2627,11 +2678,14 @@ mod tests {
         // Regression: feed() applies asynchronously while reset() acts
         // immediately, so when GTK maps a card several times in one main-loop
         // turn every queued snapshot survives its following reset and the
-        // copies concatenate ("/home/yj/home/yj…"). The wipe must travel
+        // copies concatenate ("/home/tester/home/tester…"). The wipe must travel
         // inside the fed byte stream, ordered before the snapshot it protects.
-        let stream = super::finished_snapshot_stream("/home/yj");
+        let stream = super::finished_snapshot_stream("/home/tester");
         assert!(stream.starts_with(super::FINISHED_SNAPSHOT_CLEAR));
-        assert_eq!(&stream[super::FINISHED_SNAPSHOT_CLEAR.len()..], b"/home/yj");
+        assert_eq!(
+            &stream[super::FINISHED_SNAPSHOT_CLEAR.len()..],
+            b"/home/tester"
+        );
         // The clear must reach cursor home, screen, and scrollback — dropping
         // any of the three reintroduces stacked copies on remap bursts.
         let clear = std::str::from_utf8(super::FINISHED_SNAPSHOT_CLEAR).unwrap();

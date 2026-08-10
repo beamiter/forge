@@ -53,5 +53,5 @@ Any user-visible change in one repository must be checked against every row
 above in the companion repository. Pure parsing, persistence, security,
 selection, and reducer logic should move to `jterm_core` when practical;
 frontend repositories should retain only thin framework adapters and native
-widget construction. Run each repository's complete `make verify` gate before
-declaring a parity change complete.
+widget construction. Run each repository's documented complete local quality
+gates before declaring a parity change complete.

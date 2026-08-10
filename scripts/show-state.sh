@@ -1,77 +1,59 @@
 #!/usr/bin/env bash
-# Visualize forge session state
+# Summarize forge legacy session state without printing its contents.
 
-STATE_FILE="${HOME}/.config/forge/tabs.state"
+set -Eeuo pipefail
 
-if [ ! -f "$STATE_FILE" ]; then
-    echo "❌ No state file found at $STATE_FILE"
+readonly STATE_FILE="${HOME}/.config/forge/tabs.state"
+
+show_usage() {
+    printf '%s\n' "Usage: $0 [--raw]"
+    printf '%s\n' '  default  Show metadata only.'
+    printf '%s\n' '  --raw    Print raw contents only with FORGE_DEBUG_ALLOW_STATE_CONTENT=1.'
+}
+
+print_metadata() {
+    printf '%s\n' 'forge legacy session state summary'
+    printf '%s\n' '=================================='
+    printf 'Path: %s\n' "${STATE_FILE}"
+    printf 'Size: %s bytes\n' "$(wc -c < "${STATE_FILE}")"
+    printf 'Lines: %s\n' "$(wc -l < "${STATE_FILE}")"
+    stat -c 'Mode: %a  Owner: %U:%G  Modified: %y' "${STATE_FILE}"
+    printf 'Current page entries: %s\n' "$(grep -c '^current_page=' "${STATE_FILE}")"
+    printf 'Tab entries: %s\n' "$(grep -c '^tab=' "${STATE_FILE}")"
+}
+
+print_raw() {
+    if [[ "${FORGE_DEBUG_ALLOW_STATE_CONTENT:-0}" != "1" ]]; then
+        printf '%s\n' \
+            'Refusing to print raw session contents.' \
+            'Set FORGE_DEBUG_ALLOW_STATE_CONTENT=1 and rerun only if you fully trust the destination.' >&2
+        exit 2
+    fi
+    printf '%s\n' 'Warning: raw session state may expose commands, directories, and layout details.' >&2
+    cat "${STATE_FILE}"
+}
+
+case "${1:-}" in
+    -h|--help)
+        show_usage
+        exit 0
+        ;;
+esac
+
+if [[ ! -f "${STATE_FILE}" ]]; then
+    printf 'No legacy state file found at %s\n' "${STATE_FILE}" >&2
     exit 1
 fi
 
-echo "📊 forge Session State Visualization"
-echo "======================================"
-echo ""
-
-# Parse current page
-current_page=$(grep '^current_page=' "$STATE_FILE" | cut -d= -f2)
-echo "📌 Current Page: ${current_page:-0}"
-echo ""
-
-# Parse tabs
-tab_num=0
-while IFS=$'\t' read -r line; do
-    if [[ "$line" =~ ^tab= ]]; then
-        tab_num=$((tab_num + 1))
-
-        # Remove "tab=" prefix
-        data="${line#tab=}"
-
-        # Split by tab
-        IFS=$'\t' read -r name layout_json <<< "$data"
-
-        echo "📑 Tab $tab_num: $name"
-
-        # Try to parse as JSON
-        if echo "$layout_json" | jq . &> /dev/null 2>&1; then
-            layout_type=$(echo "$layout_json" | jq -r '.type')
-
-            case "$layout_type" in
-                leaf)
-                    dir=$(echo "$layout_json" | jq -r '.dir')
-                    sid=$(echo "$layout_json" | jq -r '.sid')
-                    cmds=$(echo "$layout_json" | jq -r '.cmds // "none"')
-
-                    echo "   Type: Single pane"
-                    echo "   Directory: $dir"
-                    echo "   Session ID: $sid"
-                    echo "   Commands: $cmds"
-                    ;;
-
-                split)
-                    orientation=$(echo "$layout_json" | jq -r '.orientation')
-                    position=$(echo "$layout_json" | jq -r '.position')
-
-                    orientation_name=$([[ "$orientation" == "h" ]] && echo "Horizontal" || echo "Vertical")
-
-                    echo "   Type: Split pane ($orientation_name)"
-                    echo "   Position: $position"
-                    echo "   Structure:"
-
-                    # Show simplified tree
-                    echo "$layout_json" | jq -C '.' | sed 's/^/      /'
-                    ;;
-            esac
-        else
-            # Legacy format or simple directory
-            echo "   Format: Legacy"
-            echo "   Data: $layout_json"
-        fi
-
-        echo ""
-    fi
-done < "$STATE_FILE"
-
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Total tabs: $tab_num"
-echo ""
-echo "💡 Tip: Edit state file at: $STATE_FILE"
+case "${1:-}" in
+    "")
+        print_metadata
+        ;;
+    --raw)
+        print_raw
+        ;;
+    *)
+        show_usage >&2
+        exit 1
+        ;;
+esac

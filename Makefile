@@ -1,7 +1,7 @@
 # forge Makefile
 # Convenience wrapper for common development tasks
 
-.PHONY: help build run test check fmt clippy security verify package support-bundle clean install dev watch benchmark debug
+.PHONY: help build run test check fmt clippy privacy security verify package support-bundle clean install dev watch benchmark debug
 
 help:
 	@echo "forge Development Commands"
@@ -18,8 +18,9 @@ help:
 	@echo "  make check      - Check code without building"
 	@echo "  make fmt        - Format code"
 	@echo "  make clippy     - Lint code"
+	@echo "  make privacy    - Scan tracked text for known personal identifiers"
 	@echo "  make security   - Audit dependencies and shell scripts"
-	@echo "  make verify     - Run the complete local quality gate"
+	@echo "  make verify     - Run the core build, test, syntax, and privacy gate"
 	@echo ""
 	@echo "Development:"
 	@echo "  make dev        - Run dev script"
@@ -50,10 +51,13 @@ fmt:
 clippy:
 	@./scripts/dev.sh clippy
 
+privacy:
+	@./scripts/privacy-check.sh
+
 security:
 	@./scripts/security-check.sh
 
-verify:
+verify: privacy
 	@cargo fmt --all -- --check
 	@cargo test --all-features --locked
 	@cargo clippy --all-targets --all-features --locked -- -D warnings

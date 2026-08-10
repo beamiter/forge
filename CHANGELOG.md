@@ -4,7 +4,7 @@ All notable user-visible and operational changes are recorded here.
 
 ## Unreleased
 
-### Added
+### Highlights
 
 - 设置面板的 Remote Hosts 现在能**编辑**已保存的主机，不再只有添加和删除。每行新增
   铅笔按钮，用同一个对话框打开（标题与按钮变成 Edit / Save），条目就地替换，因此在
@@ -13,12 +13,20 @@ All notable user-visible and operational changes are recorded here.
   也会显示 `ssh_args`：改个名字顺手把 `-p 2222` 删掉，正是事后没人会去核对的那种改动。
   改名不再和自己撞重名检查；对话框打开期间配置被重新加载时，按名字重新定位条目，找不到
   就报错而不是悄悄新增一条。
-- 配置文件里完全没有 `remote_hosts` 键时，默认值从空列表改为两条可照抄的示例（一台
-  ssh、一个容器）。空列表看不出这条语法唯一不肯迁就的两点：端口写在 `ssh_args` 里而不是
-  `host = "box:22"`，登录名写在 `user` 里而不是 `host = "root@box"`。显式写出的列表仍
-  然照办，`remote_hosts = []` 也算，所以在面板里删掉后（面板会把该键写回）不会复活。
+- 远程主机现在严格按用户配置启用：缺少 `remote_hosts`、配置不可读或配置无效时都使用
+  空列表，不再注入示例目标。可复制的 SSH/容器写法只保留在示例配置与用户指南中，避免
+  新安装或损坏配置在主机选择器里呈现并尝试连接并非用户添加的地址。
+- 高频设置保存改为 250 ms 去抖的后台 latest-wins 队列；拖动透明度、字体缩放和 AI 面板
+  宽度不再阻塞 GTK 主线程。文件监听以内容 revision 识别应用自己的写入，外部冲突与写盘
+  失败继续保留内存设置并给出可操作的界面提示，窗口关闭前会提交并有界等待最后一次写入。
+- 剪贴板边界现在覆盖所有 Block 复制入口：跨 VTE、选中块、输出和 Markdown 都流式写入
+  32 MiB 上限，超限时整次复制原子失败；粘贴在改变选区或编辑状态前按 256 KiB 上限预检，
+  队列拒绝时不会发送命令前缀或制造“已经粘贴”的假象。
+- 默认字体改为系统可用的 `Monospace 14`，纯图标操作恢复键盘焦点与可访问名称，并以 GTK
+  symbolic icon 取代 Nerd Font 私用区字符。八套内置主题的普通、次级和语义状态文字都经
+  4.5:1 对比度校正；终端中的 ANSI 原色保持不变。
 
-### Fixed
+#### Reliability and UX
 
 - 顶部栏模式下只有一个标签页时，标签不再被藏起来：标签条在该模式下始终显示，当前
   标签的标题（含 OSC 改名与 cwd）一直看得见，新建/关闭标签时顶部栏也不再改变高度与
@@ -30,8 +38,10 @@ All notable user-visible and operational changes are recorded here.
   按每个标签按钮的 `is_visible()` 判断该行是否被过滤掉，而 GTK 的 `is_visible()` 连
   同祖先一起回答：单标签时顶部标签条整条隐藏，于是所有按钮都报告"不可见"，镜像把每
   一行都当成被过滤而隐藏。改用按钮自身的 `get_visible()`（即过滤器唯一写入的那个标
-  志），镜像只反映过滤结果，与标签条容器当下是否可见无关。，整个面板不再在两帧内容之间
-  持续闪烁。根因：完成块的行数与高度一直按块完成时记录的列宽计算，而 VTE 的网格实
+  志），镜像只反映过滤结果，与标签条容器当下是否可见无关。
+
+- 窄面板中的完成 Block 不再在两帧内容之间持续闪烁。根因：完成块的行数与高度一直按块
+  完成时记录的列宽计算，而 VTE 的网格实
   际跟随分配宽度换行——面板一旦更窄，每次重挂载都会先按记录列宽申请偏矮的高度，随
   后异步 settle 按真实换行量把卡片撑高，高度往返抖动又推动外层滚动与虚拟化反复重挂
   载边界卡片，形成自持振荡。现在渲染列宽取记录宽度与实际分配宽度的较小值（面板更宽
@@ -43,7 +53,9 @@ All notable user-visible and operational changes are recorded here.
   写（umask 0002 下手工建出来的 `~/.config/forge` 正好是 775），此前这种情况只写一行
   `log::warn!` 就退回内置默认值——主题、快捷键、`[[remote_hosts]]` 全部失效，界面上没有任何
   迹象，`--doctor` 里的 `remote hosts: none configured` 还标着 `(ok)`。现在：窗口启动时弹出
-  一条不自动消失的 toast 说明配置未加载及原因；错误文本直接给出可执行的补救命令
+  一条不自动消失的 toast 说明配置未加载及原因；不可读、非 UTF-8、TOML 语法错误与
+  语义错误现在走同一条可见失败路径，语法错误给出脱敏后的行列号与
+  `forge --check-config <path>` 操作提示；权限错误直接给出可执行的补救命令
   （`run: chmod g-w,o-w <目录>`）；`--doctor` 在配置未加载时把远程主机一行标为
   `unknown: the configuration file was not loaded (warning)`，不再假装配置里什么都没有。
 - `--doctor` 的远程主机检查按 transport 分别判断：ssh 目标看 `ssh`，`docker = true` 的目标看
@@ -126,10 +138,6 @@ All notable user-visible and operational changes are recorded here.
 - Project licensing under `MIT OR Apache-2.0`, including canonical license texts, Cargo/AppStream metadata, inbound-contribution terms, and license files in release artifacts.
 - Reproducible GNOME 50 Flatpak packaging, stable desktop application ID, AppStream metadata, scalable/raster icons, checksummed CI bundles, and X11/Wayland VTE/Block smoke tests.
 - A Flatpak host-command bridge so shells, SSH, Git probes, AI curl requests, and desktop notifications operate on the host instead of the application sandbox.
-- Modern GTK4 `TreeListModel`/`ListView` file browser with asynchronous lazy directory scans.
-- Per-window session snapshots with atomic claiming, stale-process recovery, legacy migration, retention, and doctor counts.
-- Target-aware `FORGE_LOG` / `RUST_LOG` filtering with relative timestamps and module targets.
-- Cargo-or-Nix installer, safe uninstaller, Rust toolchain metadata, CODEOWNERS, contribution/security/architecture/release documentation, Dependabot, and RustSec auditing.
 - Packaged OSC 133/7 shell integration for bash, zsh, fish, and PowerShell, also printable through `--shell-integration`.
 - Headless JSON diagnostics, config initialization and backup restore, cwd/argv launch overrides, backend override, no-restore, and isolated safe mode.
 - Metadata-only bounded JSONL command history shared by Block and VTE palettes.
@@ -158,7 +166,6 @@ All notable user-visible and operational changes are recorded here.
 - Default shortcuts now share the jterm ergonomic layout: directional Pane
   focus/resize layers, browser-style tab digits, symmetric zoom/opacity keys,
   and shell-owned `Ctrl+P` passthrough.
-- Session snapshots and Block history now use owner-only Unix permissions and durable atomic replacement.
 - Session autosave 与 Block history 读写现由有界单 worker 串行处理，同一目标的待写快照采用 latest-wins 合并；后台失败会显示去重提示，关闭窗口前会保存并 detach 全部 pane、发布最终 session snapshot，并有界 flush 队列。
 - Block is now the default terminal backend. New splits inherit the focused pane's backend, so Block and VTE layouts both remain structurally consistent.
 - Repeated same-axis splits rebalance by pane-tree span, keeping three or more panes evenly sized instead of recursively squeezing newer siblings.
@@ -168,7 +175,6 @@ All notable user-visible and operational changes are recorded here.
 - Application config saves now validate syntax/semantics, serialize through an advisory lock, reject stale revisions, rotate two valid backups, and use private durable atomic replacement.
 - Safe mode now constructs a fully isolated built-in VTE profile without reading user config or behavior overrides; configuration reload is disabled and save failures are visible in the UI.
 - The installer, uninstaller, and Flatpak bundle now manage shell integration, workflows, and Notebook runtime assets under `share/forge`.
-- CI now checks maintained shell scripts and exports complete formatting diagnostics.
 - Notebook output transport now applies bounded backpressure, and both cancellation
   and normal interpreter exit terminate the cell process group before joining pipes.
 - The AI panel now restores and persists its dragged width, has a themed empty/composer/status UI, routes focused copy/paste correctly, and uses Enter or Ctrl+Enter to send while Shift+Enter inserts a newline without stealing IME candidate confirmation.
@@ -184,7 +190,6 @@ All notable user-visible and operational changes are recorded here.
 - Provider traffic now uses a four-request global concurrency bound, recent-history request compaction, explicit output-limit notices, cancellable curl child reaping, and hard request/context/response capture budgets.
 - Live Chat/Agent activity and the Agent core transcript are now independently bounded; compaction preserves in-flight questions, Block output truncation is visible, and memory-only Ask Block retries become durable draft/context during shutdown.
 - Agent pane environment metadata moved out of the system prompt into bounded untrusted user-role JSON; edited approvals preserve exact whitespace and dangerous-command recognition handles common `env`/`command`, assignment, and Git global-option wrappers.
-- Temporary round-two source-export workflows and marker files were removed.
 - 快捷键 chord 的解析/显示迁移到家族共享的 `jterm_core::keybindings`：配置里的 chord 语法按家族并集放宽——新增 `control`/`option`/`cmd`/`win`/`meta` 等修饰键别名、`esc`/`del`/`ins`/箭头等按键别名、`f1..f24`、更多符号名与 Unicode 字母，重复修饰键（含别名，如 `ctrl+control+t`）现在会被报错拒绝；解除绑定除 false、空串、"none"、"disabled" 外新增 "unbind"。`--doctor`/加载期的 chord 静态校验与运行时覆写走同一解析器，校验通过的 chord 必定能生效（此前两边各自实现可能不一致）。显示形式保持既有的 `Ctrl+Shift+Alt+…` 修饰键顺序与 `Enter` 拼写不变；唯一变化是侧栏快捷键现在显示为 `Ctrl+\` 而非泄漏 X11 keysym 名的 `Ctrl+backslash`（配置里两种写法都照常解析）。默认键位与冲突拒绝策略不变，新增测试钉住家族 38 项默认 chord 契约；示例配置中 resize/AI 面板 chord 注释改为与显示一致的 `Ctrl+Shift+Alt+…` 顺序。旧配置里任意 X11 keysym 名（如 `Menu`）作为键名的写法不再被接受，会在加载时得到明确警告。
 
 - 终端子进程的终止与回收迁移到共享库 `jterm_core::process`（`ChildLifecycle` / `ProcessRef` / `EscalationPolicy`），删除本地的 `process_exists`、`signal_pid_and_group`、`wait_for_process_exit`、`terminate_terminal_process`。pane 现在随 widget 保存一个内核绑定的子进程句柄（Linux 上是 pidfd）而不是裸 pid，并显式记录由谁 `waitpid`：Block pane 的 PTY 由 forge 自己 fork、自己回收；常规 VTE pane 的子进程由 glib/VTE 的 child watch 回收，其生命周期只经 pidfd 发信号、绝不 `waitpid`，退出码由 `child-exited` 记账。HUP → TERM → KILL 阶梯与既有的 120ms/250ms 宽限期不变，但最后一发 KILL 改为按 PTY 会话清扫（两个 backend 都对 PTY 子进程 `setsid`）：关闭 pane 时会一并清掉 shell job control 放进别的进程组、此前只补一发进程组信号会遗漏的后台任务。常规 VTE pane 的 `child-exited` 状态现在按家族约定归一（正常退出取退出码、被信号杀取 128+信号号），与 Block pane 上报的数字一致；此前把 `waitpid` 原始状态字直接当成退出码交给远端重连逻辑（只有 0 的语义碰巧是对的）。窗口快照“属主进程是否还在”改为纯 `/proc` 探测，不再向别的 forge 窗口发信号 0。
@@ -197,8 +202,12 @@ All notable user-visible and operational changes are recorded here.
 
 ### Security
 
+- 删除会以写令牌执行 PR 分支脚本的一次性 `pull_request_target` 迁移工作流；新增已知个人
+  地址/路径隐私护栏、完整 `cargo deny` 依赖策略和独立 Xvfb GTK 回归 job。维护脚本的
+  `bash -n` / ShellCheck 现在动态覆盖 `scripts/` 与 `packaging/` 下的全部 shell 文件，
+  调试脚本默认只显示会话元数据，查看原始内容必须显式 opt-in。
+
 - 会话恢复回放加固（移植 anvil 的同类修复）：可恢复命令此前以空格拼接成字符串保存、恢复时按 `", "` 拆分后原样写入 PTY——远端参数里的 `;`、逗号或换行可以在重启后被拆成一条新的本地命令。现在窗口快照保存结构化 argv（JSON 数组），回放前用配置 shell 对应的语法（POSIX 单引号或 PowerShell `& '...'`）把整个 argv 安全引用为恰好一条命令；含控制字符的 argv 或未知 shell 语法一律跳过回放并记录警告。旧快照里拼接字符串形式的命令仍可正常加载（标签页、目录、会话 ID 不受影响），但绝不自动回放，丢弃时记 debug 日志。
-- Persisted commands, output, working directories, and session metadata are restricted to `0700` directories and `0600` files on Unix.
 - AI credential contents remain outside `config.toml`: environment variables take priority, with an optional owner-only `ai_api_key_file` fallback; safe mode disables AI/Agent, executable notebooks, history, remote hosts, restoration, and persistence.
 - AI chat metadata, completed pairs, drafts, and provider-bound Block context share the bounded, owner-only, atomically replaced per-window snapshot. Redaction covers active, non-active, and archived chats, and in-flight requests are never restored as completed replies.
 - AI/Agent command proposals never submit or execute a command without an explicit user action.
@@ -208,3 +217,22 @@ All notable user-visible and operational changes are recorded here.
 - History, workflow, file-tree and AI review insertions reject line breaks and terminal control characters before writing to a PTY.
 - Support archives are created owner-only, make no network requests, and exclude configuration/history/session contents, credentials, host identity, SSH targets, and local paths.
 - The repository is dual-licensed under `MIT OR Apache-2.0`; crates.io publication remains separately disabled with `publish = false`.
+
+## [0.2.0] - 2026-07-14
+
+### Added
+
+- Modern GTK4 `TreeListModel`/`ListView` file browser with asynchronous lazy directory scans.
+- Per-window session snapshots with atomic claiming, stale-process recovery, legacy migration, retention, and doctor counts.
+- Target-aware logging with relative timestamps and module filters.
+- Cargo-or-Nix installation, safe uninstall, project governance documentation, Dependabot, and RustSec auditing.
+
+### Changed
+
+- Session snapshots and Block history use owner-only Unix permissions and durable atomic replacement.
+- CI validates maintained shell scripts and preserves complete formatting diagnostics.
+- Temporary source-export migration workflows and marker files were removed after publication.
+
+### Security
+
+- Persisted commands, output, working directories, and session metadata are restricted to `0700` directories and `0600` files on Unix.

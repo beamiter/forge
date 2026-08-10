@@ -351,8 +351,10 @@ impl UiState {
         *self.file_tree_root.borrow_mut() = root.clone();
 
         let model = self.file_tree_model.clone();
+        let model_for_start_error = model.clone();
         let expected_root = root.clone();
         let active_root = self.file_tree_root.clone();
+        let toast_overlay = self.toast_overlay.clone();
         if let Err(error) = request_dir_scan(root, move |result| {
             if *active_root.borrow() != expected_root {
                 return;
@@ -361,13 +363,33 @@ impl UiState {
                 Ok(entries) => {
                     model.replace_root(generation, entries);
                 }
-                Err(error) => log::warn!(
-                    "failed to scan file-tree root {}: {error}",
-                    expected_root.display()
-                ),
+                Err(error) => {
+                    log::warn!(
+                        "failed to scan file-tree root {}: {error}",
+                        expected_root.display()
+                    );
+                    // An empty directory and an unreadable directory must not
+                    // look identical. `replace_root` doubles as a generation
+                    // check so a late failure cannot toast for a newer scan.
+                    if model.replace_root(generation, Vec::new()) {
+                        let path = display_path(&expected_root);
+                        let error =
+                            crate::review_input::safe_inline_display(&error.to_string(), 512);
+                        toast_overlay
+                            .add_toast(adw::Toast::new(&format!("Cannot open {path}: {error}")));
+                    }
+                }
             }
         }) {
             log::warn!("failed to start file-tree scan: {error}");
+            // The start error is synchronous, but still respect the current
+            // generation in case this function is re-entered by UI callbacks.
+            if model_for_start_error.replace_root(generation, Vec::new()) {
+                let path = display_path(&self.file_tree_root.borrow());
+                let error = crate::review_input::safe_inline_display(&error.to_string(), 512);
+                self.toast_overlay
+                    .add_toast(adw::Toast::new(&format!("Cannot open {path}: {error}")));
+            }
         }
     }
 

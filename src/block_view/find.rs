@@ -52,7 +52,7 @@ pub(crate) struct FindState {
     pub(crate) current: usize,
 }
 
-/// One result row from a cross-block ripgrep-style scan. Carries enough
+/// One result row from the built-in cross-block substring/regex scan. Carries enough
 /// context for a flat result list — block id (for jump), surface flag (so
 /// the per-block VTE search cursor goes to the right widget), the 1-based
 /// line number inside that surface, the line snippet itself (trimmed/
@@ -370,7 +370,7 @@ impl TermView {
         });
     }
 
-    /// Cross-block ripgrep-style flat-result scan over cached stripped output
+    /// Cross-block substring/regex flat-result scan over cached stripped output
     /// and command text. Caller passes a literal substring (case-insensitive)
     /// when `is_regex == false`, else a regex.
     ///

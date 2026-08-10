@@ -13,7 +13,7 @@ forge 是一个面向开发工作流的原生 GTK4 终端。它默认使用 Bloc
 - 基于现代 GTK4 列表模型的异步文件树、Git 分支/脏状态条、长命令桌面通知
 - SSH 主机选择、连接复用与自动重连
 - 可选多 provider AI、可搜索和归档的多会话 Chats 库，以及绑定当前 Block pane 的原生 Shell Agent；每条候选命令均可编辑且需单独批准
-- 配置热重载、可覆盖快捷键、8 套内置主题
+- 配置热重载、可覆盖的应用动作快捷键、8 套内置主题
 - CJK 输入法和 Unicode 安全的搜索/通知显示
 
 分屏会继承当前 pane 的后端：Block 创建 Block sibling，VTE 创建 VTE sibling，并可继续嵌套。每个可见 pane 都独立拥有并清理其进程，关闭 pane、标签或窗口前会统一检查前台任务。
@@ -43,15 +43,17 @@ GTK4 栈必须足够新（glib >= 2.80、pango >= 1.52、gtk4 >= 4.14、libadwai
 脚本默认使用 Nix（精确固定匹配的库版本、不污染系统包），也可用 `--backend system`
 改装发行版 `-dev` 包。
 
-完整质量门禁：
+完整本地质量门禁由核心验证和扩展安全检查两部分组成：
 
 ```bash
-cargo fmt --all -- --check
-cargo test --all-features --locked
-cargo clippy --all-targets --all-features --locked -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
-cargo build --release --all-features --locked
+make verify
+make security
 ```
+
+`make verify` 运行格式、测试、Clippy、Rustdoc、release 构建、shell 语法和已跟踪文本隐私
+检查；`make security` 运行 RustSec、依赖策略/许可证/来源门禁、重复依赖审计与 ShellCheck，
+需要本机已安装 `cargo-audit`、`cargo-deny` 和 `shellcheck`。只需运行轻量隐私检查时可使用
+`make privacy`。
 
 安装脚本默认优先使用 Nix；没有 Nix 时自动退回 Cargo，并且不会覆盖已有配置：
 
@@ -244,7 +246,11 @@ jsh_update_check = "daily"    # "startup" 每次启动联网；"daily" 复用缓
 | Shell Agent（Block） | `Ctrl+Alt+G` |
 | 字号增 / 减 / 复位 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
 
-全部命令和当前绑定可在 `Ctrl+Shift+P` 中搜索。快捷键可在 `[keybindings]` 中覆盖，设为 `false` 可解除绑定。`Ctrl+R` 与 `Ctrl+P` 保留给 shell/readline；Block 历史统一使用 `Ctrl+Shift+H`。
+命令面板中的应用动作及其当前绑定可在 `Ctrl+Shift+P` 中搜索；这些动作可在
+`[keybindings]` 中覆盖，设为 `false` 可解除绑定。Block 视图内的上下文键
+`Alt+Shift+F`（过滤）、`Ctrl+Shift+B`（书签）和 `Ctrl+,` / `Ctrl+.`（前后书签）
+目前固定，不会被 `[keybindings]` 覆盖。`Ctrl+R` 与 `Ctrl+P` 保留给 shell/readline；
+Block 历史统一使用 `Ctrl+Shift+H`。
 
 AI provider、model、endpoint 和 API key 均可在 Settings 的 **AI & Agent** 分组配置；面板输入的 key 会原子保存到独立的 owner-only 文件，绝不会写入 `config.toml`，环境变量仍具有最高优先级。AI 面板的分隔条宽度会随配置持久化。**New chat** 会创建并选中一个新会话，旧会话继续保留在可搜索的 **Chats** 会话库中；会话自动取标题，也可 Rename、Archive/Unarchive，Delete 前会要求确认。输入框使用 `Enter` 或 `Ctrl+Enter` 发送，`Shift+Enter` 换行，并保留输入法候选确认语义。请求期间可 **Stop**，失败或停止后可按原 chat/context **Retry**；选中 Block 会显示可清除的 context chip，输出被截断时 chip 会明确提示。空会话也提供只填充、不自动发送的快捷提示。
 

@@ -360,7 +360,7 @@ flatpak run io.github.beamiter.forge
 
 ## 10. 远程会话与容器
 
-配置文件里完全没有 `remote_hosts` 键时，会拿到两条可以照抄的示例（一台 ssh、一个容器）。空列表看不出的正是这条语法唯一不肯迁就的两点：端口写在 `ssh_args` 里，不能写成 `host = "box:22"`；登录名写在 `user` 里，不能写成 `host = "root@box"`。显式写出的列表一律照办，`remote_hosts = []` 也算，所以在设置面板里删掉的主机不会回来。
+远程主机严格按用户配置启用。配置文件没有 `remote_hosts` 键、显式写成 `remote_hosts = []`，或配置加载失败时，主机选择器都保持为空；forge 不会注入地址、用户名或容器名。下面的 SSH/容器片段只是可复制模板：端口写在 `ssh_args` 里，不能写成 `host = "box:22"`；登录名写在 `user` 里，不能写成 `host = "root@box"`。
 
 设置面板（`Ctrl+Shift+O` → Remote Hosts）可以添加/编辑/删除主机：铅笔图标用同一个对话框打开已保存的条目，面板没有控件的进阶字段（`ssh_args`、`session`、`remote_shell`、`login_shell`、`multiplex`、`deploy_artifact`）在编辑时原样保留，要改这些仍然直接编辑配置：
 
@@ -494,6 +494,10 @@ toggle_ai_panel = false
 ```
 
 修饰键名称不区分大小写，`Ctrl` 与 `Control` 等价。若两个 action 使用同一组合，配置检查器会报告冲突。`Ctrl+R` / `Ctrl+P` 留给 shell/readline。
+
+`[keybindings]` 只管理命令面板中可发现的应用动作。Block 视图的上下文键
+`Alt+Shift+F`（过滤）、`Ctrl+Shift+B`（书签）和 `Ctrl+,` / `Ctrl+.`（前后书签）
+目前是固定绑定，不能通过该表覆盖或解除。
 
 ## 13. 状态与历史位置
 

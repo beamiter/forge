@@ -20,6 +20,36 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  privacy:
+    name: Tracked-text privacy guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Reject known personal identifiers
+        run: ./scripts/privacy-check.sh
+
+  dependency-policy:
+    name: Dependency policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --force
+
+      - name: Enforce dependency policy
+        run: cargo deny check
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
@@ -65,14 +95,51 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y shellcheck
 
-      - name: Check installer and smoke scripts
+      - name: Check tracked shell scripts
         run: |
-          bash -n scripts/install.sh scripts/uninstall.sh scripts/smoke-flatpak.sh \
-            scripts/support-bundle.sh scripts/package-release.sh packaging/install-release.sh
-          shellcheck scripts/install.sh scripts/uninstall.sh scripts/smoke-flatpak.sh \
-            scripts/support-bundle.sh scripts/package-release.sh packaging/install-release.sh
+          mapfile -t shell_files < <(find scripts packaging -type f -name '*.sh' -print | sort)
+          bash -n "${shell_files[@]}"
+          shellcheck "${shell_files[@]}"
           scripts/install.sh --help >/dev/null
           scripts/uninstall.sh --help >/dev/null
+
+  gtk-display:
+    name: GTK display regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install GTK display test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libvte-2.91-gtk4-dev \
+            libpcre2-dev \
+            xvfb \
+            xauth \
+            dbus-x11
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gtk-display
+
+      - name: Run display-backed diagnostic regression
+        env:
+          RUST_TEST_THREADS: "1"
+        run: |
+          dbus-run-session -- \
+            xvfb-run -a cargo test --lib --all-features --locked \
+              block_view::blocks::tests::diag_short_ls_block_geometry -- \
+              --ignored --exact --nocapture
 
   clippy:
     name: Clippy

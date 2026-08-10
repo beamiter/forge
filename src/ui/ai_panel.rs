@@ -187,6 +187,13 @@ pub(crate) struct AiPanel {
 }
 
 impl AiPanel {
+    pub(crate) fn apply_theme_colors(&self) {
+        let error = self.config.borrow().semantic_colors().error;
+        if let Some(tag) = self.convo_buffer.tag_table().lookup("role-err") {
+            tag.set_foreground_rgba(Some(&error));
+        }
+    }
+
     pub(crate) fn build(config: Rc<RefCell<Config>>) -> Self {
         let header = GBox::new(Orientation::Horizontal, 6);
         header.add_css_class("ai-panel-header");
@@ -251,10 +258,11 @@ impl AiPanel {
         let tag_table = convo_buffer.tag_table();
         tag_table.add(&TextTag::builder().name("role-user").weight(700).build());
         tag_table.add(&TextTag::builder().name("role-asst").weight(700).build());
+        let error_color = config.borrow().semantic_colors().error;
         tag_table.add(
             &TextTag::builder()
                 .name("role-err")
-                .foreground("#e01b24")
+                .foreground_rgba(&error_color)
                 .weight(700)
                 .build(),
         );

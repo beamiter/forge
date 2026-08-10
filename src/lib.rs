@@ -196,10 +196,8 @@ pub mod process {
             where
                 E: serde::de::Error,
             {
-                let program = joined.split_whitespace().next().unwrap_or("(empty)");
-                log::warn!(
-                    "Ignoring legacy session restore command '{program}' without argv boundaries"
-                );
+                let _ = joined;
+                log::warn!("Ignoring legacy session restore command without argv boundaries");
                 Ok(None)
             }
 

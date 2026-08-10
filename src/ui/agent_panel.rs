@@ -1547,7 +1547,7 @@ impl AgentRuntime {
         let review = CommandReviewCard::new(CommandReviewSpec {
             presentation: ReviewPresentation::Embedded,
             compact: runtime.config.borrow().block_compact,
-            icon: "\u{f544}", // nf-fa-robot
+            icon: "utilities-terminal-symbolic",
             title: "Command proposal".to_string(),
             badge: format!("Shell Agent · #{}", id.get()),
             description: "Edit or copy the proposal, insert it for manual review without running, reject it, or explicitly approve execution.".to_string(),
@@ -1941,13 +1941,14 @@ fn build_agent_message_block(speaker: &str, body: &str, compact: bool) -> gtk4::
         header.set_margin_top(6);
         header.set_margin_bottom(2);
     }
-    let icon = Label::new(Some(if speaker == "You" {
-        "\u{f007}" // nf-fa-user
+    let icon = Image::from_icon_name(if speaker == "You" {
+        "avatar-default-symbolic"
     } else {
-        "\u{f544}" // nf-fa-robot
-    }));
+        "utilities-terminal-symbolic"
+    });
     icon.add_css_class("agent-card-icon");
     icon.add_css_class("assistant-card-icon");
+    icon.set_accessible_role(gtk4::AccessibleRole::Presentation);
     header.append(&icon);
     let title = Label::new(Some("Shell Agent"));
     title.add_css_class("agent-card-title");
@@ -1990,7 +1991,6 @@ fn agent_message_display_bytes(speaker: &str, body: &str) -> usize {
     let body = agent_message_display_text(body);
     "Shell Agent"
         .len()
-        .saturating_add('\u{f007}'.len_utf8())
         .saturating_add(speaker.len())
         .saturating_add(body.len())
         .saturating_add("Shell Agent activity: ".len())
@@ -2378,9 +2378,10 @@ impl UiState {
             header.set_margin_top(6);
             header.set_margin_bottom(2);
         }
-        let icon = Label::new(Some("\u{f544}")); // nf-fa-robot
+        let icon = Image::from_icon_name("utilities-terminal-symbolic");
         icon.add_css_class("agent-card-icon");
         icon.add_css_class("assistant-card-icon");
+        icon.set_accessible_role(gtk4::AccessibleRole::Presentation);
         header.append(&icon);
         let title = Label::new(Some("Shell Agent"));
         title.add_css_class("agent-card-title");
@@ -2398,15 +2399,13 @@ impl UiState {
         binding_label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
         binding_label.set_tooltip_text(Some(&cwd));
         header.append(&binding_label);
-        let settings_btn = Button::with_label("\u{f013}"); // nf-fa-cog
+        let settings_btn = Button::from_icon_name("preferences-system-symbolic");
         settings_btn.add_css_class("flat");
-        settings_btn.set_focusable(false);
         settings_btn.set_tooltip_text(Some("Shell Agent settings"));
         settings_btn.update_property(&[gtk4::accessible::Property::Label("Shell Agent settings")]);
         header.append(&settings_btn);
-        let close_btn = Button::with_label("\u{2715}");
+        let close_btn = Button::from_icon_name("window-close-symbolic");
         close_btn.add_css_class("flat");
-        close_btn.set_focusable(false);
         close_btn.set_tooltip_text(Some("Cancel Agent and close this card"));
         close_btn.update_property(&[gtk4::accessible::Property::Label(
             "Cancel Shell Agent session",
@@ -2822,7 +2821,6 @@ mod tests {
     fn agent_activity_accounts_the_exact_bounded_dynamic_labels() {
         let body = "界".repeat(MAX_AGENT_MESSAGE_DISPLAY_BYTES);
         let expected = "Shell Agent".len()
-            + '\u{f007}'.len_utf8()
             + crate::review_input::safe_inline_display("Agent", 256).len()
             + agent_message_display_text(&body).len()
             + "Shell Agent activity: ".len()

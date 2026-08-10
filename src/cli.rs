@@ -477,7 +477,8 @@ fn check_config(path: &Path, format: ReportFormat) -> bool {
             }
             errors == 0
         }
-        Err(_err) => {
+        Err(error) => {
+            let diagnostic = crate::config::config_syntax_diagnostic(&contents, &error);
             if format == ReportFormat::Json {
                 println!(
                     "{}",
@@ -489,15 +490,24 @@ fn check_config(path: &Path, format: ReportFormat) -> bool {
                         "warnings": 0,
                         "issues": [{
                             "level":"error", "severity":"error",
-                            "path":"$", "key":"$", "message":"invalid TOML"
+                            "path":"$", "key":"$",
+                            "line":diagnostic.line,
+                            "column":diagnostic.column,
+                            "message":diagnostic.message
                         }]
                     })
                 );
             } else {
-                // A TOML decoder error can include the offending source line.
-                // Keep the explicit file path useful without echoing config
-                // contents into logs or copied diagnostic output.
-                eprintln!("error: {}: invalid TOML", path.display());
+                // `config_syntax_diagnostic` deliberately omits TOML's source
+                // excerpt so a copied diagnostic cannot disclose config values.
+                match (diagnostic.line, diagnostic.column) {
+                    (Some(line), Some(column)) => eprintln!(
+                        "error: {}:{line}:{column}: {}",
+                        path.display(),
+                        diagnostic.message
+                    ),
+                    _ => eprintln!("error: {}: {}", path.display(), diagnostic.message),
+                }
             }
             false
         }
@@ -505,10 +515,7 @@ fn check_config(path: &Path, format: ReportFormat) -> bool {
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
+    crate::host::find_executable_in_path(name)
 }
 
 fn env_presence(name: &str) -> &'static str {
@@ -1064,24 +1071,73 @@ fn print_completion(shell: ShellIntegration) {
 }
 
 fn validate_launch_options(options: &LaunchOptions) -> Result<(), String> {
-    if let Some(directory) = &options.working_directory {
-        if !directory.is_dir() {
+    let requested_cwd = if let Some(directory) = &options.working_directory {
+        let directory = directory.to_str().ok_or_else(|| {
+            "working directory must be valid UTF-8 (the terminal backend cannot represent this path)"
+                .to_string()
+        })?;
+        // Use the same namespace-aware probe as the terminal backend. A valid
+        // host directory may not be stat-able from inside a Flatpak sandbox.
+        if !crate::host::working_directory_available(directory) {
             return Err(format!(
                 "working directory does not exist or is not a directory: {}",
-                directory.display()
+                Path::new(directory).display()
             ));
         }
-    }
+        Some(directory)
+    } else {
+        None
+    };
     if let Some(argv) = &options.execute {
         let executable = argv.first().expect("parser rejects empty commands");
-        let path = Path::new(executable);
-        let found = if path.components().count() > 1 {
-            path.is_file()
+        let effective_cwd = requested_cwd
+            .map(PathBuf::from)
+            .or_else(|| {
+                // VTE intentionally starts an unspecified cwd in HOME, while
+                // the native Block PTY inherits the application cwd. Resolve a
+                // relative executable against the backend that will actually
+                // spawn it so early validation cannot approve a different path.
+                let uses_vte = options.safe_mode
+                    || matches!(options.mode, Some(Mode::Vte))
+                    || (options.mode.is_none()
+                        && matches!(
+                            load_config().0.terminal_mode,
+                            crate::config::TerminalMode::Vte
+                        ));
+                uses_vte.then(dirs::home_dir).flatten()
+            })
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let found = if crate::host::is_flatpak() {
+            if executable.contains('/') {
+                let base = if effective_cwd.is_absolute() {
+                    effective_cwd
+                } else {
+                    std::env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("/"))
+                        .join(effective_cwd)
+                };
+                let candidate = if Path::new(executable).is_absolute() {
+                    PathBuf::from(executable)
+                } else {
+                    base.join(executable)
+                };
+                candidate
+                    .to_str()
+                    .is_some_and(|candidate| executable_available(candidate, true))
+            } else {
+                crate::host::command_available(executable)
+            }
         } else {
-            find_on_path(executable).is_some()
+            crate::host::resolve_executable(
+                executable,
+                std::env::var_os("PATH").as_deref(),
+                effective_cwd.to_str(),
+            )
+            .is_ok()
         };
         if !found {
-            return Err(format!("command not found: {executable}"));
+            return Err(format!("command not found or not executable: {executable}"));
         }
     }
     Ok(())
@@ -1277,10 +1333,44 @@ mod tests {
     #[test]
     fn executable_probe_checks_explicit_shell_paths() {
         assert!(executable_available("/bin/sh", false));
+        assert!(!executable_available("/etc/passwd", false));
         assert!(!executable_available(
             "/definitely/missing/forge-shell",
             false
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_validation_checks_execute_bits_in_the_child_directory() {
+        let valid = LaunchOptions {
+            working_directory: Some(PathBuf::from("/bin")),
+            execute: Some(vec!["./sh".into()]),
+            ..LaunchOptions::default()
+        };
+        assert!(validate_launch_options(&valid).is_ok());
+
+        let not_executable = LaunchOptions {
+            working_directory: Some(PathBuf::from("/bin")),
+            execute: Some(vec!["../etc/passwd".into()]),
+            ..LaunchOptions::default()
+        };
+        assert!(validate_launch_options(&not_executable).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_validation_rejects_a_lossy_working_directory() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let options = LaunchOptions {
+            working_directory: Some(PathBuf::from(OsString::from_vec(vec![
+                b'/', b't', b'm', b'p', b'/', 0xff,
+            ]))),
+            ..LaunchOptions::default()
+        };
+        let error = validate_launch_options(&options).unwrap_err();
+        assert!(error.contains("valid UTF-8"), "{error}");
     }
 
     #[test]

@@ -515,7 +515,6 @@ pub fn run() -> glib::ExitCode {
              .terminal-box scrollbar slider { min-width: 6px; border-radius: 3px; }
              .terminal-box scrollbar { padding: 0; }
              .tab-activity { font-style: italic; }
-             .tab-bell { color: #f1fa8c; }
              @keyframes bell-flash { 0% { opacity: 1.0; } 50% { opacity: 0.5; } 100% { opacity: 1.0; } }
              .tab-bell-flash { animation: bell-flash 0.3s ease-in-out 2; }
              .tab-pinned { font-weight: bold; }
@@ -526,15 +525,13 @@ pub fn run() -> glib::ExitCode {
              .tab-strip:not(.top-tabs) .tab-drop-before { box-shadow: inset 0 3px currentColor; }
              .tab-strip:not(.top-tabs) .tab-drop-after { box-shadow: inset 0 -3px currentColor; }
              .tab-process-indicator { font-size: 0.8em; opacity: 0.6; margin-left: 4px; }
-             .tab-pin-icon { font-size: 0.9em; opacity: 0.8; margin-right: 2px; color: #ffb86c; }
+             .tab-pin-icon { font-size: 0.9em; opacity: 0.8; margin-right: 2px; }
              .tab-selected { background-color: alpha(currentColor, 0.14); outline: 2px solid alpha(currentColor, 0.8); outline-offset: -2px; }
              .tab-conn-dot { font-size: 0.7em; margin-right: 2px; }
              .window-controls { margin-left: 2px; }
              .window-control { min-width: 24px; min-height: 24px; padding: 0; border-radius: 999px; }
              @keyframes conn-pulse { 0% { opacity: 1.0; } 50% { opacity: 0.35; } 100% { opacity: 1.0; } }
-             .tab-conn-dot.tab-connecting { color: #f1fa8c; animation: conn-pulse 1.2s ease-in-out infinite; }
-             .tab-conn-dot.tab-connected { color: #50fa7b; }
-             .tab-conn-dot.tab-disconnected { color: #ff5555; }
+             .tab-conn-dot.tab-connecting { animation: conn-pulse 1.2s ease-in-out infinite; }
              .tab-strip-search { padding: 4px 8px; margin: 2px 4px; }
              .top-tabs .tab-strip-btn { border-bottom: none; margin-bottom: 0; margin-right: 2px; }
              .bottom-bar { min-height: 22px; padding: 0 6px; border-top: 1px solid alpha(currentColor, 0.15); font-size: 0.85em; }
@@ -921,8 +918,8 @@ pub fn run() -> glib::ExitCode {
             notebook: notebook.clone(),
             tab_counter: tab_counter.clone(),
             font_scale: font_scale.clone(),
+            config_persist_generation: Rc::new(Cell::new(0)),
             font_persist_generation: Rc::new(Cell::new(0)),
-            config_last_write: Rc::new(Cell::new(None)),
             window_opacity: window_opacity.clone(),
             shell_argv: shell_argv.clone(),
             config: config.clone(),
@@ -996,12 +993,25 @@ pub fn run() -> glib::ExitCode {
         // turns otherwise invisible fsync/permission failures into one concise
         // toast per affected operation.
         let persistence_toasts = toast_overlay.downgrade();
+        let ui_for_persistence = Rc::downgrade(&ui);
         let ai_panel_for_persistence = ui.ai_panel.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
             let Some(overlay) = persistence_toasts.upgrade() else {
                 return glib::ControlFlow::Break;
             };
             for failure in crate::persistence::drain_failures() {
+                if failure.operation == ui::CONFIG_PERSIST_OPERATION {
+                    if let Some(ui) = ui_for_persistence.upgrade() {
+                        ui.show_config_error(
+                            "Settings were not saved",
+                            &format!(
+                                "{}\n\nThe in-memory setting is still active. Reload the configuration (Ctrl+Shift+R) before trying again if the file changed elsewhere.",
+                                failure.error
+                            ),
+                        );
+                    }
+                    continue;
+                }
                 let toast = adw::Toast::new(&format!("{} failed: {}", failure.operation, failure.error));
                 toast.set_timeout(8);
                 overlay.add_toast(toast);
@@ -1131,7 +1141,11 @@ pub fn run() -> glib::ExitCode {
         let requested_cwd = launch
             .working_directory
             .as_ref()
-            .map(|path| path.to_string_lossy().into_owned());
+            .map(|path| {
+                path.to_str()
+                    .expect("CLI validation rejects non-UTF-8 working directories")
+                    .to_owned()
+            });
         let restore_session = !launch.safe_mode
             && !launch.no_restore
             && launch.working_directory.is_none()
@@ -1499,6 +1513,7 @@ pub fn run() -> glib::ExitCode {
         // Save state *before* GTK starts destroying widgets.
         let notebook_for_close_request = notebook.clone();
         let session_ids_for_close = ui.session_ids.clone();
+        let ui_for_close_request = ui.clone();
         let app_for_close = app.clone();
         let config_for_close = ui.config.clone();
         let sidebar_for_close = sidebar.clone();
@@ -1563,7 +1578,7 @@ pub fn run() -> glib::ExitCode {
                     }
                 }
             }
-            let _ = crate::config::save_config(&config_for_close.borrow());
+            ui_for_close_request.flush_pending_config();
 
             // Stop and reap any in-flight provider processes before widgets
             // and their request-routing state are destroyed.

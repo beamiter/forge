@@ -9,7 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk4::prelude::*;
-use gtk4::{Box as GBox, Button, Entry, Label, Orientation};
+use gtk4::{Box as GBox, Button, Entry, Image, Label, Orientation};
 
 const MAX_REVIEW_LABEL_BYTES: usize = 1024;
 const MAX_REVIEW_DESCRIPTION_BYTES: usize = 16 * 1024;
@@ -111,8 +111,9 @@ impl CommandReviewCard {
         header.set_margin_top(top_margin);
         header.set_margin_bottom(bottom_margin);
 
-        let icon = Label::new(Some(spec.icon));
+        let icon = Image::from_icon_name(spec.icon);
         icon.add_css_class("assistant-card-icon");
+        icon.set_accessible_role(gtk4::AccessibleRole::Presentation);
         header.append(&icon);
 
         let title_text =
@@ -134,9 +135,8 @@ impl CommandReviewCard {
         header.append(&badge);
 
         let close = spec.close_button.then(|| {
-            let button = Button::with_label("\u{2715}");
+            let button = Button::from_icon_name("window-close-symbolic");
             button.add_css_class("flat");
-            button.set_focusable(false);
             button.set_tooltip_text(Some("Dismiss (Esc)"));
             button.update_property(&[gtk4::accessible::Property::Label(
                 "Dismiss command proposal",

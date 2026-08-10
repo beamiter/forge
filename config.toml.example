@@ -10,7 +10,7 @@
 terminal_mode = "block"
 opacity = 0.95                 # 0.01 .. 1.0
 scrollback = 5000             # 0 .. 1000000
-font = "SauceCodePro Nerd Font Mono 14"
+font = "Monospace 14"
 font_scale = 1.0              # 0.1 .. 10.0
 
 # default, light, solarized-dark, solarized-light, gruvbox-dark,
@@ -41,6 +41,8 @@ tab_width = 180                # 顶部 tab 宽度；拖动右缘调整，80 .. 
 # 窗口底部状态栏：cwd、git 分支、上一条命令结果、终端网格、标签页序号。
 # 四个 jterm 使用同一个键名。
 bottom_bar = true
+# 在支持 shell capability handshake 的本地 Block prompt 中，单击可移动编辑光标。
+click_moves_cursor = true
 
 # Block 模式 -----------------------------------------------------------------
 
@@ -117,6 +119,8 @@ ai_panel_visible = false
 ai_panel_width = 360           # 240 .. 1200；拖动 AI 分隔条后自动更新
 ai_model = "claude-sonnet-4-6"
 ai_max_tokens = 1024           # 64 .. 32768
+# 可选采样温度；0.0 .. 2.0。省略时使用 provider 默认值。
+# ai_temperature = 0.7
 ai_stream = true               # 聊天回复边生成边显示；关闭则等完整回复后一次性显示
 ai_redact_secrets = true
 
@@ -171,7 +175,7 @@ ai_redact_secrets = true
 # export_session_markdown / export_session_json 这两个 key 自行绑定。
 
 # 远程主机（可重复；默认不会注入任何个人地址） ------------------------------
-# 设置面板（Ctrl+Shift+O → Remote Hosts）现在也能添加/删除主机；
+# 设置面板（Ctrl+Shift+O → Remote Hosts）可以添加、编辑和删除主机；
 # ssh_args、session、deploy_artifact 等进阶字段仍只能在这里编辑。
 
 # 例一：SSH 主机——用 ssh -t 连接 dev.example.com 并部署 jsh。

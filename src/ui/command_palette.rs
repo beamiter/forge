@@ -4,7 +4,7 @@
 use adw::prelude::*;
 use gtk4::gdk::{Key, ModifierType};
 use gtk4::{
-    Box as GBox, Button, EventControllerKey, Label, ListBox, Orientation, ScrolledWindow,
+    Box as GBox, Button, EventControllerKey, Image, Label, ListBox, Orientation, ScrolledWindow,
     SearchEntry, Spinner,
 };
 use libadwaita as adw;
@@ -193,7 +193,7 @@ impl CommandSuggestionRuntime {
         let review = CommandReviewCard::new(CommandReviewSpec {
             presentation: ReviewPresentation::Embedded,
             compact: runtime.config.borrow().block_compact,
-            icon: "\u{f0eb}", // nf-fa-lightbulb_o
+            icon: "dialog-information-symbolic",
             title: "Command proposal".to_string(),
             badge: crate::review_input::safe_inline_display(provider, 1024),
             description: format!("Generated for: {}", compact_one_line(&runtime.request, 140)),
@@ -568,8 +568,9 @@ impl UiState {
         header.set_margin_end(if compact { 6 } else { 8 });
         header.set_margin_top(if compact { 3 } else { 6 });
         header.set_margin_bottom(if compact { 1 } else { 2 });
-        let icon = Label::new(Some("\u{f0eb}")); // nf-fa-lightbulb_o
+        let icon = Image::from_icon_name("dialog-information-symbolic");
         icon.add_css_class("assistant-card-icon");
+        icon.set_accessible_role(gtk4::AccessibleRole::Presentation);
         header.append(&icon);
         let title = Label::new(Some("AI command suggestion"));
         title.add_css_class("assistant-card-title");
@@ -582,10 +583,12 @@ impl UiState {
         binding.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
         binding.set_tooltip_text(Some(&cwd_display));
         header.append(&binding);
-        let close = Button::with_label("\u{2715}");
+        let close = Button::from_icon_name("window-close-symbolic");
         close.add_css_class("flat");
-        close.set_focusable(false);
         close.set_tooltip_text(Some("Stop and dismiss this suggestion (Esc)"));
+        close.update_property(&[gtk4::accessible::Property::Label(
+            "Dismiss command suggestion",
+        )]);
         header.append(&close);
         outer.append(&header);
 

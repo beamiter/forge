@@ -9,6 +9,7 @@ use gtk4::{EventControllerKey, GestureClick, SearchEntry};
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 use vte4::Format;
 use vte4::Terminal;
 use vte4::TerminalExt;
@@ -28,6 +29,9 @@ type RemoteHostsRefresh = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 /// a stale index would silently edit a different host.
 type RemoteHostEditTarget = (usize, String);
 
+const CROSS_BLOCK_SEARCH_LIMIT: usize = 500;
+const CROSS_BLOCK_SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
+
 fn remote_picker_guard(safe_mode: bool, host_count: usize) -> Result<(), &'static str> {
     if safe_mode {
         Err("Remote connections are disabled in safe mode.")
@@ -35,6 +39,34 @@ fn remote_picker_guard(safe_mode: bool, host_count: usize) -> Result<(), &'stati
         Err("No remote hosts are configured. Add one in Settings → Remote Hosts.")
     } else {
         Ok(())
+    }
+}
+
+fn cross_block_search_dialog_title() -> &'static str {
+    "Search Blocks"
+}
+
+fn cross_block_search_idle_status() -> &'static str {
+    "Type to search across blocks."
+}
+
+fn cross_block_search_pending_status() -> &'static str {
+    "Searching blocks…"
+}
+
+fn cross_block_search_status_for_match_count(total: usize) -> String {
+    if total == 0 {
+        "No matches.".to_string()
+    } else if total == CROSS_BLOCK_SEARCH_LIMIT {
+        format!("{CROSS_BLOCK_SEARCH_LIMIT} matches (capped) — refine your query.")
+    } else {
+        format!("{total} matches")
+    }
+}
+
+fn clear_list_box(list_box: &ListBox) {
+    while let Some(child) = list_box.first_child() {
+        list_box.remove(&child);
     }
 }
 
@@ -691,12 +723,12 @@ impl UiState {
         filter_entry.grab_focus();
     }
 
-    /// Cross-block ripgrep palette. Search-as-you-type over every finished
-    /// block's command line + cached ANSI-stripped output; each hit gets a
-    /// flat row (cmd preview as title, "Lnn: snippet" as subtitle). Enter
-    /// scrolls the target block into view and lights its VTE search
-    /// highlighter on the chord-shifted hit so the user can step further
-    /// with the existing find-next chord.
+    /// Cross-block search palette. Debounced search-as-you-type over every
+    /// finished block's command line + cached ANSI-stripped output; each hit
+    /// gets a flat row (cmd preview as title, "Lnn: snippet" as subtitle).
+    /// Enter scrolls the target block into view and lights its VTE search
+    /// highlighter on the chord-shifted hit so the user can step further with
+    /// the existing find-next chord.
     ///
     /// Default mode is case-insensitive substring; ".*" toggle switches to
     /// regex. Hit count is capped at 500 to keep the palette responsive on
@@ -714,7 +746,7 @@ impl UiState {
         };
 
         let dialog = adw::Dialog::builder()
-            .title("Search Blocks (ripgrep)")
+            .title(cross_block_search_dialog_title())
             .content_width(720)
             .content_height(520)
             .build();
@@ -739,6 +771,7 @@ impl UiState {
 
         let status_label = Label::new(None);
         status_label.add_css_class("dim-label");
+        status_label.set_accessible_role(gtk4::AccessibleRole::Status);
         status_label.set_xalign(0.0);
         status_label.set_margin_start(12);
         status_label.set_margin_end(12);
@@ -769,6 +802,8 @@ impl UiState {
         // keystroke / regex-toggle change.
         let hits: Rc<RefCell<Vec<crate::block_view::CrossBlockHit>>> =
             Rc::new(RefCell::new(Vec::new()));
+        let pending_rebuild: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        let search_generation = Rc::new(Cell::new(0u64));
 
         let rebuild = {
             let term_view = term_view.clone();
@@ -781,25 +816,17 @@ impl UiState {
                 let query = filter_entry.text().to_string();
                 let is_regex = regex_toggle.is_active();
 
-                while let Some(child) = list_box.first_child() {
-                    list_box.remove(&child);
-                }
+                clear_list_box(&list_box);
                 if query.is_empty() {
                     hits.borrow_mut().clear();
-                    status_label.set_text("Type to search across blocks.");
+                    status_label.set_text(cross_block_search_idle_status());
                     return;
                 }
 
-                match term_view.cross_block_search(&query, is_regex, 500) {
+                match term_view.cross_block_search(&query, is_regex, CROSS_BLOCK_SEARCH_LIMIT) {
                     Ok(results) => {
                         let total = results.len();
-                        if total == 0 {
-                            status_label.set_text("No matches.");
-                        } else if total == 500 {
-                            status_label.set_text("500 matches (capped) — refine your query.");
-                        } else {
-                            status_label.set_text(&format!("{total} matches"));
-                        }
+                        status_label.set_text(&cross_block_search_status_for_match_count(total));
                         for hit in results.iter() {
                             let surface = if hit.is_output { "out" } else { "cmd" };
                             let subtitle = format!(
@@ -821,21 +848,63 @@ impl UiState {
                     }
                     Err(e) => {
                         hits.borrow_mut().clear();
+                        clear_list_box(&list_box);
                         status_label.set_text(&format!("Bad regex: {e}"));
                     }
                 }
             })
         };
 
-        // Initial state.
-        status_label.set_text("Type to search across blocks.");
+        let schedule_rebuild = {
+            let pending_rebuild = pending_rebuild.clone();
+            let search_generation = search_generation.clone();
+            let rebuild = rebuild.clone();
+            let hits = hits.clone();
+            let list_box = list_box.clone();
+            let status_label = status_label.clone();
+            let filter_entry = filter_entry.clone();
+            Rc::new(move || {
+                let generation = search_generation.get().wrapping_add(1);
+                search_generation.set(generation);
+                if let Some(source) = pending_rebuild.borrow_mut().take() {
+                    source.remove();
+                }
 
-        let rebuild_for_change = rebuild.clone();
+                clear_list_box(&list_box);
+                hits.borrow_mut().clear();
+                if filter_entry.text().is_empty() {
+                    status_label.set_text(cross_block_search_idle_status());
+                    return;
+                }
+                status_label.set_text(cross_block_search_pending_status());
+
+                let pending_rebuild = pending_rebuild.clone();
+                let search_generation = search_generation.clone();
+                let rebuild = rebuild.clone();
+                let pending_rebuild_slot = pending_rebuild.clone();
+                let pending_rebuild_clear = pending_rebuild.clone();
+                let source = glib::timeout_add_local(CROSS_BLOCK_SEARCH_DEBOUNCE, move || {
+                    if search_generation.get() == generation {
+                        rebuild();
+                        // Only the current generation owns the stored source.
+                        // A stale callback must never clear a newer timeout.
+                        pending_rebuild_clear.borrow_mut().take();
+                    }
+                    glib::ControlFlow::Break
+                });
+                *pending_rebuild_slot.borrow_mut() = Some(source);
+            })
+        };
+
+        // Initial state.
+        status_label.set_text(cross_block_search_idle_status());
+
+        let rebuild_for_change = schedule_rebuild.clone();
         filter_entry.connect_search_changed(move |_| {
             rebuild_for_change();
         });
 
-        let rebuild_for_toggle = rebuild.clone();
+        let rebuild_for_toggle = schedule_rebuild.clone();
         regex_toggle.connect_toggled(move |_| {
             rebuild_for_toggle();
         });
@@ -931,7 +1000,11 @@ impl UiState {
         dialog.add_controller(key_controller);
 
         let dialog_ref = self.cross_block_search_dialog.clone();
+        let pending_rebuild_for_close = pending_rebuild.clone();
         dialog.connect_closed(move |_| {
+            if let Some(source) = pending_rebuild_for_close.borrow_mut().take() {
+                source.remove();
+            }
             *dialog_ref.borrow_mut() = None;
         });
 
@@ -2655,7 +2728,11 @@ impl UiState {
 
 #[cfg(test)]
 mod tests {
-    use super::remote_picker_guard;
+    use super::{
+        cross_block_search_dialog_title, cross_block_search_idle_status,
+        cross_block_search_pending_status, cross_block_search_status_for_match_count,
+        remote_picker_guard, CROSS_BLOCK_SEARCH_LIMIT,
+    };
 
     #[test]
     fn remote_picker_reports_safe_mode_and_empty_config() {
@@ -2668,5 +2745,21 @@ mod tests {
             Err("No remote hosts are configured. Add one in Settings → Remote Hosts.")
         );
         assert!(remote_picker_guard(false, 1).is_ok());
+    }
+
+    #[test]
+    fn cross_block_search_copy_stays_generic_and_consistent() {
+        assert_eq!(cross_block_search_dialog_title(), "Search Blocks");
+        assert_eq!(
+            cross_block_search_idle_status(),
+            "Type to search across blocks."
+        );
+        assert_eq!(cross_block_search_pending_status(), "Searching blocks…");
+        assert_eq!(cross_block_search_status_for_match_count(0), "No matches.");
+        assert_eq!(
+            cross_block_search_status_for_match_count(CROSS_BLOCK_SEARCH_LIMIT),
+            "500 matches (capped) — refine your query."
+        );
+        assert_eq!(cross_block_search_status_for_match_count(37), "37 matches");
     }
 }
