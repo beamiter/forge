@@ -106,7 +106,7 @@ jobs:
 
       - name: Upload Cargo source diagnostics
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cargo-sources-diagnostics-${{ github.run_id }}
           path: |
@@ -148,7 +148,7 @@ jobs:
 
       - name: Upload Flatpak build diagnostics
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: flatpak-build-diagnostics-${{ github.run_id }}
           path: flatpak-build.log
@@ -178,7 +178,7 @@ jobs:
 
       - name: Upload Flatpak install diagnostics
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: flatpak-install-diagnostics-${{ github.run_id }}
           path: flatpak-install.log
@@ -194,7 +194,7 @@ jobs:
 
       - name: Upload Flatpak bundle and diagnostics
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: forge-flatpak-${{ github.sha }}
           path: |
