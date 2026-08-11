@@ -1071,6 +1071,113 @@ fn prompt_anchor_may_settle(
         && !pending_typeahead
 }
 
+/// Where a chunk that arrives after `OSC 133;B` goes while the prompt anchor is
+/// still being established.
+///
+/// The fence is a display delay, never a filter: every parked byte is replayed
+/// through the same live-VTE feed, in arrival order. It buys the settling pass
+/// a cursor position that the shell's own post-B repaint has not moved yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PostPromptFeed {
+    /// No fence is holding this prompt: feed the chunk now.
+    Live,
+    /// Park the chunk; the settling pass owns the replay.
+    Park,
+    /// Parking would exceed the ring: replay what is parked, feed this chunk,
+    /// and stop parking for the rest of this prompt.
+    ReleaseThenFeed,
+}
+
+/// The fence holds bytes only while a settling pass can still publish an
+/// anchor for them to be measured against. `anchor_ready` means that pass
+/// succeeded; `fence_released` means it gave up (or the ring overflowed). Both
+/// end the fence, so neither state may leave a chunk parked — the parked bytes
+/// include the shell's echo of the user's own keystrokes, and a prompt that
+/// swallows its echo until the next `CommandStart` looks dead while it is in
+/// fact accepting input.
+fn post_prompt_feed(
+    anchor_ready: bool,
+    fence_released: bool,
+    parked_bytes: usize,
+    chunk_bytes: usize,
+    ring_capacity: usize,
+) -> PostPromptFeed {
+    if anchor_ready || fence_released {
+        return PostPromptFeed::Live;
+    }
+    if parked_bytes.saturating_add(chunk_bytes) > ring_capacity {
+        return PostPromptFeed::ReleaseThenFeed;
+    }
+    PostPromptFeed::Park
+}
+
+/// Why a prompt-anchor settling pass stopped before publishing an anchor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnchorAbandoned {
+    /// The fence is already released, so an anchor published now could not
+    /// describe the surface the user is looking at.
+    FenceReleased,
+    /// The prompt stopped being a quiet, unedited editor: the user typed, a
+    /// submission is in flight, or the state left AwaitingCommand.
+    PromptNotQuiet,
+    /// The cursor never settled inside the safety budget.
+    Deadline,
+}
+
+/// One frame's decision for the prompt-anchor settling pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnchorTickExit {
+    /// A newer PromptEnd owns the fence, the ring and the tick slot; stop
+    /// without touching any of them.
+    Superseded,
+    /// Stop and release the fence — no anchor will be published for this
+    /// prompt, so nothing else would ever drain the parked bytes.
+    Abandon(AnchorAbandoned),
+    /// Keep polling.
+    Continue,
+}
+
+fn anchor_tick_exit(
+    generation_matches: bool,
+    fence_released: bool,
+    may_settle: bool,
+    polls: u32,
+) -> AnchorTickExit {
+    if !generation_matches {
+        return AnchorTickExit::Superseded;
+    }
+    if fence_released {
+        return AnchorTickExit::Abandon(AnchorAbandoned::FenceReleased);
+    }
+    if !may_settle {
+        return AnchorTickExit::Abandon(AnchorAbandoned::PromptNotQuiet);
+    }
+    if polls >= VERIFIED_SUBMISSION_MAX_POLLS {
+        return AnchorTickExit::Abandon(AnchorAbandoned::Deadline);
+    }
+    AnchorTickExit::Continue
+}
+
+/// Release the post-prompt feed fence and replay whatever it parked.
+///
+/// Every exit from the settling pass that leaves the anchor unpublished must
+/// come through here. The fence has exactly one owner, and an owner that stops
+/// without releasing parks the prompt's echo indefinitely: with the anchor
+/// permanently unready, `post_prompt_feed` keeps choosing `Park` for every
+/// later chunk, and the first drain is the one `CommandStart` performs — so the
+/// whole typed line stays invisible until Enter.
+fn release_post_prompt_fence(
+    vte: &Terminal,
+    parked: &RefCell<BoundedByteRing>,
+    fence_released: &Cell<bool>,
+) {
+    fence_released.set(true);
+    let deferred = parked.borrow_mut().take_vec();
+    if !deferred.is_empty() {
+        vte.feed(&deferred);
+    }
+}
+
 /// Mirror input that bypasses VTE's `commit` signal (clipboard, Agent, and other
 /// programmatic insertion) into the editor-state guards. Escape/control sequences
 /// still mark the line dirty, but are not copied into the fallback command text.
@@ -2998,7 +3105,10 @@ struct ReaderCtx {
     contents_generation_rc: Rc<Cell<u64>>,
     prompt_render_generation_rc: Rc<Cell<u64>>,
     post_prompt_bytes_rc: Rc<RefCell<BoundedByteRing>>,
-    post_prompt_overflow_rc: Rc<Cell<bool>>,
+    /// True once the post-`OSC 133;B` feed fence has been released for this
+    /// prompt: the settling pass finished, gave up, or overflowed the ring, so
+    /// later chunks go straight to the live VTE. Cleared at PromptStart.
+    post_prompt_fence_released_rc: Rc<Cell<bool>>,
     /// Rendered prompt (last non-empty line) captured at PromptEnd, used by the
     /// finalize path since prompt_buf is cleared once the prompt ends.
     prompt_display_rc: Rc<RefCell<String>>,
@@ -3180,7 +3290,7 @@ impl ReaderCtx {
             contents_generation_rc,
             prompt_render_generation_rc,
             post_prompt_bytes_rc,
-            post_prompt_overflow_rc,
+            post_prompt_fence_released_rc,
             prompt_display_rc,
             block_list_rc,
             block_scroll_rc,
@@ -3334,30 +3444,33 @@ impl ReaderCtx {
                                         // (bracketed-paste mode, suggestion
                                         // repaint, or a shell-side prefill) are
                                         // replayed against the fixed anchor.
-                                        if post_prompt_overflow_rc.get() {
-                                            active_vte.feed(bytes);
-                                            scroll_debouncer.mark_dirty(&block_scroll_rc);
-                                            false
-                                        } else {
-                                            let would_overflow = post_prompt_bytes_rc
-                                                .borrow()
-                                                .len()
-                                                .saturating_add(bytes.len())
-                                                > MAX_RAW_OUTPUT_BYTES;
-                                            if would_overflow {
-                                                let buffered =
-                                                    post_prompt_bytes_rc.borrow_mut().take_vec();
-                                                if !buffered.is_empty() {
-                                                    active_vte.feed(&buffered);
-                                                }
+                                        // Take the ring length in its own
+                                        // statement: a borrow inside the match
+                                        // scrutinee would still be live in the
+                                        // arm that borrows it mutably.
+                                        let parked_bytes = post_prompt_bytes_rc.borrow().len();
+                                        match post_prompt_feed(
+                                            prompt_anchor_ready_rc.get(),
+                                            post_prompt_fence_released_rc.get(),
+                                            parked_bytes,
+                                            bytes.len(),
+                                            MAX_RAW_OUTPUT_BYTES,
+                                        ) {
+                                            PostPromptFeed::Live => active_vte.feed(bytes),
+                                            PostPromptFeed::ReleaseThenFeed => {
+                                                release_post_prompt_fence(
+                                                    &active_vte,
+                                                    &post_prompt_bytes_rc,
+                                                    &post_prompt_fence_released_rc,
+                                                );
                                                 active_vte.feed(bytes);
-                                                post_prompt_overflow_rc.set(true);
-                                            } else {
-                                                post_prompt_bytes_rc.borrow_mut().append(bytes);
                                             }
-                                            scroll_debouncer.mark_dirty(&block_scroll_rc);
-                                            false
+                                            PostPromptFeed::Park => {
+                                                post_prompt_bytes_rc.borrow_mut().append(bytes)
+                                            }
                                         }
+                                        scroll_debouncer.mark_dirty(&block_scroll_rc);
+                                        false
                                     } else {
                                         // Warp separates asynchronous output only when it
                                         // arrives before the user begins editing. Once input
@@ -3460,7 +3573,7 @@ impl ReaderCtx {
                             }
                             prompt_render_generation_rc.set(contents_generation_rc.get());
                             post_prompt_bytes_rc.borrow_mut().clear();
-                            post_prompt_overflow_rc.set(false);
+                            post_prompt_fence_released_rc.set(false);
                             let background_output = if state == BlockState::AwaitingCommand {
                                 take_background_output(&background_output_rc)
                             } else {
@@ -4466,7 +4579,7 @@ impl ReaderCtx {
                             let contents_generation = contents_generation_rc.clone();
                             let prompt_render_generation = prompt_render_generation_rc.get();
                             let post_prompt_bytes = post_prompt_bytes_rc.clone();
-                            let post_prompt_overflow = post_prompt_overflow_rc.clone();
+                            let post_prompt_fence_released = post_prompt_fence_released_rc.clone();
                             let stage = Rc::new(Cell::new(0u8));
                             let stage_baseline = Rc::new(Cell::new(prompt_render_generation));
                             let stage_polls = Rc::new(Cell::new(0u8));
@@ -4484,31 +4597,42 @@ impl ReaderCtx {
                             let tick_id = active_vte.add_tick_callback(move |vte, _| {
                                 let poll = polls.get().saturating_add(1);
                                 polls.set(poll);
-                                if anchor_generation_cell.get() != anchor_generation
-                                    || post_prompt_overflow.get()
-                                    || !prompt_anchor_may_settle(
+                                match anchor_tick_exit(
+                                    anchor_generation_cell.get() == anchor_generation,
+                                    post_prompt_fence_released.get(),
+                                    prompt_anchor_may_settle(
                                         anchor_state.get(),
                                         anchor_dirty.get(),
                                         anchor_synced.get(),
                                         anchor_submission.get(),
                                         anchor_typeahead.get(),
-                                    )
-                                {
-                                    let deferred = post_prompt_bytes.borrow_mut().take_vec();
-                                    if !deferred.is_empty() {
-                                        vte.feed(&deferred);
+                                    ),
+                                    poll,
+                                ) {
+                                    AnchorTickExit::Superseded => {
+                                        return glib::ControlFlow::Break;
                                     }
-                                    anchor_tick_slot.borrow_mut().take();
-                                    return glib::ControlFlow::Break;
-                                }
-                                if poll >= VERIFIED_SUBMISSION_MAX_POLLS {
-                                    log::warn!("prompt cursor did not settle before the safety deadline");
-                                    let deferred = post_prompt_bytes.borrow_mut().take_vec();
-                                    if !deferred.is_empty() {
-                                        vte.feed(&deferred);
+                                    AnchorTickExit::Abandon(reason) => {
+                                        if reason == AnchorAbandoned::Deadline {
+                                            log::warn!(
+                                                "prompt cursor did not settle before the safety deadline"
+                                            );
+                                        }
+                                        // This prompt will never publish an
+                                        // anchor, so nothing else would drain
+                                        // the ring before CommandStart. Release
+                                        // it: the user's own echo must stay
+                                        // visible even when the capture anchor
+                                        // is lost.
+                                        release_post_prompt_fence(
+                                            vte,
+                                            &post_prompt_bytes,
+                                            &post_prompt_fence_released,
+                                        );
+                                        anchor_tick_slot.borrow_mut().take();
+                                        return glib::ControlFlow::Break;
                                     }
-                                    anchor_tick_slot.borrow_mut().take();
-                                    return glib::ControlFlow::Break;
+                                    AnchorTickExit::Continue => {}
                                 }
                                 let contents = contents_generation.get();
                                 let after_fence = contents != stage_baseline.get();
@@ -6277,7 +6401,7 @@ impl TermView {
             Rc::new(RefCell::new(None));
         let prompt_render_generation = Rc::new(Cell::new(0u64));
         let post_prompt_bytes = Rc::new(RefCell::new(BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES)));
-        let post_prompt_overflow = Rc::new(Cell::new(false));
+        let post_prompt_fence_released = Rc::new(Cell::new(false));
         let contents_generation = Rc::new(Cell::new(0u64));
         let verified_submission_source_id: Rc<RefCell<Option<glib::SourceId>>> =
             Rc::new(RefCell::new(None));
@@ -6792,7 +6916,7 @@ impl TermView {
                 contents_generation_rc: contents_generation.clone(),
                 prompt_render_generation_rc: prompt_render_generation.clone(),
                 post_prompt_bytes_rc: post_prompt_bytes,
-                post_prompt_overflow_rc: post_prompt_overflow,
+                post_prompt_fence_released_rc: post_prompt_fence_released,
                 prompt_display_rc,
                 block_list_rc,
                 block_scroll_rc,
@@ -9139,34 +9263,36 @@ impl TermView {
 #[cfg(test)]
 mod tests {
     use super::{
-        accept_agent_integration_token, append_bounded_text_tail, apply_vte_commit_to_shadow,
-        approved_command_submission_payload, background_output_has_visible_text,
-        bounded_journal_output, build_clipboard_paste, build_command_recall,
-        build_keyboard_query_reply, classify_command_prompt_status, coalesce_bytes_events,
-        collapse_repaint_output, command_capture_range_is_bounded, command_id_uses_shell_token,
-        compute_viewport_state, decide_agent_command_end, emit_activity, emit_command_finished,
-        emit_command_started, failed_block_marker_fractions, format_color_query_reply,
-        history_edge_navigation_available, input_is_typeahead_for_existing_submission,
-        input_may_survive_into_next_prompt, input_submits_line, mutate_block_data_and_redraw,
-        next_prompt_shadow_state, normalize_captured_command, normalize_loaded_block_ids,
-        notification_allowed, output_has_vertical_repaint, parse_color_spec,
-        preflight_clipboard_paste, prepend_in_order, prompt_anchor_may_settle,
-        prompt_layout_reflow_can_reanchor, prompt_surface_is_clean, rebase_prompt_anchor,
-        record_external_input, record_protocol_reply_input, replace_nonempty_stash,
-        resolve_command_for_block, resolve_submitted_command,
-        reviewed_pre_command_bytes_are_identity_neutral, reviewed_submission_matches,
-        scroll_delta_to_reveal, selected_blocks_markdown, selected_command_text, selected_id_range,
-        shell_argv_supports_agent_ids, shell_argv_uses_jsh, should_buffer_background_output,
-        stable_visible_indices, step_marked_indices, strip_ansi, strip_ansi_with_clear_detect,
-        take_background_output, take_stash_for_undo, truncate_plain_output_for_height,
+        accept_agent_integration_token, anchor_tick_exit, append_bounded_text_tail,
+        apply_vte_commit_to_shadow, approved_command_submission_payload,
+        background_output_has_visible_text, bounded_journal_output, build_clipboard_paste,
+        build_command_recall, build_keyboard_query_reply, classify_command_prompt_status,
+        coalesce_bytes_events, collapse_repaint_output, command_capture_range_is_bounded,
+        command_id_uses_shell_token, compute_viewport_state, decide_agent_command_end,
+        emit_activity, emit_command_finished, emit_command_started, failed_block_marker_fractions,
+        format_color_query_reply, history_edge_navigation_available,
+        input_is_typeahead_for_existing_submission, input_may_survive_into_next_prompt,
+        input_submits_line, mutate_block_data_and_redraw, next_prompt_shadow_state,
+        normalize_captured_command, normalize_loaded_block_ids, notification_allowed,
+        output_has_vertical_repaint, parse_color_spec, post_prompt_feed, preflight_clipboard_paste,
+        prepend_in_order, prompt_anchor_may_settle, prompt_layout_reflow_can_reanchor,
+        prompt_surface_is_clean, rebase_prompt_anchor, record_external_input,
+        record_protocol_reply_input, replace_nonempty_stash, resolve_command_for_block,
+        resolve_submitted_command, reviewed_pre_command_bytes_are_identity_neutral,
+        reviewed_submission_matches, scroll_delta_to_reveal, selected_blocks_markdown,
+        selected_command_text, selected_id_range, shell_argv_supports_agent_ids,
+        shell_argv_uses_jsh, should_buffer_background_output, stable_visible_indices,
+        step_marked_indices, strip_ansi, strip_ansi_with_clear_detect, take_background_output,
+        take_stash_for_undo, truncate_plain_output_for_height,
         verified_editor_contains_exact_command, viewport_page_size_changed,
         viewport_state_for_scroll, visible_indices_for_viewport, AgentCommandEndDecision,
-        BlockData, BlockState, BoundedByteRing, BoundedClipboardAccumulator, CommandFinishedEvent,
-        CommandIdCorrelation, CommandMeta, CommandPromptStatus, CommandStartedEvent, DynamicColors,
-        HumanInputKind, InputOrigin, PendingCommandMeta, TypedShadowFidelity, ViewportState,
+        AnchorAbandoned, AnchorTickExit, BlockData, BlockState, BoundedByteRing,
+        BoundedClipboardAccumulator, CommandFinishedEvent, CommandIdCorrelation, CommandMeta,
+        CommandPromptStatus, CommandStartedEvent, DynamicColors, HumanInputKind, InputOrigin,
+        PendingCommandMeta, PostPromptFeed, TypedShadowFidelity, ViewportState,
         MAX_COMMAND_CAPTURE_BYTES, MAX_JOURNAL_OUTPUT_BYTES, MAX_PROMPT_CAPTURE_BYTES,
         MAX_RAW_OUTPUT_BYTES, MAX_SELECTED_CLIPBOARD_BYTES, TRUNCATED_COMMAND_PLACEHOLDER,
-        UNAVAILABLE_COMMAND_PLACEHOLDER,
+        UNAVAILABLE_COMMAND_PLACEHOLDER, VERIFIED_SUBMISSION_MAX_POLLS,
     };
     use crate::parser::{ColorKind, KeyboardProtocolQuery, ParserEvent};
     use crate::pty::PtyForeground;
@@ -9496,6 +9622,114 @@ mod tests {
                 guards.0, guards.1, guards.2, guards.3, guards.4
             ));
         }
+    }
+
+    #[test]
+    fn post_prompt_fence_parks_only_while_the_anchor_can_still_be_published() {
+        // Fence armed, room left in the ring: park, and let the settling pass
+        // replay against the anchor it is about to publish.
+        assert_eq!(
+            post_prompt_feed(false, false, 0, 8, 64),
+            PostPromptFeed::Park
+        );
+        // A published anchor and a released fence both mean the same thing —
+        // no settling pass will ever replay these bytes.
+        assert_eq!(
+            post_prompt_feed(true, false, 0, 8, 64),
+            PostPromptFeed::Live
+        );
+        assert_eq!(
+            post_prompt_feed(false, true, 0, 8, 64),
+            PostPromptFeed::Live
+        );
+        // The ring bound releases the fence instead of dropping its head: the
+        // delay is a display order, never a filter.
+        assert_eq!(
+            post_prompt_feed(false, false, 60, 4, 64),
+            PostPromptFeed::Park
+        );
+        assert_eq!(
+            post_prompt_feed(false, false, 60, 5, 64),
+            PostPromptFeed::ReleaseThenFeed
+        );
+        assert_eq!(
+            post_prompt_feed(false, false, 0, 65, 64),
+            PostPromptFeed::ReleaseThenFeed
+        );
+    }
+
+    #[test]
+    fn anchor_settling_exits_release_the_fence_unless_a_newer_prompt_owns_it() {
+        assert_eq!(
+            anchor_tick_exit(true, false, true, 1),
+            AnchorTickExit::Continue
+        );
+        assert_eq!(
+            anchor_tick_exit(true, true, true, 1),
+            AnchorTickExit::Abandon(AnchorAbandoned::FenceReleased)
+        );
+        assert_eq!(
+            anchor_tick_exit(true, false, false, 1),
+            AnchorTickExit::Abandon(AnchorAbandoned::PromptNotQuiet)
+        );
+        assert_eq!(
+            anchor_tick_exit(true, false, true, VERIFIED_SUBMISSION_MAX_POLLS),
+            AnchorTickExit::Abandon(AnchorAbandoned::Deadline)
+        );
+        // A pass whose generation moved on keeps its hands off the ring and the
+        // fence flag even when it would otherwise abandon: the newer PromptEnd
+        // owns both, and replaying here would feed this prompt's bytes into the
+        // next prompt's fence.
+        assert_eq!(
+            anchor_tick_exit(false, false, true, 1),
+            AnchorTickExit::Superseded
+        );
+        assert_eq!(
+            anchor_tick_exit(false, true, false, VERIFIED_SUBMISSION_MAX_POLLS),
+            AnchorTickExit::Superseded
+        );
+    }
+
+    #[test]
+    fn an_abandoned_prompt_anchor_stops_parking_the_shell_echo() {
+        // A prompt opened after typeahead is dirty on arrival, so the settling
+        // pass abandons on its very first frame. The anchor is then never
+        // published for this prompt — and while the fence had no release, that
+        // left `post_prompt_feed` parking every later chunk, including the
+        // shell's echo of each keystroke. The prompt looked dead until Enter,
+        // when CommandStart drained the ring and the whole line appeared at
+        // once.
+        let anchor_never_published = false;
+        let mut fence_released = false;
+        assert_eq!(
+            post_prompt_feed(
+                anchor_never_published,
+                fence_released,
+                0,
+                32,
+                MAX_RAW_OUTPUT_BYTES
+            ),
+            PostPromptFeed::Park
+        );
+
+        let exit = anchor_tick_exit(true, fence_released, false, 1);
+        assert_eq!(
+            exit,
+            AnchorTickExit::Abandon(AnchorAbandoned::PromptNotQuiet)
+        );
+        fence_released = matches!(exit, AnchorTickExit::Abandon(_));
+
+        // Every chunk after the abandoned pass reaches the live VTE.
+        assert_eq!(
+            post_prompt_feed(
+                anchor_never_published,
+                fence_released,
+                0,
+                32,
+                MAX_RAW_OUTPUT_BYTES
+            ),
+            PostPromptFeed::Live
+        );
     }
 
     #[test]
