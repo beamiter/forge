@@ -530,8 +530,9 @@ pub fn run() -> glib::ExitCode {
 
         // Custom tab bar CSS
         let css_provider = CssProvider::new();
+        let bottom_bar_height = jterm_core::bottom_bar::BAR_HEIGHT;
         css_provider.load_from_string(&format!(
-            "{}{}",
+            "{}{} .bottom-bar {{ min-height: {bottom_bar_height}px; }}",
             ui::PANE_HEADER_CSS,
             ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; border-bottom: 1px solid alpha(currentColor, 0.1); margin-bottom: 2px; }
              .tab-strip-btn:checked { font-weight: bold; border-radius: 4px; background-color: alpha(currentColor, 0.14); outline: 2px solid alpha(currentColor, 0.8); outline-offset: -2px; }
@@ -564,7 +565,7 @@ pub fn run() -> glib::ExitCode {
              .tab-conn-dot.tab-connecting { animation: conn-pulse 1.2s ease-in-out infinite; }
              .tab-strip-search { padding: 4px 8px; margin: 2px 4px; }
              .top-tabs .tab-strip-btn { border-bottom: none; margin-bottom: 0; margin-right: 2px; }
-             .bottom-bar { min-height: 22px; padding: 0 6px; border-top: 1px solid alpha(currentColor, 0.15); font-size: 0.85em; }
+             .bottom-bar { padding: 0 8px; border-top: 1px solid alpha(currentColor, 0.20); font-size: 0.85em; }
              .file-tree-box { border-top: 1px solid alpha(currentColor, 0.15); }
              .file-tree-header { padding: 2px 4px; }
              .file-tree-root { font-size: 0.85em; opacity: 0.7; }
@@ -576,8 +577,19 @@ pub fn run() -> glib::ExitCode {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
 
-        // Top bar: [☰ toggle] [spacer] [+ new tab] [native window controls]
-        let toggle_sidebar_btn = gtk4::Button::from_icon_name("open-menu-symbolic");
+        // Keep the visible command/navigation entry points in the same order as
+        // Anvil: command center, sidebar, then tab placement.
+        let command_palette_btn = gtk4::Button::from_icon_name("system-search-symbolic");
+        command_palette_btn.set_focus_on_click(false);
+        command_palette_btn.set_focusable(true);
+        command_palette_btn.set_tooltip_text(Some("Open command center (Ctrl+Shift+P)"));
+        command_palette_btn.update_property(&[
+            gtk4::accessible::Property::Label("Open command center"),
+            gtk4::accessible::Property::KeyShortcuts("Control+Shift+P"),
+        ]);
+        command_palette_btn.add_css_class("flat");
+
+        let toggle_sidebar_btn = gtk4::Button::from_icon_name("sidebar-show-symbolic");
         toggle_sidebar_btn.set_focus_on_click(false);
         toggle_sidebar_btn.set_focusable(true);
         toggle_sidebar_btn.set_tooltip_text(Some("Toggle sidebar (Ctrl+\\)"));
@@ -612,21 +624,34 @@ pub fn run() -> glib::ExitCode {
         let top_tab_scroll = ScrolledWindow::new();
         top_tab_scroll.set_hexpand(true);
         top_tab_scroll.set_vexpand(false);
-        top_tab_scroll.set_policy(gtk4::PolicyType::Automatic, gtk4::PolicyType::Never);
+        top_tab_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Never);
+        top_tab_scroll.set_overflow(gtk4::Overflow::Hidden);
+        top_tab_scroll.set_width_request(0);
+        top_tab_scroll.set_min_content_width(0);
+        top_tab_scroll.set_max_content_width(1);
+        top_tab_scroll.set_propagate_natural_width(false);
         top_tab_scroll.add_css_class("top-tab-scroll");
         top_tab_scroll.set_visible(false);
+        top_tab_scroll.set_margin_start(128);
+        top_tab_scroll.set_margin_end(104);
 
-        let top_bar = gtk4::Box::new(Orientation::Horizontal, 4);
+        // Overlay the leading controls, tab strip, and trailing actions so tab
+        // geometry is independent of which controls happen to be visible.
+        let top_bar = gtk4::Overlay::new();
         top_bar.add_css_class("top-bar");
-        top_bar.append(&toggle_sidebar_btn);
-        top_bar.append(&toggle_placement_btn);
-        top_bar.append(&top_tab_scroll);
-        // Spacer pushes the trailing actions and window controls to the right.
-        // `sync_tab_bar_visibility` turns its expansion off only while the top
-        // tab strip is visible and expanding in its place.
-        let spacer = gtk4::Box::new(Orientation::Horizontal, 0);
-        spacer.set_hexpand(true);
-        top_bar.append(&spacer);
+        top_bar.set_height_request(40);
+        top_bar.set_hexpand(true);
+        let top_bar_background = gtk4::Box::new(Orientation::Horizontal, 0);
+        top_bar.set_child(Some(&top_bar_background));
+
+        let leading_actions = gtk4::Box::new(Orientation::Horizontal, 4);
+        leading_actions.set_halign(gtk4::Align::Start);
+        leading_actions.set_valign(gtk4::Align::Center);
+        leading_actions.append(&command_palette_btn);
+        leading_actions.append(&toggle_sidebar_btn);
+        leading_actions.append(&toggle_placement_btn);
+        top_bar.add_overlay(&leading_actions);
+        top_bar.add_overlay(&top_tab_scroll);
 
         // A compact, stateful counterpart to Ctrl+Alt+G. Its checked state
         // follows the lifetime of the approval-gated Shell Agent session;
@@ -641,8 +666,6 @@ pub fn run() -> glib::ExitCode {
             gtk4::accessible::Property::KeyShortcuts("Control+Alt+G"),
         ]);
         agent_toggle.add_css_class("flat");
-        top_bar.append(&agent_toggle);
-        top_bar.append(&add_tab_button);
 
         // AdwApplicationWindow does not add a HeaderBar on its own. Keep the
         // compact custom bar, but give it the two pieces a real titlebar needs:
@@ -655,8 +678,11 @@ pub fn run() -> glib::ExitCode {
         //
         // Interactive children (buttons, tab drag sources, search) continue to
         // receive their own gestures before the handle considers a window move.
-        let window_controls = gtk4::Box::new(Orientation::Horizontal, 4);
-        window_controls.add_css_class("window-controls");
+        let trailing_actions = gtk4::Box::new(Orientation::Horizontal, 4);
+        trailing_actions.set_halign(gtk4::Align::End);
+        trailing_actions.set_valign(gtk4::Align::Center);
+        trailing_actions.add_css_class("top-bar-actions");
+        trailing_actions.add_css_class("window-controls");
 
         let minimize_window_button =
             gtk4::Button::from_icon_name("window-minimize-symbolic");
@@ -682,10 +708,12 @@ pub fn run() -> glib::ExitCode {
         close_window_button
             .update_property(&[gtk4::accessible::Property::Label("Close window")]);
 
-        window_controls.append(&minimize_window_button);
-        window_controls.append(&maximize_window_button);
-        window_controls.append(&close_window_button);
-        top_bar.append(&window_controls);
+        trailing_actions.append(&agent_toggle);
+        trailing_actions.append(&add_tab_button);
+        trailing_actions.append(&minimize_window_button);
+        trailing_actions.append(&maximize_window_button);
+        trailing_actions.append(&close_window_button);
+        top_bar.add_overlay(&trailing_actions);
 
         let top_bar_handle = gtk4::WindowHandle::new();
         top_bar_handle.set_child(Some(&top_bar));
@@ -946,7 +974,6 @@ pub fn run() -> glib::ExitCode {
             search_generation: Rc::new(Cell::new(0)),
             tab_strip: tab_strip.clone(),
             sidebar: sidebar.clone(),
-            top_spacer: spacer.clone(),
             tab_strip_scroll: tab_strip_scroll.clone(),
             sidebar_tab_mirror: sidebar_tab_mirror.clone(),
             sidebar_tab_mirror_scroll: sidebar_tab_mirror_scroll.clone(),
@@ -1091,6 +1118,12 @@ pub fn run() -> glib::ExitCode {
                     ui.persist_config();
                 }
             });
+        });
+
+        // Wire the visible command-center entry point.
+        let ui_for_palette = ui.clone();
+        command_palette_btn.connect_clicked(move |_| {
+            ui_for_palette.execute_action(crate::keybindings::Action::ToggleCommandPalette);
         });
 
         // Wire toggle sidebar button
@@ -1678,8 +1711,16 @@ pub fn run() -> glib::ExitCode {
         // only the visible tab, and only while that tab is actually split.
         {
             let ui = Rc::clone(&ui);
+            let mut refresh_processes = false;
             glib::timeout_add_seconds_local(1, move || {
                 ui.refresh_pane_headers();
+                // Process badges historically refreshed every two seconds.
+                // Keep that cadence while sharing one window timer, so moving
+                // the work out of per-tab sources does not double /proc reads.
+                refresh_processes = !refresh_processes;
+                if !refresh_processes {
+                    ui.refresh_tab_process_indicators();
+                }
                 // Same poll keeps the bottom bar's running/cwd/grid segments
                 // honest for the focused pane.
                 ui.refresh_bottom_bar();

@@ -103,16 +103,17 @@ impl UiState {
             .as_ref()
             .and_then(|leaf| self.pane_working_directory(leaf))
             .map(PathBuf::from);
-        // The worker-cached probe returns stale-or-fresh within a bounded UI
-        // wait; the local meta converts field-for-field into the family type.
-        let git = cwd.as_deref().and_then(crate::git_meta::read).map(|meta| {
-            jterm_core::git_meta::RepoMeta {
+        // Never wait for Git on GTK's frame thread. The worker refreshes its
+        // cache and the next status tick observes the completed value.
+        let git = cwd
+            .as_deref()
+            .and_then(crate::git_meta::read_cached_and_refresh)
+            .map(|meta| jterm_core::git_meta::RepoMeta {
                 branch: meta.branch,
                 dirty: meta.dirty,
                 ahead: meta.ahead,
                 behind: meta.behind,
-            }
-        });
+            });
         let (last_exit, last_duration_ms) = leaf
             .as_ref()
             .and_then(|leaf| leaf.block_view())

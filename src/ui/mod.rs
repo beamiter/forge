@@ -153,8 +153,6 @@ pub(crate) struct UiState {
     pub(crate) search_generation: Rc<Cell<u64>>,
     pub(crate) tab_strip: gtk4::Box,
     pub(crate) sidebar: gtk4::Box,
-    /// Flexible spacer in the top bar; its hexpand toggles with tab placement.
-    pub(crate) top_spacer: gtk4::Box,
     /// Sidebar scroll holder for the (vertical) tab strip.
     pub(crate) tab_strip_scroll: ScrolledWindow,
     /// Sidebar list mirroring the strip while the strip lives in the top bar,

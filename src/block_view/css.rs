@@ -17,6 +17,8 @@ const MAX_BRANCH_DISPLAY_CHARS: usize = 256;
 /// `.block-active` rule below; if the margin/border/padding here changes,
 /// update this constant too.
 pub(crate) const BLOCK_ACTIVE_VCHROME_PX: i32 = 14;
+/// Compact mode: 1px top/bottom margin + 1px top/bottom border, no padding.
+pub(crate) const BLOCK_ACTIVE_COMPACT_VCHROME_PX: i32 = 4;
 
 pub(crate) fn rgba_to_hex(c: &RGBA) -> String {
     format!(
@@ -574,6 +576,12 @@ pub(crate) fn install_block_css(config: &Config) {
             border-radius: 6px;
             padding: 0;
             box-shadow: none;
+        }}
+        .block-finished.block-compact {{
+            min-height: 32px;
+        }}
+        .block-active.block-compact {{
+            margin: 1px 4px;
         }}
         .block-active.block-fullscreen {{
             border: none;

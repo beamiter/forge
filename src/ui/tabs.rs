@@ -6,6 +6,7 @@ use gtk4::{glib, Label};
 use gtk4::{EventControllerKey, GestureClick, ToggleButton};
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use vte4::Terminal;
 use vte4::TerminalExt;
@@ -30,6 +31,21 @@ struct TabLaunch {
 }
 
 type TitleChangedCallback = Box<dyn Fn(&str)>;
+const TAB_PROCESS_LABEL_DATA: &str = "tab-process-label";
+
+fn attach_tab_process_label(button: &ToggleButton, label: &Label) {
+    unsafe {
+        button.set_data::<Label>(TAB_PROCESS_LABEL_DATA, label.clone());
+    }
+}
+
+fn tab_process_label(button: &ToggleButton) -> Option<Label> {
+    unsafe {
+        button
+            .data::<Label>(TAB_PROCESS_LABEL_DATA)
+            .map(|label| label.as_ref().clone())
+    }
+}
 
 fn tab_num_for_widget(widget: &gtk4::Widget) -> Option<u32> {
     widget
@@ -82,6 +98,45 @@ fn is_plain_tab_activation_key(keyval: Key, modifiers: ModifierType) -> bool {
 }
 
 impl UiState {
+    /// Refresh every tab's foreground-process badge from the single window
+    /// heartbeat. Older code installed one permanent timer per tab, multiplying
+    /// idle wakeups as a workspace grew.
+    pub(crate) fn refresh_tab_process_indicators(&self) {
+        // Index Notebook pages once. Looking each button up with a fresh
+        // linear page scan made this heartbeat quadratic in the tab count.
+        let pages: HashMap<String, gtk4::Widget> = (0..self.notebook.n_pages())
+            .filter_map(|index| self.notebook.nth_page(Some(index)))
+            .map(|page| (page.widget_name().to_string(), page))
+            .collect();
+        let mut child = self.tab_strip.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            let Ok(button) = widget.downcast::<ToggleButton>() else {
+                continue;
+            };
+            let Some(label) = tab_process_label(&button) else {
+                continue;
+            };
+            let process = pages
+                .get(button.widget_name().as_str())
+                .and_then(PaneNode::from_widget)
+                .and_then(|node| {
+                    node.leaves()
+                        .into_iter()
+                        .find_map(|leaf| leaf.foreground_process_name())
+                });
+            match process {
+                Some(process) => {
+                    if label.text() != process {
+                        label.set_text(&process);
+                    }
+                    label.set_visible(true);
+                }
+                None => label.set_visible(false),
+            }
+        }
+    }
+
     pub(super) fn activate_tab_named(&self, name: &str) {
         self.clear_tab_selection();
         for index in 0..self.notebook.n_pages() {
@@ -539,6 +594,7 @@ impl UiState {
             button.set_data::<Label>("tab-title-label", strip_label.clone());
             button.set_data::<bool>("pinned", pinned);
         }
+        attach_tab_process_label(&button, &process_label);
         self.track_tab_title_for_filter(&button, &strip_label);
 
         let hover = gtk4::EventControllerMotion::new();
@@ -743,29 +799,8 @@ impl UiState {
         });
         button.add_controller(close);
 
-        // Keep process/tool-tip behavior aligned with normal tabs.
-        let notebook_for_process = self.notebook.clone();
-        let page_name_for_process = tab_widget_name.clone();
-        let process_for_tick = process_label.clone();
-        glib::timeout_add_local(std::time::Duration::from_secs(2), move || {
-            if process_for_tick.parent().is_none() {
-                return glib::ControlFlow::Break;
-            }
-            let process = notebook_page_named(&notebook_for_process, &page_name_for_process)
-                .and_then(|page| PaneNode::from_widget(&page))
-                .and_then(|node| {
-                    node.leaves()
-                        .into_iter()
-                        .find_map(|leaf| leaf.foreground_process_name())
-                });
-            if let Some(process) = process {
-                process_for_tick.set_text(&process);
-                process_for_tick.set_visible(true);
-            } else {
-                process_for_tick.set_visible(false);
-            }
-            glib::ControlFlow::Continue
-        });
+        // Tooltips are queried on demand; the visible process badge is updated
+        // by the window's single status heartbeat.
         button.set_has_tooltip(true);
         let notebook_for_tooltip = self.notebook.clone();
         let page_name_for_tooltip = tab_widget_name.clone();
@@ -1648,6 +1683,7 @@ impl UiState {
         unsafe {
             strip_btn.set_data::<Label>("tab-title-label", strip_label.clone());
         }
+        attach_tab_process_label(&strip_btn, &process_label);
         self.track_tab_title_for_filter(&strip_btn, &strip_label);
         strip_btn.add_css_class("tab-strip-btn");
         strip_btn.add_css_class("flat");
@@ -1748,32 +1784,6 @@ impl UiState {
         self.make_tab_strip_button_keyboard_accessible(&strip_btn, &strip_label, &tab_widget_name);
         // Also name the wrapper widget so we can find the button when removing
         term_wrapper.set_widget_name(&tab_widget_name);
-
-        // Periodic process indicator update (every 2 seconds)
-        let notebook_for_proc = self.notebook.clone();
-        let page_name_for_proc = tab_widget_name.clone();
-        let process_label_for_update = process_label.clone();
-        glib::timeout_add_local(std::time::Duration::from_secs(2), move || {
-            // Check if widget is still alive
-            if process_label_for_update.parent().is_none() {
-                return glib::ControlFlow::Break;
-            }
-
-            let process = notebook_page_named(&notebook_for_proc, &page_name_for_proc)
-                .and_then(|page| PaneNode::from_widget(&page))
-                .and_then(|node| {
-                    node.leaves()
-                        .into_iter()
-                        .find_map(|leaf| leaf.foreground_process_name())
-                });
-            if let Some(proc_name) = process {
-                process_label_for_update.set_text(&proc_name);
-                process_label_for_update.set_visible(true);
-            } else {
-                process_label_for_update.set_visible(false);
-            }
-            glib::ControlFlow::Continue
-        });
 
         // Bell signal: flash the tab strip button when bell rings on non-active tab
         let ui_for_bell = self.clone();

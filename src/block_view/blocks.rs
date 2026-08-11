@@ -906,6 +906,26 @@ fn output_fits_viewport(output_rows: i64, cap: i64) -> bool {
     output_rows.max(1) <= cap.max(1)
 }
 
+/// Identity of the snapshot picture that is currently on screen.
+///
+/// The fitted cap itself is not part of that picture. A three-row result looks
+/// identical with a three-row or a twenty-four-row cap, so treating the cap as
+/// identity needlessly clears and re-feeds VTE during map/resize churn. Record
+/// only the columns, visible rows, whether all content fits, and text generation.
+fn output_render_stamp(
+    cols: i64,
+    output_rows: i64,
+    cap: i64,
+    generation: u64,
+) -> (i64, i64, bool, u64) {
+    (
+        cols.max(1),
+        output_rows.max(1).min(cap.max(1)),
+        output_fits_viewport(output_rows, cap),
+        generation,
+    )
+}
+
 fn fitted_output_rows_for_viewport(
     viewport_rows: Option<i64>,
     fallback_rows: i64,
@@ -1696,8 +1716,8 @@ impl FinishedBlock {
         // Tracks whether the user has toggled this block to its complete height.
         // The default cap is recomputed whenever virtualization remaps the card.
         let expanded: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        // (effective cols, fitted cap, expanded, displayed-text generation) of
-        // the snapshot most recently fed into the output VTE. Virtualization
+        // Identity of the snapshot most recently fed into the output VTE.
+        // Virtualization
         // only hides a card's content — the VTE keeps its buffer while
         // unmapped — so a remap whose geometry is unchanged must not re-feed:
         // every feed re-requests the estimated height and re-runs the async
@@ -1732,21 +1752,16 @@ impl FinishedBlock {
                 let fitted_cap = fitted_output_rows_for_widget(w, fallback_cap_for_map, rows);
                 current_cap_for_map.set(fitted_cap);
                 let manually_expanded = expanded_for_map.get();
-                let stamp = (
-                    eff_cols,
-                    fitted_cap,
-                    manually_expanded,
-                    generation_for_map.get(),
-                );
-                if stamp_for_map.replace(stamp) == stamp {
-                    return;
-                }
                 let cap = finished_output_cap(
                     rows,
                     fitted_cap,
                     manually_expanded,
                     max_expanded_cap_for_map,
                 );
+                let stamp = output_render_stamp(eff_cols, rows, cap, generation_for_map.get());
+                if stamp_for_map.replace(stamp) == stamp {
+                    return;
+                }
                 let (_, visible_rows, _) =
                     bounded_finished_vte_geometry(eff_cols, rows.min(cap).max(1), 0);
                 let fit_to_content = output_fits_viewport(rows, cap);
@@ -1800,9 +1815,14 @@ impl FinishedBlock {
                     rows,
                 );
                 current_cap_for_btn.set(fitted_cap);
-                stamp_for_btn.set((eff_cols, fitted_cap, now_expanded, generation_for_btn.get()));
                 let cap =
                     finished_output_cap(rows, fitted_cap, now_expanded, max_expanded_cap_for_btn);
+                stamp_for_btn.set(output_render_stamp(
+                    eff_cols,
+                    rows,
+                    cap,
+                    generation_for_btn.get(),
+                ));
                 let (_, visible_rows, _) =
                     bounded_finished_vte_geometry(eff_cols, rows.min(cap).max(1), 0);
                 let fit_to_content = output_fits_viewport(rows, cap);
@@ -1877,13 +1897,7 @@ impl FinishedBlock {
                 let rows = output_visual_row_count(&text, eff_cols);
                 let fitted_cap =
                     fitted_output_rows_for_widget(&output_vte, current_cap_for_refit.get(), rows);
-                let cap_unchanged = current_cap_for_refit.replace(fitted_cap) == fitted_cap;
-                // A width-only resize leaves the cap alone but changes how the
-                // snapshot wraps; both must match for the render to be current.
-                let (last_cols, ..) = stamp_for_refit.get();
-                if cap_unchanged && last_cols == eff_cols {
-                    return None;
-                }
+                current_cap_for_refit.set(fitted_cap);
                 // Pane sizing is authoritative over a manual expansion: a block
                 // expanded for the old geometry must not outlive it.
                 if expanded_for_refit.replace(false) {
@@ -1892,11 +1906,14 @@ impl FinishedBlock {
                     expand_btn
                         .update_property(&[gtk4::accessible::Property::Label("Expand block")]);
                 }
-                stamp_for_refit.set((eff_cols, fitted_cap, false, generation_for_refit.get()));
                 let can_expand = rows > fitted_cap;
                 expand_btn.set_visible(can_expand);
                 jump_btn.set_visible(can_expand);
                 let cap = finished_output_cap(rows, fitted_cap, false, max_expanded_cap_for_refit);
+                let stamp = output_render_stamp(eff_cols, rows, cap, generation_for_refit.get());
+                if stamp_for_refit.replace(stamp) == stamp {
+                    return None;
+                }
                 let (_, visible_rows, _) =
                     bounded_finished_vte_geometry(eff_cols, rows.min(cap).max(1), 0);
                 let fit_to_content = output_fits_viewport(rows, cap);
@@ -2246,13 +2263,18 @@ impl FinishedBlock {
                     // unmap → remap with unchanged geometry still re-feeds it.
                     let generation = displayed_generation.get().wrapping_add(1);
                     displayed_generation.set(generation);
-                    render_stamp.set((eff_cols, fitted_cap, manually_expanded, generation));
                     let active_cap = finished_output_cap(
                         shown_visual_rows,
                         fitted_cap,
                         manually_expanded,
                         max_expanded_cap_for_filter,
                     );
+                    render_stamp.set(output_render_stamp(
+                        eff_cols,
+                        shown_visual_rows,
+                        active_cap,
+                        generation,
+                    ));
                     let fit_to_content = output_fits_viewport(shown_visual_rows, active_cap);
                     render_bytes_into_finished_vte(
                         &output_vte,
@@ -3115,6 +3137,20 @@ mod tests {
         for required in ["\x1b[H", "\x1b[2J", "\x1b[3J"] {
             assert!(clear.contains(required), "missing {required:?}");
         }
+    }
+
+    #[test]
+    fn cap_changes_that_do_not_change_the_picture_skip_a_refeed() {
+        assert_eq!(
+            super::output_render_stamp(137, 3, 3, 0),
+            super::output_render_stamp(137, 3, 24, 0),
+        );
+
+        let base = super::output_render_stamp(137, 40, 24, 0);
+        assert_ne!(base, super::output_render_stamp(135, 40, 24, 0));
+        assert_ne!(base, super::output_render_stamp(137, 40, 12, 0));
+        assert_ne!(base, super::output_render_stamp(137, 40, 40, 0));
+        assert_ne!(base, super::output_render_stamp(137, 40, 24, 1));
     }
 
     #[test]

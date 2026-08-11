@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 const GIT_STATUS_TIMEOUT: Duration = Duration::from_millis(500);
 const GIT_WAIT_POLL: Duration = Duration::from_millis(5);
 const MAX_GIT_STATUS_OUTPUT_BYTES: u64 = 512 * 1024;
+const MAX_GIT_CWD_BYTES: usize = 16 * 1024;
 const MAX_BRANCH_DISPLAY_CHARS: usize = 256;
 const MAX_QUEUED_GIT_PROBES: usize = 64;
 const MAX_GIT_CACHE_ENTRIES: usize = 256;
@@ -174,7 +175,7 @@ fn worker_loop(
 /// A healthy local repository usually completes inside `UI_WAIT_BUDGET`. A slow
 /// refresh returns the cached value while the worker continues in the background.
 pub fn read(cwd: &Path) -> Option<RepoMeta> {
-    if !cwd.is_dir() {
+    if !cwd_key_is_bounded(cwd) || !cwd.is_dir() {
         return None;
     }
 
@@ -188,6 +189,31 @@ pub fn read(cwd: &Path) -> Option<RepoMeta> {
         Ok(fresh) => fresh,
         Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => stale,
     }
+}
+
+/// Return the last completed probe immediately and schedule a coalesced refresh.
+///
+/// This is the UI-strip variant of [`read`]. A cache hit must not spend the
+/// caller's frame budget waiting for a newer Git process: the worker updates the
+/// shared cache, and the next ordinary UI refresh observes it. The disconnected
+/// one-shot receiver is harmless; the worker's send simply reports that nobody
+/// is waiting for this result.
+pub fn read_cached_and_refresh(cwd: &Path) -> Option<RepoMeta> {
+    // Do not stat the path on the GTK thread: a FUSE/remote mount can make
+    // even `is_dir` miss a frame. The worker-side blocking reader validates it.
+    if !cwd_key_is_bounded(cwd) {
+        return None;
+    }
+
+    let service = service()?;
+    let stale = service.cached(cwd).flatten();
+    let _refresh = service.request(cwd);
+    stale
+}
+
+fn cwd_key_is_bounded(cwd: &Path) -> bool {
+    let bytes = cwd.as_os_str().as_encoded_bytes();
+    bytes.len() <= MAX_GIT_CWD_BYTES && !bytes.contains(&0)
 }
 
 fn read_uncached(cwd: &Path) -> ProbeResult {
@@ -685,6 +711,22 @@ mod tests {
             service.pending.lock().unwrap().get(path).map(Vec::len),
             Some(2)
         );
+    }
+
+    #[test]
+    fn cache_keys_reject_unbounded_or_nul_paths_without_filesystem_io() {
+        assert!(cwd_key_is_bounded(Path::new("/work/repo")));
+        assert!(!cwd_key_is_bounded(Path::new(
+            &"x".repeat(MAX_GIT_CWD_BYTES + 1)
+        )));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(!cwd_key_is_bounded(Path::new(std::ffi::OsStr::from_bytes(
+                b"bad\0path",
+            ))));
+        }
     }
 
     #[test]

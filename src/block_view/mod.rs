@@ -5333,12 +5333,19 @@ fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
     }
     // Normal active cards reserve margin/border/padding. Alt-screen mode removes
     // that chrome so vim/less/htop receive every row in the pane.
-    let fullscreen = vte
+    let holder = vte
         .ancestor(gtk4::Box::static_type())
-        .and_then(|widget| widget.downcast::<gtk4::Box>().ok())
-        .is_some_and(|holder| holder.has_css_class("block-fullscreen"));
-    let chrome = if fullscreen {
+        .and_then(|widget| widget.downcast::<gtk4::Box>().ok());
+    let chrome = if holder
+        .as_ref()
+        .is_some_and(|holder| holder.has_css_class("block-fullscreen"))
+    {
         0
+    } else if holder
+        .as_ref()
+        .is_some_and(|holder| holder.has_css_class("block-compact"))
+    {
+        css::BLOCK_ACTIVE_COMPACT_VCHROME_PX
     } else {
         css::BLOCK_ACTIVE_VCHROME_PX
     };
@@ -5351,14 +5358,12 @@ fn compute_viewport_state(
     visible_top: i32,
     visible_bottom: i32,
 ) -> ViewportState {
-    let mut y = 0;
+    let mut y = 0_i32;
     let mut first = None;
     let mut last = 0;
-    let mut iter = block_data.iter().enumerate();
-
-    while let Some((i, block)) = iter.next() {
+    for (i, block) in block_data.iter().enumerate() {
         let block_top = y;
-        let block_bottom = y + block.estimated_height;
+        let block_bottom = y.saturating_add(block.estimated_height.max(1));
         if first.is_none() && block_bottom > visible_top {
             first = Some(i);
         }
@@ -5368,9 +5373,6 @@ fn compute_viewport_state(
         y = block_bottom;
 
         if first.is_some() && y >= visible_bottom {
-            for (_, block) in iter {
-                y += block.estimated_height;
-            }
             break;
         }
     }
@@ -5378,7 +5380,6 @@ fn compute_viewport_state(
     ViewportState {
         first_visible: first.unwrap_or(0),
         last_visible: last,
-        total_height: y,
     }
 }
 
@@ -7771,7 +7772,6 @@ impl TermView {
             viewport: Rc::new(RefCell::new(ViewportState {
                 first_visible: 0,
                 last_visible: 0,
-                total_height: 0,
             })),
             visible_indices,
             selected_block_ids,
@@ -8782,7 +8782,6 @@ impl TermView {
             let mut viewport = self.viewport.borrow_mut();
             viewport.first_visible = 0;
             viewport.last_visible = 0;
-            viewport.total_height = 0;
         }
         self.block_list.queue_allocate();
 
@@ -9104,6 +9103,12 @@ impl TermView {
             .iter()
             .map(|b| b.output.len())
             .sum();
+        let total_height: i64 = self
+            .block_data
+            .borrow()
+            .iter()
+            .map(|block| i64::from(block.estimated_height.max(1)))
+            .sum();
         let viewport = self.viewport.borrow().clone();
         let visible = self.visible_indices.borrow().len();
         let selected = self
@@ -9168,10 +9173,7 @@ impl TermView {
                         "Last visible".to_string(),
                         viewport.last_visible.to_string(),
                     ),
-                    (
-                        "Total height".to_string(),
-                        format!("{}px", viewport.total_height),
-                    ),
+                    ("Total height".to_string(), format!("{total_height}px")),
                     ("Realized widgets".to_string(), visible.to_string()),
                     ("Profiling".to_string(), prof_enabled().to_string()),
                 ],
@@ -10755,7 +10757,7 @@ mod tests {
     }
 
     #[test]
-    fn viewport_state_keeps_total_height_after_visible_range() {
+    fn viewport_state_finds_the_intersecting_range() {
         let blocks: VecDeque<BlockData> = [10, 20, 30, 40]
             .into_iter()
             .map(block_with_height)
@@ -10765,7 +10767,6 @@ mod tests {
 
         assert_eq!(vp.first_visible, 1);
         assert_eq!(vp.last_visible, 2);
-        assert_eq!(vp.total_height, 100);
     }
 
     #[test]
@@ -10851,7 +10852,6 @@ mod tests {
         let vp = ViewportState {
             first_visible: 10,
             last_visible: 2_000,
-            total_height: 0,
         };
 
         let visible = visible_indices_for_viewport(&vp);

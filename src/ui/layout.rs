@@ -7,9 +7,7 @@ use crate::config::{SidebarView, TabPlacement};
 
 impl UiState {
     /// Move the tab strip into the holder matching the current placement and
-    /// adjust orientation and per-button sizing. The top-bar spacer is left to
-    /// `sync_tab_bar_visibility` below, which is the only place that knows
-    /// whether the strip ends up visible at all.
+    /// adjust orientation and per-button sizing.
     pub(crate) fn apply_tab_placement(&self) {
         let placement = self.tab_placement.get();
 
@@ -25,6 +23,7 @@ impl UiState {
                 self.tab_strip.set_valign(gtk4::Align::Start);
                 self.tab_strip.set_hexpand(false);
                 self.tab_strip.set_vexpand(true);
+                self.tab_strip.set_width_request(-1);
                 self.tab_strip.remove_css_class("top-tabs");
                 self.tab_strip_scroll.set_child(Some(&self.tab_strip));
             }
@@ -33,6 +32,9 @@ impl UiState {
                 self.tab_strip.set_valign(gtk4::Align::Center);
                 self.tab_strip.set_hexpand(true);
                 self.tab_strip.set_vexpand(false);
+                // The scroller owns overflow; the sum of fixed tab widths must
+                // not become the application's minimum window width.
+                self.tab_strip.set_width_request(1);
                 self.tab_strip.add_css_class("top-tabs");
                 self.top_tab_scroll.set_child(Some(&self.tab_strip));
             }

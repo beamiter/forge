@@ -169,7 +169,6 @@ impl ScrollDebouncer {
 pub(crate) struct ViewportState {
     pub(crate) first_visible: usize,
     pub(crate) last_visible: usize,
-    pub(crate) total_height: i32,
 }
 
 pub(crate) struct WidgetPool {

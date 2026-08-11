@@ -818,7 +818,7 @@ impl OwnedPty {
         let on_exit = std::cell::Cell::new(Some(on_exit));
 
         unix_fd_add_local(eventfd.as_raw_fd(), move || {
-            drain_eventfd(eventfd.as_raw_fd());
+            let _ = drain_eventfd(eventfd.as_raw_fd());
 
             // A producer may enqueue between the first empty read and clearing
             // `wake_pending`. Recheck after clearing so that transition cannot
@@ -830,7 +830,7 @@ impl OwnedPty {
                     match rx.try_recv() {
                         Ok(message) => {
                             wake_pending.store(true, Ordering::Release);
-                            drain_eventfd(eventfd.as_raw_fd());
+                            let _ = drain_eventfd(eventfd.as_raw_fd());
                             message
                         }
                         Err(mpsc::TryRecvError::Empty) => return true,
@@ -844,8 +844,11 @@ impl OwnedPty {
                 PtyMsg::Data(data) => {
                     callback(data);
                     let eventfd = Arc::clone(&eventfd);
+                    let wake_pending = Arc::clone(&wake_pending);
                     glib::timeout_add_local_once(PTY_DISPATCH_INTERVAL, move || {
-                        signal_eventfd(eventfd.as_raw_fd());
+                        if signal_eventfd(eventfd.as_raw_fd()).is_err() {
+                            wake_pending.store(false, Ordering::Release);
+                        }
                     });
                     true
                 }
@@ -1013,26 +1016,62 @@ fn coalesce_pending(fd: RawFd, file: &mut std::fs::File, buf: &mut [u8], combine
 }
 
 fn notify_eventfd_once(eventfd: &OwnedFd, wake_pending: &AtomicBool) {
-    if !wake_pending.swap(true, Ordering::AcqRel) {
-        signal_eventfd(eventfd.as_raw_fd());
+    if !wake_pending.swap(true, Ordering::AcqRel) && signal_eventfd(eventfd.as_raw_fd()).is_err() {
+        // Do not leave the queue permanently armed without a kernel wakeup.
+        // EINTR is retried below; this covers any other write failure.
+        wake_pending.store(false, Ordering::Release);
     }
 }
 
-fn drain_eventfd(eventfd: RawFd) {
+fn drain_eventfd(eventfd: RawFd) -> io::Result<()> {
     let mut value = 0u64;
-    unsafe {
-        libc::read(
-            eventfd,
-            (&mut value as *mut u64).cast::<libc::c_void>(),
-            std::mem::size_of::<u64>(),
-        );
+    loop {
+        // SAFETY: eventfd reads exactly one native u64. The descriptor is
+        // nonblocking, so a raced or redundant drain is harmless.
+        let read = unsafe {
+            libc::read(
+                eventfd,
+                (&mut value as *mut u64).cast::<libc::c_void>(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if read == std::mem::size_of::<u64>() as isize {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Ok(());
+        }
+        return Err(error);
     }
 }
 
-fn signal_eventfd(efd: RawFd) {
-    let val: u64 = 1;
-    unsafe {
-        libc::write(efd, &val as *const u64 as *const libc::c_void, 8);
+fn signal_eventfd(eventfd: RawFd) -> io::Result<()> {
+    let value = 1u64;
+    loop {
+        // SAFETY: eventfd writes exactly one native u64. EAGAIN is harmless:
+        // it means a kernel wakeup is already pending in the counter.
+        let written = unsafe {
+            libc::write(
+                eventfd,
+                (&value as *const u64).cast::<libc::c_void>(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if written == std::mem::size_of::<u64>() as isize {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Ok(());
+        }
+        return Err(error);
     }
 }
 

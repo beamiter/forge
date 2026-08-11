@@ -355,28 +355,18 @@ impl UiState {
         // mirror; exactly one is shown, decided by where the strip lives, so
         // the page never renders an empty holder or a duplicate list. The
         // filter above them stays put in both cases.
-        let top_strip_visible = match self.tab_placement.get() {
+        match self.tab_placement.get() {
             TabPlacement::Sidebar => {
                 self.tab_strip_scroll.set_visible(true);
                 self.sidebar_tab_mirror_scroll.set_visible(false);
                 self.top_tab_scroll.set_visible(false);
-                false
             }
             TabPlacement::TopBar => {
                 self.top_tab_scroll.set_visible(true);
                 self.tab_strip_scroll.set_visible(false);
                 self.sidebar_tab_mirror_scroll.set_visible(true);
-                true
             }
-        };
-        // What pins the trailing actions and window controls to the right edge
-        // is whichever top-bar child expands. The tab scroller only does that
-        // job while it is visible, and a hidden widget expands nothing, so the
-        // spacer takes over whenever the strip is not in the top bar. This is
-        // the one place that knows the strip's real visibility, so it owns the
-        // decision for both placements rather than sharing it with
-        // apply_tab_placement.
-        self.top_spacer.set_hexpand(!top_strip_visible);
+        }
         self.refresh_sidebar_tab_mirror();
     }
 
