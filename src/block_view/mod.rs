@@ -2070,6 +2070,121 @@ struct BlockRemovalRefs<'a> {
     failure_marker_redraw: &'a dyn Fn(),
 }
 
+fn plan_completed_block_retention_with_restored(
+    restored: &[BlockData],
+    finished: &[FinishedBlock],
+    max_blocks: usize,
+) -> CompletedBlockRetentionPlan {
+    let candidates: Vec<(u64, usize)> = restored
+        .iter()
+        .map(|block| (block.id, block.estimated_restored_retained_bytes()))
+        .chain(
+            finished
+                .iter()
+                .map(|block| (block.id, block.estimated_retained_bytes())),
+        )
+        .collect();
+    completed_block_retention_plan(&candidates, max_blocks, MAX_COMPLETED_BLOCK_RETAINED_BYTES)
+}
+
+fn plan_completed_block_retention_with_newest(
+    finished: &[FinishedBlock],
+    newest_id: u64,
+    newest_estimated_bytes: usize,
+    max_blocks: usize,
+) -> CompletedBlockRetentionPlan {
+    let candidates: Vec<(u64, usize)> = finished
+        .iter()
+        .map(|block| (block.id, block.estimated_retained_bytes()))
+        .chain(std::iter::once((newest_id, newest_estimated_bytes)))
+        .collect();
+    completed_block_retention_plan(&candidates, max_blocks, MAX_COMPLETED_BLOCK_RETAINED_BYTES)
+}
+
+fn log_completed_block_retention(context: &str, plan: CompletedBlockRetentionPlan) {
+    if plan.byte_budget_evictions > 0 {
+        log::info!(
+            "{context}: completed-block byte budget evicted {} additional oldest block(s) ({} total with count limit); retained {} block(s), estimated {} bytes of {}",
+            plan.byte_budget_evictions,
+            plan.evict_prefix,
+            plan.retained_count,
+            plan.retained_estimated_bytes,
+            MAX_COMPLETED_BLOCK_RETAINED_BYTES,
+        );
+    }
+    if plan.newest_exceeds_byte_budget {
+        log::warn!(
+            "{context}: newest completed block alone is estimated at {} bytes, above the {}-byte per-pane cap; retaining it by newest-wins policy",
+            plan.retained_estimated_bytes,
+            MAX_COMPLETED_BLOCK_RETAINED_BYTES,
+        );
+    }
+}
+
+/// Strip the heavyweight child tree before pooling the reusable outer card.
+/// Otherwise an evicted VTE and its scrollback remain retained by WidgetPool
+/// and sit outside the completed-block byte ledger.
+fn recycle_finished_block_outer(widget_pool: &Rc<RefCell<WidgetPool>>, widget: gtk4::Box) {
+    while let Some(child) = widget.first_child() {
+        widget.remove(&child);
+    }
+    widget_pool.borrow_mut().release(widget);
+}
+
+/// Remove an oldest prefix and every piece of state indexed by those blocks.
+/// A single bulk operation avoids repeated Vec shifts and keeps BlockData,
+/// widgets, selection, bookmarks, and virtual-scroll indices aligned.
+fn evict_finished_block_prefix(
+    requested: usize,
+    finished_blocks: &Rc<RefCell<Vec<FinishedBlock>>>,
+    block_data: &Rc<RefCell<VecDeque<BlockData>>>,
+    block_list: &gtk4::Box,
+    widget_pool: &Rc<RefCell<WidgetPool>>,
+    refs: BlockRemovalRefs<'_>,
+) -> usize {
+    let evicted: Vec<_> = {
+        let mut finished = finished_blocks.borrow_mut();
+        let count = requested.min(finished.len());
+        finished.drain(..count).collect()
+    };
+    if evicted.is_empty() {
+        return 0;
+    }
+
+    let evicted_count = evicted.len();
+    let evicted_ids: Vec<_> = evicted.iter().map(|block| block.id).collect();
+    let evicted_id_set: HashSet<_> = evicted_ids.iter().copied().collect();
+    mutate_block_data_and_redraw(block_data, refs.failure_marker_redraw, |blocks| {
+        blocks.retain(|block| !evicted_id_set.contains(&block.id));
+    });
+    remove_finished_blocks_from_selection(
+        &finished_blocks.borrow(),
+        refs.selection.ids,
+        refs.selection.active,
+        refs.selection.anchor,
+        &evicted_ids,
+    );
+    {
+        let mut bookmarks = refs.bookmarks.borrow_mut();
+        for id in &evicted_ids {
+            bookmarks.remove(id);
+        }
+    }
+    {
+        let mut visible = refs.visible_indices.borrow_mut();
+        *visible = visible
+            .iter()
+            .filter_map(|&index| index.checked_sub(evicted_count))
+            .collect();
+    }
+    for oldest in evicted {
+        let widget = oldest.widget().clone();
+        block_list.remove(&widget);
+        recycle_finished_block_outer(widget_pool, widget);
+    }
+    evicted_count
+}
+
 /// Remove one block and all of its parallel state. Keeping the GTK widgets,
 /// serializable history, selection, and bookmarks in lockstep prevents deleted
 /// blocks from reappearing in history/search or leaving stale keyboard targets.
@@ -2079,8 +2194,21 @@ fn remove_finished_block(
     finished_blocks: &Rc<RefCell<Vec<FinishedBlock>>>,
     block_data: &Rc<RefCell<VecDeque<BlockData>>>,
     block_list: &gtk4::Box,
+    find_state: &Rc<RefCell<FindState>>,
+    active_vte: &Terminal,
     refs: BlockRemovalRefs<'_>,
 ) -> Option<u64> {
+    if !finished_blocks
+        .borrow()
+        .iter()
+        .any(|block| block.id == block_id)
+    {
+        return None;
+    }
+    // Clear while every highlighted VTE is still reachable. The helper drops
+    // its block-list borrow before calling GTK, so re-entrant signals cannot
+    // collide with the mutation below.
+    find::clear_find_state(find_state.as_ref(), finished_blocks.as_ref(), active_vte);
     let removed = {
         let mut finished = finished_blocks.borrow_mut();
         finished
@@ -2887,6 +3015,7 @@ struct ReaderCtx {
     block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
     failure_marker_redraw: FailureMarkerRedraw,
     finished_blocks_for_cb: Rc<RefCell<Vec<FinishedBlock>>>,
+    find_state_for_cb: Rc<RefCell<FindState>>,
     scroll_debouncer: ScrollDebouncer,
     widget_pool_for_cb: Rc<RefCell<WidgetPool>>,
     pty_synced_rc: Rc<Cell<bool>>,
@@ -3066,6 +3195,7 @@ impl ReaderCtx {
             block_data_for_cb,
             failure_marker_redraw,
             finished_blocks_for_cb,
+            find_state_for_cb,
             scroll_debouncer,
             widget_pool_for_cb,
             pty_synced_rc,
@@ -3484,6 +3614,11 @@ impl ReaderCtx {
                                 // the same width — preserving column-formatted output
                                 // (ls, git log, etc.) instead of reflowing it.
                                 let cols = active_rc.borrow().grid_cols() as i64;
+                                // FinishedBlock may lazily cache the complete
+                                // stripped snapshot, while BlockData stores a
+                                // trimmed copy. Charge the larger pre-trim
+                                // length for both plain-text owners.
+                                let plain_output_bytes = output_plain.len();
                                 let block_output = output_plain.trim().to_string();
 
                                 // Correlate what this terminal actually rendered
@@ -3514,6 +3649,59 @@ impl ReaderCtx {
                                     cols: cols.clamp(1, u16::MAX as i64) as u16,
                                 };
 
+                                // The live surface is about to become a new
+                                // finished surface and retention may evict an
+                                // old prefix. Reset search while both sides of
+                                // that transition are still reachable.
+                                find::clear_find_state(
+                                    find_state_for_cb.as_ref(),
+                                    finished_blocks_for_cb.as_ref(),
+                                    &active_vte,
+                                );
+                                let max_blocks = config_for_cb.borrow().max_visible_blocks as usize;
+                                let newest_estimated_bytes = {
+                                    let images = kitty_pending_images_rc.borrow();
+                                    estimated_live_finished_block_retained_bytes(
+                                        &prompt,
+                                        &cmd,
+                                        None,
+                                        &output_with_ansi,
+                                        &output_plain,
+                                        block_cwd.as_deref(),
+                                        cols,
+                                        &images,
+                                    )
+                                };
+                                let prebuild_retention_plan = {
+                                    let finished = finished_blocks_for_cb.borrow();
+                                    plan_completed_block_retention_with_newest(
+                                        &finished,
+                                        block_id,
+                                        newest_estimated_bytes,
+                                        max_blocks,
+                                    )
+                                };
+                                log_completed_block_retention(
+                                    "preparing live block",
+                                    prebuild_retention_plan,
+                                );
+                                evict_finished_block_prefix(
+                                    prebuild_retention_plan.evict_prefix,
+                                    &finished_blocks_for_cb,
+                                    &block_data_for_cb,
+                                    &block_list_rc,
+                                    &widget_pool_for_cb,
+                                    BlockRemovalRefs {
+                                        selection: BlockSelectionRefs {
+                                            ids: &selected_block_ids_rc,
+                                            active: &selected_block_id_rc,
+                                            anchor: &selection_anchor_id_rc,
+                                        },
+                                        bookmarks: &bookmarks_for_cb,
+                                        visible_indices: &visible_indices_rc,
+                                        failure_marker_redraw: failure_marker_redraw.as_ref(),
+                                    },
+                                );
                                 mutate_block_data_and_redraw(
                                     &block_data_for_cb,
                                     failure_marker_redraw.as_ref(),
@@ -3543,6 +3731,7 @@ impl ReaderCtx {
                                     block_cwd.as_deref(),
                                     cols,
                                     &kitty_images,
+                                    plain_output_bytes,
                                     recycled,
                                 );
                                 // A block finishing after an app recolored the
@@ -3568,7 +3757,6 @@ impl ReaderCtx {
                                     jump_fab.set_visible(true);
                                 }
 
-                                let max_blocks = config_for_cb.borrow().max_visible_blocks as usize;
                                 let finished_clone = finished.clone();
                                 let finished_widget = finished_clone.widget().clone();
 
@@ -3646,6 +3834,7 @@ impl ReaderCtx {
                                 let bookmarks_for_menu = bookmarks_for_cb.clone();
                                 let visible_for_menu = visible_indices_rc.clone();
                                 let failure_marker_redraw_for_menu = failure_marker_redraw.clone();
+                                let find_state_for_menu = find_state_for_cb.clone();
                                 let ask_ai_cbs_for_menu = ask_ai_cbs.clone();
                                 let block_id = finished_clone.id;
 
@@ -4095,6 +4284,8 @@ impl ReaderCtx {
                                         let visible_for_delete = visible_for_menu.clone();
                                         let failure_marker_redraw_for_delete =
                                             failure_marker_redraw_for_menu.clone();
+                                        let find_state_for_delete = find_state_for_menu.clone();
+                                        let active_vte_for_delete = vte_for_copy.clone();
                                         let block_id_del = block_id;
                                         item.connect_clicked(move |_| {
                                             popdown_if_alive(&popover_c);
@@ -4113,6 +4304,8 @@ impl ReaderCtx {
                                                 &finished_blocks_for_delete,
                                                 &block_data_for_delete,
                                                 &block_list_for_delete,
+                                                &find_state_for_delete,
+                                                &active_vte_for_delete,
                                                 BlockRemovalRefs {
                                                     selection: BlockSelectionRefs {
                                                         ids: &selected_ids_for_delete,
@@ -4146,58 +4339,35 @@ impl ReaderCtx {
                                     &selection_anchor_id_rc,
                                 );
 
-                                let excess = finished_blocks_for_cb
-                                    .borrow()
-                                    .len()
-                                    .saturating_sub(max_blocks);
-                                if excess > 0 {
-                                    // One Vec shift, one selection/CSS pass, and
-                                    // one visible-index remap even when a config
-                                    // reduction evicts thousands of old blocks.
-                                    let evicted: Vec<_> = finished_blocks_for_cb
-                                        .borrow_mut()
-                                        .drain(..excess)
-                                        .collect();
-                                    let evicted_ids: Vec<_> =
-                                        evicted.iter().map(|block| block.id).collect();
-                                    remove_finished_blocks_from_selection(
-                                        &finished_blocks_for_cb.borrow(),
-                                        &selected_block_ids_rc,
-                                        &selected_block_id_rc,
-                                        &selection_anchor_id_rc,
-                                        &evicted_ids,
-                                    );
-                                    {
-                                        let mut bookmarks = bookmarks_for_cb.borrow_mut();
-                                        for id in &evicted_ids {
-                                            bookmarks.remove(id);
-                                        }
-                                    }
-                                    {
-                                        let mut visible = visible_indices_rc.borrow_mut();
-                                        *visible = visible
-                                            .iter()
-                                            .filter_map(|&index| index.checked_sub(excess))
-                                            .collect();
-                                    }
-                                    for oldest in evicted {
-                                        let widget_to_release = oldest.widget().clone();
-                                        block_list_rc.remove(&widget_to_release);
-                                        widget_pool_for_cb.borrow_mut().release(widget_to_release);
-                                    }
-                                }
-
-                                if block_data_for_cb.borrow().len() > max_blocks {
-                                    mutate_block_data_and_redraw(
-                                        &block_data_for_cb,
-                                        failure_marker_redraw.as_ref(),
-                                        |blocks| {
-                                            while blocks.len() > max_blocks {
-                                                blocks.pop_front();
-                                            }
+                                let retention_plan = {
+                                    let finished = finished_blocks_for_cb.borrow();
+                                    plan_completed_block_retention_with_restored(
+                                        &[],
+                                        &finished,
+                                        max_blocks,
+                                    )
+                                };
+                                log_completed_block_retention(
+                                    "finalizing live block",
+                                    retention_plan,
+                                );
+                                evict_finished_block_prefix(
+                                    retention_plan.evict_prefix,
+                                    &finished_blocks_for_cb,
+                                    &block_data_for_cb,
+                                    &block_list_rc,
+                                    &widget_pool_for_cb,
+                                    BlockRemovalRefs {
+                                        selection: BlockSelectionRefs {
+                                            ids: &selected_block_ids_rc,
+                                            active: &selected_block_id_rc,
+                                            anchor: &selection_anchor_id_rc,
                                         },
-                                    );
-                                }
+                                        bookmarks: &bookmarks_for_cb,
+                                        visible_indices: &visible_indices_rc,
+                                        failure_marker_redraw: failure_marker_redraw.as_ref(),
+                                    },
+                                );
 
                                 let preserve = config_for_cb.borrow().preserve_live_scrollback;
                                 active_rc.borrow().reset_active(preserve);
@@ -4894,7 +5064,19 @@ impl ReaderCtx {
                             // finished block. Non-G APC payloads keep the silent
                             // consume today's libvte would apply.
                             if payload.first() == Some(&b'G') {
-                                let outcome = kitty_assembler_rc.borrow_mut().feed(payload);
+                                let image_budget_saturated = kitty_pending_images_rc.borrow().len()
+                                    >= kitty_graphics::MAX_IMAGES_PER_BLOCK
+                                    || kitty_pending_bytes_rc.get()
+                                        >= kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK;
+                                let outcome = if image_budget_saturated {
+                                    // Do not decode and instantiate an unbounded
+                                    // stream of tiny textures after the block can
+                                    // no longer retain another image.
+                                    kitty_assembler_rc.borrow_mut().reset();
+                                    kitty_graphics::Outcome::Skipped
+                                } else {
+                                    kitty_assembler_rc.borrow_mut().feed(payload)
+                                };
                                 // Answer before consuming the outcome: clients
                                 // like `kitten icat` block on the `i=`-keyed
                                 // OK/error reply (ember's responder semantics;
@@ -4918,26 +5100,38 @@ impl ReaderCtx {
                                         );
                                     }
                                 }
-                                if let kitty_graphics::Outcome::Complete(texture) = outcome {
-                                    // Rough memory bound: width*height*4 (bytes
-                                    // per RGBA pixel). Once the shared per-block
-                                    // budget is exhausted, further images drop —
-                                    // the transmission was still acknowledged
-                                    // above, only the display is skipped.
-                                    let approx = (texture.width() as usize)
-                                        .saturating_mul(texture.height() as usize)
+                                if let kitty_graphics::Outcome::Complete {
+                                    texture,
+                                    encoded_source_backing_bytes,
+                                } = outcome
+                                {
+                                    // Charge decoded pixels and the fixed
+                                    // Texture/Picture object cost. A separate
+                                    // count cap prevents millions of 1x1 images
+                                    // from bypassing a pixel-only budget.
+                                    let pixel_bytes = (texture.width().max(0) as usize)
+                                        .saturating_mul(texture.height().max(0) as usize)
                                         .saturating_mul(4);
                                     let used = kitty_pending_bytes_rc.get();
-                                    if used + approx <= kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK
+                                    let image_count = kitty_pending_images_rc.borrow().len();
+                                    if let Some(next) =
+                                        kitty_graphics::pending_image_bytes_after_admission(
+                                            used,
+                                            image_count,
+                                            pixel_bytes,
+                                            encoded_source_backing_bytes,
+                                        )
                                     {
-                                        kitty_pending_bytes_rc.set(used + approx);
+                                        kitty_pending_bytes_rc.set(next);
                                         kitty_pending_images_rc.borrow_mut().push(texture);
                                     } else {
                                         log::warn!(
-                                            "kitty graphics: per-block image budget exhausted ({} + {} > {}), dropping",
+                                            "kitty graphics: per-block image budget/count exhausted (used={}, pixels={}, count={}, max_bytes={}, max_count={}), dropping",
                                             used,
-                                            approx,
-                                            kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK
+                                            pixel_bytes,
+                                            image_count,
+                                            kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK,
+                                            kitty_graphics::MAX_IMAGES_PER_BLOCK,
                                         );
                                     }
                                 }
@@ -5396,6 +5590,7 @@ struct KeyCtx {
     submission_pending_for_key: Rc<Cell<bool>>,
     pending_typeahead_for_key: Rc<Cell<bool>>,
     finished_blocks_for_key: Weak<RefCell<Vec<FinishedBlock>>>,
+    find_state_for_key: Rc<RefCell<FindState>>,
     block_data_for_key: Rc<RefCell<VecDeque<BlockData>>>,
     block_list_for_key: glib::WeakRef<gtk4::Box>,
     selected_block_ids_for_key: SelectedBlockIds,
@@ -5420,6 +5615,7 @@ impl KeyCtx {
             submission_pending_for_key,
             pending_typeahead_for_key,
             finished_blocks_for_key,
+            find_state_for_key,
             block_data_for_key,
             block_list_for_key,
             selected_block_ids_for_key,
@@ -5616,6 +5812,8 @@ impl KeyCtx {
                         &finished_blocks_for_key,
                         &block_data_for_key,
                         &block_list_for_key,
+                        &find_state_for_key,
+                        &active_vte_for_key,
                         BlockRemovalRefs {
                             selection: BlockSelectionRefs {
                                 ids: &selected_block_ids_for_key,
@@ -6102,6 +6300,7 @@ impl TermView {
         let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
             Rc::new(RefCell::new(VecDeque::new()));
         let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
+        let find_state = Rc::new(RefCell::new(FindState::default()));
 
         // Failed commands are marked against the full-history scrollbar track,
         // independent of the current viewport. The overlay is deliberately not
@@ -6608,6 +6807,7 @@ impl TermView {
                 block_data_for_cb,
                 failure_marker_redraw: failure_marker_redraw.clone(),
                 finished_blocks_for_cb,
+                find_state_for_cb: find_state.clone(),
                 scroll_debouncer: scroll_debouncer.clone(),
                 widget_pool_for_cb,
                 pty_synced_rc,
@@ -7161,6 +7361,7 @@ impl TermView {
                 submission_pending_for_key,
                 pending_typeahead_for_key,
                 finished_blocks_for_key,
+                find_state_for_key: find_state.clone(),
                 block_data_for_key,
                 block_list_for_key: block_list_for_key.downgrade(),
                 selected_block_ids_for_key,
@@ -7453,7 +7654,7 @@ impl TermView {
             selected_block_id,
             selection_anchor_id,
             bookmarks: block_bookmarks,
-            find_state: Rc::new(RefCell::new(FindState::default())),
+            find_state,
             current_cwd: current_cwd.clone(),
             session_id: session_id_owned,
             history_load: Arc::new(history::HistoryLoadShared::default()),
@@ -8417,7 +8618,7 @@ impl TermView {
         // A background load that completes after Clear must not resurrect the
         // just-deleted history, and its shutdown merge must not prepend it to
         // the empty replacement snapshot.
-        self.history_load.discard();
+        self.history_load.discard_for_explicit_clear();
         self.clear_find();
         self.active_vte.unselect_all();
 
@@ -8430,6 +8631,11 @@ impl TermView {
         let mut pool = self.widget_pool.borrow_mut();
         for widget in widgets {
             self.block_list.remove(&widget);
+            // Pool only the lightweight outer shell. Keeping its VTE children
+            // would retain completed-block scrollback outside the byte budget.
+            while let Some(child) = widget.first_child() {
+                widget.remove(&child);
+            }
             pool.release(widget);
         }
         drop(pool);
@@ -8473,6 +8679,38 @@ impl TermView {
         if restored.is_empty() {
             return 0;
         }
+        // Undo inserts restored cards and may evict a live prefix. Invalidate
+        // index-based search metadata before either structural change.
+        self.clear_find();
+
+        let max_blocks = self.config.borrow().max_visible_blocks as usize;
+        let retention_plan = {
+            let finished = self.finished_blocks.borrow();
+            plan_completed_block_retention_with_restored(&restored, &finished, max_blocks)
+        };
+        log_completed_block_retention("restoring cleared blocks", retention_plan);
+        let restored_evictions = retention_plan.evict_prefix.min(restored.len());
+        restored.drain(..restored_evictions);
+        let live_evictions = retention_plan
+            .evict_prefix
+            .saturating_sub(restored_evictions);
+        evict_finished_block_prefix(
+            live_evictions,
+            &self.finished_blocks,
+            &self.block_data,
+            &self.block_list,
+            &self.widget_pool,
+            BlockRemovalRefs {
+                selection: BlockSelectionRefs {
+                    ids: &self.selected_block_ids,
+                    active: &self.selected_block_id,
+                    anchor: &self.selection_anchor_id,
+                },
+                bookmarks: &self.bookmarks,
+                visible_indices: &self.visible_indices,
+                failure_marker_redraw: self.failure_marker_redraw.as_ref(),
+            },
+        );
 
         let fallback_cols = self.active.borrow().grid_cols() as i64;
         {
@@ -8839,6 +9077,8 @@ impl TermView {
             &self.finished_blocks,
             &self.block_data,
             &self.block_list,
+            &self.find_state,
+            &self.active_vte,
             BlockRemovalRefs {
                 selection: BlockSelectionRefs {
                     ids: &self.selected_block_ids,
@@ -8867,14 +9107,14 @@ impl TermView {
             return Vec::new();
         }
         let finished = self.finished_blocks.borrow();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut out: Vec<String> = Vec::with_capacity(limit.min(finished.len()));
         for block in finished.iter().rev() {
             let cmd = block.cmd_text.trim();
             if cmd.is_empty() {
                 continue;
             }
-            if seen.insert(cmd.to_string()) {
+            if seen.insert(cmd) {
                 out.push(cmd.to_string());
                 if out.len() == limit {
                     break;

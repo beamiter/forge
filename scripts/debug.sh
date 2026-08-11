@@ -3,9 +3,27 @@
 
 set -Eeuo pipefail
 
-readonly CONFIG_DIR="${HOME}/.config/forge"
-readonly CONFIG_FILE="${CONFIG_DIR}/config.toml"
-readonly STATE_FILE="${CONFIG_DIR}/tabs.state"
+if [[ "${XDG_CONFIG_HOME:-}" == /* ]]; then
+    forge_config_home="${XDG_CONFIG_HOME}"
+else
+    forge_config_home="${HOME}/.config"
+fi
+readonly FORGE_CONFIG_HOME="${forge_config_home}"
+unset forge_config_home
+
+if [[ -n "${FORGE_CONFIG:-}" ]]; then
+    config_file="${FORGE_CONFIG}"
+    config_source='custom FORGE_CONFIG override'
+else
+    config_file="${FORGE_CONFIG_HOME}/forge/config.toml"
+    config_source='default XDG config location'
+fi
+readonly CONFIG_FILE="${config_file}"
+config_dir="$(dirname -- "${CONFIG_FILE}")"
+readonly CONFIG_DIR="${config_dir}"
+readonly CONFIG_SOURCE="${config_source}"
+readonly STATE_FILE="${FORGE_CONFIG_HOME}/forge/tabs.state"
+unset config_dir config_file config_source
 
 state_exists() {
     [[ -f "${STATE_FILE}" ]]
@@ -14,12 +32,35 @@ state_exists() {
 show_file_metadata() {
     local path="$1"
     if [[ -f "${path}" ]]; then
-        printf '   Path: %s\n' "${path}"
         printf '   Size: %s bytes\n' "$(wc -c < "${path}")"
         printf '   Lines: %s\n' "$(wc -l < "${path}")"
-        stat -c '   Mode: %a  Owner: %U:%G  Modified: %y' "${path}"
+        stat -c '   Mode: %a  Modified: %y' "${path}"
     else
         printf '   (missing)\n'
+    fi
+}
+
+run_strace() {
+    if [[ "${FORGE_DEBUG_ALLOW_SENSITIVE_TRACE:-0}" != "1" ]]; then
+        printf '%s\n' \
+            'Refusing to capture a system-call trace by default.' \
+            'A trace can contain commands, paths, environment data, and file contents.' \
+            'Set FORGE_DEBUG_ALLOW_SENSITIVE_TRACE=1 only when you trust the trace destination.' >&2
+        exit 2
+    fi
+
+    local trace_file status
+    umask 077
+    trace_file="$(mktemp "${TMPDIR:-/tmp}/forge-strace.XXXXXX.log")"
+    printf '%s\n' 'Running forge with strace; the output may contain sensitive data.' >&2
+    printf 'Trace destination (owner-only): %s\n' "${trace_file}" >&2
+    if strace -o "${trace_file}" target/release/forge; then
+        printf 'Trace saved with owner-only permissions: %s\n' "${trace_file}"
+    else
+        status=$?
+        rm -f -- "${trace_file}"
+        printf '%s\n' 'Incomplete trace removed.' >&2
+        return "${status}"
     fi
 }
 
@@ -72,11 +113,22 @@ CMD="${1:-info}"
 case "${CMD}" in
     info)
         printf '%s\n\n' 'forge debug information'
-        printf '%s\n' 'Paths:'
-        printf '   Config dir: %s\n' "${CONFIG_DIR}"
-        printf '   Config: %s\n' "${CONFIG_FILE}"
-        printf '   Legacy state: %s\n' "${STATE_FILE}"
-        printf '   Binary: %s\n\n' "$(command -v forge 2>/dev/null || echo 'Not in PATH')"
+        printf '%s\n' 'Locations (absolute paths withheld):'
+        if [[ -f "${CONFIG_FILE}" ]]; then
+            printf '   Config: %s (exists)\n' "${CONFIG_SOURCE}"
+        else
+            printf '   Config: %s (missing)\n' "${CONFIG_SOURCE}"
+        fi
+        if state_exists; then
+            printf '%s\n' '   Legacy state: XDG config location (exists)'
+        else
+            printf '%s\n' '   Legacy state: XDG config location (missing)'
+        fi
+        if command -v forge >/dev/null 2>&1; then
+            printf '%s\n\n' '   Binary in PATH: yes'
+        else
+            printf '%s\n\n' '   Binary in PATH: no'
+        fi
 
         printf '%s\n' 'Legacy state summary:'
         show_state_summary
@@ -133,9 +185,7 @@ case "${CMD}" in
         ;;
 
     strace)
-        printf '%s\n' 'Running with strace...'
-        strace -o /tmp/forge-strace.log target/release/forge
-        printf '%s\n' 'Trace saved to /tmp/forge-strace.log'
+        run_strace
         ;;
 
     *)
@@ -149,7 +199,7 @@ case "${CMD}" in
         printf '%s\n' '  clean-state  - Remove the legacy tabs.state file'
         printf '%s\n' '  reset-config - Reset config to defaults'
         printf '%s\n' '  valgrind     - Run with valgrind'
-        printf '%s\n' '  strace       - Run with strace'
+        printf '%s\n' '  strace       - Capture an owner-only trace with explicit sensitive-data opt-in'
         exit 1
         ;;
 esac

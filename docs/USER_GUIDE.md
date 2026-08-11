@@ -266,13 +266,13 @@ repo 身份，也不会抢焦点、弹窗或改写任一 pane 的 inline/sticky 
 | 过滤标签 | `Ctrl+Shift+L` |
 | 标签栏位置 | `Ctrl+Alt+B` |
 
-标签支持按落点前后拖放排序、双击重命名、固定、标记、复制和右键菜单。过滤框会跟随标签栏位置：侧栏模式显示在 Tabs 视图中，顶部模式直接显示在顶部栏。侧栏在 Tabs 与 Files 之间切换；开关、宽度和视图会持久化。
+标签支持按落点前后拖放排序、双击重命名、固定、标记、复制和右键菜单。过滤框固定显示在侧栏的 Tabs 视图中；`Ctrl+Shift+L` 会自动打开侧栏、切换到 Tabs 并聚焦过滤框。侧栏在 Tabs 与 Files 之间切换；开关、宽度和视图会持久化。
 
 每个进程维护独立 active 快照。正常关闭后才原子发布为 ready；并发窗口不会读取或覆盖彼此 active 状态。后续启动逐个领取最近快照，确认 owner PID 已结束后才回收崩溃遗留的 active 快照，最多保留 32 个 ready 快照。旧版 `tabs.state` 会在首次启动时迁移。
 
 ## 5. 搜索与 Block 操作
 
-`Ctrl+Shift+F` 打开当前标签搜索：普通文本不区分大小写，`/expression/` 使用正则；Enter/Shift+Enter 前后跳转，Escape 关闭。清空输入立即清除 VTE 和 Block 高亮。
+`Ctrl+Shift+F` 打开当前标签搜索：普通文本不区分大小写，`/expression/` 使用正则；Enter/Shift+Enter 前后跳转，Escape 关闭。清空输入立即清除 VTE 和 Block 高亮。查询上限为 8 KiB；增量搜索最多检查 4 MiB，并以 12 ms 为 surface 间的停止目标，最多记录 10,000 个命中。达到任一边界时状态栏会显示结果不完整，请缩小关键词。可能产生零宽命中的正则会明确拒绝，避免游标与高亮失去同步。
 
 | Block 功能 | 快捷键 |
 |---|---|
@@ -291,6 +291,7 @@ repo 身份，也不会抢焦点、弹窗或改写任一 pane 的 inline/sticky 
 - `Ctrl+Shift+B` 收藏 active 块，`Ctrl+,` / `Ctrl+.` 在收藏块之间跳转。
 - 多选右键可批量复制命令、输出、完整块或回填命令；复制按界面顺序合并。
 - 长块提供顶部/底部导航与 sticky header，后台异步输出使用独立 Block 样式。
+- 完成块同时受 `max_visible_blocks` 和每 pane 128 MiB 估算内存预算约束；预算包含 ANSI 原文、重复显示副本、VTE/控件与图片，超限时从最旧块开始淘汰，最新块始终保留。每个完成 VTE 最多保留 1,048,576 个 cells（最多 4096 列），因此极端长输出只在界面中保留有界终端窗口；这一几何裁剪不会再额外影响复制/导出中已捕获的文本（最多 8 MiB）。Kitty 图片每块最多 64 张。
 
 命令运行中或 alt-screen TUI 活跃时，Enter 和应用所需按键继续发送给前台进程，不会误触发旧块回填。
 
@@ -305,7 +306,7 @@ repo 身份，也不会抢焦点、弹窗或改写任一 pane 的 inline/sticky 
 | `:` | YAML/TOML workflow | 填参数后写入编辑行，不提交 |
 | `?` | 自然语言命令请求 | 交给 AI 生成候选，先审阅 |
 
-JSONL 历史默认位于 `${XDG_STATE_HOME:-~/.local/state}/forge/history.jsonl`，只保存 command、cwd、exit code 和完成时间，不保存终端输出。文件权限为 `0600`，重复命令按最新记录展示，损坏或超限记录会跳过，文件会按上限压缩。
+JSONL 历史默认位于 `${XDG_STATE_HOME:-~/.local/state}/forge/history.jsonl`，只保存 command、cwd、exit code 和完成时间，不保存终端输出。文件权限为 `0600`，重复命令按最新记录展示，损坏或超限记录会跳过，文件会按上限压缩。`Ctrl+Shift+H` 面板最多创建最近 500 行，即使磁盘保留上限更高；状态行会明确标出显示边界。
 
 用户 workflow 放在 `~/.config/forge/workflows/`，支持 `.toml`、`.yaml`、`.yml`；也可用 `FORGE_WORKFLOW_DIR` 增加以路径列表表示的目录。用户定义优先于已安装示例，同名项不会被示例覆盖。
 
@@ -493,7 +494,7 @@ show_remote_picker = "F8"
 toggle_ai_panel = false
 ```
 
-修饰键名称不区分大小写，`Ctrl` 与 `Control` 等价。若两个 action 使用同一组合，配置检查器会报告冲突。`Ctrl+R` / `Ctrl+P` 留给 shell/readline。
+修饰键名称不区分大小写：`Ctrl` / `Control`、`Alt` / `Option` 等价，`Super` / `Cmd` / `Command` / `Win` / `Meta` 映射为同一跨平台修饰键。数字小键盘的 `0`–`9` 与主键区数字共用组合（例如 `Ctrl+1`）；小键盘 Enter 和运算符仍保持独立。若两个 action 使用同一组合，配置检查器会报告冲突。`Ctrl+R` / `Ctrl+P` 留给 shell/readline。
 
 `[keybindings]` 只管理命令面板中可发现的应用动作。Block 视图的上下文键
 `Alt+Shift+F`（过滤）、`Ctrl+Shift+B`（书签）和 `Ctrl+,` / `Ctrl+.`（前后书签）

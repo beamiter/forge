@@ -148,6 +148,9 @@ pub(crate) struct UiState {
     pub(crate) available_themes: Rc<Vec<Theme>>,
     pub(crate) search_bar: SearchBar,
     pub(crate) search_entry: SearchEntry,
+    pub(crate) search_status: gtk4::Label,
+    pub(crate) search_debounce_source: Rc<RefCell<Option<gtk4::glib::SourceId>>>,
+    pub(crate) search_generation: Rc<Cell<u64>>,
     pub(crate) tab_strip: gtk4::Box,
     pub(crate) sidebar: gtk4::Box,
     /// Flexible spacer in the top bar; its hexpand toggles with tab placement.

@@ -10,6 +10,212 @@ use std::rc::Rc;
 use vte4::Terminal;
 use vte4::TerminalExt;
 
+/// Conservative per-pane estimated-memory budget for completed-block objects.
+///
+/// This is deliberately independent of the configurable record-count limit:
+/// a handful of ANSI-heavy snapshots can otherwise retain hundreds of MiB in
+/// duplicate Strings and VTE buffers long before the count limit is reached.
+/// The newest block is the sole exception when it cannot fit by itself.
+pub(crate) const MAX_COMPLETED_BLOCK_RETAINED_BYTES: usize = 128 * 1024 * 1024;
+
+// A finished card owns two VTEs plus a sizeable GTK widget/controller tree.
+// These bases cover allocations which cannot be recovered from text lengths.
+const RETAINED_BYTES_PER_VTE_BASE: usize = 128 * 1024;
+const RETAINED_BYTES_PER_WIDGET_TREE_BASE: usize = 256 * 1024;
+const FINISHED_BLOCK_FIXED_RETAINED_BYTES: usize =
+    2 * RETAINED_BYTES_PER_VTE_BASE + RETAINED_BYTES_PER_WIDGET_TREE_BASE;
+
+// For ordinary output, full_output, displayed_output, stripped_output, and
+// BlockData.output are several similarly sized byte owners. Keep the original
+// capture multiple as a conservative floor for repaint-heavy streams, then
+// separately charge the actual rendered/plain lengths. VTE stores a terminal
+// grid (cells plus attributes and row metadata), not a byte string: charging
+// one byte per printable cell made a pane with a few multi-megabyte blocks
+// exceed the advertised budget by a wide margin. 32 bytes per materialized
+// cell/row byte is a deliberately conservative retained-memory estimate for
+// the output and command VTE grids; plain reconstruction also covers expansion
+// from tabs and sparse cursor movement.
+const ORIGINAL_OUTPUT_RETENTION_EQUIVALENT: usize = 5;
+const MATERIALIZED_OUTPUT_RETAINED_OWNERS: usize = 3;
+const PLAIN_OUTPUT_RETAINED_OWNERS: usize = 2;
+const VTE_RETAINED_BYTES_PER_MATERIALIZED_BYTE: usize = 32;
+// GDK may retain both decoded pixels and the encoded/source backing.
+const IMAGE_RETAINED_OWNERS: usize = 2;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CompletedBlockRetentionPlan {
+    /// Number of oldest entries to remove from every block-indexed collection.
+    pub(crate) evict_prefix: usize,
+    pub(crate) retained_count: usize,
+    pub(crate) retained_estimated_bytes: usize,
+    /// Evictions required in addition to those imposed by the count limit.
+    pub(crate) byte_budget_evictions: usize,
+    /// The explicit newest-wins exception to the hard byte cap.
+    pub(crate) newest_exceeds_byte_budget: bool,
+}
+
+/// Plan prefix eviction over oldest-to-newest `(block_id, estimated_bytes)`.
+///
+/// Scanning from the newest entry makes the latest-wins rule explicit and
+/// avoids summing entries which the count cap would discard anyway. Arithmetic
+/// overflow is treated as over-budget. `max_blocks == 0` still retains one
+/// newest block, matching the byte-budget exception.
+pub(crate) fn completed_block_retention_plan(
+    blocks: &[(u64, usize)],
+    max_blocks: usize,
+    max_bytes: usize,
+) -> CompletedBlockRetentionPlan {
+    let Some(&(_, newest_bytes)) = blocks.last() else {
+        return CompletedBlockRetentionPlan::default();
+    };
+
+    let count_limit = max_blocks.max(1);
+    let count_limited_start = blocks.len().saturating_sub(count_limit);
+    let mut retained_start = blocks.len() - 1;
+    let mut retained_count = 1;
+    let mut retained_estimated_bytes = newest_bytes;
+
+    for index in (count_limited_start..retained_start).rev() {
+        let Some(next_bytes) = retained_estimated_bytes.checked_add(blocks[index].1) else {
+            break;
+        };
+        if next_bytes > max_bytes {
+            break;
+        }
+        retained_start = index;
+        retained_count += 1;
+        retained_estimated_bytes = next_bytes;
+    }
+
+    CompletedBlockRetentionPlan {
+        evict_prefix: retained_start,
+        retained_count,
+        retained_estimated_bytes,
+        byte_budget_evictions: retained_start.saturating_sub(count_limited_start),
+        newest_exceeds_byte_budget: newest_bytes > max_bytes,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn estimated_completed_block_retained_bytes(
+    prompt_bytes: usize,
+    command_bytes: usize,
+    command_markup_bytes: usize,
+    rendered_command_bytes: usize,
+    raw_output_bytes: usize,
+    materialized_output_bytes: usize,
+    plain_output_bytes: usize,
+    cwd_bytes: usize,
+    image_pixel_bytes: usize,
+) -> usize {
+    // A collapsed repaint stream contains only printable bytes, CR/LF, and
+    // SGR. Its later stripped cache cannot exceed the materialized byte length;
+    // use the larger value so both the cache and BlockData copy stay covered.
+    let plain_owner_bytes = plain_output_bytes.max(materialized_output_bytes);
+    let output_bytes = raw_output_bytes
+        .saturating_mul(ORIGINAL_OUTPUT_RETENTION_EQUIVALENT)
+        .max(
+            materialized_output_bytes
+                .saturating_mul(MATERIALIZED_OUTPUT_RETAINED_OWNERS)
+                .saturating_add(plain_owner_bytes.saturating_mul(PLAIN_OUTPUT_RETAINED_OWNERS))
+                .saturating_add(
+                    plain_owner_bytes
+                        .min(MAX_FINISHED_VTE_GRID_CELLS)
+                        .saturating_mul(VTE_RETAINED_BYTES_PER_MATERIALIZED_BYTE),
+                ),
+        );
+    FINISHED_BLOCK_FIXED_RETAINED_BYTES
+        .saturating_add(output_bytes)
+        // BlockData.cmd plus FinishedBlock.cmd_text.
+        .saturating_add(command_bytes.saturating_mul(2))
+        // The map closure owns the rendered command while VTE retains a cell
+        // grid whose allocation is substantially larger than the UTF-8 feed.
+        .saturating_add(rendered_command_bytes)
+        .saturating_add(
+            rendered_command_bytes
+                .min(MAX_FINISHED_VTE_GRID_CELLS)
+                .saturating_mul(VTE_RETAINED_BYTES_PER_MATERIALIZED_BYTE),
+        )
+        // BlockData.prompt plus FinishedBlock.prompt_text.
+        .saturating_add(prompt_bytes.saturating_mul(2))
+        .saturating_add(command_markup_bytes)
+        // BlockData.cwd plus the rendered cwd chip.
+        .saturating_add(cwd_bytes.saturating_mul(2))
+        .saturating_add(image_pixel_bytes.saturating_mul(IMAGE_RETAINED_OWNERS))
+        .saturating_add(std::mem::size_of::<BlockData>())
+        .saturating_add(std::mem::size_of::<FinishedBlock>())
+}
+
+/// Upper-bound terminal grid units from the UTF-8/control stream without
+/// parsing it a second time. Every byte is charged as one unit; HT receives an
+/// additional full-row allowance because a one-byte tab may advance to the
+/// right margin after applications modify tab stops. ANSI sparse-cursor
+/// expansion is covered separately by the reconstructed plain-output length.
+fn terminal_grid_units_upper_bound(bytes: &[u8], cols: usize) -> usize {
+    let tab_extra = cols.max(1).saturating_sub(1);
+    bytes.iter().fold(bytes.len(), |units, byte| {
+        if *byte == b'\t' {
+            units.saturating_add(tab_extra)
+        } else {
+            units
+        }
+    })
+}
+
+/// Conservative estimate available before the GTK/VTE widget tree exists.
+/// This lets the live-finalize path evict old cards before constructing a
+/// potentially huge newest card, avoiding an old-budget + new-card RSS spike.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn estimated_live_finished_block_retained_bytes(
+    prompt: &str,
+    cmd: &str,
+    cmd_ansi: Option<&str>,
+    raw_output: &str,
+    plain_output: &str,
+    cwd: Option<&str>,
+    cols: i64,
+    images: &[gtk4::gdk::Texture],
+) -> usize {
+    let cols = cols.max(1) as usize;
+    let display_cmd = crate::review_input::safe_multiline_display(
+        cmd,
+        crate::review_input::MAX_REVIEW_INPUT_BYTES,
+    );
+    let command = finished_command_bytes(&display_cmd);
+    let image_pixel_bytes = images.iter().fold(0usize, |total, texture| {
+        total.saturating_add(
+            (texture.width().max(0) as usize)
+                .saturating_mul(texture.height().max(0) as usize)
+                .saturating_mul(4),
+        )
+    });
+    estimated_completed_block_retained_bytes(
+        prompt.len(),
+        cmd.len(),
+        cmd_ansi.map_or(0, str::len),
+        command
+            .len()
+            .max(terminal_grid_units_upper_bound(&command, cols).min(MAX_FINISHED_VTE_GRID_CELLS)),
+        raw_output.len(),
+        plain_output.len(),
+        plain_output.len().max(
+            terminal_grid_units_upper_bound(plain_output.as_bytes(), cols)
+                .min(MAX_FINISHED_VTE_GRID_CELLS),
+        ),
+        cwd.map_or(0, str::len),
+        image_pixel_bytes,
+    )
+    .saturating_add(if images.is_empty() {
+        0
+    } else {
+        // Pending admission charges encoded PNG backing, decoded pixels and
+        // every Texture/Picture object together. The exact per-image split is
+        // no longer available after we move only Textures into FinishedBlock,
+        // so charge the complete block graphics budget conservatively.
+        super::kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK
+    })
+}
+
 // ─── FinishedBlock ────────────────────────────────────────────────────────────
 
 /// Data for a finished command block (decoupled from widget representation)
@@ -47,6 +253,43 @@ pub(crate) struct BlockData {
 impl BlockData {
     pub(crate) fn is_background(&self) -> bool {
         self.cmd.trim().is_empty()
+    }
+
+    /// Conservative cost of rebuilding this text-only history record as a
+    /// finished card. Persisted output has no separate ANSI source, so its
+    /// exact byte length is charged as the raw snapshot length.
+    pub(crate) fn estimated_restored_retained_bytes(&self) -> usize {
+        let display_cmd = crate::review_input::safe_multiline_display(
+            &self.cmd,
+            crate::review_input::MAX_REVIEW_INPUT_BYTES,
+        );
+        let rendered_command = finished_command_bytes(&display_cmd);
+        // `cols == 0` is the legacy on-disk sentinel. Rendering later falls
+        // back to the live terminal width, which is unavailable during the
+        // retention plan; use the persisted u16 ceiling so tab expansion can
+        // never be underestimated before widgets are built.
+        let cols = if self.cols == 0 {
+            u16::MAX as usize
+        } else {
+            usize::from(self.cols)
+        };
+        estimated_completed_block_retained_bytes(
+            self.prompt.len(),
+            self.cmd.len(),
+            self.cmd_markup.as_ref().map_or(0, String::len),
+            rendered_command.len().max(
+                terminal_grid_units_upper_bound(&rendered_command, cols)
+                    .min(MAX_FINISHED_VTE_GRID_CELLS),
+            ),
+            self.output.len(),
+            self.output.len(),
+            self.output.len().max(
+                terminal_grid_units_upper_bound(self.output.as_bytes(), cols)
+                    .min(MAX_FINISHED_VTE_GRID_CELLS),
+            ),
+            self.cwd.as_ref().map_or(0, String::len),
+            0,
+        )
     }
 
     /// Export block to JSON format
@@ -275,6 +518,8 @@ pub(crate) struct FinishedBlock {
     pub(crate) viewport_cap: i64,
     /// Whether this block exceeds the configured long-output threshold.
     pub(crate) long_output: bool,
+    /// Whole-block retained-memory estimate, including its aligned BlockData.
+    estimated_retained_bytes: usize,
 }
 
 impl Clone for FinishedBlock {
@@ -308,6 +553,7 @@ impl Clone for FinishedBlock {
             cols: self.cols,
             viewport_cap: self.viewport_cap,
             long_output: self.long_output,
+            estimated_retained_bytes: self.estimated_retained_bytes,
         }
     }
 }
@@ -915,18 +1161,22 @@ pub(crate) fn render_bytes_into_finished_vte(
     // The pixel height request below is based on this same row count. Capping
     // the VTE grid at 32 while requesting a taller widget created the large
     // blank tail visible in long cards.
-    let visible_rows = output_rows.min(viewport_cap).max(1);
-    let overflow_rows = output_rows.saturating_sub(visible_rows).saturating_add(64);
-    let scrollback = capture_rows.max(overflow_rows).max(64);
+    let requested_visible_rows = output_rows.min(viewport_cap).max(1);
+    let overflow_rows = output_rows
+        .saturating_sub(requested_visible_rows)
+        .saturating_add(64);
+    let requested_scrollback = capture_rows.max(overflow_rows).max(64);
+    let (cols, visible_rows, scrollback) =
+        bounded_finished_vte_geometry(cols, requested_visible_rows, requested_scrollback);
     let cell_height = vte.char_height() as i32;
     if cell_height > 0 {
         vte.set_height_request(finished_vte_height_px(visible_rows, cell_height));
     }
     vte.set_scroll_on_output(false);
-    vte.set_size(cols.max(1), visible_rows);
+    vte.set_size(cols, visible_rows);
     vte.set_scrollback_lines(scrollback);
     vte.reset(true, true);
-    vte.set_size(cols.max(1), visible_rows);
+    vte.set_size(cols, visible_rows);
     vte.set_scrollback_lines(scrollback);
     vte.feed(&finished_snapshot_stream(display_text));
     let settle_tail = snapshot_settle_tail(display_text);
@@ -962,6 +1212,14 @@ fn terminalize_line_breaks(bytes: &[u8]) -> Vec<u8> {
         terminal_bytes.push(byte);
     }
     terminal_bytes
+}
+
+fn finished_command_bytes(display_cmd: &str) -> Vec<u8> {
+    let highlighted = match display_cmd {
+        "" => b"(empty)".to_vec(),
+        command => highlight_command_to_ansi(command).into_bytes(),
+    };
+    terminalize_line_breaks(&highlighted)
 }
 
 impl FinishedBlock {
@@ -1013,6 +1271,7 @@ impl FinishedBlock {
             cwd,
             cols,
             &[],
+            output.len(),
             None,
         )
     }
@@ -1022,7 +1281,7 @@ impl FinishedBlock {
         id: u64,
         prompt: &str,
         cmd: &str,
-        _cmd_ansi: Option<&str>,
+        cmd_ansi: Option<&str>,
         output: &str,
         exit_code: Option<i32>,
         config: &Config,
@@ -1031,6 +1290,7 @@ impl FinishedBlock {
         cwd: Option<&str>,
         cols: i64,
         images: &[gtk4::gdk::Texture],
+        plain_output_bytes: usize,
         recycled: Option<gtk4::Box>,
     ) -> Self {
         let is_background = cmd.trim().is_empty();
@@ -1039,6 +1299,13 @@ impl FinishedBlock {
             cmd,
             crate::review_input::MAX_REVIEW_INPUT_BYTES,
         );
+        let cmd_bytes = finished_command_bytes(&display_cmd);
+        let image_pixel_bytes = images.iter().fold(0usize, |total, texture| {
+            let width = texture.width().max(0) as usize;
+            let height = texture.height().max(0) as usize;
+            total.saturating_add(width.saturating_mul(height).saturating_mul(4))
+        });
+        let raw_output_bytes = output.len();
 
         // A command that repaints in place without the alternate screen (top,
         // watch, multi-line progress) emits one frame per refresh, each behind a
@@ -1054,6 +1321,28 @@ impl FinishedBlock {
         } else {
             output
         };
+        let estimated_retained_bytes = estimated_completed_block_retained_bytes(
+            prompt.len(),
+            cmd.len(),
+            cmd_ansi.map_or(0, str::len),
+            cmd_bytes.len().max(
+                terminal_grid_units_upper_bound(&cmd_bytes, cols.max(1) as usize)
+                    .min(MAX_FINISHED_VTE_GRID_CELLS),
+            ),
+            raw_output_bytes,
+            output.len(),
+            plain_output_bytes.max(
+                terminal_grid_units_upper_bound(output.as_bytes(), cols.max(1) as usize)
+                    .min(MAX_FINISHED_VTE_GRID_CELLS),
+            ),
+            cwd.map_or(0, str::len),
+            image_pixel_bytes,
+        )
+        .saturating_add(if images.is_empty() {
+            0
+        } else {
+            super::kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK
+        });
 
         let output_rows = output_visual_row_count(output, cols);
         let fallback_viewport_cap = (config.finished_block_viewport_rows as i64).max(3);
@@ -1085,6 +1374,7 @@ impl FinishedBlock {
             reused.remove_css_class("block-bookmarked");
             reused.remove_css_class("block-success");
             reused.remove_css_class("block-failed");
+            reused.remove_css_class("block-unknown");
             reused.remove_css_class("block-background");
             reused.remove_css_class("block-compact");
             reused
@@ -1098,6 +1388,10 @@ impl FinishedBlock {
         // spare vertical space from the document box.
         outer.set_hexpand(true);
         outer.set_vexpand(false);
+        // A pooled card may have been virtualized with a fixed placeholder
+        // height. New block state starts non-virtualized, so reset that GTK
+        // request explicitly instead of inheriting the previous card's geometry.
+        outer.set_height_request(-1);
         if config.block_compact {
             outer.add_css_class("block-compact");
             outer.set_margin_top(1);
@@ -1344,11 +1638,6 @@ impl FinishedBlock {
 
         // ── VTE-rendered command + output ─────────────────────────────────
         // Command VTE: full-height read-only renderer for the executed command.
-        let cmd_bytes: Vec<u8> = match display_cmd.as_str() {
-            "" => b"(empty)".to_vec(),
-            command => highlight_command_to_ansi(command).into_bytes(),
-        };
-        let cmd_bytes = terminalize_line_breaks(&cmd_bytes);
         let cmd_rows = cmd_bytes.iter().filter(|&&b| b == b'\n').count() as i64 + 1;
         let command_vte =
             create_finished_terminal(config, cols, cmd_rows.max(1), cmd_rows.max(1), false);
@@ -1372,13 +1661,16 @@ impl FinishedBlock {
                 // onto more rows; size the grid and the pixel request for the
                 // wrapped count or the settle pass fights the allocation.
                 let eff_cols = effective_render_cols(w, cols_for_map);
-                let cmd_rows_for_map = if eff_cols < cols_for_map {
+                let requested_cmd_rows = if eff_cols < cols_for_map {
                     output_visual_row_count(&String::from_utf8_lossy(&cmd_bytes_for_map), eff_cols)
                         .max(cmd_rows_for_map)
                 } else {
                     cmd_rows_for_map
                 };
+                let (eff_cols, cmd_rows_for_map, _) =
+                    bounded_finished_vte_geometry(eff_cols, requested_cmd_rows, 0);
                 w.set_size(eff_cols, cmd_rows_for_map);
+                w.set_scrollback_lines(0);
                 w.feed(&cmd_bytes_for_map);
                 let tail = snapshot_settle_tail(&String::from_utf8_lossy(&cmd_bytes_for_map));
                 settle_finished_terminal_after_feed(w, tail.as_deref());
@@ -1395,7 +1687,8 @@ impl FinishedBlock {
         let full_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
         let displayed_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
         let output_vte = create_finished_terminal(config, cols, output_rows, viewport_cap, false);
-        let initial_visible_rows = output_rows.min(viewport_cap).max(1);
+        let (_, initial_visible_rows, _) =
+            bounded_finished_vte_geometry(cols, output_rows.min(viewport_cap).max(1), 0);
         output_vte.set_height_request(finished_vte_height_px(
             initial_visible_rows,
             estimated_cell_height_px(config),
@@ -1454,7 +1747,8 @@ impl FinishedBlock {
                     manually_expanded,
                     max_expanded_cap_for_map,
                 );
-                let visible_rows = rows.min(cap).max(1);
+                let (_, visible_rows, _) =
+                    bounded_finished_vte_geometry(eff_cols, rows.min(cap).max(1), 0);
                 let fit_to_content = output_fits_viewport(rows, cap);
                 let can_expand = rows > fitted_cap;
                 expand_btn_for_map.set_visible(can_expand);
@@ -1509,7 +1803,8 @@ impl FinishedBlock {
                 stamp_for_btn.set((eff_cols, fitted_cap, now_expanded, generation_for_btn.get()));
                 let cap =
                     finished_output_cap(rows, fitted_cap, now_expanded, max_expanded_cap_for_btn);
-                let visible_rows = rows.min(cap).max(1);
+                let (_, visible_rows, _) =
+                    bounded_finished_vte_geometry(eff_cols, rows.min(cap).max(1), 0);
                 let fit_to_content = output_fits_viewport(rows, cap);
                 render_bytes_into_finished_vte(
                     &output_vte_for_btn,
@@ -1602,7 +1897,8 @@ impl FinishedBlock {
                 expand_btn.set_visible(can_expand);
                 jump_btn.set_visible(can_expand);
                 let cap = finished_output_cap(rows, fitted_cap, false, max_expanded_cap_for_refit);
-                let visible_rows = rows.min(cap).max(1);
+                let (_, visible_rows, _) =
+                    bounded_finished_vte_geometry(eff_cols, rows.min(cap).max(1), 0);
                 let fit_to_content = output_fits_viewport(rows, cap);
                 render_bytes_into_finished_vte(
                     &output_vte,
@@ -1970,10 +2266,12 @@ impl FinishedBlock {
                     if !fit_to_content {
                         let ch = output_vte.char_height() as i32;
                         if ch > 0 {
-                            output_vte.set_height_request(finished_vte_height_px(
+                            let (_, visible_rows, _) = bounded_finished_vte_geometry(
+                                eff_cols,
                                 shown_visual_rows.min(active_cap).max(1),
-                                ch,
-                            ));
+                                0,
+                            );
+                            output_vte.set_height_request(finished_vte_height_px(visible_rows, ch));
                         }
                     }
                     let has_query = filter_enabled.get() && !q.trim().is_empty();
@@ -2085,7 +2383,12 @@ impl FinishedBlock {
             cols,
             viewport_cap,
             long_output,
+            estimated_retained_bytes,
         }
+    }
+
+    pub(crate) const fn estimated_retained_bytes(&self) -> usize {
+        self.estimated_retained_bytes
     }
 
     pub(crate) fn widget(&self) -> &gtk4::Box {
@@ -2437,6 +2740,23 @@ impl ActiveBlock {
         String::from_utf8_lossy(raw.make_contiguous()).into_owned()
     }
 
+    /// Return at most `max_bytes` from the live capture for bounded main-thread
+    /// consumers such as incremental find. Raw PTY bytes may not be valid UTF-8;
+    /// lossy conversion keeps the returned String safe even when the byte budget
+    /// ends in the middle of a code point.
+    pub(crate) fn output_text_prefix(&self, max_bytes: usize) -> (String, bool) {
+        let mut raw = self.raw_output.borrow_mut();
+        if raw.is_empty() {
+            return (String::new(), false);
+        }
+        let bytes = raw.make_contiguous();
+        let end = bytes.len().min(max_bytes);
+        (
+            String::from_utf8_lossy(&bytes[..end]).into_owned(),
+            end < bytes.len(),
+        )
+    }
+
     /// Clear the accumulated output buffer (without touching the VTE).
     pub(crate) fn reset_output_buffer(&self) {
         self.raw_output.borrow_mut().clear();
@@ -2580,10 +2900,113 @@ pub(crate) fn write_recalled_command(
 mod tests {
     use super::{
         block_clipboard_text, collapsed_output_summary, command_recall_available,
+        completed_block_retention_plan, estimated_completed_block_retained_bytes,
         exit_code_for_shared_surface, filter_output_lines, live_organism_alt_transition,
-        live_organism_is_visible, terminalize_line_breaks, BlockData, BlockOutcome, BlockState,
-        UNKNOWN_EXIT_NOTE, UNKNOWN_EXIT_SENTINEL,
+        live_organism_is_visible, terminal_grid_units_upper_bound, terminalize_line_breaks,
+        BlockData, BlockOutcome, BlockState, UNKNOWN_EXIT_NOTE, UNKNOWN_EXIT_SENTINEL,
     };
+
+    #[test]
+    fn retention_plan_accepts_an_exact_byte_limit() {
+        let plan = completed_block_retention_plan(&[(11, 40), (12, 60)], 10, 100);
+
+        assert_eq!(plan.evict_prefix, 0);
+        assert_eq!(plan.retained_count, 2);
+        assert_eq!(plan.retained_estimated_bytes, 100);
+        assert_eq!(plan.byte_budget_evictions, 0);
+        assert!(!plan.newest_exceeds_byte_budget);
+    }
+
+    #[test]
+    fn retention_plan_evicts_oldest_when_one_byte_over_limit() {
+        let plan = completed_block_retention_plan(&[(11, 41), (12, 60)], 10, 100);
+
+        assert_eq!(plan.evict_prefix, 1);
+        assert_eq!(plan.retained_count, 1);
+        assert_eq!(plan.retained_estimated_bytes, 60);
+        assert_eq!(plan.byte_budget_evictions, 1);
+        assert!(!plan.newest_exceeds_byte_budget);
+    }
+
+    #[test]
+    fn retention_plan_keeps_a_huge_newest_block() {
+        let plan = completed_block_retention_plan(&[(99, 101)], 10, 100);
+
+        assert_eq!(plan.evict_prefix, 0);
+        assert_eq!(plan.retained_count, 1);
+        assert_eq!(plan.retained_estimated_bytes, 101);
+        assert_eq!(plan.byte_budget_evictions, 0);
+        assert!(plan.newest_exceeds_byte_budget);
+    }
+
+    #[test]
+    fn retention_plan_enforces_count_without_claiming_a_byte_eviction() {
+        let plan = completed_block_retention_plan(&[(1, 10), (2, 10), (3, 10)], 2, 100);
+
+        assert_eq!(plan.evict_prefix, 1);
+        assert_eq!(plan.retained_count, 2);
+        assert_eq!(plan.retained_estimated_bytes, 20);
+        assert_eq!(plan.byte_budget_evictions, 0);
+        assert!(!plan.newest_exceeds_byte_budget);
+    }
+
+    #[test]
+    fn retained_estimate_charges_actual_raw_ansi_length() {
+        let plain = estimated_completed_block_retained_bytes(2, 3, 0, 12, 5, 5, 5, 4, 0);
+        let escape_heavy = estimated_completed_block_retained_bytes(2, 3, 0, 12, 500, 5, 5, 4, 0);
+
+        assert_eq!(escape_heavy - plain, 2_315);
+    }
+
+    #[test]
+    fn retained_estimate_charges_cursor_expanded_materialized_and_plain_output() {
+        let raw_only = estimated_completed_block_retained_bytes(0, 0, 0, 0, 100, 100, 100, 0, 0);
+        let expanded =
+            estimated_completed_block_retained_bytes(0, 0, 0, 0, 100, 10_000, 20_000, 0, 0);
+
+        assert_eq!(expanded - raw_only, 706_300);
+    }
+
+    #[test]
+    fn retained_estimate_charges_bounded_vte_cells_not_only_utf8_bytes() {
+        let eight_mib = 8 * 1024 * 1024;
+        let retained = estimated_completed_block_retained_bytes(
+            0, 0, 0, 0, eight_mib, eight_mib, eight_mib, 0, 0,
+        );
+
+        assert!(retained > eight_mib * super::ORIGINAL_OUTPUT_RETENTION_EQUIVALENT);
+        assert!(retained < super::MAX_COMPLETED_BLOCK_RETAINED_BYTES);
+    }
+
+    #[test]
+    fn terminal_grid_estimate_charges_tabs_to_the_right_margin() {
+        assert_eq!(terminal_grid_units_upper_bound(b"\tX", 80), 81);
+        assert_eq!(terminal_grid_units_upper_bound(b"\t\t", 80), 160);
+        assert_eq!(terminal_grid_units_upper_bound(b"abc", 80), 3);
+    }
+
+    #[test]
+    fn restored_legacy_block_uses_safe_tab_width_when_cols_are_unknown() {
+        let mut block = block_with_exit(Some(0));
+        block.output = "\tX".repeat(128);
+        block.cols = 80;
+        let known_width = block.estimated_restored_retained_bytes();
+        block.cols = 0;
+        let legacy_unknown_width = block.estimated_restored_retained_bytes();
+
+        assert!(legacy_unknown_width >= known_width);
+        assert!(legacy_unknown_width < super::MAX_COMPLETED_BLOCK_RETAINED_BYTES);
+    }
+
+    #[test]
+    fn retention_plan_treats_addition_overflow_as_over_budget() {
+        let plan = completed_block_retention_plan(&[(1, usize::MAX), (2, 1)], 2, usize::MAX);
+
+        assert_eq!(plan.evict_prefix, 1);
+        assert_eq!(plan.retained_count, 1);
+        assert_eq!(plan.retained_estimated_bytes, 1);
+        assert_eq!(plan.byte_budget_evictions, 1);
+    }
 
     #[test]
     fn alt_screen_exit_never_restores_stale_organism_visibility() {

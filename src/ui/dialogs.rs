@@ -1,4 +1,4 @@
-//! dialogs — UiState methods extracted from ui (mechanical split, no logic changes)
+//! Bounded, accessible dialogs and palettes for remote, history, search, and settings UI.
 use adw::prelude::*;
 use gtk4::gdk::Key;
 use gtk4::gdk::ModifierType;
@@ -30,7 +30,12 @@ type RemoteHostsRefresh = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 type RemoteHostEditTarget = (usize, String);
 
 const CROSS_BLOCK_SEARCH_LIMIT: usize = 500;
+const CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES: usize = 8 * 1024;
 const CROSS_BLOCK_SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
+/// A ListBox owns one widget tree per row; unlike ListView it does not recycle
+/// off-screen rows. Keep this palette intentionally small until it moves to a
+/// virtualized model, regardless of the much larger on-disk retention limit.
+const HISTORY_PALETTE_ROW_LIMIT: usize = 500;
 
 fn remote_picker_guard(safe_mode: bool, host_count: usize) -> Result<(), &'static str> {
     if safe_mode {
@@ -52,6 +57,11 @@ fn cross_block_search_idle_status() -> &'static str {
 
 fn cross_block_search_pending_status() -> &'static str {
     "Searching blocks…"
+}
+
+fn cross_block_search_query_error(query: &str) -> Option<&'static str> {
+    (query.len() > CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES)
+        .then_some("Query is too long (maximum 8 KiB).")
 }
 
 fn cross_block_search_status_for_match_count(total: usize) -> String {
@@ -425,6 +435,10 @@ impl UiState {
             }
             if let Some(row) = first_visible {
                 list_box_for_filter.select_row(Some(&row));
+            } else {
+                // Do not leave a now-hidden command selected: Enter must never
+                // insert a result the filter says does not exist.
+                list_box_for_filter.unselect_all();
             }
         });
 
@@ -461,7 +475,10 @@ impl UiState {
                 return true.into();
             }
             if matches!(keyval, Key::Return | Key::KP_Enter) {
-                if let Some(row) = list_box_for_key.selected_row() {
+                if let Some(row) = list_box_for_key
+                    .selected_row()
+                    .filter(|row| row.is_visible())
+                {
                     let idx = row.index() as usize;
                     dialog_for_key.force_close();
                     connect_for_key(idx);
@@ -529,21 +546,55 @@ impl UiState {
         };
         let mut history = pane
             .block_view()
-            .map(|view| view.command_history())
+            // Probe one extra entry so the status line can say that the
+            // widget-backed view reached its display budget. The clone itself
+            // is bounded before leaving TermView.
+            .map(|view| view.command_history_bounded(HISTORY_PALETTE_ROW_LIMIT + 1))
             .unwrap_or_default();
+        let mut display_limited = history.len() > HISTORY_PALETTE_ROW_LIMIT;
+        let mut history_read_failed = false;
+        history.truncate(HISTORY_PALETTE_ROW_LIMIT);
         let mut seen: std::collections::HashSet<String> = history.iter().cloned().collect();
         {
             let config = self.config.borrow();
             if config.command_history_enabled {
                 if let Some(path) = config.command_history_path.as_deref() {
-                    for record in crate::command_history::read_recent(
+                    let configured_limit = config.command_history_max_entries as usize;
+                    let read_limit = configured_limit.min(HISTORY_PALETTE_ROW_LIMIT + 1);
+                    match crate::command_history::read_recent_with_status(
                         std::path::Path::new(path),
-                        config.command_history_max_entries as usize,
-                    )
-                    .unwrap_or_default()
-                    {
-                        if seen.insert(record.command.clone()) {
-                            history.push(record.command);
+                        read_limit,
+                    ) {
+                        Ok(recent) => {
+                            display_limited |= recent.tail_truncated;
+                            let records = recent.records;
+                            if records.len() == read_limit && configured_limit > read_limit {
+                                display_limited = true;
+                            }
+                            for record in records {
+                                if !seen.insert(record.command.clone()) {
+                                    continue;
+                                }
+                                if history.len() == HISTORY_PALETTE_ROW_LIMIT {
+                                    display_limited = true;
+                                    break;
+                                }
+                                history.push(record.command);
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            // A fresh installation has no history file yet.
+                            // That is an empty state, not a storage failure.
+                        }
+                        Err(error) => {
+                            history_read_failed = true;
+                            let error =
+                                crate::review_input::safe_inline_display(&error.to_string(), 512);
+                            let toast = adw::Toast::new(&format!(
+                                "Command history could not be read: {error}"
+                            ));
+                            toast.set_timeout(8);
+                            self.toast_overlay.add_toast(toast);
                         }
                     }
                 }
@@ -552,6 +603,16 @@ impl UiState {
         let history: Rc<Vec<String>> = Rc::new(history);
         if history.is_empty() {
             log::debug!("[history] no finished commands to show");
+            if !history_read_failed {
+                let message = if display_limited {
+                    "No readable commands in the recent 4 MiB history window."
+                } else {
+                    "No command history yet."
+                };
+                let toast = adw::Toast::new(message);
+                toast.set_timeout(4);
+                self.toast_overlay.add_toast(toast);
+            }
             return;
         }
 
@@ -564,7 +625,22 @@ impl UiState {
         let header_bar = adw::HeaderBar::new();
         let filter_entry = SearchEntry::new();
         filter_entry.set_placeholder_text(Some("Filter history…"));
+        filter_entry
+            .update_property(&[gtk4::accessible::Property::Label("Filter command history")]);
         filter_entry.set_hexpand(true);
+
+        let initial_status = if display_limited {
+            format!("Showing the {HISTORY_PALETTE_ROW_LIMIT} most recent commands (display limit).")
+        } else {
+            format!("{} recent commands", history.len())
+        };
+        let status_label = Label::new(Some(&initial_status));
+        status_label.add_css_class("dim-label");
+        status_label.set_accessible_role(gtk4::AccessibleRole::Status);
+        status_label.set_xalign(0.0);
+        status_label.set_margin_start(12);
+        status_label.set_margin_end(12);
+        status_label.set_margin_bottom(6);
 
         let list_box = ListBox::new();
         list_box.set_selection_mode(gtk4::SelectionMode::Single);
@@ -603,6 +679,7 @@ impl UiState {
         filter_entry.set_margin_top(8);
         filter_entry.set_margin_bottom(8);
         search_box.append(&filter_entry);
+        search_box.append(&status_label);
         search_box.append(&scrolled);
 
         let toolbar_view = adw::ToolbarView::new();
@@ -612,9 +689,11 @@ impl UiState {
 
         let list_box_for_filter = list_box.clone();
         let haystacks_for_filter = haystacks.clone();
+        let status_for_filter = status_label.clone();
         filter_entry.connect_search_changed(move |entry| {
             let query = entry.text().to_string().to_lowercase();
             let mut first_visible: Option<gtk4::ListBoxRow> = None;
+            let mut visible_count = 0usize;
             for (idx, hay) in haystacks_for_filter.iter().enumerate() {
                 if let Some(row) = list_box_for_filter.row_at_index(idx as i32) {
                     let visible = query.is_empty() || hay.contains(&query);
@@ -622,10 +701,42 @@ impl UiState {
                     if visible && first_visible.is_none() {
                         first_visible = Some(row);
                     }
+                    visible_count += usize::from(visible);
                 }
             }
             if let Some(row) = first_visible {
                 list_box_for_filter.select_row(Some(&row));
+            } else {
+                // Do not leave a now-hidden command selected: Enter must never
+                // insert a result the filter says does not exist.
+                list_box_for_filter.unselect_all();
+            }
+            if query.is_empty() {
+                let status = if display_limited {
+                    format!(
+                        "Showing the {HISTORY_PALETTE_ROW_LIMIT} most recent commands (display limit)."
+                    )
+                } else {
+                    format!("{} recent commands", haystacks_for_filter.len())
+                };
+                status_for_filter.set_text(&status);
+            } else if visible_count == 0 {
+                if display_limited {
+                    status_for_filter.set_text(&format!(
+                        "No matches within the {HISTORY_PALETTE_ROW_LIMIT} most recent commands (display limit)."
+                    ));
+                } else {
+                    status_for_filter.set_text("No matching commands.");
+                }
+            } else {
+                let status = if display_limited {
+                    format!(
+                        "{visible_count} matches within the {HISTORY_PALETTE_ROW_LIMIT} most recent commands (display limit)."
+                    )
+                } else {
+                    format!("{visible_count} matching commands")
+                };
+                status_for_filter.set_text(&status);
             }
         });
 
@@ -670,7 +781,10 @@ impl UiState {
                 return true.into();
             }
             if matches!(keyval, Key::Return | Key::KP_Enter) {
-                if let Some(row) = list_box_for_key.selected_row() {
+                if let Some(row) = list_box_for_key
+                    .selected_row()
+                    .filter(|row| row.is_visible())
+                {
                     let idx = row.index() as usize;
                     dialog_for_key.force_close();
                     paste_for_key(idx);
@@ -822,6 +936,11 @@ impl UiState {
                     status_label.set_text(cross_block_search_idle_status());
                     return;
                 }
+                if let Some(message) = cross_block_search_query_error(&query) {
+                    hits.borrow_mut().clear();
+                    status_label.set_text(message);
+                    return;
+                }
 
                 match term_view.cross_block_search(&query, is_regex, CROSS_BLOCK_SEARCH_LIMIT) {
                     Ok(results) => {
@@ -874,6 +993,11 @@ impl UiState {
                 hits.borrow_mut().clear();
                 if filter_entry.text().is_empty() {
                     status_label.set_text(cross_block_search_idle_status());
+                    return;
+                }
+                if let Some(message) = cross_block_search_query_error(filter_entry.text().as_str())
+                {
+                    status_label.set_text(message);
                     return;
                 }
                 status_label.set_text(cross_block_search_pending_status());
@@ -1029,6 +1153,9 @@ impl UiState {
         let header_bar = adw::HeaderBar::new();
         let refresh_btn = gtk4::Button::from_icon_name("view-refresh-symbolic");
         refresh_btn.set_tooltip_text(Some("Refresh"));
+        refresh_btn.update_property(&[gtk4::accessible::Property::Label(
+            "Refresh debug information",
+        )]);
         header_bar.pack_start(&refresh_btn);
 
         let content = gtk4::Box::new(Orientation::Vertical, 18);
@@ -1512,6 +1639,7 @@ impl UiState {
         ));
         let add_host_btn = gtk4::Button::from_icon_name("list-add-symbolic");
         add_host_btn.set_tooltip_text(Some("Add Remote Host"));
+        add_host_btn.update_property(&[gtk4::accessible::Property::Label("Add remote host")]);
         add_host_btn.add_css_class("flat");
         add_host_btn.set_valign(gtk4::Align::Center);
         remote_group.set_header_suffix(Some(&add_host_btn));
@@ -1847,6 +1975,7 @@ impl UiState {
                 return;
             }
             for (index, host) in hosts.into_iter().enumerate() {
+                let host_display = crate::review_input::safe_inline_display(&host.name, 1024);
                 let transport = if host.docker { "docker" } else { "ssh" };
                 let target = match &host.user {
                     Some(user) => format!("{user}@{}", host.host),
@@ -1860,7 +1989,7 @@ impl UiState {
                     subtitle.push_str(&format!(" · ssh_args {}", host.ssh_args.join(" ")));
                 }
                 let row = adw::ActionRow::builder()
-                    .title(crate::review_input::safe_inline_display(&host.name, 1024))
+                    .title(&host_display)
                     .subtitle(crate::review_input::safe_inline_display(
                         &subtitle,
                         4 * 1024,
@@ -1871,11 +2000,17 @@ impl UiState {
                 edit_btn.add_css_class("flat");
                 edit_btn.set_valign(gtk4::Align::Center);
                 edit_btn.set_tooltip_text(Some("Edit Host"));
+                edit_btn.update_property(&[gtk4::accessible::Property::Label(&format!(
+                    "Edit remote host {host_display}"
+                ))]);
                 row.add_suffix(&edit_btn);
                 let delete_btn = gtk4::Button::from_icon_name("user-trash-symbolic");
                 delete_btn.add_css_class("flat");
                 delete_btn.set_valign(gtk4::Align::Center);
                 delete_btn.set_tooltip_text(Some("Remove Host"));
+                delete_btn.update_property(&[gtk4::accessible::Property::Label(&format!(
+                    "Remove remote host {host_display}"
+                ))]);
                 row.add_suffix(&delete_btn);
 
                 let ui_for_edit = ui_for_hosts.clone();
@@ -2730,8 +2865,9 @@ impl UiState {
 mod tests {
     use super::{
         cross_block_search_dialog_title, cross_block_search_idle_status,
-        cross_block_search_pending_status, cross_block_search_status_for_match_count,
-        remote_picker_guard, CROSS_BLOCK_SEARCH_LIMIT,
+        cross_block_search_pending_status, cross_block_search_query_error,
+        cross_block_search_status_for_match_count, remote_picker_guard, CROSS_BLOCK_SEARCH_LIMIT,
+        CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
 
     #[test]
@@ -2761,5 +2897,25 @@ mod tests {
             "500 matches (capped) — refine your query."
         );
         assert_eq!(cross_block_search_status_for_match_count(37), "37 matches");
+    }
+
+    #[test]
+    fn cross_block_search_rejects_queries_over_eight_kibibytes() {
+        assert_eq!(
+            cross_block_search_query_error(&"x".repeat(CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES)),
+            None
+        );
+        assert_eq!(
+            cross_block_search_query_error(&"x".repeat(CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES + 1)),
+            Some("Query is too long (maximum 8 KiB).")
+        );
+        assert_eq!(
+            cross_block_search_query_error(&"界".repeat(CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES / 3)),
+            None
+        );
+        assert!(cross_block_search_query_error(
+            &"界".repeat(CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES / 3 + 1)
+        )
+        .is_some());
     }
 }

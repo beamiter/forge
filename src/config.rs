@@ -1,7 +1,6 @@
 use gtk4::gdk::RGBA;
 use gtk4::glib;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -1735,42 +1734,17 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
 
     if let Some(bindings) = table.get("keybindings") {
         if let Some(bindings) = bindings.as_table() {
-            // Same parser the runtime override path uses, so a chord that
-            // validates here can never fail to load later (and vice versa).
-            let mut chords: HashMap<crate::core_keybindings::Chord, &str> = HashMap::new();
-            for (action, value) in bindings {
-                let path = format!("keybindings.{action}");
-                if crate::keybindings::Action::from_config_key(action).is_none() {
-                    config_issue(&mut issues, Error, &path, "unknown action");
-                    continue;
-                }
-                if value.as_bool() == Some(false) {
-                    continue;
-                }
-                let Some(chord) = value.as_str() else {
+            // Validate the complete effective map through the exact atomic path
+            // runtime loading uses. This catches collisions with unchanged
+            // defaults while still permitting explicit swaps/reassignments.
+            if let Err(binding_issues) = KeybindingMap::from_user_overrides(bindings) {
+                for issue in binding_issues {
                     config_issue(
                         &mut issues,
                         Error,
-                        &path,
-                        "expected a chord string or false",
+                        format!("keybindings.{}", issue.key),
+                        issue.message,
                     );
-                    continue;
-                };
-                if crate::core_keybindings::is_unbind_token(chord) {
-                    continue;
-                }
-                match crate::core_keybindings::parse(chord) {
-                    Ok(combo) => {
-                        if let Some(previous) = chords.insert(combo, action) {
-                            config_issue(
-                                &mut issues,
-                                Warning,
-                                &path,
-                                format!("same chord as keybindings.{previous}; last one wins"),
-                            );
-                        }
-                    }
-                    Err(err) => config_issue(&mut issues, Error, &path, err.to_string()),
                 }
             }
         } else {
@@ -2814,10 +2788,28 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         persistence_revision: std::sync::Arc::new(std::sync::Mutex::new(persistence_revision)),
     };
 
-    let mut keybinding_map = KeybindingMap::from_defaults();
-    if let Some(ref kb_table) = fc.keybindings {
-        keybinding_map.apply_user_overrides(kb_table);
-    }
+    let keybinding_map =
+        fc.keybindings
+            .as_ref()
+            .map_or_else(KeybindingMap::from_defaults, |table| {
+                match KeybindingMap::from_user_overrides(table) {
+                    Ok(map) => map,
+                    Err(issues) => {
+                        // `load_file_config` rejects these tables before constructing
+                        // `FileConfig`; reaching this branch is an internal invariant
+                        // violation. Preserve one coherent default map rather than ever
+                        // partially applying the invalid table.
+                        for issue in issues {
+                            log::error!(
+                                "Validated keybinding table became invalid at keybindings.{}: {}",
+                                issue.key,
+                                issue.message
+                            );
+                        }
+                        KeybindingMap::from_defaults()
+                    }
+                }
+            });
 
     (config, themes, keybinding_map)
 }
@@ -3252,6 +3244,44 @@ open_palette = "F8"
         )
         .unwrap();
         assert!(issues.is_empty(), "unexpected issues: {issues:?}");
+    }
+
+    #[test]
+    fn config_validator_rejects_collision_with_unchanged_default() {
+        let issues =
+            validate_config_contents("[keybindings]\nfont_increase = 'Ctrl+Shift+T'\n").unwrap();
+
+        assert!(issues.iter().any(|issue| {
+            issue.level == ConfigIssueLevel::Error
+                && issue.path == "keybindings.font_increase"
+                && issue.message.contains("keybindings.new_tab")
+                && issue.message.contains("rebind or disable")
+        }));
+    }
+
+    #[test]
+    fn config_validator_accepts_nonconflicting_override_and_atomic_swap() {
+        let nonconflicting =
+            validate_config_contents("[keybindings]\nfont_increase = 'F10'\n").unwrap();
+        assert!(
+            nonconflicting.is_empty(),
+            "unexpected issues: {nonconflicting:?}"
+        );
+
+        let swap = validate_config_contents(
+            "[keybindings]\nnew_tab = 'Ctrl+Shift+W'\nclose_pane_or_tab = 'Ctrl+Shift+T'\n",
+        )
+        .unwrap();
+        assert!(swap.is_empty(), "unexpected issues: {swap:?}");
+
+        let reassignment = validate_config_contents(
+            "[keybindings]\nnew_tab = false\nfont_increase = 'Ctrl+Shift+T'\n",
+        )
+        .unwrap();
+        assert!(
+            reassignment.is_empty(),
+            "unexpected issues: {reassignment:?}"
+        );
     }
 
     #[test]

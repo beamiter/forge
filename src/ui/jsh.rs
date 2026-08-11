@@ -86,6 +86,9 @@ impl UiState {
         let dismiss = Button::from_icon_name("window-close-symbolic");
         dismiss.add_css_class("flat");
         dismiss.set_tooltip_text(Some("Dismiss until the next launch"));
+        dismiss.update_property(&[gtk4::accessible::Property::Label(
+            "Dismiss jsh update notice",
+        )]);
         bar.append(&dismiss);
 
         {

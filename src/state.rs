@@ -39,6 +39,13 @@ const READY_STATE_EXTENSION: &str = "state";
 const ACTIVE_STATE_EXTENSION: &str = "active";
 const AI_CONVERSATION_PREFIX: &str = "ai_conversation=";
 const MAX_AI_CONVERSATION_LINE_BYTES: usize = crate::ai::MAX_CONVERSATION_SNAPSHOT_JSON_BYTES * 2;
+// The preservation worker can simultaneously own the bounded input state,
+// cloned non-AI lines, and replacement payload. AI compaction additionally
+// keeps the captured/working/original/emptied/candidate snapshots plus JSON,
+// escaped, and final line encodings. Reserve those worst-case owners rather
+// than admitting this multi-MiB job through the legacy zero-weight API.
+const PRESERVED_WORKSPACE_BUFFER_OWNERS: usize = 3;
+const PRESERVED_AI_JSON_EQUIVALENT_OWNERS: usize = 10;
 const MAX_RESTORED_TABS: usize = 32;
 const MAX_RESTORED_PANES_PER_TAB: usize = 16;
 const MAX_RESTORED_PANES_TOTAL: usize = 64;
@@ -1011,6 +1018,18 @@ fn bounded_window_state_payload(lines: &[String], max_bytes: usize) -> Option<St
     (payload.len() <= max_bytes).then_some(payload)
 }
 
+fn estimated_workspace_ai_preservation_bytes(has_ai_snapshot: bool) -> usize {
+    let workspace_bytes = MAX_WINDOW_STATE_BYTES.saturating_mul(PRESERVED_WORKSPACE_BUFFER_OWNERS);
+    if has_ai_snapshot {
+        workspace_bytes.saturating_add(
+            crate::ai::MAX_CONVERSATION_SNAPSHOT_JSON_BYTES
+                .saturating_mul(PRESERVED_AI_JSON_EQUIVALENT_OWNERS),
+        )
+    } else {
+        workspace_bytes
+    }
+}
+
 /// When the current workspace itself is too large to replace, preserve the
 /// previous tab/pane payload but still refresh its optional AI line. This
 /// keeps New chat and newly enabled redaction durable even at the workspace
@@ -1602,27 +1621,33 @@ fn preserve_existing_workspace_with_ai(
     log::error!("Refusing to replace the window snapshot: {reason}");
     let key = PersistenceKey::for_path("window-state", &path);
     let path_for_job = path.clone();
-    if let Err(error) = persistence::enqueue(key, "Save window session", move || {
-        match rewrite_existing_ai_conversation(&path_for_job, ai_snapshot.as_ref()) {
-            Ok((compacted, durable_snapshot)) => {
-                commit_ai_conversation_snapshot(ai_generation, durable_snapshot);
-                if compacted {
-                    log::warn!(
-                        "Preserved the previous workspace snapshot and compacted its AI conversation"
-                    );
-                } else {
-                    log::warn!(
-                        "Preserved the previous workspace snapshot and refreshed its AI conversation"
-                    );
+    let estimated_bytes = estimated_workspace_ai_preservation_bytes(ai_snapshot.is_some());
+    if let Err(error) = persistence::enqueue_weighted(
+        key,
+        "Save window session",
+        estimated_bytes,
+        move || {
+            match rewrite_existing_ai_conversation(&path_for_job, ai_snapshot.as_ref()) {
+                Ok((compacted, durable_snapshot)) => {
+                    commit_ai_conversation_snapshot(ai_generation, durable_snapshot);
+                    if compacted {
+                        log::warn!(
+                            "Preserved the previous workspace snapshot and compacted its AI conversation"
+                        );
+                    } else {
+                        log::warn!(
+                            "Preserved the previous workspace snapshot and refreshed its AI conversation"
+                        );
+                    }
                 }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    log::debug!("No previous workspace snapshot exists to refresh")
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                log::debug!("No previous workspace snapshot exists to refresh")
-            }
-            Err(error) => return Err(error),
-        }
-        Ok(())
-    }) {
+            Ok(())
+        },
+    ) {
         log::error!("Could not queue window session preservation: {error}");
     }
 }
@@ -1719,6 +1744,7 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
 
     let mut has_ai_line = false;
     let mut durable_ai_snapshot = None;
+    let mut durable_ai_estimated_bytes = 0usize;
     if let Some(snapshot) = ai_snapshot.as_ref() {
         match compact_ai_conversation_for_window(
             snapshot,
@@ -1737,6 +1763,11 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
                         .first()
                         .is_some_and(|line| line.starts_with("current_page=")),
                 );
+                // The durable snapshot owns the same bounded text represented
+                // by this serialized line. Charge twice its encoded size to
+                // conservatively cover Vec/String container storage as well as
+                // the final payload handed to the worker below.
+                durable_ai_estimated_bytes = line.len().saturating_mul(2);
                 lines.insert(insertion, line);
                 has_ai_line = true;
                 durable_ai_snapshot = Some(compacted_snapshot);
@@ -1762,24 +1793,29 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
         );
         return;
     };
+    let estimated_bytes = payload
+        .capacity()
+        .saturating_add(durable_ai_estimated_bytes);
 
     // GTK traversal ends here. Directory creation, write, fsync and atomic
     // replacement run on the single bounded persistence worker. Repeated
     // autosaves for this window replace an older pending snapshot.
     let key = PersistenceKey::for_path("window-state", &path);
     let path_for_job = path.clone();
-    if let Err(error) = persistence::enqueue(key, "Save window session", move || {
-        if let Some(parent) = path_for_job.parent() {
-            ensure_private_directory(parent)?;
-        }
-        atomic_write_private_file(&path_for_job, payload.as_bytes())?;
-        commit_ai_conversation_snapshot(ai_generation, durable_ai_snapshot);
-        log::info!(
-            "Successfully saved tabs state to {}",
-            path_for_job.display()
-        );
-        Ok(())
-    }) {
+    if let Err(error) =
+        persistence::enqueue_weighted(key, "Save window session", estimated_bytes, move || {
+            if let Some(parent) = path_for_job.parent() {
+                ensure_private_directory(parent)?;
+            }
+            atomic_write_private_file(&path_for_job, payload.as_bytes())?;
+            commit_ai_conversation_snapshot(ai_generation, durable_ai_snapshot);
+            log::info!(
+                "Successfully saved tabs state to {}",
+                path_for_job.display()
+            );
+            Ok(())
+        })
+    {
         log::error!("Could not queue window session save: {error}");
     }
 }
@@ -1800,6 +1836,27 @@ mod tests {
             },
         ];
         crate::ai::ConversationSnapshot::from_completed_history(&history, None).unwrap()
+    }
+
+    #[test]
+    fn workspace_ai_preservation_estimate_covers_all_bounded_owners() {
+        let workspace_only =
+            MAX_WINDOW_STATE_BYTES.saturating_mul(PRESERVED_WORKSPACE_BUFFER_OWNERS);
+        assert_eq!(
+            estimated_workspace_ai_preservation_bytes(false),
+            workspace_only
+        );
+        assert_eq!(
+            estimated_workspace_ai_preservation_bytes(true),
+            workspace_only.saturating_add(
+                crate::ai::MAX_CONVERSATION_SNAPSHOT_JSON_BYTES
+                    .saturating_mul(PRESERVED_AI_JSON_EQUIVALENT_OWNERS)
+            )
+        );
+        assert!(
+            estimated_workspace_ai_preservation_bytes(true)
+                <= crate::persistence::MAX_PENDING_ESTIMATED_BYTES
+        );
     }
 
     fn temporary_state_dir(test_name: &str) -> PathBuf {

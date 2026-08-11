@@ -25,6 +25,18 @@ All notable user-visible and operational changes are recorded here.
 - 默认字体改为系统可用的 `Monospace 14`，纯图标操作恢复键盘焦点与可访问名称，并以 GTK
   symbolic icon 取代 Nerd Font 私用区字符。八套内置主题的普通、次级和语义状态文字都经
   4.5:1 对比度校正；终端中的 ANSI 原色保持不变。
+- Block 内搜索改为 150 ms 可取消去抖，并按 VTE surface 压缩命中状态；查询限制 8 KiB，
+  单次最多记录 10,000 个命中、扫描 4 MiB，并以 12 ms 为 surface 间停止目标，不再为稀有查询遍历并永久复制全部历史。无结果、
+  无效/零宽正则、精确计数与扫描受限都有独立状态，截断结果不会越过已知边界环绕。
+- 后台持久化队列新增 512 MiB 全局 retained-byte 预算，运行中与待处理 snapshot 共同计账，
+  被拒绝的替换不会丢掉已排队版本，后续成功也会清除尚未展示的旧失败。完成 Block 另有
+  每 pane 128 MiB 保留预算，按实际 ANSI 输出、重复副本、VTE/控件和图片成本估算，历史
+  恢复同样先预算再创建控件。每个完成 VTE 另有 1,048,576 cells / 4096 列的绝对几何上限，
+  Kitty 图片每块最多 64 张并计入对象成本；VTE 几何裁剪不会再额外影响复制/导出中已捕获的文本（最多 8 MiB）。命令历史面板最多实例化最近 500 行。
+- 快捷键配置现在以完整 effective map 原子校验/应用：与未修改默认组合冲突会在
+  `--check-config` 中指出占用动作，显式交换或解绑后转移仍可用；GTK 已兑现 Super/Meta
+  与数字小键盘数字映射。搜索、AI、远程主机和标签图标补齐可访问名称，标签过滤框恢复
+  Tab 可达；调试脚本遵循 `FORGE_CONFIG`/XDG，默认隐藏绝对路径，敏感 strace 需显式授权。
 
 #### Reliability and UX
 
@@ -87,8 +99,8 @@ All notable user-visible and operational changes are recorded here.
   使用 no-replace rename，父路径被替换也不能重定向写入或覆盖另一个窗口的状态；新的
   active 文件还记录进程 start-time token，PID 被复用时不会把陈旧快照误判成仍由当前进程持有。
 - Block history 现在严格识别截断/未知 frame，限制单记录、记录数、压缩前后总字节、解码
-  时间和目录扫描量；跨进程保存持有不可被锁文件替换绕过的目录锁，陈旧 writer 只合并新增
-  记录而无权删除并发数据，任何损坏的旧文件都不会被下一次保存覆盖。GTK 线程在复制历史
+  时间和目录扫描量；跨进程保存持有不可被锁文件替换绕过的目录锁，磁盘版本不匹配的陈旧 writer
+  会拒绝写入并要求重载，不再猜测合并而复活已删除历史；任何损坏的旧文件都不会被下一次保存覆盖。GTK 线程在复制历史
   前即执行相同预算，回滚的未显示 pane 不会在 Drop 时写入历史。
 - Shell Agent 快照恢复会先原子排他 claim 并单次消费，两个进程不能恢复并审批同一 proposal；
   无效快照会保留隔离证据，重复/耗尽 ProposalId、错序 observation 与不一致 approval state
@@ -122,7 +134,7 @@ All notable user-visible and operational changes are recorded here.
 - Block 模式运行中命令的体验改进（针对 claude 等长时流式 TUI）：
   - **运行中可框选文本**：在 live 终端面上拖选时，PTY 字节流被暂存（选区期间 + 松手后最多 5 秒宽限，或复制/输入/点击别处即恢复，上限 2 MiB），高频重绘不再瞬间冲掉选区；Shift+拖选在开启鼠标上报的应用里同样受保护。暂存生效时左下角显示 "Output paused — selection" 徽标，消除"卡住了"的错觉。
   - **运行中可回看输出**：滚轮在 live 终端面上优先滚动当前命令自己的回滚缓冲，滚到顶/底才交给外层 Block 历史（此前 VTE 吞掉滚轮且新输出会把视图拽回底部，运行中的早期输出实际不可达）；右侧出现细滚动条（overlay 覆盖式，出现/消失不改变列宽、不触发 SIGWINCH），跳底按钮同时归位内外两层滚动。空闲提示符上的滚轮现在可靠地滚动 Block 历史。
-  - **运行中可搜索**：Ctrl+F 现在把正在运行命令的已产生输出纳入匹配（排在所有完成 Block 之后），VTE 原生高亮并支持 Next/Prev 跨面步进；关闭搜索一并清除 live 面高亮。
+  - **运行中可搜索**：Ctrl+Shift+F 现在把正在运行命令的已产生输出纳入匹配（排在所有完成 Block 之后），VTE 原生高亮并支持 Next/Prev 跨面步进；关闭搜索一并清除 live 面高亮。
   - **sticky 运行头更实用**：向上翻历史时的运行中头部新增 Stop 按钮（一键发送 Ctrl+C，无需先找回终端焦点），耗时超过一小时显示 `1h04m` 格式。
 
 - AI 聊天面板流式回复（`ai_stream` / `FORGE_AI_STREAM`，默认开启）：回答在生成过程中逐段显示在会话里，三个 provider（Anthropic、OpenAI-compatible、Ollama）均支持；完成时以 provider 返回的完整文本替换进行中的消息并原样落库，保存的会话与关闭流式时完全一致（包括 `ai_max_tokens` 截断提示）。中途出错时已显示的部分内容保持可见，错误照常提示并可 Retry；Stop 与关窗仍会中断流式 curl。流式期间切换 chat 不会把片段写进别的会话，切回后已收到的部分回复会完整重现。仅聊天面板流式；Shell Agent、命令生成与纠错等严格 JSON 表面继续等待完整回复。开关同时提供于 Settings（Stream Chat Responses）。

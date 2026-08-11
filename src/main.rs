@@ -42,7 +42,12 @@ fn sync_maximize_button(window: &adw::ApplicationWindow, button: &gtk4::Button) 
 }
 
 fn shortcut_modifiers(state: ModifierType) -> ModifierType {
-    state & (ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK | ModifierType::ALT_MASK)
+    state
+        & (ModifierType::CONTROL_MASK
+            | ModifierType::SHIFT_MASK
+            | ModifierType::ALT_MASK
+            | ModifierType::SUPER_MASK
+            | ModifierType::META_MASK)
 }
 
 /// GTK edge: translate a gdk key event into the family's toolkit-neutral
@@ -52,12 +57,10 @@ fn shortcut_modifiers(state: ModifierType) -> ModifierType {
 ///
 /// - `ISO_Left_Tab` (what GTK reports for Shift+Tab) folds to `Tab` so one
 ///   chord entry covers both.
-/// - Only the masked Ctrl/Shift/Alt modifiers participate; Super chords are
-///   not offered on this frontend.
-/// - Keypad keysyms (`KP_*`) are excluded rather than folded onto the main
-///   row — forge has never matched chords on the numpad, and `KP_Enter`
-///   stays distinct from `Return` (the AI-composer veto above the lookup
-///   handles both explicitly).
+/// - Ctrl/Shift/Alt and GDK's Super/Meta masks participate. The latter two map
+///   to the grammar's single cross-platform `Super` modifier.
+/// - Keypad digits fold onto main-row digits, matching the shared chord
+///   family. `KP_Enter` and keypad operators remain distinct and unbindable.
 /// - Letters and symbols go through `Key::to_unicode()` and are lowercased,
 ///   matching the chord core's storage invariant.
 /// - `F1`..`F24` are recognized via the keysym name.
@@ -67,7 +70,7 @@ fn chord_from_gdk(keyval: Key, state: ModifierType) -> Option<Chord> {
         ctrl: masked.contains(ModifierType::CONTROL_MASK),
         shift: masked.contains(ModifierType::SHIFT_MASK),
         alt: masked.contains(ModifierType::ALT_MASK),
-        sup: false,
+        sup: masked.intersects(ModifierType::SUPER_MASK | ModifierType::META_MASK),
     };
     let key = match keyval {
         Key::Tab | Key::ISO_Left_Tab => KeySym::Named(NamedKey::Tab),
@@ -85,6 +88,16 @@ fn chord_from_gdk(keyval: Key, state: ModifierType) -> Option<Chord> {
         Key::Down => KeySym::Named(NamedKey::Down),
         Key::Left => KeySym::Named(NamedKey::Left),
         Key::Right => KeySym::Named(NamedKey::Right),
+        Key::KP_0 => KeySym::Char('0'),
+        Key::KP_1 => KeySym::Char('1'),
+        Key::KP_2 => KeySym::Char('2'),
+        Key::KP_3 => KeySym::Char('3'),
+        Key::KP_4 => KeySym::Char('4'),
+        Key::KP_5 => KeySym::Char('5'),
+        Key::KP_6 => KeySym::Char('6'),
+        Key::KP_7 => KeySym::Char('7'),
+        Key::KP_8 => KeySym::Char('8'),
+        Key::KP_9 => KeySym::Char('9'),
         other => {
             let name = other.name();
             if let Some(n) = name.as_deref().and_then(function_key_number) {
@@ -472,19 +485,36 @@ pub fn run() -> glib::ExitCode {
         // Create search bar
         let search_entry = SearchEntry::new();
         search_entry.set_hexpand(true);
+        search_entry.set_placeholder_text(Some("Find in blocks…"));
+        search_entry.update_property(&[gtk4::accessible::Property::Label(
+            "Find in terminal history",
+        )]);
+
+        let search_status = gtk4::Label::new(None);
+        search_status.add_css_class("dim-label");
+        search_status.set_accessible_role(gtk4::AccessibleRole::Status);
+        search_status.set_width_chars(16);
+        search_status.set_xalign(1.0);
 
         let search_prev_btn = gtk4::Button::from_icon_name("go-up-symbolic");
         search_prev_btn.set_tooltip_text(Some("Previous match (Shift+Enter)"));
         search_prev_btn.set_focus_on_click(false);
+        search_prev_btn.update_property(&[gtk4::accessible::Property::Label(
+            "Previous search match",
+        )]);
         let search_next_btn = gtk4::Button::from_icon_name("go-down-symbolic");
         search_next_btn.set_tooltip_text(Some("Next match (Enter)"));
         search_next_btn.set_focus_on_click(false);
+        search_next_btn
+            .update_property(&[gtk4::accessible::Property::Label("Next search match")]);
         let search_close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
         search_close_btn.set_tooltip_text(Some("Close search (Escape)"));
         search_close_btn.set_focus_on_click(false);
+        search_close_btn.update_property(&[gtk4::accessible::Property::Label("Close search")]);
 
         let search_box = gtk4::Box::new(Orientation::Horizontal, 4);
         search_box.append(&search_entry);
+        search_box.append(&search_status);
         search_box.append(&search_prev_btn);
         search_box.append(&search_next_btn);
         search_box.append(&search_close_btn);
@@ -703,30 +733,15 @@ pub fn run() -> glib::ExitCode {
         // view, in both tab placements: the top bar is reserved for the tabs
         // themselves and the window controls, and a filter field there would eat
         // horizontal space the tab strip needs.
-        // Non-focusable by default to prevent GTK's automatic focus navigation
-        // from landing here when alt-screen VTE is hidden. Enabled on mouse click
-        // or via the FilterTabs keybinding.
+        // Keep the filter in normal keyboard focus order. Pointer and shortcut
+        // access are useful, but they cannot be the only ways to reach a visible
+        // text field.
         let tab_search_entry = SearchEntry::new();
         tab_search_entry.set_placeholder_text(Some("Filter tabs..."));
+        tab_search_entry.update_property(&[gtk4::accessible::Property::Label("Filter tabs")]);
         tab_search_entry.add_css_class("tab-strip-search");
-        tab_search_entry.set_can_focus(false);
-        tab_search_entry.set_focusable(false);
-        // Wrap in a clickable box so clicks on the text area are captured even
-        // when the entry itself is non-focusable.
         let tab_search_wrapper = gtk4::Box::new(Orientation::Horizontal, 0);
         tab_search_wrapper.append(&tab_search_entry);
-        {
-            let entry_for_click = tab_search_entry.clone();
-            let click_ctrl = gtk4::GestureClick::new();
-            click_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
-            click_ctrl.connect_pressed(move |gesture, _, _, _| {
-                entry_for_click.set_can_focus(true);
-                entry_for_click.set_focusable(true);
-                entry_for_click.grab_focus();
-                gesture.set_state(gtk4::EventSequenceState::Claimed);
-            });
-            tab_search_wrapper.add_controller(click_ctrl);
-        }
 
         // Mirror list, shown in place of the strip's holder when the strip is
         // docked to the top bar. Exactly one of the two is ever visible.
@@ -926,6 +941,9 @@ pub fn run() -> glib::ExitCode {
             available_themes: available_themes.clone(),
             search_bar: search_bar.clone(),
             search_entry: search_entry.clone(),
+            search_status: search_status.clone(),
+            search_debounce_source: Rc::new(RefCell::new(None)),
+            search_generation: Rc::new(Cell::new(0)),
             tab_strip: tab_strip.clone(),
             sidebar: sidebar.clone(),
             top_spacer: spacer.clone(),
@@ -1383,7 +1401,7 @@ pub fn run() -> glib::ExitCode {
         // below (next/prev); incremental highlighting runs on search_changed.
         let ui_for_search_changed = ui.clone();
         search_entry.connect_search_changed(move |_| {
-            ui_for_search_changed.search_apply();
+            ui_for_search_changed.schedule_search_apply();
         });
 
         let ui_for_search_next = ui.clone();
@@ -1426,17 +1444,6 @@ pub fn run() -> glib::ExitCode {
             false.into()
         });
         search_entry.add_controller(search_key_controller);
-
-        // Disable tab_search_entry focusability when focus leaves it
-        {
-            let entry_for_focus = tab_search_entry.clone();
-            let focus_ctrl = gtk4::EventControllerFocus::new();
-            focus_ctrl.connect_leave(move |_| {
-                entry_for_focus.set_can_focus(false);
-                entry_for_focus.set_focusable(false);
-            });
-            tab_search_entry.add_controller(focus_ctrl);
-        }
 
         // Wire tab search entry: filter tabs by name
         let ui_for_tab_search = ui.clone();
@@ -1738,7 +1745,7 @@ mod tests {
     mod gdk_chord_edge {
         //! The gdk → [`Chord`] translation is pure data (no GTK runtime),
         //! so its GTK-only facts are pinned here: ISO_Left_Tab folding,
-        //! keypad exclusion, unicode lowercasing, and F-key naming.
+        //! keypad folding, Super/Meta mapping, unicode lowercasing, and F-key naming.
         use super::super::chord_from_gdk;
         use crate::core_keybindings::parse;
         use gtk4::gdk::{Key, ModifierType};
@@ -1762,6 +1769,13 @@ mod tests {
                 // Main-row digits.
                 (Key::_1, CTRL, "Ctrl+1"),
                 (Key::_0, CTRL, "Ctrl+0"),
+                // Numeric keypad digits share the family's main-row chords.
+                (Key::KP_1, CTRL, "Ctrl+1"),
+                (Key::KP_0, CTRL, "Ctrl+0"),
+                // GDK exposes platform Super/Meta masks separately; both map
+                // to the grammar's portable Super modifier.
+                (Key::t, ModifierType::SUPER_MASK, "Super+T"),
+                (Key::t, ModifierType::META_MASK, "Super+T"),
                 // Named keys and function keys.
                 (Key::Page_Up, CTRL, "Ctrl+PageUp"),
                 (Key::Return, CTRL, "Ctrl+Enter"),
@@ -1787,10 +1801,11 @@ mod tests {
         }
 
         #[test]
-        fn keypad_keysyms_are_not_folded_onto_the_main_row() {
-            // forge has never matched chords on the numpad; keep that
-            // until the family folds numpad digits at every frontend.
-            assert_eq!(chord_from_gdk(Key::KP_1, CTRL), None);
+        fn keypad_digits_fold_but_keypad_control_and_operator_keys_remain_distinct() {
+            assert_eq!(
+                chord_from_gdk(Key::KP_1, CTRL),
+                Some(parse("Ctrl+1").unwrap())
+            );
             assert_eq!(chord_from_gdk(Key::KP_Enter, CTRL), None);
             assert_eq!(chord_from_gdk(Key::KP_Add, CTRL), None);
         }

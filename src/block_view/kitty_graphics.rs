@@ -47,12 +47,40 @@ const CAPS: Caps = Caps::BLOCK;
 /// A decoded image may occupy at most the same budget, so one image can fill a
 /// block on its own but two oversize ones cannot.
 pub(crate) const MAX_PENDING_BYTES_PER_BLOCK: usize = CAPS.max_decoded_bytes;
+/// Bound GTK/GDK object fan-out independently from decoded pixels. Tiny images
+/// still allocate a Texture, Picture, signal state and widget-tree nodes.
+pub(crate) const MAX_IMAGES_PER_BLOCK: usize = 64;
+/// Conservative fixed retained charge for one Texture + Picture pair and its
+/// surrounding GTK/GDK bookkeeping. Pixel backing is charged separately.
+pub(crate) const RETAINED_BYTES_PER_IMAGE_OBJECT: usize = 64 * 1024;
+
+pub(crate) fn pending_image_bytes_after_admission(
+    retained_bytes: usize,
+    image_count: usize,
+    pixel_bytes: usize,
+    encoded_source_backing_bytes: usize,
+) -> Option<usize> {
+    if image_count >= MAX_IMAGES_PER_BLOCK {
+        return None;
+    }
+    let next = retained_bytes
+        .checked_add(pixel_bytes)?
+        .checked_add(encoded_source_backing_bytes)?
+        .checked_add(RETAINED_BYTES_PER_IMAGE_OBJECT)?;
+    (next <= MAX_PENDING_BYTES_PER_BLOCK).then_some(next)
+}
 
 /// Parsed result of a single APC G chunk. `Complete` carries a finished image
 /// ready to render; `Pending` means more chunks are expected; `Skipped` means
 /// the chunk was valid but unsupported (e.g. `a=d`) — caller should drop it.
 pub(crate) enum Outcome {
-    Complete(gdk::Texture),
+    Complete {
+        texture: gdk::Texture,
+        /// PNG loaders may retain the encoded GBytes as well as decoded pixel
+        /// backing. Raw formats transfer/replace their source Vec, so only PNG
+        /// needs this additional retained charge.
+        encoded_source_backing_bytes: usize,
+    },
     /// Buffered but not for display (`a=t`). Future `a=p` is unsupported, so
     /// these are effectively no-ops; returned distinctly only so the caller
     /// can avoid attaching them to the current block.
@@ -148,12 +176,20 @@ fn outcome_for(error: Error) -> Outcome {
 /// Decode a finished transfer into a texture, honouring `a=t` vs `a=T`.
 fn complete(assembled: Assembled) -> Outcome {
     let display = assembled.display;
+    let encoded_source_backing_bytes = if assembled.format == Format::Png {
+        assembled.bytes.len()
+    } else {
+        0
+    };
     let texture = match texture_for(assembled) {
         Ok(texture) => texture,
         Err(error) => return outcome_for(error),
     };
     if display {
-        Outcome::Complete(texture)
+        Outcome::Complete {
+            texture,
+            encoded_source_backing_bytes,
+        }
     } else {
         // Drop the texture — we don't currently honour `a=p` placement.
         drop(texture);
@@ -303,7 +339,7 @@ pub(crate) fn response_for(payload: &[u8], outcome: &Outcome) -> Option<Vec<u8>>
     let body = match outcome {
         // Chunked uploads are answered once, after the final chunk.
         Outcome::Pending => return None,
-        Outcome::Complete(_) | Outcome::CompleteTransmitOnly | Outcome::QueryOk => {
+        Outcome::Complete { .. } | Outcome::CompleteTransmitOnly | Outcome::QueryOk => {
             if keys.quiet >= 1 {
                 return None;
             }
@@ -387,6 +423,35 @@ mod tests {
         assert_eq!(CAPS.max_dimension, 16_384);
     }
 
+    #[test]
+    fn tiny_images_are_bounded_by_object_count_and_fixed_cost() {
+        let one = pending_image_bytes_after_admission(0, 0, 4, 0).unwrap();
+        assert_eq!(one, RETAINED_BYTES_PER_IMAGE_OBJECT + 4);
+        assert!(pending_image_bytes_after_admission(one, MAX_IMAGES_PER_BLOCK, 4, 0).is_none());
+    }
+
+    #[test]
+    fn image_admission_rejects_byte_overflow_and_budget_overrun() {
+        assert!(pending_image_bytes_after_admission(usize::MAX, 0, 1, 0).is_none());
+        assert!(pending_image_bytes_after_admission(
+            MAX_PENDING_BYTES_PER_BLOCK - RETAINED_BYTES_PER_IMAGE_OBJECT,
+            0,
+            1,
+            0
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn png_encoded_backing_is_part_of_the_retained_budget() {
+        let exact_backing = MAX_PENDING_BYTES_PER_BLOCK - RETAINED_BYTES_PER_IMAGE_OBJECT - 4;
+        assert_eq!(
+            pending_image_bytes_after_admission(0, 0, 4, exact_backing),
+            Some(MAX_PENDING_BYTES_PER_BLOCK)
+        );
+        assert!(pending_image_bytes_after_admission(0, 0, 4, exact_backing + 1).is_none());
+    }
+
     // ---- outcomes --------------------------------------------------------
 
     #[test]
@@ -423,7 +488,7 @@ mod tests {
         // metadata would start a second upload for i=7.
         let second = a.feed(b"Gm=0;AA");
         match second {
-            Outcome::Complete(_) => {}
+            Outcome::Complete { .. } => {}
             _ => panic!("expected complete texture"),
         }
     }
@@ -444,7 +509,7 @@ mod tests {
             a.feed(b"Ga=T,f=24,s=1,v=1,i=7,m=1;/w"),
             Outcome::Pending
         ));
-        assert!(matches!(a.feed(b"Gm=0;AA"), Outcome::Complete(_)));
+        assert!(matches!(a.feed(b"Gm=0;AA"), Outcome::Complete { .. }));
     }
 
     #[test]
@@ -455,7 +520,7 @@ mod tests {
         ));
         assert!(matches!(
             feed(b"Ga=T,f=32,s=1,v=1,i=4;AQIDBA=="),
-            Outcome::Complete(_)
+            Outcome::Complete { .. }
         ));
     }
 
@@ -479,7 +544,7 @@ mod tests {
         // so an f=-less command now means "raw RGBA, s=/v= required".
         assert!(matches!(
             feed(b"Ga=T,i=5,s=1,v=1;AQIDBA=="),
-            Outcome::Complete(_)
+            Outcome::Complete { .. }
         ));
         // …and without s=/v= it is a malformed raw transfer, not a PNG.
         assert!(matches!(feed(b"Ga=T,i=5;AQIDBA=="), Outcome::Invalid));
@@ -498,7 +563,7 @@ mod tests {
         ));
         assert!(matches!(
             feed(b"Ga=T,f=32,i=13,s=1,v=1;AQIDBA=="),
-            Outcome::Complete(_)
+            Outcome::Complete { .. }
         ));
     }
 
@@ -546,7 +611,10 @@ mod tests {
             a.feed(b"Ga=T,f=32,i=14,s=1,v=1,m=1;AQ\r\n"),
             Outcome::Pending
         ));
-        assert!(matches!(a.feed(b"Gm=0; ID  BA== \n"), Outcome::Complete(_)));
+        assert!(matches!(
+            a.feed(b"Gm=0; ID  BA== \n"),
+            Outcome::Complete { .. }
+        ));
     }
 
     // ---- caps ------------------------------------------------------------

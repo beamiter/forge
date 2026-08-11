@@ -24,6 +24,30 @@ pub(crate) const BLOCK_CELL_HEIGHT_SCALE: f64 = 1.12;
 /// below one cell height so it can never add a phantom row.
 pub(crate) const FINISHED_VTE_HEIGHT_SLACK_PX: i32 = 6;
 
+/// Absolute retained grid bound for each read-only finished VTE. Full command
+/// and output text remains in BlockData/copy/export; the renderer keeps only a
+/// bounded terminal window so the newest-block exception cannot allocate an
+/// unbounded cell/attribute grid in every pane.
+pub(crate) const MAX_FINISHED_VTE_GRID_CELLS: usize = 1_048_576;
+/// Defensive ceiling for malicious/legacy persisted column counts. Real pane
+/// widths are far smaller, while one row at u16::MAX columns is already a large
+/// allocation before any scrollback exists.
+pub(crate) const MAX_FINISHED_VTE_COLUMNS: i64 = 4_096;
+
+pub(crate) fn bounded_finished_vte_geometry(
+    cols: i64,
+    visible_rows: i64,
+    requested_scrollback_rows: i64,
+) -> (i64, i64, i64) {
+    let cols = cols.clamp(1, MAX_FINISHED_VTE_COLUMNS);
+    let max_rows = (MAX_FINISHED_VTE_GRID_CELLS / cols as usize).max(1) as i64;
+    let visible_rows = visible_rows.clamp(1, max_rows);
+    let scrollback_rows = requested_scrollback_rows
+        .max(0)
+        .min(max_rows.saturating_sub(visible_rows));
+    (cols, visible_rows, scrollback_rows)
+}
+
 /// The one formula for a finished VTE's pixel height: `rows * cell` plus the
 /// bounded slack above.
 pub(crate) fn finished_vte_height_px(rows: i64, cell_height: i32) -> i32 {
@@ -197,9 +221,20 @@ pub(crate) fn fit_finished_terminal_to_content(terminal: &Terminal) {
                 .unwrap_or(visible_rows)
         });
 
-    if rows != visible_rows {
+    // A fit can race a later asynchronous feed. In particular, the second
+    // idle fit queued by an earlier render may run after a filter/map render
+    // reset the terminal but before that render's bytes have all landed. Keep
+    // the unused part of the absolute grid budget as scrollback so those late
+    // rows remain recoverable by the new render's tail-gated settle pass.
+    // Setting scrollback to zero here loses every row after the newly shrunken
+    // grid and turns a real six-line snapshot into a permanent one-line card.
+    let (cols, rows, scrollback_rows) = bounded_finished_vte_geometry(cols, rows, i64::MAX);
+    if rows != visible_rows || cols != terminal.column_count() {
         terminal.set_size(cols, rows);
     }
+    // Recompute rather than retain the old capture limit: visible rows plus
+    // this remainder still fit the single MAX_FINISHED_VTE_GRID_CELLS budget.
+    terminal.set_scrollback_lines(scrollback_rows);
     let cell_height = (terminal.char_height() as i32).max(1);
     terminal.set_height_request(finished_vte_height_px(rows, cell_height));
     if let Some(adj) = terminal.vadjustment() {
@@ -268,8 +303,26 @@ pub(crate) fn settle_finished_terminal_after_feed(
         }
         fit_finished_terminal_to_content(&terminal);
         let terminal = terminal.clone();
+        let settled_tail = tail.clone();
         glib::idle_add_local_once(move || {
+            // The first fit can itself trigger allocation and another render.
+            // Re-check the tail before the destructive final fold so an idle
+            // callback left behind by an older generation cannot discard the
+            // new generation's feed while it is still arriving.
+            let tail_still_applied = settled_tail
+                .as_deref()
+                .is_some_and(|tail| feed_tail_applied(&terminal, Some(tail)));
+            if settled_tail.is_some() && !tail_still_applied {
+                return;
+            }
             fit_finished_terminal_to_content(&terminal);
+            if tail_still_applied {
+                // Tail proof makes this the final fold for a non-blank
+                // snapshot. The generic fit deliberately keeps a bounded
+                // recovery ring for stale/mid-feed callers; it is safe to drop
+                // that ring only here.
+                terminal.set_scrollback_lines(0);
+            }
             let terminal = terminal.clone();
             glib::idle_add_local_once(move || anchor_terminal_top(&terminal));
         });
@@ -378,15 +431,17 @@ pub(crate) fn create_finished_terminal(
     viewport_cap: i64,
     expand_to_buffer: bool,
 ) -> Terminal {
-    let visible_rows = output_rows.min(viewport_cap).max(1);
+    let requested_visible_rows = output_rows.min(viewport_cap).max(1);
     // Estimates can be low for cursor movement, CR redraws, tabs, wide glyphs,
     // and wrapping. Keep temporary capture capacity until the post-feed settle
     // pass folds VTE's actual buffer rows into the card.
-    let capture_rows = output_rows
+    let requested_capture_rows = output_rows
         .max(viewport_cap)
         .max(config.truncation_threshold_lines as i64)
         .max(4096)
-        .clamp(1, u32::MAX as i64) as u32;
+        .clamp(1, u32::MAX as i64);
+    let (cols, visible_rows, capture_rows) =
+        bounded_finished_vte_geometry(cols, requested_visible_rows, requested_capture_rows);
     let terminal = Terminal::builder()
         .hexpand(true)
         .vexpand(false)
@@ -394,20 +449,23 @@ pub(crate) fn create_finished_terminal(
         .allow_hyperlink(true)
         .bold_is_bright(true)
         .input_enabled(false)
-        .scrollback_lines(capture_rows)
+        .scrollback_lines(capture_rows as u32)
         .cursor_blink_mode(CursorBlinkMode::Off)
         .cursor_shape(CursorShape::Block)
         .font_scale(config.default_font_scale)
         .cell_height_scale(BLOCK_CELL_HEIGHT_SCALE)
         .opacity(1.0)
         .pointer_autohide(true)
-        .enable_sixel(true)
+        // Sixel is still rendered by the bounded live VTE. Replaying an
+        // arbitrary captured DCS payload into every persistent snapshot would
+        // allocate image surfaces outside the finished-cell/image ledgers.
+        .enable_sixel(false)
         .scroll_on_output(false)
         .scroll_on_keystroke(false)
         .build();
     terminal.set_mouse_autohide(true);
     apply_snapshot_theme_to_vte(&terminal, config);
-    terminal.set_size(cols.max(1), visible_rows);
+    terminal.set_size(cols, visible_rows);
 
     if expand_to_buffer {
         let expanded = std::cell::Cell::new(false);
@@ -433,6 +491,27 @@ pub(crate) fn create_finished_terminal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finished_vte_geometry_never_exceeds_cell_or_column_caps() {
+        let (cols, visible, scrollback) =
+            bounded_finished_vte_geometry(i64::MAX, i64::MAX, i64::MAX);
+        assert_eq!(cols, MAX_FINISHED_VTE_COLUMNS);
+        assert!(visible >= 1);
+        assert_eq!(scrollback, 0);
+        assert!(
+            (cols as usize).saturating_mul((visible + scrollback) as usize)
+                <= MAX_FINISHED_VTE_GRID_CELLS
+        );
+
+        let (cols, visible, scrollback) = bounded_finished_vte_geometry(80, 24, i64::MAX);
+        assert_eq!(cols, 80);
+        assert_eq!(visible, 24);
+        assert_eq!(
+            (visible + scrollback) as usize,
+            MAX_FINISHED_VTE_GRID_CELLS / 80
+        );
+    }
 
     #[test]
     fn sgr_wheel_up_encodes_button_64() {

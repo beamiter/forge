@@ -1,21 +1,22 @@
-//! history — extracted from block_view (mechanical split, no logic changes)
+//! Bounded, crash-safe persistence and restoration for Block-mode history.
 //!
 //! Persist the in-memory `block_data` deque to/from disk as length-prefixed
 //! rkyv records (optional zstd). Truncate-on-save (not append) keeps the file
 //! bounded, since the deque was already seeded from this file on startup.
 
+#[cfg(test)]
+use super::completed_block_retention_plan;
 use super::{
     estimated_finished_block_height_for_text, install_finished_block_selection, next_block_id,
-    BlockData, FinishedBlock, TermView,
+    BlockData, FinishedBlock, TermView, MAX_COMPLETED_BLOCK_RETAINED_BYTES,
 };
 use crate::persistence::{self, PersistenceKey};
 use gtk4::glib;
 use gtk4::prelude::*;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::ffi::{CString, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -23,7 +24,9 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+#[cfg(test)]
+use std::time::SystemTime;
+use std::time::{Duration, Instant};
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAX_ENCODED_RECORD_BYTES: usize = 16 * 1024 * 1024;
@@ -34,12 +37,30 @@ const MAX_HISTORY_FRAMES: usize = 100_000;
 const MAX_HISTORY_DECODE_DURATION: Duration = Duration::from_secs(5);
 const MAX_SESSION_COMPONENT_BYTES: usize = 96;
 const HISTORY_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
 const MAX_SCANNED_HISTORY_DIRECTORY_ENTRIES: usize = 4_096;
 const MAX_HISTORY_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_HISTORY_COMMAND_BYTES: usize = crate::review_input::MAX_REVIEW_INPUT_BYTES;
 const MAX_HISTORY_COMMAND_MARKUP_BYTES: usize = crate::review_input::MAX_REVIEW_INPUT_BYTES;
 const MAX_HISTORY_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_HISTORY_CWD_BYTES: usize = 16 * 1024;
+const HISTORY_ZSTD_WINDOW_LOG_MAX: u32 = 24;
+/// One decode can briefly own the 16 MiB encoded frame, a 16 MiB decompressed
+/// archive, and the newly deserialized owned strings before either input Vec is
+/// released. Reserve another 16 MiB for zstd/allocator scratch; the retained
+/// result permit may legitimately be zero and cannot cover this peak.
+const HISTORY_LOAD_TRANSIENT_ESTIMATED_BYTES: usize = 64 * 1024 * 1024;
+/// Runtime-only save workspace. Pending closures are already charged for their
+/// owned snapshots; the single worker reserves this only while it streams one
+/// save. Half covers the worst overlap of one encoded frame, decode scratch,
+/// two bounded BlockData values and target-codec serialization. Half covers
+/// metadata for at most one complete incoming snapshot. Exact source revisions
+/// are validated one record at a time and then discarded; stale sources are
+/// rejected instead of being union-merged, so they never add candidate rows.
+const HISTORY_SAVE_WORKING_ESTIMATED_BYTES: usize = 128 * 1024 * 1024;
+const HISTORY_SAVE_RECORD_TRANSIENT_ESTIMATED_BYTES: usize = 64 * 1024 * 1024;
+const HISTORY_SAVE_METADATA_BYTES_PER_RECORD: usize = 192;
+const MAX_HISTORY_SAVE_CANDIDATE_RECORDS: usize = MAX_HISTORY_FRAMES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HistoryRevision {
@@ -65,10 +86,29 @@ impl HistoryRevision {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyHistoryAuthority {
+    /// This pane loaded its own session target (or no file), so the shared
+    /// legacy sibling is unrelated and must neither be merged nor removed.
+    Ignore,
+    /// The legacy source was not fully observed. A normal save must fail while
+    /// it remains present; union-merging a partial view could later resurrect
+    /// records removed by another pane's explicit Clear.
+    MergeOnly,
+    /// A complete fallback load observed this exact legacy revision, allowing
+    /// UI deletions only while the locked source still matches it.
+    Revision(HistoryRevision),
+}
+
 pub(super) struct LoadedHistory {
     blocks: Arc<Vec<BlockData>>,
     total_loaded: usize,
-    target_revision: HistoryRevision,
+    /// `None` means this load did not observe every eligible disk record and
+    /// therefore must reload before a normal save can authorize replacement.
+    target_revision: Option<HistoryRevision>,
+    legacy_authority: LegacyHistoryAuthority,
+    retained_estimated_bytes: usize,
+    _reservation: Option<persistence::EstimatedBytesReservation>,
 }
 
 #[derive(Clone)]
@@ -82,35 +122,104 @@ enum HistoryLoadOutcome {
     },
 }
 
+struct HistoryLoadState {
+    outcome: HistoryLoadOutcome,
+    pre_apply_save_leases: usize,
+    consume_requested: bool,
+}
+
 pub(super) struct HistoryLoadShared {
-    outcome: Mutex<HistoryLoadOutcome>,
+    state: Mutex<HistoryLoadState>,
     revision: Mutex<Option<HistoryRevision>>,
+    legacy_authority: Mutex<LegacyHistoryAuthority>,
     applied: AtomicBool,
     discarded: AtomicBool,
+    explicit_replace_epoch: AtomicU64,
+    persisted_replace_epoch: AtomicU64,
 }
 
 impl Default for HistoryLoadShared {
     fn default() -> Self {
         Self {
-            outcome: Mutex::new(HistoryLoadOutcome::Idle),
+            state: Mutex::new(HistoryLoadState {
+                outcome: HistoryLoadOutcome::Idle,
+                pre_apply_save_leases: 0,
+                consume_requested: false,
+            }),
             revision: Mutex::new(None),
+            legacy_authority: Mutex::new(LegacyHistoryAuthority::MergeOnly),
             applied: AtomicBool::new(true),
             discarded: AtomicBool::new(false),
+            explicit_replace_epoch: AtomicU64::new(0),
+            persisted_replace_epoch: AtomicU64::new(0),
         }
     }
 }
 
+struct PreApplyHistorySaveLease {
+    shared: Arc<HistoryLoadShared>,
+}
+
+impl Drop for PreApplyHistorySaveLease {
+    fn drop(&mut self) {
+        self.shared.release_pre_apply_save_lease();
+    }
+}
+
 impl HistoryLoadShared {
-    pub(super) fn discard(&self) {
+    /// Cancel any in-flight restore and persist the user's explicit request to
+    /// replace history. This intent is independent of load deletion authority:
+    /// resource pressure may make ordinary saves require a complete reload,
+    /// but must not make a successful Clear reappear on the next launch.
+    pub(super) fn discard_for_explicit_clear(&self) {
+        self.explicit_replace_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+                Some(
+                    epoch
+                        .checked_add(1)
+                        .expect("explicit Block-history replacement epoch exhausted"),
+                )
+            })
+            .expect("explicit Block-history replacement epoch update is infallible");
         self.discarded.store(true, Ordering::Release);
         self.applied.store(true, Ordering::Release);
+        let prior = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.consume_requested = true;
+            (state.pre_apply_save_leases == 0)
+                .then(|| std::mem::replace(&mut state.outcome, HistoryLoadOutcome::Idle))
+        };
+        drop(prior);
+    }
+
+    fn pending_explicit_replace_epoch(&self) -> Option<u64> {
+        let requested = self.explicit_replace_epoch.load(Ordering::Acquire);
+        let persisted = self.persisted_replace_epoch.load(Ordering::Acquire);
+        (requested > persisted).then_some(requested)
+    }
+
+    fn mark_explicit_replace_persisted(&self, epoch: u64) {
+        self.persisted_replace_epoch
+            .fetch_max(epoch, Ordering::AcqRel);
     }
 
     fn begin(&self) {
-        *self
-            .outcome
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = HistoryLoadOutcome::Pending;
+        let prior = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            debug_assert_eq!(state.pre_apply_save_leases, 0);
+            state.consume_requested = false;
+            std::mem::replace(&mut state.outcome, HistoryLoadOutcome::Pending)
+        };
+        // LoadedHistory may own a persistence reservation. Its destructor must
+        // never run while the history mutex is held: persistence replacement
+        // drops save leases in the opposite lock order.
+        drop(prior);
         self.discarded.store(false, Ordering::Release);
         self.applied.store(false, Ordering::Release);
     }
@@ -119,8 +228,18 @@ impl HistoryLoadShared {
         *self
             .revision
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            result.as_ref().ok().map(|loaded| loaded.target_revision);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = result
+            .as_ref()
+            .ok()
+            .and_then(|loaded| loaded.target_revision);
+        *self
+            .legacy_authority
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = result
+            .as_ref()
+            .map_or(LegacyHistoryAuthority::MergeOnly, |loaded| {
+                loaded.legacy_authority
+            });
         let outcome = match result {
             Ok(loaded) => HistoryLoadOutcome::Loaded(Arc::clone(loaded)),
             Err(error) => HistoryLoadOutcome::Failed {
@@ -128,16 +247,28 @@ impl HistoryLoadShared {
                 message: Arc::from(error.to_string()),
             },
         };
-        *self
-            .outcome
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = outcome;
+        let prior = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let next = if self.discarded.load(Ordering::Acquire) {
+                HistoryLoadOutcome::Idle
+            } else {
+                outcome
+            };
+            std::mem::replace(&mut state.outcome, next)
+        };
+        // See `begin`: both the displaced outcome and a discarded new result
+        // can release a persistence permit, so drop them outside this mutex.
+        drop(prior);
     }
 
     fn outcome(&self) -> HistoryLoadOutcome {
-        self.outcome
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .outcome
             .clone()
     }
 
@@ -154,10 +285,79 @@ impl HistoryLoadShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = revision;
     }
+
+    fn legacy_authority(&self) -> LegacyHistoryAuthority {
+        *self
+            .legacy_authority
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn set_legacy_authority(&self, authority: LegacyHistoryAuthority) {
+        *self
+            .legacy_authority
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = authority;
+    }
+
+    fn acquire_pre_apply_save_lease(self: &Arc<Self>) -> Option<PreApplyHistorySaveLease> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.applied.load(Ordering::Acquire) || self.discarded.load(Ordering::Acquire) {
+            return None;
+        }
+        state.pre_apply_save_leases = state
+            .pre_apply_save_leases
+            .checked_add(1)
+            .expect("pre-apply history save lease count exhausted");
+        Some(PreApplyHistorySaveLease {
+            shared: Arc::clone(self),
+        })
+    }
+
+    fn release_pre_apply_save_lease(&self) {
+        let prior = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.pre_apply_save_leases = state
+                .pre_apply_save_leases
+                .checked_sub(1)
+                .expect("pre-apply history save lease accounting underflow");
+            (state.pre_apply_save_leases == 0 && state.consume_requested)
+                .then(|| std::mem::replace(&mut state.outcome, HistoryLoadOutcome::Idle))
+        };
+        drop(prior);
+    }
+
+    /// Mark the outcome consumed. A save which snapshotted the UI before apply
+    /// holds a lease, keeping LoadedHistory (and its reservation) alive until
+    /// that closure has streamed its prefix or its rejected task is dropped.
+    fn mark_applied_and_consume(&self) {
+        let prior = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.applied.store(true, Ordering::Release);
+            state.consume_requested = true;
+            (state.pre_apply_save_leases == 0)
+                .then(|| std::mem::replace(&mut state.outcome, HistoryLoadOutcome::Idle))
+        };
+        drop(prior);
+    }
 }
 
 fn decode_zstd_bounded(data: &[u8], max_decoded_bytes: u64) -> io::Result<Vec<u8>> {
-    let decoder = zstd::Decoder::new(data).map_err(|error| io::Error::other(error.to_string()))?;
+    let mut decoder =
+        zstd::Decoder::new(data).map_err(|error| io::Error::other(error.to_string()))?;
+    // `Read::take` bounds produced bytes but not zstd's internal history
+    // window. Refuse frames which advertise more working memory than one
+    // maximum decoded record before the first read can allocate that window.
+    decoder.window_log_max(HISTORY_ZSTD_WINDOW_LOG_MAX)?;
     let mut decoded = Vec::new();
     decoder
         .take(max_decoded_bytes + 1)
@@ -315,10 +515,11 @@ fn absolute_history_path(path: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Session-history files older than this are removed opportunistically after a
-/// successful save. Closed tabs never delete their own file (the session id in
-/// the window snapshot may be restored later), so orphans from tabs that were
-/// never restored again would otherwise accumulate forever.
+/// Kept only to exercise the old filename filter in tests. Runtime saves must
+/// not prune siblings by mtime: an open or restorable pane can legitimately go
+/// longer than this without saving, and deleting its file makes its revisioned
+/// next save fail closed after the data is already gone.
+#[cfg(test)]
 const STALE_SESSION_HISTORY_MAX_AGE: std::time::Duration =
     std::time::Duration::from_secs(30 * 24 * 3600);
 
@@ -383,6 +584,7 @@ fn choose_load_path(base: &Path, per_session: Option<&Path>) -> Option<PathBuf> 
 /// Remove sibling per-session history files that have not been touched within
 /// `max_age`. Only names matching this base's `<stem>-*.<ext>` shape are
 /// candidates; `keep` (the file just written) always survives.
+#[cfg(test)]
 fn prune_stale_session_histories(base: &Path, keep: &Path, max_age: std::time::Duration) {
     let Some(parent) = base.parent() else {
         return;
@@ -809,6 +1011,58 @@ fn atomic_write_in_directory(
     parent_directory.sync_all()
 }
 
+/// Create a private read/write spool in the retained history directory and
+/// unlink its name immediately. The descriptor remains usable for seek/copy,
+/// while every failure path (including panic/process exit) lets the filesystem
+/// reclaim the staging bytes without a pathname cleanup race.
+fn create_unlinked_spool(parent_directory: &File, target: &Path) -> io::Result<File> {
+    for _ in 0..128 {
+        let temp_name = temp_file_name(target)?;
+        let temp_name_c = os_name_cstring(&temp_name, "Block-history spool")?;
+        // SAFETY: the name is relative to the retained directory; a successful
+        // descriptor is uniquely transferred into File below.
+        let descriptor = unsafe {
+            nix::libc::openat(
+                parent_directory.as_raw_fd(),
+                temp_name_c.as_ptr(),
+                nix::libc::O_RDWR
+                    | nix::libc::O_CREAT
+                    | nix::libc::O_EXCL
+                    | nix::libc::O_CLOEXEC
+                    | nix::libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                continue;
+            }
+            return Err(error);
+        }
+        // SAFETY: descriptor is newly returned and uniquely owned.
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        // SAFETY: the same retained directory and live C string are used; the
+        // open descriptor remains valid after unlink.
+        if unsafe { nix::libc::unlinkat(parent_directory.as_raw_fd(), temp_name_c.as_ptr(), 0) }
+            != 0
+        {
+            let error = io::Error::last_os_error();
+            drop(file);
+            // Best-effort cleanup if the first unlink failed transiently.
+            unsafe {
+                nix::libc::unlinkat(parent_directory.as_raw_fd(), temp_name_c.as_ptr(), 0);
+            }
+            return Err(error);
+        }
+        return Ok(file);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a temporary Block-history spool",
+    ))
+}
+
 fn push_bounded_back<T>(items: &mut VecDeque<T>, item: T, limit: usize) {
     if limit == 0 {
         return;
@@ -829,6 +1083,72 @@ struct LoadedRecords {
     blocks: VecDeque<BlockData>,
     total_loaded: usize,
     revision: HistoryRevision,
+    retained_estimated_bytes: usize,
+    retained_records_dropped: usize,
+    skipped_undecodable: usize,
+}
+
+/// Keep a chronological suffix within both the configured count and the
+/// exact retained-result permit. The just-decoded record is the only memory
+/// outside `retained_estimated_bytes`; the separate decoder reservation covers
+/// that record and its encoded frame until this function either admits or
+/// drops it.
+fn push_loaded_record_bounded(
+    blocks: &mut VecDeque<BlockData>,
+    retained_costs: &mut VecDeque<usize>,
+    block: BlockData,
+    count_limit: usize,
+    byte_limit: usize,
+    retained_estimated_bytes: &mut usize,
+) -> usize {
+    debug_assert_eq!(blocks.len(), retained_costs.len());
+    if count_limit == 0 {
+        return 1;
+    }
+
+    let mut dropped = 0usize;
+    while blocks.len() >= count_limit {
+        blocks.pop_front();
+        let removed = retained_costs
+            .pop_front()
+            .expect("history retention costs stay aligned with records");
+        *retained_estimated_bytes = retained_estimated_bytes
+            .checked_sub(removed)
+            .expect("history retained-byte accounting underflow");
+        dropped = dropped.saturating_add(1);
+    }
+
+    let cost = estimated_loaded_block_owned_bytes(&block);
+    if cost > byte_limit {
+        // With the full product budget every valid record fits and the normal
+        // newest-wins rule applies. Under global pressure a smaller permit may
+        // not fit even one record; keep no non-contiguous older prefix and
+        // revoke deletion authority at the caller.
+        dropped = dropped.saturating_add(blocks.len()).saturating_add(1);
+        blocks.clear();
+        retained_costs.clear();
+        *retained_estimated_bytes = 0;
+        return dropped;
+    }
+
+    while !blocks.is_empty() && *retained_estimated_bytes > byte_limit - cost {
+        blocks.pop_front();
+        let removed = retained_costs
+            .pop_front()
+            .expect("history retention costs stay aligned with records");
+        *retained_estimated_bytes = retained_estimated_bytes
+            .checked_sub(removed)
+            .expect("history retained-byte accounting underflow");
+        dropped = dropped.saturating_add(1);
+    }
+
+    *retained_estimated_bytes = retained_estimated_bytes
+        .checked_add(cost)
+        .expect("admission check guarantees history retained-byte sum fits");
+    blocks.push_back(block);
+    retained_costs.push_back(cost);
+    debug_assert!(*retained_estimated_bytes <= byte_limit);
+    dropped
 }
 
 fn read_frame_header(file: &mut File, frame_index: usize) -> io::Result<Option<[u8; 4]>> {
@@ -885,6 +1205,7 @@ fn read_history_records(
         prefer_compressed,
         keep_limit,
         undecodable_policy,
+        None,
     )
 }
 
@@ -894,16 +1215,69 @@ fn read_history_records_in_directory(
     prefer_compressed: bool,
     keep_limit: usize,
     undecodable_policy: UndecodablePolicy,
+    retained_budget: Option<usize>,
 ) -> io::Result<LoadedRecords> {
+    let mut blocks = VecDeque::new();
+    let mut retained_costs = VecDeque::new();
+    let mut retained_estimated_bytes = 0usize;
+    let mut retained_records_dropped = 0usize;
+    let scanned = scan_history_records_in_directory(
+        directory,
+        path,
+        prefer_compressed,
+        undecodable_policy,
+        |block| {
+            if let Some(retained_budget) = retained_budget {
+                retained_records_dropped =
+                    retained_records_dropped.saturating_add(push_loaded_record_bounded(
+                        &mut blocks,
+                        &mut retained_costs,
+                        block,
+                        keep_limit,
+                        retained_budget,
+                        &mut retained_estimated_bytes,
+                    ));
+            } else {
+                push_bounded_back(&mut blocks, block, keep_limit);
+            }
+            Ok(())
+        },
+    )?;
+    Ok(LoadedRecords {
+        blocks,
+        total_loaded: scanned.total_loaded,
+        revision: scanned.revision,
+        retained_estimated_bytes,
+        retained_records_dropped,
+        skipped_undecodable: scanned.skipped_undecodable,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct ScannedHistory {
+    total_loaded: usize,
+    revision: HistoryRevision,
+    skipped_undecodable: usize,
+}
+
+/// Strictly bound and decode each frame, handing off at most one owned record
+/// at a time. Save paths use this callback form so validation never implies
+/// retaining the complete 256 MiB decoded file.
+fn scan_history_records_in_directory(
+    directory: &File,
+    path: &Path,
+    prefer_compressed: bool,
+    undecodable_policy: UndecodablePolicy,
+    mut on_block: impl FnMut(BlockData) -> io::Result<()>,
+) -> io::Result<ScannedHistory> {
     let Some((mut file, metadata)) = open_history_file_in_directory(directory, path)? else {
-        return Ok(LoadedRecords {
-            blocks: VecDeque::new(),
+        return Ok(ScannedHistory {
             total_loaded: 0,
             revision: HistoryRevision::Missing,
+            skipped_undecodable: 0,
         });
     };
     let revision = HistoryRevision::from_metadata(&metadata);
-    let mut blocks = VecDeque::new();
     let mut total_loaded = 0usize;
     let mut total_file_bytes = 0u64;
     let mut total_decoded_bytes = 0u64;
@@ -946,7 +1320,9 @@ fn read_history_records_in_directory(
 
         let mut data = vec![0u8; len];
         read_frame_payload(&mut file, &mut data, frame_index)?;
-        match decode_block_record(&data, prefer_compressed) {
+        let decoded = decode_block_record(&data, prefer_compressed);
+        drop(data);
+        match decoded {
             Ok((block, decoded_len)) => {
                 total_decoded_bytes = total_decoded_bytes
                     .checked_add(decoded_len as u64)
@@ -963,7 +1339,7 @@ fn read_history_records_in_directory(
                     ));
                 }
                 total_loaded = total_loaded.saturating_add(1);
-                push_bounded_back(&mut blocks, block, keep_limit);
+                on_block(block)?;
             }
             Err(error) if undecodable_policy == UndecodablePolicy::Skip => {
                 undecodable = undecodable.saturating_add(1);
@@ -980,10 +1356,10 @@ fn read_history_records_in_directory(
             "Skipped {undecodable} Block-history record(s); strict save validation will preserve the original file"
         );
     }
-    Ok(LoadedRecords {
-        blocks,
+    Ok(ScannedHistory {
         total_loaded,
         revision,
+        skipped_undecodable: undecodable,
     })
 }
 
@@ -993,25 +1369,58 @@ fn read_history_snapshot(
     prefer_compressed: bool,
     load_limit: usize,
 ) -> io::Result<Arc<LoadedHistory>> {
+    read_history_snapshot_with_retained_budget(
+        base,
+        session_id,
+        prefer_compressed,
+        load_limit,
+        MAX_COMPLETED_BLOCK_RETAINED_BYTES,
+    )
+    .map(Arc::new)
+}
+
+fn read_history_snapshot_with_retained_budget(
+    base: &Path,
+    session_id: Option<&str>,
+    prefer_compressed: bool,
+    load_limit: usize,
+    retained_budget: usize,
+) -> io::Result<LoadedHistory> {
     let session_path = session_id.map(|sid| per_session_history_path(base, sid));
     let target = session_path.as_deref().unwrap_or(base);
     let Some(path) = choose_load_path(base, session_path.as_deref()) else {
-        return Ok(Arc::new(LoadedHistory {
+        return Ok(LoadedHistory {
             blocks: Arc::new(Vec::new()),
             total_loaded: 0,
-            target_revision: HistoryRevision::Missing,
-        }));
+            target_revision: Some(HistoryRevision::Missing),
+            legacy_authority: LegacyHistoryAuthority::Ignore,
+            retained_estimated_bytes: 0,
+            _reservation: None,
+        });
     };
-    let mut loaded = read_history_records(
+    let directory = open_parent_directory(&path)?;
+    let mut loaded = read_history_records_in_directory(
+        &directory,
         &path,
         prefer_compressed,
         load_limit,
         UndecodablePolicy::Skip,
+        Some(retained_budget),
     )?;
-    let target_revision = if path == target {
+    let observed_target_revision = if path == target {
         loaded.revision
     } else {
         HistoryRevision::Missing
+    };
+    let deletion_authority =
+        loaded.retained_records_dropped == 0 && loaded.skipped_undecodable == 0;
+    let target_revision = deletion_authority.then_some(observed_target_revision);
+    let legacy_authority = if path == target {
+        LegacyHistoryAuthority::Ignore
+    } else if deletion_authority {
+        LegacyHistoryAuthority::Revision(loaded.revision)
+    } else {
+        LegacyHistoryAuthority::MergeOnly
     };
 
     if loaded.total_loaded > load_limit {
@@ -1021,12 +1430,51 @@ fn read_history_snapshot(
             loaded.total_loaded
         );
     }
+    if loaded.retained_records_dropped > 0 {
+        log::warn!(
+            "Block history load omitted {} record(s) to fit its count/{}-byte retained-result limits; normal saves require a complete reload",
+            loaded.retained_records_dropped,
+            retained_budget,
+        );
+    }
     refresh_loaded_block_ids(&mut loaded.blocks);
-    Ok(Arc::new(LoadedHistory {
+    Ok(LoadedHistory {
         blocks: Arc::new(loaded.blocks.into_iter().collect()),
         total_loaded: loaded.total_loaded,
         target_revision,
-    }))
+        legacy_authority,
+        retained_estimated_bytes: loaded.retained_estimated_bytes,
+        _reservation: None,
+    })
+}
+
+/// Reserve decoder working memory first, then take only the currently
+/// available result budget. No permit waits: a queued weighted save may own
+/// the missing capacity and is itself waiting for this single worker.
+fn read_history_snapshot_reserved(
+    base: &Path,
+    session_id: Option<&str>,
+    prefer_compressed: bool,
+    load_limit: usize,
+) -> io::Result<Arc<LoadedHistory>> {
+    let _transient =
+        persistence::try_reserve_estimated_bytes(HISTORY_LOAD_TRANSIENT_ESTIMATED_BYTES)?;
+    let mut reservation =
+        persistence::reserve_estimated_bytes_up_to(MAX_COMPLETED_BLOCK_RETAINED_BYTES)?;
+    let retained_budget = reservation.estimated_bytes();
+    let mut loaded = read_history_snapshot_with_retained_budget(
+        base,
+        session_id,
+        prefer_compressed,
+        load_limit,
+        retained_budget,
+    )?;
+    debug_assert!(loaded.retained_estimated_bytes <= retained_budget);
+    reservation.shrink_to(loaded.retained_estimated_bytes);
+    if loaded.retained_estimated_bytes > 0 {
+        loaded._reservation = Some(reservation);
+    }
+    Ok(Arc::new(loaded))
 }
 
 /// Return only the newest loaded blocks that still fit before commands which
@@ -1051,6 +1499,52 @@ fn estimated_block_payload_bytes(block: &BlockData) -> u64 {
         .saturating_add(block.output.len())
         .saturating_add(block.cwd.as_ref().map_or(0, String::len));
     (std::mem::size_of::<BlockData>() as u64).saturating_add(strings as u64)
+}
+
+/// Heap actually retained by a decoded background-load result. Widget/VTE
+/// reconstruction is a later UI concern with its own per-pane retention plan;
+/// charging that future cost here would reject a valid 4–8 MiB newest record
+/// before the UI can apply the product's explicit newest-block exception.
+///
+/// A growing `VecDeque` can retain nearly two inline slots per record. During
+/// its conversion to `Vec`, that allocation can briefly coexist with one new
+/// inline slot while String allocations move, so charge three BlockData slots
+/// (plus the parallel cost ledger) and the exact owned String capacities.
+fn estimated_loaded_block_owned_bytes(block: &BlockData) -> usize {
+    std::mem::size_of::<BlockData>()
+        .saturating_mul(3)
+        .saturating_add(std::mem::size_of::<usize>().saturating_mul(2))
+        .saturating_add(block.prompt.capacity())
+        .saturating_add(block.cmd.capacity())
+        .saturating_add(block.cmd_markup.as_ref().map_or(0, String::capacity))
+        .saturating_add(block.output.capacity())
+        .saturating_add(block.cwd.as_ref().map_or(0, String::capacity))
+}
+
+/// Estimate the allocations moved into the persistence closure. Use String
+/// capacities rather than lengths and include spare Vec capacity so admission
+/// never undercounts memory that the snapshot already owns. Saturating every
+/// term turns an unrepresentable estimate into `usize::MAX`, which the weighted
+/// queue rejects instead of wrapping it into a small value.
+fn estimated_snapshot_retained_bytes(blocks: &[BlockData], capacity: usize) -> usize {
+    let inline = capacity.saturating_mul(std::mem::size_of::<BlockData>());
+    blocks.iter().fold(
+        std::mem::size_of::<Vec<BlockData>>().saturating_add(inline),
+        |total, block| {
+            total
+                .saturating_add(block.prompt.capacity())
+                .saturating_add(block.cmd.capacity())
+                .saturating_add(block.cmd_markup.as_ref().map_or(0, String::capacity))
+                .saturating_add(block.output.capacity())
+                .saturating_add(block.cwd.as_ref().map_or(0, String::capacity))
+        },
+    )
+}
+
+fn estimated_history_save_working_bytes(candidate_records: usize) -> usize {
+    HISTORY_SAVE_RECORD_TRANSIENT_ESTIMATED_BYTES
+        .saturating_add(1024 * 1024)
+        .saturating_add(candidate_records.saturating_mul(HISTORY_SAVE_METADATA_BYTES_PER_RECORD))
 }
 
 /// Clone only the newest live records that can possibly fit the persistent
@@ -1083,101 +1577,158 @@ fn snapshot_live_blocks_bounded(
         newest_first.push(block.clone());
     }
     newest_first.reverse();
-    newest_first
+    // `into_boxed_slice` discards growth slack before the closure is admitted,
+    // making the queue's Vec-inline estimate exact rather than aspirational.
+    newest_first.into_boxed_slice().into_vec()
 }
 
-fn block_identity_hash(block: &BlockData) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    // Persisted IDs are deliberately refreshed on restore and estimated height
-    // is viewport-derived. Neither is a stable cross-process identity.
-    block.prompt.hash(&mut hasher);
-    block.cmd.hash(&mut hasher);
-    block.cmd_markup.hash(&mut hasher);
-    block.output.hash(&mut hasher);
-    block.exit_code.hash(&mut hasher);
-    block.line_count.hash(&mut hasher);
-    block.start_time_ms.hash(&mut hasher);
-    block.end_time_ms.hash(&mut hasher);
-    block.duration_ms.hash(&mut hasher);
-    block.cwd.hash(&mut hasher);
-    block.cols.hash(&mut hasher);
-    hasher.finish()
+#[derive(Clone, Copy)]
+struct SpoolRecord {
+    offset: u64,
+    encoded_len: u32,
+    decoded_len: u32,
 }
 
-fn same_block_identity(left: &BlockData, right: &BlockData) -> bool {
-    left.prompt == right.prompt
-        && left.cmd == right.cmd
-        && left.cmd_markup == right.cmd_markup
-        && left.output == right.output
-        && left.exit_code == right.exit_code
-        && left.line_count == right.line_count
-        && left.start_time_ms == right.start_time_ms
-        && left.end_time_ms == right.end_time_ms
-        && left.duration_ms == right.duration_ms
-        && left.cwd == right.cwd
-        && left.cols == right.cols
+#[derive(Clone, Copy)]
+struct SpoolEntry {
+    record: SpoolRecord,
 }
 
-fn deduplicate_newest(blocks: impl IntoIterator<Item = BlockData>) -> Vec<BlockData> {
+#[derive(Default)]
+struct SpoolCandidateSet {
+    entries: Vec<SpoolEntry>,
+}
+
+fn append_spooled_block(
+    spool: &mut File,
+    block: &BlockData,
+    compress: bool,
+) -> io::Result<Option<SpoolRecord>> {
+    let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(block)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    if serialized.len() > MAX_DECODED_RECORD_BYTES as usize {
+        log::warn!(
+            "save_history: skipping a {} byte block (decoded record limit {})",
+            serialized.len(),
+            MAX_DECODED_RECORD_BYTES,
+        );
+        return Ok(None);
+    }
+    let encoded = if compress {
+        zstd::encode_all(serialized.as_slice(), 3)
+            .map_err(|error| io::Error::other(error.to_string()))?
+    } else {
+        serialized.as_slice().to_vec()
+    };
+    if encoded.len() > MAX_ENCODED_RECORD_BYTES || encoded.len() > u32::MAX as usize {
+        log::warn!(
+            "save_history: skipping a {} byte block (encoded record limit {})",
+            encoded.len(),
+            MAX_ENCODED_RECORD_BYTES,
+        );
+        return Ok(None);
+    }
+    let offset = spool.seek(SeekFrom::End(0))?;
+    spool.write_all(&encoded)?;
+    Ok(Some(SpoolRecord {
+        offset,
+        encoded_len: encoded.len() as u32,
+        decoded_len: serialized.len() as u32,
+    }))
+}
+
+impl SpoolCandidateSet {
+    /// Preserve event multiplicity and chronological order. Identical command
+    /// records are distinct terminal events and must not be set-deduplicated.
+    fn push_block(
+        &mut self,
+        spool: &mut File,
+        block: &BlockData,
+        compress: bool,
+    ) -> io::Result<()> {
+        let Some(record) = append_spooled_block(spool, block, compress)? else {
+            return Ok(());
+        };
+        self.entries.push(SpoolEntry { record });
+        Ok(())
+    }
+}
+
+fn spool_snapshot_sources(
+    prefix: &[BlockData],
+    blocks: &[BlockData],
+    compress: bool,
+    spool: &mut File,
+) -> io::Result<SpoolCandidateSet> {
+    let mut source = SpoolCandidateSet::default();
+    let skip = prefix
+        .len()
+        .saturating_add(blocks.len())
+        .saturating_sub(MAX_HISTORY_FRAMES);
+    for block in prefix.iter().chain(blocks).skip(skip) {
+        source.push_block(spool, block, compress)?;
+    }
+    Ok(source)
+}
+
+fn selected_spool_entries(candidates: &SpoolCandidateSet) -> io::Result<Vec<usize>> {
     let mut newest_first = Vec::new();
-    let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
-    let collected = blocks.into_iter().collect::<Vec<_>>();
-    for block in collected.into_iter().rev() {
-        let hash = block_identity_hash(&block);
-        let duplicate = buckets.get(&hash).is_some_and(|indices| {
-            indices
-                .iter()
-                .any(|&index| same_block_identity(&newest_first[index], &block))
-        });
-        if duplicate {
-            continue;
+    let mut encoded_bytes = 0usize;
+    let mut decoded_bytes = 0u64;
+    for (index, entry) in candidates.entries.iter().enumerate().rev() {
+        if newest_first.len() == MAX_HISTORY_FRAMES {
+            log::warn!("save_history: keeping newer blocks within the record-count limit");
+            break;
         }
-        let index = newest_first.len();
-        newest_first.push(block);
-        buckets.entry(hash).or_default().push(index);
+        let frame_bytes = 4usize
+            .checked_add(entry.record.encoded_len as usize)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::FileTooLarge,
+                    "Block history frame size overflow",
+                )
+            })?;
+        let Some(next_encoded) = encoded_bytes.checked_add(frame_bytes) else {
+            break;
+        };
+        let Some(next_decoded) = decoded_bytes.checked_add(entry.record.decoded_len as u64) else {
+            break;
+        };
+        if next_encoded > MAX_HISTORY_FILE_BYTES as usize
+            || next_decoded > MAX_HISTORY_DECODED_BYTES
+        {
+            log::warn!("save_history: keeping newer blocks within encoded and decoded byte limits");
+            break;
+        }
+        encoded_bytes = next_encoded;
+        decoded_bytes = next_decoded;
+        newest_first.push(index);
     }
-    newest_first.reverse();
-    newest_first
+    Ok(newest_first)
 }
 
-/// Existing locked disk order is authoritative. A stale pane may append its
-/// genuinely new blocks, but absence from its old UI snapshot never deletes a
-/// command another process saved in the meantime.
-fn merge_stale_snapshot(
-    existing: impl IntoIterator<Item = BlockData>,
-    incoming: impl IntoIterator<Item = BlockData>,
-) -> Vec<BlockData> {
-    let mut merged = deduplicate_newest(existing);
-    let incoming = deduplicate_newest(incoming);
-    let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (index, block) in merged.iter().enumerate() {
-        buckets
-            .entry(block_identity_hash(block))
-            .or_default()
-            .push(index);
+fn copy_spooled_record(
+    spool: &mut File,
+    target: &mut File,
+    record: SpoolRecord,
+    buffer: &mut [u8],
+) -> io::Result<()> {
+    target.write_all(&record.encoded_len.to_le_bytes())?;
+    spool.seek(SeekFrom::Start(record.offset))?;
+    let mut remaining = record.encoded_len as usize;
+    while remaining > 0 {
+        let chunk = remaining.min(buffer.len());
+        spool.read_exact(&mut buffer[..chunk])?;
+        target.write_all(&buffer[..chunk])?;
+        remaining -= chunk;
     }
-    for block in incoming {
-        let hash = block_identity_hash(&block);
-        let existing_index = buckets.get(&hash).and_then(|indices| {
-            indices
-                .iter()
-                .copied()
-                .find(|&index| same_block_identity(&merged[index], &block))
-        });
-        if let Some(index) = existing_index {
-            merged[index] = block;
-        } else {
-            let index = merged.len();
-            merged.push(block);
-            buckets.entry(hash).or_default().push(index);
-        }
-    }
-    merged
+    Ok(())
 }
 
 /// Encode a newest-first budget, then restore chronological order for disk.
 /// A single pathological block is skipped, while reaching the aggregate
 /// budget stops before any older record can displace a newer complete one.
+#[cfg(test)]
 fn encode_history_frames_bounded(
     blocks: &[BlockData],
     compress: bool,
@@ -1245,8 +1796,20 @@ fn encode_history_frames_bounded(
 struct SaveHistoryOutcome {
     revision: HistoryRevision,
     authoritative: bool,
+    legacy_handled: bool,
+    legacy_retry_revision: Option<HistoryRevision>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum HistoryWriteIntent {
+    Revision {
+        target: Option<HistoryRevision>,
+        legacy: LegacyHistoryAuthority,
+    },
+    ExplicitReplace,
+}
+
+#[cfg(test)]
 fn write_history_snapshot(
     base: &Path,
     path: &Path,
@@ -1255,56 +1818,223 @@ fn write_history_snapshot(
     compress: bool,
     expected_revision: Option<HistoryRevision>,
 ) -> io::Result<SaveHistoryOutcome> {
-    let lock = HistoryFileLock::acquire(path)?;
-    // Re-read and strictly decode while holding the cross-process lock. A
-    // corrupt/unknown old frame is evidence, not permission to overwrite it.
-    let existing = read_history_records_in_directory(
-        &lock.directory,
+    write_history_snapshot_with_intent(
+        base,
         path,
+        session_id,
+        blocks,
         compress,
-        usize::MAX,
-        UndecodablePolicy::Reject,
-    )?;
-    let authoritative = expected_revision.is_some_and(|expected| expected == existing.revision);
-    let merged = if authoritative {
-        deduplicate_newest(blocks.iter().cloned())
+        HistoryWriteIntent::Revision {
+            target: expected_revision,
+            legacy: if base == path {
+                LegacyHistoryAuthority::Ignore
+            } else {
+                LegacyHistoryAuthority::MergeOnly
+            },
+        },
+    )
+}
+
+fn current_history_revision_in_directory(
+    directory: &File,
+    path: &Path,
+) -> io::Result<HistoryRevision> {
+    Ok(open_history_file_in_directory(directory, path)?
+        .map(|(_, metadata)| HistoryRevision::from_metadata(&metadata))
+        .unwrap_or(HistoryRevision::Missing))
+}
+
+fn ensure_scanned_revision(
+    path: &Path,
+    scanned: ScannedHistory,
+    expected: HistoryRevision,
+) -> io::Result<()> {
+    if scanned.revision == expected {
+        Ok(())
     } else {
-        merge_stale_snapshot(existing.blocks, blocks.iter().cloned())
-    };
-    // Overwrite (do NOT append). The in-memory deque was itself seeded from
-    // this file at startup, so appending it re-wrote every loaded block on each
-    // session. Encode into a sibling temp file first so a crash or serialization
-    // error never truncates the last good history.
-    let frames = encode_history_frames_bounded(
-        &merged,
-        compress,
-        MAX_ENCODED_RECORD_BYTES,
-        MAX_DECODED_RECORD_BYTES as usize,
-        MAX_HISTORY_FILE_BYTES as usize,
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "Block history changed during its locked save scan: {}",
+                path.display()
+            ),
+        ))
+    }
+}
+
+fn validate_history_source(
+    directory: &File,
+    path: &Path,
+    prefer_compressed: bool,
+    expected_revision: HistoryRevision,
+) -> io::Result<()> {
+    let scanned = scan_history_records_in_directory(
+        directory,
+        path,
+        prefer_compressed,
+        UndecodablePolicy::Reject,
+        |_| Ok(()),
     )?;
+    ensure_scanned_revision(path, scanned, expected_revision)
+}
+
+fn remove_history_source_in_directory(
+    directory: &File,
+    path: &Path,
+    expected_revision: HistoryRevision,
+) -> io::Result<()> {
+    let Some((file, metadata)) = open_history_file_in_directory(directory, path)? else {
+        return Ok(());
+    };
+    if HistoryRevision::from_metadata(&metadata) != expected_revision {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "legacy Block history changed before it could be removed",
+        ));
+    }
+    drop(file);
+    let name = relative_name_cstring(path, "legacy Block history")?;
+    // SAFETY: `name` is a relative basename and `directory` retains the
+    // validated, exclusively locked parent directory for this call.
+    if unsafe { nix::libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    directory.sync_all()
+}
+
+fn legacy_removal_state(
+    should_consume: bool,
+    revision: HistoryRevision,
+    removal_succeeded: bool,
+) -> (bool, Option<HistoryRevision>) {
+    if !should_consume {
+        (false, None)
+    } else if revision == HistoryRevision::Missing || removal_succeeded {
+        (true, None)
+    } else {
+        (false, Some(revision))
+    }
+}
+
+fn write_history_snapshot_with_intent(
+    base: &Path,
+    path: &Path,
+    session_id: Option<&str>,
+    blocks: &[BlockData],
+    compress: bool,
+    intent: HistoryWriteIntent,
+) -> io::Result<SaveHistoryOutcome> {
+    write_history_snapshot_with_intent_parts(base, path, session_id, &[], blocks, compress, intent)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_history_snapshot_with_intent_parts(
+    base: &Path,
+    path: &Path,
+    session_id: Option<&str>,
+    prefix: &[BlockData],
+    blocks: &[BlockData],
+    compress: bool,
+    intent: HistoryWriteIntent,
+) -> io::Result<SaveHistoryOutcome> {
+    let lock = HistoryFileLock::acquire(path)?;
+    let target_revision = current_history_revision_in_directory(&lock.directory, path)?;
+    let legacy_revision = if base != path {
+        debug_assert_eq!(base.parent(), path.parent());
+        current_history_revision_in_directory(&lock.directory, base)?
+    } else {
+        HistoryRevision::Missing
+    };
+    let (legacy_should_consume, authoritative) = match intent {
+        HistoryWriteIntent::ExplicitReplace => (base != path, true),
+        HistoryWriteIntent::Revision {
+            target: expected_target,
+            legacy,
+        } => {
+            match expected_target {
+                Some(expected) if expected == target_revision => {}
+                None if target_revision == HistoryRevision::Missing => {}
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "Block history changed since this pane loaded it; reload before saving",
+                    ));
+                }
+            };
+            let (legacy_should_consume, legacy_safe) = match legacy {
+                LegacyHistoryAuthority::Ignore => (false, true),
+                LegacyHistoryAuthority::MergeOnly
+                    if legacy_revision == HistoryRevision::Missing =>
+                {
+                    (true, true)
+                }
+                LegacyHistoryAuthority::MergeOnly => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "legacy Block history was not fully loaded; reload before migrating it",
+                    ));
+                }
+                LegacyHistoryAuthority::Revision(expected) => {
+                    if expected != legacy_revision && legacy_revision != HistoryRevision::Missing {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "legacy Block history changed since this pane loaded it; reload before migrating it",
+                        ));
+                    }
+                    (true, true)
+                }
+            };
+            (legacy_should_consume, legacy_safe)
+        }
+    };
+
+    let mut spool = create_unlinked_spool(&lock.directory, path)?;
+
+    if base != path && legacy_should_consume && legacy_revision != HistoryRevision::Missing {
+        validate_history_source(&lock.directory, base, compress, legacy_revision)?;
+    }
+
+    validate_history_source(&lock.directory, path, compress, target_revision)?;
+
+    let candidates = spool_snapshot_sources(prefix, blocks, compress, &mut spool)?;
+    let selected = selected_spool_entries(&candidates)?;
     let result = atomic_write_in_directory(&lock.directory, path, |file| {
-        for record in &frames {
-            file.write_all(&(record.len() as u32).to_le_bytes())?;
-            file.write_all(record)?;
+        let mut buffer = vec![0u8; 64 * 1024];
+        for &index in selected.iter().rev() {
+            copy_spooled_record(
+                &mut spool,
+                file,
+                candidates.entries[index].record,
+                &mut buffer,
+            )?;
         }
         Ok(())
     });
 
+    let mut legacy_removal_succeeded = legacy_revision == HistoryRevision::Missing;
     if result.is_ok() && session_id.is_some() {
         // This tab's history now lives in its own file; the legacy shared file
-        // (which every tab used to overwrite on close) is superseded. Removing
-        // it also stops future new tabs from inheriting it.
-        if base != path && base.is_file() {
-            if let Err(error) = fs::remove_file(base) {
-                log::warn!(
-                    "remove superseded shared block history {}: {error}",
-                    base.display()
-                );
+        // is removed only when this save explicitly handled it by exact
+        // revision validation or replacement. A pane which loaded its own target must not
+        // consume an unrelated fallback source.
+        if base != path && legacy_should_consume && legacy_revision != HistoryRevision::Missing {
+            match remove_history_source_in_directory(&lock.directory, base, legacy_revision) {
+                Ok(()) => legacy_removal_succeeded = true,
+                Err(error) => {
+                    log::warn!(
+                        "could not remove superseded shared block history {}; its exact revision will be retried: {error}",
+                        base.display()
+                    );
+                }
             }
         }
-        prune_stale_session_histories(base, path, STALE_SESSION_HISTORY_MAX_AGE);
     }
     result?;
+    let (legacy_handled, legacy_retry_revision) = legacy_removal_state(
+        base != path && legacy_should_consume,
+        legacy_revision,
+        legacy_removal_succeeded,
+    );
     let (_, metadata) =
         open_history_file_in_directory(&lock.directory, path)?.ok_or_else(|| {
             io::Error::new(
@@ -1315,6 +2045,8 @@ fn write_history_snapshot(
     Ok(SaveHistoryOutcome {
         revision: HistoryRevision::from_metadata(&metadata),
         authoritative,
+        legacy_handled,
+        legacy_retry_revision,
     })
 }
 
@@ -1351,28 +2083,31 @@ impl TermView {
             Some(sid) => per_session_history_path(&base, sid),
             None => base.clone(),
         };
-        let mut blocks = snapshot_live_blocks_bounded(
+        let blocks = snapshot_live_blocks_bounded(
             &self.block_data.borrow(),
             max_blocks,
             MAX_DECODED_RECORD_BYTES,
-            MAX_HISTORY_DECODED_BYTES,
+            MAX_HISTORY_DECODED_BYTES.saturating_sub(std::mem::size_of::<Vec<BlockData>>() as u64),
         );
-        let load_applied = self.history_load.applied.load(Ordering::Acquire);
-        let load_discarded = self.history_load.discarded.load(Ordering::Acquire);
+        let explicit_replace_epoch = self.history_load.pending_explicit_replace_epoch();
+        let pre_apply_save_lease = explicit_replace_epoch
+            .is_none()
+            .then(|| self.history_load.acquire_pre_apply_save_lease())
+            .flatten();
+        let estimated_bytes = estimated_snapshot_retained_bytes(&blocks, blocks.capacity());
         let history_load = Arc::clone(&self.history_load);
         let key = PersistenceKey::for_path("block-history", &path);
-        persistence::enqueue(key, "Save Block history", move || {
-            if !load_applied && !load_discarded {
+        persistence::enqueue_weighted(key, "Save Block history", estimated_bytes, move || {
+            let _pre_apply_save_lease = pre_apply_save_lease;
+            let loaded_for_save = if _pre_apply_save_lease.is_some() {
+                if history_load.discarded.load(Ordering::Acquire) {
+                    // Clear/teardown queued a replacement snapshot after
+                    // discarding this load. Never let the earlier UI snapshot
+                    // resurrect history that the user just removed.
+                    return Ok(());
+                }
                 match history_load.outcome() {
-                    HistoryLoadOutcome::Loaded(loaded) => {
-                        let mut merged = loaded_prefix_for_live(
-                            loaded.blocks.as_ref(),
-                            blocks.len(),
-                            max_blocks,
-                        );
-                        merged.append(&mut blocks);
-                        blocks = merged;
-                    }
+                    HistoryLoadOutcome::Loaded(loaded) => Some(loaded),
                     HistoryLoadOutcome::Failed { kind, message } => {
                         return Err(io::Error::new(
                             kind,
@@ -1387,21 +2122,54 @@ impl TermView {
                             "Block history save reached the worker before its earlier load",
                         ));
                     }
-                    HistoryLoadOutcome::Idle => {}
+                    HistoryLoadOutcome::Idle => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "pre-apply Block history outcome was consumed before its save lease",
+                        ));
+                    }
                 }
-            }
-            let expected_revision = history_load.revision();
-            let outcome = write_history_snapshot(
+            } else {
+                None
+            };
+            let loaded_prefix = loaded_for_save.as_ref().map_or(&[][..], |loaded| {
+                let available = max_blocks.saturating_sub(blocks.len());
+                let start = loaded.blocks.len().saturating_sub(available);
+                &loaded.blocks[start..]
+            });
+            debug_assert!(
+                estimated_history_save_working_bytes(MAX_HISTORY_SAVE_CANDIDATE_RECORDS)
+                    <= HISTORY_SAVE_WORKING_ESTIMATED_BYTES
+            );
+            let _working_reservation =
+                persistence::try_reserve_estimated_bytes(HISTORY_SAVE_WORKING_ESTIMATED_BYTES)?;
+            let intent = explicit_replace_epoch.map_or_else(
+                || HistoryWriteIntent::Revision {
+                    target: history_load.revision(),
+                    legacy: history_load.legacy_authority(),
+                },
+                |_| HistoryWriteIntent::ExplicitReplace,
+            );
+            let outcome = write_history_snapshot_with_intent_parts(
                 &base,
                 &path,
                 session_id.as_deref(),
+                loaded_prefix,
                 &blocks,
                 compress,
-                expected_revision,
+                intent,
             )?;
-            // A stale merge cannot grant this pane deletion authority over
-            // records it never loaded. It remains merge-only until reload.
+            if let Some(epoch) = explicit_replace_epoch {
+                history_load.mark_explicit_replace_persisted(epoch);
+            }
+            // Only a complete, revision-matched snapshot grants deletion
+            // authority. Any later mismatch fails closed until reload.
             history_load.set_revision(outcome.authoritative.then_some(outcome.revision));
+            if outcome.legacy_handled {
+                history_load.set_legacy_authority(LegacyHistoryAuthority::Ignore);
+            } else if let Some(revision) = outcome.legacy_retry_revision {
+                history_load.set_legacy_authority(LegacyHistoryAuthority::Revision(revision));
+            }
             Ok(())
         })
     }
@@ -1444,7 +2212,8 @@ impl TermView {
         let load_for_job = Arc::clone(&self.history_load);
         let key = PersistenceKey::unique_for_path("block-history-load", &target);
         if let Err(error) = persistence::enqueue(key, "Load Block history", move || {
-            let result = read_history_snapshot(&base, session_id.as_deref(), compress, load_limit);
+            let result =
+                read_history_snapshot_reserved(&base, session_id.as_deref(), compress, load_limit);
             load_for_job.complete(&result);
             result.map(|_| ())
         }) {
@@ -1459,7 +2228,18 @@ impl TermView {
             let Some(view) = weak_view.upgrade() else {
                 return glib::ControlFlow::Break;
             };
+            if load_for_poll.discarded.load(Ordering::Acquire) {
+                view.history_load_poll_id.borrow_mut().take();
+                return glib::ControlFlow::Break;
+            }
             match load_for_poll.outcome() {
+                HistoryLoadOutcome::Idle
+                    if load_for_poll.applied.load(Ordering::Acquire)
+                        || load_for_poll.discarded.load(Ordering::Acquire) =>
+                {
+                    view.history_load_poll_id.borrow_mut().take();
+                    glib::ControlFlow::Break
+                }
                 HistoryLoadOutcome::Idle | HistoryLoadOutcome::Pending => {
                     glib::ControlFlow::Continue
                 }
@@ -1467,7 +2247,7 @@ impl TermView {
                     if !load_for_poll.discarded.load(Ordering::Acquire) {
                         view.apply_loaded_history(&loaded);
                     }
-                    load_for_poll.applied.store(true, Ordering::Release);
+                    load_for_poll.mark_applied_and_consume();
                     view.history_load_poll_id.borrow_mut().take();
                     glib::ControlFlow::Break
                 }
@@ -1476,7 +2256,7 @@ impl TermView {
                     // A later save may still succeed (for example, a removable
                     // drive was remounted). Pre-load shutdown saves preserve the
                     // unreadable file; subsequent user mutations may retry it.
-                    load_for_poll.applied.store(true, Ordering::Release);
+                    load_for_poll.mark_applied_and_consume();
                     view.history_load_poll_id.borrow_mut().take();
                     glib::ControlFlow::Break
                 }
@@ -1492,6 +2272,35 @@ impl TermView {
         if restored.is_empty() {
             return;
         }
+        self.clear_find();
+
+        let retention_plan = {
+            let finished = self.finished_blocks.borrow();
+            super::plan_completed_block_retention_with_restored(&restored, &finished, max_blocks)
+        };
+        super::log_completed_block_retention("restoring persisted block history", retention_plan);
+        let restored_evictions = retention_plan.evict_prefix.min(restored.len());
+        restored.drain(..restored_evictions);
+        let live_evictions = retention_plan
+            .evict_prefix
+            .saturating_sub(restored_evictions);
+        super::evict_finished_block_prefix(
+            live_evictions,
+            &self.finished_blocks,
+            &self.block_data,
+            &self.block_list,
+            &self.widget_pool,
+            super::BlockRemovalRefs {
+                selection: super::BlockSelectionRefs {
+                    ids: &self.selected_block_ids,
+                    active: &self.selected_block_id,
+                    anchor: &self.selection_anchor_id,
+                },
+                bookmarks: &self.bookmarks,
+                visible_indices: &self.visible_indices,
+                failure_marker_redraw: self.failure_marker_redraw.as_ref(),
+            },
+        );
 
         let skipped = loaded.total_loaded.saturating_sub(restored.len());
         if skipped > 0 {
@@ -1626,12 +2435,18 @@ impl TermView {
 mod tests {
     use super::{
         absolute_history_path, atomic_write, choose_load_path, decode_block_record,
-        decode_zstd_bounded, encode_history_frames_bounded, history_load_limit,
-        loaded_prefix_for_live, lock_file_name, per_session_history_path,
-        prune_stale_session_histories, push_bounded_back, read_history_records,
-        read_history_snapshot, refresh_loaded_block_ids, snapshot_live_blocks_bounded,
-        write_history_snapshot, BlockData, HistoryFileLock, HistoryRevision, UndecodablePolicy,
+        decode_zstd_bounded, encode_history_frames_bounded, estimated_history_save_working_bytes,
+        estimated_loaded_block_owned_bytes, history_load_limit, loaded_prefix_for_live,
+        lock_file_name, per_session_history_path, prune_stale_session_histories, push_bounded_back,
+        push_loaded_record_bounded, read_history_records, read_history_snapshot,
+        read_history_snapshot_reserved, read_history_snapshot_with_retained_budget,
+        refresh_loaded_block_ids, snapshot_live_blocks_bounded, write_history_snapshot,
+        write_history_snapshot_with_intent, write_history_snapshot_with_intent_parts, BlockData,
+        HistoryFileLock, HistoryLoadOutcome, HistoryLoadShared, HistoryRevision,
+        HistoryWriteIntent, LegacyHistoryAuthority, LoadedHistory, UndecodablePolicy,
+        HISTORY_LOAD_TRANSIENT_ESTIMATED_BYTES, HISTORY_SAVE_WORKING_ESTIMATED_BYTES,
         MAX_ENCODED_RECORD_BYTES, MAX_HISTORY_COMMAND_BYTES, MAX_HISTORY_FILE_BYTES,
+        MAX_HISTORY_SAVE_CANDIDATE_RECORDS,
     };
     use std::collections::VecDeque;
     use std::ffi::CString;
@@ -1640,6 +2455,7 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     struct TestDir(PathBuf);
@@ -1696,6 +2512,116 @@ mod tests {
     }
 
     #[test]
+    fn four_default_history_results_leave_room_for_one_decoder() {
+        let blocks: Vec<_> = (0..200)
+            .map(|id| sample_block(id, "printf small"))
+            .collect();
+        let candidates: Vec<_> = blocks
+            .iter()
+            .map(|block| (block.id, estimated_loaded_block_owned_bytes(block)))
+            .collect();
+        let plan = super::completed_block_retention_plan(
+            &candidates,
+            200,
+            super::MAX_COMPLETED_BLOCK_RETAINED_BYTES,
+        );
+
+        assert_eq!(plan.retained_count, 200);
+        let four_results_and_one_decoder = plan
+            .retained_estimated_bytes
+            .saturating_mul(4)
+            .saturating_add(HISTORY_LOAD_TRANSIENT_ESTIMATED_BYTES);
+        assert!(
+            four_results_and_one_decoder <= crate::persistence::MAX_PENDING_ESTIMATED_BYTES,
+            "four default panes plus the single worker's decoder need {four_results_and_one_decoder} bytes"
+        );
+    }
+
+    #[test]
+    fn streaming_pre_apply_save_fits_the_global_ledger_at_product_maxima() {
+        let total = (super::MAX_HISTORY_DECODED_BYTES as usize)
+            .saturating_add(super::MAX_COMPLETED_BLOCK_RETAINED_BYTES)
+            .saturating_add(HISTORY_SAVE_WORKING_ESTIMATED_BYTES);
+        assert_eq!(total, crate::persistence::MAX_PENDING_ESTIMATED_BYTES);
+    }
+
+    #[test]
+    fn save_working_estimate_covers_the_max_snapshot_and_saturates() {
+        let maximum = estimated_history_save_working_bytes(MAX_HISTORY_SAVE_CANDIDATE_RECORDS);
+        assert!(maximum <= HISTORY_SAVE_WORKING_ESTIMATED_BYTES);
+        assert_eq!(estimated_history_save_working_bytes(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn loaded_owner_estimate_covers_vecdeque_to_vec_inline_peak() {
+        let mut block = sample_block(1, "owner-cost");
+        block.output = String::with_capacity(4096);
+        block.output.push_str("payload");
+        let string_capacities = block
+            .prompt
+            .capacity()
+            .saturating_add(block.cmd.capacity())
+            .saturating_add(block.cmd_markup.as_ref().map_or(0, String::capacity))
+            .saturating_add(block.output.capacity())
+            .saturating_add(block.cwd.as_ref().map_or(0, String::capacity));
+        let expected = std::mem::size_of::<BlockData>()
+            .saturating_mul(3)
+            .saturating_add(std::mem::size_of::<usize>().saturating_mul(2))
+            .saturating_add(string_capacities);
+
+        assert_eq!(estimated_loaded_block_owned_bytes(&block), expected);
+    }
+
+    #[test]
+    fn failed_legacy_unlink_retains_exact_retry_authority() {
+        let revision = HistoryRevision::Present {
+            device: 1,
+            inode: 2,
+            len: 3,
+            modified_seconds: 4,
+            modified_nanoseconds: 5,
+        };
+        assert_eq!(
+            super::legacy_removal_state(true, revision, false),
+            (false, Some(revision))
+        );
+        assert_eq!(
+            super::legacy_removal_state(true, revision, true),
+            (true, None)
+        );
+        assert_eq!(
+            super::legacy_removal_state(true, HistoryRevision::Missing, false),
+            (true, None)
+        );
+    }
+
+    #[test]
+    fn applied_outcome_waits_for_pre_apply_save_lease_before_releasing_loaded_arc() {
+        let shared = Arc::new(HistoryLoadShared::default());
+        shared.begin();
+        let lease = shared.acquire_pre_apply_save_lease().unwrap();
+        let loaded = Arc::new(LoadedHistory {
+            blocks: Arc::new(vec![sample_block(1, "loaded")]),
+            total_loaded: 1,
+            target_revision: Some(HistoryRevision::Missing),
+            legacy_authority: LegacyHistoryAuthority::Ignore,
+            retained_estimated_bytes: 123,
+            _reservation: None,
+        });
+        let weak = Arc::downgrade(&loaded);
+        shared.complete(&Ok(Arc::clone(&loaded)));
+        drop(loaded);
+
+        shared.mark_applied_and_consume();
+        assert!(matches!(shared.outcome(), HistoryLoadOutcome::Loaded(_)));
+        assert!(weak.upgrade().is_some());
+
+        drop(lease);
+        assert!(matches!(shared.outcome(), HistoryLoadOutcome::Idle));
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
     fn live_history_snapshot_is_bounded_before_cloning() {
         let blocks = VecDeque::from([
             sample_block(1, "oldest"),
@@ -1706,6 +2632,7 @@ mod tests {
         let captured =
             snapshot_live_blocks_bounded(&blocks, 100, one_record_budget, one_record_budget);
         assert_eq!(captured.len(), 1);
+        assert_eq!(captured.capacity(), captured.len());
         assert_eq!(captured[0].cmd, "newest");
         assert_eq!(
             snapshot_live_blocks_bounded(&blocks, 0, 1_000, 1_000).len(),
@@ -1815,6 +2742,150 @@ mod tests {
         push_bounded_back(&mut items, 1, 0);
 
         assert!(items.is_empty());
+    }
+
+    #[test]
+    fn incremental_loaded_record_retention_honors_exact_over_and_tiny_budgets() {
+        let first = sample_block(1, "first");
+        let second = sample_block(2, "second");
+        let first_cost = estimated_loaded_block_owned_bytes(&first);
+        let second_cost = estimated_loaded_block_owned_bytes(&second);
+        let exact = first_cost.checked_add(second_cost).unwrap();
+
+        let mut blocks = VecDeque::new();
+        let mut costs = VecDeque::new();
+        let mut retained = 0;
+        assert_eq!(
+            push_loaded_record_bounded(
+                &mut blocks,
+                &mut costs,
+                first.clone(),
+                10,
+                exact,
+                &mut retained,
+            ),
+            0
+        );
+        assert_eq!(
+            push_loaded_record_bounded(
+                &mut blocks,
+                &mut costs,
+                second.clone(),
+                10,
+                exact,
+                &mut retained,
+            ),
+            0
+        );
+        assert_eq!(retained, exact);
+
+        let mut blocks = VecDeque::new();
+        let mut costs = VecDeque::new();
+        let mut retained = 0;
+        push_loaded_record_bounded(&mut blocks, &mut costs, first, 10, exact - 1, &mut retained);
+        assert_eq!(
+            push_loaded_record_bounded(
+                &mut blocks,
+                &mut costs,
+                second.clone(),
+                10,
+                exact - 1,
+                &mut retained,
+            ),
+            1
+        );
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].cmd, "second");
+        assert_eq!(retained, second_cost);
+
+        let mut blocks = VecDeque::new();
+        let mut costs = VecDeque::new();
+        let mut retained = 0;
+        assert_eq!(
+            push_loaded_record_bounded(
+                &mut blocks,
+                &mut costs,
+                second,
+                10,
+                second_cost - 1,
+                &mut retained,
+            ),
+            1
+        );
+        assert!(blocks.is_empty());
+        assert_eq!(retained, 0);
+
+        let mut blocks = VecDeque::new();
+        let mut costs = VecDeque::new();
+        let mut retained = 0;
+        assert_eq!(
+            push_loaded_record_bounded(
+                &mut blocks,
+                &mut costs,
+                sample_block(3, "count-old"),
+                1,
+                usize::MAX,
+                &mut retained,
+            ),
+            0
+        );
+        assert_eq!(
+            push_loaded_record_bounded(
+                &mut blocks,
+                &mut costs,
+                sample_block(4, "count-new"),
+                1,
+                usize::MAX,
+                &mut retained,
+            ),
+            1,
+            "count truncation must revoke deletion authority just like byte truncation"
+        );
+        assert_eq!(blocks[0].cmd, "count-new");
+
+        let mut zero_retained = 0;
+        assert_eq!(
+            push_loaded_record_bounded(
+                &mut VecDeque::new(),
+                &mut VecDeque::new(),
+                sample_block(5, "zero-count"),
+                0,
+                usize::MAX,
+                &mut zero_retained,
+            ),
+            1
+        );
+
+        let mut blocks = VecDeque::new();
+        let mut costs = VecDeque::new();
+        let mut retained = 0;
+        for id in 10..13 {
+            assert_eq!(
+                push_loaded_record_bounded(
+                    &mut blocks,
+                    &mut costs,
+                    sample_block(id, "existing"),
+                    3,
+                    usize::MAX,
+                    &mut retained,
+                ),
+                0
+            );
+        }
+        assert_eq!(
+            push_loaded_record_bounded(
+                &mut blocks,
+                &mut costs,
+                sample_block(13, "cannot-fit"),
+                3,
+                0,
+                &mut retained,
+            ),
+            4,
+            "one count eviction plus two remaining records and the rejected incoming record are four distinct omissions"
+        );
+        assert!(blocks.is_empty());
+        assert_eq!(retained, 0);
     }
 
     #[test]
@@ -2114,12 +3185,67 @@ mod tests {
     }
 
     #[test]
+    fn saving_one_session_never_prunes_an_old_sibling() {
+        let dir = TestDir::new("no-runtime-sibling-prune");
+        let base = dir.path().join("blocks.bin");
+        let session_a = per_session_history_path(&base, "sid-a");
+        let session_b = per_session_history_path(&base, "sid-b");
+        write_history_snapshot(
+            &base,
+            &session_b,
+            Some("sid-b"),
+            &[sample_block(1, "session-b")],
+            false,
+            Some(HistoryRevision::Missing),
+        )
+        .unwrap();
+        let old = SystemTime::now()
+            .checked_sub(Duration::from_secs(31 * 24 * 3600))
+            .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&session_b)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+
+        write_history_snapshot(
+            &base,
+            &session_a,
+            Some("sid-a"),
+            &[sample_block(2, "session-a")],
+            false,
+            Some(HistoryRevision::Missing),
+        )
+        .unwrap();
+
+        let restored =
+            read_history_records(&session_b, false, usize::MAX, UndecodablePolicy::Reject).unwrap();
+        assert_eq!(restored.blocks.len(), 1);
+        assert_eq!(restored.blocks[0].cmd, "session-b");
+    }
+
+    #[test]
     fn compressed_record_decode_enforces_output_limit() {
         let compressed = zstd::encode_all(&b"0123456789abcdef"[..], 1).unwrap();
 
         let error = decode_zstd_bounded(&compressed, 8).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn compressed_record_decode_rejects_an_oversized_window() {
+        let mut encoder = zstd::Encoder::new(Vec::new(), 1).unwrap();
+        encoder.window_log(25).unwrap();
+        encoder.include_contentsize(false).unwrap();
+        encoder.write_all(b"small payload").unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        assert!(
+            decode_zstd_bounded(&compressed, 1024).is_err(),
+            "a frame advertising a 32 MiB window must exceed the 16 MiB decoder cap"
+        );
     }
 
     #[test]
@@ -2160,13 +3286,25 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read(&history).unwrap(), original);
+
+        let clear_error = write_history_snapshot_with_intent(
+            &history,
+            &history,
+            None,
+            &[],
+            false,
+            HistoryWriteIntent::ExplicitReplace,
+        )
+        .unwrap_err();
+        assert_eq!(clear_error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(fs::read(&history).unwrap(), original);
     }
 
     #[test]
-    fn stale_saves_merge_concurrent_additions_but_cannot_delete_them() {
-        let dir = TestDir::new("stale-merge");
+    fn stale_saves_fail_closed_without_resurrecting_cleared_history() {
+        let dir = TestDir::new("stale-fail-closed");
         let history = dir.path().join("history.bin");
         let baseline = sample_block(1, "baseline");
         let initial = write_history_snapshot(
@@ -2180,7 +3318,7 @@ mod tests {
         .unwrap();
 
         let first = vec![baseline.clone(), sample_block(2, "first-writer")];
-        write_history_snapshot(
+        let first_outcome = write_history_snapshot(
             &history,
             &history,
             None,
@@ -2189,8 +3327,9 @@ mod tests {
             Some(initial.revision),
         )
         .unwrap();
-        // This pane still believes the initial revision is current. Its absent
-        // first-writer block must not become a deletion.
+        // This pane still believes the initial revision is current. Refusing
+        // the whole write is the only safe choice without a persisted common
+        // Clear generation: a union could revive explicitly removed records.
         let second = vec![
             BlockData { id: 99, ..baseline },
             sample_block(3, "stale-writer"),
@@ -2203,8 +3342,8 @@ mod tests {
             false,
             Some(initial.revision),
         )
-        .unwrap();
-        assert!(!stale.authoritative);
+        .unwrap_err();
+        assert_eq!(stale.kind(), io::ErrorKind::WouldBlock);
 
         let loaded =
             read_history_records(&history, false, usize::MAX, UndecodablePolicy::Reject).unwrap();
@@ -2214,11 +3353,470 @@ mod tests {
                 .iter()
                 .map(|block| block.cmd.as_str())
                 .collect::<Vec<_>>(),
-            ["baseline", "first-writer", "stale-writer"]
+            ["baseline", "first-writer"]
         );
 
-        write_history_snapshot(&history, &history, None, &[], false, Some(stale.revision)).unwrap();
+        let cleared = write_history_snapshot_with_intent(
+            &history,
+            &history,
+            None,
+            &[],
+            false,
+            HistoryWriteIntent::ExplicitReplace,
+        )
+        .unwrap();
         assert_eq!(fs::metadata(&history).unwrap().len(), 0);
+
+        let stale_after_clear = write_history_snapshot(
+            &history,
+            &history,
+            None,
+            &second,
+            false,
+            Some(first_outcome.revision),
+        )
+        .unwrap_err();
+        assert_eq!(stale_after_clear.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::metadata(&history).unwrap().len(), 0);
+
+        let new_after_clear = vec![sample_block(4, "new-after-clear")];
+        write_history_snapshot(
+            &history,
+            &history,
+            None,
+            &new_after_clear,
+            false,
+            Some(cleared.revision),
+        )
+        .unwrap();
+        let stale_after_new = write_history_snapshot(
+            &history,
+            &history,
+            None,
+            &second,
+            false,
+            Some(first_outcome.revision),
+        )
+        .unwrap_err();
+        assert_eq!(stale_after_new.kind(), io::ErrorKind::WouldBlock);
+        let reloaded =
+            read_history_records(&history, false, usize::MAX, UndecodablePolicy::Reject).unwrap();
+        assert_eq!(reloaded.blocks.len(), 1);
+        assert_eq!(reloaded.blocks[0].cmd, "new-after-clear");
+    }
+
+    #[test]
+    fn pressure_truncated_legacy_load_cannot_delete_unloaded_disk_records() {
+        let dir = TestDir::new("pressure-merge-only");
+        let base = dir.path().join("history.bin");
+        let session_id = "sid-pressure";
+        let session = per_session_history_path(&base, session_id);
+        let old = vec![
+            sample_block(1, "oldest"),
+            sample_block(2, "middle"),
+            sample_block(3, "newest-on-disk"),
+        ];
+        write_history_snapshot(
+            &base,
+            &base,
+            None,
+            &old,
+            false,
+            Some(HistoryRevision::Missing),
+        )
+        .unwrap();
+
+        // Models a worker whose transient decoder permit succeeded while
+        // queued/running work left no retained-result bytes available.
+        let loaded =
+            read_history_snapshot_with_retained_budget(&base, Some(session_id), false, 200, 0)
+                .unwrap();
+        assert!(loaded.blocks.is_empty());
+        assert_eq!(loaded.total_loaded, old.len());
+        assert_eq!(loaded.target_revision, None);
+
+        assert_eq!(loaded.legacy_authority, LegacyHistoryAuthority::MergeOnly);
+        let new = sample_block(4, "new-live-command");
+        let error = write_history_snapshot_with_intent(
+            &base,
+            &session,
+            Some(session_id),
+            std::slice::from_ref(&new),
+            false,
+            HistoryWriteIntent::Revision {
+                target: loaded.target_revision,
+                legacy: loaded.legacy_authority,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+        assert!(!session.exists());
+        let reloaded =
+            read_history_records(&base, false, usize::MAX, UndecodablePolicy::Reject).unwrap();
+        assert_eq!(
+            reloaded
+                .blocks
+                .iter()
+                .map(|block| block.cmd.as_str())
+                .collect::<Vec<_>>(),
+            ["oldest", "middle", "newest-on-disk"]
+        );
+        assert!(
+            base.exists(),
+            "an incompletely loaded legacy source must remain untouched"
+        );
+    }
+
+    #[test]
+    fn complete_legacy_migration_preserves_ui_deletions_and_removes_the_source() {
+        let dir = TestDir::new("complete-legacy-migration");
+        let base = dir.path().join("history.bin");
+        let session_id = "sid-migrate";
+        let session = per_session_history_path(&base, session_id);
+        let original = vec![sample_block(1, "keep"), sample_block(2, "delete")];
+        let initial = write_history_snapshot(
+            &base,
+            &base,
+            None,
+            &original,
+            false,
+            Some(HistoryRevision::Missing),
+        )
+        .unwrap();
+
+        let loaded = read_history_snapshot_with_retained_budget(
+            &base,
+            Some(session_id),
+            false,
+            200,
+            super::MAX_COMPLETED_BLOCK_RETAINED_BYTES,
+        )
+        .unwrap();
+        assert_eq!(loaded.target_revision, Some(HistoryRevision::Missing));
+        assert_eq!(
+            loaded.legacy_authority,
+            LegacyHistoryAuthority::Revision(initial.revision)
+        );
+        let retained = loaded
+            .blocks
+            .iter()
+            .filter(|block| block.cmd != "delete")
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let migrated = write_history_snapshot_with_intent(
+            &base,
+            &session,
+            Some(session_id),
+            &retained,
+            false,
+            HistoryWriteIntent::Revision {
+                target: loaded.target_revision,
+                legacy: loaded.legacy_authority,
+            },
+        )
+        .unwrap();
+        assert!(migrated.authoritative);
+        assert!(migrated.legacy_handled);
+        assert!(!base.exists());
+        let restored =
+            read_history_records(&session, false, usize::MAX, UndecodablePolicy::Reject).unwrap();
+        assert_eq!(restored.blocks.len(), 1);
+        assert_eq!(restored.blocks[0].cmd, "keep");
+    }
+
+    #[test]
+    fn changed_legacy_source_rejects_migration_without_swallowing_new_data() {
+        let dir = TestDir::new("changed-legacy-migration");
+        let base = dir.path().join("history.bin");
+        let session_id = "sid-changed";
+        let session = per_session_history_path(&base, session_id);
+        let original = vec![sample_block(1, "keep"), sample_block(2, "delete")];
+        let initial = write_history_snapshot(
+            &base,
+            &base,
+            None,
+            &original,
+            false,
+            Some(HistoryRevision::Missing),
+        )
+        .unwrap();
+        let loaded = read_history_snapshot_with_retained_budget(
+            &base,
+            Some(session_id),
+            false,
+            200,
+            super::MAX_COMPLETED_BLOCK_RETAINED_BYTES,
+        )
+        .unwrap();
+
+        let mut concurrent = original.clone();
+        concurrent.push(sample_block(3, "concurrent"));
+        write_history_snapshot(
+            &base,
+            &base,
+            None,
+            &concurrent,
+            false,
+            Some(initial.revision),
+        )
+        .unwrap();
+
+        let retained = loaded
+            .blocks
+            .iter()
+            .filter(|block| block.cmd != "delete")
+            .cloned()
+            .collect::<Vec<_>>();
+        let error = write_history_snapshot_with_intent(
+            &base,
+            &session,
+            Some(session_id),
+            &retained,
+            false,
+            HistoryWriteIntent::Revision {
+                target: loaded.target_revision,
+                legacy: loaded.legacy_authority,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(!session.exists());
+        let restored =
+            read_history_records(&base, false, usize::MAX, UndecodablePolicy::Reject).unwrap();
+        assert_eq!(
+            restored
+                .blocks
+                .iter()
+                .map(|block| block.cmd.as_str())
+                .collect::<Vec<_>>(),
+            ["keep", "delete", "concurrent"]
+        );
+    }
+
+    #[test]
+    fn two_sessions_can_migrate_the_same_consumed_legacy_revision() {
+        let dir = TestDir::new("parallel-legacy-migration");
+        let base = dir.path().join("history.bin");
+        let session_a = per_session_history_path(&base, "sid-a");
+        let session_b = per_session_history_path(&base, "sid-b");
+        let original = vec![sample_block(1, "legacy")];
+        write_history_snapshot(
+            &base,
+            &base,
+            None,
+            &original,
+            false,
+            Some(HistoryRevision::Missing),
+        )
+        .unwrap();
+        let loaded_a = read_history_snapshot_with_retained_budget(
+            &base,
+            Some("sid-a"),
+            false,
+            200,
+            super::MAX_COMPLETED_BLOCK_RETAINED_BYTES,
+        )
+        .unwrap();
+        let loaded_b = read_history_snapshot_with_retained_budget(
+            &base,
+            Some("sid-b"),
+            false,
+            200,
+            super::MAX_COMPLETED_BLOCK_RETAINED_BYTES,
+        )
+        .unwrap();
+
+        for (session_id, session, loaded) in [
+            ("sid-a", &session_a, &loaded_a),
+            ("sid-b", &session_b, &loaded_b),
+        ] {
+            write_history_snapshot_with_intent(
+                &base,
+                session,
+                Some(session_id),
+                loaded.blocks.as_ref(),
+                false,
+                HistoryWriteIntent::Revision {
+                    target: loaded.target_revision,
+                    legacy: loaded.legacy_authority,
+                },
+            )
+            .unwrap();
+        }
+
+        assert!(!base.exists());
+        for session in [&session_a, &session_b] {
+            let restored =
+                read_history_records(session, false, usize::MAX, UndecodablePolicy::Reject)
+                    .unwrap();
+            assert_eq!(restored.blocks.len(), 1);
+            assert_eq!(restored.blocks[0].cmd, "legacy");
+        }
+    }
+
+    #[test]
+    fn authoritative_save_preserves_identical_event_multiplicity() {
+        let dir = TestDir::new("duplicate-events");
+        let history = dir.path().join("history.bin");
+        let event = sample_block(7, "same");
+        write_history_snapshot(
+            &history,
+            &history,
+            None,
+            &[event.clone(), event],
+            false,
+            Some(HistoryRevision::Missing),
+        )
+        .unwrap();
+
+        let restored =
+            read_history_records(&history, false, usize::MAX, UndecodablePolicy::Reject).unwrap();
+        assert_eq!(restored.blocks.len(), 2);
+        assert!(restored.blocks.iter().all(|block| block.cmd == "same"));
+        assert!(restored.blocks.iter().all(|block| block.id == 7));
+    }
+
+    #[test]
+    fn pre_apply_save_streams_loaded_prefix_before_live_snapshot() {
+        let dir = TestDir::new("stream-prefix-live");
+        let history = dir.path().join("history.bin");
+        let prefix = vec![sample_block(1, "loaded-old"), sample_block(2, "loaded-new")];
+        let live = vec![sample_block(3, "live")];
+        write_history_snapshot_with_intent_parts(
+            &history,
+            &history,
+            None,
+            &prefix,
+            &live,
+            false,
+            HistoryWriteIntent::Revision {
+                target: Some(HistoryRevision::Missing),
+                legacy: LegacyHistoryAuthority::Ignore,
+            },
+        )
+        .unwrap();
+
+        let restored =
+            read_history_records(&history, false, usize::MAX, UndecodablePolicy::Reject).unwrap();
+        assert_eq!(
+            restored
+                .blocks
+                .iter()
+                .map(|block| block.cmd.as_str())
+                .collect::<Vec<_>>(),
+            ["loaded-old", "loaded-new", "live"]
+        );
+    }
+
+    #[test]
+    fn reserved_load_keeps_a_valid_large_newest_record_for_ui_retention() {
+        let dir = TestDir::new("large-result-owner-cost");
+        let history = dir.path().join("history.bin");
+        let mut block = sample_block(8, "large-output");
+        block.output = "x".repeat(super::MAX_HISTORY_OUTPUT_BYTES);
+        let ui_cost = block.estimated_restored_retained_bytes();
+        let owner_cost = estimated_loaded_block_owned_bytes(&block);
+        assert!(
+            ui_cost > owner_cost,
+            "future bounded VTE/widget cost must stay separate from BlockData ownership"
+        );
+        assert!(ui_cost <= super::MAX_COMPLETED_BLOCK_RETAINED_BYTES);
+        assert!(owner_cost < super::MAX_COMPLETED_BLOCK_RETAINED_BYTES);
+        write_history_snapshot(
+            &history,
+            &history,
+            None,
+            std::slice::from_ref(&block),
+            false,
+            Some(HistoryRevision::Missing),
+        )
+        .unwrap();
+
+        let loaded = read_history_snapshot_reserved(&history, None, false, 200).unwrap();
+        assert_eq!(loaded.blocks.len(), 1);
+        assert_eq!(
+            loaded.blocks[0].output.len(),
+            super::MAX_HISTORY_OUTPUT_BYTES
+        );
+        assert!(loaded.retained_estimated_bytes <= super::MAX_COMPLETED_BLOCK_RETAINED_BYTES);
+    }
+
+    #[test]
+    fn explicit_clear_replaces_history_after_a_low_budget_load() {
+        let dir = TestDir::new("pressure-explicit-clear");
+        let history = dir.path().join("history.bin");
+        let old = vec![sample_block(1, "oldest"), sample_block(2, "newest")];
+        write_history_snapshot(
+            &history,
+            &history,
+            None,
+            &old,
+            false,
+            Some(HistoryRevision::Missing),
+        )
+        .unwrap();
+
+        let loaded =
+            read_history_snapshot_with_retained_budget(&history, None, false, 200, 0).unwrap();
+        assert!(loaded.blocks.is_empty());
+        assert_eq!(loaded.target_revision, None);
+
+        let cleared = write_history_snapshot_with_intent(
+            &history,
+            &history,
+            None,
+            &[],
+            false,
+            HistoryWriteIntent::ExplicitReplace,
+        )
+        .unwrap();
+        assert!(cleared.authoritative);
+        let reloaded =
+            read_history_records(&history, false, usize::MAX, UndecodablePolicy::Reject).unwrap();
+        assert!(reloaded.blocks.is_empty());
+    }
+
+    #[test]
+    fn failed_pending_load_cannot_erase_explicit_clear_intent() {
+        let dir = TestDir::new("failed-load-explicit-clear");
+        let history = dir.path().join("history.bin");
+        write_history_snapshot(
+            &history,
+            &history,
+            None,
+            &[sample_block(1, "old")],
+            false,
+            Some(HistoryRevision::Missing),
+        )
+        .unwrap();
+
+        let shared = HistoryLoadShared::default();
+        shared.begin();
+        shared.discard_for_explicit_clear();
+        let epoch = shared.pending_explicit_replace_epoch().unwrap();
+        let failed: io::Result<Arc<LoadedHistory>> = Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "decoder permit unavailable",
+        ));
+        shared.complete(&failed);
+        assert_eq!(shared.pending_explicit_replace_epoch(), Some(epoch));
+
+        write_history_snapshot_with_intent(
+            &history,
+            &history,
+            None,
+            &[],
+            false,
+            HistoryWriteIntent::ExplicitReplace,
+        )
+        .unwrap();
+        shared.mark_explicit_replace_persisted(epoch);
+        assert_eq!(shared.pending_explicit_replace_epoch(), None);
+        let reloaded =
+            read_history_records(&history, false, usize::MAX, UndecodablePolicy::Reject).unwrap();
+        assert!(reloaded.blocks.is_empty());
     }
 
     #[test]

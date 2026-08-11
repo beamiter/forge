@@ -321,6 +321,7 @@ dependencies = [
  "once_cell",
  "pcre2-sys",
  "regex",
+ "regex-syntax",
  "rkyv",
  "serde",
  "serde_json",

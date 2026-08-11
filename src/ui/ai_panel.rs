@@ -238,12 +238,14 @@ impl AiPanel {
         let actions_btn = MenuButton::new();
         actions_btn.set_icon_name("view-more-symbolic");
         actions_btn.set_tooltip_text(Some("Chat actions"));
+        actions_btn.update_property(&[gtk4::accessible::Property::Label("Chat actions")]);
         actions_btn.set_popover(Some(&actions_popover));
         actions_btn.add_css_class("flat");
         actions_btn.add_css_class("ai-chat-header-button");
 
         let close_btn = Button::from_icon_name("window-close-symbolic");
         close_btn.set_tooltip_text(Some("Close AI panel"));
+        close_btn.update_property(&[gtk4::accessible::Property::Label("Close AI panel")]);
         close_btn.set_focus_on_click(false);
         close_btn.add_css_class("flat");
         close_btn.add_css_class("ai-chat-header-button");

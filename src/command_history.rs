@@ -42,6 +42,10 @@ static APPEND_COUNT: AtomicU64 = AtomicU64::new(0);
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static HISTORY_WRITER: OnceLock<Result<mpsc::SyncSender<WriterMessage>, String>> = OnceLock::new();
 
+fn recent_tail_truncated(file_len: u64) -> bool {
+    file_len > READ_RECENT_TAIL_BYTES
+}
+
 fn validate_history_path(path: &Path) -> io::Result<()> {
     if !path.is_absolute() {
         return Err(io::Error::new(
@@ -797,14 +801,33 @@ fn read_recent_from<R: Read + Seek>(
     Ok(records)
 }
 
+pub(crate) struct RecentHistory {
+    pub(crate) records: Vec<CommandHistoryRecord>,
+    /// True when older bytes existed outside the synchronous 4 MiB tail window.
+    /// Consumers must not describe a short result as the complete history then.
+    pub(crate) tail_truncated: bool,
+}
+
 /// Read newest-first from a bounded tail window, deduplicating commands while
-/// retaining newest metadata. Corrupt, oversized, incomplete, and unsafe
-/// review-only records are ignored.
-pub fn read_recent(path: &Path, max_entries: usize) -> io::Result<Vec<CommandHistoryRecord>> {
+/// retaining newest metadata and reporting whether older bytes were skipped.
+/// Corrupt, oversized, incomplete, and unsafe review-only records are ignored.
+pub(crate) fn read_recent_with_status(
+    path: &Path,
+    max_entries: usize,
+) -> io::Result<RecentHistory> {
     validate_history_path(path)?;
     let mut input = open_history_for_read(path)?;
     let file_len = input.metadata()?.len();
-    read_recent_from(&mut input, file_len, max_entries)
+    let records = read_recent_from(&mut input, file_len, max_entries)?;
+    Ok(RecentHistory {
+        records,
+        tail_truncated: recent_tail_truncated(file_len),
+    })
+}
+
+/// Compatibility wrapper for consumers which only need the recent records.
+pub fn read_recent(path: &Path, max_entries: usize) -> io::Result<Vec<CommandHistoryRecord>> {
+    read_recent_with_status(path, max_entries).map(|recent| recent.records)
 }
 
 #[cfg(test)]
@@ -1050,6 +1073,9 @@ mod tests {
 
     #[test]
     fn read_recent_reads_only_the_bounded_tail() {
+        assert!(!recent_tail_truncated(READ_RECENT_TAIL_BYTES));
+        assert!(recent_tail_truncated(READ_RECENT_TAIL_BYTES + 1));
+
         let mut contents = vec![b'x'; READ_RECENT_TAIL_BYTES as usize + 64 * 1024];
         contents.extend_from_slice(
             b"\n{\"command\":\"older\",\"exit_code\":0}\n{\"command\":\"newer\",\"exit_code\":0}\n",

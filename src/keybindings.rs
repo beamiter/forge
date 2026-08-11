@@ -11,6 +11,20 @@
 use crate::core_keybindings::{is_unbind_token, parse, Chord};
 use std::collections::HashMap;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeybindingOverrideIssue {
+    /// Key inside `[keybindings]`, without the table prefix.
+    pub(crate) key: String,
+    pub(crate) message: String,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedOverride {
+    key: String,
+    action: Action,
+    chord: Option<Chord>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Action {
     NewTab,
@@ -488,56 +502,152 @@ impl KeybindingMap {
         KeybindingMap { bindings }
     }
 
-    pub(crate) fn apply_user_overrides(&mut self, table: &toml::Table) {
+    /// Build the complete effective map from defaults and a user table.
+    ///
+    /// Configuration validation and runtime loading deliberately call this same
+    /// path so a table accepted by `--check-config` cannot later be interpreted
+    /// differently by the application.
+    pub(crate) fn from_user_overrides(
+        table: &toml::Table,
+    ) -> Result<Self, Vec<KeybindingOverrideIssue>> {
+        let mut map = Self::from_defaults();
+        map.apply_user_overrides(table)?;
+        Ok(map)
+    }
+
+    /// Atomically apply a complete `[keybindings]` table.
+    ///
+    /// Every overridden action is removed from a candidate map before any new
+    /// chord is checked. This permits intentional swaps and transfers when both
+    /// sides are present in the same table, while rejecting an override that
+    /// steals a chord from an unchanged default. `self` is unchanged on every
+    /// error, including parse/type errors and effective-map collisions.
+    pub(crate) fn apply_user_overrides(
+        &mut self,
+        table: &toml::Table,
+    ) -> Result<(), Vec<KeybindingOverrideIssue>> {
+        let mut issues = Vec::new();
+        let mut parsed = Vec::new();
+        let mut overridden_actions: HashMap<Action, String> = HashMap::new();
+
         for (config_key, value) in table {
-            let display_key = crate::review_input::safe_inline_display(config_key, 512);
             let Some(action) = Action::from_config_key(config_key) else {
-                log::warn!("Unknown keybinding action: {display_key}");
+                issues.push(KeybindingOverrideIssue {
+                    key: config_key.clone(),
+                    message: "unknown action".to_string(),
+                });
                 continue;
             };
+
+            if let Some(previous) = overridden_actions.insert(action, config_key.clone()) {
+                issues.push(KeybindingOverrideIssue {
+                    key: config_key.clone(),
+                    message: format!(
+                        "duplicates keybindings.{previous}; both names configure '{}'",
+                        action.name()
+                    ),
+                });
+                continue;
+            }
+
             // `false` and the shared unbind tokens (empty string, "false",
             // "none", "disabled", "unbind") intentionally leave the action
             // unbound. This makes it possible to resolve a desktop/window-
             // manager conflict without inventing a dummy chord.
             if value.as_bool() == Some(false) {
-                self.bindings.retain(|_, a| *a != action);
+                parsed.push(ParsedOverride {
+                    key: config_key.clone(),
+                    action,
+                    chord: None,
+                });
                 continue;
             }
             let Some(key_str) = value.as_str() else {
-                log::warn!("Keybinding value for {display_key} must be a chord string or false");
+                issues.push(KeybindingOverrideIssue {
+                    key: config_key.clone(),
+                    message: "expected a chord string or false".to_string(),
+                });
                 continue;
             };
             if is_unbind_token(key_str) {
-                self.bindings.retain(|_, a| *a != action);
+                parsed.push(ParsedOverride {
+                    key: config_key.clone(),
+                    action,
+                    chord: None,
+                });
                 continue;
             }
 
             let chord = match parse(key_str) {
                 Ok(chord) => chord,
                 Err(e) => {
-                    // A typo must not silently make the action unreachable.
-                    let display_value = crate::review_input::safe_inline_display(key_str, 512);
-                    log::warn!("Invalid keybinding '{display_value}' for {display_key}: {e}");
+                    issues.push(KeybindingOverrideIssue {
+                        key: config_key.clone(),
+                        message: e.to_string(),
+                    });
                     continue;
                 }
             };
-            if let Some(existing) = self.bindings.get(&chord).copied() {
-                if existing != action {
-                    // Keep both existing defaults instead of stealing another
-                    // action's chord and leaving that action unreachable.
-                    let display_value = crate::review_input::safe_inline_display(key_str, 512);
-                    log::warn!(
-                        "Keybinding '{display_value}' for {display_key} conflicts with '{}'",
-                        existing.name()
-                    );
-                    continue;
-                }
-            }
-
-            // Mutate only after parsing and conflict validation succeeded.
-            self.bindings.retain(|_, a| *a != action);
-            self.bindings.insert(chord, action);
+            parsed.push(ParsedOverride {
+                key: config_key.clone(),
+                action,
+                chord: Some(chord),
+            });
         }
+
+        let mut candidate = self.clone();
+        for action in overridden_actions.keys() {
+            candidate.bindings.retain(|_, bound| bound != action);
+        }
+
+        let mut requested: HashMap<Chord, (&str, Action)> = HashMap::new();
+        for requested_override in &parsed {
+            let Some(chord) = requested_override.chord else {
+                continue;
+            };
+            if let Some((previous_key, previous_action)) =
+                requested.insert(chord, (&requested_override.key, requested_override.action))
+            {
+                issues.push(KeybindingOverrideIssue {
+                    key: requested_override.key.clone(),
+                    message: format!(
+                        "{} uses the same chord as keybindings.{previous_key} ('{}'); assign different chords",
+                        chord.display(),
+                        previous_action.name()
+                    ),
+                });
+            }
+            if let Some(existing) = candidate.bindings.get(&chord).copied() {
+                let owner = existing.config_key().map_or_else(
+                    || format!("the non-configurable default action '{}'", existing.name()),
+                    |key| format!("keybindings.{key} ('{}')", existing.name()),
+                );
+                let recovery = if existing.config_key().is_some() {
+                    "rebind or disable that action in the same [keybindings] table, or choose a different chord"
+                } else {
+                    "choose a different chord"
+                };
+                issues.push(KeybindingOverrideIssue {
+                    key: requested_override.key.clone(),
+                    message: format!(
+                        "{} is already bound to {owner}; {recovery}",
+                        chord.display()
+                    ),
+                });
+            }
+        }
+
+        if !issues.is_empty() {
+            return Err(issues);
+        }
+
+        for requested_override in parsed {
+            if let Some(chord) = requested_override.chord {
+                candidate.bindings.insert(chord, requested_override.action);
+            }
+        }
+        *self = candidate;
+        Ok(())
     }
 
     pub(crate) fn lookup(&self, chord: &Chord) -> Option<Action> {
@@ -1020,7 +1130,7 @@ mod tests {
         let table = "open_history_palette = 'F10'"
             .parse::<toml::Table>()
             .unwrap();
-        map.apply_user_overrides(&table);
+        map.apply_user_overrides(&table).unwrap();
         assert_eq!(map.lookup(&chord), Some(Action::HistoryPalette));
         assert!(map.binding_display(&Action::HistoryPalette).contains("F10"));
     }
@@ -1050,7 +1160,7 @@ mod tests {
 
         let mut map = KeybindingMap::from_defaults();
         let table = "connect_remote_1 = 'F4'".parse::<toml::Table>().unwrap();
-        map.apply_user_overrides(&table);
+        map.apply_user_overrides(&table).unwrap();
         assert_eq!(
             map.lookup(&parse("F4").unwrap()),
             Some(Action::ConnectRemote(0))
@@ -1067,7 +1177,7 @@ mod tests {
         // ScrollUp is bound to Ctrl+Up by default; remap to F11.
         let mut table = toml::Table::new();
         table.insert("scroll_up".into(), toml::Value::String("F11".into()));
-        map.apply_user_overrides(&table);
+        map.apply_user_overrides(&table).unwrap();
 
         let old = parse("Ctrl+Up").unwrap();
         let new = parse("F11").unwrap();
@@ -1101,7 +1211,7 @@ mod tests {
             "export_session_json".into(),
             toml::Value::String("Ctrl+Shift+Alt+U".into()),
         );
-        map.apply_user_overrides(&table);
+        map.apply_user_overrides(&table).unwrap();
 
         assert_eq!(map.lookup(&markdown), Some(Action::ExportSessionMarkdown));
         assert_eq!(map.lookup(&json), Some(Action::ExportSessionJson));
@@ -1125,7 +1235,7 @@ jump_to_next_failed = "F7"
 "#
         .parse::<toml::Table>()
         .unwrap();
-        map.apply_user_overrides(&table);
+        map.apply_user_overrides(&table).unwrap();
         assert_eq!(
             map.lookup(&parse("F5").unwrap()),
             Some(Action::UndoClearBlocks)
@@ -1180,7 +1290,8 @@ jump_to_next_failed = "F7"
         let table = "new_tab = 'Ctrl+NoSuchModifier+T'"
             .parse::<toml::Table>()
             .unwrap();
-        map.apply_user_overrides(&table);
+        let issues = map.apply_user_overrides(&table).unwrap_err();
+        assert!(issues.iter().any(|issue| issue.key == "new_tab"));
         assert_eq!(map.lookup(&original), Some(Action::NewTab));
     }
 
@@ -1190,7 +1301,12 @@ jump_to_next_failed = "F7"
         let new_tab = parse("Ctrl+Shift+T").unwrap();
         let paste = parse("Ctrl+Shift+V").unwrap();
         let table = "new_tab = 'Ctrl+Shift+V'".parse::<toml::Table>().unwrap();
-        map.apply_user_overrides(&table);
+        let issues = map.apply_user_overrides(&table).unwrap_err();
+        assert!(issues.iter().any(|issue| {
+            issue.key == "new_tab"
+                && issue.message.contains("keybindings.paste")
+                && issue.message.contains("rebind or disable")
+        }));
         assert_eq!(map.lookup(&new_tab), Some(Action::NewTab));
         assert_eq!(map.lookup(&paste), Some(Action::Paste));
     }
@@ -1201,7 +1317,7 @@ jump_to_next_failed = "F7"
         let original = parse("Ctrl+Up").unwrap();
         let mut table = toml::Table::new();
         table.insert("scroll_up".into(), toml::Value::Boolean(false));
-        map.apply_user_overrides(&table);
+        map.apply_user_overrides(&table).unwrap();
         assert_eq!(map.lookup(&original), None);
     }
 
@@ -1215,9 +1331,81 @@ jump_to_next_failed = "F7"
             let original = parse("Ctrl+Up").unwrap();
             let mut table = toml::Table::new();
             table.insert("scroll_up".into(), toml::Value::String(token.into()));
-            map.apply_user_overrides(&table);
+            map.apply_user_overrides(&table).unwrap();
             assert_eq!(map.lookup(&original), None, "token {token:?} must unbind");
         }
+    }
+
+    #[test]
+    fn override_cannot_steal_unchanged_default_and_is_atomic() {
+        let mut map = KeybindingMap::from_defaults();
+        let new_tab = parse("Ctrl+Shift+T").unwrap();
+        let font_increase = parse("Ctrl+=").unwrap();
+        let table = "font_increase = 'Ctrl+Shift+T'"
+            .parse::<toml::Table>()
+            .unwrap();
+
+        let issues = map.apply_user_overrides(&table).unwrap_err();
+
+        assert!(issues.iter().any(|issue| {
+            issue.key == "font_increase"
+                && issue.message.contains("keybindings.new_tab")
+                && issue.message.contains("rebind or disable")
+        }));
+        assert_eq!(map.lookup(&new_tab), Some(Action::NewTab));
+        assert_eq!(map.lookup(&font_increase), Some(Action::FontIncrease));
+    }
+
+    #[test]
+    fn atomic_override_permits_swaps_and_explicit_reassignments() {
+        let swapped = r#"
+new_tab = "Ctrl+Shift+W"
+close_pane_or_tab = "Ctrl+Shift+T"
+"#
+        .parse::<toml::Table>()
+        .unwrap();
+        let swapped_map = KeybindingMap::from_user_overrides(&swapped).unwrap();
+        assert_eq!(
+            swapped_map.lookup(&parse("Ctrl+Shift+W").unwrap()),
+            Some(Action::NewTab)
+        );
+        assert_eq!(
+            swapped_map.lookup(&parse("Ctrl+Shift+T").unwrap()),
+            Some(Action::ClosePaneOrTab)
+        );
+
+        let reassigned = r#"
+new_tab = false
+font_increase = "Ctrl+Shift+T"
+"#
+        .parse::<toml::Table>()
+        .unwrap();
+        let reassigned_map = KeybindingMap::from_user_overrides(&reassigned).unwrap();
+        assert_eq!(
+            reassigned_map.lookup(&parse("Ctrl+Shift+T").unwrap()),
+            Some(Action::FontIncrease)
+        );
+        assert_eq!(
+            reassigned_map.lookup(&parse("Ctrl+=").unwrap()),
+            None,
+            "an explicit override replaces all defaults for that action"
+        );
+    }
+
+    #[test]
+    fn nonconflicting_override_builds_complete_effective_map() {
+        let table = "font_increase = 'F10'".parse::<toml::Table>().unwrap();
+        let map = KeybindingMap::from_user_overrides(&table).unwrap();
+
+        assert_eq!(
+            map.lookup(&parse("F10").unwrap()),
+            Some(Action::FontIncrease)
+        );
+        assert_eq!(map.lookup(&parse("Ctrl+=").unwrap()), None);
+        assert_eq!(
+            map.lookup(&parse("Ctrl+Shift+T").unwrap()),
+            Some(Action::NewTab)
+        );
     }
 
     #[test]

@@ -47,18 +47,189 @@ pub(crate) fn skip_escape_sequence(bytes: &[u8], i: usize) -> usize {
     }
 }
 
-/// Upper bounds on the reconstructed screen so a bogus absolute-position
-/// parameter (`\x1b[9999999999H`) can never make us allocate an unbounded grid.
-/// Real full-screen redraws (top, htop, watch) stay well under these.
+/// Independent bounds for terminal-replay state. A row/column bound alone is
+/// insufficient: a short stream can visit every row at the final column and
+/// force `MAX_GRID_ROWS * MAX_GRID_COLS` padded cells into memory. The aggregate
+/// cell budget keeps both the plain and styled replay grids bounded regardless
+/// of cursor-movement patterns.
 const MAX_GRID_ROWS: usize = 100_000;
 const MAX_GRID_COLS: usize = 10_000;
+const MAX_REPLAY_CELLS: usize = 1024 * 1024;
+const MAX_REPLAY_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CSI_PARAM_BYTES: usize = 256;
 
-/// Grow `grid` so `row` is a valid index and return a mutable handle to it.
-fn ensure_row(grid: &mut Vec<Vec<char>>, row: usize) -> &mut Vec<char> {
-    while grid.len() <= row {
-        grid.push(Vec::new());
+/// A row-oriented terminal snapshot with aggregate live and retained-cell
+/// budgets. Empty row descriptors are separately bounded by `MAX_GRID_ROWS`;
+/// all growth goes through `ensure_len`/`resize_row`, so sparse writes cannot
+/// bypass `MAX_REPLAY_CELLS`. Per-row high-water marks also prevent erase/refill
+/// cycles from hiding memory retained in `Vec` capacities from the budget.
+struct ReplayGrid<T> {
+    rows: Vec<Vec<T>>,
+    row_cell_high_water: Vec<usize>,
+    cells: usize,
+    retained_cells: usize,
+}
+
+impl<T> ReplayGrid<T> {
+    fn new() -> Self {
+        Self {
+            rows: vec![Vec::new()],
+            row_cell_high_water: vec![0],
+            cells: 0,
+            retained_cells: 0,
+        }
     }
-    &mut grid[row]
+
+    fn ensure_row(&mut self, row: usize) -> bool {
+        if row >= MAX_GRID_ROWS {
+            return false;
+        }
+        if self.rows.len() <= row {
+            self.rows.resize_with(row + 1, Vec::new);
+            self.row_cell_high_water.resize(row + 1, 0);
+        }
+        true
+    }
+
+    fn clear(&mut self) {
+        self.rows.clear();
+        self.rows.push(Vec::new());
+        self.row_cell_high_water.clear();
+        self.row_cell_high_water.push(0);
+        self.cells = 0;
+        self.retained_cells = 0;
+    }
+
+    fn clear_row(&mut self, row: usize) {
+        let Some(cells) = self.rows.get_mut(row) else {
+            return;
+        };
+        self.cells = self.cells.saturating_sub(cells.len());
+        cells.clear();
+    }
+
+    fn clear_rows_before(&mut self, end: usize) {
+        for cells in self.rows.iter_mut().take(end) {
+            self.cells = self.cells.saturating_sub(cells.len());
+            cells.clear();
+        }
+    }
+
+    fn truncate_row(&mut self, row: usize, len: usize) {
+        let Some(cells) = self.rows.get_mut(row) else {
+            return;
+        };
+        if cells.len() > len {
+            self.cells -= cells.len() - len;
+            cells.truncate(len);
+        }
+    }
+
+    fn truncate_rows(&mut self, len: usize) {
+        if self.rows.len() <= len {
+            return;
+        }
+        let removed = self.rows[len..].iter().map(Vec::len).sum::<usize>();
+        let removed_retained = self.row_cell_high_water[len..].iter().sum::<usize>();
+        self.cells = self.cells.saturating_sub(removed);
+        self.retained_cells = self.retained_cells.saturating_sub(removed_retained);
+        self.rows.truncate(len);
+        self.row_cell_high_water.truncate(len);
+    }
+
+    fn pop_row(&mut self) {
+        if let Some(row) = self.rows.pop() {
+            self.cells = self.cells.saturating_sub(row.len());
+            self.retained_cells = self
+                .retained_cells
+                .saturating_sub(self.row_cell_high_water.pop().unwrap_or(0));
+        }
+    }
+}
+
+impl<T: Clone> ReplayGrid<T> {
+    fn ensure_len(&mut self, row: usize, len: usize, fill: T) -> bool {
+        if row >= MAX_GRID_ROWS || len > MAX_GRID_COLS {
+            return false;
+        }
+        let old_len = self.rows.get(row).map_or(0, Vec::len);
+        let old_high_water = self.row_cell_high_water.get(row).copied().unwrap_or(0);
+        let additional = len.saturating_sub(old_len);
+        let retained_additional = len.saturating_sub(old_high_water);
+        if additional > MAX_REPLAY_CELLS.saturating_sub(self.cells)
+            || retained_additional > MAX_REPLAY_CELLS.saturating_sub(self.retained_cells)
+        {
+            return false;
+        }
+        if !self.ensure_row(row) {
+            return false;
+        }
+        if additional > 0 {
+            if self.rows[row].capacity() < len
+                && self.rows[row].try_reserve_exact(additional).is_err()
+            {
+                return false;
+            }
+            self.rows[row].resize(len, fill);
+            self.cells += additional;
+        }
+        if retained_additional > 0 {
+            self.row_cell_high_water[row] = len;
+            self.retained_cells += retained_additional;
+        }
+        true
+    }
+
+    fn resize_row(&mut self, row: usize, len: usize, fill: T) -> bool {
+        if row >= MAX_GRID_ROWS || len > MAX_GRID_COLS {
+            return false;
+        }
+        let old_len = self.rows.get(row).map_or(0, Vec::len);
+        let old_high_water = self.row_cell_high_water.get(row).copied().unwrap_or(0);
+        let cells_without_row = self.cells - old_len;
+        let retained_additional = len.saturating_sub(old_high_water);
+        if len > MAX_REPLAY_CELLS.saturating_sub(cells_without_row)
+            || retained_additional > MAX_REPLAY_CELLS.saturating_sub(self.retained_cells)
+        {
+            return false;
+        }
+        if !self.ensure_row(row) {
+            return false;
+        }
+        if self.rows[row].capacity() < len
+            && self.rows[row]
+                .try_reserve_exact(len.saturating_sub(old_len))
+                .is_err()
+        {
+            return false;
+        }
+        self.rows[row].resize(len, fill);
+        self.cells = cells_without_row + len;
+        if retained_additional > 0 {
+            self.row_cell_high_water[row] = len;
+            self.retained_cells += retained_additional;
+        }
+        true
+    }
+
+    fn set_cell(&mut self, row: usize, col: usize, value: T, fill: T) -> bool {
+        let Some(len) = col.checked_add(1) else {
+            return false;
+        };
+        if !self.ensure_len(row, len, fill) {
+            return false;
+        }
+        self.rows[row][col] = value;
+        true
+    }
+}
+
+fn bounded_utf8_prefix(input: &str, max_bytes: usize) -> &str {
+    let mut end = input.len().min(max_bytes);
+    while !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    &input[..end]
 }
 
 /// Reconstruct the on-screen text a stream of bytes would leave behind, applying
@@ -77,94 +248,99 @@ fn ensure_row(grid: &mut Vec<Vec<char>>, row: usize) -> &mut Vec<char> {
 pub(crate) fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
     let bytes = input.as_bytes();
     if memchr::memchr3(0x1b, b'\r', b'\x08', bytes).is_none() {
-        return (input.to_string(), false);
+        return (
+            bounded_utf8_prefix(input, MAX_REPLAY_OUTPUT_BYTES).to_owned(),
+            false,
+        );
     }
 
-    let mut grid: Vec<Vec<char>> = vec![Vec::new()];
+    let mut grid = ReplayGrid::<char>::new();
     let mut row = 0usize;
     let mut col = 0usize;
     let mut i = 0;
     let mut should_clear = false;
-    let mut param_buf: Vec<u8> = Vec::with_capacity(16);
 
     while i < bytes.len() {
         if bytes[i] == 0x1b && i + 1 < bytes.len() {
             match bytes[i + 1] {
                 b'[' => {
                     i += 2;
-                    param_buf.clear();
+                    let params_start = i;
                     while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-                        param_buf.push(bytes[i]);
                         i += 1;
                     }
                     if i < bytes.len() {
                         let final_byte = bytes[i];
+                        let params = &bytes[params_start..i];
                         i += 1;
+
+                        // CSI parameters are normally a handful of bytes. Ignore
+                        // absurd runs so downstream parsing (notably styled SGR)
+                        // cannot turn a bounded input into a large temporary.
+                        if params.len() > MAX_CSI_PARAM_BYTES {
+                            continue;
+                        }
 
                         // Private-mode sequences (`\x1b[?…`, `\x1b[>…`) never move
                         // the cursor or edit cells in this shadow; skip them so a
                         // trailing `h`/`l` is not mistaken for a real command.
-                        if matches!(param_buf.first(), Some(0x3c..=0x3f)) {
+                        if matches!(params.first(), Some(0x3c..=0x3f)) {
                             continue;
                         }
 
                         match final_byte {
                             b'H' | b'f' => {
-                                let r = parse_param_nth(&param_buf, 0, 1);
-                                let c = parse_param_nth(&param_buf, 1, 1);
+                                let r = parse_param_nth(params, 0, 1);
+                                let c = parse_param_nth(params, 1, 1);
                                 row = r.saturating_sub(1).min(MAX_GRID_ROWS);
                                 col = c.saturating_sub(1).min(MAX_GRID_COLS);
                             }
                             b'A' => {
-                                let n = parse_param_first(&param_buf, 1);
+                                let n = parse_param_first(params, 1);
                                 row = row.saturating_sub(n);
                             }
                             b'B' | b'e' => {
-                                let n = parse_param_first(&param_buf, 1);
-                                row = (row + n).min(MAX_GRID_ROWS);
+                                let n = parse_param_first(params, 1);
+                                row = row.saturating_add(n).min(MAX_GRID_ROWS);
                             }
                             b'E' => {
-                                let n = parse_param_first(&param_buf, 1);
-                                row = (row + n).min(MAX_GRID_ROWS);
+                                let n = parse_param_first(params, 1);
+                                row = row.saturating_add(n).min(MAX_GRID_ROWS);
                                 col = 0;
                             }
                             b'F' => {
-                                let n = parse_param_first(&param_buf, 1);
+                                let n = parse_param_first(params, 1);
                                 row = row.saturating_sub(n);
                                 col = 0;
                             }
                             b'd' => {
-                                let r = parse_param_first(&param_buf, 1);
+                                let r = parse_param_first(params, 1);
                                 row = r.saturating_sub(1).min(MAX_GRID_ROWS);
                             }
                             b'C' | b'a' => {
-                                let n = parse_param_first(&param_buf, 1);
-                                col = (col + n).min(MAX_GRID_COLS);
+                                let n = parse_param_first(params, 1);
+                                col = col.saturating_add(n).min(MAX_GRID_COLS);
                             }
                             b'D' => {
-                                let n = parse_param_first(&param_buf, 1);
+                                let n = parse_param_first(params, 1);
                                 col = col.saturating_sub(n);
                             }
                             b'G' | b'`' => {
-                                let c = parse_param_first(&param_buf, 1);
+                                let c = parse_param_first(params, 1);
                                 col = c.saturating_sub(1).min(MAX_GRID_COLS);
                             }
-                            b'J' => match param_buf.as_slice() {
+                            b'J' => match params {
                                 b"" | b"0" => {
                                     // Erase from the cursor to the end of screen.
-                                    if row < grid.len() && col < grid[row].len() {
-                                        grid[row].truncate(col);
-                                    }
-                                    grid.truncate(row + 1);
+                                    grid.truncate_row(row, col);
+                                    grid.truncate_rows(row.saturating_add(1));
                                 }
                                 b"1" => {
                                     // Erase from the start of screen up to the cursor.
-                                    for r in grid.iter_mut().take(row) {
-                                        r.clear();
-                                    }
-                                    if row < grid.len() {
-                                        let upto = col.min(grid[row].len());
-                                        for c in grid[row].iter_mut().take(upto) {
+                                    grid.clear_rows_before(row);
+                                    if let Some(cells) = grid.rows.get_mut(row) {
+                                        let upto = col.min(cells.len());
+                                        for c in cells.iter_mut().take(upto) {
                                             *c = ' ';
                                         }
                                     }
@@ -172,30 +348,26 @@ pub(crate) fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
                                 b"2" | b"3" => {
                                     should_clear = true;
                                     grid.clear();
-                                    grid.push(Vec::new());
                                     row = 0;
                                     col = 0;
                                 }
                                 _ => {}
                             },
-                            b'K' => {
-                                let cells = ensure_row(&mut grid, row);
-                                match param_buf.as_slice() {
-                                    b"" | b"0" => {
-                                        if col < cells.len() {
-                                            cells.truncate(col);
-                                        }
-                                    }
-                                    b"1" => {
+                            b'K' => match params {
+                                b"" | b"0" => {
+                                    grid.truncate_row(row, col);
+                                }
+                                b"1" => {
+                                    if let Some(cells) = grid.rows.get_mut(row) {
                                         let upto = col.min(cells.len());
                                         for c in cells.iter_mut().take(upto) {
                                             *c = ' ';
                                         }
                                     }
-                                    b"2" => cells.clear(),
-                                    _ => {}
                                 }
-                            }
+                                b"2" => grid.clear_row(row),
+                                _ => {}
+                            },
                             _ => {}
                         }
                     }
@@ -208,11 +380,13 @@ pub(crate) fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
                 }
             }
         } else if bytes[i] == b'\n' {
-            row = (row + 1).min(MAX_GRID_ROWS);
+            row = row.saturating_add(1).min(MAX_GRID_ROWS);
             col = 0;
             // Materialise the destination row so a trailing newline still emits
             // its blank line, matching a real terminal's line feed.
-            ensure_row(&mut grid, row);
+            if !grid.ensure_row(row) {
+                break;
+            }
             i += 1;
         } else if bytes[i] == b'\r' {
             col = 0;
@@ -223,26 +397,24 @@ pub(crate) fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
         } else {
             let ch = input[i..].chars().next().unwrap_or('\u{FFFD}');
             i += ch.len_utf8();
-            if col < MAX_GRID_COLS {
-                let cells = ensure_row(&mut grid, row);
-                if col < cells.len() {
-                    cells[col] = ch;
-                } else {
-                    while cells.len() < col {
-                        cells.push(' ');
-                    }
-                    cells.push(ch);
-                }
+            if col >= MAX_GRID_COLS || !grid.set_cell(row, col, ch, ' ') {
+                break;
             }
-            col += 1;
+            col = col.saturating_add(1);
         }
     }
-    let mut result = String::with_capacity(input.len());
-    for (line_idx, cells) in grid.iter().enumerate() {
+    let mut result = String::with_capacity(input.len().min(MAX_REPLAY_OUTPUT_BYTES));
+    'rows: for (line_idx, cells) in grid.rows.iter().enumerate() {
         if line_idx > 0 {
+            if result.len() == MAX_REPLAY_OUTPUT_BYTES {
+                break;
+            }
             result.push('\n');
         }
         for &ch in cells {
+            if ch.len_utf8() > MAX_REPLAY_OUTPUT_BYTES.saturating_sub(result.len()) {
+                break 'rows;
+            }
             result.push(ch);
         }
     }
@@ -476,17 +648,11 @@ pub(crate) fn collapse_repaint_output(input: &str, cols: usize) -> String {
     let width = cols.clamp(1, MAX_GRID_COLS);
     let blank = (' ', Sgr::default());
 
-    let mut grid: Vec<Vec<(char, Sgr)>> = vec![Vec::new()];
+    let mut grid = ReplayGrid::<(char, Sgr)>::new();
     let mut row = 0usize;
     let mut col = 0usize;
     let mut cur = Sgr::default();
     let mut i = 0;
-
-    let ensure = |grid: &mut Vec<Vec<(char, Sgr)>>, row: usize| {
-        while grid.len() <= row {
-            grid.push(Vec::new());
-        }
-    };
 
     while i < bytes.len() {
         if bytes[i] == 0x1b && i + 1 < bytes.len() {
@@ -503,6 +669,9 @@ pub(crate) fn collapse_repaint_output(input: &str, cols: usize) -> String {
                     let final_byte = bytes[i];
                     let params = &bytes[ps..i];
                     i += 1;
+                    if params.len() > MAX_CSI_PARAM_BYTES {
+                        continue;
+                    }
                     if matches!(params.first(), Some(0x3c..=0x3f)) {
                         continue; // private mode — no cursor/text effect here
                     }
@@ -516,10 +685,14 @@ pub(crate) fn collapse_repaint_output(input: &str, cols: usize) -> String {
                         }
                         b'A' => row = row.saturating_sub(parse_param_first(params, 1)),
                         b'B' | b'e' => {
-                            row = (row + parse_param_first(params, 1)).min(MAX_GRID_ROWS)
+                            row = row
+                                .saturating_add(parse_param_first(params, 1))
+                                .min(MAX_GRID_ROWS)
                         }
                         b'E' => {
-                            row = (row + parse_param_first(params, 1)).min(MAX_GRID_ROWS);
+                            row = row
+                                .saturating_add(parse_param_first(params, 1))
+                                .min(MAX_GRID_ROWS);
                             col = 0;
                         }
                         b'F' => {
@@ -531,34 +704,43 @@ pub(crate) fn collapse_repaint_output(input: &str, cols: usize) -> String {
                                 .saturating_sub(1)
                                 .min(MAX_GRID_ROWS)
                         }
-                        b'C' | b'a' => col = (col + parse_param_first(params, 1)).min(width),
+                        b'C' | b'a' => {
+                            col = col.saturating_add(parse_param_first(params, 1)).min(width)
+                        }
                         b'D' => col = col.saturating_sub(parse_param_first(params, 1)),
                         b'G' | b'`' => {
                             col = parse_param_first(params, 1).saturating_sub(1).min(width)
                         }
                         b'K' => {
-                            ensure(&mut grid, row);
-                            let cells = &mut grid[row];
                             let fill = (' ', cur);
                             match params {
                                 b"" | b"0" => {
-                                    cells.truncate(col);
-                                    while cells.len() < width {
-                                        cells.push(fill);
+                                    grid.truncate_row(row, col);
+                                    if !grid.resize_row(row, width, fill) {
+                                        break;
+                                    }
+                                    if let Some(cells) = grid.rows.get_mut(row) {
+                                        for cell in cells.iter_mut().skip(col) {
+                                            *cell = fill;
+                                        }
                                     }
                                 }
                                 b"1" => {
-                                    while cells.len() < col {
-                                        cells.push(blank);
+                                    if !grid.ensure_len(row, col, blank) {
+                                        break;
                                     }
-                                    for c in cells.iter_mut().take(col) {
-                                        *c = fill;
+                                    if let Some(cells) = grid.rows.get_mut(row) {
+                                        for cell in cells.iter_mut().take(col) {
+                                            *cell = fill;
+                                        }
                                     }
                                 }
                                 b"2" => {
-                                    cells.clear();
-                                    for _ in 0..width {
-                                        cells.push(fill);
+                                    if !grid.resize_row(row, width, fill) {
+                                        break;
+                                    }
+                                    if let Some(cells) = grid.rows.get_mut(row) {
+                                        cells.fill(fill);
                                     }
                                 }
                                 _ => {}
@@ -566,30 +748,30 @@ pub(crate) fn collapse_repaint_output(input: &str, cols: usize) -> String {
                         }
                         b'J' => match params {
                             b"" | b"0" => {
-                                ensure(&mut grid, row);
-                                let cells = &mut grid[row];
-                                cells.truncate(col);
-                                while cells.len() < width {
-                                    cells.push((' ', cur));
+                                grid.truncate_rows(row.saturating_add(1));
+                                grid.truncate_row(row, col);
+                                if !grid.resize_row(row, width, (' ', cur)) {
+                                    break;
                                 }
-                                grid.truncate(row + 1);
+                                if let Some(cells) = grid.rows.get_mut(row) {
+                                    for cell in cells.iter_mut().skip(col) {
+                                        *cell = (' ', cur);
+                                    }
+                                }
                             }
                             b"1" => {
-                                for r in grid.iter_mut().take(row) {
-                                    r.clear();
+                                grid.clear_rows_before(row);
+                                if !grid.ensure_len(row, col, blank) {
+                                    break;
                                 }
-                                ensure(&mut grid, row);
-                                let cells = &mut grid[row];
-                                while cells.len() < col {
-                                    cells.push(blank);
-                                }
-                                for c in cells.iter_mut().take(col) {
-                                    *c = (' ', cur);
+                                if let Some(cells) = grid.rows.get_mut(row) {
+                                    for cell in cells.iter_mut().take(col) {
+                                        *cell = (' ', cur);
+                                    }
                                 }
                             }
                             b"2" | b"3" => {
                                 grid.clear();
-                                grid.push(Vec::new());
                                 row = 0;
                                 col = 0;
                             }
@@ -602,9 +784,11 @@ pub(crate) fn collapse_repaint_output(input: &str, cols: usize) -> String {
                 _ => i = skip_escape_sequence(bytes, i),
             }
         } else if bytes[i] == b'\n' {
-            row = (row + 1).min(MAX_GRID_ROWS);
+            row = row.saturating_add(1).min(MAX_GRID_ROWS);
             col = 0;
-            ensure(&mut grid, row);
+            if !grid.ensure_row(row) {
+                break;
+            }
             i += 1;
         } else if bytes[i] == b'\r' {
             col = 0;
@@ -615,28 +799,30 @@ pub(crate) fn collapse_repaint_output(input: &str, cols: usize) -> String {
         } else {
             let ch = input[i..].chars().next().unwrap_or('\u{FFFD}');
             i += ch.len_utf8();
-            if col < width {
-                ensure(&mut grid, row);
-                let cells = &mut grid[row];
-                while cells.len() <= col {
-                    cells.push(blank);
-                }
-                cells[col] = (ch, cur);
+            // Preserve the existing simplified right-edge behaviour: bytes past
+            // the terminal width are ignored until CR/LF repositions the cursor.
+            // `width` is a real terminal dimension, not a security-budget hit.
+            if col < width && !grid.set_cell(row, col, (ch, cur), blank) {
+                break;
             }
-            col += 1;
+            col = col.saturating_add(1).min(width);
         }
     }
 
     // Drop screen-padding rows at the bottom that carry no visible content.
     let is_blank_row =
         |r: &[(char, Sgr)]| r.iter().all(|&(ch, s)| ch == ' ' && s == Sgr::default());
-    while grid.len() > 1 && grid.last().is_some_and(|r| is_blank_row(r)) {
-        grid.pop();
+    while grid.rows.len() > 1 && grid.rows.last().is_some_and(|r| is_blank_row(r)) {
+        grid.pop_row();
     }
 
-    let mut out = String::with_capacity(input.len().min(64 * 1024));
-    for (ri, cells) in grid.iter().enumerate() {
+    const ANSI_RESET: &str = "\x1b[0m";
+    let mut out = String::with_capacity(input.len().min(64 * 1024).min(MAX_REPLAY_OUTPUT_BYTES));
+    'rows: for (ri, cells) in grid.rows.iter().enumerate() {
         if ri > 0 {
+            if "\r\n".len() > MAX_REPLAY_OUTPUT_BYTES.saturating_sub(out.len()) {
+                break;
+            }
             out.push_str("\r\n");
         }
         // Keep coloured trailing cells (the bars); trim default-styled padding.
@@ -651,16 +837,37 @@ pub(crate) fn collapse_repaint_output(input: &str, cols: usize) -> String {
         }
         let mut emitted = Sgr::default();
         for &(ch, s) in &cells[..end] {
-            if s != emitted {
+            let codes = (s != emitted).then(|| sgr_codes(&s));
+            let transition_bytes = codes.as_ref().map_or(0, |codes| 3 + codes.len());
+            // If this cell leaves a non-default style active, reserve room for
+            // the reset as part of the same atomic output unit. Truncation can
+            // therefore never leak an unfinished SGR state into the VTE.
+            let reset_bytes = if s == Sgr::default() {
+                0
+            } else {
+                ANSI_RESET.len()
+            };
+            let required = transition_bytes
+                .saturating_add(ch.len_utf8())
+                .saturating_add(reset_bytes);
+            if required > MAX_REPLAY_OUTPUT_BYTES.saturating_sub(out.len()) {
+                if emitted != Sgr::default()
+                    && ANSI_RESET.len() <= MAX_REPLAY_OUTPUT_BYTES.saturating_sub(out.len())
+                {
+                    out.push_str(ANSI_RESET);
+                }
+                break 'rows;
+            }
+            if let Some(codes) = codes {
                 out.push_str("\x1b[");
-                out.push_str(&sgr_codes(&s));
+                out.push_str(&codes);
                 out.push('m');
                 emitted = s;
             }
             out.push(ch);
         }
         if emitted != Sgr::default() {
-            out.push_str("\x1b[0m");
+            out.push_str(ANSI_RESET);
         }
     }
     out
@@ -747,7 +954,13 @@ pub(crate) fn strip_ansi(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{contains_case_insensitive as cci, strip_ansi_with_clear_detect};
+    use std::fmt::Write as _;
+
+    use super::{
+        bounded_utf8_prefix, collapse_repaint_output, contains_case_insensitive as cci,
+        strip_ansi_with_clear_detect, ReplayGrid, MAX_CSI_PARAM_BYTES, MAX_GRID_COLS,
+        MAX_REPLAY_CELLS, MAX_REPLAY_OUTPUT_BYTES,
+    };
 
     #[test]
     fn matches_regardless_of_case() {
@@ -780,6 +993,99 @@ mod tests {
         assert_eq!(
             strip_ansi_with_clear_detect("plain\ntext\n"),
             ("plain\ntext\n".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn bounded_prefix_never_splits_utf8() {
+        assert_eq!(bounded_utf8_prefix("ab€cd", 4), "ab");
+        assert_eq!(bounded_utf8_prefix("ab€cd", 5), "ab€");
+        assert_eq!(bounded_utf8_prefix("ab€cd", usize::MAX), "ab€cd");
+    }
+
+    #[test]
+    fn replay_grid_enforces_aggregate_cell_budget_and_reclaims_it() {
+        let mut grid = ReplayGrid::<char>::new();
+        let full_rows = MAX_REPLAY_CELLS / MAX_GRID_COLS;
+        for row in 0..full_rows {
+            assert!(grid.ensure_len(row, MAX_GRID_COLS, ' '));
+        }
+        assert_eq!(grid.cells, full_rows * MAX_GRID_COLS);
+        assert!(!grid.ensure_len(full_rows, MAX_GRID_COLS, ' '));
+        assert!(grid.cells <= MAX_REPLAY_CELLS);
+
+        grid.clear();
+        for row in 0..full_rows {
+            assert!(grid.ensure_len(row, MAX_GRID_COLS, ' '));
+            grid.clear_row(row);
+        }
+        assert_eq!(grid.cells, 0);
+        assert_eq!(grid.retained_cells, full_rows * MAX_GRID_COLS);
+        assert!(!grid.ensure_len(full_rows, MAX_GRID_COLS, ' '));
+
+        // A full screen reset drops every inner allocation and may safely make
+        // the budget available again.
+        grid.clear();
+        assert!(grid.ensure_len(0, MAX_GRID_COLS, ' '));
+        assert_eq!(grid.cells, MAX_GRID_COLS);
+    }
+
+    fn sparse_last_column_stream() -> String {
+        let mut input = String::new();
+        let attempted_rows = MAX_REPLAY_CELLS / MAX_GRID_COLS + 2;
+        for row in 1..=attempted_rows {
+            write!(input, "\x1b[{row};{MAX_GRID_COLS}H#").unwrap();
+        }
+        input
+    }
+
+    #[test]
+    fn sparse_cursor_writes_cannot_expand_plain_grid_without_bound() {
+        let input = sparse_last_column_stream();
+        assert!(input.len() < 1024 * 1024);
+
+        let (output, _) = strip_ansi_with_clear_detect(&input);
+        let full_rows = MAX_REPLAY_CELLS / MAX_GRID_COLS;
+        assert_eq!(
+            output.bytes().filter(|&byte| byte == b'#').count(),
+            full_rows
+        );
+        assert!(output.len() <= MAX_REPLAY_CELLS + full_rows);
+        assert!(output.len() <= MAX_REPLAY_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn sparse_cursor_writes_cannot_expand_styled_grid_without_bound() {
+        let input = sparse_last_column_stream();
+        let output = collapse_repaint_output(&input, MAX_GRID_COLS);
+        let full_rows = MAX_REPLAY_CELLS / MAX_GRID_COLS;
+        assert_eq!(
+            output.bytes().filter(|&byte| byte == b'#').count(),
+            full_rows
+        );
+        assert!(output.len() <= MAX_REPLAY_CELLS + full_rows * 2);
+        assert!(output.len() <= MAX_REPLAY_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn saturated_cursor_parameters_do_not_overflow() {
+        let digits = "9".repeat(MAX_CSI_PARAM_BYTES);
+        assert_eq!(
+            strip_ansi_with_clear_detect(&format!("ok\x1b[{digits}Bignored")),
+            ("ok".to_string(), false)
+        );
+        assert_eq!(
+            strip_ansi_with_clear_detect(&format!("ok\r\x1b[{digits}Cignored")),
+            ("ok".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn oversized_csi_parameter_run_is_ignored() {
+        let digits = "9".repeat(MAX_CSI_PARAM_BYTES + 1);
+        assert_eq!(
+            strip_ansi_with_clear_detect(&format!("a\x1b[{digits}Cb")),
+            ("ab".to_string(), false)
         );
     }
 }

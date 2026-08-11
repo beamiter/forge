@@ -170,6 +170,7 @@ impl UiState {
         close.add_css_class("flat");
         close.add_css_class("tab-strip-close");
         close.set_tooltip_text(Some("Close tab"));
+        close.update_property(&[gtk4::accessible::Property::Label("Close tab")]);
         close.set_focus_on_click(false);
         let ui = self.clone();
         let page_name = row.page_name.clone();
