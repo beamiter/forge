@@ -9713,10 +9713,11 @@ mod tests {
     // rendering seams, the lifecycle context they serve, and the engine state
     // it owns.
     use super::{
-        kitty_graphics, live_output_text, AgentExecutionLostCallbacks, AnchorSettleArgs,
-        BlockFinishedCallbacks, CommandFinishedCallbacks, CommandStartedCallbacks, EngineState,
-        FinalizedBlockArgs, MouseReportingMode, ReaderCtx, RenderBackend, SelectionFeedHold,
-        SubmissionSurface, VerifiedSubmissionCtx,
+        estimated_finished_block_height_for_text, kitty_graphics, live_output_text,
+        AgentExecutionLostCallbacks, AnchorSettleArgs, BlockFinishedCallbacks,
+        CommandFinishedCallbacks, CommandStartedCallbacks, EngineState, FinalizedBlockArgs,
+        MouseReportingMode, ReaderCtx, RenderBackend, SelectionFeedHold, SubmissionSurface,
+        VerifiedSubmissionCtx,
     };
     use crate::config::Config;
     use crate::parser::{ColorKind, KeyboardProtocolQuery, Parser, ParserEvent};
@@ -12131,11 +12132,26 @@ mod tests {
     // implemented headlessly below, so these tests pin the ordered effect
     // sequences the lifecycle produces for a given run of parser events —
     // the sequences the trait split was hand-validated against.
+    //
+    // What this seam cannot reach, stated plainly: swapping [`BlockBackend`]
+    // out for [`RecordingBackend`] is exactly what makes the lifecycle
+    // testable, and it is also what puts `BlockBackend`'s own bodies out of
+    // reach — above all its `finalize_block`, whose ordered sub-step chain
+    // (finished-block construction, retention passes, menu and selection
+    // installs, `reset_active`, the deferred scroll pin) runs no statement
+    // under `cargo test` and stays GUI-verified. These tests pin what the
+    // engine *hands* a backend and in what order, never what the GTK backend
+    // then does with it.
 
     /// Where the harness pretends the shell is. Pinned so the cwd that reaches
     /// a finished block is a value the test chose rather than whatever the
     /// developer's working directory happened to be.
     const HARNESS_CWD: &str = "/harness/cwd";
+
+    /// The cwd the *shell* reports on its `OSC 133;C` packet, distinct from
+    /// [`HARNESS_CWD`] so a block that took the pane's fallback instead of the
+    /// shell's own answer is visible.
+    const SHELL_REPORTED_CWD: &str = "/shell/reported/cwd";
 
     /// How long a test waits for the PTY writer thread to hand a protocol
     /// reply to the kernel. Generous: it is only ever paid once, and only by
@@ -12154,6 +12170,10 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Query {
         CursorAndRows,
+        /// The DSR 6 read. Recorded because it is the only surface read a
+        /// protocol reply depends on: a reply built without it — or from
+        /// `cursor_and_rows` instead — would still be a well-formed CPR.
+        CursorPositionReport,
         CommandCaptureAnchor {
             provisional: (i64, i64),
             anchor_rows: i64,
@@ -12186,6 +12206,12 @@ mod tests {
         plain_output_bytes: usize,
         cwd: Option<String>,
         cols: i64,
+        /// `BlockData::estimated_height`, the virtualization placeholder. It
+        /// is the only observable that carries the *second* `grid_cols()`
+        /// read — the one feeding the height estimate — so it is what tells
+        /// that read apart from `live_column_count()`; the width above pins
+        /// only the first.
+        estimated_height: i32,
         exit_code: Option<i32>,
         has_duration: bool,
         has_end_time: bool,
@@ -12322,6 +12348,16 @@ mod tests {
                 .collect()
         }
 
+        /// Undrained geometry pushes, for pinning where an engine-side fan-out
+        /// sits relative to the handler's closing effects.
+        fn geometry_pushes(&self) -> usize {
+            self.calls
+                .borrow()
+                .iter()
+                .filter(|call| matches!(call, Call::SyncGeometryToPty))
+                .count()
+        }
+
         /// Put `text` on `row` and park the cursor just past its last
         /// character — the shape the live surface has once the shell has
         /// echoed its prompt, and again once the user has typed after it.
@@ -12413,6 +12449,7 @@ mod tests {
                 plain_output_bytes: args.plain_output_bytes,
                 cwd: args.block_cwd,
                 cols: args.cols,
+                estimated_height: block_data.estimated_height,
                 exit_code: args.exit_code,
                 has_duration: args.duration_ms.is_some(),
                 has_end_time: args.end_time_ms.is_some(),
@@ -12483,6 +12520,7 @@ mod tests {
         }
 
         fn cursor_position_report(&self) -> (i64, i64) {
+            self.record(Call::Query(Query::CursorPositionReport));
             self.grid.borrow().cursor
         }
 
@@ -12491,8 +12529,20 @@ mod tests {
                 provisional,
                 anchor_rows,
             }));
-            // The rebase is backend policy; this fixed grid keeps the anchor.
-            provisional
+            // A real rebase, not a pass-through: the anchor is a text-buffer
+            // row, so it has to move by however much the buffer grew between
+            // the PromptEnd that recorded `anchor_rows` and now. This models
+            // Block's policy (the same shared helper, driven by this grid's
+            // own row count) precisely so the engine's half is testable — that
+            // it hands over the row count recorded *at PromptEnd* and not the
+            // current one, and that it uses the rebased anchor for the capture
+            // range. A backend that returned `provisional` unchanged would
+            // make every one of those interchangeable.
+            rebase_prompt_anchor(
+                provisional,
+                anchor_rows,
+                self.grid.borrow().rows.len() as i64,
+            )
         }
 
         fn grid_cols(&self) -> i64 {
@@ -12566,11 +12616,14 @@ mod tests {
     /// before it installs a `glib` timeout, which is what makes the seam's
     /// refusals testable without a main loop. The polling half that follows
     /// (`visible_editor_text`) needs one, so it stays out of reach here.
+    ///
+    /// There is deliberately no canned `visible_editor_text`: no test can
+    /// reach that read, so a settable answer for it would be wiring that
+    /// nothing drives and no assertion could ever disagree with.
     struct RecordingSurface {
         reads: RefCell<Vec<SurfaceRead>>,
         cursor: Cell<(i64, i64)>,
         rows: Cell<i64>,
-        editor_text: RefCell<Option<String>>,
         suffix_is_empty: Cell<Option<bool>>,
     }
 
@@ -12580,7 +12633,6 @@ mod tests {
                 reads: RefCell::new(Vec::new()),
                 cursor: Cell::new((0, 0)),
                 rows: Cell::new(24),
-                editor_text: RefCell::new(None),
                 suffix_is_empty: Cell::new(None),
             })
         }
@@ -12605,7 +12657,12 @@ mod tests {
             self.reads
                 .borrow_mut()
                 .push(SurfaceRead::VisibleEditorText { anchor });
-            self.editor_text.borrow().clone()
+            // Unreachable from these tests (see the struct doc): the polling
+            // tick that calls this needs a `glib` main loop. Answering `None`
+            // is the fail-closed answer a surface that cannot read itself
+            // gives, so a path that ever did reach it would refuse, not
+            // silently accept a canned string.
+            None
         }
 
         fn suffix_is_empty(&self, _suggestion_rgb: [u8; 3]) -> Option<bool> {
@@ -12628,6 +12685,25 @@ mod tests {
         state_at_fan_out: BlockState,
     }
 
+    /// One engine-side `command_started` fan-out, with the same treatment its
+    /// block-finished twin gets: *when* it runs is a decision. Consumers
+    /// (bottom bar, history index, organism) read the running command out of
+    /// pane state as soon as they are called, so the fan-out must come after
+    /// the lifecycle has committed to the command — running flag set, state
+    /// advanced — and before the geometry push that ends the CommandStart
+    /// handler.
+    #[derive(Debug, Clone, PartialEq)]
+    struct StartedFanOut {
+        event: CommandStartedEvent,
+        cmd_running: bool,
+        state_at_fan_out: BlockState,
+        /// Geometry pushes recorded since the test last drained the backend.
+        /// Zero means the fan-out ran ahead of the one CommandStart makes on
+        /// its way out — the counterpart of `blocks_finalized_before`, which
+        /// pins the finished fan-out to the far side of its backend call.
+        geometry_pushes_before: usize,
+    }
+
     /// A `ReaderCtx` wired to [`RecordingBackend`], a bare-`openpty` PTY and
     /// real engine state, plus the observable fan-outs the lifecycle drives.
     struct ReaderHarness {
@@ -12639,7 +12715,7 @@ mod tests {
         bstate: Rc<Cell<BlockState>>,
         live_raw_output: Rc<RefCell<BoundedByteRing>>,
         blocks_finished: Rc<RefCell<Vec<FinishedFanOut>>>,
-        commands_started: Rc<RefCell<Vec<CommandStartedEvent>>>,
+        commands_started: Rc<RefCell<Vec<StartedFanOut>>>,
         commands_finished: Rc<RefCell<Vec<CommandFinishedEvent>>>,
         alt_screen: Rc<RefCell<Vec<AltScreenTransition>>>,
         agent_lost: Rc<RefCell<Vec<(u64, &'static str)>>>,
@@ -12655,14 +12731,41 @@ mod tests {
             let backend = RecordingBackend::new();
             let surface = RecordingSurface::new();
             let bstate = Rc::new(Cell::new(BlockState::Idle));
+            // Held here as well as in the ctx: the command-started fan-out
+            // records it, and a fan-out that fired before the flag was set
+            // would hand consumers a pane that is not running anything.
+            let cmd_running = Rc::new(Cell::new(false));
             let live_raw_output = Rc::new(RefCell::new(BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES)));
-            // The lifecycle reads only these knobs on the paths under test;
-            // pin them so no developer's config file can move an assertion.
+            // Configuration is an input to the lifecycle, so it is built here
+            // rather than loaded: `load_safe_config` reads neither the
+            // developer's config file nor the `FORGE_*` environment (see its
+            // doc), which `load_config` does on every call. Two of these tests
+            // assert values derived from config — a finished block's estimated
+            // height (font metrics, viewport rows) and an OSC color reply
+            // (theme palette) — and every one of them would otherwise be at
+            // the mercy of whoever ran it.
+            //
+            // The knobs the paths under test read are then set explicitly, so
+            // the assertion and the input that decides it stay side by side
+            // even if the built-in defaults move.
             let config = {
-                let mut config = crate::config::load_config().0;
+                let mut config = crate::config::load_safe_config().0;
+                // Read by the empty-command bail.
                 config.preserve_live_scrollback = false;
+                // Read by the finalize path (line count + estimated height).
                 config.truncation_threshold_lines = 50_000;
+                config.finished_block_viewport_rows = 24;
+                config.finished_block_max_expanded_rows = 5_000;
+                config.font_desc = "Monospace 14".to_string();
+                config.default_font_scale = 1.0;
+                // Read by the OSC 52 gate.
                 config.allow_remote_clipboard_write = false;
+                // Read by the GTK finalize policy this harness swaps out, and
+                // pinned anyway: a backend that grew a notification or an
+                // eviction assertion must not inherit a developer's numbers.
+                config.notify_long_blocks = false;
+                config.notify_long_block_threshold_ms = 10_000;
+                config.max_visible_blocks = 200;
                 Rc::new(RefCell::new(config))
             };
             // The reader's own foreground gate.
@@ -12720,9 +12823,19 @@ mod tests {
             let command_started_cbs: CommandStartedCallbacks = Rc::new(RefCell::new(Vec::new()));
             {
                 let seen = commands_started.clone();
+                let backend_at_fan_out = backend.clone();
+                let bstate_at_fan_out = bstate.clone();
+                let cmd_running_at_fan_out = cmd_running.clone();
                 command_started_cbs
                     .borrow_mut()
-                    .push(Box::new(move |event| seen.borrow_mut().push(event)));
+                    .push(Box::new(move |event| {
+                        seen.borrow_mut().push(StartedFanOut {
+                            event,
+                            cmd_running: cmd_running_at_fan_out.get(),
+                            state_at_fan_out: bstate_at_fan_out.get(),
+                            geometry_pushes_before: backend_at_fan_out.geometry_pushes(),
+                        })
+                    }));
             }
             let commands_finished = Rc::new(RefCell::new(Vec::new()));
             let command_finished_cbs: CommandFinishedCallbacks = Rc::new(RefCell::new(Vec::new()));
@@ -12825,7 +12938,7 @@ mod tests {
                 block_start_time_for_cb: Rc::new(Cell::new(None)),
                 current_cwd_for_cb: Rc::new(RefCell::new(HARNESS_CWD.to_string())),
                 event_buf: Rc::new(RefCell::new(Vec::new())),
-                cmd_running_rc: Rc::new(Cell::new(false)),
+                cmd_running_rc: cmd_running.clone(),
                 running_cmd_rc: Rc::new(RefCell::new(String::new())),
                 active_agent_generation_rc: Rc::new(Cell::new(None)),
                 command_started_cbs,
@@ -12852,7 +12965,18 @@ mod tests {
             }
         }
 
-        /// Dispatch one event, exactly as the per-chunk pipeline does.
+        /// Dispatch one already-decoded event through the lifecycle.
+        ///
+        /// This is the dispatch half of the per-chunk pipeline only. Three
+        /// stages of `ReaderCtx::install`'s closure sit *above* this seam and
+        /// are not exercised here: the selection feed hold, which can park a
+        /// whole chunk and replay it later; `Parser::feed`, which turns bytes
+        /// into these events (and owns every OSC/CSI edge, including sequences
+        /// split across chunks); and `coalesce_bytes_events`, which folds runs
+        /// of consecutive `Bytes` into one — so a test that feeds two adjacent
+        /// `Bytes` events sees two dispatches where a real chunk would produce
+        /// one. Each of those stages has its own tests; nothing below re-tests
+        /// them, and nothing below can catch a defect in them.
         fn feed(&self, event: ParserEvent) {
             self.ctx.handle_event(&event);
         }
@@ -12892,9 +13016,23 @@ mod tests {
         }
     }
 
+    /// A `C` packet from a shell that reports no cwd, so the pane's own
+    /// [`HARNESS_CWD`] fills the gap.
     fn command_start(command: Option<&str>) -> ParserEvent {
         ParserEvent::CommandStart(CommandMeta {
             command: command.map(str::to_string),
+            ..CommandMeta::default()
+        })
+    }
+
+    /// A `C` packet from a shell that does report where it is. Its answer is
+    /// the one a block must carry: the pane's cwd is a fallback, and it can be
+    /// stale (a `cd` inside the command, a pane whose tracker missed an
+    /// update), which is exactly why the shell is asked at all.
+    fn command_start_in(command: Option<&str>, cwd: &str) -> ParserEvent {
+        ParserEvent::CommandStart(CommandMeta {
+            command: command.map(str::to_string),
+            cwd: Some(cwd.to_string()),
             ..CommandMeta::default()
         })
     }
@@ -12917,8 +13055,8 @@ mod tests {
     /// Nothing here is canned. The command text is read off the surface grid
     /// between the anchor captured at PromptEnd and the cursor at
     /// CommandStart, so the four coordinates the engine passes decide it; the
-    /// two column counts differ, so the width the block records says which
-    /// query produced it.
+    /// two column counts differ, so both the width the block records and the
+    /// height it is estimated at say which query produced them.
     #[test]
     fn a_full_command_cycle_finalizes_one_block_and_resyncs_geometry() {
         let harness = ReaderHarness::new();
@@ -12927,7 +13065,9 @@ mod tests {
         // coordinate of the capture range is zero.
         harness.backend.render_row(3, "user@host $ ");
 
-        harness.feed_all([ParserEvent::PromptStart, bytes("user@host $ ")]);
+        // A two-line prompt: only its last rendered line is the prompt the
+        // block shows, so the banner above it must not reach the block.
+        harness.feed_all([ParserEvent::PromptStart, bytes("top-line\r\nuser@host $ ")]);
         harness.feed(ParserEvent::PromptEnd);
         assert_eq!(harness.bstate.get(), BlockState::AwaitingCommand);
         assert_eq!(harness.ctx.prompt_end_pos_rc.get(), (12, 3));
@@ -12936,7 +13076,7 @@ mod tests {
         harness.backend.render_row(3, "user@host $ echo hi");
         harness.backend.take_calls();
 
-        harness.feed(command_start(None));
+        harness.feed(command_start_in(None, SHELL_REPORTED_CWD));
         assert_eq!(harness.bstate.get(), BlockState::CollectingOutput);
         assert_eq!(
             harness.backend.take_calls(),
@@ -12959,15 +13099,30 @@ mod tests {
         );
         assert_eq!(
             harness.commands_started.borrow().as_slice(),
-            &[CommandStartedEvent {
-                command: "echo hi".to_string(),
-                cwd: Some(HARNESS_CWD.to_string()),
+            &[StartedFanOut {
+                event: CommandStartedEvent {
+                    command: "echo hi".to_string(),
+                    // The shell said where it was; the pane's own cwd is only
+                    // a fallback (see `background_output_at_an_idle_prompt...`).
+                    cwd: Some(SHELL_REPORTED_CWD.to_string()),
+                },
+                // Emitted with the lifecycle already committed to the command
+                // and before the handler's closing geometry push.
+                cmd_running: true,
+                state_at_fan_out: BlockState::CollectingOutput,
+                geometry_pushes_before: 0,
             }]
         );
 
-        harness.feed(bytes("\x1b[32mhi\x1b[0m\r\n"));
+        // A line wider than one grid but not the other: the height estimate
+        // has to wrap it, so the number the block records tells the two
+        // column counts apart a second time.
+        let wide_line = "w".repeat(110);
+        let raw_output = format!("\x1b[32mhi\x1b[0m\r\n{wide_line}\r\n");
+        let plain_output = format!("hi\n{wide_line}\n");
+        harness.feed(bytes(&raw_output));
         // The raw-output ring is engine-owned state, not a backend query.
-        assert_eq!(harness.live_output(), "\x1b[32mhi\x1b[0m\r\n");
+        assert_eq!(harness.live_output(), raw_output);
         harness.feed(command_end(Some(0)));
         assert_eq!(harness.bstate.get(), BlockState::PostCommand);
 
@@ -12975,7 +13130,7 @@ mod tests {
         assert!(harness
             .backend
             .calls()
-            .contains(&Call::FeedLive(b"\x1b[32mhi\x1b[0m\r\n".to_vec())));
+            .contains(&Call::FeedLive(raw_output.as_bytes().to_vec())));
 
         let before_finalize = harness.backend.take_calls();
         assert!(
@@ -12985,24 +13140,42 @@ mod tests {
             "the block is minted at the next prompt, not at OSC 133;D: {before_finalize:?}"
         );
 
+        // What the placeholder height must be, and what it would be had the
+        // estimate read the live grid instead. The two differ only because the
+        // wide line wraps at one width and not the other.
+        let (height_at_block_cols, height_at_live_cols) = {
+            let config = harness.config.borrow();
+            (
+                estimated_finished_block_height_for_text(&config, "echo hi", &plain_output, 100),
+                estimated_finished_block_height_for_text(&config, "echo hi", &plain_output, 120),
+            )
+        };
+        assert_ne!(
+            height_at_block_cols, height_at_live_cols,
+            "the fixture must make the two column counts produce different heights"
+        );
+
         harness.feed(ParserEvent::PromptStart);
 
         assert_eq!(
             harness.backend.calls(),
             vec![
                 Call::FinalizeBlock(FinalizeRecord {
+                    // The last rendered prompt line, not the banner above it.
                     prompt: "user@host $".to_string(),
                     command: "echo hi".to_string(),
                     // The finished VTE is fed the decorated copy: the block
                     // keeps the colour the live surface showed.
-                    output_with_ansi: "\x1b[32mhi\x1b[0m\r\n".to_string(),
+                    output_with_ansi: raw_output.clone(),
                     // The plain copy loses the SGR runs and the PTY's ONLCR
                     // carriage returns with them.
-                    output_plain: "hi\n".to_string(),
-                    plain_output_bytes: 3,
-                    cwd: Some(HARNESS_CWD.to_string()),
+                    output_plain: plain_output.clone(),
+                    plain_output_bytes: plain_output.len(),
+                    cwd: Some(SHELL_REPORTED_CWD.to_string()),
                     // The floored block width, not the live grid's 120.
                     cols: 100,
+                    // ...and the same width again for the height estimate.
+                    estimated_height: height_at_block_cols,
                     exit_code: Some(0),
                     has_duration: true,
                     has_end_time: true,
@@ -13026,13 +13199,82 @@ mod tests {
             &[FinishedFanOut {
                 command: "echo hi".to_string(),
                 exit_code: Some(0),
-                output_sample: "hi\n".to_string(),
+                output_sample: plain_output,
                 agent_generation: None,
                 blocks_finalized_before: 1,
                 state_at_fan_out: BlockState::PostCommand,
             }]
         );
         assert_eq!(harness.commands_finished.borrow().len(), 1);
+    }
+
+    /// A second command on the same pane, ending the way a shell that reports
+    /// no status ends one. `None` must reach the block as `None`: everything
+    /// downstream presents `Some(0)` as success, and an outcome nobody
+    /// reported is not a success.
+    ///
+    /// Running it as a *second* cycle is the point — the first block's status,
+    /// output ring and command text all have to be gone by the time the second
+    /// one is minted, and a lifecycle that leaked any of them would report the
+    /// first command's zero here.
+    #[test]
+    fn a_second_cycle_carries_its_own_unreported_exit_status() {
+        let harness = ReaderHarness::new();
+        harness.backend.render_row(3, "$ ");
+
+        // Cycle one: an ordinary success.
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("$ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.backend.render_row(3, "$ first");
+        harness.feed(command_start(None));
+        harness.feed(bytes("one\r\n"));
+        harness.feed(command_end(Some(0)));
+        harness.feed(ParserEvent::PromptStart);
+        assert_eq!(harness.backend.finalized().len(), 1);
+
+        // Cycle two, on the same pane: the shell sends `D` with no status.
+        harness.backend.render_row(3, "$ ");
+        harness.feed_all([bytes("$ "), ParserEvent::PromptEnd]);
+        harness.backend.render_row(3, "$ second");
+        harness.feed(command_start(None));
+        harness.feed(bytes("two\r\n"));
+        harness.feed(command_end(None));
+        harness.feed(ParserEvent::PromptStart);
+
+        let finalized = harness.backend.finalized();
+        assert_eq!(finalized.len(), 2);
+        let Call::FinalizeBlock(second) = &finalized[1] else {
+            panic!("the second call must be a finalize: {finalized:?}");
+        };
+        assert_eq!(second.command, "second");
+        assert_eq!(second.output_plain, "two\n");
+        assert_eq!(
+            second.exit_code, None,
+            "a status the shell never reported must not be minted as Some(0)"
+        );
+        // The duration is ours (C→D), so it survives a missing status.
+        assert!(second.has_duration);
+        assert_eq!(
+            harness
+                .blocks_finished
+                .borrow()
+                .iter()
+                .map(|fan_out| (fan_out.command.clone(), fan_out.exit_code))
+                .collect::<Vec<_>>(),
+            vec![("first".to_string(), Some(0)), ("second".to_string(), None),]
+        );
+        assert_eq!(
+            harness
+                .commands_finished
+                .borrow()
+                .iter()
+                .map(|event| event.exit_code)
+                .collect::<Vec<_>>(),
+            vec![Some(0), None]
+        );
     }
 
     /// The capture's size guard is measured against the live grid's own column
@@ -13069,11 +13311,91 @@ mod tests {
             "an out-of-bounds range is refused before the surface is read at all"
         );
         assert_eq!(
-            harness.commands_started.borrow().as_slice(),
-            &[CommandStartedEvent {
+            harness
+                .commands_started
+                .borrow()
+                .iter()
+                .map(|fan_out| fan_out.event.clone())
+                .collect::<Vec<_>>(),
+            vec![CommandStartedEvent {
                 command: TRUNCATED_COMMAND_PLACEHOLDER.to_string(),
+                // This shell reported no cwd, so the pane's own answer fills in.
                 cwd: Some(HARNESS_CWD.to_string()),
             }]
+        );
+    }
+
+    /// The anchor captured at PromptEnd is a *text-buffer* row, and the buffer
+    /// grows under it: output scrolling in between the two marks moves the
+    /// prompt row without moving the prompt. So the row alone is meaningless —
+    /// it is only interpretable together with the row count recorded beside
+    /// it, and rebasing the pair onto the surface as it stands at CommandStart
+    /// is what turns it back into a position.
+    ///
+    /// The rebase itself is backend policy (this backend applies Block's, by
+    /// the same shared helper). What is pinned here is the engine's half: that
+    /// it hands over the row count recorded *at PromptEnd* rather than the
+    /// current one, that the rebased answer — not the provisional anchor — is
+    /// what the capture range starts from, and that the pair it leaves behind
+    /// describes the surface as it is now.
+    #[test]
+    fn a_command_capture_rebases_its_anchor_onto_the_rows_added_since_prompt_end() {
+        let harness = ReaderHarness::new();
+        harness.backend.render_row(3, "$ ");
+
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("$ "),
+            ParserEvent::PromptEnd,
+        ]);
+        assert_eq!(harness.ctx.prompt_end_pos_rc.get(), (2, 3));
+        assert_eq!(harness.ctx.prompt_anchor_rows_rc.get(), 24);
+
+        // Four rows scroll into the buffer before the user submits; the prompt
+        // is now four rows further down, unchanged and un-re-echoed.
+        harness.backend.set_row_count(28);
+        harness.backend.render_row(7, "$ echo hi");
+        harness.backend.take_calls();
+
+        harness.feed(command_start(None));
+
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                Call::Query(Query::CursorAndRows),
+                Call::Query(Query::CommandCaptureAnchor {
+                    // The PromptEnd pair, handed over as it was recorded.
+                    provisional: (2, 3),
+                    anchor_rows: 24,
+                }),
+                Call::Query(Query::CaptureTextRange {
+                    // Row 7, not the row 3 the anchor was written down at.
+                    start: (7, 2),
+                    end: (7, 9),
+                }),
+                Call::SyncGeometryToPty,
+                Call::MarkScrollDirty,
+            ]
+        );
+        assert_eq!(
+            harness
+                .commands_started
+                .borrow()
+                .iter()
+                .map(|fan_out| fan_out.event.command.clone())
+                .collect::<Vec<_>>(),
+            vec!["echo hi".to_string()],
+            "an anchor left un-rebased reads four rows of scrollback as the command"
+        );
+        assert_eq!(
+            harness.ctx.prompt_end_pos_rc.get(),
+            (2, 7),
+            "the rebased anchor replaces the provisional one"
+        );
+        assert_eq!(
+            harness.ctx.prompt_anchor_rows_rc.get(),
+            28,
+            "...beside the row count it now means something against"
         );
     }
 
@@ -13170,6 +13492,12 @@ mod tests {
 
         harness.feed(ParserEvent::PromptStart);
 
+        let expected_height = estimated_finished_block_height_for_text(
+            &harness.config.borrow(),
+            "",
+            "cron: backup done\n",
+            80,
+        );
         assert_eq!(
             harness.backend.calls(),
             vec![
@@ -13181,8 +13509,12 @@ mod tests {
                     output_with_ansi: "cron: backup done\r\n".to_string(),
                     output_plain: "cron: backup done\n".to_string(),
                     plain_output_bytes: 18,
+                    // No command ran, so no shell reported a cwd: this is the
+                    // pane's own tracker, the fallback the foreground cycle
+                    // never takes.
                     cwd: Some(HARNESS_CWD.to_string()),
                     cols: 80,
+                    estimated_height: expected_height,
                     exit_code: None,
                     has_duration: false,
                     has_end_time: true,
@@ -13197,6 +13529,96 @@ mod tests {
             "a commandless block has no command lifecycle to report"
         );
         assert!(harness.commands_started.borrow().is_empty());
+    }
+
+    /// The upper bound of the background rule. Warp separates asynchronous
+    /// output only while the prompt is *quiet*: once the user has begun
+    /// editing, the shell's own echo and completion redraws are
+    /// indistinguishable from a background process, so nothing is buffered and
+    /// no block is minted. The bytes are still displayed — this is a
+    /// classification, not a filter.
+    #[test]
+    fn output_at_a_dirty_prompt_is_displayed_but_never_becomes_a_block() {
+        let harness = ReaderHarness::new();
+
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("user@host $ "),
+            ParserEvent::PromptEnd,
+        ]);
+        assert!(harness.ctx.prompt_anchor_ready_rc.get());
+        // The user typed: input is dirty from here on.
+        harness.ctx.idle_input_dirty_rc.set(true);
+        harness.backend.take_calls();
+
+        harness.feed(bytes("ec\r\n"));
+
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![Call::MarkScrollDirty, Call::FeedLive(b"ec\r\n".to_vec()),],
+            "a dirty prompt still displays what arrives"
+        );
+        assert!(
+            harness.ctx.engine.borrow().background_output.is_empty(),
+            "an edited prompt's echo may not be collected as background output"
+        );
+
+        harness.feed(ParserEvent::PromptStart);
+
+        assert!(
+            harness.backend.finalized().is_empty(),
+            "with nothing buffered there is no commandless block to mint"
+        );
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![Call::SyncGeometryToPty, Call::MarkScrollDirty],
+            "the prompt return is the ordinary one, with no finalize in it"
+        );
+    }
+
+    /// The other bound: background output belongs to the *gap between*
+    /// commands. A command that starts while bytes are still buffered takes
+    /// the terminal over, so what was collected for a would-be commandless
+    /// block is dropped rather than folded into that command's output.
+    #[test]
+    fn background_output_is_dropped_when_a_command_claims_the_terminal() {
+        let harness = ReaderHarness::new();
+        harness.backend.render_row(3, "user@host $ ");
+
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("user@host $ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.feed(bytes("cron: backup done\r\n"));
+        assert!(
+            !harness.ctx.engine.borrow().background_output.is_empty(),
+            "an idle prompt buffers asynchronous output (the other test's premise)"
+        );
+
+        harness.backend.render_row(3, "user@host $ echo hi");
+        harness.feed(command_start(None));
+
+        assert!(
+            harness.ctx.engine.borrow().background_output.is_empty(),
+            "a command start drops what was collected for a commandless block"
+        );
+
+        harness.feed(bytes("hi\r\n"));
+        harness.feed(command_end(Some(0)));
+        harness.feed(ParserEvent::PromptStart);
+
+        let finalized = harness.backend.finalized();
+        assert_eq!(finalized.len(), 1, "one command, one block: {finalized:?}");
+        let Call::FinalizeBlock(block) = &finalized[0] else {
+            panic!("a finalize is the only call filtered here");
+        };
+        assert_eq!(block.command, "echo hi");
+        assert_eq!(
+            block.output_plain, "hi\n",
+            "the pre-command background bytes must not be prepended to the command's output"
+        );
+        assert!(!block.is_background);
     }
 
     /// While the prompt anchor is still being established, bytes that arrive
@@ -13254,8 +13676,13 @@ mod tests {
             ]
         );
         assert_eq!(
-            harness.commands_started.borrow().as_slice(),
-            &[CommandStartedEvent {
+            harness
+                .commands_started
+                .borrow()
+                .iter()
+                .map(|fan_out| fan_out.event.clone())
+                .collect::<Vec<_>>(),
+            vec![CommandStartedEvent {
                 command: String::new(),
                 cwd: Some(HARNESS_CWD.to_string()),
             }],
@@ -13344,9 +13771,20 @@ mod tests {
     /// draws: chrome, then fullscreen, then the resize, and only then the
     /// re-synthesized enter sequence — so the app's first frame is written
     /// into a surface that already has its final size. Leaving mirrors it.
+    ///
+    /// Both entry states are exercised, because leaving restores the one it
+    /// interrupted: an app launched at the prompt (`AwaitingCommand`, a pager
+    /// invoked by shell completion) and one launched by a running command
+    /// (`CollectingOutput`, `git log` reaching for `less`, `vim` from a
+    /// script). Restoring the wrong one strands the pane — a prompt that
+    /// thinks a command is running, or a command whose output stops being
+    /// collected.
     #[test]
     fn alt_screen_resizes_before_replaying_the_enter_sequence() {
         let harness = ReaderHarness::new();
+        // The prompt is echoed onto the surface: the second half runs a real
+        // command, whose text is read off the grid from this anchor.
+        harness.backend.render_row(3, "user@host $ ");
 
         harness.feed_all([
             ParserEvent::PromptStart,
@@ -13389,6 +13827,61 @@ mod tests {
             harness.alt_screen.borrow().as_slice(),
             &[AltScreenTransition::Entered, AltScreenTransition::Left]
         );
+
+        // The same round trip from the other entry state: a command is
+        // running and reaches for a full-screen viewer.
+        harness.backend.render_row(3, "user@host $ git log");
+        harness.feed(command_start(None));
+        assert_eq!(harness.bstate.get(), BlockState::CollectingOutput);
+        harness.backend.take_calls();
+
+        harness.feed(ParserEvent::AltScreenEnter(1049));
+
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                Call::EnterAltScreenChrome,
+                Call::EnterFullscreen,
+                Call::SyncGeometryToPty,
+                Call::FeedLive(b"\x1b[?1049h".to_vec()),
+            ],
+            "the hand-over is the same whichever state the app interrupted"
+        );
+        assert_eq!(harness.bstate.get(), BlockState::AltScreen);
+
+        harness.feed(ParserEvent::AltScreenLeave(1049));
+
+        assert_eq!(
+            harness.bstate.get(),
+            BlockState::CollectingOutput,
+            "the viewer's caller is still running: its output must keep being collected"
+        );
+        // Proof that it really is collecting again, rather than merely
+        // reporting that it is: the next bytes reach the command's ring, and
+        // the command they belong to still finishes into one block.
+        harness.feed(bytes("after-pager\r\n"));
+        assert_eq!(harness.live_output(), "after-pager\r\n");
+        harness.feed(command_end(Some(0)));
+        harness.feed(ParserEvent::PromptStart);
+        let finalized = harness.backend.finalized();
+        assert_eq!(finalized.len(), 1, "one command, one block: {finalized:?}");
+        let Call::FinalizeBlock(block) = &finalized[0] else {
+            panic!("a finalize is the only call filtered here");
+        };
+        assert_eq!(block.command, "git log");
+        assert_eq!(
+            block.output_plain, "after-pager\n",
+            "alt-screen content is ephemeral; only what followed it is the block's output"
+        );
+        assert_eq!(
+            harness.alt_screen.borrow().as_slice(),
+            &[
+                AltScreenTransition::Entered,
+                AltScreenTransition::Left,
+                AltScreenTransition::Entered,
+                AltScreenTransition::Left,
+            ]
+        );
     }
 
     /// A foreground job can print OSC 133 marks of its own. While the shell
@@ -13429,6 +13922,12 @@ mod tests {
         assert_eq!(harness.bstate.get(), BlockState::PostCommand);
         harness.feed(ParserEvent::PromptStart);
 
+        let expected_height = estimated_finished_block_height_for_text(
+            &harness.config.borrow(),
+            "run-nested",
+            "",
+            80,
+        );
         assert_eq!(
             harness.backend.finalized(),
             vec![Call::FinalizeBlock(FinalizeRecord {
@@ -13439,6 +13938,7 @@ mod tests {
                 plain_output_bytes: 0,
                 cwd: Some(HARNESS_CWD.to_string()),
                 cols: 80,
+                estimated_height: expected_height,
                 exit_code: Some(0),
                 has_duration: true,
                 has_end_time: true,
@@ -13458,8 +13958,15 @@ mod tests {
     /// The same nested pair on a PTY the shell does not own, where both
     /// foreground gates fail closed. The nested C is not counted at all — so
     /// the next D is the shell's as far as the lifecycle can tell, and ends
-    /// the command — and an approved command's Agent identity is dropped when
-    /// its block is finalized without the shell on the foreground.
+    /// the command — and the approved command running through it loses its
+    /// Agent identity twice over: once at that end mark, which no longer
+    /// proves the approved command is what finished, and again at the
+    /// finalize, which will not mint a trusted block off the shell's
+    /// foreground.
+    ///
+    /// The identity is real, not poked in: it is handed to the lifecycle the
+    /// way a reviewed submission hands it over, and `on_command_start` is what
+    /// binds it to the running command.
     #[test]
     fn a_foreign_foreground_neither_counts_nested_marks_nor_keeps_agent_identity() {
         let harness = ReaderHarness::with_foreground(PtyForeground::Other);
@@ -13471,8 +13978,24 @@ mod tests {
             ParserEvent::PromptEnd,
         ]);
         harness.backend.render_row(3, "user@host $ run-nested");
+        // An approved submission's generation, waiting for the command start
+        // that will bind it.
+        harness.ctx.external_submission_generation_rc.set(Some(42));
         harness.feed(command_start(None));
         assert_eq!(harness.bstate.get(), BlockState::CollectingOutput);
+        assert_eq!(
+            harness.ctx.active_agent_generation_rc.get(),
+            Some(42),
+            "the command start binds the approval to the command now running"
+        );
+
+        // The running app queries the terminal. The reply is bytes the shell
+        // will eventually read, which is what makes a command end after it
+        // ambiguous rather than simply unbelievable.
+        harness.feed(ParserEvent::KeyboardProtocolQuery(
+            KeyboardProtocolQuery::DeviceStatus,
+        ));
+        assert!(harness.ctx.pending_typeahead_rc.get());
 
         harness.feed(command_start(Some("inner")));
         harness.feed(command_end(Some(7)));
@@ -13482,18 +14005,36 @@ mod tests {
             "an uncounted nested start leaves the next end to finish the command"
         );
         assert_eq!(harness.commands_finished.borrow().len(), 1);
-
-        // An approval still bound to this command reaches the finalize with
-        // the shell off the foreground.
-        harness.ctx.active_agent_generation_rc.set(Some(42));
-        harness.feed(ParserEvent::PromptStart);
-
         assert_eq!(
             harness.agent_lost.borrow().as_slice(),
             &[(
                 42,
+                "terminal ownership or command identifiers could not verify the approved command completion"
+            )],
+            "the end mark is accepted for the UI but never for the approval"
+        );
+        assert_eq!(
+            harness.ctx.active_agent_generation_rc.get(),
+            None,
+            "a refused identity is taken, not left bound for the finalize to reconsider"
+        );
+
+        // The other refusal, on the other side of the command. Re-binding here
+        // stands in for the one sequence this fixed-foreground PTY cannot
+        // produce: a shell that owned the terminal at `D` (so the end mark was
+        // accepted with the identity intact) and lost it to a background job
+        // before the next prompt. `active_agent_generation_rc` is the cell
+        // `on_command_start` writes and the finalize reads, so the finalize
+        // sees exactly what that sequence would leave it.
+        harness.ctx.active_agent_generation_rc.set(Some(43));
+        harness.feed(ParserEvent::PromptStart);
+
+        assert_eq!(
+            harness.agent_lost.borrow()[1],
+            (
+                43,
                 "the shell did not own the terminal when the approved command block was finalized"
-            )]
+            )
         );
         assert_eq!(harness.backend.finalized().len(), 1);
         assert_eq!(
@@ -13543,6 +14084,130 @@ mod tests {
             harness.ctx.accepted_input_generation_rc.get(),
             1,
             "a reply the PTY accepted counts as input the shell will see"
+        );
+    }
+
+    /// DSR 6. The answer is `ESC[{row};{col}R`, one-based, in that order — a
+    /// protocol every full-screen app uses to find out where it is, and one
+    /// where the two numbers are interchangeable to everything but the app
+    /// reading them. The grid's cursor is deliberately off the diagonal so a
+    /// transposed reply is a different string.
+    ///
+    /// The read is recorded too: the reply must come from the backend's own
+    /// CPR query, which Block answers differently from `cursor_and_rows` (see
+    /// [`RenderBackend::cursor_position_report`]).
+    #[test]
+    fn a_cursor_position_report_answers_the_cursors_row_then_its_column() {
+        let harness = ReaderHarness::new();
+        // Row 3, column 12 — one-based, that is line 4, column 13.
+        harness.backend.render_row(3, "user@host $ ");
+
+        harness.feed(ParserEvent::KeyboardProtocolQuery(
+            KeyboardProtocolQuery::CursorPosition,
+        ));
+
+        assert_eq!(
+            harness.pty.drain_test_slave(PTY_REPLY_WAIT),
+            b"\x1b[4;13R".to_vec(),
+            "row before column, both one-based"
+        );
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![Call::Query(Query::CursorPositionReport)],
+            "the reply is built from the CPR query, not from any other cursor read"
+        );
+        assert_eq!(
+            harness.ctx.accepted_input_generation_rc.get(),
+            1,
+            "a reply the PTY accepted counts as input the shell will see"
+        );
+    }
+
+    /// OSC 52 read. Forge answers every clipboard *query* with an empty
+    /// payload: a terminal that reports its clipboard hands whatever the user
+    /// last copied — passwords, tokens — to any process that can write ten
+    /// bytes to the PTY, including one on the far side of an SSH session. The
+    /// answer is unconditional, unlike the write side's config gate, because
+    /// there is no setting that makes disclosure safe.
+    #[test]
+    fn a_clipboard_query_is_answered_without_disclosing_the_clipboard() {
+        let harness = ReaderHarness::new();
+        harness.config.borrow_mut().allow_remote_clipboard_write = true;
+
+        harness.feed(ParserEvent::ClipboardQuery);
+
+        assert_eq!(
+            harness.pty.drain_test_slave(PTY_REPLY_WAIT),
+            b"\x1b]52;c;\x1b\\".to_vec(),
+            "the `c` selection, with an empty base64 payload"
+        );
+        assert!(
+            harness.backend.take_calls().is_empty(),
+            "reading the clipboard is answered from nothing: no surface is consulted"
+        );
+        assert_eq!(harness.ctx.accepted_input_generation_rc.get(), 1);
+    }
+
+    /// OSC 10/11/12 read. The reply reports the colour the app would actually
+    /// see: the configured theme until something recolours the terminal, and
+    /// the override afterwards — a tracker the OSC *set* arm maintains purely
+    /// so this answer stays true, since the set itself is applied natively by
+    /// the live surface and never comes back through here.
+    #[test]
+    fn a_color_query_answers_from_the_theme_until_an_app_overrides_it() {
+        let harness = ReaderHarness::new();
+
+        // OSC 12, straight off the built-in theme the harness config is built
+        // from — the one assertion here that reads a colour nobody set, so it
+        // is also what proves that config is built rather than loaded from
+        // whatever theme the developer running the test happens to use.
+        harness.feed(ParserEvent::ColorQuery(ColorKind::Cursor));
+        assert_eq!(
+            harness.pty.drain_test_slave(PTY_REPLY_WAIT),
+            b"\x1b]12;rgb:7f7f/b8b8/0e0e\x1b\\".to_vec(),
+            "the default theme's cursor colour, at 16 bits per channel"
+        );
+
+        // Pinned beside the assertion: the reply is 16-bit-per-channel, and
+        // these two are the values whose scaling is exact.
+        harness.config.borrow_mut().background = RGBA::new(1.0, 0.0, 0.0, 1.0);
+
+        harness.feed(ParserEvent::ColorQuery(ColorKind::Background));
+        assert_eq!(
+            harness.pty.drain_test_slave(PTY_REPLY_WAIT),
+            b"\x1b]11;rgb:ffff/0000/0000\x1b\\".to_vec(),
+            "OSC 11 answers the configured background"
+        );
+
+        // An app recolours the terminal (a theme-switching vim, say). The
+        // bytes went straight to the live surface; only the tracker updates.
+        harness.feed(ParserEvent::ColorSet {
+            kind: ColorKind::Background,
+            spec: "rgb:0000/ffff/0000".to_string(),
+        });
+        harness.feed(ParserEvent::ColorQuery(ColorKind::Background));
+        assert_eq!(
+            harness.pty.drain_test_slave(PTY_REPLY_WAIT),
+            b"\x1b]11;rgb:0000/ffff/0000\x1b\\".to_vec(),
+            "the live colour wins over the theme once one is set"
+        );
+
+        // ...and the reset puts the theme back.
+        harness.feed(ParserEvent::ColorReset(ColorKind::Background));
+        harness.feed(ParserEvent::ColorQuery(ColorKind::Background));
+        assert_eq!(
+            harness.pty.drain_test_slave(PTY_REPLY_WAIT),
+            b"\x1b]11;rgb:ffff/0000/0000\x1b\\".to_vec()
+        );
+
+        assert!(
+            harness.backend.take_calls().is_empty(),
+            "colours are engine-side state; no surface is read to answer one"
+        );
+        assert_eq!(
+            harness.ctx.accepted_input_generation_rc.get(),
+            4,
+            "four replies, four counted inputs; the set and reset write nothing"
         );
     }
 
