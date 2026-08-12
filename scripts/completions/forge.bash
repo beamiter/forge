@@ -16,7 +16,7 @@ _forge()
             return
             ;;
         --mode)
-            COMPREPLY=($(compgen -W "block vte" -- "${current}"))
+            COMPREPLY=($(compgen -W "block vte unified" -- "${current}"))
             return
             ;;
         --shell-integration|--generate-completion|--completion)
@@ -32,7 +32,7 @@ _forge()
     case "${current}" in
         --mode=*)
             local value="${current#*=}"
-            COMPREPLY=($(compgen -W "block vte" -- "${value}"))
+            COMPREPLY=($(compgen -W "block vte unified" -- "${value}"))
             COMPREPLY=("${COMPREPLY[@]/#/--mode=}")
             return
             ;;

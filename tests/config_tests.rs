@@ -9,7 +9,7 @@ fn test_terminal_mode_block() {
         TerminalMode::Block => {
             // Expected
         }
-        TerminalMode::Vte => {
+        TerminalMode::Vte | TerminalMode::Unified => {
             panic!("Expected Block mode");
         }
     }
@@ -22,7 +22,7 @@ fn test_terminal_mode_vte() {
         TerminalMode::Vte => {
             // Expected
         }
-        TerminalMode::Block => {
+        TerminalMode::Block | TerminalMode::Unified => {
             panic!("Expected Vte mode");
         }
     }

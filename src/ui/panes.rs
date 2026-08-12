@@ -235,12 +235,15 @@ impl UiState {
         leaf
     }
 
-    /// Create a managed Block pane leaf.
+    /// Create a managed `TermView` pane leaf in `mode` (Block or Unified).
     ///
     /// Mirrors `create_vte_leaf` so Block tabs split into Block panes instead of
-    /// silently downgrading the new pane to the conventional VTE backend.
+    /// silently downgrading the new pane to the conventional VTE backend. The
+    /// mode is passed down to `TermView::new` rather than re-read from the
+    /// shared config, so a caller that pinned Block keeps Block.
     pub(crate) fn create_block_leaf(
         &self,
+        mode: &crate::config::TerminalMode,
         working_directory: Option<&str>,
         session_id: Option<&str>,
         initial_commands: &[String],
@@ -253,6 +256,7 @@ impl UiState {
         let shell_argv = self.shell_argv.borrow();
         let view = Rc::new(TermView::new(
             &self.config.borrow(),
+            mode,
             shell_argv.as_slice(),
             working_directory,
             Some(&sid),
@@ -371,12 +375,18 @@ impl UiState {
         tab_widget_name: Option<String>,
     ) -> io::Result<PaneLeaf> {
         match mode {
-            crate::config::TerminalMode::Block => self.create_block_leaf(
-                working_directory,
-                session_id,
-                initial_commands,
-                tab_widget_name,
-            ),
+            // Unified is a render backend inside `TermView`, not a separate
+            // leaf: the pane tree, headers and drag/drop are identical, so the
+            // requested mode travels on into `TermView::new` and picks the
+            // backend there.
+            crate::config::TerminalMode::Block | crate::config::TerminalMode::Unified => self
+                .create_block_leaf(
+                    mode,
+                    working_directory,
+                    session_id,
+                    initial_commands,
+                    tab_widget_name,
+                ),
             crate::config::TerminalMode::Vte => Ok(self.create_vte_leaf(
                 working_directory,
                 session_id,
@@ -745,8 +755,17 @@ impl UiState {
 
         // The new pane inherits the backend of the pane being split so a Block
         // tab splits into Block panes rather than a conventional VTE sibling.
+        // Block and Unified share the leaf type; which of the two the new
+        // `TermView` renders with follows the shared config, exactly as for a
+        // new tab, and is honoured by `TermView::new` because it is passed
+        // down rather than re-derived.
         let split_mode = if current_leaf.is_block() {
-            crate::config::TerminalMode::Block
+            let configured = self.config.borrow().terminal_mode.clone();
+            if configured.uses_term_view() {
+                configured
+            } else {
+                crate::config::TerminalMode::Block
+            }
         } else {
             crate::config::TerminalMode::Vte
         };

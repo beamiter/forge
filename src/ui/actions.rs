@@ -348,6 +348,14 @@ impl UiState {
                             "Cleared {count} block{plural} — \"Undo clear blocks\" restores them."
                         );
                         self.toast_overlay.add_toast(adw::Toast::new(&message));
+                    } else if term_view.is_unified() {
+                        // In Block, "nothing to clear" is self-evident from an
+                        // empty pane. In Unified the pane is full of output
+                        // that this action will never touch, so silence reads
+                        // as a broken menu item.
+                        self.toast_overlay.add_toast(adw::Toast::new(
+                            "Unified mode keeps no blocks to clear — use the shell's own clear.",
+                        ));
                     }
                 }
             }
@@ -594,6 +602,18 @@ impl UiState {
             );
             return;
         };
+        // A Unified pane is a `PaneLeaf::Block`, so it reaches this far — but
+        // it keeps no `BlockData` at all, and exporting it would write a
+        // well-formed *empty* session file and report success. Refuse with the
+        // same dialog the VTE backend gets instead of lying about the write.
+        if term_view.is_unified() {
+            log::debug!("export: the active pane renders in unified mode and keeps no blocks");
+            self.show_session_export_result(
+                "Session export unavailable",
+                "Session export needs a Block-mode pane. Unified mode keeps the session on one terminal surface instead of in per-command blocks, so there is nothing to write.",
+            );
+            return;
+        }
         match term_view.export_session_to_file(format) {
             Ok(path) => {
                 log::info!("Session exported to {}", path.display());

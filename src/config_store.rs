@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::config::{self, Config, TerminalMode};
+use crate::config::{self, Config};
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
@@ -880,13 +880,7 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
     );
     table.insert(
         "terminal_mode".into(),
-        toml::Value::String(
-            match config.terminal_mode {
-                TerminalMode::Block => "block",
-                TerminalMode::Vte => "vte",
-            }
-            .to_string(),
-        ),
+        toml::Value::String(config.terminal_mode.as_str().to_string()),
     );
     table.insert(
         "tab_placement".into(),

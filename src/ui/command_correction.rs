@@ -326,6 +326,16 @@ fn attach_term_view(
     organism_signal: Rc<OrganismCorrectionSignal>,
     remote: bool,
 ) {
+    // A correction is only ever offered as an inline card. A Unified pane has
+    // nowhere to mount one — `insert_inline_notice` refuses there — and a
+    // proposal the user can neither see nor dismiss, whose entry would silently
+    // take the keyboard, is worse than no proposal. Skip the whole monitor: no
+    // request, no worker thread, no AI call.
+    if !view.supports_inline_notices() {
+        log::debug!("unified pane: command-correction monitor not attached (no card surface)");
+        return;
+    }
+
     let root = view.widget();
     if unsafe { root.data::<bool>(VIEW_DATA_KEY).is_some() } {
         return;
@@ -994,7 +1004,15 @@ fn show_correction_card(
     review.root.add_css_class("block-correction");
     let card: gtk4::Widget = review.root.clone().upcast();
     *card_slot.borrow_mut() = Some(card.clone());
-    view.insert_inline_notice(&card);
+    if !view.insert_inline_notice(&card) {
+        // Nothing was mounted (Unified mode), so there is no card to dismiss
+        // and nothing to focus. Attaching the monitor is already refused for
+        // such panes; this keeps the invariant local to the one place that
+        // would otherwise move the keyboard into an off-screen entry.
+        card_slot.borrow_mut().take();
+        log::debug!("command correction not shown: this pane cannot host an inline card");
+        return;
+    }
     // Take keyboard focus only when the prompt is clean and idle; a prompt the
     // user is already typing into must keep its keystrokes.
     if view.can_accept_agent_command() {

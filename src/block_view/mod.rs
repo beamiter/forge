@@ -1002,6 +1002,52 @@ fn rebase_prompt_anchor(anchor: (i64, i64), recorded_rows: i64, current_rows: i6
     )
 }
 
+/// The one prompt-anchor policy, parameterized by the only thing that differs
+/// between the render backends: whether this surface's row count can change
+/// under an anchor between PromptEnd and CommandStart.
+///
+/// Block's live VTE is resized between its compact and full layouts, and that
+/// `set_size` churn moves the text buffer beneath an anchor recorded in ring
+/// coordinates — so the anchor is shifted by the row-count delta. The Unified
+/// surface is viewport-sized for its whole life, and ring rows do not move
+/// when the grid height changes (the height-resize spike), so rebasing there
+/// would be actively wrong.
+///
+/// Every site that needs "the anchor, as of now" routes through this:
+/// [`RenderBackend::command_capture_anchor`] (command capture) and
+/// [`SubmissionSurface::prompt_anchor`] (the verified-submission check and the
+/// agent-readiness probe). Those are the security-relevant reads, and they
+/// must not be able to disagree about where the editor starts.
+fn prompt_anchor_for_surface(
+    rebase_on_row_delta: bool,
+    provisional: (i64, i64),
+    recorded_rows: i64,
+    current_rows: i64,
+) -> (i64, i64) {
+    if rebase_on_row_delta {
+        rebase_prompt_anchor(provisional, recorded_rows, current_rows)
+    } else {
+        provisional
+    }
+}
+
+/// Screen-relative row for a DSR 6 cursor-position report: `row` is the
+/// text-buffer (ring) row VTE reports, `top_row` the ring row currently at the
+/// top of the viewport (the live surface's vertical adjustment value), `rows`
+/// the grid height.
+///
+/// CPR is a screen-coordinate protocol — an application that saves the answer
+/// and later restores with `ESC[{row};{col}H` addresses the visible grid — so
+/// a ring row is only survivable while the ring stays short. Clamped into the
+/// grid because the adjustment and the cursor are read from the same frame but
+/// a scrolled-up reader can put the cursor outside the visible rows.
+fn screen_relative_cpr_row(row: i64, top_row: i64, rows: i64) -> i64 {
+    if rows <= 0 {
+        return row.max(0);
+    }
+    (row - top_row).clamp(0, rows - 1)
+}
+
 fn visible_editor_text(vte: &Terminal, anchor: (i64, i64)) -> Option<String> {
     let (end_col, end_row) = vte.cursor_position();
     let (start_col, start_row) = anchor;
@@ -1027,10 +1073,6 @@ fn visible_row_prefix(vte: &Terminal, cursor: (i64, i64)) -> Option<String> {
     vte.text_range_format(vte4::Format::Text, row, 0, row, col)
         .0
         .map(|text| text.to_string())
-}
-
-fn current_prompt_anchor(vte: &Terminal, anchor: (i64, i64), recorded_rows: i64) -> (i64, i64) {
-    rebase_prompt_anchor(anchor, recorded_rows, vte.row_count())
 }
 
 fn prompt_layout_reflow_can_reanchor(
@@ -3161,6 +3203,16 @@ trait SubmissionSurface {
     /// Current surface row count, against which the anchor recorded at
     /// PromptEnd is rebased.
     fn row_count(&self) -> i64;
+    /// The anchor recorded at PromptEnd (`provisional`, with the row count
+    /// `recorded_rows` read beside it), as of this surface right now.
+    ///
+    /// This is the same decision [`RenderBackend::command_capture_anchor`]
+    /// makes for command capture, and it must give the same answer: the two
+    /// callers here — the verified-submission editor check and the
+    /// agent-readiness probe — decide whether an approved command may execute.
+    /// Implementations route through [`prompt_anchor_for_surface`] so a pane
+    /// cannot end up holding two anchor policies at once.
+    fn prompt_anchor(&self, provisional: (i64, i64), recorded_rows: i64) -> (i64, i64);
     /// Rendered text between the prompt anchor and the cursor, `None` when the
     /// surface cannot answer for that range.
     fn visible_editor_text(&self, anchor: (i64, i64)) -> Option<String>;
@@ -3170,9 +3222,15 @@ trait SubmissionSurface {
 }
 
 /// The GTK/VTE implementation of [`SubmissionSurface`]: the same live VTE the
-/// [`BlockBackend`] feeds.
+/// render backend feeds, in either mode.
 struct VteSubmissionSurface {
     vte: Terminal,
+    /// This pane's anchor policy, mirroring its render backend's: `true` for
+    /// Block (compact/full `set_size` churn moves the text buffer between
+    /// PromptEnd and CommandStart), `false` for Unified (one viewport-sized
+    /// surface for the pane's whole life). Set once at construction from the
+    /// same mode that selects the backend, so the two cannot drift.
+    rebase_on_row_delta: bool,
 }
 
 impl SubmissionSurface for VteSubmissionSurface {
@@ -3182,6 +3240,15 @@ impl SubmissionSurface for VteSubmissionSurface {
 
     fn row_count(&self) -> i64 {
         self.vte.row_count()
+    }
+
+    fn prompt_anchor(&self, provisional: (i64, i64), recorded_rows: i64) -> (i64, i64) {
+        prompt_anchor_for_surface(
+            self.rebase_on_row_delta,
+            provisional,
+            recorded_rows,
+            self.vte.row_count(),
+        )
     }
 
     fn visible_editor_text(&self, anchor: (i64, i64)) -> Option<String> {
@@ -3233,11 +3300,10 @@ type VerifiedSubmissionCompletion = Box<dyn FnOnce(Result<(), String>)>;
 
 impl VerifiedSubmissionCtx {
     fn current_anchor(&self) -> (i64, i64) {
-        rebase_prompt_anchor(
-            self.prompt_end_pos.get(),
-            self.prompt_anchor_rows.get(),
-            self.surface.row_count(),
-        )
+        // Through the surface's own policy, never `rebase_prompt_anchor`
+        // directly: this pane may not be a Block pane.
+        self.surface
+            .prompt_anchor(self.prompt_end_pos.get(), self.prompt_anchor_rows.get())
     }
 
     fn fail(&self, generation: Option<u64>, reason: &'static str) {
@@ -3574,6 +3640,11 @@ pub struct TermView {
     /// on copy/typing/timeout. Kept here so input and copy paths can resume
     /// the feed immediately.
     selection_feed_hold: Rc<SelectionFeedHold>,
+    /// `Some` only in Unified mode, where it is the zone table
+    /// [`UnifiedBackend`] records into and the marker that this pane has no
+    /// finished-block widgets at all. Block-mode panes hold `None` and every
+    /// block-indexed method behaves exactly as before.
+    unified_zones: Option<Rc<RefCell<Vec<UnifiedZone>>>>,
 }
 
 impl Drop for TermView {
@@ -3704,9 +3775,15 @@ trait RenderBackend {
     /// and capture ranges live in this coordinate space.
     fn cursor_and_rows(&self) -> ((i64, i64), i64);
     /// Cursor position `(col, row)` for the DSR 6 cursor-position report
-    /// (`ESC[{row+1};{col+1}R`). Block reports the text-buffer row here
-    /// (pre-existing quirk kept for compatibility); a correct implementation
-    /// reports screen-relative coordinates as the CPR protocol expects.
+    /// (`ESC[{row+1};{col+1}R`), in the coordinates the reply is written with.
+    ///
+    /// CPR is screen-relative by protocol. Block answers with the text-buffer
+    /// (ring) row anyway — a pre-existing quirk kept so the reply bytes did
+    /// not change under this split — and gets away with it only because its
+    /// ring is wiped at every prompt, which keeps the two spaces within one
+    /// command's output of each other. A backend whose ring is never wiped
+    /// MUST convert (see [`screen_relative_cpr_row`]) or the reported row
+    /// grows without bound for the life of the pane.
     fn cursor_position_report(&self) -> (i64, i64);
     /// Rebase the prompt anchor captured at PromptEnd (`provisional`, with
     /// the surface row count `anchor_rows` recorded beside it) onto the
@@ -3760,6 +3837,143 @@ struct AnchorSettleArgs {
     init_commands: Rc<RefCell<std::collections::VecDeque<String>>>,
     verified_submission: VerifiedSubmissionCtx,
     config: Rc<RefCell<Config>>,
+}
+
+/// Install the prompt-anchor settling tick on `vte`, replacing whatever tick
+/// the previous prompt left in `tick_slot`.
+///
+/// Surface-coupled (frame ticks, cursor reads, deferred-byte replay) but
+/// layout-agnostic: it only reads the live VTE's cursor and row count and
+/// feeds parked bytes back into it. The Block surface's compact/full
+/// `set_size` churn happens around this pass, not inside it, so the single
+/// full-size Unified surface uses the identical fence — the anchor publishes
+/// on the same stability rule in both modes.
+fn schedule_anchor_settle_on(
+    vte: &Terminal,
+    tick_slot: &Rc<RefCell<Option<gtk4::TickCallbackId>>>,
+    args: AnchorSettleArgs,
+) {
+    // Local names keep the former `on_prompt_end` capture names so the
+    // tick body below stays verbatim.
+    let AnchorSettleArgs {
+        anchor_generation,
+        prompt_render_generation,
+        prompt_had_bytes,
+        prompt_anchor_generation: anchor_generation_cell,
+        prompt_anchor_ready: anchor_ready,
+        prompt_end_pos: anchor_pos,
+        prompt_anchor_rows: anchor_rows,
+        prompt_anchor_prefix: anchor_prefix,
+        bstate: anchor_state,
+        idle_input_dirty: anchor_dirty,
+        pty_synced: anchor_synced,
+        submission_pending: anchor_submission,
+        pending_typeahead: anchor_typeahead,
+        contents_generation,
+        post_prompt_bytes,
+        post_prompt_fence_released,
+        init_commands,
+        verified_submission,
+        config: config_for_anchor,
+    } = args;
+    let stage = Rc::new(Cell::new(0u8));
+    let stage_baseline = Rc::new(Cell::new(prompt_render_generation));
+    let stage_polls = Rc::new(Cell::new(0u8));
+    let stage_requires_content = Rc::new(Cell::new(prompt_had_bytes));
+    let last_observed = Rc::new(Cell::new(None::<(u64, i64, i64)>));
+    let stable_polls = Rc::new(Cell::new(0u8));
+    let polls = Rc::new(Cell::new(0u32));
+    if let Some(previous) = tick_slot.borrow_mut().take() {
+        previous.remove();
+    }
+    let anchor_tick_slot = tick_slot.clone();
+    let tick_id = vte.add_tick_callback(move |vte, _| {
+        let poll = polls.get().saturating_add(1);
+        polls.set(poll);
+        match anchor_tick_exit(
+            anchor_generation_cell.get() == anchor_generation,
+            post_prompt_fence_released.get(),
+            prompt_anchor_may_settle(
+                anchor_state.get(),
+                anchor_dirty.get(),
+                anchor_synced.get(),
+                anchor_submission.get(),
+                anchor_typeahead.get(),
+            ),
+            poll,
+        ) {
+            AnchorTickExit::Superseded => {
+                return glib::ControlFlow::Break;
+            }
+            AnchorTickExit::Abandon(reason) => {
+                if reason == AnchorAbandoned::Deadline {
+                    log::warn!("prompt cursor did not settle before the safety deadline");
+                }
+                // This prompt will never publish an
+                // anchor, so nothing else would drain
+                // the ring before CommandStart. Release
+                // it: the user's own echo must stay
+                // visible even when the capture anchor
+                // is lost.
+                release_post_prompt_fence(
+                    &|deferred| vte.feed(deferred),
+                    &post_prompt_bytes,
+                    &post_prompt_fence_released,
+                );
+                anchor_tick_slot.borrow_mut().take();
+                return glib::ControlFlow::Break;
+            }
+            AnchorTickExit::Continue => {}
+        }
+        let contents = contents_generation.get();
+        let after_fence = contents != stage_baseline.get();
+        stage_polls.set(stage_polls.get().saturating_add(1));
+        if !after_fence && (stage_requires_content.get() || stage_polls.get() < 4) {
+            return glib::ControlFlow::Continue;
+        }
+        let (col, row) = vte.cursor_position();
+        let observed = (contents, col, row);
+        if last_observed.get() != Some(observed) {
+            last_observed.set(Some(observed));
+            stable_polls.set(0);
+            return glib::ControlFlow::Continue;
+        }
+        stable_polls.set(stable_polls.get().saturating_add(1));
+        if stable_polls.get() < 1 {
+            return glib::ControlFlow::Continue;
+        }
+        if stage.get() == 0 {
+            anchor_pos.set((col, row));
+            anchor_rows.set(vte.row_count());
+            *anchor_prefix.borrow_mut() = visible_row_prefix(vte, (col, row)).unwrap_or_default();
+        }
+        // New post-B bytes can arrive while an earlier
+        // deferred batch is settling. Drain repeatedly;
+        // Ready is published only at a stable boundary
+        // where the ring is still empty.
+        let deferred = post_prompt_bytes.borrow_mut().take_vec();
+        if !deferred.is_empty() {
+            stage.set(1);
+            stage_baseline.set(contents);
+            stage_polls.set(0);
+            stage_requires_content.set(background_output_has_visible_text(&deferred));
+            last_observed.set(None);
+            stable_polls.set(0);
+            vte.feed(&deferred);
+            return glib::ControlFlow::Continue;
+        }
+        anchor_ready.set(true);
+
+        if let Some(command) = init_commands.borrow_mut().pop_front() {
+            let suggestion = click_cursor::suggestion_rgb(&config_for_anchor.borrow().palette);
+            if let Err(error) = verified_submission.begin(&command, None, suggestion) {
+                log::warn!("initial command was not queued at an unverified prompt: {error}");
+            }
+        }
+        anchor_tick_slot.borrow_mut().take();
+        glib::ControlFlow::Break
+    });
+    *tick_slot.borrow_mut() = Some(tick_id);
 }
 
 /// The GTK/VTE implementation of [`RenderBackend`] for Block mode: owns the
@@ -5228,10 +5442,7 @@ impl RenderBackend for BlockBackend {
     }
 
     fn set_system_clipboard(&self, text: &str) {
-        if let Some(display) = gtk4::gdk::Display::default() {
-            let clipboard = display.clipboard();
-            clipboard.set_text(text);
-        }
+        set_display_clipboard_text(text);
     }
 
     fn desktop_notify(&self, title: Option<&str>, body: &str) {
@@ -5239,128 +5450,7 @@ impl RenderBackend for BlockBackend {
     }
 
     fn schedule_anchor_settle(&self, args: AnchorSettleArgs) {
-        // Local names keep the former `on_prompt_end` capture names so the
-        // tick body below stays verbatim.
-        let AnchorSettleArgs {
-            anchor_generation,
-            prompt_render_generation,
-            prompt_had_bytes,
-            prompt_anchor_generation: anchor_generation_cell,
-            prompt_anchor_ready: anchor_ready,
-            prompt_end_pos: anchor_pos,
-            prompt_anchor_rows: anchor_rows,
-            prompt_anchor_prefix: anchor_prefix,
-            bstate: anchor_state,
-            idle_input_dirty: anchor_dirty,
-            pty_synced: anchor_synced,
-            submission_pending: anchor_submission,
-            pending_typeahead: anchor_typeahead,
-            contents_generation,
-            post_prompt_bytes,
-            post_prompt_fence_released,
-            init_commands,
-            verified_submission,
-            config: config_for_anchor,
-        } = args;
-        let stage = Rc::new(Cell::new(0u8));
-        let stage_baseline = Rc::new(Cell::new(prompt_render_generation));
-        let stage_polls = Rc::new(Cell::new(0u8));
-        let stage_requires_content = Rc::new(Cell::new(prompt_had_bytes));
-        let last_observed = Rc::new(Cell::new(None::<(u64, i64, i64)>));
-        let stable_polls = Rc::new(Cell::new(0u8));
-        let polls = Rc::new(Cell::new(0u32));
-        if let Some(previous) = self.prompt_anchor_tick_id_rc.borrow_mut().take() {
-            previous.remove();
-        }
-        let anchor_tick_slot = self.prompt_anchor_tick_id_rc.clone();
-        let tick_id = self.active_vte.add_tick_callback(move |vte, _| {
-            let poll = polls.get().saturating_add(1);
-            polls.set(poll);
-            match anchor_tick_exit(
-                anchor_generation_cell.get() == anchor_generation,
-                post_prompt_fence_released.get(),
-                prompt_anchor_may_settle(
-                    anchor_state.get(),
-                    anchor_dirty.get(),
-                    anchor_synced.get(),
-                    anchor_submission.get(),
-                    anchor_typeahead.get(),
-                ),
-                poll,
-            ) {
-                AnchorTickExit::Superseded => {
-                    return glib::ControlFlow::Break;
-                }
-                AnchorTickExit::Abandon(reason) => {
-                    if reason == AnchorAbandoned::Deadline {
-                        log::warn!("prompt cursor did not settle before the safety deadline");
-                    }
-                    // This prompt will never publish an
-                    // anchor, so nothing else would drain
-                    // the ring before CommandStart. Release
-                    // it: the user's own echo must stay
-                    // visible even when the capture anchor
-                    // is lost.
-                    release_post_prompt_fence(
-                        &|deferred| vte.feed(deferred),
-                        &post_prompt_bytes,
-                        &post_prompt_fence_released,
-                    );
-                    anchor_tick_slot.borrow_mut().take();
-                    return glib::ControlFlow::Break;
-                }
-                AnchorTickExit::Continue => {}
-            }
-            let contents = contents_generation.get();
-            let after_fence = contents != stage_baseline.get();
-            stage_polls.set(stage_polls.get().saturating_add(1));
-            if !after_fence && (stage_requires_content.get() || stage_polls.get() < 4) {
-                return glib::ControlFlow::Continue;
-            }
-            let (col, row) = vte.cursor_position();
-            let observed = (contents, col, row);
-            if last_observed.get() != Some(observed) {
-                last_observed.set(Some(observed));
-                stable_polls.set(0);
-                return glib::ControlFlow::Continue;
-            }
-            stable_polls.set(stable_polls.get().saturating_add(1));
-            if stable_polls.get() < 1 {
-                return glib::ControlFlow::Continue;
-            }
-            if stage.get() == 0 {
-                anchor_pos.set((col, row));
-                anchor_rows.set(vte.row_count());
-                *anchor_prefix.borrow_mut() =
-                    visible_row_prefix(vte, (col, row)).unwrap_or_default();
-            }
-            // New post-B bytes can arrive while an earlier
-            // deferred batch is settling. Drain repeatedly;
-            // Ready is published only at a stable boundary
-            // where the ring is still empty.
-            let deferred = post_prompt_bytes.borrow_mut().take_vec();
-            if !deferred.is_empty() {
-                stage.set(1);
-                stage_baseline.set(contents);
-                stage_polls.set(0);
-                stage_requires_content.set(background_output_has_visible_text(&deferred));
-                last_observed.set(None);
-                stable_polls.set(0);
-                vte.feed(&deferred);
-                return glib::ControlFlow::Continue;
-            }
-            anchor_ready.set(true);
-
-            if let Some(command) = init_commands.borrow_mut().pop_front() {
-                let suggestion = click_cursor::suggestion_rgb(&config_for_anchor.borrow().palette);
-                if let Err(error) = verified_submission.begin(&command, None, suggestion) {
-                    log::warn!("initial command was not queued at an unverified prompt: {error}");
-                }
-            }
-            anchor_tick_slot.borrow_mut().take();
-            glib::ControlFlow::Break
-        });
-        *self.prompt_anchor_tick_id_rc.borrow_mut() = Some(tick_id);
+        schedule_anchor_settle_on(&self.active_vte, &self.prompt_anchor_tick_id_rc, args);
     }
 
     fn cursor_and_rows(&self) -> ((i64, i64), i64) {
@@ -5374,16 +5464,18 @@ impl RenderBackend for BlockBackend {
         // Bug-compatible on purpose: VTE's `cursor_position()` row is a
         // text-buffer (ring) row, and the pre-split code fed exactly this
         // value into the `ESC[{row+1};{col+1}R` reply. Kept so the reply
-        // bytes do not change under the trait split; see the CPR note on
-        // `RenderBackend::cursor_position_report`.
+        // bytes do not change under the trait split; the row stays small
+        // because `reset_active` wipes this ring at every prompt. See the CPR
+        // note on `RenderBackend::cursor_position_report`.
         self.active_vte.cursor_position()
     }
 
     fn command_capture_anchor(&self, provisional: (i64, i64), anchor_rows: i64) -> (i64, i64) {
         // Verbatim pre-split math: shift the anchor row by the row-count
         // delta the compact/full `set_size` churn produced between PromptEnd
-        // and CommandStart (same helper the verified-submission path uses).
-        rebase_prompt_anchor(provisional, anchor_rows, self.active_vte.row_count())
+        // and CommandStart. Through the shared policy, which is also what this
+        // pane's `SubmissionSurface` answers with.
+        prompt_anchor_for_surface(true, provisional, anchor_rows, self.active_vte.row_count())
     }
 
     fn grid_cols(&self) -> i64 {
@@ -5401,10 +5493,7 @@ impl RenderBackend for BlockBackend {
         end_row: i64,
         end_col: i64,
     ) -> Option<String> {
-        self.active_vte
-            .text_range_format(vte4::Format::Text, start_row, start_col, end_row, end_col)
-            .0
-            .map(|gs| gs.to_string())
+        capture_vte_text_range(&self.active_vte, start_row, start_col, end_row, end_col)
     }
 
     /// Mount a finished command as a history block and reset the live surface.
@@ -5617,6 +5706,346 @@ impl RenderBackend for BlockBackend {
             self.scroll_debouncer
                 .pin_to_bottom_deferred(&self.block_scroll_rc);
         }
+    }
+}
+
+/// Plain text between two grid positions on `vte`, `None` when the surface has
+/// nothing there. Shared by both backends: the coordinate space (text-buffer
+/// rows) and the bounding rules are engine-side, so the read itself is the
+/// only surface-specific part and it is identical for either surface.
+fn capture_vte_text_range(
+    vte: &Terminal,
+    start_row: i64,
+    start_col: i64,
+    end_row: i64,
+    end_col: i64,
+) -> Option<String> {
+    vte.text_range_format(vte4::Format::Text, start_row, start_col, end_row, end_col)
+        .0
+        .map(|gs| gs.to_string())
+}
+
+/// Write `text` to the desktop clipboard (OSC 52 write, policy-gated
+/// engine-side). Backend-shared: nothing about it is per-surface.
+fn set_display_clipboard_text(text: &str) {
+    if let Some(display) = gtk4::gdk::Display::default() {
+        let clipboard = display.clipboard();
+        clipboard.set_text(text);
+    }
+}
+
+/// One finished command recorded by the Unified backend: everything
+/// [`FinalizedBlockArgs`] carries about a command's identity and outcome,
+/// minus the output text — in Unified mode the output is already on the
+/// single surface and is never copied into a second widget.
+///
+/// This table is the seam increment 1b builds on (OSC 8 zone markers, a
+/// probe-driven chrome pass); 1a only proves the lifecycle delivers every
+/// field a zone needs, at the right moment, through the existing trait.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UnifiedZone {
+    id: u64,
+    /// Empty for a background zone; never a placeholder for one.
+    command: String,
+    exit_code: Option<i32>,
+    duration_ms: Option<u64>,
+    cwd: Option<String>,
+    end_time_ms: Option<u64>,
+    /// Commandless asynchronous output finalized at the next prompt. It has no
+    /// command and must never be presented as one.
+    is_background: bool,
+}
+
+/// Append `args` to the zone table, dropping the oldest entries past
+/// `max_zones`.
+///
+/// The bound is deliberately the same `max_visible_blocks` knob Block-mode
+/// retention uses: a zone is much smaller than a finished block, so this is
+/// conservative, but until 1b decides what a zone must outlive (the VTE's own
+/// scrollback trim, most likely) an unbounded table would be the only
+/// unbounded allocation this mode adds. Pure so the retention rule is
+/// testable without a surface.
+fn record_unified_zone(zones: &mut Vec<UnifiedZone>, args: &FinalizedBlockArgs, max_zones: usize) {
+    zones.push(UnifiedZone {
+        id: args.block_id,
+        command: args.cmd.clone(),
+        exit_code: args.exit_code,
+        duration_ms: args.duration_ms,
+        cwd: args.block_cwd.clone(),
+        end_time_ms: args.end_time_ms,
+        is_background: args.is_background,
+    });
+    let max = max_zones.max(1);
+    if zones.len() > max {
+        zones.drain(..zones.len() - max);
+    }
+}
+
+/// The Unified-mode implementation of [`RenderBackend`]: one long-lived,
+/// full-size [`vte4::Terminal`] with no block chrome at all.
+///
+/// Everything the Block surface does *between* commands — clearing the live
+/// VTE, growing and shrinking it between compact and full layouts, mounting a
+/// finished-block widget, hiding those widgets for an alt-screen app — is
+/// absent by construction here: the surface is already full-size, already
+/// continuous, and never loses a row. The methods that exist only to drive
+/// that churn are therefore honest no-ops, each documented at its body.
+///
+/// The PTY, the parser and the whole reader lifecycle are unchanged; this
+/// type only answers the same 24 trait methods differently.
+struct UnifiedBackend {
+    /// The single surface. Prompt, echo, command output and alt-screen apps
+    /// all render here, in order, and nothing ever clears it.
+    vte: Terminal,
+    /// The live holder around that surface. Its block chrome is inert in this
+    /// mode, but it also owns the ASCII organism's live-body overlay, which is
+    /// drawn *over* the terminal and is the organism's only surface here — so
+    /// the alt-screen suppression still has to reach it.
+    active_rc: Rc<RefCell<ActiveBlock>>,
+    /// Held for geometry only (`viewport_rows_for` reads its page size). The
+    /// block list contains just the live surface in this mode, so the outer
+    /// scroller never scrolls: the VTE owns the scrollback.
+    block_scroll_rc: ScrolledWindow,
+    /// Sizes the surface to the viewport. The Unified closure has no
+    /// compact/full branch and no finished-block re-fit pass.
+    layout_active_surface: Rc<dyn Fn()>,
+    config_for_cb: Rc<RefCell<Config>>,
+    /// Same PTY as the `ReaderCtx` clone: geometry sync here, replies
+    /// engine-side.
+    pty_for_init: Rc<OwnedPty>,
+    /// Shared with `TermView` so Drop can remove a still-armed settling tick.
+    prompt_anchor_tick_id_rc: Rc<RefCell<Option<gtk4::TickCallbackId>>>,
+    /// The in-memory zone table (see [`UnifiedZone`]). Shared with `TermView`
+    /// so it can be inspected without reaching through the trait.
+    zones: Rc<RefCell<Vec<UnifiedZone>>>,
+    /// Kitty graphics: parsed for protocol fidelity, never rendered. libvte
+    /// has no APC G handler, so the engine must still consume these payloads
+    /// and answer the `i=`-keyed reply; there is simply nowhere to mount the
+    /// texture until 1b gives a zone its own widget row. Because there is
+    /// nowhere, the reply is a refusal — see [`Self::kitty_feed`].
+    kitty_assembler: RefCell<kitty_graphics::Assembler>,
+}
+
+impl RenderBackend for UnifiedBackend {
+    fn feed_live(&self, bytes: &[u8]) {
+        self.vte.feed(bytes);
+    }
+
+    /// Intentionally does NOT clear the screen — that per-prompt reset is
+    /// exactly what this mode abandons; the previous command's output is the
+    /// history here.
+    ///
+    /// What it does do is Block's `preserve_scrollback: true` branch: feed a
+    /// bare SGR reset so a command killed mid-attribute cannot tint the next
+    /// prompt. The `preserve_scrollback` argument is ignored because this
+    /// surface always preserves; the knob only ever meant "which of Block's
+    /// two resets".
+    fn reset_active_surface(&self, _preserve_scrollback: bool) {
+        self.vte.feed(b"\x1b[0m");
+    }
+
+    fn focus_live_deferred(&self) {
+        let vte = self.vte.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(vte) = vte.upgrade() {
+                vte.grab_focus();
+            }
+        });
+    }
+
+    fn sync_geometry_to_pty(&self) {
+        sync_active_to_pty(
+            &self.layout_active_surface,
+            &self.vte,
+            &self.block_scroll_rc,
+            &self.pty_for_init,
+        );
+    }
+
+    fn layout_active_surface(&self) {
+        (self.layout_active_surface)();
+    }
+
+    /// No-op: the VTE's own adjustment is authoritative here. The live surface
+    /// is created with `scroll_on_output(false)`, which keeps a view already at
+    /// the bottom following new output while leaving a scrolled-up reader
+    /// alone — the exact autoscroll policy Block's debouncer reproduces on the
+    /// outer scroller. That scroller has nothing to follow in this mode: the
+    /// block list holds only the viewport-sized surface.
+    fn mark_scroll_dirty(&self) {}
+
+    /// No-op for the same reason as [`Self::mark_scroll_dirty`]: there is no
+    /// second scroll lock to release. The engine calls this when a command
+    /// starts so the view snaps back to the prompt; a Unified reader who
+    /// scrolled up into the VTE's scrollback deliberately keeps their
+    /// position (VTE re-pins on the next keystroke).
+    fn reset_scroll_lock(&self) {}
+
+    /// Record the zone and paint nothing.
+    ///
+    /// No widget is mounted, no output is copied, and — unlike Block — the
+    /// live surface is NOT reset afterwards: the command's output stays where
+    /// the user watched it appear. Only the kitty assembler is reset, so
+    /// half-uploaded chunks cannot bleed across the command boundary.
+    fn finalize_block(&self, _block_data: BlockData, args: FinalizedBlockArgs) {
+        let max_zones = self.config_for_cb.borrow().max_visible_blocks as usize;
+        record_unified_zone(&mut self.zones.borrow_mut(), &args, max_zones);
+        log::debug!(
+            "unified zone {} recorded: exit={:?} duration_ms={:?} background={} zones={}",
+            args.block_id,
+            args.exit_code,
+            args.duration_ms,
+            args.is_background,
+            self.zones.borrow().len(),
+        );
+        self.kitty_assembler.borrow_mut().reset();
+    }
+
+    /// The chrome half is genuinely a no-op here: the surface is already
+    /// full-bleed (the holder carries `block-fullscreen` for its whole life),
+    /// there are no finished-block widgets to hide, and neither the sticky
+    /// header nor the jump FAB can be visible in this mode.
+    ///
+    /// The organism half is not. The ASCII organism's live body is an overlay
+    /// on the live surface — it exists in this mode exactly as in Block, and
+    /// it is the organism's *only* surface here since the inline card is
+    /// refused — so a fullscreen TUI would be drawn over by it unless the same
+    /// suppression runs. Both cells are cleared for the reason Block states:
+    /// the alt-screen override alone would restore the pre-TUI coordinates
+    /// synchronously on rmcup, before the heartbeat has remeasured.
+    fn enter_alt_screen_chrome(&self) {
+        let active = self.active_rc.borrow();
+        active.set_live_organism_visible(false);
+        active.set_live_organism_alt_screen(true);
+    }
+
+    /// Releases the alt-screen override set on the way in. Nothing else was
+    /// changed, so nothing else is restored; the alt-screen app's `rmcup`
+    /// restores the primary screen content itself, and the organism heartbeat
+    /// decides on its own frame whether the body may show again.
+    fn exit_alt_screen_chrome(&self) {
+        self.active_rc.borrow().set_live_organism_alt_screen(false);
+    }
+
+    /// No-op: "give the viewport to the alt-screen app" is already the
+    /// permanent state of this surface.
+    fn enter_fullscreen(&self) {}
+
+    /// No-op — see [`Self::enter_fullscreen`].
+    fn exit_fullscreen(&self) {}
+
+    /// Parse, then refuse. Chunk assembly still runs for real — a multi-chunk
+    /// upload must be consumed to completion or its terminating `m=0` would be
+    /// answered as an unknown payload — but the decoded texture is dropped
+    /// instead of parked, and every status that would have been answered `OK`
+    /// is downgraded to `Skipped`, i.e. `ENOTSUP`.
+    ///
+    /// The downgrade is the honest half. No widget in this mode can display an
+    /// image (1b gives a zone its own row; until then there is nowhere to
+    /// mount one), so answering `OK` to an `a=T` transmit-and-display — or
+    /// affirming an `a=q` support probe — would tell `kitten icat`, `timg` and
+    /// friends that the image is on screen when it has just been discarded.
+    /// Told ENOTSUP, those clients fall back to their ASCII/half-block
+    /// rendering, which this surface does draw. The trade-off is deliberate:
+    /// Block mode still answers `OK` and still shows the image.
+    fn kitty_feed(&self, payload: &[u8]) -> kitty_graphics::FeedStatus {
+        let outcome = self.kitty_assembler.borrow_mut().feed(payload);
+        let status = outcome.status();
+        // Drop the texture (and its decoded pixels) immediately.
+        drop(outcome);
+        match status {
+            // Mid-upload: the engine must not answer this chunk at all.
+            kitty_graphics::FeedStatus::Pending => kitty_graphics::FeedStatus::Pending,
+            // A malformed payload is malformed whatever could be displayed.
+            kitty_graphics::FeedStatus::Invalid => kitty_graphics::FeedStatus::Invalid,
+            // Complete, CompleteTransmitOnly, QueryOk, Skipped: this surface
+            // cannot display any of them, and says so.
+            _ => {
+                log::debug!("unified: refusing a kitty graphics payload (nothing can display it)");
+                kitty_graphics::FeedStatus::Skipped
+            }
+        }
+    }
+
+    /// Unreachable no-op: [`Self::kitty_feed`] never reports `Complete` in
+    /// this mode, so nothing is ever parked for admission and the engine never
+    /// calls this. An empty body is the truthful shape — a texture-free
+    /// admission state machine here could only ever model a transition that
+    /// cannot happen.
+    fn kitty_admit_pending(&self) {}
+
+    fn reset_kitty_pipeline(&self) {
+        self.kitty_assembler.borrow_mut().reset();
+    }
+
+    fn set_system_clipboard(&self, text: &str) {
+        set_display_clipboard_text(text);
+    }
+
+    fn desktop_notify(&self, title: Option<&str>, body: &str) {
+        crate::notify::app_notification(title, body);
+    }
+
+    fn schedule_anchor_settle(&self, args: AnchorSettleArgs) {
+        // The same fence, on the same terms: the pass is layout-agnostic, so
+        // Unified needs no variant of it (see `schedule_anchor_settle_on`).
+        schedule_anchor_settle_on(&self.vte, &self.prompt_anchor_tick_id_rc, args);
+    }
+
+    fn cursor_and_rows(&self) -> ((i64, i64), i64) {
+        (self.vte.cursor_position(), self.vte.row_count())
+    }
+
+    /// Screen-relative, unlike Block. Block's ring is wiped at every prompt,
+    /// so its text-buffer row never grows far from the screen row; this ring
+    /// is never wiped, so answering with it would mean `ESC[801;1R` a few
+    /// hundred lines into a session and cursor-restore misdraws in fzf,
+    /// powerlevel10k and any ncurses app that saves and restores the
+    /// position. Answering what the protocol actually defines is the only
+    /// option here, and the trait note says so explicitly.
+    fn cursor_position_report(&self) -> (i64, i64) {
+        let (col, row) = self.vte.cursor_position();
+        let top_row = gtk4::prelude::ScrollableExt::vadjustment(&self.vte)
+            .map(|adj| adj.value() as i64)
+            .unwrap_or(0);
+        (
+            col,
+            screen_relative_cpr_row(row, top_row, self.vte.row_count()),
+        )
+    }
+
+    /// The identity, through the shared policy. The provisional anchor was
+    /// captured on this surface and nothing moves the text buffer under it
+    /// between PromptEnd and CommandStart: there is no compact/full `set_size`
+    /// churn here. The Unified layout closure *does* resize the live holder —
+    /// the grid can gain or lose rows — but ring rows are unaffected by a
+    /// height change (the height-resize spike), which is why the row-count
+    /// delta is the wrong correction to apply. This pane's `SubmissionSurface`
+    /// is constructed with the same policy bit, so the readiness probe and the
+    /// verified-submission check agree with this.
+    fn command_capture_anchor(&self, provisional: (i64, i64), anchor_rows: i64) -> (i64, i64) {
+        prompt_anchor_for_surface(false, provisional, anchor_rows, self.vte.row_count())
+    }
+
+    fn grid_cols(&self) -> i64 {
+        // Same floor as `ActiveBlock::grid_cols`: the engine uses this for
+        // height/width estimates that must not divide by a degenerate width
+        // before the surface is allocated.
+        self.vte.column_count().max(20)
+    }
+
+    fn live_column_count(&self) -> i64 {
+        self.vte.column_count()
+    }
+
+    fn capture_text_range(
+        &self,
+        start_row: i64,
+        start_col: i64,
+        end_row: i64,
+        end_col: i64,
+    ) -> Option<String> {
+        capture_vte_text_range(&self.vte, start_row, start_col, end_row, end_col)
     }
 }
 
@@ -6508,8 +6937,15 @@ impl TermView {
         *self.config.borrow_mut() = config.clone();
     }
 
+    /// `mode` is the render backend this pane must use, decided by the caller
+    /// and never re-derived from `config` here. Callers pin the mode for
+    /// reasons the shared config cannot express: a managed remote tab is
+    /// hard-coded to Block (`launch_remote`) because reconnect depends on
+    /// Block's OSC 7/133/7770 metadata and its history save/restore, so a
+    /// `terminal_mode = "unified"` config must not convert it.
     pub fn new(
         config: &Config,
+        mode: &crate::config::TerminalMode,
         shell_argv: &[String],
         cwd: Option<&str>,
         session_id: Option<&str>,
@@ -6517,6 +6953,7 @@ impl TermView {
     ) -> io::Result<Self> {
         Self::new_with_spawner(
             config,
+            mode,
             shell_argv,
             cwd,
             session_id,
@@ -6533,6 +6970,7 @@ impl TermView {
     /// injectable also makes the failure contract testable without a display.
     fn new_with_spawner<F>(
         config: &Config,
+        mode: &crate::config::TerminalMode,
         shell_argv: &[String],
         cwd: Option<&str>,
         session_id: Option<&str>,
@@ -6626,6 +7064,28 @@ impl TermView {
             live_raw_output.clone(),
         )));
         let active_vte = active.borrow().active_vte.clone();
+
+        // Unified mode: same widget tree, same live VTE, no block chrome. The
+        // holder wears `block-fullscreen` for its whole life — the CSS rule
+        // that strips the live card's border/margin/padding, and the same
+        // class `viewport_rows_for` reads to stop reserving vertical chrome.
+        // Alt-screen transitions therefore change no geometry at all.
+        //
+        // Read from the requested `mode`, NOT from `config.terminal_mode`: a
+        // caller that pins a mode (remote tabs pin Block) would otherwise be
+        // silently overridden by the shared config. `Vte` never reaches this
+        // constructor — that mode has no `TermView` at all — and is treated as
+        // Block if it somehow does.
+        let unified = mode.is_unified();
+        // Allocated in both modes (an empty `Vec` costs nothing) so the reader
+        // wiring below stays a single expression; only a Unified pane hands it
+        // to a backend or exposes it on `TermView`.
+        let unified_zones: Rc<RefCell<Vec<UnifiedZone>>> = Rc::new(RefCell::new(Vec::new()));
+        if unified {
+            let holder = active.borrow().widget().clone();
+            holder.remove_css_class("block-compact");
+            holder.add_css_class("block-fullscreen");
+        }
 
         block_list.append(active.borrow().widget());
 
@@ -6877,12 +7337,44 @@ impl TermView {
                 .connect_changed(move |_| redraw());
         }
 
+        // ── Unified live-surface layout ────────────────────────────────────
+        // One state, one size: the surface is always the whole viewport. No
+        // compact prompt cell (there are no blocks for output to live in
+        // instead) and no finished-block re-fit pass (there are none). Kept as
+        // its own closure rather than a branch inside the Block one so the
+        // Block layout stays byte-for-byte what it was.
+        let unified_layout_active_surface: Rc<dyn Fn()> = {
+            let holder = active.borrow().widget().downgrade();
+            let vte = active_vte.downgrade();
+            let scroll = block_scroll.downgrade();
+            let last_size_target: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
+            Rc::new(move || {
+                let (Some(holder), Some(vte), Some(scroll)) =
+                    (holder.upgrade(), vte.upgrade(), scroll.upgrade())
+                else {
+                    return;
+                };
+                let cell_h = (vte.char_height() as i32).max(1);
+                let Some(viewport_rows) = viewport_rows_for(&vte, &scroll) else {
+                    return;
+                };
+                let cols = vte.column_count().max(1);
+                holder.set_visible(true);
+                let target = (cols, viewport_rows);
+                if last_size_target.get() != target {
+                    vte.set_size(cols, viewport_rows);
+                    last_size_target.set(target);
+                }
+                holder.set_height_request((viewport_rows as i32) * cell_h);
+            })
+        };
+
         // ── Hybrid live-surface layout ─────────────────────────────────────
         // Idle prompts use a compact visual cell so completed output exists only
         // once, in blocks above. Running commands and terminal apps receive the
         // full live VTE. PTY rows are NOT taken from this visual height; see
         // `pty_grid_size`, which always reports the full viewport to the child.
-        let layout_active_surface: Rc<dyn Fn()> = {
+        let block_layout_active_surface: Rc<dyn Fn()> = {
             let holder = active.borrow().widget().downgrade();
             let vte = active_vte.downgrade();
             let scroll = block_scroll.downgrade();
@@ -6972,6 +7464,14 @@ impl TermView {
                 );
             })
         };
+        // Every later user of the layout hook — the contents-changed pass, the
+        // viewport-resize triggers, `sync_active_to_pty` — is mode-agnostic and
+        // takes whichever closure this pane was built with.
+        let layout_active_surface: Rc<dyn Fn()> = if unified {
+            unified_layout_active_surface
+        } else {
+            block_layout_active_surface
+        };
         // Coalesces follow-bottom pins so a burst of contents-changed signals
         // schedules at most one deferred scroll.
         let pin_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -7053,6 +7553,9 @@ impl TermView {
         let verified_submission = VerifiedSubmissionCtx {
             surface: Rc::new(VteSubmissionSurface {
                 vte: active_vte.clone(),
+                // Same bit that selects the render backend below, so this
+                // surface's anchor policy is that backend's by construction.
+                rebase_on_row_delta: !unified,
             }),
             bstate: bstate.clone(),
             pty: pty.clone(),
@@ -7271,44 +7774,62 @@ impl TermView {
                 Rc::new(RefCell::new(Vec::with_capacity(32)));
             // The widget-owning half of the reader pipeline. Lifecycle cells
             // are clones of the same Rc cells ReaderCtx receives below.
-            let backend: Rc<dyn RenderBackend> = Rc::new(BlockBackend {
-                active_rc,
-                active_vte: active_vte_rc,
-                block_list_rc,
-                block_scroll_rc,
-                jump_fab: jump_fab.clone(),
-                sticky_bar: sticky_bar.clone(),
-                scroll_debouncer: scroll_debouncer.clone(),
-                failure_marker_redraw: failure_marker_redraw.clone(),
-                finished_blocks_for_cb,
-                widget_pool_for_cb,
-                find_state_for_cb: find_state.clone(),
-                visible_indices_rc,
-                fullscreen_rc,
-                selected_block_ids_rc: selected_block_ids.clone(),
-                selected_block_id_rc: selected_block_id.clone(),
-                selection_anchor_id_rc: selection_anchor_id.clone(),
-                bookmarks_for_cb: block_bookmarks.clone(),
-                block_data_for_cb,
-                unread_count_rc: unread_count.clone(),
-                layout_active_surface: layout_active_surface.clone(),
-                config_for_cb: config_for_cb.clone(),
-                dynamic_colors_rc: dynamic_colors.clone(),
-                pty_for_init: pty_for_init.clone(),
-                ask_ai_cbs: ask_ai_callbacks.clone(),
-                prompt_anchor_tick_id_rc: prompt_anchor_tick_id.clone(),
-                bstate_rc: bstate_rc.clone(),
-                typed_cmd_rc: typed_cmd_rc.clone(),
-                typed_cmd_fidelity_rc: typed_cmd_fidelity_rc.clone(),
-                submission_pending_rc: submission_pending_rc.clone(),
-                pending_typeahead_rc: pending_typeahead_rc.clone(),
-                bracketed_paste_rc: bracketed_paste_rc.clone(),
-                pty_synced_rc: pty_synced_rc.clone(),
-                kitty_assembler: RefCell::new(kitty_graphics::Assembler::new()),
-                kitty_pending_images: RefCell::new(Vec::new()),
-                kitty_pending_bytes: Cell::new(0),
-                kitty_pending_admission: RefCell::new(None),
-            });
+            //
+            // This `if` is the whole of the mode switch on the reader path:
+            // everything above (PTY, parser, engine state, lifecycle cells) is
+            // shared, and everything below dispatches through the trait.
+            let backend: Rc<dyn RenderBackend> = if unified {
+                Rc::new(UnifiedBackend {
+                    vte: active_vte_rc,
+                    active_rc,
+                    block_scroll_rc,
+                    layout_active_surface: layout_active_surface.clone(),
+                    config_for_cb: config_for_cb.clone(),
+                    pty_for_init: pty_for_init.clone(),
+                    prompt_anchor_tick_id_rc: prompt_anchor_tick_id.clone(),
+                    zones: unified_zones.clone(),
+                    kitty_assembler: RefCell::new(kitty_graphics::Assembler::new()),
+                })
+            } else {
+                Rc::new(BlockBackend {
+                    active_rc,
+                    active_vte: active_vte_rc,
+                    block_list_rc,
+                    block_scroll_rc,
+                    jump_fab: jump_fab.clone(),
+                    sticky_bar: sticky_bar.clone(),
+                    scroll_debouncer: scroll_debouncer.clone(),
+                    failure_marker_redraw: failure_marker_redraw.clone(),
+                    finished_blocks_for_cb,
+                    widget_pool_for_cb,
+                    find_state_for_cb: find_state.clone(),
+                    visible_indices_rc,
+                    fullscreen_rc,
+                    selected_block_ids_rc: selected_block_ids.clone(),
+                    selected_block_id_rc: selected_block_id.clone(),
+                    selection_anchor_id_rc: selection_anchor_id.clone(),
+                    bookmarks_for_cb: block_bookmarks.clone(),
+                    block_data_for_cb,
+                    unread_count_rc: unread_count.clone(),
+                    layout_active_surface: layout_active_surface.clone(),
+                    config_for_cb: config_for_cb.clone(),
+                    dynamic_colors_rc: dynamic_colors.clone(),
+                    pty_for_init: pty_for_init.clone(),
+                    ask_ai_cbs: ask_ai_callbacks.clone(),
+                    prompt_anchor_tick_id_rc: prompt_anchor_tick_id.clone(),
+                    bstate_rc: bstate_rc.clone(),
+                    typed_cmd_rc: typed_cmd_rc.clone(),
+                    typed_cmd_fidelity_rc: typed_cmd_fidelity_rc.clone(),
+                    submission_pending_rc: submission_pending_rc.clone(),
+                    pending_typeahead_rc: pending_typeahead_rc.clone(),
+                    bracketed_paste_rc: bracketed_paste_rc.clone(),
+                    pty_synced_rc: pty_synced_rc.clone(),
+                    kitty_assembler: RefCell::new(kitty_graphics::Assembler::new()),
+                    kitty_pending_images: RefCell::new(Vec::new()),
+                    kitty_pending_bytes: Cell::new(0),
+                    kitty_pending_admission: RefCell::new(None),
+                })
+            };
             ReaderCtx {
                 backend,
                 bstate_rc,
@@ -8203,6 +8724,7 @@ impl TermView {
             prompt_anchor_tick_id,
             agent_execution_supported,
             selection_feed_hold,
+            unified_zones: unified.then_some(unified_zones),
         };
 
         // Before the first map GTK has no real page_size. In that case
@@ -8569,6 +9091,25 @@ impl TermView {
             .begin(command, agent_generation, suggestion)
     }
 
+    /// Whether this pane renders through the Unified backend: one long-lived
+    /// full-size surface, no finished-block widgets, no `BlockData`. Features
+    /// built on the block document (session export, Clear blocks, inline
+    /// notice cards) must branch on this and refuse rather than operate on an
+    /// empty document or mount a widget nobody can scroll to.
+    pub(crate) fn is_unified(&self) -> bool {
+        self.unified_zones.is_some()
+    }
+
+    /// Whether [`Self::insert_inline_notice`] can actually put a card where
+    /// the user will see it. False in Unified: the live holder asks for the
+    /// whole viewport and the outer scroller has nothing else to show, so a
+    /// card inserted above it is mounted off-screen with no way to reach it.
+    /// Callers check this before building a card and take their existing
+    /// "this pane cannot host it" path instead.
+    pub(crate) fn supports_inline_notices(&self) -> bool {
+        !self.is_unified()
+    }
+
     /// Insert a transient notice card (e.g. an AI command-correction proposal
     /// or the Shell Agent session card) into the block list just above the live
     /// prompt, so it reads like part of the block conversation. The card is not
@@ -8577,7 +9118,21 @@ impl TermView {
     ///
     /// Calling this again for a widget already in the block list re-pins it
     /// directly above the prompt (used after a finished block lands below it).
-    pub fn insert_inline_notice(&self, widget: &gtk4::Widget) {
+    ///
+    /// Returns whether the card is mounted. `false` — always, in Unified mode,
+    /// where the live surface owns the whole viewport and a card above it
+    /// cannot be scrolled to — means nothing was inserted, and the caller must
+    /// fall back rather than assume an invisible card is on screen (ask
+    /// `supports_inline_notices` first if the fallback has to happen before the
+    /// card is built). Re-pin call sites may ignore the result: a card that was
+    /// never inserted has nothing to re-pin.
+    pub fn insert_inline_notice(&self, widget: &gtk4::Widget) -> bool {
+        if !self.supports_inline_notices() {
+            log::debug!(
+                "unified mode: refusing to mount an inline notice card (nothing can scroll to it)"
+            );
+            return false;
+        }
         let active_widget = self.active.borrow().widget().clone();
         let already_inserted = widget
             .parent()
@@ -8593,6 +9148,7 @@ impl TermView {
         self.block_list.queue_allocate();
         self.scroll_debouncer
             .pin_to_bottom_deferred(&self.block_scroll);
+        true
     }
 
     /// Remove a card previously added by `insert_inline_notice`. Safe to call
@@ -8605,6 +9161,17 @@ impl TermView {
             self.block_list.remove(widget);
             self.block_list.queue_allocate();
         }
+    }
+
+    /// The PromptEnd anchor as of the live surface right now, through this
+    /// pane's own policy ([`SubmissionSurface::prompt_anchor`]) rather than
+    /// Block's math applied blind. The verified-submission path reads the same
+    /// surface through the same method, so the readiness probe below and the
+    /// approval check cannot disagree about where the editor starts.
+    fn current_prompt_anchor(&self) -> (i64, i64) {
+        self.verified_submission
+            .surface
+            .prompt_anchor(self.prompt_end_pos.get(), self.prompt_anchor_rows.get())
     }
 
     /// Review-gated commands may only be inserted or submitted into a clean,
@@ -8645,11 +9212,7 @@ impl TermView {
                 // authoritative PromptEnd anchor is therefore input until the
                 // next clean prompt proves otherwise.
                 let rows = self.active_vte.row_count();
-                let anchor = current_prompt_anchor(
-                    &self.active_vte,
-                    self.prompt_end_pos.get(),
-                    self.prompt_anchor_rows.get(),
-                );
+                let anchor = self.current_prompt_anchor();
                 let cursor = self.active_vte.cursor_position();
                 let suffix_is_empty = (anchor.0 >= 0 && anchor.1 >= 0)
                     .then(|| {
@@ -9064,6 +9627,19 @@ impl TermView {
     }
 
     pub fn scroll_lines(&self, lines: i32) {
+        // Unified mode: the scrollback lives in the live VTE, and the block
+        // list holds only that viewport-sized surface — the outer adjustment
+        // has nowhere to move, so keyboard scrolling has to drive the VTE's
+        // own adjustment or it silently does nothing.
+        if self.unified_zones.is_some() {
+            let Some(adj) = gtk4::prelude::ScrollableExt::vadjustment(&self.active_vte) else {
+                return;
+            };
+            let step = adj.step_increment().max(1.0);
+            let max_val = (adj.upper() - adj.page_size()).max(adj.lower());
+            adj.set_value((adj.value() + step * lines as f64).clamp(adj.lower(), max_val));
+            return;
+        }
         // Ctrl+Up enters anvil/Warp-style block selection at the newest block.
         {
             let finished = self.finished_blocks.borrow();
@@ -9150,7 +9726,18 @@ impl TermView {
     }
 
     /// Remove every completed block and all block-indexed UI state.
+    ///
+    /// A no-op in Unified mode, which has no finished blocks: every step below
+    /// would either drain something already empty or mutate shared state this
+    /// mode does not own — the history-load handshake it never starts, and the
+    /// on-disk block store `save_history` deliberately refuses to rewrite
+    /// here. Clearing the *surface* is the shell's own `clear`, not this
+    /// action. Returning 0 without touching anything lets the caller say so.
     pub fn clear_blocks(&self) -> usize {
+        if self.is_unified() {
+            log::debug!("unified pane: Clear blocks has nothing to clear and touches no state");
+            return 0;
+        }
         // A background load that completes after Clear must not resurrect the
         // just-deleted history, and its shutdown merge must not prepend it to
         // the empty replacement snapshot.
@@ -9543,8 +10130,13 @@ impl TermView {
                         format!("{:?}", self.mouse_reporting_mode.get()),
                     ),
                     (
+                        // `fullscreen` is the Block chrome's own flag (hide the
+                        // finished cards), and Unified never sets it because it
+                        // has no cards to hide. The lifecycle state is the mode-
+                        // independent truth; in Block the two always agree.
                         "Alt screen visible".to_string(),
-                        self.fullscreen.get().to_string(),
+                        (self.fullscreen.get() || self.bstate.get() == BlockState::AltScreen)
+                            .to_string(),
                     ),
                 ],
             ),
@@ -9562,6 +10154,13 @@ impl TermView {
             (
                 "Blocks",
                 vec![
+                    (
+                        "Render backend".to_string(),
+                        match &self.unified_zones {
+                            Some(zones) => format!("unified ({} zones)", zones.borrow().len()),
+                            None => "block".to_string(),
+                        },
+                    ),
                     ("Finished blocks".to_string(), finished_len.to_string()),
                     ("Block data entries".to_string(), block_data_len.to_string()),
                     ("Failed blocks".to_string(), failed.to_string()),
@@ -9644,6 +10243,26 @@ impl TermView {
         if limit == 0 {
             return Vec::new();
         }
+        // Unified mode has no finished blocks, but it does know every command
+        // that ran: the zone table carries the same text this list is made of.
+        // Reading it here keeps the palette truthful instead of silently
+        // reporting an empty session.
+        if let Some(zones) = &self.unified_zones {
+            let zones = zones.borrow();
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let mut out: Vec<String> = Vec::with_capacity(limit.min(zones.len()));
+            for zone in zones.iter().rev() {
+                let cmd = zone.command.trim();
+                if cmd.is_empty() || !seen.insert(cmd) {
+                    continue;
+                }
+                out.push(cmd.to_string());
+                if out.len() == limit {
+                    break;
+                }
+            }
+            return out;
+        }
         let finished = self.finished_blocks.borrow();
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut out: Vec<String> = Vec::with_capacity(limit.min(finished.len()));
@@ -9689,11 +10308,12 @@ mod tests {
         input_submits_line, mutate_block_data_and_redraw, next_prompt_shadow_state,
         normalize_captured_command, normalize_loaded_block_ids, notification_allowed,
         output_has_vertical_repaint, parse_color_spec, post_prompt_feed, preflight_clipboard_paste,
-        prepend_in_order, prompt_anchor_may_settle, prompt_layout_reflow_can_reanchor,
-        prompt_surface_is_clean, rebase_prompt_anchor, record_external_input,
-        record_protocol_reply_input, replace_nonempty_stash, resolve_command_for_block,
-        resolve_submitted_command, reviewed_pre_command_bytes_are_identity_neutral,
-        reviewed_submission_matches, scroll_delta_to_reveal, selected_blocks_markdown,
+        prepend_in_order, prompt_anchor_for_surface, prompt_anchor_may_settle,
+        prompt_layout_reflow_can_reanchor, prompt_surface_is_clean, rebase_prompt_anchor,
+        record_external_input, record_protocol_reply_input, replace_nonempty_stash,
+        resolve_command_for_block, resolve_submitted_command,
+        reviewed_pre_command_bytes_are_identity_neutral, reviewed_submission_matches,
+        screen_relative_cpr_row, scroll_delta_to_reveal, selected_blocks_markdown,
         selected_command_text, selected_id_range, shell_argv_supports_agent_ids,
         shell_argv_uses_jsh, should_buffer_background_output, stable_visible_indices,
         step_marked_indices, strip_ansi, strip_ansi_with_clear_detect, take_background_output,
@@ -9714,7 +10334,7 @@ mod tests {
     // it owns.
     use super::{
         estimated_finished_block_height_for_text, kitty_graphics, live_output_text,
-        AgentExecutionLostCallbacks, AnchorSettleArgs, BlockFinishedCallbacks,
+        record_unified_zone, AgentExecutionLostCallbacks, AnchorSettleArgs, BlockFinishedCallbacks,
         CommandFinishedCallbacks, CommandStartedCallbacks, EngineState, FinalizedBlockArgs,
         MouseReportingMode, ReaderCtx, RenderBackend, SelectionFeedHold, SubmissionSurface,
         VerifiedSubmissionCtx,
@@ -9839,6 +10459,7 @@ mod tests {
         let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             super::TermView::new_with_spawner(
                 &config,
+                &crate::config::TerminalMode::Block,
                 &shell_argv,
                 None,
                 Some("injected-session"),
@@ -9862,6 +10483,56 @@ mod tests {
         };
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         assert_eq!(error.to_string(), "injected PTY spawn failure");
+    }
+
+    /// The Unified backend's only durable output. The record must carry the
+    /// whole command identity the engine hands to `finalize_block` (nothing
+    /// about a zone may need re-deriving later), and the table must stay
+    /// bounded — it is the one allocation this mode grows per command.
+    #[test]
+    fn unified_zones_keep_the_command_identity_and_drop_the_oldest_past_the_cap() {
+        let finalized = |id: u64, cmd: &str| FinalizedBlockArgs {
+            block_id: id,
+            prompt: "user@host $ ".to_string(),
+            cmd: cmd.to_string(),
+            output_with_ansi: "output".to_string(),
+            output_plain: "output".to_string(),
+            plain_output_bytes: 6,
+            block_cwd: Some("/tmp/work".to_string()),
+            cols: 80,
+            exit_code: Some(3),
+            duration_ms: Some(1200),
+            end_time_ms: Some(1_700_000_000_000),
+            is_background: false,
+        };
+
+        let mut zones = Vec::new();
+        record_unified_zone(&mut zones, &finalized(1, "first"), 2);
+        record_unified_zone(&mut zones, &finalized(2, "second"), 2);
+        record_unified_zone(&mut zones, &finalized(3, "third"), 2);
+
+        assert_eq!(
+            zones.iter().map(|zone| zone.id).collect::<Vec<_>>(),
+            vec![2, 3],
+            "the oldest zone is dropped, newest-last order preserved"
+        );
+        assert_eq!(
+            zones.last().expect("a recorded zone"),
+            &super::UnifiedZone {
+                id: 3,
+                command: "third".to_string(),
+                exit_code: Some(3),
+                duration_ms: Some(1200),
+                cwd: Some("/tmp/work".to_string()),
+                end_time_ms: Some(1_700_000_000_000),
+                is_background: false,
+            }
+        );
+
+        // A degenerate cap must still bound the table rather than panic.
+        record_unified_zone(&mut zones, &finalized(4, "fourth"), 0);
+        assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].id, 4);
     }
 
     // ── Dynamic OSC 10/11/12 color tracking ──────────────────────────────
@@ -10181,6 +10852,45 @@ mod tests {
         assert_eq!(rebase_prompt_anchor((3, 2), 5, 8), (3, 5));
         assert_eq!(rebase_prompt_anchor((3, 0), 5, 2), (3, 0));
         assert_eq!(rebase_prompt_anchor((3, 2), 0, 8), (3, 2));
+    }
+
+    /// One anchor policy per mode, shared by command capture, the
+    /// verified-submission check and the agent-readiness probe. The bit is
+    /// "can this surface's row count move under an anchor", and it is set once
+    /// from the same mode that selects the render backend.
+    #[test]
+    fn the_prompt_anchor_policy_is_the_surfaces_own_and_nothing_elses() {
+        // Block: the compact/full `set_size` churn moved the buffer, so the
+        // anchor moves with it — the same answer `rebase_prompt_anchor` gives.
+        assert_eq!(prompt_anchor_for_surface(true, (11, 6), 7, 5), (11, 4));
+        assert_eq!(
+            prompt_anchor_for_surface(true, (3, 2), 5, 8),
+            rebase_prompt_anchor((3, 2), 5, 8)
+        );
+        // Unified: identity, whatever the row counts say. A grid that gained
+        // or lost rows did not move this surface's ring rows.
+        assert_eq!(prompt_anchor_for_surface(false, (11, 6), 7, 5), (11, 6));
+        assert_eq!(prompt_anchor_for_surface(false, (3, 2), 5, 8), (3, 2));
+    }
+
+    /// DSR 6 answers a *screen* row. A surface whose ring is never wiped (the
+    /// Unified backend) must subtract the scroll offset, or a long session
+    /// reports rows far outside the grid and every save/restore-cursor client
+    /// misdraws.
+    #[test]
+    fn the_cursor_position_report_row_is_screen_relative_and_stays_in_the_grid() {
+        // Cursor on the last visible row of a 24-row grid, 800 rows into the
+        // ring: the report is row 23, not row 823.
+        assert_eq!(screen_relative_cpr_row(823, 800, 24), 23);
+        // Bottom-pinned prompt on a surface shorter than one screen.
+        assert_eq!(screen_relative_cpr_row(5, 0, 24), 5);
+        // A reader scrolled up (or down) past the cursor cannot push the
+        // answer outside the grid in either direction.
+        assert_eq!(screen_relative_cpr_row(10, 40, 24), 0);
+        assert_eq!(screen_relative_cpr_row(900, 800, 24), 23);
+        // Before the surface is allocated there is no grid to be relative to.
+        assert_eq!(screen_relative_cpr_row(7, 0, 0), 7);
+        assert_eq!(screen_relative_cpr_row(-3, 0, 0), 0);
     }
 
     #[test]
@@ -12538,7 +13248,8 @@ mod tests {
             // current one, and that it uses the rebased anchor for the capture
             // range. A backend that returned `provisional` unchanged would
             // make every one of those interchangeable.
-            rebase_prompt_anchor(
+            prompt_anchor_for_surface(
+                true,
                 provisional,
                 anchor_rows,
                 self.grid.borrow().rows.len() as i64,
@@ -12651,6 +13362,16 @@ mod tests {
         fn row_count(&self) -> i64 {
             self.reads.borrow_mut().push(SurfaceRead::RowCount);
             self.rows.get()
+        }
+
+        fn prompt_anchor(&self, provisional: (i64, i64), recorded_rows: i64) -> (i64, i64) {
+            // Models Block's policy, for the same reason
+            // `RecordingBackend::command_capture_anchor` does: a pass-through
+            // would make "the anchor recorded at PromptEnd" and "the anchor
+            // now" interchangeable, and every assertion about which one the
+            // engine used would hold vacuously. Reading the row count through
+            // `row_count` also keeps this a recorded surface read.
+            prompt_anchor_for_surface(true, provisional, recorded_rows, self.row_count())
         }
 
         fn visible_editor_text(&self, anchor: (i64, i64)) -> Option<String> {

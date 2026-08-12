@@ -2065,6 +2065,16 @@ impl TermView {
         if !self.persist_history_on_drop.get() {
             return Ok(());
         }
+        // Unified mode keeps no `BlockData`: its history is the surface's own
+        // scrollback plus the in-memory zone table. Saving from here would
+        // write an *empty* snapshot over whatever this session id saved in
+        // Block mode — the store must not be rewritten by a mode that does not
+        // own that representation. Snapshot/replay of a Unified surface is a
+        // later increment; until then a Unified pane is read-nothing,
+        // write-nothing with respect to Block history.
+        if self.unified_zones.is_some() {
+            return Ok(());
+        }
         let (path_opt, compress, max_blocks) = {
             let config = self.config.borrow();
             (
@@ -2178,6 +2188,14 @@ impl TermView {
     /// GTK widgets in a short main-thread callback. Commands that finish while
     /// the read is pending remain newer than every restored block.
     pub(crate) fn start_history_load(self: &Rc<Self>) {
+        // Nothing in Unified mode can display a restored block: rebuilding the
+        // finished-block widgets would paint exactly the chrome this mode
+        // exists to remove. Restored history is therefore not shown (and, per
+        // `save_history`, not overwritten either) until snapshot-replay lands.
+        if self.unified_zones.is_some() {
+            log::debug!("unified mode: skipping Block history restore for this pane");
+            return;
+        }
         let (path_opt, compress, load_limit) = {
             let config = self.config.borrow();
             (

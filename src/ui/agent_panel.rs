@@ -88,7 +88,12 @@ impl AgentActivityBudget {
 
 impl AgentUiLifetime {
     fn insert_activity(&self, target: &Rc<TermView>, widget: &gtk4::Widget, display_bytes: usize) {
-        target.insert_inline_notice(widget);
+        if !target.insert_inline_notice(widget) {
+            // Unreachable today — a session is refused on panes that cannot
+            // host cards — but an unmounted widget must never take a slot in
+            // the display budget or the global activity history.
+            return;
+        }
 
         let evicted = {
             let mut history = self.activity.borrow_mut();
@@ -2333,6 +2338,17 @@ impl UiState {
             self.show_ai_error("Agent mode requires an active Block pane.");
             return;
         };
+        // The session card *is* the Agent UI — transcript, proposals and the
+        // input entry all live on it. A Unified pane cannot mount an inline
+        // card anywhere the user could reach it, so starting a session there
+        // would put the whole conversation off-screen. Refuse instead.
+        if !target.supports_inline_notices() {
+            self.agent_toggle.set_active(false);
+            self.show_ai_error(
+                "Shell Agent runs as an inline card in the block conversation. Unified mode has a single continuous terminal surface with no place to mount one, so switch this pane to Block mode to use the Agent. AI Chat remains available.",
+            );
+            return;
+        }
         self.ensure_agent_event_bridge(&target);
         let block_context = target.selected_block_context(80);
         let cwd = target.cwd();

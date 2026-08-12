@@ -33,6 +33,20 @@ struct TabLaunch {
 type TitleChangedCallback = Box<dyn Fn(&str)>;
 const TAB_PROCESS_LABEL_DATA: &str = "tab-process-label";
 
+/// The render backend a managed remote tab launches with.
+///
+/// Always Block, whatever `_configured` says: reconnect depends on Block's
+/// OSC 7/133/7770 metadata, its command results, and its history
+/// save/restore, none of which the Unified backend keeps. The configured mode
+/// is taken as an argument it deliberately ignores so that independence is
+/// visible — and testable — at the one site that decides it. The mode chosen
+/// here reaches `TermView::new` unchanged, so this is the whole decision.
+fn remote_tab_terminal_mode(
+    _configured: &crate::config::TerminalMode,
+) -> crate::config::TerminalMode {
+    crate::config::TerminalMode::Block
+}
+
 fn attach_tab_process_label(button: &ToggleButton, label: &Label) {
     unsafe {
         button.set_data::<Label>(TAB_PROCESS_LABEL_DATA, label.clone());
@@ -1022,10 +1036,7 @@ impl UiState {
         tab_name: Option<String>,
     ) -> Terminal {
         let argv = crate::config::build_remote_argv(host);
-        // Remote tabs use Block so OSC 7/133/7770 metadata, command results and
-        // reconnect session identifiers are observed consistently, matching
-        // anvil even when local tabs default to conventional VTE.
-        let terminal_mode = crate::config::TerminalMode::Block;
+        let terminal_mode = remote_tab_terminal_mode(&self.config.borrow().terminal_mode);
         log::info!(
             "[remote] connecting to {} (attempt {})",
             crate::review_input::safe_inline_display(&host.name, 512),
@@ -1259,11 +1270,17 @@ impl UiState {
         // Create terminal view based on configured mode
         let (view_type, terminal) = {
             match &terminal_mode {
-                crate::config::TerminalMode::Block => {
+                // Unified renders inside the same `TermView` (the OSC 133
+                // engine with a single full-size surface); only the render
+                // backend differs, and it follows *this* launch's mode — which
+                // is why a remote tab (pinned to Block above) stays Block even
+                // when `terminal_mode = "unified"`.
+                crate::config::TerminalMode::Block | crate::config::TerminalMode::Unified => {
                     let term_view = {
                         let config = self.config.borrow();
                         TermView::new(
                             &config,
+                            &terminal_mode,
                             shell_argv,
                             working_directory.as_deref(),
                             Some(&sid),
@@ -2197,5 +2214,31 @@ mod tests {
             assert!(!is_plain_tab_activation_key(Key::Return, modifiers));
         }
         assert!(!is_plain_tab_activation_key(Key::a, ModifierType::empty()));
+    }
+
+    /// Regression guard for the mode a managed remote tab launches with. A
+    /// remote pane must stay Block under every configured `terminal_mode` —
+    /// Unified records no `BlockData`, saves no history and restores none, and
+    /// reconnect reads exactly that. The mode decided here is the one
+    /// `TermView::new` selects its backend from, so "Block here" means "Block
+    /// rendered".
+    #[test]
+    fn managed_remote_tabs_stay_block_under_every_configured_mode() {
+        use crate::config::TerminalMode;
+
+        for configured in [
+            TerminalMode::Block,
+            TerminalMode::Vte,
+            TerminalMode::Unified,
+        ] {
+            let launched = remote_tab_terminal_mode(&configured);
+            assert_eq!(launched, TerminalMode::Block);
+            assert!(!launched.is_unified());
+        }
+        // The other half of the invariant: only `Unified` selects the Unified
+        // backend, so nothing else can convert a Block-pinned pane.
+        assert!(TerminalMode::Unified.is_unified());
+        assert!(!TerminalMode::Block.is_unified());
+        assert!(!TerminalMode::Vte.is_unified());
     }
 }

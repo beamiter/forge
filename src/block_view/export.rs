@@ -147,10 +147,22 @@ impl TermView {
     /// directory and report where it landed. The path is the caller's only way
     /// to tell the user where the export went, so it is returned rather than
     /// logged here.
+    ///
+    /// Fails with `Unsupported` in Unified mode. Every method above reads
+    /// `block_data`, which that backend never populates, so exporting would
+    /// otherwise produce a valid-looking empty file. The UI refuses earlier
+    /// with a clearer dialog (`export_current_session`); this guard keeps the
+    /// writer itself from ever being the one that lies.
     pub(crate) fn export_session_to_file(
         &self,
         format: SessionExportFormat,
     ) -> io::Result<PathBuf> {
+        if self.is_unified() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "unified panes keep no finished blocks to export",
+            ));
+        }
         let contents = match format {
             SessionExportFormat::Markdown => self.export_session_markdown(),
             SessionExportFormat::Json => self.export_session_json(),

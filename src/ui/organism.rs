@@ -2888,7 +2888,16 @@ impl UiState {
             persistent,
         );
         self.organism_presence.bind(presence_token, view, &runtime);
-        view.insert_inline_notice(&runtime.card);
+        // Two surfaces, deliberately: the card is the organism's home in the
+        // block conversation, the live body below is its home on the terminal
+        // surface itself. A pane that cannot host inline cards (Unified) keeps
+        // only the overlay — which is also why that overlay must be suppressed
+        // for alt-screen apps there, see `UnifiedBackend::enter_alt_screen_chrome`.
+        if !view.insert_inline_notice(&runtime.card) {
+            log::debug!(
+                "organism card not mounted in this pane; the live-surface body is its only home"
+            );
+        }
         if motion != OrganismMotion::Static {
             if !view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0) {
                 log::warn!("could not attach ASCII organism to the live terminal surface");

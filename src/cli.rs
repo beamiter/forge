@@ -18,6 +18,7 @@ use crate::config::{
 pub(crate) enum Mode {
     Block,
     Vte,
+    Unified,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,7 +83,8 @@ Launch options:
   -d, --working-directory DIR
                               Start in DIR
   -e, --execute COMMAND ...   Run a command instead of the configured shell
-      --mode block|vte        Override the terminal backend for this window
+      --mode block|vte|unified
+                              Override the terminal backend for this window
       --no-restore            Start a fresh workspace
       --safe-mode             Use isolated VTE defaults without restore or persistence
 
@@ -136,8 +138,9 @@ fn parse_mode(value: &str) -> Result<Mode, String> {
     match value.to_ascii_lowercase().as_str() {
         "block" => Ok(Mode::Block),
         "vte" => Ok(Mode::Vte),
+        "unified" => Ok(Mode::Unified),
         _ => Err(format!(
-            "invalid terminal mode '{value}' (use block or vte)"
+            "invalid terminal mode '{value}' (use block, vte or unified)"
         )),
     }
 }
@@ -234,7 +237,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs, St
                 let value = args
                     .get(index)
                     .and_then(|value| value.to_str())
-                    .ok_or_else(|| "--mode requires 'block' or 'vte'".to_string())?;
+                    .ok_or_else(|| "--mode requires 'block', 'vte' or 'unified'".to_string())?;
                 parsed.launch.mode = Some(parse_mode(value)?);
             }
             "-e" | "--execute" | "--" => {
@@ -981,11 +984,7 @@ fn doctor(format: ReportFormat) -> bool {
     checks.push(DoctorCheck {
         name: "terminal mode",
         status: "ok",
-        detail: match config.terminal_mode {
-            crate::config::TerminalMode::Block => "block",
-            crate::config::TerminalMode::Vte => "vte",
-        }
-        .to_string(),
+        detail: config.terminal_mode.as_str().to_string(),
     });
 
     let errors = checks
@@ -1168,6 +1167,7 @@ pub(crate) fn handle_early_args() -> Option<glib::ExitCode> {
             let value = match mode {
                 Mode::Block => "block",
                 Mode::Vte => "vte",
+                Mode::Unified => "unified",
             };
             // SAFETY: no threads or configuration reads exist yet.
             unsafe { std::env::set_var("FORGE_MODE", value) };

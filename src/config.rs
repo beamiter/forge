@@ -20,10 +20,53 @@ use crate::keybindings::KeybindingMap;
 // Terminal Mode
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalMode {
     Block,
     Vte,
+    /// One long-lived full-size VTE driven by the same OSC 133 lifecycle
+    /// engine as Block, with no per-command block chrome: finished commands
+    /// are recorded as zones over the single continuous surface instead of
+    /// being snapshotted into separate widgets. Experimental.
+    Unified,
+}
+
+impl TerminalMode {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            TerminalMode::Block => "block",
+            TerminalMode::Vte => "vte",
+            TerminalMode::Unified => "unified",
+        }
+    }
+
+    /// `None` for an unrecognized value; callers warn and fall back so a typo
+    /// in the config file cannot silently change the backend.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "block" => Some(TerminalMode::Block),
+            "vte" => Some(TerminalMode::Vte),
+            "unified" => Some(TerminalMode::Unified),
+            _ => None,
+        }
+    }
+
+    /// Whether this mode is rendered by `TermView` (the OSC 133 engine), as
+    /// opposed to a conventional VTE pane.
+    pub(crate) fn uses_term_view(&self) -> bool {
+        matches!(self, TerminalMode::Block | TerminalMode::Unified)
+    }
+
+    /// Whether a `TermView` in this mode renders through the Unified backend
+    /// (one long-lived full-size surface) rather than Block chrome. This is
+    /// the *only* input to that choice: `TermView::new` selects its backend
+    /// from the mode its caller passes, never by re-reading the shared
+    /// `terminal_mode`, so a pane pinned to Block (managed remote tabs, which
+    /// need Block's reconnect metadata and history save/restore) stays Block
+    /// under `terminal_mode = "unified"`.
+    pub(crate) fn is_unified(&self) -> bool {
+        matches!(self, TerminalMode::Unified)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1582,12 +1625,12 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
     }
 
     if let Some(mode) = table.get("terminal_mode").and_then(toml::Value::as_str) {
-        if !matches!(mode.to_ascii_lowercase().as_str(), "block" | "vte") {
+        if TerminalMode::parse(mode).is_none() {
             config_issue(
                 &mut issues,
                 Error,
                 "terminal_mode",
-                "expected 'block' or 'vte'",
+                "expected 'block', 'vte' or 'unified'",
             );
         }
     }
@@ -2625,14 +2668,10 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .or(fc.terminal_mode)
         .filter(|value| setting_text_is_safe(value, 64))
         .unwrap_or_else(|| "block".to_string());
-    let terminal_mode = match terminal_mode_str.to_ascii_lowercase().as_str() {
-        "block" => TerminalMode::Block,
-        "vte" => TerminalMode::Vte,
-        other => {
-            log::warn!("Unknown terminal_mode '{other}', using block");
-            TerminalMode::Block
-        }
-    };
+    let terminal_mode = TerminalMode::parse(&terminal_mode_str).unwrap_or_else(|| {
+        log::warn!("Unknown terminal_mode '{terminal_mode_str}', using block");
+        TerminalMode::Block
+    });
 
     let tab_placement = TabPlacement::parse(
         &env_string("FORGE_TAB_PLACEMENT")
@@ -3222,6 +3261,39 @@ unknown_action = "F8"
         assert!(issues
             .iter()
             .any(|issue| issue.message.contains("same chord")));
+    }
+
+    /// One vocabulary for the backend across the config file, `FORGE_MODE`,
+    /// `--mode`, the settings dialog and the saved config: every one of them
+    /// goes through this pair, so a mode that parses must also serialize back
+    /// to the same word.
+    #[test]
+    fn terminal_mode_parses_and_round_trips_every_backend() {
+        for (text, mode) in [
+            ("block", TerminalMode::Block),
+            ("vte", TerminalMode::Vte),
+            ("unified", TerminalMode::Unified),
+        ] {
+            assert_eq!(TerminalMode::parse(text).as_ref(), Some(&mode));
+            assert_eq!(
+                TerminalMode::parse(&text.to_uppercase()).as_ref(),
+                Some(&mode)
+            );
+            assert_eq!(mode.as_str(), text);
+            assert_eq!(TerminalMode::parse(mode.as_str()).as_ref(), Some(&mode));
+        }
+        assert_eq!(TerminalMode::parse("warp"), None);
+        // Unified is rendered by TermView, so it takes the Block leaf/pane
+        // path everywhere a mode is dispatched on.
+        assert!(TerminalMode::Unified.uses_term_view());
+        assert!(TerminalMode::Block.uses_term_view());
+        assert!(!TerminalMode::Vte.uses_term_view());
+    }
+
+    #[test]
+    fn config_validator_accepts_unified_terminal_mode() {
+        let issues = validate_config_contents("terminal_mode = 'unified'\n").unwrap();
+        assert!(issues.is_empty(), "unexpected issues: {issues:?}");
     }
 
     #[test]
