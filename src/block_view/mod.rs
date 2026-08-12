@@ -3406,11 +3406,6 @@ pub struct TermView {
     active_vte: Terminal,
     active: Rc<RefCell<ActiveBlock>>,
     bstate: Rc<Cell<BlockState>>,
-    #[allow(dead_code)]
-    prompt_buf: Rc<RefCell<String>>,
-    /// Visible prompt furniture captured at PromptEnd. Besides finished-block
-    /// display it lets readiness distinguish a VTE reflowed prompt from input.
-    prompt_display: Rc<RefCell<String>>,
     /// Keystroke shadow used only as a fallback command capture. The authoritative
     /// finished-command text is read off the live VTE at CommandStart.
     #[allow(dead_code)]
@@ -3654,7 +3649,6 @@ struct ReaderCtx {
     pty_synced_rc: Rc<Cell<bool>>,
     visible_indices_rc: Rc<RefCell<std::collections::HashSet<usize>>>,
     fullscreen_rc: Rc<Cell<bool>>,
-    ftcs_seen_rc: Rc<Cell<bool>>,
     init_cmds_queue_for_cb: Rc<RefCell<std::collections::VecDeque<String>>>,
     pty_for_init: Rc<OwnedPty>,
     shell_integration_token: Rc<String>,
@@ -3860,7 +3854,6 @@ impl ReaderCtx {
     }
 
     fn on_prompt_start(&self) {
-        self.ftcs_seen_rc.set(true);
         self.prompt_identity_output_rc.set(false);
         // Readiness is prompt-scoped. A replacement shell
         // cannot inherit a previous integration's ability
@@ -4363,7 +4356,6 @@ impl ReaderCtx {
     }
 
     fn on_command_start(&self, meta: &CommandMeta) {
-        self.ftcs_seen_rc.set(true);
         let state = self.bstate_rc.get();
         if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
             if self.pty_for_init.foreground_owner() != PtyForeground::Shell {
@@ -6889,9 +6881,6 @@ impl TermView {
         let command_start_instant: Rc<Cell<Option<std::time::Instant>>> = Rc::new(Cell::new(None));
         let visible_indices: Rc<RefCell<std::collections::HashSet<usize>>> =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
-        // Set once any OSC-133 (FTCS) event is seen, so the view knows shell
-        // integration is live.
-        let ftcs_seen: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let current_cwd: Rc<RefCell<String>> = Rc::new(RefCell::new(cwd.unwrap_or("").to_string()));
 
         // CWD updates come from VTE's native OSC 7 signal (the parser passes
@@ -6972,7 +6961,6 @@ impl TermView {
             let pty_synced_rc = pty_synced.clone();
             let visible_indices_rc = visible_indices.clone();
             let fullscreen_rc = fullscreen.clone();
-            let ftcs_seen_rc = ftcs_seen.clone();
 
             // Command queue for replaying initial_commands on PromptEnd events.
             // Commands are pre-parsed at the application boundary; splitting
@@ -7041,7 +7029,6 @@ impl TermView {
                 pty_synced_rc,
                 visible_indices_rc,
                 fullscreen_rc,
-                ftcs_seen_rc,
                 init_cmds_queue_for_cb,
                 pty_for_init,
                 shell_integration_token,
@@ -7837,8 +7824,6 @@ impl TermView {
             active_vte,
             active,
             bstate,
-            prompt_buf,
-            prompt_display,
             typed_cmd,
             prompt_end_pos,
             prompt_anchor_rows,
