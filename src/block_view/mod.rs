@@ -3575,6 +3575,37 @@ impl Drop for TermView {
     }
 }
 
+/// Reader-pipeline state private to this pane's PTY event dispatch: nothing
+/// outside [`ReaderCtx`] reads or writes these, so they live as plain values
+/// behind one `RefCell`. Borrows must stay short — never held across a
+/// callback fan-out, `render_finalized_block`, `layout_active_surface`,
+/// `sync_active_to_pty`, or a VTE feed.
+struct EngineState {
+    /// State to restore when an alt-screen app exits (anvil model).
+    prev_state: BlockState,
+    osc133_depth: u32,
+    prompt_buf: String,
+    /// Bytes emitted asynchronously after PromptEnd and before the next PromptStart.
+    /// Empty-command blocks are inferred from this separate buffer, so no history
+    /// schema change is needed.
+    background_output: BoundedByteRing,
+    /// Command text read from the live VTE at CommandStart; primary source
+    /// for the finished block.
+    vte_typed_cmd: String,
+    prompt_render_generation: u64,
+    /// Rendered prompt (last non-empty line) captured at PromptEnd, used by the
+    /// finalize path since prompt_buf is cleared once the prompt ends.
+    prompt_display: String,
+    shell_integration_token: String,
+    command_start_instant: Option<std::time::Instant>,
+    /// `None` means the shell reported no exit status for the finished command.
+    /// It must not read as a successful 0.
+    pending_exit_code: Option<i32>,
+    /// OSC 133 metadata for the command currently running, if the shell sends any.
+    pending_command_meta: PendingCommandMeta,
+    active_alt_screen_mode: Option<u32>,
+}
+
 /// Captures the shared handles the PTY reader/exit callbacks need, so
 /// `TermView::new` does not carry the reader closure inline.
 struct ReaderCtx {
@@ -3582,10 +3613,7 @@ struct ReaderCtx {
     /// The live VTE — every byte is fed here; alt-screen toggles feed it 1049h/l.
     active_vte: Terminal,
     bstate_rc: Rc<Cell<BlockState>>,
-    /// State to restore when an alt-screen app exits (anvil model).
-    prev_state_rc: Rc<Cell<BlockState>>,
-    osc133_depth_rc: Rc<Cell<u32>>,
-    prompt_buf_rc: Rc<RefCell<String>>,
+    engine: RefCell<EngineState>,
     /// Keystroke-shadow input line, used only as a fallback if the VTE-text
     /// capture at CommandStart returns empty.
     typed_cmd_rc: Rc<RefCell<String>>,
@@ -3598,18 +3626,11 @@ struct ReaderCtx {
     /// Agent identity paired with the approved external submission, if any.
     external_submission_generation_rc: Rc<Cell<Option<u64>>>,
     reviewed_submission_tainted_rc: Rc<Cell<bool>>,
-    /// Bytes emitted asynchronously after PromptEnd and before the next PromptStart.
-    /// Empty-command blocks are inferred from this separate buffer, so no history
-    /// schema change is needed.
-    background_output_rc: Rc<RefCell<BoundedByteRing>>,
     /// Once the user starts editing at an idle prompt, output is intentionally left
     /// inline: shell echo/completion and true background output are ambiguous then.
     idle_input_dirty_rc: Rc<Cell<bool>>,
-    /// Command text read from the live VTE at CommandStart; primary source
-    /// for the finished block.
-    vte_typed_cmd_rc: Rc<RefCell<String>>,
     /// VTE cursor position (col, row) captured at PromptEnd; the start anchor
-    /// for the text-range read that produces `vte_typed_cmd_rc`.
+    /// for the text-range read that produces `EngineState::vte_typed_cmd`.
     prompt_end_pos_rc: Rc<Cell<(i64, i64)>>,
     prompt_anchor_rows_rc: Rc<Cell<i64>>,
     prompt_anchor_resize_generation_rc: Rc<Cell<u64>>,
@@ -3620,15 +3641,11 @@ struct ReaderCtx {
     prompt_anchor_generation_rc: Rc<Cell<u64>>,
     prompt_anchor_tick_id_rc: Rc<RefCell<Option<gtk4::TickCallbackId>>>,
     contents_generation_rc: Rc<Cell<u64>>,
-    prompt_render_generation_rc: Rc<Cell<u64>>,
     post_prompt_bytes_rc: Rc<RefCell<BoundedByteRing>>,
     /// True once the post-`OSC 133;B` feed fence has been released for this
     /// prompt: the settling pass finished, gave up, or overflowed the ring, so
     /// later chunks go straight to the live VTE. Cleared at PromptStart.
     post_prompt_fence_released_rc: Rc<Cell<bool>>,
-    /// Rendered prompt (last non-empty line) captured at PromptEnd, used by the
-    /// finalize path since prompt_buf is cleared once the prompt ends.
-    prompt_display_rc: Rc<RefCell<String>>,
     block_list_rc: gtk4::Box,
     block_scroll_rc: ScrolledWindow,
     remote_session_cbs: StrCallbacks,
@@ -3651,15 +3668,8 @@ struct ReaderCtx {
     fullscreen_rc: Rc<Cell<bool>>,
     init_cmds_queue_for_cb: Rc<RefCell<std::collections::VecDeque<String>>>,
     pty_for_init: Rc<OwnedPty>,
-    shell_integration_token: Rc<String>,
     agent_execution_supported_rc: Rc<Cell<bool>>,
     block_start_time_for_cb: Rc<Cell<Option<SystemTime>>>,
-    command_start_instant_for_cb: Rc<Cell<Option<std::time::Instant>>>,
-    /// `None` means the shell reported no exit status for the finished command.
-    /// It must not read as a successful 0.
-    pending_exit_code_rc: Rc<Cell<Option<i32>>>,
-    /// OSC 133 metadata for the command currently running, if the shell sends any.
-    pending_command_meta_rc: Rc<RefCell<PendingCommandMeta>>,
     current_cwd_for_cb: Rc<RefCell<String>>,
     event_buf: Rc<RefCell<Vec<ParserEvent>>>,
     unread_count_rc: Rc<Cell<u32>>,
@@ -3686,7 +3696,6 @@ struct ReaderCtx {
     /// Parks incoming PTY chunks while the user drag-selects text on the live
     /// VTE, so streaming repaints can't destroy the selection mid-drag.
     selection_feed_hold: Rc<SelectionFeedHold>,
-    active_alt_screen_mode_rc: Rc<Cell<Option<u32>>>,
     /// Kitty graphics (APC G) — multi-chunk uploads assemble here; completed
     /// textures wait against the running command until its block finishes.
     /// The byte counter enforces the shared per-block budget so a runaway
@@ -3762,7 +3771,7 @@ impl ReaderCtx {
             BlockState::CollectingPrompt => {
                 let text = String::from_utf8_lossy(bytes);
                 append_bounded_text_tail(
-                    &mut self.prompt_buf_rc.borrow_mut(),
+                    &mut self.engine.borrow_mut().prompt_buf,
                     &text,
                     MAX_PROMPT_CAPTURE_BYTES,
                 );
@@ -3825,7 +3834,7 @@ impl ReaderCtx {
                         self.idle_input_dirty_rc.get(),
                         self.pty_synced_rc.get(),
                     ) {
-                        self.background_output_rc.borrow_mut().append(bytes);
+                        self.engine.borrow_mut().background_output.append(bytes);
                     }
                     self.scroll_debouncer.mark_dirty(&self.block_scroll_rc);
                     true
@@ -3878,7 +3887,12 @@ impl ReaderCtx {
             // unknown exit status. Otherwise a missing D
             // would leave both the card and terminal stuck.
             if state == BlockState::AltScreen {
-                let mode = self.active_alt_screen_mode_rc.replace(None).unwrap_or(1049);
+                let mode = self
+                    .engine
+                    .borrow_mut()
+                    .active_alt_screen_mode
+                    .take()
+                    .unwrap_or(1049);
                 self.active_vte.feed(format!("\x1b[?{mode}l").as_bytes());
                 exit_fullscreen(
                     &self.finished_blocks_for_cb,
@@ -3895,9 +3909,12 @@ impl ReaderCtx {
                 emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
                 (self.layout_active_surface)();
             }
-            self.osc133_depth_rc.set(0);
-            self.pending_exit_code_rc.set(None);
-            self.command_start_instant_for_cb.take();
+            {
+                let mut engine = self.engine.borrow_mut();
+                engine.osc133_depth = 0;
+                engine.pending_exit_code = None;
+                engine.command_start_instant = None;
+            }
             self.cmd_running_rc.set(false);
             self.bstate_rc.set(BlockState::PostCommand);
             state = BlockState::PostCommand;
@@ -3911,12 +3928,11 @@ impl ReaderCtx {
             self.verified_submission.command_start_observed(false);
             self.external_submission_rc.borrow_mut().take();
         }
-        self.prompt_render_generation_rc
-            .set(self.contents_generation_rc.get());
+        self.engine.borrow_mut().prompt_render_generation = self.contents_generation_rc.get();
         self.post_prompt_bytes_rc.borrow_mut().clear();
         self.post_prompt_fence_released_rc.set(false);
         let background_output = if state == BlockState::AwaitingCommand {
-            take_background_output(&self.background_output_rc)
+            take_background_output(&mut self.engine.borrow_mut().background_output)
         } else {
             None
         };
@@ -3933,7 +3949,7 @@ impl ReaderCtx {
             let mut cmd = if is_background {
                 String::new()
             } else {
-                let vte_cmd = self.vte_typed_cmd_rc.borrow().trim().to_string();
+                let vte_cmd = self.engine.borrow().vte_typed_cmd.trim().to_string();
                 if !vte_cmd.is_empty() {
                     vte_cmd
                 } else {
@@ -3968,7 +3984,7 @@ impl ReaderCtx {
                     self.kitty_pending_images_rc.borrow_mut().clear();
                     self.kitty_pending_bytes_rc.set(0);
                     self.bstate_rc.set(BlockState::CollectingPrompt);
-                    self.prompt_buf_rc.borrow_mut().clear();
+                    self.engine.borrow_mut().prompt_buf.clear();
                     self.scroll_debouncer.mark_dirty(&self.block_scroll_rc);
                     return;
                 }
@@ -3977,7 +3993,7 @@ impl ReaderCtx {
             let prompt = if is_background {
                 String::new()
             } else {
-                self.prompt_display_rc.borrow().clone()
+                self.engine.borrow().prompt_display.clone()
             };
 
             // The raw bytes already carry CRLF — the PTY's
@@ -4026,7 +4042,7 @@ impl ReaderCtx {
             let command_meta = if is_background {
                 PendingCommandMeta::default()
             } else {
-                std::mem::take(&mut *self.pending_command_meta_rc.borrow_mut())
+                std::mem::take(&mut self.engine.borrow_mut().pending_command_meta)
             };
 
             // The shell timed the command itself; our timer
@@ -4049,7 +4065,7 @@ impl ReaderCtx {
             let exit_code = if is_background {
                 None
             } else {
-                self.pending_exit_code_rc.take()
+                self.engine.borrow_mut().pending_exit_code.take()
             };
 
             // Single id shared by the serializable BlockData and
@@ -4162,7 +4178,7 @@ impl ReaderCtx {
             );
         }
         self.bstate_rc.set(BlockState::CollectingPrompt);
-        self.prompt_buf_rc.borrow_mut().clear();
+        self.engine.borrow_mut().prompt_buf.clear();
         // Reassert the stable viewport grid before the shell
         // renders the next prompt.
         sync_active_to_pty(
@@ -4178,27 +4194,27 @@ impl ReaderCtx {
         if self.bstate_rc.get() != BlockState::CollectingPrompt {
             return;
         }
-        let prompt_had_bytes = !self.prompt_buf_rc.borrow().is_empty();
-        // Capture the rendered prompt (last non-empty line) for the
-        // finished block / export.
-        let prompt_line = {
-            let pb = self.prompt_buf_rc.borrow();
-            strip_ansi(&pb)
+        let prompt_had_bytes = {
+            let mut engine = self.engine.borrow_mut();
+            let prompt_had_bytes = !engine.prompt_buf.is_empty();
+            // Capture the rendered prompt (last non-empty line) for the
+            // finished block / export.
+            engine.prompt_display = strip_ansi(&engine.prompt_buf)
                 .lines()
                 .rev()
                 .find(|l| !l.trim().is_empty())
                 .unwrap_or("")
                 .trim()
-                .to_string()
+                .to_string();
+            engine.prompt_buf.clear();
+            prompt_had_bytes
         };
-        *self.prompt_display_rc.borrow_mut() = prompt_line;
-        self.prompt_buf_rc.borrow_mut().clear();
         let had_typeahead = self.pending_typeahead_rc.replace(false);
         self.submission_pending_rc.set(false);
         let (next_fidelity, prompt_dirty) = next_prompt_shadow_state(had_typeahead);
         self.typed_cmd_rc.borrow_mut().clear();
         self.typed_cmd_fidelity_rc.set(next_fidelity);
-        self.vte_typed_cmd_rc.borrow_mut().clear();
+        self.engine.borrow_mut().vte_typed_cmd.clear();
         if self.external_submission_rc.borrow().is_some() {
             self.verified_submission.command_start_observed(false);
         }
@@ -4216,7 +4232,7 @@ impl ReaderCtx {
             &self.agent_execution_lost_cbs,
             "the approved command reached a new prompt without a trusted finished block",
         );
-        self.background_output_rc.borrow_mut().clear();
+        self.engine.borrow_mut().background_output.clear();
         self.idle_input_dirty_rc.set(prompt_dirty);
         // VTE applies feed asynchronously. The provisional
         // cursor below is never trusted for approval or
@@ -4242,7 +4258,9 @@ impl ReaderCtx {
         let anchor_submission = self.submission_pending_rc.clone();
         let anchor_typeahead = self.pending_typeahead_rc.clone();
         let contents_generation = self.contents_generation_rc.clone();
-        let prompt_render_generation = self.prompt_render_generation_rc.get();
+        // Read by value before the tick closure: the anchor tick must observe
+        // the generation as of this PromptEnd, and must not capture engine.
+        let prompt_render_generation = self.engine.borrow().prompt_render_generation;
         let post_prompt_bytes = self.post_prompt_bytes_rc.clone();
         let post_prompt_fence_released = self.post_prompt_fence_released_rc.clone();
         let stage = Rc::new(Cell::new(0u8));
@@ -4364,29 +4382,34 @@ impl ReaderCtx {
                 // consume the shell's eventual real D.
                 return;
             }
-            self.osc133_depth_rc.set(self.osc133_depth_rc.get() + 1);
+            let mut engine = self.engine.borrow_mut();
+            engine.osc133_depth += 1;
             return;
         }
         if state != BlockState::AwaitingCommand {
             return;
         }
-        self.osc133_depth_rc.set(0);
-        let mut command_meta =
-            PendingCommandMeta::from_command_start_with_token(meta, &self.shell_integration_token);
+        let mut command_meta = PendingCommandMeta::from_command_start_with_token(
+            meta,
+            &self.engine.borrow().shell_integration_token,
+        );
         if command_meta.cwd.is_none() {
             command_meta.cwd =
                 safe_command_metadata_cwd(Some(self.current_cwd_for_cb.borrow().as_str()));
         }
-        *self.pending_command_meta_rc.borrow_mut() = command_meta;
-        // A command start without an intervening PromptStart is
-        // an ambiguous shell-integration edge. Keep those bytes
-        // visible in the live VTE but do not merge them into the
-        // command's output block.
-        self.background_output_rc.borrow_mut().clear();
+        {
+            let mut engine = self.engine.borrow_mut();
+            engine.osc133_depth = 0;
+            engine.pending_command_meta = command_meta;
+            // A command start without an intervening PromptStart is
+            // an ambiguous shell-integration edge. Keep those bytes
+            // visible in the live VTE but do not merge them into the
+            // command's output block.
+            engine.background_output.clear();
+        }
         self.active_rc.borrow().reset_output_buffer();
         self.block_start_time_for_cb.set(Some(SystemTime::now()));
-        self.command_start_instant_for_cb
-            .set(Some(std::time::Instant::now()));
+        self.engine.borrow_mut().command_start_instant = Some(std::time::Instant::now());
         // Read the typed command directly off the live VTE,
         // not from a shadow keystroke buffer. The VTE shows
         // what the user actually saw — including history
@@ -4429,7 +4452,7 @@ impl ReaderCtx {
         if !deferred.is_empty() {
             self.active_vte.feed(&deferred);
         }
-        let prompt_display = self.prompt_display_rc.borrow().clone();
+        let prompt_display = self.engine.borrow().prompt_display.clone();
         let typed_shadow = self.typed_cmd_rc.borrow().clone();
         let external_submission = self.external_submission_rc.borrow_mut().take();
         let mut agent_generation = self.external_submission_generation_rc.take();
@@ -4489,12 +4512,12 @@ impl ReaderCtx {
             submitted_command = UNAVAILABLE_COMMAND_PLACEHOLDER.to_string();
         }
         self.submission_pending_rc.set(false);
-        *self.vte_typed_cmd_rc.borrow_mut() = submitted_command.clone();
+        self.engine.borrow_mut().vte_typed_cmd = submitted_command.clone();
         *self.running_cmd_rc.borrow_mut() = submitted_command.clone();
         self.cmd_running_rc.set(true);
         self.bstate_rc.set(BlockState::CollectingOutput);
         self.typed_cmd_rc.borrow_mut().clear();
-        let command_cwd = self.pending_command_meta_rc.borrow().cwd.clone();
+        let command_cwd = self.engine.borrow().pending_command_meta.cwd.clone();
         emit_command_started(
             &self.command_started_cbs,
             CommandStartedEvent {
@@ -4521,13 +4544,17 @@ impl ReaderCtx {
         if state != BlockState::CollectingOutput && state != BlockState::AltScreen {
             return;
         }
-        if self.osc133_depth_rc.get() > 0 {
-            self.osc133_depth_rc.set(self.osc133_depth_rc.get() - 1);
-            return;
+        {
+            let mut engine = self.engine.borrow_mut();
+            if engine.osc133_depth > 0 {
+                engine.osc133_depth -= 1;
+                return;
+            }
         }
         let id_correlation = self
-            .pending_command_meta_rc
+            .engine
             .borrow()
+            .pending_command_meta
             .command_end_correlation(meta);
         match decide_agent_command_end(
             self.active_agent_generation_rc.get().is_some(),
@@ -4550,13 +4577,18 @@ impl ReaderCtx {
             }
         }
         if id_correlation == CommandIdCorrelation::Mismatch {
-            self.pending_command_meta_rc.borrow_mut().id = None;
+            self.engine.borrow_mut().pending_command_meta.id = None;
         }
         // Safety net (Warp parity): if the alt-screen app
         // crashed or exited without rmcup, force the UI back
         // to the block list so the next prompt is usable.
         if state == BlockState::AltScreen {
-            let mode = self.active_alt_screen_mode_rc.replace(None).unwrap_or(1049);
+            let mode = self
+                .engine
+                .borrow_mut()
+                .active_alt_screen_mode
+                .take()
+                .unwrap_or(1049);
             let leave = format!("\x1b[?{mode}l");
             self.active_vte.feed(leave.as_bytes());
             exit_fullscreen(
@@ -4574,22 +4606,27 @@ impl ReaderCtx {
             emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
             (self.layout_active_surface)();
         }
-        self.pending_exit_code_rc.set(exit);
-        self.pending_command_meta_rc
-            .borrow_mut()
-            .merge_command_end(meta);
-        let command_started_at = self.command_start_instant_for_cb.take();
-        let frontend_duration_ms = command_started_at
-            .and_then(|started| u64::try_from(started.elapsed().as_millis()).ok());
-        let (command_cwd, duration_ms) = {
-            let mut meta = self.pending_command_meta_rc.borrow_mut();
-            let duration_ms = meta.duration_ms.or(frontend_duration_ms);
+        let (command_started_at, command_cwd, duration_ms) = {
+            let mut engine = self.engine.borrow_mut();
+            engine.pending_exit_code = exit;
+            engine.pending_command_meta.merge_command_end(meta);
+            let command_started_at = engine.command_start_instant.take();
+            let frontend_duration_ms = command_started_at
+                .and_then(|started| u64::try_from(started.elapsed().as_millis()).ok());
+            let duration_ms = engine
+                .pending_command_meta
+                .duration_ms
+                .or(frontend_duration_ms);
             // Reuse the C→D monotonic fallback when the
             // next PromptStart builds BlockData. Otherwise
             // the card and the visible block would report
             // different durations (C→D vs C→A).
-            meta.duration_ms = duration_ms;
-            (meta.cwd.clone(), duration_ms)
+            engine.pending_command_meta.duration_ms = duration_ms;
+            (
+                command_started_at,
+                engine.pending_command_meta.cwd.clone(),
+                duration_ms,
+            )
         };
         self.cmd_running_rc.set(false);
         self.bstate_rc.set(BlockState::PostCommand);
@@ -4613,9 +4650,9 @@ impl ReaderCtx {
         if from_state != BlockState::CollectingOutput && from_state != BlockState::AwaitingCommand {
             return;
         }
-        self.prev_state_rc.set(from_state);
+        self.engine.borrow_mut().prev_state = from_state;
         self.bstate_rc.set(BlockState::AltScreen);
-        self.active_alt_screen_mode_rc.set(Some(mode));
+        self.engine.borrow_mut().active_alt_screen_mode = Some(mode);
         enter_alt_screen_chrome(&self.active_rc, &self.sticky_bar, &self.jump_fab);
         emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Entered);
         // The control sequence may be the only event in
@@ -4652,7 +4689,7 @@ impl ReaderCtx {
         // Warp parity: alt-screen content is ephemeral and is
         // NOT merged into the block. The active block keeps
         // just the command name + exit code.
-        self.active_alt_screen_mode_rc.set(None);
+        self.engine.borrow_mut().active_alt_screen_mode = None;
         let leave = format!("\x1b[?{mode}l");
         self.active_vte.feed(leave.as_bytes());
         exit_fullscreen(
@@ -4668,8 +4705,8 @@ impl ReaderCtx {
             self.unread_count_rc.get(),
         );
         emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
-        self.osc133_depth_rc.set(0);
-        self.bstate_rc.set(self.prev_state_rc.get());
+        self.engine.borrow_mut().osc133_depth = 0;
+        self.bstate_rc.set(self.engine.borrow().prev_state);
         // The primary and alternate screens share the same
         // viewport-sized grid, just like regular VTE mode.
         sync_active_to_pty(
@@ -4780,7 +4817,7 @@ impl ReaderCtx {
     fn on_agent_integration_ready(&self, token: &str) {
         accept_agent_integration_token(
             self.bstate_rc.get(),
-            &self.shell_integration_token,
+            &self.engine.borrow().shell_integration_token,
             token,
             &self.agent_execution_supported_rc,
         );
@@ -4955,8 +4992,8 @@ fn background_output_has_visible_text(bytes: &[u8]) -> bool {
         .any(|ch| !ch.is_whitespace() && !ch.is_control())
 }
 
-fn take_background_output(pending: &RefCell<BoundedByteRing>) -> Option<String> {
-    let bytes = pending.borrow_mut().take_vec();
+fn take_background_output(pending: &mut BoundedByteRing) -> Option<String> {
+    let bytes = pending.take_vec();
     background_output_has_visible_text(&bytes).then(|| String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -6284,7 +6321,6 @@ impl TermView {
         // must consume and close its private fd, then echo OSC 7771 with this
         // exact token before reviewed commands may be executed.
         let agent_execution_supported = Rc::new(Cell::new(false));
-        let shell_integration_token = Rc::new(shell_integration_token);
         // ── Build widget tree ──────────────────────────────────────────────
         let root = gtk4::Box::new(Orientation::Vertical, 0);
         root.set_hexpand(true);
@@ -6473,13 +6509,7 @@ impl TermView {
         let external_submission_generation: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         let reviewed_submission_tainted: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let active_agent_generation: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
-        let background_output: Rc<RefCell<BoundedByteRing>> =
-            Rc::new(RefCell::new(BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES)));
         let idle_input_dirty: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        // Command text snapshot taken at CommandStart from the VTE itself,
-        // between `prompt_end_pos` and the current cursor. This is what
-        // finalize uses to record the run.
-        let vte_typed_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         // VTE cursor position (col, row) right after the prompt finished
         // drawing — anchor for the text-range read at CommandStart.
         let prompt_end_pos: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
@@ -6492,7 +6522,6 @@ impl TermView {
         let prompt_anchor_generation = Rc::new(Cell::new(0u64));
         let prompt_anchor_tick_id: Rc<RefCell<Option<gtk4::TickCallbackId>>> =
             Rc::new(RefCell::new(None));
-        let prompt_render_generation = Rc::new(Cell::new(0u64));
         let post_prompt_bytes = Rc::new(RefCell::new(BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES)));
         let post_prompt_fence_released = Rc::new(Cell::new(false));
         let contents_generation = Rc::new(Cell::new(0u64));
@@ -6721,13 +6750,6 @@ impl TermView {
             });
         }
 
-        // State to restore when an alt-screen app exits (anvil model).
-        let prev_state: Rc<Cell<BlockState>> = Rc::new(Cell::new(BlockState::Idle));
-        let osc133_depth: Rc<Cell<u32>> = Rc::new(Cell::new(0));
-        let prompt_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        // Rendered prompt captured at PromptEnd (prompt_buf is cleared once the
-        // prompt ends, so the finalize path reads this instead).
-        let prompt_display: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         // True while an alt-screen app owns the viewport (finished blocks hidden).
         let fullscreen: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let cwd_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
@@ -6787,12 +6809,6 @@ impl TermView {
         // DECSET 2004 state here so clipboard pastes can be forwarded as one
         // ordered byte stream instead of relying on VTE's unrelated PTY.
         let bracketed_paste: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        // `None` until a CommandEnd reports one. A shell that sends the bare
-        // FinalTerm `D` mark with no status leaves it None, which must not be
-        // rendered as a success.
-        let pending_exit_code: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(None));
-        let pending_command_meta: Rc<RefCell<PendingCommandMeta>> =
-            Rc::new(RefCell::new(PendingCommandMeta::default()));
 
         // Dynamic OSC 10/11/12 colors: the reader updates this shared state and
         // Undo uses it when recreating snapshot VTEs.
@@ -6878,7 +6894,6 @@ impl TermView {
         let cmd_running: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let running_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let block_start_time: Rc<Cell<Option<SystemTime>>> = Rc::new(Cell::new(None));
-        let command_start_instant: Rc<Cell<Option<std::time::Instant>>> = Rc::new(Cell::new(None));
         let visible_indices: Rc<RefCell<std::collections::HashSet<usize>>> =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
         let current_cwd: Rc<RefCell<String>> = Rc::new(RefCell::new(cwd.unwrap_or("").to_string()));
@@ -6934,14 +6949,10 @@ impl TermView {
             let active_rc = active.clone();
             let active_vte_rc = active_vte.clone();
             let bstate_rc = bstate.clone();
-            let prev_state_rc = prev_state.clone();
-            let osc133_depth_rc = osc133_depth.clone();
-            let prompt_buf_rc = prompt_buf.clone();
             let typed_cmd_rc = typed_cmd.clone();
             let typed_cmd_fidelity_rc = typed_cmd_fidelity.clone();
             let submission_pending_rc = submission_pending.clone();
             let pending_typeahead_rc = pending_typeahead.clone();
-            let vte_typed_cmd_rc = vte_typed_cmd.clone();
             let prompt_end_pos_rc = prompt_end_pos.clone();
             let prompt_anchor_rows_rc = prompt_anchor_rows.clone();
             let prompt_anchor_resize_generation_rc = prompt_anchor_resize_generation.clone();
@@ -6949,7 +6960,6 @@ impl TermView {
             let prompt_anchor_prefix_rc = prompt_anchor_prefix.clone();
             let prompt_anchor_ready_rc = prompt_anchor_ready.clone();
             let prompt_anchor_generation_rc = prompt_anchor_generation.clone();
-            let prompt_display_rc = prompt_display.clone();
             let block_list_rc = block_list.clone();
             let block_scroll_rc = block_scroll.clone();
             let exited_cbs = exited_callbacks.clone();
@@ -6977,9 +6987,6 @@ impl TermView {
             let init_cmds_queue_for_cb = Rc::clone(&init_cmds_queue);
             let pty_for_init = Rc::clone(&pty);
             let block_start_time_for_cb = block_start_time.clone();
-            let command_start_instant_for_cb = command_start_instant.clone();
-            let pending_exit_code_rc = pending_exit_code.clone();
-            let pending_command_meta_rc = pending_command_meta.clone();
             let current_cwd_for_cb = current_cwd.clone();
 
             let event_buf: Rc<RefCell<Vec<ParserEvent>>> =
@@ -6988,9 +6995,20 @@ impl TermView {
                 active_rc,
                 active_vte: active_vte_rc,
                 bstate_rc,
-                prev_state_rc,
-                osc133_depth_rc,
-                prompt_buf_rc,
+                engine: RefCell::new(EngineState {
+                    prev_state: BlockState::Idle,
+                    osc133_depth: 0,
+                    prompt_buf: String::new(),
+                    background_output: BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES),
+                    vte_typed_cmd: String::new(),
+                    prompt_render_generation: 0,
+                    prompt_display: String::new(),
+                    shell_integration_token,
+                    command_start_instant: None,
+                    pending_exit_code: None,
+                    pending_command_meta: PendingCommandMeta::default(),
+                    active_alt_screen_mode: None,
+                }),
                 typed_cmd_rc,
                 typed_cmd_fidelity_rc,
                 submission_pending_rc,
@@ -6999,9 +7017,7 @@ impl TermView {
                 external_submission_rc: external_submission.clone(),
                 external_submission_generation_rc: external_submission_generation.clone(),
                 reviewed_submission_tainted_rc: reviewed_submission_tainted,
-                background_output_rc: background_output.clone(),
                 idle_input_dirty_rc: idle_input_dirty.clone(),
-                vte_typed_cmd_rc,
                 prompt_end_pos_rc,
                 prompt_anchor_rows_rc,
                 prompt_anchor_resize_generation_rc,
@@ -7012,10 +7028,8 @@ impl TermView {
                 prompt_anchor_generation_rc,
                 prompt_anchor_tick_id_rc: prompt_anchor_tick_id.clone(),
                 contents_generation_rc: contents_generation.clone(),
-                prompt_render_generation_rc: prompt_render_generation.clone(),
                 post_prompt_bytes_rc: post_prompt_bytes,
                 post_prompt_fence_released_rc: post_prompt_fence_released,
-                prompt_display_rc,
                 block_list_rc,
                 block_scroll_rc,
                 remote_session_cbs: remote_session_callbacks.clone(),
@@ -7038,12 +7052,8 @@ impl TermView {
                 fullscreen_rc,
                 init_cmds_queue_for_cb,
                 pty_for_init,
-                shell_integration_token,
                 agent_execution_supported_rc: agent_execution_supported.clone(),
                 block_start_time_for_cb,
-                command_start_instant_for_cb,
-                pending_exit_code_rc,
-                pending_command_meta_rc,
                 current_cwd_for_cb,
                 event_buf,
                 unread_count_rc: unread_count.clone(),
@@ -7064,7 +7074,6 @@ impl TermView {
                 agent_execution_lost_cbs: agent_execution_lost_callbacks.clone(),
                 verified_submission: verified_submission.clone(),
                 selection_feed_hold: selection_feed_hold.clone(),
-                active_alt_screen_mode_rc: Rc::new(Cell::new(None)),
                 kitty_assembler_rc: Rc::new(RefCell::new(kitty_graphics::Assembler::new())),
                 kitty_pending_images_rc: Rc::new(RefCell::new(Vec::new())),
                 kitty_pending_bytes_rc: Rc::new(Cell::new(0)),
@@ -9672,15 +9681,14 @@ mod tests {
 
     #[test]
     fn taking_background_output_drains_the_pending_buffer() {
-        let mut bytes = BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES);
-        bytes.append(b"async line\r\n");
-        let pending = RefCell::new(bytes);
+        let mut pending = BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES);
+        pending.append(b"async line\r\n");
         assert_eq!(
-            take_background_output(&pending).as_deref(),
+            take_background_output(&mut pending).as_deref(),
             Some("async line\r\n")
         );
-        assert!(pending.borrow().is_empty());
-        assert!(take_background_output(&pending).is_none());
+        assert!(pending.is_empty());
+        assert!(take_background_output(&mut pending).is_none());
     }
 
     #[test]
