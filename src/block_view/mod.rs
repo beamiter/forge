@@ -6922,6 +6922,13 @@ impl TermView {
             });
         }
 
+        // One shared cell for the runtime Config: TermView.config and the
+        // reader/finalize path must alias, or reload_config would update a
+        // copy the reader callbacks never see. reload_config's borrow_mut is
+        // statement-scoped and runs from UI actions outside reader dispatch;
+        // every reader-path read takes a short borrow.
+        let config_shared: Rc<RefCell<Config>> = Rc::new(RefCell::new(config.clone()));
+
         // ── Wire PTY → parser → block events ─────────────────────────────
         {
             let active_rc = active.clone();
@@ -6950,7 +6957,7 @@ impl TermView {
             let alt_screen_cbs = alt_screen_callbacks.clone();
             let mouse_reporting_rc = mouse_reporting_mode.clone();
             let bracketed_paste_rc = bracketed_paste.clone();
-            let config_for_cb = Rc::new(RefCell::new(config.clone()));
+            let config_for_cb = config_shared.clone();
             let parser = Rc::new(RefCell::new(Parser::with_config(ParserConfig {
                 mouse_reporting: config.mouse_reporting_enabled,
                 focus_reporting: config.focus_reporting_enabled,
@@ -7855,7 +7862,7 @@ impl TermView {
             alt_screen_callbacks,
             mouse_reporting_mode,
             bracketed_paste,
-            config: Rc::new(RefCell::new(config.clone())),
+            config: config_shared,
             block_data: block_data_rc,
             failure_marker_redraw,
             cleared_blocks: RefCell::new(Vec::new()),
