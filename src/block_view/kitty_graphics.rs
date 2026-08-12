@@ -93,6 +93,35 @@ pub(crate) enum Outcome {
     QueryOk,
 }
 
+/// Texture-free mirror of [`Outcome`]: what crosses the `RenderBackend` trait
+/// and what [`response_for`] answers from. `Complete` here means "a decoded
+/// texture is parked backend-side awaiting admission" — the texture itself
+/// never leaves the backend.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FeedStatus {
+    Complete,
+    CompleteTransmitOnly,
+    Pending,
+    Skipped,
+    Invalid,
+    QueryOk,
+}
+
+impl Outcome {
+    /// Drop the texture payload, keeping the variant identity the protocol
+    /// responder and the admission decision need.
+    pub(crate) fn status(&self) -> FeedStatus {
+        match self {
+            Outcome::Complete { .. } => FeedStatus::Complete,
+            Outcome::CompleteTransmitOnly => FeedStatus::CompleteTransmitOnly,
+            Outcome::Pending => FeedStatus::Pending,
+            Outcome::Skipped => FeedStatus::Skipped,
+            Outcome::Invalid => FeedStatus::Invalid,
+            Outcome::QueryOk => FeedStatus::QueryOk,
+        }
+    }
+}
+
 /// Stateful assembler — a thin GTK-side wrapper over the shared one.
 pub(crate) struct Assembler {
     inner: core::Assembler,
@@ -331,27 +360,27 @@ impl ReplyKeys {
 ///   `i=` to answer;
 /// - `q=` is read per-chunk from the payload being answered, not remembered
 ///   across an upload the way the shared assembler remembers it.
-pub(crate) fn response_for(payload: &[u8], outcome: &Outcome) -> Option<Vec<u8>> {
+pub(crate) fn response_for(payload: &[u8], outcome: &FeedStatus) -> Option<Vec<u8>> {
     let keys = ReplyKeys::scan(payload)?;
     if keys.id.is_none() && keys.number.is_none() {
         return None;
     }
     let body = match outcome {
         // Chunked uploads are answered once, after the final chunk.
-        Outcome::Pending => return None,
-        Outcome::Complete { .. } | Outcome::CompleteTransmitOnly | Outcome::QueryOk => {
+        FeedStatus::Pending => return None,
+        FeedStatus::Complete | FeedStatus::CompleteTransmitOnly | FeedStatus::QueryOk => {
             if keys.quiet >= 1 {
                 return None;
             }
             "OK"
         }
-        Outcome::Invalid => {
+        FeedStatus::Invalid => {
             if keys.quiet >= 2 {
                 return None;
             }
             "EINVAL:invalid graphics payload"
         }
-        Outcome::Skipped => {
+        FeedStatus::Skipped => {
             if keys.quiet >= 2 {
                 return None;
             }
@@ -664,7 +693,7 @@ mod tests {
         let outcome = a.feed(payload);
         assert!(matches!(outcome, Outcome::QueryOk));
         assert_eq!(
-            response_for(payload, &outcome).as_deref(),
+            response_for(payload, &outcome.status()).as_deref(),
             Some(b"\x1b_Gi=31;OK\x1b\\".as_slice())
         );
     }
@@ -718,14 +747,14 @@ mod tests {
     #[test]
     fn responses_require_an_identifier() {
         assert_eq!(
-            response_for(b"Ga=t,f=24,s=1,v=1;AAAA", &Outcome::Invalid),
+            response_for(b"Ga=t,f=24,s=1,v=1;AAAA", &FeedStatus::Invalid),
             None
         );
         assert_eq!(
-            response_for(b"Ga=T;AAAA", &Outcome::CompleteTransmitOnly),
+            response_for(b"Ga=T;AAAA", &FeedStatus::CompleteTransmitOnly),
             None
         );
-        assert_eq!(response_for(b"not graphics", &Outcome::Invalid), None);
+        assert_eq!(response_for(b"not graphics", &FeedStatus::Invalid), None);
     }
 
     #[test]
@@ -733,17 +762,17 @@ mod tests {
         assert_eq!(
             response_for(
                 b"Ga=t,i=41,s=1,v=1,f=24;AAAA",
-                &Outcome::CompleteTransmitOnly
+                &FeedStatus::CompleteTransmitOnly
             )
             .as_deref(),
             Some(b"\x1b_Gi=41;OK\x1b\\".as_slice())
         );
         assert_eq!(
-            response_for(b"GI=13,a=T;AAAA", &Outcome::Invalid).as_deref(),
+            response_for(b"GI=13,a=T;AAAA", &FeedStatus::Invalid).as_deref(),
             Some(b"\x1b_GI=13;EINVAL:invalid graphics payload\x1b\\".as_slice())
         );
         assert_eq!(
-            response_for(b"Ga=d,i=5,p=17;", &Outcome::Skipped).as_deref(),
+            response_for(b"Ga=d,i=5,p=17;", &FeedStatus::Skipped).as_deref(),
             Some(
                 b"\x1b_Gi=5,p=17;ENOTSUP:action, format, transport, or size not supported\x1b\\"
                     .as_slice()
@@ -759,7 +788,7 @@ mod tests {
         let outcome = feed(payload);
         assert!(matches!(outcome, Outcome::Invalid));
         assert_eq!(
-            response_for(payload, &outcome).as_deref(),
+            response_for(payload, &outcome.status()).as_deref(),
             Some(b"\x1b_Gi=1,I=2;EINVAL:invalid graphics payload\x1b\\".as_slice())
         );
     }
@@ -768,26 +797,29 @@ mod tests {
     fn responses_ignore_base64_padding_in_the_data_section() {
         // Splitting once at ';' keeps `=` padding out of the control scan.
         assert_eq!(
-            response_for(b"Ga=T,i=8;AQIDBA==", &Outcome::Invalid).as_deref(),
+            response_for(b"Ga=T,i=8;AQIDBA==", &FeedStatus::Invalid).as_deref(),
             Some(b"\x1b_Gi=8;EINVAL:invalid graphics payload\x1b\\".as_slice())
         );
     }
 
     #[test]
     fn responses_wait_for_the_final_chunk() {
-        assert_eq!(response_for(b"Ga=T,i=7,m=1;/w", &Outcome::Pending), None);
+        assert_eq!(response_for(b"Ga=T,i=7,m=1;/w", &FeedStatus::Pending), None);
     }
 
     #[test]
     fn quiet_levels_suppress_responses() {
         assert_eq!(
-            response_for(b"Ga=q,i=31,q=1,s=1,v=1,f=24;AAAA", &Outcome::QueryOk),
+            response_for(b"Ga=q,i=31,q=1,s=1,v=1,f=24;AAAA", &FeedStatus::QueryOk),
             None
         );
         // q=1 still reports errors …
-        assert!(response_for(b"Ga=T,i=2,q=1;!!!!", &Outcome::Invalid).is_some());
+        assert!(response_for(b"Ga=T,i=2,q=1;!!!!", &FeedStatus::Invalid).is_some());
         // … q=2 silences those too.
-        assert_eq!(response_for(b"Ga=T,i=2,q=2;!!!!", &Outcome::Invalid), None);
-        assert_eq!(response_for(b"Ga=d,i=3,q=2;", &Outcome::Skipped), None);
+        assert_eq!(
+            response_for(b"Ga=T,i=2,q=2;!!!!", &FeedStatus::Invalid),
+            None
+        );
+        assert_eq!(response_for(b"Ga=d,i=3,q=2;", &FeedStatus::Skipped), None);
     }
 }

@@ -2659,13 +2659,18 @@ pub(crate) struct ActiveBlock {
     /// screen temporarily overrides it without losing the requested state.
     live_organism_visible: Cell<bool>,
     live_organism_alt_screen: Cell<bool>,
-    /// Raw output bytes accumulated during CollectingOutput, consumed by the
-    /// finalize path to build the styled finished block (anvil's `out_buf`).
+    /// Raw output bytes accumulated during CollectingOutput (anvil's
+    /// `out_buf`). Engine-owned shared state constructed in `TermView::new`:
+    /// the reader engine appends, clears, and snapshots it directly; this
+    /// clone exists only so live-find can read a bounded prefix
+    /// ([`Self::output_text_prefix`]).
     raw_output: Rc<RefCell<BoundedByteRing>>,
 }
 
 impl ActiveBlock {
-    pub(crate) fn new(config: &Config) -> Self {
+    /// `pub(super)`: only `TermView::new` constructs the live block, and the
+    /// ring parameter's type is itself private to `block_view`.
+    pub(super) fn new(config: &Config, raw_output: Rc<RefCell<BoundedByteRing>>) -> Self {
         let widget = gtk4::Box::new(Orientation::Vertical, 0);
         widget.add_css_class("block-active");
         if config.block_compact {
@@ -2741,25 +2746,8 @@ impl ActiveBlock {
             live_scrollbar,
             live_organism_visible: Cell::new(false),
             live_organism_alt_screen: Cell::new(false),
-            raw_output: Rc::new(RefCell::new(BoundedByteRing::new(
-                super::MAX_RAW_OUTPUT_BYTES,
-            ))),
+            raw_output,
         }
-    }
-
-    /// Append raw command-output bytes to the snapshot buffer (bounded). The bytes
-    /// are also fed to the live VTE separately by the reader; this buffer is only
-    /// the source the finalize path styles into a finished block.
-    pub(crate) fn accumulate_output(&self, raw_bytes: &[u8]) {
-        self.raw_output.borrow_mut().append(raw_bytes);
-    }
-
-    pub(crate) fn output_text(&self) -> String {
-        let mut raw = self.raw_output.borrow_mut();
-        if raw.is_empty() {
-            return String::new();
-        }
-        String::from_utf8_lossy(raw.make_contiguous()).into_owned()
     }
 
     /// Return at most `max_bytes` from the live capture for bounded main-thread
@@ -2779,11 +2767,6 @@ impl ActiveBlock {
         )
     }
 
-    /// Clear the accumulated output buffer (without touching the VTE).
-    pub(crate) fn reset_output_buffer(&self) {
-        self.raw_output.borrow_mut().clear();
-    }
-
     /// The column count the live VTE is wrapping at — the single source of truth
     /// for pre-wrapping finished blocks so they align with what the user watched.
     pub(crate) fn grid_cols(&self) -> usize {
@@ -2795,10 +2778,13 @@ impl ActiveBlock {
     /// in-stream clear (fed after them) wipes stale output in the correct order.
     ///
     /// `preserve_scrollback`: when true, keep the VTE's buffer + scrollback intact
-    /// (only the accumulated raw_output snapshot for the *next* block is cleared,
-    /// and SGR state is soft-reset). When false (the default), finished blocks
+    /// (SGR state is soft-reset). When false (the default), finished blocks
     /// remain the sole historical surface and the compact live cell shows only
     /// the current prompt.
+    ///
+    /// Deliberately does NOT touch the `raw_output` ring: that is engine-owned
+    /// state, cleared explicitly by the reader engine around this reset (see
+    /// `RenderBackend::reset_active_surface`).
     pub(crate) fn reset_active(&self, preserve_scrollback: bool) {
         if preserve_scrollback {
             self.active_vte.feed(b"\x1b[0m");
@@ -2806,7 +2792,6 @@ impl ActiveBlock {
             self.active_vte.reset(true, true);
             self.active_vte.feed(b"\x1b[H\x1b[2J\x1b[3J");
         }
-        self.raw_output.borrow_mut().clear();
     }
 
     pub(crate) fn widget(&self) -> &gtk4::Box {
