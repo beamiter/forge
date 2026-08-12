@@ -1,14 +1,16 @@
 # Engineering handoff
 
-Updated: 2026-08-10
+Updated: 2026-08-12
 
 This working tree contains the nine-round "Evolve ASCII organism" series
 (`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
 layer, and the current five-round debugging-vigil evolution: the experimental
 Block-pane organism grew from an event reflex into a continuous life
 simulation with utility-selected behavior, agent attribution, interpolated
-spatial motion, motion restraint, and a persistent per-repo build-duration
-baseline. Every historical round followed the
+spatial motion, motion restraint, a persistent per-repo build-duration
+baseline, and a five-part embodiment pass covering visible growth, output
+rhythm, semantic transitions, repo territory, and attention arbitration.
+Every historical round followed the
 same loop — implement, unit-test, sync `docs/USER_GUIDE.md`, run a
 three-agent adversarial verification workflow, fix confirmed findings,
 commit, push. The verification pass caught one to two real defects almost
@@ -196,6 +198,34 @@ The continued pass adds six more coherent layers:
   input now hides the live body for the
   whole 900 ms retreat window and returns by snap, so typing never triggers a
   distracting run. No schema field or content-bearing perception was added.
+- **Five-part embodiment pass (current working tree)**: lifetime stage now has
+  a visible phenotype as well as a badge — large eyes and quicker micro-motion
+  for juvenile, the existing adult silhouette, and a notched ear with slower
+  cadence for seasoned. A composable render context keeps semantic behavior,
+  quantized `BodyLanguage`, `GrowthStage`, and content-free `OutputRhythm`
+  independent instead of multiplying reducer states. Every phenotype variant
+  in a pose family retains the exact bounding box, and semantic reaction marks
+  remain canonical. Output rhythm exists only in memory: the most recent three
+  pulses inside roughly 1.2 seconds read as busy, roughly three quiet seconds
+  (including a command with no output yet) as waiting,
+  and returning output gets a roughly 0.9-second resume acknowledgement;
+  existing commands past 60 seconds still use `WatchSettled`. None of those
+  states inspects bytes or infers a command result.
+
+  Full motion connects selected semantic boundaries with four fixed-envelope
+  frames: error reaction→failure vigil, celebration→recovery or
+  cautious guard, settled watch→celebration, and recovery guard→post-push rest.
+  Calm snaps and Static stays card-only. A newer event, typing retreat,
+  alternate-screen yield, and fail-closed sizing always preempt transitions.
+  A process-local stable hash of an already canonical repo identity chooses
+  the preferred nest side and route; an unfamiliar repo receives one short
+  post-settle exploration when no higher-priority vigil conflicts, otherwise
+  that exploration is dropped rather than replayed later. It never displays the path, enters the reducer, or
+  adds a persisted field. Finally, a window/session-local attention arbiter
+  admits failure/vigil before closure/recovery/push, then long-command changes,
+  then greetings/insights. An admitted expression owns a shared focus window
+  and starts its cue-local cooldown; suppressed expression is dropped, never
+  queued, while durable repo facts remain intact.
 
 Hard lines the series preserved, verified every round: perception only
 ever widens by enums, counters, or geometry scalars — command text, output,

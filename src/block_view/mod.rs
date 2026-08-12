@@ -2496,6 +2496,13 @@ pub(crate) enum HumanInputKind {
     StickyStop,
 }
 
+/// Content-free ownership change for the terminal's alternate screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AltScreenTransition {
+    Entered,
+    Left,
+}
+
 /// Every PTY-writing UI path is classified at its origin.  Only direct-human
 /// origins cross the organism callback boundary; Agent, correction, command
 /// palette and other callers all share `TermView::write_input` and therefore
@@ -2576,6 +2583,7 @@ pub(crate) struct CommandFinishedEvent {
 type CommandStartedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandStartedEvent)>>>>;
 type CommandFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandFinishedEvent)>>>>;
 type HumanInputCallbacks = Rc<RefCell<Vec<Box<dyn Fn(HumanInputKind)>>>>;
+type AltScreenCallbacks = Rc<RefCell<Vec<Box<dyn Fn(AltScreenTransition)>>>>;
 type AskAiCallbacks = Rc<RefCell<Vec<Box<dyn Fn(crate::ai::BlockContext)>>>>;
 
 fn block_context_for_id(
@@ -2614,6 +2622,12 @@ fn block_context_for_id(
 fn emit_activity(callbacks: &VoidCallbacks) {
     for callback in callbacks.borrow().iter() {
         callback();
+    }
+}
+
+fn emit_alt_screen_transition(callbacks: &AltScreenCallbacks, transition: AltScreenTransition) {
+    for callback in callbacks.borrow().iter() {
+        callback(transition);
     }
 }
 
@@ -2961,6 +2975,7 @@ pub struct TermView {
     title_callbacks: StrCallbacks,
     activity_callbacks: VoidCallbacks,
     human_input_callbacks: HumanInputCallbacks,
+    alt_screen_callbacks: AltScreenCallbacks,
     mouse_reporting_mode: Rc<Cell<MouseReportingMode>>,
     /// Whether the shell has enabled DECSET 2004. Clipboard input is written
     /// directly to our PTY, so block mode must apply this wrapper itself.
@@ -3117,6 +3132,7 @@ struct ReaderCtx {
     remote_session_cbs: StrCallbacks,
     exited_cbs: IntCallbacks,
     activity_cbs: VoidCallbacks,
+    alt_screen_cbs: AltScreenCallbacks,
     mouse_reporting_rc: Rc<Cell<MouseReportingMode>>,
     bracketed_paste_rc: Rc<Cell<bool>>,
     config_for_cb: Rc<RefCell<Config>>,
@@ -3297,6 +3313,7 @@ impl ReaderCtx {
             remote_session_cbs,
             exited_cbs,
             activity_cbs,
+            alt_screen_cbs,
             mouse_reporting_rc,
             bracketed_paste_rc,
             config_for_cb,
@@ -3550,6 +3567,10 @@ impl ReaderCtx {
                                         &jump_fab,
                                         scroll_debouncer.user_scrolled_up.get(),
                                         unread_count_rc.get(),
+                                    );
+                                    emit_alt_screen_transition(
+                                        &alt_screen_cbs,
+                                        AltScreenTransition::Left,
                                     );
                                     layout_active_surface();
                                 }
@@ -4934,6 +4955,10 @@ impl ReaderCtx {
                                     scroll_debouncer.user_scrolled_up.get(),
                                     unread_count_rc.get(),
                                 );
+                                emit_alt_screen_transition(
+                                    &alt_screen_cbs,
+                                    AltScreenTransition::Left,
+                                );
                                 layout_active_surface();
                             }
                             pending_exit_code_rc.set(*exit);
@@ -4980,6 +5005,10 @@ impl ReaderCtx {
                             bstate_rc.set(BlockState::AltScreen);
                             active_alt_screen_mode_rc.set(Some(*mode));
                             enter_alt_screen_chrome(&active_rc, &sticky_bar, &jump_fab);
+                            emit_alt_screen_transition(
+                                &alt_screen_cbs,
+                                AltScreenTransition::Entered,
+                            );
                             // The control sequence may be the only event in
                             // this parser turn, so ordinary output bytes cannot
                             // be relied on to revoke live organism state. The
@@ -5029,6 +5058,7 @@ impl ReaderCtx {
                                 scroll_debouncer.user_scrolled_up.get(),
                                 unread_count_rc.get(),
                             );
+                            emit_alt_screen_transition(&alt_screen_cbs, AltScreenTransition::Left);
                             osc133_depth_rc.set(0);
                             bstate_rc.set(prev_state_rc.get());
                             // The primary and alternate screens share the same
@@ -6656,6 +6686,7 @@ impl TermView {
         let title_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
         let activity_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
         let human_input_callbacks: HumanInputCallbacks = Rc::new(RefCell::new(vec![]));
+        let alt_screen_callbacks: AltScreenCallbacks = Rc::new(RefCell::new(vec![]));
         let command_started_callbacks: CommandStartedCallbacks = Rc::new(RefCell::new(vec![]));
         let command_finished_callbacks: CommandFinishedCallbacks = Rc::new(RefCell::new(vec![]));
         let block_finished_callbacks: BlockFinishedCallbacks = Rc::new(RefCell::new(vec![]));
@@ -6857,6 +6888,7 @@ impl TermView {
             let block_scroll_rc = block_scroll.clone();
             let exited_cbs = exited_callbacks.clone();
             let activity_cbs = activity_callbacks.clone();
+            let alt_screen_cbs = alt_screen_callbacks.clone();
             let mouse_reporting_rc = mouse_reporting_mode.clone();
             let bracketed_paste_rc = bracketed_paste.clone();
             let config_for_cb = Rc::new(RefCell::new(config.clone()));
@@ -6924,6 +6956,7 @@ impl TermView {
                 remote_session_cbs: remote_session_callbacks.clone(),
                 exited_cbs,
                 activity_cbs,
+                alt_screen_cbs,
                 mouse_reporting_rc,
                 bracketed_paste_rc,
                 config_for_cb,
@@ -7760,6 +7793,7 @@ impl TermView {
             title_callbacks,
             activity_callbacks,
             human_input_callbacks,
+            alt_screen_callbacks,
             mouse_reporting_mode,
             bracketed_paste,
             config: Rc::new(RefCell::new(config.clone())),
@@ -8580,6 +8614,14 @@ impl TermView {
         self.human_input_callbacks.borrow_mut().push(Box::new(f));
     }
 
+    /// Observe alternate-screen ownership without exposing terminal bytes.
+    pub(crate) fn connect_alt_screen_transition<F>(&self, f: F)
+    where
+        F: Fn(AltScreenTransition) + 'static,
+    {
+        self.alt_screen_callbacks.borrow_mut().push(Box::new(f));
+    }
+
     /// Observe a foreground command after Forge has captured its authoritative
     /// text and cwd at the shell's CommandStart boundary.
     pub(crate) fn connect_command_started<F>(&self, f: F)
@@ -9271,8 +9313,8 @@ mod tests {
         build_command_recall, build_keyboard_query_reply, classify_command_prompt_status,
         coalesce_bytes_events, collapse_repaint_output, command_capture_range_is_bounded,
         command_id_uses_shell_token, compute_viewport_state, decide_agent_command_end,
-        emit_activity, emit_command_finished, emit_command_started, failed_block_marker_fractions,
-        format_color_query_reply, history_edge_navigation_available,
+        emit_activity, emit_alt_screen_transition, emit_command_finished, emit_command_started,
+        failed_block_marker_fractions, format_color_query_reply, history_edge_navigation_available,
         input_is_typeahead_for_existing_submission, input_may_survive_into_next_prompt,
         input_submits_line, mutate_block_data_and_redraw, next_prompt_shadow_state,
         normalize_captured_command, normalize_loaded_block_ids, notification_allowed,
@@ -9288,13 +9330,14 @@ mod tests {
         take_stash_for_undo, truncate_plain_output_for_height,
         verified_editor_contains_exact_command, viewport_page_size_changed,
         viewport_state_for_scroll, visible_indices_for_viewport, AgentCommandEndDecision,
-        AnchorAbandoned, AnchorTickExit, BlockData, BlockState, BoundedByteRing,
-        BoundedClipboardAccumulator, CommandFinishedEvent, CommandIdCorrelation, CommandMeta,
-        CommandPromptStatus, CommandStartedEvent, DynamicColors, HumanInputKind, InputOrigin,
-        PendingCommandMeta, PostPromptFeed, TypedShadowFidelity, ViewportState,
-        MAX_COMMAND_CAPTURE_BYTES, MAX_JOURNAL_OUTPUT_BYTES, MAX_PROMPT_CAPTURE_BYTES,
-        MAX_RAW_OUTPUT_BYTES, MAX_SELECTED_CLIPBOARD_BYTES, TRUNCATED_COMMAND_PLACEHOLDER,
-        UNAVAILABLE_COMMAND_PLACEHOLDER, VERIFIED_SUBMISSION_MAX_POLLS,
+        AltScreenCallbacks, AltScreenTransition, AnchorAbandoned, AnchorTickExit, BlockData,
+        BlockState, BoundedByteRing, BoundedClipboardAccumulator, CommandFinishedEvent,
+        CommandIdCorrelation, CommandMeta, CommandPromptStatus, CommandStartedEvent, DynamicColors,
+        HumanInputKind, InputOrigin, PendingCommandMeta, PostPromptFeed, TypedShadowFidelity,
+        ViewportState, MAX_COMMAND_CAPTURE_BYTES, MAX_JOURNAL_OUTPUT_BYTES,
+        MAX_PROMPT_CAPTURE_BYTES, MAX_RAW_OUTPUT_BYTES, MAX_SELECTED_CLIPBOARD_BYTES,
+        TRUNCATED_COMMAND_PLACEHOLDER, UNAVAILABLE_COMMAND_PLACEHOLDER,
+        VERIFIED_SUBMISSION_MAX_POLLS,
     };
     use crate::parser::{ColorKind, KeyboardProtocolQuery, ParserEvent};
     use crate::pty::PtyForeground;
@@ -9317,6 +9360,24 @@ mod tests {
 
         emit_activity(&callbacks);
         assert_eq!(seen.borrow().as_slice(), &["tab", "organism"]);
+    }
+
+    #[test]
+    fn alt_screen_boundaries_are_typed_content_free_and_not_coalesced() {
+        let callbacks: AltScreenCallbacks = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let seen_for_callback = seen.clone();
+        callbacks.borrow_mut().push(Box::new(move |transition| {
+            seen_for_callback.borrow_mut().push(transition)
+        }));
+
+        emit_alt_screen_transition(&callbacks, AltScreenTransition::Entered);
+        emit_alt_screen_transition(&callbacks, AltScreenTransition::Left);
+
+        assert_eq!(
+            seen.borrow().as_slice(),
+            &[AltScreenTransition::Entered, AltScreenTransition::Left]
+        );
     }
 
     #[test]
