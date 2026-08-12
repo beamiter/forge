@@ -6237,10 +6237,12 @@ impl KeyCtx {
 
 #[allow(dead_code)]
 impl TermView {
-    /// Replace the runtime configuration shared by parser/render callbacks.
-    /// Existing widgets receive their visual updates through UiState; this
-    /// updates behavioral options such as notifications, filtering, mouse
-    /// reporting, history limits, and clipboard policy for subsequent events.
+    /// Replace the runtime configuration shared by the reader/finalize
+    /// callbacks. Existing widgets receive their visual updates through
+    /// UiState; this updates behavioral options such as notifications,
+    /// filtering, history limits, and clipboard policy for subsequent
+    /// events. Parser flags (mouse/focus reporting) are snapshotted into
+    /// ParserConfig at pane construction and are NOT affected.
     pub(crate) fn reload_config(&self, config: &Config) {
         *self.config.borrow_mut() = config.clone();
     }
@@ -6940,8 +6942,12 @@ impl TermView {
         // One shared cell for the runtime Config: TermView.config and the
         // reader/finalize path must alias, or reload_config would update a
         // copy the reader callbacks never see. reload_config's borrow_mut is
-        // statement-scoped and runs from UI actions outside reader dispatch;
-        // every reader-path read takes a short borrow.
+        // statement-scoped and runs from UI actions outside reader dispatch.
+        // Reader-path borrows may span calls only into code that cannot
+        // reach a borrow_mut of this cell (height estimation,
+        // FinishedBlock::new_with_pool, notify_long_block are all
+        // non-reentrant). Parser flags (mouse/focus reporting) are NOT
+        // covered: ParserConfig below snapshots them at construction.
         let config_shared: Rc<RefCell<Config>> = Rc::new(RefCell::new(config.clone()));
 
         // ── Wire PTY → parser → block events ─────────────────────────────
