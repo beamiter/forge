@@ -75,6 +75,17 @@ pub struct OwnedPty {
     /// pipe fd (never argv/environment). Updated bundled integrations close the
     /// fd before launching user commands and bind C/D ids to this value.
     shell_integration_token: Option<String>,
+    /// Test-only slave end of a bare [`OwnedPty::for_tests`] pair, held open so
+    /// master-side writes are not hung up. Never present in a spawned PTY,
+    /// where the child owns the slave.
+    #[cfg(test)]
+    test_slave: Option<OwnedFd>,
+    /// Test-only recorded answer for [`OwnedPty::foreground_owner`]. A bare
+    /// PTY pair has no session, so the real `tcgetpgrp` probe could only ever
+    /// return [`PtyForeground::Unknown`]; tests that exercise a foreground
+    /// decision record the answer they mean instead.
+    #[cfg(test)]
+    test_foreground: Option<PtyForeground>,
 }
 
 #[cfg(target_os = "linux")]
@@ -622,6 +633,10 @@ impl OwnedPty {
                     input_error_reported: AtomicBool::new(false),
                     shell_bracketed_paste: AtomicBool::new(false),
                     shell_integration_token,
+                    #[cfg(test)]
+                    test_slave: None,
+                    #[cfg(test)]
+                    test_foreground: None,
                 })
             }
             Err(error) => Err(io::Error::other(error)),
@@ -661,6 +676,13 @@ impl OwnedPty {
     /// jobs, currently owns this PTY. Syscall failures remain distinct from a
     /// positive shell match so approval/observation paths can fail closed.
     pub(crate) fn foreground_owner(&self) -> PtyForeground {
+        // A test PTY (`for_tests`) has no session behind its slave end, so the
+        // probe below could only answer `Unknown`. Compiled out of every
+        // non-test build together with the field it reads.
+        #[cfg(test)]
+        if let Some(recorded) = self.test_foreground {
+            return recorded;
+        }
         let fd = self.master_fd_raw();
         let shell_pid = self.pid_i32();
         if fd < 0 || shell_pid <= 0 {
@@ -1072,6 +1094,141 @@ fn signal_eventfd(eventfd: RawFd) -> io::Result<()> {
             return Ok(());
         }
         return Err(error);
+    }
+}
+
+/// Test-only PTY plumbing, so the block reader's dispatch can be driven
+/// without a shell (or a display) behind it.
+#[cfg(test)]
+impl OwnedPty {
+    /// A PTY over a bare `openpty` pair with no shell behind it.
+    ///
+    /// Nothing runs on the slave end; it is held open only so master-side
+    /// writes (the reader's protocol replies) reach a kernel buffer instead of
+    /// failing with `EIO`, and put into raw non-blocking mode so
+    /// [`Self::drain_test_slave`] can read them back. A placeholder child is
+    /// forked and exits immediately
+    /// because [`ChildLifecycle`] must own a real pid — it is what `Drop`
+    /// signals and reaps, and a production `OwnedPty` never exists without one.
+    /// The child sets its own process group first, so the ladder's group
+    /// signal cannot reach the test runner.
+    ///
+    /// `foreground` is what [`OwnedPty::foreground_owner`] answers: a bare
+    /// pair has no session, so the real `tcgetpgrp` probe could only ever
+    /// return [`PtyForeground::Unknown`], which would silence every
+    /// foreground-gated decision under test.
+    pub(crate) fn for_tests(foreground: PtyForeground) -> io::Result<Self> {
+        let OpenptyResult { master, slave } = openpty(None, None).map_err(io::Error::other)?;
+        prepare_test_slave(&slave);
+        // SAFETY: the child performs only async-signal-safe syscalls before
+        // `_exit`, which is the rule for forking from this multi-threaded
+        // process (the same rule `spawn_inner`'s child body follows).
+        let child = match unsafe { unistd::fork() }.map_err(io::Error::other)? {
+            ForkResult::Child => unsafe {
+                libc::setpgid(0, 0);
+                libc::_exit(0);
+            },
+            ForkResult::Parent { child } => child,
+        };
+        let lifecycle = match ChildLifecycle::new(child.as_raw(), ReapOwner::Ours) {
+            Ok(lifecycle) => lifecycle,
+            Err(error) => {
+                kill_and_reap_unreferenced(child);
+                return Err(error);
+            }
+        };
+        let writer_fd = match master.try_clone() {
+            Ok(fd) => fd,
+            Err(error) => return Err(abort_spawn(&lifecycle, error)),
+        };
+        let input_tx = match spawn_fd_writer(writer_fd) {
+            Ok(tx) => tx,
+            Err(error) => return Err(abort_spawn(&lifecycle, error)),
+        };
+        Ok(OwnedPty {
+            master: std::sync::Arc::new(std::sync::Mutex::new(Some(master))),
+            input_tx: std::sync::Mutex::new(Some(input_tx)),
+            lifecycle,
+            input_guard: std::sync::Mutex::new(InputGuard::new()),
+            input_error_reported: AtomicBool::new(false),
+            shell_bracketed_paste: AtomicBool::new(false),
+            shell_integration_token: None,
+            test_slave: Some(slave),
+            test_foreground: Some(foreground),
+        })
+    }
+
+    /// Read whatever the master side has already been written, waiting up to
+    /// `wait` for the first byte to appear.
+    ///
+    /// Two reasons a test PTY needs this. A protocol reply is written by the
+    /// background writer thread, so a test that wants to observe one has to
+    /// wait for it rather than assume it landed; and nothing else drains the
+    /// slave's input queue, so a test that provoked replies past the kernel
+    /// buffer would wedge that writer thread instead of failing.
+    pub(crate) fn drain_test_slave(&self, wait: std::time::Duration) -> Vec<u8> {
+        let Some(slave) = self.test_slave.as_ref() else {
+            return Vec::new();
+        };
+        let fd = slave.as_raw_fd();
+        let deadline = std::time::Instant::now() + wait;
+        let mut drained = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            // SAFETY: `buffer` is a live, correctly sized local and `fd` is
+            // owned by `self` for the duration of the call.
+            let read =
+                unsafe { libc::read(fd, buffer.as_mut_ptr().cast::<libc::c_void>(), buffer.len()) };
+            if read > 0 {
+                drained.extend_from_slice(&buffer[..read as usize]);
+                continue;
+            }
+            if read == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            // Nothing queued yet: keep waiting only while nothing at all has
+            // arrived. Once a reply has started, one drained read is the whole
+            // of it — `write_all_fd` hands the kernel a reply in one call.
+            if error.kind() == io::ErrorKind::WouldBlock
+                && drained.is_empty()
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            break;
+        }
+        drained
+    }
+}
+
+/// Put a bare test slave into raw, non-blocking mode.
+///
+/// A slave left in its default canonical mode buffers master-side writes until
+/// a line delimiter, and terminal protocol replies carry none — a reader would
+/// see nothing at all. Raw mode also drops `ECHO`, so replies are not mirrored
+/// back into the master's own read queue. Best-effort: a failure here only
+/// costs a test its ability to observe replies, never correctness of the code
+/// under test.
+#[cfg(test)]
+fn prepare_test_slave(slave: &OwnedFd) {
+    let fd = slave.as_raw_fd();
+    // SAFETY: `fd` is owned by the caller for the duration of the call and
+    // `attrs` is a live local of the exact type these calls expect.
+    unsafe {
+        let mut attrs: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut attrs) == 0 {
+            libc::cfmakeraw(&mut attrs);
+            let _ = libc::tcsetattr(fd, libc::TCSANOW, &attrs);
+        }
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
     }
 }
 

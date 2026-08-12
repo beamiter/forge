@@ -3148,6 +3148,51 @@ const VERIFIED_SUBMISSION_LOST: &str =
 const REVIEWED_COMMAND_START_LOST: &str =
     "the shell did not report the exact reviewed command starting before the safety deadline";
 
+/// The live-surface reads the verified submission path performs. Every one is
+/// a query — this boundary never draws — and the decisions built on them
+/// ([`verified_editor_contains_exact_command`], the anchor rebase) stay
+/// engine-side. [`VteSubmissionSurface`] is the GTK/VTE implementation; a
+/// second implementation (a recording stub in tests) lets the reader dispatch
+/// run without a display.
+trait SubmissionSurface {
+    /// Cursor position `(col, row)` in text-buffer (ring) coordinates, the
+    /// same space the prompt anchor is recorded in.
+    fn cursor_position(&self) -> (i64, i64);
+    /// Current surface row count, against which the anchor recorded at
+    /// PromptEnd is rebased.
+    fn row_count(&self) -> i64;
+    /// Rendered text between the prompt anchor and the cursor, `None` when the
+    /// surface cannot answer for that range.
+    fn visible_editor_text(&self, anchor: (i64, i64)) -> Option<String>;
+    /// Whether everything after the cursor is structurally empty — `None` when
+    /// the surface cannot answer, which never reads as "empty".
+    fn suffix_is_empty(&self, suggestion_rgb: [u8; 3]) -> Option<bool>;
+}
+
+/// The GTK/VTE implementation of [`SubmissionSurface`]: the same live VTE the
+/// [`BlockBackend`] feeds.
+struct VteSubmissionSurface {
+    vte: Terminal,
+}
+
+impl SubmissionSurface for VteSubmissionSurface {
+    fn cursor_position(&self) -> (i64, i64) {
+        self.vte.cursor_position()
+    }
+
+    fn row_count(&self) -> i64 {
+        self.vte.row_count()
+    }
+
+    fn visible_editor_text(&self, anchor: (i64, i64)) -> Option<String> {
+        visible_editor_text(&self.vte, anchor)
+    }
+
+    fn suffix_is_empty(&self, suggestion_rgb: [u8; 3]) -> Option<bool> {
+        click_cursor::verified_suffix_is_empty(&self.vte, suggestion_rgb)
+    }
+}
+
 /// Two-phase programmatic execution boundary. The command is inserted without
 /// Enter, VTE must render the exact text in an otherwise empty editor, and only
 /// then is CR admitted. This does not rely on a portable "clear line" binding
@@ -3155,7 +3200,9 @@ const REVIEWED_COMMAND_START_LOST: &str =
 /// files, hooks and key bindings remain part of the trusted shell boundary.
 #[derive(Clone)]
 struct VerifiedSubmissionCtx {
-    active_vte: Terminal,
+    /// The live surface the inserted command must render on, behind the
+    /// query-only [`SubmissionSurface`] seam.
+    surface: Rc<dyn SubmissionSurface>,
     bstate: Rc<Cell<BlockState>>,
     pty: Rc<OwnedPty>,
     typed_cmd: Rc<RefCell<String>>,
@@ -3186,10 +3233,10 @@ type VerifiedSubmissionCompletion = Box<dyn FnOnce(Result<(), String>)>;
 
 impl VerifiedSubmissionCtx {
     fn current_anchor(&self) -> (i64, i64) {
-        current_prompt_anchor(
-            &self.active_vte,
+        rebase_prompt_anchor(
             self.prompt_end_pos.get(),
             self.prompt_anchor_rows.get(),
+            self.surface.row_count(),
         )
     }
 
@@ -3268,9 +3315,8 @@ impl VerifiedSubmissionCtx {
             return Err("the shell prompt is no longer verified empty".to_string());
         }
         let anchor = self.current_anchor();
-        let cursor = self.active_vte.cursor_position();
-        let suffix_is_empty =
-            click_cursor::verified_suffix_is_empty(&self.active_vte, suggestion_rgb);
+        let cursor = self.surface.cursor_position();
+        let suffix_is_empty = self.surface.suffix_is_empty(suggestion_rgb);
         if cursor != anchor || suffix_is_empty != Some(true) {
             return Err("the shell prompt visibly contains input".to_string());
         }
@@ -3323,7 +3369,7 @@ impl VerifiedSubmissionCtx {
             if contents == contents_before {
                 return glib::ControlFlow::Continue;
             }
-            let (col, row) = ctx.active_vte.cursor_position();
+            let (col, row) = ctx.surface.cursor_position();
             let observed = (contents, col, row);
             if last_observed.get() == Some(observed) {
                 stable_polls.set(stable_polls.get().saturating_add(1));
@@ -3336,9 +3382,8 @@ impl VerifiedSubmissionCtx {
                 return glib::ControlFlow::Continue;
             }
 
-            let rendered = visible_editor_text(&ctx.active_vte, ctx.current_anchor());
-            let suffix_is_empty =
-                click_cursor::verified_suffix_is_empty(&ctx.active_vte, suggestion_rgb);
+            let rendered = ctx.surface.visible_editor_text(ctx.current_anchor());
+            let suffix_is_empty = ctx.surface.suffix_is_empty(suggestion_rgb);
             if !verified_editor_contains_exact_command(
                 rendered.as_deref(),
                 suffix_is_empty,
@@ -7006,7 +7051,9 @@ impl TermView {
             Rc::new(RefCell::new(vec![]));
         let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let verified_submission = VerifiedSubmissionCtx {
-            active_vte: active_vte.clone(),
+            surface: Rc::new(VteSubmissionSurface {
+                vte: active_vte.clone(),
+            }),
             bstate: bstate.clone(),
             pty: pty.clone(),
             typed_cmd: typed_cmd.clone(),
@@ -9662,7 +9709,17 @@ mod tests {
         TRUNCATED_COMMAND_PLACEHOLDER, UNAVAILABLE_COMMAND_PLACEHOLDER,
         VERIFIED_SUBMISSION_MAX_POLLS,
     };
-    use crate::parser::{ColorKind, KeyboardProtocolQuery, ParserEvent};
+    // The reader-dispatch harness at the bottom of this module: the two
+    // rendering seams, the lifecycle context they serve, and the engine state
+    // it owns.
+    use super::{
+        kitty_graphics, live_output_text, AgentExecutionLostCallbacks, AnchorSettleArgs,
+        BlockFinishedCallbacks, CommandFinishedCallbacks, CommandStartedCallbacks, EngineState,
+        FinalizedBlockArgs, MouseReportingMode, ReaderCtx, RenderBackend, SelectionFeedHold,
+        SubmissionSurface, VerifiedSubmissionCtx,
+    };
+    use crate::config::Config;
+    use crate::parser::{ColorKind, KeyboardProtocolQuery, Parser, ParserEvent};
     use crate::pty::PtyForeground;
     use gtk4::gdk::RGBA;
     use std::cell::{Cell, RefCell};
@@ -12064,5 +12121,1550 @@ mod tests {
             true
         )
         .is_empty());
+    }
+
+    // ── OSC 133 reader dispatch ───────────────────────────────────────────
+    //
+    // `ReaderCtx::handle_event` drives the whole block lifecycle, and every
+    // widget it used to touch now sits behind [`RenderBackend`] (rendering)
+    // and [`SubmissionSurface`] (the verified-submission reads). Both are
+    // implemented headlessly below, so these tests pin the ordered effect
+    // sequences the lifecycle produces for a given run of parser events —
+    // the sequences the trait split was hand-validated against.
+
+    /// Where the harness pretends the shell is. Pinned so the cwd that reaches
+    /// a finished block is a value the test chose rather than whatever the
+    /// developer's working directory happened to be.
+    const HARNESS_CWD: &str = "/harness/cwd";
+
+    /// How long a test waits for the PTY writer thread to hand a protocol
+    /// reply to the kernel. Generous: it is only ever paid once, and only by
+    /// the test that observes a reply.
+    const PTY_REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// A live-surface read the lifecycle performs, recorded in line with the
+    /// effects.
+    ///
+    /// Only reads whose *position* in the stream is itself a decision are
+    /// recorded: the command-text capture has to happen before the geometry
+    /// push that could reflow the surface it reads, and it must not happen at
+    /// all against an anchor that never settled. The two column queries stay
+    /// out — which of them a call site reads is pinned by value instead, since
+    /// the harness answers them with different numbers.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Query {
+        CursorAndRows,
+        CommandCaptureAnchor {
+            provisional: (i64, i64),
+            anchor_rows: i64,
+        },
+        /// The four capture coordinates as the engine ordered them, paired
+        /// `(row, col)` — the pairing the trait's signature prescribes.
+        CaptureTextRange {
+            start: (i64, i64),
+            end: (i64, i64),
+        },
+    }
+
+    /// Everything [`RenderBackend::finalize_block`] is handed that decides what
+    /// the user ends up looking at.
+    ///
+    /// `block_id`, `duration_ms` and `end_time_ms` are a process-global counter
+    /// and two wall clocks, so only their shape is kept here; the ids
+    /// themselves are recorded separately in
+    /// [`RecordingBackend::finalized_ids`].
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FinalizeRecord {
+        prompt: String,
+        command: String,
+        /// The copy the finished VTE is fed, terminal decoration intact.
+        /// Recorded beside `output_plain` because the two differ by exactly
+        /// that decoration, and a block that lost it would still look right
+        /// against `output_plain` alone.
+        output_with_ansi: String,
+        output_plain: String,
+        plain_output_bytes: usize,
+        cwd: Option<String>,
+        cols: i64,
+        exit_code: Option<i32>,
+        has_duration: bool,
+        has_end_time: bool,
+        is_background: bool,
+    }
+
+    /// One recorded [`RenderBackend`] interaction: every effect, plus the
+    /// [`Query`] reads whose ordering the lifecycle depends on.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Call {
+        FeedLive(Vec<u8>),
+        ResetActiveSurface {
+            preserve_scrollback: bool,
+        },
+        FocusLiveDeferred,
+        SyncGeometryToPty,
+        LayoutActiveSurface,
+        MarkScrollDirty,
+        ResetScrollLock,
+        FinalizeBlock(FinalizeRecord),
+        EnterAltScreenChrome,
+        ExitAltScreenChrome,
+        EnterFullscreen,
+        ExitFullscreen,
+        KittyFeed(Vec<u8>),
+        KittyAdmitPending,
+        ResetKittyPipeline,
+        SetSystemClipboard(String),
+        DesktopNotify {
+            title: Option<String>,
+            body: String,
+        },
+        ScheduleAnchorSettle {
+            anchor_generation: u64,
+        },
+        Query(Query),
+        /// Bytes the PTY had already been handed at this point in the
+        /// sequence, drained by [`RecordingBackend::admit_probe`]. A PTY write
+        /// is invisible through [`RenderBackend`], so the one ordering that
+        /// spans both — reply before admit — needs a foot in each.
+        PtyReply(Vec<u8>),
+    }
+
+    /// The tiny text grid [`RecordingBackend`] answers surface queries from.
+    struct SurfaceGrid {
+        /// Text-buffer (ring) rows: the coordinate space prompt anchors and
+        /// capture ranges live in.
+        rows: Vec<String>,
+        /// `(col, row)`, the order every cursor query on the trait uses.
+        cursor: (i64, i64),
+        /// `ActiveBlock::grid_cols()` — the floored width finished blocks
+        /// pre-wrap at.
+        grid_cols: i64,
+        /// `vte.column_count()` — the live grid's own width, which the command
+        /// capture's bounds guard reads. Deliberately a second number: the two
+        /// are separate queries in production, and a call site that reads the
+        /// wrong one has to be visible here.
+        live_cols: i64,
+    }
+
+    /// A [`RenderBackend`] that records effects and answers queries from a
+    /// grid model, so the reader lifecycle runs with no GTK widget anywhere.
+    struct RecordingBackend {
+        calls: RefCell<Vec<Call>>,
+        grid: RefCell<SurfaceGrid>,
+        /// Block ids handed to `finalize_block`, kept out of
+        /// [`FinalizeRecord`] because `next_block_id` is a process-global
+        /// counter shared with every other test running in parallel.
+        finalized_ids: RefCell<Vec<u64>>,
+        /// Canned status for [`RenderBackend::kitty_feed`].
+        kitty_status: Cell<kitty_graphics::FeedStatus>,
+        /// Whether `schedule_anchor_settle` publishes the anchor immediately.
+        /// The real pass settles asynchronously over frame ticks; a backend
+        /// with no frame clock can answer synchronously. `false` reproduces a
+        /// prompt whose anchor never settles: the post-`B` feed fence stays up
+        /// for the rest of that prompt.
+        ///
+        /// Only `prompt_anchor_ready` is published here, and that is the whole
+        /// of the model. The production pass does considerably more before it
+        /// sets that flag — it republishes `prompt_end_pos`,
+        /// `prompt_anchor_rows` and `prompt_anchor_prefix` from the settled
+        /// cursor, replays and re-checks the parked ring, reads `bstate`,
+        /// `idle_input_dirty`, `pty_synced`, `submission_pending`,
+        /// `pending_typeahead` and `contents_generation` to decide whether it
+        /// may settle at all, and drains one queued init command through
+        /// `VerifiedSubmissionCtx::begin`. None of that is modelled: these
+        /// tests pin the reader dispatch on either side of the flag, while the
+        /// pass's own decisions stay covered by the `anchor_tick_exit`,
+        /// `prompt_anchor_may_settle` and `post_prompt_feed` unit tests above.
+        settle_anchor_now: Cell<bool>,
+        /// Runs at the top of `kitty_admit_pending`, before the admit is
+        /// recorded, so a test can capture out-of-band state (the PTY reply
+        /// queue) at exactly that point.
+        admit_probe: RefCell<Option<Box<dyn Fn()>>>,
+    }
+
+    impl RecordingBackend {
+        fn new() -> Rc<Self> {
+            Rc::new(Self {
+                calls: RefCell::new(Vec::new()),
+                grid: RefCell::new(SurfaceGrid {
+                    rows: vec![String::new(); 24],
+                    cursor: (0, 0),
+                    grid_cols: 80,
+                    live_cols: 80,
+                }),
+                finalized_ids: RefCell::new(Vec::new()),
+                kitty_status: Cell::new(kitty_graphics::FeedStatus::Pending),
+                settle_anchor_now: Cell::new(true),
+                admit_probe: RefCell::new(None),
+            })
+        }
+
+        fn record(&self, call: Call) {
+            self.calls.borrow_mut().push(call);
+        }
+
+        fn calls(&self) -> Vec<Call> {
+            self.calls.borrow().clone()
+        }
+
+        fn take_calls(&self) -> Vec<Call> {
+            std::mem::take(&mut *self.calls.borrow_mut())
+        }
+
+        /// Only the minted blocks, for sequences whose other effects are
+        /// pinned elsewhere.
+        fn finalized(&self) -> Vec<Call> {
+            self.calls
+                .borrow()
+                .iter()
+                .filter(|call| matches!(call, Call::FinalizeBlock(_)))
+                .cloned()
+                .collect()
+        }
+
+        /// Put `text` on `row` and park the cursor just past its last
+        /// character — the shape the live surface has once the shell has
+        /// echoed its prompt, and again once the user has typed after it.
+        fn render_row(&self, row: i64, text: &str) {
+            let index = usize::try_from(row).expect("a non-negative grid row");
+            let mut grid = self.grid.borrow_mut();
+            if grid.rows.len() <= index {
+                grid.rows.resize(index + 1, String::new());
+            }
+            grid.rows[index] = text.to_string();
+            grid.cursor = (text.chars().count() as i64, row);
+        }
+
+        /// Answer the two column queries with different numbers, so a test can
+        /// tell which one a call site read.
+        fn set_columns(&self, grid_cols: i64, live_cols: i64) {
+            let mut grid = self.grid.borrow_mut();
+            grid.grid_cols = grid_cols;
+            grid.live_cols = live_cols;
+        }
+
+        fn set_row_count(&self, rows: i64) {
+            let rows = usize::try_from(rows).expect("a non-negative row count");
+            self.grid.borrow_mut().rows.resize(rows, String::new());
+        }
+
+        fn set_admit_probe(&self, probe: impl Fn() + 'static) {
+            *self.admit_probe.borrow_mut() = Some(Box::new(probe));
+        }
+    }
+
+    impl RenderBackend for RecordingBackend {
+        fn feed_live(&self, bytes: &[u8]) {
+            self.record(Call::FeedLive(bytes.to_vec()));
+        }
+
+        fn reset_active_surface(&self, preserve_scrollback: bool) {
+            self.record(Call::ResetActiveSurface {
+                preserve_scrollback,
+            });
+        }
+
+        fn focus_live_deferred(&self) {
+            self.record(Call::FocusLiveDeferred);
+        }
+
+        fn sync_geometry_to_pty(&self) {
+            self.record(Call::SyncGeometryToPty);
+        }
+
+        fn layout_active_surface(&self) {
+            self.record(Call::LayoutActiveSurface);
+        }
+
+        fn mark_scroll_dirty(&self) {
+            self.record(Call::MarkScrollDirty);
+        }
+
+        fn reset_scroll_lock(&self) {
+            self.record(Call::ResetScrollLock);
+        }
+
+        fn finalize_block(&self, block_data: BlockData, args: FinalizedBlockArgs) {
+            // The serializable record and the render args are built from one
+            // set of locals; a divergence between them is a finalize bug that
+            // no downstream assertion could attribute.
+            assert_eq!(
+                block_data.id, args.block_id,
+                "the serializable block and the render args must share one id"
+            );
+            assert_eq!(
+                block_data.cmd, args.cmd,
+                "the serializable block and the render args must share one command"
+            );
+            assert_eq!(
+                block_data.prompt, args.prompt,
+                "the serializable block and the render args must share one prompt"
+            );
+            assert_eq!(
+                block_data.exit_code, args.exit_code,
+                "the serializable block and the render args must share one status"
+            );
+            self.finalized_ids.borrow_mut().push(args.block_id);
+            self.record(Call::FinalizeBlock(FinalizeRecord {
+                prompt: args.prompt,
+                command: args.cmd,
+                output_with_ansi: args.output_with_ansi,
+                output_plain: args.output_plain,
+                plain_output_bytes: args.plain_output_bytes,
+                cwd: args.block_cwd,
+                cols: args.cols,
+                exit_code: args.exit_code,
+                has_duration: args.duration_ms.is_some(),
+                has_end_time: args.end_time_ms.is_some(),
+                is_background: args.is_background,
+            }));
+        }
+
+        fn enter_alt_screen_chrome(&self) {
+            self.record(Call::EnterAltScreenChrome);
+        }
+
+        fn exit_alt_screen_chrome(&self) {
+            self.record(Call::ExitAltScreenChrome);
+        }
+
+        fn enter_fullscreen(&self) {
+            self.record(Call::EnterFullscreen);
+        }
+
+        fn exit_fullscreen(&self) {
+            self.record(Call::ExitFullscreen);
+        }
+
+        fn kitty_feed(&self, payload: &[u8]) -> kitty_graphics::FeedStatus {
+            self.record(Call::KittyFeed(payload.to_vec()));
+            self.kitty_status.get()
+        }
+
+        fn kitty_admit_pending(&self) {
+            // The trait doc makes reply-before-admit load-bearing: clients
+            // block on the `i=`-keyed answer. That reply is a PTY write and so
+            // invisible through this trait; the probe records what the PTY had
+            // already been handed at this exact point.
+            if let Some(probe) = self.admit_probe.borrow().as_ref() {
+                probe();
+            }
+            self.record(Call::KittyAdmitPending);
+        }
+
+        fn reset_kitty_pipeline(&self) {
+            self.record(Call::ResetKittyPipeline);
+        }
+
+        fn set_system_clipboard(&self, text: &str) {
+            self.record(Call::SetSystemClipboard(text.to_string()));
+        }
+
+        fn desktop_notify(&self, title: Option<&str>, body: &str) {
+            self.record(Call::DesktopNotify {
+                title: title.map(str::to_string),
+                body: body.to_string(),
+            });
+        }
+
+        fn schedule_anchor_settle(&self, args: AnchorSettleArgs) {
+            self.record(Call::ScheduleAnchorSettle {
+                anchor_generation: args.anchor_generation,
+            });
+            if self.settle_anchor_now.get() {
+                args.prompt_anchor_ready.set(true);
+            }
+        }
+
+        fn cursor_and_rows(&self) -> ((i64, i64), i64) {
+            self.record(Call::Query(Query::CursorAndRows));
+            let grid = self.grid.borrow();
+            (grid.cursor, grid.rows.len() as i64)
+        }
+
+        fn cursor_position_report(&self) -> (i64, i64) {
+            self.grid.borrow().cursor
+        }
+
+        fn command_capture_anchor(&self, provisional: (i64, i64), anchor_rows: i64) -> (i64, i64) {
+            self.record(Call::Query(Query::CommandCaptureAnchor {
+                provisional,
+                anchor_rows,
+            }));
+            // The rebase is backend policy; this fixed grid keeps the anchor.
+            provisional
+        }
+
+        fn grid_cols(&self) -> i64 {
+            self.grid.borrow().grid_cols
+        }
+
+        fn live_column_count(&self) -> i64 {
+            self.grid.borrow().live_cols
+        }
+
+        fn capture_text_range(
+            &self,
+            start_row: i64,
+            start_col: i64,
+            end_row: i64,
+            end_col: i64,
+        ) -> Option<String> {
+            self.record(Call::Query(Query::CaptureTextRange {
+                start: (start_row, start_col),
+                end: (end_row, end_col),
+            }));
+            let grid = self.grid.borrow();
+            let row_index = |row: i64| {
+                usize::try_from(row)
+                    .ok()
+                    .filter(|index| *index < grid.rows.len())
+            };
+            // Off the modelled surface: the live one has nothing there either.
+            let (first, last) = (row_index(start_row)?, row_index(end_row)?);
+            if (end_row, end_col) <= (start_row, start_col) {
+                // A zero-length or inverted range selects nothing. VTE answers
+                // the same way, and the engine's callers rely on it: an anchor
+                // that still equals the cursor means nothing was typed.
+                return Some(String::new());
+            }
+            let mut text = String::new();
+            for index in first..=last {
+                let row: Vec<char> = grid.rows[index].chars().collect();
+                if index > first {
+                    text.push('\n');
+                }
+                let from = if index == first {
+                    usize::try_from(start_col).unwrap_or(0).min(row.len())
+                } else {
+                    0
+                };
+                let to = if index == last {
+                    usize::try_from(end_col).unwrap_or(0).clamp(from, row.len())
+                } else {
+                    row.len()
+                };
+                text.extend(&row[from..to]);
+            }
+            Some(text)
+        }
+    }
+
+    /// One read of the verified-submission surface.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SurfaceRead {
+        CursorPosition,
+        RowCount,
+        VisibleEditorText { anchor: (i64, i64) },
+        SuffixIsEmpty,
+    }
+
+    /// A [`SubmissionSurface`] with no VTE behind it: canned answers plus the
+    /// reads that were taken.
+    ///
+    /// Every fail-closed pre-check in [`VerifiedSubmissionCtx::begin`] returns
+    /// before it installs a `glib` timeout, which is what makes the seam's
+    /// refusals testable without a main loop. The polling half that follows
+    /// (`visible_editor_text`) needs one, so it stays out of reach here.
+    struct RecordingSurface {
+        reads: RefCell<Vec<SurfaceRead>>,
+        cursor: Cell<(i64, i64)>,
+        rows: Cell<i64>,
+        editor_text: RefCell<Option<String>>,
+        suffix_is_empty: Cell<Option<bool>>,
+    }
+
+    impl RecordingSurface {
+        fn new() -> Rc<Self> {
+            Rc::new(Self {
+                reads: RefCell::new(Vec::new()),
+                cursor: Cell::new((0, 0)),
+                rows: Cell::new(24),
+                editor_text: RefCell::new(None),
+                suffix_is_empty: Cell::new(None),
+            })
+        }
+
+        fn reads(&self) -> Vec<SurfaceRead> {
+            self.reads.borrow().clone()
+        }
+    }
+
+    impl SubmissionSurface for RecordingSurface {
+        fn cursor_position(&self) -> (i64, i64) {
+            self.reads.borrow_mut().push(SurfaceRead::CursorPosition);
+            self.cursor.get()
+        }
+
+        fn row_count(&self) -> i64 {
+            self.reads.borrow_mut().push(SurfaceRead::RowCount);
+            self.rows.get()
+        }
+
+        fn visible_editor_text(&self, anchor: (i64, i64)) -> Option<String> {
+            self.reads
+                .borrow_mut()
+                .push(SurfaceRead::VisibleEditorText { anchor });
+            self.editor_text.borrow().clone()
+        }
+
+        fn suffix_is_empty(&self, _suggestion_rgb: [u8; 3]) -> Option<bool> {
+            self.reads.borrow_mut().push(SurfaceRead::SuffixIsEmpty);
+            self.suffix_is_empty.get()
+        }
+    }
+
+    /// One engine-side `block_finished` fan-out. The duration is wall-clock
+    /// and deliberately left out of the recording; the last two fields capture
+    /// *when* the fan-out ran, which is a decision of its own — it fires after
+    /// the whole backend finalize, with the lifecycle still in `PostCommand`.
+    #[derive(Debug, Clone, PartialEq)]
+    struct FinishedFanOut {
+        command: String,
+        exit_code: Option<i32>,
+        output_sample: String,
+        agent_generation: Option<u64>,
+        blocks_finalized_before: usize,
+        state_at_fan_out: BlockState,
+    }
+
+    /// A `ReaderCtx` wired to [`RecordingBackend`], a bare-`openpty` PTY and
+    /// real engine state, plus the observable fan-outs the lifecycle drives.
+    struct ReaderHarness {
+        ctx: ReaderCtx,
+        backend: Rc<RecordingBackend>,
+        surface: Rc<RecordingSurface>,
+        pty: Rc<crate::pty::OwnedPty>,
+        config: Rc<RefCell<Config>>,
+        bstate: Rc<Cell<BlockState>>,
+        live_raw_output: Rc<RefCell<BoundedByteRing>>,
+        blocks_finished: Rc<RefCell<Vec<FinishedFanOut>>>,
+        commands_started: Rc<RefCell<Vec<CommandStartedEvent>>>,
+        commands_finished: Rc<RefCell<Vec<CommandFinishedEvent>>>,
+        alt_screen: Rc<RefCell<Vec<AltScreenTransition>>>,
+        agent_lost: Rc<RefCell<Vec<(u64, &'static str)>>>,
+    }
+
+    impl ReaderHarness {
+        /// The ordinary case: the interactive shell owns the terminal.
+        fn new() -> Self {
+            Self::with_foreground(PtyForeground::Shell)
+        }
+
+        fn with_foreground(foreground: PtyForeground) -> Self {
+            let backend = RecordingBackend::new();
+            let surface = RecordingSurface::new();
+            let bstate = Rc::new(Cell::new(BlockState::Idle));
+            let live_raw_output = Rc::new(RefCell::new(BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES)));
+            // The lifecycle reads only these knobs on the paths under test;
+            // pin them so no developer's config file can move an assertion.
+            let config = {
+                let mut config = crate::config::load_config().0;
+                config.preserve_live_scrollback = false;
+                config.truncation_threshold_lines = 50_000;
+                config.allow_remote_clipboard_write = false;
+                Rc::new(RefCell::new(config))
+            };
+            // The reader's own foreground gate.
+            let pty =
+                Rc::new(crate::pty::OwnedPty::for_tests(foreground).expect("open a test PTY"));
+            let prompt_end_pos = Rc::new(Cell::new((0, 0)));
+            let prompt_anchor_rows = Rc::new(Cell::new(24));
+            let prompt_anchor_ready = Rc::new(Cell::new(false));
+            let prompt_anchor_generation = Rc::new(Cell::new(0));
+            let contents_generation = Rc::new(Cell::new(0));
+            let typed_cmd = Rc::new(RefCell::new(String::new()));
+            let typed_cmd_fidelity = Rc::new(Cell::new(TypedShadowFidelity::Inexact));
+            let submission_pending = Rc::new(Cell::new(false));
+            let pending_typeahead = Rc::new(Cell::new(false));
+            let external_submission = Rc::new(RefCell::new(None));
+            let external_submission_generation = Rc::new(Cell::new(None));
+            let reviewed_submission_tainted = Rc::new(Cell::new(false));
+            let idle_input_dirty = Rc::new(Cell::new(false));
+            let pty_synced = Rc::new(Cell::new(false));
+            let accepted_input_generation = Rc::new(Cell::new(0));
+            let agent_execution_supported = Rc::new(Cell::new(false));
+
+            let agent_lost = Rc::new(RefCell::new(Vec::new()));
+            let agent_execution_lost_cbs: AgentExecutionLostCallbacks =
+                Rc::new(RefCell::new(Vec::new()));
+            {
+                let seen = agent_lost.clone();
+                agent_execution_lost_cbs
+                    .borrow_mut()
+                    .push(Box::new(move |generation, reason| {
+                        seen.borrow_mut().push((generation, reason));
+                    }));
+            }
+
+            let blocks_finished = Rc::new(RefCell::new(Vec::new()));
+            let block_finished_cbs: BlockFinishedCallbacks = Rc::new(RefCell::new(Vec::new()));
+            {
+                let seen = blocks_finished.clone();
+                let backend_at_fan_out = backend.clone();
+                let bstate_at_fan_out = bstate.clone();
+                block_finished_cbs.borrow_mut().push(Box::new(
+                    move |command, exit_code, output_sample, agent_generation, _duration| {
+                        seen.borrow_mut().push(FinishedFanOut {
+                            command,
+                            exit_code,
+                            output_sample,
+                            agent_generation,
+                            blocks_finalized_before: backend_at_fan_out.finalized().len(),
+                            state_at_fan_out: bstate_at_fan_out.get(),
+                        });
+                    },
+                ));
+            }
+            let commands_started = Rc::new(RefCell::new(Vec::new()));
+            let command_started_cbs: CommandStartedCallbacks = Rc::new(RefCell::new(Vec::new()));
+            {
+                let seen = commands_started.clone();
+                command_started_cbs
+                    .borrow_mut()
+                    .push(Box::new(move |event| seen.borrow_mut().push(event)));
+            }
+            let commands_finished = Rc::new(RefCell::new(Vec::new()));
+            let command_finished_cbs: CommandFinishedCallbacks = Rc::new(RefCell::new(Vec::new()));
+            {
+                let seen = commands_finished.clone();
+                command_finished_cbs
+                    .borrow_mut()
+                    .push(Box::new(move |event| seen.borrow_mut().push(event)));
+            }
+            let alt_screen = Rc::new(RefCell::new(Vec::new()));
+            let alt_screen_cbs: AltScreenCallbacks = Rc::new(RefCell::new(Vec::new()));
+            {
+                let seen = alt_screen.clone();
+                alt_screen_cbs
+                    .borrow_mut()
+                    .push(Box::new(move |transition| {
+                        seen.borrow_mut().push(transition)
+                    }));
+            }
+
+            let verified_submission = VerifiedSubmissionCtx {
+                surface: surface.clone(),
+                bstate: bstate.clone(),
+                pty: pty.clone(),
+                typed_cmd: typed_cmd.clone(),
+                typed_cmd_fidelity: typed_cmd_fidelity.clone(),
+                submission_pending: submission_pending.clone(),
+                pending_typeahead: pending_typeahead.clone(),
+                external_submission: external_submission.clone(),
+                external_submission_generation: external_submission_generation.clone(),
+                reviewed_submission_tainted: reviewed_submission_tainted.clone(),
+                idle_input_dirty: idle_input_dirty.clone(),
+                pty_synced: pty_synced.clone(),
+                prompt_end_pos: prompt_end_pos.clone(),
+                prompt_anchor_rows: prompt_anchor_rows.clone(),
+                prompt_anchor_ready: prompt_anchor_ready.clone(),
+                prompt_anchor_generation: prompt_anchor_generation.clone(),
+                contents_generation: contents_generation.clone(),
+                accepted_input_generation: accepted_input_generation.clone(),
+                source_id: Rc::new(RefCell::new(None)),
+                completion: Rc::new(RefCell::new(None)),
+                pending_agent_generation: Rc::new(Cell::new(None)),
+                agent_execution_lost_callbacks: agent_execution_lost_cbs.clone(),
+                agent_execution_supported: agent_execution_supported.clone(),
+            };
+
+            let ctx = ReaderCtx {
+                backend: backend.clone(),
+                bstate_rc: bstate.clone(),
+                engine: RefCell::new(EngineState {
+                    prev_state: BlockState::Idle,
+                    osc133_depth: 0,
+                    prompt_buf: String::new(),
+                    background_output: BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES),
+                    vte_typed_cmd: String::new(),
+                    prompt_render_generation: 0,
+                    prompt_display: String::new(),
+                    shell_integration_token: String::new(),
+                    command_start_instant: None,
+                    pending_exit_code: None,
+                    pending_command_meta: PendingCommandMeta::default(),
+                    active_alt_screen_mode: None,
+                }),
+                live_raw_output_rc: live_raw_output.clone(),
+                typed_cmd_rc: typed_cmd,
+                typed_cmd_fidelity_rc: typed_cmd_fidelity,
+                submission_pending_rc: submission_pending,
+                pending_typeahead_rc: pending_typeahead,
+                accepted_input_generation_rc: accepted_input_generation,
+                external_submission_rc: external_submission,
+                external_submission_generation_rc: external_submission_generation,
+                reviewed_submission_tainted_rc: reviewed_submission_tainted,
+                idle_input_dirty_rc: idle_input_dirty,
+                prompt_end_pos_rc: prompt_end_pos,
+                prompt_anchor_rows_rc: prompt_anchor_rows,
+                prompt_anchor_resize_generation_rc: Rc::new(Cell::new(0)),
+                pty_resize_generation_rc: Rc::new(Cell::new(0)),
+                prompt_anchor_prefix_rc: Rc::new(RefCell::new(String::new())),
+                prompt_anchor_ready_rc: prompt_anchor_ready,
+                prompt_identity_output_rc: Rc::new(Cell::new(false)),
+                prompt_anchor_generation_rc: prompt_anchor_generation,
+                contents_generation_rc: contents_generation,
+                post_prompt_bytes_rc: Rc::new(RefCell::new(BoundedByteRing::new(
+                    MAX_RAW_OUTPUT_BYTES,
+                ))),
+                post_prompt_fence_released_rc: Rc::new(Cell::new(false)),
+                remote_session_cbs: Rc::new(RefCell::new(Vec::new())),
+                exited_cbs: Rc::new(RefCell::new(Vec::new())),
+                activity_cbs: Rc::new(RefCell::new(Vec::new())),
+                alt_screen_cbs,
+                mouse_reporting_rc: Rc::new(Cell::new(MouseReportingMode::None)),
+                bracketed_paste_rc: Rc::new(Cell::new(false)),
+                config_for_cb: config.clone(),
+                dynamic_colors_rc: Rc::new(Cell::new(DynamicColors::default())),
+                parser: Rc::new(RefCell::new(Parser::new())),
+                pty_synced_rc: pty_synced,
+                init_cmds_queue_for_cb: Rc::new(RefCell::new(VecDeque::new())),
+                pty_for_init: pty.clone(),
+                agent_execution_supported_rc: agent_execution_supported,
+                block_start_time_for_cb: Rc::new(Cell::new(None)),
+                current_cwd_for_cb: Rc::new(RefCell::new(HARNESS_CWD.to_string())),
+                event_buf: Rc::new(RefCell::new(Vec::new())),
+                cmd_running_rc: Rc::new(Cell::new(false)),
+                running_cmd_rc: Rc::new(RefCell::new(String::new())),
+                active_agent_generation_rc: Rc::new(Cell::new(None)),
+                command_started_cbs,
+                command_finished_cbs,
+                block_finished_cbs,
+                agent_execution_lost_cbs,
+                verified_submission,
+                selection_feed_hold: SelectionFeedHold::new(),
+            };
+
+            Self {
+                ctx,
+                backend,
+                surface,
+                pty,
+                config,
+                bstate,
+                live_raw_output,
+                blocks_finished,
+                commands_started,
+                commands_finished,
+                alt_screen,
+                agent_lost,
+            }
+        }
+
+        /// Dispatch one event, exactly as the per-chunk pipeline does.
+        fn feed(&self, event: ParserEvent) {
+            self.ctx.handle_event(&event);
+        }
+
+        fn feed_all(&self, events: impl IntoIterator<Item = ParserEvent>) {
+            for event in events {
+                self.feed(event);
+            }
+        }
+
+        /// The running command's engine-owned raw-output ring.
+        fn live_output(&self) -> String {
+            live_output_text(&self.live_raw_output)
+        }
+
+        /// Drive the lifecycle to the quiet, anchored prompt that every
+        /// fail-closed pre-check in [`VerifiedSubmissionCtx::begin`] demands,
+        /// and point the submission surface at that same settled anchor with a
+        /// provably empty suffix. Returns the anchor, so a test can move
+        /// exactly one thing off it and know which check refused.
+        fn arm_verified_prompt(&self) -> (i64, i64) {
+            self.backend.render_row(3, "user@host $ ");
+            self.feed_all([
+                ParserEvent::PromptStart,
+                bytes("user@host $ "),
+                ParserEvent::PromptEnd,
+            ]);
+            assert_eq!(self.bstate.get(), BlockState::AwaitingCommand);
+            assert!(self.ctx.prompt_anchor_ready_rc.get());
+            let anchor = self.ctx.prompt_end_pos_rc.get();
+            self.surface.rows.set(self.ctx.prompt_anchor_rows_rc.get());
+            self.surface.cursor.set(anchor);
+            self.surface.suffix_is_empty.set(Some(true));
+            self.surface.reads.borrow_mut().clear();
+            self.backend.take_calls();
+            anchor
+        }
+    }
+
+    fn command_start(command: Option<&str>) -> ParserEvent {
+        ParserEvent::CommandStart(CommandMeta {
+            command: command.map(str::to_string),
+            ..CommandMeta::default()
+        })
+    }
+
+    fn command_end(exit: Option<i32>) -> ParserEvent {
+        ParserEvent::CommandEnd {
+            exit,
+            meta: CommandMeta::default(),
+        }
+    }
+
+    fn bytes(text: &str) -> ParserEvent {
+        ParserEvent::Bytes(text.as_bytes().to_vec())
+    }
+
+    /// A whole foreground command — prompt, submission, output, exit, next
+    /// prompt — produces exactly one finished block, and the geometry push
+    /// that reasserts the viewport grid follows it.
+    ///
+    /// Nothing here is canned. The command text is read off the surface grid
+    /// between the anchor captured at PromptEnd and the cursor at
+    /// CommandStart, so the four coordinates the engine passes decide it; the
+    /// two column counts differ, so the width the block records says which
+    /// query produced it.
+    #[test]
+    fn a_full_command_cycle_finalizes_one_block_and_resyncs_geometry() {
+        let harness = ReaderHarness::new();
+        harness.backend.set_columns(100, 120);
+        // The shell echoes its prompt well inside the scrollback, so neither
+        // coordinate of the capture range is zero.
+        harness.backend.render_row(3, "user@host $ ");
+
+        harness.feed_all([ParserEvent::PromptStart, bytes("user@host $ ")]);
+        harness.feed(ParserEvent::PromptEnd);
+        assert_eq!(harness.bstate.get(), BlockState::AwaitingCommand);
+        assert_eq!(harness.ctx.prompt_end_pos_rc.get(), (12, 3));
+
+        // The user types and the shell echoes onto the same row.
+        harness.backend.render_row(3, "user@host $ echo hi");
+        harness.backend.take_calls();
+
+        harness.feed(command_start(None));
+        assert_eq!(harness.bstate.get(), BlockState::CollectingOutput);
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                Call::Query(Query::CursorAndRows),
+                Call::Query(Query::CommandCaptureAnchor {
+                    provisional: (12, 3),
+                    anchor_rows: 24,
+                }),
+                // Anchor first, cursor second. Both reads come before the
+                // geometry push below, which lays out the live surface and can
+                // reflow the very text being captured.
+                Call::Query(Query::CaptureTextRange {
+                    start: (3, 12),
+                    end: (3, 19),
+                }),
+                Call::SyncGeometryToPty,
+                Call::MarkScrollDirty,
+            ]
+        );
+        assert_eq!(
+            harness.commands_started.borrow().as_slice(),
+            &[CommandStartedEvent {
+                command: "echo hi".to_string(),
+                cwd: Some(HARNESS_CWD.to_string()),
+            }]
+        );
+
+        harness.feed(bytes("\x1b[32mhi\x1b[0m\r\n"));
+        // The raw-output ring is engine-owned state, not a backend query.
+        assert_eq!(harness.live_output(), "\x1b[32mhi\x1b[0m\r\n");
+        harness.feed(command_end(Some(0)));
+        assert_eq!(harness.bstate.get(), BlockState::PostCommand);
+
+        // Output bytes were displayed as they arrived, before any block existed.
+        assert!(harness
+            .backend
+            .calls()
+            .contains(&Call::FeedLive(b"\x1b[32mhi\x1b[0m\r\n".to_vec())));
+
+        let before_finalize = harness.backend.take_calls();
+        assert!(
+            !before_finalize
+                .iter()
+                .any(|call| matches!(call, Call::FinalizeBlock(_))),
+            "the block is minted at the next prompt, not at OSC 133;D: {before_finalize:?}"
+        );
+
+        harness.feed(ParserEvent::PromptStart);
+
+        assert_eq!(
+            harness.backend.calls(),
+            vec![
+                Call::FinalizeBlock(FinalizeRecord {
+                    prompt: "user@host $".to_string(),
+                    command: "echo hi".to_string(),
+                    // The finished VTE is fed the decorated copy: the block
+                    // keeps the colour the live surface showed.
+                    output_with_ansi: "\x1b[32mhi\x1b[0m\r\n".to_string(),
+                    // The plain copy loses the SGR runs and the PTY's ONLCR
+                    // carriage returns with them.
+                    output_plain: "hi\n".to_string(),
+                    plain_output_bytes: 3,
+                    cwd: Some(HARNESS_CWD.to_string()),
+                    // The floored block width, not the live grid's 120.
+                    cols: 100,
+                    exit_code: Some(0),
+                    has_duration: true,
+                    has_end_time: true,
+                    is_background: false,
+                }),
+                Call::SyncGeometryToPty,
+                Call::MarkScrollDirty,
+            ]
+        );
+        assert_eq!(harness.backend.finalized_ids.borrow().len(), 1);
+        assert!(
+            harness.live_output().is_empty(),
+            "the finalized command's ring must be cleared for the next one"
+        );
+        assert_eq!(harness.bstate.get(), BlockState::CollectingPrompt);
+
+        // The engine-side fan-out runs exactly once, after the whole backend
+        // finalize has returned and while the lifecycle is still PostCommand.
+        assert_eq!(
+            harness.blocks_finished.borrow().as_slice(),
+            &[FinishedFanOut {
+                command: "echo hi".to_string(),
+                exit_code: Some(0),
+                output_sample: "hi\n".to_string(),
+                agent_generation: None,
+                blocks_finalized_before: 1,
+                state_at_fan_out: BlockState::PostCommand,
+            }]
+        );
+        assert_eq!(harness.commands_finished.borrow().len(), 1);
+    }
+
+    /// The capture's size guard is measured against the live grid's own column
+    /// count, not the floored width finished blocks pre-wrap at. A command
+    /// soft-wrapped across 2500 rows is inside the limit for one and outside
+    /// it for the other, so the placeholder proves which query ran.
+    #[test]
+    fn a_soft_wrapped_capture_is_bounded_by_the_live_column_count() {
+        assert!(command_capture_range_is_bounded(0, 2499, 100));
+        assert!(!command_capture_range_is_bounded(0, 2499, 120));
+
+        let harness = ReaderHarness::new();
+        harness.backend.set_row_count(2600);
+        harness.backend.set_columns(100, 120);
+        harness.backend.render_row(0, "");
+
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("$ "),
+            ParserEvent::PromptEnd,
+        ]);
+        // The echoed command ends 2499 rows below the anchor.
+        harness.backend.render_row(2499, "wrapped-tail");
+        harness.backend.take_calls();
+
+        harness.feed(command_start(None));
+
+        assert!(
+            !harness
+                .backend
+                .take_calls()
+                .iter()
+                .any(|call| matches!(call, Call::Query(Query::CaptureTextRange { .. }))),
+            "an out-of-bounds range is refused before the surface is read at all"
+        );
+        assert_eq!(
+            harness.commands_started.borrow().as_slice(),
+            &[CommandStartedEvent {
+                command: TRUNCATED_COMMAND_PLACEHOLDER.to_string(),
+                cwd: Some(HARNESS_CWD.to_string()),
+            }]
+        );
+    }
+
+    /// A command lifecycle that produced neither text nor output is not
+    /// history: the live surface is reset and the kitty pipeline dropped, and
+    /// — the asymmetry with every other prompt return — the PTY geometry push
+    /// is deliberately skipped by that early return. The second half pins the
+    /// other side of the asymmetry: a prompt that never started a command at
+    /// all resets nothing and still pushes the geometry.
+    #[test]
+    fn an_empty_command_bails_without_a_block_or_a_geometry_push() {
+        let harness = ReaderHarness::new();
+        harness.config.borrow_mut().preserve_live_scrollback = true;
+        // Nothing was typed, so the anchor and the cursor are the same cell
+        // and the capture range is empty.
+
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("user@host $ "),
+            ParserEvent::PromptEnd,
+            command_start(None),
+            command_end(Some(0)),
+        ]);
+        assert_eq!(harness.bstate.get(), BlockState::PostCommand);
+        harness.backend.take_calls();
+
+        harness.feed(ParserEvent::PromptStart);
+
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                Call::ResetActiveSurface {
+                    preserve_scrollback: true,
+                },
+                Call::ResetKittyPipeline,
+                Call::MarkScrollDirty,
+            ],
+            "the bail resets the live surface and returns before the finalize \
+             path and before the geometry push every other prompt return makes"
+        );
+        assert_eq!(harness.bstate.get(), BlockState::CollectingPrompt);
+        assert!(harness.blocks_finished.borrow().is_empty());
+
+        // A prompt cycle with no command lifecycle at all (no C/D) never
+        // enters the finalize path, so it neither resets the surface nor bails
+        // out of the geometry push.
+        harness.feed_all([ParserEvent::PromptEnd, ParserEvent::PromptStart]);
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                Call::Query(Query::CursorAndRows),
+                Call::ScheduleAnchorSettle {
+                    anchor_generation: 2,
+                },
+                Call::LayoutActiveSurface,
+                Call::FocusLiveDeferred,
+                Call::ResetScrollLock,
+                Call::MarkScrollDirty,
+                Call::SyncGeometryToPty,
+                Call::MarkScrollDirty,
+            ]
+        );
+        assert!(harness.blocks_finished.borrow().is_empty());
+    }
+
+    /// Output that arrives at an idle prompt belongs to no command: it becomes
+    /// a background block, and the block-finished fan-out — which feeds
+    /// command-scoped consumers — stays silent for it.
+    ///
+    /// This is reachable only *after* the prompt anchor settles. Before that
+    /// the same bytes are held by the post-`B` feed fence and never reach the
+    /// background ring at all; see
+    /// `output_parked_before_the_anchor_settles_is_dropped_by_the_next_prompt`.
+    #[test]
+    fn background_output_at_an_idle_prompt_becomes_a_commandless_block() {
+        let harness = ReaderHarness::new();
+
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("user@host $ "),
+            ParserEvent::PromptEnd,
+        ]);
+        assert!(harness.ctx.prompt_anchor_ready_rc.get());
+        harness.backend.take_calls();
+        harness.feed(bytes("cron: backup done\r\n"));
+        // Asynchronous output is displayed live and buffered for the block.
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                Call::MarkScrollDirty,
+                Call::FeedLive(b"cron: backup done\r\n".to_vec()),
+            ]
+        );
+
+        harness.feed(ParserEvent::PromptStart);
+
+        assert_eq!(
+            harness.backend.calls(),
+            vec![
+                Call::FinalizeBlock(FinalizeRecord {
+                    // Background output belongs to no command, so it carries
+                    // neither a prompt line nor a shell status nor a duration.
+                    prompt: String::new(),
+                    command: String::new(),
+                    output_with_ansi: "cron: backup done\r\n".to_string(),
+                    output_plain: "cron: backup done\n".to_string(),
+                    plain_output_bytes: 18,
+                    cwd: Some(HARNESS_CWD.to_string()),
+                    cols: 80,
+                    exit_code: None,
+                    has_duration: false,
+                    has_end_time: true,
+                    is_background: true,
+                }),
+                Call::SyncGeometryToPty,
+                Call::MarkScrollDirty,
+            ]
+        );
+        assert!(
+            harness.blocks_finished.borrow().is_empty(),
+            "a commandless block has no command lifecycle to report"
+        );
+        assert!(harness.commands_started.borrow().is_empty());
+    }
+
+    /// While the prompt anchor is still being established, bytes that arrive
+    /// after `OSC 133;B` are parked: not displayed, not buffered as background
+    /// output. No command text may be captured against that unsettled anchor
+    /// either — and CommandStart is what replays the parked bytes, in arrival
+    /// order, before it pushes the geometry.
+    #[test]
+    fn post_prompt_bytes_are_parked_until_the_anchor_settles() {
+        let harness = ReaderHarness::new();
+        // No frame clock ever publishes this prompt's anchor.
+        harness.backend.settle_anchor_now.set(false);
+        harness.backend.render_row(3, "user@host $ ");
+
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("user@host $ "),
+            ParserEvent::PromptEnd,
+        ]);
+        assert_eq!(harness.bstate.get(), BlockState::AwaitingCommand);
+        assert!(!harness.ctx.prompt_anchor_ready_rc.get());
+        harness.backend.take_calls();
+
+        // A bracketed-paste repaint, then the shell's echo of two keystrokes.
+        harness.feed(bytes("\x1b[?2004h"));
+        harness.feed(bytes("ec"));
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![Call::MarkScrollDirty, Call::MarkScrollDirty],
+            "parked bytes reach the live surface through no path but the replay"
+        );
+        assert!(
+            harness.ctx.engine.borrow().background_output.is_empty(),
+            "the fence branch returns before the background-output bookkeeping"
+        );
+
+        // The surface would answer with a full command line if anything asked
+        // it to. Nothing may: this anchor never settled.
+        harness.backend.render_row(3, "user@host $ echo hi");
+
+        harness.feed(command_start(None));
+
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                Call::Query(Query::CursorAndRows),
+                Call::Query(Query::CommandCaptureAnchor {
+                    provisional: (12, 3),
+                    anchor_rows: 24,
+                }),
+                // No CaptureTextRange: an unsettled anchor is never read.
+                Call::FeedLive(b"\x1b[?2004hec".to_vec()),
+                Call::SyncGeometryToPty,
+                Call::MarkScrollDirty,
+            ]
+        );
+        assert_eq!(
+            harness.commands_started.borrow().as_slice(),
+            &[CommandStartedEvent {
+                command: String::new(),
+                cwd: Some(HARNESS_CWD.to_string()),
+            }],
+            "with no capture and an empty typed shadow there is no text to report"
+        );
+    }
+
+    /// The fence is a display delay, never a filter. When parking the next
+    /// chunk would exceed the ring, everything already parked is replayed
+    /// first, the overflowing chunk follows it, and the fence stays down for
+    /// the rest of the prompt.
+    #[test]
+    fn an_overflowing_post_prompt_fence_replays_before_it_feeds() {
+        let harness = ReaderHarness::new();
+        harness.backend.settle_anchor_now.set(false);
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("$ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.backend.take_calls();
+
+        let bulk = vec![b'b'; MAX_RAW_OUTPUT_BYTES];
+        harness.feed(ParserEvent::Bytes(bulk.clone()));
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![Call::MarkScrollDirty],
+            "a chunk that exactly fills the ring still parks"
+        );
+
+        harness.feed(bytes("tail"));
+
+        // Asserted field by field: a failed `assert_eq!` over the whole
+        // sequence would print megabytes.
+        let calls = harness.backend.take_calls();
+        assert_eq!(calls.len(), 3, "one replay, one chunk, one scroll mark");
+        match &calls[0] {
+            Call::FeedLive(replayed) => {
+                assert_eq!(replayed.len(), bulk.len(), "the whole ring is replayed");
+                assert!(replayed.iter().all(|byte| *byte == b'b'));
+            }
+            _ => panic!("the fence must replay what it parked before the chunk that overflowed it"),
+        }
+        assert_eq!(calls[1], Call::FeedLive(b"tail".to_vec()));
+        assert_eq!(calls[2], Call::MarkScrollDirty);
+        assert!(harness.ctx.post_prompt_fence_released_rc.get());
+
+        // Released stays released: later chunks are fed straight through.
+        harness.feed(bytes("more"));
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![Call::FeedLive(b"more".to_vec()), Call::MarkScrollDirty]
+        );
+    }
+
+    /// The other side of the background-output rule. Before the anchor
+    /// settles, the same asynchronous bytes are parked; a new PromptStart
+    /// clears the ring outright, so they are never displayed and never become
+    /// a block. Nothing but the settling pass or CommandStart drains a fence.
+    #[test]
+    fn output_parked_before_the_anchor_settles_is_dropped_by_the_next_prompt() {
+        let harness = ReaderHarness::new();
+        harness.backend.settle_anchor_now.set(false);
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("user@host $ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.backend.take_calls();
+
+        harness.feed(bytes("cron: backup done\r\n"));
+        assert_eq!(harness.backend.take_calls(), vec![Call::MarkScrollDirty]);
+
+        harness.feed(ParserEvent::PromptStart);
+
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![Call::SyncGeometryToPty, Call::MarkScrollDirty],
+            "no block is minted, and the parked bytes are not replayed on the way out"
+        );
+        assert!(harness.ctx.post_prompt_bytes_rc.borrow().is_empty());
+        assert!(harness.backend.finalized().is_empty());
+    }
+
+    /// Entering the alternate screen hands the viewport over before the app
+    /// draws: chrome, then fullscreen, then the resize, and only then the
+    /// re-synthesized enter sequence — so the app's first frame is written
+    /// into a surface that already has its final size. Leaving mirrors it.
+    #[test]
+    fn alt_screen_resizes_before_replaying_the_enter_sequence() {
+        let harness = ReaderHarness::new();
+
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("user@host $ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.backend.take_calls();
+
+        harness.feed(ParserEvent::AltScreenEnter(1049));
+
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                Call::EnterAltScreenChrome,
+                Call::EnterFullscreen,
+                Call::SyncGeometryToPty,
+                Call::FeedLive(b"\x1b[?1049h".to_vec()),
+            ]
+        );
+        assert_eq!(harness.bstate.get(), BlockState::AltScreen);
+
+        harness.feed(ParserEvent::AltScreenLeave(1049));
+
+        assert_eq!(
+            harness.backend.calls(),
+            vec![
+                Call::FeedLive(b"\x1b[?1049l".to_vec()),
+                Call::ExitFullscreen,
+                Call::ExitAltScreenChrome,
+                Call::SyncGeometryToPty,
+                Call::FocusLiveDeferred,
+            ]
+        );
+        assert_eq!(
+            harness.bstate.get(),
+            BlockState::AwaitingCommand,
+            "leaving restores the state the app interrupted"
+        );
+        assert_eq!(
+            harness.alt_screen.borrow().as_slice(),
+            &[AltScreenTransition::Entered, AltScreenTransition::Left]
+        );
+    }
+
+    /// A foreground job can print OSC 133 marks of its own. While the shell
+    /// owns the terminal the depth counter makes the nested pair cancel out,
+    /// so the shell's own D — not the inner one — is what finishes the
+    /// command, and only one block is minted.
+    #[test]
+    fn a_nested_command_mark_pair_does_not_mint_its_own_block() {
+        let harness = ReaderHarness::new();
+        harness.backend.render_row(3, "user@host $ ");
+
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("user@host $ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.backend.render_row(3, "user@host $ run-nested");
+        harness.feed(command_start(None));
+        assert_eq!(harness.bstate.get(), BlockState::CollectingOutput);
+
+        // The running command prints its own C/D pair as ordinary output.
+        harness.feed(command_start(Some("inner")));
+        assert_eq!(
+            harness.bstate.get(),
+            BlockState::CollectingOutput,
+            "a nested command start must not restart the lifecycle"
+        );
+        harness.feed(command_end(Some(7)));
+        assert_eq!(
+            harness.bstate.get(),
+            BlockState::CollectingOutput,
+            "the nested end is consumed by the depth guard, not by the command"
+        );
+        assert!(harness.commands_finished.borrow().is_empty());
+
+        // The shell's own D.
+        harness.feed(command_end(Some(0)));
+        assert_eq!(harness.bstate.get(), BlockState::PostCommand);
+        harness.feed(ParserEvent::PromptStart);
+
+        assert_eq!(
+            harness.backend.finalized(),
+            vec![Call::FinalizeBlock(FinalizeRecord {
+                prompt: "user@host $".to_string(),
+                command: "run-nested".to_string(),
+                output_with_ansi: String::new(),
+                output_plain: String::new(),
+                plain_output_bytes: 0,
+                cwd: Some(HARNESS_CWD.to_string()),
+                cols: 80,
+                exit_code: Some(0),
+                has_duration: true,
+                has_end_time: true,
+                is_background: false,
+            })],
+            "the inner pair must not mint a block, and must not supply the exit status"
+        );
+        assert_eq!(harness.commands_started.borrow().len(), 1);
+        assert_eq!(harness.commands_finished.borrow().len(), 1);
+        assert_eq!(
+            harness.blocks_finished.borrow().len(),
+            1,
+            "one command lifecycle, one block-finished fan-out"
+        );
+    }
+
+    /// The same nested pair on a PTY the shell does not own, where both
+    /// foreground gates fail closed. The nested C is not counted at all — so
+    /// the next D is the shell's as far as the lifecycle can tell, and ends
+    /// the command — and an approved command's Agent identity is dropped when
+    /// its block is finalized without the shell on the foreground.
+    #[test]
+    fn a_foreign_foreground_neither_counts_nested_marks_nor_keeps_agent_identity() {
+        let harness = ReaderHarness::with_foreground(PtyForeground::Other);
+        harness.backend.render_row(3, "user@host $ ");
+
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("user@host $ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.backend.render_row(3, "user@host $ run-nested");
+        harness.feed(command_start(None));
+        assert_eq!(harness.bstate.get(), BlockState::CollectingOutput);
+
+        harness.feed(command_start(Some("inner")));
+        harness.feed(command_end(Some(7)));
+        assert_eq!(
+            harness.bstate.get(),
+            BlockState::PostCommand,
+            "an uncounted nested start leaves the next end to finish the command"
+        );
+        assert_eq!(harness.commands_finished.borrow().len(), 1);
+
+        // An approval still bound to this command reaches the finalize with
+        // the shell off the foreground.
+        harness.ctx.active_agent_generation_rc.set(Some(42));
+        harness.feed(ParserEvent::PromptStart);
+
+        assert_eq!(
+            harness.agent_lost.borrow().as_slice(),
+            &[(
+                42,
+                "the shell did not own the terminal when the approved command block was finalized"
+            )]
+        );
+        assert_eq!(harness.backend.finalized().len(), 1);
+        assert_eq!(
+            harness.blocks_finished.borrow().as_slice(),
+            &[FinishedFanOut {
+                command: "run-nested".to_string(),
+                exit_code: Some(7),
+                output_sample: String::new(),
+                agent_generation: None,
+                blocks_finalized_before: 1,
+                state_at_fan_out: BlockState::PostCommand,
+            }]
+        );
+    }
+
+    /// APC G is answered before the decoded image is admitted: clients like
+    /// `kitten icat` block on the `i=`-keyed reply, and the trait doc makes
+    /// that ordering binding on every backend. The reply is a PTY write, so it
+    /// is observed by draining the test PTY's slave end at exactly the moment
+    /// of the admit.
+    #[test]
+    fn a_kitty_upload_is_answered_before_its_image_is_admitted() {
+        let harness = ReaderHarness::new();
+        harness
+            .backend
+            .kitty_status
+            .set(kitty_graphics::FeedStatus::Complete);
+        {
+            let probe_backend = harness.backend.clone();
+            let probe_pty = harness.pty.clone();
+            harness.backend.set_admit_probe(move || {
+                probe_backend.record(Call::PtyReply(probe_pty.drain_test_slave(PTY_REPLY_WAIT)));
+            });
+        }
+
+        harness.feed(ParserEvent::ApcSequence(b"Gi=31,a=T;AAAA".to_vec()));
+
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                Call::KittyFeed(b"Gi=31,a=T;AAAA".to_vec()),
+                Call::PtyReply(b"\x1b_Gi=31;OK\x1b\\".to_vec()),
+                Call::KittyAdmitPending,
+            ]
+        );
+        assert_eq!(
+            harness.ctx.accepted_input_generation_rc.get(),
+            1,
+            "a reply the PTY accepted counts as input the shell will see"
+        );
+    }
+
+    /// Two OSC effects that leave the terminal. A remote clipboard write is
+    /// gated on a config knob and fails closed with it off; a notification
+    /// carries its title through.
+    #[test]
+    fn a_remote_clipboard_write_is_config_gated_and_a_notification_keeps_its_title() {
+        let harness = ReaderHarness::new();
+
+        harness.feed(ParserEvent::ClipboardSet("secret".to_string()));
+        assert!(
+            harness.backend.take_calls().is_empty(),
+            "OSC 52 may not reach the system clipboard while the knob is off"
+        );
+
+        harness.config.borrow_mut().allow_remote_clipboard_write = true;
+        harness.feed(ParserEvent::ClipboardSet("secret".to_string()));
+        harness.feed(ParserEvent::Notification {
+            title: Some("build".to_string()),
+            body: "finished".to_string(),
+        });
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                Call::SetSystemClipboard("secret".to_string()),
+                Call::DesktopNotify {
+                    title: Some("build".to_string()),
+                    body: "finished".to_string(),
+                },
+            ]
+        );
+    }
+
+    /// The anchor a verified submission compares the cursor against is the
+    /// PromptEnd anchor rebased onto the surface's *current* row count — the
+    /// compact/full `set_size` churn moves the text buffer under it. The two
+    /// row counts here differ by four, so inverting them moves the anchor
+    /// eight rows.
+    #[test]
+    fn a_verified_submission_rebases_its_anchor_onto_the_current_row_count() {
+        let harness = ReaderHarness::new();
+        harness.backend.set_row_count(20);
+        harness.backend.render_row(10, "$ 123");
+
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("$ 123"),
+            ParserEvent::PromptEnd,
+        ]);
+        assert_eq!(harness.ctx.prompt_end_pos_rc.get(), (5, 10));
+        assert_eq!(harness.ctx.prompt_anchor_rows_rc.get(), 20);
+        harness.surface.rows.set(24);
+        // Where inverting the recorded and current row counts would put the
+        // anchor: 10 + (20 - 24) instead of 10 + (24 - 20).
+        harness.surface.cursor.set((5, 6));
+        harness.surface.suffix_is_empty.set(Some(true));
+        harness.surface.reads.borrow_mut().clear();
+
+        assert_eq!(
+            harness
+                .ctx
+                .verified_submission
+                .begin("echo hi", None, [0, 0, 0]),
+            Err("the shell prompt visibly contains input".to_string()),
+            "the anchor is row 14, so a cursor on row 6 is not sitting on it"
+        );
+        assert_eq!(
+            harness.surface.reads(),
+            vec![
+                SurfaceRead::RowCount,
+                SurfaceRead::CursorPosition,
+                SurfaceRead::SuffixIsEmpty,
+            ],
+            "the anchor is rebased against the live row count before the \
+             cursor is compared to it"
+        );
+    }
+
+    /// One rendered column of unseen input past the anchor is enough to refuse
+    /// a programmatic submission.
+    #[test]
+    fn a_verified_submission_refuses_a_cursor_that_left_the_anchor() {
+        let harness = ReaderHarness::new();
+        let anchor = harness.arm_verified_prompt();
+        harness.surface.cursor.set((anchor.0 + 1, anchor.1));
+
+        assert_eq!(
+            harness
+                .ctx
+                .verified_submission
+                .begin("echo hi", None, [0, 0, 0]),
+            Err("the shell prompt visibly contains input".to_string())
+        );
+        assert!(harness
+            .surface
+            .reads()
+            .contains(&SurfaceRead::CursorPosition));
+    }
+
+    /// The `None`-versus-`Some(false)` distinction is the reason the seam
+    /// answers with an `Option` at all: a surface that *cannot* say whether
+    /// the suffix is empty must never be read as saying it is.
+    #[test]
+    fn a_verified_submission_refuses_every_suffix_that_is_not_provably_empty() {
+        for suffix in [None, Some(false)] {
+            let harness = ReaderHarness::new();
+            harness.arm_verified_prompt();
+            harness.surface.suffix_is_empty.set(suffix);
+
+            assert_eq!(
+                harness
+                    .ctx
+                    .verified_submission
+                    .begin("echo hi", None, [0, 0, 0]),
+                Err("the shell prompt visibly contains input".to_string()),
+                "a suffix answered {suffix:?} may not admit a submission"
+            );
+            assert!(harness
+                .surface
+                .reads()
+                .contains(&SurfaceRead::SuffixIsEmpty));
+        }
     }
 }
