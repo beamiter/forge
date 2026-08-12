@@ -2456,6 +2456,513 @@ fn popdown_if_alive(popover: &glib::WeakRef<gtk4::Popover>) {
     }
 }
 
+/// Handles for [`install_finished_block_context_menu`], cloned per finished
+/// block by the finalize path. Field names mirror the reader-closure locals
+/// they are cloned from.
+struct FinishedBlockMenuCtx {
+    finished_blocks_for_cb: Rc<RefCell<Vec<FinishedBlock>>>,
+    block_list_rc: gtk4::Box,
+    active_vte: Terminal,
+    pty_for_init: Rc<OwnedPty>,
+    pty_synced_rc: Rc<Cell<bool>>,
+    active_rc: Rc<RefCell<ActiveBlock>>,
+    bstate_rc: Rc<Cell<BlockState>>,
+    bracketed_paste_rc: Rc<Cell<bool>>,
+    typed_cmd_rc: Rc<RefCell<String>>,
+    typed_cmd_fidelity_rc: Rc<Cell<TypedShadowFidelity>>,
+    submission_pending_rc: Rc<Cell<bool>>,
+    pending_typeahead_rc: Rc<Cell<bool>>,
+    selected_block_ids_rc: SelectedBlockIds,
+    selected_block_id_rc: Rc<Cell<Option<u64>>>,
+    selection_anchor_id_rc: Rc<Cell<Option<u64>>>,
+    bookmarks_for_cb: Rc<RefCell<HashSet<u64>>>,
+    visible_indices_rc: Rc<RefCell<HashSet<usize>>>,
+    failure_marker_redraw: FailureMarkerRedraw,
+    find_state_for_cb: Rc<RefCell<FindState>>,
+    ask_ai_cbs: AskAiCallbacks,
+    block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
+    block_scroll_rc: ScrolledWindow,
+    /// Root widget of the finished block; the right-click gesture attaches here.
+    finished_widget: gtk4::Box,
+    block_id: u64,
+    long_output: bool,
+}
+
+/// Install the right-click context menu on a finished block.
+///
+/// Live-finalize path only: `undo_clear_blocks` and history restore
+/// deliberately rebuild blocks without this menu.
+fn install_finished_block_context_menu(ctx: FinishedBlockMenuCtx) {
+    let FinishedBlockMenuCtx {
+        finished_blocks_for_cb,
+        block_list_rc,
+        active_vte,
+        pty_for_init,
+        pty_synced_rc,
+        active_rc,
+        bstate_rc,
+        bracketed_paste_rc,
+        typed_cmd_rc,
+        typed_cmd_fidelity_rc,
+        submission_pending_rc,
+        pending_typeahead_rc,
+        selected_block_ids_rc,
+        selected_block_id_rc,
+        selection_anchor_id_rc,
+        bookmarks_for_cb,
+        visible_indices_rc,
+        failure_marker_redraw,
+        find_state_for_cb,
+        ask_ai_cbs,
+        block_data_for_cb,
+        block_scroll_rc,
+        finished_widget,
+        block_id,
+        long_output,
+    } = ctx;
+    let finished_blocks_for_menu = Rc::downgrade(&finished_blocks_for_cb);
+    let block_list_for_menu = block_list_rc.downgrade();
+    let vte_for_copy = active_vte.downgrade();
+    let pty_for_rerun_menu = pty_for_init.clone();
+    let pty_synced_for_rerun_menu = pty_synced_rc.clone();
+    let active_for_rerun_menu = Rc::downgrade(&active_rc);
+    let bstate_for_rerun_menu = bstate_rc.clone();
+    let bracketed_paste_for_menu = bracketed_paste_rc.clone();
+    let typed_cmd_for_rerun_menu = typed_cmd_rc.clone();
+    let typed_cmd_fidelity_for_rerun_menu = typed_cmd_fidelity_rc.clone();
+    let submission_pending_for_rerun_menu = submission_pending_rc.clone();
+    let pending_typeahead_for_rerun_menu = pending_typeahead_rc.clone();
+    let selected_ids_for_menu = selected_block_ids_rc.clone();
+    let selected_for_menu = selected_block_id_rc.clone();
+    let anchor_for_menu = selection_anchor_id_rc.clone();
+    let bookmarks_for_menu = bookmarks_for_cb.clone();
+    let visible_for_menu = visible_indices_rc.clone();
+    let failure_marker_redraw_for_menu = failure_marker_redraw.clone();
+    let find_state_for_menu = find_state_for_cb.clone();
+    let ask_ai_cbs_for_menu = ask_ai_cbs.clone();
+
+    let right_click = gtk4::GestureClick::new();
+    right_click.set_button(3);
+
+    let finished_widget_for_menu = finished_widget.downgrade();
+    let long_output_for_menu = long_output;
+    let block_data_for_export = block_data_for_cb.clone();
+    let block_scroll_for_menu = block_scroll_rc.downgrade();
+    right_click.connect_pressed(move |gesture, _n_press, x, y| {
+        let Some(finished_blocks) = finished_blocks_for_menu.upgrade() else {
+            return;
+        };
+        let Some(vte_for_copy) = vte_for_copy.upgrade() else {
+            return;
+        };
+        let Some(finished_widget) = finished_widget_for_menu.upgrade() else {
+            return;
+        };
+        gesture.set_state(gtk4::EventSequenceState::Claimed);
+        {
+            let finished = finished_blocks.borrow();
+            clear_vte_text_selections(&finished, &vte_for_copy);
+            activate_finished_block_selection(
+                &finished,
+                &selected_ids_for_menu,
+                &selected_for_menu,
+                &anchor_for_menu,
+                block_id,
+            );
+        }
+
+        let popover = gtk4::Popover::new();
+        popover.set_parent(&finished_widget);
+        popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover.set_has_arrow(false);
+
+        let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        vbox.add_css_class("menu");
+
+        let make_item = |label: &str| -> gtk4::Button {
+            let btn = gtk4::Button::with_label(label);
+            btn.set_has_frame(false);
+            btn.set_halign(gtk4::Align::Fill);
+            if let Some(child) = btn.child() {
+                child.set_halign(gtk4::Align::Start);
+            }
+            btn.add_css_class("flat");
+            btn
+        };
+
+        let selected_count = selected_ids_for_menu.borrow().len();
+        let has_selected_commands = {
+            let selected = selected_ids_for_menu.borrow();
+            block_data_for_export
+                .borrow()
+                .iter()
+                .any(|block| selected.contains(&block.id) && !block.cmd.trim().is_empty())
+        };
+
+        if has_selected_commands {
+            let item = make_item(if selected_count > 1 {
+                "Copy Commands"
+            } else {
+                "Copy Command"
+            });
+            let popover_c = popover.downgrade();
+            let block_data_for_copy = block_data_for_export.clone();
+            let selected_ids_for_copy = selected_ids_for_menu.clone();
+            let vte_for_action = vte_for_copy.downgrade();
+            item.connect_clicked(move |_| {
+                popdown_if_alive(&popover_c);
+                let Some(vte_for_action) = vte_for_action.upgrade() else {
+                    return;
+                };
+                let selected = selected_ids_for_copy.borrow();
+                let blocks = block_data_for_copy.borrow();
+                let text = selected_command_text(
+                    blocks.iter().map(|block| (block.id, block.cmd.as_str())),
+                    &selected,
+                );
+                vte_for_action.clipboard().set_text(&text);
+            });
+            vbox.append(&item);
+        }
+
+        {
+            let item = make_item("Ask AI About Block");
+            let popover_c = popover.downgrade();
+            let finished_for_ai = Rc::downgrade(&finished_blocks);
+            let block_data_for_ai = block_data_for_export.clone();
+            let callbacks_for_ai = ask_ai_cbs_for_menu.clone();
+            item.connect_clicked(move |_| {
+                popdown_if_alive(&popover_c);
+                let Some(finished_for_ai) = finished_for_ai.upgrade() else {
+                    return;
+                };
+                let finished = finished_for_ai.borrow();
+                let data = block_data_for_ai.borrow();
+                let Some(context) = block_context_for_id(&finished, &data, block_id, 80) else {
+                    return;
+                };
+                for callback in callbacks_for_ai.borrow().iter() {
+                    callback(context.clone());
+                }
+            });
+            vbox.append(&item);
+        }
+
+        {
+            let item = make_item(if selected_count > 1 {
+                "Copy Outputs"
+            } else {
+                "Copy Output"
+            });
+            let popover_c = popover.downgrade();
+            let block_data_for_copy = block_data_for_export.clone();
+            let selected_ids_for_copy = selected_ids_for_menu.clone();
+            let vte_for_action = vte_for_copy.downgrade();
+            item.connect_clicked(move |_| {
+                popdown_if_alive(&popover_c);
+                let Some(vte_for_action) = vte_for_action.upgrade() else {
+                    return;
+                };
+                let selected = selected_ids_for_copy.borrow();
+                let blocks = block_data_for_copy.borrow();
+                let text = selected_clipboard_text(blocks.iter(), &selected, |block, output| {
+                    output.append(&block.output)
+                });
+                publish_bounded_clipboard(&vte_for_action, text);
+            });
+            vbox.append(&item);
+        }
+
+        {
+            let item = make_item(if selected_count > 1 {
+                "Copy Blocks"
+            } else {
+                "Copy Block"
+            });
+            let popover_c = popover.downgrade();
+            let block_data_for_copy = block_data_for_export.clone();
+            let selected_ids_for_copy = selected_ids_for_menu.clone();
+            let vte_for_action = vte_for_copy.downgrade();
+            item.connect_clicked(move |_| {
+                popdown_if_alive(&popover_c);
+                let Some(vte_for_action) = vte_for_action.upgrade() else {
+                    return;
+                };
+                let selected = selected_ids_for_copy.borrow();
+                let blocks = block_data_for_copy.borrow();
+                let text = selected_clipboard_text(blocks.iter(), &selected, |block, output| {
+                    append_block_clipboard_text(output, &block.cmd, &block.output, false)
+                });
+                publish_bounded_clipboard(&vte_for_action, text);
+            });
+            vbox.append(&item);
+        }
+
+        {
+            let item = make_item(if selected_count > 1 {
+                "Copy Blocks as Markdown"
+            } else {
+                "Copy Block as Markdown"
+            });
+            let popover_c = popover.downgrade();
+            let block_data_for_copy = block_data_for_export.clone();
+            let selected_ids_for_copy = selected_ids_for_menu.clone();
+            let vte_for_action = vte_for_copy.downgrade();
+            item.connect_clicked(move |_| {
+                popdown_if_alive(&popover_c);
+                let Some(vte_for_action) = vte_for_action.upgrade() else {
+                    return;
+                };
+                let selected = selected_ids_for_copy.borrow();
+                let blocks = block_data_for_copy.borrow();
+                let text = selected_blocks_markdown(blocks.iter(), &selected, block_id);
+                publish_bounded_clipboard(&vte_for_action, text);
+            });
+            vbox.append(&item);
+        }
+
+        if has_selected_commands {
+            let item = make_item(if selected_count > 1 {
+                "Insert Commands at Prompt"
+            } else {
+                "Insert Command at Prompt"
+            });
+            let popover_c = popover.downgrade();
+            let finished_for_rerun = finished_blocks_for_menu.clone();
+            let selected_ids_for_rerun = selected_ids_for_menu.clone();
+            let selected_for_rerun = selected_for_menu.clone();
+            let anchor_for_rerun = anchor_for_menu.clone();
+            let pty_for_action = pty_for_rerun_menu.clone();
+            let pty_synced_for_action = pty_synced_for_rerun_menu.clone();
+            let bracketed_for_action = bracketed_paste_for_menu.clone();
+            let typed_cmd_for_action = typed_cmd_for_rerun_menu.clone();
+            let typed_cmd_fidelity_for_action = typed_cmd_fidelity_for_rerun_menu.clone();
+            let submission_pending_for_action = submission_pending_for_rerun_menu.clone();
+            let pending_typeahead_for_action = pending_typeahead_for_rerun_menu.clone();
+            let bstate_for_action = bstate_for_rerun_menu.clone();
+            let active_for_action = active_for_rerun_menu.clone();
+            item.set_sensitive(command_recall_available(bstate_for_rerun_menu.get()));
+            item.set_tooltip_text(Some("Available when the shell prompt is ready"));
+            item.connect_clicked(move |_| {
+                popdown_if_alive(&popover_c);
+                let Some(finished_for_rerun) = finished_for_rerun.upgrade() else {
+                    return;
+                };
+                let finished = finished_for_rerun.borrow();
+                let recalled = {
+                    let selected = selected_ids_for_rerun.borrow();
+                    recall_selected_commands_at_prompt(
+                        PromptRecallCtx {
+                            pty: &pty_for_action,
+                            pty_synced: &pty_synced_for_action,
+                            typed_cmd: &typed_cmd_for_action,
+                            typed_cmd_fidelity: &typed_cmd_fidelity_for_action,
+                            submission_pending: &submission_pending_for_action,
+                            pending_typeahead: &pending_typeahead_for_action,
+                        },
+                        bstate_for_action.get(),
+                        &finished,
+                        &selected,
+                        bracketed_for_action.get(),
+                    )
+                };
+                if recalled {
+                    clear_finished_block_selection(
+                        &finished,
+                        &selected_ids_for_rerun,
+                        &selected_for_rerun,
+                        &anchor_for_rerun,
+                    );
+                    if let Some(active_for_action) = active_for_action.upgrade() {
+                        active_for_action.borrow().grab_focus();
+                    }
+                }
+            });
+            vbox.append(&item);
+        }
+
+        {
+            let item = make_item("Scroll to Top of Block");
+            let popover_c = popover.downgrade();
+            let finished = finished_blocks_for_menu.clone();
+            let scroll = block_scroll_for_menu.clone();
+            item.connect_clicked(move |_| {
+                popdown_if_alive(&popover_c);
+                let (Some(finished), Some(scroll)) = (finished.upgrade(), scroll.upgrade()) else {
+                    return;
+                };
+                let finished = finished.borrow();
+                if let Some(block) = finished.iter().find(|b| b.id == block_id) {
+                    block.scroll_to_edge(&scroll, false);
+                }
+            });
+            vbox.append(&item);
+        }
+        if long_output_for_menu {
+            let item = make_item("Jump to Bottom of Block");
+            let popover_c = popover.downgrade();
+            let finished = finished_blocks_for_menu.clone();
+            let scroll = block_scroll_for_menu.clone();
+            item.connect_clicked(move |_| {
+                popdown_if_alive(&popover_c);
+                let (Some(finished), Some(scroll)) = (finished.upgrade(), scroll.upgrade()) else {
+                    return;
+                };
+                let finished = finished.borrow();
+                if let Some(block) = finished.iter().find(|b| b.id == block_id) {
+                    block.scroll_to_edge(&scroll, true);
+                }
+            });
+            vbox.append(&item);
+        }
+        {
+            let item = make_item("Toggle Output Filter");
+            let popover_c = popover.downgrade();
+            let finished = finished_blocks_for_menu.clone();
+            item.connect_clicked(move |_| {
+                popdown_if_alive(&popover_c);
+                let Some(finished) = finished.upgrade() else {
+                    return;
+                };
+                let finished = finished.borrow();
+                if let Some(block) = finished.iter().find(|b| b.id == block_id) {
+                    (block.toggle_filter)();
+                }
+            });
+            vbox.append(&item);
+        }
+        {
+            let bookmarked = bookmarks_for_menu.borrow().contains(&block_id);
+            let item = make_item(if bookmarked {
+                "Remove Bookmark"
+            } else {
+                "Bookmark Block"
+            });
+            let popover_c = popover.downgrade();
+            let finished = finished_blocks_for_menu.clone();
+            let bookmarks = bookmarks_for_menu.clone();
+            item.connect_clicked(move |_| {
+                popdown_if_alive(&popover_c);
+                let Some(finished) = finished.upgrade() else {
+                    return;
+                };
+                let finished = finished.borrow();
+                let Some(block) = finished.iter().find(|b| b.id == block_id) else {
+                    return;
+                };
+                let mut marks = bookmarks.borrow_mut();
+                let now_bookmarked = if marks.remove(&block_id) {
+                    false
+                } else {
+                    marks.insert(block_id);
+                    true
+                };
+                block.bookmark_star.set_visible(now_bookmarked);
+                if now_bookmarked {
+                    block.widget().add_css_class("block-bookmarked");
+                } else {
+                    block.widget().remove_css_class("block-bookmarked");
+                }
+            });
+            vbox.append(&item);
+        }
+
+        let separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        vbox.append(&separator);
+
+        {
+            let item = make_item("Export as JSON");
+            let popover_c = popover.downgrade();
+            let block_data_for_json = block_data_for_export.clone();
+            let vte_for_json = vte_for_copy.downgrade();
+            let block_id_json = block_id;
+            item.connect_clicked(move |_| {
+                popdown_if_alive(&popover_c);
+                let Some(vte_for_json) = vte_for_json.upgrade() else {
+                    return;
+                };
+                let blocks = block_data_for_json.borrow();
+                if let Some(block) = blocks.iter().find(|b| b.id == block_id_json) {
+                    let json = block.to_json();
+                    vte_for_json.clipboard().set_text(&json);
+                }
+            });
+            vbox.append(&item);
+        }
+
+        {
+            let item = make_item("Export as Markdown");
+            let popover_c = popover.downgrade();
+            let block_data_for_md = block_data_for_export.clone();
+            let vte_for_md = vte_for_copy.downgrade();
+            let block_id_md = block_id;
+            item.connect_clicked(move |_| {
+                popdown_if_alive(&popover_c);
+                let Some(vte_for_md) = vte_for_md.upgrade() else {
+                    return;
+                };
+                let blocks = block_data_for_md.borrow();
+                if let Some(block) = blocks.iter().find(|b| b.id == block_id_md) {
+                    publish_bounded_clipboard(&vte_for_md, block_markdown(block));
+                }
+            });
+            vbox.append(&item);
+        }
+
+        {
+            let item = make_item("Delete Block");
+            let popover_c = popover.downgrade();
+            let finished_blocks_for_delete = finished_blocks_for_menu.clone();
+            let block_list_for_delete = block_list_for_menu.clone();
+            let block_data_for_delete = block_data_for_export.clone();
+            let selected_ids_for_delete = selected_ids_for_menu.clone();
+            let selected_for_delete = selected_for_menu.clone();
+            let anchor_for_delete = anchor_for_menu.clone();
+            let bookmarks_for_delete = bookmarks_for_menu.clone();
+            let visible_for_delete = visible_for_menu.clone();
+            let failure_marker_redraw_for_delete = failure_marker_redraw_for_menu.clone();
+            let find_state_for_delete = find_state_for_menu.clone();
+            let active_vte_for_delete = vte_for_copy.clone();
+            let block_id_del = block_id;
+            item.connect_clicked(move |_| {
+                popdown_if_alive(&popover_c);
+                let (Some(finished_blocks_for_delete), Some(block_list_for_delete)) = (
+                    finished_blocks_for_delete.upgrade(),
+                    block_list_for_delete.upgrade(),
+                ) else {
+                    return;
+                };
+                let _ = remove_finished_block(
+                    block_id_del,
+                    &finished_blocks_for_delete,
+                    &block_data_for_delete,
+                    &block_list_for_delete,
+                    &find_state_for_delete,
+                    &active_vte_for_delete,
+                    BlockRemovalRefs {
+                        selection: BlockSelectionRefs {
+                            ids: &selected_ids_for_delete,
+                            active: &selected_for_delete,
+                            anchor: &anchor_for_delete,
+                        },
+                        bookmarks: &bookmarks_for_delete,
+                        visible_indices: &visible_for_delete,
+                        failure_marker_redraw: failure_marker_redraw_for_delete.as_ref(),
+                    },
+                );
+            });
+            vbox.append(&item);
+        }
+
+        popover.set_child(Some(&vbox));
+        popover.connect_closed(move |p| {
+            p.unparent();
+        });
+        popover.popup();
+    });
+    finished_widget.add_controller(right_click);
+}
+
 /// Cap on the retained raw output buffer for a single running command. The raw
 /// byte buffer used to re-render the finished block grew without bound — a runaway
 /// command (`cat /dev/urandom`) could exhaust memory before CommandEnd. When the
@@ -3274,6 +3781,353 @@ fn notification_allowed(last: Option<std::time::Instant>, now: std::time::Instan
     last.is_none_or(|prev| now.duration_since(prev) >= NOTIFICATION_MIN_INTERVAL)
 }
 
+/// Per-block lifecycle values the reader closure computes before the render
+/// path runs; their computation stays engine-side. The string fields are the
+/// pre-trim originals the finished widgets are built from, and `cols` is the
+/// unclamped live-grid width (`BlockData` stores the clamped copy).
+struct FinalizedBlockArgs {
+    block_id: u64,
+    prompt: String,
+    cmd: String,
+    output_with_ansi: String,
+    output_plain: String,
+    plain_output_bytes: usize,
+    block_cwd: Option<String>,
+    cols: i64,
+    exit_code: Option<i32>,
+    duration_ms: Option<u64>,
+    end_time_ms: Option<u64>,
+    is_background: bool,
+    /// Taken from the active-agent cell by the reader closure; `None` for
+    /// background output so the identity stays reserved for the foreground
+    /// command's fan-out.
+    agent_generation: Option<u64>,
+}
+
+/// Shared handles for [`render_finalized_block`], cloned per finished block
+/// by the reader closure. Field names mirror the reader-closure locals they
+/// are cloned from.
+struct FinalizeRenderCtx {
+    active_rc: Rc<RefCell<ActiveBlock>>,
+    active_vte: Terminal,
+    bstate_rc: Rc<Cell<BlockState>>,
+    typed_cmd_rc: Rc<RefCell<String>>,
+    typed_cmd_fidelity_rc: Rc<Cell<TypedShadowFidelity>>,
+    submission_pending_rc: Rc<Cell<bool>>,
+    pending_typeahead_rc: Rc<Cell<bool>>,
+    bracketed_paste_rc: Rc<Cell<bool>>,
+    config_for_cb: Rc<RefCell<Config>>,
+    dynamic_colors_for_pipeline: Rc<Cell<DynamicColors>>,
+    block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
+    failure_marker_redraw: FailureMarkerRedraw,
+    finished_blocks_for_cb: Rc<RefCell<Vec<FinishedBlock>>>,
+    find_state_for_cb: Rc<RefCell<FindState>>,
+    scroll_debouncer: ScrollDebouncer,
+    widget_pool_for_cb: Rc<RefCell<WidgetPool>>,
+    pty_synced_rc: Rc<Cell<bool>>,
+    visible_indices_rc: Rc<RefCell<HashSet<usize>>>,
+    pty_for_init: Rc<OwnedPty>,
+    unread_count_rc: Rc<Cell<u32>>,
+    jump_fab: gtk4::Button,
+    selected_block_ids_rc: SelectedBlockIds,
+    selected_block_id_rc: Rc<Cell<Option<u64>>>,
+    selection_anchor_id_rc: Rc<Cell<Option<u64>>>,
+    bookmarks_for_cb: Rc<RefCell<HashSet<u64>>>,
+    block_list_rc: gtk4::Box,
+    block_scroll_rc: ScrolledWindow,
+    block_finished_cbs: BlockFinishedCallbacks,
+    ask_ai_cbs: AskAiCallbacks,
+    agent_execution_lost_cbs: AgentExecutionLostCallbacks,
+    kitty_assembler_rc: Rc<RefCell<kitty_graphics::Assembler>>,
+    kitty_pending_images_rc: Rc<RefCell<Vec<gtk4::gdk::Texture>>>,
+    kitty_pending_bytes_rc: Rc<Cell<usize>>,
+}
+
+/// Mount a finished command as a history block and reset the live surface.
+///
+/// Statement order is load-bearing: find state clears before eviction can
+/// drop a block, the `BlockData` record lands before the widget mounts, the
+/// callback fan-out runs only after the block is in `finished_blocks_for_cb`,
+/// and the live-surface reset comes last.
+fn render_finalized_block(ctx: FinalizeRenderCtx, block_data: BlockData, args: FinalizedBlockArgs) {
+    let FinalizeRenderCtx {
+        active_rc,
+        active_vte,
+        bstate_rc,
+        typed_cmd_rc,
+        typed_cmd_fidelity_rc,
+        submission_pending_rc,
+        pending_typeahead_rc,
+        bracketed_paste_rc,
+        config_for_cb,
+        dynamic_colors_for_pipeline,
+        block_data_for_cb,
+        failure_marker_redraw,
+        finished_blocks_for_cb,
+        find_state_for_cb,
+        scroll_debouncer,
+        widget_pool_for_cb,
+        pty_synced_rc,
+        visible_indices_rc,
+        pty_for_init,
+        unread_count_rc,
+        jump_fab,
+        selected_block_ids_rc,
+        selected_block_id_rc,
+        selection_anchor_id_rc,
+        bookmarks_for_cb,
+        block_list_rc,
+        block_scroll_rc,
+        block_finished_cbs,
+        ask_ai_cbs,
+        agent_execution_lost_cbs,
+        kitty_assembler_rc,
+        kitty_pending_images_rc,
+        kitty_pending_bytes_rc,
+    } = ctx;
+    let FinalizedBlockArgs {
+        block_id,
+        prompt,
+        cmd,
+        output_with_ansi,
+        output_plain,
+        plain_output_bytes,
+        block_cwd,
+        cols,
+        exit_code,
+        duration_ms,
+        end_time_ms,
+        is_background,
+        mut agent_generation,
+    } = args;
+    // The live surface is about to become a new
+    // finished surface and retention may evict an
+    // old prefix. Reset search while both sides of
+    // that transition are still reachable.
+    find::clear_find_state(
+        find_state_for_cb.as_ref(),
+        finished_blocks_for_cb.as_ref(),
+        &active_vte,
+    );
+    let max_blocks = config_for_cb.borrow().max_visible_blocks as usize;
+    let newest_estimated_bytes = {
+        let images = kitty_pending_images_rc.borrow();
+        estimated_live_finished_block_retained_bytes(
+            &prompt,
+            &cmd,
+            None,
+            &output_with_ansi,
+            &output_plain,
+            block_cwd.as_deref(),
+            cols,
+            &images,
+        )
+    };
+    let prebuild_retention_plan = {
+        let finished = finished_blocks_for_cb.borrow();
+        plan_completed_block_retention_with_newest(
+            &finished,
+            block_id,
+            newest_estimated_bytes,
+            max_blocks,
+        )
+    };
+    log_completed_block_retention("preparing live block", prebuild_retention_plan);
+    evict_finished_block_prefix(
+        prebuild_retention_plan.evict_prefix,
+        &finished_blocks_for_cb,
+        &block_data_for_cb,
+        &block_list_rc,
+        &widget_pool_for_cb,
+        BlockRemovalRefs {
+            selection: BlockSelectionRefs {
+                ids: &selected_block_ids_rc,
+                active: &selected_block_id_rc,
+                anchor: &selection_anchor_id_rc,
+            },
+            bookmarks: &bookmarks_for_cb,
+            visible_indices: &visible_indices_rc,
+            failure_marker_redraw: failure_marker_redraw.as_ref(),
+        },
+    );
+    mutate_block_data_and_redraw(
+        &block_data_for_cb,
+        failure_marker_redraw.as_ref(),
+        |blocks| blocks.push_back(block_data),
+    );
+
+    // Drain the kitty-graphics images decoded during
+    // this command so the finished block mounts them
+    // below its text output. Images are display-only:
+    // BlockData/history stay text-only, so a restored
+    // session simply omits them.
+    let kitty_images: Vec<gtk4::gdk::Texture> =
+        kitty_pending_images_rc.borrow_mut().drain(..).collect();
+    kitty_pending_bytes_rc.set(0);
+
+    let recycled = widget_pool_for_cb.borrow_mut().acquire();
+    let finished = FinishedBlock::new_with_pool(
+        block_id,
+        &prompt,
+        &cmd,
+        None,
+        &output_with_ansi,
+        exit_code,
+        &config_for_cb.borrow(),
+        duration_ms,
+        end_time_ms,
+        block_cwd.as_deref(),
+        cols,
+        &kitty_images,
+        plain_output_bytes,
+        recycled,
+    );
+    // A block finishing after an app recolored the
+    // terminal must not pop in with static theme
+    // colors next to the recolored live VTE.
+    apply_dynamic_colors_to_finished(&finished, dynamic_colors_for_pipeline.get());
+    finished
+        .widget()
+        .insert_before(&block_list_rc, Some(active_rc.borrow().widget()));
+
+    let was_user_scrolled = scroll_debouncer.user_scrolled_up.get();
+
+    // If the user is reading history (scrolled up), this
+    // freshly-finished block is "unread": bump the FAB badge
+    // so they can see work completed below and jump to it.
+    if was_user_scrolled {
+        unread_count_rc.set(unread_count_rc.get().saturating_add(1));
+        set_jump_fab_label(&jump_fab, unread_count_rc.get());
+        jump_fab.set_visible(true);
+    }
+
+    let finished_clone = finished.clone();
+    let finished_widget = finished_clone.widget().clone();
+
+    finished_clone.connect_actions(
+        &active_vte,
+        &pty_for_init,
+        &pty_synced_rc,
+        &active_rc,
+        &typed_cmd_rc,
+        &typed_cmd_fidelity_rc,
+        &submission_pending_rc,
+        &pending_typeahead_rc,
+        &bstate_rc,
+        &bracketed_paste_rc,
+    );
+    finished_clone.connect_scroll_forwarding(&block_scroll_rc);
+
+    finished_blocks_for_cb.borrow_mut().push(finished);
+
+    if !is_background {
+        let output_sample = sample_output_for_event(&output_plain);
+        if agent_generation.is_some() && pty_for_init.foreground_owner() != PtyForeground::Shell {
+            if let Some(generation) = agent_generation.take() {
+                emit_agent_execution_lost(
+                    &agent_execution_lost_cbs,
+                    generation,
+                    "the shell did not own the terminal when the approved command block was finalized",
+                );
+            }
+        }
+        for cb in block_finished_cbs.borrow().iter() {
+            cb(
+                cmd.clone(),
+                exit_code,
+                output_sample.clone(),
+                agent_generation,
+                duration_ms,
+            );
+        }
+    }
+
+    {
+        let cfg = config_for_cb.borrow();
+        if !is_background && cfg.notify_long_blocks {
+            if let Some(ms) = duration_ms {
+                if ms >= cfg.notify_long_block_threshold_ms {
+                    notify_long_block(&cmd, exit_code, ms);
+                }
+            }
+        }
+    }
+
+    // Right-click context menu.
+    install_finished_block_context_menu(FinishedBlockMenuCtx {
+        finished_blocks_for_cb: finished_blocks_for_cb.clone(),
+        block_list_rc: block_list_rc.clone(),
+        active_vte: active_vte.clone(),
+        pty_for_init: pty_for_init.clone(),
+        pty_synced_rc: pty_synced_rc.clone(),
+        active_rc: active_rc.clone(),
+        bstate_rc: bstate_rc.clone(),
+        bracketed_paste_rc: bracketed_paste_rc.clone(),
+        typed_cmd_rc: typed_cmd_rc.clone(),
+        typed_cmd_fidelity_rc: typed_cmd_fidelity_rc.clone(),
+        submission_pending_rc: submission_pending_rc.clone(),
+        pending_typeahead_rc: pending_typeahead_rc.clone(),
+        selected_block_ids_rc: selected_block_ids_rc.clone(),
+        selected_block_id_rc: selected_block_id_rc.clone(),
+        selection_anchor_id_rc: selection_anchor_id_rc.clone(),
+        bookmarks_for_cb: bookmarks_for_cb.clone(),
+        visible_indices_rc: visible_indices_rc.clone(),
+        failure_marker_redraw: failure_marker_redraw.clone(),
+        find_state_for_cb: find_state_for_cb.clone(),
+        ask_ai_cbs: ask_ai_cbs.clone(),
+        block_data_for_cb: block_data_for_cb.clone(),
+        block_scroll_rc: block_scroll_rc.clone(),
+        finished_widget,
+        block_id: finished_clone.id,
+        long_output: finished_clone.long_output,
+    });
+
+    install_finished_block_selection(
+        &finished_clone,
+        &active_rc,
+        &finished_blocks_for_cb,
+        &selected_block_ids_rc,
+        &selected_block_id_rc,
+        &selection_anchor_id_rc,
+    );
+
+    let retention_plan = {
+        let finished = finished_blocks_for_cb.borrow();
+        plan_completed_block_retention_with_restored(&[], &finished, max_blocks)
+    };
+    log_completed_block_retention("finalizing live block", retention_plan);
+    evict_finished_block_prefix(
+        retention_plan.evict_prefix,
+        &finished_blocks_for_cb,
+        &block_data_for_cb,
+        &block_list_rc,
+        &widget_pool_for_cb,
+        BlockRemovalRefs {
+            selection: BlockSelectionRefs {
+                ids: &selected_block_ids_rc,
+                active: &selected_block_id_rc,
+                anchor: &selection_anchor_id_rc,
+            },
+            bookmarks: &bookmarks_for_cb,
+            visible_indices: &visible_indices_rc,
+            failure_marker_redraw: failure_marker_redraw.as_ref(),
+        },
+    );
+
+    let preserve = config_for_cb.borrow().preserve_live_scrollback;
+    active_rc.borrow().reset_active(preserve);
+    // Drop any half-uploaded kitty chunks so they can't
+    // leak into the next command (the finalize above
+    // already drained every completed image).
+    kitty_assembler_rc.borrow_mut().reset();
+    kitty_pending_images_rc.borrow_mut().clear();
+    kitty_pending_bytes_rc.set(0);
+    if !was_user_scrolled {
+        scroll_debouncer.reset_scroll_lock();
+        scroll_debouncer.pin_to_bottom_deferred(&block_scroll_rc);
+    }
+}
+
 impl ReaderCtx {
     fn install(self, pty: &Rc<OwnedPty>) {
         let ReaderCtx {
@@ -3783,738 +4637,73 @@ impl ReaderCtx {
                                     cols: cols.clamp(1, u16::MAX as i64) as u16,
                                 };
 
-                                // The live surface is about to become a new
-                                // finished surface and retention may evict an
-                                // old prefix. Reset search while both sides of
-                                // that transition are still reachable.
-                                find::clear_find_state(
-                                    find_state_for_cb.as_ref(),
-                                    finished_blocks_for_cb.as_ref(),
-                                    &active_vte,
-                                );
-                                let max_blocks = config_for_cb.borrow().max_visible_blocks as usize;
-                                let newest_estimated_bytes = {
-                                    let images = kitty_pending_images_rc.borrow();
-                                    estimated_live_finished_block_retained_bytes(
-                                        &prompt,
-                                        &cmd,
-                                        None,
-                                        &output_with_ansi,
-                                        &output_plain,
-                                        block_cwd.as_deref(),
-                                        cols,
-                                        &images,
-                                    )
+                                // The take is engine-side and conditional: background
+                                // output must not consume the agent identity reserved
+                                // for the foreground command's fan-out. Taking before
+                                // render_finalized_block assumes no synchronous GTK
+                                // handler installed during finalize (eviction unmaps,
+                                // insert_before, connect_actions) queries
+                                // agent_command_active(); such a handler would observe
+                                // None one step earlier than the pre-extraction code.
+                                let agent_generation = if is_background {
+                                    None
+                                } else {
+                                    active_agent_generation_rc.take()
                                 };
-                                let prebuild_retention_plan = {
-                                    let finished = finished_blocks_for_cb.borrow();
-                                    plan_completed_block_retention_with_newest(
-                                        &finished,
+                                render_finalized_block(
+                                    FinalizeRenderCtx {
+                                        active_rc: active_rc.clone(),
+                                        active_vte: active_vte.clone(),
+                                        bstate_rc: bstate_rc.clone(),
+                                        typed_cmd_rc: typed_cmd_rc.clone(),
+                                        typed_cmd_fidelity_rc: typed_cmd_fidelity_rc.clone(),
+                                        submission_pending_rc: submission_pending_rc.clone(),
+                                        pending_typeahead_rc: pending_typeahead_rc.clone(),
+                                        bracketed_paste_rc: bracketed_paste_rc.clone(),
+                                        config_for_cb: config_for_cb.clone(),
+                                        dynamic_colors_for_pipeline: dynamic_colors_for_pipeline
+                                            .clone(),
+                                        block_data_for_cb: block_data_for_cb.clone(),
+                                        failure_marker_redraw: failure_marker_redraw.clone(),
+                                        finished_blocks_for_cb: finished_blocks_for_cb.clone(),
+                                        find_state_for_cb: find_state_for_cb.clone(),
+                                        scroll_debouncer: scroll_debouncer.clone(),
+                                        widget_pool_for_cb: widget_pool_for_cb.clone(),
+                                        pty_synced_rc: pty_synced_rc.clone(),
+                                        visible_indices_rc: visible_indices_rc.clone(),
+                                        pty_for_init: pty_for_init.clone(),
+                                        unread_count_rc: unread_count_rc.clone(),
+                                        jump_fab: jump_fab.clone(),
+                                        selected_block_ids_rc: selected_block_ids_rc.clone(),
+                                        selected_block_id_rc: selected_block_id_rc.clone(),
+                                        selection_anchor_id_rc: selection_anchor_id_rc.clone(),
+                                        bookmarks_for_cb: bookmarks_for_cb.clone(),
+                                        block_list_rc: block_list_rc.clone(),
+                                        block_scroll_rc: block_scroll_rc.clone(),
+                                        block_finished_cbs: block_finished_cbs.clone(),
+                                        ask_ai_cbs: ask_ai_cbs.clone(),
+                                        agent_execution_lost_cbs: agent_execution_lost_cbs.clone(),
+                                        kitty_assembler_rc: kitty_assembler_rc.clone(),
+                                        kitty_pending_images_rc: kitty_pending_images_rc.clone(),
+                                        kitty_pending_bytes_rc: kitty_pending_bytes_rc.clone(),
+                                    },
+                                    block_data,
+                                    FinalizedBlockArgs {
                                         block_id,
-                                        newest_estimated_bytes,
-                                        max_blocks,
-                                    )
-                                };
-                                log_completed_block_retention(
-                                    "preparing live block",
-                                    prebuild_retention_plan,
-                                );
-                                evict_finished_block_prefix(
-                                    prebuild_retention_plan.evict_prefix,
-                                    &finished_blocks_for_cb,
-                                    &block_data_for_cb,
-                                    &block_list_rc,
-                                    &widget_pool_for_cb,
-                                    BlockRemovalRefs {
-                                        selection: BlockSelectionRefs {
-                                            ids: &selected_block_ids_rc,
-                                            active: &selected_block_id_rc,
-                                            anchor: &selection_anchor_id_rc,
-                                        },
-                                        bookmarks: &bookmarks_for_cb,
-                                        visible_indices: &visible_indices_rc,
-                                        failure_marker_redraw: failure_marker_redraw.as_ref(),
+                                        prompt,
+                                        cmd,
+                                        output_with_ansi,
+                                        output_plain,
+                                        plain_output_bytes,
+                                        block_cwd,
+                                        cols,
+                                        exit_code,
+                                        duration_ms,
+                                        end_time_ms,
+                                        is_background,
+                                        agent_generation,
                                     },
                                 );
-                                mutate_block_data_and_redraw(
-                                    &block_data_for_cb,
-                                    failure_marker_redraw.as_ref(),
-                                    |blocks| blocks.push_back(block_data),
-                                );
-
-                                // Drain the kitty-graphics images decoded during
-                                // this command so the finished block mounts them
-                                // below its text output. Images are display-only:
-                                // BlockData/history stay text-only, so a restored
-                                // session simply omits them.
-                                let kitty_images: Vec<gtk4::gdk::Texture> =
-                                    kitty_pending_images_rc.borrow_mut().drain(..).collect();
-                                kitty_pending_bytes_rc.set(0);
-
-                                let recycled = widget_pool_for_cb.borrow_mut().acquire();
-                                let finished = FinishedBlock::new_with_pool(
-                                    block_id,
-                                    &prompt,
-                                    &cmd,
-                                    None,
-                                    &output_with_ansi,
-                                    exit_code,
-                                    &config_for_cb.borrow(),
-                                    duration_ms,
-                                    end_time_ms,
-                                    block_cwd.as_deref(),
-                                    cols,
-                                    &kitty_images,
-                                    plain_output_bytes,
-                                    recycled,
-                                );
-                                // A block finishing after an app recolored the
-                                // terminal must not pop in with static theme
-                                // colors next to the recolored live VTE.
-                                apply_dynamic_colors_to_finished(
-                                    &finished,
-                                    dynamic_colors_for_pipeline.get(),
-                                );
-                                finished.widget().insert_before(
-                                    &block_list_rc,
-                                    Some(active_rc.borrow().widget()),
-                                );
-
-                                let was_user_scrolled = scroll_debouncer.user_scrolled_up.get();
-
-                                // If the user is reading history (scrolled up), this
-                                // freshly-finished block is "unread": bump the FAB badge
-                                // so they can see work completed below and jump to it.
-                                if was_user_scrolled {
-                                    unread_count_rc.set(unread_count_rc.get().saturating_add(1));
-                                    set_jump_fab_label(&jump_fab, unread_count_rc.get());
-                                    jump_fab.set_visible(true);
-                                }
-
-                                let finished_clone = finished.clone();
-                                let finished_widget = finished_clone.widget().clone();
-
-                                finished_clone.connect_actions(
-                                    &active_vte,
-                                    &pty_for_init,
-                                    &pty_synced_rc,
-                                    &active_rc,
-                                    &typed_cmd_rc,
-                                    &typed_cmd_fidelity_rc,
-                                    &submission_pending_rc,
-                                    &pending_typeahead_rc,
-                                    &bstate_rc,
-                                    &bracketed_paste_rc,
-                                );
-                                finished_clone.connect_scroll_forwarding(&block_scroll_rc);
-
-                                finished_blocks_for_cb.borrow_mut().push(finished);
-
-                                if !is_background {
-                                    let output_sample = sample_output_for_event(&output_plain);
-                                    let mut agent_generation = active_agent_generation_rc.take();
-                                    if agent_generation.is_some()
-                                        && pty_for_init.foreground_owner() != PtyForeground::Shell
-                                    {
-                                        if let Some(generation) = agent_generation.take() {
-                                            emit_agent_execution_lost(
-                                                &agent_execution_lost_cbs,
-                                                generation,
-                                                "the shell did not own the terminal when the approved command block was finalized",
-                                            );
-                                        }
-                                    }
-                                    for cb in block_finished_cbs.borrow().iter() {
-                                        cb(
-                                            cmd.clone(),
-                                            exit_code,
-                                            output_sample.clone(),
-                                            agent_generation,
-                                            duration_ms,
-                                        );
-                                    }
-                                }
-
-                                {
-                                    let cfg = config_for_cb.borrow();
-                                    if !is_background && cfg.notify_long_blocks {
-                                        if let Some(ms) = duration_ms {
-                                            if ms >= cfg.notify_long_block_threshold_ms {
-                                                notify_long_block(&cmd, exit_code, ms);
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Right-click context menu.
-                                let finished_blocks_for_menu =
-                                    Rc::downgrade(&finished_blocks_for_cb);
-                                let block_list_for_menu = block_list_rc.downgrade();
-                                let vte_for_copy = active_vte.downgrade();
-                                let pty_for_rerun_menu = pty_for_init.clone();
-                                let pty_synced_for_rerun_menu = pty_synced_rc.clone();
-                                let active_for_rerun_menu = Rc::downgrade(&active_rc);
-                                let bstate_for_rerun_menu = bstate_rc.clone();
-                                let bracketed_paste_for_menu = bracketed_paste_rc.clone();
-                                let typed_cmd_for_rerun_menu = typed_cmd_rc.clone();
-                                let typed_cmd_fidelity_for_rerun_menu =
-                                    typed_cmd_fidelity_rc.clone();
-                                let submission_pending_for_rerun_menu =
-                                    submission_pending_rc.clone();
-                                let pending_typeahead_for_rerun_menu = pending_typeahead_rc.clone();
-                                let selected_ids_for_menu = selected_block_ids_rc.clone();
-                                let selected_for_menu = selected_block_id_rc.clone();
-                                let anchor_for_menu = selection_anchor_id_rc.clone();
-                                let bookmarks_for_menu = bookmarks_for_cb.clone();
-                                let visible_for_menu = visible_indices_rc.clone();
-                                let failure_marker_redraw_for_menu = failure_marker_redraw.clone();
-                                let find_state_for_menu = find_state_for_cb.clone();
-                                let ask_ai_cbs_for_menu = ask_ai_cbs.clone();
-                                let block_id = finished_clone.id;
-
-                                let right_click = gtk4::GestureClick::new();
-                                right_click.set_button(3);
-
-                                let finished_widget_for_menu = finished_widget.downgrade();
-                                let long_output_for_menu = finished_clone.long_output;
-                                let block_data_for_export = block_data_for_cb.clone();
-                                let block_scroll_for_menu = block_scroll_rc.downgrade();
-                                right_click.connect_pressed(move |gesture, _n_press, x, y| {
-                                    let Some(finished_blocks) = finished_blocks_for_menu.upgrade()
-                                    else {
-                                        return;
-                                    };
-                                    let Some(vte_for_copy) = vte_for_copy.upgrade() else {
-                                        return;
-                                    };
-                                    let Some(finished_widget) = finished_widget_for_menu.upgrade()
-                                    else {
-                                        return;
-                                    };
-                                    gesture.set_state(gtk4::EventSequenceState::Claimed);
-                                    {
-                                        let finished = finished_blocks.borrow();
-                                        clear_vte_text_selections(&finished, &vte_for_copy);
-                                        activate_finished_block_selection(
-                                            &finished,
-                                            &selected_ids_for_menu,
-                                            &selected_for_menu,
-                                            &anchor_for_menu,
-                                            block_id,
-                                        );
-                                    }
-
-                                    let popover = gtk4::Popover::new();
-                                    popover.set_parent(&finished_widget);
-                                    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
-                                        x as i32, y as i32, 1, 1,
-                                    )));
-                                    popover.set_has_arrow(false);
-
-                                    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-                                    vbox.add_css_class("menu");
-
-                                    let make_item = |label: &str| -> gtk4::Button {
-                                        let btn = gtk4::Button::with_label(label);
-                                        btn.set_has_frame(false);
-                                        btn.set_halign(gtk4::Align::Fill);
-                                        if let Some(child) = btn.child() {
-                                            child.set_halign(gtk4::Align::Start);
-                                        }
-                                        btn.add_css_class("flat");
-                                        btn
-                                    };
-
-                                    let selected_count = selected_ids_for_menu.borrow().len();
-                                    let has_selected_commands = {
-                                        let selected = selected_ids_for_menu.borrow();
-                                        block_data_for_export.borrow().iter().any(|block| {
-                                            selected.contains(&block.id)
-                                                && !block.cmd.trim().is_empty()
-                                        })
-                                    };
-
-                                    if has_selected_commands {
-                                        let item = make_item(if selected_count > 1 {
-                                            "Copy Commands"
-                                        } else {
-                                            "Copy Command"
-                                        });
-                                        let popover_c = popover.downgrade();
-                                        let block_data_for_copy = block_data_for_export.clone();
-                                        let selected_ids_for_copy = selected_ids_for_menu.clone();
-                                        let vte_for_action = vte_for_copy.downgrade();
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let Some(vte_for_action) = vte_for_action.upgrade()
-                                            else {
-                                                return;
-                                            };
-                                            let selected = selected_ids_for_copy.borrow();
-                                            let blocks = block_data_for_copy.borrow();
-                                            let text = selected_command_text(
-                                                blocks
-                                                    .iter()
-                                                    .map(|block| (block.id, block.cmd.as_str())),
-                                                &selected,
-                                            );
-                                            vte_for_action.clipboard().set_text(&text);
-                                        });
-                                        vbox.append(&item);
-                                    }
-
-                                    {
-                                        let item = make_item("Ask AI About Block");
-                                        let popover_c = popover.downgrade();
-                                        let finished_for_ai = Rc::downgrade(&finished_blocks);
-                                        let block_data_for_ai = block_data_for_export.clone();
-                                        let callbacks_for_ai = ask_ai_cbs_for_menu.clone();
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let Some(finished_for_ai) = finished_for_ai.upgrade()
-                                            else {
-                                                return;
-                                            };
-                                            let finished = finished_for_ai.borrow();
-                                            let data = block_data_for_ai.borrow();
-                                            let Some(context) = block_context_for_id(
-                                                &finished, &data, block_id, 80,
-                                            ) else {
-                                                return;
-                                            };
-                                            for callback in callbacks_for_ai.borrow().iter() {
-                                                callback(context.clone());
-                                            }
-                                        });
-                                        vbox.append(&item);
-                                    }
-
-                                    {
-                                        let item = make_item(if selected_count > 1 {
-                                            "Copy Outputs"
-                                        } else {
-                                            "Copy Output"
-                                        });
-                                        let popover_c = popover.downgrade();
-                                        let block_data_for_copy = block_data_for_export.clone();
-                                        let selected_ids_for_copy = selected_ids_for_menu.clone();
-                                        let vte_for_action = vte_for_copy.downgrade();
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let Some(vte_for_action) = vte_for_action.upgrade()
-                                            else {
-                                                return;
-                                            };
-                                            let selected = selected_ids_for_copy.borrow();
-                                            let blocks = block_data_for_copy.borrow();
-                                            let text = selected_clipboard_text(
-                                                blocks.iter(),
-                                                &selected,
-                                                |block, output| output.append(&block.output),
-                                            );
-                                            publish_bounded_clipboard(&vte_for_action, text);
-                                        });
-                                        vbox.append(&item);
-                                    }
-
-                                    {
-                                        let item = make_item(if selected_count > 1 {
-                                            "Copy Blocks"
-                                        } else {
-                                            "Copy Block"
-                                        });
-                                        let popover_c = popover.downgrade();
-                                        let block_data_for_copy = block_data_for_export.clone();
-                                        let selected_ids_for_copy = selected_ids_for_menu.clone();
-                                        let vte_for_action = vte_for_copy.downgrade();
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let Some(vte_for_action) = vte_for_action.upgrade()
-                                            else {
-                                                return;
-                                            };
-                                            let selected = selected_ids_for_copy.borrow();
-                                            let blocks = block_data_for_copy.borrow();
-                                            let text = selected_clipboard_text(
-                                                blocks.iter(),
-                                                &selected,
-                                                |block, output| {
-                                                    append_block_clipboard_text(
-                                                        output,
-                                                        &block.cmd,
-                                                        &block.output,
-                                                        false,
-                                                    )
-                                                },
-                                            );
-                                            publish_bounded_clipboard(&vte_for_action, text);
-                                        });
-                                        vbox.append(&item);
-                                    }
-
-                                    {
-                                        let item = make_item(if selected_count > 1 {
-                                            "Copy Blocks as Markdown"
-                                        } else {
-                                            "Copy Block as Markdown"
-                                        });
-                                        let popover_c = popover.downgrade();
-                                        let block_data_for_copy = block_data_for_export.clone();
-                                        let selected_ids_for_copy = selected_ids_for_menu.clone();
-                                        let vte_for_action = vte_for_copy.downgrade();
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let Some(vte_for_action) = vte_for_action.upgrade()
-                                            else {
-                                                return;
-                                            };
-                                            let selected = selected_ids_for_copy.borrow();
-                                            let blocks = block_data_for_copy.borrow();
-                                            let text = selected_blocks_markdown(
-                                                blocks.iter(),
-                                                &selected,
-                                                block_id,
-                                            );
-                                            publish_bounded_clipboard(&vte_for_action, text);
-                                        });
-                                        vbox.append(&item);
-                                    }
-
-                                    if has_selected_commands {
-                                        let item = make_item(if selected_count > 1 {
-                                            "Insert Commands at Prompt"
-                                        } else {
-                                            "Insert Command at Prompt"
-                                        });
-                                        let popover_c = popover.downgrade();
-                                        let finished_for_rerun = finished_blocks_for_menu.clone();
-                                        let selected_ids_for_rerun = selected_ids_for_menu.clone();
-                                        let selected_for_rerun = selected_for_menu.clone();
-                                        let anchor_for_rerun = anchor_for_menu.clone();
-                                        let pty_for_action = pty_for_rerun_menu.clone();
-                                        let pty_synced_for_action =
-                                            pty_synced_for_rerun_menu.clone();
-                                        let bracketed_for_action = bracketed_paste_for_menu.clone();
-                                        let typed_cmd_for_action = typed_cmd_for_rerun_menu.clone();
-                                        let typed_cmd_fidelity_for_action =
-                                            typed_cmd_fidelity_for_rerun_menu.clone();
-                                        let submission_pending_for_action =
-                                            submission_pending_for_rerun_menu.clone();
-                                        let pending_typeahead_for_action =
-                                            pending_typeahead_for_rerun_menu.clone();
-                                        let bstate_for_action = bstate_for_rerun_menu.clone();
-                                        let active_for_action = active_for_rerun_menu.clone();
-                                        item.set_sensitive(command_recall_available(
-                                            bstate_for_rerun_menu.get(),
-                                        ));
-                                        item.set_tooltip_text(Some(
-                                            "Available when the shell prompt is ready",
-                                        ));
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let Some(finished_for_rerun) =
-                                                finished_for_rerun.upgrade()
-                                            else {
-                                                return;
-                                            };
-                                            let finished = finished_for_rerun.borrow();
-                                            let recalled = {
-                                                let selected = selected_ids_for_rerun.borrow();
-                                                recall_selected_commands_at_prompt(
-                                                    PromptRecallCtx {
-                                                        pty: &pty_for_action,
-                                                        pty_synced: &pty_synced_for_action,
-                                                        typed_cmd: &typed_cmd_for_action,
-                                                        typed_cmd_fidelity:
-                                                            &typed_cmd_fidelity_for_action,
-                                                        submission_pending:
-                                                            &submission_pending_for_action,
-                                                        pending_typeahead:
-                                                            &pending_typeahead_for_action,
-                                                    },
-                                                    bstate_for_action.get(),
-                                                    &finished,
-                                                    &selected,
-                                                    bracketed_for_action.get(),
-                                                )
-                                            };
-                                            if recalled {
-                                                clear_finished_block_selection(
-                                                    &finished,
-                                                    &selected_ids_for_rerun,
-                                                    &selected_for_rerun,
-                                                    &anchor_for_rerun,
-                                                );
-                                                if let Some(active_for_action) =
-                                                    active_for_action.upgrade()
-                                                {
-                                                    active_for_action.borrow().grab_focus();
-                                                }
-                                            }
-                                        });
-                                        vbox.append(&item);
-                                    }
-
-                                    {
-                                        let item = make_item("Scroll to Top of Block");
-                                        let popover_c = popover.downgrade();
-                                        let finished = finished_blocks_for_menu.clone();
-                                        let scroll = block_scroll_for_menu.clone();
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let (Some(finished), Some(scroll)) =
-                                                (finished.upgrade(), scroll.upgrade())
-                                            else {
-                                                return;
-                                            };
-                                            let finished = finished.borrow();
-                                            if let Some(block) =
-                                                finished.iter().find(|b| b.id == block_id)
-                                            {
-                                                block.scroll_to_edge(&scroll, false);
-                                            }
-                                        });
-                                        vbox.append(&item);
-                                    }
-                                    if long_output_for_menu {
-                                        let item = make_item("Jump to Bottom of Block");
-                                        let popover_c = popover.downgrade();
-                                        let finished = finished_blocks_for_menu.clone();
-                                        let scroll = block_scroll_for_menu.clone();
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let (Some(finished), Some(scroll)) =
-                                                (finished.upgrade(), scroll.upgrade())
-                                            else {
-                                                return;
-                                            };
-                                            let finished = finished.borrow();
-                                            if let Some(block) =
-                                                finished.iter().find(|b| b.id == block_id)
-                                            {
-                                                block.scroll_to_edge(&scroll, true);
-                                            }
-                                        });
-                                        vbox.append(&item);
-                                    }
-                                    {
-                                        let item = make_item("Toggle Output Filter");
-                                        let popover_c = popover.downgrade();
-                                        let finished = finished_blocks_for_menu.clone();
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let Some(finished) = finished.upgrade() else {
-                                                return;
-                                            };
-                                            let finished = finished.borrow();
-                                            if let Some(block) =
-                                                finished.iter().find(|b| b.id == block_id)
-                                            {
-                                                (block.toggle_filter)();
-                                            }
-                                        });
-                                        vbox.append(&item);
-                                    }
-                                    {
-                                        let bookmarked =
-                                            bookmarks_for_menu.borrow().contains(&block_id);
-                                        let item = make_item(if bookmarked {
-                                            "Remove Bookmark"
-                                        } else {
-                                            "Bookmark Block"
-                                        });
-                                        let popover_c = popover.downgrade();
-                                        let finished = finished_blocks_for_menu.clone();
-                                        let bookmarks = bookmarks_for_menu.clone();
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let Some(finished) = finished.upgrade() else {
-                                                return;
-                                            };
-                                            let finished = finished.borrow();
-                                            let Some(block) =
-                                                finished.iter().find(|b| b.id == block_id)
-                                            else {
-                                                return;
-                                            };
-                                            let mut marks = bookmarks.borrow_mut();
-                                            let now_bookmarked = if marks.remove(&block_id) {
-                                                false
-                                            } else {
-                                                marks.insert(block_id);
-                                                true
-                                            };
-                                            block.bookmark_star.set_visible(now_bookmarked);
-                                            if now_bookmarked {
-                                                block.widget().add_css_class("block-bookmarked");
-                                            } else {
-                                                block.widget().remove_css_class("block-bookmarked");
-                                            }
-                                        });
-                                        vbox.append(&item);
-                                    }
-
-                                    let separator =
-                                        gtk4::Separator::new(gtk4::Orientation::Horizontal);
-                                    vbox.append(&separator);
-
-                                    {
-                                        let item = make_item("Export as JSON");
-                                        let popover_c = popover.downgrade();
-                                        let block_data_for_json = block_data_for_export.clone();
-                                        let vte_for_json = vte_for_copy.downgrade();
-                                        let block_id_json = block_id;
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let Some(vte_for_json) = vte_for_json.upgrade() else {
-                                                return;
-                                            };
-                                            let blocks = block_data_for_json.borrow();
-                                            if let Some(block) =
-                                                blocks.iter().find(|b| b.id == block_id_json)
-                                            {
-                                                let json = block.to_json();
-                                                vte_for_json.clipboard().set_text(&json);
-                                            }
-                                        });
-                                        vbox.append(&item);
-                                    }
-
-                                    {
-                                        let item = make_item("Export as Markdown");
-                                        let popover_c = popover.downgrade();
-                                        let block_data_for_md = block_data_for_export.clone();
-                                        let vte_for_md = vte_for_copy.downgrade();
-                                        let block_id_md = block_id;
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let Some(vte_for_md) = vte_for_md.upgrade() else {
-                                                return;
-                                            };
-                                            let blocks = block_data_for_md.borrow();
-                                            if let Some(block) =
-                                                blocks.iter().find(|b| b.id == block_id_md)
-                                            {
-                                                publish_bounded_clipboard(
-                                                    &vte_for_md,
-                                                    block_markdown(block),
-                                                );
-                                            }
-                                        });
-                                        vbox.append(&item);
-                                    }
-
-                                    {
-                                        let item = make_item("Delete Block");
-                                        let popover_c = popover.downgrade();
-                                        let finished_blocks_for_delete =
-                                            finished_blocks_for_menu.clone();
-                                        let block_list_for_delete = block_list_for_menu.clone();
-                                        let block_data_for_delete = block_data_for_export.clone();
-                                        let selected_ids_for_delete = selected_ids_for_menu.clone();
-                                        let selected_for_delete = selected_for_menu.clone();
-                                        let anchor_for_delete = anchor_for_menu.clone();
-                                        let bookmarks_for_delete = bookmarks_for_menu.clone();
-                                        let visible_for_delete = visible_for_menu.clone();
-                                        let failure_marker_redraw_for_delete =
-                                            failure_marker_redraw_for_menu.clone();
-                                        let find_state_for_delete = find_state_for_menu.clone();
-                                        let active_vte_for_delete = vte_for_copy.clone();
-                                        let block_id_del = block_id;
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let (
-                                                Some(finished_blocks_for_delete),
-                                                Some(block_list_for_delete),
-                                            ) = (
-                                                finished_blocks_for_delete.upgrade(),
-                                                block_list_for_delete.upgrade(),
-                                            )
-                                            else {
-                                                return;
-                                            };
-                                            let _ = remove_finished_block(
-                                                block_id_del,
-                                                &finished_blocks_for_delete,
-                                                &block_data_for_delete,
-                                                &block_list_for_delete,
-                                                &find_state_for_delete,
-                                                &active_vte_for_delete,
-                                                BlockRemovalRefs {
-                                                    selection: BlockSelectionRefs {
-                                                        ids: &selected_ids_for_delete,
-                                                        active: &selected_for_delete,
-                                                        anchor: &anchor_for_delete,
-                                                    },
-                                                    bookmarks: &bookmarks_for_delete,
-                                                    visible_indices: &visible_for_delete,
-                                                    failure_marker_redraw:
-                                                        failure_marker_redraw_for_delete.as_ref(),
-                                                },
-                                            );
-                                        });
-                                        vbox.append(&item);
-                                    }
-
-                                    popover.set_child(Some(&vbox));
-                                    popover.connect_closed(move |p| {
-                                        p.unparent();
-                                    });
-                                    popover.popup();
-                                });
-                                finished_widget.add_controller(right_click);
-
-                                install_finished_block_selection(
-                                    &finished_clone,
-                                    &active_rc,
-                                    &finished_blocks_for_cb,
-                                    &selected_block_ids_rc,
-                                    &selected_block_id_rc,
-                                    &selection_anchor_id_rc,
-                                );
-
-                                let retention_plan = {
-                                    let finished = finished_blocks_for_cb.borrow();
-                                    plan_completed_block_retention_with_restored(
-                                        &[],
-                                        &finished,
-                                        max_blocks,
-                                    )
-                                };
-                                log_completed_block_retention(
-                                    "finalizing live block",
-                                    retention_plan,
-                                );
-                                evict_finished_block_prefix(
-                                    retention_plan.evict_prefix,
-                                    &finished_blocks_for_cb,
-                                    &block_data_for_cb,
-                                    &block_list_rc,
-                                    &widget_pool_for_cb,
-                                    BlockRemovalRefs {
-                                        selection: BlockSelectionRefs {
-                                            ids: &selected_block_ids_rc,
-                                            active: &selected_block_id_rc,
-                                            anchor: &selection_anchor_id_rc,
-                                        },
-                                        bookmarks: &bookmarks_for_cb,
-                                        visible_indices: &visible_indices_rc,
-                                        failure_marker_redraw: failure_marker_redraw.as_ref(),
-                                    },
-                                );
-
-                                let preserve = config_for_cb.borrow().preserve_live_scrollback;
-                                active_rc.borrow().reset_active(preserve);
-                                // Drop any half-uploaded kitty chunks so they can't
-                                // leak into the next command (the finalize above
-                                // already drained every completed image).
-                                kitty_assembler_rc.borrow_mut().reset();
-                                kitty_pending_images_rc.borrow_mut().clear();
-                                kitty_pending_bytes_rc.set(0);
-                                if !was_user_scrolled {
-                                    scroll_debouncer.reset_scroll_lock();
-                                    scroll_debouncer.pin_to_bottom_deferred(&block_scroll_rc);
-                                }
                             }
                             bstate_rc.set(BlockState::CollectingPrompt);
                             prompt_buf_rc.borrow_mut().clear();
