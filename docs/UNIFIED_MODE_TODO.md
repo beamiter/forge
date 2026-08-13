@@ -16,7 +16,7 @@
 - [x] **`finalize_block` 签名瘦身**。引擎只构造 `CompletedCommandRecord`；Block 通过 memoized 惰性访问器物化渲染负载，Unified metadata-only 路径不读取输出。journal 与 Agent/output observer 也先做 capability/interest 判断。
 - [x] **A→C 标记注入器**。128-bit pane nonce、全局 zone id、每次 live feed 重申、C 后无条件 close、idle A 复用及 pre/post-C alt-screen 恢复均已接线；注入字节不进入 prompt/output capture。
 - [x] **探针驱动的 chrome（功能核心）**。严格校验 canonical URI + nonce + active authority；逐可见行一次探针，可信 predecessor span 可从长 zone 中段续画；gutter/分隔线/completed badge 与宽字符安全的空白检测已落地。真实 VTE 证明 `check_hyperlink_at` 接受 widget 坐标，因此探针使用 content origin + cell center，不能预先减 CSS padding。行坐标只由可见 canonical marker 校准，无法证明时 fail closed。
-- [ ] **chrome 性能/resize 验收**。已有 Xvfb 的 non-bottom anchor、rewrap marker、bounded-ring trim+CUP 与宽字符回归；仍需正式记录滚动 p95，并补完整 overlay 在 resize/rewrap 后的人工/性能验收。
+- [x] **chrome 性能/resize 验收**。`FORGE_UNIFIED_CHROME_STATS` 门控的 draw 计时（Drop guard 覆盖所有 early-return 出口）实测：70 zone、21 可见行、Xvfb 软渲染下滚动 p95 = 328-377µs/draw（p50 243-315µs，max<600µs），约为 60fps 帧预算 2%；探针 O(可见行) 线性，更高窗口无风险。列宽变化（侧栏切换往返）无错位残留：jsh 收到 SIGWINCH 重绘 prompt 即触发 idle-A 复用，chrome 立即重新标定，无需等下一条命令。VTE 0.58+ 的 `rewrap-on-resize` 已废弃恒为 TRUE。发现两个非 chrome 缺陷的边缘：见下。
 - [x] **marker authority 上限与安全淘汰**。pending 也计入硬上限 256，并同时服从更小的 `max_visible_blocks`；ED3 仅退休已证明完整位于 live grid 上方的 completed span，RIS 全清 authority，natural trim/rewrap/config resize 经 row epoch + quarantine 硬门失效。旧 URI、空白探针或晚到 completion 均不能复活已淘汰 authority。
 - [ ] **超限 zone 的快照寻址**。metadata 记录仍可供 palette/export/filter 使用，但 marker authority 退役后精确跳转目前 fail closed；尚未保存 bounded per-zone 输出快照。
 
@@ -30,7 +30,8 @@
 - [ ] inline 卡片安置：当前在 Unified 下诚实拒绝（agent/correction/palette 卡片）。设计方案是底部**占位**停靠区（VTE 的垂直兄弟节点，开关各触发一次 SIGWINCH），不是覆盖层——覆盖会精确遮住用户正在盯的 prompt 行。
 - [ ] organism：`ascii_organism_enabled` + `OrganismMotion::Static` 组合下 Unified 无任何 organism 表面（卡片是它在该组合下的唯一载体）。需要在停靠区设计里给它位置。
 - [ ] sticky 运行头 / jump FAB：Unified 下已不可达（1a 发现它此前只是借了卡片撑开的外层滚动条，属意外而非特性）。需要在覆盖层设计里重新接线。
-- [ ] jsh 启动噪音：Block 的每-prompt 清屏顺手吞掉了它，Unified 不清屏所以会永久留在屏上。判断是否需要 shell 侧或首-prompt 侧处理。
+- [ ] badge/分隔线头行归因边缘：^C 中断的 prompt 或带 ghost 建议的多行 prompt 经 idle-A 复用重绘后，相邻 zone 的 marker 首格可不落在 CWD 行，badge/分隔线随之下移 1-2 行（验收实测，非破坏、fail-visible）。修复方向：注入器在 idle 重申时把重开位置钉回 zone 首行，或 head 归因对"URI 首行是输出行"做 CWD-行回溯校验。
+- [ ] jsh 启动噪音：Block 的每-prompt 清屏顺手吞掉了它，Unified 不清屏所以会永久留在屏上。判断是否需要 shell 侧或首-prompt 侧处理。另两个验收实测的 shell 侧现象一并考虑：SIGWINCH 重绘按 rewrap 前行数向上定位，会覆盖 rewrap 后的输出尾行；prompt 处滚轮被 jsh 鼠标上报吃掉（历史导航而非滚动视口，Shift+滚轮/Ctrl+Up 可绕过）。
 - [ ] kitty 图片：当前 Unified 答 `ENOTSUP`（解析即弃）。v2 可用探针行锚定 overlay `Picture`。
 
 ## P2 · anvil 镜像

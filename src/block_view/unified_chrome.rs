@@ -24,6 +24,69 @@ const MAX_CACHED_HEADS: usize = 512;
 /// Include the currently-open prompt in this hard cap so a shell that keeps
 /// opening zones cannot grow the authority table independently of records.
 const MAX_ACTIVE_ZONE_MARKERS: usize = 256;
+const DRAW_STATS_WINDOW: usize = 120;
+
+/// Opt-in draw timing, enabled by setting `FORGE_UNIFIED_CHROME_STATS`.
+/// Chrome has no frame budget of its own — it rides VTE's draw — so the
+/// honest scroll cost is the full draw-func duration, early-out frames
+/// included. Disabled means no `DrawStats` exists and the draw path only
+/// pays one `Option` check per frame.
+struct DrawStats {
+    samples_us: RefCell<Vec<u32>>,
+    draws: Cell<u64>,
+}
+
+impl DrawStats {
+    fn from_env() -> Option<Rc<DrawStats>> {
+        std::env::var_os("FORGE_UNIFIED_CHROME_STATS").map(|_| {
+            Rc::new(DrawStats {
+                samples_us: RefCell::new(Vec::with_capacity(DRAW_STATS_WINDOW)),
+                draws: Cell::new(0),
+            })
+        })
+    }
+
+    fn record(&self, elapsed: std::time::Duration) {
+        let mut samples = self.samples_us.borrow_mut();
+        samples.push(elapsed.as_micros().min(u128::from(u32::MAX)) as u32);
+        self.draws.set(self.draws.get().wrapping_add(1));
+        if samples.len() < DRAW_STATS_WINDOW {
+            return;
+        }
+        samples.sort_unstable();
+        log::info!(
+            "unified chrome draw stats: draws={} window={} p50_us={} p95_us={} max_us={}",
+            self.draws.get(),
+            samples.len(),
+            percentile_us(&samples, 50.0),
+            percentile_us(&samples, 95.0),
+            samples.last().copied().unwrap_or(0),
+        );
+        samples.clear();
+    }
+}
+
+/// Records on drop so every early `return` in the draw func is counted;
+/// skipping cheap frames would overstate the percentile.
+struct DrawTimerGuard {
+    stats: Rc<DrawStats>,
+    start: std::time::Instant,
+}
+
+impl Drop for DrawTimerGuard {
+    fn drop(&mut self) {
+        self.stats.record(self.start.elapsed());
+    }
+}
+
+/// Nearest-rank percentile over an ascending-sorted, non-empty window.
+fn percentile_us(sorted: &[u32], pct: f64) -> u32 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = ((pct / 100.0) * sorted.len() as f64).ceil() as usize;
+    sorted[rank.clamp(1, sorted.len()) - 1]
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ZoneRowSpan {
@@ -748,7 +811,12 @@ impl UnifiedChrome {
         let projection_for_draw = projection.clone();
         let calibration_anchor_for_draw = calibration_anchor.clone();
         let row_epoch_for_draw = row_epoch.clone();
+        let draw_stats = DrawStats::from_env();
         surface.set_draw_func(move |_area, cr, width, height| {
+            let _draw_timer = draw_stats.as_ref().map(|stats| DrawTimerGuard {
+                stats: stats.clone(),
+                start: std::time::Instant::now(),
+            });
             if width <= 0 || height <= 0 {
                 return;
             }
@@ -1248,6 +1316,17 @@ mod tests {
     use super::*;
 
     const NONCE: [u8; 16] = [0xab; 16];
+
+    #[test]
+    fn draw_stats_percentile_uses_nearest_rank_on_the_sorted_window() {
+        assert_eq!(percentile_us(&[], 95.0), 0);
+        assert_eq!(percentile_us(&[7], 50.0), 7);
+        assert_eq!(percentile_us(&[7], 95.0), 7);
+        let window: Vec<u32> = (1..=100).collect();
+        assert_eq!(percentile_us(&window, 50.0), 50);
+        assert_eq!(percentile_us(&window, 95.0), 95);
+        assert_eq!(percentile_us(&window, 100.0), 100);
+    }
 
     fn uri(id: u64) -> String {
         format!("block://abababababababababababababababab/{id}")
