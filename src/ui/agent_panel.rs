@@ -2211,7 +2211,7 @@ impl UiState {
 
         let target_weak = Rc::downgrade(target);
         let slot = self.agent_session.clone();
-        target.connect_block_finished(
+        target.connect_block_finished_with_output(
             move |command, exit_code, output, agent_generation, _duration_ms| {
                 let Some(target) = target_weak.upgrade() else {
                     return;

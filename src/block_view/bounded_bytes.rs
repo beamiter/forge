@@ -75,6 +75,15 @@ impl BoundedByteRing {
         let bytes = std::mem::take(&mut self.bytes);
         bytes.into_iter().collect()
     }
+
+    /// Move the retained ring into a new owner without copying its byte
+    /// storage, leaving this capture ready to accept the next stream.
+    pub(super) fn take_ring(&mut self) -> Self {
+        Self {
+            bytes: std::mem::take(&mut self.bytes),
+            limit: self.limit,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -128,6 +137,10 @@ mod tests {
 
         ring.append(b"34567");
         assert_eq!(ring.to_vec(), b"4567");
+
+        let mut moved = ring.take_ring();
+        assert!(ring.is_empty());
+        assert_eq!(moved.make_contiguous(), b"4567");
     }
 
     #[test]

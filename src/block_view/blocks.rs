@@ -2650,6 +2650,9 @@ pub(crate) struct ActiveBlock {
     /// remains the overlay's measured child, and the scrollbar is stacked
     /// above this surface so an organism can never make it unreachable.
     pub(crate) live_organism_surface: gtk4::Fixed,
+    /// Pass-through, non-measuring chrome overlay used only by Unified mode.
+    /// It exists (hidden) in Block mode so the widget tree stays mode-neutral.
+    pub(crate) unified_chrome_surface: gtk4::DrawingArea,
     /// Slim overlay scrollbar bound to the live VTE's own adjustment, so the
     /// still-running command's scrollback is visibly navigable. An overlay —
     /// not a sibling like the finished-block scrollbar — because appearing
@@ -2707,6 +2710,18 @@ impl ActiveBlock {
         vte_overlay.set_measure_overlay(&live_organism_surface, false);
         vte_overlay.set_clip_overlay(&live_organism_surface, true);
 
+        let unified_chrome_surface = gtk4::DrawingArea::new();
+        unified_chrome_surface.set_hexpand(true);
+        unified_chrome_surface.set_vexpand(true);
+        unified_chrome_surface.set_halign(gtk4::Align::Fill);
+        unified_chrome_surface.set_valign(gtk4::Align::Fill);
+        unified_chrome_surface.set_can_target(false);
+        unified_chrome_surface.set_focusable(false);
+        unified_chrome_surface.set_visible(false);
+        vte_overlay.add_overlay(&unified_chrome_surface);
+        vte_overlay.set_measure_overlay(&unified_chrome_surface, false);
+        vte_overlay.set_clip_overlay(&unified_chrome_surface, true);
+
         let live_scrollbar =
             gtk4::Scrollbar::new(Orientation::Vertical, active_vte.vadjustment().as_ref());
         live_scrollbar.add_css_class("block-output-scrollbar");
@@ -2743,6 +2758,7 @@ impl ActiveBlock {
             widget,
             active_vte,
             live_organism_surface,
+            unified_chrome_surface,
             live_scrollbar,
             live_organism_visible: Cell::new(false),
             live_organism_alt_screen: Cell::new(false),

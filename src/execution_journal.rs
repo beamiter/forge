@@ -353,7 +353,13 @@ pub fn flush(timeout: std::time::Duration) -> bool {
         .is_ok()
 }
 
-fn enabled() -> bool {
+/// Whether a terminal output producer has a journal consumer to serve.
+///
+/// Callers which hold output lazily use this capability before constructing a
+/// snapshot. `submit` repeats the check at the queue boundary because the
+/// environment can change between the two calls (and because direct callers
+/// must remain safe on their own).
+pub(crate) fn output_capture_enabled() -> bool {
     std::env::var("JSH_EXECUTION_JOURNAL")
         .ok()
         .map(|value| {
@@ -363,6 +369,10 @@ fn enabled() -> bool {
             )
         })
         .unwrap_or(true)
+}
+
+fn enabled() -> bool {
+    output_capture_enabled()
 }
 
 fn unix_time_ms() -> u64 {

@@ -9,7 +9,7 @@ use vte4::Terminal;
 use vte4::TerminalExt;
 
 use super::*;
-use crate::block_view::{SessionExportFormat, TermView};
+use crate::block_view::{RecordNavigationResult, SessionExportFormat, TermView};
 use crate::keybindings::{Action, Direction};
 use crate::terminal::terminal_working_directory;
 
@@ -56,6 +56,15 @@ fn remote_host_index_for_action(
     Ok(index)
 }
 
+fn record_navigation_toast(result: RecordNavigationResult) -> Option<&'static str> {
+    match result {
+        RecordNavigationResult::LocationUnavailable => Some(
+            "Unified mode can identify matching records, but exact record locations aren't available yet.",
+        ),
+        RecordNavigationResult::Navigated | RecordNavigationResult::NoMatchingRecord => None,
+    }
+}
+
 impl UiState {
     /// Hotkey path for opacity: apply to the window, write through to the
     /// config (same persistence as the settings dialog, so the value survives
@@ -84,6 +93,12 @@ impl UiState {
         });
         *self.opacity_toast.borrow_mut() = Some(toast.clone());
         self.toast_overlay.add_toast(toast);
+    }
+
+    fn report_record_navigation(&self, result: RecordNavigationResult) {
+        if let Some(message) = record_navigation_toast(result) {
+            self.toast_overlay.add_toast(adw::Toast::new(message));
+        }
     }
 
     pub(crate) fn execute_action(&self, action: Action) {
@@ -311,13 +326,13 @@ impl UiState {
             Action::FilterFailedBlocks => {
                 log::info!("Jump to first failed block");
                 if let Some(term_view) = self.current_term_view() {
-                    term_view.apply_failed_filter();
+                    self.report_record_navigation(term_view.apply_failed_filter());
                 }
             }
             Action::FilterSlowBlocks => {
                 log::info!("Jump to first slow block");
                 if let Some(term_view) = self.current_term_view() {
-                    term_view.apply_slow_filter();
+                    self.report_record_navigation(term_view.apply_slow_filter());
                 }
             }
             Action::FilterPinnedBlocks => {
@@ -348,7 +363,7 @@ impl UiState {
                             "Cleared {count} block{plural} — \"Undo clear blocks\" restores them."
                         );
                         self.toast_overlay.add_toast(adw::Toast::new(&message));
-                    } else if term_view.is_unified() {
+                    } else if !term_view.supports_block_mutation() {
                         // In Block, "nothing to clear" is self-evident from an
                         // empty pane. In Unified the pane is full of output
                         // that this action will never touch, so silence reads
@@ -390,12 +405,12 @@ impl UiState {
             }
             Action::JumpToPrevFailed => {
                 if let Some(term_view) = self.current_term_view() {
-                    term_view.jump_to_failed(-1);
+                    self.report_record_navigation(term_view.jump_to_failed(-1));
                 }
             }
             Action::JumpToNextFailed => {
                 if let Some(term_view) = self.current_term_view() {
-                    term_view.jump_to_failed(1);
+                    self.report_record_navigation(term_view.jump_to_failed(1));
                 }
             }
             Action::ExportSessionMarkdown => {
@@ -602,18 +617,6 @@ impl UiState {
             );
             return;
         };
-        // A Unified pane is a `PaneLeaf::Block`, so it reaches this far — but
-        // it keeps no `BlockData` at all, and exporting it would write a
-        // well-formed *empty* session file and report success. Refuse with the
-        // same dialog the VTE backend gets instead of lying about the write.
-        if term_view.is_unified() {
-            log::debug!("export: the active pane renders in unified mode and keeps no blocks");
-            self.show_session_export_result(
-                "Session export unavailable",
-                "Session export needs a Block-mode pane. Unified mode keeps the session on one terminal surface instead of in per-command blocks, so there is nothing to write.",
-            );
-            return;
-        }
         match term_view.export_session_to_file(format) {
             Ok(path) => {
                 log::info!("Session exported to {}", path.display());
@@ -703,8 +706,10 @@ impl UiState {
 #[cfg(test)]
 mod tests {
     use super::{
-        ai_panel_width_from_geometry, remote_host_index_for_action, restored_ai_panel_position,
+        ai_panel_width_from_geometry, record_navigation_toast, remote_host_index_for_action,
+        restored_ai_panel_position,
     };
+    use crate::block_view::RecordNavigationResult;
 
     #[test]
     fn ai_panel_geometry_preserves_workspace_and_clamps_configured_limits() {
@@ -728,6 +733,17 @@ mod tests {
         assert_eq!(
             remote_host_index_for_action(0, 1, true),
             Err("Remote connections are disabled in safe mode.")
+        );
+    }
+
+    #[test]
+    fn unavailable_record_target_has_action_feedback() {
+        let message = record_navigation_toast(RecordNavigationResult::LocationUnavailable)
+            .expect("an unavailable exact location must not be a silent no-op");
+        assert!(message.contains("Unified mode"));
+        assert_eq!(
+            record_navigation_toast(RecordNavigationResult::Navigated),
+            None
         );
     }
 }

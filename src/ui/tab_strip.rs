@@ -168,7 +168,7 @@ impl UiState {
     ) {
         let ui = self.clone();
         let root = root.downgrade();
-        view.connect_block_finished(move |_command, exit_code, _, _, _| {
+        view.connect_block_finished(move |_command, exit_code, _, _| {
             let Some(root) = root.upgrade() else {
                 return;
             };

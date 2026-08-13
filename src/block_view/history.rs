@@ -2065,14 +2065,11 @@ impl TermView {
         if !self.persist_history_on_drop.get() {
             return Ok(());
         }
-        // Unified mode keeps no `BlockData`: its history is the surface's own
-        // scrollback plus the in-memory zone table. Saving from here would
-        // write an *empty* snapshot over whatever this session id saved in
-        // Block mode — the store must not be rewritten by a mode that does not
-        // own that representation. Snapshot/replay of a Unified surface is a
-        // later increment; until then a Unified pane is read-nothing,
-        // write-nothing with respect to Block history.
-        if self.unified_zones.is_some() {
+        // Some backends expose in-memory records without owning the persisted
+        // Block-card representation. Snapshot/replay for such a surface is a
+        // separate capability; until then it must not overwrite this session's
+        // existing Block history with a representation it cannot restore.
+        if !self.render_backend.persists_block_history() {
             return Ok(());
         }
         let (path_opt, compress, max_blocks) = {
@@ -2093,8 +2090,12 @@ impl TermView {
             Some(sid) => per_session_history_path(&base, sid),
             None => base.clone(),
         };
+        let records = self.render_backend.records();
+        let Some(block_data) = records.block_data() else {
+            return Ok(());
+        };
         let blocks = snapshot_live_blocks_bounded(
-            &self.block_data.borrow(),
+            block_data,
             max_blocks,
             MAX_DECODED_RECORD_BYTES,
             MAX_HISTORY_DECODED_BYTES.saturating_sub(std::mem::size_of::<Vec<BlockData>>() as u64),
@@ -2188,12 +2189,11 @@ impl TermView {
     /// GTK widgets in a short main-thread callback. Commands that finish while
     /// the read is pending remain newer than every restored block.
     pub(crate) fn start_history_load(self: &Rc<Self>) {
-        // Nothing in Unified mode can display a restored block: rebuilding the
-        // finished-block widgets would paint exactly the chrome this mode
-        // exists to remove. Restored history is therefore not shown (and, per
-        // `save_history`, not overwritten either) until snapshot-replay lands.
-        if self.unified_zones.is_some() {
-            log::debug!("unified mode: skipping Block history restore for this pane");
+        // Backends that do not own Block persistence cannot display restored
+        // cards. Their bounded surface-replay implementation remains separate
+        // from this Block-history loader.
+        if !self.render_backend.persists_block_history() {
+            log::debug!("render backend does not restore Block history for this pane");
             return;
         }
         let (path_opt, compress, load_limit) = {

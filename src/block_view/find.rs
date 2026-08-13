@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use vte4::TerminalExt;
 
 use super::{
-    contains_case_insensitive, replace_finished_block_selection, BlockFilters, BlockOutcome,
-    TermView,
+    contains_case_insensitive, replace_finished_block_selection, BackendRecordRef,
+    BackendSearchWindow, BlockFilters, BlockOutcome, TermView,
 };
 
 fn outcome_matches_filters(
@@ -56,8 +56,9 @@ pub(crate) struct FindSurface {
     pub(crate) block_index: usize,
     /// false = command VTE, true = output VTE.
     pub(crate) is_output: bool,
-    /// Hit lives in the live VTE (the still-running command's output), not in
-    /// any finished block; `block_id`/`block_index` are meaningless then.
+    /// Hit is painted on the backend's live VTE. In Block this means the
+    /// still-running command (`block_id == 0`); in Unified completed records
+    /// also map here because its whole history is one persistent surface.
     pub(crate) is_live: bool,
     /// Number of occurrences retained for navigation on this surface. Always
     /// positive and bounded by [`FIND_MATCH_LIMIT`].
@@ -66,6 +67,14 @@ pub(crate) struct FindSurface {
     vte_cursor: Option<usize>,
     /// False when the match or scan budget stopped inside this surface.
     complete: bool,
+    /// The first native step must wrap from a deliberately reset viewport
+    /// cursor into a selected oldest-history window.
+    initial_wrap: bool,
+    /// Occurrence whose entry crosses VTE's one physical wrap boundary. For a
+    /// viewport-first Unified domain this is the first counted history hit;
+    /// for ordinary oldest-first surfaces it is occurrence zero. `None` means
+    /// the counted set is partial and navigation may not cross that boundary.
+    wrap_before: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,16 +82,6 @@ struct FindHighlight {
     block_id: u64,
     block_index: usize,
     is_output: bool,
-}
-
-impl From<&FindSurface> for FindHighlight {
-    fn from(surface: &FindSurface) -> Self {
-        Self {
-            block_id: surface.block_id,
-            block_index: surface.block_index,
-            is_output: surface.is_output,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -100,6 +99,11 @@ pub(crate) struct FindState {
     total: usize,
     capped: bool,
     scan_limited: bool,
+    /// Exact terminals with regexes installed by the current pass. Several
+    /// logical Unified records can map to the same persistent VTE, so cleanup
+    /// must deduplicate these handles rather than reconstructing them from the
+    /// Block-only finished-widget list.
+    highlighted_terminals: Vec<vte4::Terminal>,
     /// Highlights installed by the flat cross-block palette do not participate
     /// in incremental navigation, but must still be cleared without walking all
     /// retained blocks on every debounced query.
@@ -133,6 +137,16 @@ pub(crate) enum FindNavigationResult {
     Invalidated,
 }
 
+/// Result of an action that targets a completed record by stable identity.
+/// Unified can filter its metadata today, but deliberately reports
+/// `LocationUnavailable` until a zone id has an exact VTE row target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecordNavigationResult {
+    Navigated,
+    NoMatchingRecord,
+    LocationUnavailable,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FindDirection {
     Next,
@@ -149,6 +163,15 @@ enum NativeCursorAction {
 struct BoundedMatchCount {
     count: usize,
     reached_limit: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowMatchPlan {
+    count: usize,
+    reached_limit: bool,
+    incomplete: bool,
+    initial_wrap: bool,
+    wrap_before: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,6 +214,10 @@ impl FindScanBudget {
 
     fn remaining_bytes(&self) -> usize {
         self.remaining_bytes
+    }
+
+    fn consume_bytes(&mut self, bytes: usize) {
+        self.remaining_bytes = self.remaining_bytes.saturating_sub(bytes);
     }
 }
 
@@ -241,6 +268,73 @@ fn bounded_match_count(
         count,
         reached_limit: count == remaining,
     }
+}
+
+fn plan_matching_windows(
+    regex: &regex::Regex,
+    windows: &[BackendSearchWindow],
+    remaining: usize,
+) -> Option<WindowMatchPlan> {
+    let exact_domain = windows.iter().all(|window| !window.incomplete);
+    if !exact_domain {
+        return windows.iter().find_map(|window| {
+            let found = bounded_match_count(regex, &window.text, remaining);
+            (found.count > 0).then_some(WindowMatchPlan {
+                count: found.count,
+                reached_limit: found.reached_limit,
+                incomplete: true,
+                initial_wrap: window.initial_wrap,
+                wrap_before: None,
+            })
+        });
+    }
+
+    let mut count = 0usize;
+    let mut reached_limit = false;
+    let mut initial_wrap = false;
+    let mut wrap_before = None;
+    for window in windows {
+        let found = bounded_match_count(regex, &window.text, remaining.saturating_sub(count));
+        if found.count > 0 {
+            if count == 0 {
+                initial_wrap = window.initial_wrap;
+            }
+            if window.initial_wrap && wrap_before.is_none() {
+                wrap_before = Some(count);
+            }
+            count += found.count;
+        }
+        if found.reached_limit {
+            reached_limit = true;
+            break;
+        }
+    }
+    (count > 0).then_some(WindowMatchPlan {
+        count,
+        reached_limit,
+        incomplete: reached_limit,
+        initial_wrap,
+        // A fully counted native domain always has one cyclic boundary. If
+        // the wrapped region had no matches, it lies between the last and
+        // first retained occurrences, hence occurrence zero.
+        wrap_before: wrap_before.or((!reached_limit).then_some(0)),
+    })
+}
+
+/// Select exactly one forward native match from VTE's current viewport, with
+/// wrapping disabled. This is the fail-safe path used when absolute ring rows
+/// are temporarily untrusted: one real result is useful, while any numeric
+/// total or further navigation would be invented.
+fn focus_one_native_forward_match(terminal: &vte4::Terminal, regex: &vte4::Regex) -> bool {
+    terminal.search_set_regex(None::<&vte4::Regex>, 0);
+    terminal.unselect_all();
+    terminal.search_set_regex(Some(regex), 0);
+    terminal.search_set_wrap_around(false);
+    let found = terminal.search_find_next();
+    if !found {
+        terminal.search_set_regex(None::<&vte4::Regex>, 0);
+    }
+    found
 }
 
 fn step_compressed_cursor(
@@ -312,25 +406,25 @@ fn native_cursor_action(
         return Some(NativeCursorAction::AlreadySelected);
     }
     let wrap_once = match (surface.vte_cursor, direction) {
-        (None, FindDirection::Next) if occurrence == 0 => false,
+        (None, FindDirection::Next) if occurrence == 0 => surface.initial_wrap,
         (None, FindDirection::Previous) if occurrence + 1 == surface.count => false,
         (Some(current), FindDirection::Next)
             if current + 1 < surface.count && occurrence == current + 1 =>
         {
-            false
+            surface.wrap_before == Some(occurrence)
         }
         (Some(current), FindDirection::Previous) if current > 0 && occurrence + 1 == current => {
-            false
+            surface.wrap_before == Some(current)
         }
         (Some(current), FindDirection::Next)
             if surface.complete && current + 1 == surface.count && occurrence == 0 =>
         {
-            true
+            surface.wrap_before == Some(0)
         }
         (Some(0), FindDirection::Previous)
             if surface.complete && occurrence + 1 == surface.count =>
         {
-            true
+            surface.wrap_before == Some(0)
         }
         _ => return None,
     };
@@ -396,85 +490,82 @@ fn duration_matches(duration: Option<u64>, filters: &BlockFilters) -> bool {
     !filters.slow_only || duration >= filters.slow_threshold_ms
 }
 
-fn find_surface_block<'a>(
-    finished: &'a [super::FinishedBlock],
-    surface: &FindSurface,
-) -> Option<&'a super::FinishedBlock> {
-    finished
-        .get(surface.block_index)
-        .filter(|block| block.id == surface.block_id)
-        .or_else(|| finished.iter().find(|block| block.id == surface.block_id))
+fn matching_record_ids<'a>(
+    records: impl IntoIterator<Item = BackendRecordRef<'a>>,
+    query: &str,
+    filters: &BlockFilters,
+) -> Vec<u64> {
+    let q = query.to_lowercase();
+    let q_bytes = q.as_bytes();
+
+    let re = if filters.use_regex && !query.is_empty() {
+        regex::RegexBuilder::new(query)
+            .case_insensitive(true)
+            .build()
+            .ok()
+    } else {
+        None
+    };
+
+    records
+        .into_iter()
+        .filter_map(|record| {
+            let prompt = record.prompt().unwrap_or("");
+            let command = record.command();
+            let output = record.output().unwrap_or("");
+            let text_match = if q.is_empty() {
+                true
+            } else if let Some(ref re) = re {
+                re.is_match(prompt) || re.is_match(command) || re.is_match(output)
+            } else {
+                contains_case_insensitive(prompt.as_bytes(), q_bytes)
+                    || contains_case_insensitive(command.as_bytes(), q_bytes)
+                    || contains_case_insensitive(output.as_bytes(), q_bytes)
+            };
+
+            if !text_match {
+                return None;
+            }
+
+            // Both predicates use the completed, resolved-command outcome.
+            // In particular, background output never matches a raw status
+            // attached by a producer, while Unknown matches no exact code.
+            if !outcome_matches_filters(command, record.exit_code(), filters) {
+                return None;
+            }
+
+            if !duration_matches(record.duration_ms(), filters) {
+                return None;
+            }
+
+            Some(record.id())
+        })
+        .collect()
 }
 
-fn find_highlight_block<'a>(
-    finished: &'a [super::FinishedBlock],
-    highlight: &FindHighlight,
-) -> Option<&'a super::FinishedBlock> {
-    finished
-        .get(highlight.block_index)
-        .filter(|block| block.id == highlight.block_id)
-        .or_else(|| finished.iter().find(|block| block.id == highlight.block_id))
+fn unresolved_record_target_result<'a>(
+    records: impl IntoIterator<Item = BackendRecordRef<'a>>,
+    block_id: u64,
+) -> RecordNavigationResult {
+    if records.into_iter().any(|record| record.id() == block_id) {
+        RecordNavigationResult::LocationUnavailable
+    } else {
+        RecordNavigationResult::NoMatchingRecord
+    }
 }
 
 #[allow(dead_code)]
 impl TermView {
     /// Search blocks for a query string (case-insensitive).
-    /// Returns indices of matching blocks.
-    pub fn search_blocks(&self, query: &str) -> Vec<usize> {
+    /// Returns stable record ids rather than positions in a mutable deque.
+    pub fn search_blocks(&self, query: &str) -> Vec<u64> {
         self.search_blocks_with_filters(query, &BlockFilters::default())
     }
 
-    /// Search blocks with optional filters
-    pub fn search_blocks_with_filters(&self, query: &str, filters: &BlockFilters) -> Vec<usize> {
-        let q = query.to_lowercase();
-        let q_bytes = q.as_bytes();
-
-        let re = if filters.use_regex && !query.is_empty() {
-            regex::RegexBuilder::new(query)
-                .case_insensitive(true)
-                .build()
-                .ok()
-        } else {
-            None
-        };
-
-        let results: Vec<usize> = self
-            .block_data
-            .borrow()
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| {
-                let text_match = if q.is_empty() {
-                    true
-                } else if let Some(ref re) = re {
-                    re.is_match(&b.prompt) || re.is_match(&b.cmd) || re.is_match(&b.output)
-                } else {
-                    contains_case_insensitive(b.prompt.as_bytes(), q_bytes)
-                        || contains_case_insensitive(b.cmd.as_bytes(), q_bytes)
-                        || contains_case_insensitive(b.output.as_bytes(), q_bytes)
-                };
-
-                if !text_match {
-                    return false;
-                }
-
-                // Both predicates use the completed, resolved-command outcome.
-                // In particular, background output never matches a raw status
-                // attached by a producer, while Unknown matches no exact code.
-                if !outcome_matches_filters(&b.cmd, b.exit_code, filters) {
-                    return false;
-                }
-
-                if !duration_matches(b.duration_ms, filters) {
-                    return false;
-                }
-
-                true
-            })
-            .map(|(i, _)| i)
-            .collect();
-
-        results
+    /// Search completed records with optional filters, returning stable ids.
+    pub fn search_blocks_with_filters(&self, query: &str, filters: &BlockFilters) -> Vec<u64> {
+        let records = self.render_backend.records();
+        matching_record_ids(records.iter(), query, filters)
     }
 
     /// Highlight occurrences of `query` across the finished blocks and focus
@@ -514,113 +605,111 @@ impl TermView {
         };
 
         let mut surfaces = Vec::new();
+        let mut highlighted_terminals = Vec::new();
         let mut total = 0usize;
         let mut match_limited = false;
         let mut scan_limited = false;
         let mut scan_budget = FindScanBudget::new();
-        'finished: {
-            let finished = self.finished_blocks.borrow();
-            for (block_index, block) in finished.iter().enumerate() {
-                // Count exactly the bounded command text fed to the command VTE,
-                // not an original tail that the renderer deliberately omitted.
-                let displayed_command = crate::review_input::safe_multiline_display(
-                    &block.cmd_text,
-                    crate::review_input::MAX_REVIEW_INPUT_BYTES,
-                );
-                let command_prefix = scan_budget.take_prefix(&displayed_command);
-                let command = bounded_match_count(
-                    &re,
-                    command_prefix.text,
-                    FIND_MATCH_LIMIT.saturating_sub(total),
-                );
-                if command.count > 0 {
-                    block.command_vte.search_set_regex(Some(&vte_re), 0);
-                    block.command_vte.search_set_wrap_around(false);
-                    surfaces.push(FindSurface {
-                        block_id: block.id,
-                        block_index,
-                        is_output: false,
-                        is_live: false,
-                        count: command.count,
-                        vte_cursor: None,
-                        complete: true,
-                    });
-                    total += command.count;
+        let completed_batch = {
+            let mut deadline_exhausted = || scan_budget.time_exhausted();
+            self.render_backend
+                .completed_search_surfaces(scan_budget.remaining_bytes(), &mut deadline_exhausted)
+        };
+        let completed_owns_live_surface = completed_batch
+            .surfaces
+            .iter()
+            .any(|surface| surface.is_live)
+            || completed_batch
+                .native_fallback
+                .as_ref()
+                .is_some_and(|fallback| fallback.is_live);
+        let completed_incomplete = completed_batch.incomplete;
+        let native_fallback = completed_batch.native_fallback;
+        for backend_surface in completed_batch.surfaces {
+            scan_budget.consume_bytes(backend_surface.scanned_bytes);
+            let selected = plan_matching_windows(
+                &re,
+                &backend_surface.windows,
+                FIND_MATCH_LIMIT.saturating_sub(total),
+            );
+            if let Some(plan) = selected {
+                if backend_surface.reset_cursor {
+                    // A shared Unified VTE retains its selection/search anchor
+                    // across queries. Clearing it makes the first native step
+                    // begin at the current viewport, exactly like window zero.
+                    backend_surface.terminal.unselect_all();
                 }
-                if command.reached_limit {
-                    if command.count > 0 {
-                        surfaces
-                            .last_mut()
-                            .expect("a matching command surface was just appended")
-                            .complete = false;
-                    }
+                backend_surface.terminal.search_set_regex(Some(&vte_re), 0);
+                backend_surface.terminal.search_set_wrap_around(false);
+                if !highlighted_terminals
+                    .iter()
+                    .any(|terminal| terminal == &backend_surface.terminal)
+                {
+                    highlighted_terminals.push(backend_surface.terminal.clone());
+                }
+                surfaces.push(FindSurface {
+                    block_id: backend_surface.block_id,
+                    block_index: backend_surface.block_index,
+                    is_output: backend_surface.is_output,
+                    is_live: backend_surface.is_live,
+                    count: plan.count,
+                    vte_cursor: None,
+                    complete: !plan.incomplete,
+                    initial_wrap: plan.initial_wrap,
+                    wrap_before: plan.wrap_before,
+                });
+                total += plan.count;
+                if plan.reached_limit {
+                    surfaces
+                        .last_mut()
+                        .expect("a matching backend surface was just appended")
+                        .complete = false;
                     match_limited = true;
-                    break 'finished;
+                    break;
                 }
-                if command_prefix.incomplete || scan_budget.time_exhausted() {
-                    if command_prefix.incomplete && command.count > 0 {
-                        surfaces
-                            .last_mut()
-                            .expect("a matching command surface was just appended")
-                            .complete = false;
-                    }
+                if plan.incomplete || scan_budget.time_exhausted() {
+                    surfaces
+                        .last_mut()
+                        .expect("a matching backend surface was just appended")
+                        .complete = false;
                     scan_limited = true;
-                    break 'finished;
+                    break;
                 }
+            } else if scan_budget.time_exhausted() {
+                scan_limited = true;
+                break;
+            }
+        }
+        if !match_limited && !scan_limited && completed_incomplete {
+            scan_limited = true;
+        }
 
-                // Enforce the aggregate budget before ANSI stripping. Calling
-                // `with_stripped_output` here would allocate and permanently
-                // cache a full plain-text copy for every visited block even when
-                // only a small prefix is permitted.
-                let (output, output_incomplete) = {
-                    // Per-block filters re-feed only `displayed_output` into the
-                    // VTE. Searching the hidden full capture would create logical
-                    // matches which VTE can never focus.
-                    let raw_output = block.displayed_output.borrow();
-                    let output_prefix = scan_budget.take_prefix(&raw_output);
-                    let plain_output = super::strip_ansi(output_prefix.text);
-                    (
-                        bounded_match_count(
-                            &re,
-                            &plain_output,
-                            FIND_MATCH_LIMIT.saturating_sub(total),
-                        ),
-                        output_prefix.incomplete,
-                    )
-                };
-                if output.count > 0 {
-                    block.output_vte.search_set_regex(Some(&vte_re), 0);
-                    block.output_vte.search_set_wrap_around(false);
+        // When trusted absolute rows are unavailable (or the bounded snapshot
+        // stopped before finding anything), still let the one persistent VTE
+        // prove a real forward match. The result is intentionally represented
+        // as `1+`: it is already selected, cannot wrap, and Next/Prev stop at
+        // the capped boundary instead of pretending to know unseen counts.
+        if surfaces.is_empty() && scan_limited {
+            if let Some(fallback) = native_fallback {
+                if focus_one_native_forward_match(&fallback.terminal, &vte_re) {
+                    if !highlighted_terminals
+                        .iter()
+                        .any(|terminal| terminal == &fallback.terminal)
+                    {
+                        highlighted_terminals.push(fallback.terminal.clone());
+                    }
                     surfaces.push(FindSurface {
-                        block_id: block.id,
-                        block_index,
-                        is_output: true,
-                        is_live: false,
-                        count: output.count,
-                        vte_cursor: None,
-                        complete: true,
+                        block_id: fallback.block_id,
+                        block_index: fallback.block_index,
+                        is_output: fallback.is_output,
+                        is_live: fallback.is_live,
+                        count: 1,
+                        vte_cursor: Some(0),
+                        complete: false,
+                        initial_wrap: false,
+                        wrap_before: None,
                     });
-                    total += output.count;
-                }
-                if output.reached_limit {
-                    if output.count > 0 {
-                        surfaces
-                            .last_mut()
-                            .expect("a matching output surface was just appended")
-                            .complete = false;
-                    }
-                    match_limited = true;
-                    break 'finished;
-                }
-                if output_incomplete || scan_budget.time_exhausted() {
-                    if output_incomplete && output.count > 0 {
-                        surfaces
-                            .last_mut()
-                            .expect("a matching output surface was just appended")
-                            .complete = false;
-                    }
-                    scan_limited = true;
-                    break 'finished;
+                    total = 1;
                 }
             }
         }
@@ -631,6 +720,7 @@ impl TermView {
         // VTE's own highlighter paints and steps the on-screen hits.
         if !match_limited
             && !scan_limited
+            && !completed_owns_live_surface
             && matches!(
                 self.bstate.get(),
                 super::BlockState::CollectingOutput | super::BlockState::PostCommand
@@ -646,6 +736,12 @@ impl TermView {
             if live.count > 0 {
                 self.active_vte.search_set_regex(Some(&vte_re), 0);
                 self.active_vte.search_set_wrap_around(false);
+                if !highlighted_terminals
+                    .iter()
+                    .any(|terminal| terminal == &self.active_vte)
+                {
+                    highlighted_terminals.push(self.active_vte.clone());
+                }
                 surfaces.push(FindSurface {
                     block_id: 0,
                     block_index: 0,
@@ -654,6 +750,8 @@ impl TermView {
                     count: live.count,
                     vte_cursor: None,
                     complete: true,
+                    initial_wrap: false,
+                    wrap_before: Some(0),
                 });
                 total += live.count;
             }
@@ -683,6 +781,7 @@ impl TermView {
             st.total = total;
             st.capped = capped;
             st.scan_limited = scan_limited;
+            st.highlighted_terminals = highlighted_terminals;
         }
         if !self.focus_current_match() {
             self.clear_find();
@@ -782,18 +881,16 @@ impl TermView {
             None => return false,
         };
 
-        let vte = if surface.is_live {
+        let vte = if surface.is_live && surface.block_id == 0 {
             self.active_vte.clone()
         } else {
-            let finished = self.finished_blocks.borrow();
-            let Some(block) = find_surface_block(&finished, &surface) else {
+            let Some(target) = self
+                .render_backend
+                .record_search_target(surface.block_id, surface.is_output)
+            else {
                 return false;
             };
-            if surface.is_output {
-                block.output_vte.clone()
-            } else {
-                block.command_vte.clone()
-            }
+            target.terminal
         };
         vte.search_set_wrap_around(wrap_once);
         let found = match direction {
@@ -826,17 +923,20 @@ impl TermView {
     }
 
     fn scroll_to_current_match(&self) {
-        let finished = self.finished_blocks.borrow();
         let st = self.find_state.borrow();
         let Some(surface) = st.surfaces.get(st.cursor.surface) else {
             return;
         };
-        let widget = if surface.is_live {
-            self.active.borrow().widget().clone()
-        } else if let Some(block) = find_surface_block(&finished, surface) {
-            block.widget().clone()
+        let widget: gtk4::Widget = if surface.is_live && surface.block_id == 0 {
+            self.active.borrow().widget().clone().upcast()
         } else {
-            return;
+            let Some(target) = self
+                .render_backend
+                .record_search_target(surface.block_id, surface.is_output)
+            else {
+                return;
+            };
+            target.widget
         };
         let scroll = self.block_scroll.clone();
         glib::idle_add_local_once(move || {
@@ -881,23 +981,24 @@ impl TermView {
             .build()
             .map_err(|e| format!("{e}"))?;
 
-        let finished = self.finished_blocks.borrow();
+        let records = self.render_backend.records();
         let mut hits: Vec<CrossBlockHit> = Vec::new();
 
-        for block in finished.iter() {
+        for record in records.iter() {
             if hits.len() >= max_hits {
                 break;
             }
-            let cmd_preview = command_preview(&block.cmd_text);
+            let command = record.command();
+            let cmd_preview = command_preview(command);
 
             // Cmd surface — usually 1 line, but multiline commands exist.
-            for (ln_idx, line) in block.cmd_text.lines().enumerate() {
+            for (ln_idx, line) in command.lines().enumerate() {
                 if hits.len() >= max_hits {
                     break;
                 }
                 if re.is_match(line) {
                     hits.push(CrossBlockHit {
-                        block_id: block.id,
+                        block_id: record.id(),
                         is_output: false,
                         line_no: ln_idx + 1,
                         line_text: snippet(line),
@@ -906,23 +1007,20 @@ impl TermView {
                 }
             }
 
-            // Output surface — uses the cached ANSI-stripped view.
-            block.with_stripped_output(|s| {
-                for (ln_idx, line) in s.lines().enumerate() {
-                    if hits.len() >= max_hits {
-                        break;
-                    }
-                    if re.is_match(line) {
-                        hits.push(CrossBlockHit {
-                            block_id: block.id,
-                            is_output: true,
-                            line_no: ln_idx + 1,
-                            line_text: snippet(line),
-                            cmd_preview: cmd_preview.clone(),
-                        });
-                    }
+            for (ln_idx, line) in record.output().unwrap_or("").lines().enumerate() {
+                if hits.len() >= max_hits {
+                    break;
                 }
-            });
+                if re.is_match(line) {
+                    hits.push(CrossBlockHit {
+                        block_id: record.id(),
+                        is_output: true,
+                        line_no: ln_idx + 1,
+                        line_text: snippet(line),
+                        cmd_preview: cmd_preview.clone(),
+                    });
+                }
+            }
         }
         Ok(hits)
     }
@@ -930,30 +1028,58 @@ impl TermView {
     /// Scroll the named block into view (by stable id, not list index).
     /// Returns `false` if the id is unknown — likely evicted by the
     /// `max_blocks` cap or deleted via the per-block menu.
-    pub fn scroll_to_block_id(&self, block_id: u64) -> bool {
-        let finished = self.finished_blocks.borrow();
-        let Some(block) = finished.iter().find(|b| b.id == block_id) else {
-            return false;
+    pub fn can_jump_to_record(&self, block_id: u64, is_output: bool) -> bool {
+        self.render_backend
+            .record_search_target(block_id, is_output)
+            .is_some()
+    }
+
+    pub(crate) fn navigate_to_record_id(
+        &self,
+        block_id: u64,
+        is_output: bool,
+    ) -> RecordNavigationResult {
+        let Some(target) = self
+            .render_backend
+            .record_search_target(block_id, is_output)
+        else {
+            let records = self.render_backend.records();
+            return unresolved_record_target_result(records.iter(), block_id);
         };
+        if target.uses_live_surface {
+            target.terminal.grab_focus();
+            return RecordNavigationResult::Navigated;
+        }
+
         self.cross_selection.clear_all();
-        replace_finished_block_selection(
-            &finished,
-            &self.selected_block_ids,
-            &self.selected_block_id,
-            &self.selection_anchor_id,
-            Some(block_id),
-        );
-        block.widget().grab_focus();
+        {
+            let finished = self.finished_blocks.borrow();
+            if !finished.iter().any(|block| block.id == block_id) {
+                return RecordNavigationResult::NoMatchingRecord;
+            }
+            replace_finished_block_selection(
+                &finished,
+                &self.selected_block_ids,
+                &self.selected_block_id,
+                &self.selection_anchor_id,
+                Some(block_id),
+            );
+        }
+        target.widget.grab_focus();
         let adj = self.block_scroll.vadjustment();
-        if let Some(value) = block
-            .widget()
+        if let Some(value) = target
+            .widget
             .compute_point(&self.block_scroll, &gtk4::graphene::Point::new(0.0, 0.0))
         {
             let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
-            let target = adj.value() + value.y() as f64;
-            adj.set_value(target.clamp(adj.lower(), max_value));
+            let target_value = adj.value() + value.y() as f64;
+            adj.set_value(target_value.clamp(adj.lower(), max_value));
         }
-        true
+        RecordNavigationResult::Navigated
+    }
+
+    pub fn scroll_to_block_id(&self, block_id: u64, is_output: bool) -> bool {
+        self.navigate_to_record_id(block_id, is_output) == RecordNavigationResult::Navigated
     }
 
     /// Light up the chosen block's command/output VTE with a PCRE2 search
@@ -979,22 +1105,18 @@ impl TermView {
         let Ok(vte_re) = vte4::Regex::for_search(&compiled, VTE_SEARCH_FLAGS) else {
             return false;
         };
-        let (block_index, vte) = {
-            let finished = self.finished_blocks.borrow();
-            let Some((block_index, block)) = finished
-                .iter()
-                .enumerate()
-                .find(|(_, block)| block.id == block_id)
-            else {
-                return false;
-            };
-            let vte = if is_output {
-                block.output_vte.clone()
-            } else {
-                block.command_vte.clone()
-            };
-            (block_index, vte)
+        let records = self.render_backend.records();
+        let Some(block_index) = records.iter().position(|record| record.id() == block_id) else {
+            return false;
         };
+        drop(records);
+        let Some(target) = self
+            .render_backend
+            .record_search_target(block_id, is_output)
+        else {
+            return false;
+        };
+        let vte = target.terminal;
         vte.search_set_regex(Some(&vte_re), 0);
         vte.search_set_wrap_around(true);
         if !vte.search_find_next() {
@@ -1007,6 +1129,13 @@ impl TermView {
             is_output,
         };
         let mut state = self.find_state.borrow_mut();
+        if !state
+            .highlighted_terminals
+            .iter()
+            .any(|terminal| terminal == &vte)
+        {
+            state.highlighted_terminals.push(vte);
+        }
         if !state.extra_highlights.contains(&highlight) {
             state.extra_highlights.push(highlight);
         }
@@ -1015,15 +1144,11 @@ impl TermView {
 
     /// Remove all find highlights and reset the find cursor (call on close).
     pub fn clear_find(&self) {
-        clear_find_state(
-            self.find_state.as_ref(),
-            self.finished_blocks.as_ref(),
-            &self.active_vte,
-        );
+        clear_find_state(self.find_state.as_ref(), &self.active_vte);
     }
 
-    /// Get only failed blocks (exit_code != 0)
-    pub fn get_failed_blocks(&self) -> Vec<usize> {
+    /// Stable ids of failed completed records (exit_code != 0).
+    pub fn get_failed_blocks(&self) -> Vec<u64> {
         let filters = BlockFilters {
             failed_only: true,
             ..Default::default()
@@ -1031,8 +1156,8 @@ impl TermView {
         self.search_blocks_with_filters("", &filters)
     }
 
-    /// Get only slow blocks (duration > threshold)
-    pub fn get_slow_blocks(&self, threshold_ms: u64) -> Vec<usize> {
+    /// Stable ids of slow completed records (duration >= threshold).
+    pub fn get_slow_blocks(&self, threshold_ms: u64) -> Vec<u64> {
         let filters = BlockFilters {
             slow_only: true,
             slow_threshold_ms: threshold_ms,
@@ -1048,46 +1173,32 @@ impl TermView {
 /// a structural path and panic on the `RefCell`.
 pub(super) fn clear_find_state(
     find_state: &std::cell::RefCell<FindState>,
-    finished_blocks: &std::cell::RefCell<Vec<super::FinishedBlock>>,
     active_vte: &vte4::Terminal,
 ) {
-    let (surfaces, extra_highlights) = {
+    let highlighted_terminals = {
         let state = std::mem::take(&mut *find_state.borrow_mut());
-        (state.surfaces, state.extra_highlights)
+        state.highlighted_terminals
     };
-    let highlighted_vtes: Vec<vte4::Terminal> = {
-        let finished = finished_blocks.borrow();
-        surfaces
-            .iter()
-            .filter(|surface| !surface.is_live)
-            .map(FindHighlight::from)
-            .chain(extra_highlights.iter().copied())
-            .filter_map(|highlight| {
-                find_highlight_block(&finished, &highlight).map(|block| {
-                    if highlight.is_output {
-                        block.output_vte.clone()
-                    } else {
-                        block.command_vte.clone()
-                    }
-                })
-            })
-            .collect()
-    };
-    for vte in highlighted_vtes {
+    for vte in highlighted_terminals {
         vte.search_set_regex(None::<&vte4::Regex>, 0);
     }
+    // The UI's no-record fallback installs a regex directly on the live VTE,
+    // outside `FindState`; always clear it before a new structured pass too.
     active_vte.search_set_regex(None::<&vte4::Regex>, 0);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_match_count, command_preview, duration_matches, native_cursor_action,
-        outcome_matches_filters, regex_consumption, snippet, step_compressed_cursor, utf8_prefix,
-        FindCursor, FindDirection, FindScanBudget, FindSurface, NativeCursorAction,
-        RegexConsumption, VTE_SEARCH_FLAGS,
+        bounded_match_count, command_preview, duration_matches, focus_one_native_forward_match,
+        matching_record_ids, native_cursor_action, outcome_matches_filters, plan_matching_windows,
+        regex_consumption, snippet, step_compressed_cursor, unresolved_record_target_result,
+        utf8_prefix, FindCursor, FindDirection, FindScanBudget, FindSurface, NativeCursorAction,
+        RecordNavigationResult, RegexConsumption, VTE_SEARCH_FLAGS,
     };
-    use crate::block_view::BlockFilters;
+    use crate::block_view::{
+        BackendRecordRef, BackendSearchWindow, BlockFilters, CompletedCommandRecord,
+    };
     use std::time::Instant;
 
     fn surface(count: usize, complete: bool) -> FindSurface {
@@ -1099,6 +1210,8 @@ mod tests {
             count,
             vte_cursor: None,
             complete,
+            initial_wrap: false,
+            wrap_before: complete.then_some(0),
         }
     }
 
@@ -1120,6 +1233,50 @@ mod tests {
         let counted = bounded_match_count(&regex, &"x".repeat(20_000), 10_000);
         assert_eq!(counted.count, 10_000);
         assert!(counted.reached_limit);
+    }
+
+    #[test]
+    fn unified_window_count_prefers_viewport_before_matching_old_history() {
+        let regex = regex::Regex::new("needle").unwrap();
+        let windows = [
+            BackendSearchWindow {
+                text: "visible needle\n".to_string(),
+                incomplete: true,
+                initial_wrap: false,
+            },
+            BackendSearchWindow {
+                text: format!("old needle\n{}", "old filler\n".repeat(100_000)),
+                incomplete: true,
+                initial_wrap: true,
+            },
+        ];
+        let plan = plan_matching_windows(&regex, &windows, super::FIND_MATCH_LIMIT).unwrap();
+        assert_eq!(plan.count, 1, "old history must not consume the scan");
+        assert!(plan.incomplete);
+        assert!(!plan.initial_wrap);
+        assert_eq!(plan.wrap_before, None);
+    }
+
+    #[test]
+    fn unified_complete_windows_restore_exact_whole_domain_navigation() {
+        let regex = regex::Regex::new("needle").unwrap();
+        let windows = [
+            BackendSearchWindow {
+                text: "visible needle\n".to_string(),
+                incomplete: false,
+                initial_wrap: false,
+            },
+            BackendSearchWindow {
+                text: "old needle\n".to_string(),
+                incomplete: false,
+                initial_wrap: true,
+            },
+        ];
+        let plan = plan_matching_windows(&regex, &windows, super::FIND_MATCH_LIMIT).unwrap();
+        assert_eq!(plan.count, 2);
+        assert!(!plan.incomplete);
+        assert!(!plan.initial_wrap);
+        assert_eq!(plan.wrap_before, Some(1));
     }
 
     #[test]
@@ -1197,6 +1354,33 @@ mod tests {
     }
 
     #[test]
+    fn native_cursor_wraps_only_at_the_unified_viewport_history_boundary() {
+        let mut unified = surface(2, true);
+        unified.is_live = true;
+        unified.block_id = 0;
+        unified.wrap_before = Some(1);
+
+        assert_eq!(
+            native_cursor_action(&unified, 0, FindDirection::Next),
+            Some(NativeCursorAction::Step { wrap_once: false })
+        );
+        unified.vte_cursor = Some(0);
+        assert_eq!(
+            native_cursor_action(&unified, 1, FindDirection::Next),
+            Some(NativeCursorAction::Step { wrap_once: true })
+        );
+        unified.vte_cursor = Some(1);
+        assert_eq!(
+            native_cursor_action(&unified, 0, FindDirection::Next),
+            Some(NativeCursorAction::Step { wrap_once: false })
+        );
+        assert_eq!(
+            native_cursor_action(&unified, 0, FindDirection::Previous),
+            Some(NativeCursorAction::Step { wrap_once: true })
+        );
+    }
+
+    #[test]
     fn compressed_navigation_preserves_surface_order_and_direction_reversal() {
         let surfaces = [surface(2, true), surface(3, true)];
         let mut cursor = FindCursor::default();
@@ -1269,6 +1453,233 @@ mod tests {
     }
 
     #[test]
+    fn unified_whole_surface_cursor_steps_across_record_boundaries() {
+        // Unified paints all zones into one VTE, hence one native cursor
+        // domain. Model three chronological records whose query appears only
+        // in the latter two; splitting them into two pseudo-surfaces would
+        // reset/rewrap the same native VTE cursor at the artificial boundary.
+        let screen = "first record\nlater record: needle\nlatest record: needle\n";
+        let regex = regex::RegexBuilder::new("needle")
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        let count = bounded_match_count(&regex, screen, super::FIND_MATCH_LIMIT).count;
+        assert_eq!(count, 2);
+
+        let surfaces = [surface(count, true)];
+        let second = step(
+            &surfaces,
+            FindCursor::default(),
+            count,
+            false,
+            FindDirection::Next,
+        );
+        assert_eq!(
+            (second.surface, second.occurrence, second.global),
+            (0, 1, 1)
+        );
+        assert_eq!(
+            step(&surfaces, second, count, false, FindDirection::Previous,),
+            FindCursor::default()
+        );
+    }
+
+    #[test]
+    fn unified_first_native_step_wraps_from_the_reset_live_cursor() {
+        let mut unified = surface(2, true);
+        unified.is_live = true;
+        unified.block_id = 0;
+        unified.initial_wrap = true;
+        assert_eq!(
+            native_cursor_action(&unified, 0, FindDirection::Next),
+            Some(NativeCursorAction::Step { wrap_once: true })
+        );
+
+        let block = surface(2, true);
+        assert_eq!(
+            native_cursor_action(&block, 0, FindDirection::Next),
+            Some(NativeCursorAction::Step { wrap_once: false })
+        );
+    }
+
+    /// VTE keeps its search anchor/selection across regex changes. When the
+    /// viewport-to-tail window has no match, Unified's second bounded window
+    /// enters oldest history with one native wrap. This display-backed
+    /// regression exercises that real cursor transition.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn unified_vte_fresh_query_reaches_scrollback_before_a_prior_match() {
+        use gtk4::prelude::*;
+        use std::time::Duration;
+        use vte4::TerminalExt;
+
+        gtk4::init().expect("gtk init");
+        let terminal = vte4::Terminal::new();
+        terminal.set_size(24, 4);
+        terminal.set_scrollback_lines(256);
+        let window = gtk4::Window::new();
+        window.set_child(Some(&terminal));
+        window.present();
+        terminal.feed(b"bar-oldest\r\n");
+        for index in 0..32 {
+            terminal.feed(format!("filler-{index:02}\r\n").as_bytes());
+        }
+        terminal.feed(b"foo-latest\r\n");
+        let context = gtk4::glib::MainContext::default();
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(100) {
+            while context.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let foo = vte4::Regex::for_search("foo-latest", VTE_SEARCH_FLAGS).unwrap();
+        terminal.unselect_all();
+        terminal.search_set_regex(Some(&foo), 0);
+        terminal.search_set_wrap_around(true);
+        assert!(terminal.search_find_next());
+
+        let bar = vte4::Regex::for_search("bar-oldest", VTE_SEARCH_FLAGS).unwrap();
+        terminal.search_set_regex(None::<&vte4::Regex>, 0);
+        terminal.unselect_all();
+        terminal.search_set_regex(Some(&bar), 0);
+        terminal.search_set_wrap_around(true);
+        assert!(
+            terminal.search_find_next(),
+            "the fresh query must wrap from the bottom into retained scrollback"
+        );
+        let selected = terminal
+            .text_selected(vte4::Format::Text)
+            .map(|text| text.to_string())
+            .unwrap_or_default();
+        assert_eq!(selected, "bar-oldest");
+        window.close();
+        while context.iteration(false) {}
+    }
+
+    /// Absolute row authority is deliberately absent immediately after
+    /// reset/rewrap. The native limited fallback must still select a visible
+    /// hit, and must not wrap to the same query in a history larger than the
+    /// structured scan budget.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn unified_bounded_and_native_fallback_prefer_visible_match_with_huge_old_scrollback() {
+        use gtk4::prelude::*;
+        use std::time::Duration;
+        use vte4::TerminalExt;
+
+        gtk4::init().expect("gtk init");
+        let terminal = vte4::Terminal::new();
+        terminal.set_size(64, 4);
+        terminal.set_scrollback_lines(80_000);
+        let window = gtk4::Window::new();
+        window.set_child(Some(&terminal));
+        window.present();
+
+        let mut transcript = Vec::with_capacity(1_500_000);
+        transcript.extend_from_slice(b"needle-old\r\n");
+        for _ in 0..70_000 {
+            transcript.extend_from_slice(b"filler-history-row\r\n");
+        }
+        transcript.extend_from_slice(b"needle-visible");
+        terminal.feed(&transcript);
+        let context = gtk4::glib::MainContext::default();
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(250) {
+            while context.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let regex = vte4::Regex::for_search("needle-(?:old|visible)", VTE_SEARCH_FLAGS).unwrap();
+        // Structured, trusted-bounds path: the selected viewport-first window
+        // produces an unwrapped first native step.
+        terminal.unselect_all();
+        terminal.search_set_regex(Some(&regex), 0);
+        let mut bounded_surface = surface(1, false);
+        bounded_surface.is_live = true;
+        bounded_surface.block_id = 0;
+        let Some(NativeCursorAction::Step { wrap_once }) =
+            native_cursor_action(&bounded_surface, 0, FindDirection::Next)
+        else {
+            panic!("the first bounded native action must step")
+        };
+        assert!(!wrap_once);
+        terminal.search_set_wrap_around(wrap_once);
+        assert!(terminal.search_find_next());
+        let selected = terminal
+            .text_selected(vte4::Format::Text)
+            .map(|text| text.to_string())
+            .unwrap_or_default();
+        assert_eq!(selected, "needle-visible");
+
+        // Unknown-projection path shares the same viewport-forward native
+        // semantics but exposes only one capped representative result.
+        assert!(focus_one_native_forward_match(&terminal, &regex));
+        let selected = terminal
+            .text_selected(vte4::Format::Text)
+            .map(|text| text.to_string())
+            .unwrap_or_default();
+        assert_eq!(selected, "needle-visible");
+        window.close();
+        while context.iteration(false) {}
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn unified_complete_windows_step_visible_then_wrapped_history_on_real_vte() {
+        use gtk4::prelude::*;
+        use std::time::Duration;
+        use vte4::TerminalExt;
+
+        gtk4::init().expect("gtk init");
+        let terminal = vte4::Terminal::new();
+        terminal.set_size(32, 4);
+        terminal.set_scrollback_lines(256);
+        let window = gtk4::Window::new();
+        window.set_child(Some(&terminal));
+        window.present();
+        terminal.feed(b"needle-old\r\n");
+        for _ in 0..32 {
+            terminal.feed(b"filler\r\n");
+        }
+        terminal.feed(b"needle-visible");
+        let context = gtk4::glib::MainContext::default();
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(100) {
+            while context.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let regex = vte4::Regex::for_search("needle-(?:old|visible)", VTE_SEARCH_FLAGS).unwrap();
+        terminal.unselect_all();
+        terminal.search_set_regex(Some(&regex), 0);
+        let mut surface = surface(2, true);
+        surface.is_live = true;
+        surface.block_id = 0;
+        surface.wrap_before = Some(1);
+
+        for (occurrence, expected, expected_wrap) in
+            [(0, "needle-visible", false), (1, "needle-old", true)]
+        {
+            let Some(NativeCursorAction::Step { wrap_once }) =
+                native_cursor_action(&surface, occurrence, FindDirection::Next)
+            else {
+                panic!("native occurrence {occurrence} must step")
+            };
+            assert_eq!(wrap_once, expected_wrap);
+            terminal.search_set_wrap_around(wrap_once);
+            assert!(terminal.search_find_next());
+            let selected = terminal
+                .text_selected(vte4::Format::Text)
+                .map(|text| text.to_string())
+                .unwrap_or_default();
+            assert_eq!(selected, expected);
+            surface.vte_cursor = Some(occurrence);
+        }
+        window.close();
+        while context.iteration(false) {}
+    }
+
+    #[test]
     fn unknown_duration_does_not_match_duration_filters() {
         let filters = BlockFilters {
             slow_only: true,
@@ -1294,6 +1705,58 @@ mod tests {
     #[test]
     fn duration_is_irrelevant_without_duration_predicates() {
         assert!(duration_matches(None, &BlockFilters::default()));
+    }
+
+    #[test]
+    fn metadata_filters_return_stable_record_ids_for_actions_and_debug_counts() {
+        let metadata = [
+            CompletedCommandRecord {
+                id: 91,
+                cmd: "false".to_string(),
+                exit_code: Some(1),
+                start_time_ms: None,
+                end_time_ms: None,
+                duration_ms: Some(50),
+                cwd: None,
+                is_background: false,
+            },
+            CompletedCommandRecord {
+                id: 7,
+                cmd: "sleep 2".to_string(),
+                exit_code: Some(0),
+                start_time_ms: None,
+                end_time_ms: None,
+                duration_ms: Some(2_000),
+                cwd: None,
+                is_background: false,
+            },
+        ];
+        let failed = BlockFilters {
+            failed_only: true,
+            ..Default::default()
+        };
+        let slow = BlockFilters {
+            slow_only: true,
+            slow_threshold_ms: 1_000,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            matching_record_ids(metadata.iter().map(BackendRecordRef::Metadata), "", &failed,),
+            [91]
+        );
+        assert_eq!(
+            matching_record_ids(metadata.iter().map(BackendRecordRef::Metadata), "", &slow,),
+            [7]
+        );
+        assert_eq!(
+            unresolved_record_target_result(metadata.iter().map(BackendRecordRef::Metadata), 91,),
+            RecordNavigationResult::LocationUnavailable
+        );
+        assert_eq!(
+            unresolved_record_target_result(metadata.iter().map(BackendRecordRef::Metadata), 999,),
+            RecordNavigationResult::NoMatchingRecord
+        );
     }
 
     #[test]

@@ -329,40 +329,38 @@ impl UiState {
     pub(crate) fn connect_block_command_history(&self, view: &Rc<TermView>) {
         let config_for_history = self.config.clone();
         let view_for_history = Rc::downgrade(view);
-        view.connect_block_finished(
-            move |command, exit_code, _output_sample, _agent_generation, _duration_ms| {
-                let config = config_for_history.borrow();
-                if !config.command_history_enabled {
-                    return;
-                }
-                let Some(path) = config.command_history_path.as_deref() else {
-                    return;
-                };
-                let cwd = view_for_history
-                    .upgrade()
-                    .map(|view| view.cwd())
-                    .filter(|cwd| !cwd.is_empty());
-                let end_time_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-                    .and_then(|duration| u64::try_from(duration.as_millis()).ok());
-                // The family's history JSONL is shared with jsh and the other
-                // terminals, and its schema has a plain exit_code — so a status the
-                // shell never reported is recorded as the sentinel rather than as a
-                // successful 0.
-                let (exit_code, _) = crate::block_view::exit_code_for_shared_surface(exit_code);
-                if let Err(err) = crate::command_history::enqueue(
-                    std::path::Path::new(path),
-                    config.command_history_max_entries as usize,
-                    &command,
-                    cwd.as_deref(),
-                    exit_code,
-                    end_time_ms,
-                ) {
-                    log::warn!("failed to append command history: {err}");
-                }
-            },
-        );
+        view.connect_block_finished(move |command, exit_code, _agent_generation, _duration_ms| {
+            let config = config_for_history.borrow();
+            if !config.command_history_enabled {
+                return;
+            }
+            let Some(path) = config.command_history_path.as_deref() else {
+                return;
+            };
+            let cwd = view_for_history
+                .upgrade()
+                .map(|view| view.cwd())
+                .filter(|cwd| !cwd.is_empty());
+            let end_time_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+            // The family's history JSONL is shared with jsh and the other
+            // terminals, and its schema has a plain exit_code — so a status the
+            // shell never reported is recorded as the sentinel rather than as a
+            // successful 0.
+            let (exit_code, _) = crate::block_view::exit_code_for_shared_surface(exit_code);
+            if let Err(err) = crate::command_history::enqueue(
+                std::path::Path::new(path),
+                config.command_history_max_entries as usize,
+                &command,
+                cwd.as_deref(),
+                exit_code,
+                end_time_ms,
+            ) {
+                log::warn!("failed to append command history: {err}");
+            }
+        });
     }
 
     /// Create a split/restore pane leaf matching the requested terminal mode.

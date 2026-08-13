@@ -245,15 +245,29 @@ fn bounded_utf8_prefix(input: &str, max_bytes: usize) -> &str {
 ///
 /// The `bool` reports whether a full-screen clear (`\x1b[2J`/`\x1b[3J`) was
 /// seen — retained for callers that key off it.
-pub(crate) fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
-    let bytes = input.as_bytes();
-    if memchr::memchr3(0x1b, b'\r', b'\x08', bytes).is_none() {
-        return (
-            bounded_utf8_prefix(input, MAX_REPLAY_OUTPUT_BYTES).to_owned(),
-            false,
-        );
+fn next_lossy_char(bytes: &[u8], i: usize) -> (char, usize) {
+    let first = bytes[i];
+    if first.is_ascii() {
+        return (char::from(first), i + 1);
     }
 
+    let width = match first {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return ('\u{fffd}', i + 1),
+    };
+    let end = i.saturating_add(width);
+    if end > bytes.len() {
+        return ('\u{fffd}', i + 1);
+    }
+    match std::str::from_utf8(&bytes[i..end]) {
+        Ok(scalar) => (scalar.chars().next().unwrap_or('\u{fffd}'), end),
+        Err(_) => ('\u{fffd}', i + 1),
+    }
+}
+
+fn replay_plain_ansi_bytes(bytes: &[u8]) -> (ReplayGrid<char>, bool) {
     let mut grid = ReplayGrid::<char>::new();
     let mut row = 0usize;
     let mut col = 0usize;
@@ -395,14 +409,31 @@ pub(crate) fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
             col = col.saturating_sub(1);
             i += 1;
         } else {
-            let ch = input[i..].chars().next().unwrap_or('\u{FFFD}');
-            i += ch.len_utf8();
+            let (ch, next) = next_lossy_char(bytes, i);
+            i = next;
             if col >= MAX_GRID_COLS || !grid.set_cell(row, col, ch, ' ') {
                 break;
             }
             col = col.saturating_add(1);
         }
     }
+    (grid, should_clear)
+}
+
+fn replay_plain_ansi(input: &str) -> (ReplayGrid<char>, bool) {
+    replay_plain_ansi_bytes(input.as_bytes())
+}
+
+pub(crate) fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
+    let bytes = input.as_bytes();
+    if memchr::memchr3(0x1b, b'\r', b'\x08', bytes).is_none() {
+        return (
+            bounded_utf8_prefix(input, MAX_REPLAY_OUTPUT_BYTES).to_owned(),
+            false,
+        );
+    }
+
+    let (grid, should_clear) = replay_plain_ansi(input);
     let mut result = String::with_capacity(input.len().min(MAX_REPLAY_OUTPUT_BYTES));
     'rows: for (line_idx, cells) in grid.rows.iter().enumerate() {
         if line_idx > 0 {
@@ -419,6 +450,40 @@ pub(crate) fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
         }
     }
     (result, should_clear)
+}
+
+/// Whether replaying `input` leaves any visible, non-whitespace cell.
+///
+/// Unlike [`strip_ansi_with_clear_detect`], this never serialises a plain-text
+/// copy. The common no-control path is a direct character scan; cursor motion
+/// and erases reuse the same bounded replay grid as final Block rendering.
+pub(crate) fn ansi_has_visible_text(input: &str) -> bool {
+    ansi_bytes_have_visible_text(input.as_bytes())
+}
+
+/// Byte-oriented visibility check for raw PTY capture.
+///
+/// This deliberately performs lossy UTF-8 decoding a scalar at a time instead
+/// of calling `String::from_utf8_lossy`: malformed output must not make the
+/// metadata-only Unified finalize path allocate and copy the whole capture.
+pub(crate) fn ansi_bytes_have_visible_text(bytes: &[u8]) -> bool {
+    if memchr::memchr3(0x1b, b'\r', b'\x08', bytes).is_none() {
+        let mut i = 0;
+        while i < bytes.len() {
+            let (ch, next) = next_lossy_char(bytes, i);
+            if !ch.is_whitespace() && !ch.is_control() {
+                return true;
+            }
+            i = next;
+        }
+        return false;
+    }
+
+    let (grid, _) = replay_plain_ansi_bytes(bytes);
+    grid.rows
+        .iter()
+        .flatten()
+        .any(|ch| !ch.is_whitespace() && !ch.is_control())
 }
 
 /// Whether a captured output stream repaints in place using vertical cursor
@@ -957,10 +1022,18 @@ mod tests {
     use std::fmt::Write as _;
 
     use super::{
-        bounded_utf8_prefix, collapse_repaint_output, contains_case_insensitive as cci,
-        strip_ansi_with_clear_detect, ReplayGrid, MAX_CSI_PARAM_BYTES, MAX_GRID_COLS,
-        MAX_REPLAY_CELLS, MAX_REPLAY_OUTPUT_BYTES,
+        ansi_bytes_have_visible_text, bounded_utf8_prefix, collapse_repaint_output,
+        contains_case_insensitive as cci, strip_ansi_with_clear_detect, ReplayGrid,
+        MAX_CSI_PARAM_BYTES, MAX_GRID_COLS, MAX_REPLAY_CELLS, MAX_REPLAY_OUTPUT_BYTES,
     };
+
+    #[test]
+    fn byte_visibility_decodes_malformed_utf8_without_a_lossy_string() {
+        assert!(ansi_bytes_have_visible_text(b"\xff"));
+        assert!(!ansi_bytes_have_visible_text(b"\xff\r\x1b[2K"));
+        assert!(ansi_bytes_have_visible_text("\u{3000}\u{754c}".as_bytes()));
+        assert!(!ansi_bytes_have_visible_text("\u{3000}\n".as_bytes()));
+    }
 
     #[test]
     fn matches_regardless_of_case() {

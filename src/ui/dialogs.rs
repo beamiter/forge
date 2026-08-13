@@ -74,6 +74,10 @@ fn cross_block_search_status_for_match_count(total: usize) -> String {
     }
 }
 
+fn cross_block_search_jump_unavailable_status() -> &'static str {
+    "This result is searchable, but its exact terminal location is not available yet."
+}
+
 fn clear_list_box(list_box: &ListBox) {
     while let Some(child) = list_box.first_child() {
         list_box.remove(&child);
@@ -947,16 +951,21 @@ impl UiState {
                         let total = results.len();
                         status_label.set_text(&cross_block_search_status_for_match_count(total));
                         for hit in results.iter() {
+                            let can_jump =
+                                term_view.can_jump_to_record(hit.block_id, hit.is_output);
                             let surface = if hit.is_output { "out" } else { "cmd" };
-                            let subtitle = format!(
+                            let mut subtitle = format!(
                                 "{surface} L{}: {}",
                                 hit.line_no,
                                 glib::markup_escape_text(&hit.line_text)
                             );
+                            if !can_jump {
+                                subtitle.push_str(" — location unavailable");
+                            }
                             let row = adw::ActionRow::builder()
                                 .title(glib::markup_escape_text(&hit.cmd_preview).as_str())
                                 .subtitle(&subtitle)
-                                .activatable(true)
+                                .activatable(can_jump)
                                 .build();
                             list_box.append(&row);
                         }
@@ -1041,16 +1050,19 @@ impl UiState {
             let hits = hits.clone();
             let filter_entry = filter_entry.clone();
             let regex_toggle = regex_toggle.clone();
-            move |idx: usize| {
+            let status_label = status_label.clone();
+            move |idx: usize| -> bool {
                 let pattern = filter_entry.text().to_string();
                 let is_regex = regex_toggle.is_active();
                 let hit = match hits.borrow().get(idx) {
                     Some(h) => h.clone(),
-                    None => return,
+                    None => return false,
                 };
-                if term_view.scroll_to_block_id(hit.block_id) {
-                    term_view.focus_match_in_block(hit.block_id, &pattern, is_regex, hit.is_output);
+                if !term_view.scroll_to_block_id(hit.block_id, hit.is_output) {
+                    status_label.set_text(cross_block_search_jump_unavailable_status());
+                    return false;
                 }
+                term_view.focus_match_in_block(hit.block_id, &pattern, is_regex, hit.is_output)
             }
         };
 
@@ -1058,8 +1070,9 @@ impl UiState {
         let dialog_for_activate = dialog.clone();
         list_box.connect_row_activated(move |_, row| {
             let idx = row.index() as usize;
-            dialog_for_activate.force_close();
-            jump_for_activate(idx);
+            if jump_for_activate(idx) {
+                dialog_for_activate.force_close();
+            }
         });
 
         let key_controller = EventControllerKey::new();
@@ -1082,8 +1095,9 @@ impl UiState {
             if matches!(keyval, Key::Return | Key::KP_Enter) {
                 if let Some(row) = list_box_for_key.selected_row() {
                     let idx = row.index() as usize;
-                    dialog_for_key.force_close();
-                    jump_for_key(idx);
+                    if jump_for_key(idx) {
+                        dialog_for_key.force_close();
+                    }
                 }
                 return true.into();
             }
@@ -2863,9 +2877,9 @@ impl UiState {
 mod tests {
     use super::{
         cross_block_search_dialog_title, cross_block_search_idle_status,
-        cross_block_search_pending_status, cross_block_search_query_error,
-        cross_block_search_status_for_match_count, remote_picker_guard, CROSS_BLOCK_SEARCH_LIMIT,
-        CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
+        cross_block_search_jump_unavailable_status, cross_block_search_pending_status,
+        cross_block_search_query_error, cross_block_search_status_for_match_count,
+        remote_picker_guard, CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
 
     #[test]
@@ -2895,6 +2909,10 @@ mod tests {
             "500 matches (capped) — refine your query."
         );
         assert_eq!(cross_block_search_status_for_match_count(37), "37 matches");
+        assert_eq!(
+            cross_block_search_jump_unavailable_status(),
+            "This result is searchable, but its exact terminal location is not available yet."
+        );
     }
 
     #[test]

@@ -349,7 +349,7 @@ fn attach_term_view(
     let card_slot: Rc<RefCell<Option<gtk4::Widget>>> = Rc::new(RefCell::new(None));
     let request_state = Rc::new(CorrectionRequestState::default());
     let view_weak = Rc::downgrade(&view);
-    view.connect_block_finished(
+    view.connect_block_finished_with_output(
         move |command, exit_code, output, _agent_generation, _duration_ms| {
             let generation = request_state.advance();
             if let Some(card) = card_slot.borrow_mut().take() {

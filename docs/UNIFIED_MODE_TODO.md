@@ -12,15 +12,20 @@
 
 ## P1 · 增量 1b（顺序由 1a 实测确定，不要跳步）
 
-- [ ] **zone 表升为后端查询 `records()`**。当前 `TermView` 有 ~15 个方法直接读 `finished_blocks`/`block_data`，1a 被迫加 `unified_zones: Option<...>` 当模式标志并在四处分支。真正的 Block 耦合在 `TermView` 而非 trait。验收：find/export/history/palette 在两种模式下读同一来源，`if unified` 分支归零；`Ctrl+F` 在 Unified 下能命中屏上文本。
-- [ ] **`finalize_block` 签名瘦身**。现在同时收 `BlockData`（含 `estimated_height`/`line_count`/`cols` 等渲染字段）和 12 字段的 `FinalizedBlockArgs`；引擎每条命令都会 `strip_ansi` + 截断 + 分配输出文本，纯粹为了 widget 渲染，Unified 一个字节不用。验收：一条命令记录只带身份/结果字段，输出负载走惰性访问器或后端能力协商；Block 行为不变。
-- [ ] **A→C 标记注入器**。在 FTCS `A` 注入 `OSC 8 ;; block://<nonce>/<zone_id>`，到 `C`（不是 `B`）关闭；A..C 窗口内每段 fed Bytes 重发 open（幂等，封顶 guest OSC 8 / DECRC 的破坏半径）；空闲 prompt 重渲染复用同一 zone id。理由：jsh 每键重印 prompt 且不重发 OSC 133，A→B 包裹会在第一次按键后被抹掉（spike2 G1 实证）。验收：`less`/`vim` 进出后标记仍在；连续按键不新增 zone。
-- [ ] **探针驱动的 chrome**。逐可见行 `check_hyperlink_at` 在**第 0 列**探（guest PS1 的 OSC 8 覆盖不到）；URI 必须精确匹配本 pane nonce 且对照有序 zone 表校验；已知头行探到不匹配 URI 仍归该 zone。绘制 gutter 竖条 → 分隔线 → badge（落点空白检测）。探针坐标需减去 widget CSS padding。验收：0.2µs/次量级的探针开销不影响滚动 p95；rewrap 后 chrome 仍对齐。
-- [ ] **zone 上限与淘汰**：活 zone 上限 256（frost 先例），超限最旧者降为快照寻址并停止注入标记；`[3J` 只淘汰严格位于视口顶之上的 zone，RIS/reset 全量淘汰；`rows_evicted` 是所有 ring 抽取路径的硬门。验收：`[3J` 后已清除内容不能经 badge 空白检测或重扫描复活。
+- [x] **zone 表升为后端查询 `records()`**。find/export/history/palette 已统一读取 `RenderBackend::records()`，不再靠 `unified_zones` 或空的 Block widget 集合猜模式；Unified `Ctrl+F` 搜索一整个持久 VTE。
+- [x] **`finalize_block` 签名瘦身**。引擎只构造 `CompletedCommandRecord`；Block 通过 memoized 惰性访问器物化渲染负载，Unified metadata-only 路径不读取输出。journal 与 Agent/output observer 也先做 capability/interest 判断。
+- [x] **A→C 标记注入器**。128-bit pane nonce、全局 zone id、每次 live feed 重申、C 后无条件 close、idle A 复用及 pre/post-C alt-screen 恢复均已接线；注入字节不进入 prompt/output capture。
+- [x] **探针驱动的 chrome（功能核心）**。严格校验 canonical URI + nonce + active authority；逐可见行一次探针，可信 predecessor span 可从长 zone 中段续画；gutter/分隔线/completed badge 与宽字符安全的空白检测已落地。真实 VTE 证明 `check_hyperlink_at` 接受 widget 坐标，因此探针使用 content origin + cell center，不能预先减 CSS padding。行坐标只由可见 canonical marker 校准，无法证明时 fail closed。
+- [ ] **chrome 性能/resize 验收**。已有 Xvfb 的 non-bottom anchor、rewrap marker、bounded-ring trim+CUP 与宽字符回归；仍需正式记录滚动 p95，并补完整 overlay 在 resize/rewrap 后的人工/性能验收。
+- [x] **marker authority 上限与安全淘汰**。pending 也计入硬上限 256，并同时服从更小的 `max_visible_blocks`；ED3 仅退休已证明完整位于 live grid 上方的 completed span，RIS 全清 authority，natural trim/rewrap/config resize 经 row epoch + quarantine 硬门失效。旧 URI、空白探针或晚到 completion 均不能复活已淘汰 authority。
+- [ ] **超限 zone 的快照寻址**。metadata 记录仍可供 palette/export/filter 使用，但 marker authority 退役后精确跳转目前 fail closed；尚未保存 bounded per-zone 输出快照。
 
 ## P2 · Unified 的已知缺口（1b 期间逐项关闭）
 
-- [ ] 会话导出：当前诚实拒绝（`ErrorKind::Unsupported`），待 `records()` 落地后基于 zone 表实现。
+- [x] metadata 会话导出：JSON/Markdown 已基于 `records()` 导出 command/status/time/duration/cwd/background，并用 `output_available: false` 明确表示 Unified 没有伪造的空输出。
+- [ ] 带输出的会话导出：仍依赖 bounded per-zone 快照。
+- [x] Unified `Ctrl+F`：按 native cursor 顺序优先扫描 viewport→tail，再 wrap 到旧历史；共享 4 MiB/时间预算。可信 ring bounds 暂失时由 VTE native cursor 返回真实的 `1+` limited result，屏上命中不会被很长的旧历史饿死。
+- [ ] per-zone output 搜索与精确跳转：metadata filter 可返回稳定 record id，但 `record_search_target()` 在 Unified 仍 fail closed 为 location unavailable。
 - [ ] 会话恢复：当前跳过 Block 历史存取。设计方案是有界快照回放（最近 ~64 zone / 4 MiB 经注入器重新 feed），避免重启后空屏。
 - [ ] inline 卡片安置：当前在 Unified 下诚实拒绝（agent/correction/palette 卡片）。设计方案是底部**占位**停靠区（VTE 的垂直兄弟节点，开关各触发一次 SIGWINCH），不是覆盖层——覆盖会精确遮住用户正在盯的 prompt 行。
 - [ ] organism：`ascii_organism_enabled` + `OrganismMotion::Static` 组合下 Unified 无任何 organism 表面（卡片是它在该组合下的唯一载体）。需要在停靠区设计里给它位置。
@@ -30,14 +35,16 @@
 
 ## P2 · anvil 镜像
 
-- [ ] **锚点绕过修复**（与 forge M6 同款，anvil 侧仍开着）：anvil 的 `command_capture_anchor` 是单路径钩子，`VerifiedSubmissionCtx::submit` 守卫、其验证轮询、`command_prompt_status`、`click_cursor.rs` 四处仍读 raw `prompt_end_pos`。照 forge 的做法引入 `SubmissionSurface::prompt_anchor` + 单一 `prompt_anchor_for_surface`，标志位与后端选择同源。
-- [ ] **dispatch 测试线束**：需要 forge 已验证的两个 seam（`SubmissionSurface` 隔离 VTE 句柄、`#[cfg(test)] OwnedPty::from_openpty`）+ `RecordingBackend`。照抄 forge 的经验：stub 要建模不要顺从，配置用 `load_safe_config()` 不读开发者配置文件。
-- [ ] Phase 1 增量 1a 镜像（`TerminalMode::Unified` + 无 chrome 后端），可直接落 forge 修完六个 major 后的最终形态。
+- [x] **锚点绕过修复**：submission/status/click/capture 共用 `SubmissionSurface::prompt_anchor`，策略与 backend switch 同源（Block rebase、Unified identity）。
+- [x] **dispatch 测试线束**：`SubmissionSurface`、test openpty、建模 `RecordingBackend` 与 safe config 已落地；覆盖 effect/query 顺序、anchor、alt、clipboard/notify、kitty 与 verified-submission guard。
+- [x] Phase 1 增量 1a 镜像：config/CLI/completions/settings/workspace 与单一 Unified backend 路由均已完成，受管远程仍强制 Block。
+- [x] Phase 1 增量 1b 核心镜像：`records()`、metadata-only record、惰性 finalize、A→C marker、probe chrome、authority 淘汰、visible-first bounded `Ctrl+F` 与 metadata export 已按 Anvil 的 Relm4/Agent/journal 边界同步。
+- [x] ED3/RIS 顺序镜像：pinned `jterm_core` 尚无 reset event，Anvil 在 core parser 之前用流式 ANSI-aware splitter建立 reset 边界；reset hook、原始 reset bytes、suffix 严格按线序执行，control-string lookalike 与跨 chunk 输入 fail closed。
 
 ## P3 · 卫生与债务
 
-- [ ] forge：三处 finalize 路径的 config 借用跨越 `new_with_pool`/高度估算/通知调用，收窄为显式短作用域（当前安全，因被跨越的调用不可重入到 `borrow_mut`，但不变量脆弱）。
-- [ ] forge：`ui/config_apply.rs:129` 在 per-view `borrow_mut` 期间持有 UiState config 的 `Ref`——今天安全（两个 cell 不同），但若将来统一 cell 会必然 panic。改为循环前 clone。
+- [x] forge：finalize 路径的 config 借用已收窄；widget 构造/高度估算/通知只接 owned snapshot 或提前复制的 scalar。
+- [x] forge：`ui/config_apply.rs` 已在 per-view 循环前 clone config，不再跨 view 的 `borrow_mut` 持有 UiState config `Ref`。
 - [ ] 两仓：菜单方法内冗余的 `*_for_menu` 再克隆层（为等价性证明故意保留），可在等价窗口关闭后删除。
 - [ ] forge：`BlockBackend` 自身的 finalize 链与 `command_capture_anchor` 的 rebase 行需要真 VTE，测试套件够不到（设计使然），保持 GUI 验证。
 

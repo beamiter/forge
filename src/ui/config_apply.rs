@@ -117,6 +117,11 @@ impl UiState {
     /// Push the current behavioral configuration into every live Block pane,
     /// including panes nested under splits.
     pub(crate) fn sync_block_configs(&self) {
+        // Keep the UiState cell unborrowed while pane callbacks apply the
+        // snapshot. The cells are separate today, but holding this `Ref`
+        // across `reload_config` would become re-entrant if their ownership is
+        // ever unified.
+        let config = self.config.borrow().clone();
         for page in 0..self.notebook.n_pages() {
             let Some(widget) = self.notebook.nth_page(Some(page)) else {
                 continue;
@@ -126,7 +131,7 @@ impl UiState {
             };
             for leaf in node.leaves() {
                 if let Some(view) = leaf.block_view() {
-                    view.reload_config(&self.config.borrow());
+                    view.reload_config(&config);
                 }
             }
         }

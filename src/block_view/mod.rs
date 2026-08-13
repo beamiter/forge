@@ -2,7 +2,7 @@ use gtk4::gdk::RGBA;
 use gtk4::pango::FontDescription;
 use gtk4::prelude::*;
 use gtk4::{glib, Orientation, ScrolledWindow};
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, Ref, RefCell};
 use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::rc::{Rc, Weak};
@@ -36,6 +36,7 @@ mod kitty_graphics;
 mod palette;
 mod scroll;
 mod selection_hold;
+mod unified_chrome;
 pub(crate) use alt_screen::*;
 pub(crate) use ansi::*;
 pub(crate) use blocks::*;
@@ -110,6 +111,178 @@ impl CommandPromptStatus {
 
 fn next_block_id() -> u64 {
     BLOCK_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+const ZONE_MARKER_CLOSE: &[u8] = b"\x1b]8;;\x1b\\";
+
+/// Per-pane OSC 8 marker framing for Unified's persistent VTE.
+///
+/// The nonce is deliberately generated from Linux `getrandom(2)` only. If
+/// strong randomness is unavailable, the injector stays disabled: a
+/// predictable fallback would let guest output forge this pane's zones and is
+/// worse than temporarily drawing no chrome at all.
+///
+/// RIS/reset invalidation is coordinated by `UnifiedBackend::hard_reset`:
+/// injector state and chrome authority are cleared before the raw reset bytes
+/// reach VTE.
+#[derive(Debug)]
+struct ZoneMarkerInjector {
+    nonce: Option<[u8; 16]>,
+    open: Option<OpenZoneMarker>,
+}
+
+#[derive(Debug)]
+struct OpenZoneMarker {
+    id: u64,
+    bytes: Rc<[u8]>,
+}
+
+impl ZoneMarkerInjector {
+    fn from_system_entropy() -> Self {
+        let nonce = secure_zone_marker_nonce();
+        if nonce.is_none() {
+            log::warn!("unified zone markers disabled: strong per-pane randomness is unavailable");
+        }
+        Self { nonce, open: None }
+    }
+
+    #[cfg(test)]
+    fn with_nonce(nonce: [u8; 16]) -> Self {
+        Self {
+            nonce: Some(nonce),
+            open: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn disabled() -> Self {
+        Self {
+            nonce: None,
+            open: None,
+        }
+    }
+
+    fn begin_zone(&mut self, zone_id: u64) {
+        if self.open.as_ref().is_some_and(|open| open.id == zone_id) {
+            return;
+        }
+        let Some(nonce) = self.nonce else {
+            self.open = None;
+            return;
+        };
+        let mut nonce_hex = String::with_capacity(32);
+        for byte in nonce {
+            use std::fmt::Write as _;
+            let _ = write!(nonce_hex, "{byte:02x}");
+        }
+        self.open = Some(OpenZoneMarker {
+            id: zone_id,
+            bytes: format!("\x1b]8;;block://{nonce_hex}/{zone_id}\x1b\\")
+                .into_bytes()
+                .into(),
+        });
+    }
+
+    fn close_zone(&mut self, zone_id: Option<u64>) {
+        match (self.open.take(), zone_id) {
+            (Some(open), Some(zone_id)) if open.id == zone_id => {}
+            (Some(_), None) => {}
+            (Some(open), Some(zone_id)) => {
+                log::debug!(
+                    "unified zone marker close mismatch: requested={zone_id} open={}",
+                    open.id
+                );
+            }
+            (None, _) => {}
+        }
+    }
+
+    fn open_bytes(&self) -> Option<Rc<[u8]>> {
+        self.open.as_ref().map(|open| open.bytes.clone())
+    }
+
+    fn nonce(&self) -> Option<[u8; 16]> {
+        self.nonce
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingZone {
+    Prompt(u64),
+    Command(u64),
+}
+
+impl PendingZone {
+    fn id(self) -> u64 {
+        match self {
+            Self::Prompt(id) | Self::Command(id) => id,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PromptZonePlan {
+    completed_record_id: Option<u64>,
+    prompt_id: u64,
+}
+
+/// Decide the id owned by an accepted FTCS `A`. Repeated idle-prompt redraws
+/// reuse their id; a completed command/background record consumes the old id
+/// and the following prompt gets a fresh one. Records are still created only
+/// by the normal completion path, never merely because a marker was opened.
+fn plan_prompt_zone(pending: Option<PendingZone>, completes_record: bool) -> PromptZonePlan {
+    if completes_record {
+        PromptZonePlan {
+            completed_record_id: Some(pending.map(PendingZone::id).unwrap_or_else(next_block_id)),
+            prompt_id: next_block_id(),
+        }
+    } else {
+        PromptZonePlan {
+            completed_record_id: None,
+            prompt_id: pending.map(PendingZone::id).unwrap_or_else(next_block_id),
+        }
+    }
+}
+
+fn prompt_zone_to_reopen_after_alt(
+    restored_state: BlockState,
+    pending: Option<PendingZone>,
+) -> Option<u64> {
+    match (restored_state, pending) {
+        (BlockState::AwaitingCommand, Some(PendingZone::Prompt(id))) => Some(id),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn secure_zone_marker_nonce() -> Option<[u8; 16]> {
+    let mut nonce = [0_u8; 16];
+    let mut filled = 0;
+    while filled < nonce.len() {
+        // SAFETY: the suffix beginning at `filled` is writable for exactly
+        // the length passed to the kernel and remains alive for the call.
+        let read = unsafe {
+            nix::libc::getrandom(
+                nonce[filled..].as_mut_ptr().cast(),
+                nonce.len() - filled,
+                nix::libc::GRND_NONBLOCK,
+            )
+        };
+        if read > 0 {
+            filled += read as usize;
+            continue;
+        }
+        if read < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return None;
+    }
+    Some(nonce)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn secure_zone_marker_nonce() -> Option<[u8; 16]> {
+    None
 }
 
 /// Keep newly-created block ids above every id restored from persistent history.
@@ -233,6 +406,17 @@ fn sample_output_for_event(output: &str) -> String {
         tail_start.saturating_sub(head_end),
         &output[tail_start..]
     )
+}
+
+fn utf8_prefix_bounded(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Normalize the cells captured from the settled PromptEnd anchor.
@@ -783,6 +967,17 @@ fn submit_captured_output_to_journal(id: String, output: &str) {
         })
     {
         log::debug!("jsh execution journal rejected a captured output: {error:?}");
+    }
+}
+
+fn submit_lazy_output_to_journal(
+    journal_execution_id: Option<String>,
+    capture_enabled: bool,
+    payload: &dyn BlockRenderPayloadAccessor,
+    submit: impl FnOnce(String, &str),
+) {
+    if let Some(id) = journal_execution_id.filter(|_| capture_enabled) {
+        submit(id, payload.materialize().output_plain.trim());
     }
 }
 
@@ -1545,6 +1740,24 @@ fn step_marked_indices(marked: &[usize], current: Option<usize>, direction: i32)
             .copied()
             .or_else(|| marked.first().copied())
     }
+}
+
+/// Resolve stable marked record ids through current document order before
+/// applying the existing previous/next wrapping behavior.
+fn step_marked_record_ids(
+    record_ids: &[u64],
+    marked_ids: &[u64],
+    current_id: Option<u64>,
+    direction: i32,
+) -> Option<u64> {
+    let marked_ids: HashSet<u64> = marked_ids.iter().copied().collect();
+    let marked_indices: Vec<usize> = record_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(index, id)| marked_ids.contains(id).then_some(index))
+        .collect();
+    let current = current_id.and_then(|id| record_ids.iter().position(|record| *record == id));
+    step_marked_indices(&marked_indices, current, direction).map(|index| record_ids[index])
 }
 
 pub(crate) struct PromptRecallCtx<'a> {
@@ -2359,7 +2572,7 @@ fn remove_finished_block(
     // Clear while every highlighted VTE is still reachable. The helper drops
     // its block-list borrow before calling GTK, so re-entrant signals cannot
     // collide with the mutation below.
-    find::clear_find_state(find_state.as_ref(), finished_blocks.as_ref(), active_vte);
+    find::clear_find_state(find_state.as_ref(), active_vte);
     let removed = {
         let mut finished = finished_blocks.borrow_mut();
         finished
@@ -3058,13 +3271,37 @@ impl InputOrigin {
     }
 }
 
-/// `(command, exit status, output sample, Agent generation, duration ms)`. The
-/// status is `None` when the shell reported none, so every observer has to
-/// decide what that means for it rather than being handed a 0 that reads as
-/// success. The Agent generation is armed locally before its reviewed command
-/// enters the PTY.
-type BlockFinishedCallbacks =
-    Rc<RefCell<Vec<Box<dyn Fn(String, Option<i32>, String, Option<u64>, Option<u64>)>>>>;
+/// The identity and outcome of one completed command. Rendering-only values
+/// (prompt text, captured output, terminal columns and height estimates) are
+/// deliberately absent: Unified retains exactly this record and never needs to
+/// build a Block card payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompletedCommandRecord {
+    id: u64,
+    /// Empty only for asynchronous output observed at an idle prompt.
+    cmd: String,
+    exit_code: Option<i32>,
+    start_time_ms: Option<u64>,
+    end_time_ms: Option<u64>,
+    duration_ms: Option<u64>,
+    cwd: Option<String>,
+    is_background: bool,
+}
+
+/// A completed-command observer either consumes metadata only or explicitly
+/// opts into a bounded output sample. Keeping both variants in one ordered
+/// vector preserves registration/fan-out order while letting a metadata-only
+/// pane avoid materializing captured output altogether.
+type MetadataBlockFinishedCallback = Box<dyn Fn(String, Option<i32>, Option<u64>, Option<u64>)>;
+type OutputBlockFinishedCallback =
+    Box<dyn Fn(String, Option<i32>, String, Option<u64>, Option<u64>)>;
+
+enum BlockFinishedCallback {
+    Metadata(MetadataBlockFinishedCallback),
+    WithOutput(OutputBlockFinishedCallback),
+}
+
+type BlockFinishedCallbacks = Rc<RefCell<Vec<BlockFinishedCallback>>>;
 
 /// A locally armed Agent execution lost the lifecycle proof needed to bind a
 /// future Block to that approval. Reasons are fixed, non-sensitive strings.
@@ -3189,6 +3426,8 @@ const VERIFIED_SUBMISSION_LOST: &str =
     "the rendered shell editor did not exactly match the approved command before execution";
 const REVIEWED_COMMAND_START_LOST: &str =
     "the shell did not report the exact reviewed command starting before the safety deadline";
+const TERMINAL_RESET_INVALIDATED_SUBMISSION: &str =
+    "the terminal reset before the reviewed command could be verified";
 
 /// The live-surface reads the verified submission path performs. Every one is
 /// a query — this boundary never draws — and the decisions built on them
@@ -3333,6 +3572,23 @@ impl VerifiedSubmissionCtx {
         } else if !matches_reviewed_text {
             log::warn!("a reviewed command start could not be verified");
         }
+    }
+
+    /// Cancel either phase of a reviewed submission when RIS destroys the
+    /// surface proof it was built on. Before Enter, `pending_agent_generation`
+    /// owns the Agent identity; after Enter, the reader's
+    /// `external_submission_generation` owns it. Return the former so the
+    /// caller can emit the same fail-closed loss signal for either phase.
+    fn invalidate_for_terminal_reset(&self) -> Option<u64> {
+        if let Some(source) = self.source_id.borrow_mut().take() {
+            source.remove();
+        }
+        let generation = self.pending_agent_generation.take();
+        if let Some(completion) = self.completion.borrow_mut().take() {
+            completion(Err(TERMINAL_RESET_INVALIDATED_SUBMISSION.to_string()));
+        }
+        self.typed_cmd_fidelity.set(TypedShadowFidelity::Inexact);
+        generation
     }
 
     fn arm_command_start_deadline(&self, agent_generation: Option<u64>) {
@@ -3640,11 +3896,10 @@ pub struct TermView {
     /// on copy/typing/timeout. Kept here so input and copy paths can resume
     /// the feed immediately.
     selection_feed_hold: Rc<SelectionFeedHold>,
-    /// `Some` only in Unified mode, where it is the zone table
-    /// [`UnifiedBackend`] records into and the marker that this pane has no
-    /// finished-block widgets at all. Block-mode panes hold `None` and every
-    /// block-indexed method behaves exactly as before.
-    unified_zones: Option<Rc<RefCell<Vec<UnifiedZone>>>>,
+    /// The same backend instance driven by [`ReaderCtx`]. Record consumers
+    /// query it directly, so `TermView` never infers its data model from an
+    /// empty Block-only collection or an optional Unified side channel.
+    render_backend: Rc<dyn RenderBackend>,
 }
 
 impl Drop for TermView {
@@ -3700,7 +3955,295 @@ struct EngineState {
     pending_exit_code: Option<i32>,
     /// OSC 133 metadata for the command currently running, if the shell sends any.
     pending_command_meta: PendingCommandMeta,
+    /// The id opened at A and carried through C until its completed record is
+    /// finalized at the following A. A marker alone is not a record.
+    pending_zone: Option<PendingZone>,
     active_alt_screen_mode: Option<u32>,
+}
+
+/// The VTE/widget pair that presents one field of a completed record.
+///
+/// Block mode maps command and output to the two snapshot VTEs owned by the
+/// matching card. Unified's whole-surface find does not need a record target;
+/// exact record targets remain unavailable until bounded per-zone snapshots
+/// or a stable addressable row target are retained with each record.
+/// Keeping that distinction behind the backend lets consumers avoid using an
+/// empty finished-widget list as an accidental mode test.
+struct RecordSearchTarget {
+    terminal: Terminal,
+    widget: gtk4::Widget,
+    uses_live_surface: bool,
+}
+
+/// One bounded window inside a native VTE search domain. Windows are ordered
+/// exactly as a freshly reset native cursor visits them. Unified therefore
+/// presents the viewport-to-tail window first and, only when that extraction
+/// completed, the wrapped oldest-history prefix second. They remain one
+/// [`BackendSearchSurface`] and one native cursor domain.
+struct BackendSearchWindow {
+    text: String,
+    /// Counting this window does not prove the domain's total match count.
+    incomplete: bool,
+    /// The native step entering this window must wrap around once.
+    initial_wrap: bool,
+}
+
+/// One native VTE search domain and bounded plain-text windows used to count
+/// its matches. A domain must correspond one-to-one with a VTE search cursor:
+/// Block returns two domains per finished card, while Unified returns exactly
+/// one domain for its persistent surface (never one pseudo-domain per zone).
+struct BackendSearchSurface {
+    block_id: u64,
+    block_index: usize,
+    is_output: bool,
+    is_live: bool,
+    windows: Vec<BackendSearchWindow>,
+    /// Hard-budget charge for extracting every window. For native VTE reads
+    /// this is requested grid work, not merely the returned nonblank bytes.
+    scanned_bytes: usize,
+    /// Clear the native selection/search anchor before entering the selected
+    /// window. Unified shares one persistent cursor across successive queries.
+    reset_cursor: bool,
+    terminal: Terminal,
+}
+
+/// Last-resort native search for a persistent surface whose absolute ring
+/// rows are not currently trustworthy (for example just after RIS/rewrap).
+/// The caller may select one forward match from the current viewport, but
+/// cannot claim a count or navigate beyond that representative result.
+struct BackendNativeSearchFallback {
+    block_id: u64,
+    block_index: usize,
+    is_output: bool,
+    is_live: bool,
+    terminal: Terminal,
+}
+
+/// One bounded backend snapshot. `incomplete` also covers a deadline reached
+/// between surfaces (including before the first one), where no individual
+/// surface exists on which to carry the partial-state bit.
+struct BackendSearchBatch {
+    surfaces: Vec<BackendSearchSurface>,
+    incomplete: bool,
+    native_fallback: Option<BackendNativeSearchFallback>,
+}
+
+/// Materialize one search surface only while the caller's deadline remains
+/// live. Checking again after the closure keeps a surface that crossed the
+/// deadline usable while telling the caller not to touch the next one.
+fn push_search_surface_before_deadline<T>(
+    surfaces: &mut Vec<T>,
+    deadline_exhausted: &mut dyn FnMut() -> bool,
+    materialize: impl FnOnce() -> T,
+) -> bool {
+    if deadline_exhausted() {
+        return false;
+    }
+    surfaces.push(materialize());
+    !deadline_exhausted()
+}
+
+/// Borrowed completed-record storage. Block owns the historical serialized
+/// representation; Unified owns only command identity/outcome metadata. The
+/// enum keeps the distinction explicit without making callers branch on a
+/// terminal mode or forcing Unified to allocate dummy `BlockData` values.
+enum BackendRecords<'a> {
+    Blocks(Ref<'a, VecDeque<BlockData>>),
+    Metadata(Ref<'a, VecDeque<CompletedCommandRecord>>),
+}
+
+#[derive(Clone, Copy)]
+enum BackendRecordRef<'a> {
+    Block(&'a BlockData),
+    Metadata(&'a CompletedCommandRecord),
+}
+
+enum BackendRecordIter<'a> {
+    Blocks(std::collections::vec_deque::Iter<'a, BlockData>),
+    Metadata(std::collections::vec_deque::Iter<'a, CompletedCommandRecord>),
+}
+
+impl<'a> Iterator for BackendRecordIter<'a> {
+    type Item = BackendRecordRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Blocks(records) => records.next().map(BackendRecordRef::Block),
+            Self::Metadata(records) => records.next().map(BackendRecordRef::Metadata),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Blocks(records) => records.size_hint(),
+            Self::Metadata(records) => records.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for BackendRecordIter<'_> {}
+
+impl DoubleEndedIterator for BackendRecordIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Blocks(records) => records.next_back().map(BackendRecordRef::Block),
+            Self::Metadata(records) => records.next_back().map(BackendRecordRef::Metadata),
+        }
+    }
+}
+
+impl BackendRecords<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Blocks(records) => records.len(),
+            Self::Metadata(records) => records.len(),
+        }
+    }
+
+    fn iter(&self) -> BackendRecordIter<'_> {
+        match self {
+            Self::Blocks(records) => BackendRecordIter::Blocks(records.iter()),
+            Self::Metadata(records) => BackendRecordIter::Metadata(records.iter()),
+        }
+    }
+
+    fn block_data(&self) -> Option<&VecDeque<BlockData>> {
+        match self {
+            Self::Blocks(records) => Some(records),
+            Self::Metadata(_) => None,
+        }
+    }
+}
+
+impl<'a> BackendRecordRef<'a> {
+    fn id(self) -> u64 {
+        match self {
+            Self::Block(record) => record.id,
+            Self::Metadata(record) => record.id,
+        }
+    }
+
+    fn command(self) -> &'a str {
+        match self {
+            Self::Block(record) => &record.cmd,
+            Self::Metadata(record) => &record.cmd,
+        }
+    }
+
+    fn prompt(self) -> Option<&'a str> {
+        match self {
+            Self::Block(record) => Some(&record.prompt),
+            Self::Metadata(_) => None,
+        }
+    }
+
+    fn output(self) -> Option<&'a str> {
+        match self {
+            Self::Block(record) => Some(&record.output),
+            Self::Metadata(_) => None,
+        }
+    }
+
+    fn exit_code(self) -> Option<i32> {
+        match self {
+            Self::Block(record) => record.exit_code,
+            Self::Metadata(record) => record.exit_code,
+        }
+    }
+
+    fn duration_ms(self) -> Option<u64> {
+        match self {
+            Self::Block(record) => record.duration_ms,
+            Self::Metadata(record) => record.duration_ms,
+        }
+    }
+
+    fn is_metadata_only(self) -> bool {
+        matches!(self, Self::Metadata(_))
+    }
+}
+
+/// Output which already lives in engine-owned capture storage. Converting it
+/// to a `String` is deferred until a backend or an explicit output consumer
+/// asks for the render payload.
+enum CapturedFinalizeOutput {
+    Foreground(Rc<RefCell<BoundedByteRing>>),
+    Background(BoundedByteRing),
+}
+
+struct BlockRenderPayload {
+    prompt: String,
+    output_with_ansi: String,
+    output_plain: String,
+}
+
+/// Object-safe, memoized accessor handed to every backend. A backend needs no
+/// preliminary capability query and receives no `Option` it could interpret
+/// inconsistently: Block calls `materialize`, Unified simply does not.
+trait BlockRenderPayloadAccessor {
+    fn materialize(&self) -> &BlockRenderPayload;
+
+    #[cfg(test)]
+    fn materialization_counter(&self) -> Rc<Cell<usize>>;
+}
+
+struct LazyBlockRenderPayload {
+    value: OnceCell<BlockRenderPayload>,
+    prompt: RefCell<Option<String>>,
+    output: RefCell<Option<CapturedFinalizeOutput>>,
+    materializations: Rc<Cell<usize>>,
+}
+
+impl LazyBlockRenderPayload {
+    fn new(prompt: String, output: CapturedFinalizeOutput) -> Self {
+        Self {
+            value: OnceCell::new(),
+            prompt: RefCell::new(Some(prompt)),
+            output: RefCell::new(Some(output)),
+            materializations: Rc::new(Cell::new(0)),
+        }
+    }
+
+    #[cfg(test)]
+    fn materialization_count(&self) -> usize {
+        self.materializations.get()
+    }
+}
+
+impl BlockRenderPayloadAccessor for LazyBlockRenderPayload {
+    fn materialize(&self) -> &BlockRenderPayload {
+        self.value.get_or_init(|| {
+            self.materializations
+                .set(self.materializations.get().saturating_add(1));
+            let prompt = self
+                .prompt
+                .borrow_mut()
+                .take()
+                .expect("a finalize payload is materialized at most once");
+            let output_with_ansi = match self
+                .output
+                .borrow_mut()
+                .take()
+                .expect("a finalize payload is materialized at most once")
+            {
+                CapturedFinalizeOutput::Foreground(output) => live_output_text(&output),
+                CapturedFinalizeOutput::Background(mut output) => {
+                    String::from_utf8_lossy(output.make_contiguous()).into_owned()
+                }
+            };
+            let output_plain = strip_ansi(&output_with_ansi);
+            BlockRenderPayload {
+                prompt,
+                output_with_ansi,
+                output_plain,
+            }
+        })
+    }
+
+    #[cfg(test)]
+    fn materialization_counter(&self) -> Rc<Cell<usize>> {
+        self.materializations.clone()
+    }
 }
 
 /// Rendering seam for the OSC 133 block lifecycle. Every statement in the
@@ -3718,6 +4261,17 @@ trait RenderBackend {
     /// Feed bytes to the live terminal surface (including re-synthesized
     /// `\x1b[?..h/l` alt-screen toggles).
     fn feed_live(&self, bytes: &[u8]);
+    /// Open/reassert the prompt zone selected by the engine at FTCS `A`.
+    /// Block has no persistent marker surface, so this is a no-op by default.
+    fn begin_prompt_zone(&self, _zone_id: u64) {}
+    /// Close the A→C marker before command output begins. Backends without
+    /// marker-based row discovery leave the default no-op in place.
+    fn close_prompt_zone(&self, _zone_id: Option<u64>) {}
+    /// Invalidate row-address authority immediately before ED3 reaches VTE.
+    fn erase_scrollback(&self) {}
+    /// Invalidate all persistent-surface address authority before RIS reaches
+    /// VTE. Block's replace-per-command surface has no such authority.
+    fn hard_reset(&self) {}
     /// Reset the live surface for the next prompt. `preserve_scrollback` is
     /// Block-surface mechanics (the engine passes the config knob through; a
     /// backend without a persistent live scrollback may ignore it). Does NOT
@@ -3731,13 +4285,61 @@ trait RenderBackend {
     fn sync_geometry_to_pty(&self);
     /// Re-run only the live-surface layout (compact vs full-screen).
     fn layout_active_surface(&self);
+    // ── completed-record document ──
+    /// Chronological completed-command records owned by this backend.
+    ///
+    /// The returned borrow is a stable snapshot for the duration of one UI
+    /// operation. Block exposes its serializable block deque; Unified exposes
+    /// the zone records it accumulated while leaving their text on the live
+    /// surface. Consumers must use this query instead of reaching into
+    /// `TermView::block_data`/`finished_blocks`.
+    fn records(&self) -> BackendRecords<'_>;
+    /// Resolve the terminal surface that visibly presents one record field.
+    /// `is_output == false` selects command text. `None` means the record was
+    /// concurrently removed or the backend has no visible surface for it.
+    fn record_search_target(&self, block_id: u64, is_output: bool) -> Option<RecordSearchTarget>;
+    /// Snapshot completed text into native search-cursor domains. The byte
+    /// argument is a hard aggregate ceiling; implementations report a partial
+    /// batch rather than silently scanning beyond it. `deadline_exhausted` is
+    /// checked around each potentially allocating surface read.
+    fn completed_search_surfaces(
+        &self,
+        max_bytes: usize,
+        deadline_exhausted: &mut dyn FnMut() -> bool,
+    ) -> BackendSearchBatch;
+    /// Whether this backend owns the persisted Block-history representation.
+    /// Unified records are currently in-memory zones; bounded surface replay
+    /// remains a later increment, so it neither loads nor overwrites Block
+    /// history files.
+    fn persists_block_history(&self) -> bool {
+        true
+    }
+    /// Whether cards can be inserted into the backend's scrollable document.
+    fn supports_inline_notices(&self) -> bool {
+        true
+    }
+    /// Whether Clear/Undo may mutate the Block card document.
+    fn supports_block_mutation(&self) -> bool {
+        true
+    }
+    /// Handle keyboard line scrolling on a backend-owned surface. Returning
+    /// true means the outer Block scroller must not also move.
+    fn scroll_surface_lines(&self, _lines: i32) -> bool {
+        false
+    }
+    /// Short label for diagnostics only.
+    fn debug_name(&self) -> &'static str;
     // ── autoscroll ──
     fn mark_scroll_dirty(&self);
     fn reset_scroll_lock(&self);
     // ── finished blocks ──
     /// Mount a finished command as a history block and reset the live
     /// surface; subsumes the whole ordered finalize sub-step chain.
-    fn finalize_block(&self, block_data: BlockData, args: FinalizedBlockArgs);
+    fn finalize_block(
+        &self,
+        record: &CompletedCommandRecord,
+        payload: &dyn BlockRenderPayloadAccessor,
+    );
     // ── alt-screen chrome ──
     fn enter_alt_screen_chrome(&self);
     fn exit_alt_screen_chrome(&self);
@@ -3848,9 +4450,12 @@ struct AnchorSettleArgs {
 /// `set_size` churn happens around this pass, not inside it, so the single
 /// full-size Unified surface uses the identical fence — the anchor publishes
 /// on the same stability rule in both modes.
+type LiveSurfaceFeed = Rc<dyn Fn(&Terminal, &[u8])>;
+
 fn schedule_anchor_settle_on(
     vte: &Terminal,
     tick_slot: &Rc<RefCell<Option<gtk4::TickCallbackId>>>,
+    feed_live: LiveSurfaceFeed,
     args: AnchorSettleArgs,
 ) {
     // Local names keep the former `on_prompt_end` capture names so the
@@ -3916,7 +4521,7 @@ fn schedule_anchor_settle_on(
                 // visible even when the capture anchor
                 // is lost.
                 release_post_prompt_fence(
-                    &|deferred| vte.feed(deferred),
+                    &|deferred| feed_live(vte, deferred),
                     &post_prompt_bytes,
                     &post_prompt_fence_released,
                 );
@@ -3959,7 +4564,7 @@ fn schedule_anchor_settle_on(
             stage_requires_content.set(background_output_has_visible_text(&deferred));
             last_observed.set(None);
             stable_polls.set(0);
-            vte.feed(&deferred);
+            feed_live(vte, &deferred);
             return glib::ControlFlow::Continue;
         }
         anchor_ready.set(true);
@@ -4087,6 +4692,10 @@ struct ReaderCtx {
     prompt_anchor_ready_rc: Rc<Cell<bool>>,
     prompt_identity_output_rc: Rc<Cell<bool>>,
     prompt_anchor_generation_rc: Rc<Cell<u64>>,
+    /// Same slot owned by the backend's settling implementation and
+    /// `TermView::drop`; RIS must synchronously remove it before invalidating
+    /// the generation it could otherwise publish.
+    prompt_anchor_tick_id_rc: Rc<RefCell<Option<gtk4::TickCallbackId>>>,
     contents_generation_rc: Rc<Cell<u64>>,
     post_prompt_bytes_rc: Rc<RefCell<BoundedByteRing>>,
     /// True once the post-`OSC 133;B` feed fence has been released for this
@@ -4147,12 +4756,113 @@ impl ReaderCtx {
             ParserEvent::ColorQuery(kind) => self.on_color_query(*kind),
             ParserEvent::ColorSet { kind, spec } => self.on_color_set(*kind, spec),
             ParserEvent::ColorReset(kind) => self.on_color_reset(*kind),
+            ParserEvent::EraseScrollback => self.on_erase_scrollback(),
+            ParserEvent::HardReset => self.on_hard_reset(),
             ParserEvent::KeyboardProtocolQuery(query) => self.on_keyboard_protocol_query(*query),
             ParserEvent::RemoteSessionId(id) => self.on_remote_session_id(id),
             ParserEvent::AgentIntegrationReady(token) => self.on_agent_integration_ready(token),
             ParserEvent::Notification { title, body } => self.on_notification(title, body),
             ParserEvent::ApcSequence(payload) => self.on_apc_sequence(payload),
         }
+    }
+
+    /// A terminal reset sequence is a display-order barrier. Bytes parked
+    /// behind PromptEnd's settling fence arrived before the reset and must be
+    /// fed before the backend snapshots/invalidates its pre-reset row map.
+    /// Releasing the fence also makes a still-live settling tick abandon the
+    /// old anchor instead of publishing it after the reset.
+    fn release_prompt_fence_before_reset(&self) {
+        release_post_prompt_fence(
+            &|deferred| self.backend.feed_live(deferred),
+            &self.post_prompt_bytes_rc,
+            &self.post_prompt_fence_released_rc,
+        );
+    }
+
+    fn on_erase_scrollback(&self) {
+        self.release_prompt_fence_before_reset();
+        self.backend.erase_scrollback();
+    }
+
+    fn on_hard_reset(&self) {
+        self.release_prompt_fence_before_reset();
+
+        // No frame callback or reviewed-submission timeout may publish an
+        // answer derived from the pre-RIS surface. Generation invalidation is
+        // kept even after removing the current source so a callback already
+        // dispatched by GLib also fails its own guard.
+        if let Some(tick) = self.prompt_anchor_tick_id_rc.borrow_mut().take() {
+            tick.remove();
+        }
+        self.prompt_anchor_ready_rc.set(false);
+        self.prompt_anchor_generation_rc
+            .set(self.prompt_anchor_generation_rc.get().wrapping_add(1));
+        self.prompt_end_pos_rc.set((-1, -1));
+        self.prompt_anchor_rows_rc.set(0);
+        self.prompt_anchor_prefix_rc.borrow_mut().clear();
+        self.prompt_identity_output_rc.set(true);
+        self.accepted_input_generation_rc
+            .set(self.accepted_input_generation_rc.get().wrapping_add(1));
+
+        let pending_agent_generation = self.verified_submission.invalidate_for_terminal_reset();
+        let submitted_agent_generation = self.external_submission_generation_rc.take();
+        self.external_submission_rc.borrow_mut().take();
+        self.reviewed_submission_tainted_rc.set(false);
+        self.submission_pending_rc.set(false);
+        for generation in [
+            pending_agent_generation,
+            submitted_agent_generation
+                .filter(|generation| Some(*generation) != pending_agent_generation),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            emit_agent_execution_lost(
+                &self.agent_execution_lost_cbs,
+                generation,
+                TERMINAL_RESET_INVALIDATED_SUBMISSION,
+            );
+        }
+
+        // RIS invalidates the terminal's saved screens and every row address.
+        // Keep completed metadata, but do not let a later A/C lifecycle reuse
+        // an id whose marker cells no longer exist.
+        let (was_alt_screen, restored_state) = {
+            let mut engine = self.engine.borrow_mut();
+            engine.pending_zone = None;
+            engine.osc133_depth = 0;
+            engine.prompt_buf.clear();
+            engine.prompt_display.clear();
+            engine.vte_typed_cmd.clear();
+            engine.background_output.clear();
+            (
+                self.bstate_rc.get() == BlockState::AltScreen,
+                engine.prev_state,
+            )
+        };
+
+        // This hook runs before the parser's following Bytes(ESC c). In
+        // Unified it must clear the injector and row authority first, or the
+        // generic feed wrapper would prepend an already-retired OSC 8 marker
+        // to RIS itself. Completed command records live in a separate store.
+        self.backend.hard_reset();
+
+        if was_alt_screen {
+            // RIS itself returns VTE to the primary screen. Do not synthesize
+            // rmcup: doing so would restore terminal state *after* the reset.
+            // Only unwind the frontend ownership/chrome half of alt-screen.
+            self.backend.exit_fullscreen();
+            self.backend.exit_alt_screen_chrome();
+            emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
+            self.backend.layout_active_surface();
+            self.bstate_rc.set(restored_state);
+        }
+        self.engine.borrow_mut().active_alt_screen_mode = None;
+        self.agent_execution_supported_rc.set(false);
+        self.bracketed_paste_rc.set(false);
+        self.pty_for_init.set_shell_bracketed_paste(false);
+        self.mouse_reporting_rc.set(MouseReportingMode::None);
+        self.dynamic_colors_rc.set(DynamicColors::default());
     }
 
     fn on_decset_mode(&self, mode: u32, set: bool) {
@@ -4308,13 +5018,22 @@ impl ReaderCtx {
             // unknown exit status. Otherwise a missing D
             // would leave both the card and terminal stuck.
             if state == BlockState::AltScreen {
-                let mode = self
-                    .engine
-                    .borrow_mut()
-                    .active_alt_screen_mode
-                    .take()
-                    .unwrap_or(1049);
+                let (mode, restored_state, pending_zone) = {
+                    let mut engine = self.engine.borrow_mut();
+                    (
+                        engine.active_alt_screen_mode.take().unwrap_or(1049),
+                        engine.prev_state,
+                        engine.pending_zone,
+                    )
+                };
                 self.backend.feed_live(format!("\x1b[?{mode}l").as_bytes());
+                if let Some(id) = prompt_zone_to_reopen_after_alt(restored_state, pending_zone) {
+                    // `rmcup` restores the main screen *after* the wrapper's
+                    // prefix was interpreted, so reassert on the restored
+                    // screen. A post-C command zone is closed and never
+                    // reopened here.
+                    self.backend.begin_prompt_zone(id);
+                }
                 self.backend.exit_fullscreen();
                 self.backend.exit_alt_screen_chrome();
                 emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
@@ -4348,6 +5067,12 @@ impl ReaderCtx {
             None
         };
         let is_background = background_output.is_some();
+        let zone_plan = plan_prompt_zone(
+            self.engine.borrow().pending_zone,
+            state == BlockState::PostCommand || is_background,
+        );
+        self.engine.borrow_mut().pending_zone = Some(PendingZone::Prompt(zone_plan.prompt_id));
+        self.backend.begin_prompt_zone(zone_plan.prompt_id);
         // Finalize the previous command (deferred from CommandEnd),
         // or turn commandless async output into a first-class block.
         if state == BlockState::PostCommand || is_background {
@@ -4375,9 +5100,10 @@ impl ReaderCtx {
                 // populate the printable keystroke shadow. Keep a
                 // visible diagnostic card whenever input activity
                 // or actual output proves that something ran.
-                let output_visible = background_output_has_visible_text(
-                    live_output_text(&self.live_raw_output_rc).as_bytes(),
-                );
+                let output_visible = {
+                    let mut output = self.live_raw_output_rc.borrow_mut();
+                    background_output_has_visible_text(output.make_contiguous())
+                };
                 if self.pty_synced_rc.get() || output_visible {
                     log::warn!(
                         "finished command text was unavailable; preserving block with placeholder"
@@ -4406,31 +5132,17 @@ impl ReaderCtx {
             let prompt = if is_background {
                 String::new()
             } else {
-                self.engine.borrow().prompt_display.clone()
+                std::mem::take(&mut self.engine.borrow_mut().prompt_display)
             };
 
-            // The raw bytes already carry CRLF — the PTY's
-            // ONLCR turns `\n` into `\r\n` on the master side
-            // before we ever see them — and the finished VTE
-            // handles in-line CR overwrites natively, just
-            // like the live VTE did while the command ran. So
-            // we feed the captured bytes verbatim, with no
-            // reconstruction pass.
-            let output_with_ansi =
-                background_output.unwrap_or_else(|| live_output_text(&self.live_raw_output_rc));
-
-            let output_plain = strip_ansi(&output_with_ansi);
-
-            let truncation_limit = self.config_for_cb.borrow().truncation_threshold_lines as usize;
-            let (_output_trimmed, line_count) =
-                truncate_plain_output_for_height(&output_plain, truncation_limit);
-            let cols_for_height = self.backend.grid_cols();
-            let estimated_height = estimated_finished_block_height_for_text(
-                &self.config_for_cb.borrow(),
-                &cmd,
-                &output_plain,
-                cols_for_height,
-            );
+            // Keep bytes in their existing capture owner until an actual
+            // output consumer asks for them. Unified finalization therefore
+            // does not build a raw String, strip ANSI, truncate, estimate a
+            // widget height or allocate a BlockData.
+            let captured_output = match background_output {
+                Some(output) => CapturedFinalizeOutput::Background(output),
+                None => CapturedFinalizeOutput::Foreground(self.live_raw_output_rc.clone()),
+            };
 
             let start_time = if is_background {
                 None
@@ -4463,7 +5175,8 @@ impl ReaderCtx {
             // later and includes our own parse latency.
             let duration_ms = command_meta.duration_ms.or(measured_duration_ms);
 
-            let block_cwd = command_meta.cwd.clone().or_else(|| {
+            let journal_execution_id = command_meta.journal_execution_id().map(str::to_owned);
+            let block_cwd = command_meta.cwd.or_else(|| {
                 let cwd_str = self.current_cwd_for_cb.borrow().clone();
                 if cwd_str.is_empty() {
                     None
@@ -4481,47 +5194,34 @@ impl ReaderCtx {
                 self.engine.borrow_mut().pending_exit_code.take()
             };
 
-            // Single id shared by the serializable BlockData and
-            // the GTK FinishedBlock so id-keyed lookups (export,
-            // delete) resolve in both lists.
-            let block_id = next_block_id();
-            // Capture cols now (live VTE is allocated by the time
-            // a command finishes) and store it on BlockData so
-            // session restore can recreate the finished VTE at
-            // the same width — preserving column-formatted output
-            // (ls, git log, etc.) instead of reflowing it.
-            let cols = self.backend.grid_cols();
-            // FinishedBlock may lazily cache the complete
-            // stripped snapshot, while BlockData stores a
-            // trimmed copy. Charge the larger pre-trim
-            // length for both plain-text owners.
-            let plain_output_bytes = output_plain.len();
-            let block_output = output_plain.trim().to_string();
-
-            // Correlate what this terminal actually rendered
-            // with jsh's own execution record. jsh owns the
-            // command/cwd/exit/duration events; the id it put
-            // on the OSC 133 mark is the only key that can
-            // attach our captured output to them.
-            if let Some(id) = command_meta.journal_execution_id() {
-                submit_captured_output_to_journal(id.to_string(), &block_output);
-            }
-
-            let block_data = BlockData {
+            // Single id shared by the completed record and, in Block mode,
+            // the serializable BlockData and GTK FinishedBlock.
+            let block_id = zone_plan
+                .completed_record_id
+                .expect("a finalized lifecycle has a pending zone id");
+            let record = CompletedCommandRecord {
                 id: block_id,
-                prompt: prompt.clone(),
                 cmd: cmd.clone(),
-                cmd_markup: None,
-                output: block_output,
                 exit_code,
-                estimated_height,
-                line_count,
                 start_time_ms,
                 end_time_ms,
                 duration_ms,
-                cwd: block_cwd.clone(),
-                cols: cols.clamp(1, u16::MAX as i64) as u16,
+                cwd: block_cwd,
+                is_background,
             };
+            let payload = LazyBlockRenderPayload::new(prompt, captured_output);
+
+            // jsh owns the command/cwd/status/duration events. A correlated
+            // id identifies the record, while the journal capability confirms
+            // that an output consumer is actually enabled. Both must exist
+            // before this path touches the lazy terminal payload; `submit`
+            // repeats its own boundary check in case the environment changes.
+            submit_lazy_output_to_journal(
+                journal_execution_id,
+                crate::execution_journal::output_capture_enabled(),
+                &payload,
+                submit_captured_output_to_journal,
+            );
 
             // The take is engine-side and conditional: background
             // output must not consume the agent identity reserved
@@ -4554,34 +5254,7 @@ impl ReaderCtx {
                 }
                 resolved => resolved,
             };
-            // Sampled before `output_plain` moves into the finalize args; the
-            // block-finished fan-out below runs after the backend returns.
-            let output_sample = if is_background {
-                String::new()
-            } else {
-                sample_output_for_event(&output_plain)
-            };
-            self.backend.finalize_block(
-                block_data,
-                FinalizedBlockArgs {
-                    block_id,
-                    prompt,
-                    cmd: cmd.clone(),
-                    output_with_ansi,
-                    output_plain,
-                    plain_output_bytes,
-                    block_cwd,
-                    cols,
-                    exit_code,
-                    duration_ms,
-                    end_time_ms,
-                    is_background,
-                },
-            );
-            // The backend's live-surface reset no longer clears output state;
-            // the engine-owned ring is cleared here instead (pre-split parity:
-            // the clear rode inside finalize's tail reset_active).
-            self.live_raw_output_rc.borrow_mut().clear();
+            self.backend.finalize_block(&record, &payload);
             // DECISION: the block-finished fan-out is engine policy and now
             // runs AFTER the whole backend finalize. Pre-split it ran
             // mid-finalize — after the finished-blocks push, before the menu
@@ -4598,16 +5271,35 @@ impl ReaderCtx {
             // emission point is observationally equivalent; bstate is still
             // PostCommand here, exactly as at the old emission point.
             if !is_background {
+                let output_sample = OnceCell::new();
                 for cb in self.block_finished_cbs.borrow().iter() {
-                    cb(
-                        cmd.clone(),
-                        exit_code,
-                        output_sample.clone(),
-                        agent_generation,
-                        duration_ms,
-                    );
+                    match cb {
+                        BlockFinishedCallback::Metadata(cb) => cb(
+                            record.cmd.clone(),
+                            record.exit_code,
+                            agent_generation,
+                            record.duration_ms,
+                        ),
+                        BlockFinishedCallback::WithOutput(cb) => cb(
+                            record.cmd.clone(),
+                            record.exit_code,
+                            output_sample
+                                .get_or_init(|| {
+                                    sample_output_for_event(&payload.materialize().output_plain)
+                                })
+                                .clone(),
+                            agent_generation,
+                            record.duration_ms,
+                        ),
+                    }
                 }
             }
+            // Keep the engine-owned ring alive through output-sample fan-out:
+            // a metadata-only backend (Unified) legitimately leaves the lazy
+            // payload untouched, while an explicit WithOutput observer must
+            // still be able to materialize it here. Clear only after every
+            // potential consumer has returned.
+            self.live_raw_output_rc.borrow_mut().clear();
         }
         self.bstate_rc.set(BlockState::CollectingPrompt);
         self.engine.borrow_mut().prompt_buf.clear();
@@ -4783,6 +5475,23 @@ impl ReaderCtx {
         if !deferred.is_empty() {
             self.backend.feed_live(&deferred);
         }
+        let command_zone_id = {
+            let mut engine = self.engine.borrow_mut();
+            match engine.pending_zone {
+                Some(PendingZone::Prompt(id)) => {
+                    engine.pending_zone = Some(PendingZone::Command(id));
+                    Some(id)
+                }
+                other => {
+                    log::debug!("command start without a prompt zone: {other:?}");
+                    None
+                }
+            }
+        };
+        // Every accepted C closes OSC 8, even when RIS or a malformed
+        // integration sequence removed the pending id. This prevents guest
+        // hyperlinks and stale marker state from leaking into command output.
+        self.backend.close_prompt_zone(command_zone_id);
         let prompt_display = self.engine.borrow().prompt_display.clone();
         let typed_shadow = self.typed_cmd_rc.borrow().clone();
         let external_submission = self.external_submission_rc.borrow_mut().take();
@@ -4909,14 +5618,19 @@ impl ReaderCtx {
         // crashed or exited without rmcup, force the UI back
         // to the block list so the next prompt is usable.
         if state == BlockState::AltScreen {
-            let mode = self
-                .engine
-                .borrow_mut()
-                .active_alt_screen_mode
-                .take()
-                .unwrap_or(1049);
+            let (mode, restored_state, pending_zone) = {
+                let mut engine = self.engine.borrow_mut();
+                (
+                    engine.active_alt_screen_mode.take().unwrap_or(1049),
+                    engine.prev_state,
+                    engine.pending_zone,
+                )
+            };
             let leave = format!("\x1b[?{mode}l");
             self.backend.feed_live(leave.as_bytes());
+            if let Some(id) = prompt_zone_to_reopen_after_alt(restored_state, pending_zone) {
+                self.backend.begin_prompt_zone(id);
+            }
             self.backend.exit_fullscreen();
             self.backend.exit_alt_screen_chrome();
             emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
@@ -4996,14 +5710,21 @@ impl ReaderCtx {
         // Warp parity: alt-screen content is ephemeral and is
         // NOT merged into the block. The active block keeps
         // just the command name + exit code.
-        self.engine.borrow_mut().active_alt_screen_mode = None;
+        let (restored_state, pending_zone) = {
+            let mut engine = self.engine.borrow_mut();
+            engine.active_alt_screen_mode = None;
+            (engine.prev_state, engine.pending_zone)
+        };
         let leave = format!("\x1b[?{mode}l");
         self.backend.feed_live(leave.as_bytes());
+        if let Some(id) = prompt_zone_to_reopen_after_alt(restored_state, pending_zone) {
+            self.backend.begin_prompt_zone(id);
+        }
         self.backend.exit_fullscreen();
         self.backend.exit_alt_screen_chrome();
         emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
         self.engine.borrow_mut().osc133_depth = 0;
-        self.bstate_rc.set(self.engine.borrow().prev_state);
+        self.bstate_rc.set(restored_state);
         // The primary and alternate screens share the same
         // viewport-sized grid, just like regular VTE mode.
         self.backend.sync_geometry_to_pty();
@@ -5238,15 +5959,16 @@ fn is_post_command_metadata(bytes: &[u8]) -> bool {
 /// at least one visible character. Prompt redraw control sequences and blank CR/LF
 /// bursts should not create empty history cards.
 fn background_output_has_visible_text(bytes: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(bytes);
-    strip_ansi(text.as_ref())
-        .chars()
-        .any(|ch| !ch.is_whitespace() && !ch.is_control())
+    ansi::ansi_bytes_have_visible_text(bytes)
 }
 
-fn take_background_output(pending: &mut BoundedByteRing) -> Option<String> {
-    let bytes = pending.take_vec();
-    background_output_has_visible_text(&bytes).then(|| String::from_utf8_lossy(&bytes).into_owned())
+fn take_background_output(pending: &mut BoundedByteRing) -> Option<BoundedByteRing> {
+    if background_output_has_visible_text(pending.make_contiguous()) {
+        Some(pending.take_ring())
+    } else {
+        pending.clear();
+        None
+    }
 }
 
 /// Lossy text of the running command's accumulated raw output. The ring is
@@ -5276,25 +5998,6 @@ thread_local! {
 /// fire when none has fired yet or the previous one is old enough.
 fn notification_allowed(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
     last.is_none_or(|prev| now.duration_since(prev) >= NOTIFICATION_MIN_INTERVAL)
-}
-
-/// Per-block lifecycle values the reader closure computes before the render
-/// path runs; their computation stays engine-side. The string fields are the
-/// pre-trim originals the finished widgets are built from, and `cols` is the
-/// unclamped live-grid width (`BlockData` stores the clamped copy).
-struct FinalizedBlockArgs {
-    block_id: u64,
-    prompt: String,
-    cmd: String,
-    output_with_ansi: String,
-    output_plain: String,
-    plain_output_bytes: usize,
-    block_cwd: Option<String>,
-    cols: i64,
-    exit_code: Option<i32>,
-    duration_ms: Option<u64>,
-    end_time_ms: Option<u64>,
-    is_background: bool,
 }
 
 /// The GTK/VTE rendering seam. Bodies moved verbatim from the former
@@ -5328,6 +6031,157 @@ impl RenderBackend for BlockBackend {
 
     fn layout_active_surface(&self) {
         (self.layout_active_surface)();
+    }
+
+    fn records(&self) -> BackendRecords<'_> {
+        BackendRecords::Blocks(self.block_data_for_cb.borrow())
+    }
+
+    fn record_search_target(&self, block_id: u64, is_output: bool) -> Option<RecordSearchTarget> {
+        let finished = self.finished_blocks_for_cb.borrow();
+        let block = finished.iter().find(|block| block.id == block_id)?;
+        let terminal = if is_output {
+            block.output_vte.clone()
+        } else {
+            block.command_vte.clone()
+        };
+        Some(RecordSearchTarget {
+            terminal,
+            widget: block.widget().clone().upcast(),
+            uses_live_surface: false,
+        })
+    }
+
+    fn completed_search_surfaces(
+        &self,
+        max_bytes: usize,
+        deadline_exhausted: &mut dyn FnMut() -> bool,
+    ) -> BackendSearchBatch {
+        let finished = self.finished_blocks_for_cb.borrow();
+        let mut remaining = max_bytes;
+        let mut surfaces = Vec::new();
+        for (block_index, block) in finished.iter().enumerate() {
+            if remaining == 0 {
+                return BackendSearchBatch {
+                    surfaces,
+                    incomplete: true,
+                    native_fallback: None,
+                };
+            }
+            let mut command_incomplete = false;
+            if !push_search_surface_before_deadline(&mut surfaces, deadline_exhausted, || {
+                let command = crate::review_input::safe_multiline_display(
+                    &block.cmd_text,
+                    crate::review_input::MAX_REVIEW_INPUT_BYTES,
+                );
+                let command_prefix = utf8_prefix_bounded(&command, remaining);
+                command_incomplete = command_prefix.len() < command.len();
+                remaining = remaining.saturating_sub(command_prefix.len());
+                BackendSearchSurface {
+                    block_id: block.id,
+                    block_index,
+                    is_output: false,
+                    is_live: false,
+                    windows: vec![BackendSearchWindow {
+                        text: command_prefix.to_string(),
+                        incomplete: command_incomplete,
+                        initial_wrap: false,
+                    }],
+                    scanned_bytes: command_prefix.len(),
+                    reset_cursor: false,
+                    terminal: block.command_vte.clone(),
+                }
+            }) {
+                return BackendSearchBatch {
+                    surfaces,
+                    incomplete: true,
+                    native_fallback: None,
+                };
+            }
+            if command_incomplete {
+                return BackendSearchBatch {
+                    surfaces,
+                    incomplete: true,
+                    native_fallback: None,
+                };
+            }
+            if remaining == 0 {
+                let has_more =
+                    !block.displayed_output.borrow().is_empty() || block_index + 1 < finished.len();
+                surfaces
+                    .last_mut()
+                    .expect("the command surface was just appended")
+                    .windows
+                    .last_mut()
+                    .expect("a command search window exists")
+                    .incomplete = has_more;
+                return BackendSearchBatch {
+                    surfaces,
+                    incomplete: has_more,
+                    native_fallback: None,
+                };
+            }
+
+            // Bound the raw decorated prefix before stripping, preserving the
+            // old aggregate budget without allocating a full cached plain copy.
+            let mut output_incomplete = false;
+            if !push_search_surface_before_deadline(&mut surfaces, deadline_exhausted, || {
+                let raw_output = block.displayed_output.borrow();
+                let raw_prefix = utf8_prefix_bounded(&raw_output, remaining);
+                output_incomplete = raw_prefix.len() < raw_output.len();
+                remaining = remaining.saturating_sub(raw_prefix.len());
+                BackendSearchSurface {
+                    block_id: block.id,
+                    block_index,
+                    is_output: true,
+                    is_live: false,
+                    windows: vec![BackendSearchWindow {
+                        text: strip_ansi(raw_prefix),
+                        incomplete: output_incomplete,
+                        initial_wrap: false,
+                    }],
+                    scanned_bytes: raw_prefix.len(),
+                    reset_cursor: false,
+                    terminal: block.output_vte.clone(),
+                }
+            }) {
+                return BackendSearchBatch {
+                    surfaces,
+                    incomplete: true,
+                    native_fallback: None,
+                };
+            }
+            if output_incomplete {
+                return BackendSearchBatch {
+                    surfaces,
+                    incomplete: true,
+                    native_fallback: None,
+                };
+            }
+            if remaining == 0 && block_index + 1 < finished.len() {
+                surfaces
+                    .last_mut()
+                    .expect("the output surface was just appended")
+                    .windows
+                    .last_mut()
+                    .expect("an output search window exists")
+                    .incomplete = true;
+                return BackendSearchBatch {
+                    surfaces,
+                    incomplete: true,
+                    native_fallback: None,
+                };
+            }
+        }
+        BackendSearchBatch {
+            surfaces,
+            incomplete: false,
+            native_fallback: None,
+        }
+    }
+
+    fn debug_name(&self) -> &'static str {
+        "block"
     }
 
     fn mark_scroll_dirty(&self) {
@@ -5450,7 +6304,12 @@ impl RenderBackend for BlockBackend {
     }
 
     fn schedule_anchor_settle(&self, args: AnchorSettleArgs) {
-        schedule_anchor_settle_on(&self.active_vte, &self.prompt_anchor_tick_id_rc, args);
+        schedule_anchor_settle_on(
+            &self.active_vte,
+            &self.prompt_anchor_tick_id_rc,
+            Rc::new(|vte, bytes| vte.feed(bytes)),
+            args,
+        );
     }
 
     fn cursor_and_rows(&self) -> ((i64, i64), i64) {
@@ -5504,40 +6363,63 @@ impl RenderBackend for BlockBackend {
     /// policy and runs after this returns (see `on_prompt_start`); the ring
     /// clear that used to ride on the tail `reset_active` is likewise the
     /// engine's now.
-    fn finalize_block(&self, block_data: BlockData, args: FinalizedBlockArgs) {
-        let FinalizedBlockArgs {
-            block_id,
-            prompt,
-            cmd,
-            output_with_ansi,
-            output_plain,
-            plain_output_bytes,
-            block_cwd,
-            cols,
-            exit_code,
-            duration_ms,
-            end_time_ms,
-            is_background,
-        } = args;
+    fn finalize_block(
+        &self,
+        record: &CompletedCommandRecord,
+        payload: &dyn BlockRenderPayloadAccessor,
+    ) {
+        // This is the sole production backend which asks for the rendering
+        // payload. Every derived widget/persistence value stays on this side
+        // of the seam so metadata-only backends pay none of its cost.
+        let payload = payload.materialize();
+        let block_id = record.id;
+        let prompt = payload.prompt.as_str();
+        let cmd = record.cmd.as_str();
+        let output_with_ansi = payload.output_with_ansi.as_str();
+        let output_plain = payload.output_plain.as_str();
+        let plain_output_bytes = output_plain.len();
+        let block_cwd = record.cwd.as_deref();
+        let cols = self.grid_cols();
+        let truncation_limit = { self.config_for_cb.borrow().truncation_threshold_lines as usize };
+        let (_output_trimmed, line_count) =
+            truncate_plain_output_for_height(output_plain, truncation_limit);
+        let estimated_height = {
+            // Copy the scalar inputs before calling the estimator. Keeping a
+            // Ref to the live config cell across this call would make a future
+            // callback added inside the estimator an accidental borrow panic.
+            let config = self.config_for_cb.borrow().clone();
+            estimated_finished_block_height_for_text(&config, cmd, output_plain, cols)
+        };
+        let block_data = BlockData {
+            id: block_id,
+            prompt: prompt.to_owned(),
+            cmd: cmd.to_owned(),
+            cmd_markup: None,
+            output: output_plain.trim().to_owned(),
+            exit_code: record.exit_code,
+            estimated_height,
+            line_count,
+            start_time_ms: record.start_time_ms,
+            end_time_ms: record.end_time_ms,
+            duration_ms: record.duration_ms,
+            cwd: record.cwd.clone(),
+            cols: cols.clamp(1, u16::MAX as i64) as u16,
+        };
         // The live surface is about to become a new
         // finished surface and retention may evict an
         // old prefix. Reset search while both sides of
         // that transition are still reachable.
-        find::clear_find_state(
-            self.find_state_for_cb.as_ref(),
-            self.finished_blocks_for_cb.as_ref(),
-            &self.active_vte,
-        );
+        find::clear_find_state(self.find_state_for_cb.as_ref(), &self.active_vte);
         let max_blocks = self.config_for_cb.borrow().max_visible_blocks as usize;
         let newest_estimated_bytes = {
             let images = self.kitty_pending_images.borrow();
             estimated_live_finished_block_retained_bytes(
-                &prompt,
-                &cmd,
+                prompt,
+                cmd,
                 None,
-                &output_with_ansi,
-                &output_plain,
-                block_cwd.as_deref(),
+                output_with_ansi,
+                output_plain,
+                block_cwd,
                 cols,
                 &images,
             )
@@ -5585,17 +6467,21 @@ impl RenderBackend for BlockBackend {
         self.kitty_pending_bytes.set(0);
 
         let recycled = self.widget_pool_for_cb.borrow_mut().acquire();
+        // Widget construction connects signals and may grow new synchronous
+        // hooks over time. Hand it an owned snapshot rather than holding the
+        // pane's live config Ref across that boundary.
+        let finished_config = self.config_for_cb.borrow().clone();
         let finished = FinishedBlock::new_with_pool(
             block_id,
-            &prompt,
-            &cmd,
+            prompt,
+            cmd,
             None,
-            &output_with_ansi,
-            exit_code,
-            &self.config_for_cb.borrow(),
-            duration_ms,
-            end_time_ms,
-            block_cwd.as_deref(),
+            output_with_ansi,
+            record.exit_code,
+            &finished_config,
+            record.duration_ms,
+            record.end_time_ms,
+            block_cwd,
             cols,
             &kitty_images,
             plain_output_bytes,
@@ -5640,14 +6526,14 @@ impl RenderBackend for BlockBackend {
 
         self.finished_blocks_for_cb.borrow_mut().push(finished);
 
-        {
+        let notification_threshold = {
             let cfg = self.config_for_cb.borrow();
-            if !is_background && cfg.notify_long_blocks {
-                if let Some(ms) = duration_ms {
-                    if ms >= cfg.notify_long_block_threshold_ms {
-                        notify_long_block(&cmd, exit_code, ms);
-                    }
-                }
+            (!record.is_background && cfg.notify_long_blocks)
+                .then_some(cfg.notify_long_block_threshold_ms)
+        };
+        if let (Some(threshold), Some(ms)) = (notification_threshold, record.duration_ms) {
+            if ms >= threshold {
+                notify_long_block(cmd, record.exit_code, ms);
             }
         }
 
@@ -5725,6 +6611,165 @@ fn capture_vte_text_range(
         .map(|gs| gs.to_string())
 }
 
+const VTE_SEARCH_CAPTURE_TIME_LIMIT: std::time::Duration = std::time::Duration::from_millis(10);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VteCaptureSpan {
+    start_row: i64,
+    end_row: i64,
+    end_col: i64,
+    work_cells: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BoundedVteCapture {
+    text: String,
+    incomplete: bool,
+    /// Grid-cell work charged against the caller's byte/work ceiling. Blank
+    /// rows still cost native extraction work even when they return no text.
+    work_cells: usize,
+}
+
+/// Extract terminal rows oldest-first without ever asking VTE to copy its
+/// whole scrollback. Both requested grid work and retained UTF-8 are bounded
+/// by `max_bytes`; each native call spans exactly one row. Despite calling it
+/// the "last column", VTE 0.82 treats `end_col` as the exclusive edge (pinned
+/// by the display-backed test below), so a request from column zero through
+/// `end_col = N` costs N cells. A multi-row range cannot be honestly charged
+/// from only its final `end_col`: every intermediate row is copied at full
+/// width. The time predicate lets the UI stop between calls, so a large blank
+/// ring is bounded too.
+fn capture_vte_rows_bounded(
+    start_row: i64,
+    end_row: i64,
+    columns: i64,
+    max_bytes: usize,
+    mut time_exhausted: impl FnMut() -> bool,
+    mut capture: impl FnMut(VteCaptureSpan) -> Option<String>,
+) -> BoundedVteCapture {
+    if start_row > end_row {
+        return BoundedVteCapture {
+            text: String::new(),
+            incomplete: false,
+            work_cells: 0,
+        };
+    }
+    if max_bytes == 0 {
+        return BoundedVteCapture {
+            text: String::new(),
+            incomplete: true,
+            work_cells: 0,
+        };
+    }
+
+    let mut text = String::with_capacity(max_bytes.min(64 * 1024));
+    let mut work_remaining = max_bytes;
+    let mut row = start_row;
+    let columns = usize::try_from(columns.max(1)).unwrap_or(usize::MAX);
+    while row <= end_row && work_remaining > 0 && text.len() < max_bytes {
+        if time_exhausted() {
+            return BoundedVteCapture {
+                text,
+                incomplete: true,
+                work_cells: max_bytes.saturating_sub(work_remaining),
+            };
+        }
+        let work_cells = columns.min(work_remaining);
+        // `work_cells` is non-zero by the loop condition and cannot exceed
+        // the original positive i64 column count, so the exclusive edge is
+        // representable by VTE's signed coordinate type.
+        let end_col = i64::try_from(work_cells).unwrap_or(i64::MAX);
+        let span = VteCaptureSpan {
+            start_row: row,
+            end_row: row,
+            end_col,
+            work_cells,
+        };
+        let raw = capture(span).unwrap_or_default();
+        let remaining_bytes = max_bytes.saturating_sub(text.len());
+        let prefix = utf8_prefix_bounded(&raw, remaining_bytes);
+        text.push_str(prefix);
+        work_remaining = work_remaining.saturating_sub(work_cells);
+
+        let width_incomplete = work_cells < columns;
+        let bytes_incomplete = prefix.len() < raw.len();
+        row = row.saturating_add(1);
+        if width_incomplete || bytes_incomplete {
+            return BoundedVteCapture {
+                text,
+                incomplete: true,
+                work_cells: max_bytes.saturating_sub(work_remaining),
+            };
+        }
+    }
+
+    BoundedVteCapture {
+        incomplete: row <= end_row,
+        text,
+        work_cells: max_bytes.saturating_sub(work_remaining),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BoundedVteSearchWindows {
+    /// Native forward-search order after clearing selection begins at VTE's
+    /// current viewport top, not at the oldest retained row.
+    viewport_to_tail: BoundedVteCapture,
+    /// Only present when the first window completed. Entering this window
+    /// corresponds to enabling one-shot native wrap-around.
+    oldest_history: Option<BoundedVteCapture>,
+}
+
+/// Extract one persistent VTE domain in exactly the order a fresh native
+/// forward cursor traverses it: current viewport through ring tail, then the
+/// oldest retained prefix after wrap. The second window is never requested if
+/// the first was partial, because an unseen tail match would otherwise precede
+/// every counted history match and desynchronise the logical cursor.
+fn capture_vte_search_windows_bounded(
+    retained_start: i64,
+    retained_end_exclusive: i64,
+    viewport_top: i64,
+    columns: i64,
+    max_bytes: usize,
+    mut time_exhausted: impl FnMut() -> bool,
+    mut capture: impl FnMut(VteCaptureSpan) -> Option<String>,
+) -> BoundedVteSearchWindows {
+    let viewport_top = viewport_top.clamp(retained_start, retained_end_exclusive);
+    let viewport_to_tail = capture_vte_rows_bounded(
+        viewport_top,
+        retained_end_exclusive.saturating_sub(1),
+        columns,
+        max_bytes,
+        &mut time_exhausted,
+        &mut capture,
+    );
+    // The shared ceiling covers both native grid work and retained UTF-8.
+    // Combining marks can make returned text larger than requested cells.
+    let remaining = max_bytes
+        .saturating_sub(viewport_to_tail.work_cells)
+        .min(max_bytes.saturating_sub(viewport_to_tail.text.len()));
+    let oldest_history = if !viewport_to_tail.incomplete
+        && retained_start < viewport_top
+        && remaining > 0
+        && !time_exhausted()
+    {
+        Some(capture_vte_rows_bounded(
+            retained_start,
+            viewport_top.saturating_sub(1),
+            columns,
+            remaining,
+            &mut time_exhausted,
+            &mut capture,
+        ))
+    } else {
+        None
+    };
+    BoundedVteSearchWindows {
+        viewport_to_tail,
+        oldest_history,
+    }
+}
+
 /// Write `text` to the desktop clipboard (OSC 52 write, policy-gated
 /// engine-side). Backend-shared: nothing about it is per-surface.
 fn set_display_clipboard_text(text: &str) {
@@ -5734,29 +6779,8 @@ fn set_display_clipboard_text(text: &str) {
     }
 }
 
-/// One finished command recorded by the Unified backend: everything
-/// [`FinalizedBlockArgs`] carries about a command's identity and outcome,
-/// minus the output text — in Unified mode the output is already on the
-/// single surface and is never copied into a second widget.
-///
-/// This table is the seam increment 1b builds on (OSC 8 zone markers, a
-/// probe-driven chrome pass); 1a only proves the lifecycle delivers every
-/// field a zone needs, at the right moment, through the existing trait.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct UnifiedZone {
-    id: u64,
-    /// Empty for a background zone; never a placeholder for one.
-    command: String,
-    exit_code: Option<i32>,
-    duration_ms: Option<u64>,
-    cwd: Option<String>,
-    end_time_ms: Option<u64>,
-    /// Commandless asynchronous output finalized at the next prompt. It has no
-    /// command and must never be presented as one.
-    is_background: bool,
-}
-
-/// Append `args` to the zone table, dropping the oldest entries past
+/// Append a completed record to the Unified zone table, dropping the oldest
+/// entries past
 /// `max_zones`.
 ///
 /// The bound is deliberately the same `max_visible_blocks` knob Block-mode
@@ -5765,20 +6789,43 @@ struct UnifiedZone {
 /// scrollback trim, most likely) an unbounded table would be the only
 /// unbounded allocation this mode adds. Pure so the retention rule is
 /// testable without a surface.
-fn record_unified_zone(zones: &mut Vec<UnifiedZone>, args: &FinalizedBlockArgs, max_zones: usize) {
-    zones.push(UnifiedZone {
-        id: args.block_id,
-        command: args.cmd.clone(),
-        exit_code: args.exit_code,
-        duration_ms: args.duration_ms,
-        cwd: args.block_cwd.clone(),
-        end_time_ms: args.end_time_ms,
-        is_background: args.is_background,
-    });
+fn record_unified_zone(
+    zones: &mut VecDeque<CompletedCommandRecord>,
+    record: CompletedCommandRecord,
+    max_zones: usize,
+) -> Vec<u64> {
+    zones.push_back(record);
     let max = max_zones.max(1);
     if zones.len() > max {
-        zones.drain(..zones.len() - max);
+        return zones
+            .drain(..zones.len() - max)
+            .map(|record| record.id)
+            .collect();
     }
+    Vec::new()
+}
+
+/// The sole Unified live-feed wrapper, also captured by the prompt-settling
+/// tick. Marker bytes are a separate VTE feed, so no PTY chunk is copied and
+/// no injected byte can enter engine-owned prompt/output capture.
+fn feed_vte_with_zone_marker(
+    vte: &Terminal,
+    zone_marker: &RefCell<ZoneMarkerInjector>,
+    bytes: &[u8],
+) {
+    feed_with_zone_marker(zone_marker, bytes, |part| vte.feed(part));
+}
+
+fn feed_with_zone_marker(
+    zone_marker: &RefCell<ZoneMarkerInjector>,
+    bytes: &[u8],
+    mut feed: impl FnMut(&[u8]),
+) {
+    let open = zone_marker.borrow().open_bytes();
+    if let Some(open) = open {
+        feed(&open);
+    }
+    feed(bytes);
 }
 
 /// The Unified-mode implementation of [`RenderBackend`]: one long-lived,
@@ -5815,9 +6862,18 @@ struct UnifiedBackend {
     pty_for_init: Rc<OwnedPty>,
     /// Shared with `TermView` so Drop can remove a still-armed settling tick.
     prompt_anchor_tick_id_rc: Rc<RefCell<Option<gtk4::TickCallbackId>>>,
-    /// The in-memory zone table (see [`UnifiedZone`]). Shared with `TermView`
-    /// so it can be inspected without reaching through the trait.
-    zones: Rc<RefCell<Vec<UnifiedZone>>>,
+    find_state_for_cb: Rc<RefCell<FindState>>,
+    /// The in-memory zone table. Its records are the backend's completed
+    /// document for find/export/history palettes; the terminal text remains
+    /// on `vte`, so no finished widget is mounted.
+    zones: Rc<RefCell<VecDeque<CompletedCommandRecord>>>,
+    /// Per-pane, fail-closed marker state. Its bytes are fed directly to VTE
+    /// inside this backend, so they never enter prompt/command/output capture.
+    zone_marker: Rc<RefCell<ZoneMarkerInjector>>,
+    /// Probe/paint half of Unified zone chrome. Its authority table is
+    /// deliberately separate from `zones`, so later marker eviction cannot
+    /// delete search/export metadata or let an evicted URI revive itself.
+    chrome: unified_chrome::UnifiedChrome,
     /// Kitty graphics: parsed for protocol fidelity, never rendered. libvte
     /// has no APC G handler, so the engine must still consume these payloads
     /// and answer the `i=`-keyed reply; there is simply nowhere to mount the
@@ -5828,7 +6884,47 @@ struct UnifiedBackend {
 
 impl RenderBackend for UnifiedBackend {
     fn feed_live(&self, bytes: &[u8]) {
-        self.vte.feed(bytes);
+        feed_vte_with_zone_marker(&self.vte, &self.zone_marker, bytes);
+    }
+
+    fn begin_prompt_zone(&self, zone_id: u64) {
+        // Capture the pre-marker cursor row. Chrome does not infer a mapping
+        // from cursor-to-grid slack; a later visible canonical marker proves
+        // the exact adjustment→ring projection or drawing remains hidden.
+        self.chrome.begin_zone(zone_id, &self.vte);
+        self.chrome
+            .enforce_limit(self.config_for_cb.borrow().max_visible_blocks as usize);
+        let open = {
+            let mut marker = self.zone_marker.borrow_mut();
+            marker.begin_zone(zone_id);
+            marker.open_bytes()
+        };
+        if let Some(open) = open {
+            self.vte.feed(&open);
+        }
+    }
+
+    fn close_prompt_zone(&self, zone_id: Option<u64>) {
+        self.zone_marker.borrow_mut().close_zone(zone_id);
+        // Close unconditionally on every accepted C. Besides ending our own
+        // marker, this prevents a guest PS1 OSC 8 from leaking into command
+        // output when marker generation was disabled or phases drifted.
+        self.vte.feed(ZONE_MARKER_CLOSE);
+    }
+
+    fn erase_scrollback(&self) {
+        self.chrome.erase_scrollback(&self.vte);
+    }
+
+    fn hard_reset(&self) {
+        // This runs before the raw RIS bytes. Clear both sources of row
+        // authority first so the generic feed wrapper cannot prepend a stale
+        // OSC 8 open and a later scan cannot revive an old id. Completed
+        // metadata remains in `zones` for export/filter/history palettes.
+        self.zone_marker.borrow_mut().close_zone(None);
+        self.chrome.clear_authority();
+        find::clear_find_state(self.find_state_for_cb.as_ref(), &self.vte);
+        self.kitty_assembler.borrow_mut().reset();
     }
 
     /// Intentionally does NOT clear the screen — that per-prompt reset is
@@ -5841,7 +6937,7 @@ impl RenderBackend for UnifiedBackend {
     /// surface always preserves; the knob only ever meant "which of Block's
     /// two resets".
     fn reset_active_surface(&self, _preserve_scrollback: bool) {
-        self.vte.feed(b"\x1b[0m");
+        self.feed_live(b"\x1b[0m");
     }
 
     fn focus_live_deferred(&self) {
@@ -5866,6 +6962,149 @@ impl RenderBackend for UnifiedBackend {
         (self.layout_active_surface)();
     }
 
+    fn records(&self) -> BackendRecords<'_> {
+        BackendRecords::Metadata(self.zones.borrow())
+    }
+
+    fn record_search_target(&self, _block_id: u64, _is_output: bool) -> Option<RecordSearchTarget> {
+        // Chrome's marker spans are deliberately short-lived authority, not a
+        // durable per-record search target. Mapping metadata ids to the shared
+        // VTE after marker retirement would pretend an exact jump exists.
+        // Whole-surface Ctrl+F uses its native `block_id == 0` domain instead.
+        None
+    }
+
+    fn completed_search_surfaces(
+        &self,
+        max_bytes: usize,
+        deadline_exhausted: &mut dyn FnMut() -> bool,
+    ) -> BackendSearchBatch {
+        let native_fallback = || BackendNativeSearchFallback {
+            block_id: 0,
+            block_index: 0,
+            is_output: true,
+            is_live: true,
+            terminal: self.vte.clone(),
+        };
+        if max_bytes == 0 || deadline_exhausted() {
+            return BackendSearchBatch {
+                surfaces: Vec::new(),
+                incomplete: true,
+                native_fallback: Some(native_fallback()),
+            };
+        }
+        // Adjustment rows are renumbered when bounded scrollback trims, while
+        // VTE's text API keeps absolute ring rows. Only use the mapping that
+        // chrome proved at a coherent bottom-boundary epoch; reset, rewrap or
+        // natural eviction clears it first. Treat unknown bounds as a partial
+        // scan instead of asking VTE for a reused/stale row number.
+        let Some(bounds) = self.chrome.trusted_ring_bounds(&self.vte) else {
+            return BackendSearchBatch {
+                surfaces: Vec::new(),
+                incomplete: true,
+                native_fallback: Some(native_fallback()),
+            };
+        };
+        let (cursor_col, _cursor_row) = self.vte.cursor_position();
+        let columns = self.vte.column_count().max(cursor_col).max(1);
+        let started = std::time::Instant::now();
+        let captured_windows = {
+            let capture_deadline_exhausted =
+                || deadline_exhausted() || started.elapsed() >= VTE_SEARCH_CAPTURE_TIME_LIMIT;
+            capture_vte_search_windows_bounded(
+                bounds.retained_start,
+                bounds.retained_end_exclusive,
+                bounds.viewport_top,
+                columns,
+                max_bytes,
+                capture_deadline_exhausted,
+                |span| {
+                    capture_vte_text_range(&self.vte, span.start_row, 0, span.end_row, span.end_col)
+                },
+            )
+        };
+        let deadline_limited =
+            deadline_exhausted() || started.elapsed() >= VTE_SEARCH_CAPTURE_TIME_LIMIT;
+        let has_older_history = bounds.retained_start < bounds.viewport_top;
+        let history_complete = !has_older_history
+            || captured_windows
+                .oldest_history
+                .as_ref()
+                .is_some_and(|capture| !capture.incomplete);
+        let incomplete =
+            deadline_limited || captured_windows.viewport_to_tail.incomplete || !history_complete;
+        let scanned_work = captured_windows.viewport_to_tail.work_cells
+            + captured_windows
+                .oldest_history
+                .as_ref()
+                .map_or(0, |capture| capture.work_cells);
+        let retained_bytes = captured_windows.viewport_to_tail.text.len()
+            + captured_windows
+                .oldest_history
+                .as_ref()
+                .map_or(0, |capture| capture.text.len());
+        let scanned_bytes = scanned_work.max(retained_bytes);
+        let mut windows = vec![BackendSearchWindow {
+            text: captured_windows.viewport_to_tail.text,
+            // If this window wins, older matches remain deliberately
+            // uncounted while either extraction is partial. When the complete
+            // ring fits, Find counts both windows and models their one native
+            // wrap boundary instead.
+            incomplete: incomplete
+                && (deadline_limited
+                    || captured_windows.viewport_to_tail.incomplete
+                    || has_older_history),
+            initial_wrap: false,
+        }];
+        if let Some(history) = captured_windows.oldest_history {
+            windows.push(BackendSearchWindow {
+                text: history.text,
+                incomplete: incomplete && (deadline_limited || history.incomplete),
+                initial_wrap: true,
+            });
+        }
+        BackendSearchBatch {
+            surfaces: vec![BackendSearchSurface {
+                block_id: 0,
+                block_index: 0,
+                is_output: true,
+                is_live: true,
+                windows,
+                scanned_bytes,
+                reset_cursor: true,
+                terminal: self.vte.clone(),
+            }],
+            incomplete,
+            native_fallback: incomplete.then(native_fallback),
+        }
+    }
+
+    fn persists_block_history(&self) -> bool {
+        false
+    }
+
+    fn supports_inline_notices(&self) -> bool {
+        false
+    }
+
+    fn supports_block_mutation(&self) -> bool {
+        false
+    }
+
+    fn scroll_surface_lines(&self, lines: i32) -> bool {
+        let Some(adj) = self.vte.vadjustment() else {
+            return true;
+        };
+        let step = adj.step_increment().max(1.0);
+        let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
+        adj.set_value((adj.value() + step * f64::from(lines)).clamp(adj.lower(), max_value));
+        true
+    }
+
+    fn debug_name(&self) -> &'static str {
+        "unified"
+    }
+
     /// No-op: the VTE's own adjustment is authoritative here. The live surface
     /// is created with `scroll_on_output(false)`, which keeps a view already at
     /// the bottom following new output while leaving a scrolled-up reader
@@ -5887,15 +7126,30 @@ impl RenderBackend for UnifiedBackend {
     /// live surface is NOT reset afterwards: the command's output stays where
     /// the user watched it appear. Only the kitty assembler is reset, so
     /// half-uploaded chunks cannot bleed across the command boundary.
-    fn finalize_block(&self, _block_data: BlockData, args: FinalizedBlockArgs) {
+    fn finalize_block(
+        &self,
+        record: &CompletedCommandRecord,
+        _payload: &dyn BlockRenderPayloadAccessor,
+    ) {
+        find::clear_find_state(self.find_state_for_cb.as_ref(), &self.vte);
         let max_zones = self.config_for_cb.borrow().max_visible_blocks as usize;
-        record_unified_zone(&mut self.zones.borrow_mut(), &args, max_zones);
+        let retired_record_ids =
+            record_unified_zone(&mut self.zones.borrow_mut(), record.clone(), max_zones);
+        self.chrome.retire_ids(&retired_record_ids);
+        self.chrome.enforce_limit(max_zones);
+        self.chrome
+            .record_completed(unified_chrome::ZoneChromeRecord {
+                id: record.id,
+                exit_code: record.exit_code,
+                duration_ms: record.duration_ms,
+                is_background: record.is_background,
+            });
         log::debug!(
             "unified zone {} recorded: exit={:?} duration_ms={:?} background={} zones={}",
-            args.block_id,
-            args.exit_code,
-            args.duration_ms,
-            args.is_background,
+            record.id,
+            record.exit_code,
+            record.duration_ms,
+            record.is_background,
             self.zones.borrow().len(),
         );
         self.kitty_assembler.borrow_mut().reset();
@@ -5914,6 +7168,7 @@ impl RenderBackend for UnifiedBackend {
     /// the alt-screen override alone would restore the pre-TUI coordinates
     /// synchronously on rmcup, before the heartbeat has remeasured.
     fn enter_alt_screen_chrome(&self) {
+        self.chrome.set_alt_screen(true);
         let active = self.active_rc.borrow();
         active.set_live_organism_visible(false);
         active.set_live_organism_alt_screen(true);
@@ -5924,6 +7179,7 @@ impl RenderBackend for UnifiedBackend {
     /// restores the primary screen content itself, and the organism heartbeat
     /// decides on its own frame whether the body may show again.
     fn exit_alt_screen_chrome(&self) {
+        self.chrome.set_alt_screen(false);
         self.active_rc.borrow().set_live_organism_alt_screen(false);
     }
 
@@ -5989,7 +7245,13 @@ impl RenderBackend for UnifiedBackend {
     fn schedule_anchor_settle(&self, args: AnchorSettleArgs) {
         // The same fence, on the same terms: the pass is layout-agnostic, so
         // Unified needs no variant of it (see `schedule_anchor_settle_on`).
-        schedule_anchor_settle_on(&self.vte, &self.prompt_anchor_tick_id_rc, args);
+        let zone_marker = self.zone_marker.clone();
+        schedule_anchor_settle_on(
+            &self.vte,
+            &self.prompt_anchor_tick_id_rc,
+            Rc::new(move |vte, bytes| feed_vte_with_zone_marker(vte, &zone_marker, bytes)),
+            args,
+        );
     }
 
     fn cursor_and_rows(&self) -> ((i64, i64), i64) {
@@ -7077,10 +8339,11 @@ impl TermView {
         // constructor — that mode has no `TermView` at all — and is treated as
         // Block if it somehow does.
         let unified = mode.is_unified();
-        // Allocated in both modes (an empty `Vec` costs nothing) so the reader
+        // Allocated in both modes (an empty `VecDeque` costs nothing) so the reader
         // wiring below stays a single expression; only a Unified pane hands it
-        // to a backend or exposes it on `TermView`.
-        let unified_zones: Rc<RefCell<Vec<UnifiedZone>>> = Rc::new(RefCell::new(Vec::new()));
+        // to a backend.
+        let unified_records: Rc<RefCell<VecDeque<CompletedCommandRecord>>> =
+            Rc::new(RefCell::new(VecDeque::new()));
         if unified {
             let holder = active.borrow().widget().clone();
             holder.remove_css_class("block-compact");
@@ -7718,14 +8981,15 @@ impl TermView {
         // reader/finalize path must alias, or reload_config would update a
         // copy the reader callbacks never see. reload_config's borrow_mut is
         // statement-scoped and runs from UI actions outside reader dispatch.
-        // Reader-path borrows may span calls only into code that cannot
-        // reach a borrow_mut of this cell (height estimation,
-        // FinishedBlock::new_with_pool, notify_long_block are all
-        // non-reentrant). Parser flags (mouse/focus reporting) are NOT
-        // covered: ParserConfig below snapshots them at construction.
+        // Finalize snapshots/scalars are taken in short scopes before widget
+        // construction, height estimation, or notification fan-out. Parser
+        // flags (mouse/focus reporting) are NOT live: ParserConfig below
+        // snapshots them at construction.
         let config_shared: Rc<RefCell<Config>> = Rc::new(RefCell::new(config.clone()));
 
         // ── Wire PTY → parser → block events ─────────────────────────────
+        let render_backend_for_view: Rc<RefCell<Option<Rc<dyn RenderBackend>>>> =
+            Rc::new(RefCell::new(None));
         {
             let active_rc = active.clone();
             let active_vte_rc = active_vte.clone();
@@ -7779,6 +9043,17 @@ impl TermView {
             // everything above (PTY, parser, engine state, lifecycle cells) is
             // shared, and everything below dispatches through the trait.
             let backend: Rc<dyn RenderBackend> = if unified {
+                let zone_marker = Rc::new(RefCell::new(ZoneMarkerInjector::from_system_entropy()));
+                let chrome_authority = Rc::new(RefCell::new(
+                    unified_chrome::ZoneChromeAuthority::new(zone_marker.borrow().nonce()),
+                ));
+                let chrome = unified_chrome::UnifiedChrome::new(
+                    &active_vte_rc,
+                    &active_rc.borrow().unified_chrome_surface,
+                    chrome_authority,
+                    config_for_cb.clone(),
+                );
+                active_rc.borrow().unified_chrome_surface.set_visible(true);
                 Rc::new(UnifiedBackend {
                     vte: active_vte_rc,
                     active_rc,
@@ -7787,7 +9062,10 @@ impl TermView {
                     config_for_cb: config_for_cb.clone(),
                     pty_for_init: pty_for_init.clone(),
                     prompt_anchor_tick_id_rc: prompt_anchor_tick_id.clone(),
-                    zones: unified_zones.clone(),
+                    find_state_for_cb: find_state.clone(),
+                    zones: unified_records.clone(),
+                    zone_marker,
+                    chrome,
                     kitty_assembler: RefCell::new(kitty_graphics::Assembler::new()),
                 })
             } else {
@@ -7830,6 +9108,7 @@ impl TermView {
                     kitty_pending_admission: RefCell::new(None),
                 })
             };
+            *render_backend_for_view.borrow_mut() = Some(backend.clone());
             ReaderCtx {
                 backend,
                 bstate_rc,
@@ -7845,6 +9124,7 @@ impl TermView {
                     command_start_instant: None,
                     pending_exit_code: None,
                     pending_command_meta: PendingCommandMeta::default(),
+                    pending_zone: None,
                     active_alt_screen_mode: None,
                 }),
                 live_raw_output_rc: live_raw_output.clone(),
@@ -7865,6 +9145,7 @@ impl TermView {
                 prompt_anchor_ready_rc,
                 prompt_identity_output_rc: prompt_identity_output.clone(),
                 prompt_anchor_generation_rc,
+                prompt_anchor_tick_id_rc: prompt_anchor_tick_id.clone(),
                 contents_generation_rc: contents_generation.clone(),
                 post_prompt_bytes_rc: post_prompt_bytes,
                 post_prompt_fence_released_rc: post_prompt_fence_released,
@@ -7896,6 +9177,10 @@ impl TermView {
             }
             .install(&pty, &active_vte);
         }
+        let render_backend = render_backend_for_view
+            .borrow_mut()
+            .take()
+            .expect("reader wiring always installs one render backend");
 
         // ── Scroll lock + jump-to-bottom FAB ──────────────────────────────
         // The block list virtualizes (off-screen finished blocks are hidden →
@@ -8724,7 +10009,7 @@ impl TermView {
             prompt_anchor_tick_id,
             agent_execution_supported,
             selection_feed_hold,
-            unified_zones: unified.then_some(unified_zones),
+            render_backend,
         };
 
         // Before the first map GTK has no real page_size. In that case
@@ -9091,15 +10376,6 @@ impl TermView {
             .begin(command, agent_generation, suggestion)
     }
 
-    /// Whether this pane renders through the Unified backend: one long-lived
-    /// full-size surface, no finished-block widgets, no `BlockData`. Features
-    /// built on the block document (session export, Clear blocks, inline
-    /// notice cards) must branch on this and refuse rather than operate on an
-    /// empty document or mount a widget nobody can scroll to.
-    pub(crate) fn is_unified(&self) -> bool {
-        self.unified_zones.is_some()
-    }
-
     /// Whether [`Self::insert_inline_notice`] can actually put a card where
     /// the user will see it. False in Unified: the live holder asks for the
     /// whole viewport and the outer scroller has nothing else to show, so a
@@ -9107,7 +10383,13 @@ impl TermView {
     /// Callers check this before building a card and take their existing
     /// "this pane cannot host it" path instead.
     pub(crate) fn supports_inline_notices(&self) -> bool {
-        !self.is_unified()
+        self.render_backend.supports_inline_notices()
+    }
+
+    /// Whether Block-card mutations such as Clear/Undo are meaningful for
+    /// this pane's backend.
+    pub(crate) fn supports_block_mutation(&self) -> bool {
+        self.render_backend.supports_block_mutation()
     }
 
     /// Insert a transient notice card (e.g. an AI command-correction proposal
@@ -9598,9 +10880,23 @@ impl TermView {
 
     pub fn connect_block_finished<F>(&self, f: F)
     where
+        F: Fn(String, Option<i32>, Option<u64>, Option<u64>) + 'static,
+    {
+        self.block_finished_callbacks
+            .borrow_mut()
+            .push(BlockFinishedCallback::Metadata(Box::new(f)));
+    }
+
+    /// Observe a completed foreground command and opt into the bounded output
+    /// sample. Registering this callback is an explicit payload capability;
+    /// panes with metadata-only observers never materialize output for fan-out.
+    pub(crate) fn connect_block_finished_with_output<F>(&self, f: F)
+    where
         F: Fn(String, Option<i32>, String, Option<u64>, Option<u64>) + 'static,
     {
-        self.block_finished_callbacks.borrow_mut().push(Box::new(f));
+        self.block_finished_callbacks
+            .borrow_mut()
+            .push(BlockFinishedCallback::WithOutput(Box::new(f)));
     }
 
     pub(crate) fn connect_ask_ai_about_block<F>(&self, f: F)
@@ -9627,17 +10923,7 @@ impl TermView {
     }
 
     pub fn scroll_lines(&self, lines: i32) {
-        // Unified mode: the scrollback lives in the live VTE, and the block
-        // list holds only that viewport-sized surface — the outer adjustment
-        // has nowhere to move, so keyboard scrolling has to drive the VTE's
-        // own adjustment or it silently does nothing.
-        if self.unified_zones.is_some() {
-            let Some(adj) = gtk4::prelude::ScrollableExt::vadjustment(&self.active_vte) else {
-                return;
-            };
-            let step = adj.step_increment().max(1.0);
-            let max_val = (adj.upper() - adj.page_size()).max(adj.lower());
-            adj.set_value((adj.value() + step * lines as f64).clamp(adj.lower(), max_val));
+        if self.render_backend.scroll_surface_lines(lines) {
             return;
         }
         // Ctrl+Up enters anvil/Warp-style block selection at the newest block.
@@ -9734,8 +11020,8 @@ impl TermView {
     /// here. Clearing the *surface* is the shell's own `clear`, not this
     /// action. Returning 0 without touching anything lets the caller say so.
     pub fn clear_blocks(&self) -> usize {
-        if self.is_unified() {
-            log::debug!("unified pane: Clear blocks has nothing to clear and touches no state");
+        if !self.render_backend.supports_block_mutation() {
+            log::debug!("render backend has no mutable Block document to clear");
             return 0;
         }
         // A background load that completes after Clear must not resurrect the
@@ -9944,16 +11230,18 @@ impl TermView {
         restored_len
     }
 
-    pub fn apply_failed_filter(&self) {
-        if let Some(idx) = self.get_failed_blocks().first().copied() {
-            self.scroll_to_block(idx);
-        }
+    pub(crate) fn apply_failed_filter(&self) -> RecordNavigationResult {
+        let Some(record_id) = self.get_failed_blocks().first().copied() else {
+            return RecordNavigationResult::NoMatchingRecord;
+        };
+        self.navigate_to_record_id(record_id, false)
     }
 
-    pub fn apply_slow_filter(&self) {
-        if let Some(idx) = self.get_slow_blocks(1000).first().copied() {
-            self.scroll_to_block(idx);
-        }
+    pub(crate) fn apply_slow_filter(&self) -> RecordNavigationResult {
+        let Some(record_id) = self.get_slow_blocks(1000).first().copied() else {
+            return RecordNavigationResult::NoMatchingRecord;
+        };
+        self.navigate_to_record_id(record_id, false)
     }
 
     pub fn apply_pinned_filter(&self) {
@@ -10001,21 +11289,25 @@ impl TermView {
         }
     }
 
-    pub fn jump_to_failed(&self, direction: i32) {
+    pub(crate) fn jump_to_failed(&self, direction: i32) -> RecordNavigationResult {
         let failed = self.get_failed_blocks();
         if failed.is_empty() {
-            return;
+            return RecordNavigationResult::NoMatchingRecord;
         }
-        let finished = self.finished_blocks.borrow();
-        let current = self
-            .selected_block_id
-            .get()
-            .and_then(|id| finished.iter().position(|block| block.id == id));
-        let target = step_marked_indices(&failed, current, direction);
-        drop(finished);
-        if let Some(index) = target {
-            self.scroll_to_block(index);
-        }
+        let record_ids = {
+            let records = self.render_backend.records();
+            records.iter().map(|record| record.id()).collect::<Vec<_>>()
+        };
+        let target = step_marked_record_ids(
+            &record_ids,
+            &failed,
+            self.selected_block_id.get(),
+            direction,
+        );
+        let Some(record_id) = target else {
+            return RecordNavigationResult::NoMatchingRecord;
+        };
+        self.navigate_to_record_id(record_id, false)
     }
 
     /// Apply updated theme colors to the block widgets and the live VTE.
@@ -10156,10 +11448,11 @@ impl TermView {
                 vec![
                     (
                         "Render backend".to_string(),
-                        match &self.unified_zones {
-                            Some(zones) => format!("unified ({} zones)", zones.borrow().len()),
-                            None => "block".to_string(),
-                        },
+                        format!(
+                            "{} ({} records)",
+                            self.render_backend.debug_name(),
+                            self.render_backend.records().len()
+                        ),
                     ),
                     ("Finished blocks".to_string(), finished_len.to_string()),
                     ("Block data entries".to_string(), block_data_len.to_string()),
@@ -10243,31 +11536,11 @@ impl TermView {
         if limit == 0 {
             return Vec::new();
         }
-        // Unified mode has no finished blocks, but it does know every command
-        // that ran: the zone table carries the same text this list is made of.
-        // Reading it here keeps the palette truthful instead of silently
-        // reporting an empty session.
-        if let Some(zones) = &self.unified_zones {
-            let zones = zones.borrow();
-            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-            let mut out: Vec<String> = Vec::with_capacity(limit.min(zones.len()));
-            for zone in zones.iter().rev() {
-                let cmd = zone.command.trim();
-                if cmd.is_empty() || !seen.insert(cmd) {
-                    continue;
-                }
-                out.push(cmd.to_string());
-                if out.len() == limit {
-                    break;
-                }
-            }
-            return out;
-        }
-        let finished = self.finished_blocks.borrow();
+        let records = self.render_backend.records();
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        let mut out: Vec<String> = Vec::with_capacity(limit.min(finished.len()));
-        for block in finished.iter().rev() {
-            let cmd = block.cmd_text.trim();
+        let mut out: Vec<String> = Vec::with_capacity(limit.min(records.len()));
+        for record in records.iter().rev() {
+            let cmd = record.command().trim();
             if cmd.is_empty() {
                 continue;
             }
@@ -10299,10 +11572,11 @@ mod tests {
         accept_agent_integration_token, anchor_tick_exit, append_bounded_text_tail,
         apply_vte_commit_to_shadow, approved_command_submission_payload,
         background_output_has_visible_text, bounded_journal_output, build_clipboard_paste,
-        build_command_recall, build_keyboard_query_reply, classify_command_prompt_status,
-        coalesce_bytes_events, collapse_repaint_output, command_capture_range_is_bounded,
-        command_id_uses_shell_token, compute_viewport_state, decide_agent_command_end,
-        emit_activity, emit_alt_screen_transition, emit_command_finished, emit_command_started,
+        build_command_recall, build_keyboard_query_reply, capture_vte_rows_bounded,
+        capture_vte_search_windows_bounded, classify_command_prompt_status, coalesce_bytes_events,
+        collapse_repaint_output, command_capture_range_is_bounded, command_id_uses_shell_token,
+        compute_viewport_state, decide_agent_command_end, emit_activity,
+        emit_alt_screen_transition, emit_command_finished, emit_command_started,
         failed_block_marker_fractions, format_color_query_reply, history_edge_navigation_available,
         input_is_typeahead_for_existing_submission, input_may_survive_into_next_prompt,
         input_submits_line, mutate_block_data_and_redraw, next_prompt_shadow_state,
@@ -10316,8 +11590,8 @@ mod tests {
         screen_relative_cpr_row, scroll_delta_to_reveal, selected_blocks_markdown,
         selected_command_text, selected_id_range, shell_argv_supports_agent_ids,
         shell_argv_uses_jsh, should_buffer_background_output, stable_visible_indices,
-        step_marked_indices, strip_ansi, strip_ansi_with_clear_detect, take_background_output,
-        take_stash_for_undo, truncate_plain_output_for_height,
+        step_marked_indices, step_marked_record_ids, strip_ansi, strip_ansi_with_clear_detect,
+        take_background_output, take_stash_for_undo, truncate_plain_output_for_height,
         verified_editor_contains_exact_command, viewport_page_size_changed,
         viewport_state_for_scroll, visible_indices_for_viewport, AgentCommandEndDecision,
         AltScreenCallbacks, AltScreenTransition, AnchorAbandoned, AnchorTickExit, BlockData,
@@ -10326,18 +11600,20 @@ mod tests {
         HumanInputKind, InputOrigin, PendingCommandMeta, PostPromptFeed, TypedShadowFidelity,
         ViewportState, MAX_COMMAND_CAPTURE_BYTES, MAX_JOURNAL_OUTPUT_BYTES,
         MAX_PROMPT_CAPTURE_BYTES, MAX_RAW_OUTPUT_BYTES, MAX_SELECTED_CLIPBOARD_BYTES,
-        TRUNCATED_COMMAND_PLACEHOLDER, UNAVAILABLE_COMMAND_PLACEHOLDER,
-        VERIFIED_SUBMISSION_MAX_POLLS,
+        TERMINAL_RESET_INVALIDATED_SUBMISSION, TRUNCATED_COMMAND_PLACEHOLDER,
+        UNAVAILABLE_COMMAND_PLACEHOLDER, VERIFIED_SUBMISSION_MAX_POLLS,
     };
     // The reader-dispatch harness at the bottom of this module: the two
     // rendering seams, the lifecycle context they serve, and the engine state
     // it owns.
     use super::{
         estimated_finished_block_height_for_text, kitty_graphics, live_output_text,
-        record_unified_zone, AgentExecutionLostCallbacks, AnchorSettleArgs, BlockFinishedCallbacks,
-        CommandFinishedCallbacks, CommandStartedCallbacks, EngineState, FinalizedBlockArgs,
-        MouseReportingMode, ReaderCtx, RenderBackend, SelectionFeedHold, SubmissionSurface,
-        VerifiedSubmissionCtx,
+        push_search_surface_before_deadline, record_unified_zone, AgentExecutionLostCallbacks,
+        AnchorSettleArgs, BackendRecords, BackendSearchBatch, BlockFinishedCallback,
+        BlockFinishedCallbacks, BlockRenderPayloadAccessor, CommandFinishedCallbacks,
+        CommandStartedCallbacks, CompletedCommandRecord, EngineState, MouseReportingMode,
+        ReaderCtx, RecordSearchTarget, RenderBackend, SelectionFeedHold, SubmissionSurface,
+        VerifiedSubmissionCtx, ZoneMarkerInjector,
     };
     use crate::config::Config;
     use crate::parser::{ColorKind, KeyboardProtocolQuery, Parser, ParserEvent};
@@ -10490,49 +11766,300 @@ mod tests {
     /// about a zone may need re-deriving later), and the table must stay
     /// bounded — it is the one allocation this mode grows per command.
     #[test]
-    fn unified_zones_keep_the_command_identity_and_drop_the_oldest_past_the_cap() {
-        let finalized = |id: u64, cmd: &str| FinalizedBlockArgs {
-            block_id: id,
-            prompt: "user@host $ ".to_string(),
+    fn unified_records_keep_the_command_identity_and_drop_the_oldest_past_the_cap() {
+        let record = |id: u64, cmd: &str| CompletedCommandRecord {
+            id,
             cmd: cmd.to_string(),
-            output_with_ansi: "output".to_string(),
-            output_plain: "output".to_string(),
-            plain_output_bytes: 6,
-            block_cwd: Some("/tmp/work".to_string()),
-            cols: 80,
             exit_code: Some(3),
-            duration_ms: Some(1200),
+            start_time_ms: None,
             end_time_ms: Some(1_700_000_000_000),
+            duration_ms: Some(1200),
+            cwd: Some("/tmp/work".to_string()),
             is_background: false,
         };
 
-        let mut zones = Vec::new();
-        record_unified_zone(&mut zones, &finalized(1, "first"), 2);
-        record_unified_zone(&mut zones, &finalized(2, "second"), 2);
-        record_unified_zone(&mut zones, &finalized(3, "third"), 2);
+        let mut zones = VecDeque::new();
+        record_unified_zone(&mut zones, record(1, "first"), 2);
+        record_unified_zone(&mut zones, record(2, "second"), 2);
+        record_unified_zone(&mut zones, record(3, "third"), 2);
 
         assert_eq!(
             zones.iter().map(|zone| zone.id).collect::<Vec<_>>(),
             vec![2, 3],
             "the oldest zone is dropped, newest-last order preserved"
         );
-        assert_eq!(
-            zones.last().expect("a recorded zone"),
-            &super::UnifiedZone {
-                id: 3,
-                command: "third".to_string(),
-                exit_code: Some(3),
-                duration_ms: Some(1200),
-                cwd: Some("/tmp/work".to_string()),
-                end_time_ms: Some(1_700_000_000_000),
-                is_background: false,
-            }
-        );
+        let newest = zones.back().expect("a recorded zone");
+        assert_eq!(newest.cmd, "third");
+        assert_eq!(newest.exit_code, Some(3));
+        assert_eq!(newest.duration_ms, Some(1200));
+        assert_eq!(newest.cwd.as_deref(), Some("/tmp/work"));
+        assert_eq!(newest.end_time_ms, Some(1_700_000_000_000));
 
         // A degenerate cap must still bound the table rather than panic.
-        record_unified_zone(&mut zones, &finalized(4, "fourth"), 0);
+        record_unified_zone(&mut zones, record(4, "fourth"), 0);
         assert_eq!(zones.len(), 1);
         assert_eq!(zones[0].id, 4);
+    }
+
+    #[test]
+    fn unified_search_extracts_viewport_before_huge_old_history() {
+        let mut requested_rows = Vec::new();
+        let captured = capture_vte_search_windows_bounded(
+            -100_000,
+            4,
+            0,
+            80,
+            400,
+            || false,
+            |span| {
+                requested_rows.push(span.start_row);
+                Some(String::new())
+            },
+        );
+
+        assert_eq!(requested_rows[..4], [0, 1, 2, 3]);
+        assert_eq!(requested_rows[4], -100_000);
+        assert!(!captured.viewport_to_tail.incomplete);
+        assert_eq!(captured.viewport_to_tail.work_cells, 320);
+        let history = captured.oldest_history.expect("remaining bounded history");
+        assert!(history.incomplete);
+        assert_eq!(history.work_cells, 80);
+        assert_eq!(
+            captured.viewport_to_tail.work_cells + history.work_cells,
+            400,
+            "both windows share one hard extraction budget"
+        );
+    }
+
+    #[test]
+    fn unified_search_capture_bounds_native_requests_and_retained_text() {
+        let budget = 73usize;
+        let mut requested_cells = 0usize;
+        let mut requested_spans = Vec::new();
+        let captured = capture_vte_rows_bounded(
+            -10_000,
+            10_000,
+            80,
+            budget,
+            || false,
+            |span| {
+                requested_cells = requested_cells.saturating_add(span.work_cells);
+                requested_spans.push(span);
+                // Model a native extractor whose UTF-8 result expands well
+                // beyond its grid-cell request. Retention still must not cross
+                // the byte ceiling.
+                Some("雪".repeat(span.work_cells))
+            },
+        );
+
+        assert!(captured.incomplete);
+        assert!(captured.text.len() <= budget);
+        assert!(requested_cells <= budget);
+        assert!(!requested_spans.is_empty());
+        assert!(requested_spans
+            .iter()
+            .all(|span| span.start_row == span.end_row));
+        assert!(requested_spans
+            .iter()
+            .all(|span| usize::try_from(span.end_col).ok() == Some(span.work_cells)));
+        assert!(
+            requested_spans.len() < 20_001,
+            "the whole ring was not requested"
+        );
+
+        let mut calls = 0usize;
+        let timed_out = capture_vte_rows_bounded(
+            0,
+            999,
+            80,
+            4 * 1024 * 1024,
+            || true,
+            |_| {
+                calls += 1;
+                Some(String::new())
+            },
+        );
+        assert!(timed_out.incomplete);
+        assert!(timed_out.text.is_empty());
+        assert_eq!(calls, 0, "the time guard fires before another VTE call");
+    }
+
+    #[test]
+    fn unified_search_capture_charges_every_single_row_half_open_range() {
+        let mut spans = Vec::new();
+        let captured = capture_vte_rows_bounded(
+            5,
+            99,
+            10,
+            25,
+            || false,
+            |span| {
+                spans.push(span);
+                Some(String::new())
+            },
+        );
+        assert_eq!(
+            spans,
+            vec![
+                super::VteCaptureSpan {
+                    start_row: 5,
+                    end_row: 5,
+                    end_col: 10,
+                    work_cells: 10,
+                },
+                super::VteCaptureSpan {
+                    start_row: 6,
+                    end_row: 6,
+                    end_col: 10,
+                    work_cells: 10,
+                },
+                super::VteCaptureSpan {
+                    start_row: 7,
+                    end_row: 7,
+                    end_col: 5,
+                    work_cells: 5,
+                },
+            ]
+        );
+        assert_eq!(spans.iter().map(|span| span.work_cells).sum::<usize>(), 25);
+        assert!(captured.incomplete);
+
+        let mut exact_spans = Vec::new();
+        let exact = capture_vte_rows_bounded(
+            0,
+            2,
+            4,
+            12,
+            || false,
+            |span| {
+                exact_spans.push(span);
+                Some(String::new())
+            },
+        );
+        assert!(!exact.incomplete);
+        assert_eq!(exact_spans.len(), 3);
+        assert!(exact_spans.iter().all(|span| {
+            span.start_row == span.end_row && span.end_col == 4 && span.work_cells == 4
+        }));
+        assert_eq!(
+            exact_spans
+                .iter()
+                .map(|span| span.work_cells)
+                .sum::<usize>(),
+            12
+        );
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn unified_search_capture_real_vte_uses_half_open_column_boundary() {
+        use gtk4::prelude::*;
+        use std::time::{Duration, Instant};
+        use vte4::TerminalExt;
+
+        gtk4::init().expect("gtk init");
+        let terminal = vte4::Terminal::new();
+        terminal.set_size(5, 2);
+        let window = gtk4::Window::new();
+        window.set_child(Some(&terminal));
+        window.present();
+        terminal.feed(b"ABCDE");
+        let context = gtk4::glib::MainContext::default();
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(100) {
+            while context.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let mut spans = Vec::new();
+        let captured = capture_vte_rows_bounded(
+            0,
+            0,
+            5,
+            4,
+            || false,
+            |span| {
+                spans.push(span);
+                super::capture_vte_text_range(
+                    &terminal,
+                    span.start_row,
+                    0,
+                    span.end_row,
+                    span.end_col,
+                )
+            },
+        );
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].end_col, 4);
+        assert_eq!(spans[0].work_cells, 4);
+        assert_eq!(captured.text, "ABCD");
+        assert!(captured.incomplete);
+    }
+
+    #[test]
+    fn lazy_finalize_payload_materializes_and_strips_exactly_once() {
+        let output = Rc::new(RefCell::new(BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES)));
+        output.borrow_mut().append(b"\x1b[32mhello\x1b[0m\r\n");
+        let payload = super::LazyBlockRenderPayload::new(
+            "$ ".to_string(),
+            super::CapturedFinalizeOutput::Foreground(output),
+        );
+
+        assert_eq!(payload.materialization_count(), 0);
+        assert_eq!(payload.materialize().output_plain, "hello\n");
+        assert_eq!(
+            payload.materialize().output_with_ansi,
+            "\x1b[32mhello\x1b[0m\r\n"
+        );
+        assert_eq!(
+            payload.materialization_count(),
+            1,
+            "all consumers share one raw/plain snapshot"
+        );
+    }
+
+    #[test]
+    fn journal_capability_and_correlation_gate_lazy_output() {
+        let make_payload = || {
+            let output = Rc::new(RefCell::new(BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES)));
+            output
+                .borrow_mut()
+                .append(b"\x1b[32mjournal text\x1b[0m\r\n");
+            super::LazyBlockRenderPayload::new(
+                String::new(),
+                super::CapturedFinalizeOutput::Foreground(output),
+            )
+        };
+
+        for (id, enabled) in [(None, true), (Some("jsh-id".to_string()), false)] {
+            let payload = make_payload();
+            let mut submitted = false;
+            super::submit_lazy_output_to_journal(id, enabled, &payload, |_, _| {
+                submitted = true;
+            });
+            assert!(!submitted);
+            assert_eq!(payload.materialization_count(), 0);
+        }
+
+        let payload = make_payload();
+        let mut submitted = None;
+        super::submit_lazy_output_to_journal(
+            Some("jsh-id".to_string()),
+            true,
+            &payload,
+            |id, text| submitted = Some((id, text.to_string())),
+        );
+        assert_eq!(
+            submitted,
+            Some(("jsh-id".to_string(), "journal text".to_string()))
+        );
+        assert_eq!(payload.materialization_count(), 1);
+        assert_eq!(
+            payload.materialize().output_plain,
+            "journal text\n",
+            "a later observer shares the journal's memoized snapshot"
+        );
+        assert_eq!(payload.materialization_count(), 1);
     }
 
     // ── Dynamic OSC 10/11/12 color tracking ──────────────────────────────
@@ -10654,16 +12181,23 @@ mod tests {
         assert!(background_output_has_visible_text(
             b"\x1b[36mworker finished\x1b[0m\r\n"
         ));
+        assert!(background_output_has_visible_text(b"visible\rhidden"));
+        assert!(!background_output_has_visible_text(b"visible\r\x1b[2K"));
+        assert!(!background_output_has_visible_text(
+            b"\x1b]8;;https://example.invalid\x1b\\\x1b]8;;\x1b\\"
+        ));
+        assert!(background_output_has_visible_text(b"\xff\xfe"));
+        assert!(!background_output_has_visible_text(
+            b"invalid:\xff\xfe\r\x1b[2K"
+        ));
     }
 
     #[test]
     fn taking_background_output_drains_the_pending_buffer() {
         let mut pending = BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES);
         pending.append(b"async line\r\n");
-        assert_eq!(
-            take_background_output(&mut pending).as_deref(),
-            Some("async line\r\n")
-        );
+        let mut taken = take_background_output(&mut pending).expect("visible output");
+        assert_eq!(taken.make_contiguous(), b"async line\r\n");
         assert!(pending.is_empty());
         assert!(take_background_output(&mut pending).is_none());
     }
@@ -11116,6 +12650,68 @@ mod tests {
         assert_eq!(step_marked_indices(&marked, Some(9), 1), Some(2));
         assert_eq!(step_marked_indices(&marked, Some(2), -1), Some(9));
         assert_eq!(step_marked_indices(&[], Some(2), 1), None);
+    }
+
+    #[test]
+    fn marked_record_navigation_uses_document_order_and_stable_ids() {
+        let records = [900, 17, 450, 3];
+        let marked = [17, 3];
+
+        assert_eq!(
+            step_marked_record_ids(&records, &marked, Some(900), 1),
+            Some(17)
+        );
+        assert_eq!(
+            step_marked_record_ids(&records, &marked, Some(450), -1),
+            Some(17)
+        );
+        assert_eq!(
+            step_marked_record_ids(&records, &marked, Some(3), 1),
+            Some(17)
+        );
+    }
+
+    #[test]
+    fn search_deadline_before_next_surface_prevents_its_materialization() {
+        let materializations = Cell::new(0usize);
+        let deadline = Cell::new(false);
+        let mut deadline_exhausted = || deadline.get();
+        let mut surfaces = Vec::new();
+
+        assert!(push_search_surface_before_deadline(
+            &mut surfaces,
+            &mut deadline_exhausted,
+            || {
+                materializations.set(materializations.get() + 1);
+                "first"
+            }
+        ));
+        deadline.set(true);
+        let completed =
+            push_search_surface_before_deadline(&mut surfaces, &mut deadline_exhausted, || {
+                materializations.set(materializations.get() + 1);
+                "second"
+            });
+
+        assert_eq!(surfaces, ["first"]);
+        assert_eq!(materializations.get(), 1);
+        assert!(!completed, "the caller must return an incomplete batch");
+    }
+
+    #[test]
+    fn search_surface_crossing_deadline_marks_the_batch_incomplete() {
+        let deadline = Cell::new(false);
+        let mut deadline_exhausted = || deadline.get();
+        let mut surfaces = Vec::new();
+
+        let completed =
+            push_search_surface_before_deadline(&mut surfaces, &mut deadline_exhausted, || {
+                deadline.set(true);
+                "slow surface"
+            });
+
+        assert_eq!(surfaces, ["slow surface"]);
+        assert!(!completed, "the caller must return an incomplete batch");
     }
 
     #[test]
@@ -12836,6 +14432,82 @@ mod tests {
 
     // ── OSC 133 reader dispatch ───────────────────────────────────────────
     //
+    #[test]
+    fn zone_marker_injector_uses_canonical_lower_hex_and_reasserts_each_feed() {
+        let marker = RefCell::new(ZoneMarkerInjector::with_nonce([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ]));
+        marker.borrow_mut().begin_zone(42);
+        let open = b"\x1b]8;;block://000102030405060708090a0b0c0d0e0f/42\x1b\\".to_vec();
+        let mut fed = Vec::new();
+        super::feed_with_zone_marker(&marker, b"prompt", |part| fed.push(part.to_vec()));
+        super::feed_with_zone_marker(
+            &marker,
+            b"\x1b]8;;https://guest.invalid\x1b\\guest\x1b8tail",
+            |part| fed.push(part.to_vec()),
+        );
+        assert_eq!(
+            fed,
+            vec![
+                open.clone(),
+                b"prompt".to_vec(),
+                open,
+                b"\x1b]8;;https://guest.invalid\x1b\\guest\x1b8tail".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn zone_marker_close_mismatch_fails_closed_and_disabled_nonce_stays_unmarked() {
+        let marker = RefCell::new(ZoneMarkerInjector::with_nonce([0xab; 16]));
+        marker.borrow_mut().begin_zone(7);
+        marker.borrow_mut().close_zone(Some(8));
+        let mut fed = Vec::new();
+        super::feed_with_zone_marker(&marker, b"command output", |part| fed.push(part.to_vec()));
+        assert_eq!(fed, vec![b"command output".to_vec()]);
+        let disabled = RefCell::new(ZoneMarkerInjector::disabled());
+        disabled.borrow_mut().begin_zone(9);
+        let mut fed = Vec::new();
+        super::feed_with_zone_marker(&disabled, b"raw", |part| fed.push(part.to_vec()));
+        assert_eq!(fed, vec![b"raw".to_vec()]);
+    }
+
+    #[test]
+    fn prompt_zone_plan_reuses_idle_ids_and_aligns_completed_records() {
+        let first = super::plan_prompt_zone(None, false);
+        let repeated =
+            super::plan_prompt_zone(Some(super::PendingZone::Prompt(first.prompt_id)), false);
+        assert_eq!(repeated.prompt_id, first.prompt_id);
+        assert_eq!(repeated.completed_record_id, None);
+        let foreground =
+            super::plan_prompt_zone(Some(super::PendingZone::Command(first.prompt_id)), true);
+        assert_eq!(foreground.completed_record_id, Some(first.prompt_id));
+        assert_ne!(foreground.prompt_id, first.prompt_id);
+        let background =
+            super::plan_prompt_zone(Some(super::PendingZone::Prompt(foreground.prompt_id)), true);
+        assert_eq!(background.completed_record_id, Some(foreground.prompt_id));
+        assert_ne!(background.prompt_id, foreground.prompt_id);
+    }
+
+    #[test]
+    fn only_pre_command_alt_screen_restore_reopens_the_prompt_zone() {
+        assert_eq!(
+            super::prompt_zone_to_reopen_after_alt(
+                BlockState::AwaitingCommand,
+                Some(super::PendingZone::Prompt(17)),
+            ),
+            Some(17)
+        );
+        assert_eq!(
+            super::prompt_zone_to_reopen_after_alt(
+                BlockState::CollectingOutput,
+                Some(super::PendingZone::Command(17)),
+            ),
+            None
+        );
+    }
+
     // `ReaderCtx::handle_event` drives the whole block lifecycle, and every
     // widget it used to touch now sits behind [`RenderBackend`] (rendering)
     // and [`SubmissionSurface`] (the verified-submission reads). Both are
@@ -12936,12 +14608,19 @@ mod tests {
         ResetActiveSurface {
             preserve_scrollback: bool,
         },
+        EraseScrollback,
+        HardReset,
         FocusLiveDeferred,
         SyncGeometryToPty,
         LayoutActiveSurface,
         MarkScrollDirty,
         ResetScrollLock,
         FinalizeBlock(FinalizeRecord),
+        FinalizeMetadata {
+            command: String,
+            exit_code: Option<i32>,
+            is_background: bool,
+        },
         EnterAltScreenChrome,
         ExitAltScreenChrome,
         EnterFullscreen,
@@ -12986,6 +14665,13 @@ mod tests {
     /// grid model, so the reader lifecycle runs with no GTK widget anywhere.
     struct RecordingBackend {
         calls: RefCell<Vec<Call>>,
+        marker_trace: RefCell<Vec<MarkerTrace>>,
+        records: RefCell<VecDeque<BlockData>>,
+        metadata_records: RefCell<VecDeque<CompletedCommandRecord>>,
+        materialize_finalize_payload: Cell<bool>,
+        payload_materializations: Cell<usize>,
+        payload_counters: RefCell<Vec<Rc<Cell<usize>>>>,
+        finalize_config: Config,
         grid: RefCell<SurfaceGrid>,
         /// Block ids handed to `finalize_block`, kept out of
         /// [`FinalizeRecord`] because `next_block_id` is a process-global
@@ -13018,10 +14704,40 @@ mod tests {
         admit_probe: RefCell<Option<Box<dyn Fn()>>>,
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum MarkerTrace {
+        Feed(Vec<u8>),
+        Begin(u64),
+        Close(Option<u64>),
+        Finalize(u64),
+        HardReset,
+    }
+
     impl RecordingBackend {
         fn new() -> Rc<Self> {
+            Self::with_finalize_payload(true)
+        }
+
+        fn metadata_only() -> Rc<Self> {
+            Self::with_finalize_payload(false)
+        }
+
+        fn with_finalize_payload(materialize_finalize_payload: bool) -> Rc<Self> {
+            let mut finalize_config = crate::config::load_safe_config().0;
+            finalize_config.truncation_threshold_lines = 50_000;
+            finalize_config.finished_block_viewport_rows = 24;
+            finalize_config.finished_block_max_expanded_rows = 5_000;
+            finalize_config.font_desc = "Monospace 14".to_string();
+            finalize_config.default_font_scale = 1.0;
             Rc::new(Self {
                 calls: RefCell::new(Vec::new()),
+                marker_trace: RefCell::new(Vec::new()),
+                records: RefCell::new(VecDeque::new()),
+                metadata_records: RefCell::new(VecDeque::new()),
+                materialize_finalize_payload: Cell::new(materialize_finalize_payload),
+                payload_materializations: Cell::new(0),
+                payload_counters: RefCell::new(Vec::new()),
+                finalize_config,
                 grid: RefCell::new(SurfaceGrid {
                     rows: vec![String::new(); 24],
                     cursor: (0, 0),
@@ -13053,7 +14769,9 @@ mod tests {
             self.calls
                 .borrow()
                 .iter()
-                .filter(|call| matches!(call, Call::FinalizeBlock(_)))
+                .filter(|call| {
+                    matches!(call, Call::FinalizeBlock(_) | Call::FinalizeMetadata { .. })
+                })
                 .cloned()
                 .collect()
         }
@@ -13101,7 +14819,31 @@ mod tests {
 
     impl RenderBackend for RecordingBackend {
         fn feed_live(&self, bytes: &[u8]) {
+            self.marker_trace
+                .borrow_mut()
+                .push(MarkerTrace::Feed(bytes.to_vec()));
             self.record(Call::FeedLive(bytes.to_vec()));
+        }
+
+        fn begin_prompt_zone(&self, zone_id: u64) {
+            self.marker_trace
+                .borrow_mut()
+                .push(MarkerTrace::Begin(zone_id));
+        }
+
+        fn close_prompt_zone(&self, zone_id: Option<u64>) {
+            self.marker_trace
+                .borrow_mut()
+                .push(MarkerTrace::Close(zone_id));
+        }
+
+        fn erase_scrollback(&self) {
+            self.record(Call::EraseScrollback);
+        }
+
+        fn hard_reset(&self) {
+            self.marker_trace.borrow_mut().push(MarkerTrace::HardReset);
+            self.record(Call::HardReset);
         }
 
         fn reset_active_surface(&self, preserve_scrollback: bool) {
@@ -13122,6 +14864,38 @@ mod tests {
             self.record(Call::LayoutActiveSurface);
         }
 
+        fn records(&self) -> BackendRecords<'_> {
+            if self.materialize_finalize_payload.get() {
+                BackendRecords::Blocks(self.records.borrow())
+            } else {
+                BackendRecords::Metadata(self.metadata_records.borrow())
+            }
+        }
+
+        fn record_search_target(
+            &self,
+            _block_id: u64,
+            _is_output: bool,
+        ) -> Option<RecordSearchTarget> {
+            None
+        }
+
+        fn completed_search_surfaces(
+            &self,
+            _max_bytes: usize,
+            _deadline_exhausted: &mut dyn FnMut() -> bool,
+        ) -> BackendSearchBatch {
+            BackendSearchBatch {
+                surfaces: Vec::new(),
+                incomplete: false,
+                native_fallback: None,
+            }
+        }
+
+        fn debug_name(&self) -> &'static str {
+            "recording"
+        }
+
         fn mark_scroll_dirty(&self) {
             self.record(Call::MarkScrollDirty);
         }
@@ -13130,40 +14904,70 @@ mod tests {
             self.record(Call::ResetScrollLock);
         }
 
-        fn finalize_block(&self, block_data: BlockData, args: FinalizedBlockArgs) {
-            // The serializable record and the render args are built from one
-            // set of locals; a divergence between them is a finalize bug that
-            // no downstream assertion could attribute.
-            assert_eq!(
-                block_data.id, args.block_id,
-                "the serializable block and the render args must share one id"
+        fn finalize_block(
+            &self,
+            record: &CompletedCommandRecord,
+            payload: &dyn BlockRenderPayloadAccessor,
+        ) {
+            self.finalized_ids.borrow_mut().push(record.id);
+            self.marker_trace
+                .borrow_mut()
+                .push(MarkerTrace::Finalize(record.id));
+            self.payload_counters
+                .borrow_mut()
+                .push(payload.materialization_counter());
+            if !self.materialize_finalize_payload.get() {
+                self.metadata_records.borrow_mut().push_back(record.clone());
+                self.record(Call::FinalizeMetadata {
+                    command: record.cmd.clone(),
+                    exit_code: record.exit_code,
+                    is_background: record.is_background,
+                });
+                return;
+            }
+
+            self.payload_materializations
+                .set(self.payload_materializations.get().saturating_add(1));
+            let payload = payload.materialize();
+            let cols = self.grid.borrow().grid_cols;
+            let truncation_limit = self.finalize_config.truncation_threshold_lines as usize;
+            let (_trimmed, line_count) =
+                truncate_plain_output_for_height(&payload.output_plain, truncation_limit);
+            let estimated_height = estimated_finished_block_height_for_text(
+                &self.finalize_config,
+                &record.cmd,
+                &payload.output_plain,
+                cols,
             );
-            assert_eq!(
-                block_data.cmd, args.cmd,
-                "the serializable block and the render args must share one command"
-            );
-            assert_eq!(
-                block_data.prompt, args.prompt,
-                "the serializable block and the render args must share one prompt"
-            );
-            assert_eq!(
-                block_data.exit_code, args.exit_code,
-                "the serializable block and the render args must share one status"
-            );
-            self.finalized_ids.borrow_mut().push(args.block_id);
+            let block_data = BlockData {
+                id: record.id,
+                prompt: payload.prompt.clone(),
+                cmd: record.cmd.clone(),
+                cmd_markup: None,
+                output: payload.output_plain.trim().to_string(),
+                exit_code: record.exit_code,
+                estimated_height,
+                line_count,
+                start_time_ms: record.start_time_ms,
+                end_time_ms: record.end_time_ms,
+                duration_ms: record.duration_ms,
+                cwd: record.cwd.clone(),
+                cols: cols.clamp(1, u16::MAX as i64) as u16,
+            };
+            self.records.borrow_mut().push_back(block_data);
             self.record(Call::FinalizeBlock(FinalizeRecord {
-                prompt: args.prompt,
-                command: args.cmd,
-                output_with_ansi: args.output_with_ansi,
-                output_plain: args.output_plain,
-                plain_output_bytes: args.plain_output_bytes,
-                cwd: args.block_cwd,
-                cols: args.cols,
-                estimated_height: block_data.estimated_height,
-                exit_code: args.exit_code,
-                has_duration: args.duration_ms.is_some(),
-                has_end_time: args.end_time_ms.is_some(),
-                is_background: args.is_background,
+                prompt: payload.prompt.clone(),
+                command: record.cmd.clone(),
+                output_with_ansi: payload.output_with_ansi.clone(),
+                output_plain: payload.output_plain.clone(),
+                plain_output_bytes: payload.output_plain.len(),
+                cwd: record.cwd.clone(),
+                cols,
+                estimated_height,
+                exit_code: record.exit_code,
+                has_duration: record.duration_ms.is_some(),
+                has_end_time: record.end_time_ms.is_some(),
+                is_background: record.is_background,
             }));
         }
 
@@ -13449,7 +15253,22 @@ mod tests {
         }
 
         fn with_foreground(foreground: PtyForeground) -> Self {
-            let backend = RecordingBackend::new();
+            Self::with_backend(foreground, RecordingBackend::new(), true)
+        }
+
+        fn metadata_only(with_output_observer: bool) -> Self {
+            Self::with_backend(
+                PtyForeground::Shell,
+                RecordingBackend::metadata_only(),
+                with_output_observer,
+            )
+        }
+
+        fn with_backend(
+            foreground: PtyForeground,
+            backend: Rc<RecordingBackend>,
+            with_output_observer: bool,
+        ) -> Self {
             let surface = RecordingSurface::new();
             let bstate = Rc::new(Cell::new(BlockState::Idle));
             // Held here as well as in the ctx: the command-started fan-out
@@ -13523,22 +15342,24 @@ mod tests {
 
             let blocks_finished = Rc::new(RefCell::new(Vec::new()));
             let block_finished_cbs: BlockFinishedCallbacks = Rc::new(RefCell::new(Vec::new()));
-            {
+            if with_output_observer {
                 let seen = blocks_finished.clone();
                 let backend_at_fan_out = backend.clone();
                 let bstate_at_fan_out = bstate.clone();
-                block_finished_cbs.borrow_mut().push(Box::new(
-                    move |command, exit_code, output_sample, agent_generation, _duration| {
-                        seen.borrow_mut().push(FinishedFanOut {
-                            command,
-                            exit_code,
-                            output_sample,
-                            agent_generation,
-                            blocks_finalized_before: backend_at_fan_out.finalized().len(),
-                            state_at_fan_out: bstate_at_fan_out.get(),
-                        });
-                    },
-                ));
+                block_finished_cbs
+                    .borrow_mut()
+                    .push(BlockFinishedCallback::WithOutput(Box::new(
+                        move |command, exit_code, output_sample, agent_generation, _duration| {
+                            seen.borrow_mut().push(FinishedFanOut {
+                                command,
+                                exit_code,
+                                output_sample,
+                                agent_generation,
+                                blocks_finalized_before: backend_at_fan_out.finalized().len(),
+                                state_at_fan_out: bstate_at_fan_out.get(),
+                            });
+                        },
+                    )));
             }
             let commands_started = Rc::new(RefCell::new(Vec::new()));
             let command_started_cbs: CommandStartedCallbacks = Rc::new(RefCell::new(Vec::new()));
@@ -13618,6 +15439,7 @@ mod tests {
                     command_start_instant: None,
                     pending_exit_code: None,
                     pending_command_meta: PendingCommandMeta::default(),
+                    pending_zone: None,
                     active_alt_screen_mode: None,
                 }),
                 live_raw_output_rc: live_raw_output.clone(),
@@ -13638,6 +15460,7 @@ mod tests {
                 prompt_anchor_ready_rc: prompt_anchor_ready,
                 prompt_identity_output_rc: Rc::new(Cell::new(false)),
                 prompt_anchor_generation_rc: prompt_anchor_generation,
+                prompt_anchor_tick_id_rc: Rc::new(RefCell::new(None)),
                 contents_generation_rc: contents_generation,
                 post_prompt_bytes_rc: Rc::new(RefCell::new(BoundedByteRing::new(
                     MAX_RAW_OUTPUT_BYTES,
@@ -13907,6 +15730,17 @@ mod tests {
             ]
         );
         assert_eq!(harness.backend.finalized_ids.borrow().len(), 1);
+        {
+            let records = harness.backend.records();
+            let BackendRecords::Blocks(records) = records else {
+                panic!("the ordinary recording backend stores BlockData");
+            };
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].cmd, "echo hi");
+            assert_eq!(records[0].output, plain_output.trim());
+            assert_eq!(records[0].cwd.as_deref(), Some(SHELL_REPORTED_CWD));
+            assert_eq!(records[0].exit_code, Some(0));
+        }
         assert!(
             harness.live_output().is_empty(),
             "the finalized command's ring must be cleared for the next one"
@@ -13927,6 +15761,462 @@ mod tests {
             }]
         );
         assert_eq!(harness.commands_finished.borrow().len(), 1);
+    }
+
+    fn drive_simple_command(harness: &ReaderHarness, command: &str, output: &str) {
+        harness.backend.render_row(3, "$ ");
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("$ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.backend.render_row(3, &format!("$ {command}"));
+        harness.feed(command_start(None));
+        harness.feed(bytes(output));
+        harness.feed(command_end(Some(0)));
+        harness.feed(ParserEvent::PromptStart);
+    }
+
+    #[test]
+    fn command_start_replays_fenced_bytes_before_closing_the_same_zone() {
+        let harness = ReaderHarness::new();
+        harness.backend.settle_anchor_now.set(false);
+        harness.backend.render_row(3, "$ ");
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("$ "),
+            ParserEvent::PromptEnd,
+            bytes("deferred-editor-redraw"),
+        ]);
+        let zone_id = match harness.ctx.engine.borrow().pending_zone {
+            Some(super::PendingZone::Prompt(id)) => id,
+            other => panic!("expected prompt zone, got {other:?}"),
+        };
+        harness.feed(command_start(None));
+        let trace = harness.backend.marker_trace.borrow();
+        let deferred = trace
+            .iter()
+            .rposition(|event| *event == MarkerTrace::Feed(b"deferred-editor-redraw".to_vec()))
+            .expect("C replays the fenced bytes");
+        let close = trace
+            .iter()
+            .rposition(|event| *event == MarkerTrace::Close(Some(zone_id)))
+            .expect("C closes its prompt zone");
+        assert!(
+            deferred < close,
+            "deferred replay must remain marked through C"
+        );
+        assert_eq!(
+            harness.ctx.engine.borrow().pending_zone,
+            Some(super::PendingZone::Command(zone_id))
+        );
+    }
+
+    #[test]
+    fn repeated_prompt_and_completed_records_keep_one_aligned_zone_id() {
+        let harness = ReaderHarness::new();
+        harness.feed(ParserEvent::PromptStart);
+        let first_id = harness.ctx.engine.borrow().pending_zone.unwrap().id();
+        harness.feed(ParserEvent::PromptEnd);
+        harness.feed(ParserEvent::PromptStart);
+        assert_eq!(
+            harness.ctx.engine.borrow().pending_zone.unwrap().id(),
+            first_id,
+            "idle prompt redraw reuses its id"
+        );
+
+        harness.feed(ParserEvent::PromptEnd);
+        harness.backend.render_row(0, "echo ok");
+        harness.feed(command_start(Some("echo ok")));
+        harness.feed(command_end(Some(0)));
+        harness.feed(ParserEvent::PromptStart);
+        assert_eq!(
+            harness.backend.finalized_ids.borrow().as_slice(),
+            &[first_id]
+        );
+        let next_id = harness.ctx.engine.borrow().pending_zone.unwrap().id();
+        assert_ne!(next_id, first_id);
+        let trace = harness.backend.marker_trace.borrow();
+        assert!(trace.contains(&MarkerTrace::Close(Some(first_id))));
+        assert!(trace.contains(&MarkerTrace::Finalize(first_id)));
+        assert!(trace.contains(&MarkerTrace::Begin(next_id)));
+    }
+
+    #[test]
+    fn empty_lifecycle_and_nested_marks_never_create_extra_zone_records() {
+        let harness = ReaderHarness::new();
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            ParserEvent::PromptEnd,
+            command_start(None),
+            command_start(Some("nested")),
+            command_end(Some(9)),
+            command_end(Some(0)),
+            ParserEvent::PromptStart,
+        ]);
+        assert!(harness.backend.finalized_ids.borrow().is_empty());
+        let trace = harness.backend.marker_trace.borrow();
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|event| matches!(event, MarkerTrace::Close(_)))
+                .count(),
+            1,
+            "nested C does not close or mint another zone"
+        );
+        assert!(
+            !trace
+                .iter()
+                .any(|event| matches!(event, MarkerTrace::Finalize(_))),
+            "an empty lifecycle remains absent from completed records"
+        );
+    }
+
+    #[test]
+    fn background_record_uses_the_open_idle_prompt_zone_id() {
+        let harness = ReaderHarness::new();
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("$ "),
+            ParserEvent::PromptEnd,
+        ]);
+        let prompt_id = harness.ctx.engine.borrow().pending_zone.unwrap().id();
+        harness.feed(bytes("background\r\n"));
+        harness.feed(ParserEvent::PromptStart);
+        assert_eq!(
+            harness.backend.finalized_ids.borrow().as_slice(),
+            &[prompt_id]
+        );
+    }
+
+    #[test]
+    fn alt_leave_reopens_before_c_but_never_after_c() {
+        let harness = ReaderHarness::new();
+        harness.feed_all([ParserEvent::PromptStart, ParserEvent::PromptEnd]);
+        let zone_id = harness.ctx.engine.borrow().pending_zone.unwrap().id();
+        harness.backend.marker_trace.borrow_mut().clear();
+        harness.feed_all([
+            ParserEvent::AltScreenEnter(1049),
+            ParserEvent::AltScreenLeave(1049),
+        ]);
+        assert_eq!(
+            harness.backend.marker_trace.borrow().as_slice(),
+            &[
+                MarkerTrace::Feed(b"\x1b[?1049h".to_vec()),
+                MarkerTrace::Feed(b"\x1b[?1049l".to_vec()),
+                MarkerTrace::Begin(zone_id),
+            ],
+            "rmcup must run before the marker is reopened on the restored main screen"
+        );
+
+        harness.feed(command_start(None));
+        harness.backend.marker_trace.borrow_mut().clear();
+        harness.feed_all([
+            ParserEvent::AltScreenEnter(1049),
+            ParserEvent::AltScreenLeave(1049),
+        ]);
+        assert!(
+            !harness
+                .backend
+                .marker_trace
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, MarkerTrace::Begin(_))),
+            "a closed command zone is not reopened after C"
+        );
+    }
+
+    #[test]
+    fn ris_retires_the_open_zone_before_raw_bytes_and_preserves_records() {
+        let harness = ReaderHarness::metadata_only(false);
+        drive_simple_command(&harness, "printf kept", "kept\r\n");
+        assert_eq!(harness.backend.metadata_records.borrow().len(), 1);
+        assert!(harness.ctx.engine.borrow().pending_zone.is_some());
+
+        harness.backend.take_calls();
+        harness.backend.marker_trace.borrow_mut().clear();
+        harness.feed(ParserEvent::DecsetMode {
+            mode: 2004,
+            set: true,
+        });
+        assert!(harness.pty.shell_bracketed_paste());
+        harness.feed(ParserEvent::HardReset);
+        harness.feed(ParserEvent::Bytes(b"\x1bc".to_vec()));
+
+        assert_eq!(harness.ctx.engine.borrow().pending_zone, None);
+        assert_eq!(harness.backend.metadata_records.borrow().len(), 1);
+        assert!(!harness.pty.shell_bracketed_paste());
+        assert_eq!(
+            harness.backend.marker_trace.borrow().as_slice(),
+            &[MarkerTrace::HardReset, MarkerTrace::Feed(b"\x1bc".to_vec()),],
+            "the generic Bytes feed cannot prepend the retired marker to RIS"
+        );
+    }
+
+    #[test]
+    fn ed3_releases_the_post_prompt_fence_before_invalidating_rows() {
+        let harness = ReaderHarness::new();
+        harness.backend.settle_anchor_now.set(false);
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("$ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.backend.take_calls();
+
+        harness.feed(bytes("deferred-before-ed3"));
+        assert_eq!(harness.backend.take_calls(), [Call::MarkScrollDirty]);
+
+        harness.feed(ParserEvent::EraseScrollback);
+        assert_eq!(
+            harness.backend.take_calls(),
+            [
+                Call::FeedLive(b"deferred-before-ed3".to_vec()),
+                Call::EraseScrollback,
+            ],
+            "older parked bytes must reach VTE before the pre-feed ED3 hook"
+        );
+        assert!(harness.ctx.post_prompt_bytes_rc.borrow().is_empty());
+        assert!(harness.ctx.post_prompt_fence_released_rc.get());
+
+        harness.feed(bytes("\x1b[3J"));
+        assert_eq!(
+            harness.backend.take_calls(),
+            [Call::FeedLive(b"\x1b[3J".to_vec()), Call::MarkScrollDirty,],
+            "the raw ED3 bytes cannot be parked after their semantic hook"
+        );
+    }
+
+    #[test]
+    fn ris_releases_the_fence_then_invalidates_prompt_and_review_trust() {
+        let harness = ReaderHarness::new();
+        harness.backend.settle_anchor_now.set(false);
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("$ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.feed(bytes("deferred-before-ris"));
+        harness.backend.take_calls();
+        harness.backend.marker_trace.borrow_mut().clear();
+
+        harness.ctx.prompt_anchor_ready_rc.set(true);
+        harness.ctx.agent_execution_supported_rc.set(true);
+        harness.ctx.submission_pending_rc.set(true);
+        *harness.ctx.external_submission_rc.borrow_mut() = Some("approved".to_string());
+        harness.ctx.external_submission_generation_rc.set(Some(42));
+        {
+            let mut engine = harness.ctx.engine.borrow_mut();
+            engine.prompt_buf = "old prompt bytes".to_string();
+            engine.prompt_display = "old prompt".to_string();
+            engine.vte_typed_cmd = "old command".to_string();
+            engine.background_output.append(b"old background output");
+        }
+        let anchor_generation = harness.ctx.prompt_anchor_generation_rc.get();
+        let input_generation = harness.ctx.accepted_input_generation_rc.get();
+
+        harness.feed(ParserEvent::HardReset);
+        assert_eq!(
+            harness.backend.take_calls(),
+            [
+                Call::FeedLive(b"deferred-before-ris".to_vec()),
+                Call::HardReset,
+            ],
+            "pre-RIS display bytes are replayed before authority is cleared"
+        );
+        assert_eq!(
+            harness.backend.marker_trace.borrow().as_slice(),
+            &[
+                MarkerTrace::Feed(b"deferred-before-ris".to_vec()),
+                MarkerTrace::HardReset,
+            ]
+        );
+        assert!(!harness.ctx.prompt_anchor_ready_rc.get());
+        assert_eq!(harness.ctx.prompt_end_pos_rc.get(), (-1, -1));
+        assert_eq!(harness.ctx.prompt_anchor_rows_rc.get(), 0);
+        assert_ne!(
+            harness.ctx.prompt_anchor_generation_rc.get(),
+            anchor_generation
+        );
+        assert_ne!(
+            harness.ctx.accepted_input_generation_rc.get(),
+            input_generation
+        );
+        assert!(!harness.ctx.agent_execution_supported_rc.get());
+        assert!(!harness.ctx.submission_pending_rc.get());
+        assert!(harness.ctx.external_submission_rc.borrow().is_none());
+        assert_eq!(harness.ctx.external_submission_generation_rc.get(), None);
+        {
+            let engine = harness.ctx.engine.borrow();
+            assert!(engine.prompt_buf.is_empty());
+            assert!(engine.prompt_display.is_empty());
+            assert!(engine.vte_typed_cmd.is_empty());
+            assert!(engine.background_output.is_empty());
+        }
+        assert_eq!(
+            harness.agent_lost.borrow().as_slice(),
+            &[(42, TERMINAL_RESET_INVALIDATED_SUBMISSION)]
+        );
+
+        harness.backend.marker_trace.borrow_mut().clear();
+        harness.feed(bytes("\x1bc"));
+        assert_eq!(
+            harness.backend.marker_trace.borrow().as_slice(),
+            &[MarkerTrace::Feed(b"\x1bc".to_vec())],
+            "the raw RIS cannot be parked or prefixed with retired authority"
+        );
+    }
+
+    #[test]
+    fn ris_in_alt_screen_restores_frontend_state_without_synthesizing_rmcup() {
+        let harness = ReaderHarness::new();
+        harness.feed_all([ParserEvent::PromptStart, ParserEvent::PromptEnd]);
+        harness.feed(ParserEvent::AltScreenEnter(1049));
+        assert_eq!(harness.bstate.get(), BlockState::AltScreen);
+        harness.backend.take_calls();
+        harness.backend.marker_trace.borrow_mut().clear();
+
+        harness.feed(ParserEvent::HardReset);
+
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                Call::HardReset,
+                Call::ExitFullscreen,
+                Call::ExitAltScreenChrome,
+                Call::LayoutActiveSurface,
+            ]
+        );
+        assert_eq!(harness.bstate.get(), BlockState::AwaitingCommand);
+        assert_eq!(harness.ctx.engine.borrow().pending_zone, None);
+        assert_eq!(harness.ctx.engine.borrow().active_alt_screen_mode, None);
+        assert_eq!(
+            harness.alt_screen.borrow().as_slice(),
+            &[AltScreenTransition::Entered, AltScreenTransition::Left]
+        );
+        assert_eq!(
+            harness.backend.marker_trace.borrow().as_slice(),
+            &[MarkerTrace::HardReset],
+            "RIS owns the terminal reset; frontend recovery must not feed rmcup"
+        );
+    }
+
+    #[test]
+    fn linux_zone_nonce_is_full_128_bit_entropy() {
+        #[cfg(target_os = "linux")]
+        {
+            let first = super::secure_zone_marker_nonce().expect("Linux getrandom is available");
+            let second = super::secure_zone_marker_nonce().expect("Linux getrandom is available");
+            assert_ne!(first, second);
+            assert_eq!(first.len(), 16);
+        }
+    }
+
+    #[test]
+    fn metadata_only_finalize_never_materializes_payload() {
+        let harness = ReaderHarness::metadata_only(false);
+        drive_simple_command(&harness, "printf hi", "\x1b[32mhi\x1b[0m\r\n");
+
+        assert_eq!(harness.backend.payload_materializations.get(), 0);
+        assert_eq!(harness.backend.payload_counters.borrow()[0].get(), 0);
+        assert!(harness.blocks_finished.borrow().is_empty());
+        let records = harness.backend.records();
+        let BackendRecords::Metadata(records) = records else {
+            panic!("the metadata-only backend must not manufacture BlockData");
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].cmd, "printf hi");
+        assert!(harness.live_output().is_empty());
+    }
+
+    #[test]
+    fn metadata_backend_output_observer_materializes_once_before_ring_clear() {
+        let harness = ReaderHarness::metadata_only(true);
+        drive_simple_command(&harness, "printf hi", "\x1b[32mhi\x1b[0m\r\n");
+
+        assert_eq!(harness.backend.payload_materializations.get(), 0);
+        assert_eq!(
+            harness.backend.payload_counters.borrow()[0].get(),
+            1,
+            "the explicit output observer materializes the shared accessor once"
+        );
+        assert_eq!(harness.blocks_finished.borrow().len(), 1);
+        assert_eq!(
+            harness.blocks_finished.borrow()[0].output_sample,
+            "hi\n",
+            "Unified output observers see the live ring before it is cleared"
+        );
+        assert!(harness.live_output().is_empty());
+    }
+
+    #[test]
+    fn block_backend_and_output_observer_share_one_materialization() {
+        let harness = ReaderHarness::new();
+        drive_simple_command(&harness, "printf hi", "\x1b[32mhi\x1b[0m\r\n");
+
+        assert_eq!(
+            harness.backend.payload_materializations.get(),
+            1,
+            "the rendering backend is the only accessor invocation; fan-out reuses its cache"
+        );
+        assert_eq!(harness.backend.payload_counters.borrow()[0].get(), 1);
+        assert_eq!(harness.blocks_finished.borrow()[0].output_sample, "hi\n");
+    }
+
+    #[test]
+    fn metadata_only_missing_end_recovery_does_not_materialize_payload() {
+        let harness = ReaderHarness::metadata_only(false);
+        harness.backend.render_row(3, "$ ");
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("$ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.backend.render_row(3, "$ interrupted");
+        harness.feed(command_start(None));
+        harness.feed(bytes("partial output\r\n"));
+        // Only an approved/Agent command may recover a missing D at the next
+        // prompt. The identity is deliberately dropped by that recovery, but
+        // the ordinary metadata record must still be finalized.
+        harness.ctx.active_agent_generation_rc.set(Some(71));
+        harness.feed(ParserEvent::PromptStart);
+
+        assert_eq!(harness.backend.payload_materializations.get(), 0);
+        assert_eq!(harness.backend.payload_counters.borrow()[0].get(), 0);
+        assert_eq!(harness.backend.finalized().len(), 1);
+        let records = harness.backend.records();
+        let BackendRecords::Metadata(records) = records else {
+            panic!("the metadata-only backend must retain a recovery record");
+        };
+        assert_eq!(records[0].cmd, "interrupted");
+        assert_eq!(records[0].exit_code, None);
+        assert!(harness.live_output().is_empty());
+    }
+
+    #[test]
+    fn metadata_only_background_finalize_does_not_materialize_payload() {
+        // Keep a WithOutput observer installed: commandless background records
+        // intentionally do not enter command-scoped callback fan-out, so even
+        // its presence must not force an output snapshot.
+        let harness = ReaderHarness::metadata_only(true);
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("$ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.feed(bytes("cron: done\r\n"));
+        harness.feed(ParserEvent::PromptStart);
+
+        assert_eq!(harness.backend.payload_materializations.get(), 0);
+        assert_eq!(harness.backend.payload_counters.borrow()[0].get(), 0);
+        assert!(harness.blocks_finished.borrow().is_empty());
+        let records = harness.backend.records();
+        let BackendRecords::Metadata(records) = records else {
+            panic!("the metadata-only backend must retain a background record");
+        };
+        assert_eq!(records.len(), 1);
+        assert!(records[0].is_background);
+        assert!(records[0].cmd.is_empty());
     }
 
     /// A second command on the same pane, ending the way a shell that reports
