@@ -42,6 +42,8 @@
 - [x] Phase 1 增量 1a 镜像：config/CLI/completions/settings/workspace 与单一 Unified backend 路由均已完成，受管远程仍强制 Block。
 - [x] Phase 1 增量 1b 核心镜像：`records()`、metadata-only record、惰性 finalize、A→C marker、probe chrome、authority 淘汰、visible-first bounded `Ctrl+F` 与 metadata export 已按 Anvil 的 Relm4/Agent/journal 边界同步。
 - [x] ED3/RIS 顺序镜像：pinned `jterm_core` 尚无 reset event，Anvil 在 core parser 之前用流式 ANSI-aware splitter建立 reset 边界；reset hook、原始 reset bytes、suffix 严格按线序执行，control-string lookalike 与跨 chunk 输入 fail closed。
+- [x] 有界 zone 快照镜像（anvil `646e65d`）。两处 anvil 边界强制的偏离：(1) **不做 replay-abort 标志** —— anvil 的 `strip_ansi_with_clear_detect` 无 cell 预算、无跳出字节循环的 `break`，CUF 用 `.min(cells.len())` 钳位而非填充，既不会中止也不会放大（带预算的 `replay_visibility` 只喂布尔探针 `ansi_has_visible_text`），永假的标志是装饰性覆盖；改用「重放一旦获得预算就失败」的测试钉住这个前提。(2) **回绕标记不进 newtype** —— anvil 的 ring 是与 `ActiveBlock` 共享的裸 `VecDeque`，改 newtype 会波及五处；改为 `append_bounded_output` 返回是否丢字节（`#[must_use]`）+ 单一 `clear_live_raw_output` 拥有全部四个清空点 + payload 构造时捕获标记。
+- [x] anvil 专属 blocker（审查发现，forge 无对应代码）：快照对话框的 slot 在 `force_close` 期间仍被借用。libadwaita 1.8.4 的 `force_close` **同步**发出 `closed`，其 handler 写同一 cell，于是在 C signal trampoline 里 panic 且无法 unwind → SIGABRT 整个工作区。默认路径可达（面板里连按两次回车）。修法是把 `take()` 提升为独立语句，与 `cross_block_search.rs` 既有写法一致。`clippy::significant_drop_in_scrutinee` **抓不到**这个（不把 `RefMut` 算作 significant drop，全仓只在一处 `Mutex::lock` 触发），所以保护只能靠代码注释陈述约束。
 
 ## P3 · 卫生与债务
 
@@ -59,4 +61,6 @@
 - **测试不得自证**：`zone_marker_bytes_never_enter_the_snapshot_capture` 初版自己往 ring 里塞无标记数据再断言 ring 无标记——生产接线怎么改它都绿。改为驱动 `ReaderHarness` 跑完整命令周期后，「删掉引擎 raw-output 捕获」这个变异才被杀死。判据：**这个测试能被哪个生产改动杀死？** 答不上来就是装饰。
 - **契约字段要枚举全部信息丢失源**。`truncated` 初版只算尾部切割，漏了三处：ring 回绕、`strip_ansi` 触到自身 grid 预算而 `break` 掉剩余全部字节（重放不是过滤）、以及 strip 后的钳位。写下「任何未存活的字节都要报告」这种契约时，先把能丢字节的路径列全再实现。
 - **默认路径可能不是你以为的那条**。jsh 下 journal 提交在 `finalize_block` **之前**物化 payload，所以 Unified 每条前台命令走的都是「已物化」分支——挂在 ring 分支上的 `dropped_front` 管线在生产中整个是死的，而小样本 GUI 测试恰好看不出来（小输出本来就该报 false）。
-- 小样本 GUI 验证能证明「通路存在」，证不了「边界正确」。本轮 GUI 全绿的同时，对抗性审查在同一份代码里找出三条静默丢数据的路径。两者都要。
+- 小样本 GUI 验证能证明「通路存在」，证不了「边界正确」。本轮 GUI 全绿的同时，对抗性审查在同一份代码里找出三条静默丢数据的路径；反过来审查也漏了「新功能的行 `activatable(false)` 根本点不动」这种只有真跑才撞得到的问题。两者都要。
+- **镜像最危险的是没有对照的那部分**。anvil 侧唯一的 blocker（同步 `closed` 回调里的 RefCell 重入 → 进程 abort）出在 forge 根本不存在的代码上（forge 不跟踪 dialog slot）。镜像评审要专设一个「无对照代码」视角，别只做逐条比对。
+- **别指望 lint 兜底再去验证**：`clippy::significant_drop_in_scrutinee` 看起来正对这个缺陷，实测零命中（不把 `RefMut` 当 significant drop）。先验证工具真的会响，再决定要不要依赖它。
