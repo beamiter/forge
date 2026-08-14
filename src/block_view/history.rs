@@ -6,6 +6,7 @@
 
 #[cfg(test)]
 use super::completed_block_retention_plan;
+use super::zone_history;
 use super::{
     estimated_finished_block_height_for_text, install_finished_block_selection, next_block_id,
     BlockData, FinishedBlock, TermView, MAX_COMPLETED_BLOCK_RETAINED_BYTES,
@@ -2059,18 +2060,87 @@ impl TermView {
         self.persist_history_on_drop.set(false);
     }
 
+    /// Where this pane's bounded zone document lives: a sibling of the Block
+    /// history file, distinct by stem so a pane that changes mode between
+    /// runs can never decode one as the other.
+    fn zone_history_path(&self) -> Option<PathBuf> {
+        let configured = self.config.borrow().block_history_path.as_ref().cloned()?;
+        let base = absolute_history_path(&configured).ok()?;
+        let stem = base
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "blocks".to_string());
+        let name = match base.extension() {
+            Some(ext) => format!("{stem}-zones.{}", ext.to_string_lossy()),
+            None => format!("{stem}-zones"),
+        };
+        let zone_base = base.with_file_name(name);
+        Some(match self.session_id.as_deref() {
+            Some(sid) => per_session_history_path(&zone_base, sid),
+            None => zone_base,
+        })
+    }
+
+    /// Persist the backend's bounded zone document. Encoding is small and
+    /// bounded by construction, so it stays on this thread rather than
+    /// contending for the Block persistence worker.
+    fn save_zone_history(&self) -> std::io::Result<()> {
+        let Some(zones) = self.render_backend.zone_replay_snapshot(
+            zone_history::MAX_RESTORED_ZONES,
+            zone_history::MAX_RESTORED_SNAPSHOT_BYTES,
+        ) else {
+            return Ok(());
+        };
+        let Some(path) = self.zone_history_path() else {
+            return Ok(());
+        };
+        if zones.is_empty() {
+            // An empty session must not leave a stale document behind for the
+            // next run to replay.
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            return Ok(());
+        }
+        let encoded = zone_history::encode_session(zones)?;
+        atomic_write(&path, |file| file.write_all(&encoded))
+    }
+
+    /// Replay this pane's persisted zones onto the surface before any PTY
+    /// byte reaches it. A failed or unreadable document is logged and skipped:
+    /// a restart with no history is a working pane, and refusing to start is
+    /// not.
+    fn restore_zone_history(&self) {
+        let Some(path) = self.zone_history_path() else {
+            return;
+        };
+        let zones = match zone_history::read_session(&path) {
+            Ok(zones) => zones,
+            Err(error) => {
+                log::warn!("zone history not restored from {}: {error}", path.display());
+                return;
+            }
+        };
+        if zones.is_empty() {
+            return;
+        }
+        let restored = self.render_backend.replay_zone_snapshot(zones);
+        log::debug!("restored {restored} zones from {}", path.display());
+    }
+
     /// Snapshot block history on the GTK thread and queue all encoding and
     /// durable file I/O on the shared persistence worker.
     pub fn save_history(&self) -> std::io::Result<()> {
         if !self.persist_history_on_drop.get() {
             return Ok(());
         }
-        // Some backends expose in-memory records without owning the persisted
-        // Block-card representation. Snapshot/replay for such a surface is a
-        // separate capability; until then it must not overwrite this session's
-        // existing Block history with a representation it cannot restore.
+        // A backend that does not own the Block card document persists its
+        // own bounded zone document instead, on a sibling path, so neither
+        // representation can overwrite the other.
         if !self.render_backend.persists_block_history() {
-            return Ok(());
+            return self.save_zone_history();
         }
         let (path_opt, compress, max_blocks) = {
             let config = self.config.borrow();
@@ -2189,11 +2259,12 @@ impl TermView {
     /// GTK widgets in a short main-thread callback. Commands that finish while
     /// the read is pending remain newer than every restored block.
     pub(crate) fn start_history_load(self: &Rc<Self>) {
-        // Backends that do not own Block persistence cannot display restored
-        // cards. Their bounded surface-replay implementation remains separate
-        // from this Block-history loader.
+        // A backend without the Block card document restores its own bounded
+        // zone document instead. That replay is synchronous on purpose: it
+        // must reach the surface before the shell's first prompt, or restored
+        // rows would land under output they precede.
         if !self.render_backend.persists_block_history() {
-            log::debug!("render backend does not restore Block history for this pane");
+            self.restore_zone_history();
             return;
         }
         let (path_opt, compress, load_limit) = {

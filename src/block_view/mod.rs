@@ -37,6 +37,7 @@ mod palette;
 mod scroll;
 mod selection_hold;
 mod unified_chrome;
+mod zone_history;
 pub(crate) use alt_screen::*;
 pub(crate) use ansi::*;
 pub(crate) use blocks::*;
@@ -4504,11 +4505,25 @@ trait RenderBackend {
         deadline_exhausted: &mut dyn FnMut() -> bool,
     ) -> BackendSearchBatch;
     /// Whether this backend owns the persisted Block-history representation.
-    /// Unified records are currently in-memory zones; bounded surface replay
-    /// remains a later increment, so it neither loads nor overwrites Block
-    /// history files.
+    /// A backend that answers `false` must instead implement the bounded
+    /// zone-replay pair below, or it retains nothing across a restart.
     fn persists_block_history(&self) -> bool {
         true
+    }
+    /// Bounded, replayable form of this backend's completed zones, newest
+    /// last. `None` from a backend whose history is the Block card document.
+    fn zone_replay_snapshot(
+        &self,
+        _max_zones: usize,
+        _max_bytes: usize,
+    ) -> Option<Vec<zone_history::PersistedZone>> {
+        None
+    }
+    /// Replay a restored session onto the surface and adopt its records,
+    /// returning how many zones landed. Ids are issued from this process's
+    /// counter: a persisted id must never re-enter marker authority.
+    fn replay_zone_snapshot(&self, _zones: Vec<zone_history::PersistedZone>) -> usize {
+        0
     }
     /// Whether cards can be inserted into the backend's scrollable document.
     fn supports_inline_notices(&self) -> bool {
@@ -7406,6 +7421,73 @@ impl RenderBackend for UnifiedBackend {
 
     fn persists_block_history(&self) -> bool {
         false
+    }
+
+    fn zone_replay_snapshot(
+        &self,
+        max_zones: usize,
+        max_bytes: usize,
+    ) -> Option<Vec<zone_history::PersistedZone>> {
+        let zones = self.zones.borrow();
+        let persisted = zones
+            .records
+            .iter()
+            .map(|record| zone_history::PersistedZone::from_live(record, zones.snapshot(record.id)))
+            .collect();
+        Some(zone_history::bound_persisted_zones(
+            persisted, max_zones, max_bytes,
+        ))
+    }
+
+    fn replay_zone_snapshot(&self, zones: Vec<zone_history::PersistedZone>) -> usize {
+        if zones.is_empty() {
+            return 0;
+        }
+        // Replay is display-only: the bytes go straight to VTE, never through
+        // the parser, so a restored zone cannot be mistaken for a command this
+        // session ran. The marker frames come from this pane's own injector
+        // under freshly issued ids, so chrome addresses restored rows exactly
+        // as it addresses live ones.
+        self.vte.feed(&zone_history::replay_banner(zones.len()));
+        let max_zones = self.config_for_cb.borrow().max_visible_blocks as usize;
+        let mut restored = 0;
+        for zone in zones {
+            let id = next_block_id();
+            let (record, snapshot) = zone.into_live(id);
+            self.chrome.begin_zone(id, &self.vte);
+            {
+                let mut marker = self.zone_marker.borrow_mut();
+                marker.begin_zone(id);
+            }
+            let bytes = zone_history::replay_bytes(
+                &record,
+                snapshot.as_ref().map(|snapshot| snapshot.plain.as_str()),
+                snapshot.as_ref().is_some_and(|snapshot| snapshot.truncated),
+            );
+            feed_vte_with_zone_marker(&self.vte, &self.zone_marker, &bytes);
+            self.zone_marker.borrow_mut().close_zone(Some(id));
+            self.vte.feed(ZONE_MARKER_CLOSE);
+            self.chrome
+                .record_completed(unified_chrome::ZoneChromeRecord {
+                    id: record.id,
+                    exit_code: record.exit_code,
+                    duration_ms: record.duration_ms,
+                    is_background: record.is_background,
+                });
+            {
+                let mut store = self.zones.borrow_mut();
+                let retired = record_unified_zone(&mut store, record, max_zones);
+                if let Some(snapshot) = snapshot {
+                    store.insert_snapshot(id, snapshot);
+                }
+                store.enforce_snapshot_budget(MAX_TOTAL_SNAPSHOT_BYTES);
+                drop(store);
+                self.chrome.retire_ids(&retired);
+            }
+            restored += 1;
+        }
+        self.chrome.enforce_limit(max_zones);
+        restored
     }
 
     fn supports_inline_notices(&self) -> bool {
