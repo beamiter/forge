@@ -15,6 +15,7 @@ use vte4::Terminal;
 use vte4::TerminalExt;
 
 use super::*;
+use crate::block_view::RecordNavigationResult;
 use crate::keybindings::Action;
 use crate::terminal::open_uri;
 
@@ -76,6 +77,57 @@ fn cross_block_search_status_for_match_count(total: usize) -> String {
 
 fn cross_block_search_jump_unavailable_status() -> &'static str {
     "This result is searchable, but its exact terminal location is not available yet."
+}
+
+/// What the cross-block palette does with one activated hit. Every arm of
+/// [`RecordNavigationResult`] resolves to exactly one of these: a record the
+/// view could reach, or could only show a snapshot of, always closes the
+/// palette; only a record it can do neither for keeps it open with a status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrossBlockJumpOutcome {
+    Close,
+    ShowSnapshot(u64),
+    KeepOpen,
+}
+
+fn cross_block_jump_outcome(result: RecordNavigationResult) -> CrossBlockJumpOutcome {
+    match result {
+        RecordNavigationResult::Navigated => CrossBlockJumpOutcome::Close,
+        RecordNavigationResult::SnapshotView { record_id } => {
+            CrossBlockJumpOutcome::ShowSnapshot(record_id)
+        }
+        RecordNavigationResult::LocationUnavailable | RecordNavigationResult::NoMatchingRecord => {
+            CrossBlockJumpOutcome::KeepOpen
+        }
+    }
+}
+
+fn record_snapshot_dialog_title() -> &'static str {
+    "Output Snapshot"
+}
+
+fn record_snapshot_unavailable_message() -> &'static str {
+    "This record's output snapshot is no longer retained."
+}
+
+/// One-line outcome header for the snapshot dialog. Identity and outcome come
+/// from the parser-fed completed record, never from a terminal surface.
+fn record_snapshot_status_line(view: &crate::block_view::RecordSnapshotView) -> String {
+    let mut status = if view.is_background {
+        "Background output".to_string()
+    } else {
+        match view.exit_code {
+            Some(code) => format!("Exit code {code}"),
+            None => "Exit code unknown (the shell reported none)".to_string(),
+        }
+    };
+    if let Some(duration_ms) = view.duration_ms {
+        status.push_str(&format!(
+            " · {}",
+            crate::block_view::format_block_duration(duration_ms)
+        ));
+    }
+    status
 }
 
 fn clear_list_box(list_box: &ListBox) {
@@ -1042,45 +1094,74 @@ impl UiState {
             rebuild_for_toggle();
         });
 
-        // Jump-to-hit: scroll the target block into view AND turn on its
-        // per-VTE search highlight at the matching hit. Closes the palette
-        // so the user lands on the block they picked.
+        // Jump-to-hit: take the target record's best available surface AND
+        // turn on its per-VTE search highlight at the matching hit. Closes the
+        // palette so the user lands on the record they picked.
         let jump = {
             let term_view = term_view.clone();
             let hits = hits.clone();
             let filter_entry = filter_entry.clone();
             let regex_toggle = regex_toggle.clone();
             let status_label = status_label.clone();
-            move |idx: usize| -> bool {
+            move |idx: usize| -> CrossBlockJumpOutcome {
                 let pattern = filter_entry.text().to_string();
                 let is_regex = regex_toggle.is_active();
                 let hit = match hits.borrow().get(idx) {
                     Some(h) => h.clone(),
-                    None => return false,
+                    None => return CrossBlockJumpOutcome::KeepOpen,
                 };
-                if !term_view.scroll_to_block_id(hit.block_id, hit.is_output) {
-                    status_label.set_text(cross_block_search_jump_unavailable_status());
-                    return false;
+                let outcome = cross_block_jump_outcome(
+                    term_view.navigate_to_record_id(hit.block_id, hit.is_output),
+                );
+                match outcome {
+                    CrossBlockJumpOutcome::Close => {
+                        // The surface has already scrolled and taken focus. A
+                        // highlight that cannot be set is not a reason to
+                        // strand this modal over it.
+                        term_view.focus_match_in_block(
+                            hit.block_id,
+                            &pattern,
+                            is_regex,
+                            hit.is_output,
+                        );
+                    }
+                    CrossBlockJumpOutcome::KeepOpen => {
+                        status_label.set_text(cross_block_search_jump_unavailable_status());
+                    }
+                    CrossBlockJumpOutcome::ShowSnapshot(_) => {}
                 }
-                term_view.focus_match_in_block(hit.block_id, &pattern, is_regex, hit.is_output)
+                outcome
             }
         };
 
+        // The snapshot view replaces this palette rather than stacking over
+        // it, so the close always precedes the present.
+        let apply_jump_outcome = {
+            let ui = self.clone();
+            let dialog = dialog.clone();
+            Rc::new(move |outcome: CrossBlockJumpOutcome| match outcome {
+                CrossBlockJumpOutcome::Close => dialog.force_close(),
+                CrossBlockJumpOutcome::ShowSnapshot(record_id) => {
+                    dialog.force_close();
+                    ui.show_record_snapshot_dialog(record_id);
+                }
+                CrossBlockJumpOutcome::KeepOpen => {}
+            })
+        };
+
         let jump_for_activate = jump.clone();
-        let dialog_for_activate = dialog.clone();
+        let apply_for_activate = apply_jump_outcome.clone();
         list_box.connect_row_activated(move |_, row| {
             let idx = row.index() as usize;
-            if jump_for_activate(idx) {
-                dialog_for_activate.force_close();
-            }
+            apply_for_activate(jump_for_activate(idx));
         });
 
         let key_controller = EventControllerKey::new();
         key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let dialog_ref = self.cross_block_search_dialog.clone();
         let list_box_for_key = list_box.clone();
-        let dialog_for_key = dialog.clone();
         let jump_for_key = jump.clone();
+        let apply_for_key = apply_jump_outcome.clone();
         key_controller.connect_key_pressed(move |_, keyval, _, state| {
             if keyval == Key::Escape
                 || (matches!(keyval, Key::G | Key::g)
@@ -1095,9 +1176,7 @@ impl UiState {
             if matches!(keyval, Key::Return | Key::KP_Enter) {
                 if let Some(row) = list_box_for_key.selected_row() {
                     let idx = row.index() as usize;
-                    if jump_for_key(idx) {
-                        dialog_for_key.force_close();
-                    }
+                    apply_for_key(jump_for_key(idx));
                 }
                 return true.into();
             }
@@ -2871,16 +2950,105 @@ impl UiState {
 
         dialog.present(Some(&self.window));
     }
+
+    /// Read-only view of a completed record's bounded output snapshot:
+    /// command identity plus outcome from the record, the snapshot text in a
+    /// selectable, scrollable TextView. Deliberately not a terminal surface —
+    /// nothing here replays bytes or accepts input.
+    pub(crate) fn show_record_snapshot_dialog(&self, record_id: u64) {
+        let Some(term_view) = self.current_term_view() else {
+            return;
+        };
+        let Some(view) = term_view.record_snapshot_view(record_id) else {
+            // The budget can evict a snapshot between navigation and
+            // presentation; answer with the honest message, not an empty pane.
+            self.toast_overlay
+                .add_toast(adw::Toast::new(record_snapshot_unavailable_message()));
+            return;
+        };
+
+        let dialog = adw::Dialog::builder()
+            .title(record_snapshot_dialog_title())
+            .content_width(640)
+            .content_height(480)
+            .build();
+        let header_bar = adw::HeaderBar::new();
+
+        let body = gtk4::Box::new(Orientation::Vertical, 8);
+        body.set_margin_start(16);
+        body.set_margin_end(16);
+        body.set_margin_top(12);
+        body.set_margin_bottom(12);
+
+        if !view.cmd.is_empty() {
+            let command = Label::new(Some(&view.cmd));
+            command.set_xalign(0.0);
+            command.set_wrap(true);
+            command.set_selectable(true);
+            command.add_css_class("monospace");
+            body.append(&command);
+        }
+
+        let status = Label::new(Some(&record_snapshot_status_line(&view)));
+        status.set_xalign(0.0);
+        status.add_css_class("dim-label");
+        body.append(&status);
+
+        if let Some(note) = view.truncation_note() {
+            let note_label = Label::new(Some(&note));
+            note_label.set_xalign(0.0);
+            note_label.add_css_class("dim-label");
+            body.append(&note_label);
+        }
+
+        let text = gtk4::TextView::new();
+        text.buffer().set_text(&view.output);
+        text.set_editable(false);
+        text.set_monospace(true);
+        text.set_top_margin(8);
+        text.set_bottom_margin(8);
+        text.set_left_margin(8);
+        text.set_right_margin(8);
+        let scrolled = ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::Automatic)
+            .vscrollbar_policy(gtk4::PolicyType::Automatic)
+            .vexpand(true)
+            .child(&text)
+            .build();
+        body.append(&scrolled);
+
+        let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.add_top_bar(&header_bar);
+        toolbar_view.set_content(Some(&body));
+        dialog.set_child(Some(&toolbar_view));
+
+        let key_controller = EventControllerKey::new();
+        key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let dialog_for_key = dialog.clone();
+        key_controller.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval == Key::Escape {
+                dialog_for_key.force_close();
+                return true.into();
+            }
+            false.into()
+        });
+        dialog.add_controller(key_controller);
+
+        dialog.present(Some(&self.window));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        cross_block_search_dialog_title, cross_block_search_idle_status,
+        cross_block_jump_outcome, cross_block_search_dialog_title, cross_block_search_idle_status,
         cross_block_search_jump_unavailable_status, cross_block_search_pending_status,
         cross_block_search_query_error, cross_block_search_status_for_match_count,
-        remote_picker_guard, CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
+        record_snapshot_dialog_title, record_snapshot_status_line,
+        record_snapshot_unavailable_message, remote_picker_guard, CrossBlockJumpOutcome,
+        CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
+    use crate::block_view::{RecordNavigationResult, RecordSnapshotView};
 
     #[test]
     fn remote_picker_reports_safe_mode_and_empty_config() {
@@ -2893,6 +3061,30 @@ mod tests {
             Err("No remote hosts are configured. Add one in Settings → Remote Hosts.")
         );
         assert!(remote_picker_guard(false, 1).is_ok());
+    }
+
+    /// The palette must dispatch on the whole navigation ladder, not on
+    /// "did it scroll": a record whose retained snapshot produced the hit is
+    /// reachable, and only a record with neither location nor snapshot keeps
+    /// the palette open with the unavailable status.
+    #[test]
+    fn cross_block_jump_dispatches_every_navigation_outcome() {
+        assert_eq!(
+            cross_block_jump_outcome(RecordNavigationResult::Navigated),
+            CrossBlockJumpOutcome::Close
+        );
+        assert_eq!(
+            cross_block_jump_outcome(RecordNavigationResult::SnapshotView { record_id: 42 }),
+            CrossBlockJumpOutcome::ShowSnapshot(42)
+        );
+        assert_eq!(
+            cross_block_jump_outcome(RecordNavigationResult::LocationUnavailable),
+            CrossBlockJumpOutcome::KeepOpen
+        );
+        assert_eq!(
+            cross_block_jump_outcome(RecordNavigationResult::NoMatchingRecord),
+            CrossBlockJumpOutcome::KeepOpen
+        );
     }
 
     #[test]
@@ -2912,6 +3104,38 @@ mod tests {
         assert_eq!(
             cross_block_search_jump_unavailable_status(),
             "This result is searchable, but its exact terminal location is not available yet."
+        );
+    }
+
+    /// The snapshot dialog's header values come from the completed record;
+    /// unknown outcomes stay explicit and background output names itself.
+    #[test]
+    fn record_snapshot_dialog_copy_states_outcome_and_retention_honestly() {
+        assert_eq!(record_snapshot_dialog_title(), "Output Snapshot");
+        assert_eq!(
+            record_snapshot_unavailable_message(),
+            "This record's output snapshot is no longer retained."
+        );
+
+        let view = |exit_code, duration_ms, is_background| RecordSnapshotView {
+            cmd: "cargo test".to_string(),
+            exit_code,
+            duration_ms,
+            is_background,
+            output: "ok".to_string(),
+            truncated: false,
+        };
+        assert_eq!(
+            record_snapshot_status_line(&view(Some(0), Some(1_500), false)),
+            "Exit code 0 · 1.5s"
+        );
+        assert_eq!(
+            record_snapshot_status_line(&view(None, None, false)),
+            "Exit code unknown (the shell reported none)"
+        );
+        assert_eq!(
+            record_snapshot_status_line(&view(None, Some(250), true)),
+            "Background output · 250ms"
         );
     }
 

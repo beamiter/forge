@@ -267,12 +267,22 @@ fn next_lossy_char(bytes: &[u8], i: usize) -> (char, usize) {
     }
 }
 
-fn replay_plain_ansi_bytes(bytes: &[u8]) -> (ReplayGrid<char>, bool) {
+/// Replay outcome. `aborted` means the grid refused a cell and the loop
+/// stopped there, so every remaining input byte was discarded: the caller
+/// holds a prefix of the stream, not the whole of it.
+struct ReplayOutcome {
+    grid: ReplayGrid<char>,
+    should_clear: bool,
+    aborted: bool,
+}
+
+fn replay_plain_ansi_bytes(bytes: &[u8]) -> ReplayOutcome {
     let mut grid = ReplayGrid::<char>::new();
     let mut row = 0usize;
     let mut col = 0usize;
     let mut i = 0;
     let mut should_clear = false;
+    let mut aborted = false;
 
     while i < bytes.len() {
         if bytes[i] == 0x1b && i + 1 < bytes.len() {
@@ -399,6 +409,7 @@ fn replay_plain_ansi_bytes(bytes: &[u8]) -> (ReplayGrid<char>, bool) {
             // Materialise the destination row so a trailing newline still emits
             // its blank line, matching a real terminal's line feed.
             if !grid.ensure_row(row) {
+                aborted = true;
                 break;
             }
             i += 1;
@@ -412,44 +423,68 @@ fn replay_plain_ansi_bytes(bytes: &[u8]) -> (ReplayGrid<char>, bool) {
             let (ch, next) = next_lossy_char(bytes, i);
             i = next;
             if col >= MAX_GRID_COLS || !grid.set_cell(row, col, ch, ' ') {
+                aborted = true;
                 break;
             }
             col = col.saturating_add(1);
         }
     }
-    (grid, should_clear)
+    ReplayOutcome {
+        grid,
+        should_clear,
+        aborted,
+    }
 }
 
-fn replay_plain_ansi(input: &str) -> (ReplayGrid<char>, bool) {
+fn replay_plain_ansi(input: &str) -> ReplayOutcome {
     replay_plain_ansi_bytes(input.as_bytes())
 }
 
 pub(crate) fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
+    let (text, should_clear, _) = strip_ansi_replay(input);
+    (text, should_clear)
+}
+
+/// Plain text plus whether any input byte failed to reach it — the replay was
+/// refused a cell and stopped, or serialisation hit its own ceiling. The text
+/// alone cannot reveal either, so a caller that reports truncation must OR
+/// this in rather than treat a prefix as the whole output.
+pub(crate) fn strip_ansi_reporting_loss(input: &str) -> (String, bool) {
+    let (text, _, lost) = strip_ansi_replay(input);
+    (text, lost)
+}
+
+fn strip_ansi_replay(input: &str) -> (String, bool, bool) {
     let bytes = input.as_bytes();
     if memchr::memchr3(0x1b, b'\r', b'\x08', bytes).is_none() {
-        return (
-            bounded_utf8_prefix(input, MAX_REPLAY_OUTPUT_BYTES).to_owned(),
-            false,
-        );
+        let prefix = bounded_utf8_prefix(input, MAX_REPLAY_OUTPUT_BYTES);
+        return (prefix.to_owned(), false, prefix.len() < input.len());
     }
 
-    let (grid, should_clear) = replay_plain_ansi(input);
+    let outcome = replay_plain_ansi(input);
     let mut result = String::with_capacity(input.len().min(MAX_REPLAY_OUTPUT_BYTES));
-    'rows: for (line_idx, cells) in grid.rows.iter().enumerate() {
+    let mut serialisation_cut = false;
+    'rows: for (line_idx, cells) in outcome.grid.rows.iter().enumerate() {
         if line_idx > 0 {
             if result.len() == MAX_REPLAY_OUTPUT_BYTES {
+                serialisation_cut = true;
                 break;
             }
             result.push('\n');
         }
         for &ch in cells {
             if ch.len_utf8() > MAX_REPLAY_OUTPUT_BYTES.saturating_sub(result.len()) {
+                serialisation_cut = true;
                 break 'rows;
             }
             result.push(ch);
         }
     }
-    (result, should_clear)
+    (
+        result,
+        outcome.should_clear,
+        outcome.aborted || serialisation_cut,
+    )
 }
 
 /// Whether replaying `input` leaves any visible, non-whitespace cell.
@@ -479,8 +514,9 @@ pub(crate) fn ansi_bytes_have_visible_text(bytes: &[u8]) -> bool {
         return false;
     }
 
-    let (grid, _) = replay_plain_ansi_bytes(bytes);
-    grid.rows
+    replay_plain_ansi_bytes(bytes)
+        .grid
+        .rows
         .iter()
         .flatten()
         .any(|ch| !ch.is_whitespace() && !ch.is_control())

@@ -3273,7 +3273,8 @@ impl InputOrigin {
 
 /// The identity and outcome of one completed command. Rendering-only values
 /// (prompt text, captured output, terminal columns and height estimates) are
-/// deliberately absent: Unified retains exactly this record and never needs to
+/// deliberately absent: Unified retains this record — with at most a bounded
+/// output snapshot beside it in [`UnifiedZoneStore`] — and never needs to
 /// build a Block card payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CompletedCommandRecord {
@@ -3846,6 +3847,11 @@ pub struct TermView {
     visible_indices: Rc<RefCell<std::collections::HashSet<usize>>>,
     selected_block_ids: SelectedBlockIds,
     selected_block_id: Rc<Cell<Option<u64>>>,
+    /// Stepping cursor for a backend that mounts no finished widget, where
+    /// `selected_block_id` — which only ever holds an id that passes the
+    /// finished-block lookup — stays `None` for the pane's whole life. Holds
+    /// the record this view last navigated to, so next/previous can advance.
+    navigated_record_id: Cell<Option<u64>>,
     selection_anchor_id: Rc<Cell<Option<u64>>>,
     bookmarks: Rc<RefCell<std::collections::HashSet<u64>>>,
     /// Find-within-blocks state: every match across the finished blocks plus a
@@ -3964,9 +3970,10 @@ struct EngineState {
 /// The VTE/widget pair that presents one field of a completed record.
 ///
 /// Block mode maps command and output to the two snapshot VTEs owned by the
-/// matching card. Unified's whole-surface find does not need a record target;
-/// exact record targets remain unavailable until bounded per-zone snapshots
-/// or a stable addressable row target are retained with each record.
+/// matching card. Unified's whole-surface find does not need a record target
+/// and never returns one: its shared VTE cannot scope per-record match
+/// highlighting. Record navigation instead uses the backend's
+/// `scroll_to_record` seam plus the retained zone snapshot as a fallback.
 /// Keeping that distinction behind the backend lets consumers avoid using an
 /// empty finished-widget list as an accidental mode test.
 struct RecordSearchTarget {
@@ -4044,23 +4051,30 @@ fn push_search_surface_before_deadline<T>(
 }
 
 /// Borrowed completed-record storage. Block owns the historical serialized
-/// representation; Unified owns only command identity/outcome metadata. The
-/// enum keeps the distinction explicit without making callers branch on a
-/// terminal mode or forcing Unified to allocate dummy `BlockData` values.
+/// representation; Unified owns command identity/outcome metadata plus the
+/// bounded snapshot table beside it. The enum keeps the distinction explicit
+/// without making callers branch on a terminal mode or forcing Unified to
+/// allocate dummy `BlockData` values.
 enum BackendRecords<'a> {
     Blocks(Ref<'a, VecDeque<BlockData>>),
-    Metadata(Ref<'a, VecDeque<CompletedCommandRecord>>),
+    Metadata(Ref<'a, UnifiedZoneStore>),
 }
 
 #[derive(Clone, Copy)]
 enum BackendRecordRef<'a> {
     Block(&'a BlockData),
-    Metadata(&'a CompletedCommandRecord),
+    Metadata {
+        record: &'a CompletedCommandRecord,
+        snapshot: Option<&'a ZoneOutputSnapshot>,
+    },
 }
 
 enum BackendRecordIter<'a> {
     Blocks(std::collections::vec_deque::Iter<'a, BlockData>),
-    Metadata(std::collections::vec_deque::Iter<'a, CompletedCommandRecord>),
+    Metadata {
+        records: std::collections::vec_deque::Iter<'a, CompletedCommandRecord>,
+        store: &'a UnifiedZoneStore,
+    },
 }
 
 impl<'a> Iterator for BackendRecordIter<'a> {
@@ -4069,14 +4083,19 @@ impl<'a> Iterator for BackendRecordIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::Blocks(records) => records.next().map(BackendRecordRef::Block),
-            Self::Metadata(records) => records.next().map(BackendRecordRef::Metadata),
+            Self::Metadata { records, store } => {
+                records.next().map(|record| BackendRecordRef::Metadata {
+                    record,
+                    snapshot: store.snapshot(record.id),
+                })
+            }
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
             Self::Blocks(records) => records.size_hint(),
-            Self::Metadata(records) => records.size_hint(),
+            Self::Metadata { records, .. } => records.size_hint(),
         }
     }
 }
@@ -4087,7 +4106,14 @@ impl DoubleEndedIterator for BackendRecordIter<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         match self {
             Self::Blocks(records) => records.next_back().map(BackendRecordRef::Block),
-            Self::Metadata(records) => records.next_back().map(BackendRecordRef::Metadata),
+            Self::Metadata { records, store } => {
+                records
+                    .next_back()
+                    .map(|record| BackendRecordRef::Metadata {
+                        record,
+                        snapshot: store.snapshot(record.id),
+                    })
+            }
         }
     }
 }
@@ -4096,14 +4122,17 @@ impl BackendRecords<'_> {
     fn len(&self) -> usize {
         match self {
             Self::Blocks(records) => records.len(),
-            Self::Metadata(records) => records.len(),
+            Self::Metadata(store) => store.records.len(),
         }
     }
 
     fn iter(&self) -> BackendRecordIter<'_> {
         match self {
             Self::Blocks(records) => BackendRecordIter::Blocks(records.iter()),
-            Self::Metadata(records) => BackendRecordIter::Metadata(records.iter()),
+            Self::Metadata(store) => BackendRecordIter::Metadata {
+                records: store.records.iter(),
+                store,
+            },
         }
     }
 
@@ -4119,47 +4148,50 @@ impl<'a> BackendRecordRef<'a> {
     fn id(self) -> u64 {
         match self {
             Self::Block(record) => record.id,
-            Self::Metadata(record) => record.id,
+            Self::Metadata { record, .. } => record.id,
         }
     }
 
     fn command(self) -> &'a str {
         match self {
             Self::Block(record) => &record.cmd,
-            Self::Metadata(record) => &record.cmd,
+            Self::Metadata { record, .. } => &record.cmd,
         }
     }
 
     fn prompt(self) -> Option<&'a str> {
         match self {
             Self::Block(record) => Some(&record.prompt),
-            Self::Metadata(_) => None,
+            Self::Metadata { .. } => None,
         }
     }
 
+    /// Completed plain-text output. For a metadata record this is the bounded
+    /// finalize-time snapshot; `None` means no output is retained for it —
+    /// never an empty stand-in string.
     fn output(self) -> Option<&'a str> {
         match self {
             Self::Block(record) => Some(&record.output),
-            Self::Metadata(_) => None,
+            Self::Metadata { snapshot, .. } => snapshot.map(|snapshot| snapshot.plain.as_str()),
         }
     }
 
     fn exit_code(self) -> Option<i32> {
         match self {
             Self::Block(record) => record.exit_code,
-            Self::Metadata(record) => record.exit_code,
+            Self::Metadata { record, .. } => record.exit_code,
         }
     }
 
     fn duration_ms(self) -> Option<u64> {
         match self {
             Self::Block(record) => record.duration_ms,
-            Self::Metadata(record) => record.duration_ms,
+            Self::Metadata { record, .. } => record.duration_ms,
         }
     }
 
     fn is_metadata_only(self) -> bool {
-        matches!(self, Self::Metadata(_))
+        matches!(self, Self::Metadata { .. })
     }
 }
 
@@ -4175,13 +4207,27 @@ struct BlockRenderPayload {
     prompt: String,
     output_with_ansi: String,
     output_plain: String,
+    /// Whether the ANSI replay that produced `output_plain` stopped before the
+    /// last captured byte. The text is a prefix then, and nothing in it says
+    /// so, so a snapshot taken from it must report the loss.
+    output_plain_lost_bytes: bool,
 }
 
 /// Object-safe, memoized accessor handed to every backend. A backend needs no
 /// preliminary capability query and receives no `Option` it could interpret
-/// inconsistently: Block calls `materialize`, Unified simply does not.
+/// inconsistently: Block calls `materialize`; Unified calls only the bounded
+/// `output_snapshot`, which never builds or memoizes the full card payload.
 trait BlockRenderPayloadAccessor {
     fn materialize(&self) -> &BlockRenderPayload;
+
+    /// Bounded plain-text TAIL of the captured output: at most `max_bytes`
+    /// raw bytes are decoded and ANSI-stripped, `truncated` reports any byte
+    /// of the command's output that did not survive into the text. `None`
+    /// when the capture is empty or strips to nothing — an absent snapshot
+    /// must never be presented as an empty one. Reads the same engine-owned
+    /// ring `materialize` consumes, which the engine keeps alive until the
+    /// finalize fan-out completes.
+    fn output_snapshot(&self, max_bytes: usize) -> Option<ZoneOutputSnapshot>;
 
     #[cfg(test)]
     fn materialization_counter(&self) -> Rc<Cell<usize>>;
@@ -4191,15 +4237,24 @@ struct LazyBlockRenderPayload {
     value: OnceCell<BlockRenderPayload>,
     prompt: RefCell<Option<String>>,
     output: RefCell<Option<CapturedFinalizeOutput>>,
+    /// The capture ring's wrap marker, read while the ring is still here.
+    /// Whoever materializes first consumes the ring, and the decoded text
+    /// carries no trace of the bytes that fell out of its front.
+    dropped_front: bool,
     materializations: Rc<Cell<usize>>,
 }
 
 impl LazyBlockRenderPayload {
     fn new(prompt: String, output: CapturedFinalizeOutput) -> Self {
+        let dropped_front = match &output {
+            CapturedFinalizeOutput::Foreground(ring) => ring.borrow().dropped_front(),
+            CapturedFinalizeOutput::Background(ring) => ring.dropped_front(),
+        };
         Self {
             value: OnceCell::new(),
             prompt: RefCell::new(Some(prompt)),
             output: RefCell::new(Some(output)),
+            dropped_front,
             materializations: Rc::new(Cell::new(0)),
         }
     }
@@ -4231,19 +4286,146 @@ impl BlockRenderPayloadAccessor for LazyBlockRenderPayload {
                     String::from_utf8_lossy(output.make_contiguous()).into_owned()
                 }
             };
-            let output_plain = strip_ansi(&output_with_ansi);
+            let (output_plain, output_plain_lost_bytes) =
+                strip_ansi_reporting_loss(&output_with_ansi);
             BlockRenderPayload {
                 prompt,
                 output_with_ansi,
                 output_plain,
+                output_plain_lost_bytes,
             }
         })
+    }
+
+    fn output_snapshot(&self, max_bytes: usize) -> Option<ZoneOutputSnapshot> {
+        // The jsh journal fan-out runs before backend finalize and may have
+        // materialized the payload, consuming the ring. The memoized plain
+        // text is the same stream decoded, so the tail bound applies to it
+        // instead; the ring's wrap marker and the replay's own abort are
+        // carried separately because neither survives into that text.
+        if let Some(value) = self.value.get() {
+            return zone_output_snapshot_from_plain(
+                &value.output_plain,
+                max_bytes,
+                self.dropped_front || value.output_plain_lost_bytes,
+            );
+        }
+        let mut output = self.output.borrow_mut();
+        match output.as_mut()? {
+            CapturedFinalizeOutput::Foreground(ring) => {
+                zone_output_snapshot_from_ring(&mut ring.borrow_mut(), max_bytes)
+            }
+            CapturedFinalizeOutput::Background(ring) => {
+                zone_output_snapshot_from_ring(ring, max_bytes)
+            }
+        }
     }
 
     #[cfg(test)]
     fn materialization_counter(&self) -> Rc<Cell<usize>> {
         self.materializations.clone()
     }
+}
+
+/// TAIL cut of raw captured bytes. The cut may land inside an escape sequence
+/// whose introducer lies before it; resuming after that sequence keeps its
+/// parameter bytes from surfacing as literal text. UTF-8 continuation bytes
+/// at the cut are skipped for the same reason. Returns the tail and whether
+/// anything was cut.
+fn bounded_output_tail(bytes: &[u8], max_bytes: usize) -> (&[u8], bool) {
+    if bytes.len() <= max_bytes {
+        return (bytes, false);
+    }
+    let mut start = bytes.len() - max_bytes;
+    // The last ESC before the cut is the only sequence that can contain it:
+    // these skippers never nest, and a later ESC would have ended it. The skip
+    // must never consume the whole buffer — an OSC terminated on the final
+    // byte, or never terminated, would otherwise leave an empty tail, which is
+    // indistinguishable from a command that printed nothing.
+    if let Some(esc) = memchr::memrchr(0x1b, &bytes[..start]) {
+        let end = skip_escape_sequence(bytes, esc);
+        if end > start && end < bytes.len() {
+            start = end;
+        }
+    }
+    while start < bytes.len() && (bytes[start] & 0xc0) == 0x80 {
+        start += 1;
+    }
+    (&bytes[start..], true)
+}
+
+/// The same cut with no escape-sequence adjustment: the fallback for a tail
+/// whose adjusted form strips to nothing. Literal parameter characters are a
+/// poorer record than clean text, but a far better one than no snapshot.
+fn unadjusted_output_tail(bytes: &[u8], max_bytes: usize) -> &[u8] {
+    let mut start = bytes.len().saturating_sub(max_bytes);
+    while start < bytes.len() && (bytes[start] & 0xc0) == 0x80 {
+        start += 1;
+    }
+    &bytes[start..]
+}
+
+/// Bounded snapshot from the raw ring — the metadata (Unified) finalize path.
+/// The ring stays usable afterwards: `make_contiguous` rearranges in place,
+/// and the engine clears the ring explicitly once fan-out completes.
+fn zone_output_snapshot_from_ring(
+    ring: &mut BoundedByteRing,
+    max_bytes: usize,
+) -> Option<ZoneOutputSnapshot> {
+    if ring.is_empty() {
+        return None;
+    }
+    let ring_dropped = ring.dropped_front();
+    let bytes = ring.make_contiguous();
+    let (tail, cut) = bounded_output_tail(bytes, max_bytes);
+    let (plain, replay_lost) = strip_ansi_reporting_loss(&String::from_utf8_lossy(tail));
+    // The bound is re-applied to the stripped text: the replay pads rows out
+    // to the cursor, so a tail bounded in raw bytes can still strip to many
+    // times `max_bytes` — and the stripped length is the quantity the
+    // retention budget charges and the reader sees.
+    if let Some(snapshot) =
+        zone_output_snapshot_from_plain(&plain, max_bytes, cut || ring_dropped || replay_lost)
+    {
+        return Some(snapshot);
+    }
+    if !cut {
+        return None;
+    }
+    // Nothing visible survived the escape-sequence adjustment; a snapshot of
+    // stray parameter characters still reports this command's output, while
+    // `None` here would claim it produced none.
+    let (plain, replay_lost) = strip_ansi_reporting_loss(&String::from_utf8_lossy(
+        unadjusted_output_tail(bytes, max_bytes),
+    ));
+    zone_output_snapshot_from_plain(&plain, max_bytes, cut || ring_dropped || replay_lost)
+}
+
+/// The same tail bound applied to already-stripped plain text: the payload
+/// another consumer materialized first (the ring is consumed by then), and the
+/// second, post-strip bound of the ring path. `already_truncated` carries every
+/// byte known to be missing before this text existed — the ring's own wrap
+/// marker, an aborted ANSI replay — because none of them is visible in it.
+///
+/// Trimmed like `BlockData.output`, so the two record kinds present one
+/// whitespace convention to search and export.
+fn zone_output_snapshot_from_plain(
+    output_plain: &str,
+    max_bytes: usize,
+    already_truncated: bool,
+) -> Option<ZoneOutputSnapshot> {
+    let cut = output_plain.len() > max_bytes;
+    let mut start = output_plain.len().saturating_sub(max_bytes);
+    while start < output_plain.len() && !output_plain.is_char_boundary(start) {
+        start += 1;
+    }
+    let plain = output_plain[start..].trim();
+    if plain.is_empty() {
+        return None;
+    }
+    Some(ZoneOutputSnapshot {
+        plain: plain.to_string(),
+        truncated: cut || already_truncated,
+    })
 }
 
 /// Rendering seam for the OSC 133 block lifecycle. Every statement in the
@@ -4298,6 +4480,20 @@ trait RenderBackend {
     /// `is_output == false` selects command text. `None` means the record was
     /// concurrently removed or the backend has no visible surface for it.
     fn record_search_target(&self, block_id: u64, is_output: bool) -> Option<RecordSearchTarget>;
+    /// Scroll the backend's document to the named completed record, returning
+    /// whether an exact, proven location was shown. `false` obliges the
+    /// caller to fall back honestly (snapshot view, toast); an implementation
+    /// must never scroll to a guessed row.
+    fn scroll_to_record(&self, _block_id: u64) -> bool {
+        false
+    }
+    /// Whether [`Self::scroll_to_record`] would find an exact location for
+    /// this record right now. Asked once per rendered search hit, so it must
+    /// answer from the same proof and move nothing: no scroll, no focus, no
+    /// selection.
+    fn can_scroll_to_record(&self, _block_id: u64) -> bool {
+        false
+    }
     /// Snapshot completed text into native search-cursor domains. The byte
     /// argument is a hard aggregate ceiling; implementations report a partial
     /// batch rather than silently scanning beyond it. `deadline_exhausted` is
@@ -6052,6 +6248,27 @@ impl RenderBackend for BlockBackend {
         })
     }
 
+    fn scroll_to_record(&self, block_id: u64) -> bool {
+        let widget: gtk4::Widget = {
+            let finished = self.finished_blocks_for_cb.borrow();
+            let Some(block) = finished.iter().find(|block| block.id == block_id) else {
+                return false;
+            };
+            block.widget().clone().upcast()
+        };
+        widget.grab_focus();
+        find::scroll_widget_to_block_scroller_top(&widget, &self.block_scroll_rc);
+        true
+    }
+
+    fn can_scroll_to_record(&self, block_id: u64) -> bool {
+        // The same mounted-widget lookup `scroll_to_record` resolves.
+        self.finished_blocks_for_cb
+            .borrow()
+            .iter()
+            .any(|block| block.id == block_id)
+    }
+
     fn completed_search_surfaces(
         &self,
         max_bytes: usize,
@@ -6779,6 +6996,83 @@ fn set_display_clipboard_text(text: &str) {
     }
 }
 
+/// Per-zone snapshot ceiling: finalize captures at most this many raw bytes
+/// from the TAIL of the engine's output ring before ANSI stripping. A longer
+/// output is truncated at the front, never sampled from the middle.
+const MAX_ZONE_SNAPSHOT_BYTES: usize = 64 * 1024;
+
+/// Aggregate ceiling across every retained zone snapshot in one pane. Past it
+/// the OLDEST snapshots are evicted first; their records stay, and a record
+/// whose snapshot is gone honestly reports no output again.
+const MAX_TOTAL_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Bounded plain-text tail of one completed command's output, captured at
+/// finalize from the engine-owned raw ring (pre-injector PTY bytes only —
+/// zone-marker OSC 8 frames are a separate VTE feed and can never appear
+/// here).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ZoneOutputSnapshot {
+    plain: String,
+    /// Whether any of this command's output did not survive into `plain`
+    /// (the ring wrapped before finalize, or the per-zone tail bound cut).
+    truncated: bool,
+}
+
+/// Unified's completed-command document: chronological metadata records plus
+/// bounded output snapshots keyed by record id. One cell holds both so a
+/// records borrow can resolve a record's snapshot without a second borrow.
+/// Snapshots are strictly optional satellites — every mutation path removes
+/// snapshot bytes without touching the record they belonged to.
+struct UnifiedZoneStore {
+    records: VecDeque<CompletedCommandRecord>,
+    snapshots: std::collections::HashMap<u64, ZoneOutputSnapshot>,
+    /// Running total of the retained snapshots' `plain` byte lengths, the
+    /// quantity [`MAX_TOTAL_SNAPSHOT_BYTES`] bounds.
+    snapshot_bytes: usize,
+}
+
+impl UnifiedZoneStore {
+    fn new() -> Self {
+        Self {
+            records: VecDeque::new(),
+            snapshots: std::collections::HashMap::new(),
+            snapshot_bytes: 0,
+        }
+    }
+
+    fn snapshot(&self, id: u64) -> Option<&ZoneOutputSnapshot> {
+        self.snapshots.get(&id)
+    }
+
+    fn insert_snapshot(&mut self, id: u64, snapshot: ZoneOutputSnapshot) {
+        self.remove_snapshot(id);
+        self.snapshot_bytes = self.snapshot_bytes.saturating_add(snapshot.plain.len());
+        self.snapshots.insert(id, snapshot);
+    }
+
+    fn remove_snapshot(&mut self, id: u64) {
+        if let Some(snapshot) = self.snapshots.remove(&id) {
+            self.snapshot_bytes = self.snapshot_bytes.saturating_sub(snapshot.plain.len());
+        }
+    }
+
+    /// Shed snapshot text, oldest record first, until the aggregate fits
+    /// `max_total_bytes`. Records are never removed here: eviction only ever
+    /// takes bytes, so the newest commands keep their output.
+    fn enforce_snapshot_budget(&mut self, max_total_bytes: usize) {
+        if self.snapshot_bytes <= max_total_bytes {
+            return;
+        }
+        let ids: Vec<u64> = self.records.iter().map(|record| record.id).collect();
+        for id in ids {
+            if self.snapshot_bytes <= max_total_bytes {
+                break;
+            }
+            self.remove_snapshot(id);
+        }
+    }
+}
+
 /// Append a completed record to the Unified zone table, dropping the oldest
 /// entries past
 /// `max_zones`.
@@ -6787,20 +7081,25 @@ fn set_display_clipboard_text(text: &str) {
 /// retention uses: a zone is much smaller than a finished block, so this is
 /// conservative, but until 1b decides what a zone must outlive (the VTE's own
 /// scrollback trim, most likely) an unbounded table would be the only
-/// unbounded allocation this mode adds. Pure so the retention rule is
-/// testable without a surface.
+/// unbounded allocation this mode adds. A drained record takes its snapshot
+/// with it. Pure so the retention rule is testable without a surface.
 fn record_unified_zone(
-    zones: &mut VecDeque<CompletedCommandRecord>,
+    zones: &mut UnifiedZoneStore,
     record: CompletedCommandRecord,
     max_zones: usize,
 ) -> Vec<u64> {
-    zones.push_back(record);
+    zones.records.push_back(record);
     let max = max_zones.max(1);
-    if zones.len() > max {
-        return zones
-            .drain(..zones.len() - max)
+    if zones.records.len() > max {
+        let drained: Vec<u64> = zones
+            .records
+            .drain(..zones.records.len() - max)
             .map(|record| record.id)
             .collect();
+        for id in &drained {
+            zones.remove_snapshot(*id);
+        }
+        return drained;
     }
     Vec::new()
 }
@@ -6864,9 +7163,10 @@ struct UnifiedBackend {
     prompt_anchor_tick_id_rc: Rc<RefCell<Option<gtk4::TickCallbackId>>>,
     find_state_for_cb: Rc<RefCell<FindState>>,
     /// The in-memory zone table. Its records are the backend's completed
-    /// document for find/export/history palettes; the terminal text remains
-    /// on `vte`, so no finished widget is mounted.
-    zones: Rc<RefCell<VecDeque<CompletedCommandRecord>>>,
+    /// document for find/export/history palettes, each with an optional
+    /// bounded output snapshot captured at finalize; the terminal text
+    /// remains on `vte`, so no finished widget is mounted.
+    zones: Rc<RefCell<UnifiedZoneStore>>,
     /// Per-pane, fail-closed marker state. Its bytes are fed directly to VTE
     /// inside this backend, so they never enter prompt/command/output capture.
     zone_marker: Rc<RefCell<ZoneMarkerInjector>>,
@@ -6920,7 +7220,9 @@ impl RenderBackend for UnifiedBackend {
         // This runs before the raw RIS bytes. Clear both sources of row
         // authority first so the generic feed wrapper cannot prepend a stale
         // OSC 8 open and a later scan cannot revive an old id. Completed
-        // metadata remains in `zones` for export/filter/history palettes.
+        // metadata and output snapshots remain in `zones` for export/filter/
+        // history palettes: snapshots come from the byte stream, not the
+        // ring, so a reset cannot resurrect anything through them.
         self.zone_marker.borrow_mut().close_zone(None);
         self.chrome.clear_authority();
         find::clear_find_state(self.find_state_for_cb.as_ref(), &self.vte);
@@ -6968,10 +7270,33 @@ impl RenderBackend for UnifiedBackend {
 
     fn record_search_target(&self, _block_id: u64, _is_output: bool) -> Option<RecordSearchTarget> {
         // Chrome's marker spans are deliberately short-lived authority, not a
-        // durable per-record search target. Mapping metadata ids to the shared
-        // VTE after marker retirement would pretend an exact jump exists.
-        // Whole-surface Ctrl+F uses its native `block_id == 0` domain instead.
+        // durable per-record search target: returning the shared VTE here
+        // would mis-scope per-record match highlighting onto every zone.
+        // Whole-surface Ctrl+F uses its native `block_id == 0` domain, and
+        // record navigation goes through [`Self::scroll_to_record`] instead.
         None
+    }
+
+    fn scroll_to_record(&self, block_id: u64) -> bool {
+        // Chrome only answers with a row it proved at the current epoch; any
+        // doubt is `None` and this jump honestly fails.
+        let Some(value) = self.chrome.proven_zone_scroll_value(&self.vte, block_id) else {
+            return false;
+        };
+        let Some(adjustment) = self.vte.vadjustment() else {
+            return false;
+        };
+        adjustment.set_value(value);
+        self.vte.grab_focus();
+        true
+    }
+
+    fn can_scroll_to_record(&self, block_id: u64) -> bool {
+        // The same proof, read only: a search hit is labelled reachable
+        // exactly when chrome can already name the row it would scroll to.
+        self.chrome
+            .proven_zone_scroll_value(&self.vte, block_id)
+            .is_some()
     }
 
     fn completed_search_surfaces(
@@ -7120,21 +7445,32 @@ impl RenderBackend for UnifiedBackend {
     /// position (VTE re-pins on the next keystroke).
     fn reset_scroll_lock(&self) {}
 
-    /// Record the zone and paint nothing.
+    /// Record the zone with a bounded output snapshot and paint nothing.
     ///
-    /// No widget is mounted, no output is copied, and — unlike Block — the
-    /// live surface is NOT reset afterwards: the command's output stays where
-    /// the user watched it appear. Only the kitty assembler is reset, so
-    /// half-uploaded chunks cannot bleed across the command boundary.
+    /// No widget is mounted, no full payload is materialized, and — unlike
+    /// Block — the live surface is NOT reset afterwards: the command's output
+    /// stays where the user watched it appear. Only the kitty assembler is
+    /// reset, so half-uploaded chunks cannot bleed across the command
+    /// boundary.
     fn finalize_block(
         &self,
         record: &CompletedCommandRecord,
-        _payload: &dyn BlockRenderPayloadAccessor,
+        payload: &dyn BlockRenderPayloadAccessor,
     ) {
         find::clear_find_state(self.find_state_for_cb.as_ref(), &self.vte);
         let max_zones = self.config_for_cb.borrow().max_visible_blocks as usize;
-        let retired_record_ids =
-            record_unified_zone(&mut self.zones.borrow_mut(), record.clone(), max_zones);
+        // The engine keeps the raw ring alive through the whole finalize
+        // fan-out, so this bounded read still sees the command's bytes.
+        let snapshot = payload.output_snapshot(MAX_ZONE_SNAPSHOT_BYTES);
+        let retired_record_ids = {
+            let mut zones = self.zones.borrow_mut();
+            let retired = record_unified_zone(&mut zones, record.clone(), max_zones);
+            if let Some(snapshot) = snapshot {
+                zones.insert_snapshot(record.id, snapshot);
+            }
+            zones.enforce_snapshot_budget(MAX_TOTAL_SNAPSHOT_BYTES);
+            retired
+        };
         self.chrome.retire_ids(&retired_record_ids);
         self.chrome.enforce_limit(max_zones);
         self.chrome
@@ -7150,7 +7486,7 @@ impl RenderBackend for UnifiedBackend {
             record.exit_code,
             record.duration_ms,
             record.is_background,
-            self.zones.borrow().len(),
+            self.zones.borrow().records.len(),
         );
         self.kitty_assembler.borrow_mut().reset();
     }
@@ -8339,11 +8675,11 @@ impl TermView {
         // constructor — that mode has no `TermView` at all — and is treated as
         // Block if it somehow does.
         let unified = mode.is_unified();
-        // Allocated in both modes (an empty `VecDeque` costs nothing) so the reader
+        // Allocated in both modes (an empty store costs nothing) so the reader
         // wiring below stays a single expression; only a Unified pane hands it
         // to a backend.
-        let unified_records: Rc<RefCell<VecDeque<CompletedCommandRecord>>> =
-            Rc::new(RefCell::new(VecDeque::new()));
+        let unified_records: Rc<RefCell<UnifiedZoneStore>> =
+            Rc::new(RefCell::new(UnifiedZoneStore::new()));
         if unified {
             let holder = active.borrow().widget().clone();
             holder.remove_css_class("block-compact");
@@ -9986,6 +10322,7 @@ impl TermView {
             visible_indices,
             selected_block_ids,
             selected_block_id,
+            navigated_record_id: Cell::new(None),
             selection_anchor_id,
             bookmarks: block_bookmarks,
             find_state,
@@ -11301,7 +11638,9 @@ impl TermView {
         let target = step_marked_record_ids(
             &record_ids,
             &failed,
-            self.selected_block_id.get(),
+            self.selected_block_id
+                .get()
+                .or_else(|| self.navigated_record_id.get()),
             direction,
         );
         let Some(record_id) = target else {
@@ -11601,19 +11940,21 @@ mod tests {
         ViewportState, MAX_COMMAND_CAPTURE_BYTES, MAX_JOURNAL_OUTPUT_BYTES,
         MAX_PROMPT_CAPTURE_BYTES, MAX_RAW_OUTPUT_BYTES, MAX_SELECTED_CLIPBOARD_BYTES,
         TERMINAL_RESET_INVALIDATED_SUBMISSION, TRUNCATED_COMMAND_PLACEHOLDER,
-        UNAVAILABLE_COMMAND_PLACEHOLDER, VERIFIED_SUBMISSION_MAX_POLLS,
+        UNAVAILABLE_COMMAND_PLACEHOLDER, VERIFIED_SUBMISSION_MAX_POLLS, ZONE_MARKER_CLOSE,
     };
     // The reader-dispatch harness at the bottom of this module: the two
     // rendering seams, the lifecycle context they serve, and the engine state
     // it owns.
     use super::{
-        estimated_finished_block_height_for_text, kitty_graphics, live_output_text,
-        push_search_surface_before_deadline, record_unified_zone, AgentExecutionLostCallbacks,
-        AnchorSettleArgs, BackendRecords, BackendSearchBatch, BlockFinishedCallback,
-        BlockFinishedCallbacks, BlockRenderPayloadAccessor, CommandFinishedCallbacks,
-        CommandStartedCallbacks, CompletedCommandRecord, EngineState, MouseReportingMode,
-        ReaderCtx, RecordSearchTarget, RenderBackend, SelectionFeedHold, SubmissionSurface,
-        VerifiedSubmissionCtx, ZoneMarkerInjector,
+        estimated_finished_block_height_for_text, feed_with_zone_marker, kitty_graphics,
+        live_output_text, push_search_surface_before_deadline, record_unified_zone,
+        zone_output_snapshot_from_plain, zone_output_snapshot_from_ring,
+        AgentExecutionLostCallbacks, AnchorSettleArgs, BackendRecords, BackendSearchBatch,
+        BlockFinishedCallback, BlockFinishedCallbacks, BlockRenderPayloadAccessor,
+        CommandFinishedCallbacks, CommandStartedCallbacks, CompletedCommandRecord, EngineState,
+        MouseReportingMode, ReaderCtx, RecordSearchTarget, RenderBackend, SelectionFeedHold,
+        SubmissionSurface, UnifiedZoneStore, VerifiedSubmissionCtx, ZoneMarkerInjector,
+        ZoneOutputSnapshot, MAX_TOTAL_SNAPSHOT_BYTES, MAX_ZONE_SNAPSHOT_BYTES,
     };
     use crate::config::Config;
     use crate::parser::{ColorKind, KeyboardProtocolQuery, Parser, ParserEvent};
@@ -11778,17 +12119,30 @@ mod tests {
             is_background: false,
         };
 
-        let mut zones = VecDeque::new();
+        let mut zones = UnifiedZoneStore::new();
         record_unified_zone(&mut zones, record(1, "first"), 2);
+        zones.insert_snapshot(
+            1,
+            ZoneOutputSnapshot {
+                plain: "first output".to_string(),
+                truncated: false,
+            },
+        );
         record_unified_zone(&mut zones, record(2, "second"), 2);
         record_unified_zone(&mut zones, record(3, "third"), 2);
 
         assert_eq!(
-            zones.iter().map(|zone| zone.id).collect::<Vec<_>>(),
+            zones.records.iter().map(|zone| zone.id).collect::<Vec<_>>(),
             vec![2, 3],
             "the oldest zone is dropped, newest-last order preserved"
         );
-        let newest = zones.back().expect("a recorded zone");
+        assert_eq!(
+            zones.snapshot(1),
+            None,
+            "a drained record takes its snapshot with it"
+        );
+        assert_eq!(zones.snapshot_bytes, 0);
+        let newest = zones.records.back().expect("a recorded zone");
         assert_eq!(newest.cmd, "third");
         assert_eq!(newest.exit_code, Some(3));
         assert_eq!(newest.duration_ms, Some(1200));
@@ -11797,8 +12151,269 @@ mod tests {
 
         // A degenerate cap must still bound the table rather than panic.
         record_unified_zone(&mut zones, record(4, "fourth"), 0);
-        assert_eq!(zones.len(), 1);
-        assert_eq!(zones[0].id, 4);
+        assert_eq!(zones.records.len(), 1);
+        assert_eq!(zones.records[0].id, 4);
+    }
+
+    /// The global budget only ever removes snapshot BYTES, oldest record
+    /// first; every record survives and later looks up its own snapshot by
+    /// id, so eviction can never shift output onto a different command.
+    #[test]
+    fn snapshot_budget_evicts_oldest_first_and_keeps_ids_aligned() {
+        let record = |id: u64| CompletedCommandRecord {
+            id,
+            cmd: format!("command-{id}"),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            is_background: false,
+        };
+        let mut zones = UnifiedZoneStore::new();
+        for id in 1..=3 {
+            record_unified_zone(&mut zones, record(id), 10);
+            zones.insert_snapshot(
+                id,
+                ZoneOutputSnapshot {
+                    plain: format!("output-{id}-{}", "x".repeat(96)),
+                    truncated: false,
+                },
+            );
+        }
+        let per_snapshot = zones.snapshot_bytes / 3;
+
+        zones.enforce_snapshot_budget(per_snapshot * 2);
+        assert_eq!(zones.records.len(), 3, "records are never removed");
+        assert_eq!(zones.snapshot(1), None, "the oldest snapshot goes first");
+        assert!(zones.snapshot(2).is_some());
+        assert!(zones.snapshot(3).is_some());
+        assert_eq!(zones.snapshot_bytes, per_snapshot * 2);
+        assert!(zones
+            .snapshot(3)
+            .is_some_and(|snapshot| snapshot.plain.starts_with("output-3-")));
+
+        zones.enforce_snapshot_budget(0);
+        assert_eq!(zones.snapshot_bytes, 0);
+        assert!((1..=3).all(|id| zones.snapshot(id).is_none()));
+        assert_eq!(zones.records.len(), 3);
+    }
+
+    #[test]
+    fn zone_snapshot_takes_the_bounded_tail_and_reports_truncation() {
+        let mut ring = BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES);
+        ring.append(b"head head head\r\ntail line\r\n");
+        let snapshot = zone_output_snapshot_from_ring(&mut ring, 11).expect("tail snapshot");
+        assert_eq!(snapshot.plain, "tail line");
+        assert!(snapshot.truncated);
+
+        let complete = zone_output_snapshot_from_ring(&mut ring, 4096).expect("full snapshot");
+        assert_eq!(complete.plain, "head head head\ntail line");
+        assert!(!complete.truncated);
+    }
+
+    /// A byte-bounded tail cut can land inside an escape sequence; its
+    /// introducer lies before the cut, so the stripper would otherwise emit
+    /// the parameter bytes as literal text.
+    #[test]
+    fn zone_snapshot_tail_swallows_a_leading_partial_escape_sequence() {
+        let mut ring = BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES);
+        ring.append(b"before\r\n\x1b[38;5;196mred tail\x1b[0m\r\n");
+        // The cut lands between `\x1b[38;` and `5;196m`: the retained bytes
+        // start mid-parameters.
+        let max_bytes = b"5;196mred tail\x1b[0m\r\n".len();
+        let snapshot = zone_output_snapshot_from_ring(&mut ring, max_bytes).expect("tail snapshot");
+        assert_eq!(snapshot.plain, "red tail");
+        assert!(snapshot.truncated);
+
+        // A cut inside a multi-byte scalar resumes at the next boundary.
+        let mut ring = BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES);
+        ring.append("padding界tail".as_bytes());
+        let snapshot =
+            zone_output_snapshot_from_ring(&mut ring, "界tail".len() - 1).expect("tail snapshot");
+        assert_eq!(snapshot.plain, "tail");
+        assert!(snapshot.truncated);
+    }
+
+    /// An escape sequence can be longer than the whole tail bound, and its
+    /// terminator can be the last captured byte or absent altogether. Skipping
+    /// it must never consume the buffer: an empty snapshot is stored as no
+    /// snapshot at all, which reads exactly like a command that printed
+    /// nothing and carries no truncation signal either.
+    #[test]
+    fn zone_snapshot_tail_survives_an_escape_sequence_longer_than_the_bound() {
+        let max_bytes = 4096;
+
+        // OSC 52 clipboard write terminated by the final captured byte.
+        let terminated = format!(
+            "200 KB of log\r\n\x1b]52;c;{}\x07",
+            "QUJD".repeat(max_bytes)
+        );
+        // The tail helper's own invariant, whoever calls it: a non-empty
+        // capture never yields an empty tail.
+        let (tail, cut) = super::bounded_output_tail(terminated.as_bytes(), max_bytes);
+        assert!(cut);
+        assert!(!tail.is_empty(), "the escape skip must not eat the buffer");
+
+        let mut ring = BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES);
+        ring.append(terminated.as_bytes());
+        let snapshot = zone_output_snapshot_from_ring(&mut ring, max_bytes).expect("tail snapshot");
+        assert!(snapshot.plain.contains("QUJD"));
+        assert!(snapshot.truncated);
+
+        // The same payload with no terminator at all.
+        let unterminated = format!("200 KB of log\r\n\x1b]52;c;{}", "QUJD".repeat(max_bytes));
+        let (tail, cut) = super::bounded_output_tail(unterminated.as_bytes(), max_bytes);
+        assert!(cut);
+        assert!(!tail.is_empty(), "the escape skip must not eat the buffer");
+
+        let mut ring = BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES);
+        ring.append(unterminated.as_bytes());
+        let snapshot = zone_output_snapshot_from_ring(&mut ring, max_bytes).expect("tail snapshot");
+        assert!(snapshot.plain.contains("QUJD"));
+        assert!(snapshot.truncated);
+
+        // A skip that lands inside the buffer but leaves nothing visible falls
+        // back to the unadjusted cut: stray parameter characters still report
+        // that this command produced output.
+        let mut ring = BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES);
+        ring.append(b"xxxxxxxx\x1b]0;title\x07\n");
+        let snapshot =
+            zone_output_snapshot_from_ring(&mut ring, "title\x07\n".len()).expect("tail snapshot");
+        assert!(snapshot.plain.starts_with("title"));
+        assert!(snapshot.truncated);
+    }
+
+    /// `strip_ansi` is a replay, not a filter: one line past the replay grid's
+    /// column bound stops it, and every later byte — the command's verdict
+    /// lines included — is discarded. Nothing in the retained text says so, so
+    /// both snapshot constructors have to say it.
+    #[test]
+    fn zone_snapshot_reports_an_aborted_ansi_replay_as_truncated() {
+        // Colour leaves the no-control fast path, so the replay actually runs.
+        let raw = format!(
+            "\x1b[32mbuilding\x1b[0m\r\n{}\r\nERROR: build failed\r\n",
+            "w".repeat(20_000)
+        );
+
+        let mut ring = BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES);
+        ring.append(raw.as_bytes());
+        let snapshot = zone_output_snapshot_from_ring(&mut ring, MAX_ZONE_SNAPSHOT_BYTES)
+            .expect("captured output");
+        assert!(
+            !snapshot.plain.contains("ERROR: build failed"),
+            "the replay stopped at the column bound"
+        );
+        assert!(snapshot.truncated);
+
+        // The same loss through the memoized-plain path, where the journal
+        // materialized the text before finalize could read the ring.
+        let output = Rc::new(RefCell::new(BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES)));
+        output.borrow_mut().append(raw.as_bytes());
+        let payload = super::LazyBlockRenderPayload::new(
+            String::new(),
+            super::CapturedFinalizeOutput::Foreground(output),
+        );
+        payload.materialize();
+        let snapshot = payload
+            .output_snapshot(MAX_ZONE_SNAPSHOT_BYTES)
+            .expect("memoized output");
+        assert!(!snapshot.plain.contains("ERROR: build failed"));
+        assert!(snapshot.truncated);
+    }
+
+    /// The per-zone cap and the retention budget must bound the same
+    /// quantity. The replay pads each row out to the cursor, so a raw tail far
+    /// inside the cap can still strip to many times it — and it is the
+    /// stripped text that `insert_snapshot` charges and eviction acts on.
+    #[test]
+    fn zone_snapshot_bounds_the_stripped_text_the_budget_charges() {
+        let mut ring = BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES);
+        let raw = "\x1b[999C.\n".repeat(100);
+        assert!(raw.len() < MAX_ZONE_SNAPSHOT_BYTES);
+        ring.append(raw.as_bytes());
+
+        let snapshot = zone_output_snapshot_from_ring(&mut ring, MAX_ZONE_SNAPSHOT_BYTES)
+            .expect("captured output");
+        assert!(
+            snapshot.plain.len() <= MAX_ZONE_SNAPSHOT_BYTES,
+            "sparse cursor writes expanded past the per-zone cap: {}",
+            snapshot.plain.len()
+        );
+        assert!(snapshot.truncated);
+    }
+
+    #[test]
+    fn zone_snapshot_reports_a_wrapped_ring_as_truncated() {
+        let mut ring = BoundedByteRing::new(8);
+        ring.append(b"0123456789");
+        let snapshot =
+            zone_output_snapshot_from_ring(&mut ring, MAX_ZONE_SNAPSHOT_BYTES).expect("snapshot");
+        assert_eq!(snapshot.plain, "23456789");
+        assert!(
+            snapshot.truncated,
+            "front bytes the ring already dropped are truncation even under the tail bound"
+        );
+    }
+
+    #[test]
+    fn zone_snapshot_never_fabricates_an_empty_string() {
+        let mut empty = BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES);
+        assert_eq!(
+            zone_output_snapshot_from_ring(&mut empty, MAX_ZONE_SNAPSHOT_BYTES),
+            None
+        );
+
+        let mut ansi_only = BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES);
+        ansi_only.append(b"\x1b[2K\r");
+        assert_eq!(
+            zone_output_snapshot_from_ring(&mut ansi_only, MAX_ZONE_SNAPSHOT_BYTES),
+            None
+        );
+
+        assert_eq!(
+            zone_output_snapshot_from_plain("   \n", MAX_ZONE_SNAPSHOT_BYTES, false),
+            None
+        );
+        let materialized = zone_output_snapshot_from_plain("plain output", 5, false).expect("tail");
+        assert_eq!(materialized.plain, "utput");
+        assert!(materialized.truncated);
+    }
+
+    /// The char-boundary guard on the memoized-plain path: the byte cut can
+    /// land inside a scalar there exactly as it can in the raw ring, and
+    /// indexing a `str` at a non-boundary panics — on the GTK main thread, at
+    /// finalize, for any command whose tail is not ASCII.
+    #[test]
+    fn zone_snapshot_from_plain_cuts_on_a_char_boundary() {
+        let snapshot = zone_output_snapshot_from_plain("padding界tail", "界tail".len() - 1, false)
+            .expect("tail snapshot");
+        assert_eq!(snapshot.plain, "tail");
+        assert!(snapshot.truncated);
+    }
+
+    /// Whatever the ring dropped out of its front is invisible in the decoded
+    /// text, and under jsh the journal materializes that text before finalize
+    /// reads the ring — so the marker has to be carried, not re-derived.
+    #[test]
+    fn materialized_payload_still_reports_a_wrapped_ring_as_truncated() {
+        let output = Rc::new(RefCell::new(BoundedByteRing::new(8)));
+        output.borrow_mut().append(b"0123456789");
+        let payload = super::LazyBlockRenderPayload::new(
+            String::new(),
+            super::CapturedFinalizeOutput::Foreground(output),
+        );
+
+        // The journal observer runs first and consumes the ring.
+        payload.materialize();
+        let snapshot = payload
+            .output_snapshot(MAX_ZONE_SNAPSHOT_BYTES)
+            .expect("memoized output");
+        assert_eq!(snapshot.plain, "23456789");
+        assert!(
+            snapshot.truncated,
+            "the ring's wrap marker survives materialization"
+        );
     }
 
     #[test]
@@ -12016,6 +12631,45 @@ mod tests {
             1,
             "all consumers share one raw/plain snapshot"
         );
+    }
+
+    #[test]
+    fn accessor_snapshot_is_bounded_and_survives_prior_materialization() {
+        let output = Rc::new(RefCell::new(BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES)));
+        output.borrow_mut().append(b"\x1b[32mhello\x1b[0m\r\n");
+        let payload = super::LazyBlockRenderPayload::new(
+            "$ ".to_string(),
+            super::CapturedFinalizeOutput::Foreground(output.clone()),
+        );
+
+        let snapshot = payload
+            .output_snapshot(MAX_ZONE_SNAPSHOT_BYTES)
+            .expect("captured output");
+        assert_eq!(snapshot.plain, "hello");
+        assert!(!snapshot.truncated);
+        assert_eq!(
+            payload.materialization_count(),
+            0,
+            "the bounded path never materializes the card payload"
+        );
+        assert!(
+            !output.borrow().is_empty(),
+            "the engine-owned ring is left for later consumers"
+        );
+
+        // A journal observer may materialize first; the snapshot then comes
+        // from the memoized plain text under the same tail bound.
+        payload.materialize();
+        let snapshot = payload.output_snapshot(3).expect("memoized output");
+        assert_eq!(snapshot.plain, "lo");
+        assert!(snapshot.truncated);
+        assert_eq!(payload.materialization_count(), 1);
+
+        let empty = super::LazyBlockRenderPayload::new(
+            String::new(),
+            super::CapturedFinalizeOutput::Background(BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES)),
+        );
+        assert_eq!(empty.output_snapshot(MAX_ZONE_SNAPSHOT_BYTES), None);
     }
 
     #[test]
@@ -14666,8 +15320,13 @@ mod tests {
     struct RecordingBackend {
         calls: RefCell<Vec<Call>>,
         marker_trace: RefCell<Vec<MarkerTrace>>,
+        /// Everything a live surface would receive, in order. Mirrors
+        /// `UnifiedBackend`'s feed: the zone marker is injected here, on the
+        /// backend side of the engine, and never touches a captured chunk.
+        live_feed: RefCell<Vec<u8>>,
+        zone_marker: RefCell<ZoneMarkerInjector>,
         records: RefCell<VecDeque<BlockData>>,
-        metadata_records: RefCell<VecDeque<CompletedCommandRecord>>,
+        metadata_records: RefCell<UnifiedZoneStore>,
         materialize_finalize_payload: Cell<bool>,
         payload_materializations: Cell<usize>,
         payload_counters: RefCell<Vec<Rc<Cell<usize>>>>,
@@ -14732,8 +15391,10 @@ mod tests {
             Rc::new(Self {
                 calls: RefCell::new(Vec::new()),
                 marker_trace: RefCell::new(Vec::new()),
+                live_feed: RefCell::new(Vec::new()),
+                zone_marker: RefCell::new(ZoneMarkerInjector::with_nonce([0xab; 16])),
                 records: RefCell::new(VecDeque::new()),
-                metadata_records: RefCell::new(VecDeque::new()),
+                metadata_records: RefCell::new(UnifiedZoneStore::new()),
                 materialize_finalize_payload: Cell::new(materialize_finalize_payload),
                 payload_materializations: Cell::new(0),
                 payload_counters: RefCell::new(Vec::new()),
@@ -14823,18 +15484,33 @@ mod tests {
                 .borrow_mut()
                 .push(MarkerTrace::Feed(bytes.to_vec()));
             self.record(Call::FeedLive(bytes.to_vec()));
+            feed_with_zone_marker(&self.zone_marker, bytes, |part| {
+                self.live_feed.borrow_mut().extend_from_slice(part)
+            });
         }
 
         fn begin_prompt_zone(&self, zone_id: u64) {
             self.marker_trace
                 .borrow_mut()
                 .push(MarkerTrace::Begin(zone_id));
+            let open = {
+                let mut marker = self.zone_marker.borrow_mut();
+                marker.begin_zone(zone_id);
+                marker.open_bytes()
+            };
+            if let Some(open) = open {
+                self.live_feed.borrow_mut().extend_from_slice(&open);
+            }
         }
 
         fn close_prompt_zone(&self, zone_id: Option<u64>) {
             self.marker_trace
                 .borrow_mut()
                 .push(MarkerTrace::Close(zone_id));
+            self.zone_marker.borrow_mut().close_zone(zone_id);
+            self.live_feed
+                .borrow_mut()
+                .extend_from_slice(ZONE_MARKER_CLOSE);
         }
 
         fn erase_scrollback(&self) {
@@ -14917,7 +15593,17 @@ mod tests {
                 .borrow_mut()
                 .push(payload.materialization_counter());
             if !self.materialize_finalize_payload.get() {
-                self.metadata_records.borrow_mut().push_back(record.clone());
+                // Mirrors `UnifiedBackend::finalize_block`: bounded snapshot
+                // through the accessor, no full materialization.
+                let snapshot = payload.output_snapshot(MAX_ZONE_SNAPSHOT_BYTES);
+                {
+                    let mut store = self.metadata_records.borrow_mut();
+                    record_unified_zone(&mut store, record.clone(), usize::MAX);
+                    if let Some(snapshot) = snapshot {
+                        store.insert_snapshot(record.id, snapshot);
+                    }
+                    store.enforce_snapshot_budget(MAX_TOTAL_SNAPSHOT_BYTES);
+                }
                 self.record(Call::FinalizeMetadata {
                     command: record.cmd.clone(),
                     exit_code: record.exit_code,
@@ -15930,7 +16616,7 @@ mod tests {
     fn ris_retires_the_open_zone_before_raw_bytes_and_preserves_records() {
         let harness = ReaderHarness::metadata_only(false);
         drive_simple_command(&harness, "printf kept", "kept\r\n");
-        assert_eq!(harness.backend.metadata_records.borrow().len(), 1);
+        assert_eq!(harness.backend.metadata_records.borrow().records.len(), 1);
         assert!(harness.ctx.engine.borrow().pending_zone.is_some());
 
         harness.backend.take_calls();
@@ -15944,7 +16630,18 @@ mod tests {
         harness.feed(ParserEvent::Bytes(b"\x1bc".to_vec()));
 
         assert_eq!(harness.ctx.engine.borrow().pending_zone, None);
-        assert_eq!(harness.backend.metadata_records.borrow().len(), 1);
+        {
+            // Records and their snapshots both survive RIS: the snapshot came
+            // from the byte stream, not the ring, so nothing can resurrect
+            // erased surface content through it.
+            let store = harness.backend.metadata_records.borrow();
+            assert_eq!(store.records.len(), 1);
+            let id = store.records[0].id;
+            assert_eq!(
+                store.snapshot(id).map(|snapshot| snapshot.plain.as_str()),
+                Some("kept")
+            );
+        }
         assert!(!harness.pty.shell_bracketed_paste());
         assert_eq!(
             harness.backend.marker_trace.borrow().as_slice(),
@@ -16121,12 +16818,49 @@ mod tests {
         assert_eq!(harness.backend.payload_counters.borrow()[0].get(), 0);
         assert!(harness.blocks_finished.borrow().is_empty());
         let records = harness.backend.records();
-        let BackendRecords::Metadata(records) = records else {
+        let BackendRecords::Metadata(store) = records else {
             panic!("the metadata-only backend must not manufacture BlockData");
         };
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].cmd, "printf hi");
+        assert_eq!(store.records.len(), 1);
+        assert_eq!(store.records[0].cmd, "printf hi");
+        // The bounded snapshot is captured without materializing: plain text
+        // only, complete, and sourced from pre-injector PTY bytes.
+        let snapshot = store
+            .snapshot(store.records[0].id)
+            .expect("finalize retains a bounded output snapshot");
+        assert_eq!(snapshot.plain, "hi");
+        assert!(!snapshot.truncated);
+        drop(store);
         assert!(harness.live_output().is_empty());
+    }
+
+    /// Pin for the snapshot provenance invariant, driven through the real
+    /// reader: zone-marker OSC 8 frames are a backend-side surface feed, while
+    /// engine capture takes the raw PTY chunk, so no injected byte can reach
+    /// the snapshot finalize stores.
+    #[test]
+    fn zone_marker_bytes_never_enter_the_snapshot_capture() {
+        let harness = ReaderHarness::metadata_only(false);
+        drive_simple_command(&harness, "printf hi", "real output\r\n");
+
+        let live_feed = String::from_utf8(harness.backend.live_feed.borrow().clone())
+            .expect("marker bytes are UTF-8");
+        assert!(
+            live_feed.contains("block://"),
+            "the live surface feed IS marked"
+        );
+        assert!(live_feed.contains("real output"));
+
+        let records = harness.backend.records();
+        let BackendRecords::Metadata(store) = records else {
+            panic!("the metadata-only backend records zones");
+        };
+        let snapshot = store
+            .snapshot(store.records[0].id)
+            .expect("finalize retains a bounded output snapshot");
+        assert_eq!(snapshot.plain, "real output");
+        assert!(!snapshot.plain.contains("block://"));
+        assert!(!snapshot.plain.contains('\x1b'));
     }
 
     #[test]
@@ -16185,11 +16919,12 @@ mod tests {
         assert_eq!(harness.backend.payload_counters.borrow()[0].get(), 0);
         assert_eq!(harness.backend.finalized().len(), 1);
         let records = harness.backend.records();
-        let BackendRecords::Metadata(records) = records else {
+        let BackendRecords::Metadata(store) = records else {
             panic!("the metadata-only backend must retain a recovery record");
         };
-        assert_eq!(records[0].cmd, "interrupted");
-        assert_eq!(records[0].exit_code, None);
+        assert_eq!(store.records[0].cmd, "interrupted");
+        assert_eq!(store.records[0].exit_code, None);
+        drop(store);
         assert!(harness.live_output().is_empty());
     }
 
@@ -16211,12 +16946,12 @@ mod tests {
         assert_eq!(harness.backend.payload_counters.borrow()[0].get(), 0);
         assert!(harness.blocks_finished.borrow().is_empty());
         let records = harness.backend.records();
-        let BackendRecords::Metadata(records) = records else {
+        let BackendRecords::Metadata(store) = records else {
             panic!("the metadata-only backend must retain a background record");
         };
-        assert_eq!(records.len(), 1);
-        assert!(records[0].is_background);
-        assert!(records[0].cmd.is_empty());
+        assert_eq!(store.records.len(), 1);
+        assert!(store.records[0].is_background);
+        assert!(store.records[0].cmd.is_empty());
     }
 
     /// A second command on the same pane, ending the way a shell that reports

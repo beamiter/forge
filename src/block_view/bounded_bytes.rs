@@ -9,6 +9,11 @@ use std::collections::VecDeque;
 pub(super) struct BoundedByteRing {
     bytes: VecDeque<u8>,
     limit: usize,
+    /// Whether any appended byte fell out of the front since the last
+    /// `clear`/`take_vec`/`take_ring`. The retained tail alone cannot reveal
+    /// this, and a consumer snapshotting the tail must be able to report that
+    /// the stream was longer than what survives here.
+    dropped_front: bool,
 }
 
 impl BoundedByteRing {
@@ -16,15 +21,21 @@ impl BoundedByteRing {
         Self {
             bytes: VecDeque::new(),
             limit,
+            dropped_front: false,
         }
     }
 
     pub(super) fn append(&mut self, input: &[u8]) {
-        if input.is_empty() || self.limit == 0 {
+        if input.is_empty() {
+            return;
+        }
+        if self.limit == 0 {
+            self.dropped_front = true;
             return;
         }
 
         if input.len() >= self.limit {
+            self.dropped_front |= !self.bytes.is_empty() || input.len() > self.limit;
             self.bytes.clear();
             self.bytes
                 .extend(input[input.len() - self.limit..].iter().copied());
@@ -38,8 +49,13 @@ impl BoundedByteRing {
             .saturating_sub(self.limit);
         if overflow > 0 {
             self.bytes.drain(..overflow);
+            self.dropped_front = true;
         }
         self.bytes.extend(input.iter().copied());
+    }
+
+    pub(super) fn dropped_front(&self) -> bool {
+        self.dropped_front
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -52,6 +68,7 @@ impl BoundedByteRing {
 
     pub(super) fn clear(&mut self) {
         self.bytes.clear();
+        self.dropped_front = false;
     }
 
     /// Make the retained tail contiguous for one final linear read.
@@ -73,15 +90,18 @@ impl BoundedByteRing {
 
     pub(super) fn take_vec(&mut self) -> Vec<u8> {
         let bytes = std::mem::take(&mut self.bytes);
+        self.dropped_front = false;
         bytes.into_iter().collect()
     }
 
     /// Move the retained ring into a new owner without copying its byte
-    /// storage, leaving this capture ready to accept the next stream.
+    /// storage, leaving this capture ready to accept the next stream. The
+    /// drop marker belongs to the moved stream and travels with it.
     pub(super) fn take_ring(&mut self) -> Self {
         Self {
             bytes: std::mem::take(&mut self.bytes),
             limit: self.limit,
+            dropped_front: std::mem::take(&mut self.dropped_front),
         }
     }
 }
@@ -149,5 +169,35 @@ mod tests {
         ring.append(b"ignored");
         assert!(ring.is_empty());
         assert!(ring.take_vec().is_empty());
+    }
+
+    /// The retained tail cannot reveal a front drop on its own; the marker is
+    /// what lets a tail snapshot honestly report truncation.
+    #[test]
+    fn front_drops_are_observable_until_the_stream_owner_resets() {
+        let mut ring = BoundedByteRing::new(5);
+        ring.append(b"abc");
+        assert!(!ring.dropped_front());
+
+        ring.append(b"def");
+        assert!(ring.dropped_front());
+        ring.clear();
+        assert!(!ring.dropped_front());
+
+        // An exactly-limit-sized append into an empty ring drops nothing; the
+        // same append over existing bytes does.
+        ring.append(b"12345");
+        assert!(!ring.dropped_front());
+        ring.append(b"67890");
+        assert!(ring.dropped_front());
+
+        let moved = ring.take_ring();
+        assert!(moved.dropped_front(), "the marker follows the moved stream");
+        assert!(!ring.dropped_front());
+
+        ring.append(b"123456");
+        assert!(ring.dropped_front());
+        ring.take_vec();
+        assert!(!ring.dropped_front());
     }
 }

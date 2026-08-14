@@ -12,7 +12,10 @@ use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use super::{BackendRecordRef, BackendRecords, CompletedCommandRecord, TermView};
+use super::{
+    BackendRecordRef, BackendRecords, CompletedCommandRecord, TermView, ZoneOutputSnapshot,
+    MAX_ZONE_SNAPSHOT_BYTES,
+};
 
 #[derive(serde::Serialize)]
 struct MetadataRecordExport<'a> {
@@ -24,29 +27,41 @@ struct MetadataRecordExport<'a> {
     duration_ms: Option<u64>,
     cwd: Option<&'a str>,
     is_background: bool,
-    /// Unified leaves output on its persistent terminal surface; it is not a
-    /// per-command snapshot and must never be exported as a misleading empty
-    /// string.
+    /// The bounded finalize-time snapshot. Omitted — never an empty string —
+    /// when no snapshot is retained (none was captured, or the global budget
+    /// evicted it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<&'a str>,
+    /// `Some` exactly when `output` is; `true` when the snapshot holds only
+    /// the bounded tail of the command's output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_truncated: Option<bool>,
     output_available: bool,
 }
 
-impl<'a> From<&'a CompletedCommandRecord> for MetadataRecordExport<'a> {
-    fn from(record: &'a CompletedCommandRecord) -> Self {
-        Self {
-            id: record.id,
-            cmd: &record.cmd,
-            exit_code: record.exit_code,
-            start_time_ms: record.start_time_ms,
-            end_time_ms: record.end_time_ms,
-            duration_ms: record.duration_ms,
-            cwd: record.cwd.as_deref(),
-            is_background: record.is_background,
-            output_available: false,
-        }
+fn metadata_record_export<'a>(
+    record: &'a CompletedCommandRecord,
+    snapshot: Option<&'a ZoneOutputSnapshot>,
+) -> MetadataRecordExport<'a> {
+    MetadataRecordExport {
+        id: record.id,
+        cmd: &record.cmd,
+        exit_code: record.exit_code,
+        start_time_ms: record.start_time_ms,
+        end_time_ms: record.end_time_ms,
+        duration_ms: record.duration_ms,
+        cwd: record.cwd.as_deref(),
+        is_background: record.is_background,
+        output: snapshot.map(|snapshot| snapshot.plain.as_str()),
+        output_truncated: snapshot.map(|snapshot| snapshot.truncated),
+        output_available: snapshot.is_some(),
     }
 }
 
-fn metadata_record_markdown(record: &CompletedCommandRecord) -> String {
+fn metadata_record_markdown(
+    record: &CompletedCommandRecord,
+    snapshot: Option<&ZoneOutputSnapshot>,
+) -> String {
     let mut markdown = if record.is_background {
         "## Background Output\n\n".to_string()
     } else {
@@ -55,9 +70,21 @@ fn metadata_record_markdown(record: &CompletedCommandRecord) -> String {
             record.cmd
         )
     };
-    markdown.push_str(
-        "**Output:** unavailable (retained on the live Unified terminal surface only)\n\n",
-    );
+    match snapshot {
+        Some(snapshot) => {
+            markdown.push_str("**Output:**");
+            if snapshot.truncated {
+                markdown.push_str(&format!(
+                    " (truncated to the last {} KiB)",
+                    MAX_ZONE_SNAPSHOT_BYTES / 1024
+                ));
+            }
+            markdown.push_str(&format!("\n```\n{}\n```\n\n", snapshot.plain));
+        }
+        None => markdown.push_str(
+            "**Output:** unavailable (retained on the live Unified terminal surface only)\n\n",
+        ),
+    }
     if !record.is_background {
         match record.exit_code {
             Some(code) => markdown.push_str(&format!("**Exit Code:** {code}\n\n")),
@@ -76,8 +103,8 @@ fn metadata_record_markdown(record: &CompletedCommandRecord) -> String {
 fn record_json(record: BackendRecordRef<'_>) -> String {
     match record {
         BackendRecordRef::Block(record) => record.to_json(),
-        BackendRecordRef::Metadata(record) => {
-            serde_json::to_string_pretty(&MetadataRecordExport::from(record))
+        BackendRecordRef::Metadata { record, snapshot } => {
+            serde_json::to_string_pretty(&metadata_record_export(record, snapshot))
                 .unwrap_or_else(|_| "{}".to_string())
         }
     }
@@ -86,7 +113,9 @@ fn record_json(record: BackendRecordRef<'_>) -> String {
 fn record_markdown(record: BackendRecordRef<'_>) -> String {
     match record {
         BackendRecordRef::Block(record) => record.to_markdown(),
-        BackendRecordRef::Metadata(record) => metadata_record_markdown(record),
+        BackendRecordRef::Metadata { record, snapshot } => {
+            metadata_record_markdown(record, snapshot)
+        }
     }
 }
 
@@ -95,8 +124,12 @@ fn records_json(records: &BackendRecords<'_>) -> String {
         BackendRecords::Blocks(records) => {
             serde_json::to_string_pretty(&**records).unwrap_or_else(|_| "[]".to_string())
         }
-        BackendRecords::Metadata(records) => {
-            let exports: Vec<_> = records.iter().map(MetadataRecordExport::from).collect();
+        BackendRecords::Metadata(store) => {
+            let exports: Vec<_> = store
+                .records
+                .iter()
+                .map(|record| metadata_record_export(record, store.snapshot(record.id)))
+                .collect();
             serde_json::to_string_pretty(&exports).unwrap_or_else(|_| "[]".to_string())
         }
     }
@@ -272,10 +305,10 @@ mod tests {
     use super::{
         export_file_name, record_json, record_markdown, records_json, session_markdown_document,
         write_session_export, BackendRecordRef, BackendRecords, CompletedCommandRecord,
-        SessionExportFormat,
+        SessionExportFormat, ZoneOutputSnapshot,
     };
+    use crate::block_view::UnifiedZoneStore;
     use std::cell::RefCell;
-    use std::collections::VecDeque;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -344,7 +377,8 @@ mod tests {
 
     #[test]
     fn unified_metadata_json_preserves_schema_without_fabricating_output() {
-        let records = RefCell::new(VecDeque::from([
+        let mut store = UnifiedZoneStore::new();
+        store.records.extend([
             CompletedCommandRecord {
                 id: 41,
                 cmd: "cargo check --locked".to_string(),
@@ -375,7 +409,8 @@ mod tests {
                 cwd: Some("/work/forge".to_string()),
                 is_background: true,
             },
-        ]));
+        ]);
+        let records = RefCell::new(store);
         let records = BackendRecords::Metadata(records.borrow());
         let value: serde_json::Value =
             serde_json::from_str(&records_json(&records)).expect("valid metadata export JSON");
@@ -444,13 +479,20 @@ mod tests {
             is_background: false,
         };
         let unknown_json: serde_json::Value =
-            serde_json::from_str(&record_json(BackendRecordRef::Metadata(&unknown)))
-                .expect("valid single-record JSON");
+            serde_json::from_str(&record_json(BackendRecordRef::Metadata {
+                record: &unknown,
+                snapshot: None,
+            }))
+            .expect("valid single-record JSON");
         assert_eq!(unknown_json["exit_code"], serde_json::Value::Null);
         assert_eq!(unknown_json["output_available"], false);
         assert!(unknown_json.get("output").is_none());
+        assert!(unknown_json.get("output_truncated").is_none());
         assert_eq!(
-            record_markdown(BackendRecordRef::Metadata(&unknown)),
+            record_markdown(BackendRecordRef::Metadata {
+                record: &unknown,
+                snapshot: None,
+            }),
             "## Command Record\n\n**Command:**\n```bash\nmystery-command\n```\n\n\
              **Output:** unavailable (retained on the live Unified terminal surface only)\n\n\
              **Exit Code:** unknown (the shell reported none)\n\n\
@@ -467,7 +509,10 @@ mod tests {
             cwd: Some("/work/forge".to_string()),
             is_background: true,
         };
-        let markdown = record_markdown(BackendRecordRef::Metadata(&background));
+        let markdown = record_markdown(BackendRecordRef::Metadata {
+            record: &background,
+            snapshot: None,
+        });
         assert_eq!(
             markdown,
             "## Background Output\n\n\
@@ -479,6 +524,129 @@ mod tests {
             !markdown.contains("```"),
             "no empty output fence is fabricated"
         );
+    }
+
+    #[test]
+    fn unified_metadata_with_snapshot_exports_output_in_json_and_markdown() {
+        let record = CompletedCommandRecord {
+            id: 81,
+            cmd: "cargo test".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(2_500),
+            cwd: None,
+            is_background: false,
+        };
+        let snapshot = ZoneOutputSnapshot {
+            plain: "running 3 tests\ntest result: ok".to_string(),
+            truncated: false,
+        };
+
+        let json: serde_json::Value =
+            serde_json::from_str(&record_json(BackendRecordRef::Metadata {
+                record: &record,
+                snapshot: Some(&snapshot),
+            }))
+            .expect("valid single-record JSON");
+        assert_eq!(json["output"], "running 3 tests\ntest result: ok");
+        assert_eq!(json["output_truncated"], false);
+        assert_eq!(json["output_available"], true);
+
+        assert_eq!(
+            record_markdown(BackendRecordRef::Metadata {
+                record: &record,
+                snapshot: Some(&snapshot),
+            }),
+            "## Command Record\n\n**Command:**\n```bash\ncargo test\n```\n\n\
+             **Output:**\n```\nrunning 3 tests\ntest result: ok\n```\n\n\
+             **Exit Code:** 0\n\n\
+             **Duration:** 2.500s\n\n"
+        );
+    }
+
+    #[test]
+    fn truncated_snapshot_markdown_carries_the_tail_bound_note() {
+        let record = CompletedCommandRecord {
+            id: 82,
+            cmd: "cat big.log".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            is_background: false,
+        };
+        let snapshot = ZoneOutputSnapshot {
+            plain: "…last lines".to_string(),
+            truncated: true,
+        };
+
+        let markdown = record_markdown(BackendRecordRef::Metadata {
+            record: &record,
+            snapshot: Some(&snapshot),
+        });
+        assert!(markdown
+            .contains("**Output:** (truncated to the last 64 KiB)\n```\n…last lines\n```\n\n"));
+
+        let json: serde_json::Value =
+            serde_json::from_str(&record_json(BackendRecordRef::Metadata {
+                record: &record,
+                snapshot: Some(&snapshot),
+            }))
+            .expect("valid single-record JSON");
+        assert_eq!(json["output_truncated"], true);
+    }
+
+    /// Budget eviction removes only snapshot bytes; the surviving record must
+    /// export exactly like one that never had output retained.
+    #[test]
+    fn budget_evicted_snapshot_exports_as_unavailable_again() {
+        let mut store = UnifiedZoneStore::new();
+        store.records.push_back(CompletedCommandRecord {
+            id: 90,
+            cmd: "make".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            is_background: false,
+        });
+        store.insert_snapshot(
+            90,
+            ZoneOutputSnapshot {
+                plain: "compiling".to_string(),
+                truncated: false,
+            },
+        );
+        store.enforce_snapshot_budget(0);
+
+        let store = RefCell::new(store);
+        let records = BackendRecords::Metadata(store.borrow());
+        let value: serde_json::Value =
+            serde_json::from_str(&records_json(&records)).expect("valid metadata export JSON");
+        let object = value[0].as_object().expect("one exported record");
+        assert_eq!(object.get("cmd"), Some(&serde_json::json!("make")));
+        assert_eq!(
+            object.get("output_available"),
+            Some(&serde_json::json!(false))
+        );
+        assert!(!object.contains_key("output"));
+        assert!(!object.contains_key("output_truncated"));
+
+        let markdown = store
+            .borrow()
+            .records
+            .front()
+            .map(|record| {
+                record_markdown(BackendRecordRef::Metadata {
+                    record,
+                    snapshot: store.borrow().snapshot(90),
+                })
+            })
+            .expect("one record");
+        assert!(markdown.contains("**Output:** unavailable"));
     }
 
     /// An export is command output on disk, so it must not be world-readable,

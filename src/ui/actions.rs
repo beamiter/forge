@@ -58,10 +58,13 @@ fn remote_host_index_for_action(
 
 fn record_navigation_toast(result: RecordNavigationResult) -> Option<&'static str> {
     match result {
-        RecordNavigationResult::LocationUnavailable => Some(
-            "Unified mode can identify matching records, but exact record locations aren't available yet.",
-        ),
-        RecordNavigationResult::Navigated | RecordNavigationResult::NoMatchingRecord => None,
+        RecordNavigationResult::LocationUnavailable => {
+            Some("This record has no exact terminal location and no retained output snapshot.")
+        }
+        // SnapshotView opens the read-only dialog instead of toasting.
+        RecordNavigationResult::Navigated
+        | RecordNavigationResult::NoMatchingRecord
+        | RecordNavigationResult::SnapshotView { .. } => None,
     }
 }
 
@@ -96,6 +99,10 @@ impl UiState {
     }
 
     fn report_record_navigation(&self, result: RecordNavigationResult) {
+        if let RecordNavigationResult::SnapshotView { record_id } = result {
+            self.show_record_snapshot_dialog(record_id);
+            return;
+        }
         if let Some(message) = record_navigation_toast(result) {
             self.toast_overlay.add_toast(adw::Toast::new(message));
         }
@@ -740,10 +747,15 @@ mod tests {
     fn unavailable_record_target_has_action_feedback() {
         let message = record_navigation_toast(RecordNavigationResult::LocationUnavailable)
             .expect("an unavailable exact location must not be a silent no-op");
-        assert!(message.contains("Unified mode"));
+        assert!(message.contains("no retained output snapshot"));
         assert_eq!(
             record_navigation_toast(RecordNavigationResult::Navigated),
             None
+        );
+        assert_eq!(
+            record_navigation_toast(RecordNavigationResult::SnapshotView { record_id: 7 }),
+            None,
+            "the snapshot dialog, not a toast, answers this result"
         );
     }
 }
