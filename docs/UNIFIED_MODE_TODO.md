@@ -26,7 +26,6 @@
 - [x] 带输出的会话导出：JSON 增 `output`/`output_truncated`，`output_available` 改为快照存在性；Markdown 用围栏输出并在截断时注明。无快照的记录**根本不写 `output` 键**（诚实缺席，而非空串）。
 - [x] Unified `Ctrl+F`：按 native cursor 顺序优先扫描 viewport→tail，再 wrap 到旧历史；共享 4 MiB/时间预算。可信 ring bounds 暂失时由 VTE native cursor 返回真实的 `1+` limited result，屏上命中不会被很长的旧历史饿死。
 - [x] per-zone output 搜索与精确跳转：`BackendRecordRef::output()` 现返回快照文本，`matching_record_ids`/`cross_block_search` 随之点亮。`record_search_target()` 仍**故意** fail closed（共享 VTE 无法为单条记录限定高亮范围），跳转改走新的 `scroll_to_record`/`can_scroll_to_record` 接缝；跨块面板据此启用行激活，并按 `Navigated`/`SnapshotView`/`LocationUnavailable` 分派。
-- [ ] 会话恢复的快照回放：快照已具备，但重启回放尚未接线（见下条）。
 - [x] 会话恢复（`5d15898`）：zone 文档持久化到 Block 历史文件的兄弟路径（stem 加 `-zones`，同样按 session 分文件），上限 64 zone / 4 MiB；预算不够时**先丢输出再丢记录**，所以重启至少留下命令与结果。恢复在 `start_history_load` 同步执行——必须早于 shell 首个 prompt，否则恢复的行会落在它本该领先的输出下面。回放是纯显示：字节直接进 VTE 不过 parser，故恢复的 zone 不会被记成本次会话执行过的命令；marker 用**新分配的 id**（持久化里根本不存 id），保住注入器的单调重放防御；每个持久化字段先剥离控制字节——历史文件是数据不是程序。
 - [x] inline 卡片安置（`d83c453`）：底部**占位**停靠区落地（`notice_dock`，`block_scroll` 的垂直兄弟）。`RenderBackend::docks_inline_notices()` 决定卡片进文档还是进停靠区；Unified `supports_inline_notices()` 因此转为 true，agent/correction/palette 卡片不再被拒。GUI 实测：organism 卡片挂在底部、prompt 未被遮挡、表面由 71×21 缩为 71×17——每次开关一次 SIGWINCH，不是每张卡片一次。
 - [x] organism：停靠区即其载体，Unified 下卡片正常出现（实测显示 juvenile · repo memory · no LLM）。
