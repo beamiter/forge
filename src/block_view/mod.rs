@@ -7075,6 +7075,28 @@ impl UnifiedZoneStore {
     }
 }
 
+/// What mounting a card in the bottom dock must do, given where the widget is
+/// parented right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DockMount {
+    /// Unparented: the dock takes it.
+    Append,
+    /// Already docked. Re-pinning exists to keep a card beside the prompt in a
+    /// scrolling document; the dock is always beside the prompt, so leave it.
+    Keep,
+    /// Parented elsewhere. Appending would reparent a widget the other region
+    /// still owns, so refuse and let the caller fall back.
+    Refuse,
+}
+
+fn dock_mount_decision(parent: Option<&gtk4::Widget>, dock: &gtk4::Widget) -> DockMount {
+    match parent {
+        None => DockMount::Append,
+        Some(parent) if parent == dock => DockMount::Keep,
+        Some(_) => DockMount::Refuse,
+    }
+}
+
 /// Append a completed record to the Unified zone table, dropping the oldest
 /// entries past
 /// `max_zones`.
@@ -10903,20 +10925,21 @@ impl TermView {
     /// re-pinning exists to keep a card next to the prompt in a scrolling
     /// document, and the dock is always next to the prompt.
     fn dock_inline_notice(&self, widget: &gtk4::Widget) -> bool {
-        let already_docked = widget
-            .parent()
-            .is_some_and(|parent| parent == *self.notice_dock.upcast_ref::<gtk4::Widget>());
-        if !already_docked {
-            if widget.parent().is_some() {
-                // A card built for the scrolling document must not be parented
-                // twice; GTK would warn and leave it in neither place.
-                return false;
+        let dock_widget: &gtk4::Widget = self.notice_dock.upcast_ref();
+        match dock_mount_decision(widget.parent().as_ref(), dock_widget) {
+            DockMount::Refuse => false,
+            DockMount::Keep => {
+                self.notice_dock.set_visible(true);
+                self.relayout_after_dock_change();
+                true
             }
-            self.notice_dock.append(widget);
+            DockMount::Append => {
+                self.notice_dock.append(widget);
+                self.notice_dock.set_visible(true);
+                self.relayout_after_dock_change();
+                true
+            }
         }
-        self.notice_dock.set_visible(true);
-        self.relayout_after_dock_change();
-        true
     }
 
     /// Give the surface back the rows the dock no longer needs. Hiding the
@@ -12117,15 +12140,15 @@ mod tests {
     // rendering seams, the lifecycle context they serve, and the engine state
     // it owns.
     use super::{
-        estimated_finished_block_height_for_text, feed_with_zone_marker, kitty_graphics,
-        live_output_text, push_search_surface_before_deadline, record_unified_zone,
+        dock_mount_decision, estimated_finished_block_height_for_text, feed_with_zone_marker,
+        kitty_graphics, live_output_text, push_search_surface_before_deadline, record_unified_zone,
         zone_output_snapshot_from_plain, zone_output_snapshot_from_ring,
         AgentExecutionLostCallbacks, AnchorSettleArgs, BackendRecords, BackendSearchBatch,
         BlockFinishedCallback, BlockFinishedCallbacks, BlockRenderPayloadAccessor,
-        CommandFinishedCallbacks, CommandStartedCallbacks, CompletedCommandRecord, EngineState,
-        MouseReportingMode, ReaderCtx, RecordSearchTarget, RenderBackend, SelectionFeedHold,
-        SubmissionSurface, UnifiedZoneStore, VerifiedSubmissionCtx, ZoneMarkerInjector,
-        ZoneOutputSnapshot, MAX_TOTAL_SNAPSHOT_BYTES, MAX_ZONE_SNAPSHOT_BYTES,
+        CommandFinishedCallbacks, CommandStartedCallbacks, CompletedCommandRecord, DockMount,
+        EngineState, MouseReportingMode, ReaderCtx, RecordSearchTarget, RenderBackend,
+        SelectionFeedHold, SubmissionSurface, UnifiedZoneStore, VerifiedSubmissionCtx,
+        ZoneMarkerInjector, ZoneOutputSnapshot, MAX_TOTAL_SNAPSHOT_BYTES, MAX_ZONE_SNAPSHOT_BYTES,
     };
     use crate::config::Config;
     use crate::parser::{ColorKind, KeyboardProtocolQuery, Parser, ParserEvent};
@@ -12733,6 +12756,42 @@ mod tests {
                 .map(|span| span.work_cells)
                 .sum::<usize>(),
             12
+        );
+    }
+
+    /// The dock must never reparent a widget another region still owns: GTK
+    /// would warn and the card would end up in neither place.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn dock_mount_refuses_a_widget_another_region_owns() {
+        use gtk4::prelude::*;
+
+        gtk4::init().expect("gtk init");
+        let dock = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let elsewhere = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let dock_widget: &gtk4::Widget = dock.upcast_ref();
+
+        let card = gtk4::Label::new(Some("card"));
+        let card_widget: gtk4::Widget = card.clone().upcast();
+        assert_eq!(
+            dock_mount_decision(card_widget.parent().as_ref(), dock_widget),
+            DockMount::Append,
+            "an unparented card is taken by the dock"
+        );
+
+        dock.append(&card);
+        assert_eq!(
+            dock_mount_decision(card_widget.parent().as_ref(), dock_widget),
+            DockMount::Keep,
+            "a docked card stays where it is; the dock is already beside the prompt"
+        );
+
+        dock.remove(&card);
+        elsewhere.append(&card);
+        assert_eq!(
+            dock_mount_decision(card_widget.parent().as_ref(), dock_widget),
+            DockMount::Refuse,
+            "a card the scrolling document owns is refused, not stolen"
         );
     }
 

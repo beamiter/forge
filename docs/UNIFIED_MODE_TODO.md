@@ -30,7 +30,7 @@
 - [x] inline 卡片安置（`d83c453`）：底部**占位**停靠区落地（`notice_dock`，`block_scroll` 的垂直兄弟）。`RenderBackend::docks_inline_notices()` 决定卡片进文档还是进停靠区；Unified `supports_inline_notices()` 因此转为 true，agent/correction/palette 卡片不再被拒。GUI 实测：organism 卡片挂在底部、prompt 未被遮挡、表面由 71×21 缩为 71×17——每次开关一次 SIGWINCH，不是每张卡片一次。
 - [x] organism：停靠区即其载体，Unified 下卡片正常出现（实测显示 juvenile · repo memory · no LLM）。
 - [x] sticky 运行头 / jump FAB（`d83c453`）：两者都读同一个 `user_scrolled_up`，而 Unified 下外层滚动条从不移动。改由 live VTE 自己的 adjustment 驱动该标志（留一行余量），FAB 实测在向上滚动后出现；FAB 的点击本就会把 VTE adjustment 拉到底，无需改动。
-- [ ] 停靠区的 GTK 侧无单元测试（`dock_inline_notice`/`remove_inline_notice` 需要真 `TermView`），与 `BlockBackend` finalize 链同属设计使然的盲区，保持 GUI 验证。
+- [x] 停靠区的挂载决策已钉住：抽出纯 `dock_mount_decision(parent, dock) -> DockMount{Append,Keep,Refuse}`，display-backed 测试覆盖三种父节点状态（变异验证：把 `Refuse` 改成 `Append` 会被抓）。真正需要 `TermView` 的只剩 GTK 管道（append/set_visible/relayout），与 `BlockBackend` finalize 链同属设计使然的盲区，保持 GUI 验证。
 - [ ] badge/分隔线头行归因边缘：^C 中断的 prompt 或带 ghost 建议的多行 prompt 经 idle-A 复用重绘后，相邻 zone 的 marker 首格可不落在 CWD 行，badge/分隔线随之下移 1-2 行（验收实测，非破坏、fail-visible）。修复方向：注入器在 idle 重申时把重开位置钉回 zone 首行，或 head 归因对"URI 首行是输出行"做 CWD-行回溯校验。
 - [ ] jsh 启动噪音：Block 的每-prompt 清屏顺手吞掉了它，Unified 不清屏所以会永久留在屏上。判断是否需要 shell 侧或首-prompt 侧处理。另两个验收实测的 shell 侧现象一并考虑：SIGWINCH 重绘按 rewrap 前行数向上定位，会覆盖 rewrap 后的输出尾行；prompt 处滚轮被 jsh 鼠标上报吃掉（历史导航而非滚动视口，Shift+滚轮/Ctrl+Up 可绕过）。
 - [ ] kitty 图片：当前 Unified 答 `ENOTSUP`（解析即弃）。v2 可用探针行锚定 overlay `Picture`。
