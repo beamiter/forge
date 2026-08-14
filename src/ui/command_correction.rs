@@ -326,13 +326,12 @@ fn attach_term_view(
     organism_signal: Rc<OrganismCorrectionSignal>,
     remote: bool,
 ) {
-    // A correction is only ever offered as an inline card. A Unified pane has
-    // nowhere to mount one — `insert_inline_notice` refuses there — and a
-    // proposal the user can neither see nor dismiss, whose entry would silently
-    // take the keyboard, is worse than no proposal. Skip the whole monitor: no
-    // request, no worker thread, no AI call.
+    // A correction is only ever offered as an inline card. Where none can be
+    // mounted at all, a proposal the user can neither see nor dismiss, whose
+    // entry would silently take the keyboard, is worse than no proposal: skip
+    // the whole monitor — no request, no worker thread, no AI call.
     if !view.supports_inline_notices() {
-        log::debug!("unified pane: command-correction monitor not attached (no card surface)");
+        log::debug!("pane has no card surface: command-correction monitor not attached");
         return;
     }
 

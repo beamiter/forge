@@ -2339,9 +2339,9 @@ impl UiState {
             return;
         };
         // The session card *is* the Agent UI — transcript, proposals and the
-        // input entry all live on it. A Unified pane cannot mount an inline
-        // card anywhere the user could reach it, so starting a session there
-        // would put the whole conversation off-screen. Refuse instead.
+        // input entry all live on it. A backend with nowhere to mount one at
+        // all would put the whole conversation off-screen; a docking backend
+        // answers true and receives the card below its surface.
         if !target.supports_inline_notices() {
             self.agent_toggle.set_active(false);
             self.show_ai_error(

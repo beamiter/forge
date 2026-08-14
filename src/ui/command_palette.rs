@@ -525,9 +525,9 @@ impl UiState {
             );
             return;
         };
-        // The suggestion is delivered as an inline card; a Unified pane has
-        // nowhere visible to mount one, so refuse rather than run the request
-        // and drop its answer off-screen.
+        // The suggestion is delivered as an inline card. A backend with
+        // nowhere visible to mount one refuses here rather than running the
+        // request and dropping its answer off-screen.
         if !target.supports_inline_notices() {
             self.show_ai_error(
                 "AI command suggestions are shown as an inline card in the block conversation, which unified mode has no place for. Switch this pane to Block mode and try again.",

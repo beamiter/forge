@@ -3749,6 +3749,9 @@ pub struct TermView {
     pane_header: crate::ui::PaneHeader,
     block_scroll: ScrolledWindow,
     block_list: gtk4::Box,
+    /// Space-occupying card region below the surface. Used by a backend whose
+    /// document cannot scroll to a mounted card; empty and hidden otherwise.
+    notice_dock: gtk4::Box,
     jump_fab: gtk4::Button,
     unread_count: Rc<Cell<u32>>,
     /// The single persistent live VTE (anvil model): prompt + typing + output all
@@ -4528,6 +4531,12 @@ trait RenderBackend {
     /// Whether cards can be inserted into the backend's scrollable document.
     fn supports_inline_notices(&self) -> bool {
         true
+    }
+    /// Whether cards belong in the space-occupying bottom dock instead of the
+    /// scrollable document. True for a surface that owns the whole viewport,
+    /// where a card in the document exists at a position nothing can reach.
+    fn docks_inline_notices(&self) -> bool {
+        false
     }
     /// Whether Clear/Undo may mutate the Block card document.
     fn supports_block_mutation(&self) -> bool {
@@ -7490,8 +7499,14 @@ impl RenderBackend for UnifiedBackend {
         restored
     }
 
+    /// Cards are mounted, but in the dock: this surface owns the viewport, so
+    /// a card in the scrolling document would sit where nothing can scroll.
     fn supports_inline_notices(&self) -> bool {
-        false
+        true
+    }
+
+    fn docks_inline_notices(&self) -> bool {
+        true
     }
 
     fn supports_block_mutation(&self) -> bool {
@@ -8893,6 +8908,15 @@ impl TermView {
         scroll_overlay.add_overlay(&jump_fab);
         root.append(&scroll_overlay);
 
+        // Cards dock BELOW the surface as a sibling that takes space, not as
+        // an overlay: the row an overlay would cover is the prompt the user is
+        // typing at. Occupying space costs one grid resize per toggle, which
+        // the layout closure turns into a single SIGWINCH.
+        let notice_dock = gtk4::Box::new(Orientation::Vertical, 0);
+        notice_dock.add_css_class("notice-dock");
+        notice_dock.set_visible(false);
+        root.append(&notice_dock);
+
         let unread_count: Rc<Cell<u32>> = Rc::new(Cell::new(0));
 
         // ── PTY ───────────────────────────────────────────────────────────
@@ -9682,6 +9706,43 @@ impl TermView {
                 });
         }
 
+        // ── Unified scroll-position detector ──────────────────────────────
+        // The outer scroller holds one full-viewport surface, so its
+        // adjustment never moves and the detector above never fires. Reading
+        // history here means scrolling the VTE's own adjustment, which is what
+        // must drive the same flag: the sticky running header and the jump FAB
+        // both key off it, and both were unreachable in this mode without it.
+        if unified {
+            let user_scrolled = user_scrolled_up.clone();
+            let fab = jump_fab.downgrade();
+            let unread = unread_count.clone();
+            let fullscreen = fullscreen.clone();
+            if let Some(adjustment) = active_vte.vadjustment() {
+                adjustment.connect_value_changed(move |adj| {
+                    let Some(fab) = fab.upgrade() else {
+                        return;
+                    };
+                    if fullscreen.get() {
+                        user_scrolled.set(false);
+                        unread.set(0);
+                        fab.set_visible(false);
+                        return;
+                    }
+                    // One row of slack: a partially scrolled last row still
+                    // counts as following the bottom.
+                    let at_bottom = adj.value() >= adj.upper() - adj.page_size() - 1.0;
+                    user_scrolled.set(!at_bottom);
+                    if at_bottom {
+                        unread.set(0);
+                        fab.set_visible(false);
+                    } else {
+                        set_jump_fab_label(&fab, unread.get());
+                        fab.set_visible(true);
+                    }
+                });
+            }
+        }
+
         // ── Recompute the live grid on viewport resize ────────────────────
         // `changed` fires during the viewport's size-allocate, after layout. We
         // re-clamp the input height here ONLY when the viewport itself resized
@@ -10354,6 +10415,7 @@ impl TermView {
             pane_header,
             block_scroll,
             block_list,
+            notice_dock,
             jump_fab: jump_fab.clone(),
             unread_count: unread_count.clone(),
             active_vte,
@@ -10820,14 +10882,20 @@ impl TermView {
     /// Calling this again for a widget already in the block list re-pins it
     /// directly above the prompt (used after a finished block lands below it).
     ///
-    /// Returns whether the card is mounted. `false` — always, in Unified mode,
-    /// where the live surface owns the whole viewport and a card above it
-    /// cannot be scrolled to — means nothing was inserted, and the caller must
-    /// fall back rather than assume an invisible card is on screen (ask
-    /// `supports_inline_notices` first if the fallback has to happen before the
-    /// card is built). Re-pin call sites may ignore the result: a card that was
-    /// never inserted has nothing to re-pin.
+    /// A backend whose document cannot scroll to a mounted card gets the
+    /// bottom dock instead: a sibling of the surface that takes space, so the
+    /// card is on screen without covering the prompt row the user is typing
+    /// at. The surface loses those rows and the child sees one resize.
+    ///
+    /// Returns whether the card is mounted. `false` means nothing was
+    /// inserted and the caller must fall back rather than assume an invisible
+    /// card is on screen (ask `supports_inline_notices` first if the fallback
+    /// has to happen before the card is built). Re-pin call sites may ignore
+    /// the result: a card that was never inserted has nothing to re-pin.
     pub fn insert_inline_notice(&self, widget: &gtk4::Widget) -> bool {
+        if self.render_backend.docks_inline_notices() {
+            return self.dock_inline_notice(widget);
+        }
         if !self.supports_inline_notices() {
             log::debug!(
                 "unified mode: refusing to mount an inline notice card (nothing can scroll to it)"
@@ -10852,9 +10920,52 @@ impl TermView {
         true
     }
 
+    /// Mount a card in the bottom dock, newest last, and give the surface its
+    /// new height. Re-mounting a card already docked leaves it where it is:
+    /// re-pinning exists to keep a card next to the prompt in a scrolling
+    /// document, and the dock is always next to the prompt.
+    fn dock_inline_notice(&self, widget: &gtk4::Widget) -> bool {
+        let already_docked = widget
+            .parent()
+            .is_some_and(|parent| parent == *self.notice_dock.upcast_ref::<gtk4::Widget>());
+        if !already_docked {
+            if widget.parent().is_some() {
+                // A card built for the scrolling document must not be parented
+                // twice; GTK would warn and leave it in neither place.
+                return false;
+            }
+            self.notice_dock.append(widget);
+        }
+        self.notice_dock.set_visible(true);
+        self.relayout_after_dock_change();
+        true
+    }
+
+    /// Give the surface back the rows the dock no longer needs. Hiding the
+    /// empty dock is what returns them: an empty visible box still asks for
+    /// padding, and the child would keep the smaller grid.
+    fn relayout_after_dock_change(&self) {
+        if self.notice_dock.first_child().is_none() {
+            self.notice_dock.set_visible(false);
+        }
+        self.notice_dock.queue_allocate();
+        // The grid follows the viewport the dock just resized. One pass here
+        // is one SIGWINCH for the child, not one per card.
+        self.render_backend.layout_active_surface();
+        self.render_backend.sync_geometry_to_pty();
+    }
+
     /// Remove a card previously added by `insert_inline_notice`. Safe to call
-    /// twice: removal is skipped when the widget is no longer in the block list.
+    /// twice: removal is skipped when the widget is in neither region.
     pub fn remove_inline_notice(&self, widget: &gtk4::Widget) {
+        if widget
+            .parent()
+            .is_some_and(|parent| parent == *self.notice_dock.upcast_ref::<gtk4::Widget>())
+        {
+            self.notice_dock.remove(widget);
+            self.relayout_after_dock_change();
+            return;
+        }
         if widget
             .parent()
             .is_some_and(|parent| parent == *self.block_list.upcast_ref::<gtk4::Widget>())
