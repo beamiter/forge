@@ -50,7 +50,7 @@
 
 - [x] forge：finalize 路径的 config 借用已收窄；widget 构造/高度估算/通知只接 owned snapshot 或提前复制的 scalar。
 - [x] forge：`ui/config_apply.rs` 已在 per-view 循环前 clone config，不再跨 view 的 `borrow_mut` 持有 UiState config `Ref`。
-- [ ] 两仓：菜单方法内冗余的 `*_for_menu` 再克隆层（为等价性证明故意保留），可在等价窗口关闭后删除。
+- [x] forge：菜单方法内冗余的 `*_for_menu` 再克隆层已折叠——每个 `self.X` 曾被克隆两次（先进等价性证明用的中间局部，再进闭包），22 对合并为一次。anvil **本就没有**这一层（其提取保留 ctx 字段于原位，直接从 `self` 克隆），所以此项只涉及 forge。
 - [ ] forge：`BlockBackend` 自身的 finalize 链与 `command_capture_anchor` 的 rebase 行需要真 VTE，测试套件够不到（设计使然），保持 GUI 验证。
 
 ## 方法论备忘（血泪换来的）

@@ -2727,59 +2727,37 @@ impl BlockBackend {
         block_id: u64,
         long_output: bool,
     ) {
-        // Owned handles for the menu closures, cloned from the backend per
-        // finished block. Local names mirror the former `FinishedBlockMenuCtx`
-        // fields so the body below stays verbatim.
-        let finished_blocks_for_cb = self.finished_blocks_for_cb.clone();
-        let block_list_rc = self.block_list_rc.clone();
-        let active_vte = self.active_vte.clone();
-        let pty_for_init = self.pty_for_init.clone();
-        let pty_synced_rc = self.pty_synced_rc.clone();
-        let active_rc = self.active_rc.clone();
-        let bstate_rc = self.bstate_rc.clone();
-        let bracketed_paste_rc = self.bracketed_paste_rc.clone();
-        let typed_cmd_rc = self.typed_cmd_rc.clone();
-        let typed_cmd_fidelity_rc = self.typed_cmd_fidelity_rc.clone();
-        let submission_pending_rc = self.submission_pending_rc.clone();
-        let pending_typeahead_rc = self.pending_typeahead_rc.clone();
-        let selected_block_ids_rc = self.selected_block_ids_rc.clone();
-        let selected_block_id_rc = self.selected_block_id_rc.clone();
-        let selection_anchor_id_rc = self.selection_anchor_id_rc.clone();
-        let bookmarks_for_cb = self.bookmarks_for_cb.clone();
-        let visible_indices_rc = self.visible_indices_rc.clone();
-        let failure_marker_redraw = self.failure_marker_redraw.clone();
-        let find_state_for_cb = self.find_state_for_cb.clone();
-        let ask_ai_cbs = self.ask_ai_cbs.clone();
-        let block_data_for_cb = self.block_data_for_cb.clone();
-        let block_scroll_rc = self.block_scroll_rc.clone();
-        let finished_blocks_for_menu = Rc::downgrade(&finished_blocks_for_cb);
-        let block_list_for_menu = block_list_rc.downgrade();
-        let vte_for_copy = active_vte.downgrade();
-        let pty_for_rerun_menu = pty_for_init.clone();
-        let pty_synced_for_rerun_menu = pty_synced_rc.clone();
-        let active_for_rerun_menu = Rc::downgrade(&active_rc);
-        let bstate_for_rerun_menu = bstate_rc.clone();
-        let bracketed_paste_for_menu = bracketed_paste_rc.clone();
-        let typed_cmd_for_rerun_menu = typed_cmd_rc.clone();
-        let typed_cmd_fidelity_for_rerun_menu = typed_cmd_fidelity_rc.clone();
-        let submission_pending_for_rerun_menu = submission_pending_rc.clone();
-        let pending_typeahead_for_rerun_menu = pending_typeahead_rc.clone();
-        let selected_ids_for_menu = selected_block_ids_rc.clone();
-        let selected_for_menu = selected_block_id_rc.clone();
-        let anchor_for_menu = selection_anchor_id_rc.clone();
-        let bookmarks_for_menu = bookmarks_for_cb.clone();
-        let visible_for_menu = visible_indices_rc.clone();
-        let failure_marker_redraw_for_menu = failure_marker_redraw.clone();
-        let find_state_for_menu = find_state_for_cb.clone();
-        let ask_ai_cbs_for_menu = ask_ai_cbs.clone();
+        // Handles for the menu closures, taken from the backend once per
+        // finished block. Weak wherever the closure outliving the widget is
+        // the expected case.
+        let finished_blocks_for_menu = Rc::downgrade(&self.finished_blocks_for_cb);
+        let block_list_for_menu = self.block_list_rc.downgrade();
+        let vte_for_copy = self.active_vte.downgrade();
+        let pty_for_rerun_menu = self.pty_for_init.clone();
+        let pty_synced_for_rerun_menu = self.pty_synced_rc.clone();
+        let active_for_rerun_menu = Rc::downgrade(&self.active_rc);
+        let bstate_for_rerun_menu = self.bstate_rc.clone();
+        let bracketed_paste_for_menu = self.bracketed_paste_rc.clone();
+        let typed_cmd_for_rerun_menu = self.typed_cmd_rc.clone();
+        let typed_cmd_fidelity_for_rerun_menu = self.typed_cmd_fidelity_rc.clone();
+        let submission_pending_for_rerun_menu = self.submission_pending_rc.clone();
+        let pending_typeahead_for_rerun_menu = self.pending_typeahead_rc.clone();
+        let selected_ids_for_menu = self.selected_block_ids_rc.clone();
+        let selected_for_menu = self.selected_block_id_rc.clone();
+        let anchor_for_menu = self.selection_anchor_id_rc.clone();
+        let bookmarks_for_menu = self.bookmarks_for_cb.clone();
+        let visible_for_menu = self.visible_indices_rc.clone();
+        let failure_marker_redraw_for_menu = self.failure_marker_redraw.clone();
+        let find_state_for_menu = self.find_state_for_cb.clone();
+        let ask_ai_cbs_for_menu = self.ask_ai_cbs.clone();
 
         let right_click = gtk4::GestureClick::new();
         right_click.set_button(3);
 
         let finished_widget_for_menu = finished_widget.downgrade();
         let long_output_for_menu = long_output;
-        let block_data_for_export = block_data_for_cb.clone();
-        let block_scroll_for_menu = block_scroll_rc.downgrade();
+        let block_data_for_export = self.block_data_for_cb.clone();
+        let block_scroll_for_menu = self.block_scroll_rc.downgrade();
         right_click.connect_pressed(move |gesture, _n_press, x, y| {
             let Some(finished_blocks) = finished_blocks_for_menu.upgrade() else {
                 return;
