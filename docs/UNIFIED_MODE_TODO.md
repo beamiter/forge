@@ -27,10 +27,11 @@
 - [x] Unified `Ctrl+F`：按 native cursor 顺序优先扫描 viewport→tail，再 wrap 到旧历史；共享 4 MiB/时间预算。可信 ring bounds 暂失时由 VTE native cursor 返回真实的 `1+` limited result，屏上命中不会被很长的旧历史饿死。
 - [x] per-zone output 搜索与精确跳转：`BackendRecordRef::output()` 现返回快照文本，`matching_record_ids`/`cross_block_search` 随之点亮。`record_search_target()` 仍**故意** fail closed（共享 VTE 无法为单条记录限定高亮范围），跳转改走新的 `scroll_to_record`/`can_scroll_to_record` 接缝；跨块面板据此启用行激活，并按 `Navigated`/`SnapshotView`/`LocationUnavailable` 分派。
 - [ ] 会话恢复的快照回放：快照已具备，但重启回放尚未接线（见下条）。
-- [ ] 会话恢复：当前跳过 Block 历史存取（`persists_block_history() == false` 两处早退）。设计方案是有界快照回放（最近 ~64 zone / 4 MiB 经注入器重新 feed），避免重启后空屏；per-zone 快照已就位，缺的是持久化与回放本身。
-- [ ] inline 卡片安置：当前在 Unified 下诚实拒绝（agent/correction/palette 卡片）。设计方案是底部**占位**停靠区（VTE 的垂直兄弟节点，开关各触发一次 SIGWINCH），不是覆盖层——覆盖会精确遮住用户正在盯的 prompt 行。
-- [ ] organism：`ascii_organism_enabled` + `OrganismMotion::Static` 组合下 Unified 无任何 organism 表面（卡片是它在该组合下的唯一载体）。需要在停靠区设计里给它位置。
-- [ ] sticky 运行头 / jump FAB：Unified 下已不可达（1a 发现它此前只是借了卡片撑开的外层滚动条，属意外而非特性）。需要在覆盖层设计里重新接线。
+- [x] 会话恢复（`5d15898`）：zone 文档持久化到 Block 历史文件的兄弟路径（stem 加 `-zones`，同样按 session 分文件），上限 64 zone / 4 MiB；预算不够时**先丢输出再丢记录**，所以重启至少留下命令与结果。恢复在 `start_history_load` 同步执行——必须早于 shell 首个 prompt，否则恢复的行会落在它本该领先的输出下面。回放是纯显示：字节直接进 VTE 不过 parser，故恢复的 zone 不会被记成本次会话执行过的命令；marker 用**新分配的 id**（持久化里根本不存 id），保住注入器的单调重放防御；每个持久化字段先剥离控制字节——历史文件是数据不是程序。
+- [x] inline 卡片安置（`d83c453`）：底部**占位**停靠区落地（`notice_dock`，`block_scroll` 的垂直兄弟）。`RenderBackend::docks_inline_notices()` 决定卡片进文档还是进停靠区；Unified `supports_inline_notices()` 因此转为 true，agent/correction/palette 卡片不再被拒。GUI 实测：organism 卡片挂在底部、prompt 未被遮挡、表面由 71×21 缩为 71×17——每次开关一次 SIGWINCH，不是每张卡片一次。
+- [x] organism：停靠区即其载体，Unified 下卡片正常出现（实测显示 juvenile · repo memory · no LLM）。
+- [x] sticky 运行头 / jump FAB（`d83c453`）：两者都读同一个 `user_scrolled_up`，而 Unified 下外层滚动条从不移动。改由 live VTE 自己的 adjustment 驱动该标志（留一行余量），FAB 实测在向上滚动后出现；FAB 的点击本就会把 VTE adjustment 拉到底，无需改动。
+- [ ] 停靠区的 GTK 侧无单元测试（`dock_inline_notice`/`remove_inline_notice` 需要真 `TermView`），与 `BlockBackend` finalize 链同属设计使然的盲区，保持 GUI 验证。
 - [ ] badge/分隔线头行归因边缘：^C 中断的 prompt 或带 ghost 建议的多行 prompt 经 idle-A 复用重绘后，相邻 zone 的 marker 首格可不落在 CWD 行，badge/分隔线随之下移 1-2 行（验收实测，非破坏、fail-visible）。修复方向：注入器在 idle 重申时把重开位置钉回 zone 首行，或 head 归因对"URI 首行是输出行"做 CWD-行回溯校验。
 - [ ] jsh 启动噪音：Block 的每-prompt 清屏顺手吞掉了它，Unified 不清屏所以会永久留在屏上。判断是否需要 shell 侧或首-prompt 侧处理。另两个验收实测的 shell 侧现象一并考虑：SIGWINCH 重绘按 rewrap 前行数向上定位，会覆盖 rewrap 后的输出尾行；prompt 处滚轮被 jsh 鼠标上报吃掉（历史导航而非滚动视口，Shift+滚轮/Ctrl+Up 可绕过）。
 - [ ] kitty 图片：当前 Unified 答 `ENOTSUP`（解析即弃）。v2 可用探针行锚定 overlay `Picture`。
