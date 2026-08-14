@@ -534,11 +534,16 @@ fn wrap_exec_in_login_bash(command: &str) -> String {
 }
 
 fn wrap_jsh_argv_in_interactive_bash(jsh_path: &str) -> Option<Vec<String>> {
-    let bash_path = crate::host::find_executable_in_path("bash")?;
+    let bash_path = crate::host::interactive_bash_path()?;
     Some(vec![
         bash_path.to_string_lossy().to_string(),
         "-ic".to_string(),
-        crate::process::build_jsh_exec_command(jsh_path, None),
+        // `bash -c CMD a b` assigns `a` to `$0` and `b` onward to `$@`. The
+        // shell path therefore travels as `$0`, and a `--session <id>` the
+        // caller appends reaches the shell through `$@` instead of being
+        // consumed as the wrapper's own operands.
+        "exec \"$0\" \"$@\"".to_string(),
+        jsh_path.to_string(),
     ])
 }
 
@@ -2973,8 +2978,10 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
         return vec![jsh_path.to_string_lossy().to_string()];
     }
 
-    // Fallback: bash
-    if let Some(bash_path) = crate::host::find_executable_in_path("bash") {
+    // Fallback: bash. This one *is* the pane's shell rather than a wrapper
+    // that execs itself away, so resolving it off the inherited PATH would
+    // leave the user in a bash their rc was not written for.
+    if let Some(bash_path) = crate::host::interactive_bash_path() {
         return vec![bash_path.to_string_lossy().to_string(), "-l".to_string()];
     }
 
@@ -3131,8 +3138,36 @@ mod tests {
     fn local_jsh_is_wrapped_in_interactive_bash() {
         let argv = wrap_jsh_argv_in_interactive_bash("/home/tester/.cargo/bin/jsh")
             .expect("bash should be available on the test runner");
+        // The wrapper sources the user's rc, so it must be the system's
+        // interactive bash whenever one exists — never whichever bash the
+        // inherited PATH names first.
+        if crate::host::is_executable_file(Path::new("/usr/bin/bash")) {
+            assert_eq!(argv[0], "/usr/bin/bash");
+        }
         assert_eq!(argv[1], "-ic");
-        assert_eq!(argv[2], "exec '/home/tester/.cargo/bin/jsh'");
+        // The shell travels as `$0` and appended operands as `$@`, so a
+        // `--session <id>` the spawn path adds reaches the shell.
+        assert_eq!(argv[2], "exec \"$0\" \"$@\"");
+        assert_eq!(argv[3], "/home/tester/.cargo/bin/jsh");
+    }
+
+    /// A session id appended by the spawn path must land on the shell's own
+    /// argv, not be eaten as the wrapper's `$0`/`$1`.
+    #[test]
+    fn a_session_id_appended_after_the_wrapper_reaches_the_shell() {
+        let mut argv = wrap_jsh_argv_in_interactive_bash("/home/tester/.cargo/bin/jsh")
+            .expect("bash should be available on the test runner");
+        argv.push("--session".to_string());
+        argv.push("home-main".to_string());
+        assert_eq!(
+            &argv[2..],
+            &[
+                "exec \"$0\" \"$@\"".to_string(),
+                "/home/tester/.cargo/bin/jsh".to_string(),
+                "--session".to_string(),
+                "home-main".to_string(),
+            ]
+        );
     }
 
     #[test]

@@ -249,6 +249,26 @@ pub fn bridge_available() -> bool {
         || find_executable_in_path("flatpak-spawn").is_some()
 }
 
+/// The interactive-bash wrapper runs the *user's* rc, so it needs the system's
+/// interactive bash — not whichever bash the PATH we inherited happens to name
+/// first. A `nix develop`/`nix-shell` puts stdenv's bash ahead of the system
+/// one, and that build has no programmable completion: no `complete` builtin,
+/// and `progcomp`/`hostcomplete` are not shopt names. A stock `~/.bashrc`
+/// sources `/usr/share/bash-completion/bash_completion`, so every one of its
+/// directives fails and ~65 error lines land on the pane before the shell's
+/// first prompt — where a continuous surface never clears them away.
+pub fn interactive_bash_path() -> Option<PathBuf> {
+    [
+        "/usr/bin/bash",
+        "/bin/bash",
+        "/run/current-system/sw/bin/bash",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|candidate| is_executable_file(candidate))
+    .or_else(|| find_executable_in_path("bash"))
+}
+
 /// Resolve the sandbox-side bridge without ever consulting an empty or
 /// relative PATH entry. The absolute fallback deliberately fails closed when
 /// Flatpak support is unavailable instead of executing a project-local file
