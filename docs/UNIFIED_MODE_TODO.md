@@ -18,15 +18,16 @@
 - [x] **探针驱动的 chrome（功能核心）**。严格校验 canonical URI + nonce + active authority；逐可见行一次探针，可信 predecessor span 可从长 zone 中段续画；gutter/分隔线/completed badge 与宽字符安全的空白检测已落地。真实 VTE 证明 `check_hyperlink_at` 接受 widget 坐标，因此探针使用 content origin + cell center，不能预先减 CSS padding。行坐标只由可见 canonical marker 校准，无法证明时 fail closed。
 - [x] **chrome 性能/resize 验收**。`FORGE_UNIFIED_CHROME_STATS` 门控的 draw 计时（Drop guard 覆盖所有 early-return 出口）实测：70 zone、21 可见行、Xvfb 软渲染下滚动 p95 = 328-377µs/draw（p50 243-315µs，max<600µs），约为 60fps 帧预算 2%；探针 O(可见行) 线性，更高窗口无风险。列宽变化（侧栏切换往返）无错位残留：jsh 收到 SIGWINCH 重绘 prompt 即触发 idle-A 复用，chrome 立即重新标定，无需等下一条命令。VTE 0.58+ 的 `rewrap-on-resize` 已废弃恒为 TRUE。发现两个非 chrome 缺陷的边缘：见下。
 - [x] **marker authority 上限与安全淘汰**。pending 也计入硬上限 256，并同时服从更小的 `max_visible_blocks`；ED3 仅退休已证明完整位于 live grid 上方的 completed span，RIS 全清 authority，natural trim/rewrap/config resize 经 row epoch + quarantine 硬门失效。旧 URI、空白探针或晚到 completion 均不能复活已淘汰 authority。
-- [ ] **超限 zone 的快照寻址**。metadata 记录仍可供 palette/export/filter 使用，但 marker authority 退役后精确跳转目前 fail closed；尚未保存 bounded per-zone 输出快照。
+- [x] **超限 zone 的快照寻址**。finalize 从引擎自有的 raw ring 取有界纯文本尾（每 zone 64 KiB、全局 4 MiB，按 id 存于 `UnifiedZoneStore`）。快照是可选卫星：淘汰只减字节不动记录，快照没了就重新诚实报告「无输出」。`truncated` 覆盖全部四个丢字节来源——尾部截断、finalize 前 ring 已回绕、ANSI 重放触到自身 grid 预算而中止、strip 后再钳位。尾部切割会跨过骑在切点上的转义序列但**绝不越过缓冲区末尾**，否则退回原始切割，避免一个终止于最后一字节的 OSC 把整份快照吞掉。导航因此多出一级：chrome 证明得了行就精确跳转，否则只读呈现快照，两级跨块面板都能到达。
 
 ## P2 · Unified 的已知缺口（1b 期间逐项关闭）
 
 - [x] metadata 会话导出：JSON/Markdown 已基于 `records()` 导出 command/status/time/duration/cwd/background，并用 `output_available: false` 明确表示 Unified 没有伪造的空输出。
-- [ ] 带输出的会话导出：仍依赖 bounded per-zone 快照。
+- [x] 带输出的会话导出：JSON 增 `output`/`output_truncated`，`output_available` 改为快照存在性；Markdown 用围栏输出并在截断时注明。无快照的记录**根本不写 `output` 键**（诚实缺席，而非空串）。
 - [x] Unified `Ctrl+F`：按 native cursor 顺序优先扫描 viewport→tail，再 wrap 到旧历史；共享 4 MiB/时间预算。可信 ring bounds 暂失时由 VTE native cursor 返回真实的 `1+` limited result，屏上命中不会被很长的旧历史饿死。
-- [ ] per-zone output 搜索与精确跳转：metadata filter 可返回稳定 record id，但 `record_search_target()` 在 Unified 仍 fail closed 为 location unavailable。
-- [ ] 会话恢复：当前跳过 Block 历史存取。设计方案是有界快照回放（最近 ~64 zone / 4 MiB 经注入器重新 feed），避免重启后空屏。
+- [x] per-zone output 搜索与精确跳转：`BackendRecordRef::output()` 现返回快照文本，`matching_record_ids`/`cross_block_search` 随之点亮。`record_search_target()` 仍**故意** fail closed（共享 VTE 无法为单条记录限定高亮范围），跳转改走新的 `scroll_to_record`/`can_scroll_to_record` 接缝；跨块面板据此启用行激活，并按 `Navigated`/`SnapshotView`/`LocationUnavailable` 分派。
+- [ ] 会话恢复的快照回放：快照已具备，但重启回放尚未接线（见下条）。
+- [ ] 会话恢复：当前跳过 Block 历史存取（`persists_block_history() == false` 两处早退）。设计方案是有界快照回放（最近 ~64 zone / 4 MiB 经注入器重新 feed），避免重启后空屏；per-zone 快照已就位，缺的是持久化与回放本身。
 - [ ] inline 卡片安置：当前在 Unified 下诚实拒绝（agent/correction/palette 卡片）。设计方案是底部**占位**停靠区（VTE 的垂直兄弟节点，开关各触发一次 SIGWINCH），不是覆盖层——覆盖会精确遮住用户正在盯的 prompt 行。
 - [ ] organism：`ascii_organism_enabled` + `OrganismMotion::Static` 组合下 Unified 无任何 organism 表面（卡片是它在该组合下的唯一载体）。需要在停靠区设计里给它位置。
 - [ ] sticky 运行头 / jump FAB：Unified 下已不可达（1a 发现它此前只是借了卡片撑开的外层滚动条，属意外而非特性）。需要在覆盖层设计里重新接线。
@@ -55,3 +56,7 @@
 - 新测试套件在信任前先做变异测试。第一版 dispatch 线束 1237 全绿却抓不住任何注入缺陷。
 - 测试不得依赖开发者环境：旧线束通过是因为本机 `config.toml` 恰好把 cursor 设成了断言期待的颜色。
 - 大改动前先做「只跑通、不出功能」的骨架增量：1a 花的代价换回六个纸面设计想不到的缺陷，其中一个会让 Block 用户的远程会话丢历史。
+- **测试不得自证**：`zone_marker_bytes_never_enter_the_snapshot_capture` 初版自己往 ring 里塞无标记数据再断言 ring 无标记——生产接线怎么改它都绿。改为驱动 `ReaderHarness` 跑完整命令周期后，「删掉引擎 raw-output 捕获」这个变异才被杀死。判据：**这个测试能被哪个生产改动杀死？** 答不上来就是装饰。
+- **契约字段要枚举全部信息丢失源**。`truncated` 初版只算尾部切割，漏了三处：ring 回绕、`strip_ansi` 触到自身 grid 预算而 `break` 掉剩余全部字节（重放不是过滤）、以及 strip 后的钳位。写下「任何未存活的字节都要报告」这种契约时，先把能丢字节的路径列全再实现。
+- **默认路径可能不是你以为的那条**。jsh 下 journal 提交在 `finalize_block` **之前**物化 payload，所以 Unified 每条前台命令走的都是「已物化」分支——挂在 ring 分支上的 `dropped_front` 管线在生产中整个是死的，而小样本 GUI 测试恰好看不出来（小输出本来就该报 false）。
+- 小样本 GUI 验证能证明「通路存在」，证不了「边界正确」。本轮 GUI 全绿的同时，对抗性审查在同一份代码里找出三条静默丢数据的路径。两者都要。
