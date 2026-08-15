@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-15 (AI module round)
+Updated: 2026-08-15 (parser unification round)
 
 This working tree contains the nine-round "Evolve ASCII organism" series
 (`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
@@ -91,6 +91,41 @@ saturation hole in a validate invariant); do not skip it.
   and fixed a correction-worker hang on supervised probe-failure paths, two
   helper-construction tests that no longer exercised the function under test,
   a dead `JSH_LOOKUP_PATH` export, and a stale vendored-script leftover.
+
+- **Agent hardening adoption round (2026-08-15/16)**: `src/agent.rs` is a
+  pure re-export of `jterm_core::agent`; the panel's hand-rolled claim
+  machinery (~860 lines of raw `openat`/`renameat2` audit code) is replaced
+  by `try_claim_session_file` under a new `PrivateParentLock` in
+  `config_store.rs`, and snapshot writes take the same lock. Behavior
+  changes: `AwaitingObservation` checkpoints restore as `Ready` with an
+  explicit unknown-result note instead of being silently discarded; invalid
+  evidence quarantines under core's `.claimed-*` name; live model replies
+  auto-reject unsafe proposals inside the session. Adversarial review then
+  drove a core hardening round (pin `cf0dd2c`): the dropped forge audit
+  rules (pending-must-be-final-turn, approved-requires-observation,
+  turn-counter arithmetic, final-turn/state matching) are now enforced by
+  core's pre-restore validation for both apps, and claimed snapshots are
+  read with `read_bounded_private` (a group-readable snapshot quarantines as
+  tampering). Accepted trade-off, reviewed and kept: snapshot load/save now
+  serialize with config saves through the shared directory flock, so a
+  contended `persist()` at window close can stall the GTK thread up to the
+  2s lock timeout and then skip the write with a `log::warn!` (the old
+  lock-free write could race a claim instead). Forge's own
+  `task_epoch`/proposal-id plumbing already covers stale-callback rejection,
+  so core's `AgentSessionEpoch` remains additive and unadopted.
+
+- **Parser unification round (2026-08-15)**: repinned to `73c1411` and
+  deleted `src/parser.rs` — core upstreamed the parser verbatim (only
+  `crate::` → `jterm_core::` path prefixes and rustfmt line wraps differ),
+  including `ParserEvent::AgentIntegrationReady`/`EraseScrollback`/
+  `HardReset`, strict ST-only APC/DCS/PM/SOS termination with
+  abort-and-reprocess, SOS/RIS handling, and `is_erase_scrollback`.
+  `src/lib.rs` keeps a `pub mod parser { pub use jterm_core::parser::*; }`
+  re-export (the `exit_status`/`redact` pattern), so every `crate::parser::…`
+  and `forge::parser::…` path — `block_view/mod.rs`,
+  `tests/regression_parser.rs` — compiles unchanged, and the exhaustive
+  `ParserEvent` match in `block_view/mod.rs` already covered the three new
+  events. Zero behavior change; all release checks pass.
 
 Nine organism evolution rounds, in order:
 
@@ -315,7 +350,7 @@ stimulus; big celebrations and speech belong to the human's own commands.
 ### Helper-runner consolidation: done
 
 Both apps now pin `jterm_core`
-`04f63283090591d9ad88500224e848dbb69b1f61`. The app-owned helper
+`cf0dd2c9cd369c1d8113eadde0ec6254d3fb81b1`. The app-owned helper
 runners are migrated. `src/host.rs` is now a thin shim
 over `jterm_core::host` (`pub use` + `APP_ID` + `interactive_bash_path`) whose
 only local code is `pub(crate) helper_command`, kept for the two callers
@@ -359,15 +394,19 @@ doctor and correction probes.
 
 ### Follow-up migrations (next rounds)
 
-- Forge-ahead local modules to upstream into core rather than delete:
-  `parser` (OSC 7771, erase-scrollback/hard-reset barriers, strict ST
-  termination). Done at pin `592d663`: `review_input` (safe-display helpers,
+- Forge-ahead local modules to upstream into core rather than delete: none
+  left — `parser` (OSC 7771, erase-scrollback/hard-reset barriers, strict ST
+  termination) was upstreamed and the local copy deleted at pin `73c1411`.
+  Done earlier at pin `592d663`: `review_input` (safe-display helpers,
   wider spoof set), `pty_input` (`AdmittedInput`), and `execution_journal`
   (`output_capture_enabled`) were upstreamed and the local copies deleted.
-- Core-ahead modules not yet adopted: the hardened `jterm_core::agent`
-  session wrapper. (`child_env`'s inherited-environment freeze is adopted:
-  `app::run` captures first, `pty.rs` uses `envp_from_captured`, and the VTE
-  spawn pairs `vte_envv_from_captured` with `VTE_SPAWN_NO_PARENT_ENVV`.)
+- Core-ahead modules: none left — the hardened `jterm_core::agent` session
+  wrapper is adopted (pin `cf0dd2c`; only core's additive
+  `AgentSessionEpoch` remains unused, forge's own `task_epoch` plumbing
+  covers the same ground), and `child_env`'s inherited-environment freeze is
+  wired (`app::run` captures first, `pty.rs` uses `envp_from_captured`, and
+  the VTE spawn pairs `vte_envv_from_captured` with
+  `VTE_SPAWN_NO_PARENT_ENVV`).
 - `src/pty.rs:1579` and `src/state.rs:1953` spawn `sh` directly, outside the
   helper-runner contract; `src/notebook.rs` long-lived terminal children keep
   their own wait logic by design (`SupervisedChild` scopes itself to

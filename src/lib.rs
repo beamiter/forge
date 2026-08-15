@@ -7,7 +7,11 @@ pub mod cli;
 pub mod config;
 pub mod config_store;
 pub mod git_meta;
-pub mod parser;
+/// The OSC/CSI stream parser lives in [`jterm_core::parser`], shared with the
+/// other terminals; re-exported here so `crate::parser::…` paths keep working.
+pub mod parser {
+    pub use jterm_core::parser::*;
+}
 pub mod exit_status {
     pub use jterm_core::exit_status::*;
 }
