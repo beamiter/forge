@@ -151,7 +151,7 @@ pub(crate) fn gather(
         let text = query.text.trim();
         let too_large = text.len() > MAX_AI_QUERY_BYTES;
         let display_text = bounded_label(
-            &crate::review_input::safe_inline_display(text, 16 * 1024),
+            &jterm_core::review_input::safe_inline_display(text, 16 * 1024),
             MAX_AI_QUERY_LABEL_CHARS,
         );
         entries.push(Entry {
@@ -184,7 +184,7 @@ pub(crate) fn gather(
     if matches!(query.mode, PaletteMode::All | PaletteMode::History) {
         let count = history.len();
         for (index, item) in history.iter().enumerate() {
-            if crate::review_input::validate(&item.command).is_err() {
+            if jterm_core::review_input::validate(&item.command).is_err() {
                 continue;
             }
             let cwd = item
@@ -193,7 +193,7 @@ pub(crate) fn gather(
                 .filter(|cwd| {
                     cwd.len() <= 16 * 1024
                         && !cwd.chars().any(char::is_control)
-                        && !crate::review_input::contains_visual_spoof(cwd)
+                        && !jterm_core::review_input::contains_visual_spoofing(cwd)
                 })
                 .map(|cwd| bounded_label(cwd, 256))
                 .unwrap_or_default();

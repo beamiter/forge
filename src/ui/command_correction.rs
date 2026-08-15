@@ -1587,7 +1587,7 @@ fn validate_candidate(command: &str, original_command: &str) -> Result<String, S
             "the candidate exceeds the {MAX_COMMAND_BYTES}-byte limit"
         ));
     }
-    crate::review_input::validate(command).map_err(|error| error.to_string())?;
+    jterm_core::review_input::validate(command).map_err(|error| error.to_string())?;
     if !original_command.trim().is_empty() && command == original_command.trim() {
         return Err("the candidate is the original command unchanged".into());
     }

@@ -903,7 +903,7 @@ fn validate_agent_snapshot(
                 if command.is_empty()
                     || command.len() > MAX_RESTORED_COMMAND_BYTES
                     || command.chars().any(char::is_control)
-                    || crate::review_input::contains_visual_spoof(command)
+                    || jterm_core::review_input::contains_visual_spoofing(command)
                 {
                     return Err(crate::agent::AgentSnapshotError::Invalid(
                         "proposal command is invalid",
@@ -1126,7 +1126,7 @@ impl AgentRuntime {
 
     fn set_status(&self, message: &str, active: bool) {
         self.status
-            .set_text(&crate::review_input::safe_inline_display(
+            .set_text(&jterm_core::review_input::safe_inline_display(
                 message,
                 MAX_AGENT_STATUS_DISPLAY_BYTES,
             ));
@@ -1474,7 +1474,7 @@ impl AgentRuntime {
                             id,
                             command,
                             danger,
-                        }) => match crate::review_input::validate(&command) {
+                        }) => match jterm_core::review_input::validate(&command) {
                             Ok(_) => Self::render_proposal(&runtime, id, command, danger),
                             Err(error) => {
                                 // Keep the app boundary fail-closed even though
@@ -1613,7 +1613,7 @@ impl AgentRuntime {
             log::debug!("ignored stale Agent proposal callback");
             return;
         }
-        let command = match crate::review_input::validate(&entry.text()) {
+        let command = match jterm_core::review_input::validate(&entry.text()) {
             Ok(command) => command.to_string(),
             Err(error) => {
                 set_review_feedback(feedback, &format!("Cannot insert: {error}"), true);
@@ -1678,7 +1678,7 @@ impl AgentRuntime {
             log::debug!("ignored stale Agent proposal callback");
             return;
         }
-        let command = match crate::review_input::validate(&command) {
+        let command = match jterm_core::review_input::validate(&command) {
             Ok(command) => command.to_string(),
             Err(error) => {
                 runtime.set_status(&format!("Cannot approve: {error}"), false);
@@ -1915,7 +1915,7 @@ fn build_agent_message_block(speaker: &str, body: &str, compact: bool) -> gtk4::
     outer.add_css_class("block-agent");
     let accessible_name = format!(
         "Shell Agent activity: {}",
-        crate::review_input::safe_inline_display(speaker, 256)
+        jterm_core::review_input::safe_inline_display(speaker, 256)
     );
     outer.update_property(&[gtk4::accessible::Property::Label(&accessible_name)]);
     outer.set_hexpand(true);
@@ -1960,7 +1960,7 @@ fn build_agent_message_block(speaker: &str, body: &str, compact: bool) -> gtk4::
     title.add_css_class("assistant-card-title");
     title.set_xalign(0.0);
     header.append(&title);
-    let speaker = crate::review_input::safe_inline_display(speaker, 256);
+    let speaker = jterm_core::review_input::safe_inline_display(speaker, 256);
     let speaker_chip = Label::new(Some(&speaker));
     speaker_chip.add_css_class("agent-chip");
     if error_speaker {
@@ -1988,11 +1988,11 @@ fn build_agent_message_block(speaker: &str, body: &str, compact: bool) -> gtk4::
 }
 
 fn agent_message_display_text(body: &str) -> String {
-    crate::review_input::safe_multiline_display(body, MAX_AGENT_MESSAGE_DISPLAY_BYTES)
+    jterm_core::review_input::safe_multiline_display(body, MAX_AGENT_MESSAGE_DISPLAY_BYTES)
 }
 
 fn agent_message_display_bytes(speaker: &str, body: &str) -> usize {
-    let speaker = crate::review_input::safe_inline_display(speaker, 256);
+    let speaker = jterm_core::review_input::safe_inline_display(speaker, 256);
     let body = agent_message_display_text(body);
     "Shell Agent"
         .len()
@@ -2028,7 +2028,7 @@ fn agent_block_context_label(context: &crate::ai::BlockContext) -> String {
 }
 
 fn agent_block_context_tooltip(context: &crate::ai::BlockContext) -> String {
-    let cwd = crate::review_input::safe_inline_display(
+    let cwd = jterm_core::review_input::safe_inline_display(
         context.cwd.as_deref().unwrap_or("unknown cwd"),
         4 * 1024,
     );
@@ -2045,7 +2045,7 @@ fn agent_block_context_tooltip(context: &crate::ai::BlockContext) -> String {
 }
 
 fn compact_one_line(text: &str, max_chars: usize) -> String {
-    let text = crate::review_input::safe_inline_display(text, 16 * 1024);
+    let text = jterm_core::review_input::safe_inline_display(text, 16 * 1024);
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = collapsed.chars();
     let preview: String = chars.by_ref().take(max_chars).collect();
@@ -2088,10 +2088,10 @@ fn show_agent_settings_dialog(ui: &UiState, cwd: &str, shell: &str) {
     let title = Label::new(Some("Approval-gated shell assistant"));
     title.set_xalign(0.0);
     title.add_css_class("title-3");
-    let cwd = crate::review_input::safe_inline_display(cwd, 4 * 1024);
-    let shell = crate::review_input::safe_inline_display(shell, 4 * 1024);
-    let provider = crate::review_input::safe_inline_display(&provider, 256);
-    let model = crate::review_input::safe_inline_display(&model, 512);
+    let cwd = jterm_core::review_input::safe_inline_display(cwd, 4 * 1024);
+    let shell = jterm_core::review_input::safe_inline_display(shell, 4 * 1024);
+    let provider = jterm_core::review_input::safe_inline_display(&provider, 256);
+    let model = jterm_core::review_input::safe_inline_display(&model, 512);
     let target_label = Label::new(Some(&format!("Bound to Block pane · {cwd}")));
     target_label.set_xalign(0.0);
     target_label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
@@ -2404,7 +2404,7 @@ impl UiState {
         title.add_css_class("assistant-card-title");
         title.set_xalign(0.0);
         header.append(&title);
-        let cwd = crate::review_input::safe_inline_display(&cwd, 4 * 1024);
+        let cwd = jterm_core::review_input::safe_inline_display(&cwd, 4 * 1024);
         let binding_label = Label::new(Some(&format!(
             "{cwd} · review required · every command needs approval"
         )));
@@ -2837,10 +2837,10 @@ mod tests {
     fn agent_activity_accounts_the_exact_bounded_dynamic_labels() {
         let body = "界".repeat(MAX_AGENT_MESSAGE_DISPLAY_BYTES);
         let expected = "Shell Agent".len()
-            + crate::review_input::safe_inline_display("Agent", 256).len()
+            + jterm_core::review_input::safe_inline_display("Agent", 256).len()
             + agent_message_display_text(&body).len()
             + "Shell Agent activity: ".len()
-            + crate::review_input::safe_inline_display("Agent", 256).len();
+            + jterm_core::review_input::safe_inline_display("Agent", 256).len();
         assert_eq!(agent_message_display_bytes("Agent", &body), expected);
         assert!(agent_message_display_bytes("Agent", &body) < MAX_AGENT_ACTIVITY_DISPLAY_BYTES);
     }

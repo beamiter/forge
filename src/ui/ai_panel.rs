@@ -681,7 +681,7 @@ impl AiPanel {
             "ollama" => "Ollama",
             _ => "Anthropic",
         };
-        let model = crate::review_input::safe_inline_display(config.ai_model.trim(), 1024);
+        let model = jterm_core::review_input::safe_inline_display(config.ai_model.trim(), 1024);
         let provider_model = if model.is_empty() {
             provider.to_string()
         } else {
@@ -927,7 +927,7 @@ impl AiPanel {
 
     fn show_delete_chat_dialog(&self) {
         let title = self.store.borrow().active_title().to_string();
-        let title = crate::review_input::safe_inline_display(&title, 1024);
+        let title = jterm_core::review_input::safe_inline_display(&title, 1024);
         let dialog = adw::AlertDialog::new(
             Some("Delete this chat?"),
             Some(&format!(
@@ -974,7 +974,7 @@ impl AiPanel {
                 store.at_capacity(),
             )
         };
-        let title = crate::review_input::safe_inline_display(&title, 1024);
+        let title = jterm_core::review_input::safe_inline_display(&title, 1024);
         self.chat_title.set_text(&title);
         self.chat_title.set_tooltip_text(Some(&title));
         self.archive_chat_btn
@@ -1065,8 +1065,8 @@ impl AiPanel {
         } else {
             summary.preview.clone()
         };
-        let title = crate::review_input::safe_inline_display(&summary.title, 1024);
-        let subtitle = crate::review_input::safe_inline_display(&subtitle, 16 * 1024);
+        let title = jterm_core::review_input::safe_inline_display(&summary.title, 1024);
+        let subtitle = jterm_core::review_input::safe_inline_display(&subtitle, 16 * 1024);
         let row = adw::ActionRow::builder()
             .title(&title)
             .subtitle(&subtitle)
@@ -1210,7 +1210,7 @@ impl AiPanel {
             .map(|cwd| {
                 format!(
                     "cwd: {}",
-                    crate::review_input::safe_inline_display(cwd, 4 * 1024)
+                    jterm_core::review_input::safe_inline_display(cwd, 4 * 1024)
                 )
             })
             .unwrap_or_else(|| "cwd unavailable".to_string());
@@ -1304,7 +1304,7 @@ impl AiPanel {
             .update_state(&[gtk4::accessible::State::Busy(true)]);
         self.status_row.remove_css_class("error");
         self.status_label
-            .set_text(&crate::review_input::safe_inline_display(
+            .set_text(&jterm_core::review_input::safe_inline_display(
                 message,
                 MAX_STATUS_DISPLAY_BYTES,
             ));
@@ -1320,7 +1320,7 @@ impl AiPanel {
         self.status_spinner.set_visible(false);
         self.status_row.remove_css_class("error");
         self.status_label
-            .set_text(&crate::review_input::safe_inline_display(
+            .set_text(&jterm_core::review_input::safe_inline_display(
                 message,
                 MAX_STATUS_DISPLAY_BYTES,
             ));
@@ -1334,7 +1334,7 @@ impl AiPanel {
         self.status_spinner.set_visible(false);
         self.status_row.add_css_class("error");
         self.status_label
-            .set_text(&crate::review_input::safe_inline_display(
+            .set_text(&jterm_core::review_input::safe_inline_display(
                 message,
                 MAX_STATUS_DISPLAY_BYTES,
             ));
@@ -1481,7 +1481,7 @@ impl AiPanel {
         self.convo_buffer.insert(&mut end, label);
         let label_end = end.offset();
         self.convo_buffer.insert(&mut end, "\n");
-        let body = crate::review_input::safe_multiline_display(
+        let body = jterm_core::review_input::safe_multiline_display(
             body,
             super::bounded_text::MAX_AI_VISIBLE_TRANSCRIPT_BYTES,
         );
@@ -1524,7 +1524,7 @@ impl AiPanel {
             adjustment.value() + adjustment.page_size() >= adjustment.upper() - 32.0;
         let mut end = self.convo_buffer.end_iter();
         let fragment =
-            crate::review_input::safe_multiline_display(fragment, MAX_LIVE_MESSAGE_BYTES);
+            jterm_core::review_input::safe_multiline_display(fragment, MAX_LIVE_MESSAGE_BYTES);
         self.convo_buffer.insert(&mut end, &fragment);
         super::bounded_text::trim_ai_transcript(&self.convo_buffer);
         if was_near_bottom {
@@ -1867,7 +1867,7 @@ fn prompt_button(label: &str) -> Button {
 
 fn context_chip_text(context: &BlockContext, pending_retry: bool) -> String {
     let collapsed = context.cmd.split_whitespace().collect::<Vec<_>>().join(" ");
-    let collapsed = crate::review_input::safe_inline_display(&collapsed, 16 * 1024);
+    let collapsed = jterm_core::review_input::safe_inline_display(&collapsed, 16 * 1024);
     let command = if collapsed.is_empty() {
         "(no command)".to_string()
     } else {

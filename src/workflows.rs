@@ -259,7 +259,7 @@ struct YamlWorkflowArg {
 
 fn command_is_reviewable(command: &str, source_path: &Path) -> bool {
     let source_display =
-        crate::review_input::safe_inline_display(&source_path.to_string_lossy(), 2 * 1024);
+        jterm_core::review_input::safe_inline_display(&source_path.to_string_lossy(), 2 * 1024);
     if command.len() > MAX_WORKFLOW_COMMAND_BYTES {
         log::warn!(
             "workflows: skipping {}: command exceeds {MAX_WORKFLOW_COMMAND_BYTES} bytes",
@@ -267,7 +267,7 @@ fn command_is_reviewable(command: &str, source_path: &Path) -> bool {
         );
         return false;
     }
-    match crate::review_input::validate(command) {
+    match jterm_core::review_input::validate(command) {
         Ok(_) => true,
         Err(error) => {
             log::warn!(
@@ -283,7 +283,7 @@ fn validate_display_field(label: &str, value: &str, max_bytes: usize, allow_empt
     let valid = (allow_empty || !value.trim().is_empty())
         && value.len() <= max_bytes
         && !value.chars().any(char::is_control)
-        && !crate::review_input::contains_visual_spoof(value);
+        && !jterm_core::review_input::contains_visual_spoofing(value);
     if !valid {
         log::warn!("workflows: invalid {label}");
     }
@@ -330,7 +330,7 @@ fn validate_workflow(workflow: &Workflow) -> bool {
             )
             && argument.default.len() <= MAX_WORKFLOW_COMMAND_BYTES
             && !argument.default.chars().any(char::is_control)
-            && !crate::review_input::contains_visual_spoof(&argument.default)
+            && !jterm_core::review_input::contains_visual_spoofing(&argument.default)
     })
 }
 
@@ -340,7 +340,10 @@ fn parse_yaml_workflow(source: &str, source_path: &Path) -> Option<Workflow> {
         Err(err) => {
             log::warn!(
                 "workflows: skipping {}: {err}",
-                crate::review_input::safe_inline_display(&source_path.to_string_lossy(), 2 * 1024)
+                jterm_core::review_input::safe_inline_display(
+                    &source_path.to_string_lossy(),
+                    2 * 1024
+                )
             );
             return None;
         }
@@ -443,7 +446,7 @@ pub fn substitute(template: &str, bindings: &[(String, String)]) -> Result<Strin
         if !validate_display_field("binding name", name, MAX_WORKFLOW_FIELD_BYTES, false)
             || value.len() > MAX_WORKFLOW_COMMAND_BYTES
             || value.chars().any(char::is_control)
-            || crate::review_input::contains_visual_spoof(value)
+            || jterm_core::review_input::contains_visual_spoofing(value)
         {
             return Err(format!("workflow binding '{name}' is unsafe or oversized"));
         }
@@ -503,7 +506,7 @@ pub fn substitute(template: &str, bindings: &[(String, String)]) -> Result<Strin
             }
         }
     }
-    crate::review_input::validate(&out)
+    jterm_core::review_input::validate(&out)
         .map_err(|error| format!("rendered command is unsafe: {error}"))?;
     Ok(out)
 }
@@ -755,7 +758,7 @@ args:
         assert!(workflows.len() >= 6);
         assert!(workflows
             .iter()
-            .all(|workflow| crate::review_input::validate(&workflow.command).is_ok()));
+            .all(|workflow| jterm_core::review_input::validate(&workflow.command).is_ok()));
     }
 
     // ----- test helpers (no external `tempfile` dep) -----

@@ -41,8 +41,8 @@ const HISTORY_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const MAX_SCANNED_HISTORY_DIRECTORY_ENTRIES: usize = 4_096;
 const MAX_HISTORY_PROMPT_BYTES: usize = 64 * 1024;
-const MAX_HISTORY_COMMAND_BYTES: usize = crate::review_input::MAX_REVIEW_INPUT_BYTES;
-const MAX_HISTORY_COMMAND_MARKUP_BYTES: usize = crate::review_input::MAX_REVIEW_INPUT_BYTES;
+const MAX_HISTORY_COMMAND_BYTES: usize = jterm_core::review_input::MAX_REVIEW_INPUT_BYTES;
+const MAX_HISTORY_COMMAND_MARKUP_BYTES: usize = jterm_core::review_input::MAX_REVIEW_INPUT_BYTES;
 const MAX_HISTORY_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_HISTORY_CWD_BYTES: usize = 16 * 1024;
 const HISTORY_ZSTD_WINDOW_LOG_MAX: u32 = 24;

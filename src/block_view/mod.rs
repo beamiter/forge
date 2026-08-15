@@ -17,9 +17,9 @@ use crate::parser::{
     ColorKind, CommandMeta, KeyboardProtocolQuery, Parser, ParserConfig, ParserEvent,
 };
 use crate::pty::{OwnedPty, PtyForeground};
-use crate::pty_input::{self, Paste, PasteModes, PastePolicy, UnbracketedMultiline};
 use crate::terminal::{apply_terminal_theme, focus_terminal};
 use bounded_bytes::BoundedByteRing;
+use jterm_core::pty_input::{self, Paste, PasteModes, PastePolicy, UnbracketedMultiline};
 
 mod alt_screen;
 mod ansi;
@@ -581,7 +581,7 @@ impl TypedShadowFidelity {
 /// bounded-packet outcome, not a capture race.
 const TRUNCATED_COMMAND_PLACEHOLDER: &str = "(command too long for shell integration)";
 const UNAVAILABLE_COMMAND_PLACEHOLDER: &str = "(command capture unavailable)";
-const MAX_COMMAND_CAPTURE_BYTES: usize = crate::review_input::MAX_REVIEW_INPUT_BYTES;
+const MAX_COMMAND_CAPTURE_BYTES: usize = jterm_core::review_input::MAX_REVIEW_INPUT_BYTES;
 const MAX_TYPED_COMMAND_SHADOW_BYTES: usize = MAX_COMMAND_CAPTURE_BYTES;
 const MAX_PROMPT_CAPTURE_BYTES: usize = 64 * 1024;
 const MAX_SELECTED_CLIPBOARD_BYTES: usize = 32 * 1024 * 1024;
@@ -858,7 +858,7 @@ impl PendingCommandMeta {
         let id = meta
             .id
             .as_deref()
-            .filter(|id| crate::review_input::valid_jsh_id(id))
+            .filter(|id| jterm_core::execution_journal::is_valid_jsh_session_id(id))
             .map(str::to_owned);
         Self {
             id_present: meta.id.is_some(),
@@ -896,7 +896,7 @@ impl PendingCommandMeta {
         let end_id = meta
             .id
             .as_deref()
-            .filter(|id| crate::review_input::valid_jsh_id(id));
+            .filter(|id| jterm_core::execution_journal::is_valid_jsh_session_id(id));
         match (self.id_present, self.id.as_deref(), end_present, end_id) {
             (false, None, false, None) => CommandIdCorrelation::Bare,
             (true, Some(start), true, Some(end)) if start == end && self.id_trusted => {
@@ -921,7 +921,7 @@ fn safe_command_metadata_cwd(cwd: Option<&str>) -> Option<String> {
         !cwd.is_empty()
             && cwd.len() <= 16 * 1024
             && !cwd.chars().any(char::is_control)
-            && !crate::review_input::contains_visual_spoof(cwd)
+            && !jterm_core::review_input::contains_visual_spoofing(cwd)
     })
     .map(str::to_owned)
 }
@@ -932,8 +932,10 @@ fn safe_command_metadata_cwd(cwd: Option<&str>) -> Option<String> {
 /// which cannot express "the shell did not say". A status we never learned gets a
 /// plain app notification instead of borrowing either verdict.
 fn notify_long_block(command: &str, exit_code: Option<i32>, duration_ms: u64) {
-    let command =
-        crate::review_input::safe_inline_display(command.lines().next().unwrap_or(command), 1_024);
+    let command = jterm_core::review_input::safe_inline_display(
+        command.lines().next().unwrap_or(command),
+        1_024,
+    );
     match exit_code {
         Some(code) => jterm_core::notify::long_block_finished(&command, code, duration_ms),
         None => jterm_core::notify::app_notification(
@@ -959,7 +961,7 @@ const MAX_JOURNAL_OUTPUT_BYTES: usize = 256 * 1024;
 fn submit_captured_output_to_journal(id: String, output: &str) {
     let (text, truncated) = bounded_journal_output(output);
     if let Err(error) =
-        crate::execution_journal::submit(crate::execution_journal::CompletedExecution {
+        jterm_core::execution_journal::submit(jterm_core::execution_journal::CompletedExecution {
             id,
             output: text,
             output_available: true,
@@ -1013,7 +1015,7 @@ fn resolve_command_for_block(meta: &CommandMeta, reconstructed: &str) -> String 
             && !command
                 .chars()
                 .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
-            && !crate::review_input::contains_noncontrol_visual_spoof(command)
+            && !jterm_core::review_input::contains_noncontrol_visual_spoofing(command)
         {
             return command.to_string();
         }
@@ -1050,8 +1052,8 @@ fn paste_modes(bracketed_paste: bool) -> PasteModes {
 pub(crate) fn build_command_recall(command: &str, bracketed_paste: bool) -> Paste {
     let command = command.trim_end_matches(['\r', '\n']);
     let modes = paste_modes(bracketed_paste);
-    if command.len() > crate::review_input::MAX_REVIEW_INPUT_BYTES
-        || crate::review_input::contains_noncontrol_visual_spoof(command)
+    if command.len() > jterm_core::review_input::MAX_REVIEW_INPUT_BYTES
+        || jterm_core::review_input::contains_noncontrol_visual_spoofing(command)
     {
         // Do not return a bare Ctrl+U for rejected history: that would erase a
         // pending line even though no replacement text is safe to insert.
@@ -1463,7 +1465,7 @@ fn record_external_input(
 /// step: Forge reads the rendered editor back from VTE and only then queues
 /// Enter. This avoids relying on shell/keymap-specific "clear line" bindings.
 fn approved_command_submission_payload(command: &str) -> Result<Vec<u8>, String> {
-    crate::review_input::validate(command).map_err(|error| {
+    jterm_core::review_input::validate(command).map_err(|error| {
         format!("rejected unsafe programmatic command at the PTY boundary: {error}")
     })?;
     if command != command.trim() {
@@ -3353,14 +3355,14 @@ fn block_context_for_id(
         None => output,
     };
     Some(crate::ai::BlockContext {
-        cmd: crate::review_input::safe_multiline_display(
+        cmd: jterm_core::review_input::safe_multiline_display(
             &block.cmd_text,
             MAX_COMMAND_CAPTURE_BYTES,
         ),
-        output: crate::review_input::safe_multiline_display(&output, 128 * 1024),
+        output: jterm_core::review_input::safe_multiline_display(&output, 128 * 1024),
         cwd: block_data
             .and_then(|block| block.cwd.as_deref())
-            .map(|cwd| crate::review_input::safe_inline_display(cwd, 16 * 1024)),
+            .map(|cwd| jterm_core::review_input::safe_inline_display(cwd, 16 * 1024)),
         exit_code,
         truncated,
     })
@@ -5416,7 +5418,7 @@ impl ReaderCtx {
             // repeats its own boundary check in case the environment changes.
             submit_lazy_output_to_journal(
                 journal_execution_id,
-                crate::execution_journal::output_capture_enabled(),
+                jterm_core::execution_journal::output_capture_enabled(),
                 &payload,
                 submit_captured_output_to_journal,
             );
@@ -6016,7 +6018,7 @@ impl ReaderCtx {
     }
 
     fn on_remote_session_id(&self, id: &str) {
-        if crate::review_input::valid_jsh_id(id) {
+        if jterm_core::execution_journal::is_valid_jsh_session_id(id) {
             for cb in self.remote_session_cbs.borrow().iter() {
                 cb(id);
             }
@@ -6048,8 +6050,8 @@ impl ReaderCtx {
         if allowed {
             let title = title
                 .as_deref()
-                .map(|title| crate::review_input::safe_inline_display(title, 1_024));
-            let body = crate::review_input::safe_inline_display(body, 4 * 1_024);
+                .map(|title| jterm_core::review_input::safe_inline_display(title, 1_024));
+            let body = jterm_core::review_input::safe_inline_display(body, 4 * 1_024);
             if !body.trim().is_empty() {
                 self.backend.desktop_notify(title.as_deref(), &body);
             }
@@ -6289,9 +6291,9 @@ impl RenderBackend for BlockBackend {
             }
             let mut command_incomplete = false;
             if !push_search_surface_before_deadline(&mut surfaces, deadline_exhausted, || {
-                let command = crate::review_input::safe_multiline_display(
+                let command = jterm_core::review_input::safe_multiline_display(
                     &block.cmd_text,
-                    crate::review_input::MAX_REVIEW_INPUT_BYTES,
+                    jterm_core::review_input::MAX_REVIEW_INPUT_BYTES,
                 );
                 let command_prefix = utf8_prefix_bounded(&command, remaining);
                 command_incomplete = command_prefix.len() < command.len();
@@ -8678,7 +8680,8 @@ impl TermView {
         // Detect jsh shell for session_id passing.
         let is_jsh = shell_argv_uses_jsh(shell_argv);
 
-        let session_id = session_id.filter(|sid| crate::review_input::valid_jsh_id(sid));
+        let session_id =
+            session_id.filter(|sid| jterm_core::execution_journal::is_valid_jsh_session_id(sid));
 
         // Build argv with optional --session for jsh.
         let mut argv_vec: Vec<String> = shell_argv.to_vec();
@@ -9396,7 +9399,7 @@ impl TermView {
                     {
                         *current_cwd_for_signal.borrow_mut() = path.clone();
                         let display_path =
-                            crate::review_input::safe_inline_display(&path, 4 * 1024);
+                            jterm_core::review_input::safe_inline_display(&path, 4 * 1024);
                         for cb in cwd_cbs.borrow().iter() {
                             cb(&display_path);
                         }
@@ -9409,7 +9412,7 @@ impl TermView {
             let title_cbs = title_callbacks.clone();
             active_vte.connect_window_title_changed(move |terminal| {
                 if let Some(title) = terminal.window_title() {
-                    let title_str = crate::review_input::safe_inline_display(&title, 512);
+                    let title_str = jterm_core::review_input::safe_inline_display(&title, 512);
                     if !title_str.is_empty() {
                         for cb in title_cbs.borrow().iter() {
                             cb(&title_str);
@@ -9953,7 +9956,7 @@ impl TermView {
                     } else {
                         command
                     };
-                    let command = crate::review_input::safe_inline_display(&command, 512);
+                    let command = jterm_core::review_input::safe_inline_display(&command, 512);
                     sticky_label.set_text(&format!("\u{276f}  {command}"));
                     sticky_label.set_visible(!minimized);
                     sticky_jump_bottom.set_visible(!minimized && long_output);
@@ -15126,7 +15129,8 @@ mod tests {
     #[test]
     fn clipboard_paste_preflight_counts_framing_and_utf8_bytes() {
         let limit = crate::pty::MAX_PTY_INPUT_MESSAGE_BYTES;
-        let framing = crate::pty_input::PASTE_START.len() + crate::pty_input::PASTE_END.len();
+        let framing =
+            jterm_core::pty_input::PASTE_START.len() + jterm_core::pty_input::PASTE_END.len();
         let body_limit = limit - framing;
         let mut exact = "界".repeat(body_limit / "界".len());
         exact.push_str(&"x".repeat(body_limit - exact.len()));
@@ -15308,7 +15312,7 @@ mod tests {
 
         assert!(build_command_recall("echo safe\u{202e}txt", true).is_empty());
         assert!(build_command_recall(
-            &"x".repeat(crate::review_input::MAX_REVIEW_INPUT_BYTES + 1),
+            &"x".repeat(jterm_core::review_input::MAX_REVIEW_INPUT_BYTES + 1),
             true
         )
         .is_empty());

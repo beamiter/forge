@@ -127,7 +127,7 @@ fn sanitize_branch(branch: &str) -> Option<String> {
     let mut output = String::new();
     let mut chars = branch.chars();
     for ch in chars.by_ref().take(MAX_BRANCH_DISPLAY_CHARS) {
-        if ch.is_control() || crate::review_input::is_visual_spoof_character(ch) {
+        if ch.is_control() || jterm_core::review_input::is_visual_spoofing_character(ch) {
             output.push('\u{fffd}');
         } else {
             output.push(ch);

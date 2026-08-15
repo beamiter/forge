@@ -142,7 +142,7 @@ impl PaneLeaf {
     /// input path, this rejects all terminal control characters so a history,
     /// workflow, file name, or model response cannot smuggle Enter into the PTY.
     pub(crate) fn write_review_input(&self, text: &str) -> Result<(), String> {
-        let text = crate::review_input::validate(text).map_err(|error| error.to_string())?;
+        let text = jterm_core::review_input::validate(text).map_err(|error| error.to_string())?;
         self.write_input(text.as_bytes())
             .map_err(|error| error.to_string())
     }
@@ -251,7 +251,7 @@ impl PaneLeaf {
     pub(crate) fn foreground_process_name(&self) -> Option<String> {
         let (pty_fd, shell_pid) = self.process_probe();
         crate::process::foreground_process_name(pty_fd, shell_pid)
-            .map(|name| crate::review_input::safe_inline_display(&name, 256))
+            .map(|name| jterm_core::review_input::safe_inline_display(&name, 256))
     }
 
     /// Terminate this leaf's shell and everything in its PTY session through

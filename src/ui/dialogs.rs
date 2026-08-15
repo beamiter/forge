@@ -442,8 +442,8 @@ impl UiState {
                 Some(u) => format!("{u}@{}", h.host),
                 None => h.host.clone(),
             };
-            let name = crate::review_input::safe_inline_display(&h.name, 256);
-            let target = crate::review_input::safe_inline_display(&target, 512);
+            let name = jterm_core::review_input::safe_inline_display(&h.name, 256);
+            let target = jterm_core::review_input::safe_inline_display(&target, 512);
             let row = adw::ActionRow::builder()
                 .title(name.as_str())
                 .subtitle(target.as_str())
@@ -644,8 +644,10 @@ impl UiState {
                         }
                         Err(error) => {
                             history_read_failed = true;
-                            let error =
-                                crate::review_input::safe_inline_display(&error.to_string(), 512);
+                            let error = jterm_core::review_input::safe_inline_display(
+                                &error.to_string(),
+                                512,
+                            );
                             let toast = adw::Toast::new(&format!(
                                 "Command history could not be read: {error}"
                             ));
@@ -2066,7 +2068,7 @@ impl UiState {
                 return;
             }
             for (index, host) in hosts.into_iter().enumerate() {
-                let host_display = crate::review_input::safe_inline_display(&host.name, 1024);
+                let host_display = jterm_core::review_input::safe_inline_display(&host.name, 1024);
                 let transport = if host.docker { "docker" } else { "ssh" };
                 let target = match &host.user {
                     Some(user) => format!("{user}@{}", host.host),
@@ -2081,7 +2083,7 @@ impl UiState {
                 }
                 let row = adw::ActionRow::builder()
                     .title(&host_display)
-                    .subtitle(crate::review_input::safe_inline_display(
+                    .subtitle(jterm_core::review_input::safe_inline_display(
                         &subtitle,
                         4 * 1024,
                     ))
@@ -2118,7 +2120,7 @@ impl UiState {
                 let populate_ref = populate_for_delete.clone();
                 let name = host.name.clone();
                 delete_btn.connect_clicked(move |_| {
-                    let display = crate::review_input::safe_inline_display(&name, 1024);
+                    let display = jterm_core::review_input::safe_inline_display(&name, 1024);
                     let dialog = adw::AlertDialog::new(
                         Some("Remove this host?"),
                         Some(&format!(
@@ -2304,7 +2306,7 @@ impl UiState {
                 kept.push(format!("deploy_artifact = {artifact:?}"));
             }
             if !kept.is_empty() {
-                let note = Label::new(Some(&crate::review_input::safe_inline_display(
+                let note = Label::new(Some(&jterm_core::review_input::safe_inline_display(
                     &format!("Kept as configured: {}", kept.join(", ")),
                     4 * 1024,
                 )));

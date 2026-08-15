@@ -601,8 +601,10 @@ impl UiState {
                     return;
                 }
                 Err(err) => {
-                    let path_display =
-                        crate::review_input::safe_inline_display(&path.to_string_lossy(), 2 * 1024);
+                    let path_display = jterm_core::review_input::safe_inline_display(
+                        &path.to_string_lossy(),
+                        2 * 1024,
+                    );
                     log::error!("Config reload rejected for {path_display}: {err}");
                     self.show_config_error(
                         "Configuration reload rejected",

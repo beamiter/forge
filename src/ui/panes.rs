@@ -176,7 +176,7 @@ impl UiState {
         tab_widget_name: Option<String>,
     ) -> PaneLeaf {
         let sid = session_id
-            .filter(|sid| crate::review_input::valid_jsh_id(sid))
+            .filter(|sid| jterm_core::execution_journal::is_valid_jsh_session_id(sid))
             .map(str::to_owned)
             .unwrap_or_else(generate_session_id);
         let shell_argv = self.shell_argv.borrow();
@@ -250,7 +250,7 @@ impl UiState {
         tab_widget_name: Option<String>,
     ) -> io::Result<PaneLeaf> {
         let sid = session_id
-            .filter(|sid| crate::review_input::valid_jsh_id(sid))
+            .filter(|sid| jterm_core::execution_journal::is_valid_jsh_session_id(sid))
             .map(str::to_owned)
             .unwrap_or_else(generate_session_id);
         let shell_argv = self.shell_argv.borrow();

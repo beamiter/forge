@@ -225,7 +225,7 @@ impl VteTerminalView {
                     .map(|p| p.to_string_lossy().to_string())
                     .filter(|s| !s.is_empty())
                 {
-                    let path = crate::review_input::safe_inline_display(&path, 4 * 1024);
+                    let path = jterm_core::review_input::safe_inline_display(&path, 4 * 1024);
                     for callback in cwd_callbacks_clone.borrow().iter() {
                         callback(&path);
                     }
@@ -266,7 +266,7 @@ impl VteTerminalView {
         let terminal_for_title = terminal.clone();
         terminal.connect_window_title_changed(move |_term| {
             if let Some(title) = terminal_for_title.window_title() {
-                let title_str = crate::review_input::safe_inline_display(&title, 512);
+                let title_str = jterm_core::review_input::safe_inline_display(&title, 512);
                 if !title_str.is_empty() {
                     for callback in title_callbacks_clone.borrow().iter() {
                         callback(&title_str);
@@ -465,9 +465,9 @@ impl InitialCommands {
     pub(crate) fn from_config(configured: Option<&str>) -> Self {
         const MAX_INITIAL_COMMANDS: usize = 128;
         let Some(configured) = configured.filter(|value| {
-            value.len() <= crate::review_input::MAX_REVIEW_INPUT_BYTES
+            value.len() <= jterm_core::review_input::MAX_REVIEW_INPUT_BYTES
                 && !value.chars().any(char::is_control)
-                && !crate::review_input::contains_visual_spoof(value)
+                && !jterm_core::review_input::contains_visual_spoofing(value)
         }) else {
             return Self::default();
         };
@@ -478,7 +478,7 @@ impl InitialCommands {
             .filter(|command| !command.is_empty())
         {
             if commands.len() == MAX_INITIAL_COMMANDS
-                || crate::review_input::validate(command).is_err()
+                || jterm_core::review_input::validate(command).is_err()
             {
                 log::warn!(
                     "Skipping startup commands because the configuration exceeds the safe execution contract"
@@ -527,7 +527,9 @@ pub(crate) fn spawn_shell(
 ) {
     // Append --session <id> to argv when restoring a session (only for jsh)
     let mut argv_vec: Vec<String> = argv_owned.to_vec();
-    if let Some(sid) = session_id.filter(|sid| crate::review_input::valid_jsh_id(sid)) {
+    if let Some(sid) =
+        session_id.filter(|sid| jterm_core::execution_journal::is_valid_jsh_session_id(sid))
+    {
         let is_jsh = argv_vec
             .first()
             .and_then(|s| std::path::Path::new(s).file_name())
@@ -664,7 +666,7 @@ pub(crate) fn open_uri(uri: &str) {
     if let Err(err) = gio::AppInfo::launch_default_for_uri(uri, None::<&gio::AppLaunchContext>) {
         log::warn!(
             "Failed to open URI {}: {err}",
-            crate::review_input::safe_inline_display(uri, 2 * 1024)
+            jterm_core::review_input::safe_inline_display(uri, 2 * 1024)
         );
     }
 }
@@ -694,7 +696,7 @@ pub(crate) fn show_rename_dialog(
             let text = value.text();
             let trimmed = text.trim();
             if !trimmed.is_empty() {
-                let title = crate::review_input::safe_inline_display(trimmed, 512);
+                let title = jterm_core::review_input::safe_inline_display(trimmed, 512);
                 label_clone.set_text(&title);
                 custom_title_clone.set(true);
             }
@@ -731,7 +733,7 @@ pub(crate) fn show_rename_dialog_with_strip(
             let text = value.text();
             let trimmed = text.trim();
             if !trimmed.is_empty() {
-                let title = crate::review_input::safe_inline_display(trimmed, 512);
+                let title = jterm_core::review_input::safe_inline_display(trimmed, 512);
                 label_clone.set_text(&title);
                 strip_label_clone.set_text(&title);
                 custom_title_clone.set(true);
@@ -779,7 +781,7 @@ pub(crate) fn default_tab_title(tab_index_1based: u32, working_directory: Option
     } else {
         normalized.to_string()
     };
-    let display_dir = crate::review_input::safe_inline_display(&display_dir, 4 * 1024);
+    let display_dir = jterm_core::review_input::safe_inline_display(&display_dir, 4 * 1024);
 
     if display_dir == "/" || display_dir == "~" {
         return display_dir;
@@ -822,7 +824,7 @@ pub(crate) fn default_tab_title(tab_index_1based: u32, working_directory: Option
 
     let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
     if parts.len() <= 1 {
-        return crate::review_input::safe_inline_display(&format!("{prefix}{rest}"), 512);
+        return jterm_core::review_input::safe_inline_display(&format!("{prefix}{rest}"), 512);
     }
 
     let mut out_parts: Vec<String> = Vec::with_capacity(parts.len());
@@ -834,7 +836,7 @@ pub(crate) fn default_tab_title(tab_index_1based: u32, working_directory: Option
         }
     }
 
-    crate::review_input::safe_inline_display(&format!("{prefix}{}", out_parts.join("/")), 512)
+    jterm_core::review_input::safe_inline_display(&format!("{prefix}{}", out_parts.join("/")), 512)
 }
 
 pub(crate) fn setup_terminal_click_handler(terminal: &Terminal) {
@@ -967,7 +969,7 @@ mod tests {
         assert!(InitialCommands::from_config(Some("echo one\necho two"))
             .as_slice()
             .is_empty());
-        let oversized = "x".repeat(crate::review_input::MAX_REVIEW_INPUT_BYTES + 1);
+        let oversized = "x".repeat(jterm_core::review_input::MAX_REVIEW_INPUT_BYTES + 1);
         assert!(InitialCommands::from_config(Some(&oversized))
             .as_slice()
             .is_empty());

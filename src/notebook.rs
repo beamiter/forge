@@ -98,7 +98,7 @@ fn safe_notebook_display(value: &str, max_bytes: usize) -> String {
     for ch in value.chars() {
         if matches!(ch, '\n' | '\t') {
             safe.push(ch);
-        } else if ch.is_control() || crate::review_input::is_visual_spoof_character(ch) {
+        } else if ch.is_control() || jterm_core::review_input::is_visual_spoofing_character(ch) {
             safe.push('\u{fffd}');
         } else {
             safe.push(ch);
@@ -125,7 +125,7 @@ fn notebook_cell_source_is_safe(source: &str) -> bool {
         && !source
             .chars()
             .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
-        && !crate::review_input::contains_noncontrol_visual_spoof(source)
+        && !jterm_core::review_input::contains_noncontrol_visual_spoofing(source)
 }
 
 #[derive(Debug)]

@@ -69,7 +69,7 @@ fn restored_remote_host(
         .iter()
         .find(|host| host.name == remote_name)
         .cloned()?;
-    if crate::review_input::valid_jsh_id(session_id) {
+    if jterm_core::execution_journal::is_valid_jsh_session_id(session_id) {
         host.session = Some(session_id.to_string());
     }
     Some(host)
@@ -300,7 +300,7 @@ impl UiState {
     }
 
     fn show_missing_remote_profile(&self, remote_name: &str) {
-        let remote_name = crate::review_input::safe_inline_display(remote_name, 512);
+        let remote_name = jterm_core::review_input::safe_inline_display(remote_name, 512);
         log::warn!(
             "Managed remote '{remote_name}' is no longer configured; restoring a local shell without replaying stale connection data"
         );

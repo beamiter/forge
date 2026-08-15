@@ -12,8 +12,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use crate::process::{ChildLifecycle, ReapOwner};
-use crate::pty_input::{AdmittedInput, InputGuard, PasteModes, PastePolicy, UnbracketedMultiline};
 use crate::terminal::TERMINAL_ESCALATION;
+use jterm_core::pty_input::{
+    AdmittedInput, InputGuard, PasteModes, PastePolicy, UnbracketedMultiline,
+};
 
 enum PtyMsg {
     Data(Vec<u8>),
@@ -328,30 +330,47 @@ fn filter_and_enqueue_input_with<T>(
     modes: PasteModes,
     observe: impl FnOnce(&[u8], bool) -> T,
 ) -> Result<T, PtyWriteError> {
-    let before = *guard;
+    // Core's `InputGuard` exposes its frame state but no setter, so a rollback
+    // reconstructs an equivalent guard from the one-bit state.
+    let before_in_frame = guard.in_frame();
     let safe_data = guard
         .filter(data, modes, boundary_paste_policy())
         .into_owned();
     if safe_data.is_empty() {
         // No bytes crossed the boundary, so no frame transition did either.
-        *guard = before;
-        return Ok(observe(&[], before.in_frame()));
+        *guard = input_guard_with_frame(before_in_frame);
+        return Ok(observe(&[], before_in_frame));
     }
     if safe_data.len() > MAX_PTY_INPUT_MESSAGE_BYTES {
-        *guard = before;
+        *guard = input_guard_with_frame(before_in_frame);
         return Err(PtyWriteError::TooLarge {
             bytes: safe_data.len(),
             limit: MAX_PTY_INPUT_MESSAGE_BYTES,
         });
     }
-    let observed = observe(&safe_data, before.in_frame());
+    let observed = observe(&safe_data, before_in_frame);
     let result = try_enqueue_input(sender, safe_data);
     if result.is_err() {
         // Queue admission is the commit point. A rejected opener/closer must
         // not alter how the next independent write is sanitized.
-        *guard = before;
+        *guard = input_guard_with_frame(before_in_frame);
     }
     result.map(|()| observed)
+}
+
+/// Rebuild an `InputGuard` with the given frame state. Filtering an opener
+/// through a fresh guard is the one public transition into `in_frame`.
+fn input_guard_with_frame(in_frame: bool) -> InputGuard {
+    let mut guard = InputGuard::new();
+    if in_frame {
+        let _ = guard.filter(
+            jterm_core::pty_input::PASTE_START,
+            PasteModes { bracketed: true },
+            boundary_paste_policy(),
+        );
+        debug_assert!(guard.in_frame());
+    }
+    guard
 }
 
 fn invalid_nul(context: &str) -> io::Error {
@@ -417,7 +436,7 @@ fn open_working_directory(cwd: Option<&str>) -> Option<File> {
         Err(error) => {
             log::warn!(
                 "Cannot open PTY working directory {}: {error}",
-                crate::review_input::safe_inline_display(directory, 2 * 1024)
+                jterm_core::review_input::safe_inline_display(directory, 2 * 1024)
             );
             None
         }
@@ -727,7 +746,7 @@ impl OwnedPty {
     /// command shadow ahead of the shell.
     #[must_use = "terminal input may be rejected by bounded nonblocking backpressure"]
     pub(crate) fn write_bytes_admitted(&self, data: &[u8]) -> Result<AdmittedInput, PtyWriteError> {
-        self.write_bytes_with(data, crate::pty_input::admitted_input)
+        self.write_bytes_with(data, jterm_core::pty_input::admitted_input)
     }
 
     fn write_bytes_with<T>(
@@ -1446,7 +1465,7 @@ mod tests {
             &sender,
             b"one\rtwo",
             PasteModes { bracketed: false },
-            crate::pty_input::admitted_input,
+            jterm_core::pty_input::admitted_input,
         )
         .unwrap();
         assert_eq!(receiver.try_recv().unwrap(), b"one");
@@ -1458,7 +1477,7 @@ mod tests {
             &sender,
             b"one\ntwo",
             PasteModes { bracketed: true },
-            crate::pty_input::admitted_input,
+            jterm_core::pty_input::admitted_input,
         )
         .unwrap();
         assert_eq!(receiver.try_recv().unwrap(), b"\x1b[200~one\ntwo\x1b[201~");
@@ -1471,7 +1490,7 @@ mod tests {
             &sender,
             b"\x1b[200~",
             PasteModes { bracketed: true },
-            crate::pty_input::admitted_input,
+            jterm_core::pty_input::admitted_input,
         )
         .unwrap();
         assert_eq!(receiver.try_recv().unwrap(), b"\x1b[200~");
@@ -1481,7 +1500,7 @@ mod tests {
             &sender,
             b"three\nfour",
             PasteModes { bracketed: true },
-            crate::pty_input::admitted_input,
+            jterm_core::pty_input::admitted_input,
         )
         .unwrap();
         assert_eq!(receiver.try_recv().unwrap(), b"three\nfour");
@@ -1502,7 +1521,7 @@ mod tests {
             &sender,
             b"\x1b[201~",
             PasteModes { bracketed: false },
-            crate::pty_input::admitted_input,
+            jterm_core::pty_input::admitted_input,
         )
         .unwrap();
         assert_eq!(filtered_empty, AdmittedInput::default());
@@ -1812,9 +1831,9 @@ mod tests {
         assert_eq!(value, 1);
     }
 
-    /// The PTY boundary is now `pty_input::InputGuard`; these tests pin the
-    /// wiring (which policy this repo passes) rather than re-testing the shared
-    /// filter, whose own suite lives in jterm_core.
+    /// The PTY boundary is now `jterm_core::pty_input::InputGuard`; these tests
+    /// pin the wiring (which policy this repo passes) rather than re-testing
+    /// the shared filter, whose own suite lives in jterm_core.
     fn guarded(chunks: &[&[u8]], bracketed: bool) -> Vec<Vec<u8>> {
         let mut guard = InputGuard::new();
         let modes = PasteModes { bracketed };
@@ -1886,16 +1905,16 @@ mod tests {
         assert_eq!(
             guarded(
                 &[
-                    crate::pty_input::PASTE_START,
+                    jterm_core::pty_input::PASTE_START,
                     body,
-                    crate::pty_input::PASTE_END
+                    jterm_core::pty_input::PASTE_END
                 ],
                 false
             ),
             vec![
-                crate::pty_input::PASTE_START.to_vec(),
+                jterm_core::pty_input::PASTE_START.to_vec(),
                 body.to_vec(),
-                crate::pty_input::PASTE_END.to_vec(),
+                jterm_core::pty_input::PASTE_END.to_vec(),
             ]
         );
     }
@@ -1907,14 +1926,14 @@ mod tests {
     fn an_embedded_terminator_is_removed_from_a_frame_body() {
         let filtered = guarded(
             &[
-                crate::pty_input::PASTE_START,
+                jterm_core::pty_input::PASTE_START,
                 b"docs\x1b[201~\rrm -rf ~\r",
-                crate::pty_input::PASTE_END,
+                jterm_core::pty_input::PASTE_END,
             ],
             false,
         );
         assert_eq!(filtered[1], b"docs\rrm -rf ~\r".to_vec());
-        assert_eq!(filtered[2], crate::pty_input::PASTE_END.to_vec());
+        assert_eq!(filtered[2], jterm_core::pty_input::PASTE_END.to_vec());
     }
 
     #[test]

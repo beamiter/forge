@@ -120,13 +120,13 @@ impl PaneHeader {
         command: Option<&str>,
     ) {
         self.index.set_text(&(position + 1).to_string());
-        let title = crate::review_input::safe_inline_display(title, 512);
+        let title = jterm_core::review_input::safe_inline_display(title, 512);
         self.title.set_text(&title);
         match cwd {
             // The title is usually the directory's last component; repeating
             // the whole path only earns its space when it differs.
             Some(cwd) if cwd != title.as_str() => {
-                let cwd = crate::review_input::safe_inline_display(cwd, 4 * 1024);
+                let cwd = jterm_core::review_input::safe_inline_display(cwd, 4 * 1024);
                 self.cwd.set_text(&cwd);
                 self.cwd.set_visible(true);
             }
@@ -134,7 +134,7 @@ impl PaneHeader {
         }
         match command {
             Some(command) => {
-                let command = crate::review_input::safe_inline_display(command, 512);
+                let command = jterm_core::review_input::safe_inline_display(command, 512);
                 self.command.set_text(&format!("▶ {command}"));
                 self.command.set_visible(true);
             }

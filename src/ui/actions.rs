@@ -650,7 +650,7 @@ impl UiState {
     }
 
     pub(crate) fn show_ai_error(&self, message: &str) {
-        let message = crate::review_input::safe_multiline_display(message, 16 * 1024);
+        let message = jterm_core::review_input::safe_multiline_display(message, 16 * 1024);
         let dialog = adw::AlertDialog::new(Some("AI unavailable"), Some(&message));
         dialog.add_response("ok", "OK");
         dialog.set_default_response(Some("ok"));

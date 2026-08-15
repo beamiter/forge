@@ -643,7 +643,7 @@ fn normalise_title(title: &str) -> String {
         .map(|ch| {
             if ch.is_control() || ch.is_whitespace() {
                 ' '
-            } else if crate::review_input::is_visual_spoof_character(ch) {
+            } else if jterm_core::review_input::is_visual_spoofing_character(ch) {
                 '\u{fffd}'
             } else {
                 ch
@@ -688,7 +688,7 @@ fn chat_preview(chat: &ChatRuntime) -> String {
         .filter(|text| !text.trim().is_empty())
         .or_else(|| (!chat.draft.trim().is_empty()).then_some(chat.draft.as_str()))
         .unwrap_or("Empty conversation");
-    let source = crate::review_input::safe_inline_display(source, 16 * 1024);
+    let source = jterm_core::review_input::safe_inline_display(source, 16 * 1024);
     let collapsed = source.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = collapsed.chars();
     let preview: String = chars.by_ref().take(72).collect();
@@ -1480,7 +1480,7 @@ mod tests {
         store.rename_active(&format!("bad\0title\u{202e}\u{fe0f} {}", "😀".repeat(100)));
 
         assert!(!store.active_title().chars().any(char::is_control));
-        assert!(!crate::review_input::contains_visual_spoof(
+        assert!(!jterm_core::review_input::contains_visual_spoofing(
             store.active_title()
         ));
         assert!(store.active_title().len() <= MAX_CHAT_TITLE_BYTES);

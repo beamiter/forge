@@ -519,7 +519,7 @@ impl UiState {
             .get(&tab_num)
             .map(|connection| connection.host.name.clone())
             .unwrap_or_else(|| default_tab_title(tab_num + 1, working_directory.as_deref()));
-        let tab_name = crate::review_input::safe_inline_display(&tab_name, 512);
+        let tab_name = jterm_core::review_input::safe_inline_display(&tab_name, 512);
         let pinned = unsafe {
             page_widget
                 .data::<bool>("pinned")
@@ -825,7 +825,7 @@ impl UiState {
                 .and_then(|node| node.active_leaf())
             {
                 if let Some(cwd) = terminal_working_directory(leaf.terminal()) {
-                    let cwd = crate::review_input::safe_inline_display(&cwd, 4 * 1024);
+                    let cwd = jterm_core::review_input::safe_inline_display(&cwd, 4 * 1024);
                     parts.push(format!("Dir: {cwd}"));
                 }
                 if let Some(process) = leaf.foreground_process_name() {
@@ -1039,7 +1039,7 @@ impl UiState {
         let terminal_mode = remote_tab_terminal_mode(&self.config.borrow().terminal_mode);
         log::info!(
             "[remote] connecting to {} (attempt {})",
-            crate::review_input::safe_inline_display(&host.name, 512),
+            jterm_core::review_input::safe_inline_display(&host.name, 512),
             attempt.saturating_add(1)
         );
         self.add_tab_with_argv(TabLaunch {
@@ -1259,7 +1259,7 @@ impl UiState {
 
         // Generate or reuse session ID for jsh session persistence
         let sid = session_id
-            .filter(|sid| crate::review_input::valid_jsh_id(sid))
+            .filter(|sid| jterm_core::execution_journal::is_valid_jsh_session_id(sid))
             .unwrap_or_else(generate_session_id);
 
         let configured_shell = self.shell_argv.borrow();
@@ -1400,7 +1400,7 @@ impl UiState {
                     if let Some(conn) = conns_for_session.borrow_mut().get_mut(&current_tab_num) {
                         conn.host.session = Some(id.to_string());
                     }
-                    if crate::review_input::valid_jsh_id(id) {
+                    if jterm_core::execution_journal::is_valid_jsh_session_id(id) {
                         if let Some(leaf) = PaneLeaf::from_widget(&root) {
                             leaf.set_managed_remote_session_id(id);
                         }
@@ -1476,7 +1476,10 @@ impl UiState {
         let (label_text, is_custom) = match tab_name {
             Some(name) => {
                 let custom = name != computed_default_title;
-                (crate::review_input::safe_inline_display(&name, 512), custom)
+                (
+                    jterm_core::review_input::safe_inline_display(&name, 512),
+                    custom,
+                )
             }
             None => (computed_default_title, false),
         };
@@ -1623,11 +1626,9 @@ impl UiState {
         view_type.set_remote(is_remote);
         if let Some((host, _)) = remote.as_ref() {
             view_type.set_managed_remote_name(&host.name);
-            if let Some(session_id) = host
-                .session
-                .as_deref()
-                .filter(|session_id| crate::review_input::valid_jsh_id(session_id))
-            {
+            if let Some(session_id) = host.session.as_deref().filter(|session_id| {
+                jterm_core::execution_journal::is_valid_jsh_session_id(session_id)
+            }) {
                 view_type.set_managed_remote_session_id(session_id);
             }
         }
@@ -1741,7 +1742,7 @@ impl UiState {
                         ConnStatus::Connected => "connected",
                         ConnStatus::Disconnected => "disconnected",
                     };
-                    let name = crate::review_input::safe_inline_display(&conn.host.name, 256);
+                    let name = jterm_core::review_input::safe_inline_display(&conn.host.name, 256);
                     tooltip_parts.push(format!("Remote: {name} ({state})"));
                 }
             }
@@ -1753,7 +1754,7 @@ impl UiState {
                 if let Some(leaf) = PaneNode::from_widget(&page).and_then(|node| node.active_leaf())
                 {
                     if let Some(cwd) = terminal_working_directory(leaf.terminal()) {
-                        let cwd = crate::review_input::safe_inline_display(&cwd, 4 * 1024);
+                        let cwd = jterm_core::review_input::safe_inline_display(&cwd, 4 * 1024);
                         tooltip_parts.push(format!("Dir: {cwd}"));
                     }
                     if let Some(proc_name) = leaf.foreground_process_name() {
@@ -2015,7 +2016,7 @@ impl UiState {
 
             // Remote connect items
             for h in remote_hosts.iter() {
-                let name = crate::review_input::safe_inline_display(&h.name, 256);
+                let name = jterm_core::review_input::safe_inline_display(&h.name, 256);
                 let item = make_item(&format!("Remote: {name}"));
                 let popover_c = popover.clone();
                 let ui_remote = ui_for_ctx.clone();

@@ -55,7 +55,7 @@ struct CommandSuggestionRuntime {
 impl CommandSuggestionRuntime {
     fn set_status(&self, message: &str, active: bool, error: bool) {
         self.status
-            .set_text(&crate::review_input::safe_inline_display(
+            .set_text(&jterm_core::review_input::safe_inline_display(
                 message,
                 16 * 1024,
             ));
@@ -178,7 +178,7 @@ impl CommandSuggestionRuntime {
 
     fn render_proposal(runtime: &Rc<Self>, command: String, provider: &str) {
         runtime.clear_review();
-        let command = match crate::review_input::validate(&command) {
+        let command = match jterm_core::review_input::validate(&command) {
             Ok(command) => command.to_string(),
             Err(error) => {
                 runtime.set_status(
@@ -195,7 +195,7 @@ impl CommandSuggestionRuntime {
             compact: runtime.config.borrow().block_compact,
             icon: "dialog-information-symbolic",
             title: "Command proposal".to_string(),
-            badge: crate::review_input::safe_inline_display(provider, 1024),
+            badge: jterm_core::review_input::safe_inline_display(provider, 1024),
             description: format!("Generated for: {}", compact_one_line(&runtime.request, 140)),
             command,
             primary_label: "Insert for review".to_string(),
@@ -237,7 +237,7 @@ impl CommandSuggestionRuntime {
     }
 
     fn insert_for_review(runtime: Rc<Self>, entry: &gtk4::Entry, feedback: &Label) {
-        let command = match crate::review_input::validate(&entry.text()) {
+        let command = match jterm_core::review_input::validate(&entry.text()) {
             Ok(command) => command.to_string(),
             Err(error) => {
                 set_review_feedback(feedback, &format!("Cannot insert: {error}"), true);
@@ -291,7 +291,7 @@ impl CommandSuggestionRuntime {
 }
 
 fn compact_one_line(text: &str, max_chars: usize) -> String {
-    let text = crate::review_input::safe_inline_display(text, 16 * 1024);
+    let text = jterm_core::review_input::safe_inline_display(text, 16 * 1024);
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = collapsed.chars();
     let preview: String = chars.by_ref().take(max_chars).collect();
@@ -311,19 +311,19 @@ fn clear_rows(list: &ListBox) {
 fn render_rows(list: &ListBox, entries: &[Entry]) {
     clear_rows(list);
     for entry in entries {
-        let title = crate::review_input::safe_inline_display(&entry.label, 16 * 1024);
+        let title = jterm_core::review_input::safe_inline_display(&entry.label, 16 * 1024);
         let row = adw::ActionRow::builder()
             .title(&title)
             .activatable(true)
             .build();
         if let Some(subtitle) = entry.sublabel.as_deref() {
-            row.set_subtitle(&crate::review_input::safe_inline_display(
+            row.set_subtitle(&jterm_core::review_input::safe_inline_display(
                 subtitle,
                 16 * 1024,
             ));
         }
         if let Some(right) = entry.right.as_deref() {
-            let right = crate::review_input::safe_inline_display(right, 4 * 1024);
+            let right = jterm_core::review_input::safe_inline_display(right, 4 * 1024);
             let label = Label::new(Some(&right));
             label.add_css_class("dim-label");
             row.add_suffix(&label);
@@ -362,7 +362,7 @@ fn merge_palette_history(
         if merged.len() == limit {
             break;
         }
-        if crate::review_input::validate(&entry.command).is_ok()
+        if jterm_core::review_input::validate(&entry.command).is_ok()
             && seen.insert(entry.command.clone())
         {
             merged.push(entry);
@@ -543,7 +543,7 @@ impl UiState {
             cwd if !cwd.is_empty() => cwd,
             _ => ".".to_string(),
         };
-        let cwd_display = crate::review_input::safe_inline_display(&cwd, 4 * 1024);
+        let cwd_display = jterm_core::review_input::safe_inline_display(&cwd, 4 * 1024);
         let shell = self
             .shell_argv
             .borrow()

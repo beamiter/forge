@@ -177,9 +177,9 @@ pub(crate) fn estimated_live_finished_block_retained_bytes(
     images: &[gtk4::gdk::Texture],
 ) -> usize {
     let cols = cols.max(1) as usize;
-    let display_cmd = crate::review_input::safe_multiline_display(
+    let display_cmd = jterm_core::review_input::safe_multiline_display(
         cmd,
-        crate::review_input::MAX_REVIEW_INPUT_BYTES,
+        jterm_core::review_input::MAX_REVIEW_INPUT_BYTES,
     );
     let command = finished_command_bytes(&display_cmd);
     let image_pixel_bytes = images.iter().fold(0usize, |total, texture| {
@@ -259,9 +259,9 @@ impl BlockData {
     /// finished card. Persisted output has no separate ANSI source, so its
     /// exact byte length is charged as the raw snapshot length.
     pub(crate) fn estimated_restored_retained_bytes(&self) -> usize {
-        let display_cmd = crate::review_input::safe_multiline_display(
+        let display_cmd = jterm_core::review_input::safe_multiline_display(
             &self.cmd,
-            crate::review_input::MAX_REVIEW_INPUT_BYTES,
+            jterm_core::review_input::MAX_REVIEW_INPUT_BYTES,
         );
         let rendered_command = finished_command_bytes(&display_cmd);
         // `cols == 0` is the legacy on-disk sentinel. Rendering later falls
@@ -1315,9 +1315,9 @@ impl FinishedBlock {
     ) -> Self {
         let is_background = cmd.trim().is_empty();
         let has_output = !output.trim().is_empty();
-        let display_cmd = crate::review_input::safe_multiline_display(
+        let display_cmd = jterm_core::review_input::safe_multiline_display(
             cmd,
-            crate::review_input::MAX_REVIEW_INPUT_BYTES,
+            jterm_core::review_input::MAX_REVIEW_INPUT_BYTES,
         );
         let cmd_bytes = finished_command_bytes(&display_cmd);
         let image_pixel_bytes = images.iter().fold(0usize, |total, texture| {
@@ -1490,7 +1490,8 @@ impl FinishedBlock {
 
         // Context chips (Warp-style): cwd pill + git-branch pill.
         if let Some(cwd_path) = cwd {
-            let shortened = crate::review_input::safe_inline_display(&shorten_path(cwd_path), 512);
+            let shortened =
+                jterm_core::review_input::safe_inline_display(&shorten_path(cwd_path), 512);
             let cwd_chip = gtk4::Label::new(Some(&format!("cwd · {shortened}")));
             cwd_chip.add_css_class("block-chip");
             cwd_chip.set_halign(gtk4::Align::Start);

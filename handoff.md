@@ -53,11 +53,28 @@ saturation hole in a validate invariant); do not skip it.
   but is refused with a log line, the same silent-refusal UX as before). The
   doctor's Flatpak probe runs through `helper::bounded_command_output`, so
   `command_status_with_timeout` left the host shim. Adversarial review caught
-  two stale comments (fixed) and noted: core's history validation uses the
-  narrower spoof set until forge's `review_input` is upstreamed (display-side
-  `safe_inline_display` still sanitizes with the wider set), and core's
+  two stale comments (fixed) and noted: core's history validation used the
+  narrower spoof set until forge's `review_input` was upstreamed in round 4
+  (display-side `safe_inline_display` still sanitizes with the wider set), and
+  core's
   `command_history::prepare_path` preflight is available but not yet adopted
   by either app.
+
+- **Deduplication round 4 (2026-08-15)**: repinned to `592d663` and deleted
+  `src/review_input.rs`, `src/pty_input.rs`, and `src/execution_journal.rs` —
+  core upstreamed the widened spoof table, `safe_inline_display`/
+  `safe_multiline_display`, `AdmittedInput`/`admitted_input`, and
+  `output_capture_enabled`. Mechanical renames: `contains_visual_spoof` →
+  `contains_visual_spoofing`, `contains_noncontrol_visual_spoof` →
+  `contains_noncontrol_visual_spoofing`, `is_visual_spoof_character` →
+  `is_visual_spoofing_character`. All `valid_jsh_id` call sites moved to
+  `execution_journal::is_valid_jsh_session_id`; core's execution-id validator
+  (which additionally allows `.`) stays private, and jsh-generated execution
+  ids are dot-free, so the two OSC 133 correlation sites
+  (`block_view/mod.rs`) keep the session grammar — same acceptance as before.
+  Core's `InputGuard` dropped `Clone`/`Copy`; the PTY writer's rollback now
+  reconstructs the guard from its one-bit frame state
+  (`pty.rs::input_guard_with_frame`) instead of copying it.
 
 - **AI module unification round (2026-08-15, second half)**: `src/ai/` is
   gone, replaced by a thin shim over `jterm_core::ai`; see "AI module: done"
@@ -343,10 +360,10 @@ doctor and correction probes.
 ### Follow-up migrations (next rounds)
 
 - Forge-ahead local modules to upstream into core rather than delete:
-  `review_input` (safe-display helpers, `valid_jsh_id`, wider spoof set),
-  `pty_input` (`AdmittedInput`), `execution_journal` (`output_capture_enabled`),
-  and `parser` (OSC 7771, erase-scrollback/hard-reset barriers, strict ST
-  termination).
+  `parser` (OSC 7771, erase-scrollback/hard-reset barriers, strict ST
+  termination). Done at pin `592d663`: `review_input` (safe-display helpers,
+  wider spoof set), `pty_input` (`AdmittedInput`), and `execution_journal`
+  (`output_capture_enabled`) were upstreamed and the local copies deleted.
 - Core-ahead modules not yet adopted: the hardened `jterm_core::agent`
   session wrapper. (`child_env`'s inherited-environment freeze is adopted:
   `app::run` captures first, `pty.rs` uses `envp_from_captured`, and the VTE

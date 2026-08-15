@@ -59,7 +59,7 @@ pub(super) struct CommandReviewPrimary {
 impl CommandReviewPrimary {
     pub(super) fn set(&self, label: &str, executes: bool, command: &str) {
         self.button
-            .set_label(&crate::review_input::safe_inline_display(
+            .set_label(&jterm_core::review_input::safe_inline_display(
                 label,
                 MAX_REVIEW_LABEL_BYTES,
             ));
@@ -117,7 +117,7 @@ impl CommandReviewCard {
         header.append(&icon);
 
         let title_text =
-            crate::review_input::safe_inline_display(&spec.title, MAX_REVIEW_LABEL_BYTES);
+            jterm_core::review_input::safe_inline_display(&spec.title, MAX_REVIEW_LABEL_BYTES);
         let title = Label::new(Some(&title_text));
         title.add_css_class("assistant-card-title");
         title.set_xalign(0.0);
@@ -125,7 +125,7 @@ impl CommandReviewCard {
         header.append(&title);
 
         let badge_text =
-            crate::review_input::safe_inline_display(&spec.badge, MAX_REVIEW_LABEL_BYTES);
+            jterm_core::review_input::safe_inline_display(&spec.badge, MAX_REVIEW_LABEL_BYTES);
         let badge = Label::new(Some(&badge_text));
         badge.add_css_class("assistant-card-badge");
         badge.set_hexpand(true);
@@ -153,7 +153,7 @@ impl CommandReviewCard {
         body.set_margin_top(2);
         body.set_margin_bottom(if spec.compact { 7 } else { 11 });
 
-        let description_text = crate::review_input::safe_multiline_display(
+        let description_text = jterm_core::review_input::safe_multiline_display(
             &spec.description,
             MAX_REVIEW_DESCRIPTION_BYTES,
         );
@@ -197,19 +197,23 @@ impl CommandReviewCard {
         copy.set_tooltip_text(Some("Copy the command without inserting or running it"));
         actions.append(&copy);
         let auxiliary = spec.auxiliary_label.map(|label| {
-            let label = crate::review_input::safe_inline_display(&label, MAX_REVIEW_LABEL_BYTES);
+            let label =
+                jterm_core::review_input::safe_inline_display(&label, MAX_REVIEW_LABEL_BYTES);
             let button = Button::with_label(&label);
             actions.append(&button);
             button
         });
         let secondary = spec.secondary_label.map(|label| {
-            let label = crate::review_input::safe_inline_display(&label, MAX_REVIEW_LABEL_BYTES);
+            let label =
+                jterm_core::review_input::safe_inline_display(&label, MAX_REVIEW_LABEL_BYTES);
             let button = Button::with_label(&label);
             actions.append(&button);
             button
         });
-        let primary_label =
-            crate::review_input::safe_inline_display(&spec.primary_label, MAX_REVIEW_LABEL_BYTES);
+        let primary_label = jterm_core::review_input::safe_inline_display(
+            &spec.primary_label,
+            MAX_REVIEW_LABEL_BYTES,
+        );
         let primary = Button::with_label(&primary_label);
         actions.append(&primary);
         body.append(&actions);
@@ -271,7 +275,7 @@ impl CommandReviewCard {
     }
 
     pub(super) fn validated_command(&self) -> Result<String, String> {
-        crate::review_input::validate(&self.entry.text())
+        jterm_core::review_input::validate(&self.entry.text())
             .map(str::to_string)
             .map_err(|error| error.to_string())
     }
@@ -310,7 +314,7 @@ impl CommandReviewCard {
 }
 
 fn accepted_review_entry_text(previous: &str, candidate: &str) -> (String, bool) {
-    if candidate.len() <= crate::review_input::MAX_REVIEW_INPUT_BYTES {
+    if candidate.len() <= jterm_core::review_input::MAX_REVIEW_INPUT_BYTES {
         (candidate.to_string(), false)
     } else {
         (previous.to_string(), true)
@@ -318,7 +322,7 @@ fn accepted_review_entry_text(previous: &str, candidate: &str) -> (String, bool)
 }
 
 fn initial_review_entry_text(text: &str) -> (String, Option<String>) {
-    match crate::review_input::validate(text) {
+    match jterm_core::review_input::validate(text) {
         Ok(command) => (command.to_string(), None),
         Err(error) => (
             String::new(),
@@ -330,7 +334,7 @@ fn initial_review_entry_text(text: &str) -> (String, Option<String>) {
 }
 
 fn safe_review_feedback_text(message: &str) -> String {
-    crate::review_input::safe_multiline_display(message, MAX_REVIEW_FEEDBACK_BYTES)
+    jterm_core::review_input::safe_multiline_display(message, MAX_REVIEW_FEEDBACK_BYTES)
 }
 
 pub(super) fn set_review_feedback(feedback: &Label, message: &str, error: bool) {
@@ -383,8 +387,8 @@ mod tests {
     use gtk4::{Button, Label};
 
     // GTK widget construction requires a display in normal unit-test runs, so
-    // behavior exercised without GTK lives in agent/review_input tests. Keep
-    // this symbol referenced to prevent accidental dead-code drift.
+    // behavior exercised without GTK lives in jterm_core's review_input tests.
+    // Keep this symbol referenced to prevent accidental dead-code drift.
     #[test]
     fn shared_risk_renderer_is_linked() {
         let _renderer: fn(&Label, &Button, &str, bool) = sync_risk;
@@ -395,7 +399,7 @@ mod tests {
         let prior = "printf safe";
         let input = format!(
             "{}界",
-            "a".repeat(crate::review_input::MAX_REVIEW_INPUT_BYTES - 1)
+            "a".repeat(jterm_core::review_input::MAX_REVIEW_INPUT_BYTES - 1)
         );
         let (accepted, rejected) = accepted_review_entry_text(prior, &input);
         assert!(rejected);
@@ -423,7 +427,7 @@ mod tests {
         for command in [
             "echo one\necho two".to_string(),
             "echo safe\u{202e}txt".to_string(),
-            "x".repeat(crate::review_input::MAX_REVIEW_INPUT_BYTES + 1),
+            "x".repeat(jterm_core::review_input::MAX_REVIEW_INPUT_BYTES + 1),
         ] {
             let (entry, error) = initial_review_entry_text(&command);
             assert!(entry.is_empty());

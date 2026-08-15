@@ -1674,7 +1674,7 @@ pub fn run() -> glib::ExitCode {
             // Captured outputs queued for jsh's execution journal ride a
             // writer thread of their own; without this bounded wait the last
             // command's output is lost whenever quit wins the race to disk.
-            if !crate::execution_journal::flush(std::time::Duration::from_secs(2)) {
+            if !jterm_core::execution_journal::flush(std::time::Duration::from_secs(2)) {
                 log::warn!("execution-journal writer did not flush before shutdown");
             }
             // Publish after every window save and Block-history snapshot, then

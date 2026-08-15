@@ -823,7 +823,7 @@ fn emit_dcs_passthrough(payload: &[u8], passthrough: &mut Vec<u8>) {
 /// This parser used to split on `;`, read the mark, and throw every parameter
 /// away, so the two frontends that share it reconstructed the command by
 /// scraping it back off the screen and could never correlate their captured
-/// output with a journal record — while [`crate::execution_journal::submit`]
+/// output with a journal record — while [`jterm_core::execution_journal::submit`]
 /// existed for exactly that.
 ///
 /// Every field is optional: the same mark is emitted by shells that send no
@@ -865,19 +865,19 @@ impl CommandMeta {
                     meta.id = decode_osc133(value, MAX_OSC133_ID_BYTES).filter(|id| {
                         !id.is_empty()
                             && !id.chars().any(char::is_control)
-                            && !crate::review_input::contains_visual_spoof(id)
+                            && !jterm_core::review_input::contains_visual_spoofing(id)
                     });
                 }
                 "cmdline_url" | "command_url" | "command" | "cmdline" => {
                     meta.command = decode_osc133(value, MAX_OSC133_COMMAND_BYTES).filter(|text| {
                         !text.chars().any(char::is_control)
-                            && !crate::review_input::contains_visual_spoof(text)
+                            && !jterm_core::review_input::contains_visual_spoofing(text)
                     });
                 }
                 "cwd_url" | "cwd" => {
                     meta.cwd = decode_osc133(value, MAX_OSC133_CWD_BYTES).filter(|text| {
                         !text.chars().any(char::is_control)
-                            && !crate::review_input::contains_visual_spoof(text)
+                            && !jterm_core::review_input::contains_visual_spoofing(text)
                     });
                 }
                 "duration_ms" | "duration" => {
@@ -927,7 +927,7 @@ fn decode_osc133(value: &str, max_bytes: usize) -> Option<String> {
 }
 
 fn valid_remote_session_id(id: &str) -> bool {
-    crate::execution_journal::is_valid_jsh_session_id(id)
+    jterm_core::execution_journal::is_valid_jsh_session_id(id)
 }
 
 fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
@@ -1011,7 +1011,7 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
     if matches!(s.split_once(';'), Some(("0" | "1" | "2", _)))
         && (payload.len() > MAX_TITLE_BYTES
             || s.chars().any(char::is_control)
-            || crate::review_input::contains_visual_spoof(s))
+            || jterm_core::review_input::contains_visual_spoofing(s))
     {
         return;
     }
@@ -1129,7 +1129,9 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
 /// percent decoding. Checking only the former lets `%0a` or `%E2%80%AE`
 /// reappear as a line break or bidi override in cwd-derived terminal chrome.
 fn safe_osc7_text(value: &str) -> bool {
-    if value.chars().any(char::is_control) || crate::review_input::contains_visual_spoof(value) {
+    if value.chars().any(char::is_control)
+        || jterm_core::review_input::contains_visual_spoofing(value)
+    {
         return false;
     }
 
@@ -1156,7 +1158,7 @@ fn safe_osc7_text(value: &str) -> bool {
     }
     String::from_utf8(decoded).is_ok_and(|decoded| {
         !decoded.chars().any(char::is_control)
-            && !crate::review_input::contains_visual_spoof(&decoded)
+            && !jterm_core::review_input::contains_visual_spoofing(&decoded)
     })
 }
 
@@ -1167,7 +1169,7 @@ fn safe_osc7_text(value: &str) -> bool {
 fn bounded_notification_field(raw: &str) -> String {
     raw.chars()
         .map(|ch| {
-            if ch.is_control() || crate::review_input::is_visual_spoof_character(ch) {
+            if ch.is_control() || jterm_core::review_input::is_visual_spoofing_character(ch) {
                 '\u{fffd}'
             } else {
                 ch

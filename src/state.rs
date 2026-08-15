@@ -1177,7 +1177,7 @@ fn normalize_pane_layout_bounded(layout: &mut PaneLayout, limit: usize) -> Optio
                     let valid = !name.trim().is_empty()
                         && name.len() <= MAX_RESTORED_TAB_NAME_BYTES
                         && !name.chars().any(char::is_control)
-                        && !crate::review_input::contains_visual_spoof(name);
+                        && !jterm_core::review_input::contains_visual_spoofing(name);
                     // One tab owns at most one reconnect controller. A modified
                     // snapshot must not smuggle a second managed argv into a
                     // local shell when that invariant cannot be represented.
@@ -1609,7 +1609,7 @@ pub(crate) fn get_foreground_process_name(terminal: &Terminal) -> Option<String>
     let shell_pid = terminal_child_pid(terminal)?;
     let pty_fd = terminal.pty()?.fd().as_raw_fd();
     crate::process::foreground_process_name(pty_fd, shell_pid)
-        .map(|name| crate::review_input::safe_inline_display(&name, 256))
+        .map(|name| jterm_core::review_input::safe_inline_display(&name, 256))
 }
 
 fn preserve_existing_workspace_with_ai(

@@ -61,11 +61,12 @@ fn scan_dir(dir: &Path) -> io::Result<Vec<FileEntry>> {
 fn safe_file_label(value: &str) -> String {
     let mut label = String::with_capacity(value.len().min(MAX_FILE_LABEL_BYTES));
     for ch in value.chars() {
-        let rendered = if ch.is_control() || crate::review_input::is_visual_spoof_character(ch) {
-            '\u{fffd}'
-        } else {
-            ch
-        };
+        let rendered =
+            if ch.is_control() || jterm_core::review_input::is_visual_spoofing_character(ch) {
+                '\u{fffd}'
+            } else {
+                ch
+            };
         if label.len().saturating_add(rendered.len_utf8()) > MAX_FILE_LABEL_BYTES {
             if label.len().saturating_add('…'.len_utf8()) <= MAX_FILE_LABEL_BYTES {
                 label.push('…');
@@ -374,7 +375,7 @@ impl UiState {
                     if model.replace_root(generation, Vec::new()) {
                         let path = display_path(&expected_root);
                         let error =
-                            crate::review_input::safe_inline_display(&error.to_string(), 512);
+                            jterm_core::review_input::safe_inline_display(&error.to_string(), 512);
                         toast_overlay
                             .add_toast(adw::Toast::new(&format!("Cannot open {path}: {error}")));
                     }
@@ -386,7 +387,7 @@ impl UiState {
             // generation in case this function is re-entered by UI callbacks.
             if model_for_start_error.replace_root(generation, Vec::new()) {
                 let path = display_path(&self.file_tree_root.borrow());
-                let error = crate::review_input::safe_inline_display(&error.to_string(), 512);
+                let error = jterm_core::review_input::safe_inline_display(&error.to_string(), 512);
                 self.toast_overlay
                     .add_toast(adw::Toast::new(&format!("Cannot open {path}: {error}")));
             }

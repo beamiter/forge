@@ -45,9 +45,9 @@ impl UiState {
                 let error = error.to_string();
                 log::warn!(
                     "cannot stage the jsh installer: {}",
-                    crate::review_input::safe_inline_display(&error, 4 * 1024)
+                    jterm_core::review_input::safe_inline_display(&error, 4 * 1024)
                 );
-                let error = crate::review_input::safe_multiline_display(&error, 16 * 1024);
+                let error = jterm_core::review_input::safe_multiline_display(&error, 16 * 1024);
                 let dialog = adw::AlertDialog::new(
                     Some("Cannot install jsh"),
                     Some(&format!("Writing the installer script failed: {error}")),
@@ -147,7 +147,7 @@ fn apply_jsh_status(bar: &GBox, label: &Label, action: &Button, status: &Status)
     if let Some(error) = &status.error {
         log::info!(
             "jsh update check unavailable: {}",
-            crate::review_input::safe_inline_display(error, 4 * 1024)
+            jterm_core::review_input::safe_inline_display(error, 4 * 1024)
         );
     }
     if let Some(other) = &status.shadowed_by {
@@ -156,7 +156,7 @@ fn apply_jsh_status(bar: &GBox, label: &Label, action: &Button, status: &Status)
         // worth a log line.
         log::warn!(
             "PATH resolves jsh to {}, which jterm does not manage",
-            crate::review_input::safe_inline_display(other, 4 * 1024)
+            jterm_core::review_input::safe_inline_display(other, 4 * 1024)
         );
     }
 
@@ -164,8 +164,8 @@ fn apply_jsh_status(bar: &GBox, label: &Label, action: &Button, status: &Status)
         bar.set_visible(false);
         return;
     };
-    let title = crate::review_input::safe_inline_display(&prompt.banner_title(), 4 * 1024);
-    let button = crate::review_input::safe_inline_display(prompt.button_label(), 256);
+    let title = jterm_core::review_input::safe_inline_display(&prompt.banner_title(), 4 * 1024);
+    let button = jterm_core::review_input::safe_inline_display(prompt.button_label(), 256);
     log::info!("jsh notice: {title}");
     label.set_text(&title);
     action.set_label(&button);

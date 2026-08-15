@@ -11,14 +11,11 @@ pub mod parser;
 pub mod exit_status {
     pub use jterm_core::exit_status::*;
 }
-pub mod review_input;
-
 pub mod host;
 
 pub mod identity {
     pub use jterm_core::identity::*;
 }
-pub mod execution_journal;
 pub mod keybindings;
 pub mod logging;
 pub mod notebook;
@@ -33,7 +30,9 @@ pub mod process {
     /// Refuse path text whose terminal rendering can disagree with the bytes
     /// inserted into the interactive shell editor.
     pub fn try_shell_quote_path(path: &str) -> Option<String> {
-        if path.chars().any(char::is_control) || crate::review_input::contains_visual_spoof(path) {
+        if path.chars().any(char::is_control)
+            || jterm_core::review_input::contains_visual_spoofing(path)
+        {
             return None;
         }
         if path.is_empty() {
@@ -55,7 +54,7 @@ pub mod process {
 
     pub fn foreground_process_name(pty_fd: i32, shell_pid: i32) -> Option<String> {
         let name = jterm_core::process::foreground_process_name(pty_fd, shell_pid)?;
-        let visible = crate::review_input::safe_inline_display(&name, 4 * 1024);
+        let visible = jterm_core::review_input::safe_inline_display(&name, 4 * 1024);
         let mut characters = visible.chars();
         let mut bounded = characters.by_ref().take(128).collect::<String>();
         if characters.next().is_some() {
@@ -82,7 +81,7 @@ pub mod process {
         for argument in args {
             if argument.len() > MAX_RESTORABLE_ARG_BYTES_LOCAL
                 || argument.chars().any(char::is_control)
-                || crate::review_input::contains_visual_spoof(argument)
+                || jterm_core::review_input::contains_visual_spoofing(argument)
             {
                 return false;
             }
@@ -146,7 +145,7 @@ pub mod process {
                         Ok(BoundedArgument(
                             (value.len() <= MAX_RESTORABLE_ARG_BYTES_LOCAL
                                 && !value.chars().any(char::is_control)
-                                && !crate::review_input::contains_visual_spoof(value))
+                                && !jterm_core::review_input::contains_visual_spoofing(value))
                             .then(|| value.to_string()),
                         ))
                     }
@@ -158,7 +157,7 @@ pub mod process {
                         Ok(BoundedArgument(
                             (value.len() <= MAX_RESTORABLE_ARG_BYTES_LOCAL
                                 && !value.chars().any(char::is_control)
-                                && !crate::review_input::contains_visual_spoof(&value))
+                                && !jterm_core::review_input::contains_visual_spoofing(&value))
                             .then_some(value),
                         ))
                     }
@@ -243,7 +242,6 @@ pub mod process {
     }
 }
 pub mod pty;
-pub mod pty_input;
 pub mod redact {
     pub use jterm_core::redact::*;
 }

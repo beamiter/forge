@@ -222,20 +222,20 @@ const MAX_REMOTE_SSH_ARGS: usize = 64;
 const MAX_FONT_DESC_BYTES: usize = 1024;
 const MAX_CONFIG_PATH_BYTES: usize = 16 * 1024;
 const MAX_AI_IDENTIFIER_BYTES: usize = 1024;
-const MAX_STARTUP_COMMANDS_BYTES: usize = crate::review_input::MAX_REVIEW_INPUT_BYTES;
+const MAX_STARTUP_COMMANDS_BYTES: usize = jterm_core::review_input::MAX_REVIEW_INPUT_BYTES;
 
 pub(crate) fn remote_field_is_safe(value: &str) -> bool {
     !value.trim().is_empty()
         && value.len() <= MAX_REMOTE_HOST_FIELD_BYTES
         && !value.chars().any(char::is_control)
-        && !crate::review_input::contains_visual_spoof(value)
+        && !jterm_core::review_input::contains_visual_spoofing(value)
 }
 
 fn setting_text_is_safe(value: &str, max_bytes: usize) -> bool {
     !value.trim().is_empty()
         && value.len() <= max_bytes
         && !value.chars().any(char::is_control)
-        && !crate::review_input::contains_visual_spoof(value)
+        && !jterm_core::review_input::contains_visual_spoofing(value)
 }
 
 fn ai_base_url_is_structurally_safe(value: &str) -> bool {
@@ -491,7 +491,7 @@ fn control_socket_path_is_safe(path: &Path) -> bool {
         path.len() <= MAX_CONFIG_PATH_BYTES
             && !path.contains('%')
             && !path.chars().any(char::is_control)
-            && !crate::review_input::contains_visual_spoof(path)
+            && !jterm_core::review_input::contains_visual_spoofing(path)
     })
 }
 
@@ -501,7 +501,7 @@ fn control_socket_dir() -> Option<PathBuf> {
         Err(error) => {
             log::warn!(
                 "SSH multiplexing disabled: {}",
-                crate::review_input::safe_inline_display(&error.to_string(), 1024)
+                jterm_core::review_input::safe_inline_display(&error.to_string(), 1024)
             );
             return None;
         }
@@ -610,7 +610,7 @@ fn build_docker_argv(host: &RemoteHost) -> Vec<String> {
     if let Some(sid) = host
         .session
         .as_deref()
-        .filter(|sid| crate::review_input::valid_jsh_id(sid))
+        .filter(|sid| jterm_core::execution_journal::is_valid_jsh_session_id(sid))
     {
         argv.push("--session".to_string());
         argv.push(sid.to_string());
@@ -630,7 +630,7 @@ fn build_remote_argv_with_control_dir(
     if let Some(sid) = host
         .session
         .as_deref()
-        .filter(|sid| crate::review_input::valid_jsh_id(sid))
+        .filter(|sid| jterm_core::execution_journal::is_valid_jsh_session_id(sid))
     {
         remote_cmd.push_str(" --session ");
         remote_cmd.push_str(sid);
@@ -1358,8 +1358,8 @@ fn config_issue(
 ) {
     issues.push(ConfigIssue {
         level,
-        path: crate::review_input::safe_inline_display(&path.into(), 512),
-        message: crate::review_input::safe_inline_display(&message.into(), 2 * 1024),
+        path: jterm_core::review_input::safe_inline_display(&path.into(), 512),
+        message: jterm_core::review_input::safe_inline_display(&message.into(), 2 * 1024),
     });
 }
 
@@ -1400,7 +1400,7 @@ fn validate_remote_host_string(
             path,
             "must not contain control characters",
         );
-    } else if crate::review_input::contains_visual_spoof(value) {
+    } else if jterm_core::review_input::contains_visual_spoofing(value) {
         config_issue(
             issues,
             ConfigIssueLevel::Error,
@@ -1837,7 +1837,7 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
                     validate_remote_host_string(&mut issues, host.get(key), &field_path, false);
                 }
                 if let Some(session) = host.get("session").and_then(toml::Value::as_str) {
-                    if !crate::review_input::valid_jsh_id(session) {
+                    if !jterm_core::execution_journal::is_valid_jsh_session_id(session) {
                         config_issue(
                             &mut issues,
                             Error,
@@ -2050,7 +2050,7 @@ pub(crate) fn config_syntax_diagnostic(
     ConfigSyntaxDiagnostic {
         line: location.map(|(line, _)| line),
         column: location.map(|(_, column)| column),
-        message: crate::review_input::safe_inline_display(error.message(), 512),
+        message: jterm_core::review_input::safe_inline_display(error.message(), 512),
     }
 }
 
@@ -2163,7 +2163,7 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
     clear_load_error();
     let path = config_file_path();
     let display_path =
-        || crate::review_input::safe_inline_display(&path.to_string_lossy(), 2 * 1024);
+        || jterm_core::review_input::safe_inline_display(&path.to_string_lossy(), 2 * 1024);
     let bytes = match crate::config_store::read_config_bytes(&path) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
@@ -2224,7 +2224,7 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
             "{}: {error_count} configuration error{} (first at {}); run: forge --check-config",
             display_path(),
             if error_count == 1 { "" } else { "s" },
-            crate::review_input::safe_inline_display(first_path, 512)
+            jterm_core::review_input::safe_inline_display(first_path, 512)
         ));
         log::warn!(
             "Ignoring semantically invalid config file {} ({error_count} errors)",
@@ -2429,7 +2429,7 @@ pub(crate) fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
             let session = match t.get("session") {
                 Some(value) => {
                     let session = value.as_str()?;
-                    if !crate::review_input::valid_jsh_id(session) {
+                    if !jterm_core::execution_journal::is_valid_jsh_session_id(session) {
                         return None;
                     }
                     Some(session.to_string())
