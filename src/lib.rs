@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 pub mod agent;
-#[path = "ai/mod.rs"]
 pub mod ai;
 pub mod block_view;
 pub mod cli;

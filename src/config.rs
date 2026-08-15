@@ -253,7 +253,7 @@ fn ai_base_url_is_structurally_safe(value: &str) -> bool {
     })
 }
 
-fn ai_base_url_is_safe(provider: &str, value: &str) -> bool {
+pub(crate) fn ai_base_url_is_safe(provider: &str, value: &str) -> bool {
     if !ai_base_url_is_structurally_safe(value) {
         return false;
     }
@@ -823,7 +823,7 @@ impl Config {
         *self = Self::safe_defaults();
     }
 
-    fn safe_defaults() -> Self {
+    pub(crate) fn safe_defaults() -> Self {
         let themes = builtin_themes();
         let theme = &themes[0];
         Self {
@@ -3538,16 +3538,17 @@ open_palette = "F8"
             resolved, insecure_loopback,
             "the runtime validator must reject the requested destination itself"
         );
-        assert!(crate::ai::AiClient::new(
-            crate::ai::Provider::OpenAiCompatible,
-            None,
-            "local-model",
-            resolved,
-            512,
-            None,
-            true,
-        )
-        .is_err());
+        let mut config = Config::safe_defaults();
+        config.ai_enabled = true;
+        config.ai_provider = "openai-compatible".to_string();
+        config.ai_base_url = resolved.clone();
+        assert!(
+            matches!(
+                crate::ai::client_from_config(&config),
+                Err(crate::ai::AiError::InvalidConfiguration(_))
+            ),
+            "the client boundary must reject the unsafe endpoint before any network I/O"
+        );
         assert_eq!(
             resolve_ai_base_url(
                 Some("https://user:secret@example.com/v1".to_string()),

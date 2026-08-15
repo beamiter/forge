@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-15
+Updated: 2026-08-15 (AI module round)
 
 This working tree contains the nine-round "Evolve ASCII organism" series
 (`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
@@ -18,6 +18,13 @@ every round (attribution races, a Drop panic on a fired glib source, a
 saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
+
+- **AI module unification round (2026-08-15, second half)**: `src/ai/` is
+  gone, replaced by a thin shim over `jterm_core::ai`; see "AI module: done"
+  below. Adversarial review confirmed symbol coverage, the endpoint-safety
+  gate ordering, snapshot decode compatibility, and the stronger credential
+  staging; it found no defects beyond the stale-handoff lines this update
+  fixes.
 
 - **Architecture unification round (2026-08-15)**: the app-owned helper
   runners and the five verbatim duplicate modules (`kitty_graphics`,
@@ -255,8 +262,9 @@ Both apps now pin `jterm_core`
 runners are migrated. `src/host.rs` is now a thin shim
 over `jterm_core::host` (`pub use` + `APP_ID` + `interactive_bash_path`) whose
 only local code is `pub(crate) helper_command`/`command_status_with_timeout`
-wrappers for callers still outside the core's scope (ai curl transport, CLI
-doctor); `src/git_meta.rs` is a re-export plus the forge-only
+wrappers for the two callers still outside the core's scope (the CLI doctor
+probe and the command-correction probes); `src/git_meta.rs` is a re-export
+plus the forge-only
 `read_cached_and_refresh` UI cache worker; `src/jsh_install.rs` is a pure
 re-export; `src/ui/command_correction.rs` probes run on the now-public
 `jterm_core::supervised::SupervisedChild`. Intentional tightenings adopted
@@ -272,11 +280,27 @@ vendored copy lives in core). The verbatim modules `kitty_graphics`,
 `notebook_text`, `notify`, `core_keybindings`, and `atomic_file` were deleted
 in favor of the core equivalents.
 
+### AI module: done
+
+`src/ai/mod.rs` + `src/ai/conversation.rs` (~5400 lines) are replaced by a
+160-line `src/ai.rs` shim over `jterm_core::ai`: pure re-exports plus one
+local `client_from_config` that gates on `config::ai_base_url_is_safe` before
+constructing the client, compensating for core's `AiClient::new` not
+validating the endpoint at construction (core fails closed at request-build
+time instead). Core's conversation decoder is byte-compatible with forge's
+on-disk snapshots (v1 legacy and v2, identical budgets), and its credential
+staging (`atomic_file::write_atomic`) and supervised curl transport are
+strictly stronger than the deleted nonce-temp/kill-and-reap code. Known
+diagnostic-only quirk: a hand-constructed Config with an unrecognized
+provider string now reports the endpoint-safety error instead of "unknown AI
+provider" (unreachable through normal config load, which normalizes unknown
+providers). `config::ai_api_key_file_env_override` (forge's own resolver,
+with its absolute-path filter) remains untested — pre-existing gap. The host
+shim's `helper_command` lost its biggest consumer (curl) but stays for the
+doctor and correction probes.
+
 ### Follow-up migrations (next rounds)
 
-- `src/ai/mod.rs` still hand-rolls its curl lifecycle; core's AI transport has
-  the supervised collector. Migrate it, then collapse the host shim's
-  `helper_command`/`command_status_with_timeout` wrappers.
 - Forge-ahead local modules to upstream into core rather than delete:
   `review_input` (safe-display helpers, `valid_jsh_id`, wider spoof set),
   `pty_input` (`AdmittedInput`), `command_history`
