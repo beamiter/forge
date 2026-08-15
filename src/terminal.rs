@@ -548,16 +548,57 @@ pub(crate) fn spawn_shell(
     let argv_vec = crate::host::wrap_argv(&argv_vec, requested_working_directory, &[]);
     let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
 
-    // VTE inherits the rest of the environment and injects its own
-    // TERM/VTE_VERSION, and an `envv` entry wins unconditionally — so this
-    // carries identity only (TERM, COLORTERM, TERM_PROGRAM,
-    // TERM_PROGRAM_VERSION, VTE_VERSION) and never a pager or locale default
-    // that would clobber one the user set deliberately.
-    let child_identity = crate::child_env::ChildEnv::from_identity();
-    let envv_owned = crate::child_env::vte_envv(&child_identity, &[]);
+    // The child gets the complete environment frozen at launch (see
+    // `capture_inherited_environment` in `app::run`), so variables written
+    // after startup — CLI's `FORGE_*`, the input-method `GTK_*` rewrites —
+    // never reach the shell. `VTE_SPAWN_NO_PARENT_ENVV` stops VTE from merging
+    // the live, toolkit-mutated process environment back in; without it the
+    // frozen block would be pointless. The flag and the frozen block must stay
+    // paired: with the pre-freeze identity-only fallback envv the flag would
+    // strip the whole parent environment.
+    let child_identity = jterm_core::child_env::ChildEnv::from_identity();
+    let (envv_owned, frozen) =
+        match jterm_core::child_env::vte_envv_from_captured(&child_identity, &[]) {
+            Ok(envv) => (envv, true),
+            Err(err) => {
+                match jterm_core::child_env::envp_from_captured(&child_identity, &[]) {
+                    Ok(block) => {
+                        // The frozen block exists but `vte_envv_from_captured`
+                        // rejected it: some inherited name or value is not
+                        // UTF-8, which the `&str`-based VTE envv cannot carry.
+                        // Rebuild the same block from the frozen capture with
+                        // those entries dropped (a non-UTF-8 name drops the
+                        // whole entry) and keep the pairing invariant — the
+                        // flag must still suppress the live, mutated parent
+                        // environment instead of merging it back in.
+                        let envv: Vec<String> = block
+                            .into_iter()
+                            .filter_map(|entry| String::from_utf8(entry.into_bytes()).ok())
+                            .collect();
+                        log::warn!(
+                            "non-UTF-8 entries scrubbed from the frozen launch environment: {err}"
+                        );
+                        (envv, true)
+                    }
+                    Err(err) => {
+                        // Unreachable in the app (`app::run` captures before GTK
+                        // starts); keep the pre-freeze identity-only behavior
+                        // rather than failing the spawn.
+                        log::warn!(
+                            "no frozen launch environment; VTE inherits the live one: {err}"
+                        );
+                        (jterm_core::child_env::vte_envv(&child_identity, &[]), false)
+                    }
+                }
+            }
+        };
     let envv: Vec<&str> = envv_owned.iter().map(String::as_str).collect();
     let envv: &[&str] = &envv;
-    let spawn_flags = SpawnFlags::SEARCH_PATH;
+    let mut spawn_flags = SpawnFlags::SEARCH_PATH;
+    if frozen {
+        spawn_flags |=
+            SpawnFlags::from_bits_retain(jterm_core::child_env::VTE_SPAWN_NO_PARENT_ENVV_BITS);
+    }
     let cancellable: Option<&Cancellable> = None;
     let spawn_working_directory = if crate::host::is_flatpak() {
         None

@@ -15,7 +15,6 @@ pub mod review_input;
 
 pub mod host;
 
-pub mod child_env;
 pub mod identity {
     pub use jterm_core::identity::*;
 }

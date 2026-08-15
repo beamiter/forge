@@ -420,6 +420,18 @@ fn init_input_method_env() {
 }
 
 pub fn run() -> glib::ExitCode {
+    // Freeze the launch-time environment before CLI parsing writes FORGE_*,
+    // before input-method setup rewrites GTK_PATH/GTK_IM_MODULE/XMODIFIERS,
+    // and before GTK or any worker thread starts: terminal and PTY children
+    // spawned later must inherit the environment as it was at launch, not
+    // these process-only mutations. (Other spawn paths — notebook cell
+    // workers, the `flatpak-spawn` host bridge — still start from the live
+    // environment.) A second capture would mean this ordering broke, so
+    // treat it as a startup error.
+    if let Err(err) = jterm_core::child_env::capture_inherited_environment() {
+        eprintln!("forge: failed to capture the inherited environment: {err}");
+        return glib::ExitCode::FAILURE;
+    }
     jterm_core::identity::init(jterm_core::identity::AppIdentity {
         app_name: "forge",
         app_id: crate::host::APP_ID,

@@ -19,6 +19,27 @@ saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
 
+- **Inherited-environment freeze (2026-08-15, fourth round)**: the local
+  `src/child_env.rs` is deleted and both spawn paths run on
+  `jterm_core::child_env`'s frozen launch snapshot.
+  `capture_inherited_environment()` is the first statement of `app::run`
+  (before `identity::init` and `cli::handle_early_args`; every `set_var` —
+  the FORGE_* flags and the input-method writes — runs strictly after, and a
+  capture failure is fatal per core's contract). `pty.rs` builds the
+  block-mode child block with `envp_from_captured`; `terminal.rs` uses
+  `vte_envv_from_captured` and ORs `VTE_SPAWN_NO_PARENT_ENVV_BITS` into the
+  spawn flags so libvte cannot re-merge the live environment. A non-UTF-8
+  inherited variable makes the strict conversion fail; that path rebuilds
+  the envv from the frozen block with the offending entries scrubbed and
+  keeps the flag, rather than falling back to the live environment. Coverage
+  is scoped to terminal/PTY children: notebook cell workers and the
+  flatpak-spawn bridge still start from the live environment (pre-existing).
+  Adversarial review verified the capture ordering across every entry path
+  and caught the scrub-fallback misdiagnosis plus two overstated comments;
+  one accepted test weakness remains — the spawn tests tolerate an
+  `AlreadyExists` capture race, so the test binary's frozen snapshot can
+  contain another test's env mutation (no assertion depends on it).
+
 - **Deduplication round 3 (2026-08-15)**: repinned to `04f6328` and deleted
   the last two diverged local modules. `src/snapshot_file.rs` is gone (all
   callers on `jterm_core::snapshot_file`, including the now-public
@@ -326,9 +347,11 @@ doctor and correction probes.
   `pty_input` (`AdmittedInput`), `execution_journal` (`output_capture_enabled`),
   and `parser` (OSC 7771, erase-scrollback/hard-reset barriers, strict ST
   termination).
-- Core-ahead modules not yet adopted: `child_env`'s inherited-environment
-  freeze and the hardened `jterm_core::agent` session wrapper.
-- `src/pty.rs:1545` and `src/state.rs:1953` spawn `sh` directly, outside the
+- Core-ahead modules not yet adopted: the hardened `jterm_core::agent`
+  session wrapper. (`child_env`'s inherited-environment freeze is adopted:
+  `app::run` captures first, `pty.rs` uses `envp_from_captured`, and the VTE
+  spawn pairs `vte_envv_from_captured` with `VTE_SPAWN_NO_PARENT_ENVV`.)
+- `src/pty.rs:1579` and `src/state.rs:1953` spawn `sh` directly, outside the
   helper-runner contract; `src/notebook.rs` long-lived terminal children keep
   their own wait logic by design (`SupervisedChild` scopes itself to
   short-lived helpers).

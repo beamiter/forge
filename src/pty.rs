@@ -361,7 +361,13 @@ fn invalid_nul(context: &str) -> io::Error {
     )
 }
 
-/// The child's environment, built entirely before `fork`.
+/// The PTY child's environment, built entirely before `fork` from the
+/// launch-time snapshot frozen by `app::run` (see
+/// [`jterm_core::child_env::capture_inherited_environment`]), so CLI- and
+/// toolkit-written variables such as `FORGE_CONFIG` or `GTK_IM_MODULE` never
+/// leak into the shell. Other spawn paths are not covered: notebook cell
+/// workers and the `flatpak-spawn` host bridge still start from the live
+/// environment.
 ///
 /// `LESS` is a flag rather than a hardcoded value because the family disagrees:
 /// forge keeps `R` so a short `git log` still opens an interactive pager on the
@@ -371,13 +377,13 @@ fn invalid_nul(context: &str) -> io::Error {
 /// child, so before this these variables (bar `TERM`) never reached the shell
 /// and `bat`/`delta`/`lazygit` fell back to 256 colours.
 fn child_environment(env_extra: &[(&str, &str)]) -> io::Result<Vec<CString>> {
-    crate::child_env::envp(&block_mode_child_env(), env_extra)
+    jterm_core::child_env::envp_from_captured(&block_mode_child_env(), env_extra)
 }
 
-fn block_mode_child_env() -> crate::child_env::ChildEnv<'static> {
-    crate::child_env::ChildEnv {
+fn block_mode_child_env() -> jterm_core::child_env::ChildEnv<'static> {
+    jterm_core::child_env::ChildEnv {
         less_default: Some("R"),
-        ..crate::child_env::ChildEnv::from_identity()
+        ..jterm_core::child_env::ChildEnv::from_identity()
     }
 }
 
@@ -1251,6 +1257,35 @@ mod tests {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
+    /// The strict child-environment API requires the process-global one-shot
+    /// capture `app::run` performs first. Tests share one process, so a
+    /// capture already done by an earlier test (`AlreadyExists`) is fine.
+    fn ensure_environment_captured() {
+        match jterm_core::child_env::capture_inherited_environment() {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => panic!("capture inherited environment: {err}"),
+        }
+    }
+
+    /// Forge wiring around core's freeze: a variable written into the process
+    /// environment *after* the capture (what CLI's `FORGE_*` and the
+    /// input-method `GTK_*` rewrites are in the app) must not reach the child.
+    #[test]
+    fn child_environment_excludes_variables_set_after_the_capture() {
+        ensure_environment_captured();
+        assert!(jterm_core::child_env::inherited_environment_is_captured());
+        unsafe { std::env::set_var("FORGE_POST_CAPTURE_TEST", "1") };
+        let block = child_environment(&[]).expect("captured environment builds");
+        unsafe { std::env::remove_var("FORGE_POST_CAPTURE_TEST") };
+        assert!(
+            block
+                .iter()
+                .all(|entry| !entry.as_bytes().starts_with(b"FORGE_POST_CAPTURE_TEST=")),
+            "a post-capture variable leaked into the child environment"
+        );
+    }
+
     #[test]
     fn foreground_owner_never_conflates_probe_failure_with_the_shell() {
         assert_eq!(classify_foreground(42, 42), PtyForeground::Shell);
@@ -1283,6 +1318,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn bundled_bash_consumes_fd_and_announces_the_matching_token() {
+        ensure_environment_captured();
         let integration = format!(
             "{}/scripts/shell-integration/forge.bash",
             env!("CARGO_MANIFEST_DIR")
@@ -1564,6 +1600,7 @@ mod tests {
     /// one escalation ladder, and that one ladder must still reap the child.
     #[test]
     fn an_explicit_close_and_a_later_drop_share_one_teardown() {
+        ensure_environment_captured();
         let pty = OwnedPty::spawn(&["/bin/sh", "-c", "exec sleep 30"], None, &[])
             .expect("spawn PTY child");
         let lifecycle = pty.lifecycle();
@@ -1592,6 +1629,7 @@ mod tests {
 
     #[test]
     fn spawned_child_receives_prepared_environment_and_cwd() {
+        ensure_environment_captured();
         let pty = OwnedPty::spawn(
             &["/bin/sh", "-c", "printf '%s|' \"$TERM_PROGRAM\"; pwd"],
             Some("/tmp"),
@@ -1663,6 +1701,7 @@ mod tests {
     /// application down with it.
     #[test]
     fn a_vanished_working_directory_falls_back_to_the_application_directory() {
+        ensure_environment_captured();
         let missing = format!("/tmp/forge-removed-worktree-{}", std::process::id());
         assert!(!Path::new(&missing).exists(), "test path must not exist");
         let application_directory = std::env::current_dir().expect("process working directory");
