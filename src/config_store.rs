@@ -632,6 +632,48 @@ pub fn lock_status() -> ConfigLockStatus {
     lock_status_for(&config::config_file_path())
 }
 
+/// Advisory exclusive lock on a private file's parent directory.
+///
+/// Agent snapshot claims and writes hold this so concurrent forge processes
+/// serialize namespace mutations (claim renames, quarantines, replacements)
+/// against each other and against configuration saves, which take the same
+/// directory lock through `ConfigFileLock`.
+pub(crate) struct PrivateParentLock {
+    directory: fs::File,
+}
+
+impl PrivateParentLock {
+    pub(crate) fn acquire(target: &Path) -> Result<Self, ConfigWriteError> {
+        ensure_config_parent(target)?;
+        let parent = target
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let directory = validate_existing_parent(parent)?;
+        let started = Instant::now();
+        loop {
+            match try_lock_exclusive(&directory) {
+                Ok(true) => return Ok(Self { directory }),
+                Ok(false) if started.elapsed() < LOCK_TIMEOUT => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Ok(false) => {
+                    return Err(ConfigWriteError::Locked {
+                        path: parent.to_path_buf(),
+                    });
+                }
+                Err(error) => return Err(io_error("lock directory", parent, error)),
+            }
+        }
+    }
+}
+
+impl Drop for PrivateParentLock {
+    fn drop(&mut self) {
+        unlock(&self.directory);
+    }
+}
+
 struct ConfigFileLock {
     directory: fs::File,
     file: fs::File,
