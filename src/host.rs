@@ -10,21 +10,20 @@
 //! - [`interactive_bash_path`], the shell-selection rule that needs the
 //!   system's interactive bash rather than whichever bash an inherited PATH
 //!   names first.
-//! - `helper_command` and `command_status_with_timeout`, which core keeps
-//!   crate-visible. They mirror core's implementation — trusted canonical
-//!   resolution, the `/usr/bin:/bin` child PATH clamp, and a
-//!   [`jterm_core::supervised::SupervisedChild`] deadline — so the remaining
-//!   local callers (`ai`'s curl transport, the CLI doctor, and command
-//!   correction's probes) share core's contract until they migrate too. Keep
-//!   these in step with `jterm_core::host` when core's changes.
+//! - `helper_command`, which core keeps crate-visible. It mirrors core's
+//!   implementation — trusted canonical resolution and the `/usr/bin:/bin`
+//!   child PATH clamp — so the remaining local callers (the CLI doctor and
+//!   command correction's probes) share core's contract until they migrate
+//!   too. The doctor's bounded probe itself runs through
+//!   [`jterm_core::helper::bounded_command_output`]. Keep this in step with
+//!   `jterm_core::host` when core's changes.
 
 pub use jterm_core::host::*;
 
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
-use std::time::{Duration, Instant};
+use std::process::Command;
 
 pub const APP_ID: &str = "io.github.beamiter.forge";
 
@@ -179,35 +178,9 @@ fn not_executable() -> io::Error {
     )
 }
 
-/// Run a small helper without allowing it or descendants in its process group
-/// to outlive a bounded caller. `None` means the timeout elapsed.
-///
-/// This is crate-visible so fire-and-forget integrations (currently the CLI
-/// doctor) share the same reap contract instead of growing an unbounded thread
-/// per child. The supervision itself is core's
-/// [`jterm_core::supervised::SupervisedChild`].
-pub(crate) fn command_status_with_timeout(
-    mut command: Command,
-    timeout: Duration,
-) -> io::Result<Option<ExitStatus>> {
-    let deadline = Instant::now() + timeout;
-    let mut child = jterm_core::supervised::SupervisedChild::spawn(&mut command)?;
-    loop {
-        if child.root_has_exited()? {
-            return child.reap_after_group_kill().map(Some);
-        }
-        if Instant::now() >= deadline {
-            child.reap_after_group_kill()?;
-            return Ok(None);
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Stdio;
 
     #[cfg(unix)]
     #[test]
@@ -277,23 +250,5 @@ mod tests {
             .find_map(|(name, value)| (name == "PATH").then_some(value))
             .flatten();
         assert_eq!(child_path, Some(OsStr::new(TRUSTED_HELPER_PATH)));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn bounded_status_kills_a_descendant_holding_the_process_alive() {
-        let mut command = Command::new("sh");
-        command
-            .args(["-c", "sleep 5 & wait"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let started = Instant::now();
-        assert!(
-            command_status_with_timeout(command, Duration::from_millis(50))
-                .unwrap()
-                .is_none()
-        );
-        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

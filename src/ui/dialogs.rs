@@ -617,7 +617,7 @@ impl UiState {
                 if let Some(path) = config.command_history_path.as_deref() {
                     let configured_limit = config.command_history_max_entries as usize;
                     let read_limit = configured_limit.min(HISTORY_PALETTE_ROW_LIMIT + 1);
-                    match crate::command_history::read_recent_with_status(
+                    match jterm_core::command_history::read_recent_with_status(
                         std::path::Path::new(path),
                         read_limit,
                     ) {

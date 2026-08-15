@@ -11,7 +11,6 @@ pub mod parser;
 pub mod exit_status {
     pub use jterm_core::exit_status::*;
 }
-mod command_history;
 pub mod review_input;
 
 pub mod host;
@@ -250,7 +249,6 @@ pub mod redact {
     pub use jterm_core::redact::*;
 }
 pub mod jsh_install;
-pub mod snapshot_file;
 pub mod state;
 pub mod terminal;
 pub mod workflows;

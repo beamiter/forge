@@ -19,6 +19,25 @@ saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
 
+- **Deduplication round 3 (2026-08-15)**: repinned to `04f6328` and deleted
+  the last two diverged local modules. `src/snapshot_file.rs` is gone (all
+  callers on `jterm_core::snapshot_file`, including the now-public
+  `read_bounded_private`). `src/command_history.rs` is gone: core upstreamed
+  `read_recent_with_status`/`RecentHistory`, and the module's extra
+  absolute-path check was redundant with the config layer's
+  `normalize_history_path`. Ctrl+Click link opening now delegates to
+  `jterm_core::link::is_openable_url` — a deliberate tightening (2 KiB cap,
+  userinfo and backslash refused; all three `open_uri` callers pass untrusted
+  child output, so nothing legitimate breaks; a >2 KiB URL still highlights
+  but is refused with a log line, the same silent-refusal UX as before). The
+  doctor's Flatpak probe runs through `helper::bounded_command_output`, so
+  `command_status_with_timeout` left the host shim. Adversarial review caught
+  two stale comments (fixed) and noted: core's history validation uses the
+  narrower spoof set until forge's `review_input` is upstreamed (display-side
+  `safe_inline_display` still sanitizes with the wider set), and core's
+  `command_history::prepare_path` preflight is available but not yet adopted
+  by either app.
+
 - **AI module unification round (2026-08-15, second half)**: `src/ai/` is
   gone, replaced by a thin shim over `jterm_core::ai`; see "AI module: done"
   below. Adversarial review confirmed symbol coverage, the endpoint-safety
@@ -258,13 +277,14 @@ stimulus; big celebrations and speech belong to the human's own commands.
 ### Helper-runner consolidation: done
 
 Both apps now pin `jterm_core`
-`1b7598de5530b7b8ca39582a77610b22987f66bc`. The app-owned helper
+`04f63283090591d9ad88500224e848dbb69b1f61`. The app-owned helper
 runners are migrated. `src/host.rs` is now a thin shim
 over `jterm_core::host` (`pub use` + `APP_ID` + `interactive_bash_path`) whose
-only local code is `pub(crate) helper_command`/`command_status_with_timeout`
-wrappers for the two callers still outside the core's scope (the CLI doctor
-probe and the command-correction probes); `src/git_meta.rs` is a re-export
-plus the forge-only
+only local code is `pub(crate) helper_command`, kept for the two callers
+still outside the core's scope (the CLI doctor's command construction and
+the command-correction probes — the doctor's bounded run itself goes through
+`jterm_core::helper::bounded_command_output`); `src/git_meta.rs` is a
+re-export plus the forge-only
 `read_cached_and_refresh` UI cache worker; `src/jsh_install.rs` is a pure
 re-export; `src/ui/command_correction.rs` probes run on the now-public
 `jterm_core::supervised::SupervisedChild`. Intentional tightenings adopted
@@ -303,16 +323,11 @@ doctor and correction probes.
 
 - Forge-ahead local modules to upstream into core rather than delete:
   `review_input` (safe-display helpers, `valid_jsh_id`, wider spoof set),
-  `pty_input` (`AdmittedInput`), `command_history`
-  (`read_recent_with_status`), `execution_journal` (`output_capture_enabled`),
+  `pty_input` (`AdmittedInput`), `execution_journal` (`output_capture_enabled`),
   and `parser` (OSC 7771, erase-scrollback/hard-reset barriers, strict ST
   termination).
 - Core-ahead modules not yet adopted: `child_env`'s inherited-environment
   freeze and the hardened `jterm_core::agent` session wrapper.
-- `src/snapshot_file.rs` still exists only for its local
-  `read_bounded_private` copy — now available as
-  `jterm_core::snapshot_file::read_bounded_private`; delete the module next
-  round and switch its callers.
 - `src/pty.rs:1545` and `src/state.rs:1953` spawn `sh` directly, outside the
   helper-runner contract; `src/notebook.rs` long-lived terminal children keep
   their own wait logic by design (`SupervisedChild` scopes itself to

@@ -18,7 +18,7 @@ use vte4::TerminalExt;
 
 use crate::persistence::{self, PersistenceKey};
 use crate::process::deserialize_restorable_argv_bounded;
-use crate::snapshot_file;
+use jterm_core::snapshot_file;
 
 use crate::terminal::{
     find_first_terminal, terminal_child_lifecycle, terminal_child_pid, terminal_working_directory,

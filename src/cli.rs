@@ -563,11 +563,13 @@ fn executable_available(executable: &str, flatpak: bool) -> bool {
             return false;
         };
         command.args(["-x", executable]);
-        return crate::host::command_status_with_timeout(
-            command,
+        return jterm_core::helper::bounded_command_output(
+            &mut command,
+            4 * 1024,
+            4 * 1024,
             std::time::Duration::from_millis(500),
         )
-        .is_ok_and(|status| status.is_some_and(|status| status.success()));
+        .is_ok_and(|output| output.status.success());
     }
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;

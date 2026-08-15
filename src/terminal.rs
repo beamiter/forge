@@ -615,30 +615,8 @@ pub(crate) fn spawn_shell(
     );
 }
 
-fn is_safe_external_uri(uri: &str) -> bool {
-    if uri.is_empty()
-        || uri.len() > 16 * 1024
-        || uri.chars().any(char::is_whitespace)
-        || uri.chars().any(char::is_control)
-        || crate::review_input::contains_visual_spoof(uri)
-    {
-        return false;
-    }
-    let Some((scheme, remainder)) = uri.split_once("://") else {
-        return false;
-    };
-    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
-        return false;
-    }
-    !remainder
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default()
-        .is_empty()
-}
-
 pub(crate) fn open_uri(uri: &str) {
-    if !is_safe_external_uri(uri) {
+    if !jterm_core::link::is_openable_url(uri) {
         log::warn!("Refused to open an unsafe or unsupported terminal hyperlink");
         return;
     }
@@ -924,7 +902,7 @@ pub(crate) fn reattach_terminal_to_tree(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_safe_external_uri, InitialCommands};
+    use super::InitialCommands;
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -962,15 +940,20 @@ mod tests {
 
     #[test]
     fn terminal_links_are_bounded_unambiguous_http_urls() {
-        assert!(is_safe_external_uri("https://example.com/a?q=1"));
-        assert!(is_safe_external_uri("HTTP://example.com"));
-        assert!(!is_safe_external_uri("file:///etc/passwd"));
-        assert!(!is_safe_external_uri("custom://run-command"));
-        assert!(!is_safe_external_uri("https:///missing-host"));
-        assert!(!is_safe_external_uri("https://safe.example/\u{202e}fake"));
-        assert!(!is_safe_external_uri(&format!(
+        use jterm_core::link::{is_openable_url, MAX_OPENABLE_URL_BYTES};
+
+        assert!(is_openable_url("https://example.com/a?q=1"));
+        assert!(is_openable_url("HTTP://example.com"));
+        assert!(!is_openable_url("file:///etc/passwd"));
+        assert!(!is_openable_url("custom://run-command"));
+        assert!(!is_openable_url("https:///missing-host"));
+        assert!(!is_openable_url("https://safe.example/\u{202e}fake"));
+        // Userinfo would hand the system opener a credential the user never
+        // typed; the shared policy refuses it outright.
+        assert!(!is_openable_url("https://user:token@example.com/"));
+        assert!(!is_openable_url(&format!(
             "https://example.com/{}",
-            "x".repeat(16 * 1024)
+            "x".repeat(MAX_OPENABLE_URL_BYTES)
         )));
     }
 

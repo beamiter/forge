@@ -1655,7 +1655,7 @@ pub fn run() -> glib::ExitCode {
                 notebook_for_close_request.remove_page(Some(0));
             }
             if let Err(error) =
-                crate::command_history::flush_pending(std::time::Duration::from_secs(2))
+                jterm_core::command_history::flush_pending(std::time::Duration::from_secs(2))
             {
                 log::warn!("command-history worker did not flush before shutdown: {error}");
             }

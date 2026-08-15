@@ -33,7 +33,7 @@ pub fn write_snapshot_file(
     snapshot: &AgentSessionSnapshot,
 ) -> Result<(), AgentSnapshotError> {
     let encoded = snapshot.to_json()?;
-    crate::snapshot_file::write_atomic_private(path, encoded.as_bytes())
+    jterm_core::snapshot_file::write_atomic_private(path, encoded.as_bytes())
         .map_err(|error| AgentSnapshotError::Encode(format!("write {}: {error}", path.display())))
 }
 
@@ -42,7 +42,7 @@ pub fn write_snapshot_file(
 /// opening a fresh session.
 pub fn read_snapshot_file(path: &std::path::Path) -> Option<AgentSessionSnapshot> {
     let encoded =
-        crate::snapshot_file::read_bounded(path, MAX_AGENT_SNAPSHOT_JSON_BYTES as u64).ok()?;
+        jterm_core::snapshot_file::read_bounded(path, MAX_AGENT_SNAPSHOT_JSON_BYTES as u64).ok()?;
     AgentSessionSnapshot::from_json(&encoded).ok()
 }
 

@@ -345,7 +345,7 @@ struct PaletteSnapshot {
 /// observation; persisted metadata remains available for older commands.
 fn merge_palette_history(
     live: Vec<String>,
-    persisted: Vec<crate::command_history::CommandHistoryRecord>,
+    persisted: Vec<jterm_core::command_history::CommandHistoryRecord>,
     limit: usize,
 ) -> Vec<HistoryEntry> {
     let mut seen = std::collections::HashSet::new();
@@ -438,7 +438,7 @@ impl UiState {
                     .as_deref()
                     .map(std::path::Path::new)
                     .and_then(|path| {
-                        crate::command_history::read_recent(
+                        jterm_core::command_history::read_recent(
                             path,
                             (config.command_history_max_entries as usize).min(MAX_PALETTE_HISTORY),
                         )
@@ -897,13 +897,13 @@ mod tests {
     #[test]
     fn palette_history_snapshot_is_recent_first_and_deduplicated_across_sources() {
         let persisted = vec![
-            crate::command_history::CommandHistoryRecord {
+            jterm_core::command_history::CommandHistoryRecord {
                 command: "cargo test".into(),
                 cwd: Some("/repo".into()),
                 exit_code: 0,
                 end_time_ms: Some(20),
             },
-            crate::command_history::CommandHistoryRecord {
+            jterm_core::command_history::CommandHistoryRecord {
                 command: "git status".into(),
                 cwd: Some("/repo".into()),
                 exit_code: 1,

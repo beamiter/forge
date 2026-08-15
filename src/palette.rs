@@ -69,8 +69,8 @@ pub(crate) struct HistoryEntry {
     pub(crate) exit_code: Option<i32>,
 }
 
-impl From<crate::command_history::CommandHistoryRecord> for HistoryEntry {
-    fn from(record: crate::command_history::CommandHistoryRecord) -> Self {
+impl From<jterm_core::command_history::CommandHistoryRecord> for HistoryEntry {
+    fn from(record: jterm_core::command_history::CommandHistoryRecord) -> Self {
         Self {
             command: record.command,
             cwd: record.cwd,
@@ -409,7 +409,7 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
 
-        let history: Vec<HistoryEntry> = crate::command_history::read_recent(&path, 10)
+        let history: Vec<HistoryEntry> = jterm_core::command_history::read_recent(&path, 10)
             .unwrap()
             .into_iter()
             .map(HistoryEntry::from)
