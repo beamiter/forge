@@ -935,8 +935,8 @@ fn notify_long_block(command: &str, exit_code: Option<i32>, duration_ms: u64) {
     let command =
         crate::review_input::safe_inline_display(command.lines().next().unwrap_or(command), 1_024);
     match exit_code {
-        Some(code) => crate::notify::long_block_finished(&command, code, duration_ms),
-        None => crate::notify::app_notification(
+        Some(code) => jterm_core::notify::long_block_finished(&command, code, duration_ms),
+        None => jterm_core::notify::app_notification(
             Some(&format!("? {command}")),
             &format!("Exit status unknown after {duration_ms} ms"),
         ),
@@ -6519,7 +6519,7 @@ impl RenderBackend for BlockBackend {
     }
 
     fn desktop_notify(&self, title: Option<&str>, body: &str) {
-        crate::notify::app_notification(title, body);
+        jterm_core::notify::app_notification(title, body);
     }
 
     fn schedule_anchor_settle(&self, args: AnchorSettleArgs) {
@@ -7672,7 +7672,7 @@ impl RenderBackend for UnifiedBackend {
     }
 
     fn desktop_notify(&self, title: Option<&str>, body: &str) {
-        crate::notify::app_notification(title, body);
+        jterm_core::notify::app_notification(title, body);
     }
 
     fn schedule_anchor_settle(&self, args: AnchorSettleArgs) {

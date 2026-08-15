@@ -10,7 +10,7 @@
 //! `src/state.rs::atomic_write_private_file`, and frost's `save` (which was
 //! `fs::write` + `rename`, so a crash between them could publish a truncated
 //! snapshot). The durable-replacement mechanics themselves are not re-done here
-//! — `crate::atomic_file::write_atomic` already had them right.
+//! — `jterm_core::atomic_file::write_atomic` already had them right.
 //!
 //! The failure mode that motivated the module: a session snapshot is data the
 //! terminal reads *at startup*, from a path it found by scanning a directory,
@@ -365,7 +365,7 @@ fn validate_existing_directory(dir: &Path) -> io::Result<()> {
 
 /// Durably replace a snapshot file, creating its directory `0700` if needed.
 ///
-/// The atomic replacement itself is `crate::atomic_file::write_atomic`, whose
+/// The atomic replacement itself is `jterm_core::atomic_file::write_atomic`, whose
 /// temporary file is already `0600`, so the renamed-into-place snapshot is too.
 /// An existing parent is validated without following a final symlink but is not
 /// chmodded: configured snapshot paths may legitimately live directly under
@@ -394,7 +394,7 @@ pub fn write_atomic_private(path: &Path, contents: &[u8]) -> io::Result<()> {
             Err(error) => return Err(error),
         }
     }
-    crate::atomic_file::write_atomic(path, contents)
+    jterm_core::atomic_file::write_atomic(path, contents)
 }
 
 #[cfg(test)]
@@ -839,7 +839,7 @@ mod tests {
     fn atomic_temporary_names_are_not_snapshots() {
         for destination in ["tabs.state", "tabs.7f3a.state", "window-12.active"] {
             let temp =
-                crate::atomic_file::temp_file_name(OsString::from(destination).as_os_str(), 0)
+                jterm_core::atomic_file::temp_file_name(OsString::from(destination).as_os_str(), 0)
                     .into_string()
                     .expect("temp names are ASCII for ASCII destinations");
             assert!(

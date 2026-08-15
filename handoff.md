@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-12
+Updated: 2026-08-15
 
 This working tree contains the nine-round "Evolve ASCII organism" series
 (`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
@@ -18,6 +18,15 @@ every round (attribution races, a Drop panic on a fired glib source, a
 saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
+
+- **Architecture unification round (2026-08-15)**: the app-owned helper
+  runners and the five verbatim duplicate modules (`kitty_graphics`,
+  `notebook_text`, `notify`, `core_keybindings`, `atomic_file`) migrated onto
+  `jterm_core`; details and the adopted tightenings are under "Remaining
+  boundaries" below. A three-agent adversarial review of the migration caught
+  and fixed a correction-worker hang on supervised probe-failure paths, two
+  helper-construction tests that no longer exercised the function under test,
+  a dead `JSH_LOOKUP_PATH` export, and a stale vendored-script leftover.
 
 Nine organism evolution rounds, in order:
 
@@ -239,13 +248,51 @@ stimulus; big celebrations and speech belong to the human's own commands.
 
 ## Remaining boundaries
 
-### Consolidate the app-owned helper runner
+### Helper-runner consolidation: done
 
-Carried forward unchanged: Forge still has app-local trusted-helper,
-notification, command-correction, and jsh installer runners while the
-shared core has the stronger WNOWAIT/process-group/deadline contract.
-Migrate only after core exposes an opaque runner rather than a mutable raw
-`Command`, preserving Forge's Flatpak host-namespace rules and tests.
+Both apps now pin `jterm_core`
+`1b7598de5530b7b8ca39582a77610b22987f66bc`. The app-owned helper
+runners are migrated. `src/host.rs` is now a thin shim
+over `jterm_core::host` (`pub use` + `APP_ID` + `interactive_bash_path`) whose
+only local code is `pub(crate) helper_command`/`command_status_with_timeout`
+wrappers for callers still outside the core's scope (ai curl transport, CLI
+doctor); `src/git_meta.rs` is a re-export plus the forge-only
+`read_cached_and_refresh` UI cache worker; `src/jsh_install.rs` is a pure
+re-export; `src/ui/command_correction.rs` probes run on the now-public
+`jterm_core::supervised::SupervisedChild`. Intentional tightenings adopted
+from core: helper resolution requires a canonical, non-user/group-writable
+target with a `PATH=/usr/bin:/bin` child clamp (note: this also rejects
+group-writable root-owned dirs such as Debian's `/usr/local/bin` 2775 — a
+deliberate core policy, shared with anvil), `install_argv` execs `/bin/sh`
+under core's `RUN_WRAPPER`, and script staging uses core's `VendoredScript`.
+On supervised probe/reap failure paths the correction worker detaches its
+output reader instead of joining it, because a disarmed (unsignalled) group
+can hold the pipe open forever. `scripts/install-jsh.sh` was deleted (the
+vendored copy lives in core). The verbatim modules `kitty_graphics`,
+`notebook_text`, `notify`, `core_keybindings`, and `atomic_file` were deleted
+in favor of the core equivalents.
+
+### Follow-up migrations (next rounds)
+
+- `src/ai/mod.rs` still hand-rolls its curl lifecycle; core's AI transport has
+  the supervised collector. Migrate it, then collapse the host shim's
+  `helper_command`/`command_status_with_timeout` wrappers.
+- Forge-ahead local modules to upstream into core rather than delete:
+  `review_input` (safe-display helpers, `valid_jsh_id`, wider spoof set),
+  `pty_input` (`AdmittedInput`), `command_history`
+  (`read_recent_with_status`), `execution_journal` (`output_capture_enabled`),
+  and `parser` (OSC 7771, erase-scrollback/hard-reset barriers, strict ST
+  termination).
+- Core-ahead modules not yet adopted: `child_env`'s inherited-environment
+  freeze and the hardened `jterm_core::agent` session wrapper.
+- `src/snapshot_file.rs` still exists only for its local
+  `read_bounded_private` copy — now available as
+  `jterm_core::snapshot_file::read_bounded_private`; delete the module next
+  round and switch its callers.
+- `src/pty.rs:1545` and `src/state.rs:1953` spawn `sh` directly, outside the
+  helper-runner contract; `src/notebook.rs` long-lived terminal children keep
+  their own wait logic by design (`SupervisedChild` scopes itself to
+  short-lived helpers).
 
 ## Release checks
 

@@ -105,13 +105,7 @@ impl UiState {
         // cache and the next status tick observes the completed value.
         let git = cwd
             .as_deref()
-            .and_then(crate::git_meta::read_cached_and_refresh)
-            .map(|meta| jterm_core::git_meta::RepoMeta {
-                branch: meta.branch,
-                dirty: meta.dirty,
-                ahead: meta.ahead,
-                behind: meta.behind,
-            });
+            .and_then(crate::git_meta::read_cached_and_refresh);
         let (last_exit, last_duration_ms) = leaf
             .as_ref()
             .and_then(|leaf| leaf.block_view())

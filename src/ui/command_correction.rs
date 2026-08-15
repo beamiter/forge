@@ -16,8 +16,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -737,26 +736,17 @@ fn run_capture(
         return None;
     }
     let mut command = crate::host::helper_command(program).ok()?;
-    // A probe must not be able to leave background work behind. This creates
-    // a group before exec; in Flatpak it contains the `flatpak-spawn
-    // --watch-bus` bridge, whose death also tears down the host-side command.
-    command.process_group(0);
-    let mut child = command
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let Ok(process_group) = i32::try_from(child.id()) else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return None;
-    };
-    let Some(mut stdout) = child.stdout.take() else {
-        terminate_probe_group(&mut child, process_group);
-        return None;
-    };
+        .stderr(Stdio::null());
+    // A probe must not be able to leave background work behind. SupervisedChild
+    // places the child in a fresh process group before exec; in Flatpak that
+    // group contains the `flatpak-spawn --watch-bus` bridge, whose death also
+    // tears down the host-side command.
+    let mut child = jterm_core::supervised::SupervisedChild::spawn(&mut command).ok()?;
+    let mut stdout = child.take_stdout()?;
     let reader = std::thread::Builder::new()
         .name("forge-correction-probe-output".to_string())
         .spawn(move || {
@@ -779,38 +769,47 @@ fn run_capture(
     let reader = match reader {
         Ok(reader) => reader,
         Err(_) => {
-            terminate_probe_group(&mut child, process_group);
             return None;
         }
     };
 
     loop {
         if cancellation.is_cancelled() || Instant::now() >= deadline {
-            terminate_probe_group(&mut child, process_group);
+            // Dropping the supervised child signals the group and reaps the
+            // root — unless its pre-signal ownership probe fails, in which
+            // case it disarms without signalling (see the probe-error path
+            // below). Here the probe has not failed, so the signal releases a
+            // reader blocked on the probe's pipe.
+            drop(child);
             let _ = reader.join();
             return None;
         }
-        match probe_root_has_exited(process_group) {
+        match child.root_has_exited() {
             Ok(true) => break,
             Ok(false) => std::thread::sleep(Duration::from_millis(20)),
             Err(_) => {
-                terminate_probe_group(&mut child, process_group);
-                let _ = reader.join();
+                // The ownership probe just failed (ECHILD from a foreign
+                // reaper, or a flipped SIGCHLD disposition), so dropping the
+                // child disarms it WITHOUT signalling the process group:
+                // SupervisedChild refuses to reuse a numeric PGID it can no
+                // longer prove it owns. A descendant can then keep the stdout
+                // pipe open forever, so do NOT join the reader — leave it
+                // detached. It unblocks on its own if the descendant ever
+                // exits, and hanging the correction worker is worse than a
+                // detached thread.
+                drop(child);
                 return None;
             }
         }
     }
 
     // The root may exit successfully while a malicious/background descendant
-    // keeps stdout open. End the dedicated group before joining the reader so
-    // neither that process nor an indefinitely blocked reader can outlive the
-    // correction request.
-    signal_probe_group(process_group);
-    // `probe_root_has_exited` uses WNOWAIT, so the root remains our zombie and
-    // reserves this PID/group identity until after the group signal. That
-    // closes the otherwise tiny window in which a recycled group id could make
-    // cleanup target an unrelated process.
-    let status = child.wait().ok()?;
+    // keeps stdout open. The reap signals the dedicated group before joining
+    // the reader, so neither that process nor an indefinitely blocked reader
+    // can outlive the correction request. WNOWAIT observation kept the root a
+    // zombie until now, so the group id could not have been recycled and the
+    // signal cannot target an unrelated process.
+    let status = child.reap_after_group_kill().ok()?;
     let output = match reader.join() {
         Ok(Ok(output)) => output,
         Ok(Err(_)) | Err(_) => return None,
@@ -820,38 +819,6 @@ fn run_capture(
     }
 
     Some(String::from_utf8_lossy(&output).into_owned())
-}
-
-fn probe_root_has_exited(pid: i32) -> std::io::Result<bool> {
-    use nix::sys::wait::{waitid, Id, WaitPidFlag, WaitStatus};
-    use nix::unistd::Pid;
-
-    let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
-    match waitid(Id::Pid(Pid::from_raw(pid)), flags).map_err(std::io::Error::from)? {
-        WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _) => Ok(true),
-        WaitStatus::StillAlive => Ok(false),
-        _ => Ok(false),
-    }
-}
-
-fn signal_probe_group(process_group: i32) {
-    // The group was created exclusively for this probe. Validate the id before
-    // using negative-pid group signalling so an impossible setup failure can
-    // never target forge's own group.
-    if process_group > 1 && process_group != unsafe { nix::libc::getpgrp() } {
-        // SAFETY: `CommandExt::process_group(0)` made the child its own group
-        // leader before exec. ESRCH merely means every member already exited.
-        unsafe {
-            nix::libc::kill(-process_group, nix::libc::SIGKILL);
-        }
-    }
-}
-
-fn terminate_probe_group(child: &mut Child, process_group: i32) {
-    signal_probe_group(process_group);
-    // Keep a direct-child fallback, and always reap the process we spawned.
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 #[derive(Debug)]

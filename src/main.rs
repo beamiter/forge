@@ -14,7 +14,6 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::config::{choose_shell_argv, config_file_path, load_config, load_safe_config};
-use crate::core_keybindings::{Chord, KeySym, Mods, NamedKey};
 use crate::keybindings::Action;
 use crate::logging::init_logging;
 use crate::state::{
@@ -23,6 +22,7 @@ use crate::state::{
 };
 use crate::terminal::terminal_working_directory;
 use crate::ui::{self, UiState};
+use jterm_core::keybindings::{Chord, KeySym, Mods, NamedKey};
 
 /// GApplication receives only a program name. All real launch arguments are
 /// consumed by `cli::handle_early_args` before GTK is initialized.
@@ -1788,8 +1788,8 @@ mod tests {
         //! so its GTK-only facts are pinned here: ISO_Left_Tab folding,
         //! keypad folding, Super/Meta mapping, unicode lowercasing, and F-key naming.
         use super::super::chord_from_gdk;
-        use crate::core_keybindings::parse;
         use gtk4::gdk::{Key, ModifierType};
+        use jterm_core::keybindings::parse;
 
         const CTRL: ModifierType = ModifierType::CONTROL_MASK;
         const CTRL_SHIFT: ModifierType = ModifierType::CONTROL_MASK.union(ModifierType::SHIFT_MASK);

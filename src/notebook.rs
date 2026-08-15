@@ -34,7 +34,7 @@ const MAX_NOTEBOOK_CELL_SOURCE_BYTES: usize = 256 * 1024;
 const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-pub use crate::notebook_text::{parse_segments, render_text_to_pango, Segment};
+pub use jterm_core::notebook_text::{parse_segments, render_text_to_pango, Segment};
 
 pub fn is_notebook_path(path: &Path) -> bool {
     path.file_name()

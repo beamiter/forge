@@ -8,7 +8,7 @@
 //! modifier-mask extraction, keypad handling) is the frontend's job and
 //! lives beside the window key controller in `main.rs`.
 
-use crate::core_keybindings::{is_unbind_token, parse, Chord};
+use jterm_core::keybindings::{is_unbind_token, parse, Chord};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -775,7 +775,7 @@ mod tests {
     /// what it means locally.
     #[test]
     fn family_default_chord_contract_is_honored() {
-        use crate::core_keybindings::{CommonAction, DEFAULT_CHORDS};
+        use jterm_core::keybindings::{CommonAction, DEFAULT_CHORDS};
 
         fn local(action: CommonAction) -> Action {
             match action {

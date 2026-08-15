@@ -3,14 +3,11 @@
 pub mod agent;
 #[path = "ai/mod.rs"]
 pub mod ai;
-mod atomic_file;
 pub mod block_view;
 pub mod cli;
 pub mod config;
 pub mod config_store;
-pub mod core_keybindings;
 pub mod git_meta;
-pub mod notify;
 pub mod parser;
 pub mod exit_status {
     pub use jterm_core::exit_status::*;
@@ -26,10 +23,8 @@ pub mod identity {
 }
 pub mod execution_journal;
 pub mod keybindings;
-pub mod kitty_graphics;
 pub mod logging;
 pub mod notebook;
-pub mod notebook_text;
 pub(crate) mod organism;
 pub(crate) mod organism_attention;
 pub(crate) mod organism_memory;
