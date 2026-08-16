@@ -4,16 +4,16 @@
 //! programs (claude, spinners, progress bars) repaint the live surface many
 //! times per second, so a pointer selection made while a command was running
 //! used to be destroyed before it could ever be copied. The fix sits upstream
-//! of VTE: while the user drags a selection over the live VTE — and for a
-//! short grace period afterwards, while that selection still exists — incoming
-//! PTY chunks are parked here instead of being processed. A flush replays the
-//! parked bytes through the exact pipeline they were intercepted from, in
-//! order, so nothing is lost or reordered; display is merely deferred.
+//! of VTE: while the user drags a selection over the live VTE, and for as long
+//! as that selection remains visible, incoming PTY chunks are parked instead
+//! of being processed. Copying, typing, clearing the selection, or the bounded
+//! safety cap resumes the feed. A flush replays the parked bytes through the
+//! exact pipeline they were intercepted from, in order, so nothing is lost or
+//! reordered; display is merely deferred.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use gtk4::glib;
 use vte4::TerminalExt;
 
 use super::{BlockState, MouseReportingMode};
@@ -28,11 +28,6 @@ type StateFn = Box<dyn Fn(bool)>;
 /// immediately — the selection is sacrificed — so a firehose command can
 /// neither balloon RSS nor stall the block state machine unboundedly.
 const MAX_PARKED_BYTES: usize = 2 * 1024 * 1024;
-
-/// How long a finished drag may keep the feed parked while its selection is
-/// still alive — the window for pressing Ctrl+Shift+C. Copying, typing,
-/// clearing the selection, or this timeout all resume the feed.
-const RELEASE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A live-VTE selection can only survive streaming output while the stream is
 /// what destroys it: states where the child owns the surface and repaints.
@@ -63,7 +58,6 @@ pub(crate) struct SelectionFeedHold {
     /// flush: VTE clears the old selection on press before growing the new one.
     dragging: Cell<bool>,
     parked: RefCell<Vec<u8>>,
-    grace_timer: RefCell<Option<glib::SourceId>>,
     flush_cb: RefCell<Option<FlushFn>>,
     /// Fires with `true` when the first chunk is actually parked (not on
     /// every drag — a plain click must not flash the indicator) and `false`
@@ -77,7 +71,6 @@ impl SelectionFeedHold {
             holding: Cell::new(false),
             dragging: Cell::new(false),
             parked: RefCell::new(Vec::new()),
-            grace_timer: RefCell::new(None),
             flush_cb: RefCell::new(None),
             state_cb: RefCell::new(None),
         })
@@ -123,13 +116,12 @@ impl SelectionFeedHold {
     /// A selection drag over the live VTE has started; park the feed.
     /// Idempotent — a drag that grows into the live VTE calls this per motion.
     pub(crate) fn begin_drag(&self) {
-        self.cancel_grace();
         self.dragging.set(true);
         self.holding.set(true);
     }
 
-    /// The drag ended. A surviving selection earns a grace period so the copy
-    /// shortcut still has something to read; otherwise resume immediately.
+    /// The drag ended. A surviving selection keeps ownership until copy,
+    /// typing, explicit clearing, or the bounded-buffer safety cap.
     pub(crate) fn end_drag(self: &Rc<Self>, selection_alive: bool) {
         if !self.dragging.replace(false) {
             return;
@@ -137,9 +129,7 @@ impl SelectionFeedHold {
         if !self.holding.get() {
             return;
         }
-        if selection_alive {
-            self.schedule_grace();
-        } else {
+        if !selection_alive {
             self.flush_now();
         }
     }
@@ -178,7 +168,6 @@ impl SelectionFeedHold {
     /// Release the hold and replay the parked bytes through the pipeline.
     /// No-op when no hold is active, so every caller may invoke it blindly.
     pub(crate) fn flush_now(&self) {
-        self.cancel_grace();
         if !self.holding.replace(false) {
             return;
         }
@@ -199,24 +188,6 @@ impl SelectionFeedHold {
     pub(crate) fn flush_then(&self, action: impl FnOnce()) {
         self.flush_now();
         action();
-    }
-
-    fn schedule_grace(self: &Rc<Self>) {
-        self.cancel_grace();
-        let weak = Rc::downgrade(self);
-        let id = glib::timeout_add_local_once(RELEASE_GRACE, move || {
-            if let Some(hold) = weak.upgrade() {
-                hold.grace_timer.borrow_mut().take();
-                hold.flush_now();
-            }
-        });
-        *self.grace_timer.borrow_mut() = Some(id);
-    }
-
-    fn cancel_grace(&self) {
-        if let Some(id) = self.grace_timer.borrow_mut().take() {
-            id.remove();
-        }
     }
 }
 
@@ -303,6 +274,21 @@ mod tests {
         assert_eq!(log.borrow().as_slice(), [b"one two".to_vec()]);
         // Hold is over: the feed is live again.
         assert!(!hold.try_buffer(b"after"));
+    }
+
+    #[test]
+    fn surviving_selection_keeps_feed_parked_until_copy_or_input() {
+        let (hold, log) = hold_with_log();
+        hold.begin_drag();
+        assert!(hold.try_buffer(b"codex redraw"));
+        hold.end_drag(true);
+        assert!(hold.try_buffer(b" stays parked"));
+        assert!(log.borrow().is_empty());
+        hold.flush_now();
+        assert_eq!(
+            log.borrow().as_slice(),
+            [b"codex redraw stays parked".to_vec()]
+        );
     }
 
     #[test]

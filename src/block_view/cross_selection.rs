@@ -178,9 +178,21 @@ impl CrossSelection {
     }
 
     /// Drag lifecycle over: a surviving live-VTE selection keeps the feed
-    /// parked for the copy grace period; anything else resumes it now.
+    /// parked until copy/input/clear; anything else resumes it now.
     fn end_active_feed_hold(&self) {
-        self.feed_hold.end_drag(self.active_vte.has_selection());
+        // Capture-phase drag-end runs before VTE finishes its own native
+        // selection gesture. An immediate `has_selection()` can be false for
+        // that one event turn, causing the parked Codex repaint to replay and
+        // erase the just-created highlight. Inspect the settled VTE at idle.
+        let hold = self.feed_hold.clone();
+        let terminal = self.active_vte.downgrade();
+        gtk4::glib::idle_add_local_once(move || {
+            hold.end_drag(
+                terminal
+                    .upgrade()
+                    .is_some_and(|terminal| terminal.has_selection()),
+            );
+        });
     }
 
     fn clear_block_selection(&self) {

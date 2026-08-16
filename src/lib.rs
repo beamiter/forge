@@ -16,6 +16,7 @@ pub mod exit_status {
     pub use jterm_core::exit_status::*;
 }
 pub mod host;
+mod image_drop;
 
 pub mod identity {
     pub use jterm_core::identity::*;

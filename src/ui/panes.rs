@@ -399,6 +399,49 @@ impl UiState {
     /// Both sides read the pane's live session id at gesture time rather than
     /// capturing it: restore can reassign a leaf's id after construction.
     pub(crate) fn install_pane_rearrange(&self, leaf: &PaneLeaf) {
+        // OS file drops are a different typed payload from pane/tab movement,
+        // so both drop targets can coexist on the leaf. Resolve the pane again
+        // through a weak root at drop time to avoid a controller ownership
+        // cycle that would keep its PTY alive after close.
+        let image_target = gtk4::DropTarget::new(
+            gtk4::gdk::FileList::static_type(),
+            gtk4::gdk::DragAction::COPY,
+        );
+        let ui = self.clone();
+        let target_root = leaf.root_widget().downgrade();
+        image_target.connect_drop(move |_, value, _x, _y| {
+            let Ok(files) = value.get::<gtk4::gdk::FileList>() else {
+                return false;
+            };
+            let paths = files
+                .files()
+                .into_iter()
+                .filter_map(|file| file.path())
+                .collect::<Vec<_>>();
+            if paths.is_empty() {
+                return false;
+            }
+            let result = crate::image_drop::prompt_payload(&paths)
+                .map_err(|error| error.to_string())
+                .and_then(|payload| {
+                    target_root
+                        .upgrade()
+                        .and_then(|root| PaneLeaf::from_widget(&root))
+                        .ok_or_else(|| "the target terminal is no longer available".to_string())
+                        .map(|leaf| (leaf, payload))
+                })
+                .and_then(|(leaf, payload)| {
+                    leaf.grab_focus();
+                    leaf.write_review_input(&payload)
+                });
+            if let Err(error) = result {
+                ui.toast_overlay
+                    .add_toast(adw::Toast::new(&format!("Image drop rejected: {error}")));
+            }
+            true
+        });
+        leaf.root_widget().add_controller(image_target);
+
         let ui = self.clone();
         let target_root = leaf.root_widget().downgrade();
         leaf.install_pane_drag(move |dragged| {
