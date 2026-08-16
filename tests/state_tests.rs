@@ -27,6 +27,7 @@ fn test_pane_layout_leaf_serialization() {
         cwd_external: false,
         remote_name: None,
         custom_title: None,
+        private_title: Some(true),
         cmds: None,
         pinned: None,
     };
@@ -35,10 +36,17 @@ fn test_pane_layout_leaf_serialization() {
     let deserialized: PaneLayout = serde_json::from_str(&json).expect("Deserialization failed");
 
     match deserialized {
-        PaneLayout::Leaf { dir, sid, cmds, .. } => {
+        PaneLayout::Leaf {
+            dir,
+            sid,
+            cmds,
+            private_title,
+            ..
+        } => {
             assert_eq!(dir, "/tmp");
             assert_eq!(sid, "123-456");
             assert_eq!(cmds, None);
+            assert_eq!(private_title, Some(true));
         }
         _ => panic!("Expected Leaf layout"),
     }
@@ -52,6 +60,7 @@ fn test_pane_layout_leaf_with_commands() {
         cwd_external: false,
         remote_name: None,
         custom_title: None,
+        private_title: None,
         cmds: Some(vec!["nix".to_string(), "develop".to_string()]),
         pinned: None,
     };
@@ -84,6 +93,7 @@ fn restorable_command_argv_round_trips_without_losing_boundaries() {
         cwd_external: false,
         remote_name: None,
         custom_title: None,
+        private_title: None,
         cmds: Some(argv.clone()),
         pinned: None,
     };
@@ -134,6 +144,7 @@ fn test_pane_layout_split_serialization() {
             cwd_external: false,
             remote_name: None,
             custom_title: None,
+            private_title: None,
             cmds: None,
             pinned: None,
         }),
@@ -143,6 +154,7 @@ fn test_pane_layout_split_serialization() {
             cwd_external: false,
             remote_name: None,
             custom_title: None,
+            private_title: None,
             cmds: Some(vec!["nix".to_string(), "develop".to_string()]),
             pinned: None,
         }),
@@ -200,6 +212,7 @@ fn test_pane_layout_nested_splits() {
             cwd_external: false,
             remote_name: None,
             custom_title: None,
+            private_title: None,
             cmds: None,
             pinned: None,
         }),
@@ -212,6 +225,7 @@ fn test_pane_layout_nested_splits() {
                 cwd_external: false,
                 remote_name: None,
                 custom_title: None,
+                private_title: None,
                 cmds: None,
                 pinned: None,
             }),
@@ -221,6 +235,7 @@ fn test_pane_layout_nested_splits() {
                 cwd_external: false,
                 remote_name: None,
                 custom_title: None,
+                private_title: None,
                 cmds: None,
                 pinned: None,
             }),

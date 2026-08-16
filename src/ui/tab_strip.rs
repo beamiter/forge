@@ -740,7 +740,7 @@ impl UiState {
                 if page_widget.widget_name().as_str() != tab_name {
                     continue;
                 }
-                let label = crate::state::tab_label_text(&self.notebook, &page_widget)
+                let label = tab_display_title(&self.notebook, &page_widget)
                     .unwrap_or_else(|| format!("Tab {}", page + 1));
                 for process in Self::running_processes_in_widget(&page_widget) {
                     running.push(format!("{label} — {process}"));

@@ -1281,7 +1281,7 @@ impl UiState {
                 active_page.and_then(|index| ui_for_populate.notebook.nth_page(Some(index)));
             let active_title = active_widget
                 .as_ref()
-                .and_then(|page| crate::state::tab_label_text(&ui_for_populate.notebook, page))
+                .and_then(|page| tab_display_title(&ui_for_populate.notebook, page))
                 .unwrap_or_default();
             let active_panes = active_widget
                 .as_ref()

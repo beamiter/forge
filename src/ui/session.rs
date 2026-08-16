@@ -12,6 +12,7 @@ struct RestoredLeafSeed {
     cwd_external: bool,
     remote_name: Option<String>,
     custom_title: Option<bool>,
+    private_title: Option<bool>,
     cmds: Option<Vec<String>>,
     pinned: Option<bool>,
 }
@@ -25,6 +26,7 @@ impl RestoredLeafSeed {
                 cwd_external,
                 remote_name,
                 custom_title,
+                private_title,
                 cmds,
                 pinned,
             } => Some(Self {
@@ -33,6 +35,7 @@ impl RestoredLeafSeed {
                 cwd_external: *cwd_external,
                 remote_name: remote_name.clone(),
                 custom_title: *custom_title,
+                private_title: *private_title,
                 cmds: cmds.clone(),
                 pinned: *pinned,
             }),
@@ -91,6 +94,7 @@ impl UiState {
                 cwd_external,
                 remote_name,
                 custom_title,
+                private_title,
                 cmds,
                 pinned,
             } => {
@@ -100,6 +104,7 @@ impl UiState {
                     cwd_external,
                     remote_name,
                     custom_title,
+                    private_title,
                     cmds,
                     pinned,
                 };
@@ -138,6 +143,9 @@ impl UiState {
                     .expect("Just added a page");
                 if let Some(custom_title) = seed.custom_title {
                     set_tab_custom_title(&page, custom_title);
+                }
+                if seed.private_title == Some(true) {
+                    self.set_tab_title_privacy(&page, true);
                 }
                 self.apply_restored_pin(&page, seed.pinned == Some(true));
                 page
@@ -217,7 +225,11 @@ impl UiState {
         if let Some(custom_title) = first.custom_title {
             set_tab_custom_title(&first_page, custom_title);
         }
+        if first.private_title == Some(true) {
+            self.set_tab_title_privacy(&first_page, true);
+        }
         let custom_title_cell = tab_custom_title_cell(&first_page);
+        let private_title_cell = tab_private_title_cell(&first_page);
         let tab_label = self.notebook.tab_label(&first_page);
         let tab_widget_name = first_page.widget_name().to_string();
 
@@ -278,6 +290,9 @@ impl UiState {
         if let Some(custom_title) = custom_title_cell {
             attach_tab_custom_title_cell(&restored, custom_title);
         }
+        if let Some(private_title) = private_title_cell {
+            attach_tab_private_title_cell(&restored, private_title);
+        }
 
         let inserted = self
             .notebook
@@ -336,6 +351,7 @@ impl UiState {
                 cwd_external,
                 remote_name,
                 custom_title: _,
+                private_title: _,
                 cmds,
                 pinned,
             } => {

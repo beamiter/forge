@@ -805,6 +805,9 @@ pub enum PaneLayout {
         /// the historical inference behavior during restore.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         custom_title: Option<bool>,
+        /// Hide title details in tab chrome while retaining the real title.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        private_title: Option<bool>,
         /// Restorable command argv to replay on restore (e.g. `["ssh", "host"]`).
         /// Keeping it structured prevents shell metacharacters inside one
         /// argument from becoming a different local command after a restart.
@@ -831,13 +834,15 @@ pub(crate) fn serialize_pane_layout(
     session_ids: &HashMap<u32, String>,
 ) -> PaneLayout {
     let custom_title = crate::ui::tab_custom_title_cell(widget).map(|flag| flag.get());
-    serialize_pane_layout_with_custom_title(widget, session_ids, custom_title)
+    let private_title = crate::ui::tab_private_title_cell(widget).map(|flag| flag.get());
+    serialize_pane_layout_with_tab_state(widget, session_ids, custom_title, private_title)
 }
 
-fn serialize_pane_layout_with_custom_title(
+fn serialize_pane_layout_with_tab_state(
     widget: &gtk4::Widget,
     session_ids: &HashMap<u32, String>,
     custom_title: Option<bool>,
+    private_title: Option<bool>,
 ) -> PaneLayout {
     if let Some(paned) = widget.downcast_ref::<Paned>() {
         let orientation = match paned.orientation() {
@@ -852,15 +857,17 @@ fn serialize_pane_layout_with_custom_title(
         PaneLayout::Split {
             orientation,
             position: paned.position(),
-            start: Box::new(serialize_pane_layout_with_custom_title(
+            start: Box::new(serialize_pane_layout_with_tab_state(
                 &start,
                 session_ids,
                 custom_title,
+                private_title,
             )),
-            end: Box::new(serialize_pane_layout_with_custom_title(
+            end: Box::new(serialize_pane_layout_with_tab_state(
                 &end,
                 session_ids,
                 custom_title,
+                private_title,
             )),
         }
     } else {
@@ -922,6 +929,7 @@ fn serialize_pane_layout_with_custom_title(
             cwd_external,
             remote_name,
             custom_title,
+            private_title,
             cmds,
             pinned,
         }
@@ -1280,6 +1288,7 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
                         cwd_external: false,
                         remote_name: None,
                         custom_title: None,
+                        private_title: None,
                         cmds: None,
                         pinned: None,
                     };
@@ -1301,6 +1310,7 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
                             cwd_external: false,
                             remote_name: None,
                             custom_title: None,
+                            private_title: None,
                             cmds: None,
                             pinned: None,
                         };
@@ -1323,6 +1333,7 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
                         cwd_external: false,
                         remote_name: None,
                         custom_title: None,
+                        private_title: None,
                         cmds: None,
                         pinned: None,
                     };
@@ -1352,6 +1363,7 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
                         cwd_external: false,
                         remote_name: None,
                         custom_title: None,
+                        private_title: None,
                         cmds: None,
                         pinned: None,
                     };
@@ -1373,6 +1385,7 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
             cwd_external: false,
             remote_name: None,
             custom_title: None,
+            private_title: None,
             cmds: None,
             pinned: None,
         };
@@ -1873,6 +1886,7 @@ mod tests {
             cwd_external: false,
             remote_name: None,
             custom_title: None,
+            private_title: None,
             cmds: None,
             pinned: None,
         }
@@ -2525,6 +2539,7 @@ mod tests {
             cwd_external: false,
             remote_name: Some("production".into()),
             custom_title: Some(false),
+            private_title: Some(true),
             // A modified/older producer may include an argv. Normalization
             // must still prefer the stable profile identity and discard it.
             cmds: Some(vec!["ssh".into(), "stale.example".into()]),
@@ -2560,6 +2575,7 @@ mod tests {
             cwd_external: false,
             remote_name: None,
             custom_title: None,
+            private_title: None,
             cmds: None,
             pinned: None,
         };
@@ -2578,6 +2594,7 @@ mod tests {
             cwd_external: false,
             remote_name: None,
             custom_title: None,
+            private_title: None,
             cmds: None,
             pinned: None,
         };

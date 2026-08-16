@@ -711,6 +711,7 @@ pub(crate) fn show_rename_dialog_with_strip(
     label: &Label,
     strip_label: &Label,
     custom_title: Rc<Cell<bool>>,
+    private_title: Rc<Cell<bool>>,
 ) {
     let dialog = adw::AlertDialog::new(Some("Rename tab"), None);
     dialog.add_response("cancel", "Cancel");
@@ -727,6 +728,7 @@ pub(crate) fn show_rename_dialog_with_strip(
     let label_clone = label.clone();
     let strip_label_clone = strip_label.clone();
     let custom_title_clone = custom_title.clone();
+    let private_title_clone = private_title.clone();
     let value = entry.clone();
     dialog.connect_response(None, move |_dialog, response| {
         if response == "rename" {
@@ -735,7 +737,9 @@ pub(crate) fn show_rename_dialog_with_strip(
             if !trimmed.is_empty() {
                 let title = jterm_core::review_input::safe_inline_display(trimmed, 512);
                 label_clone.set_text(&title);
-                strip_label_clone.set_text(&title);
+                if !private_title_clone.get() {
+                    strip_label_clone.set_text(&title);
+                }
                 custom_title_clone.set(true);
             }
         }

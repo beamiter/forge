@@ -100,6 +100,40 @@ fn custom_tab_title(notebook: &gtk4::Notebook, page: &gtk4::Widget) -> Option<St
         .flatten()
 }
 
+impl UiState {
+    /// Apply per-tab title privacy to every visible piece of tab chrome. The
+    /// hidden Notebook header remains the real-title store used by rename,
+    /// persistence and live OSC/CWD updates.
+    pub(crate) fn set_tab_title_privacy(&self, page: &gtk4::Widget, private: bool) {
+        set_tab_private_title(page, private);
+        let real_title = crate::state::tab_label_text(&self.notebook, page).unwrap_or_default();
+        let page_name = page.widget_name();
+        let mut child = self.tab_strip.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if widget.widget_name() != page_name {
+                continue;
+            }
+            let Ok(button) = widget.downcast::<ToggleButton>() else {
+                break;
+            };
+            let strip_label = unsafe {
+                button
+                    .data::<Label>("tab-title-label")
+                    .map(|label| label.as_ref().clone())
+            };
+            if let Some(strip_label) = strip_label {
+                strip_label.set_text(if private { "Private" } else { &real_title });
+            }
+            if let Some(process_label) = tab_process_label(&button) {
+                process_label.set_visible(!private);
+            }
+            break;
+        }
+        self.apply_tab_filter(self.tab_search_entry.text().as_str());
+    }
+}
+
 fn is_plain_tab_activation_key(keyval: Key, modifiers: ModifierType) -> bool {
     let command_modifiers = ModifierType::CONTROL_MASK
         | ModifierType::SHIFT_MASK
@@ -131,14 +165,20 @@ impl UiState {
             let Some(label) = tab_process_label(&button) else {
                 continue;
             };
-            let process = pages
-                .get(button.widget_name().as_str())
-                .and_then(PaneNode::from_widget)
-                .and_then(|node| {
-                    node.leaves()
-                        .into_iter()
-                        .find_map(|leaf| leaf.foreground_process_name())
-                });
+            let page = pages.get(button.widget_name().as_str());
+            let private = page
+                .and_then(tab_private_title_cell)
+                .is_some_and(|flag| flag.get());
+            label.set_visible(!private);
+            if private {
+                label.set_text("");
+                continue;
+            }
+            let process = page.and_then(PaneNode::from_widget).and_then(|node| {
+                node.leaves()
+                    .into_iter()
+                    .find_map(|leaf| leaf.foreground_process_name())
+            });
             match process {
                 Some(process) => {
                     if label.text() != process {
@@ -292,8 +332,8 @@ impl UiState {
             let Some(widget) = notebook.nth_page(Some(page)) else {
                 continue;
             };
-            let tab_name = crate::state::tab_label_text(notebook, &widget)
-                .unwrap_or_else(|| format!("Tab {}", page + 1));
+            let tab_name =
+                tab_display_title(notebook, &widget).unwrap_or_else(|| format!("Tab {}", page + 1));
             for process in Self::running_processes_in_widget(&widget) {
                 running.push(format!("{tab_name} — {process}"));
             }
@@ -468,12 +508,22 @@ impl UiState {
                     .as_ref()
                     .and_then(terminal_working_directory);
                 let title = custom_tab_title(&self.notebook, &widget);
+                let private = tab_private_title_cell(&widget).is_some_and(|flag| flag.get());
                 self.add_new_tab(
                     working_directory,
                     title,
                     None,
                     crate::terminal::InitialCommands::default(),
                 );
+                if private {
+                    if let Some(new_page) = self
+                        .notebook
+                        .current_page()
+                        .and_then(|index| self.notebook.nth_page(Some(index)))
+                    {
+                        self.set_tab_title_privacy(&new_page, true);
+                    }
+                }
             }
         }
     }
@@ -525,6 +575,9 @@ impl UiState {
                 .data::<bool>("pinned")
                 .is_some_and(|value| *value.as_ref())
         };
+        let private_title =
+            tab_private_title_cell(&page_widget).unwrap_or_else(|| Rc::new(Cell::new(false)));
+        attach_tab_private_title_cell(&page_widget, private_title.clone());
         let tab_widget_name = format!("tab-{tab_num}");
         page_widget.set_widget_name(&tab_widget_name);
 
@@ -570,7 +623,11 @@ impl UiState {
         // Full strip shape: title/process/pin/close children are deliberately the
         // same as a freshly spawned tab, so helpers and CSS do not special-case
         // pane-move tabs.
-        let strip_label = Label::new(Some(&tab_name));
+        let strip_label = Label::new(Some(if private_title.get() {
+            "Private"
+        } else {
+            &tab_name
+        }));
         strip_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         strip_label.set_hexpand(true);
         strip_label.set_xalign(0.0);
@@ -578,6 +635,7 @@ impl UiState {
         process_label.add_css_class("tab-process-indicator");
         process_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         process_label.set_max_width_chars(15);
+        process_label.set_visible(!private_title.get());
         let pin_icon = gtk4::Image::from_icon_name("bookmark-symbolic");
         pin_icon.add_css_class("tab-pin-icon");
         pin_icon.set_visible(pinned);
@@ -629,6 +687,7 @@ impl UiState {
         let label_for_rename = label.clone();
         let strip_for_rename = strip_label.clone();
         let custom_for_rename = custom_title.clone();
+        let private_for_rename = private_title.clone();
         rename_header.connect_pressed(move |_, presses, _, _| {
             if presses == 2 {
                 show_rename_dialog_with_strip(
@@ -636,6 +695,7 @@ impl UiState {
                     &label_for_rename,
                     &strip_for_rename,
                     custom_for_rename.clone(),
+                    private_for_rename.clone(),
                 );
             }
         });
@@ -664,7 +724,9 @@ impl UiState {
                     }
                     let title = default_tab_title(tab_num + 1, Some(dir));
                     header.set_text(&title);
-                    strip.set_text(&title);
+                    if !tab_private_title_cell(&identity).is_some_and(|flag| flag.get()) {
+                        strip.set_text(&title);
+                    }
                 });
                 let identity = page_widget.downgrade();
                 let expected_name = tab_widget_name.clone();
@@ -679,7 +741,9 @@ impl UiState {
                         return;
                     }
                     header.set_text(title);
-                    strip.set_text(title);
+                    if !tab_private_title_cell(&identity).is_some_and(|flag| flag.get()) {
+                        strip.set_text(title);
+                    }
                 });
             }
             PaneLeaf::Vte(view) => {
@@ -699,7 +763,9 @@ impl UiState {
                     }
                     let title = default_tab_title(tab_num + 1, Some(dir));
                     header.set_text(&title);
-                    strip.set_text(&title);
+                    if !tab_private_title_cell(&identity).is_some_and(|flag| flag.get()) {
+                        strip.set_text(&title);
+                    }
                 });
                 let identity = page_widget.downgrade();
                 let expected_name = tab_widget_name.clone();
@@ -714,7 +780,9 @@ impl UiState {
                         return;
                     }
                     header.set_text(title);
-                    strip.set_text(title);
+                    if !tab_private_title_cell(&identity).is_some_and(|flag| flag.get()) {
+                        strip.set_text(title);
+                    }
                 });
             }
         }
@@ -818,7 +886,12 @@ impl UiState {
         button.set_has_tooltip(true);
         let notebook_for_tooltip = self.notebook.clone();
         let page_name_for_tooltip = tab_widget_name.clone();
+        let private_for_tooltip = private_title.clone();
         button.connect_query_tooltip(move |button, _, _, _, tooltip| {
+            if private_for_tooltip.get() {
+                tooltip.set_text(Some("Private tab · title details hidden"));
+                return true;
+            }
             let mut parts = Vec::new();
             if let Some(leaf) = notebook_page_named(&notebook_for_tooltip, &page_name_for_tooltip)
                 .and_then(|page| PaneNode::from_widget(&page))
@@ -854,6 +927,7 @@ impl UiState {
         let label_for_context = label.clone();
         let strip_for_context = strip_label.clone();
         let custom_for_context = custom_title.clone();
+        let private_for_context = private_title.clone();
         context.connect_pressed(move |gesture, _, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
             let popover = gtk4::Popover::new();
@@ -870,11 +944,38 @@ impl UiState {
             let label = label_for_context.clone();
             let strip = strip_for_context.clone();
             let custom = custom_for_context.clone();
+            let private = private_for_context.clone();
             rename.connect_clicked(move |_| {
                 popover_for_rename.popdown();
-                show_rename_dialog_with_strip(&window, &label, &strip, custom.clone());
+                show_rename_dialog_with_strip(
+                    &window,
+                    &label,
+                    &strip,
+                    custom.clone(),
+                    private.clone(),
+                );
             });
             menu.append(&rename);
+
+            let privacy = gtk4::Button::with_label(if private_for_context.get() {
+                "Show Title Details"
+            } else {
+                "Hide Title Details"
+            });
+            privacy.set_has_frame(false);
+            privacy.add_css_class("flat");
+            let popover_for_privacy = popover.clone();
+            let ui = ui_for_context.clone();
+            let page_name = page_name_for_context.clone();
+            let private = private_for_context.clone();
+            privacy.connect_clicked(move |_| {
+                popover_for_privacy.popdown();
+                let value = !private.get();
+                if let Some(page) = notebook_page_named(&ui.notebook, &page_name) {
+                    ui.set_tab_title_privacy(&page, value);
+                }
+            });
+            menu.append(&privacy);
 
             let pin = gtk4::Button::with_label("Pin Tab");
             pin.set_has_frame(false);
@@ -1485,6 +1586,7 @@ impl UiState {
         };
         let label = Label::new(Some(&label_text));
         let custom_title = Rc::new(Cell::new(is_custom));
+        let private_title = Rc::new(Cell::new(false));
         label.set_xalign(0.0);
         label.set_hexpand(true);
         label.set_width_chars(24);
@@ -1531,8 +1633,10 @@ impl UiState {
                     let new_title = default_tab_title(tab_index_for_pwd, Some(dir));
                     if label_for_pwd.text().as_str() != new_title {
                         label_for_pwd.set_text(&new_title);
-                        if let Some(ref btn_label) = *strip_btn_label_for_pwd.borrow() {
-                            btn_label.set_text(&new_title);
+                        if !tab_private_title_cell(&identity).is_some_and(|flag| flag.get()) {
+                            if let Some(ref btn_label) = *strip_btn_label_for_pwd.borrow() {
+                                btn_label.set_text(&new_title);
+                            }
                         }
                     }
                 });
@@ -1553,8 +1657,10 @@ impl UiState {
                     let new_title = default_tab_title(tab_index_for_pwd, Some(dir));
                     if label_for_pwd.text().as_str() != new_title {
                         label_for_pwd.set_text(&new_title);
-                        if let Some(ref btn_label) = *strip_btn_label_for_pwd.borrow() {
-                            btn_label.set_text(&new_title);
+                        if !tab_private_title_cell(&identity).is_some_and(|flag| flag.get()) {
+                            if let Some(ref btn_label) = *strip_btn_label_for_pwd.borrow() {
+                                btn_label.set_text(&new_title);
+                            }
                         }
                     }
                 });
@@ -1583,8 +1689,10 @@ impl UiState {
                     return;
                 }
                 label_for_title.set_text(title);
-                if let Some(ref btn_label) = *strip_btn_label_for_title.borrow() {
-                    btn_label.set_text(title);
+                if !tab_private_title_cell(&identity).is_some_and(|flag| flag.get()) {
+                    if let Some(ref btn_label) = *strip_btn_label_for_title.borrow() {
+                        btn_label.set_text(title);
+                    }
                 }
             }));
         };
@@ -1621,6 +1729,7 @@ impl UiState {
         term_wrapper_for_name.set_widget_name(&format!("tab-{}", tab_num));
         let term_wrapper_widget = term_wrapper.clone().upcast::<gtk4::Widget>();
         attach_tab_custom_title_cell(&term_wrapper_widget, custom_title.clone());
+        attach_tab_private_title_cell(&term_wrapper_widget, private_title.clone());
         view_type.attach_to(&term_wrapper_widget);
         view_type.set_session_id(&sid);
         view_type.set_remote(is_remote);
@@ -1726,7 +1835,12 @@ impl UiState {
         let tab_strip_for_tooltip = self.tab_strip.clone();
         let strip_btn_for_tooltip = strip_btn.clone();
         let tab_connections_for_tooltip = self.tab_connections.clone();
+        let private_title_for_tooltip = private_title.clone();
         strip_btn.connect_query_tooltip(move |_, _x, _y, _keyboard, tooltip| {
+            if private_title_for_tooltip.get() {
+                tooltip.set_text(Some("Private tab · title details hidden"));
+                return true;
+            }
             // Build tooltip text with cwd, process name, and status
             let mut tooltip_parts = Vec::new();
 
@@ -1829,6 +1943,7 @@ impl UiState {
         let strip_label_for_rename = strip_label.clone();
         let window_for_rename_strip = self.window.clone();
         let custom_title_for_rename_strip = custom_title.clone();
+        let private_title_for_rename_strip = private_title.clone();
         rename_click_strip.connect_pressed(move |_, n_press, _, _| {
             if n_press == 2 {
                 show_rename_dialog_with_strip(
@@ -1836,6 +1951,7 @@ impl UiState {
                     &label_for_rename_strip,
                     &strip_label_for_rename,
                     custom_title_for_rename_strip.clone(),
+                    private_title_for_rename_strip.clone(),
                 );
             }
         });
@@ -1884,6 +2000,7 @@ impl UiState {
                 let label_for_rename = label.clone();
                 let strip_label_for_rename = strip_label.clone();
                 let custom_title_for_rename = custom_title.clone();
+                let private_title_for_rename = private_title.clone();
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
                     show_rename_dialog_with_strip(
@@ -1891,7 +2008,30 @@ impl UiState {
                         &label_for_rename,
                         &strip_label_for_rename,
                         custom_title_for_rename.clone(),
+                        private_title_for_rename.clone(),
                     );
+                });
+                vbox.append(&item);
+            }
+
+            // Per-tab privacy: keep the real title in the hidden Notebook
+            // header while all visible tab chrome shows a neutral label.
+            {
+                let private = private_title.clone();
+                let item = make_item(if private.get() {
+                    "Show Title Details"
+                } else {
+                    "Hide Title Details"
+                });
+                let popover_c = popover.clone();
+                let ui = ui_for_ctx.clone();
+                let page_name = tab_name_for_ctx.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    let value = !private.get();
+                    if let Some(page) = notebook_page_named(&ui.notebook, &page_name) {
+                        ui.set_tab_title_privacy(&page, value);
+                    }
                 });
                 vbox.append(&item);
             }
@@ -1914,12 +2054,25 @@ impl UiState {
                     let title = page
                         .as_ref()
                         .and_then(|page| custom_tab_title(&ui_duplicate_ctx.notebook, page));
+                    let private = page
+                        .as_ref()
+                        .and_then(tab_private_title_cell)
+                        .is_some_and(|flag| flag.get());
                     ui_duplicate_ctx.add_new_tab(
                         working_directory,
                         title,
                         None,
                         crate::terminal::InitialCommands::default(),
                     );
+                    if private {
+                        if let Some(new_page) = ui_duplicate_ctx
+                            .notebook
+                            .current_page()
+                            .and_then(|index| ui_duplicate_ctx.notebook.nth_page(Some(index)))
+                        {
+                            ui_duplicate_ctx.set_tab_title_privacy(&new_page, true);
+                        }
+                    }
                 });
                 vbox.append(&item);
             }

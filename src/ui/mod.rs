@@ -101,6 +101,7 @@ pub(crate) struct TabConnection {
 /// callbacks, so replacement page widgets must carry the same cell rather than
 /// a copied boolean.
 pub(crate) const CUSTOM_TITLE_DATA: &str = "forge-custom-title";
+pub(crate) const PRIVATE_TITLE_DATA: &str = "forge-private-title";
 
 pub(crate) fn tab_custom_title_cell(widget: &gtk4::Widget) -> Option<Rc<Cell<bool>>> {
     unsafe {
@@ -121,6 +122,39 @@ pub(crate) fn set_tab_custom_title(widget: &gtk4::Widget, value: bool) {
         cell.set(value);
     } else {
         attach_tab_custom_title_cell(widget, Rc::new(Cell::new(value)));
+    }
+}
+
+pub(crate) fn tab_private_title_cell(widget: &gtk4::Widget) -> Option<Rc<Cell<bool>>> {
+    unsafe {
+        widget
+            .data::<Rc<Cell<bool>>>(PRIVATE_TITLE_DATA)
+            .map(|value| value.as_ref().clone())
+    }
+}
+
+pub(crate) fn attach_tab_private_title_cell(widget: &gtk4::Widget, value: Rc<Cell<bool>>) {
+    unsafe {
+        widget.set_data::<Rc<Cell<bool>>>(PRIVATE_TITLE_DATA, value);
+    }
+}
+
+pub(crate) fn set_tab_private_title(widget: &gtk4::Widget, value: bool) {
+    if let Some(cell) = tab_private_title_cell(widget) {
+        cell.set(value);
+    } else {
+        attach_tab_private_title_cell(widget, Rc::new(Cell::new(value)));
+    }
+}
+
+pub(crate) fn tab_display_title(
+    notebook: &gtk4::Notebook,
+    widget: &gtk4::Widget,
+) -> Option<String> {
+    if tab_private_title_cell(widget).is_some_and(|flag| flag.get()) {
+        Some("Private".to_string())
+    } else {
+        crate::state::tab_label_text(notebook, widget)
     }
 }
 

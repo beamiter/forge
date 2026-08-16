@@ -518,6 +518,7 @@ impl UiState {
 
         let target_pinned = self.tab_page_is_pinned(&target.page);
         let target_custom_title = tab_custom_title_cell(&target.page);
+        let target_private_title = tab_private_title_cell(&target.page);
         let (axis, incoming_first) = split_placement(zone);
         let orientation = match axis {
             SplitAxis::Horizontal => Orientation::Horizontal,
@@ -546,6 +547,9 @@ impl UiState {
         Self::set_tab_page_pinned(&page, target_pinned);
         if let Some(custom_title) = target_custom_title {
             attach_tab_custom_title_cell(&page, custom_title);
+        }
+        if let Some(private_title) = target_private_title {
+            attach_tab_private_title_cell(&page, private_title);
         }
         if let Some(connection) = moved_connection {
             let status = connection.status;
@@ -588,6 +592,8 @@ impl UiState {
         }
 
         let source_pinned = self.tab_page_is_pinned(&location.page);
+        let source_private_title =
+            tab_private_title_cell(&location.page).unwrap_or_else(|| Rc::new(Cell::new(false)));
         let working_directory = self.pane_working_directory(&location.leaf);
         let source_page_name = location.page.widget_name().to_string();
         let Some(sibling) = detach_leaf_and_promote(&self.notebook, &location.leaf.root_widget())
@@ -600,14 +606,20 @@ impl UiState {
                 .filter(|page| page.widget_name().as_str() == source_page_name)
         }) {
             Self::set_tab_page_pinned(&source_page, source_pinned);
+            attach_tab_private_title_cell(&source_page, source_private_title.clone());
             self.refresh_pane_headers_for(&source_page);
         } else {
             // Defensive fallback for an embedding tree without a conventional
             // tab name; the promoted subtree is still internally coherent.
             Self::set_tab_page_pinned(&sibling, source_pinned);
+            attach_tab_private_title_cell(&sibling, source_private_title.clone());
             self.refresh_pane_headers_for(&sibling);
         }
         Self::set_tab_page_pinned(&location.leaf.root_widget(), source_pinned);
+        attach_tab_private_title_cell(
+            &location.leaf.root_widget(),
+            Rc::new(Cell::new(source_private_title.get())),
+        );
         self.add_pane_leaf_as_new_tab(location.leaf, working_directory);
         true
     }
@@ -748,6 +760,7 @@ impl UiState {
         let tab_widget_name = Some(page_widget.widget_name().to_string());
         let pinned = self.tab_page_is_pinned(&page_widget);
         let custom_title = tab_custom_title_cell(&page_widget);
+        let private_title = tab_private_title_cell(&page_widget);
         let current_widget = current_leaf.root_widget();
         let parent = current_widget.parent();
 
@@ -816,6 +829,12 @@ impl UiState {
                                         attach_tab_custom_title_cell(
                                             &paned.clone().upcast(),
                                             custom_title,
+                                        );
+                                    }
+                                    if let Some(private_title) = private_title.clone() {
+                                        attach_tab_private_title_cell(
+                                            &paned.clone().upcast(),
+                                            private_title,
                                         );
                                     }
                                     let tab_label = self.notebook.tab_label(&candidate);
