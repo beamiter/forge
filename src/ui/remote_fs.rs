@@ -6,8 +6,16 @@
 //! the far side through the system `ssh` / `docker` binaries (no sshfs, no new
 //! dependencies) and its byte output is parsed back here. This mirrors the
 //! script-over-ssh philosophy of `jterm_core::jsh_remote`: the far side only
-//! ever sees a fixed script on stdin plus single-quote-escaped positional
-//! parameters, never an interpolated path.
+//! ever sees a fixed script plus single-quote-escaped positional parameters,
+//! never an interpolated path. The script travels as one `sh -c` argument (not
+//! on stdin) so that stdin stays free for the streaming `put`/`untar`
+//! payloads — a shell reading the script from a pipe may buffer-read ahead
+//! into the payload.
+//!
+//! Transfers (`cat`/`put` for files, `tar`/`untar` for directories) stream in
+//! 64 KiB chunks and never buffer a whole payload in memory; they are capped
+//! at [`MAX_TRANSFER_BYTES`] and carry a generous hard timeout, with the
+//! calling worker thread doubling as the watchdog that kills a hung child.
 //!
 //! Everything in this module blocks. Callers run it on worker threads and
 //! return results to the GTK main loop through a channel, exactly like the
@@ -16,12 +24,16 @@
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::config::RemoteHost;
 
 /// Hard cap on entries per directory listing, shared with the local scanner.
 pub(crate) const MAX_DIRECTORY_ENTRIES: usize = 4_096;
+/// Hard cap on one transfer payload. Exceeding it aborts the child, unlinks
+/// the partial local file, and errors — never a silently truncated result.
+pub(crate) const MAX_TRANSFER_BYTES: u64 = 512 * 1024 * 1024;
 /// NAME_MAX on every Linux filesystem the sidebar can realistically browse.
 const MAX_ENTRY_NAME_BYTES: usize = 255;
 /// `list` output is bounded: 4096 entries of at most 255 name bytes each,
@@ -35,7 +47,12 @@ const PROBE_OP_MAX_OUTPUT: u64 = 256 * 1024;
 /// a large tree is legitimate, a slow `ls` is a hung connection.
 const PROBE_LIST_TIMEOUT: Duration = Duration::from_secs(20);
 const PROBE_OP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Transfers get the generous ceiling: 512 MiB over a slow link takes a
+/// while, but a hung ssh or tar is still killed rather than pinning a worker.
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Streaming chunk size for transfer pumps.
+const STREAM_CHUNK: usize = 64 * 1024;
 /// Recursion limit for the local directory copier; beyond this the copy
 /// fails rather than risking the worker thread's stack.
 const MAX_COPY_DEPTH: usize = 64;
@@ -68,9 +85,9 @@ impl FsLocation {
     }
 }
 
-/// A sidebar cut/copy payload. Paste is only offered while the clipboard's
-/// location matches the tree's current location; cross-host paste would need
-/// a byte stream this module deliberately does not provide.
+/// A sidebar cut/copy payload. Same-location paste is a rename/copy; a
+/// location mismatch turns the paste into a streaming transfer (download,
+/// upload, or a temp-relayed remote-to-remote hop).
 #[derive(Clone, Debug)]
 pub(crate) struct FsClipboard {
     pub(crate) loc: FsLocation,
@@ -96,12 +113,17 @@ fn sort_entries(entries: &mut [FsEntry]) {
     });
 }
 
-/// The far-side probe, fed to `sh -s -- <op> [args...]` on stdin. Wire
-/// protocol v1: `list` prints NUL-separated `<type>,<name>` pairs (types
-/// `d`/`f`/`l`); exit codes are 0 ok, 2 usage/bad path, 3 cannot enter dir,
-/// 4 operation failed, 17 target exists.
-const PROBE_SCRIPT: &str = r#"# remote-fs probe v1 — runs under `sh -s -- <op> [args...]`.
+/// The far-side probe, invoked as `sh -c "$SCRIPT" probe <op> [args...]` so
+/// the script rides in argv and stdin is free for `put`/`untar` payloads.
+/// Wire protocol v2: `list` prints NUL-separated `<type>,<name>` pairs (types
+/// `d`/`f`/`l`); `cat`/`tar` stream to stdout, `put`/`untar` consume stdin.
+/// Exit codes are 0 ok, 2 usage/bad path, 3 cannot enter dir / not the
+/// expected kind, 4 operation failed, 17 target exists. The v1 ops
+/// (home/list/mkdir/mkfile/rm/mv/cp) are byte-identical to protocol v1.
+const PROBE_SCRIPT: &str = r#"# remote-fs probe v2 — runs under `sh -c` as $0=probe, <op> [args...] as $1+.
 # `list` stdout: NUL-separated pairs "<t>\0<name>\0", t in {d,f,l}, names relative.
+# v2 adds streaming ops: cat (file -> stdout), put (stdin -> new file),
+# tar (dir -> tar on stdout), untar (stdin tar -> existing dir).
 # Exit codes: 0 ok, 2 usage/bad path, 3 cannot enter dir, 4 op failed, 17 target exists.
 set -u
 op=${1:-}
@@ -154,6 +176,36 @@ case "$op" in
     [ -e "$n" ] && exit 17
     cp -a "$s" "$n" || exit 4
     ;;
+  cat)
+    p=${2:-}
+    case "$p" in /*) ;; *) exit 2 ;; esac
+    [ -f "$p" ] && [ -r "$p" ] || exit 3
+    cat "$p" || exit 4
+    ;;
+  put)
+    p=${2:-}
+    case "$p" in /*) ;; *) exit 2 ;; esac
+    [ -e "$p" ] && exit 17
+    t="$p.fspart.$$"
+    if ! cat > "$t"; then rm -f "$t"; exit 4; fi
+    [ -e "$p" ] && { rm -f "$t"; exit 17; }
+    mv "$t" "$p" || { rm -f "$t"; exit 4; }
+    ;;
+  tar)
+    p=${2%/}
+    case "$p" in /*?*) ;; *) exit 2 ;; esac
+    [ -d "$p" ] || exit 3
+    command -v tar >/dev/null 2>&1 || { echo "remote-fs: tar is not available" >&2; exit 4; }
+    parent=${p%/*}
+    tar cf - -C "${parent:-/}" "${p##*/}" || exit 4
+    ;;
+  untar)
+    d=${2:-}
+    case "$d" in /*) ;; *) exit 2 ;; esac
+    [ -d "$d" ] || exit 3
+    command -v tar >/dev/null 2>&1 || { echo "remote-fs: tar is not available" >&2; exit 4; }
+    tar xf - -C "$d" || exit 4
+    ;;
   *) exit 2 ;;
 esac
 exit 0
@@ -185,11 +237,14 @@ fn sq(arg: &str) -> String {
     quoted
 }
 
-/// Build the local argv that runs the probe on a host. For ssh the whole
-/// remote command is ONE argv element (`sh -s -- <op> '<arg>'...`) because
-/// ssh joins and re-parses it remotely; the script itself travels on stdin.
-/// For docker the probe argv is passed through raw, `-i` keeping stdin wired
-/// and `-t` deliberately absent so output is never CRLF-mangled.
+/// Build the local argv that runs the probe on a host. The script travels as
+/// ONE quoted argv element — `sh -c '<script>' probe <op> '<arg>'...` — so
+/// stdin stays free for streaming payloads (`put`/`untar`); a shell reading
+/// the script from a pipe could buffer-read ahead into the payload. ssh
+/// joins and re-parses the command remotely, so script and operands are
+/// single-quote-escaped. For docker the probe argv is passed through raw,
+/// `-i` keeping stdin wired and `-t` deliberately absent so output is never
+/// CRLF-mangled.
 fn probe_argv(host: &RemoteHost, op: &str, args: &[&str]) -> Vec<String> {
     if host.docker {
         let mut argv = vec!["docker".to_string(), "exec".to_string(), "-i".to_string()];
@@ -199,14 +254,19 @@ fn probe_argv(host: &RemoteHost, op: &str, args: &[&str]) -> Vec<String> {
         }
         argv.push(host.host.clone());
         argv.push("sh".to_string());
-        argv.push("-s".to_string());
-        argv.push("--".to_string());
+        argv.push("-c".to_string());
+        argv.push(PROBE_SCRIPT.to_string());
+        argv.push("probe".to_string());
         argv.push(op.to_string());
         argv.extend(args.iter().map(|arg| (*arg).to_string()));
         return argv;
     }
 
-    let mut command = format!("sh -s -- {op}");
+    let mut command = String::with_capacity(PROBE_SCRIPT.len() + 64);
+    command.push_str("sh -c ");
+    command.push_str(&sq(PROBE_SCRIPT));
+    command.push_str(" probe ");
+    command.push_str(op);
     for arg in args {
         command.push(' ');
         command.push_str(&sq(arg));
@@ -229,31 +289,65 @@ fn probe_argv(host: &RemoteHost, op: &str, args: &[&str]) -> Vec<String> {
     argv
 }
 
-/// Run a child to completion with piped stdio, bounded output and a hard
-/// timeout. The calling worker thread doubles as the watchdog: it polls the
-/// child and kills it past the deadline, so a hung ssh or stopped container
-/// cannot pin the thread forever.
-fn run_capture(
+/// Spawn a child from an argv vector with the given stdio arrangement.
+fn spawn_argv(
     argv: &[String],
-    stdin_bytes: &[u8],
-    timeout: Duration,
-    max_out: u64,
-) -> io::Result<Capture> {
+    stdin: Stdio,
+    stdout: Stdio,
+    stderr: Stdio,
+) -> io::Result<std::process::Child> {
     let Some((program, args)) = argv.split_first() else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "empty probe argv",
         ));
     };
-    let mut child = Command::new(program)
+    Command::new(program)
         .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+}
 
-    // Feed the probe script from a helper thread: a child that exits early
-    // fails the write, and the detached thread then ends on its own.
+/// Poll `child` to exit, killing and reaping it past the deadline. The
+/// calling worker thread doubles as the watchdog, so a hung ssh or stopped
+/// container cannot pin the thread forever.
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> io::Result<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait(); // reap the killed child
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "remote-fs probe timed out",
+            ));
+        }
+        std::thread::sleep(WATCHDOG_POLL_INTERVAL);
+    }
+}
+
+/// Run a child to completion with piped stdio, bounded output and a hard
+/// timeout. `stdin_bytes` is the child's whole stdin (a `put`/`untar`
+/// payload, or nothing for the other ops); stdout/stderr are captured
+/// bounded.
+fn run_capture(
+    argv: &[String],
+    stdin_bytes: &[u8],
+    timeout: Duration,
+    max_out: u64,
+) -> io::Result<Capture> {
+    let mut child = spawn_argv(argv, Stdio::piped(), Stdio::piped(), Stdio::piped())?;
+
+    // Feed stdin from a helper thread: a child that exits early fails the
+    // write, and the detached thread then ends on its own.
     if let Some(mut stdin) = child.stdin.take() {
         let stdin_bytes = stdin_bytes.to_vec();
         let _ = std::thread::Builder::new()
@@ -266,21 +360,7 @@ fn run_capture(
     let stdout_reader = spawn_bounded_reader(child.stdout.take(), max_out);
     let stderr_reader = spawn_bounded_reader(child.stderr.take(), max_out);
 
-    let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break Ok(status);
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait(); // reap the killed child
-            break Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "remote-fs probe timed out",
-            ));
-        }
-        std::thread::sleep(WATCHDOG_POLL_INTERVAL);
-    };
+    let status = wait_with_timeout(&mut child, timeout);
     let stdout = stdout_reader.join().unwrap_or_default();
     let stderr = stderr_reader.join().unwrap_or_default();
     let status = status?;
@@ -348,8 +428,598 @@ fn run_probe(
     max_out: u64,
 ) -> io::Result<Capture> {
     let argv = probe_argv(host, op, args);
-    let capture = run_capture(&argv, PROBE_SCRIPT.as_bytes(), timeout, max_out)?;
+    // The script rides in argv (`sh -c`), so stdin carries no payload here.
+    let capture = run_capture(&argv, &[], timeout, max_out)?;
     probe_result(capture)
+}
+
+/// Exit-code mapping for streaming probes, where stdout was sunk elsewhere
+/// and only bounded stderr remains.
+fn probe_status_result(status: i32, stderr: Vec<u8>) -> io::Result<()> {
+    probe_result(Capture {
+        status,
+        stdout: Vec::new(),
+        stderr,
+    })
+    .map(|_| ())
+}
+
+/// A monotonic-ish suffix making temp and relay names unique per attempt.
+fn unique_suffix() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0)
+}
+
+/// Best-effort unlink of a partial download on every failure path; `disarm`
+/// once the final rename has landed.
+struct TempFileGuard(PathBuf);
+
+impl TempFileGuard {
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The watchdog half of a streaming transfer: poll the child while the pump
+/// thread reports through `rx`. Only a FAILED pump (overflow, write error)
+/// kills the child outright — a finished pump means the payload has moved
+/// but the child may still be flushing it (`put` renames after stdin EOF),
+/// so a successful pump keeps waiting for a natural exit until the deadline.
+fn watchdog_streaming_child(
+    child: &mut std::process::Child,
+    rx: &mpsc::Receiver<io::Result<()>>,
+    timeout: Duration,
+) -> (i32, io::Result<()>) {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut pump_outcome = None;
+    loop {
+        if pump_outcome.is_none() {
+            if let Ok(outcome) = rx.try_recv() {
+                if outcome.is_err() {
+                    // The pump gave up: the child is stuck on a full pipe or
+                    // a dead peer — kill it rather than waiting it out.
+                    let _ = child.kill();
+                    let status = child
+                        .wait()
+                        .map(|status| status.code().unwrap_or(-1))
+                        .unwrap_or(-1);
+                    return (status, outcome);
+                }
+                pump_outcome = Some(outcome);
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let outcome = match pump_outcome {
+                    Some(outcome) => outcome,
+                    // The child exited without the pump reporting yet; EOF
+                    // makes that report arrive promptly.
+                    None => rx
+                        .recv()
+                        .unwrap_or_else(|_| Err(io::Error::other("transfer pump died"))),
+                };
+                return (status.code().unwrap_or(-1), outcome);
+            }
+            Ok(None) => {}
+            Err(error) => return (-1, Err(error)),
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = rx.recv();
+            return (
+                -1,
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "remote-fs transfer timed out",
+                )),
+            );
+        }
+        std::thread::sleep(WATCHDOG_POLL_INTERVAL);
+    }
+}
+
+fn transfer_cap_error(cap: u64) -> io::Error {
+    io::Error::other(format!(
+        "transfer exceeds the {} MiB limit",
+        cap / (1024 * 1024)
+    ))
+}
+
+/// Stream a probe's stdout into a new local file via a unique temp sibling,
+/// one chunk at a time. The temp file is unlinked on any failure; `dst`
+/// appears only through the final rename, after a last existence check.
+fn stream_download_to_file(
+    argv: &[String],
+    dst: &Path,
+    cap: u64,
+    timeout: Duration,
+) -> io::Result<()> {
+    fail_if_exists(dst)?;
+    let Some(file_name) = dst.file_name() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "download target has no file name",
+        ));
+    };
+    let temp = dst.with_file_name(format!(
+        ".{}.fspart-{}-{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        unique_suffix()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    let temp_guard = TempFileGuard(temp.clone());
+
+    let mut child = spawn_argv(argv, Stdio::null(), Stdio::piped(), Stdio::piped())?;
+    let stderr_reader = spawn_bounded_reader(child.stderr.take(), PROBE_OP_MAX_OUTPUT);
+    let Some(mut stdout) = child.stdout.take() else {
+        return Err(io::Error::other("could not open probe stdout"));
+    };
+    let (tx, rx) = mpsc::channel::<io::Result<()>>();
+    std::thread::Builder::new()
+        .name("forge-remote-fs-dl".to_string())
+        .spawn(move || {
+            let mut total = 0_u64;
+            let mut buffer = vec![0_u8; STREAM_CHUNK];
+            let result = loop {
+                match stdout.read(&mut buffer) {
+                    Ok(0) => break Ok(total),
+                    Ok(read) => {
+                        total += read as u64;
+                        if total > cap {
+                            break Err(transfer_cap_error(cap));
+                        }
+                        if let Err(error) = file.write_all(&buffer[..read]) {
+                            break Err(error);
+                        }
+                    }
+                    Err(error) => break Err(error),
+                }
+            };
+            let result = result.and_then(|total| file.sync_all().map(|_| total));
+            let _ = tx.send(result.map(|_| ()));
+        })
+        .map_err(|error| io::Error::other(format!("could not start download streamer: {error}")))?;
+
+    let (status, outcome) = watchdog_streaming_child(&mut child, &rx, timeout);
+    probe_status_result(status, stderr_reader.join().unwrap_or_default())?;
+    outcome?;
+    finalize_download(&temp, dst)?;
+    temp_guard.disarm();
+    Ok(())
+}
+
+/// `rename` would silently clobber a `dst` created after the pre-stream
+/// check, so re-check immediately before it. Called with the temp file still
+/// guarded, so a failure here still unlinks the partial download.
+fn finalize_download(temp: &Path, dst: &Path) -> io::Result<()> {
+    fail_if_exists(dst)?;
+    std::fs::rename(temp, dst)
+}
+
+/// Stream a local regular file into a probe's stdin (`put` payload). The
+/// remote side's exit code takes precedence over local write errors: an
+/// early `exit 17` surfaces as AlreadyExists, not as a broken pipe.
+fn stream_upload_to_probe(
+    argv: &[String],
+    src: &Path,
+    cap: u64,
+    timeout: Duration,
+) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(src)?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "upload source is not a regular file",
+        ));
+    }
+    if metadata.len() > cap {
+        return Err(transfer_cap_error(cap));
+    }
+    let mut file = std::fs::File::open(src)?;
+
+    let mut child = spawn_argv(argv, Stdio::piped(), Stdio::null(), Stdio::piped())?;
+    let stderr_reader = spawn_bounded_reader(child.stderr.take(), PROBE_OP_MAX_OUTPUT);
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err(io::Error::other("could not open probe stdin"));
+    };
+    let (tx, rx) = mpsc::channel::<io::Result<()>>();
+    std::thread::Builder::new()
+        .name("forge-remote-fs-ul".to_string())
+        .spawn(move || {
+            let mut total = 0_u64;
+            let mut buffer = vec![0_u8; STREAM_CHUNK];
+            let result = loop {
+                match file.read(&mut buffer) {
+                    Ok(0) => break Ok(total),
+                    Ok(read) => {
+                        total += read as u64;
+                        // The file grew past the cap mid-stream. Kill happens
+                        // on the calling side; the remote temp is orphaned but
+                        // no truncated file is moved into place.
+                        if total > cap {
+                            break Err(transfer_cap_error(cap));
+                        }
+                        if let Err(error) = stdin.write_all(&buffer[..read]) {
+                            break Err(error);
+                        }
+                    }
+                    Err(error) => break Err(error),
+                }
+            };
+            let _ = tx.send(result.map(|_| ()));
+        })
+        .map_err(|error| io::Error::other(format!("could not start upload streamer: {error}")))?;
+
+    let (status, outcome) = watchdog_streaming_child(&mut child, &rx, timeout);
+    probe_status_result(status, stderr_reader.join().unwrap_or_default())?;
+    outcome?;
+    Ok(())
+}
+
+/// Directory transfers shell out to the system tar on BOTH ends; check the
+/// local side up-front so the error names the real problem.
+fn local_tar_available() -> io::Result<()> {
+    match Command::new("tar")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) => Err(io::Error::other("local `tar` is present but not working")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(io::Error::other(
+            "directory transfers need a local `tar` binary",
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+fn local_tar_create_argv(src: &Path) -> io::Result<Vec<String>> {
+    let Some(name) = src.file_name() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tar source has no file name",
+        ));
+    };
+    let parent = src.parent().unwrap_or_else(|| Path::new("/"));
+    Ok(vec![
+        "tar".to_string(),
+        "cf".to_string(),
+        "-".to_string(),
+        "-C".to_string(),
+        parent.to_string_lossy().into_owned(),
+        name.to_string_lossy().into_owned(),
+    ])
+}
+
+/// Pump `reader` → `writer` in chunks with a byte cap. On overflow the
+/// `source_child` (the producing tar) is killed so it cannot linger blocked
+/// on a full pipe; IO errors kill it too, then it is reaped.
+fn pump_capped(
+    mut reader: impl Read,
+    mut writer: impl Write,
+    mut source_child: std::process::Child,
+    cap: u64,
+    timeout: Duration,
+) -> io::Result<()> {
+    let mut total = 0_u64;
+    let mut buffer = vec![0_u8; STREAM_CHUNK];
+    let result = loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break Ok(()),
+            Ok(read) => {
+                total += read as u64;
+                if total > cap {
+                    break Err(transfer_cap_error(cap));
+                }
+                if let Err(error) = writer.write_all(&buffer[..read]) {
+                    break Err(error);
+                }
+            }
+            Err(error) => break Err(error),
+        }
+    };
+    drop(writer); // EOF for the consumer
+    if result.is_err() {
+        let _ = source_child.kill();
+    }
+    // Reap the producer; after EOF it exits on its own, after a failure the
+    // kill above needs a wait to collect.
+    match wait_with_timeout(&mut source_child, timeout) {
+        Ok(status) if result.is_ok() => match status.code() {
+            Some(0) => Ok(()),
+            Some(code) => Err(io::Error::other(format!(
+                "local tar exited with status {code}"
+            ))),
+            None => Err(io::Error::other("local tar died to a signal")),
+        },
+        Ok(_) => result,
+        Err(error) => Err(error),
+    }
+}
+
+/// Download one regular file from a remote host to `dst`, streaming.
+pub(crate) fn download_file(host: &RemoteHost, src: &Path, dst: &Path) -> io::Result<()> {
+    let argv = probe_argv(host, "cat", &[remote_path_arg(src)?]);
+    stream_download_to_file(&argv, dst, MAX_TRANSFER_BYTES, TRANSFER_TIMEOUT)
+}
+
+/// Upload one regular local file to `dst` on a remote host, streaming. The
+/// probe writes a temp file and renames it into place, re-checking existence
+/// right before the rename.
+pub(crate) fn upload_file(host: &RemoteHost, src: &Path, dst: &Path) -> io::Result<()> {
+    let argv = probe_argv(host, "put", &[remote_path_arg(dst)?]);
+    stream_upload_to_probe(&argv, src, MAX_TRANSFER_BYTES, TRANSFER_TIMEOUT)
+}
+
+/// Download a remote directory tree to `dst` (which must not exist): the
+/// probe streams a tar of the directory and the local system tar extracts it
+/// into `dst`'s parent. A partial extraction is removed on failure.
+pub(crate) fn download_dir(host: &RemoteHost, src: &Path, dst: &Path) -> io::Result<()> {
+    let argv = probe_argv(host, "tar", &[remote_path_arg(src)?]);
+    fail_if_exists(dst)?;
+    local_tar_available()?;
+    let Some(parent) = dst.parent() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "download target has no parent directory",
+        ));
+    };
+    let local_argv = vec![
+        "tar".to_string(),
+        "xf".to_string(),
+        "-".to_string(),
+        "-C".to_string(),
+        parent.to_string_lossy().into_owned(),
+    ];
+
+    let result = stream_download_dir(&argv, &local_argv, MAX_TRANSFER_BYTES, TRANSFER_TIMEOUT);
+    if result.is_err() {
+        // Anything at `dst` now is our partial extraction (it did not exist
+        // before); remove it rather than leaving a half-tree behind.
+        let _ = std::fs::remove_dir_all(dst);
+    }
+    result
+}
+
+fn stream_download_dir(
+    argv: &[String],
+    local_argv: &[String],
+    cap: u64,
+    timeout: Duration,
+) -> io::Result<()> {
+    let mut remote = spawn_argv(argv, Stdio::null(), Stdio::piped(), Stdio::piped())?;
+    let remote_stderr = spawn_bounded_reader(remote.stderr.take(), PROBE_OP_MAX_OUTPUT);
+    let mut local = spawn_argv(local_argv, Stdio::piped(), Stdio::null(), Stdio::piped())?;
+    let local_stderr = spawn_bounded_reader(local.stderr.take(), PROBE_OP_MAX_OUTPUT);
+    let Some(remote_stdout) = remote.stdout.take() else {
+        return Err(io::Error::other("could not open probe stdout"));
+    };
+    let Some(local_stdin) = local.stdin.take() else {
+        return Err(io::Error::other("could not open local tar stdin"));
+    };
+
+    let (tx, rx) = mpsc::channel::<io::Result<()>>();
+    std::thread::Builder::new()
+        .name("forge-remote-fs-dldir".to_string())
+        .spawn(move || {
+            // The "source child" here is the local extractor: a pump failure
+            // must kill it so it cannot linger waiting for stdin.
+            let outcome = pump_capped(remote_stdout, local_stdin, local, cap, timeout);
+            let _ = tx.send(outcome);
+        })
+        .map_err(|error| io::Error::other(format!("could not start download pump: {error}")))?;
+
+    let (status, outcome) = watchdog_streaming_child(&mut remote, &rx, timeout);
+    probe_status_result(status, remote_stderr.join().unwrap_or_default())?;
+    outcome?;
+    let local_err = String::from_utf8_lossy(&local_stderr.join().unwrap_or_default())
+        .trim()
+        .to_string();
+    if !local_err.is_empty() {
+        log::warn!("local tar reported during directory download: {local_err}");
+    }
+    Ok(())
+}
+
+/// Upload a local directory tree to `dst` on a remote host (which must not
+/// exist): the probe creates `dst` (exit 17 if taken), then the local system
+/// tar streams the tree into `untar`. A failed upload removes the remote
+/// `dst` it just created, best-effort.
+pub(crate) fn upload_dir(host: &RemoteHost, src: &Path, dst: &Path) -> io::Result<()> {
+    local_tar_available()?;
+    if !src.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "upload source is not a directory",
+        ));
+    }
+    let dst_arg = remote_path_arg(dst)?;
+    run_probe(
+        host,
+        "mkdir",
+        &[dst_arg],
+        PROBE_OP_TIMEOUT,
+        PROBE_OP_MAX_OUTPUT,
+    )?;
+    let local_argv = local_tar_create_argv(src)?;
+    let remote_argv = probe_argv(host, "untar", &[dst_arg]);
+    let result = stream_upload_dir(
+        &local_argv,
+        &remote_argv,
+        MAX_TRANSFER_BYTES,
+        TRANSFER_TIMEOUT,
+    );
+    if result.is_err() {
+        let _ = run_probe(
+            host,
+            "rm",
+            &[dst_arg],
+            PROBE_OP_TIMEOUT,
+            PROBE_OP_MAX_OUTPUT,
+        );
+    }
+    result
+}
+
+fn stream_upload_dir(
+    local_argv: &[String],
+    remote_argv: &[String],
+    cap: u64,
+    timeout: Duration,
+) -> io::Result<()> {
+    let mut local = spawn_argv(local_argv, Stdio::null(), Stdio::piped(), Stdio::piped())?;
+    let local_stderr = spawn_bounded_reader(local.stderr.take(), PROBE_OP_MAX_OUTPUT);
+    let mut remote = spawn_argv(remote_argv, Stdio::piped(), Stdio::null(), Stdio::piped())?;
+    let remote_stderr = spawn_bounded_reader(remote.stderr.take(), PROBE_OP_MAX_OUTPUT);
+    let Some(local_stdout) = local.stdout.take() else {
+        return Err(io::Error::other("could not open local tar stdout"));
+    };
+    let Some(remote_stdin) = remote.stdin.take() else {
+        return Err(io::Error::other("could not open probe stdin"));
+    };
+
+    let (tx, rx) = mpsc::channel::<io::Result<()>>();
+    std::thread::Builder::new()
+        .name("forge-remote-fs-uldir".to_string())
+        .spawn(move || {
+            let outcome = pump_capped(local_stdout, remote_stdin, local, cap, timeout);
+            let _ = tx.send(outcome);
+        })
+        .map_err(|error| io::Error::other(format!("could not start upload pump: {error}")))?;
+
+    let (status, outcome) = watchdog_streaming_child(&mut remote, &rx, timeout);
+    probe_status_result(status, remote_stderr.join().unwrap_or_default())?;
+    outcome?;
+    let local_err = String::from_utf8_lossy(&local_stderr.join().unwrap_or_default())
+        .trim()
+        .to_string();
+    if !local_err.is_empty() {
+        log::warn!("local tar reported during directory upload: {local_err}");
+    }
+    Ok(())
+}
+
+/// Which leg a cross-location paste needs. Same-location pastes return
+/// `None`: the plain copy/rename ops handle those.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TransferPlan {
+    /// Clipboard remote, tree local.
+    Download,
+    /// Clipboard local, tree remote.
+    Upload,
+    /// Two different remote hosts, relayed through a local temp path.
+    Relay,
+}
+
+pub(crate) fn transfer_plan(from: &FsLocation, to: &FsLocation) -> Option<TransferPlan> {
+    if from == to {
+        return None;
+    }
+    Some(match (from, to) {
+        (FsLocation::Remote(_), FsLocation::Local) => TransferPlan::Download,
+        (FsLocation::Local, FsLocation::Remote(_)) => TransferPlan::Upload,
+        (FsLocation::Remote(_), FsLocation::Remote(_)) => TransferPlan::Relay,
+        // `from == to` was rejected above, so both-Local cannot reach here.
+        (FsLocation::Local, FsLocation::Local) => unreachable!(),
+    })
+}
+
+/// One cross-location transfer unit: download, upload, or a temp-relayed
+/// remote-to-remote hop. `dst` must not exist anywhere along the way; every
+/// leg pre-checks existence before a payload byte moves.
+pub(crate) fn transfer(
+    from: &FsLocation,
+    hosts: &[RemoteHost],
+    src: &Path,
+    to: &FsLocation,
+    dst: &Path,
+    is_dir: bool,
+) -> io::Result<()> {
+    match (remote_host(from, hosts)?, remote_host(to, hosts)?) {
+        (Some(src_host), None) => {
+            if is_dir {
+                download_dir(src_host, src, dst)
+            } else {
+                download_file(src_host, src, dst)
+            }
+        }
+        (None, Some(dst_host)) => {
+            if is_dir {
+                upload_dir(dst_host, src, dst)
+            } else {
+                upload_file(dst_host, src, dst)
+            }
+        }
+        (Some(src_host), Some(dst_host)) => transfer_relay(src_host, src, dst_host, dst, is_dir),
+        (None, None) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "same-location transfer must use copy or rename",
+        )),
+    }
+}
+
+/// Remote-to-remote hops relay through a unique local temp path: download,
+/// upload, clean up. The temp side never survives the call.
+fn transfer_relay(
+    src_host: &RemoteHost,
+    src: &Path,
+    dst_host: &RemoteHost,
+    dst: &Path,
+    is_dir: bool,
+) -> io::Result<()> {
+    let relay = std::env::temp_dir().join(format!(
+        "forge-fs-relay-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    if is_dir {
+        let Some(name) = src.file_name() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transfer source has no file name",
+            ));
+        };
+        std::fs::create_dir(&relay)?;
+        let staged = relay.join(name);
+        let result =
+            download_dir(src_host, src, &staged).and_then(|_| upload_dir(dst_host, &staged, dst));
+        let _ = std::fs::remove_dir_all(&relay);
+        result
+    } else {
+        let result =
+            download_file(src_host, src, &relay).and_then(|_| upload_file(dst_host, &relay, dst));
+        let _ = std::fs::remove_file(&relay);
+        result
+    }
+}
+
+/// Cut semantics for cross-location moves: copy first, delete the source only
+/// after the copy landed, and say so plainly when only the copy succeeded.
+pub(crate) fn copy_then_delete(
+    copy: impl FnOnce() -> io::Result<()>,
+    delete: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    copy()?;
+    delete().map_err(|error| {
+        io::Error::other(format!(
+            "copied, but the source could not be deleted: {error}"
+        ))
+    })
 }
 
 /// Resolve a location against the snapshot of configured hosts taken when the
@@ -718,11 +1388,11 @@ mod tests {
     }
 
     #[test]
-    fn ssh_argv_keeps_script_on_stdin_and_command_in_one_element() {
+    fn ssh_argv_carries_script_in_argv_and_command_in_one_element() {
         let argv = probe_argv(&host_fixture(), "list", &["/var/log"]);
         assert_eq!(
-            argv,
-            vec![
+            &argv[..argv.len() - 1],
+            &[
                 "ssh",
                 "-o",
                 "BatchMode=yes",
@@ -732,9 +1402,13 @@ mod tests {
                 "2222",
                 "--",
                 "alice@dev.example.com",
-                "sh -s -- list '/var/log'",
             ]
         );
+        let command = &argv[argv.len() - 1];
+        // Script and operands form exactly one argv element; stdin stays free.
+        assert!(command.starts_with("sh -c '# remote-fs probe v2"));
+        assert!(command.ends_with(" probe list '/var/log'"));
+        assert!(command.contains("'\\''"));
     }
 
     #[test]
@@ -743,19 +1417,9 @@ mod tests {
         host.user = None;
         host.ssh_args = Vec::new();
         let argv = probe_argv(&host, "mv", &["/a b/c", "/d'e"]);
-        assert_eq!(
-            argv,
-            vec![
-                "ssh",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                "--",
-                "dev.example.com",
-                "sh -s -- mv '/a b/c' '/d'\\''e'",
-            ]
-        );
+        assert_eq!(argv[0], "ssh");
+        assert_eq!(argv[argv.len() - 2], "dev.example.com");
+        assert!(argv[argv.len() - 1].ends_with(" probe mv '/a b/c' '/d'\\''e'"));
     }
 
     #[test]
@@ -767,7 +1431,17 @@ mod tests {
         assert_eq!(
             argv,
             vec![
-                "docker", "exec", "-i", "-u", "alice", "builder", "sh", "-s", "--", "rm",
+                "docker",
+                "exec",
+                "-i",
+                "-u",
+                "alice",
+                "builder",
+                "sh",
+                "-c",
+                PROBE_SCRIPT,
+                "probe",
+                "rm",
                 "/tmp/x y",
             ]
         );
@@ -777,7 +1451,17 @@ mod tests {
         let argv = probe_argv(&host, "home", &[]);
         assert_eq!(
             argv,
-            vec!["docker", "exec", "-i", "builder", "sh", "-s", "--", "home"]
+            vec![
+                "docker",
+                "exec",
+                "-i",
+                "builder",
+                "sh",
+                "-c",
+                PROBE_SCRIPT,
+                "probe",
+                "home",
+            ]
         );
     }
 
@@ -1005,19 +1689,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Run the embedded probe under the local `sh` — the same script bytes a
-    /// remote side would receive on stdin.
-    fn probe_locally(op: &str, args: &[&str]) -> Capture {
-        let mut argv = vec!["sh".to_string(), "-s".to_string(), "--".to_string()];
-        argv.push(op.to_string());
+    /// Run the embedded probe under the local `sh` — the same argv shape and
+    /// script bytes a remote side would receive, with `payload` as stdin.
+    fn probe_locally_with_stdin(op: &str, args: &[&str], payload: &[u8]) -> Capture {
+        let mut argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            PROBE_SCRIPT.to_string(),
+            "probe".to_string(),
+            op.to_string(),
+        ];
         argv.extend(args.iter().map(|arg| (*arg).to_string()));
         run_capture(
             &argv,
-            PROBE_SCRIPT.as_bytes(),
+            payload,
             Duration::from_secs(10),
             PROBE_LIST_MAX_OUTPUT,
         )
         .unwrap()
+    }
+
+    fn probe_locally(op: &str, args: &[&str]) -> Capture {
+        probe_locally_with_stdin(op, args, &[])
     }
 
     #[test]
@@ -1089,5 +1782,351 @@ mod tests {
         assert!(parse_home(&home.stdout).unwrap().is_absolute());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn probe_v2_cat_put_round_trip_is_binary_safe() {
+        let root = unique_temp_dir("probe-v2-file");
+        let target = root.join("blob.bin").to_string_lossy().into_owned();
+        // Every byte value, twice: content must survive the stream unchanged.
+        let payload: Vec<u8> = (0..=255u8).chain(0..=255u8).collect();
+
+        let put = probe_locally_with_stdin("put", &[&target], &payload);
+        assert_eq!(put.status, 0);
+        assert_eq!(std::fs::read(root.join("blob.bin")).unwrap(), payload);
+        // The temp file is renamed into place; nothing fspart is left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("fspart"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+
+        // Re-put to an existing path is refused before stdin is consumed.
+        assert_eq!(probe_locally_with_stdin("put", &[&target], b"x").status, 17);
+        assert_eq!(
+            probe_locally_with_stdin("put", &["relative"], b"x").status,
+            2
+        );
+
+        let cat = probe_locally("cat", &[&target]);
+        assert_eq!(cat.status, 0);
+        assert_eq!(cat.stdout, payload);
+        // cat requires a readable regular file.
+        let missing = root.join("missing").to_string_lossy().into_owned();
+        assert_eq!(probe_locally("cat", &[&missing]).status, 3);
+        assert_eq!(probe_locally("cat", &[&root.to_string_lossy()]).status, 3);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn probe_v2_tar_untar_round_trip() {
+        if local_tar_available().is_err() {
+            return;
+        }
+        let root = unique_temp_dir("probe-v2-dir");
+        std::fs::create_dir_all(root.join("tree/sub")).unwrap();
+        std::fs::write(root.join("tree/top.txt"), b"top").unwrap();
+        std::fs::write(root.join("tree/sub/nested.bin"), [0u8, 255, 1, 2]).unwrap();
+
+        let tree = root.join("tree").to_string_lossy().into_owned();
+        let tarred = probe_locally("tar", &[&tree]);
+        assert_eq!(tarred.status, 0);
+        assert!(!tarred.stdout.is_empty());
+
+        // tar requires a directory.
+        let file = root.join("tree/top.txt").to_string_lossy().into_owned();
+        assert_eq!(probe_locally("tar", &[&file]).status, 3);
+        let missing = root.join("missing").to_string_lossy().into_owned();
+        assert_eq!(probe_locally("tar", &[&missing]).status, 3);
+
+        let unpack = root.join("unpack");
+        std::fs::create_dir(&unpack).unwrap();
+        let unpack_arg = unpack.to_string_lossy().into_owned();
+        let untarred = probe_locally_with_stdin("untar", &[&unpack_arg], &tarred.stdout);
+        assert_eq!(untarred.status, 0);
+        assert_eq!(std::fs::read(unpack.join("tree/top.txt")).unwrap(), b"top");
+        assert_eq!(
+            std::fs::read(unpack.join("tree/sub/nested.bin")).unwrap(),
+            [0u8, 255, 1, 2]
+        );
+
+        // untar requires an existing directory.
+        assert_eq!(
+            probe_locally_with_stdin("untar", &[&missing], &tarred.stdout).status,
+            3
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The argv a remote `cat`/`put`/`tar`/`untar` probe would get, pointed
+    /// at the local sh so streaming helpers can run without ssh or docker.
+    fn local_probe_argv(op: &str, args: &[&str]) -> Vec<String> {
+        let mut argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            PROBE_SCRIPT.to_string(),
+            "probe".to_string(),
+            op.to_string(),
+        ];
+        argv.extend(args.iter().map(|arg| (*arg).to_string()));
+        argv
+    }
+
+    #[test]
+    fn download_streams_content_and_cleans_up_on_overflow() {
+        let root = unique_temp_dir("download");
+        let source = root.join("source.bin");
+        let payload: Vec<u8> = (0..10_000u32).map(|index| (index % 251) as u8).collect();
+        std::fs::write(&source, &payload).unwrap();
+        let source_arg = source.to_string_lossy().into_owned();
+
+        // Happy path: bytes land via temp + rename, leaving no fspart files.
+        let dst = root.join("out/blob.bin");
+        std::fs::create_dir(root.join("out")).unwrap();
+        let argv = local_probe_argv("cat", &[&source_arg]);
+        stream_download_to_file(&argv, &dst, 64 * 1024, Duration::from_secs(10)).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), payload);
+        let leftovers: Vec<_> = std::fs::read_dir(root.join("out"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("fspart"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+
+        // Pre-existing dst is refused before any byte streams.
+        let argv = local_probe_argv("cat", &[&source_arg]);
+        assert_eq!(
+            stream_download_to_file(&argv, &dst, 64 * 1024, Duration::from_secs(10))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+
+        // Overflow: the partial temp file is unlinked and no dst appears.
+        let dst2 = root.join("out/too-big.bin");
+        let argv = local_probe_argv("cat", &[&source_arg]);
+        let error =
+            stream_download_to_file(&argv, &dst2, 1_024, Duration::from_secs(10)).unwrap_err();
+        assert!(error.to_string().contains("limit"), "{error}");
+        assert!(!dst2.exists());
+        let leftovers: Vec<_> = std::fs::read_dir(root.join("out"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("fspart"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn finalize_download_refuses_a_racing_creator() {
+        let root = unique_temp_dir("finalize");
+        let temp = root.join("temp");
+        std::fs::write(&temp, b"payload").unwrap();
+        let dst = root.join("dst");
+        // A winner appearing between the pre-check and the rename is still
+        // refused, and the guarded temp is unlinked afterwards.
+        std::fs::write(&dst, b"winner").unwrap();
+        {
+            let guard = TempFileGuard(temp.clone());
+            assert_eq!(
+                finalize_download(&temp, &dst).unwrap_err().kind(),
+                io::ErrorKind::AlreadyExists
+            );
+            drop(guard);
+        }
+        assert!(!temp.exists());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"winner");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn upload_streams_content_and_surfaces_remote_exit_codes() {
+        let root = unique_temp_dir("upload");
+        let source = root.join("local.txt");
+        let payload: Vec<u8> = (0..5_000u32).map(|index| (index % 253) as u8).collect();
+        std::fs::write(&source, &payload).unwrap();
+
+        let remote = root
+            .join("remote/landed.txt")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::create_dir(root.join("remote")).unwrap();
+        let argv = local_probe_argv("put", &[&remote]);
+        stream_upload_to_probe(&argv, &source, 64 * 1024, Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("remote/landed.txt")).unwrap(),
+            payload
+        );
+
+        // The probe's exit 17 maps to AlreadyExists even though the local
+        // writer then sees a broken pipe.
+        let argv = local_probe_argv("put", &[&remote]);
+        assert_eq!(
+            stream_upload_to_probe(&argv, &source, 64 * 1024, Duration::from_secs(10))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+
+        // A source over the cap is refused before the probe is even spawned.
+        let argv = local_probe_argv("put", &[&root.join("remote/other").to_string_lossy()]);
+        let error =
+            stream_upload_to_probe(&argv, &source, 1_024, Duration::from_secs(10)).unwrap_err();
+        assert!(error.to_string().contains("limit"), "{error}");
+        assert!(!root.join("remote/other").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn directory_streams_round_trip_through_tar() {
+        if local_tar_available().is_err() {
+            return;
+        }
+        let root = unique_temp_dir("dir-transfer");
+        std::fs::create_dir_all(root.join("tree/sub")).unwrap();
+        std::fs::write(root.join("tree/a.txt"), b"aaa").unwrap();
+        std::fs::write(root.join("tree/sub/b.bin"), [9u8, 8, 7, 0]).unwrap();
+
+        // "Upload": local tar -> probe untar into an existing remote dir.
+        let remote_dir = root.join("remote/tree");
+        std::fs::create_dir_all(&remote_dir).unwrap();
+        let local_argv = local_tar_create_argv(&root.join("tree")).unwrap();
+        let remote_argv = local_probe_argv("untar", &[&remote_dir.to_string_lossy()]);
+        stream_upload_dir(
+            &local_argv,
+            &remote_argv,
+            64 * 1024 * 1024,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(remote_dir.join("tree/a.txt")).unwrap(),
+            b"aaa"
+        );
+        assert_eq!(
+            std::fs::read(remote_dir.join("tree/sub/b.bin")).unwrap(),
+            [9u8, 8, 7, 0]
+        );
+
+        // "Download": probe tar -> local tar into the dst parent.
+        let dst = root.join("local-back/tree");
+        std::fs::create_dir(root.join("local-back")).unwrap();
+        let probe_argv = local_probe_argv("tar", &[&remote_dir.join("tree").to_string_lossy()]);
+        let local_argv = vec![
+            "tar".to_string(),
+            "xf".to_string(),
+            "-".to_string(),
+            "-C".to_string(),
+            root.join("local-back").to_string_lossy().into_owned(),
+        ];
+        stream_download_dir(
+            &probe_argv,
+            &local_argv,
+            64 * 1024 * 1024,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"aaa");
+        assert_eq!(
+            std::fs::read(dst.join("sub/b.bin")).unwrap(),
+            [9u8, 8, 7, 0]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn transfer_plan_covers_all_location_pairs() {
+        assert_eq!(transfer_plan(&FsLocation::Local, &FsLocation::Local), None);
+        assert_eq!(
+            transfer_plan(&FsLocation::Remote(1), &FsLocation::Remote(1)),
+            None
+        );
+        assert_eq!(
+            transfer_plan(&FsLocation::Remote(1), &FsLocation::Local),
+            Some(TransferPlan::Download)
+        );
+        assert_eq!(
+            transfer_plan(&FsLocation::Local, &FsLocation::Remote(2)),
+            Some(TransferPlan::Upload)
+        );
+        assert_eq!(
+            transfer_plan(&FsLocation::Remote(1), &FsLocation::Remote(2)),
+            Some(TransferPlan::Relay)
+        );
+    }
+
+    #[test]
+    fn transfer_rejects_same_location() {
+        let hosts: &[RemoteHost] = &[];
+        assert_eq!(
+            transfer(
+                &FsLocation::Local,
+                hosts,
+                Path::new("/tmp/a"),
+                &FsLocation::Local,
+                Path::new("/tmp/b"),
+                false,
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn copy_then_delete_orders_copy_first_and_reports_partial_success() {
+        use std::sync::{Arc, Mutex};
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let recorder = |log: &Arc<Mutex<Vec<&'static str>>>, tag: &'static str, ok: bool| {
+            let log = log.clone();
+            move || {
+                log.lock().unwrap().push(tag);
+                if ok {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("boom"))
+                }
+            }
+        };
+
+        // Happy path: copy runs first, delete second.
+        copy_then_delete(recorder(&log, "copy", true), recorder(&log, "delete", true)).unwrap();
+        assert_eq!(*log.lock().unwrap(), vec!["copy", "delete"]);
+
+        // A failed copy never reaches the delete.
+        log.lock().unwrap().clear();
+        assert!(copy_then_delete(
+            recorder(&log, "copy", false),
+            recorder(&log, "delete", true)
+        )
+        .is_err());
+        assert_eq!(*log.lock().unwrap(), vec!["copy"]);
+
+        // A failed delete is reported as partial success, not as a copy failure.
+        log.lock().unwrap().clear();
+        let error = copy_then_delete(
+            recorder(&log, "copy", true),
+            recorder(&log, "delete", false),
+        )
+        .unwrap_err();
+        assert_eq!(*log.lock().unwrap(), vec!["copy", "delete"]);
+        assert!(
+            error
+                .to_string()
+                .contains("copied, but the source could not be deleted"),
+            "{error}"
+        );
     }
 }

@@ -6,6 +6,10 @@
 //! through `super::remote_fs`: the tree browses the local disk or any
 //! configured ssh/docker remote host, and a right-click context menu offers
 //! New File/Folder, Rename, Delete, Copy, Cut, Paste and Refresh on both.
+//! Paste across locations streams between the two filesystems (download,
+//! upload, or a temp-relayed remote-to-remote hop). After a mutation only
+//! the affected parent directories are re-listed, in place with a minimal
+//! diff, so expansion state elsewhere in the tree survives.
 
 use adw::prelude::*;
 use gtk4::prelude::*;
@@ -303,10 +307,76 @@ impl FileTreeModel {
         true
     }
 
+    /// The currently materialized ListStore holding `dir`'s children: the
+    /// root store when `dir` is the tree root, else the child store of an
+    /// expanded row for `dir`. `None` when `dir` is not visible right now —
+    /// a collapsed or never-expanded row needs no refresh (its cached store
+    /// is reused on re-expansion, the pre-existing TreeListModel behavior).
+    fn materialized_children_of(&self, root: &Path, dir: &Path) -> Option<gio::ListStore> {
+        if dir == root {
+            return Some(self.root_store.clone());
+        }
+        for index in 0..self.tree_model.n_items() {
+            let Some(row) = self.tree_model.row(index) else {
+                continue;
+            };
+            let Some(entry) = entry_from_row(&row) else {
+                continue;
+            };
+            if entry.path == dir && row.is_expanded() {
+                return row
+                    .children()
+                    .and_then(|model| model.downcast::<gio::ListStore>().ok());
+            }
+        }
+        None
+    }
+
     fn row_entry(&self, position: u32) -> Option<(TreeListRow, FileEntry)> {
         let row = self.tree_model.row(position)?;
         let entry = entry_from_row(&row)?;
         Some((row, entry))
+    }
+}
+
+/// Replace a store's contents with the minimal set of removals/insertions so
+/// surviving rows keep their `TreeListRow` identity — and with it their
+/// expansion state and cached child models. Both the old and new contents
+/// are sorted by the same comparator, so after vanished paths are removed
+/// the survivors already stand at their final positions and newcomers slot
+/// in at their sorted index. This is what lets a mutation refresh exactly
+/// one directory without collapsing unrelated expansion anywhere in the tree.
+fn update_store_in_place(store: &gio::ListStore, entries: Vec<FileEntry>) {
+    let store_entry = |index: u32| -> Option<PathBuf> {
+        store
+            .item(index)
+            .and_then(|item| item.downcast::<glib::BoxedAnyObject>().ok())
+            .and_then(|boxed| {
+                boxed
+                    .try_borrow::<FileEntry>()
+                    .ok()
+                    .map(|entry| entry.path.clone())
+            })
+    };
+    let new_paths: std::collections::HashSet<&Path> =
+        entries.iter().map(|entry| entry.path.as_path()).collect();
+
+    // Remove vanished rows back-to-front so earlier indices stay valid.
+    let mut index = store.n_items();
+    while index > 0 {
+        index -= 1;
+        match store_entry(index) {
+            Some(path) if new_paths.contains(path.as_path()) => {}
+            _ => store.remove(index),
+        }
+    }
+
+    let survivors: std::collections::HashSet<PathBuf> =
+        (0..store.n_items()).filter_map(store_entry).collect();
+    for (position, entry) in entries.into_iter().enumerate() {
+        if !survivors.contains(&entry.path) {
+            store.insert(position as u32, &glib::BoxedAnyObject::new(entry));
+        }
     }
 }
 
@@ -808,26 +878,27 @@ impl UiState {
         }
 
         {
-            let item = make_item("Paste");
+            // Cross-location paste is a streaming transfer: label it so the
+            // direction is visible before committing to it.
             let clipboard = self.file_tree_clipboard.borrow().clone();
-            // Cross-location paste stays insensitive: there is no byte stream
-            // between two filesystems, only same-location rename/copy.
+            let label = match clipboard
+                .as_ref()
+                .and_then(|clip| remote_fs::transfer_plan(&clip.loc, &location))
+            {
+                Some(remote_fs::TransferPlan::Download) => "Paste (download)",
+                Some(remote_fs::TransferPlan::Upload) => "Paste (upload)",
+                Some(remote_fs::TransferPlan::Relay) => "Paste (via local relay)",
+                None => "Paste",
+            };
+            let item = make_item(label);
             let pasteable = clipboard
                 .as_ref()
-                .is_some_and(|clip| clip.loc == location && clip.path.file_name().is_some());
+                .is_some_and(|clip| clip.path.file_name().is_some());
             item.set_sensitive(pasteable);
-            match &clipboard {
-                Some(clip) if clip.loc != location => {
-                    item.set_tooltip_text(Some("Paste works within one location only"));
-                }
-                None => {
-                    item.set_tooltip_text(Some("Copy or cut an item first"));
-                }
-                _ => {}
+            if clipboard.is_none() {
+                item.set_tooltip_text(Some("Copy or cut an item first"));
             }
-            if let Some(clip) =
-                clipboard.filter(|clip| clip.loc == location && clip.path.file_name().is_some())
-            {
+            if let Some(clip) = clipboard.filter(|clip| clip.path.file_name().is_some()) {
                 let popover_c = popover.clone();
                 let ui = self.clone();
                 let dir = target_dir.clone();
@@ -845,8 +916,9 @@ impl UiState {
             let ui = self.clone();
             item.connect_clicked(move |_| {
                 popover_c.popdown();
+                // In-place re-list: expanded rows stay expanded.
                 let root = ui.file_tree_root.borrow().clone();
-                ui.set_file_tree_root(root);
+                ui.refresh_dir_listing(&root);
             });
             vbox.append(&item);
         }
@@ -928,6 +1000,8 @@ impl UiState {
                     let path = dir.join(name.as_str());
                     ui.execute_fs_op(
                         kind.verb(),
+                        None,
+                        vec![dir.clone()],
                         move || {
                             if kind == NameDialogKind::NewFile {
                                 remote_fs::create_file(&location, &hosts, &path)
@@ -948,6 +1022,8 @@ impl UiState {
                     if dst != src {
                         ui.execute_fs_op(
                             kind.verb(),
+                            None,
+                            vec![dir.clone()],
                             move || remote_fs::rename(&location, &hosts, &src, &dst),
                             || {},
                         );
@@ -983,8 +1059,11 @@ impl UiState {
             let location = ui.file_tree_location.borrow().clone();
             let hosts = ui.config.borrow().remote_hosts.clone();
             let path = entry.path.clone();
+            let affected: Vec<PathBuf> = path.parent().map(Path::to_path_buf).into_iter().collect();
             ui.execute_fs_op(
                 "Delete",
+                None,
+                affected,
                 move || remote_fs::delete(&location, &hosts, &path),
                 || {},
             );
@@ -992,31 +1071,117 @@ impl UiState {
         dialog.present(Some(&self.window));
     }
 
-    /// Paste `clip` into `target_dir`: a cut moves (rename), a copy
-    /// duplicates. The clipboard clears only after a successful cut-paste.
+    /// Paste `clip` into `target_dir`. Same location: a cut moves (rename), a
+    /// copy duplicates. Different locations: a streaming transfer (download,
+    /// upload, or temp-relayed remote-to-remote hop), with a cut then
+    /// deleting the source only after the transfer landed. The clipboard
+    /// clears only after a fully successful cut.
     fn paste_file_tree_clipboard(&self, clip: FsClipboard, target_dir: PathBuf) {
         let location = self.file_tree_location.borrow().clone();
-        if clip.loc != location {
-            return;
-        }
         let dst = remote_fs::paste_destination(&target_dir, &clip.path);
-        if dst == clip.path {
-            self.toast_overlay.add_toast(adw::Toast::new(
-                "Paste failed: source and target are the same",
-            ));
-            return;
-        }
         let hosts = self.config.borrow().remote_hosts.clone();
         let src = clip.path.clone();
         let cut = clip.cut;
+
+        if clip.loc == location {
+            if dst == src {
+                self.toast_overlay.add_toast(adw::Toast::new(
+                    "Paste failed: source and target are the same",
+                ));
+                return;
+            }
+            // A copy lands in the target dir; a cut also removes the entry
+            // from its old parent. Refresh exactly those.
+            let mut affected: Vec<PathBuf> = Vec::new();
+            if cut {
+                if let Some(parent) = src.parent() {
+                    affected.push(parent.to_path_buf());
+                }
+            }
+            if !affected.contains(&target_dir) {
+                affected.push(target_dir);
+            }
+            let ui = self.clone();
+            self.execute_fs_op(
+                "Paste",
+                None,
+                affected,
+                move || {
+                    if cut {
+                        remote_fs::rename(&location, &hosts, &src, &dst)
+                    } else {
+                        remote_fs::copy(&location, &hosts, &src, &dst)
+                    }
+                },
+                move || {
+                    if cut {
+                        *ui.file_tree_clipboard.borrow_mut() = None;
+                    }
+                },
+            );
+            return;
+        }
+
+        // Cross-location: a streaming transfer on the same bounded op-worker
+        // path, with a persistent busy toast until it finishes.
+        let from = clip.loc.clone();
+        let is_dir = clip.is_dir;
+        let verb: &'static str = if cut {
+            "Move"
+        } else {
+            match remote_fs::transfer_plan(&from, &location) {
+                Some(remote_fs::TransferPlan::Download) => "Download",
+                Some(remote_fs::TransferPlan::Upload) => "Upload",
+                _ => "Transfer",
+            }
+        };
+        let display = jterm_core::review_input::safe_inline_display(
+            &src.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            256,
+        );
+        let busy = adw::Toast::new(&format!("{verb} in progress: {display}"));
+        busy.set_timeout(0);
+        self.toast_overlay.add_toast(busy.clone());
+
+        // Only the destination parent is visible in this tree; the source
+        // side lives on another location.
+        let affected = vec![target_dir];
+        let hosts_for_copy = hosts.clone();
+        let (from_copy, from_delete) = (from.clone(), from.clone());
+        let (src_copy, src_delete) = (src.clone(), src.clone());
+        let (hosts_delete, dst_copy) = (hosts.clone(), dst.clone());
+        let to = location.clone();
         let ui = self.clone();
         self.execute_fs_op(
-            "Paste",
+            verb,
+            Some(busy),
+            affected,
             move || {
                 if cut {
-                    remote_fs::rename(&location, &hosts, &src, &dst)
+                    remote_fs::copy_then_delete(
+                        || {
+                            remote_fs::transfer(
+                                &from_copy,
+                                &hosts_for_copy,
+                                &src_copy,
+                                &to,
+                                &dst_copy,
+                                is_dir,
+                            )
+                        },
+                        || remote_fs::delete(&from_delete, &hosts_delete, &src_delete),
+                    )
                 } else {
-                    remote_fs::copy(&location, &hosts, &src, &dst)
+                    remote_fs::transfer(
+                        &from_copy,
+                        &hosts_for_copy,
+                        &src_copy,
+                        &to,
+                        &dst_copy,
+                        is_dir,
+                    )
                 }
             },
             move || {
@@ -1027,33 +1192,90 @@ impl UiState {
         );
     }
 
-    /// Queue one blocking file operation on a worker thread. Success
-    /// re-scans the visible root (generation-guarded, so navigating away
-    /// first simply drops the refresh); failure toasts and logs.
-    fn execute_fs_op<W, S>(&self, verb: &'static str, work: W, on_success: S)
-    where
+    /// Re-list one directory into its already-materialized store, in place:
+    /// surviving rows keep their TreeListRow identity, so expansion state
+    /// and cached child models everywhere else in the tree are untouched.
+    /// Directories that are not currently visible (collapsed or never
+    /// expanded) need no refresh and are skipped.
+    fn refresh_dir_listing(&self, dir: &Path) {
+        let Some(store) = self
+            .file_tree_model
+            .materialized_children_of(&self.file_tree_root.borrow(), dir)
+        else {
+            return;
+        };
+        let location = self.file_tree_location.borrow().clone();
+        let hosts = self.config.borrow().remote_hosts.clone();
+        let generation = self.file_tree_model.generation.get();
+        let generation_for_scan = self.file_tree_model.generation.clone();
+        let location_for_scan = self.file_tree_location.clone();
+        let scan_location = location.clone();
+        let dir_for_error = dir.to_path_buf();
+        if let Err(error) = request_dir_scan(location, hosts, dir.to_path_buf(), move |result| {
+            if generation_for_scan.get() != generation {
+                return;
+            }
+            if *location_for_scan.borrow() != scan_location {
+                return;
+            }
+            match result {
+                Ok(entries) => update_store_in_place(&store, entries),
+                Err(error) => log::warn!(
+                    "failed to refresh directory {}: {error}",
+                    dir_for_error.display()
+                ),
+            }
+        }) {
+            log::warn!(
+                "failed to start directory refresh for {}: {error}",
+                dir.display()
+            );
+        }
+    }
+
+    /// Queue one blocking file operation on a worker thread. On success only
+    /// the affected parent directories are re-listed, in place; failures
+    /// toast and log. `busy`, when given, is dismissed on any completion.
+    fn execute_fs_op<W, S>(
+        &self,
+        verb: &'static str,
+        busy: Option<adw::Toast>,
+        affected: Vec<PathBuf>,
+        work: W,
+        on_success: S,
+    ) where
         W: FnOnce() -> io::Result<()> + Send + 'static,
         S: FnOnce() + 'static,
     {
         let ui = self.clone();
-        let apply = move |result: io::Result<()>| match result {
-            Ok(()) => {
-                on_success();
-                let root = ui.file_tree_root.borrow().clone();
-                ui.set_file_tree_root(root);
+        let busy_for_apply = busy.clone();
+        let apply = move |result: io::Result<()>| {
+            if let Some(busy) = &busy_for_apply {
+                busy.dismiss();
             }
-            Err(error) => {
-                log::warn!("sidebar file operation {verb} failed: {error}");
-                let detail = if error.kind() == io::ErrorKind::AlreadyExists {
-                    "An item with this name already exists".to_string()
-                } else {
-                    jterm_core::review_input::safe_inline_display(&error.to_string(), 512)
-                };
-                ui.toast_overlay
-                    .add_toast(adw::Toast::new(&format!("{verb} failed: {detail}")));
+            match result {
+                Ok(()) => {
+                    on_success();
+                    for dir in affected {
+                        ui.refresh_dir_listing(&dir);
+                    }
+                }
+                Err(error) => {
+                    log::warn!("sidebar file operation {verb} failed: {error}");
+                    let detail = if error.kind() == io::ErrorKind::AlreadyExists {
+                        "An item with this name already exists".to_string()
+                    } else {
+                        jterm_core::review_input::safe_inline_display(&error.to_string(), 512)
+                    };
+                    ui.toast_overlay
+                        .add_toast(adw::Toast::new(&format!("{verb} failed: {detail}")));
+                }
             }
         };
         if let Err(error) = request_fs_op(work, apply) {
+            if let Some(busy) = &busy {
+                busy.dismiss();
+            }
             log::warn!("failed to start sidebar file operation {verb}: {error}");
             let detail = jterm_core::review_input::safe_inline_display(&error.to_string(), 512);
             self.toast_overlay
@@ -1231,5 +1453,102 @@ mod tests {
         let entries = scan_dir(&root).unwrap();
         assert_eq!(entries.len(), MAX_DIRECTORY_ENTRIES);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn store_paths(store: &gio::ListStore) -> Vec<PathBuf> {
+        (0..store.n_items())
+            .filter_map(|index| {
+                store
+                    .item(index)
+                    .and_then(|item| item.downcast::<glib::BoxedAnyObject>().ok())
+                    .and_then(|boxed| {
+                        boxed
+                            .try_borrow::<FileEntry>()
+                            .ok()
+                            .map(|entry| entry.path.clone())
+                    })
+            })
+            .collect()
+    }
+
+    fn test_entry(path: &str, is_dir: bool) -> FileEntry {
+        FileEntry {
+            name: path.to_string(),
+            path: PathBuf::from(path),
+            is_dir,
+        }
+    }
+
+    #[test]
+    fn in_place_update_keeps_surviving_rows_identical() {
+        // Old contents: dirs Able, beta, gamma; files Alpha, Zulu (sorted).
+        let store = gio::ListStore::new::<glib::BoxedAnyObject>();
+        for entry in [
+            test_entry("/p/Able", true),
+            test_entry("/p/beta", true),
+            test_entry("/p/gamma", true),
+            test_entry("/p/Alpha.txt", false),
+            test_entry("/p/Zulu.txt", false),
+        ] {
+            store.append(&glib::BoxedAnyObject::new(entry));
+        }
+        // Identity of the survivors, to compare after the update.
+        let able_item = store.item(0).unwrap();
+        let gamma_item = store.item(2).unwrap();
+        let zulu_item = store.item(4).unwrap();
+
+        // New listing: beta removed, delta inserted, files unchanged.
+        update_store_in_place(
+            &store,
+            vec![
+                test_entry("/p/Able", true),
+                test_entry("/p/delta", true),
+                test_entry("/p/gamma", true),
+                test_entry("/p/Alpha.txt", false),
+                test_entry("/p/Zulu.txt", false),
+            ],
+        );
+
+        assert_eq!(
+            store_paths(&store),
+            vec![
+                PathBuf::from("/p/Able"),
+                PathBuf::from("/p/delta"),
+                PathBuf::from("/p/gamma"),
+                PathBuf::from("/p/Alpha.txt"),
+                PathBuf::from("/p/Zulu.txt"),
+            ]
+        );
+        // Surviving rows keep their object identity — this is what preserves
+        // expansion state and cached child models in the TreeListModel.
+        assert_eq!(store.item(0).unwrap(), able_item);
+        assert_eq!(store.item(2).unwrap(), gamma_item);
+        assert_eq!(store.item(4).unwrap(), zulu_item);
+        // Inserted and surviving rows did not swap positions.
+        assert_ne!(store.item(1).unwrap(), gamma_item);
+    }
+
+    #[test]
+    fn in_place_update_handles_empty_and_full_replacement() {
+        let store = gio::ListStore::new::<glib::BoxedAnyObject>();
+        update_store_in_place(&store, Vec::new());
+        assert_eq!(store.n_items(), 0);
+
+        // Everything vanished.
+        for entry in [test_entry("/p/a", true), test_entry("/p/b", false)] {
+            store.append(&glib::BoxedAnyObject::new(entry));
+        }
+        update_store_in_place(&store, Vec::new());
+        assert_eq!(store.n_items(), 0);
+
+        // Everything new.
+        update_store_in_place(
+            &store,
+            vec![test_entry("/p/dir", true), test_entry("/p/file", false)],
+        );
+        assert_eq!(
+            store_paths(&store),
+            vec![PathBuf::from("/p/dir"), PathBuf::from("/p/file")]
+        );
     }
 }
