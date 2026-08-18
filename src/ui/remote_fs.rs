@@ -16,6 +16,9 @@
 //! 64 KiB chunks and never buffer a whole payload in memory; they are capped
 //! at [`MAX_TRANSFER_BYTES`] and carry a generous hard timeout, with the
 //! calling worker thread doubling as the watchdog that kills a hung child.
+//! A [`TransferControl`] rides through every leg: its token cancels the
+//! in-flight child on the same kill path (reported as `Interrupted`, never as
+//! a failure), and its sink receives throttled bytes-transferred progress.
 //!
 //! Everything in this module blocks. Callers run it on worker threads and
 //! return results to the GTK main loop through a channel, exactly like the
@@ -444,6 +447,120 @@ fn probe_status_result(status: i32, stderr: Vec<u8>) -> io::Result<()> {
     .map(|_| ())
 }
 
+/// Shared cancellation for one in-flight transfer, cloned between the UI and
+/// the op worker. `cancel` is idempotent; the pump threads check the flag
+/// between chunks and the watchdog kills the in-flight child as soon as the
+/// flag appears — the same kill path as the timeout.
+#[derive(Clone, Default)]
+pub(crate) struct CancelToken(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelToken {
+    pub(crate) fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// The cancellation outcome: `Interrupted`, so the UI can tell a deliberate
+/// cancel apart from a failure and report a neutral "Cancelled" instead of
+/// an error toast.
+fn cancelled_error() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "transfer cancelled")
+}
+
+/// A throttled bytes-transferred report from a streaming transfer, shared
+/// between the pump thread (sender) and the UI (receiver). Called at most
+/// ~4 times per second (see `ProgressThrottle`).
+pub(crate) type ProgressSink = std::sync::Arc<std::sync::Mutex<dyn FnMut(u64) + Send>>;
+
+/// Per-transfer shared controls: user cancellation plus an optional progress
+/// sink. Cheap to clone for the worker, the pump threads and the UI.
+#[derive(Clone, Default)]
+pub(crate) struct TransferControl {
+    pub(crate) token: CancelToken,
+    pub(crate) progress: Option<ProgressSink>,
+}
+
+/// Rate-limiter for progress reports: the first report always goes through,
+/// then a report is emitted when at least ~250 ms elapsed or at least
+/// 256 KiB moved since the last one — whichever comes first.
+struct ProgressThrottle {
+    last_emit: Option<std::time::Instant>,
+    last_bytes: u64,
+}
+
+const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(250);
+const PROGRESS_MIN_STEP: u64 = 256 * 1024;
+
+impl ProgressThrottle {
+    fn new() -> Self {
+        Self {
+            last_emit: None,
+            last_bytes: 0,
+        }
+    }
+
+    /// `now` is a parameter so the policy is unit-testable without sleeping.
+    fn should_emit(&mut self, now: std::time::Instant, bytes: u64) -> bool {
+        let emit = match self.last_emit {
+            None => true,
+            Some(last) => {
+                now.duration_since(last) >= PROGRESS_MIN_INTERVAL
+                    || bytes.saturating_sub(self.last_bytes) >= PROGRESS_MIN_STEP
+            }
+        };
+        if emit {
+            self.last_emit = Some(now);
+            self.last_bytes = bytes;
+        }
+        emit
+    }
+}
+
+/// Emit one throttled progress report; the exact final total is emitted
+/// unconditionally by `ProgressSinkGuard::finish` at the end of a stream.
+fn report_progress(progress: &Option<ProgressSink>, throttle: &mut ProgressThrottle, bytes: u64) {
+    if let Some(sink) = progress {
+        if throttle.should_emit(std::time::Instant::now(), bytes) {
+            if let Ok(mut sink) = sink.lock() {
+                sink(bytes);
+            }
+        }
+    }
+}
+
+fn report_progress_final(progress: &Option<ProgressSink>, bytes: u64) {
+    if let Some(sink) = progress {
+        if let Ok(mut sink) = sink.lock() {
+            sink(bytes);
+        }
+    }
+}
+
+/// Compact human-readable byte counts for the transfer progress toast:
+/// `512 B`, `12.4 MiB`, `1.0 GiB`. Plain bytes below 1 KiB, one decimal
+/// above.
+pub(crate) fn human_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    const TIB: u64 = GIB * 1024;
+    if bytes < KIB {
+        format!("{bytes} B")
+    } else if bytes < MIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else if bytes < GIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes < TIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else {
+        format!("{:.1} TiB", bytes as f64 / TIB as f64)
+    }
+}
+
 /// A monotonic-ish suffix making temp and relay names unique per attempt.
 fn unique_suffix() -> u128 {
     std::time::SystemTime::now()
@@ -473,10 +590,12 @@ impl Drop for TempFileGuard {
 /// kills the child outright — a finished pump means the payload has moved
 /// but the child may still be flushing it (`put` renames after stdin EOF),
 /// so a successful pump keeps waiting for a natural exit until the deadline.
+/// A cancelled token kills exactly like the timeout: same kill, same reap.
 fn watchdog_streaming_child(
     child: &mut std::process::Child,
     rx: &mpsc::Receiver<io::Result<()>>,
     timeout: Duration,
+    token: &CancelToken,
 ) -> (i32, io::Result<()>) {
     let deadline = std::time::Instant::now() + timeout;
     let mut pump_outcome = None;
@@ -511,6 +630,13 @@ fn watchdog_streaming_child(
             Ok(None) => {}
             Err(error) => return (-1, Err(error)),
         }
+        if token.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            // Let the pump observe the dead child and wind down.
+            let _ = rx.recv();
+            return (-1, Err(cancelled_error()));
+        }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
@@ -542,8 +668,12 @@ fn stream_download_to_file(
     dst: &Path,
     cap: u64,
     timeout: Duration,
+    control: TransferControl,
 ) -> io::Result<()> {
     fail_if_exists(dst)?;
+    if control.token.is_cancelled() {
+        return Err(cancelled_error());
+    }
     let Some(file_name) = dst.file_name() else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -568,12 +698,17 @@ fn stream_download_to_file(
         return Err(io::Error::other("could not open probe stdout"));
     };
     let (tx, rx) = mpsc::channel::<io::Result<()>>();
+    let stream_control = control.clone();
     std::thread::Builder::new()
         .name("forge-remote-fs-dl".to_string())
         .spawn(move || {
             let mut total = 0_u64;
             let mut buffer = vec![0_u8; STREAM_CHUNK];
+            let mut throttle = ProgressThrottle::new();
             let result = loop {
+                if stream_control.token.is_cancelled() {
+                    break Err(cancelled_error());
+                }
                 match stdout.read(&mut buffer) {
                     Ok(0) => break Ok(total),
                     Ok(read) => {
@@ -584,16 +719,24 @@ fn stream_download_to_file(
                         if let Err(error) = file.write_all(&buffer[..read]) {
                             break Err(error);
                         }
+                        report_progress(&stream_control.progress, &mut throttle, total);
                     }
                     Err(error) => break Err(error),
                 }
             };
+            if let Ok(total) = result {
+                report_progress_final(&stream_control.progress, total);
+            }
             let result = result.and_then(|total| file.sync_all().map(|_| total));
             let _ = tx.send(result.map(|_| ()));
         })
         .map_err(|error| io::Error::other(format!("could not start download streamer: {error}")))?;
 
-    let (status, outcome) = watchdog_streaming_child(&mut child, &rx, timeout);
+    let (status, outcome) = watchdog_streaming_child(&mut child, &rx, timeout, &control.token);
+    // Cancellation is never an error detail: it wins over exit-status noise.
+    if control.token.is_cancelled() {
+        return Err(cancelled_error());
+    }
     probe_status_result(status, stderr_reader.join().unwrap_or_default())?;
     outcome?;
     finalize_download(&temp, dst)?;
@@ -617,6 +760,7 @@ fn stream_upload_to_probe(
     src: &Path,
     cap: u64,
     timeout: Duration,
+    control: TransferControl,
 ) -> io::Result<()> {
     let metadata = std::fs::symlink_metadata(src)?;
     if !metadata.file_type().is_file() {
@@ -628,6 +772,9 @@ fn stream_upload_to_probe(
     if metadata.len() > cap {
         return Err(transfer_cap_error(cap));
     }
+    if control.token.is_cancelled() {
+        return Err(cancelled_error());
+    }
     let mut file = std::fs::File::open(src)?;
 
     let mut child = spawn_argv(argv, Stdio::piped(), Stdio::null(), Stdio::piped())?;
@@ -636,12 +783,17 @@ fn stream_upload_to_probe(
         return Err(io::Error::other("could not open probe stdin"));
     };
     let (tx, rx) = mpsc::channel::<io::Result<()>>();
+    let stream_control = control.clone();
     std::thread::Builder::new()
         .name("forge-remote-fs-ul".to_string())
         .spawn(move || {
             let mut total = 0_u64;
             let mut buffer = vec![0_u8; STREAM_CHUNK];
+            let mut throttle = ProgressThrottle::new();
             let result = loop {
+                if stream_control.token.is_cancelled() {
+                    break Err(cancelled_error());
+                }
                 match file.read(&mut buffer) {
                     Ok(0) => break Ok(total),
                     Ok(read) => {
@@ -655,15 +807,22 @@ fn stream_upload_to_probe(
                         if let Err(error) = stdin.write_all(&buffer[..read]) {
                             break Err(error);
                         }
+                        report_progress(&stream_control.progress, &mut throttle, total);
                     }
                     Err(error) => break Err(error),
                 }
             };
+            if let Ok(total) = result {
+                report_progress_final(&stream_control.progress, total);
+            }
             let _ = tx.send(result.map(|_| ()));
         })
         .map_err(|error| io::Error::other(format!("could not start upload streamer: {error}")))?;
 
-    let (status, outcome) = watchdog_streaming_child(&mut child, &rx, timeout);
+    let (status, outcome) = watchdog_streaming_child(&mut child, &rx, timeout, &control.token);
+    if control.token.is_cancelled() {
+        return Err(cancelled_error());
+    }
     probe_status_result(status, stderr_reader.join().unwrap_or_default())?;
     outcome?;
     Ok(())
@@ -708,17 +867,22 @@ fn local_tar_create_argv(src: &Path) -> io::Result<Vec<String>> {
 
 /// Pump `reader` → `writer` in chunks with a byte cap. On overflow the
 /// `source_child` (the producing tar) is killed so it cannot linger blocked
-/// on a full pipe; IO errors kill it too, then it is reaped.
+/// on a full pipe; IO errors and cancellation kill it too, then it is reaped.
 fn pump_capped(
     mut reader: impl Read,
     mut writer: impl Write,
     mut source_child: std::process::Child,
     cap: u64,
     timeout: Duration,
+    control: TransferControl,
 ) -> io::Result<()> {
     let mut total = 0_u64;
     let mut buffer = vec![0_u8; STREAM_CHUNK];
+    let mut throttle = ProgressThrottle::new();
     let result = loop {
+        if control.token.is_cancelled() {
+            break Err(cancelled_error());
+        }
         match reader.read(&mut buffer) {
             Ok(0) => break Ok(()),
             Ok(read) => {
@@ -729,12 +893,15 @@ fn pump_capped(
                 if let Err(error) = writer.write_all(&buffer[..read]) {
                     break Err(error);
                 }
+                report_progress(&control.progress, &mut throttle, total);
             }
             Err(error) => break Err(error),
         }
     };
     drop(writer); // EOF for the consumer
-    if result.is_err() {
+    if result.is_ok() {
+        report_progress_final(&control.progress, total);
+    } else {
         let _ = source_child.kill();
     }
     // Reap the producer; after EOF it exits on its own, after a failure the
@@ -753,23 +920,50 @@ fn pump_capped(
 }
 
 /// Download one regular file from a remote host to `dst`, streaming.
-pub(crate) fn download_file(host: &RemoteHost, src: &Path, dst: &Path) -> io::Result<()> {
+pub(crate) fn download_file(
+    host: &RemoteHost,
+    src: &Path,
+    dst: &Path,
+    control: &TransferControl,
+) -> io::Result<()> {
     let argv = probe_argv(host, "cat", &[remote_path_arg(src)?]);
-    stream_download_to_file(&argv, dst, MAX_TRANSFER_BYTES, TRANSFER_TIMEOUT)
+    stream_download_to_file(
+        &argv,
+        dst,
+        MAX_TRANSFER_BYTES,
+        TRANSFER_TIMEOUT,
+        control.clone(),
+    )
 }
 
 /// Upload one regular local file to `dst` on a remote host, streaming. The
 /// probe writes a temp file and renames it into place, re-checking existence
 /// right before the rename.
-pub(crate) fn upload_file(host: &RemoteHost, src: &Path, dst: &Path) -> io::Result<()> {
+pub(crate) fn upload_file(
+    host: &RemoteHost,
+    src: &Path,
+    dst: &Path,
+    control: &TransferControl,
+) -> io::Result<()> {
     let argv = probe_argv(host, "put", &[remote_path_arg(dst)?]);
-    stream_upload_to_probe(&argv, src, MAX_TRANSFER_BYTES, TRANSFER_TIMEOUT)
+    stream_upload_to_probe(
+        &argv,
+        src,
+        MAX_TRANSFER_BYTES,
+        TRANSFER_TIMEOUT,
+        control.clone(),
+    )
 }
 
 /// Download a remote directory tree to `dst` (which must not exist): the
 /// probe streams a tar of the directory and the local system tar extracts it
 /// into `dst`'s parent. A partial extraction is removed on failure.
-pub(crate) fn download_dir(host: &RemoteHost, src: &Path, dst: &Path) -> io::Result<()> {
+pub(crate) fn download_dir(
+    host: &RemoteHost,
+    src: &Path,
+    dst: &Path,
+    control: &TransferControl,
+) -> io::Result<()> {
     let argv = probe_argv(host, "tar", &[remote_path_arg(src)?]);
     fail_if_exists(dst)?;
     local_tar_available()?;
@@ -787,7 +981,13 @@ pub(crate) fn download_dir(host: &RemoteHost, src: &Path, dst: &Path) -> io::Res
         parent.to_string_lossy().into_owned(),
     ];
 
-    let result = stream_download_dir(&argv, &local_argv, MAX_TRANSFER_BYTES, TRANSFER_TIMEOUT);
+    let result = stream_download_dir(
+        &argv,
+        &local_argv,
+        MAX_TRANSFER_BYTES,
+        TRANSFER_TIMEOUT,
+        control.clone(),
+    );
     if result.is_err() {
         // Anything at `dst` now is our partial extraction (it did not exist
         // before); remove it rather than leaving a half-tree behind.
@@ -801,6 +1001,7 @@ fn stream_download_dir(
     local_argv: &[String],
     cap: u64,
     timeout: Duration,
+    control: TransferControl,
 ) -> io::Result<()> {
     let mut remote = spawn_argv(argv, Stdio::null(), Stdio::piped(), Stdio::piped())?;
     let remote_stderr = spawn_bounded_reader(remote.stderr.take(), PROBE_OP_MAX_OUTPUT);
@@ -814,17 +1015,28 @@ fn stream_download_dir(
     };
 
     let (tx, rx) = mpsc::channel::<io::Result<()>>();
+    let pump_control = control.clone();
     std::thread::Builder::new()
         .name("forge-remote-fs-dldir".to_string())
         .spawn(move || {
             // The "source child" here is the local extractor: a pump failure
             // must kill it so it cannot linger waiting for stdin.
-            let outcome = pump_capped(remote_stdout, local_stdin, local, cap, timeout);
+            let outcome = pump_capped(
+                remote_stdout,
+                local_stdin,
+                local,
+                cap,
+                timeout,
+                pump_control,
+            );
             let _ = tx.send(outcome);
         })
         .map_err(|error| io::Error::other(format!("could not start download pump: {error}")))?;
 
-    let (status, outcome) = watchdog_streaming_child(&mut remote, &rx, timeout);
+    let (status, outcome) = watchdog_streaming_child(&mut remote, &rx, timeout, &control.token);
+    if control.token.is_cancelled() {
+        return Err(cancelled_error());
+    }
     probe_status_result(status, remote_stderr.join().unwrap_or_default())?;
     outcome?;
     let local_err = String::from_utf8_lossy(&local_stderr.join().unwrap_or_default())
@@ -840,7 +1052,12 @@ fn stream_download_dir(
 /// exist): the probe creates `dst` (exit 17 if taken), then the local system
 /// tar streams the tree into `untar`. A failed upload removes the remote
 /// `dst` it just created, best-effort.
-pub(crate) fn upload_dir(host: &RemoteHost, src: &Path, dst: &Path) -> io::Result<()> {
+pub(crate) fn upload_dir(
+    host: &RemoteHost,
+    src: &Path,
+    dst: &Path,
+    control: &TransferControl,
+) -> io::Result<()> {
     local_tar_available()?;
     if !src.is_dir() {
         return Err(io::Error::new(
@@ -863,6 +1080,7 @@ pub(crate) fn upload_dir(host: &RemoteHost, src: &Path, dst: &Path) -> io::Resul
         &remote_argv,
         MAX_TRANSFER_BYTES,
         TRANSFER_TIMEOUT,
+        control.clone(),
     );
     if result.is_err() {
         let _ = run_probe(
@@ -881,6 +1099,7 @@ fn stream_upload_dir(
     remote_argv: &[String],
     cap: u64,
     timeout: Duration,
+    control: TransferControl,
 ) -> io::Result<()> {
     let mut local = spawn_argv(local_argv, Stdio::null(), Stdio::piped(), Stdio::piped())?;
     let local_stderr = spawn_bounded_reader(local.stderr.take(), PROBE_OP_MAX_OUTPUT);
@@ -894,15 +1113,26 @@ fn stream_upload_dir(
     };
 
     let (tx, rx) = mpsc::channel::<io::Result<()>>();
+    let pump_control = control.clone();
     std::thread::Builder::new()
         .name("forge-remote-fs-uldir".to_string())
         .spawn(move || {
-            let outcome = pump_capped(local_stdout, remote_stdin, local, cap, timeout);
+            let outcome = pump_capped(
+                local_stdout,
+                remote_stdin,
+                local,
+                cap,
+                timeout,
+                pump_control,
+            );
             let _ = tx.send(outcome);
         })
         .map_err(|error| io::Error::other(format!("could not start upload pump: {error}")))?;
 
-    let (status, outcome) = watchdog_streaming_child(&mut remote, &rx, timeout);
+    let (status, outcome) = watchdog_streaming_child(&mut remote, &rx, timeout, &control.token);
+    if control.token.is_cancelled() {
+        return Err(cancelled_error());
+    }
     probe_status_result(status, remote_stderr.join().unwrap_or_default())?;
     outcome?;
     let local_err = String::from_utf8_lossy(&local_stderr.join().unwrap_or_default())
@@ -941,7 +1171,8 @@ pub(crate) fn transfer_plan(from: &FsLocation, to: &FsLocation) -> Option<Transf
 
 /// One cross-location transfer unit: download, upload, or a temp-relayed
 /// remote-to-remote hop. `dst` must not exist anywhere along the way; every
-/// leg pre-checks existence before a payload byte moves.
+/// leg pre-checks existence before a payload byte moves. `control` carries
+/// the cancellation token and optional progress sink through every leg.
 pub(crate) fn transfer(
     from: &FsLocation,
     hosts: &[RemoteHost],
@@ -949,23 +1180,26 @@ pub(crate) fn transfer(
     to: &FsLocation,
     dst: &Path,
     is_dir: bool,
+    control: &TransferControl,
 ) -> io::Result<()> {
     match (remote_host(from, hosts)?, remote_host(to, hosts)?) {
         (Some(src_host), None) => {
             if is_dir {
-                download_dir(src_host, src, dst)
+                download_dir(src_host, src, dst, control)
             } else {
-                download_file(src_host, src, dst)
+                download_file(src_host, src, dst, control)
             }
         }
         (None, Some(dst_host)) => {
             if is_dir {
-                upload_dir(dst_host, src, dst)
+                upload_dir(dst_host, src, dst, control)
             } else {
-                upload_file(dst_host, src, dst)
+                upload_file(dst_host, src, dst, control)
             }
         }
-        (Some(src_host), Some(dst_host)) => transfer_relay(src_host, src, dst_host, dst, is_dir),
+        (Some(src_host), Some(dst_host)) => {
+            transfer_relay(src_host, src, dst_host, dst, is_dir, control)
+        }
         (None, None) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "same-location transfer must use copy or rename",
@@ -981,6 +1215,7 @@ fn transfer_relay(
     dst_host: &RemoteHost,
     dst: &Path,
     is_dir: bool,
+    control: &TransferControl,
 ) -> io::Result<()> {
     let relay = std::env::temp_dir().join(format!(
         "forge-fs-relay-{}-{}",
@@ -996,13 +1231,13 @@ fn transfer_relay(
         };
         std::fs::create_dir(&relay)?;
         let staged = relay.join(name);
-        let result =
-            download_dir(src_host, src, &staged).and_then(|_| upload_dir(dst_host, &staged, dst));
+        let result = download_dir(src_host, src, &staged, control)
+            .and_then(|_| upload_dir(dst_host, &staged, dst, control));
         let _ = std::fs::remove_dir_all(&relay);
         result
     } else {
-        let result =
-            download_file(src_host, src, &relay).and_then(|_| upload_file(dst_host, &relay, dst));
+        let result = download_file(src_host, src, &relay, control)
+            .and_then(|_| upload_file(dst_host, &relay, dst, control));
         let _ = std::fs::remove_file(&relay);
         result
     }
@@ -1888,7 +2123,14 @@ mod tests {
         let dst = root.join("out/blob.bin");
         std::fs::create_dir(root.join("out")).unwrap();
         let argv = local_probe_argv("cat", &[&source_arg]);
-        stream_download_to_file(&argv, &dst, 64 * 1024, Duration::from_secs(10)).unwrap();
+        stream_download_to_file(
+            &argv,
+            &dst,
+            64 * 1024,
+            Duration::from_secs(10),
+            TransferControl::default(),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), payload);
         let leftovers: Vec<_> = std::fs::read_dir(root.join("out"))
             .unwrap()
@@ -1901,17 +2143,29 @@ mod tests {
         // Pre-existing dst is refused before any byte streams.
         let argv = local_probe_argv("cat", &[&source_arg]);
         assert_eq!(
-            stream_download_to_file(&argv, &dst, 64 * 1024, Duration::from_secs(10))
-                .unwrap_err()
-                .kind(),
+            stream_download_to_file(
+                &argv,
+                &dst,
+                64 * 1024,
+                Duration::from_secs(10),
+                TransferControl::default()
+            )
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::AlreadyExists
         );
 
         // Overflow: the partial temp file is unlinked and no dst appears.
         let dst2 = root.join("out/too-big.bin");
         let argv = local_probe_argv("cat", &[&source_arg]);
-        let error =
-            stream_download_to_file(&argv, &dst2, 1_024, Duration::from_secs(10)).unwrap_err();
+        let error = stream_download_to_file(
+            &argv,
+            &dst2,
+            1_024,
+            Duration::from_secs(10),
+            TransferControl::default(),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("limit"), "{error}");
         assert!(!dst2.exists());
         let leftovers: Vec<_> = std::fs::read_dir(root.join("out"))
@@ -1961,7 +2215,14 @@ mod tests {
             .into_owned();
         std::fs::create_dir(root.join("remote")).unwrap();
         let argv = local_probe_argv("put", &[&remote]);
-        stream_upload_to_probe(&argv, &source, 64 * 1024, Duration::from_secs(10)).unwrap();
+        stream_upload_to_probe(
+            &argv,
+            &source,
+            64 * 1024,
+            Duration::from_secs(10),
+            TransferControl::default(),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read(root.join("remote/landed.txt")).unwrap(),
             payload
@@ -1971,16 +2232,28 @@ mod tests {
         // writer then sees a broken pipe.
         let argv = local_probe_argv("put", &[&remote]);
         assert_eq!(
-            stream_upload_to_probe(&argv, &source, 64 * 1024, Duration::from_secs(10))
-                .unwrap_err()
-                .kind(),
+            stream_upload_to_probe(
+                &argv,
+                &source,
+                64 * 1024,
+                Duration::from_secs(10),
+                TransferControl::default()
+            )
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::AlreadyExists
         );
 
         // A source over the cap is refused before the probe is even spawned.
         let argv = local_probe_argv("put", &[&root.join("remote/other").to_string_lossy()]);
-        let error =
-            stream_upload_to_probe(&argv, &source, 1_024, Duration::from_secs(10)).unwrap_err();
+        let error = stream_upload_to_probe(
+            &argv,
+            &source,
+            1_024,
+            Duration::from_secs(10),
+            TransferControl::default(),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("limit"), "{error}");
         assert!(!root.join("remote/other").exists());
 
@@ -2007,6 +2280,7 @@ mod tests {
             &remote_argv,
             64 * 1024 * 1024,
             Duration::from_secs(30),
+            TransferControl::default(),
         )
         .unwrap();
         assert_eq!(
@@ -2034,6 +2308,7 @@ mod tests {
             &local_argv,
             64 * 1024 * 1024,
             Duration::from_secs(30),
+            TransferControl::default(),
         )
         .unwrap();
         assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"aaa");
@@ -2077,6 +2352,7 @@ mod tests {
                 &FsLocation::Local,
                 Path::new("/tmp/b"),
                 false,
+                &TransferControl::default(),
             )
             .unwrap_err()
             .kind(),
@@ -2128,5 +2404,200 @@ mod tests {
                 .contains("copied, but the source could not be deleted"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn human_bytes_formats_compact_counts() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1536), "1.5 KiB");
+        assert_eq!(human_bytes(13_002_342), "12.4 MiB");
+        assert_eq!(human_bytes(512 * 1024 * 1024), "512.0 MiB");
+        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 GiB");
+        assert_eq!(human_bytes(u64::MAX), "16777216.0 TiB");
+    }
+
+    #[test]
+    fn progress_throttle_bounds_rate_and_step() {
+        let start = std::time::Instant::now();
+        let mut throttle = ProgressThrottle::new();
+        // The first report always goes through.
+        assert!(throttle.should_emit(start, 0));
+        // Immediately after, neither enough time nor enough bytes.
+        assert!(!throttle.should_emit(start + Duration::from_millis(10), 1));
+        // A big enough byte step emits even without waiting.
+        assert!(throttle.should_emit(start + Duration::from_millis(10), PROGRESS_MIN_STEP));
+        // Small steps are withheld until the interval passes...
+        assert!(!throttle.should_emit(start + Duration::from_millis(20), PROGRESS_MIN_STEP + 1));
+        // ...then the interval alone is enough.
+        assert!(throttle.should_emit(
+            start + Duration::from_millis(20) + PROGRESS_MIN_INTERVAL,
+            PROGRESS_MIN_STEP + 1
+        ));
+        // The exact boundary counts: 256 KiB is emitted, one byte less is not.
+        let mut throttle = ProgressThrottle::new();
+        assert!(throttle.should_emit(start, 0));
+        assert!(!throttle.should_emit(start + Duration::from_millis(10), PROGRESS_MIN_STEP - 1));
+        let mut throttle = ProgressThrottle::new();
+        assert!(throttle.should_emit(start, 100));
+        assert!(throttle.should_emit(start + Duration::from_millis(10), 100 + PROGRESS_MIN_STEP));
+    }
+
+    #[test]
+    fn cancel_kills_the_transfer_and_cleans_up_partial_download() {
+        let root = unique_temp_dir("cancel-dl");
+        // A child that never produces output: without the cancel-kill this
+        // would run until the (generous) timeout.
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "exec sleep 30".to_string(),
+        ];
+        let control = TransferControl::default();
+        let token = control.token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            token.cancel();
+        });
+        let started = std::time::Instant::now();
+        let error = stream_download_to_file(
+            &argv,
+            &root.join("out.bin"),
+            64 * 1024,
+            Duration::from_secs(60),
+            control,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "cancel did not kill the child promptly"
+        );
+        assert!(!root.join("out.bin").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("fspart"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancel_before_start_and_after_finish_are_harmless() {
+        let root = unique_temp_dir("cancel-race");
+        std::fs::write(root.join("src.txt"), b"payload").unwrap();
+        let src = root.join("src.txt").to_string_lossy().into_owned();
+
+        // Pre-cancelled token: the transfer refuses to start.
+        let control = TransferControl::default();
+        control.token.cancel();
+        let argv = local_probe_argv("cat", &[&src]);
+        assert_eq!(
+            stream_download_to_file(
+                &argv,
+                &root.join("a.bin"),
+                64 * 1024,
+                Duration::from_secs(10),
+                control,
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(!root.join("a.bin").exists());
+
+        // Cancel after a successful transfer is a no-op.
+        let control = TransferControl::default();
+        let argv = local_probe_argv("cat", &[&src]);
+        stream_download_to_file(
+            &argv,
+            &root.join("b.bin"),
+            64 * 1024,
+            Duration::from_secs(10),
+            control.clone(),
+        )
+        .unwrap();
+        control.token.cancel();
+        assert_eq!(std::fs::read(root.join("b.bin")).unwrap(), b"payload");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancel_upload_kills_and_reports_interrupted() {
+        let root = unique_temp_dir("cancel-ul");
+        let source = root.join("big.bin");
+        std::fs::write(&source, vec![7u8; 4 * 1024 * 1024]).unwrap();
+        // The remote end never reads stdin: the writer blocks and only a
+        // cancel can end the transfer.
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "exec sleep 30".to_string(),
+        ];
+        let control = TransferControl::default();
+        let token = control.token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            token.cancel();
+        });
+        let started = std::time::Instant::now();
+        let error = stream_upload_to_probe(
+            &argv,
+            &source,
+            64 * 1024 * 1024,
+            Duration::from_secs(60),
+            control,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "cancel did not kill the child promptly"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn progress_sink_receives_throttled_updates_and_exact_total() {
+        use std::sync::{Arc, Mutex};
+        let root = unique_temp_dir("progress");
+        let source = root.join("source.bin");
+        let payload = vec![3u8; 600 * 1024];
+        std::fs::write(&source, &payload).unwrap();
+        let source_arg = source.to_string_lossy().into_owned();
+
+        let reports: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let reports_for_sink = reports.clone();
+        let control = TransferControl {
+            token: CancelToken::default(),
+            progress: Some(Arc::new(Mutex::new(move |bytes: u64| {
+                reports_for_sink.lock().unwrap().push(bytes);
+            }))),
+        };
+        let argv = local_probe_argv("cat", &[&source_arg]);
+        stream_download_to_file(
+            &argv,
+            &root.join("out.bin"),
+            64 * 1024 * 1024,
+            Duration::from_secs(10),
+            control,
+        )
+        .unwrap();
+
+        let reports = reports.lock().unwrap();
+        assert!(!reports.is_empty());
+        // The exact total always lands, last.
+        assert_eq!(*reports.last().unwrap(), payload.len() as u64);
+        // Reports are monotonically non-decreasing.
+        assert!(reports.windows(2).all(|pair| pair[0] <= pair[1]));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

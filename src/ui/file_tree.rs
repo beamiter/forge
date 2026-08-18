@@ -5,9 +5,11 @@
 //! when a directory row is expanded. Listing and file operations dispatch
 //! through `super::remote_fs`: the tree browses the local disk or any
 //! configured ssh/docker remote host, and a right-click context menu offers
-//! New File/Folder, Rename, Delete, Copy, Cut, Paste and Refresh on both.
-//! Paste across locations streams between the two filesystems (download,
-//! upload, or a temp-relayed remote-to-remote hop). After a mutation only
+//! New File/Folder, Rename, Delete, Copy, Cut, Copy Path, Paste and Refresh
+//! on both. Paste across locations streams between the two filesystems
+//! (download, upload, or a temp-relayed remote-to-remote hop) with throttled
+//! progress in a persistent toast and a Cancel action that kills the
+//! in-flight child and cleans up partial results. After a mutation only
 //! the affected parent directories are re-listed, in place with a minimal
 //! diff, so expansion state elsewhere in the tree survives.
 
@@ -878,6 +880,29 @@ impl UiState {
         }
 
         {
+            // The row's full path text as-is — remote rows copy the plain
+            // remote path without any prefix.
+            let item = make_item("Copy Path");
+            item.set_sensitive(has_target);
+            if let Some((_, entry)) = target.clone() {
+                let popover_c = popover.clone();
+                let ui = self.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    match copy_path_payload(&entry.path) {
+                        Some(text) => ui.window.clipboard().set_text(&text),
+                        None => {
+                            log::warn!("refusing to copy a path with unsafe display text");
+                            ui.toast_overlay
+                                .add_toast(adw::Toast::new("Path contains hidden or control text"));
+                        }
+                    }
+                });
+            }
+            vbox.append(&item);
+        }
+
+        {
             // Cross-location paste is a streaming transfer: label it so the
             // direction is visible before committing to it.
             let clipboard = self.file_tree_clipboard.borrow().clone();
@@ -1123,16 +1148,26 @@ impl UiState {
         }
 
         // Cross-location: a streaming transfer on the same bounded op-worker
-        // path, with a persistent busy toast until it finishes.
+        // path, with a persistent progress toast until it finishes.
         let from = clip.loc.clone();
         let is_dir = clip.is_dir;
+        let plan = remote_fs::transfer_plan(&from, &location);
         let verb: &'static str = if cut {
             "Move"
         } else {
-            match remote_fs::transfer_plan(&from, &location) {
+            match plan {
                 Some(remote_fs::TransferPlan::Download) => "Download",
                 Some(remote_fs::TransferPlan::Upload) => "Upload",
                 _ => "Transfer",
+            }
+        };
+        let verb_ing: &'static str = if cut {
+            "Moving"
+        } else {
+            match plan {
+                Some(remote_fs::TransferPlan::Download) => "Downloading",
+                Some(remote_fs::TransferPlan::Upload) => "Uploading",
+                _ => "Transferring",
             }
         };
         let display = jterm_core::review_input::safe_inline_display(
@@ -1141,8 +1176,71 @@ impl UiState {
                 .unwrap_or_default(),
             256,
         );
-        let busy = adw::Toast::new(&format!("{verb} in progress: {display}"));
+
+        // Progress flows pump thread -> channel -> glib poll -> toast title.
+        let (progress_tx, progress_rx) = mpsc::channel::<u64>();
+        let control = remote_fs::TransferControl {
+            token: remote_fs::CancelToken::default(),
+            progress: Some(std::sync::Arc::new(std::sync::Mutex::new(
+                move |bytes: u64| {
+                    let _ = progress_tx.send(bytes);
+                },
+            ))),
+        };
+        // Uploads of a local file know their total up-front.
+        let total: Option<u64> = if from == FsLocation::Local && !is_dir {
+            std::fs::symlink_metadata(&src)
+                .ok()
+                .map(|metadata| metadata.len())
+        } else {
+            None
+        };
+
+        let busy = adw::Toast::new(&format!("{verb_ing} {display}…"));
         busy.set_timeout(0);
+        busy.set_button_label(Some("Cancel"));
+        {
+            let token = control.token.clone();
+            let busy_for_cancel = busy.clone();
+            busy.connect_button_clicked(move |_| {
+                // Idempotent: racing a completion leaves a flag nobody reads
+                // any more. The completion path reports the cancel neutrally.
+                token.cancel();
+                busy_for_cancel.dismiss();
+            });
+        }
+        // The toast leaving the screen (completion, cancel, swipe) stops the
+        // progress forwarding for good.
+        let poll_done = Rc::new(Cell::new(false));
+        {
+            let poll_done = poll_done.clone();
+            busy.connect_dismissed(move |_| poll_done.set(true));
+        }
+        {
+            let busy_for_poll = busy.clone();
+            let title = format!("{verb_ing} {display}…");
+            glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+                if poll_done.get() {
+                    return glib::ControlFlow::Break;
+                }
+                let mut latest = None;
+                while let Ok(bytes) = progress_rx.try_recv() {
+                    latest = Some(bytes);
+                }
+                if let Some(bytes) = latest {
+                    let progress_text = match total {
+                        Some(total) => format!(
+                            "{} / {}",
+                            remote_fs::human_bytes(bytes),
+                            remote_fs::human_bytes(total)
+                        ),
+                        None => remote_fs::human_bytes(bytes),
+                    };
+                    busy_for_poll.set_title(&format!("{title} {progress_text}"));
+                }
+                glib::ControlFlow::Continue
+            });
+        }
         self.toast_overlay.add_toast(busy.clone());
 
         // Only the destination parent is visible in this tree; the source
@@ -1153,6 +1251,7 @@ impl UiState {
         let (src_copy, src_delete) = (src.clone(), src.clone());
         let (hosts_delete, dst_copy) = (hosts.clone(), dst.clone());
         let to = location.clone();
+        let control_for_work = control.clone();
         let ui = self.clone();
         self.execute_fs_op(
             verb,
@@ -1160,6 +1259,7 @@ impl UiState {
             affected,
             move || {
                 if cut {
+                    let control_for_copy = control_for_work.clone();
                     remote_fs::copy_then_delete(
                         || {
                             remote_fs::transfer(
@@ -1169,6 +1269,7 @@ impl UiState {
                                 &to,
                                 &dst_copy,
                                 is_dir,
+                                &control_for_copy,
                             )
                         },
                         || remote_fs::delete(&from_delete, &hosts_delete, &src_delete),
@@ -1181,6 +1282,7 @@ impl UiState {
                         &to,
                         &dst_copy,
                         is_dir,
+                        &control_for_work,
                     )
                 }
             },
@@ -1259,6 +1361,12 @@ impl UiState {
                     for dir in affected {
                         ui.refresh_dir_listing(&dir);
                     }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    // A deliberate cancel is not a failure: neutral note, no
+                    // warning in the log.
+                    log::info!("sidebar {verb} cancelled");
+                    ui.toast_overlay.add_toast(adw::Toast::new("Cancelled"));
                 }
                 Err(error) => {
                     log::warn!("sidebar file operation {verb} failed: {error}");
@@ -1381,6 +1489,14 @@ fn file_insert_snippet(path: &str) -> Option<String> {
     crate::process::try_shell_quote_path(path).map(|path| format!("{path} "))
 }
 
+/// The clipboard payload for Copy Path: the full path text as-is, or `None`
+/// when the path carries hidden or control text — the same refusal as file
+/// activation, so neither path text channel can smuggle spoofing out.
+fn copy_path_payload(path: &Path) -> Option<String> {
+    let text = path.to_string_lossy();
+    crate::process::try_shell_quote_path(text.as_ref()).map(|_| text.into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1477,6 +1593,23 @@ mod tests {
             path: PathBuf::from(path),
             is_dir,
         }
+    }
+
+    #[test]
+    fn copy_path_payload_keeps_safe_paths_and_refuses_unsafe_ones() {
+        assert_eq!(
+            copy_path_payload(Path::new("/home/u/notes.txt")).as_deref(),
+            Some("/home/u/notes.txt")
+        );
+        assert_eq!(
+            copy_path_payload(Path::new("/data/a'b c")).as_deref(),
+            Some("/data/a'b c")
+        );
+        assert_eq!(copy_path_payload(Path::new("/data/left\nright")), None);
+        assert_eq!(
+            copy_path_payload(Path::new("/data/left\u{202e}right")),
+            None
+        );
     }
 
     #[test]
