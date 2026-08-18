@@ -806,7 +806,9 @@ pub fn run() -> glib::ExitCode {
         sidebar_tabs_page.append(&sidebar_tab_mirror_scroll);
 
         // File tree section (header + tree), shown in the sidebar.
-        let (file_tree_model, file_tree) = ui::build_file_tree_widgets();
+        let file_tree_location = Rc::new(RefCell::new(ui::FsLocation::Local));
+        let (file_tree_model, file_tree) =
+            ui::build_file_tree_widgets(file_tree_location.clone(), config.clone());
 
         let file_tree_scroll = ScrolledWindow::new();
         file_tree_scroll.set_hexpand(false);
@@ -842,6 +844,11 @@ pub fn run() -> glib::ExitCode {
         file_tree_header.append(&file_tree_root_label);
         file_tree_header.append(&file_tree_up_btn);
         file_tree_header.append(&file_tree_cwd_btn);
+
+        // Location selector (Local + configured ssh/docker hosts), filled by
+        // UiState::refresh_file_tree_location_selector once UiState exists.
+        let file_tree_location_selector = ui::build_file_tree_location_selector();
+        file_tree_header.append(&file_tree_location_selector);
 
         let file_tree_box = gtk4::Box::new(Orientation::Vertical, 0);
         file_tree_box.add_css_class("file-tree-box");
@@ -1002,6 +1009,9 @@ pub fn run() -> glib::ExitCode {
             file_tree_model: file_tree_model.clone(),
             file_tree_root: Rc::new(RefCell::new(std::path::PathBuf::new())),
             file_tree_root_label: file_tree_root_label.clone(),
+            file_tree_location: file_tree_location.clone(),
+            file_tree_location_selector: file_tree_location_selector.clone(),
+            file_tree_clipboard: Rc::new(RefCell::new(None)),
             tab_search_entry: tab_search_entry.clone(),
             selected_tabs: Rc::new(RefCell::new(Vec::new())),
             tab_drag_state: Rc::new(RefCell::new(Default::default())),
@@ -1168,6 +1178,10 @@ pub fn run() -> glib::ExitCode {
 
         // Wire file-tree expansion and file activation.
         ui.connect_file_tree_handlers(&file_tree);
+
+        // Wire the file-tree location selector and fill it for the first time.
+        ui.connect_file_tree_location_selector();
+        ui.refresh_file_tree_location_selector();
 
         // Wire sidebar Tabs/Files segmented switcher
         let ui_for_tabs_view = ui.clone();

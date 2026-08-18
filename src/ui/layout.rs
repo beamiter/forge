@@ -63,7 +63,11 @@ impl UiState {
     pub(crate) fn apply_sidebar_view(&self, view: SidebarView, persist: bool) {
         match view {
             SidebarView::Tabs => self.sidebar_stack.set_visible_child_name("tabs"),
-            SidebarView::Files => self.sidebar_stack.set_visible_child_name("files"),
+            SidebarView::Files => {
+                self.sidebar_stack.set_visible_child_name("files");
+                // Hosts may have been added/removed while the tree was hidden.
+                self.refresh_file_tree_location_selector();
+            }
         }
         // set_active does not refire `clicked`, so this won't recurse.
         self.sidebar_tabs_btn.set_active(view == SidebarView::Tabs);

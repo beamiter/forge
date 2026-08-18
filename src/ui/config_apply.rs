@@ -628,6 +628,9 @@ impl UiState {
         *self.shell_argv.borrow_mut() = choose_shell_argv(new_config.shell.as_deref());
         *self.config.borrow_mut() = new_config;
 
+        // The remote host list may have changed; reflect it in the file tree.
+        self.refresh_file_tree_location_selector();
+
         // TermView owns a shared clone used by long-lived callbacks. Refresh it
         // as well so behavior changes do not require reopening block tabs.
         self.sync_block_configs();

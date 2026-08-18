@@ -33,6 +33,7 @@ mod pane_leaf;
 mod pane_node;
 mod pane_tree_edit;
 mod panes;
+mod remote_fs;
 mod search;
 mod session;
 mod sidebar_tabs;
@@ -44,7 +45,9 @@ pub(crate) use agent_panel::{AgentHandle, AgentUiLifetime};
 pub(crate) use ai_panel::AiPanel;
 pub(crate) use bottom_bar::build_bottom_bar;
 pub(crate) use command_palette::CommandSuggestionHandle;
-pub(crate) use file_tree::{build_file_tree_widgets, FileTreeModel};
+pub(crate) use file_tree::{
+    build_file_tree_location_selector, build_file_tree_widgets, FileTreeModel,
+};
 pub(crate) use organism::{
     pane_token, OrganismActivity, OrganismAgentSignal, OrganismCorrectionSignal, OrganismPresence,
 };
@@ -55,6 +58,7 @@ pub(crate) use pane_tree_edit::{
     detach_leaf_and_promote, detach_leaf_for_zoom, plan_existing_leaf_split, restore_zoomed_leaf,
     ZoomPageSwap,
 };
+pub(crate) use remote_fs::{FsClipboard, FsLocation};
 
 /// Quiet period after the last font-scale step before the config is written.
 pub(crate) const FONT_PERSIST_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
@@ -216,6 +220,15 @@ pub(crate) struct UiState {
     pub(crate) file_tree_model: FileTreeModel,
     pub(crate) file_tree_root: Rc<RefCell<PathBuf>>,
     pub(crate) file_tree_root_label: gtk4::Label,
+    /// Which filesystem the file tree browses (local disk or one of the
+    /// configured ssh/docker remote hosts).
+    pub(crate) file_tree_location: Rc<RefCell<FsLocation>>,
+    /// Location selector in the file-tree header; rebuilt when the hosts list
+    /// or the current location changes.
+    pub(crate) file_tree_location_selector: gtk4::DropDown,
+    /// Sidebar cut/copy payload for file operations; paste is offered only
+    /// while the clipboard location matches the tree location.
+    pub(crate) file_tree_clipboard: Rc<RefCell<Option<FsClipboard>>>,
     pub(crate) tab_search_entry: SearchEntry,
     pub(crate) selected_tabs: Rc<RefCell<Vec<String>>>,
     /// Global identity/generation for one native tab drag. Delayed hover work
