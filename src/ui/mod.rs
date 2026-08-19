@@ -226,6 +226,11 @@ pub(crate) struct UiState {
     /// Location selector in the file-tree header; rebuilt when the hosts list
     /// or the current location changes.
     pub(crate) file_tree_location_selector: gtk4::DropDown,
+    /// Type-to-filter row under the file-tree header (hidden until toggled).
+    pub(crate) file_tree_filter_bar: gtk4::Box,
+    pub(crate) file_tree_filter_entry: gtk4::Entry,
+    /// Header toggle opening/closing the filter row; active while it is open.
+    pub(crate) file_tree_filter_toggle: gtk4::ToggleButton,
     /// Sidebar cut/copy payload for file operations; paste is offered only
     /// while the clipboard location matches the tree location.
     pub(crate) file_tree_clipboard: Rc<RefCell<Option<FsClipboard>>>,

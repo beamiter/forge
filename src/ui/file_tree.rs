@@ -2,7 +2,13 @@
 //!
 //! The browser uses `TreeListModel` + `ListView`, the supported GTK4 model-view
 //! stack. Directory enumeration remains off the UI thread and is created lazily
-//! when a directory row is expanded. Listing and file operations dispatch
+//! when a directory row is expanded. A `MultiSelection` gives ctrl+click and
+//! shift+click selection for batch operations; a type-to-filter row wraps the
+//! tree in a `FilterListModel` whose predicate consults a visible-path set
+//! (matches + ancestors) computed from the loaded child stores, so filtering
+//! never scans and row identity/expansion is untouched.
+//!
+//! Listing and file operations dispatch
 //! through `super::remote_fs`: the tree browses the local disk or any
 //! configured ssh/docker remote host, and a right-click context menu offers
 //! New File/Folder, Rename, Delete, Copy, Cut, Copy Path, Paste and Refresh
@@ -225,6 +231,19 @@ fn entry_from_row(row: &TreeListRow) -> Option<FileEntry> {
 pub(crate) struct FileTreeModel {
     root_store: gio::ListStore,
     tree_model: TreeListModel,
+    /// The multi-selection the ListView runs on; stored here so context-menu
+    /// batch operations and the filter wrap can read and swap its model.
+    selection: gtk4::MultiSelection,
+    /// Active only while the type-to-filter row is open: wraps `tree_model`
+    /// with the visibility predicate.
+    filter_model: gtk4::FilterListModel,
+    filter: gtk4::CustomFilter,
+    filter_state: Rc<RefCell<FilterState>>,
+    /// Every child store the lazy expansion factory has created, by parent
+    /// path — the filter's descendant walk reads it instead of triggering
+    /// new scans. Cleared on reset; bounded so long browsing sessions cannot
+    /// grow it without limit.
+    child_stores: Rc<RefCell<std::collections::HashMap<PathBuf, gio::ListStore>>>,
     generation: Rc<Cell<u64>>,
     /// Browsed filesystem, shared with UiState; scans snapshot it at request
     /// time and stale results are dropped when it has moved on.
@@ -234,14 +253,54 @@ pub(crate) struct FileTreeModel {
     config: Rc<RefCell<crate::config::Config>>,
 }
 
+/// Live type-to-filter state: the current query, the path set staying visible
+/// (matches + ancestors), and which rows the filter auto-expanded (collapsed
+/// again on clear; stale paths dropped silently).
+#[derive(Default)]
+struct FilterState {
+    query: String,
+    visible: std::collections::HashSet<PathBuf>,
+    filter_expanded: std::collections::HashSet<PathBuf>,
+}
+
+/// Bound on recorded child stores; beyond it the filter simply does not
+/// descend into subtrees expanded later.
+const MAX_CHILD_STORES: usize = 512;
+
 impl FileTreeModel {
     fn new(location: Rc<RefCell<FsLocation>>, config: Rc<RefCell<crate::config::Config>>) -> Self {
         let root_store = gio::ListStore::new::<glib::BoxedAnyObject>();
         let generation = Rc::new(Cell::new(0_u64));
+        let child_stores = Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let filter_state = Rc::new(RefCell::new(FilterState::default()));
+        let filter = gtk4::CustomFilter::new({
+            let filter_state = filter_state.clone();
+            move |object| {
+                let state = filter_state.borrow();
+                if state.query.is_empty() {
+                    return true;
+                }
+                let Some(row) = object.downcast_ref::<TreeListRow>() else {
+                    return true;
+                };
+                let Some(entry) = entry_from_row(row) else {
+                    return false;
+                };
+                state.visible.contains(&entry.path)
+            }
+        });
         let tree_model = TreeListModel::new(root_store.clone(), false, false, {
             let generation = generation.clone();
             let location = location.clone();
             let config = config.clone();
+            let child_stores = child_stores.clone();
+            // A scan completing while the filter is active re-evaluates the
+            // visible set so user-expanded subtrees get filtered too. These
+            // captures point only "downward" (stores, plain state, filter),
+            // so nothing here creates a reference cycle with the model.
+            let filter_state = filter_state.clone();
+            let filter = filter.clone();
+            let root_store_for_filter = root_store.clone();
             move |object| {
                 let boxed = object.downcast_ref::<glib::BoxedAnyObject>()?;
                 let entry = boxed.try_borrow::<FileEntry>().ok()?;
@@ -252,6 +311,12 @@ impl FileTreeModel {
                 drop(entry);
 
                 let children = gio::ListStore::new::<glib::BoxedAnyObject>();
+                {
+                    let mut map = child_stores.borrow_mut();
+                    if map.len() < MAX_CHILD_STORES {
+                        map.insert(path.clone(), children.clone());
+                    }
+                }
                 let children_for_scan = children.clone();
                 let generation_for_scan = generation.clone();
                 let expected_generation = generation.get();
@@ -260,6 +325,10 @@ impl FileTreeModel {
                 let scan_hosts = config.borrow().remote_hosts.clone();
                 let path_for_result = path.clone();
                 let path_for_error = path.clone();
+                let filter_state_for_scan = filter_state.clone();
+                let filter_for_scan = filter.clone();
+                let root_store_for_filter = root_store_for_filter.clone();
+                let child_stores_for_filter = child_stores.clone();
                 if let Err(error) =
                     request_dir_scan(scan_location.clone(), scan_hosts, path, move |result| {
                         if generation_for_scan.get() != expected_generation {
@@ -269,7 +338,15 @@ impl FileTreeModel {
                             return;
                         }
                         match result {
-                            Ok(entries) => append_entries(&children_for_scan, entries),
+                            Ok(entries) => {
+                                append_entries(&children_for_scan, entries);
+                                reapply_filter_parts(
+                                    &root_store_for_filter,
+                                    &child_stores_for_filter,
+                                    &filter_state_for_scan,
+                                    &filter_for_scan,
+                                );
+                            }
                             Err(error) => log::warn!(
                                 "failed to scan directory {}: {error}",
                                 path_for_result.display()
@@ -287,9 +364,25 @@ impl FileTreeModel {
             }
         });
 
+        let selection = gtk4::MultiSelection::new(Some(tree_model.clone()));
+        // MultiSelection never autoselects; ctrl+click toggles and
+        // shift+click ranges are built in.
+
+        // The filter wrap consults a precomputed visible-path set (matches +
+        // ancestors), so TreeListRow identity — and with it expansion state —
+        // is untouched by filtering. The wrap is only installed while a query
+        // is active; clearing removes it and restores the tree model.
+        let filter_model =
+            gtk4::FilterListModel::new(Some(tree_model.clone()), Some(filter.clone()));
+
         Self {
             root_store,
             tree_model,
+            selection,
+            filter_model,
+            filter,
+            filter_state,
+            child_stores,
             generation,
             location,
             config,
@@ -300,6 +393,7 @@ impl FileTreeModel {
         let generation = self.generation.get().wrapping_add(1);
         self.generation.set(generation);
         self.root_store.remove_all();
+        self.child_stores.borrow_mut().clear();
         generation
     }
 
@@ -309,7 +403,20 @@ impl FileTreeModel {
         }
         self.root_store.remove_all();
         append_entries(&self.root_store, entries);
+        self.reapply_filter();
         true
+    }
+
+    /// Re-evaluate an active filter after directory contents changed:
+    /// recompute the visible set from the now-loaded stores and re-filter.
+    /// No-op while no query is active.
+    fn reapply_filter(&self) {
+        reapply_filter_parts(
+            &self.root_store,
+            &self.child_stores,
+            &self.filter_state,
+            &self.filter,
+        );
     }
 
     /// The currently materialized ListStore holding `dir`'s children: the
@@ -338,9 +445,123 @@ impl FileTreeModel {
     }
 
     fn row_entry(&self, position: u32) -> Option<(TreeListRow, FileEntry)> {
-        let row = self.tree_model.row(position)?;
+        // Read through the selection's current model: while the type-to-
+        // filter row is open, positions index the FilterListModel wrap.
+        let model = self.selection.model()?;
+        let row = model.item(position)?.downcast::<TreeListRow>().ok()?;
         let entry = entry_from_row(&row)?;
         Some((row, entry))
+    }
+
+    /// The selected entries in flat-model order, with their positions in the
+    /// selection's current model.
+    fn selected_entries(&self) -> Vec<(u32, FileEntry)> {
+        let bitset = self.selection.selection();
+        let mut positions = Vec::new();
+        if let Some((iter, first)) = gtk4::BitsetIter::init_first(&bitset) {
+            positions.push(first);
+            positions.extend(iter);
+        }
+        positions
+            .into_iter()
+            .filter_map(|position| self.row_entry(position).map(|(_, entry)| (position, entry)))
+            .collect()
+    }
+
+    /// The position of `path` in the selection's current model, if visible.
+    fn flat_position_of(&self, path: &Path) -> Option<u32> {
+        let model = self.selection.model()?;
+        for index in 0..model.n_items() {
+            let Some(row) = model
+                .item(index)
+                .and_then(|item| item.downcast::<TreeListRow>().ok())
+            else {
+                continue;
+            };
+            if entry_from_row(&row).is_some_and(|entry| entry.path == path) {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    /// Apply the type-to-filter query: recompute the visible path set from
+    /// the LOADED stores only (never a new scan), auto-expand materialized
+    /// ancestors of matches, and install the filter wrap. An empty query
+    /// removes the wrap and collapses exactly the rows the filter expanded.
+    fn apply_filter(&self, query: String) {
+        if query.is_empty() {
+            let expanded = {
+                let mut state = self.filter_state.borrow_mut();
+                state.query.clear();
+                state.visible.clear();
+                std::mem::take(&mut state.filter_expanded)
+            };
+            // Restore expansion: collapse the rows the filter opened. Rows
+            // whose path vanished meanwhile are dropped silently.
+            for path in expanded {
+                if let Some(position) = self.flat_position_of(&path) {
+                    if let Some((row, _)) = self.row_entry(position) {
+                        row.set_expanded(false);
+                    }
+                }
+            }
+            self.selection.set_model(Some(&self.tree_model));
+            return;
+        }
+        // Compute the new visible set and publish it before touching the
+        // model: expansion and `emit_changed` re-enter the filter closure,
+        // which borrows `filter_state` — so no borrow may be held here.
+        let (visible, was_inactive) = {
+            let roots = store_entries(&self.root_store);
+            let visible = {
+                let child_stores = self.child_stores.borrow();
+                collect_visible_paths(
+                    &roots,
+                    &|path| child_stores.get(path).map(store_entries),
+                    &query,
+                )
+            };
+            let mut state = self.filter_state.borrow_mut();
+            let was_inactive = state.query.is_empty();
+            state.query = query;
+            state.visible = visible.clone();
+            (visible, was_inactive)
+        };
+
+        // Auto-expand ancestors of matches — but only rows whose children are
+        // already materialized, so filtering never triggers a fresh scan.
+        let mut newly_expanded = Vec::new();
+        for index in 0..self.tree_model.n_items() {
+            let Some(row) = self.tree_model.row(index) else {
+                continue;
+            };
+            let Some(entry) = entry_from_row(&row) else {
+                continue;
+            };
+            if !entry.is_dir || !visible.contains(&entry.path) {
+                continue;
+            }
+            if !row.is_expanded() && row.children().is_some() {
+                row.set_expanded(true);
+                newly_expanded.push(entry.path.clone());
+            }
+        }
+        self.filter_state
+            .borrow_mut()
+            .filter_expanded
+            .extend(newly_expanded);
+
+        if was_inactive {
+            self.selection.set_model(Some(&self.filter_model));
+        } else {
+            self.filter.changed(gtk4::FilterChange::Different);
+        }
+    }
+
+    /// Whether the type-to-filter query is currently active.
+    fn filter_is_active(&self) -> bool {
+        !self.filter_state.borrow().query.is_empty()
     }
 }
 
@@ -383,6 +604,219 @@ fn update_store_in_place(store: &gio::ListStore, entries: Vec<FileEntry>) {
             store.insert(position as u32, &glib::BoxedAnyObject::new(entry));
         }
     }
+}
+
+/// Flatten one store into (name, path, is_dir) triples — the shape the
+/// filter's pure matching core consumes.
+fn store_entries(store: &gio::ListStore) -> Vec<FilterNode> {
+    (0..store.n_items())
+        .filter_map(|index| {
+            store
+                .item(index)
+                .and_then(|item| item.downcast::<glib::BoxedAnyObject>().ok())
+                .and_then(|boxed| {
+                    boxed
+                        .try_borrow::<FileEntry>()
+                        .ok()
+                        .map(|entry| (entry.name.clone(), entry.path.clone(), entry.is_dir))
+                })
+        })
+        .collect()
+}
+
+/// One node of the loaded tree as the filter sees it: name, path, is_dir.
+type FilterNode = (String, PathBuf, bool);
+/// Yields the LOADED children of a directory path (`None` when its store was
+/// never materialized), so filtering never scans.
+type FilterChildrenOf<'a> = dyn Fn(&Path) -> Option<Vec<FilterNode>> + 'a;
+
+/// The filter's pure core, separate for tests: the paths that stay visible
+/// for `query` — case-insensitive substring matches on names, plus all their
+/// ancestors. An empty query matches everything, i.e. the identity filter.
+fn collect_visible_paths(
+    roots: &[FilterNode],
+    children_of: &FilterChildrenOf,
+    query: &str,
+) -> std::collections::HashSet<PathBuf> {
+    let query = query.to_lowercase();
+    let mut visible = std::collections::HashSet::new();
+    let mut ancestors: Vec<PathBuf> = Vec::new();
+    collect_visible_into(roots, children_of, &query, &mut ancestors, &mut visible);
+    visible
+}
+
+fn collect_visible_into(
+    entries: &[FilterNode],
+    children_of: &FilterChildrenOf,
+    query: &str,
+    ancestors: &mut Vec<PathBuf>,
+    visible: &mut std::collections::HashSet<PathBuf>,
+) {
+    for (name, path, is_dir) in entries {
+        if name.to_lowercase().contains(query) {
+            visible.insert(path.clone());
+            visible.extend(ancestors.iter().cloned());
+        }
+        if *is_dir {
+            if let Some(children) = children_of(path) {
+                ancestors.push(path.clone());
+                collect_visible_into(&children, children_of, query, ancestors, visible);
+                ancestors.pop();
+            }
+        }
+    }
+}
+
+/// Re-evaluate an active filter after new directory contents landed:
+/// recompute the visible set from the now-loaded stores and re-filter. The
+/// ancestor rows are already expanded by construction (a scan only starts
+/// when a row expands), so no expansion work happens here.
+fn reapply_filter_parts(
+    root_store: &gio::ListStore,
+    child_stores: &Rc<RefCell<std::collections::HashMap<PathBuf, gio::ListStore>>>,
+    filter_state: &Rc<RefCell<FilterState>>,
+    filter: &gtk4::CustomFilter,
+) {
+    let query = filter_state.borrow().query.clone();
+    if query.is_empty() {
+        return;
+    }
+    let roots = store_entries(root_store);
+    let visible = {
+        let child_stores = child_stores.borrow();
+        collect_visible_paths(
+            &roots,
+            &|path| child_stores.get(path).map(store_entries),
+            &query,
+        )
+    };
+    {
+        let mut state = filter_state.borrow_mut();
+        // The query may have moved on while the scan was in flight.
+        if state.query != query {
+            return;
+        }
+        state.visible = visible;
+    }
+    filter.changed(gtk4::FilterChange::Different);
+}
+
+/// Which entries a context-menu action applies to, and whether the selection
+/// must first collapse to the right-clicked row. Right-clicking a row that is
+/// in the current selection targets the whole selection; right-clicking
+/// anywhere else targets just that row. Returns the affected entries and the
+/// position to collapse to, if any.
+fn resolve_menu_target(
+    target: Option<(u32, FileEntry)>,
+    selected: &[(u32, FileEntry)],
+) -> (Vec<FileEntry>, Option<u32>) {
+    match target {
+        None => (Vec::new(), None),
+        Some((position, entry)) => {
+            if selected
+                .iter()
+                .any(|(selected_pos, _)| *selected_pos == position)
+            {
+                (
+                    selected.iter().map(|(_, entry)| entry.clone()).collect(),
+                    None,
+                )
+            } else {
+                (vec![entry], Some(position))
+            }
+        }
+    }
+}
+
+/// One planned paste of a clipboard item: destination, and whether the
+/// destination already exists (checked for Local targets only — remote
+/// destinations are refused atomically by the probe at op time).
+struct PastePlanItem {
+    src: PathBuf,
+    dst: PathBuf,
+    is_dir: bool,
+    /// Regular-file bytes below `src`, measured only for local sources
+    /// (upload progress totals); zero otherwise.
+    size: u64,
+    /// Destination exists already (Local target only).
+    collides: bool,
+    /// dst == src: pasting an item onto itself.
+    self_paste: bool,
+}
+
+/// Plan a batch paste into `target_dir`: per-item destination join, self-paste
+/// detection, (for Local targets) existence pre-flags, and (for local
+/// sources) size measurement. Pure apart from those local fs reads.
+fn plan_paste(
+    items: &[remote_fs::FsClipboardItem],
+    target_dir: &Path,
+    target_is_local: bool,
+    measure_sources: bool,
+) -> Vec<PastePlanItem> {
+    items
+        .iter()
+        .map(|item| {
+            let dst = remote_fs::paste_destination(target_dir, &item.path);
+            PastePlanItem {
+                self_paste: dst == item.path,
+                collides: target_is_local && std::fs::symlink_metadata(&dst).is_ok(),
+                size: if measure_sources {
+                    remote_fs::drop_entry_size(&item.path, 0)
+                } else {
+                    0
+                },
+                is_dir: item.is_dir,
+                src: item.path.clone(),
+                dst,
+            }
+        })
+        .collect()
+}
+
+/// The batch-operation summary line: `None` when nothing failed, else
+/// "2 of 5 failed: <first>" (or just the bare failure for a single item).
+fn failure_summary(failed: usize, total: usize, first: &str) -> Option<String> {
+    if failed == 0 {
+        return None;
+    }
+    if total <= 1 {
+        Some(format!("Failed: {first}"))
+    } else {
+        Some(format!("{failed} of {total} failed: {first}"))
+    }
+}
+
+/// The delete confirmation copy for one or more entries: the title names the
+/// count, the body lists up to five names and a remainder. Names are display
+/// names (already spoofing-sanitized at scan time).
+fn delete_confirmation_text(entries: &[FileEntry]) -> (String, String) {
+    debug_assert!(!entries.is_empty());
+    if entries.len() == 1 {
+        let display =
+            jterm_core::review_input::safe_inline_display(&entries[0].path.to_string_lossy(), 1024);
+        let detail = if entries[0].is_dir {
+            format!("“{display}” and everything inside it will be permanently deleted.")
+        } else {
+            format!("“{display}” will be permanently deleted.")
+        };
+        return ("Delete this item?".to_string(), detail);
+    }
+    let mut lines: Vec<String> = entries
+        .iter()
+        .take(5)
+        .map(|entry| jterm_core::review_input::safe_inline_display(&entry.name, 256))
+        .collect();
+    if entries.len() > 5 {
+        lines.push(format!("…and {} more", entries.len() - 5));
+    }
+    (
+        format!("Delete {} items?", entries.len()),
+        format!(
+            "These {} items will be permanently deleted:\n{}",
+            entries.len(),
+            lines.join("\n")
+        ),
+    )
 }
 
 /// Build the modern GTK4 list-model file browser.
@@ -477,11 +911,9 @@ pub(crate) fn build_file_tree_widgets(
         expander.set_list_row(None);
     });
 
-    let selection = gtk4::SingleSelection::new(Some(model.tree_model.clone()));
-    selection.set_autoselect(false);
-    selection.set_can_unselect(true);
-
-    let file_tree = ListView::new(Some(selection), Some(factory));
+    // MultiSelection: ctrl+click toggles and shift+click ranges come from
+    // GTK; activation (double-click/Enter) is unaffected.
+    let file_tree = ListView::new(Some(model.selection.clone()), Some(factory));
     file_tree.set_single_click_activate(false);
     file_tree.set_show_separators(false);
     file_tree.set_can_focus(true);
@@ -598,6 +1030,45 @@ impl UiState {
                 self.refresh_file_tree_location_selector();
             }
         }
+    }
+
+    /// Toggle the type-to-filter row open/closed. Closing clears the query,
+    /// removes the filter wrap, and restores pre-filter expansion.
+    pub(crate) fn toggle_file_tree_filter(&self) {
+        if self.file_tree_filter_bar.is_visible() {
+            self.close_file_tree_filter();
+        } else {
+            self.file_tree_filter_bar.set_visible(true);
+            self.file_tree_filter_toggle.set_active(true);
+            self.file_tree_filter_entry.grab_focus();
+        }
+    }
+
+    /// Esc / toggle-off path: clear the entry (which re-applies an empty
+    /// query through the changed signal) and hide the row.
+    fn close_file_tree_filter(&self) {
+        self.file_tree_filter_entry.set_text("");
+        self.file_tree_model.apply_filter(String::new());
+        self.file_tree_filter_bar.set_visible(false);
+        self.file_tree_filter_toggle.set_active(false);
+    }
+
+    /// Wire the filter row: text changes drive the model filter, Esc closes.
+    pub(crate) fn connect_file_tree_filter_bar(&self) {
+        let model = self.file_tree_model.clone();
+        self.file_tree_filter_entry.connect_changed(move |entry| {
+            model.apply_filter(entry.text().to_string());
+        });
+        let key = gtk4::EventControllerKey::new();
+        let ui = self.clone();
+        key.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval == gtk4::gdk::Key::Escape {
+                ui.close_file_tree_filter();
+                return true.into();
+            }
+            false.into()
+        });
+        self.file_tree_filter_entry.add_controller(key);
     }
 
     /// Rebuild the location selector's entries from the configured hosts and
@@ -856,57 +1327,13 @@ impl UiState {
         };
         let title = format!("{verb_ing} {count} items to {target_desc}…");
 
-        let (progress_tx, progress_rx) = mpsc::channel::<u64>();
-        let token = remote_fs::CancelToken::default();
         // Upload progress reports carry a cumulative byte count across items;
         // uploads know the drop-wide total up-front, copies report nothing.
         let total = match action {
             remote_fs::DropAction::Upload => Some(total_bytes),
             remote_fs::DropAction::Copy => None,
         };
-
-        let busy = adw::Toast::new(&title);
-        busy.set_timeout(0);
-        busy.set_button_label(Some("Cancel"));
-        {
-            let token = token.clone();
-            let busy_for_cancel = busy.clone();
-            busy.connect_button_clicked(move |_| {
-                token.cancel();
-                busy_for_cancel.dismiss();
-            });
-        }
-        let poll_done = Rc::new(Cell::new(false));
-        {
-            let poll_done = poll_done.clone();
-            busy.connect_dismissed(move |_| poll_done.set(true));
-        }
-        {
-            let busy_for_poll = busy.clone();
-            let title_for_poll = title.clone();
-            glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-                if poll_done.get() {
-                    return glib::ControlFlow::Break;
-                }
-                let mut latest = None;
-                while let Ok(bytes) = progress_rx.try_recv() {
-                    latest = Some(bytes);
-                }
-                if let Some(bytes) = latest {
-                    let progress_text = match total {
-                        Some(total) => format!(
-                            "{} / {}",
-                            remote_fs::human_bytes(bytes),
-                            remote_fs::human_bytes(total)
-                        ),
-                        None => remote_fs::human_bytes(bytes),
-                    };
-                    busy_for_poll.set_title(&format!("{title_for_poll} {progress_text}"));
-                }
-                glib::ControlFlow::Continue
-            });
-        }
-        self.toast_overlay.add_toast(busy.clone());
+        let (busy, token, progress_tx) = self.build_transfer_feedback(&title, total);
 
         let failures: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -999,10 +1426,12 @@ impl UiState {
         );
     }
 
-    /// Right-click file-operations menu for `target`. New File/Folder, Paste
-    /// and Refresh act on the target directory (a file row contributes its
-    /// parent); Rename/Delete/Copy/Cut need a row and are insensitive without
-    /// one.
+    /// Right-click file-operations menu for `target`. Right-clicking a row in
+    /// the current selection applies row actions to the whole selection;
+    /// right-clicking elsewhere collapses the selection to that row first.
+    /// New File/Folder, Paste and Refresh act on the target directory (a file
+    /// row contributes its parent); Rename needs exactly one row;
+    /// Delete/Copy/Cut/Copy Path work on one or more.
     fn show_file_tree_context_menu(
         &self,
         file_tree: &ListView,
@@ -1014,7 +1443,21 @@ impl UiState {
         // menus: the GAction-based PopoverMenu dispatch does not fire in this
         // GTK build, so direct connect_clicked closures are used.
         let location = self.file_tree_location.borrow().clone();
-        let has_target = target.is_some();
+        let selected = self.file_tree_model.selected_entries();
+        let target_with_pos = target.clone().and_then(|(_, entry)| {
+            self.file_tree_model
+                .flat_position_of(&entry.path)
+                .map(|position| (position, entry))
+        });
+        let (entries, collapse_to) = resolve_menu_target(target_with_pos, &selected);
+        if let Some(position) = collapse_to {
+            // Right-clicked a row outside the selection: the selection
+            // collapses to that row before any action runs.
+            self.file_tree_model.selection.unselect_all();
+            self.file_tree_model.selection.select_item(position, true);
+        }
+        let has_target = !entries.is_empty();
+        let multi = entries.len() > 1;
         let target_dir = match &target {
             Some((_, entry)) if entry.is_dir => entry.path.clone(),
             Some((_, entry)) => entry
@@ -1049,6 +1492,9 @@ impl UiState {
             ("New Folder", NameDialogKind::NewFolder),
         ] {
             let item = make_item(label);
+            // Creation dialogs name one entry; under multi-selection they
+            // would be ambiguous about which rows they relate to.
+            item.set_sensitive(!multi);
             let popover_c = popover.clone();
             let ui = self.clone();
             let dir = target_dir.clone();
@@ -1061,8 +1507,8 @@ impl UiState {
 
         {
             let item = make_item("Rename");
-            item.set_sensitive(has_target);
-            if let Some((_, entry)) = target.clone() {
+            item.set_sensitive(has_target && !multi);
+            if let Some(entry) = entries.first().cloned().filter(|_| !multi) {
                 let popover_c = popover.clone();
                 let ui = self.clone();
                 item.connect_clicked(move |_| {
@@ -1083,14 +1529,20 @@ impl UiState {
         }
 
         {
-            let item = make_item("Delete");
+            let delete_label = if multi {
+                format!("Delete {} items", entries.len())
+            } else {
+                "Delete".to_string()
+            };
+            let item = make_item(&delete_label);
             item.set_sensitive(has_target);
-            if let Some((_, entry)) = target.clone() {
+            if has_target {
                 let popover_c = popover.clone();
                 let ui = self.clone();
+                let entries = entries.clone();
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
-                    ui.confirm_file_tree_delete(entry.clone());
+                    ui.confirm_file_tree_delete(entries.clone());
                 });
             }
             vbox.append(&item);
@@ -1099,16 +1551,22 @@ impl UiState {
         for (label, cut) in [("Copy", false), ("Cut", true)] {
             let item = make_item(label);
             item.set_sensitive(has_target);
-            if let Some((_, entry)) = target.clone() {
+            if has_target {
                 let popover_c = popover.clone();
                 let ui = self.clone();
                 let location = location.clone();
+                let entries = entries.clone();
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
                     *ui.file_tree_clipboard.borrow_mut() = Some(FsClipboard {
                         loc: location.clone(),
-                        path: entry.path.clone(),
-                        is_dir: entry.is_dir,
+                        items: entries
+                            .iter()
+                            .map(|entry| remote_fs::FsClipboardItem {
+                                path: entry.path.clone(),
+                                is_dir: entry.is_dir,
+                            })
+                            .collect(),
                         cut,
                     });
                 });
@@ -1117,23 +1575,30 @@ impl UiState {
         }
 
         {
-            // The row's full path text as-is — remote rows copy the plain
-            // remote path without any prefix.
+            // Full path text as-is — remote rows copy the plain remote path
+            // without any prefix; multi-selection joins paths with newlines.
             let item = make_item("Copy Path");
             item.set_sensitive(has_target);
-            if let Some((_, entry)) = target.clone() {
+            if has_target {
                 let popover_c = popover.clone();
                 let ui = self.clone();
+                let entries = entries.clone();
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
-                    match copy_path_payload(&entry.path) {
-                        Some(text) => ui.window.clipboard().set_text(&text),
-                        None => {
-                            log::warn!("refusing to copy a path with unsafe display text");
-                            ui.toast_overlay
-                                .add_toast(adw::Toast::new("Path contains hidden or control text"));
+                    let mut texts = Vec::with_capacity(entries.len());
+                    for entry in &entries {
+                        match copy_path_payload(&entry.path) {
+                            Some(text) => texts.push(text),
+                            None => {
+                                log::warn!("refusing to copy a path with unsafe display text");
+                                ui.toast_overlay.add_toast(adw::Toast::new(
+                                    "A path contains hidden or control text",
+                                ));
+                                return;
+                            }
                         }
                     }
+                    ui.window.clipboard().set_text(&texts.join("\n"));
                 });
             }
             vbox.append(&item);
@@ -1153,14 +1618,24 @@ impl UiState {
                 None => "Paste",
             };
             let item = make_item(label);
-            let pasteable = clipboard
-                .as_ref()
-                .is_some_and(|clip| clip.path.file_name().is_some());
+            let pasteable = clipboard.as_ref().is_some_and(|clip| {
+                !clip.items.is_empty()
+                    && clip
+                        .items
+                        .iter()
+                        .all(|item| item.path.file_name().is_some())
+            });
             item.set_sensitive(pasteable);
             if clipboard.is_none() {
                 item.set_tooltip_text(Some("Copy or cut an item first"));
             }
-            if let Some(clip) = clipboard.filter(|clip| clip.path.file_name().is_some()) {
+            if let Some(clip) = clipboard.filter(|clip| {
+                !clip.items.is_empty()
+                    && clip
+                        .items
+                        .iter()
+                        .all(|item| item.path.file_name().is_some())
+            }) {
                 let popover_c = popover.clone();
                 let ui = self.clone();
                 let dir = target_dir.clone();
@@ -1298,17 +1773,16 @@ impl UiState {
         dialog.present(Some(&self.window));
     }
 
-    /// Destructive-delete confirmation naming the full path, styled after the
-    /// host-removal alert dialog.
-    fn confirm_file_tree_delete(&self, entry: FileEntry) {
-        let display =
-            jterm_core::review_input::safe_inline_display(&entry.path.to_string_lossy(), 1024);
-        let detail = if entry.is_dir {
-            format!("“{display}” and everything inside it will be permanently deleted.")
-        } else {
-            format!("“{display}” will be permanently deleted.")
-        };
-        let dialog = adw::AlertDialog::new(Some("Delete this item?"), Some(&detail));
+    /// Destructive-delete confirmation for one or more entries: the title
+    /// carries the count, the body up to five names. One worker job deletes
+    /// the items in order, continuing past per-item errors, then every
+    /// affected parent refreshes in place.
+    fn confirm_file_tree_delete(&self, entries: Vec<FileEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+        let (title, detail) = delete_confirmation_text(&entries);
+        let dialog = adw::AlertDialog::new(Some(&title), Some(&detail));
         dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
@@ -1318,126 +1792,78 @@ impl UiState {
             if response != "delete" {
                 return;
             }
+            // The response closure is Fn: clone the entry list into the
+            // one-shot worker.
+            let entries = entries.clone();
             let location = ui.file_tree_location.borrow().clone();
             let hosts = ui.config.borrow().remote_hosts.clone();
-            let path = entry.path.clone();
-            let affected: Vec<PathBuf> = path.parent().map(Path::to_path_buf).into_iter().collect();
+            let total = entries.len();
+            let mut affected: Vec<PathBuf> = Vec::new();
+            for entry in &entries {
+                if let Some(parent) = entry.path.parent() {
+                    let parent = parent.to_path_buf();
+                    if !affected.contains(&parent) {
+                        affected.push(parent);
+                    }
+                }
+            }
+            let failures: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let failures_for_work = failures.clone();
+            let ui_for_success = ui.clone();
             ui.execute_fs_op(
                 "Delete",
                 None,
                 affected,
-                move || remote_fs::delete(&location, &hosts, &path),
-                || {},
+                move || {
+                    for entry in &entries {
+                        if let Err(error) = remote_fs::delete(&location, &hosts, &entry.path) {
+                            let name =
+                                jterm_core::review_input::safe_inline_display(&entry.name, 256);
+                            let detail = jterm_core::review_input::safe_inline_display(
+                                &error.to_string(),
+                                256,
+                            );
+                            failures_for_work
+                                .lock()
+                                .unwrap()
+                                .push(format!("{name}: {detail}"));
+                        }
+                    }
+                    Ok(())
+                },
+                move || {
+                    let failures = failures.lock().unwrap();
+                    if let Some(summary) = failure_summary(
+                        failures.len(),
+                        total,
+                        failures.first().map(String::as_str).unwrap_or_default(),
+                    ) {
+                        ui_for_success
+                            .toast_overlay
+                            .add_toast(adw::Toast::new(&summary));
+                    }
+                },
             );
         });
         dialog.present(Some(&self.window));
     }
 
-    /// Paste `clip` into `target_dir`. Same location: a cut moves (rename), a
-    /// copy duplicates. Different locations: a streaming transfer (download,
-    /// upload, or temp-relayed remote-to-remote hop), with a cut then
-    /// deleting the source only after the transfer landed. The clipboard
-    /// clears only after a fully successful cut.
-    fn paste_file_tree_clipboard(&self, clip: FsClipboard, target_dir: PathBuf) {
-        let location = self.file_tree_location.borrow().clone();
-        let dst = remote_fs::paste_destination(&target_dir, &clip.path);
-        let hosts = self.config.borrow().remote_hosts.clone();
-        let src = clip.path.clone();
-        let cut = clip.cut;
-
-        if clip.loc == location {
-            if dst == src {
-                self.toast_overlay.add_toast(adw::Toast::new(
-                    "Paste failed: source and target are the same",
-                ));
-                return;
-            }
-            // A copy lands in the target dir; a cut also removes the entry
-            // from its old parent. Refresh exactly those.
-            let mut affected: Vec<PathBuf> = Vec::new();
-            if cut {
-                if let Some(parent) = src.parent() {
-                    affected.push(parent.to_path_buf());
-                }
-            }
-            if !affected.contains(&target_dir) {
-                affected.push(target_dir);
-            }
-            let ui = self.clone();
-            self.execute_fs_op(
-                "Paste",
-                None,
-                affected,
-                move || {
-                    if cut {
-                        remote_fs::rename(&location, &hosts, &src, &dst)
-                    } else {
-                        remote_fs::copy(&location, &hosts, &src, &dst)
-                    }
-                },
-                move || {
-                    if cut {
-                        *ui.file_tree_clipboard.borrow_mut() = None;
-                    }
-                },
-            );
-            return;
-        }
-
-        // Cross-location: a streaming transfer on the same bounded op-worker
-        // path, with a persistent progress toast until it finishes.
-        let from = clip.loc.clone();
-        let is_dir = clip.is_dir;
-        let plan = remote_fs::transfer_plan(&from, &location);
-        let verb: &'static str = if cut {
-            "Move"
-        } else {
-            match plan {
-                Some(remote_fs::TransferPlan::Download) => "Download",
-                Some(remote_fs::TransferPlan::Upload) => "Upload",
-                _ => "Transfer",
-            }
-        };
-        let verb_ing: &'static str = if cut {
-            "Moving"
-        } else {
-            match plan {
-                Some(remote_fs::TransferPlan::Download) => "Downloading",
-                Some(remote_fs::TransferPlan::Upload) => "Uploading",
-                _ => "Transferring",
-            }
-        };
-        let display = jterm_core::review_input::safe_inline_display(
-            &src.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            256,
-        );
-
-        // Progress flows pump thread -> channel -> glib poll -> toast title.
+    /// The persistent progress toast for a batch transfer: Cancel wired to
+    /// the returned token, progress reports polled into the title. Shared by
+    /// paste and drag-and-drop import.
+    fn build_transfer_feedback(
+        &self,
+        title: &str,
+        total: Option<u64>,
+    ) -> (adw::Toast, remote_fs::CancelToken, mpsc::Sender<u64>) {
         let (progress_tx, progress_rx) = mpsc::channel::<u64>();
-        let control = remote_fs::TransferControl {
-            token: remote_fs::CancelToken::default(),
-            progress: Some(std::sync::Arc::new(std::sync::Mutex::new(
-                move |bytes: u64| {
-                    let _ = progress_tx.send(bytes);
-                },
-            ))),
-        };
-        // Uploads of a local file know their total up-front.
-        let total: Option<u64> = if from == FsLocation::Local && !is_dir {
-            std::fs::symlink_metadata(&src)
-                .ok()
-                .map(|metadata| metadata.len())
-        } else {
-            None
-        };
-
-        let busy = adw::Toast::new(&format!("{verb_ing} {display}…"));
+        let token = remote_fs::CancelToken::default();
+        let busy = adw::Toast::new(title);
         busy.set_timeout(0);
         busy.set_button_label(Some("Cancel"));
         {
-            let token = control.token.clone();
+            let token = token.clone();
             let busy_for_cancel = busy.clone();
             busy.connect_button_clicked(move |_| {
                 // Idempotent: racing a completion leaves a flag nobody reads
@@ -1455,7 +1881,7 @@ impl UiState {
         }
         {
             let busy_for_poll = busy.clone();
-            let title = format!("{verb_ing} {display}…");
+            let title = title.to_string();
             glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
                 if poll_done.get() {
                     return glib::ControlFlow::Break;
@@ -1479,53 +1905,273 @@ impl UiState {
             });
         }
         self.toast_overlay.add_toast(busy.clone());
+        (busy, token, progress_tx)
+    }
+
+    /// Paste `clip` into `target_dir`. Same location: a cut moves (rename), a
+    /// copy duplicates, per item, continuing past failures. Different
+    /// locations: streaming transfers through the round-2 machinery, with a
+    /// cut deleting only the sources whose transfer succeeded. The clipboard
+    /// clears only when a cut-paste fully succeeded.
+    fn paste_file_tree_clipboard(&self, clip: FsClipboard, target_dir: PathBuf) {
+        let location = self.file_tree_location.borrow().clone();
+        let hosts = self.config.borrow().remote_hosts.clone();
+        let cut = clip.cut;
+        let total_items = clip.items.len();
+        // Uploads (local sources) know their sizes up-front; downloads and
+        // relays report transferred bytes only.
+        let from = clip.loc.clone();
+        let measure = from == FsLocation::Local;
+        let plan_items = plan_paste(
+            &clip.items,
+            &target_dir,
+            location == FsLocation::Local,
+            measure,
+        );
+
+        if clip.loc == location {
+            // Same-location batch: per-item rename/copy, summary at the end.
+            let mut affected: Vec<PathBuf> = vec![target_dir.clone()];
+            if cut {
+                for item in &clip.items {
+                    if let Some(parent) = item.path.parent() {
+                        let parent = parent.to_path_buf();
+                        if !affected.contains(&parent) {
+                            affected.push(parent);
+                        }
+                    }
+                }
+            }
+            let failures: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let failures_for_work = failures.clone();
+            let failures_for_success = failures.clone();
+            let loc = location.clone();
+            let ui = self.clone();
+            let ui_for_success = self.clone();
+            self.execute_fs_op(
+                "Paste",
+                None,
+                affected,
+                move || {
+                    for item in &plan_items {
+                        let name = jterm_core::review_input::safe_inline_display(
+                            &item
+                                .src
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                            256,
+                        );
+                        if item.self_paste {
+                            failures_for_work
+                                .lock()
+                                .unwrap()
+                                .push(format!("{name}: source and target are the same"));
+                            continue;
+                        }
+                        if item.collides {
+                            failures_for_work
+                                .lock()
+                                .unwrap()
+                                .push(format!("{name}: already exists"));
+                            continue;
+                        }
+                        let result = if cut {
+                            remote_fs::rename(&loc, &hosts, &item.src, &item.dst)
+                        } else {
+                            remote_fs::copy(&loc, &hosts, &item.src, &item.dst)
+                        };
+                        if let Err(error) = result {
+                            let detail = jterm_core::review_input::safe_inline_display(
+                                &error.to_string(),
+                                256,
+                            );
+                            failures_for_work
+                                .lock()
+                                .unwrap()
+                                .push(format!("{name}: {detail}"));
+                        }
+                    }
+                    Ok(())
+                },
+                move || {
+                    let failures = failures_for_success.lock().unwrap();
+                    match failure_summary(
+                        failures.len(),
+                        total_items,
+                        failures.first().map(String::as_str).unwrap_or_default(),
+                    ) {
+                        Some(summary) => {
+                            ui_for_success
+                                .toast_overlay
+                                .add_toast(adw::Toast::new(&summary));
+                        }
+                        None if cut => {
+                            *ui.file_tree_clipboard.borrow_mut() = None;
+                        }
+                        None => {}
+                    }
+                },
+            );
+            return;
+        }
+
+        // Cross-location batch: per-item streaming transfers with cumulative
+        // progress, cancellation, and per-item failure collection.
+        let plan = remote_fs::transfer_plan(&from, &location);
+        let verb: &'static str = if cut {
+            "Move"
+        } else {
+            match plan {
+                Some(remote_fs::TransferPlan::Download) => "Download",
+                Some(remote_fs::TransferPlan::Upload) => "Upload",
+                _ => "Transfer",
+            }
+        };
+        let verb_ing: &'static str = if cut {
+            "Moving"
+        } else {
+            match plan {
+                Some(remote_fs::TransferPlan::Download) => "Downloading",
+                Some(remote_fs::TransferPlan::Upload) => "Uploading",
+                _ => "Transferring",
+            }
+        };
+        let title = if total_items == 1 {
+            let display = jterm_core::review_input::safe_inline_display(
+                &clip.items[0]
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                256,
+            );
+            format!("{verb_ing} {display}…")
+        } else {
+            format!("{verb_ing} {total_items} items…")
+        };
+        let total = measure.then(|| plan_items.iter().map(|item| item.size).sum::<u64>());
+        let (busy, token, progress_tx) = self.build_transfer_feedback(&title, total);
 
         // Only the destination parent is visible in this tree; the source
         // side lives on another location.
         let affected = vec![target_dir];
-        let hosts_for_copy = hosts.clone();
-        let (from_copy, from_delete) = (from.clone(), from.clone());
-        let (src_copy, src_delete) = (src.clone(), src.clone());
-        let (hosts_delete, dst_copy) = (hosts.clone(), dst.clone());
+        let failures: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let failures_for_work = failures.clone();
+        let failures_for_success = failures.clone();
         let to = location.clone();
-        let control_for_work = control.clone();
         let ui = self.clone();
+        let ui_for_success = self.clone();
         self.execute_fs_op(
             verb,
             Some(busy),
             affected,
             move || {
-                if cut {
-                    let control_for_copy = control_for_work.clone();
-                    remote_fs::copy_then_delete(
-                        || {
-                            remote_fs::transfer(
-                                &from_copy,
-                                &hosts_for_copy,
-                                &src_copy,
-                                &to,
-                                &dst_copy,
-                                is_dir,
-                                &control_for_copy,
-                            )
-                        },
-                        || remote_fs::delete(&from_delete, &hosts_delete, &src_delete),
-                    )
-                } else {
-                    remote_fs::transfer(
-                        &from_copy,
-                        &hosts_for_copy,
-                        &src_copy,
+                let mut completed_bytes = 0_u64;
+                for item in &plan_items {
+                    if token.is_cancelled() {
+                        return Err(remote_fs::cancelled_error());
+                    }
+                    let name = jterm_core::review_input::safe_inline_display(
+                        &item
+                            .src
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        256,
+                    );
+                    if item.self_paste {
+                        failures_for_work
+                            .lock()
+                            .unwrap()
+                            .push(format!("{name}: source and target are the same"));
+                        completed_bytes += item.size;
+                        continue;
+                    }
+                    if item.collides {
+                        failures_for_work
+                            .lock()
+                            .unwrap()
+                            .push(format!("{name}: already exists"));
+                        completed_bytes += item.size;
+                        continue;
+                    }
+                    // Cumulative progress across items: each transfer reports
+                    // its own bytes; the sink shifts them by the bytes of the
+                    // items that already finished.
+                    let base = completed_bytes;
+                    let progress_tx = progress_tx.clone();
+                    let item_control = remote_fs::TransferControl {
+                        token: token.clone(),
+                        progress: Some(std::sync::Arc::new(std::sync::Mutex::new(
+                            move |bytes: u64| {
+                                let _ = progress_tx.send(base + bytes);
+                            },
+                        ))),
+                    };
+                    match remote_fs::transfer(
+                        &from,
+                        &hosts,
+                        &item.src,
                         &to,
-                        &dst_copy,
-                        is_dir,
-                        &control_for_work,
-                    )
+                        &item.dst,
+                        item.is_dir,
+                        &item_control,
+                    ) {
+                        Ok(()) => {
+                            // A cut deletes only the source whose transfer
+                            // actually succeeded.
+                            if cut {
+                                if let Err(error) =
+                                    remote_fs::delete(&from, &hosts, &item.src)
+                                {
+                                    let detail =
+                                        jterm_core::review_input::safe_inline_display(
+                                            &error.to_string(),
+                                            256,
+                                        );
+                                    failures_for_work.lock().unwrap().push(format!(
+                                        "{name}: transferred, but the source could not be deleted: {detail}"
+                                    ));
+                                }
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                            return Err(error);
+                        }
+                        Err(error) => {
+                            let detail = jterm_core::review_input::safe_inline_display(
+                                &error.to_string(),
+                                256,
+                            );
+                            failures_for_work
+                                .lock()
+                                .unwrap()
+                                .push(format!("{name}: {detail}"));
+                        }
+                    }
+                    completed_bytes += item.size;
                 }
+                Ok(())
             },
             move || {
-                if cut {
-                    *ui.file_tree_clipboard.borrow_mut() = None;
+                let failures = failures_for_success.lock().unwrap();
+                match failure_summary(
+                    failures.len(),
+                    total_items,
+                    failures.first().map(String::as_str).unwrap_or_default(),
+                ) {
+                    Some(summary) => {
+                        ui_for_success
+                            .toast_overlay
+                            .add_toast(adw::Toast::new(&summary));
+                    }
+                    None if cut => {
+                        *ui.file_tree_clipboard.borrow_mut() = None;
+                    }
+                    None => {}
                 }
             },
         );
@@ -1549,6 +2195,7 @@ impl UiState {
         let generation_for_scan = self.file_tree_model.generation.clone();
         let location_for_scan = self.file_tree_location.clone();
         let scan_location = location.clone();
+        let model_for_refresh = self.file_tree_model.clone();
         let dir_for_error = dir.to_path_buf();
         if let Err(error) = request_dir_scan(location, hosts, dir.to_path_buf(), move |result| {
             if generation_for_scan.get() != generation {
@@ -1558,7 +2205,10 @@ impl UiState {
                 return;
             }
             match result {
-                Ok(entries) => update_store_in_place(&store, entries),
+                Ok(entries) => {
+                    update_store_in_place(&store, entries);
+                    model_for_refresh.reapply_filter();
+                }
                 Err(error) => log::warn!(
                     "failed to refresh directory {}: {error}",
                     dir_for_error.display()
@@ -1956,5 +2606,214 @@ mod tests {
             store_paths(&store),
             vec![PathBuf::from("/p/dir"), PathBuf::from("/p/file")]
         );
+    }
+
+    #[test]
+    fn menu_target_uses_selection_or_collapses_to_the_clicked_row() {
+        let a = test_entry("/p/a", false);
+        let b = test_entry("/p/b", true);
+        let c = test_entry("/p/c", false);
+        let selected = vec![(0_u32, a.clone()), (2_u32, c.clone())];
+
+        // Right-click on a selected row: the whole selection is the target.
+        let (entries, collapse) = resolve_menu_target(Some((2, c.clone())), &selected);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.path.as_path())
+                .collect::<Vec<_>>(),
+            [Path::new("/p/a"), Path::new("/p/c")]
+        );
+        assert_eq!(collapse, None);
+
+        // Right-click outside the selection: just that row, and the caller
+        // collapses the selection to it.
+        let (entries, collapse) = resolve_menu_target(Some((1, b.clone())), &selected);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.path.as_path())
+                .collect::<Vec<_>>(),
+            [Path::new("/p/b")]
+        );
+        assert_eq!(collapse, Some(1));
+
+        // Empty space: no row targets, nothing to collapse.
+        let (entries, collapse) = resolve_menu_target(None, &selected);
+        assert!(entries.is_empty());
+        assert_eq!(collapse, None);
+
+        // Nothing selected: the clicked row alone, collapsed to.
+        let (entries, collapse) = resolve_menu_target(Some((1, b)), &[]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(collapse, Some(1));
+    }
+
+    /// A tiny (name, path, is_dir) node for the filter tests.
+    fn node(name: &str, path: &str, is_dir: bool) -> (String, PathBuf, bool) {
+        (name.to_string(), PathBuf::from(path), is_dir)
+    }
+
+    #[test]
+    fn filter_keeps_matches_and_ancestors_from_loaded_subtrees() {
+        // Tree: /r/{a/{b/{match.txt}}, c/{other.txt}, MatchDir/{inner.txt},
+        // ghost/{…never loaded…}}
+        let children: std::collections::HashMap<PathBuf, Vec<(String, PathBuf, bool)>> =
+            std::collections::HashMap::from([
+                (
+                    PathBuf::from("/r"),
+                    vec![
+                        node("a", "/r/a", true),
+                        node("c", "/r/c", true),
+                        node("MatchDir", "/r/MatchDir", true),
+                        node("ghost", "/r/ghost", true),
+                    ],
+                ),
+                (PathBuf::from("/r/a"), vec![node("b", "/r/a/b", true)]),
+                (
+                    PathBuf::from("/r/a/b"),
+                    vec![node("match.txt", "/r/a/b/match.txt", false)],
+                ),
+                (
+                    PathBuf::from("/r/c"),
+                    vec![node("other.txt", "/r/c/other.txt", false)],
+                ),
+                (
+                    PathBuf::from("/r/MatchDir"),
+                    vec![node("inner.txt", "/r/MatchDir/inner.txt", false)],
+                ),
+                // /r/ghost has no entry: its store was never materialized.
+            ]);
+        let roots = children[&PathBuf::from("/r")].clone();
+        let children_of = |path: &Path| children.get(path).cloned();
+
+        let visible = collect_visible_paths(&roots, &children_of, "match");
+        // The match itself, its ancestors, and the case-insensitive dir match.
+        for path in ["/r/a", "/r/a/b", "/r/a/b/match.txt", "/r/MatchDir"] {
+            assert!(visible.contains(Path::new(path)), "{path} must be visible");
+        }
+        // Children of a matching dir are not auto-visible, unrelated branches
+        // stay hidden, and a never-loaded subtree is not descended into.
+        for path in [
+            "/r/MatchDir/inner.txt",
+            "/r/c",
+            "/r/c/other.txt",
+            "/r/ghost",
+        ] {
+            assert!(!visible.contains(Path::new(path)), "{path} must be hidden");
+        }
+
+        // Case-insensitivity runs both ways.
+        let visible = collect_visible_paths(&roots, &children_of, "MATCH.TXT");
+        assert!(visible.contains(Path::new("/r/a/b/match.txt")));
+
+        // An empty query is the identity filter over loaded rows.
+        let visible = collect_visible_paths(&roots, &children_of, "");
+        for path in [
+            "/r/a",
+            "/r/a/b",
+            "/r/a/b/match.txt",
+            "/r/c",
+            "/r/c/other.txt",
+            "/r/MatchDir",
+            "/r/MatchDir/inner.txt",
+            "/r/ghost",
+        ] {
+            assert!(visible.contains(Path::new(path)), "{path} must be visible");
+        }
+
+        // A query with no match keeps nothing.
+        let visible = collect_visible_paths(&roots, &children_of, "absent");
+        assert!(visible.is_empty());
+    }
+
+    #[test]
+    fn paste_plan_flags_collisions_self_pastes_and_sizes() {
+        let root = std::env::temp_dir().join(format!(
+            "forge-paste-plan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file.txt"), b"12345").unwrap();
+        std::fs::create_dir(root.join("dir")).unwrap();
+        std::fs::write(root.join("dir/inner.txt"), b"678").unwrap();
+        // A destination that already exists (Local target).
+        std::fs::write(root.join("exists.txt"), b"old").unwrap();
+
+        let items = vec![
+            remote_fs::FsClipboardItem {
+                path: root.join("file.txt"),
+                is_dir: false,
+            },
+            remote_fs::FsClipboardItem {
+                path: root.join("dir"),
+                is_dir: true,
+            },
+            remote_fs::FsClipboardItem {
+                path: root.join("exists.txt"),
+                is_dir: false,
+            },
+        ];
+        let plan = plan_paste(&items, &root, true, true);
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan[0].dst, root.join("file.txt"));
+        assert!(plan[0].self_paste, "same dir means dst == src");
+        assert_eq!(plan[0].size, 5);
+        assert!(plan[1].is_dir);
+        assert_eq!(plan[1].size, 3);
+        // exists.txt already exists in the target dir, so it is flagged.
+        assert!(plan[2].collides);
+
+        // Remote target: no local collision check, no sizes measured.
+        let plan = plan_paste(&items, &root, false, false);
+        assert!(plan.iter().all(|item| !item.collides));
+        assert!(plan.iter().all(|item| item.size == 0));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failure_summary_counts_and_single_item_form() {
+        assert_eq!(failure_summary(0, 3, "boom"), None);
+        assert_eq!(
+            failure_summary(1, 1, "boom"),
+            Some("Failed: boom".to_string())
+        );
+        assert_eq!(
+            failure_summary(2, 5, "boom"),
+            Some("2 of 5 failed: boom".to_string())
+        );
+    }
+
+    #[test]
+    fn delete_confirmation_names_count_and_bounded_names() {
+        let (title, body) = delete_confirmation_text(&[test_entry("/p/solo.txt", false)]);
+        assert_eq!(title, "Delete this item?");
+        assert!(body.contains("/p/solo.txt"), "{body}");
+
+        let (_title, body) = delete_confirmation_text(&[test_entry("/p/dir", true)]);
+        assert!(body.contains("everything inside"), "{body}");
+
+        let entries: Vec<FileEntry> = (0..7)
+            .map(|index| test_entry(&format!("/p/item-{index}"), false))
+            .collect();
+        let (title, body) = delete_confirmation_text(&entries);
+        assert_eq!(title, "Delete 7 items?");
+        for index in 0..5 {
+            assert!(body.contains(&format!("item-{index}")), "{body}");
+        }
+        assert!(!body.contains("item-5"), "{body}");
+        assert!(body.contains("…and 2 more"), "{body}");
+
+        // Exactly five: no remainder line.
+        let entries: Vec<FileEntry> = (0..5)
+            .map(|index| test_entry(&format!("/p/item-{index}"), false))
+            .collect();
+        let (_, body) = delete_confirmation_text(&entries);
+        assert!(!body.contains("…and"), "{body}");
     }
 }

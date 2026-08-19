@@ -88,15 +88,23 @@ impl FsLocation {
     }
 }
 
-/// A sidebar cut/copy payload. Same-location paste is a rename/copy; a
-/// location mismatch turns the paste into a streaming transfer (download,
-/// upload, or a temp-relayed remote-to-remote hop).
+/// A sidebar cut/copy payload: one or more items from a (multi-)selection.
+/// Same-location paste is a rename/copy per item; a location mismatch turns
+/// the paste into streaming transfers (download, upload, or temp-relayed
+/// remote-to-remote hops). A cut deletes only the sources whose transfer
+/// actually succeeded.
 #[derive(Clone, Debug)]
 pub(crate) struct FsClipboard {
     pub(crate) loc: FsLocation,
+    pub(crate) items: Vec<FsClipboardItem>,
+    pub(crate) cut: bool,
+}
+
+/// One clipboard entry: the source path and whether it is a directory.
+#[derive(Clone, Debug)]
+pub(crate) struct FsClipboardItem {
     pub(crate) path: PathBuf,
     pub(crate) is_dir: bool,
-    pub(crate) cut: bool,
 }
 
 /// One directory entry, pre-display-sanitization. `name` is lossy-decoded for
@@ -1317,8 +1325,8 @@ const MAX_DROP_WALK_DEPTH: usize = 64;
 
 /// Sum regular-file bytes under `path`, never following symlinks, bounded in
 /// depth. Unreadable entries count as zero — the transfer itself reports the
-/// real error later; this walk only enforces the drop cap.
-fn drop_entry_size(path: &Path, depth: usize) -> u64 {
+/// real error later; this walk only enforces caps and totals up-front.
+pub(crate) fn drop_entry_size(path: &Path, depth: usize) -> u64 {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return 0;
     };

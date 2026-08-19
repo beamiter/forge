@@ -846,15 +846,43 @@ pub fn run() -> glib::ExitCode {
         file_tree_header.append(&file_tree_up_btn);
         file_tree_header.append(&file_tree_cwd_btn);
 
+        // Type-to-filter toggle; the inline entry row it opens lives between
+        // the header and the tree.
+        let file_tree_filter_toggle = gtk4::ToggleButton::new();
+        file_tree_filter_toggle.set_icon_name("system-search-symbolic");
+        file_tree_filter_toggle.set_focus_on_click(false);
+        file_tree_filter_toggle.set_focusable(true);
+        file_tree_filter_toggle.set_tooltip_text(Some("Filter the loaded tree by name"));
+        file_tree_filter_toggle
+            .update_property(&[gtk4::accessible::Property::Label("Filter files")]);
+        file_tree_filter_toggle.add_css_class("flat");
+        file_tree_header.append(&file_tree_filter_toggle);
+
         // Location selector (Local + configured ssh/docker hosts), filled by
         // UiState::refresh_file_tree_location_selector once UiState exists.
         let file_tree_location_selector = ui::build_file_tree_location_selector();
         file_tree_header.append(&file_tree_location_selector);
 
+        // Inline type-to-filter row, hidden until toggled; Esc closes it.
+        let file_tree_filter_entry = gtk4::Entry::new();
+        file_tree_filter_entry.set_placeholder_text(Some("Filter loaded names…"));
+        file_tree_filter_entry.set_hexpand(true);
+        file_tree_filter_entry.update_property(&[gtk4::accessible::Property::Label(
+            "Filter loaded files by name",
+        )]);
+        let file_tree_filter_bar = gtk4::Box::new(Orientation::Horizontal, 4);
+        file_tree_filter_bar.add_css_class("file-tree-filter");
+        file_tree_filter_bar.set_margin_start(6);
+        file_tree_filter_bar.set_margin_end(6);
+        file_tree_filter_bar.set_margin_bottom(2);
+        file_tree_filter_bar.append(&file_tree_filter_entry);
+        file_tree_filter_bar.set_visible(false);
+
         let file_tree_box = gtk4::Box::new(Orientation::Vertical, 0);
         file_tree_box.add_css_class("file-tree-box");
         file_tree_box.set_vexpand(true);
         file_tree_box.append(&file_tree_header);
+        file_tree_box.append(&file_tree_filter_bar);
         file_tree_box.append(&file_tree_scroll);
 
         // Segmented switcher at the top of the sidebar: Tabs | Files.
@@ -1013,6 +1041,9 @@ pub fn run() -> glib::ExitCode {
             file_tree_location: file_tree_location.clone(),
             file_tree_location_selector: file_tree_location_selector.clone(),
             file_tree_clipboard: Rc::new(RefCell::new(None)),
+            file_tree_filter_bar: file_tree_filter_bar.clone(),
+            file_tree_filter_entry: file_tree_filter_entry.clone(),
+            file_tree_filter_toggle: file_tree_filter_toggle.clone(),
             tab_search_entry: tab_search_entry.clone(),
             selected_tabs: Rc::new(RefCell::new(Vec::new())),
             tab_drag_state: Rc::new(RefCell::new(Default::default())),
@@ -1183,6 +1214,13 @@ pub fn run() -> glib::ExitCode {
         // Wire the file-tree location selector and fill it for the first time.
         ui.connect_file_tree_location_selector();
         ui.refresh_file_tree_location_selector();
+
+        // Wire the type-to-filter row and its header toggle.
+        ui.connect_file_tree_filter_bar();
+        let ui_for_filter_toggle = ui.clone();
+        file_tree_filter_toggle.connect_clicked(move |_| {
+            ui_for_filter_toggle.toggle_file_tree_filter();
+        });
 
         // Wire sidebar Tabs/Files segmented switcher
         let ui_for_tabs_view = ui.clone();
