@@ -208,6 +208,25 @@ All notable user-visible and operational changes are recorded here.
 
 ### Fixed
 
+- Block 模式下"每输入一条命令，整个 block 先占满全屏、一闪而过再恢复"的闪屏已修复。
+  live cell 的高度此前由**状态**决定而不是由内容决定：`CommandStart` 一到就从 ~6 行的
+  prompt 直接跳到整个视口，并一直保持到下一个 prompt —— follow-bottom 把所有已完成块顶
+  出屏幕，而最终替换它的卡片只有输出那么高，于是每条命令周围都套着一次"整页空白出现再
+  塌陷"的闪烁，哪怕这条命令只打印一行。现在 live 卡片跟着**已经产生的输出**长高
+  （`max(MIN_INPUT_ROWS, 已写入行数)`，以视口封顶），也就是 ember / frost 一直在用的规则：
+  历史留在屏幕上，输出流进来时一行一行地向上平移。
+
+  底下的终端没有变：运行中的命令仍然通过 `vte.set_size` 拿到整个视口的网格——那正是
+  `pty_grid_size` 告诉子进程的 winsize，也是任何按绝对行号重绘的程序（`top`、`watch`、
+  裸 `clear`）需要的行数。变短的只有**卡片**，靠一层 clip 实现：`gtk4::Fixed` 放在一个
+  不参与测量、`Overflow::Hidden` 的 overlay 里，终端拿到自己请求的完整高度，而卡片只测量
+  一个占位 Box。GTK 是从分配尺寸推导 VTE 网格的，所以别的控件都做不到这件事——
+  ScrolledWindow/Viewport 和普通的非 FILL overlay 子控件实测都会把网格压到可见高度。
+
+  行数从 live 终端本身读出（屏幕顶端到光标），并按命令锁存一个高水位，因此 `\r` 进度条
+  或 `ESC[1A` 重绘不会让卡片缩到已经显示的输出之下。命令若清掉了 scrollback（`ESC[3J`），
+  VTE 的 adjustment 与光标会落在两套坐标里，这种情况会被识别出来并退回原来的整页卡片，
+  而不是冒着藏住输出的风险。`preserve_live_scrollback = true` 时同样退回整页。
 - Block 模式下概率性出现的“输入时什么都不显示、按下回车后整行命令才一次性出现并正常执行”已修复。
   `OSC 133;B` 之后 forge 会短暂拦下 PTY 字节（feed fence），让 prompt 光标锚点先稳定下来再回放，
   这个拦截的唯一所有者是锚点稳定回调。此前该回调在**放弃**稳定时（用户已经在编辑、有待提交输入、

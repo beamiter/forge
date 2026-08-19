@@ -51,6 +51,14 @@ read -r value; printf 'value=%s\n' "$value"
 
 - 命令运行中，Enter 必须透传给进程，不能回填旧块。
 - 运行中清空旧块不能向进程注入 form-feed，命令最终仍输出 `done`。
+- 运行 `sleep 3; ls`：运行期间 live 卡片保持提示符高度（约 6 行），上方完成块始终可见，
+  不允许"整块占满全屏、结束后再恢复排列"的闪屏；状态栏的网格行数仍是整个视口
+  （卡片被裁剪，终端网格没有变小）。
+- 运行 `for i in 1 2 3 4 5 6 7 8; do echo line-$i; sleep 0.4; done`：卡片每来一行长高一行，
+  历史平滑上移。
+- 运行 `clear; tput cup 18 4; echo DEEP; tput cup 2 0; echo TOP; sleep 3`：两行都落在各自的
+  绝对行号上（清屏后 live 卡片退回整页高度，属预期的安全回退）。
+- 提示符空闲、没有任何输出时改变 pane 宽度（开关侧边栏或分屏），状态栏列数必须跟着变。
 - 在 `vim`、`less`、`top` 等 alt-screen 程序中，Block-only 快捷键不能操作隐藏块。
 - 退出 alt-screen 后，选择、过滤、书签、复制和回填继续正常。
 
