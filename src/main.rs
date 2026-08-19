@@ -549,6 +549,7 @@ pub fn run() -> glib::ExitCode {
             ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; border-bottom: 1px solid alpha(currentColor, 0.1); margin-bottom: 2px; }
              .tab-strip-btn:checked { font-weight: bold; border-radius: 4px; background-color: alpha(currentColor, 0.14); outline: 2px solid alpha(currentColor, 0.8); outline-offset: -2px; }
              .tab-strip-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0; }
+             .file-tree-drop-hover { background-color: alpha(currentColor, 0.16); border-radius: 4px; outline: 1px dashed alpha(currentColor, 0.45); outline-offset: -1px; }
              .tab-resize-handle { min-width: 8px; margin-left: 2px; border-left: 1px solid alpha(currentColor, 0.24); }
              .tab-resize-handle:hover { border-left-color: currentColor; }
              .sidebar-box { min-width: 140px; padding: 2px 4px; }

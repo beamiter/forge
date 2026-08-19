@@ -9,9 +9,12 @@
 //! on both. Paste across locations streams between the two filesystems
 //! (download, upload, or a temp-relayed remote-to-remote hop) with throttled
 //! progress in a persistent toast and a Cancel action that kills the
-//! in-flight child and cleans up partial results. After a mutation only
-//! the affected parent directories are re-listed, in place with a minimal
-//! diff, so expansion state elsewhere in the tree survives.
+//! in-flight child and cleans up partial results. Dragging local files or
+//! folders from the OS file manager onto the tree imports them the same way
+//! (recursive copy locally, streaming upload remotely), planned up-front and
+//! refused wholesale when the drop exceeds the item/byte caps. After a
+//! mutation only the affected parent directories are re-listed, in place
+//! with a minimal diff, so expansion state elsewhere in the tree survives.
 
 use adw::prelude::*;
 use gtk4::prelude::*;
@@ -760,6 +763,240 @@ impl UiState {
             ui.show_file_tree_context_menu(&file_tree_for_menu, x, y, target);
         });
         file_tree.add_controller(right_click);
+
+        // Drag-and-drop import from the OS file manager. Only local files are
+        // accepted (Gdk::FileList is exactly the local-file format); the drop
+        // lands in the row's directory, or the tree root over empty space.
+        let drop_target = gtk4::DropTarget::new(
+            gtk4::gdk::FileList::static_type(),
+            gtk4::gdk::DragAction::COPY,
+        );
+        let drop_hover: Rc<RefCell<Option<gtk4::Widget>>> = Rc::new(RefCell::new(None));
+        {
+            let hover = drop_hover.clone();
+            let tree = file_tree.clone();
+            drop_target.connect_enter(move |_, x, y| {
+                set_drop_hover(&hover, file_tree_row_widget_at(&tree, x, y));
+                gtk4::gdk::DragAction::COPY
+            });
+        }
+        {
+            let hover = drop_hover.clone();
+            let tree = file_tree.clone();
+            drop_target.connect_motion(move |_, x, y| {
+                set_drop_hover(&hover, file_tree_row_widget_at(&tree, x, y));
+                gtk4::gdk::DragAction::COPY
+            });
+        }
+        {
+            let hover = drop_hover.clone();
+            drop_target.connect_leave(move |_| {
+                set_drop_hover(&hover, None);
+            });
+        }
+        {
+            let ui = self.clone();
+            let tree = file_tree.clone();
+            drop_target.connect_drop(move |_, value, x, y| {
+                set_drop_hover(&drop_hover, None);
+                let Ok(file_list) = value.get::<gtk4::gdk::FileList>() else {
+                    return false;
+                };
+                let paths: Vec<PathBuf> = file_list
+                    .files()
+                    .iter()
+                    .filter_map(|file| file.path())
+                    .collect();
+                if paths.is_empty() {
+                    return false;
+                }
+                let target_dir = match file_tree_row_at(&tree, x, y) {
+                    Some((_, entry)) if entry.is_dir => entry.path,
+                    Some((_, entry)) => entry
+                        .path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| ui.file_tree_root.borrow().clone()),
+                    None => ui.file_tree_root.borrow().clone(),
+                };
+                ui.import_dropped_paths(paths, target_dir);
+                true
+            });
+        }
+        file_tree.add_controller(drop_target);
+    }
+
+    /// Import OS-dragged local paths into `target_dir`: plan first (refusing
+    /// oversized or malformed drops wholesale), then run the per-item copies
+    /// or uploads on one op worker with the transfer progress/cancel wiring,
+    /// exactly like a cross-location paste.
+    fn import_dropped_paths(&self, paths: Vec<PathBuf>, target_dir: PathBuf) {
+        let location = self.file_tree_location.borrow().clone();
+        let hosts = self.config.borrow().remote_hosts.clone();
+        let (items, action, total_bytes) =
+            match remote_fs::plan_drop(&paths, &location, &target_dir) {
+                remote_fs::DropPlan::Refuse(reason) => {
+                    self.toast_overlay.add_toast(adw::Toast::new(&reason));
+                    return;
+                }
+                remote_fs::DropPlan::Import {
+                    items,
+                    action,
+                    total_bytes,
+                } => (items, action, total_bytes),
+            };
+        let count = items.len();
+        let (verb, verb_ing): (&'static str, &'static str) = match action {
+            remote_fs::DropAction::Copy => ("Copy", "Copying"),
+            remote_fs::DropAction::Upload => ("Upload", "Uploading"),
+        };
+        let target_desc = match &location {
+            FsLocation::Local => display_path(&target_dir),
+            FsLocation::Remote(_) => location.label(&hosts),
+        };
+        let title = format!("{verb_ing} {count} items to {target_desc}…");
+
+        let (progress_tx, progress_rx) = mpsc::channel::<u64>();
+        let token = remote_fs::CancelToken::default();
+        // Upload progress reports carry a cumulative byte count across items;
+        // uploads know the drop-wide total up-front, copies report nothing.
+        let total = match action {
+            remote_fs::DropAction::Upload => Some(total_bytes),
+            remote_fs::DropAction::Copy => None,
+        };
+
+        let busy = adw::Toast::new(&title);
+        busy.set_timeout(0);
+        busy.set_button_label(Some("Cancel"));
+        {
+            let token = token.clone();
+            let busy_for_cancel = busy.clone();
+            busy.connect_button_clicked(move |_| {
+                token.cancel();
+                busy_for_cancel.dismiss();
+            });
+        }
+        let poll_done = Rc::new(Cell::new(false));
+        {
+            let poll_done = poll_done.clone();
+            busy.connect_dismissed(move |_| poll_done.set(true));
+        }
+        {
+            let busy_for_poll = busy.clone();
+            let title_for_poll = title.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+                if poll_done.get() {
+                    return glib::ControlFlow::Break;
+                }
+                let mut latest = None;
+                while let Ok(bytes) = progress_rx.try_recv() {
+                    latest = Some(bytes);
+                }
+                if let Some(bytes) = latest {
+                    let progress_text = match total {
+                        Some(total) => format!(
+                            "{} / {}",
+                            remote_fs::human_bytes(bytes),
+                            remote_fs::human_bytes(total)
+                        ),
+                        None => remote_fs::human_bytes(bytes),
+                    };
+                    busy_for_poll.set_title(&format!("{title_for_poll} {progress_text}"));
+                }
+                glib::ControlFlow::Continue
+            });
+        }
+        self.toast_overlay.add_toast(busy.clone());
+
+        let failures: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let failures_for_work = failures.clone();
+        let token_for_work = token.clone();
+        let to = location.clone();
+        let affected = vec![target_dir];
+        let ui = self.clone();
+        self.execute_fs_op(
+            verb,
+            Some(busy),
+            affected,
+            move || {
+                let mut completed_bytes = 0_u64;
+                for item in &items {
+                    if token_for_work.is_cancelled() {
+                        return Err(remote_fs::cancelled_error());
+                    }
+                    let name = jterm_core::review_input::safe_inline_display(
+                        &item
+                            .src
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        256,
+                    );
+                    if item.collides {
+                        failures_for_work
+                            .lock()
+                            .unwrap()
+                            .push(format!("{name}: already exists"));
+                        completed_bytes += item.size;
+                        continue;
+                    }
+                    // Cumulative progress across items: each transfer reports
+                    // its own bytes; the sink shifts them by the bytes of the
+                    // items that already finished.
+                    let base = completed_bytes;
+                    let progress_tx = progress_tx.clone();
+                    let item_control = remote_fs::TransferControl {
+                        token: token_for_work.clone(),
+                        progress: Some(std::sync::Arc::new(std::sync::Mutex::new(
+                            move |bytes: u64| {
+                                let _ = progress_tx.send(base + bytes);
+                            },
+                        ))),
+                    };
+                    let result = match action {
+                        remote_fs::DropAction::Copy => {
+                            remote_fs::copy(&FsLocation::Local, &[], &item.src, &item.dst)
+                        }
+                        remote_fs::DropAction::Upload => remote_fs::transfer(
+                            &FsLocation::Local,
+                            &hosts,
+                            &item.src,
+                            &to,
+                            &item.dst,
+                            item.is_dir,
+                            &item_control,
+                        ),
+                    };
+                    if let Err(error) = result {
+                        if error.kind() == io::ErrorKind::Interrupted {
+                            return Err(error);
+                        }
+                        let detail =
+                            jterm_core::review_input::safe_inline_display(&error.to_string(), 256);
+                        failures_for_work
+                            .lock()
+                            .unwrap()
+                            .push(format!("{name}: {detail}"));
+                    }
+                    completed_bytes += item.size;
+                }
+                Ok(())
+            },
+            move || {
+                let failures = failures.lock().unwrap();
+                if failures.is_empty() {
+                    return;
+                }
+                let first = jterm_core::review_input::safe_inline_display(&failures[0], 256);
+                let text = if failures.len() == 1 {
+                    format!("1 item failed: {first}")
+                } else {
+                    format!("{} items failed: {first}", failures.len())
+                };
+                ui.toast_overlay.add_toast(adw::Toast::new(&text));
+            },
+        );
     }
 
     /// Right-click file-operations menu for `target`. New File/Folder, Paste
@@ -1358,14 +1595,18 @@ impl UiState {
             match result {
                 Ok(()) => {
                     on_success();
-                    for dir in affected {
-                        ui.refresh_dir_listing(&dir);
+                    for dir in &affected {
+                        ui.refresh_dir_listing(dir);
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                     // A deliberate cancel is not a failure: neutral note, no
-                    // warning in the log.
+                    // warning in the log. Work completed before the cancel
+                    // still becomes visible, so refresh like a success would.
                     log::info!("sidebar {verb} cancelled");
+                    for dir in &affected {
+                        ui.refresh_dir_listing(dir);
+                    }
                     ui.toast_overlay.add_toast(adw::Toast::new("Cancelled"));
                 }
                 Err(error) => {
@@ -1411,6 +1652,38 @@ fn file_tree_row_at(file_tree: &ListView, x: f64, y: f64) -> Option<(TreeListRow
             return Some((row, entry));
         }
         widget = widget.parent()?;
+    }
+}
+
+/// The visible row widget under a pointer position (for drop hover
+/// highlight), resolved the same way as `file_tree_row_at`.
+fn file_tree_row_widget_at(file_tree: &ListView, x: f64, y: f64) -> Option<gtk4::Widget> {
+    let root: gtk4::Widget = file_tree.clone().upcast();
+    let mut widget = file_tree.pick(x, y, gtk4::PickFlags::DEFAULT)?;
+    loop {
+        if widget == root {
+            return None;
+        }
+        if let Ok(expander) = widget.clone().downcast::<gtk4::TreeExpander>() {
+            return Some(expander.child().unwrap_or_else(|| expander.upcast()));
+        }
+        widget = widget.parent()?;
+    }
+}
+
+/// Move the drop hover highlight to `widget` (or nowhere). Only one row ever
+/// carries the class.
+fn set_drop_hover(hover: &Rc<RefCell<Option<gtk4::Widget>>>, widget: Option<gtk4::Widget>) {
+    let mut hover = hover.borrow_mut();
+    if *hover == widget {
+        return;
+    }
+    if let Some(old) = hover.take() {
+        old.remove_css_class("file-tree-drop-hover");
+    }
+    if let Some(new) = widget {
+        new.add_css_class("file-tree-drop-hover");
+        *hover = Some(new);
     }
 }
 
