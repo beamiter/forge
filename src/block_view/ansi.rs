@@ -232,6 +232,17 @@ fn bounded_utf8_prefix(input: &str, max_bytes: usize) -> &str {
     &input[..end]
 }
 
+/// The exact prefix the replay layer would return for byte-identical plain
+/// text. Consumers that only need to inspect that result can borrow it instead
+/// of allocating the replay output. `None` means terminal controls require the
+/// full cursor/erase model.
+pub(crate) fn plain_ansi_replay_prefix(input: &str) -> Option<&str> {
+    if memchr::memchr3(0x1b, b'\r', b'\x08', input.as_bytes()).is_some() {
+        return None;
+    }
+    Some(bounded_utf8_prefix(input, MAX_REPLAY_OUTPUT_BYTES))
+}
+
 /// Reconstruct the on-screen text a stream of bytes would leave behind, applying
 /// a full two-dimensional cursor model (home/absolute positioning, vertical
 /// moves, and screen clears) in addition to the horizontal CR/erase semantics.
@@ -455,9 +466,7 @@ pub(crate) fn strip_ansi_reporting_loss(input: &str) -> (String, bool) {
 }
 
 fn strip_ansi_replay(input: &str) -> (String, bool, bool) {
-    let bytes = input.as_bytes();
-    if memchr::memchr3(0x1b, b'\r', b'\x08', bytes).is_none() {
-        let prefix = bounded_utf8_prefix(input, MAX_REPLAY_OUTPUT_BYTES);
+    if let Some(prefix) = plain_ansi_replay_prefix(input) {
         return (prefix.to_owned(), false, prefix.len() < input.len());
     }
 

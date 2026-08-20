@@ -322,30 +322,38 @@ fn normalize_loaded_block_ids(blocks: &mut VecDeque<BlockData>, counter: &Atomic
 /// Approximate each failed command's vertical position on the complete history
 /// track. Keep only the newest marks so an unusually long retained session
 /// cannot turn one tiny Cairo overlay into unbounded draw work.
-fn failed_block_marker_fractions(blocks: &VecDeque<BlockData>) -> Vec<f64> {
+fn failure_marker_fractions_from(records: impl IntoIterator<Item = (u64, bool)>) -> Vec<f64> {
     const MAX_FAILURE_MARKERS: usize = 1_024;
 
-    let total_height = blocks.iter().fold(0_u64, |total, block| {
-        total.saturating_add(block.estimated_height.max(1) as u64)
-    });
+    let mut total_height = 0_u64;
+    let mut marker_tops = VecDeque::new();
+    for (height, failed) in records {
+        if failed {
+            if marker_tops.len() == MAX_FAILURE_MARKERS {
+                marker_tops.pop_front();
+            }
+            marker_tops.push_back(total_height);
+        }
+        total_height = total_height.saturating_add(height.max(1));
+    }
     if total_height == 0 {
         return Vec::new();
     }
 
-    let mut top = 0_u64;
-    let mut markers = VecDeque::new();
-    for block in blocks {
-        if jterm_core::block_contract::classify_completed(Some(&block.cmd), block.exit_code)
-            .is_failed()
-        {
-            if markers.len() == MAX_FAILURE_MARKERS {
-                markers.pop_front();
-            }
-            markers.push_back((top as f64 / total_height as f64).clamp(0.0, 1.0));
-        }
-        top = top.saturating_add(block.estimated_height.max(1) as u64);
-    }
-    markers.into()
+    marker_tops
+        .into_iter()
+        .map(|top| (top as f64 / total_height as f64).clamp(0.0, 1.0))
+        .collect()
+}
+
+fn failed_block_marker_fractions(blocks: &VecDeque<BlockData>) -> Vec<f64> {
+    failure_marker_fractions_from(blocks.iter().map(|block| {
+        (
+            block.estimated_height.max(1) as u64,
+            jterm_core::block_contract::classify_completed(Some(&block.cmd), block.exit_code)
+                .is_failed(),
+        )
+    }))
 }
 
 type FailureMarkerRedraw = Rc<dyn Fn()>;
@@ -4019,6 +4027,25 @@ struct BackendSearchBatch {
     native_fallback: Option<BackendNativeSearchFallback>,
 }
 
+/// Intersect mounted record ids with one page of search candidates. Iterating
+/// the document, rather than looking up every hit independently, keeps this
+/// path linear even when many different blocks match.
+fn mounted_jumpable_records(
+    mounted_ids: impl IntoIterator<Item = u64>,
+    candidates: &HashSet<(u64, bool)>,
+) -> HashSet<(u64, bool)> {
+    let mut jumpable = HashSet::with_capacity(candidates.len());
+    for block_id in mounted_ids {
+        for is_output in [false, true] {
+            let candidate = (block_id, is_output);
+            if candidates.contains(&candidate) {
+                jumpable.insert(candidate);
+            }
+        }
+    }
+    jumpable
+}
+
 /// Materialize one search surface only while the caller's deadline remains
 /// live. Checking again after the closure keeps a surface that crossed the
 /// deadline usable while telling the caller not to touch the next one.
@@ -4472,11 +4499,25 @@ trait RenderBackend {
         false
     }
     /// Whether [`Self::scroll_to_record`] would find an exact location for
-    /// this record right now. Asked once per rendered search hit, so it must
-    /// answer from the same proof and move nothing: no scroll, no focus, no
-    /// selection.
+    /// this record right now. It must answer from the same proof and move
+    /// nothing: no scroll, no focus, no selection. Backends whose proof is not
+    /// indexed should override [`Self::jumpable_records`] to batch this query.
     fn can_scroll_to_record(&self, _block_id: u64) -> bool {
         false
+    }
+    /// Resolve every currently reachable cross-block-search target in one
+    /// pass. The default preserves the per-target proof used by backends with
+    /// indexed lookup; widget-backed implementations should override this to
+    /// avoid rescanning their mounted document once for every rendered hit.
+    fn jumpable_records(&self, candidates: &HashSet<(u64, bool)>) -> HashSet<(u64, bool)> {
+        candidates
+            .iter()
+            .copied()
+            .filter(|(block_id, is_output)| {
+                self.record_search_target(*block_id, *is_output).is_some()
+                    || self.can_scroll_to_record(*block_id)
+            })
+            .collect()
     }
     /// Snapshot completed text into native search-cursor domains. The byte
     /// argument is a hard aggregate ceiling; implementations report a partial
@@ -6284,6 +6325,11 @@ impl RenderBackend for BlockBackend {
             .any(|block| block.id == block_id)
     }
 
+    fn jumpable_records(&self, candidates: &HashSet<(u64, bool)>) -> HashSet<(u64, bool)> {
+        let finished = self.finished_blocks_for_cb.borrow();
+        mounted_jumpable_records(finished.iter().map(|block| block.id), candidates)
+    }
+
     fn completed_search_surfaces(
         &self,
         max_bytes: usize,
@@ -6338,8 +6384,12 @@ impl RenderBackend for BlockBackend {
                 };
             }
             if remaining == 0 {
-                let has_more =
-                    !block.displayed_output.borrow().is_empty() || block_index + 1 < finished.len();
+                let has_output = {
+                    let full_output = block.full_output.borrow();
+                    let display_override = block.displayed_output.borrow();
+                    !resolved_finished_output(full_output.as_str(), &display_override).is_empty()
+                };
+                let has_more = has_output || block_index + 1 < finished.len();
                 surfaces
                     .last_mut()
                     .expect("the command surface was just appended")
@@ -6358,8 +6408,10 @@ impl RenderBackend for BlockBackend {
             // old aggregate budget without allocating a full cached plain copy.
             let mut output_incomplete = false;
             if !push_search_surface_before_deadline(&mut surfaces, deadline_exhausted, || {
-                let raw_output = block.displayed_output.borrow();
-                let raw_prefix = utf8_prefix_bounded(&raw_output, remaining);
+                let full_output = block.full_output.borrow();
+                let display_override = block.displayed_output.borrow();
+                let raw_output = resolved_finished_output(full_output.as_str(), &display_override);
+                let raw_prefix = utf8_prefix_bounded(raw_output, remaining);
                 output_incomplete = raw_prefix.len() < raw_output.len();
                 remaining = remaining.saturating_sub(raw_prefix.len());
                 BackendSearchSurface {
@@ -8011,19 +8063,61 @@ fn compute_viewport_state(
     }
 }
 
-/// Convert GTK's scroll geometry into a usable block viewport.
-///
-/// Notebook pages temporarily report a zero-sized adjustment while they are
-/// unmapped during tab switches. Treating that transient geometry as a real
-/// viewport can produce `first_visible > last_visible` at an exact block
-/// boundary, virtualizing every card and leaving only empty placeholders. Keep
-/// the last valid visibility set until the page is mapped and allocated again.
-fn viewport_state_for_scroll(
+/// Resolve the strict virtualization window and its looser hysteresis window
+/// while walking history once. Both ranges share the same document geometry;
+/// scanning them independently doubles the prefix work on every scroll tick.
+fn compute_viewport_state_pair(
     block_data: &VecDeque<BlockData>,
+    strict_top: i32,
+    strict_bottom: i32,
+    loose_top: i32,
+    loose_bottom: i32,
+) -> (ViewportState, ViewportState) {
+    let mut y = 0_i32;
+    let mut strict_first = None;
+    let mut strict_last = 0;
+    let mut loose_first = None;
+    let mut loose_last = 0;
+
+    for (i, block) in block_data.iter().enumerate() {
+        let block_top = y;
+        let block_bottom = y.saturating_add(block.estimated_height.max(1));
+        if strict_first.is_none() && block_bottom > strict_top {
+            strict_first = Some(i);
+        }
+        if block_top < strict_bottom {
+            strict_last = i;
+        }
+        if loose_first.is_none() && block_bottom > loose_top {
+            loose_first = Some(i);
+        }
+        if block_top < loose_bottom {
+            loose_last = i;
+        }
+        y = block_bottom;
+
+        if strict_first.is_some() && loose_first.is_some() && y >= strict_bottom.max(loose_bottom) {
+            break;
+        }
+    }
+
+    (
+        ViewportState {
+            first_visible: strict_first.unwrap_or(0),
+            last_visible: strict_last,
+        },
+        ViewportState {
+            first_visible: loose_first.unwrap_or(0),
+            last_visible: loose_last,
+        },
+    )
+}
+
+fn viewport_bounds_for_scroll(
     scroll_top: f64,
     viewport_height: f64,
     margin_pages: u32,
-) -> Option<ViewportState> {
+) -> Option<(i32, i32)> {
     if !scroll_top.is_finite() || !viewport_height.is_finite() || viewport_height < 1.0 {
         return None;
     }
@@ -8039,14 +8133,48 @@ fn viewport_state_for_scroll(
     let visible_bottom = scroll_top
         .saturating_add(viewport_height)
         .saturating_add(margin);
-    if visible_bottom <= visible_top {
-        return None;
-    }
+    (visible_bottom > visible_top).then_some((visible_top, visible_bottom))
+}
 
+/// Convert GTK's scroll geometry into a usable block viewport.
+///
+/// Notebook pages temporarily report a zero-sized adjustment while they are
+/// unmapped during tab switches. Treating that transient geometry as a real
+/// viewport can produce `first_visible > last_visible` at an exact block
+/// boundary, virtualizing every card and leaving only empty placeholders. Keep
+/// the last valid visibility set until the page is mapped and allocated again.
+fn viewport_state_for_scroll(
+    block_data: &VecDeque<BlockData>,
+    scroll_top: f64,
+    viewport_height: f64,
+    margin_pages: u32,
+) -> Option<ViewportState> {
+    let (visible_top, visible_bottom) =
+        viewport_bounds_for_scroll(scroll_top, viewport_height, margin_pages)?;
     Some(compute_viewport_state(
         block_data,
         visible_top,
         visible_bottom,
+    ))
+}
+
+fn viewport_state_pair_for_scroll(
+    block_data: &VecDeque<BlockData>,
+    scroll_top: f64,
+    viewport_height: f64,
+    strict_margin_pages: u32,
+    loose_margin_pages: u32,
+) -> Option<(ViewportState, ViewportState)> {
+    let (strict_top, strict_bottom) =
+        viewport_bounds_for_scroll(scroll_top, viewport_height, strict_margin_pages)?;
+    let (loose_top, loose_bottom) =
+        viewport_bounds_for_scroll(scroll_top, viewport_height, loose_margin_pages)?;
+    Some(compute_viewport_state_pair(
+        block_data,
+        strict_top,
+        strict_bottom,
+        loose_top,
+        loose_bottom,
     ))
 }
 
@@ -10738,27 +10866,22 @@ impl TermView {
                     let adj = scroll.vadjustment();
                     let margin = config.borrow().virtual_scroll_margin;
                     let block_data_ref = block_data.borrow();
-                    let Some(next_viewport) = viewport_state_for_scroll(
+                    // Resolve the strict and hysteresis windows in one walk of
+                    // the history prefix; both use the same GTK geometry.
+                    let Some((next_viewport, loose_viewport)) = viewport_state_pair_for_scroll(
                         &block_data_ref,
                         adj.value(),
                         adj.page_size(),
                         margin,
+                        margin.saturating_add(1),
                     ) else {
                         return;
                     };
-                    // One extra margin page of hysteresis: see
-                    // `stable_visible_indices`.
-                    let loose_viewport = viewport_state_for_scroll(
-                        &block_data_ref,
-                        adj.value(),
-                        adj.page_size(),
-                        margin.saturating_add(1),
-                    );
                     drop(block_data_ref);
 
                     let new_visible = stable_visible_indices(
                         &next_viewport,
-                        loose_viewport.as_ref(),
+                        Some(&loose_viewport),
                         &visible.borrow(),
                     );
                     *vp.borrow_mut() = next_viewport;
@@ -12323,23 +12446,24 @@ mod tests {
         collapse_repaint_output, command_capture_range_is_bounded, command_id_uses_shell_token,
         compute_viewport_state, decide_agent_command_end, emit_activity,
         emit_alt_screen_transition, emit_command_finished, emit_command_started,
-        failed_block_marker_fractions, format_color_query_reply, history_edge_navigation_available,
-        input_is_typeahead_for_existing_submission, input_may_survive_into_next_prompt,
-        input_submits_line, live_content_extent_for, live_visible_rows,
-        mutate_block_data_and_redraw, next_prompt_shadow_state, normalize_captured_command,
-        normalize_loaded_block_ids, notification_allowed, output_has_vertical_repaint,
-        parse_color_spec, post_prompt_feed, preflight_clipboard_paste, prepend_in_order,
-        prompt_anchor_for_surface, prompt_anchor_may_settle, prompt_layout_reflow_can_reanchor,
-        prompt_surface_is_clean, rebase_prompt_anchor, record_external_input,
-        record_protocol_reply_input, replace_nonempty_stash, resolve_command_for_block,
-        resolve_submitted_command, reviewed_pre_command_bytes_are_identity_neutral,
-        reviewed_submission_matches, screen_relative_cpr_row, scroll_delta_to_reveal,
-        selected_blocks_markdown, selected_command_text, selected_id_range,
-        shell_argv_supports_agent_ids, shell_argv_uses_jsh, should_buffer_background_output,
-        stable_visible_indices, step_marked_indices, step_marked_record_ids, strip_ansi,
-        strip_ansi_with_clear_detect, take_background_output, take_stash_for_undo,
-        truncate_plain_output_for_height, verified_editor_contains_exact_command,
-        viewport_page_size_changed, viewport_state_for_scroll, visible_indices_for_viewport,
+        failed_block_marker_fractions, failure_marker_fractions_from, format_color_query_reply,
+        history_edge_navigation_available, input_is_typeahead_for_existing_submission,
+        input_may_survive_into_next_prompt, input_submits_line, live_content_extent_for,
+        live_visible_rows, mounted_jumpable_records, mutate_block_data_and_redraw,
+        next_prompt_shadow_state, normalize_captured_command, normalize_loaded_block_ids,
+        notification_allowed, output_has_vertical_repaint, parse_color_spec, post_prompt_feed,
+        preflight_clipboard_paste, prepend_in_order, prompt_anchor_for_surface,
+        prompt_anchor_may_settle, prompt_layout_reflow_can_reanchor, prompt_surface_is_clean,
+        rebase_prompt_anchor, record_external_input, record_protocol_reply_input,
+        replace_nonempty_stash, resolve_command_for_block, resolve_submitted_command,
+        reviewed_pre_command_bytes_are_identity_neutral, reviewed_submission_matches,
+        screen_relative_cpr_row, scroll_delta_to_reveal, selected_blocks_markdown,
+        selected_command_text, selected_id_range, shell_argv_supports_agent_ids,
+        shell_argv_uses_jsh, should_buffer_background_output, stable_visible_indices,
+        step_marked_indices, step_marked_record_ids, strip_ansi, strip_ansi_with_clear_detect,
+        take_background_output, take_stash_for_undo, truncate_plain_output_for_height,
+        verified_editor_contains_exact_command, viewport_page_size_changed,
+        viewport_state_for_scroll, viewport_state_pair_for_scroll, visible_indices_for_viewport,
         AgentCommandEndDecision, AltScreenCallbacks, AltScreenTransition, AnchorAbandoned,
         AnchorTickExit, BlockData, BlockState, BoundedByteRing, BoundedClipboardAccumulator,
         CommandFinishedEvent, CommandIdCorrelation, CommandMeta, CommandPromptStatus,
@@ -13854,6 +13978,28 @@ mod tests {
     }
 
     #[test]
+    fn completed_search_uses_full_output_without_a_filter_override() {
+        let full = "plain\n\x1b[31merror\x1b[0m";
+        let display_override = None;
+
+        assert_eq!(
+            super::resolved_finished_output(full, &display_override),
+            full
+        );
+    }
+
+    #[test]
+    fn completed_search_uses_the_filtered_output_override() {
+        let full = "plain\nerror";
+        let display_override = Some("error".to_string());
+
+        assert_eq!(
+            super::resolved_finished_output(full, &display_override),
+            "error"
+        );
+    }
+
+    #[test]
     fn search_deadline_before_next_surface_prevents_its_materialization() {
         let materializations = Cell::new(0usize);
         let deadline = Cell::new(false);
@@ -14619,6 +14765,68 @@ mod tests {
     }
 
     #[test]
+    fn mounted_jumpability_intersects_both_surfaces_in_one_document_pass() {
+        let candidates = HashSet::from([(2, false), (2, true), (3, true), (9, false)]);
+        let visited = Cell::new(0);
+        let jumpable = mounted_jumpable_records(
+            [1, 2, 3, 4]
+                .into_iter()
+                .inspect(|_| visited.set(visited.get() + 1)),
+            &candidates,
+        );
+
+        assert_eq!(jumpable, HashSet::from([(2, false), (2, true), (3, true)]));
+        assert_eq!(
+            visited.get(),
+            4,
+            "each mounted block is visited exactly once"
+        );
+    }
+
+    /// Run with:
+    /// `cargo test --release --lib cross_block_jumpability_microbenchmark -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual microbenchmark"]
+    fn cross_block_jumpability_microbenchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const MOUNTED: u64 = 1_000;
+        const MATCHING_RECORDS: u64 = 250;
+        const REPETITIONS: usize = 250;
+
+        let mounted: Vec<u64> = (0..MOUNTED).collect();
+        let candidates: HashSet<(u64, bool)> = (MOUNTED - MATCHING_RECORDS..MOUNTED)
+            .flat_map(|id| [(id, false), (id, true)])
+            .collect();
+
+        let legacy_started = Instant::now();
+        for _ in 0..REPETITIONS {
+            let found: HashSet<_> = candidates
+                .iter()
+                .copied()
+                .filter(|(id, _)| mounted.iter().any(|mounted_id| mounted_id == id))
+                .collect();
+            black_box(found);
+        }
+        let legacy = legacy_started.elapsed();
+
+        let batched_started = Instant::now();
+        for _ in 0..REPETITIONS {
+            black_box(mounted_jumpable_records(
+                mounted.iter().copied(),
+                &candidates,
+            ));
+        }
+        let batched = batched_started.elapsed();
+
+        eprintln!(
+            "cross-block jumpability: legacy={legacy:?}, batched={batched:?}, speedup={:.1}x",
+            legacy.as_secs_f64() / batched.as_secs_f64()
+        );
+    }
+
+    #[test]
     fn failure_markers_share_status_rules_and_keep_a_bounded_tail() {
         let mut background = block_with_height(1);
         background.exit_code = Some(1);
@@ -14640,6 +14848,123 @@ mod tests {
         assert_eq!(markers.len(), 1_024);
         assert!((markers[0] - 1.0 / 1_025.0).abs() < f64::EPSILON);
         assert!((markers[1_023] - 1_024.0 / 1_025.0).abs() < f64::EPSILON);
+    }
+
+    fn legacy_failed_block_marker_fractions(blocks: &VecDeque<BlockData>) -> Vec<f64> {
+        const MAX_FAILURE_MARKERS: usize = 1_024;
+        let total_height = blocks.iter().fold(0_u64, |total, block| {
+            total.saturating_add(block.estimated_height.max(1) as u64)
+        });
+        if total_height == 0 {
+            return Vec::new();
+        }
+
+        let mut top = 0_u64;
+        let mut markers = VecDeque::new();
+        for block in blocks {
+            if jterm_core::block_contract::classify_completed(Some(&block.cmd), block.exit_code)
+                .is_failed()
+            {
+                if markers.len() == MAX_FAILURE_MARKERS {
+                    markers.pop_front();
+                }
+                markers.push_back((top as f64 / total_height as f64).clamp(0.0, 1.0));
+            }
+            top = top.saturating_add(block.estimated_height.max(1) as u64);
+        }
+        markers.into()
+    }
+
+    #[test]
+    fn single_pass_failure_markers_match_legacy_across_status_height_and_tail_edges() {
+        let mut blocks = VecDeque::new();
+        assert_eq!(
+            failed_block_marker_fractions(&blocks),
+            legacy_failed_block_marker_fractions(&blocks)
+        );
+
+        for index in 0..2_050 {
+            let mut block = block_with_height(match index % 5 {
+                0 => -10,
+                1 => 0,
+                2 => 1,
+                3 => 17,
+                _ => i32::MAX,
+            });
+            match index % 5 {
+                0 => {
+                    block.cmd = "false".into();
+                    block.exit_code = Some(1);
+                }
+                1 => {
+                    block.cmd = "true".into();
+                    block.exit_code = Some(0);
+                }
+                2 => {
+                    block.cmd = "status unknown".into();
+                    block.exit_code = None;
+                }
+                3 => {
+                    block.cmd = "sleep 1 &".into();
+                    block.exit_code = Some(1);
+                }
+                _ => {
+                    block.cmd.clear();
+                    block.exit_code = Some(1);
+                }
+            }
+            blocks.push_back(block);
+        }
+
+        assert_eq!(
+            failed_block_marker_fractions(&blocks),
+            legacy_failed_block_marker_fractions(&blocks)
+        );
+    }
+
+    #[test]
+    fn single_pass_failure_marker_accumulation_saturates_without_wrapping() {
+        assert_eq!(
+            failure_marker_fractions_from([(u64::MAX, true), (17, true)]),
+            [0.0, 1.0]
+        );
+    }
+
+    /// Run with:
+    /// `cargo test --release --lib failure_marker_single_pass_microbenchmark -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual microbenchmark"]
+    fn failure_marker_single_pass_microbenchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const BLOCKS: usize = 100_000;
+        const REPETITIONS: usize = 100;
+        let blocks: VecDeque<BlockData> = (0..BLOCKS)
+            .map(|index| {
+                let mut block = block_with_height((index % 80 + 1) as i32);
+                block.cmd = if index % 4 == 0 { "false" } else { "true" }.into();
+                block.exit_code = Some(if index % 4 == 0 { 1 } else { 0 });
+                block
+            })
+            .collect();
+
+        let legacy_started = Instant::now();
+        for _ in 0..REPETITIONS {
+            black_box(legacy_failed_block_marker_fractions(&blocks));
+        }
+        let legacy = legacy_started.elapsed();
+
+        let single_pass_started = Instant::now();
+        for _ in 0..REPETITIONS {
+            black_box(failed_block_marker_fractions(&blocks));
+        }
+        let single_pass = single_pass_started.elapsed();
+
+        eprintln!(
+            "failure markers (100k blocks): legacy={legacy:?}, single-pass={single_pass:?}, speedup={:.1}x",
+            legacy.as_secs_f64() / single_pass.as_secs_f64()
+        );
     }
 
     #[test]
@@ -14696,6 +15021,89 @@ mod tests {
 
         assert_eq!(vp.first_visible, 1);
         assert_eq!(vp.last_visible, 2);
+    }
+
+    #[test]
+    fn fused_viewport_windows_match_two_independent_scans_at_boundaries() {
+        let blocks: VecDeque<BlockData> = [1, 20, 3, 40, 5, 60, 7, 80]
+            .into_iter()
+            .map(block_with_height)
+            .collect();
+
+        for scroll_top in [-10.0, 0.0, 1.0, 20.0, 69.0, 70.0, 149.0, 1_000.0] {
+            for viewport_height in [1.0, 20.0, 55.0, 500.0] {
+                for strict_margin in [0, 1, 3, u32::MAX] {
+                    let loose_margin = strict_margin.saturating_add(1);
+                    let strict = viewport_state_for_scroll(
+                        &blocks,
+                        scroll_top,
+                        viewport_height,
+                        strict_margin,
+                    )
+                    .unwrap();
+                    let loose = viewport_state_for_scroll(
+                        &blocks,
+                        scroll_top,
+                        viewport_height,
+                        loose_margin,
+                    )
+                    .unwrap();
+                    let (fused_strict, fused_loose) = viewport_state_pair_for_scroll(
+                        &blocks,
+                        scroll_top,
+                        viewport_height,
+                        strict_margin,
+                        loose_margin,
+                    )
+                    .unwrap();
+
+                    assert_eq!(
+                        (fused_strict.first_visible, fused_strict.last_visible),
+                        (strict.first_visible, strict.last_visible)
+                    );
+                    assert_eq!(
+                        (fused_loose.first_visible, fused_loose.last_visible),
+                        (loose.first_visible, loose.last_visible)
+                    );
+                }
+            }
+        }
+    }
+
+    /// Run with:
+    /// `cargo test --release --lib viewport_pair_microbenchmark -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual microbenchmark"]
+    fn viewport_pair_microbenchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const BLOCKS: usize = 50_000;
+        const REPETITIONS: usize = 250;
+        let blocks: VecDeque<BlockData> = std::iter::repeat_n(20, BLOCKS)
+            .map(block_with_height)
+            .collect();
+        let scroll_top = (BLOCKS as f64 * 20.0) - 600.0;
+
+        let separate_started = Instant::now();
+        for _ in 0..REPETITIONS {
+            black_box(viewport_state_for_scroll(&blocks, scroll_top, 400.0, 1));
+            black_box(viewport_state_for_scroll(&blocks, scroll_top, 400.0, 2));
+        }
+        let separate = separate_started.elapsed();
+
+        let fused_started = Instant::now();
+        for _ in 0..REPETITIONS {
+            black_box(viewport_state_pair_for_scroll(
+                &blocks, scroll_top, 400.0, 1, 2,
+            ));
+        }
+        let fused = fused_started.elapsed();
+
+        eprintln!(
+            "viewport strict+loose: separate={separate:?}, fused={fused:?}, speedup={:.1}x",
+            separate.as_secs_f64() / fused.as_secs_f64()
+        );
     }
 
     #[test]

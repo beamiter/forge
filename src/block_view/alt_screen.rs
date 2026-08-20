@@ -252,6 +252,21 @@ const SETTLE_MAX_TICKS: u32 = 125;
 /// VTE has applied the whole asynchronous `feed()`. `None` for all-blank
 /// snapshots (nothing observable to wait for).
 pub(crate) fn snapshot_settle_tail(display_text: &str) -> Option<String> {
+    // Ordinary command output needs no terminal replay. Search from the tail
+    // so a multi-megabyte build log pays only for its final visible line,
+    // rather than allocating and scanning an equally large stripped copy on
+    // every map/filter/resize render. ESC, CR, and BS are the same conservative
+    // identity boundary used by the finished-output row counter.
+    if let Some(plain) = super::plain_ansi_replay_prefix(display_text) {
+        return plain.lines().rev().find_map(|line| {
+            let line = line.trim();
+            (!line.is_empty()).then(|| line.to_string())
+        });
+    }
+    snapshot_settle_tail_replay(display_text)
+}
+
+fn snapshot_settle_tail_replay(display_text: &str) -> Option<String> {
     let plain = super::strip_ansi(display_text);
     plain.lines().rev().find_map(|line| {
         let line = line.trim();
@@ -491,6 +506,49 @@ pub(crate) fn create_finished_terminal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_snapshot_tail_fast_path_matches_terminal_replay() {
+        let cases = [
+            "",
+            "one line",
+            "first\nsecond\n",
+            "first\n\n  \nlast visible\n\n",
+            "Unicode 界 🙂\ncombining e\u{301}\n",
+            "tabs\tand\0controls\nfinal\tvalue",
+        ];
+        for text in cases {
+            assert!(super::super::plain_ansi_replay_prefix(text).is_some());
+            assert_eq!(
+                snapshot_settle_tail(text),
+                snapshot_settle_tail_replay(text),
+                "plain fast path diverged for {text:?}",
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark; run explicitly with --ignored --nocapture"]
+    fn plain_snapshot_tail_micro_benchmark() {
+        for bytes in [1 << 20, 8 << 20] {
+            let mut text = "ordinary compiler output payload\n".repeat(bytes / 33 + 1);
+            text.truncate(bytes.saturating_sub("\nFINAL BUILD LINE\n".len()));
+            text.push_str("\nFINAL BUILD LINE\n");
+
+            let replay_started = std::time::Instant::now();
+            let replay = std::hint::black_box(snapshot_settle_tail_replay(&text));
+            let replay_elapsed = replay_started.elapsed();
+
+            let fast_started = std::time::Instant::now();
+            let fast = std::hint::black_box(snapshot_settle_tail(&text));
+            let fast_elapsed = fast_started.elapsed();
+            assert_eq!(fast, replay);
+            eprintln!(
+                "plain snapshot tail {} MiB: replay={replay_elapsed:?}, fast={fast_elapsed:?}",
+                bytes >> 20,
+            );
+        }
+    }
 
     #[test]
     fn finished_vte_geometry_never_exceeds_cell_or_column_caps() {

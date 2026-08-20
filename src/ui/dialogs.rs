@@ -1004,9 +1004,9 @@ impl UiState {
                     Ok(results) => {
                         let total = results.len();
                         status_label.set_text(&cross_block_search_status_for_match_count(total));
+                        let jumpable = term_view.jumpable_search_hits(&results);
                         for hit in results.iter() {
-                            let can_jump =
-                                term_view.can_jump_to_record(hit.block_id, hit.is_output);
+                            let can_jump = jumpable.contains(&(hit.block_id, hit.is_output));
                             let surface = if hit.is_output { "out" } else { "cmd" };
                             let mut subtitle = format!(
                                 "{surface} L{}: {}",
