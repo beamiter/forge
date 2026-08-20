@@ -4867,6 +4867,10 @@ struct ReaderCtx {
     /// prefix (`output_text_prefix`). Shared as an `Rc` cell rather than
     /// living in [`EngineState`] for exactly that one reader.
     live_raw_output_rc: Rc<RefCell<BoundedByteRing>>,
+    /// Command-scoped proof that ED3 or RIS invalidated VTE's row mapping.
+    /// Set at the parser barrier before reset bytes are fed, so layout never
+    /// has to infer a persistent reset from a transient adjustment sample.
+    live_extent_force_full_rc: Rc<Cell<bool>>,
     /// Keystroke-shadow input line, used only as a fallback if the VTE-text
     /// capture at CommandStart returns empty.
     typed_cmd_rc: Rc<RefCell<String>>,
@@ -4980,11 +4984,13 @@ impl ReaderCtx {
     }
 
     fn on_erase_scrollback(&self) {
+        self.live_extent_force_full_rc.set(true);
         self.release_prompt_fence_before_reset();
         self.backend.erase_scrollback();
     }
 
     fn on_hard_reset(&self) {
+        self.live_extent_force_full_rc.set(true);
         self.release_prompt_fence_before_reset();
 
         // No frame callback or reviewed-submission timeout may publish an
@@ -5258,6 +5264,10 @@ impl ReaderCtx {
             self.verified_submission.command_start_observed(false);
             self.external_submission_rc.borrow_mut().take();
         }
+        // All rejection/recovery guards above have passed: this PromptStart
+        // really ends the prior lifecycle. Clear an ED3/RIS full-card latch
+        // before backend finalization resets VTE and can synchronously relayout.
+        self.live_extent_force_full_rc.set(false);
         self.engine.borrow_mut().prompt_render_generation = self.contents_generation_rc.get();
         self.post_prompt_bytes_rc.borrow_mut().clear();
         self.post_prompt_fence_released_rc.set(false);
@@ -5636,6 +5646,7 @@ impl ReaderCtx {
         }
         // Start the command's output snapshot fresh (engine-owned ring).
         self.live_raw_output_rc.borrow_mut().clear();
+        self.live_extent_force_full_rc.set(false);
         self.block_start_time_for_cb.set(Some(SystemTime::now()));
         self.engine.borrow_mut().command_start_instant = Some(std::time::Instant::now());
         // Read the typed command directly off the live VTE,
@@ -7882,6 +7893,44 @@ fn live_visible_rows(extent: i64, viewport_rows: i64) -> i64 {
     extent.clamp(floor, viewport_rows.max(floor))
 }
 
+/// Resolve one live-card measurement without trusting VTE's asynchronous
+/// command-start transition before this command has emitted output.
+///
+/// `set_size()` and VTE's adjustment update do not settle atomically. The
+/// synchronous layout at `CommandStart` can therefore observe either `None` or
+/// a coherent-looking stale extent from the previous grid generation. Until
+/// real output reaches the engine-owned capture ring, ignore that sample and
+/// keep the compact input height recorded in `high_water`. Once output starts,
+/// an ordinary `None` remains provisional because bytes enter the ring before
+/// VTE finishes applying them. Only an explicit ED3/RIS parser barrier sets
+/// `force_full` and exposes the whole viewport.
+fn live_visible_rows_for_measurement(
+    measured: Option<i64>,
+    output_started: bool,
+    force_full: bool,
+    high_water: i64,
+    viewport_rows: i64,
+) -> (i64, i64) {
+    if force_full {
+        let next_high_water = high_water.max(viewport_rows);
+        return (viewport_rows, next_high_water);
+    }
+    if !output_started {
+        return (live_visible_rows(high_water, viewport_rows), high_water);
+    }
+    let next_high_water = match measured {
+        Some(measured) => high_water.max(measured),
+        // The capture ring is updated before VTE applies feed(). Keep the last
+        // proven height through that transient gap; explicit ED3/RIS state is
+        // the only reason to force the full viewport.
+        None => high_water,
+    };
+    (
+        live_visible_rows(next_high_water, viewport_rows),
+        next_high_water,
+    )
+}
+
 /// How many rows of the live grid this command has reached: the top of the
 /// screen down to the cursor.
 ///
@@ -7905,12 +7954,14 @@ fn live_content_extent(vte: &Terminal) -> Option<i64> {
 /// The arithmetic behind [`live_content_extent`], separated so it can be tested
 /// without a display.
 ///
-/// `None` means the extent is not measurable right now, and the caller must
-/// fall back to a full-viewport card. That happens when the running command
-/// emits `ESC[3J` (what `clear` sends to drop the scrollback): measured, VTE
-/// renumbers the adjustment down to the screen but leaves `cursor_position` in
-/// the old ring coordinates, so the two stop describing the same buffer and any
-/// difference between them is meaningless. `cursor_row > upper` is the tell —
+/// `None` means the extent is not measurable right now. The caller retains its
+/// last proven height unless the parser has explicitly observed ED3/RIS. When
+/// a running command emits `ESC[3J` (what `clear` sends to drop the scrollback),
+/// VTE can renumber the adjustment down to the screen but leave
+/// `cursor_position` in the old ring coordinates, so the two stop describing
+/// the same buffer and any difference between them is meaningless. The parser
+/// barrier, not this transient sample, authorizes a full-viewport card.
+/// `cursor_row > upper` is the tell —
 /// the cursor is always inside the buffer the adjustment describes, except that
 /// a cursor resting one row past the last written row is normal, so the test
 /// has to be strict. The next prompt's `reset_active` re-bases both.
@@ -8818,6 +8869,7 @@ impl TermView {
         // backend), and ActiveBlock holds this clone only so live-find can
         // read a bounded prefix.
         let live_raw_output = Rc::new(RefCell::new(BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES)));
+        let live_extent_force_full = Rc::new(Cell::new(false));
         let active = Rc::new(RefCell::new(ActiveBlock::new(
             config,
             live_raw_output.clone(),
@@ -9173,6 +9225,12 @@ impl TermView {
             // ActiveBlock so that `reset_active` — the one funnel every reset
             // path goes through — clears it for the next command.
             let live_rows_high_water = active.borrow().live_extent_rows();
+            // The engine clears this ring immediately before entering
+            // CollectingOutput and appends every subsequent output chunk before
+            // feeding the VTE. It gates coherent growth after CommandStart;
+            // only the separate parser-barrier flag authorizes a full card.
+            let live_raw_output_for_layout = live_raw_output.clone();
+            let live_force_full_for_layout = live_extent_force_full.clone();
             // Weak: ActiveBlock owns the VTE that retains this callback.
             let active_for_layout = Rc::downgrade(&active);
             Rc::new(move || {
@@ -9221,22 +9279,16 @@ impl TermView {
                 // by a page-tall reservation the command may never fill.
                 let visible_rows = match state {
                     BlockState::CollectingOutput | BlockState::PostCommand => {
-                        match live_content_extent(&vte) {
-                            Some(measured) => {
-                                let extent = live_rows_high_water.get().max(measured);
-                                live_rows_high_water.set(extent);
-                                live_visible_rows(extent, viewport_rows)
-                            }
-                            // Unmeasurable (the command cleared the
-                            // scrollback): fall back to the page-tall card
-                            // rather than risk one that hides output, and latch
-                            // it so a later pass that does measure cannot
-                            // shrink the card back mid-command.
-                            None => {
-                                live_rows_high_water.set(viewport_rows);
-                                viewport_rows
-                            }
-                        }
+                        let output_started = !live_raw_output_for_layout.borrow().is_empty();
+                        let (visible_rows, next_high_water) = live_visible_rows_for_measurement(
+                            live_content_extent(&vte),
+                            output_started,
+                            live_force_full_for_layout.get(),
+                            live_rows_high_water.get(),
+                            viewport_rows,
+                        );
+                        live_rows_high_water.set(next_high_water);
+                        visible_rows
                     }
                     // Not running. The next command starts from the prompt's
                     // height again — except on the way out of a screen
@@ -9247,7 +9299,10 @@ impl TermView {
                         target_rows
                     }
                     _ => {
-                        live_rows_high_water.set(0);
+                        // Preserve the compact input height across
+                        // CommandStart. Until output begins, VTE's cursor and
+                        // adjustment may belong to different grid generations.
+                        live_rows_high_water.set(target_rows);
                         target_rows
                     }
                 };
@@ -9698,6 +9753,7 @@ impl TermView {
                     active_alt_screen_mode: None,
                 }),
                 live_raw_output_rc: live_raw_output.clone(),
+                live_extent_force_full_rc: live_extent_force_full.clone(),
                 typed_cmd_rc,
                 typed_cmd_fidelity_rc,
                 submission_pending_rc,
@@ -12332,6 +12388,47 @@ mod tests {
         // A pane too short for the floor still gets a card, never zero rows.
         assert_eq!(live_visible_rows(1, 3), 3);
         assert_eq!(live_visible_rows(9, 3), 3);
+    }
+
+    #[test]
+    fn command_start_measurements_before_output_are_provisional() {
+        // CommandStart resizes the full grid before VTE has necessarily
+        // published a coherent adjustment. With no captured output yet, that
+        // transient `None` keeps the compact card and does not poison the
+        // command's high-water mark.
+        assert_eq!(
+            super::live_visible_rows_for_measurement(None, false, false, 6, 40),
+            (6, 6)
+        );
+        // A coherent-looking extent can be from the old grid generation too.
+        assert_eq!(
+            super::live_visible_rows_for_measurement(Some(38), false, false, 6, 40),
+            (6, 6)
+        );
+        // Preserve a multiline input baseline until actual output supersedes it.
+        assert_eq!(
+            super::live_visible_rows_for_measurement(Some(2), false, false, 9, 40),
+            (9, 9)
+        );
+        // Bytes reach the capture ring before VTE settles its cursor and
+        // adjustment, so a first-chunk None remains provisional too.
+        let (visible, high_water) =
+            super::live_visible_rows_for_measurement(None, true, false, 6, 40);
+        assert_eq!((visible, high_water), (6, 6));
+        assert_eq!(
+            super::live_visible_rows_for_measurement(Some(8), true, false, high_water, 40),
+            (8, 8)
+        );
+
+        // An explicit ED3/RIS barrier exposes the viewport and latches it; a
+        // later coherent sample cannot shrink the card underneath that output.
+        let (visible, high_water) =
+            super::live_visible_rows_for_measurement(None, true, true, 6, 40);
+        assert_eq!((visible, high_water), (40, 40));
+        assert_eq!(
+            super::live_visible_rows_for_measurement(Some(3), true, false, high_water, 40),
+            (40, 40)
+        );
     }
 
     #[test]
@@ -16357,6 +16454,7 @@ mod tests {
         config: Rc<RefCell<Config>>,
         bstate: Rc<Cell<BlockState>>,
         live_raw_output: Rc<RefCell<BoundedByteRing>>,
+        live_extent_force_full: Rc<Cell<bool>>,
         blocks_finished: Rc<RefCell<Vec<FinishedFanOut>>>,
         commands_started: Rc<RefCell<Vec<StartedFanOut>>>,
         commands_finished: Rc<RefCell<Vec<CommandFinishedEvent>>>,
@@ -16394,6 +16492,7 @@ mod tests {
             // would hand consumers a pane that is not running anything.
             let cmd_running = Rc::new(Cell::new(false));
             let live_raw_output = Rc::new(RefCell::new(BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES)));
+            let live_extent_force_full = Rc::new(Cell::new(false));
             // Configuration is an input to the lifecycle, so it is built here
             // rather than loaded: `load_safe_config` reads neither the
             // developer's config file nor the `FORGE_*` environment (see its
@@ -16561,6 +16660,7 @@ mod tests {
                     active_alt_screen_mode: None,
                 }),
                 live_raw_output_rc: live_raw_output.clone(),
+                live_extent_force_full_rc: live_extent_force_full.clone(),
                 typed_cmd_rc: typed_cmd,
                 typed_cmd_fidelity_rc: typed_cmd_fidelity,
                 submission_pending_rc: submission_pending,
@@ -16619,6 +16719,7 @@ mod tests {
                 config,
                 bstate,
                 live_raw_output,
+                live_extent_force_full,
                 blocks_finished,
                 commands_started,
                 commands_finished,
@@ -16893,6 +16994,29 @@ mod tests {
         harness.feed(bytes(output));
         harness.feed(command_end(Some(0)));
         harness.feed(ParserEvent::PromptStart);
+    }
+
+    #[test]
+    fn explicit_reset_extent_latch_is_scoped_to_one_command() {
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+
+        harness.feed(ParserEvent::EraseScrollback);
+        assert!(harness.live_extent_force_full.get());
+
+        // A new accepted C cannot inherit a reset seen while the prompt was
+        // idle; it begins from the compact input baseline.
+        harness.feed(command_start(Some("sleep 1")));
+        assert!(!harness.live_extent_force_full.get());
+
+        harness.feed(ParserEvent::EraseScrollback);
+        assert!(harness.live_extent_force_full.get());
+        harness.feed(command_end(Some(0)));
+        harness.feed(ParserEvent::PromptStart);
+        assert!(!harness.live_extent_force_full.get());
+
+        harness.feed(ParserEvent::HardReset);
+        assert!(harness.live_extent_force_full.get());
     }
 
     #[test]
