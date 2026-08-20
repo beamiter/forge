@@ -59,6 +59,15 @@ pub struct OwnedPty {
     /// it serializes every signal against its own `waitpid`, refuses to start a
     /// second escalation, and never leaves a zombie behind.
     lifecycle: Arc<ChildLifecycle>,
+    /// Set by `kill`/`Drop` to release a reader parked on an idle PTY. Without
+    /// it, a shell that left a descendant holding the slave open (`nohup ... &`,
+    /// a detached ssh, any daemonized grandchild) kept the reader blocked in
+    /// `read` for the rest of the process lifetime, pinning a duplicated master
+    /// descriptor and its buffer.
+    reader_cancelled: Arc<AtomicBool>,
+    /// Linux wakeup for that reader. `None` means eventfd creation failed (or
+    /// this is not Linux), and the reader falls back to bounded polling.
+    reader_cancel_eventfd: Option<Arc<OwnedFd>>,
     /// The shared outgoing-byte filter. It removes paste-bracket markers from
     /// any payload body — a clipboard carrying `ESC[201~` would otherwise close
     /// the frame early and have its remainder run as a command — and tracks
@@ -156,6 +165,126 @@ const G_IO_IN: u32 = 1;
 // A block command may continuously repaint a spinner or progress bar. Keep PTY
 // delivery at idle priority so GTK can dispatch pointer/button events first.
 const G_PRIORITY_DEFAULT_IDLE: i32 = 200;
+const READER_CANCEL_FALLBACK_POLL_MS: i32 = 50;
+
+#[derive(Debug)]
+enum ReaderPoll {
+    PtyReady,
+    Cancelled,
+    TimedOut,
+    /// The cancel descriptor could not be watched. The caller must discard it
+    /// and continue with the bounded polling fallback instead of stopping the
+    /// otherwise healthy PTY reader.
+    CancelUnavailable(io::Error),
+}
+
+#[cfg(target_os = "linux")]
+fn create_reader_cancel_eventfd() -> Option<Arc<OwnedFd>> {
+    // SAFETY: eventfd returns a fresh descriptor on success; ownership moves
+    // immediately into OwnedFd. Nonblocking keeps kill/Drop unable to stall.
+    let raw = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    if raw < 0 {
+        log::warn!(
+            "PTY reader cancel eventfd unavailable; using {} ms polling: {}",
+            READER_CANCEL_FALLBACK_POLL_MS,
+            io::Error::last_os_error()
+        );
+        return None;
+    }
+    // SAFETY: `raw` is a fresh successful eventfd result owned by this process.
+    Some(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_reader_cancel_eventfd() -> Option<Arc<OwnedFd>> {
+    None
+}
+
+/// Wait until the PTY can be read or teardown requests reader cancellation.
+///
+/// With a cancel fd this blocks indefinitely, so an idle reader has no timer
+/// wakeups. Without one it preserves the historical 50 ms atomic check. PTY
+/// HUP/ERR are reported as readable so the following `read` observes EOF/EIO;
+/// an invalid PTY fd remains a real reader failure.
+fn poll_pty_or_reader_cancel(pty_fd: RawFd, cancel_fd: Option<RawFd>) -> io::Result<ReaderPoll> {
+    loop {
+        let mut ready = [
+            libc::pollfd {
+                fd: pty_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: cancel_fd.unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let has_cancel_fd = cancel_fd.is_some();
+        let descriptor_count: libc::nfds_t = if has_cancel_fd { 2 } else { 1 };
+        let timeout = if has_cancel_fd {
+            -1
+        } else {
+            READER_CANCEL_FALLBACK_POLL_MS
+        };
+        // SAFETY: `ready` contains `descriptor_count` initialized pollfd values
+        // and remains writable for the duration of this blocking call.
+        let polled = unsafe { libc::poll(ready.as_mut_ptr(), descriptor_count, timeout) };
+        if polled < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return if has_cancel_fd {
+                Ok(ReaderPoll::CancelUnavailable(error))
+            } else {
+                Err(error)
+            };
+        }
+        if polled == 0 {
+            return Ok(ReaderPoll::TimedOut);
+        }
+
+        if has_cancel_fd {
+            let cancel_events = ready[1].revents;
+            if cancel_events & libc::POLLIN != 0 {
+                return Ok(ReaderPoll::Cancelled);
+            }
+            if cancel_events & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                return Ok(ReaderPoll::CancelUnavailable(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("cancel eventfd poll failure: revents={cancel_events:#x}"),
+                )));
+            }
+        }
+
+        let pty_events = ready[0].revents;
+        if pty_events & libc::POLLNVAL != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "PTY reader descriptor became invalid",
+            ));
+        }
+        if pty_events & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
+            return Ok(ReaderPoll::PtyReady);
+        }
+        // A signal or platform-specific event may produce no relevant bits.
+        // Rebuild pollfd values so stale revents can never leak into a retry.
+    }
+}
+
+fn request_reader_cancel(cancelled: &AtomicBool, cancel_eventfd: Option<&OwnedFd>) {
+    cancelled.store(true, Ordering::Release);
+    #[cfg(target_os = "linux")]
+    if let Some(cancel_eventfd) = cancel_eventfd {
+        if let Err(error) = signal_eventfd(cancel_eventfd.as_raw_fd()) {
+            log::warn!("could not wake PTY reader cancellation poll: {error}");
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cancel_eventfd;
+}
+
 /// Bound queued output. Once this queue fills, the reader blocks and the kernel
 /// PTY buffer provides natural backpressure to a runaway producer.
 const PTY_QUEUE_CAPACITY: usize = 8;
@@ -655,6 +784,8 @@ impl OwnedPty {
                     master: std::sync::Arc::new(std::sync::Mutex::new(Some(master))),
                     input_tx: std::sync::Mutex::new(Some(input_tx)),
                     lifecycle,
+                    reader_cancelled: Arc::new(AtomicBool::new(false)),
+                    reader_cancel_eventfd: create_reader_cancel_eventfd(),
                     input_guard: std::sync::Mutex::new(InputGuard::new()),
                     input_error_reported: AtomicBool::new(false),
                     shell_bracketed_paste: AtomicBool::new(false),
@@ -816,6 +947,10 @@ impl OwnedPty {
     /// `terminate` sees a teardown already in flight and returns without
     /// starting another escalation ladder for the same child.
     pub fn kill(&self) {
+        request_reader_cancel(
+            &self.reader_cancelled,
+            self.reader_cancel_eventfd.as_deref(),
+        );
         self.close_master_fd();
         self.close_input_writer();
         self.lifecycle.terminate(TERMINAL_ESCALATION);
@@ -859,9 +994,17 @@ impl OwnedPty {
         let wake_pending = Arc::new(AtomicBool::new(false));
         let eventfd_for_thread = Arc::clone(&eventfd);
         let wake_pending_for_thread = Arc::clone(&wake_pending);
-        spawn_reader_thread(reader_fd, lifecycle, tx, "forge-pty-reader", move || {
-            notify_eventfd_once(&eventfd_for_thread, &wake_pending_for_thread);
-        });
+        spawn_reader_thread(
+            reader_fd,
+            lifecycle,
+            tx,
+            "forge-pty-reader",
+            Arc::clone(&self.reader_cancelled),
+            self.reader_cancel_eventfd.clone(),
+            move || {
+                notify_eventfd_once(&eventfd_for_thread, &wake_pending_for_thread);
+            },
+        );
 
         let on_exit = std::cell::Cell::new(Some(on_exit));
 
@@ -930,7 +1073,15 @@ impl OwnedPty {
         F: FnMut(Vec<u8>) + 'static,
         E: FnOnce(i32) + 'static,
     {
-        spawn_reader_thread(reader_fd, lifecycle, tx, "forge-pty-reader-poll", || {});
+        spawn_reader_thread(
+            reader_fd,
+            lifecycle,
+            tx,
+            "forge-pty-reader-poll",
+            Arc::clone(&self.reader_cancelled),
+            self.reader_cancel_eventfd.clone(),
+            || {},
+        );
 
         let on_exit = std::cell::Cell::new(Some(on_exit));
         let rx = std::cell::RefCell::new(rx);
@@ -964,6 +1115,8 @@ fn spawn_reader_thread(
     lifecycle: Arc<ChildLifecycle>,
     tx: mpsc::SyncSender<PtyMsg>,
     thread_name: &'static str,
+    reader_cancelled: Arc<AtomicBool>,
+    mut reader_cancel_eventfd: Option<Arc<OwnedFd>>,
     notify: impl Fn() + Send + Clone + 'static,
 ) {
     let failure_tx = tx.clone();
@@ -976,6 +1129,31 @@ fn spawn_reader_thread(
             let fd = file.as_raw_fd();
             let mut buf = [0u8; PTY_READ_CHUNK_BYTES];
             loop {
+                if reader_cancelled.load(Ordering::Acquire) {
+                    break;
+                }
+                match poll_pty_or_reader_cancel(
+                    fd,
+                    reader_cancel_eventfd
+                        .as_ref()
+                        .map(|eventfd| eventfd.as_raw_fd()),
+                ) {
+                    Ok(ReaderPoll::PtyReady) => {}
+                    Ok(ReaderPoll::Cancelled) => break,
+                    Ok(ReaderPoll::TimedOut) => continue,
+                    Ok(ReaderPoll::CancelUnavailable(error)) => {
+                        log::warn!(
+                            "PTY reader cancel eventfd unavailable; reverting to {} ms polling: {error}",
+                            READER_CANCEL_FALLBACK_POLL_MS
+                        );
+                        reader_cancel_eventfd = None;
+                        continue;
+                    }
+                    Err(error) => {
+                        log::warn!("PTY reader poll stopped: {error}");
+                        break;
+                    }
+                }
                 match file.read(&mut buf) {
                     Ok(0) => break,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -1205,6 +1383,8 @@ impl OwnedPty {
             master: std::sync::Arc::new(std::sync::Mutex::new(Some(master))),
             input_tx: std::sync::Mutex::new(Some(input_tx)),
             lifecycle,
+            reader_cancelled: Arc::new(AtomicBool::new(false)),
+            reader_cancel_eventfd: create_reader_cancel_eventfd(),
             input_guard: std::sync::Mutex::new(InputGuard::new()),
             input_error_reported: AtomicBool::new(false),
             shell_bracketed_paste: AtomicBool::new(false),
@@ -1290,6 +1470,10 @@ fn prepare_test_slave(slave: &OwnedFd) {
 
 impl Drop for OwnedPty {
     fn drop(&mut self) {
+        request_reader_cancel(
+            &self.reader_cancelled,
+            self.reader_cancel_eventfd.as_deref(),
+        );
         self.close_master_fd();
         self.close_input_writer();
         // A pane closed explicitly already started this; `terminate` reports
@@ -1306,6 +1490,73 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::Path;
     use std::time::{Duration, Instant};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reader_cancel_eventfd_keeps_idle_poll_asleep_and_wakes_it() {
+        let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let cancel_eventfd = create_reader_cancel_eventfd().expect("create cancel eventfd");
+        let cancel_for_reader = Arc::clone(&cancel_eventfd);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(poll_pty_or_reader_cancel(
+                    reader.as_raw_fd(),
+                    Some(cancel_for_reader.as_raw_fd()),
+                ))
+                .unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        match result_rx.recv_timeout(Duration::from_millis(120)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(result) => {
+                reader.join().unwrap();
+                panic!("idle reader poll returned without input or cancellation: {result:?}");
+            }
+            Err(error) => {
+                reader.join().unwrap();
+                panic!("reader poll result channel failed: {error}");
+            }
+        }
+
+        let cancelled = AtomicBool::new(false);
+        request_reader_cancel(&cancelled, Some(&cancel_eventfd));
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancel eventfd must wake the idle reader poll");
+        reader.join().unwrap();
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(matches!(result, Ok(ReaderPoll::Cancelled)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn invalid_cancel_fd_downgrades_to_bounded_polling() {
+        let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let result = poll_pty_or_reader_cancel(reader.as_raw_fd(), Some(i32::MAX)).unwrap();
+        assert!(matches!(result, ReaderPoll::CancelUnavailable(_)));
+
+        let started = Instant::now();
+        let result = poll_pty_or_reader_cancel(reader.as_raw_fd(), None).unwrap();
+        assert!(matches!(result, ReaderPoll::TimedOut));
+        assert!(started.elapsed() >= Duration::from_millis(40));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reader_poll_reports_pty_hangup_as_readable() {
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let cancel_eventfd = create_reader_cancel_eventfd().expect("create cancel eventfd");
+        drop(writer);
+
+        let result =
+            poll_pty_or_reader_cancel(reader.as_raw_fd(), Some(cancel_eventfd.as_raw_fd()))
+                .unwrap();
+        assert!(matches!(result, ReaderPoll::PtyReady));
+    }
 
     /// The strict child-environment API requires the process-global one-shot
     /// capture `app::run` performs first. Tests share one process, so a

@@ -6290,7 +6290,15 @@ impl RenderBackend for BlockBackend {
         self.active_rc.borrow().reset_active(preserve_scrollback);
     }
 
+    /// Preserve the pane-focus invariant: a background pane receiving a prompt
+    /// must never steal focus merely because its shell printed one. Without
+    /// this guard, typing into a second split — or into a finished block's
+    /// output, or the find box — was interrupted whenever any other pane's
+    /// shell reached a prompt.
     fn focus_live_deferred(&self) {
+        if !self.active_vte.has_focus() {
+            return;
+        }
         let active_for_focus = self.active_rc.clone();
         glib::idle_add_local_once(move || {
             active_for_focus.borrow().grab_focus();
@@ -7360,7 +7368,12 @@ impl RenderBackend for UnifiedBackend {
         self.feed_live(b"\x1b[0m");
     }
 
+    /// Same pane-focus invariant as the block backend: a background pane must
+    /// not pull focus back to its live surface just because a prompt arrived.
     fn focus_live_deferred(&self) {
+        if !self.vte.has_focus() {
+            return;
+        }
         let vte = self.vte.downgrade();
         glib::idle_add_local_once(move || {
             if let Some(vte) = vte.upgrade() {
