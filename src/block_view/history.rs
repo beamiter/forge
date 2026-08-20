@@ -2480,7 +2480,7 @@ impl TermView {
                     &self.bstate,
                     &self.bracketed_paste,
                 );
-                finished.connect_scroll_forwarding(&self.block_scroll);
+                finished.connect_scroll_forwarding(&self.block_scroll, &self.scroll_debouncer);
                 install_finished_block_selection(
                     &finished,
                     &self.active,
