@@ -75,7 +75,16 @@ terminal_mode = "block"
 ```
 
 - `block` 把命令保存为独立块，提供退出状态、耗时、筛选、跨块搜索、历史回填和 AI 上下文。
+- `unified` 使用一个持续存在的 VTE 滚屏，同时保留可信的命令分区、状态 badge、搜索、
+  有界输出快照与恢复；Kitty `a=T` 图片按 `r=`/`c=` 单元格覆盖显示，并随滚屏与重排定位。
+  缺失 OSC 133 `D` 时，只有确认 shell 已重获 PTY 前台的新 prompt 才会恢复该记录；记录标为
+  `boundary_inferred` / `degraded`，不伪造退出码、结束时刻或耗时。
 - `vte` 是传统终端，适合要求完整滚屏语义的 TUI 或兼容性排查。
+
+Kitty 支持刻意限定为 direct `a=T` 静态显示（`i`、`c/r/C`，PNG/RGB/RGBA）与 `a=q`
+探针；`a=t`、`I`、crop/z/relative placement、delete/replacement 返回 `ENOTSUP`。
+Unified 遵守这些单元格坐标；Block 保留既有“图片作为完成卡片附件”的 profile，不保证
+`c/r` 原位坐标或 placement replacement，因此不能当作完整 Kitty placement 实现。
 
 ### 实验性 ASCII organism
 
@@ -329,7 +338,7 @@ reducer、不新增落盘字段；repo 无法验证或身份切换中时使用�
 - `Ctrl+Shift+B` 收藏 active 块，`Ctrl+,` / `Ctrl+.` 在收藏块之间跳转。
 - 多选右键可批量复制命令、输出、完整块或回填命令；复制按界面顺序合并。
 - 长块提供顶部/底部导航与 sticky header，后台异步输出使用独立 Block 样式。
-- 完成块同时受 `max_visible_blocks` 和每 pane 128 MiB 估算内存预算约束；预算包含 ANSI 原文、重复显示副本、VTE/控件与图片，超限时从最旧块开始淘汰，最新块始终保留。每个完成 VTE 最多保留 1,048,576 个 cells（最多 4096 列），因此极端长输出只在界面中保留有界终端窗口；这一几何裁剪不会再额外影响复制/导出中已捕获的文本（最多 8 MiB）。Kitty 图片每块最多 64 张。
+- 完成块同时受 `max_visible_blocks` 和每 pane 128 MiB 估算内存预算约束；预算包含 ANSI 原文、重复显示副本、VTE/控件与图片，超限时从最旧块开始淘汰，最新块始终保留。每个完成 VTE 最多保留 1,048,576 个 cells（最多 4096 列），因此极端长输出只在界面中保留有界终端窗口；这一几何裁剪不会再额外影响复制/导出中已捕获的文本（最多 8 MiB）。Block Kitty 图片每块最多 64 张；Unified 图片使用同样的 16 MiB/64-placement 上限，超出可见网格的几何会明确拒绝而非静默缩放。
 
 命令运行中或 alt-screen TUI 活跃时，Enter 和应用所需按键继续发送给前台进程，不会误触发旧块回填。
 

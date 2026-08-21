@@ -1094,8 +1094,10 @@ impl OwnedPty {
         // G_PRIORITY_DEFAULT, so this path — reached exactly when `eventfd()`
         // fails, i.e. under descriptor pressure with many panes open — used to
         // preempt GTK's redraw and input dispatch on every tick.
-        glib::timeout_add_local_full(PTY_DISPATCH_INTERVAL, glib::Priority::DEFAULT_IDLE, move || {
-            match rx.borrow().try_recv() {
+        glib::timeout_add_local_full(
+            PTY_DISPATCH_INTERVAL,
+            glib::Priority::DEFAULT_IDLE,
+            move || match rx.borrow().try_recv() {
                 Ok(PtyMsg::Data(data)) => {
                     callback(data);
                     glib::ControlFlow::Continue
@@ -1108,8 +1110,8 @@ impl OwnedPty {
                 }
                 Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                 Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
-            }
-        });
+            },
+        );
     }
 }
 

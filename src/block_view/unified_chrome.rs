@@ -108,6 +108,7 @@ pub(super) struct ZoneChromeRecord {
     pub(super) exit_code: Option<i32>,
     pub(super) duration_ms: Option<u64>,
     pub(super) is_background: bool,
+    pub(super) lifecycle_health: super::BlockLifecycleHealth,
 }
 
 impl ZoneChromeRecord {
@@ -119,6 +120,16 @@ impl ZoneChromeRecord {
                 Some(0) => "✓".to_owned(),
                 Some(code) => format!("exit:{code}"),
                 None => "exit:?".to_owned(),
+            }
+        };
+        let status = if self.is_background {
+            status
+        } else {
+            match self.lifecycle_health {
+                super::BlockLifecycleHealth::Healthy => status,
+                super::BlockLifecycleHealth::Recovered => format!("{status} · recovered"),
+                super::BlockLifecycleHealth::Degraded => format!("{status} · inferred"),
+                super::BlockLifecycleHealth::Incomplete => format!("{status} · incomplete"),
             }
         };
         self.duration_ms.map_or(status.clone(), |duration| {
@@ -180,6 +191,7 @@ impl ZoneChromeAuthority {
             exit_code: None,
             duration_ms: None,
             is_background: false,
+            lifecycle_health: super::BlockLifecycleHealth::Incomplete,
         });
         if self.active.len() > MAX_ACTIVE_ZONE_MARKERS {
             self.retire_prefix(self.active.len() - MAX_ACTIVE_ZONE_MARKERS);
@@ -496,12 +508,39 @@ pub(super) struct ViewportProjection {
     pub(super) row_epoch: u64,
 }
 
+/// Read-only projection handle for marker-addressed satellite layers. It
+/// exposes no authority mutation: a visible nonce marker plus this current
+/// epoch is the only way an image may refresh its absolute row span after
+/// rewrap/reset invalidated the old coordinates.
+#[derive(Clone)]
+pub(super) struct ImageRowProjection {
+    projection: Rc<Cell<Option<ViewportProjection>>>,
+    row_epoch: Rc<Cell<u64>>,
+}
+
+impl ImageRowProjection {
+    pub(super) fn ring_row_at_probe_band(
+        &self,
+        adjustment_value: f64,
+        band: i64,
+        cell_height_px: i64,
+    ) -> Option<(u64, i64)> {
+        let projection = self.projection.get()?;
+        let epoch = self.row_epoch.get();
+        (projection.row_epoch == epoch).then_some(())?;
+        let adjustment_row = adjustment_row_at_probe_band(adjustment_value, band, cell_height_px)?;
+        Some((epoch, adjustment_row.checked_add(projection.row_offset)?))
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // each scalar is an independently fail-closed proof input
 fn projection_from_calibration_anchor<'a>(
     anchor: CalibrationAnchor,
     expected_epoch: u64,
     adjustment_lower: f64,
     adjustment_upper: f64,
     adjustment_value: f64,
+    cell_height_px: i64,
     probe_uris: impl IntoIterator<Item = Option<&'a str>>,
     authority: &ZoneChromeAuthority,
 ) -> Option<ViewportProjection> {
@@ -518,7 +557,7 @@ fn projection_from_calibration_anchor<'a>(
     let expected_nonce = authority.nonce?;
     let lower = finite_floor_i64(adjustment_lower)?;
     let upper = finite_ceil_i64(adjustment_upper)?;
-    let viewport_top = finite_floor_i64(adjustment_value)?;
+    let viewport_top = adjustment_row_at_probe_band(adjustment_value, 0, cell_height_px)?;
     if lower > viewport_top || viewport_top > upper {
         return None;
     }
@@ -530,7 +569,8 @@ fn projection_from_calibration_anchor<'a>(
             (nonce == expected_nonce && id == anchor.zone_id).then_some(visible_row)
         })?;
     let visible_row = i64::try_from(visible_row).ok()?;
-    let marker_adjustment_row = viewport_top.checked_add(visible_row)?;
+    let marker_adjustment_row =
+        adjustment_row_at_probe_band(adjustment_value, visible_row, cell_height_px)?;
     if marker_adjustment_row < lower || marker_adjustment_row >= upper {
         return None;
     }
@@ -754,6 +794,49 @@ fn finite_ceil_i64(value: f64) -> Option<i64> {
         .then(|| value.ceil() as i64)
 }
 
+/// Pixel shift VTE applies for fractional fallback scrolling. Rounding at the
+/// pixel boundary mirrors VTE; flooring the row-valued adjustment directly
+/// picks the wrong cell whenever more than half a row is exposed.
+pub(super) fn scroll_shift_px(adjustment_value: f64, cell_height_px: i64) -> Option<i64> {
+    if !adjustment_value.is_finite() || adjustment_value < 0.0 || cell_height_px <= 0 {
+        return None;
+    }
+    let shifted = adjustment_value * cell_height_px as f64;
+    (shifted.is_finite() && shifted >= i64::MIN as f64 && shifted <= i64::MAX as f64)
+        .then(|| shifted.round() as i64)
+}
+
+/// Adjustment-space row sampled by the centre of visible probe `band`.
+///
+/// The doubled integer formula retains the half-cell centre without floating
+/// drift and works for odd cell heights as well as even ones.
+pub(super) fn adjustment_row_at_probe_band(
+    adjustment_value: f64,
+    band: i64,
+    cell_height_px: i64,
+) -> Option<i64> {
+    let shift = i128::from(scroll_shift_px(adjustment_value, cell_height_px)?);
+    let height = i128::from(cell_height_px);
+    let band = i128::from(band);
+    let numerator = shift
+        .checked_mul(2)?
+        .checked_add(band.checked_mul(2)?.checked_add(1)?.checked_mul(height)?)?;
+    let row = numerator.div_euclid(height.checked_mul(2)?);
+    i64::try_from(row).ok()
+}
+
+pub(super) fn adjustment_row_y_px(
+    adjustment_row: i64,
+    adjustment_value: f64,
+    cell_height_px: i64,
+) -> Option<f64> {
+    let shift = scroll_shift_px(adjustment_value, cell_height_px)?;
+    let y = i128::from(adjustment_row)
+        .checked_mul(i128::from(cell_height_px))?
+        .checked_sub(i128::from(shift))?;
+    i64::try_from(y).ok().map(|y| y as f64)
+}
+
 fn invalidate_row_projection(
     projection: &Cell<Option<ViewportProjection>>,
     calibration_anchor: &Cell<Option<CalibrationAnchor>>,
@@ -774,18 +857,31 @@ pub(super) struct TrustedRingBounds {
     pub(super) viewport_top: i64,
 }
 
+/// Exact retained-row floor proved by the same projection logic that owns
+/// chrome authority. Satellite layers (Kitty images) may retire only complete
+/// spans below this boundary; surface visibility is not retention evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RetainedFloorProof {
+    pub(super) row_epoch: u64,
+    pub(super) retained_floor: i64,
+}
+
+type RetainedFloorObserver = Rc<dyn Fn(RetainedFloorProof)>;
+
 fn trusted_ring_bounds_from(
     projection: ViewportProjection,
     lower: f64,
     upper: f64,
     value: f64,
+    cell_height_px: i64,
 ) -> Option<TrustedRingBounds> {
     let retained_start = finite_floor_i64(lower)?.checked_add(projection.row_offset)?;
     if retained_start != projection.ring_lower {
         return None;
     }
     let retained_end_exclusive = finite_ceil_i64(upper)?.checked_add(projection.row_offset)?;
-    let viewport_top = finite_floor_i64(value)?.checked_add(projection.row_offset)?;
+    let viewport_top = adjustment_row_at_probe_band(value, 0, cell_height_px)?
+        .checked_add(projection.row_offset)?;
     (retained_start <= viewport_top && viewport_top <= retained_end_exclusive).then_some(
         TrustedRingBounds {
             row_epoch: projection.row_epoch,
@@ -801,6 +897,7 @@ fn trusted_ring_bounds_from(
 /// ring bounds derived from it, and the zone's recorded head — and the head
 /// must lie inside the retained ring. Any doubt is `None`: a record jump is
 /// exact or it does not happen.
+#[allow(clippy::too_many_arguments)] // keep every projection/bounds proof explicit at call sites
 fn proven_zone_scroll_value_from(
     projection: ViewportProjection,
     current_epoch: u64,
@@ -809,9 +906,10 @@ fn proven_zone_scroll_value_from(
     upper: f64,
     value: f64,
     page_size: f64,
+    cell_height_px: i64,
 ) -> Option<f64> {
     (projection.row_epoch == current_epoch).then_some(())?;
-    let bounds = trusted_ring_bounds_from(projection, lower, upper, value)?;
+    let bounds = trusted_ring_bounds_from(projection, lower, upper, value, cell_height_px)?;
     let span = span?;
     (span.row_epoch == current_epoch).then_some(())?;
     (bounds.retained_start <= span.head && span.head < bounds.retained_end_exclusive)
@@ -897,14 +995,27 @@ pub(super) struct UnifiedChrome {
     calibration_anchor: Rc<Cell<Option<CalibrationAnchor>>>,
     row_epoch: Rc<Cell<u64>>,
     cache: Rc<RefCell<KnownHeadCache>>,
+    retained_floor_observer: RetainedFloorObserver,
 }
 
 impl UnifiedChrome {
+    pub(super) fn row_epoch(&self) -> u64 {
+        self.row_epoch.get()
+    }
+
+    pub(super) fn image_row_projection(&self) -> ImageRowProjection {
+        ImageRowProjection {
+            projection: self.projection.clone(),
+            row_epoch: self.row_epoch.clone(),
+        }
+    }
+
     pub(super) fn new(
         terminal: &Terminal,
         surface: &gtk4::DrawingArea,
         authority: Rc<RefCell<ZoneChromeAuthority>>,
         config: Rc<RefCell<super::Config>>,
+        retained_floor_observer: RetainedFloorObserver,
     ) -> Self {
         let cache = Rc::new(RefCell::new(KnownHeadCache::default()));
         let projection: Rc<Cell<Option<ViewportProjection>>> = Rc::new(Cell::new(None));
@@ -917,6 +1028,7 @@ impl UnifiedChrome {
         let projection_for_draw = projection.clone();
         let calibration_anchor_for_draw = calibration_anchor.clone();
         let row_epoch_for_draw = row_epoch.clone();
+        let retained_floor_for_draw = retained_floor_observer.clone();
         let draw_stats = DrawStats::from_env();
         surface.set_draw_func(move |_area, cr, width, height| {
             let _draw_timer = draw_stats.as_ref().map(|stats| DrawTimerGuard {
@@ -969,6 +1081,7 @@ impl UnifiedChrome {
                         adjustment.lower(),
                         adjustment.upper(),
                         adjustment.value(),
+                        terminal_for_draw.char_height().max(1),
                         probe_uris.iter().map(Option::as_deref),
                         &authority,
                     ) else {
@@ -976,6 +1089,10 @@ impl UnifiedChrome {
                     };
                     authority
                         .reconcile_calibrated_floor(projection.row_epoch, projection.ring_lower);
+                    retained_floor_for_draw(RetainedFloorProof {
+                        row_epoch: projection.row_epoch,
+                        retained_floor: projection.ring_lower,
+                    });
                     projection_for_draw.set(Some(projection));
                     calibration_anchor_for_draw.set(None);
                     projection
@@ -988,9 +1105,12 @@ impl UnifiedChrome {
                 // marker probe established it.
                 return;
             }
-            let Some(top_ring_row) = finite_floor_i64(adjustment.value())
-                .and_then(|top| top.checked_add(projection.row_offset))
-            else {
+            let Some(top_ring_row) = adjustment_row_at_probe_band(
+                adjustment.value(),
+                0,
+                terminal_for_draw.char_height().max(1),
+            )
+            .and_then(|top| top.checked_add(projection.row_offset)) else {
                 return;
             };
             let layout = ScanLayoutKey {
@@ -1034,7 +1154,18 @@ impl UnifiedChrome {
                 0.72,
             );
             for line in &lines {
-                let y = content_y + line.visible_row as f64 * cell_height;
+                let Some(adjustment_row) = line.absolute_row.checked_sub(projection.row_offset)
+                else {
+                    continue;
+                };
+                let Some(row_y) = adjustment_row_y_px(
+                    adjustment_row,
+                    adjustment.value(),
+                    terminal_for_draw.char_height().max(1),
+                ) else {
+                    continue;
+                };
+                let y = content_y + row_y;
                 cr.rectangle(content_x + GUTTER_X, y, GUTTER_WIDTH, cell_height + 0.5);
             }
             let _ = cr.fill();
@@ -1043,7 +1174,18 @@ impl UnifiedChrome {
                 let Some(record) = authority.record(line.zone_id) else {
                     continue;
                 };
-                let y = content_y + line.visible_row as f64 * cell_height;
+                let Some(adjustment_row) = line.absolute_row.checked_sub(projection.row_offset)
+                else {
+                    continue;
+                };
+                let Some(row_y) = adjustment_row_y_px(
+                    adjustment_row,
+                    adjustment.value(),
+                    terminal_for_draw.char_height().max(1),
+                ) else {
+                    continue;
+                };
+                let y = content_y + row_y;
                 cr.set_source_rgba(
                     f64::from(accent.red()),
                     f64::from(accent.green()),
@@ -1137,6 +1279,7 @@ impl UnifiedChrome {
         let authority_for_contents = authority.clone();
         let cache_for_contents = cache.clone();
         let row_epoch_for_contents = row_epoch.clone();
+        let retained_floor_for_contents = retained_floor_observer.clone();
         terminal.connect_contents_changed(move |terminal| {
             if let (Some(published), Some(adjustment)) =
                 (projection_for_contents.get(), terminal.vadjustment())
@@ -1162,6 +1305,10 @@ impl UnifiedChrome {
                         );
                         authority.quarantine_eviction_drift();
                         drop(authority);
+                        retained_floor_for_contents(RetainedFloorProof {
+                            row_epoch: published.row_epoch,
+                            retained_floor,
+                        });
                         invalidate_row_projection(
                             &projection_for_contents,
                             &calibration_anchor_for_contents,
@@ -1181,6 +1328,11 @@ impl UnifiedChrome {
                                 retained_floor,
                                 protected_pending,
                             );
+                            drop(authority);
+                            retained_floor_for_contents(RetainedFloorProof {
+                                row_epoch: published.row_epoch,
+                                retained_floor,
+                            });
                         }
                         // Natural bounded-ring trim does not move surviving
                         // ring rows, so keep the epoch/authority index. It does
@@ -1221,6 +1373,7 @@ impl UnifiedChrome {
             let cache = cache.clone();
             let row_epoch = row_epoch.clone();
             let calibration_anchor = calibration_anchor.clone();
+            let retained_floor = retained_floor_observer.clone();
             adjustment.connect_changed(move |adjustment| {
                 if let Some(published) = projection.get() {
                     let current_floor = finite_floor_i64(adjustment.lower())
@@ -1240,6 +1393,11 @@ impl UnifiedChrome {
                                 protected_pending,
                             );
                             authority.quarantine_eviction_drift();
+                            drop(authority);
+                            retained_floor(RetainedFloorProof {
+                                row_epoch: published.row_epoch,
+                                retained_floor: floor,
+                            });
                         }
                         authority.borrow_mut().quarantine_eviction_drift();
                         invalidate_row_projection(
@@ -1304,6 +1462,7 @@ impl UnifiedChrome {
             calibration_anchor,
             row_epoch,
             cache,
+            retained_floor_observer,
         }
     }
 
@@ -1382,6 +1541,7 @@ impl UnifiedChrome {
                 adjustment.lower(),
                 adjustment.upper(),
                 adjustment.value(),
+                terminal.char_height().max(1),
             );
             let cutoff = finite_floor_i64(adjustment.upper() - adjustment.page_size())
                 .and_then(|top| top.checked_add(projection.row_offset));
@@ -1390,12 +1550,27 @@ impl UnifiedChrome {
                     self.authority
                         .borrow_mut()
                         .retire_completed_before(projection.row_epoch, cutoff);
+                    (self.retained_floor_observer)(RetainedFloorProof {
+                        row_epoch: projection.row_epoch,
+                        retained_floor: cutoff,
+                    });
                 }
             }
         }
         // ED3 mutates the primary ring immediately after this pre-feed hook.
         // No old coordinate/cache may survive even when no span was complete
         // enough for selective retirement.
+        invalidate_row_projection(
+            &self.projection,
+            &self.calibration_anchor,
+            &self.row_epoch,
+            &self.cache,
+        );
+        self.surface.queue_draw();
+    }
+
+    pub(super) fn erase_display(&self) {
+        self.authority.borrow_mut().quarantine_eviction_drift();
         invalidate_row_projection(
             &self.projection,
             &self.calibration_anchor,
@@ -1415,6 +1590,7 @@ impl UnifiedChrome {
             adjustment.lower(),
             adjustment.upper(),
             adjustment.value(),
+            terminal.char_height().max(1),
         )
     }
 
@@ -1438,6 +1614,7 @@ impl UnifiedChrome {
             adjustment.upper(),
             adjustment.value(),
             adjustment.page_size(),
+            terminal.char_height().max(1),
         )
     }
 
@@ -1463,6 +1640,29 @@ mod tests {
     const NONCE: [u8; 16] = [0xab; 16];
 
     #[test]
+    fn fractional_adjustment_uses_the_pixel_rounded_probe_row() {
+        // A 17px (odd-height) cell is the adversarial case: the probe centre
+        // cannot be represented by an integer pixel before the doubled-row
+        // calculation, and values either side of half a row must diverge.
+        assert_eq!(scroll_shift_px(3.49, 17), Some(59));
+        assert_eq!(scroll_shift_px(3.51, 17), Some(60));
+        assert_eq!(adjustment_row_at_probe_band(3.49, 0, 17), Some(3));
+        assert_eq!(adjustment_row_at_probe_band(3.51, 0, 17), Some(4));
+        assert_eq!(adjustment_row_at_probe_band(3.51, 7, 17), Some(11));
+        assert_eq!(adjustment_row_y_px(4, 3.51, 17), Some(8.0));
+
+        assert_eq!(scroll_shift_px(-0.01, 17), None);
+        assert_eq!(scroll_shift_px(f64::NAN, 17), None);
+        assert_eq!(scroll_shift_px(f64::INFINITY, 17), None);
+        assert_eq!(scroll_shift_px(f64::MAX, 17), None);
+        assert_eq!(adjustment_row_at_probe_band(0.0, 0, 0), None);
+        assert_eq!(
+            adjustment_row_at_probe_band(i64::MAX as f64, i64::MAX, 17),
+            None
+        );
+    }
+
+    #[test]
     fn draw_stats_percentile_uses_nearest_rank_on_the_sorted_window() {
         assert_eq!(percentile_us(&[], 95.0), 0);
         assert_eq!(percentile_us(&[7], 50.0), 7);
@@ -1471,6 +1671,18 @@ mod tests {
         assert_eq!(percentile_us(&window, 50.0), 50);
         assert_eq!(percentile_us(&window, 95.0), 95);
         assert_eq!(percentile_us(&window, 100.0), 100);
+    }
+
+    #[test]
+    fn background_badge_has_no_command_lifecycle_qualifier() {
+        let record = ZoneChromeRecord {
+            id: 1,
+            exit_code: None,
+            duration_ms: None,
+            is_background: true,
+            lifecycle_health: super::super::BlockLifecycleHealth::Incomplete,
+        };
+        assert_eq!(record.badge(), "background");
     }
 
     fn uri(id: u64) -> String {
@@ -1483,6 +1695,7 @@ mod tests {
             exit_code: Some(0),
             duration_ms: None,
             is_background: false,
+            lifecycle_health: super::super::BlockLifecycleHealth::Healthy,
         }
     }
 
@@ -1547,6 +1760,7 @@ mod tests {
             exit_code: Some(23),
             duration_ms: Some(1200),
             is_background: false,
+            lifecycle_health: super::super::BlockLifecycleHealth::Healthy,
         });
         assert_eq!(authority.record(7).unwrap().exit_code, Some(23));
     }
@@ -1656,6 +1870,8 @@ mod tests {
                     duration_ms: None,
                     cwd: None,
                     is_background: false,
+                    completion_provenance: super::super::CompletionProvenance::ShellReported,
+                    start_mark_seen: true,
                 },
                 100,
             );
@@ -1842,6 +2058,7 @@ mod tests {
             0.0,
             100.0,
             4.0,
+            1,
             [None, Some(two.as_str())],
             &authority,
         )
@@ -1943,7 +2160,7 @@ mod tests {
             row_epoch: 3,
         };
         assert_eq!(
-            trusted_ring_bounds_from(projection, 5.0, 105.0, 81.0),
+            trusted_ring_bounds_from(projection, 5.0, 105.0, 81.0, 1),
             Some(TrustedRingBounds {
                 row_epoch: 3,
                 retained_start: 40,
@@ -1951,7 +2168,16 @@ mod tests {
                 viewport_top: 116,
             })
         );
-        assert_eq!(trusted_ring_bounds_from(projection, 6.0, 105.0, 81.0), None);
+        assert_eq!(
+            trusted_ring_bounds_from(projection, 6.0, 105.0, 81.0, 1),
+            None
+        );
+        assert_eq!(
+            trusted_ring_bounds_from(projection, 5.0, 105.0, 81.51, 17)
+                .map(|bounds| bounds.viewport_top),
+            Some(117),
+            "bounds must use the same pixel-rounded band as the marker probe"
+        );
     }
 
     #[test]
@@ -1970,18 +2196,18 @@ mod tests {
         };
 
         assert_eq!(
-            proven_zone_scroll_value_from(projection, 3, span(3, 90), 5.0, 105.0, 81.0, 24.0),
+            proven_zone_scroll_value_from(projection, 3, span(3, 90), 5.0, 105.0, 81.0, 24.0, 1,),
             Some(55.0)
         );
         // The retained floor is inclusive: the oldest row the ring still holds
         // is a provable target, not a rejected one.
         assert_eq!(
-            proven_zone_scroll_value_from(projection, 3, span(3, 40), 5.0, 105.0, 81.0, 24.0),
+            proven_zone_scroll_value_from(projection, 3, span(3, 40), 5.0, 105.0, 81.0, 24.0, 1,),
             Some(5.0)
         );
         // A head near the ring tail clamps to the maximum scroll position.
         assert_eq!(
-            proven_zone_scroll_value_from(projection, 3, span(3, 139), 5.0, 105.0, 81.0, 24.0),
+            proven_zone_scroll_value_from(projection, 3, span(3, 139), 5.0, 105.0, 81.0, 24.0, 1,),
             Some(81.0)
         );
     }
@@ -2029,7 +2255,8 @@ mod tests {
                     lower,
                     105.0,
                     81.0,
-                    page_size
+                    page_size,
+                    1,
                 ),
                 None
             );
@@ -2245,7 +2472,7 @@ mod tests {
             row_epoch: 4,
         };
         assert_eq!(
-            projection_from_calibration_anchor(anchor, 4, 0.0, 36.0, 3.0, probes, &authority,),
+            projection_from_calibration_anchor(anchor, 4, 0.0, 36.0, 3.0, 1, probes, &authority,),
             Some(ViewportProjection {
                 row_offset: 302,
                 ring_lower: 302,
@@ -2271,6 +2498,7 @@ mod tests {
                 lower,
                 upper,
                 value,
+                1,
                 [probe],
                 &authority,
             )
@@ -2610,6 +2838,7 @@ mod tests {
             adjustment.lower(),
             adjustment.upper(),
             adjustment.value(),
+            terminal.char_height().max(1),
             probes.iter().map(Option::as_deref),
             &authority,
         )
@@ -2636,8 +2865,12 @@ mod tests {
             .position(|probe| probe.as_deref() == Some(uri(7).as_str()))
             .unwrap() as i64;
         assert_eq!(
-            finite_floor_i64(adjustment.value()).unwrap()
-                + marker_visible_row
+            adjustment_row_at_probe_band(
+                adjustment.value(),
+                marker_visible_row,
+                terminal.char_height().max(1),
+            )
+            .unwrap()
                 + projection.row_offset,
             anchor.ring_row
         );
@@ -2730,6 +2963,7 @@ mod tests {
             post_trim_adjustment.lower(),
             post_trim_adjustment.upper(),
             post_trim_adjustment.value(),
+            terminal.char_height().max(1),
             post_trim_probes.iter().map(Option::as_deref),
             &authority,
         )
@@ -2778,6 +3012,7 @@ mod tests {
             small_adjustment.lower(),
             small_adjustment.upper(),
             small_adjustment.value(),
+            terminal.char_height().max(1),
             small_probes.iter().map(Option::as_deref),
             &authority,
         )

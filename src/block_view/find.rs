@@ -1861,6 +1861,8 @@ mod tests {
                 duration_ms: Some(50),
                 cwd: None,
                 is_background: false,
+                completion_provenance: super::super::CompletionProvenance::ShellReported,
+                start_mark_seen: true,
             },
             CompletedCommandRecord {
                 id: 7,
@@ -1871,6 +1873,8 @@ mod tests {
                 duration_ms: Some(2_000),
                 cwd: None,
                 is_background: false,
+                completion_provenance: super::super::CompletionProvenance::ShellReported,
+                start_mark_seen: true,
             },
         ];
         let records = || {
@@ -1915,6 +1919,8 @@ mod tests {
             duration_ms: None,
             cwd: None,
             is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
         };
         let with_snapshot = record(1, "cargo test");
         let evicted = record(2, "rg needle src");
@@ -1968,6 +1974,8 @@ mod tests {
             duration_ms: None,
             cwd: None,
             is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
         };
         let evicted = CompletedCommandRecord {
             id: 2,

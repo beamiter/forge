@@ -13,8 +13,8 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use super::{
-    BackendRecordRef, BackendRecords, CompletedCommandRecord, TermView, ZoneOutputSnapshot,
-    MAX_ZONE_SNAPSHOT_BYTES,
+    markdown_fence, BackendRecordRef, BackendRecords, CompletedCommandRecord, TermView,
+    ZoneOutputSnapshot, MAX_ZONE_SNAPSHOT_BYTES,
 };
 
 #[derive(serde::Serialize)]
@@ -27,6 +27,10 @@ struct MetadataRecordExport<'a> {
     duration_ms: Option<u64>,
     cwd: Option<&'a str>,
     is_background: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion_provenance: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lifecycle_health: Option<&'a str>,
     /// The bounded finalize-time snapshot. Omitted — never an empty string —
     /// when no snapshot is retained (none was captured, or the global budget
     /// evicted it).
@@ -47,11 +51,23 @@ fn metadata_record_export<'a>(
         id: record.id,
         cmd: &record.cmd,
         exit_code: record.exit_code,
-        start_time_ms: record.start_time_ms,
-        end_time_ms: record.end_time_ms,
-        duration_ms: record.duration_ms,
+        start_time_ms: record
+            .timing_is_authoritative()
+            .then_some(record.start_time_ms)
+            .flatten(),
+        end_time_ms: record
+            .timing_is_authoritative()
+            .then_some(record.end_time_ms)
+            .flatten(),
+        duration_ms: record
+            .timing_is_authoritative()
+            .then_some(record.duration_ms)
+            .flatten(),
         cwd: record.cwd.as_deref(),
         is_background: record.is_background,
+        completion_provenance: (!record.is_background)
+            .then_some(record.completion_provenance.as_str()),
+        lifecycle_health: (!record.is_background).then_some(record.lifecycle_health().as_str()),
         output: snapshot.map(|snapshot| snapshot.plain.as_str()),
         output_truncated: snapshot.map(|snapshot| snapshot.truncated),
         output_available: snapshot.is_some(),
@@ -65,8 +81,9 @@ fn metadata_record_markdown(
     let mut markdown = if record.is_background {
         "## Background Output\n\n".to_string()
     } else {
+        let fence = markdown_fence(&record.cmd);
         format!(
-            "## Command Record\n\n**Command:**\n```bash\n{}\n```\n\n",
+            "## Command Record\n\n**Command:**\n{fence}bash\n{}\n{fence}\n\n",
             record.cmd
         )
     };
@@ -79,7 +96,8 @@ fn metadata_record_markdown(
                     MAX_ZONE_SNAPSHOT_BYTES / 1024
                 ));
             }
-            markdown.push_str(&format!("\n```\n{}\n```\n\n", snapshot.plain));
+            let fence = markdown_fence(&snapshot.plain);
+            markdown.push_str(&format!("\n{fence}\n{}\n{fence}\n\n", snapshot.plain));
         }
         None => markdown.push_str(
             "**Output:** unavailable (retained on the live Unified terminal surface only)\n\n",
@@ -90,8 +108,17 @@ fn metadata_record_markdown(
             Some(code) => markdown.push_str(&format!("**Exit Code:** {code}\n\n")),
             None => markdown.push_str("**Exit Code:** unknown (the shell reported none)\n\n"),
         }
+        markdown.push_str(&format!(
+            "**Lifecycle:** {} ({})\n\n",
+            record.lifecycle_health().as_str(),
+            record.completion_provenance.as_str(),
+        ));
     }
-    if let Some(duration_ms) = record.duration_ms {
+    if let Some(duration_ms) = record
+        .timing_is_authoritative()
+        .then_some(record.duration_ms)
+        .flatten()
+    {
         markdown.push_str(&format!(
             "**Duration:** {:.3}s\n\n",
             duration_ms as f64 / 1_000.0
@@ -303,9 +330,9 @@ impl TermView {
 #[cfg(test)]
 mod tests {
     use super::{
-        export_file_name, record_json, record_markdown, records_json, session_markdown_document,
-        write_session_export, BackendRecordRef, BackendRecords, CompletedCommandRecord,
-        SessionExportFormat, ZoneOutputSnapshot,
+        export_file_name, metadata_record_markdown, record_json, record_markdown, records_json,
+        session_markdown_document, write_session_export, BackendRecordRef, BackendRecords,
+        CompletedCommandRecord, SessionExportFormat, ZoneOutputSnapshot,
     };
     use crate::block_view::UnifiedZoneStore;
     use std::cell::RefCell;
@@ -388,6 +415,8 @@ mod tests {
                 duration_ms: Some(1_234),
                 cwd: Some("/work/forge".to_string()),
                 is_background: false,
+                completion_provenance: super::super::CompletionProvenance::ShellReported,
+                start_mark_seen: true,
             },
             CompletedCommandRecord {
                 id: 42,
@@ -398,6 +427,8 @@ mod tests {
                 duration_ms: Some(250),
                 cwd: None,
                 is_background: false,
+                completion_provenance: super::super::CompletionProvenance::BoundaryInferred,
+                start_mark_seen: true,
             },
             CompletedCommandRecord {
                 id: 43,
@@ -408,6 +439,8 @@ mod tests {
                 duration_ms: None,
                 cwd: Some("/work/forge".to_string()),
                 is_background: true,
+                completion_provenance: super::super::CompletionProvenance::Unknown,
+                start_mark_seen: false,
             },
         ]);
         let records = RefCell::new(store);
@@ -427,17 +460,21 @@ mod tests {
                     "duration_ms": 1_234,
                     "cwd": "/work/forge",
                     "is_background": false,
+                    "completion_provenance": "shell_reported",
+                    "lifecycle_health": "healthy",
                     "output_available": false
                 },
                 {
                     "id": 42,
                     "cmd": "mystery-command",
                     "exit_code": null,
-                    "start_time_ms": 1_700_000_002_000u64,
-                    "end_time_ms": 1_700_000_002_250u64,
-                    "duration_ms": 250,
+                    "start_time_ms": null,
+                    "end_time_ms": null,
+                    "duration_ms": null,
                     "cwd": null,
                     "is_background": false,
+                    "completion_provenance": "boundary_inferred",
+                    "lifecycle_health": "degraded",
                     "output_available": false
                 },
                 {
@@ -477,6 +514,8 @@ mod tests {
             duration_ms: Some(1_234),
             cwd: Some("/work/forge".to_string()),
             is_background: false,
+            completion_provenance: super::super::CompletionProvenance::BoundaryInferred,
+            start_mark_seen: true,
         };
         let unknown_json: serde_json::Value =
             serde_json::from_str(&record_json(BackendRecordRef::Metadata {
@@ -496,7 +535,7 @@ mod tests {
             "## Command Record\n\n**Command:**\n```bash\nmystery-command\n```\n\n\
              **Output:** unavailable (retained on the live Unified terminal surface only)\n\n\
              **Exit Code:** unknown (the shell reported none)\n\n\
-             **Duration:** 1.234s\n\n"
+             **Lifecycle:** degraded (boundary_inferred)\n\n"
         );
 
         let background = CompletedCommandRecord {
@@ -508,6 +547,8 @@ mod tests {
             duration_ms: None,
             cwd: Some("/work/forge".to_string()),
             is_background: true,
+            completion_provenance: super::super::CompletionProvenance::Unknown,
+            start_mark_seen: false,
         };
         let markdown = record_markdown(BackendRecordRef::Metadata {
             record: &background,
@@ -537,6 +578,8 @@ mod tests {
             duration_ms: Some(2_500),
             cwd: None,
             is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
         };
         let snapshot = ZoneOutputSnapshot {
             plain: "running 3 tests\ntest result: ok".to_string(),
@@ -561,6 +604,7 @@ mod tests {
             "## Command Record\n\n**Command:**\n```bash\ncargo test\n```\n\n\
              **Output:**\n```\nrunning 3 tests\ntest result: ok\n```\n\n\
              **Exit Code:** 0\n\n\
+             **Lifecycle:** healthy (shell_reported)\n\n\
              **Duration:** 2.500s\n\n"
         );
     }
@@ -576,6 +620,8 @@ mod tests {
             duration_ms: None,
             cwd: None,
             is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
         };
         let snapshot = ZoneOutputSnapshot {
             plain: "…last lines".to_string(),
@@ -612,6 +658,8 @@ mod tests {
             duration_ms: None,
             cwd: None,
             is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
         });
         store.insert_snapshot(
             90,
@@ -647,6 +695,29 @@ mod tests {
             })
             .expect("one record");
         assert!(markdown.contains("**Output:** unavailable"));
+    }
+
+    #[test]
+    fn metadata_markdown_fences_untrusted_command_and_output_backticks() {
+        let record = CompletedCommandRecord {
+            id: 91,
+            cmd: "printf '```'".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
+        };
+        let snapshot = ZoneOutputSnapshot {
+            plain: "```\n## not a heading".to_string(),
+            truncated: false,
+        };
+        let markdown = metadata_record_markdown(&record, Some(&snapshot));
+        assert!(markdown.contains("**Command:**\n````bash\nprintf '```'\n````\n\n"));
+        assert!(markdown.contains("**Output:**\n````\n```\n## not a heading\n````\n\n"));
     }
 
     /// An export is command output on disk, so it must not be world-readable,

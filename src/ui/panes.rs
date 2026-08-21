@@ -15,6 +15,12 @@ use crate::state::generate_session_id;
 use crate::terminal::{setup_terminal_click_handler, terminal_working_directory, VteTerminalView};
 use vte4::TerminalExt as _;
 
+fn command_history_exit_code(reported: Option<i32>) -> Option<i32> {
+    // The JSONL wire schema has a plain i32. Skipping an unknown status is the
+    // only representation that does not concretize it as success or failure.
+    reported
+}
+
 #[derive(Clone)]
 struct PaneLocation {
     page: gtk4::Widget,
@@ -330,6 +336,10 @@ impl UiState {
         let config_for_history = self.config.clone();
         let view_for_history = Rc::downgrade(view);
         view.connect_block_finished(move |command, exit_code, _agent_generation, _duration_ms| {
+            let Some(exit_code) = command_history_exit_code(exit_code) else {
+                log::debug!("command history: skipping completion with unreported status");
+                return;
+            };
             let config = config_for_history.borrow();
             if !config.command_history_enabled {
                 return;
@@ -345,11 +355,6 @@ impl UiState {
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()
                 .and_then(|duration| u64::try_from(duration.as_millis()).ok());
-            // The family's history JSONL is shared with jsh and the other
-            // terminals, and its schema has a plain exit_code — so a status the
-            // shell never reported is recorded as the sentinel rather than as a
-            // successful 0.
-            let (exit_code, _) = crate::block_view::exit_code_for_shared_surface(exit_code);
             if let Err(err) = jterm_core::command_history::enqueue(
                 std::path::Path::new(path),
                 config.command_history_max_entries as usize,
@@ -1130,5 +1135,12 @@ mod tests {
             nearest_directional_index(&centers, 0, Direction::Down),
             None
         );
+    }
+
+    #[test]
+    fn command_history_never_concretizes_an_unreported_status() {
+        assert_eq!(super::command_history_exit_code(Some(0)), Some(0));
+        assert_eq!(super::command_history_exit_code(Some(7)), Some(7));
+        assert_eq!(super::command_history_exit_code(None), None);
     }
 }
