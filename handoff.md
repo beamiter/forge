@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-15 (parser unification round)
+Updated: 2026-08-21 (exactly-once command lifecycle closure)
 
 This working tree contains the nine-round "Evolve ASCII organism" series
 (`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
@@ -18,6 +18,18 @@ every round (attribution races, a Drop panic on a fired glib source, a
 saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
+
+- **Exactly-once command lifecycle closure (2026-08-21)**: Block and Unified
+  now share one observer-side `C -> finish` latch. An accepted `D` consumes it
+  with `shell_reported` evidence; if `D` is lost, only a foreground-shell `A`
+  consumes it with `boundary_inferred`/`degraded` evidence and `None` for exit
+  status and duration. The inferred fan-out runs before that same `A` finalizes
+  the backend record, preserving the normal `D -> A` ordering. Repeated `A`,
+  background output, prompt-owned alternate screens, and RIS cannot mint a
+  finish without an accepted `C`; RIS remains invalidation, not completion.
+  The running-command display copy, engine-owned command identity, and Agent
+  correlation remain available for prompt-trust rollback and later
+  Block/Unified finalization.
 
 - **Inherited-environment freeze (2026-08-15, fourth round)**: the local
   `src/child_env.rs` is deleted and both spawn paths run on

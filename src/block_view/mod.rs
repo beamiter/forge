@@ -3531,9 +3531,10 @@ pub(crate) struct CommandStartedEvent {
     pub(crate) cwd: Option<String>,
 }
 
-/// Authoritative foreground-command lifecycle event emitted at OSC 133 `D`.
-/// Unlike `BlockFinishedCallbacks`, this does not wait for the next prompt or
-/// carry a sampled output buffer.
+/// Exactly-once foreground-command lifecycle event paired with an accepted
+/// [`CommandStartedEvent`]. It is emitted at an accepted OSC 133 `D`, or at a
+/// trusted foreground-shell prompt boundary when `D` was lost. Unlike
+/// `BlockFinishedCallbacks`, it carries no sampled output buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommandFinishedEvent {
     pub(crate) command: String,
@@ -4163,6 +4164,11 @@ struct EngineState {
     /// How the current command's completion boundary was established. Reset
     /// at C, promoted only by an accepted D or a foreground-shell A recovery.
     pending_completion_provenance: CompletionProvenance,
+    /// Exactly-once observer half of an accepted C lifecycle. Armed only by C,
+    /// consumed by the first accepted D or trusted-A recovery, and cleared by
+    /// RIS. This is deliberately separate from `cmd_running_rc`: renderer/UI
+    /// recovery may change that flag without creating a second lifecycle.
+    command_finished_event_pending: bool,
     /// OSC 133 metadata for the command currently running, if the shell sends any.
     pending_command_meta: PendingCommandMeta,
     /// The id opened at A and carried through C until its completed record is
@@ -5221,6 +5227,35 @@ struct ReaderCtx {
 /// order the events arrive. Bodies moved verbatim from the former
 /// `process_chunk` match closure (arm-level `continue` became `return`).
 impl ReaderCtx {
+    /// Close the observer-facing half of one accepted `C` lifecycle exactly
+    /// once. The engine-owned latch is shared by the ordinary `D` path and the
+    /// trusted-`A` recovery path; renderer mode cannot change this contract,
+    /// and a prompt-owned alt screen without a command start cannot manufacture
+    /// a finish event.
+    fn take_command_finished_event(
+        &self,
+        cwd: Option<String>,
+        exit_code: Option<i32>,
+        duration_ms: Option<u64>,
+        completion_provenance: CompletionProvenance,
+    ) -> Option<CommandFinishedEvent> {
+        if !std::mem::take(&mut self.engine.borrow_mut().command_finished_event_pending) {
+            return None;
+        }
+        Some(CommandFinishedEvent {
+            // Keep the engine/UI display copy intact until finalization. Anvil
+            // can legitimately resume CollectingOutput after a provisional
+            // post-D prompt loses foreground trust; sharing this rule avoids a
+            // family-only empty command on that rollback path.
+            command: self.running_cmd_rc.borrow().clone(),
+            cwd,
+            exit_code,
+            duration_ms,
+            completion_provenance,
+            lifecycle_health: assess_lifecycle(true, completion_provenance),
+        })
+    }
+
     fn handle_event(&self, event: &ParserEvent) {
         let state = self.bstate_rc.get();
         match event {
@@ -5336,6 +5371,7 @@ impl ReaderCtx {
             engine.background_output.clear();
             engine.pending_exit_code = None;
             engine.pending_completion_provenance = CompletionProvenance::Unknown;
+            engine.command_finished_event_pending = false;
             engine.pending_command_meta = PendingCommandMeta::default();
             engine.command_start_instant = None;
             engine.idle_kitty_pipeline_dirty = false;
@@ -5555,16 +5591,29 @@ impl ReaderCtx {
                 emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
                 self.backend.layout_active_surface();
             }
-            {
+            let command_cwd = {
                 let mut engine = self.engine.borrow_mut();
                 engine.osc133_depth = 0;
                 engine.pending_exit_code = None;
                 engine.command_start_instant = None;
                 engine.pending_completion_provenance = CompletionProvenance::BoundaryInferred;
-            }
+                engine.pending_command_meta.cwd.clone()
+            };
+            let inferred_finish = self.take_command_finished_event(
+                command_cwd,
+                None,
+                None,
+                CompletionProvenance::BoundaryInferred,
+            );
             self.cmd_running_rc.set(false);
             self.bstate_rc.set(BlockState::PostCommand);
             state = BlockState::PostCommand;
+            if let Some(event) = inferred_finish {
+                // The trusted A is both the recovery proof and the next
+                // prompt's start. Close observers before finalizing the block,
+                // preserving the ordinary D -> A callback order.
+                emit_command_finished(&self.command_finished_cbs, event);
+            }
         }
         if state == BlockState::AwaitingCommand && self.external_submission_rc.borrow().is_some() {
             take_agent_execution_as_lost(
@@ -5991,6 +6040,7 @@ impl ReaderCtx {
             let mut engine = self.engine.borrow_mut();
             engine.osc133_depth = 0;
             engine.pending_completion_provenance = CompletionProvenance::Unknown;
+            engine.command_finished_event_pending = true;
             engine.pending_command_meta = command_meta;
             // A command start without an intervening PromptStart is
             // an ambiguous shell-integration edge. Keep those bytes
@@ -6218,7 +6268,7 @@ impl ReaderCtx {
             emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
             self.backend.layout_active_surface();
         }
-        let (command_started_at, command_cwd, duration_ms) = {
+        let (command_cwd, duration_ms) = {
             let mut engine = self.engine.borrow_mut();
             engine.pending_exit_code = exit;
             engine.pending_completion_provenance = CompletionProvenance::ShellReported;
@@ -6235,27 +6285,18 @@ impl ReaderCtx {
             // the card and the visible block would report
             // different durations (C→D vs C→A).
             engine.pending_command_meta.duration_ms = duration_ms;
-            (
-                command_started_at,
-                engine.pending_command_meta.cwd.clone(),
-                duration_ms,
-            )
+            (engine.pending_command_meta.cwd.clone(), duration_ms)
         };
+        let command_finished = self.take_command_finished_event(
+            command_cwd,
+            exit,
+            duration_ms,
+            CompletionProvenance::ShellReported,
+        );
         self.cmd_running_rc.set(false);
         self.bstate_rc.set(BlockState::PostCommand);
-        let command = std::mem::take(&mut *self.running_cmd_rc.borrow_mut());
-        if command_started_at.is_some() {
-            emit_command_finished(
-                &self.command_finished_cbs,
-                CommandFinishedEvent {
-                    command,
-                    cwd: command_cwd,
-                    exit_code: exit,
-                    duration_ms,
-                    completion_provenance: CompletionProvenance::ShellReported,
-                    lifecycle_health: assess_lifecycle(true, CompletionProvenance::ShellReported),
-                },
-            );
+        if let Some(event) = command_finished {
+            emit_command_finished(&self.command_finished_cbs, event);
         }
         self.backend.mark_scroll_dirty();
     }
@@ -10457,6 +10498,7 @@ impl TermView {
                     command_start_instant: None,
                     pending_exit_code: None,
                     pending_completion_provenance: CompletionProvenance::Unknown,
+                    command_finished_event_pending: false,
                     pending_command_meta: PendingCommandMeta::default(),
                     pending_zone: None,
                     active_alt_screen_mode: None,
@@ -17898,6 +17940,7 @@ mod tests {
                     command_start_instant: None,
                     pending_exit_code: None,
                     pending_completion_provenance: super::CompletionProvenance::Unknown,
+                    command_finished_event_pending: false,
                     pending_command_meta: PendingCommandMeta::default(),
                     pending_zone: None,
                     active_alt_screen_mode: None,
@@ -18078,6 +18121,18 @@ mod tests {
     #[test]
     fn a_full_command_cycle_finalizes_one_block_and_resyncs_geometry() {
         let harness = ReaderHarness::new();
+        let finalized_before_finish = Rc::new(RefCell::new(Vec::new()));
+        {
+            let seen = finalized_before_finish.clone();
+            let backend = harness.backend.clone();
+            harness
+                .ctx
+                .command_finished_cbs
+                .borrow_mut()
+                .push(Box::new(move |_| {
+                    seen.borrow_mut().push(backend.finalized_ids.borrow().len());
+                }));
+        }
         harness.backend.set_columns(100, 120);
         // The shell echoes its prompt well inside the scrollback, so neither
         // coordinate of the capture range is zero.
@@ -18143,6 +18198,11 @@ mod tests {
         assert_eq!(harness.live_output(), raw_output);
         harness.feed(command_end(Some(0)));
         assert_eq!(harness.bstate.get(), BlockState::PostCommand);
+        assert_eq!(
+            harness.ctx.running_cmd_rc.borrow().as_str(),
+            "echo hi",
+            "observer delivery must not consume renderer/rollback command identity"
+        );
 
         // Output bytes were displayed as they arrived, before any block existed.
         assert!(harness
@@ -18235,6 +18295,15 @@ mod tests {
             }]
         );
         assert_eq!(harness.commands_finished.borrow().len(), 1);
+        assert_eq!(
+            harness.commands_finished.borrow()[0].completion_provenance,
+            super::CompletionProvenance::ShellReported
+        );
+        assert_eq!(
+            finalized_before_finish.borrow().as_slice(),
+            &[0],
+            "Block observers close at D before the following A finalizes widgets"
+        );
     }
 
     fn drive_simple_command(harness: &ReaderHarness, command: &str, output: &str) {
@@ -18254,6 +18323,18 @@ mod tests {
     #[test]
     fn missing_d_at_a_records_degraded_provenance_without_fabricated_timing() {
         let harness = ReaderHarness::metadata_only(false);
+        let finalized_before_finish = Rc::new(RefCell::new(Vec::new()));
+        {
+            let seen = finalized_before_finish.clone();
+            let backend = harness.backend.clone();
+            harness
+                .ctx
+                .command_finished_cbs
+                .borrow_mut()
+                .push(Box::new(move |_| {
+                    seen.borrow_mut().push(backend.finalized_ids.borrow().len());
+                }));
+        }
         harness.feed_all([
             ParserEvent::PromptStart,
             bytes("$ "),
@@ -18279,6 +18360,112 @@ mod tests {
         assert_eq!(record.exit_code, None);
         assert_eq!(record.end_time_ms, None);
         assert_eq!(record.duration_ms, None);
+        drop(store);
+
+        assert_eq!(
+            harness.commands_finished.borrow().as_slice(),
+            &[CommandFinishedEvent {
+                command: "printf partial".to_string(),
+                cwd: Some(HARNESS_CWD.to_string()),
+                exit_code: None,
+                duration_ms: None,
+                completion_provenance: super::CompletionProvenance::BoundaryInferred,
+                lifecycle_health: super::BlockLifecycleHealth::Degraded,
+            }],
+            "trusted A closes the observer lifecycle with the same degraded evidence as the record"
+        );
+        harness.feed(ParserEvent::PromptStart);
+        assert_eq!(
+            harness.commands_finished.borrow().len(),
+            1,
+            "the A that recovered D is the only finish boundary"
+        );
+        assert_eq!(
+            finalized_before_finish.borrow().as_slice(),
+            &[0],
+            "Unified observers close before the same A finalizes metadata"
+        );
+    }
+
+    #[test]
+    fn alt_screen_missing_d_closes_once_for_block_and_unified_backends() {
+        for metadata_only in [false, true] {
+            let harness = if metadata_only {
+                ReaderHarness::metadata_only(false)
+            } else {
+                ReaderHarness::new()
+            };
+            harness.feed_all([
+                ParserEvent::PromptStart,
+                bytes("$ "),
+                ParserEvent::PromptEnd,
+                command_start(Some("fullscreen-command")),
+                ParserEvent::AltScreenEnter(1049),
+                ParserEvent::PromptStart,
+                ParserEvent::PromptStart,
+            ]);
+
+            let finished = harness.commands_finished.borrow();
+            assert_eq!(finished.len(), 1, "metadata_only={metadata_only}");
+            assert_eq!(
+                finished[0].completion_provenance,
+                super::CompletionProvenance::BoundaryInferred
+            );
+            assert_eq!(finished[0].exit_code, None);
+            assert_eq!(finished[0].duration_ms, None);
+            assert_eq!(
+                harness.alt_screen.borrow().as_slice(),
+                &[AltScreenTransition::Entered, AltScreenTransition::Left]
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_owned_alt_screen_cannot_manufacture_a_command_finish() {
+        for metadata_only in [false, true] {
+            let harness = if metadata_only {
+                ReaderHarness::metadata_only(false)
+            } else {
+                ReaderHarness::new()
+            };
+            harness.feed_all([
+                ParserEvent::PromptStart,
+                ParserEvent::PromptEnd,
+                ParserEvent::AltScreenEnter(1049),
+                command_end(Some(0)),
+                ParserEvent::PromptStart,
+            ]);
+
+            assert!(
+                harness.commands_finished.borrow().is_empty(),
+                "metadata_only={metadata_only}: no accepted C armed the finish latch"
+            );
+        }
+    }
+
+    #[test]
+    fn ui_capture_rollback_cannot_rearm_the_command_finished_event() {
+        let harness = ReaderHarness::new();
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            ParserEvent::PromptEnd,
+            command_start(Some("rollback-safe")),
+            command_end(Some(0)),
+        ]);
+        assert_eq!(harness.commands_finished.borrow().len(), 1);
+        assert!(!harness.ctx.engine.borrow().command_finished_event_pending);
+
+        // Anvil's stricter Agent prompt gate can resume the rendering state
+        // after a post-D A loses foreground trust. Model those exact state
+        // writes here: the observer latch must remain consumed family-wide.
+        harness.ctx.cmd_running_rc.set(true);
+        harness.bstate.set(BlockState::CollectingOutput);
+        harness.feed(command_end(Some(0)));
+        assert_eq!(harness.commands_finished.borrow().len(), 1);
+        assert_eq!(
+            harness.ctx.running_cmd_rc.borrow().as_str(),
+            "rollback-safe"
+        );
     }
 
     #[test]
@@ -18414,6 +18601,10 @@ mod tests {
             harness.backend.finalized_ids.borrow().as_slice(),
             &[prompt_id]
         );
+        assert!(
+            harness.commands_finished.borrow().is_empty(),
+            "background output has no accepted C to pair with a finish"
+        );
     }
 
     #[test]
@@ -18515,6 +18706,10 @@ mod tests {
         assert!(harness.backend.finalized_ids.borrow().is_empty());
         assert_eq!(harness.bstate.get(), BlockState::CollectingPrompt);
         assert_eq!(harness.agent_lost.borrow().len(), 1);
+        assert!(
+            harness.commands_finished.borrow().is_empty(),
+            "RIS invalidates a running lifecycle instead of reporting a completion"
+        );
     }
 
     #[test]

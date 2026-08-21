@@ -10,7 +10,10 @@ All notable user-visible and operational changes are recorded here.
   nonce 行探针在滚屏、半格滚动和 rewrap 后重新定位图片，ED3/RIS/alt-screen 按可信行边界
   管理生命周期；探针成本按可见行 × 唯一 placement 列有界。Block 的图片预算也统一计入
   PNG backing 与 GTK 对象成本。Block/Unified 完成记录新增独立于 exit status 的 provenance/
-  health；缺失 OSC 133 D 只在 shell 重获前台时恢复，且不虚构耗时或结束时刻。
+  health；缺失 OSC 133 D 只在 shell 重获前台时恢复，且不虚构耗时或结束时刻。每个已接受
+  的 C 现在也只关闭一次 observer lifecycle：可信 A 恢复会在 Block/Unified finalize 前发出
+  unknown/degraded finish，之后的 A、后台输出与 RIS 都不能重放或伪造 finish，organism 与共享
+  activity 不会再因丢失 D 而永久停在 running。
 - 设置面板的 Remote Hosts 现在能**编辑**已保存的主机，不再只有添加和删除。每行新增
   铅笔按钮，用同一个对话框打开（标题与按钮变成 Edit / Save），条目就地替换，因此在
   选择器里的位置不变。对话框没有控件的字段——`ssh_args`、`session`、`remote_shell`、
