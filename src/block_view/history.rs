@@ -408,7 +408,8 @@ impl From<LegacyBlockDataV2> for BlockData {
                 super::CompletionProvenance::JournalRecovered
             } else {
                 super::CompletionProvenance::Unknown
-            },
+            }
+            .into(),
             start_mark_seen: trusted_completion,
             estimated_height: legacy.estimated_height,
             line_count: legacy.line_count,
@@ -460,7 +461,8 @@ impl From<LegacyBlockDataV1> for BlockData {
                 super::CompletionProvenance::JournalRecovered
             } else {
                 super::CompletionProvenance::Unknown
-            },
+            }
+            .into(),
             start_mark_seen: trusted_completion,
             estimated_height: legacy.estimated_height,
             line_count: legacy.line_count,
@@ -495,7 +497,7 @@ fn decode_rkyv_block(data: &[u8]) -> Option<BlockData> {
 fn normalize_block_lifecycle(mut block: BlockData) -> BlockData {
     if block.is_background() {
         block.exit_code = None;
-        block.completion_provenance = super::CompletionProvenance::Unknown;
+        block.completion_provenance = super::CompletionProvenance::Unknown.into();
         block.start_mark_seen = false;
     }
     if block.is_background() || !block.timing_is_authoritative() {
@@ -2664,7 +2666,7 @@ mod tests {
             output: "output".to_string(),
             exit_code: Some(0),
             lifecycle_schema: super::super::blocks::BLOCK_LIFECYCLE_SCHEMA,
-            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            completion_provenance: super::super::CompletionProvenance::ShellReported.into(),
             start_mark_seen: true,
             estimated_height: 32,
             line_count: 1,
@@ -2878,7 +2880,7 @@ mod tests {
         assert_eq!(decoded.exit_code, None);
         assert_eq!(
             decoded.completion_provenance,
-            super::super::CompletionProvenance::Unknown
+            super::super::CompletionProvenanceWire::Unknown
         );
         assert!(!decoded.start_mark_seen);
     }
@@ -2909,7 +2911,7 @@ mod tests {
         assert_eq!(decoded.duration_ms, None);
         assert_eq!(
             decoded.completion_provenance,
-            super::super::CompletionProvenance::Unknown
+            super::super::CompletionProvenanceWire::Unknown
         );
         assert!(!decoded.start_mark_seen);
     }
@@ -2943,7 +2945,7 @@ mod tests {
             assert_eq!(decoded.exit_code, Some(1));
             assert_eq!(
                 decoded.completion_provenance,
-                super::super::CompletionProvenance::JournalRecovered
+                super::super::CompletionProvenanceWire::JournalRecovered
             );
             assert!(decoded.start_mark_seen);
             assert_eq!(decoded.cwd.as_deref(), Some("/tmp"));
@@ -2982,7 +2984,7 @@ mod tests {
         assert_eq!(decoded.exit_code, None);
         assert_eq!(
             decoded.completion_provenance,
-            super::super::CompletionProvenance::Unknown
+            super::super::CompletionProvenanceWire::Unknown
         );
         assert!(!decoded.start_mark_seen);
         assert_eq!(decoded.start_time_ms, None);

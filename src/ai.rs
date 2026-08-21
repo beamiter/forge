@@ -34,7 +34,7 @@ pub fn client_from_config(config: &crate::config::Config) -> Result<AiClient, Ai
         && !crate::config::ai_base_url_is_safe(&config.ai_provider, &config.ai_base_url)
     {
         return Err(AiError::InvalidConfiguration(
-            "AI endpoint must use HTTPS; plain HTTP is allowed only for loopback Ollama".into(),
+            "AI endpoint must use HTTPS unless plain HTTP targets a loopback host".into(),
         ));
     }
     AiClient::from_settings(&AiSettings {
@@ -109,7 +109,7 @@ mod tests {
     #[test]
     fn client_from_config_rejects_unsafe_endpoints_before_credentials_or_transport() {
         for (provider, endpoint) in [
-            ("openai-compatible", "http://127.0.0.1:8000/v1"),
+            ("openai-compatible", "http://models.example.com:8000/v1"),
             ("ollama", "http://models.example.com:11434"),
             ("anthropic", "https://user:secret@example.com"),
         ] {

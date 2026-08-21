@@ -45,6 +45,10 @@ All notable user-visible and operational changes are recorded here.
 
 #### Reliability and UX
 
+- AI endpoint 校验与升级后的 jagent 共享传输契约对齐：Anthropic、OpenAI-compatible 和
+  Ollama 都可连接明确的 `localhost`、IPv4 loopback 或 `[::1]` 明文 HTTP 服务；任何远程
+  HTTP endpoint 仍会在读取凭据或发起网络请求前失败。
+
 - 顶部栏模式下只有一个标签页时，标签不再被藏起来：标签条在该模式下始终显示，当前
   标签的标题（含 OSC 改名与 cwd）一直看得见，新建/关闭标签时顶部栏也不再改变高度与
   布局。原先 `sync_tab_bar_visibility` 用 `n_pages() > 1` 决定顶部标签条的可见性，

@@ -96,9 +96,9 @@ notify_long_block_threshold_ms = 10000
 
 # provider: anthropic | openai-compatible | ollama
 # Anthropic: export ANTHROPIC_API_KEY=...
-# OpenAI-compatible: 只接受 HTTPS endpoint；export OPENAI_API_KEY=...
-# 若 HTTPS 服务（包括 loopback）明确无需鉴权，可不设置 Key。
-# 仅 loopback Ollama 可使用明文 HTTP；远程 Ollama endpoint 也必须使用 HTTPS。
+# OpenAI-compatible: export OPENAI_API_KEY=...
+# 明确无需鉴权的兼容服务可不设置 Key。
+# 所有 provider 的 loopback endpoint 可使用明文 HTTP；远程 endpoint 必须使用 HTTPS。
 # Settings 中输入的 Key 会写入独立私有文件，不会写入此 TOML。
 # 也可手工配置密钥文件（必须为当前用户所有，权限不超过 0600）：
 # ai_api_key_file = "~/.config/forge/ai.key"

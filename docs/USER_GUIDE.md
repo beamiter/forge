@@ -449,9 +449,9 @@ deploy = "persist"
 
 ## 11. AI 与 Agent 安全边界
 
-AI 总开关、provider 和 endpoint 由配置控制。支持 Anthropic、OpenAI-compatible 和 Ollama wire protocol。Anthropic 与 OpenAI-compatible 的 `ai_base_url` 必须是绝对 HTTPS URL，包括指向本机的兼容服务；HTTPS loopback 服务若明确无需鉴权，仍可不配置 Key。明文 HTTP 只对 loopback Ollama 例外开放（`localhost`、IPv4 loopback 或 `[::1]`，可带数字端口），远程 Ollama endpoint 也必须使用 HTTPS。密钥内容不会写入 TOML；环境变量优先。也可直接在 **Settings → AI & Agent → API Key** 输入密钥并按 Apply：forge 会将它原子写入 owner-only 的 `~/.config/forge/ai.key`，并只把文件路径写入配置。设置面板不会回显已经保存的密钥，再次输入并 Apply 可替换它。
+AI 总开关、provider 和 endpoint 由配置控制。支持 Anthropic、OpenAI-compatible 和 Ollama wire protocol。`ai_base_url` 必须是绝对 HTTPS URL，或是明确的 loopback HTTP endpoint（`localhost`、IPv4 loopback 或 `[::1]`，可带数字端口）；该本机例外对三个 provider 一致，便于连接本机兼容服务和代理，任何远程明文 HTTP endpoint 仍会在联网前被拒绝。明确无需鉴权的 loopback 服务可不配置 Key。密钥内容不会写入 TOML；环境变量优先。也可直接在 **Settings → AI & Agent → API Key** 输入密钥并按 Apply：forge 会将它原子写入 owner-only 的 `~/.config/forge/ai.key`，并只把文件路径写入配置。设置面板不会回显已经保存的密钥，再次输入并 Apply 可替换它。
 
-测试本机 OpenAI-compatible mock 时，应为 `localhost`/loopback SAN 签发测试证书，并让系统 `curl` 信任对应测试 CA（例如在隔离测试进程设置 `CURL_CA_BUNDLE`）；Forge 不会为 loopback 降级 TLS 或跳过证书校验。`--check-config` 会在联网前拒绝 OpenAI-compatible HTTP URL。
+测试本机 provider mock 时可直接使用 loopback HTTP；若选择 HTTPS，仍须让系统 `curl` 信任包含实际 `localhost`/loopback SAN 的测试证书，Forge 不会使用 `-k` 或跳过证书校验。`--check-config` 会在联网前拒绝所有非 loopback HTTP URL。
 
 也可通过环境变量配置：
 

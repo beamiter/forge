@@ -1667,7 +1667,7 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
                 &mut issues,
                 Error,
                 "ai_base_url",
-                "expected a bounded absolute HTTPS URL without credentials or ambiguous components; plain HTTP is allowed only for a loopback Ollama endpoint",
+                "expected a bounded absolute HTTPS URL without credentials or ambiguous components; plain HTTP is allowed only for a loopback endpoint",
             );
         }
     }
@@ -3496,16 +3496,22 @@ open_palette = "F8"
             "openai-compatible",
             "https://localhost:8000/v1"
         ));
-        assert!(!ai_base_url_is_safe(
-            "openai-compatible",
-            "http://127.0.0.1:8000/v1"
-        ));
-        assert!(ai_base_url_is_safe("ollama", "http://127.0.0.1:11434"));
-        assert!(ai_base_url_is_safe("ollama", "http://[::1]:11434"));
-        assert!(!ai_base_url_is_safe(
-            "ollama",
-            "http://models.example.com:11434"
-        ));
+        for provider in ["anthropic", "openai-compatible", "ollama"] {
+            for endpoint in [
+                "http://localhost:8000/v1",
+                "http://127.0.0.1:8000/v1",
+                "http://[::1]:8000/v1",
+            ] {
+                assert!(
+                    ai_base_url_is_safe(provider, endpoint),
+                    "{provider} should accept loopback endpoint {endpoint}"
+                );
+            }
+            assert!(
+                !ai_base_url_is_safe(provider, "http://models.example.com:8000/v1"),
+                "{provider} must reject remote clear-text transport"
+            );
+        }
         for value in [
             "https://user:secret@example.com/v1",
             "https://example.com/v1?key=secret",
@@ -3529,13 +3535,13 @@ open_palette = "F8"
 
     #[test]
     fn explicit_invalid_ai_endpoint_never_drifts_to_a_public_default() {
-        let insecure_loopback = "http://127.0.0.1:8000/v1";
+        let remote_cleartext = "http://models.example.com:8000/v1";
         let resolved = resolve_ai_base_url(
-            Some(insecure_loopback.to_string()),
+            Some(remote_cleartext.to_string()),
             "https://api.openai.com/v1",
         );
         assert_eq!(
-            resolved, insecure_loopback,
+            resolved, remote_cleartext,
             "the runtime validator must reject the requested destination itself"
         );
         let mut config = Config::safe_defaults();
@@ -4065,14 +4071,20 @@ session = "bad/session"
         .unwrap();
         assert!(keyless_https_openai.is_empty(), "{keyless_https_openai:?}");
 
-        let insecure_openai = validate_config_contents(
+        let local_openai = validate_config_contents(
             "ai_provider = 'openai-compatible'\nai_base_url = 'http://127.0.0.1:8000/v1'\n",
         )
         .unwrap();
-        assert!(insecure_openai.iter().any(|issue| {
+        assert!(local_openai.is_empty(), "{local_openai:?}");
+
+        let remote_cleartext = validate_config_contents(
+            "ai_provider = 'openai-compatible'\nai_base_url = 'http://models.example.com:8000/v1'\n",
+        )
+        .unwrap();
+        assert!(remote_cleartext.iter().any(|issue| {
             issue.path == "ai_base_url"
                 && issue.level == ConfigIssueLevel::Error
-                && issue.message.contains("HTTPS")
+                && issue.message.contains("loopback")
         }));
 
         let local_ollama = validate_config_contents(

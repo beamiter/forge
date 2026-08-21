@@ -17,7 +17,7 @@ source <(target/debug/forge --shell-integration bash)
 RUST_LOG=forge=debug target/debug/forge --mode block --no-restore
 ```
 
-provider 测试使用 loopback mock server 或可记录 argv、环境、stdin 与子进程 PID 的 `curl` stub。OpenAI-compatible loopback mock 必须启用 HTTPS：证书应包含实际使用的 `localhost`/loopback SAN，并仅在隔离测试进程通过 `CURL_CA_BUNDLE` 等 curl 信任配置加载测试 CA；不得使用 `-k` 或把 endpoint 降为 HTTP。至少准备成功、延迟、401、429、500、断连、空内容、非法 JSON、迟到回复和超大响应 fixture。每项记录 `PASS/FAIL/N/A`、X11/Wayland、shell、provider、复现步骤和脱敏日志。
+provider 测试使用 loopback mock server 或可记录 argv、环境、stdin 与子进程 PID 的 `curl` stub。三个 provider 都可使用明确的 loopback HTTP endpoint；任何非 loopback HTTP endpoint 必须在读取凭据或联网前失败。若 mock 使用 HTTPS，证书应包含实际使用的 `localhost`/loopback SAN，并仅在隔离测试进程通过 `CURL_CA_BUNDLE` 等 curl 信任配置加载测试 CA；不得使用 `-k`。至少准备成功、延迟、401、429、500、断连、空内容、非法 JSON、迟到回复和超大响应 fixture。每项记录 `PASS/FAIL/N/A`、X11/Wayland、shell、provider、复现步骤和脱敏日志。
 
 selected Block fixture：
 
@@ -47,7 +47,7 @@ python3 -c 'print("x" * 1000000)'
 | 编号 | 场景 | 通过标准 | 建议层级 |
 |---|---|---|---|
 | T-1 | Anthropic | endpoint、`x-api-key`、version header、system/history 与 token limit 符合协议；缺少密钥时离线失败并给出可操作提示。 | mock integration |
-| T-2 | OpenAI-compatible | endpoint 必须为 HTTPS（loopback 也不例外）；Bearer 保持可选，HTTPS 无鉴权 loopback 服务可工作；system/history 与 response shape 正确。 | TLS mock integration |
+| T-2 | OpenAI-compatible | endpoint 必须为 HTTPS 或明确的 loopback HTTP；Bearer 保持可选，无鉴权 loopback 服务可工作；system/history 与 response shape 正确。 | mock integration |
 | T-3 | Ollama | `/api/chat`、`stream`/options、system/history 与 response shape 正确；无需密钥的本地服务可工作。 | mock integration |
 | T-4 | HTTP/协议错误 | 401、429、5xx、空内容、非法 JSON、断连和超时均转为有界、可复制且不含 secret 的错误；Retry 不重复提交旧 generation。 | mock integration |
 | T-5 | 凭据与进程 | API key、请求 body 与 URL 不出现在进程 argv、继承环境或普通日志；host bridge 与本机路径使用相同边界。 | process integration |
