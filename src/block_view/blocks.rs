@@ -770,7 +770,7 @@ struct OutputVisualRowsCacheEntry {
 /// Rows occupied after VTE wraps the snapshot at `cols`. Finished cards need
 /// this rather than the logical line count, otherwise long stack-trace lines
 /// are still pushed into the VTE's private scrollback.
-fn output_visual_row_count(text: &str, cols: i64) -> i64 {
+pub(crate) fn output_visual_row_count(text: &str, cols: i64) -> i64 {
     #[cfg(test)]
     OUTPUT_VISUAL_ROW_COUNT_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
     use unicode_width::UnicodeWidthChar;
@@ -1003,7 +1003,7 @@ fn output_render_stamp(
     output_rows: i64,
     cap: i64,
     generation: u64,
-) -> (i64, i64, bool, u64) {
+) -> RenderStamp {
     (
         cols.max(1),
         output_rows.max(1).min(cap.max(1)),
@@ -1183,21 +1183,51 @@ fn finished_block_height_for_rows(cell_height_px: i32, command_rows: i64, output
 
 /// Virtualization metadata must follow terminal visual rows rather than logical
 /// newlines. Wide glyphs and long stack-trace lines can wrap many times.
+/// Values `finalize_block` already derived from the very bytes it is about to
+/// hand to [`FinishedBlock::new_with_pool`].
+///
+/// The row count is a unicode-width walk (plus a `strip_ansi` replay when the
+/// text still has escapes in it). Recomputing it inside the constructor walked
+/// a 1.3 MB transcript a second time for a number the caller was already
+/// holding. `None` keeps the old self-sufficient behavior for restore paths
+/// and tests.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FinishedBlockPrecomputed {
+    pub(crate) output_rows: Option<i64>,
+}
+
 pub(crate) fn estimated_finished_block_height_for_text(
     config: &Config,
     command: &str,
     output: &str,
     cols: i64,
 ) -> i32 {
-    let command_rows = if command.trim().is_empty() {
-        0
-    } else {
-        output_visual_row_count(command, cols).max(1)
-    };
     let output_rows = if output.trim().is_empty() {
         0
     } else {
         output_visual_row_count(output, cols).max(1)
+    };
+    estimated_finished_block_height_for_rows(config, command, output_rows, cols)
+}
+
+/// The same estimate from an output row count the caller already holds.
+///
+/// `output_visual_row_count` is a per-character unicode-width walk over the
+/// whole transcript, preceded by a full `strip_ansi` whenever the text still
+/// carries escapes. `finalize_block` needs that count anyway to build the card,
+/// so it derives it once and threads it through here instead of paying for a
+/// second identical walk on the way to the same number. `output_rows` follows
+/// this function's own convention: 0 for output that trims to nothing.
+pub(crate) fn estimated_finished_block_height_for_rows(
+    config: &Config,
+    command: &str,
+    output_rows: i64,
+    cols: i64,
+) -> i32 {
+    let command_rows = if command.trim().is_empty() {
+        0
+    } else {
+        output_visual_row_count(command, cols).max(1)
     };
     let fallback_cap = (config.finished_block_viewport_rows as i64).max(3);
     let visible_output_rows = if output_rows == 0 {
@@ -1254,6 +1284,69 @@ fn finished_snapshot_stream(display_text: &str) -> Vec<u8> {
 /// real terminal semantics. The post-feed settle pass expands short/full-height
 /// blocks to the actual retained buffer span, covering ANSI cursor movement,
 /// carriage-return redraws, combining/wide glyphs, tabs, and soft wrapping.
+/// `(effective_cols, visible_rows, fits, generation)` — see
+/// [`stamp_change_needs_refeed`] for which half is content and which geometry.
+type RenderStamp = (i64, i64, bool, u64);
+
+/// Whether a render-stamp change means the bytes in VTE are wrong, or only the
+/// window onto them.
+///
+/// Columns decide how the transcript wraps and the generation identifies which
+/// text is displayed; those two are the content. The other two are geometry,
+/// and geometry alone never invalidates a parsed ring.
+fn stamp_change_needs_refeed(previous: RenderStamp, next: RenderStamp) -> bool {
+    previous.0 != next.0 || previous.3 != next.3
+}
+
+/// Re-window a finished VTE that already holds the right bytes.
+///
+/// How many rows a card SHOWS is not a property of what was fed into it: the
+/// transcript is already parsed and sitting in VTE's ring, and the visible grid
+/// is a window onto that ring. `render_bytes_into_finished_vte` was being used
+/// for this anyway, which reset the terminal and re-parsed the whole snapshot —
+/// up to a 1.3 MB re-parse per card, per re-fit, and the re-fit sweep runs on a
+/// window resize. Measured on anvil, which had the identical bug: 20 window
+/// resizes over one 200k-line block cost 970ms of CPU and left the card BLANK;
+/// re-windowing costs 600ms and keeps the output on screen.
+///
+/// The scrollback dance mirrors `render_bytes_into_finished_vte`: arm a
+/// generous limit first so no `set_size` in either direction can trim the ring,
+/// then settle on the real one, which keeps screen + scrollback at exactly the
+/// same total the feed path left behind.
+fn rewindow_finished_vte(
+    vte: &vte4::Terminal,
+    cols: i64,
+    visible_rows: i64,
+    requested_scrollback: i64,
+    expand_to_buffer: bool,
+    expected_tail: Option<&str>,
+) {
+    let (cols, visible_rows, scrollback) =
+        bounded_finished_vte_geometry(cols, visible_rows.max(1), requested_scrollback.max(64));
+    let cell_height = vte.char_height() as i32;
+    if cell_height > 0 {
+        vte.set_height_request(finished_vte_height_px(visible_rows, cell_height));
+    }
+    vte.set_scrollback_lines(bounded_finished_vte_max_rows(cols));
+    vte.set_size(cols, visible_rows);
+    vte.set_scrollback_lines(scrollback);
+    // The tail gate still matters. This call feeds nothing, but an EARLIER
+    // feed — the map-time render, a filter render — applies asynchronously, and
+    // a re-fit can land in the same frame as it. Passing `None` makes
+    // `feed_tail_applied` return true unconditionally, so the settle would
+    // measure a half-parsed ring and shrink the card to the rows applied so
+    // far, permanently. The bytes VTE should hold are unchanged by a
+    // re-window, so the feed's own tail is still the right proof.
+    if expand_to_buffer {
+        settle_finished_terminal_after_feed(vte, expected_tail);
+    } else {
+        settle_finished_terminal_at_top(vte, expected_tail);
+    }
+    if let Some(adj) = vte.vadjustment() {
+        adj.set_value(adj.lower());
+    }
+}
+
 pub(crate) fn render_bytes_into_finished_vte(
     vte: &vte4::Terminal,
     text: &str,
@@ -1379,6 +1472,7 @@ impl FinishedBlock {
             &[],
             output.len(),
             None,
+            FinishedBlockPrecomputed::default(),
         )
     }
 
@@ -1398,6 +1492,7 @@ impl FinishedBlock {
         images: &[gtk4::gdk::Texture],
         plain_output_bytes: usize,
         recycled: Option<gtk4::Box>,
+        precomputed: FinishedBlockPrecomputed,
     ) -> Self {
         let is_background = cmd.trim().is_empty();
         let has_output = !output.trim().is_empty();
@@ -1421,7 +1516,8 @@ impl FinishedBlock {
         // so the finished block mirrors what the live VTE showed. Ordinary output
         // has no vertical repaint and is fed unchanged.
         let collapsed;
-        let output = if output_has_vertical_repaint(output) {
+        let repaint_collapsed = output_has_vertical_repaint(output);
+        let output = if repaint_collapsed {
             collapsed = collapse_repaint_output(output, cols.max(1) as usize);
             collapsed.as_str()
         } else {
@@ -1450,7 +1546,15 @@ impl FinishedBlock {
             super::kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK
         });
 
-        let output_rows = output_visual_row_count(output, cols);
+        // A collapsed transcript is a DIFFERENT string from the one the caller
+        // measured — `collapse_repaint_output` clips every row at `cols` and
+        // pops trailing blank rows, neither of which `strip_ansi` does — so the
+        // precomputed count is only valid when no collapse happened. Measuring
+        // the collapsed frame here is cheap: it is already bounded to `cols`.
+        let output_rows = precomputed
+            .output_rows
+            .filter(|_| !repaint_collapsed)
+            .unwrap_or_else(|| output_visual_row_count(output, cols));
         let fallback_viewport_cap = (config.finished_block_viewport_rows as i64).max(3);
         let viewport_cap =
             fitted_output_rows_for_viewport(None, fallback_viewport_cap, output_rows);
@@ -1812,7 +1916,7 @@ impl FinishedBlock {
         // document, re-clamps the scroll, and re-toggles boundary cards —
         // the self-sustaining flicker loop on narrow panes. Cols start at 0
         // (below any real value) so the first map always renders.
-        let render_stamp: Rc<Cell<(i64, i64, bool, u64)>> = Rc::new(Cell::new((0, 0, false, 0)));
+        let render_stamp: Rc<Cell<RenderStamp>> = Rc::new(Cell::new((0, 0, false, 0)));
         // Bumped whenever `displayed_output` is replaced (per-block filter), so
         // a stale stamp can never suppress rendering fresh text.
         let displayed_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
@@ -2034,21 +2138,37 @@ impl FinishedBlock {
                 jump_btn.set_visible(can_expand);
                 let cap = finished_output_cap(rows, fitted_cap, false, max_expanded_cap_for_refit);
                 let stamp = output_render_stamp(eff_cols, rows, cap, generation_for_refit.get());
-                if stamp_for_refit.replace(stamp) == stamp {
+                let previous_stamp = stamp_for_refit.replace(stamp);
+                if previous_stamp == stamp {
                     return None;
                 }
                 let (_, visible_rows, _) =
                     bounded_finished_vte_geometry(eff_cols, rows.min(cap).max(1), 0);
                 let fit_to_content = output_fits_viewport(rows, cap);
-                render_bytes_into_finished_vte(
-                    &output_vte,
-                    text,
-                    eff_cols,
-                    rows,
-                    cap,
-                    capture_rows,
-                    fit_to_content,
-                );
+                // Same columns and same displayed generation means VTE already
+                // holds exactly these bytes wrapped exactly this way; only the
+                // number of rows on screen moved.
+                if stamp_change_needs_refeed(previous_stamp, stamp) {
+                    render_bytes_into_finished_vte(
+                        &output_vte,
+                        text,
+                        eff_cols,
+                        rows,
+                        cap,
+                        capture_rows,
+                        fit_to_content,
+                    );
+                } else {
+                    let settle_tail = snapshot_settle_tail(output_display_text(text));
+                    rewindow_finished_vte(
+                        &output_vte,
+                        eff_cols,
+                        rows.min(cap).max(1),
+                        capture_rows.max(rows),
+                        fit_to_content,
+                        settle_tail.as_deref(),
+                    );
+                }
                 let cell_height = (output_vte.char_height() as i32).max(1);
                 if !fit_to_content {
                     output_vte
@@ -3513,6 +3633,33 @@ mod tests {
         assert_ne!(base, super::output_render_stamp(137, 40, 24, 1));
     }
 
+
+    #[test]
+    fn only_a_content_change_earns_a_re_feed() {
+        let base = super::output_render_stamp(137, 40, 24, 0);
+        // Cap moved: for a long block this changes the stamp (the visible rows
+        // ARE the cap), but the ring already holds the right bytes.
+        assert!(!super::stamp_change_needs_refeed(
+            base,
+            super::output_render_stamp(137, 40, 12, 0)
+        ));
+        assert!(!super::stamp_change_needs_refeed(
+            base,
+            super::output_render_stamp(137, 40, 200, 0)
+        ));
+        // Different wrap width: the ring's line breaks are wrong.
+        assert!(super::stamp_change_needs_refeed(
+            base,
+            super::output_render_stamp(135, 40, 24, 0)
+        ));
+        // Different displayed text (a filter was applied).
+        assert!(super::stamp_change_needs_refeed(
+            base,
+            super::output_render_stamp(137, 40, 24, 1)
+        ));
+        // The construction-time zero stamp always feeds.
+        assert!(super::stamp_change_needs_refeed((0, 0, false, 0), base));
+    }
     #[test]
     fn duration_badge_keeps_seconds_past_the_minute_mark() {
         use super::format_block_duration;

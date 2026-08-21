@@ -1829,6 +1829,27 @@ pub(crate) fn recall_command_at_prompt(
     true
 }
 
+/// Lines [`truncate_plain_output_for_height`] would report, without building
+/// the string it has to allocate to report them.
+///
+/// `finalize_block` only ever consumed the count. Note the asymmetry this
+/// mirrors: on the truncated branch the helper returns the DISPLAYED line
+/// count (kept lines, one blank, the banner), not the total.
+fn plain_output_height_line_count(output_plain: &str, line_limit: usize) -> usize {
+    let total_lines = output_plain.trim().lines().count();
+    if total_lines <= line_limit {
+        return total_lines;
+    }
+    // `kept + "\n\n" + banner`: the kept lines, one blank line, then the
+    // banner. A zero limit joins nothing, which still leaves an empty first
+    // line ahead of that blank.
+    if line_limit == 0 {
+        3
+    } else {
+        line_limit + 2
+    }
+}
+
 fn truncate_plain_output_for_height(output_plain: &str, line_limit: usize) -> (String, usize) {
     let trimmed = output_plain.trim();
     let total_lines = trimmed.lines().count();
@@ -6702,14 +6723,30 @@ impl RenderBackend for BlockBackend {
         let block_cwd = record.cwd.as_deref();
         let cols = self.grid_cols();
         let truncation_limit = { self.config_for_cb.borrow().truncation_threshold_lines as usize };
-        let (_output_trimmed, line_count) =
-            truncate_plain_output_for_height(output_plain, truncation_limit);
+        // Only the count was ever consumed here. Reaching it through
+        // `truncate_plain_output_for_height` built a `Vec<&str>` over every line
+        // of the transcript plus a full second copy of it, on the main thread.
+        let line_count = plain_output_height_line_count(output_plain, truncation_limit);
+        // One unicode-width walk for the whole finalize, and it must be over the
+        // SAME string the card constructor measures — `output_with_ansi`.
+        // Counting `output_plain` instead would be cheaper (the strip replay is
+        // already paid) but `strip_ansi` is not idempotent: a capture ending in
+        // a lone ESC after cursor motion replays that ESC as a literal cell, and
+        // a second strip then consumes it as the head of an escape sequence.
+        // `new_with_pool` declines this number outright for a transcript it
+        // collapses, because a collapsed frame is a different string again.
+        let output_rows = output_visual_row_count(output_with_ansi, cols);
         let estimated_height = {
             // Copy the scalar inputs before calling the estimator. Keeping a
             // Ref to the live config cell across this call would make a future
             // callback added inside the estimator an accidental borrow panic.
             let config = self.config_for_cb.borrow().clone();
-            estimated_finished_block_height_for_text(&config, cmd, output_plain, cols)
+            let estimator_rows = if output_plain.trim().is_empty() {
+                0
+            } else {
+                output_rows.max(1)
+            };
+            estimated_finished_block_height_for_rows(&config, cmd, estimator_rows, cols)
         };
         let block_data = BlockData {
             id: block_id,
@@ -6807,6 +6844,9 @@ impl RenderBackend for BlockBackend {
             &kitty_images,
             plain_output_bytes,
             recycled,
+            FinishedBlockPrecomputed {
+                output_rows: Some(output_rows),
+            },
         );
         // A block finishing after an app recolored the
         // terminal must not pop in with static theme
@@ -15246,6 +15286,65 @@ mod tests {
         assert!(visible.contains(&1010));
         assert!(!visible.contains(&1011));
         assert_eq!(visible.len(), 1001);
+    }
+
+    #[test]
+    fn height_line_count_matches_the_string_it_no_longer_builds() {
+        // `finalize_block` derives the count arithmetically now. Pin it against
+        // the function whose second return value it is predicting, including
+        // the truncation banner's own two lines and the zero-limit join.
+        let corpora = [
+            "",
+            "one",
+            "one\ntwo",
+            "one\ntwo\nthree\n",
+            "  leading and trailing  \n\n",
+            "a\r\nb\r\nc",
+        ];
+        for text in corpora {
+            for limit in [0usize, 1, 2, 3, 5, 100] {
+                let (_, expected) = super::truncate_plain_output_for_height(text, limit);
+                assert_eq!(
+                    super::plain_output_height_line_count(text, limit),
+                    expected,
+                    "text={text:?} limit={limit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn finalize_measures_the_same_string_the_card_constructor_does() {
+        use super::blocks::output_visual_row_count as rows;
+
+        // finalize counts rows ONCE and hands the result to
+        // `FinishedBlock::new_with_pool`. The number is only usable there
+        // because both measure `output_with_ansi`.
+        //
+        // Measuring the already-stripped `output_plain` instead would be
+        // cheaper and is WRONG: `strip_ansi` is not idempotent. A capture
+        // ending in a lone ESC after a carriage return replays the ESC as a
+        // literal cell, and stripping that a second time consumes it together
+        // with the byte after it.
+        let not_idempotent = format!("{}\r\x1b", "a".repeat(82));
+        assert_ne!(
+            rows(&strip_ansi(&not_idempotent), 80),
+            rows(&not_idempotent, 80),
+            "if this ever becomes equal, strip_ansi was made idempotent and \
+             finalize may measure output_plain again"
+        );
+
+        // And the constructor declines the precomputed count outright for a
+        // transcript it collapses, because the collapsed frame is a third
+        // string again: `collapse_repaint_output` clips every row at `cols`
+        // and pops trailing blank rows, neither of which `strip_ansi` does.
+        let repainting = format!("first\n\x1b[H{}", "A".repeat(200));
+        assert!(super::output_has_vertical_repaint(&repainting));
+        assert_ne!(
+            rows(&super::collapse_repaint_output(&repainting, 20), 20),
+            rows(&repainting, 20),
+            "a collapsed frame must not be sized from the uncollapsed count"
+        );
     }
 
     #[test]

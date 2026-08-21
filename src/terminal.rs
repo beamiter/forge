@@ -111,6 +111,26 @@ pub(crate) fn focus_terminal(terminal: &Terminal) {
 /// Apply the visual profile shared by regular VTE mode, block mode's live
 /// surface, and block snapshots. Keeping this in one place prevents a runtime
 /// theme change from making the two terminal modes drift apart.
+/// One Pango parse per distinct font string, shared by every VTE.
+///
+/// `FontDescription::from_string` re-parses the same configured string for the
+/// live surface and for both read-only VTEs of every finished card. The value
+/// changes only when the config does, so a one-entry cache is enough.
+fn with_font_description<R>(desc: &str, f: impl FnOnce(&FontDescription) -> R) -> R {
+    thread_local! {
+        static CACHED: std::cell::RefCell<Option<(String, FontDescription)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    CACHED.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        if cached.as_ref().map(|(key, _)| key.as_str()) != Some(desc) {
+            *cached = Some((desc.to_owned(), FontDescription::from_string(desc)));
+        }
+        let (_, parsed) = cached.as_ref().expect("populated above");
+        f(parsed)
+    })
+}
+
 pub(crate) fn apply_terminal_theme(terminal: &Terminal, config: &Config) {
     let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
     terminal.set_colors(
@@ -121,8 +141,9 @@ pub(crate) fn apply_terminal_theme(terminal: &Terminal, config: &Config) {
     terminal.set_color_bold(None);
     terminal.set_color_cursor(Some(&config.cursor));
     terminal.set_color_cursor_foreground(Some(&config.cursor_foreground));
-    let font_desc = FontDescription::from_string(&config.font_desc);
-    terminal.set_font(Some(&font_desc));
+    with_font_description(&config.font_desc, |font_desc| {
+        terminal.set_font(Some(font_desc));
+    });
     terminal.set_font_scale(config.default_font_scale);
 }
 

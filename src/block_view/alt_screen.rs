@@ -34,13 +34,19 @@ pub(crate) const MAX_FINISHED_VTE_GRID_CELLS: usize = 1_048_576;
 /// allocation before any scrollback exists.
 pub(crate) const MAX_FINISHED_VTE_COLUMNS: i64 = 4_096;
 
+/// Total rows a finished VTE may hold at `cols` — screen plus scrollback.
+pub(crate) fn bounded_finished_vte_max_rows(cols: i64) -> i64 {
+    let cols = cols.clamp(1, MAX_FINISHED_VTE_COLUMNS);
+    (MAX_FINISHED_VTE_GRID_CELLS / cols as usize).max(1) as i64
+}
+
 pub(crate) fn bounded_finished_vte_geometry(
     cols: i64,
     visible_rows: i64,
     requested_scrollback_rows: i64,
 ) -> (i64, i64, i64) {
     let cols = cols.clamp(1, MAX_FINISHED_VTE_COLUMNS);
-    let max_rows = (MAX_FINISHED_VTE_GRID_CELLS / cols as usize).max(1) as i64;
+    let max_rows = bounded_finished_vte_max_rows(cols);
     let visible_rows = visible_rows.clamp(1, max_rows);
     let scrollback_rows = requested_scrollback_rows
         .max(0)
@@ -415,13 +421,30 @@ pub(crate) fn create_active_terminal(config: &Config) -> Terminal {
     apply_terminal_theme(&terminal, config);
     // Match the regular VTE surface: links are detectable while the command is
     // still running, not only after its output becomes a finished block.
-    if let Ok(regex) = vte4::Regex::for_match(
-        r"[a-z]+://[[:graph:]]+",
-        pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
-    ) {
-        terminal.match_add_regex(&regex, 0);
-    }
+    add_url_match_regex(&terminal);
     terminal
+}
+
+/// One PCRE2 compile of the URL pattern for the whole thread.
+///
+/// `vte4::Regex::for_match` compiles and JIT-studies the pattern; the live VTE
+/// and every finished card's TWO read-only VTEs used to do that independently,
+/// so a session with 200 blocks paid ~400 identical compiles.
+/// `match_add_regex` takes its own reference, so one handle can be shared by
+/// every terminal.
+pub(crate) fn add_url_match_regex(terminal: &Terminal) {
+    thread_local! {
+        static URL_REGEX: Option<vte4::Regex> = vte4::Regex::for_match(
+            r"[a-z]+://[[:graph:]]+",
+            pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
+        )
+        .ok();
+    }
+    URL_REGEX.with(|regex| {
+        if let Some(regex) = regex.as_ref() {
+            terminal.match_add_regex(regex, 0);
+        }
+    });
 }
 
 /// Apply the common terminal theme to a snapshot VTE, then restore its hidden
@@ -494,12 +517,7 @@ pub(crate) fn create_finished_terminal(
         });
     }
 
-    if let Ok(regex) = vte4::Regex::for_match(
-        r"[a-z]+://[[:graph:]]+",
-        pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
-    ) {
-        terminal.match_add_regex(&regex, 0);
-    }
+    add_url_match_regex(&terminal);
     terminal
 }
 

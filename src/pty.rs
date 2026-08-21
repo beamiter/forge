@@ -1226,12 +1226,35 @@ fn kill_and_reap_unreferenced(child: Pid) {
     let _ = nix::sys::wait::waitpid(child, None);
 }
 
+/// Wall-clock a reader thread may spend merging follow-up reads into one
+/// delivered chunk. Bounds reader dwell for a producer that never stops being
+/// readable; `PTY_READ_CHUNK_BYTES` is what ends the loop for everything else.
+const PTY_COALESCE_BUDGET: std::time::Duration = std::time::Duration::from_millis(2);
+
 /// Merge bytes already waiting on the PTY into one bounded delivery. This
 /// reduces GTK crossings for programs that emit a repaint in several writes.
+///
+/// The bound that matters is `PTY_READ_CHUNK_BYTES` — one delivered chunk, one
+/// main-thread callback — plus a small wall-clock budget so a firehose cannot
+/// park the reader here. It used to be a count of follow-up reads instead, and
+/// that count, not the byte cap, is what every chunk actually hit: a line-
+/// buffered writer such as `seq` emits one small write per line, so nine reads
+/// delivered ~700 bytes and the 32 KiB cap was never reached. Every per-chunk
+/// fixed cost in the pipeline — the GLib idle round trip and the source churn
+/// it causes, the chunk `Vec`, the parse pass, the activity fan-out, the
+/// `vte_terminal_feed` call — was therefore paid about twelve times more often
+/// than the design intended.
+///
+/// Every poll still waits a millisecond, exactly as before — that is what
+/// merges the writes of a producer the reader can outrun, which is most of
+/// them: a paced writer leaves the tty buffer momentarily empty between writes,
+/// and a zero-timeout follow-up poll would stop coalescing at the first such
+/// gap and deliver SMALLER chunks than the old loop did. The budget, not the
+/// poll timeout, is what bounds the dwell, and at 2 ms it is a quarter of the
+/// 8 ms the old nine-poll loop could spend.
 fn coalesce_pending(fd: RawFd, file: &mut std::fs::File, buf: &mut [u8], combined: &mut Vec<u8>) {
-    const MAX_FOLLOWUP_READS: u32 = 8;
-    let mut follow_ups = 0u32;
-    while combined.len() < PTY_READ_CHUNK_BYTES && follow_ups < MAX_FOLLOWUP_READS {
+    let started = std::time::Instant::now();
+    while combined.len() < PTY_READ_CHUNK_BYTES && started.elapsed() < PTY_COALESCE_BUDGET {
         let mut poll_fd = libc::pollfd {
             fd,
             events: libc::POLLIN,
@@ -1250,7 +1273,6 @@ fn coalesce_pending(fd: RawFd, file: &mut std::fs::File, buf: &mut [u8], combine
             Err(_) => break,
             Ok(read) => combined.extend_from_slice(&buf[..read]),
         }
-        follow_ups += 1;
     }
 }
 
