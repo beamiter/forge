@@ -14,9 +14,11 @@ use vte4::TerminalExt;
 
 use crate::config::Config;
 use crate::parser::{
-    ColorKind, CommandMeta, KeyboardProtocolQuery, Parser, ParserConfig, ParserEvent,
+    ColorKind, CommandMeta, KeyboardProtocolQuery, KittyKeyboardOp, Parser, ParserConfig,
+    ParserEvent,
 };
 use crate::pty::{OwnedPty, PtyForeground};
+use jterm_core::kitty_keyboard::{self, KittyKey, KittyKeyboardStacks, Modifiers as KittyModifiers};
 use crate::terminal::{apply_terminal_theme, focus_terminal};
 use bounded_bytes::BoundedByteRing;
 use jterm_core::pty_input::{self, Paste, PasteModes, PastePolicy, UnbracketedMultiline};
@@ -728,35 +730,6 @@ fn bounded_command_text(command: &str) -> String {
     } else {
         command.to_string()
     }
-}
-
-fn append_bounded_text_tail(buffer: &mut String, text: &str, max_bytes: usize) {
-    if max_bytes == 0 {
-        buffer.clear();
-        return;
-    }
-    if text.len() >= max_bytes {
-        let mut start = text.len() - max_bytes;
-        while !text.is_char_boundary(start) {
-            start += 1;
-        }
-        buffer.clear();
-        buffer.push_str(&text[start..]);
-        return;
-    }
-    let overflow = buffer
-        .len()
-        .checked_add(text.len())
-        .map(|length| length.saturating_sub(max_bytes))
-        .unwrap_or(buffer.len());
-    if overflow != 0 {
-        let mut start = overflow.min(buffer.len());
-        while !buffer.is_char_boundary(start) {
-            start += 1;
-        }
-        buffer.drain(..start);
-    }
-    buffer.push_str(text);
 }
 
 fn append_typed_command_shadow(buffer: &mut String, text: &str) {
@@ -2028,9 +2001,15 @@ fn build_keyboard_query_reply(
     query: KeyboardProtocolQuery,
     cursor_col: i64,
     cursor_row: i64,
+    kitty_flags: u8,
 ) -> String {
     match query {
-        KeyboardProtocolQuery::KittyQuery => "\x1b[?0u".to_string(),
+        // The flags really in effect. Answering `?0u` regardless, as this
+        // used to, told every crossterm client the protocol was available and
+        // then fed it legacy keys.
+        KeyboardProtocolQuery::KittyQuery => {
+            String::from_utf8(kitty_keyboard::query_reply(kitty_flags)).expect("ascii reply")
+        }
         KeyboardProtocolQuery::ModifyOtherKeysQuery => "\x1b[>4;0m".to_string(),
         KeyboardProtocolQuery::PrimaryDeviceAttributes => "\x1b[?1;2c".to_string(),
         KeyboardProtocolQuery::SecondaryDeviceAttributes => "\x1b[>0;0;0c".to_string(),
@@ -2045,6 +2024,103 @@ fn build_keyboard_query_reply(
             cursor_col.saturating_add(1).max(1)
         ),
     }
+}
+
+/// The kitty keyboard protocol's view of a GDK key press: the key's base
+/// codepoint for text keys, the keys the protocol names, and "functional" for
+/// everything whose legacy encoding already serves — plus the modifiers held.
+fn kitty_key_event(
+    keyval: gtk4::gdk::Key,
+    keycode: u32,
+    layout: u32,
+    modifiers: gtk4::gdk::ModifierType,
+    display: Option<&gtk4::gdk::Display>,
+) -> (KittyKey, KittyModifiers) {
+    use gtk4::gdk::ModifierType;
+    let mods = KittyModifiers {
+        shift: modifiers.contains(ModifierType::SHIFT_MASK),
+        alt: modifiers.contains(ModifierType::ALT_MASK),
+        ctrl: modifiers.contains(ModifierType::CONTROL_MASK),
+        super_key: modifiers.contains(ModifierType::SUPER_MASK),
+    };
+    (
+        kitty_key_for(keyval, base_unicode_for(keyval, keycode, layout, display)),
+        mods,
+    )
+}
+
+fn kitty_key_for(keyval: gtk4::gdk::Key, base: Option<char>) -> KittyKey {
+    use gtk4::gdk::Key;
+    match keyval {
+        Key::Escape => KittyKey::Escape,
+        Key::Return | Key::KP_Enter | Key::ISO_Enter => KittyKey::Enter,
+        Key::Tab | Key::ISO_Left_Tab | Key::KP_Tab => KittyKey::Tab,
+        Key::BackSpace => KittyKey::Backspace,
+        Key::space | Key::KP_Space => KittyKey::Space,
+        _ => match base {
+            Some(ch) if !ch.is_control() => KittyKey::Unicode(ch),
+            _ => KittyKey::Functional,
+        },
+    }
+}
+
+/// The codepoint of the key's unshifted, lowercase form in the layout the
+/// event was produced in: what the protocol reports for a text key whatever
+/// modifiers are held. The keymap's level-0 entry for the hardware key is that
+/// form (Shift+2 on a US layout reports `2`).
+///
+/// The event's own group has to be honoured. `map_keycode` returns entries
+/// group-major, so taking the first level-0 entry reports the FIRST installed
+/// layout: someone with ru before us in their list would have every Ctrl+key
+/// reported as the Cyrillic letter on that physical key. Falling back to any
+/// level-0 entry, and then to the keyval, keeps a keymap-less display working.
+fn base_unicode_for(
+    keyval: gtk4::gdk::Key,
+    keycode: u32,
+    layout: u32,
+    display: Option<&gtk4::gdk::Display>,
+) -> Option<char> {
+    let from_keymap = display
+        .and_then(|display| display.map_keycode(keycode))
+        .and_then(|entries| base_keyval_in_layout(&entries, layout))
+        .and_then(|keyval| keyval.to_lower().to_unicode());
+    from_keymap
+        .or_else(|| keyval.to_lower().to_unicode())
+        .and_then(|ch| ch.to_lowercase().next())
+}
+
+/// The unshifted keyval for `layout`, or for any group when that layout has no
+/// level-0 entry.
+fn base_keyval_in_layout(
+    entries: &[(gtk4::gdk::KeymapKey, gtk4::gdk::Key)],
+    layout: u32,
+) -> Option<gtk4::gdk::Key> {
+    let level_zero = |(key, _): &&(gtk4::gdk::KeymapKey, gtk4::gdk::Key)| key.level() == 0;
+    entries
+        .iter()
+        .find(|entry| level_zero(entry) && entry.0.group() == layout as i32)
+        .or_else(|| entries.iter().find(level_zero))
+        .map(|(_, keyval)| *keyval)
+}
+
+/// The process-control bytes for Ctrl+C / Ctrl+D under the kitty keyboard
+/// protocol, or the legacy bytes when no client asked for it.
+fn kitty_control_bytes(keyval: gtk4::gdk::Key, legacy: &[u8], flags: u8) -> Vec<u8> {
+    use gtk4::gdk::Key;
+    let key = match keyval {
+        Key::c | Key::C => 'c',
+        Key::d | Key::D => 'd',
+        _ => return legacy.to_vec(),
+    };
+    kitty_keyboard::encode_key(
+        KittyKey::Unicode(key),
+        KittyModifiers {
+            ctrl: true,
+            ..KittyModifiers::default()
+        },
+        flags,
+    )
+    .unwrap_or_else(|| legacy.to_vec())
 }
 
 type SelectedBlockIds = Rc<RefCell<std::collections::HashSet<u64>>>;
@@ -3955,7 +4031,7 @@ struct EngineState {
     /// State to restore when an alt-screen app exits (anvil model).
     prev_state: BlockState,
     osc133_depth: u32,
-    prompt_buf: String,
+    prompt_buf: BoundedByteRing,
     /// Bytes emitted asynchronously after PromptEnd and before the next PromptStart.
     /// Empty-command blocks are inferred from this separate buffer, so no history
     /// schema change is needed.
@@ -4978,6 +5054,10 @@ struct ReaderCtx {
     alt_screen_cbs: AltScreenCallbacks,
     mouse_reporting_rc: Rc<Cell<MouseReportingMode>>,
     bracketed_paste_rc: Rc<Cell<bool>>,
+    /// Kitty keyboard protocol flag stacks for the live surface, and a mirror
+    /// of the flags in effect that the GTK-side key and commit handlers read.
+    kitty_keyboard_rc: Rc<RefCell<KittyKeyboardStacks>>,
+    kitty_flags_rc: Rc<Cell<u8>>,
     config_for_cb: Rc<RefCell<Config>>,
     dynamic_colors_rc: Rc<Cell<DynamicColors>>,
     parser: Rc<RefCell<Parser>>,
@@ -5033,6 +5113,7 @@ impl ReaderCtx {
             ParserEvent::AgentIntegrationReady(token) => self.on_agent_integration_ready(token),
             ParserEvent::Notification { title, body } => self.on_notification(title, body),
             ParserEvent::ApcSequence(payload) => self.on_apc_sequence(payload),
+            ParserEvent::KittyKeyboard(op) => self.on_kitty_keyboard(*op),
         }
     }
 
@@ -5056,6 +5137,7 @@ impl ReaderCtx {
     }
 
     fn on_hard_reset(&self) {
+        self.reset_kitty_keyboard();
         self.live_extent_force_full_rc.set(true);
         self.release_prompt_fence_before_reset();
 
@@ -5172,12 +5254,11 @@ impl ReaderCtx {
 
         let feed_active_vte = match self.bstate_rc.get() {
             BlockState::CollectingPrompt => {
-                let text = String::from_utf8_lossy(bytes);
-                append_bounded_text_tail(
-                    &mut self.engine.borrow_mut().prompt_buf,
-                    &text,
-                    MAX_PROMPT_CAPTURE_BYTES,
-                );
+                // Bytes, not text: a multi-byte character split across two
+                // PTY chunks decoded per chunk became U+FFFD in the captured
+                // prompt, and a 64 KiB `String` tail was memmoved per chunk
+                // once at its cap. Decode once, at PromptEnd.
+                self.engine.borrow_mut().prompt_buf.append(bytes);
                 self.backend.mark_scroll_dirty();
                 true
             }
@@ -5330,6 +5411,13 @@ impl ReaderCtx {
             self.verified_submission.command_start_observed(false);
             self.external_submission_rc.borrow_mut().take();
         }
+        // Only now does the shell own the keyboard again. Resetting above the
+        // guards would have wiped a running client's kitty flags on any marker
+        // the guards exist to ignore — a nested integrated shell, a marker
+        // replayed in captured output, a prompt redrawn after Ctrl+Z — and the
+        // client, which never re-pushes, would keep sending CSI u expectations
+        // into a terminal that had stopped honouring them.
+        self.reset_kitty_keyboard();
         // All rejection/recovery guards above have passed: this PromptStart
         // really ends the prior lifecycle. Clear an ED3/RIS full-card latch
         // before backend finalization resets VTE and can synchronously relayout.
@@ -5594,7 +5682,9 @@ impl ReaderCtx {
             let prompt_had_bytes = !engine.prompt_buf.is_empty();
             // Capture the rendered prompt (last non-empty line) for the
             // finished block / export.
-            engine.prompt_display = strip_ansi(&engine.prompt_buf)
+            let prompt_text =
+                String::from_utf8_lossy(engine.prompt_buf.make_contiguous()).into_owned();
+            engine.prompt_display = strip_ansi(&prompt_text)
                 .lines()
                 .rev()
                 .find(|l| !l.trim().is_empty())
@@ -5900,6 +5990,11 @@ impl ReaderCtx {
         if id_correlation == CommandIdCorrelation::Mismatch {
             self.engine.borrow_mut().pending_command_meta.id = None;
         }
+        // Every arbitration above accepted this marker as the real end of the
+        // command, so the client that owned the keyboard is gone. Resetting
+        // higher up would have wiped a still-running client's kitty flags on a
+        // nested or replayed D that those guards exist to ignore.
+        self.reset_kitty_keyboard();
         // Safety net (Warp parity): if the alt-screen app
         // crashed or exited without rmcup, force the UI back
         // to the block list so the next prompt is usable.
@@ -5968,6 +6063,8 @@ impl ReaderCtx {
         }
         self.engine.borrow_mut().prev_state = from_state;
         self.bstate_rc.set(BlockState::AltScreen);
+        self.kitty_keyboard_rc.borrow_mut().enter_alt_screen();
+        self.sync_kitty_flags();
         self.engine.borrow_mut().active_alt_screen_mode = Some(mode);
         self.backend.enter_alt_screen_chrome();
         emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Entered);
@@ -5993,6 +6090,8 @@ impl ReaderCtx {
         if self.bstate_rc.get() != BlockState::AltScreen {
             return;
         }
+        self.kitty_keyboard_rc.borrow_mut().leave_alt_screen();
+        self.sync_kitty_flags();
         // Warp parity: alt-screen content is ephemeral and is
         // NOT merged into the block. The active block keeps
         // just the command name + exit code.
@@ -6086,7 +6185,7 @@ impl ReaderCtx {
         // (see `RenderBackend::cursor_position_report`) while a correct
         // backend answers screen-relative without engine changes.
         let (col, row) = self.backend.cursor_position_report();
-        let reply = build_keyboard_query_reply(query, col, row);
+        let reply = build_keyboard_query_reply(query, col, row, self.kitty_flags_rc.get());
         if let Err(error) = self.pty_for_init.write_bytes(reply.as_bytes()) {
             self.pty_for_init
                 .report_write_error("could not queue keyboard-query reply", error);
@@ -6142,6 +6241,26 @@ impl ReaderCtx {
                 self.backend.desktop_notify(title.as_deref(), &body);
             }
         }
+    }
+
+    /// `CSI > flags u` / `CSI < n u` / `CSI = flags ; mode u` from the
+    /// application: drive the stacks and publish the flags in effect.
+    fn on_kitty_keyboard(&self, op: KittyKeyboardOp) {
+        self.kitty_keyboard_rc.borrow_mut().apply(op);
+        self.sync_kitty_flags();
+    }
+
+    fn sync_kitty_flags(&self) {
+        self.kitty_flags_rc
+            .set(self.kitty_keyboard_rc.borrow().flags());
+    }
+
+    /// The shell is back, or the terminal was reset: whatever an application
+    /// pushed is forgotten, so a client that exited without popping cannot
+    /// leave the prompt receiving CSI u keys.
+    fn reset_kitty_keyboard(&self) {
+        self.kitty_keyboard_rc.borrow_mut().reset();
+        self.sync_kitty_flags();
     }
 
     fn on_apc_sequence(&self, payload: &[u8]) {
@@ -6763,11 +6882,6 @@ impl RenderBackend for BlockBackend {
             cwd: record.cwd.clone(),
             cols: cols.clamp(1, u16::MAX as i64) as u16,
         };
-        // The live surface is about to become a new
-        // finished surface and retention may evict an
-        // old prefix. Reset search while both sides of
-        // that transition are still reachable.
-        find::clear_find_state(self.find_state_for_cb.as_ref(), &self.active_vte);
         let max_blocks = self.config_for_cb.borrow().max_visible_blocks as usize;
         let newest_estimated_bytes = {
             let images = self.kitty_pending_images.borrow();
@@ -6792,6 +6906,14 @@ impl RenderBackend for BlockBackend {
             )
         };
         log_completed_block_retention("preparing live block", prebuild_retention_plan);
+        if prebuild_retention_plan.evict_prefix > 0 {
+            // Retention changes block indices and may remove the VTE owning a
+            // highlighted hit. Only then is the search state reset: clearing it
+            // on every finalize, as this used to, dropped an active find each
+            // time a background loop completed a command — which at the default
+            // 200-block cap is every finalize that evicts nothing, i.e. most.
+            find::clear_find_state(self.find_state_for_cb.as_ref(), &self.active_vte);
+        }
         evict_finished_block_prefix(
             prebuild_retention_plan.evict_prefix,
             &self.finished_blocks_for_cb,
@@ -6919,6 +7041,11 @@ impl RenderBackend for BlockBackend {
             plan_completed_block_retention_with_restored(&[], &finished, max_blocks)
         };
         log_completed_block_retention("finalizing live block", retention_plan);
+        if retention_plan.evict_prefix > 0 {
+            // Same pairing as the pre-build pass: a card destroyed here may be
+            // the one holding a highlight handle.
+            find::clear_find_state(self.find_state_for_cb.as_ref(), &self.active_vte);
+        }
         evict_finished_block_prefix(
             retention_plan.evict_prefix,
             &self.finished_blocks_for_cb,
@@ -8069,54 +8196,84 @@ fn live_visible_rows_for_measurement(
     )
 }
 
-/// How many rows of the live grid this command has reached: the distance the
-/// cursor has travelled since the command's output began, capped by the grid.
+/// How many rows of the live grid this command has reached: from the row the
+/// prompt began on to the lowest row the cursor has reached, capped by the
+/// grid.
 ///
-/// Both readings come from `cursor_position()`, so they are in the same
-/// coordinate system by construction. The origin is re-sampled on every layout
-/// pass that runs before this command has produced output, which is the row its
-/// first output line will land on.
+/// The card is a clip over the TOP of the live grid — screen rows
+/// `0..visible_rows`, prompt included — so the count runs from the prompt, not
+/// from the row output happened to start on. Sampling the LATEST cursor row
+/// during the prompt phase (what this used to do) put the origin at the end of
+/// the echoed command line, so however many rows the prompt occupied above it
+/// were never counted and sat below the card's edge — exactly where an inline
+/// TUI such as codex or kimi draws its composer. Latch the LOWEST row instead.
 ///
-/// This used to subtract the *adjustment's* screen top (`upper - page_size`)
-/// from the cursor row and treat `cursor_row > upper` as "not measurable".
-/// Measured on VTE 0.82, those two APIs are not coherent for a live grid that
-/// gets resized at CommandStart: `upper` then trails `cursor_position().1` by a
-/// fixed offset for the rest of the command, and once the output passes the
-/// live scrollback limit `upper` stops moving altogether while the cursor keeps
-/// climbing (`seq 1 200000` on a 36-row grid reported a pinned `upper = 5000`
-/// against `cursor = 196103`). The coherence guard therefore latched `None` on
-/// every sample of every streaming command, the high-water never grew, and the
-/// card stayed at the compact prompt height — a six-row peephole showing rows
-/// thirty behind the cursor, with the rest of the pane blank — until the block
-/// finished.
+/// Every reading here comes from `cursor_position()`, so they share one
+/// coordinate system by construction. Nothing else does: the live adjustment
+/// is ring-relative and stops tracking the cursor past the scrollback limit,
+/// and a literal zero is wrong too, because `vte.reset()` does not rewind
+/// VTE's absolute row counter — `Ring::reset` returns `m_end` unchanged, so
+/// rows climb for the life of the pane and every card after the first
+/// screenful would measure as a full viewport.
 fn live_content_extent(
     vte: &Terminal,
     origin: &Cell<Option<i64>>,
+    cursor_high: &Cell<i64>,
     output_started: bool,
 ) -> Option<i64> {
     let cursor_row = vte.cursor_position().1;
     if !output_started {
-        // Still showing the prompt. Keep the origin pinned to the live cursor
-        // so the first output sample measures a true distance; fixing it only
-        // once output exists would put the origin several thousand rows into a
-        // fast stream and hold the card at its floor.
-        origin.set(Some(cursor_row));
+        // Still drawing the prompt. CommandStart lays the surface out before
+        // VTE has necessarily applied the bytes already queued, so the caller
+        // keeps the compact height until the capture proves output exists.
+        origin.set(Some(latched_live_origin(origin.get(), cursor_row)));
         return None;
     }
     let Some(origin_row) = origin.get() else {
         // Output beat every layout pass, so there is no origin to measure
         // against yet. Adopt this cursor and report the sample as provisional,
-        // exactly as the caller's `None` contract expects. CommandStart lays
-        // the surface out before the first chunk can arrive, so this is a
-        // fallback rather than the normal entry point.
+        // exactly as the caller's `None` contract expects.
         origin.set(Some(cursor_row));
+        cursor_high.set(cursor_row);
         return None;
     };
-    Some(live_content_extent_for(
-        origin_row,
-        cursor_row,
-        vte.row_count(),
-    ))
+    let high = cursor_high.get().max(cursor_row).max(origin_row);
+    cursor_high.set(high);
+    Some(live_content_extent_for(origin_row, high, vte.row_count()))
+}
+
+/// The origin a prompt-phase sample leaves behind: the LOWEST cursor row seen
+/// since `reset_active`, which is the first row the prompt drew on.
+fn latched_live_origin(previous: Option<i64>, cursor_row: i64) -> i64 {
+    previous.map_or(cursor_row, |row| row.min(cursor_row))
+}
+
+/// The lowest screen row in `from..grid_rows` that already holds text, if any,
+/// where row `0` is the ring row `origin`.
+///
+/// The cursor is a floor on the card's extent, not the truth: an inline TUI
+/// parks it in its composer and draws a status line below, a full-frame
+/// repaint homes it to the top, and some hide it altogether. Probing the rows
+/// the card does not show yet is what lets it grow to cover them. It is only
+/// asked while the card is shorter than the grid — a plain stream fills the
+/// grid within its first screenful and never pays for it.
+///
+/// One query per row, from the bottom up, stopping at the first row with
+/// content: `get_text` ends a segment per PARAGRAPH, not per screen row (it
+/// appends a newline only when the row is not soft-wrapped), so a single
+/// range query cannot be indexed by screen row at all.
+fn lowest_drawn_screen_row(vte: &Terminal, origin: i64, from: i64, grid_rows: i64) -> Option<i64> {
+    let cols = vte.column_count().max(1);
+    let mut row = grid_rows - 1;
+    while row >= from {
+        let (text, _) =
+            vte.text_range_format(vte4::Format::Text, origin + row, 0, origin + row, cols - 1);
+        if text.is_some_and(|text| !text.trim().is_empty()) {
+            return Some(row);
+        }
+        row -= 1;
+    }
+    None
 }
 
 /// The arithmetic behind [`live_content_extent`], separated so it can be tested
@@ -8564,6 +8721,10 @@ fn focused_widget_keeps_key(focused: &gtk4::Widget, keyval: gtk4::gdk::Key) -> b
 /// fall through to the VTE.
 struct KeyCtx {
     pty_for_key: Rc<OwnedPty>,
+    /// Kitty keyboard protocol: the flags in effect, and the last key pressed
+    /// so the commit handler can replace the legacy bytes VTE emits for it.
+    kitty_flags_for_key: Rc<Cell<u8>>,
+    kitty_last_key_for_key: Rc<Cell<Option<(KittyKey, KittyModifiers)>>>,
     active_vte_for_key: glib::WeakRef<Terminal>,
     pty_synced_for_key: Rc<Cell<bool>>,
     bracketed_paste_for_key: Rc<Cell<bool>>,
@@ -8589,6 +8750,8 @@ impl KeyCtx {
     fn connect(self, key_ctrl: &gtk4::EventControllerKey) {
         let KeyCtx {
             pty_for_key,
+            kitty_flags_for_key,
+            kitty_last_key_for_key,
             active_vte_for_key,
             pty_synced_for_key,
             bracketed_paste_for_key,
@@ -8609,8 +8772,26 @@ impl KeyCtx {
             failure_marker_redraw_for_key,
             bstate_for_key,
         } = self;
-        key_ctrl.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
+        key_ctrl.connect_key_pressed(move |controller, keyval, keycode, modifiers| {
             use gtk4::gdk::Key;
+            // Kitty keyboard protocol: remember what was pressed so the commit
+            // handler can replace the legacy bytes VTE is about to emit for it.
+            // Recording only — the key still reaches VTE and its input method,
+            // which is what keeps IME composition, Esc-cancels-preedit and
+            // Ctrl+Space intact while a kitty client runs.
+            kitty_last_key_for_key.set(
+                (kitty_flags_for_key.get() & kitty_keyboard::DISAMBIGUATE != 0).then(|| {
+                    let display = controller.widget().map(|widget| widget.display());
+                    // The event's own layout group, so a multi-layout user is
+                    // not reported the first installed layout's letters.
+                    let layout = controller
+                        .current_event()
+                        .and_then(|event| event.downcast::<gtk4::gdk::KeyEvent>().ok())
+                        .map(|event| event.layout())
+                        .unwrap_or(0);
+                    kitty_key_event(keyval, keycode, layout, modifiers, display.as_ref())
+                }),
+            );
             let Some(active_vte_for_key) = active_vte_for_key.upgrade() else {
                 return glib::Propagation::Proceed;
             };
@@ -9457,6 +9638,7 @@ impl TermView {
             // Origin for the extent measurement, re-based by the same
             // `reset_active` funnel that clears the high-water.
             let live_cursor_origin = active.borrow().live_cursor_origin();
+            let live_cursor_high = active.borrow().live_cursor_high();
             // The engine clears this ring immediately before entering
             // CollectingOutput and appends every subsequent output chunk before
             // feeding the VTE. It gates coherent growth after CommandStart;
@@ -9513,12 +9695,36 @@ impl TermView {
                     BlockState::CollectingOutput | BlockState::PostCommand => {
                         let output_started = !live_raw_output_for_layout.borrow().is_empty();
                         let (visible_rows, next_high_water) = live_visible_rows_for_measurement(
-                            live_content_extent(&vte, &live_cursor_origin, output_started),
+                            live_content_extent(
+                                &vte,
+                                &live_cursor_origin,
+                                &live_cursor_high,
+                                output_started,
+                            ),
                             output_started,
                             live_force_full_for_layout.get(),
                             live_rows_high_water.get(),
                             viewport_rows,
                         );
+                        // Rows below the cursor-derived extent that already hold
+                        // text belong to the card too (see `lowest_drawn_screen_row`).
+                        let (visible_rows, next_high_water) = match live_cursor_origin.get() {
+                            Some(origin) if output_started && next_high_water < viewport_rows => {
+                                match lowest_drawn_screen_row(
+                                    &vte,
+                                    origin,
+                                    next_high_water,
+                                    viewport_rows,
+                                ) {
+                                    Some(lowest) => {
+                                        let high_water = next_high_water.max(lowest + 1);
+                                        (live_visible_rows(high_water, viewport_rows), high_water)
+                                    }
+                                    None => (visible_rows, next_high_water),
+                                }
+                            }
+                            _ => (visible_rows, next_high_water),
+                        };
                         live_rows_high_water.set(next_high_water);
                         visible_rows
                     }
@@ -9690,6 +9896,14 @@ impl TermView {
         // DECSET 2004 state here so clipboard pastes can be forwarded as one
         // ordered byte stream instead of relying on VTE's unrelated PTY.
         let bracketed_paste: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        // Kitty keyboard protocol state for this pane's live surface. The
+        // engine drives the stacks from the byte stream; the key and commit
+        // handlers below read the mirrored flags and the last key pressed.
+        let kitty_keyboard: Rc<RefCell<KittyKeyboardStacks>> =
+            Rc::new(RefCell::new(KittyKeyboardStacks::new()));
+        let kitty_flags: Rc<Cell<u8>> = Rc::new(Cell::new(0));
+        let kitty_last_key: Rc<Cell<Option<(KittyKey, KittyModifiers)>>> =
+            Rc::new(Cell::new(None));
 
         // Dynamic OSC 10/11/12 colors: the reader updates this shared state and
         // Undo uses it when recreating snapshot VTEs.
@@ -9953,10 +10167,12 @@ impl TermView {
             ReaderCtx {
                 backend,
                 bstate_rc,
+                kitty_keyboard_rc: kitty_keyboard.clone(),
+                kitty_flags_rc: kitty_flags.clone(),
                 engine: RefCell::new(EngineState {
                     prev_state: BlockState::Idle,
                     osc133_depth: 0,
-                    prompt_buf: String::new(),
+                    prompt_buf: BoundedByteRing::new(MAX_PROMPT_CAPTURE_BYTES),
                     background_output: BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES),
                     vte_typed_cmd: String::new(),
                     prompt_render_generation: 0,
@@ -10393,8 +10609,39 @@ impl TermView {
             let selected_block_id_for_commit = selected_block_id.clone();
             let selection_anchor_id_for_commit = selection_anchor_id.clone();
             let human_input_for_commit = human_input_callbacks.clone();
+            let kitty_flags_for_commit = kitty_flags.clone();
+            let kitty_last_key_for_commit = kitty_last_key.clone();
             active_vte.connect_commit(move |_, text, _size| {
                 let block_state = bstate_for_commit.get();
+                // Kitty keyboard protocol: if these are the legacy bytes for
+                // the key the capture handler just recorded, the application
+                // asked for the CSI u form instead. Anything else — composed
+                // text, a paste, a key the IME swallowed — passes unchanged.
+                if let Some((key, mods)) = kitty_last_key_for_commit.replace(None) {
+                    let app_in_foreground = matches!(
+                        block_state,
+                        BlockState::CollectingOutput | BlockState::AltScreen
+                    );
+                    if app_in_foreground {
+                        if let Some(encoded) = kitty_keyboard::rewrite_commit(
+                            key,
+                            mods,
+                            text.as_bytes(),
+                            kitty_flags_for_commit.get(),
+                        ) {
+                            if let Err(error) = pty_for_commit.write_bytes(&encoded) {
+                                pty_for_commit
+                                    .report_write_error("could not queue terminal input", error);
+                            } else {
+                                accepted_input_generation_for_commit.set(
+                                    accepted_input_generation_for_commit.get().wrapping_add(1),
+                                );
+                                emit_accepted_input(&human_input_for_commit, InputOrigin::VteCommit);
+                            }
+                            return;
+                        }
+                    }
+                }
                 let awaiting_command = block_state == BlockState::AwaitingCommand;
                 let previous_fidelity = typed_cmd_fidelity_for_commit.get();
                 let previous_submission_pending = submission_pending_for_commit.get();
@@ -10474,6 +10721,7 @@ impl TermView {
         {
             let pty_for_root_key = pty.clone();
             let bstate_for_root_key = bstate.clone();
+            let kitty_flags_for_root_key = kitty_flags.clone();
             let human_input_for_root_key = human_input_callbacks.clone();
             let hold_for_root_key = selection_feed_hold.clone();
             let root_key = gtk4::EventControllerKey::new();
@@ -10487,8 +10735,12 @@ impl TermView {
                 }
 
                 if let Some(bytes) = running_root_control_bytes(keyval, modifiers) {
+                    // These bypass VTE, so the kitty encoding is applied here:
+                    // a client that pushed the disambiguate flag expects
+                    // `CSI 99 ; 5 u` for Ctrl+C, not the raw 0x03 byte.
+                    let bytes = kitty_control_bytes(keyval, bytes, kitty_flags_for_root_key.get());
                     hold_for_root_key.flush_then(|| {
-                        if let Err(error) = pty_for_root_key.write_bytes(bytes) {
+                        if let Err(error) = pty_for_root_key.write_bytes(&bytes) {
                             pty_for_root_key
                                 .report_write_error("could not queue process-control key", error);
                         } else {
@@ -10568,6 +10820,8 @@ impl TermView {
 
             KeyCtx {
                 pty_for_key,
+                kitty_flags_for_key: kitty_flags.clone(),
+                kitty_last_key_for_key: kitty_last_key.clone(),
                 active_vte_for_key: active_vte.downgrade(),
                 pty_synced_for_key: pty_synced.clone(),
                 bracketed_paste_for_key: bracketed_paste.clone(),
@@ -12530,7 +12784,7 @@ impl TermView {
 #[cfg(test)]
 mod tests {
     use super::{
-        accept_agent_integration_token, anchor_tick_exit, append_bounded_text_tail,
+        accept_agent_integration_token, anchor_tick_exit,
         apply_vte_commit_to_shadow, approved_command_submission_payload,
         background_output_has_visible_text, bounded_journal_output, build_clipboard_paste,
         build_command_recall, build_keyboard_query_reply, capture_vte_rows_bounded,
@@ -12646,6 +12900,28 @@ mod tests {
             (40, 40)
         );
     }
+
+    #[test]
+    fn live_card_measures_from_the_row_the_prompt_began_on() {
+        // Prompt-phase samples: the shell draws a two-row prompt starting at
+        // ring row 5000 (rows climb for the life of the pane — `vte.reset()`
+        // never rewinds them), then echoes the command, leaving the cursor on
+        // 5001. The origin is the FIRST row, not the last sample; taking the
+        // last one is what hid an inline TUI's composer below the card.
+        let mut origin = None;
+        for row in [5000, 5001, 5001] {
+            origin = Some(super::latched_live_origin(origin, row));
+        }
+        assert_eq!(origin, Some(5000));
+        // Cursor parked in a composer 14 rows down: the card shows all 15.
+        assert_eq!(live_content_extent_for(5000, 5014, 32), 15);
+        // Output past the grid caps at the grid.
+        assert_eq!(live_content_extent_for(5000, 9999, 32), 32);
+        // A lower sample still wins while the prompt is drawing.
+        assert_eq!(super::latched_live_origin(Some(5), 3), 3);
+        assert_eq!(super::latched_live_origin(None, 7), 7);
+    }
+
 
     #[test]
     fn live_content_extent_measures_cursor_travel_not_adjustment_geometry() {
@@ -13979,15 +14255,6 @@ mod tests {
     }
 
     #[test]
-    fn prompt_capture_retains_a_bounded_utf8_tail() {
-        let mut prompt = "old".repeat(MAX_PROMPT_CAPTURE_BYTES);
-        append_bounded_text_tail(&mut prompt, "界-new-prompt", MAX_PROMPT_CAPTURE_BYTES);
-        assert!(prompt.len() <= MAX_PROMPT_CAPTURE_BYTES);
-        assert!(prompt.ends_with("界-new-prompt"));
-        assert!(std::str::from_utf8(prompt.as_bytes()).is_ok());
-    }
-
-    #[test]
     fn command_capture_range_is_rejected_before_a_large_vte_allocation() {
         assert!(command_capture_range_is_bounded(10, 10, 120));
         assert!(!command_capture_range_is_bounded(10, 9, 120));
@@ -14787,33 +15054,98 @@ mod tests {
     }
 
     #[test]
+    fn kitty_keyboard_flags_follow_the_app_and_are_forgotten_at_the_prompt() {
+        let harness = ReaderHarness::new();
+        // codex and kimi push 7; only the disambiguate bit is honoured and
+        // that is what the query reports — not the `?0u` that told every
+        // crossterm client the protocol was available while keys stayed legacy.
+        harness.feed(ParserEvent::KittyKeyboard(super::KittyKeyboardOp::Push(7)));
+        harness.feed(ParserEvent::KeyboardProtocolQuery(
+            KeyboardProtocolQuery::KittyQuery,
+        ));
+        assert_eq!(harness.pty.drain_test_slave(PTY_REPLY_WAIT), b"\x1b[?1u");
+        assert_eq!(harness.ctx.kitty_flags_rc.get(), 1);
+        harness.feed(ParserEvent::KittyKeyboard(super::KittyKeyboardOp::Pop(1)));
+        assert_eq!(harness.ctx.kitty_flags_rc.get(), 0);
+        // A client that exits without popping leaves nothing behind once the
+        // shell draws its prompt, and RIS clears everything too.
+        harness.feed(ParserEvent::KittyKeyboard(super::KittyKeyboardOp::Push(1)));
+        assert_eq!(harness.ctx.kitty_flags_rc.get(), 1);
+        harness.feed(ParserEvent::PromptStart);
+        assert_eq!(harness.ctx.kitty_flags_rc.get(), 0);
+        harness.feed(ParserEvent::KittyKeyboard(super::KittyKeyboardOp::Push(1)));
+        harness.feed(ParserEvent::HardReset);
+        assert_eq!(harness.ctx.kitty_flags_rc.get(), 0);
+    }
+
+    #[test]
+    fn kitty_key_mapping_names_the_keys_the_protocol_treats_specially() {
+        use super::{base_unicode_for, kitty_control_bytes, kitty_key_for, KittyKey};
+        use gtk4::gdk::Key;
+        assert_eq!(kitty_key_for(Key::Escape, None), KittyKey::Escape);
+        assert_eq!(kitty_key_for(Key::Return, None), KittyKey::Enter);
+        assert_eq!(kitty_key_for(Key::KP_Enter, None), KittyKey::Enter);
+        assert_eq!(kitty_key_for(Key::ISO_Left_Tab, None), KittyKey::Tab);
+        assert_eq!(kitty_key_for(Key::BackSpace, None), KittyKey::Backspace);
+        assert_eq!(kitty_key_for(Key::space, None), KittyKey::Space);
+        assert_eq!(kitty_key_for(Key::A, Some('a')), KittyKey::Unicode('a'));
+        assert_eq!(kitty_key_for(Key::Up, None), KittyKey::Functional);
+        assert_eq!(kitty_key_for(Key::F1, None), KittyKey::Functional);
+        assert_eq!(kitty_key_for(Key::Shift_L, None), KittyKey::Functional);
+        // Without a keymap the lowercase keyval is the base form.
+        assert_eq!(base_unicode_for(Key::A, 0, 0, None), Some('a'));
+        assert_eq!(base_unicode_for(Key::Up, 0, 0, None), None);
+        // Layout selection: entries are group-major, so the first level-0
+        // entry belongs to the first installed layout, not the active one.
+        use gtk4::gdk::KeymapKey;
+        let entries = [
+            (KeymapKey::new(30, 0, 0), Key::Cyrillic_ghe),
+            (KeymapKey::new(30, 1, 0), Key::u),
+        ];
+        assert_eq!(super::base_keyval_in_layout(&entries, 1), Some(Key::u));
+        assert_eq!(
+            super::base_keyval_in_layout(&entries, 0),
+            Some(Key::Cyrillic_ghe)
+        );
+        assert_eq!(
+            super::base_keyval_in_layout(&entries, 7),
+            Some(Key::Cyrillic_ghe)
+        );
+        assert_eq!(super::base_keyval_in_layout(&[], 0), None);
+        // Ctrl+C stays 0x03 until a client asks for the protocol.
+        assert_eq!(kitty_control_bytes(Key::c, b"\x03", 0), b"\x03");
+        assert_eq!(kitty_control_bytes(Key::c, b"\x03", 1), b"\x1b[99;5u");
+        assert_eq!(kitty_control_bytes(Key::D, b"\x04", 1), b"\x1b[100;5u");
+    }
+
+    #[test]
     fn keyboard_protocol_queries_have_safe_fallback_replies() {
         assert_eq!(
-            build_keyboard_query_reply(KeyboardProtocolQuery::KittyQuery, 0, 0),
+            build_keyboard_query_reply(KeyboardProtocolQuery::KittyQuery, 0, 0, 0),
             "\x1b[?0u"
         );
         assert_eq!(
-            build_keyboard_query_reply(KeyboardProtocolQuery::ModifyOtherKeysQuery, 0, 0),
+            build_keyboard_query_reply(KeyboardProtocolQuery::ModifyOtherKeysQuery, 0, 0, 0),
             "\x1b[>4;0m"
         );
         assert_eq!(
-            build_keyboard_query_reply(KeyboardProtocolQuery::PrimaryDeviceAttributes, 0, 0),
+            build_keyboard_query_reply(KeyboardProtocolQuery::PrimaryDeviceAttributes, 0, 0, 0),
             "\x1b[?1;2c"
         );
         assert_eq!(
-            build_keyboard_query_reply(KeyboardProtocolQuery::DeviceStatus, 0, 0),
+            build_keyboard_query_reply(KeyboardProtocolQuery::DeviceStatus, 0, 0, 0),
             "\x1b[0n"
         );
         assert_eq!(
-            build_keyboard_query_reply(KeyboardProtocolQuery::CursorPosition, 4, 2),
+            build_keyboard_query_reply(KeyboardProtocolQuery::CursorPosition, 4, 2, 0),
             "\x1b[3;5R"
         );
         assert_eq!(
-            build_keyboard_query_reply(KeyboardProtocolQuery::CursorPosition, -8, -2),
+            build_keyboard_query_reply(KeyboardProtocolQuery::CursorPosition, -8, -2, 0),
             "\x1b[1;1R"
         );
 
-        let version = build_keyboard_query_reply(KeyboardProtocolQuery::XtVersion, 0, 0);
+        let version = build_keyboard_query_reply(KeyboardProtocolQuery::XtVersion, 0, 0, 0);
         assert!(version.contains(env!("CARGO_PKG_VERSION")));
         assert!(version.starts_with("\x1bP>|forge "));
         assert!(version.ends_with("\x1b\\"));
@@ -17242,7 +17574,7 @@ mod tests {
                 engine: RefCell::new(EngineState {
                     prev_state: BlockState::Idle,
                     osc133_depth: 0,
-                    prompt_buf: String::new(),
+                    prompt_buf: BoundedByteRing::new(MAX_PROMPT_CAPTURE_BYTES),
                     background_output: BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES),
                     vte_typed_cmd: String::new(),
                     prompt_render_generation: 0,
@@ -17285,6 +17617,8 @@ mod tests {
                 alt_screen_cbs,
                 mouse_reporting_rc: Rc::new(Cell::new(MouseReportingMode::None)),
                 bracketed_paste_rc: Rc::new(Cell::new(false)),
+                kitty_keyboard_rc: Rc::new(RefCell::new(super::KittyKeyboardStacks::new())),
+                kitty_flags_rc: Rc::new(Cell::new(0)),
                 config_for_cb: config.clone(),
                 dynamic_colors_rc: Rc::new(Cell::new(DynamicColors::default())),
                 parser: Rc::new(RefCell::new(Parser::new())),
@@ -17855,7 +18189,7 @@ mod tests {
         harness.ctx.external_submission_generation_rc.set(Some(42));
         {
             let mut engine = harness.ctx.engine.borrow_mut();
-            engine.prompt_buf = "old prompt bytes".to_string();
+            engine.prompt_buf.append(b"old prompt bytes");
             engine.prompt_display = "old prompt".to_string();
             engine.vte_typed_cmd = "old command".to_string();
             engine.background_output.append(b"old background output");
