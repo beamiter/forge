@@ -70,6 +70,7 @@ fn restored_remote_host(
 ) -> Option<crate::config::RemoteHost> {
     let mut host = hosts
         .iter()
+        .take(crate::config::MAX_REMOTE_HOSTS)
         .find(|host| host.name == remote_name)
         .cloned()?;
     if jterm_core::execution_journal::is_valid_jsh_session_id(session_id) {
@@ -519,5 +520,15 @@ mod tests {
         assert_eq!(restored.ssh_args, ["-p", "2222"]);
         assert_eq!(restored.session.as_deref(), Some("saved-session-7"));
         assert!(restored_remote_host(&[current], "removed", "saved-session-7").is_none());
+
+        let mut active = vec![profile(); crate::config::MAX_REMOTE_HOSTS];
+        for (index, host) in active.iter_mut().enumerate() {
+            host.name = format!("active-{index}");
+        }
+        active.push(profile());
+        assert!(
+            restored_remote_host(&active, "production", "saved-session-7").is_none(),
+            "workspace restore must not reactivate profile 129"
+        );
     }
 }

@@ -2482,12 +2482,13 @@ impl FinishedBlock {
                 glib::WeakRef<gtk4::SearchEntry>,
                 Rc<dyn Fn()>,
             );
+            type FilterRowBuilder = dyn Fn(&gtk4::Box, &gtk4::Box) -> Option<FilterRowHandles>;
             let output_vte = output_vte.downgrade();
             let expand_btn = expand_btn.downgrade();
             let filter_btn_weak = filter_btn.downgrade();
             let jump_bottom_btn = jump_bottom_btn.downgrade();
             let collapsed_summary = collapsed_summary.downgrade();
-            let build_filter_row: Rc<dyn Fn(&gtk4::Box, &gtk4::Box) -> Option<FilterRowHandles>> = {
+            let build_filter_row: Rc<FilterRowBuilder> = {
                 let filter_btn = filter_btn_weak.clone();
                 let full_output = full_output.clone();
                 let displayed_output = displayed_output.clone();

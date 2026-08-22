@@ -60,15 +60,38 @@ make security
 ```bash
 ./scripts/install.sh
 ./scripts/install.sh --backend cargo
+./scripts/install.sh --binary /path/to/forge   # 跳过构建，安装已有产物
 ./scripts/install.sh --prefix /opt/forge --no-config
 ./scripts/install.sh --dry-run
 ```
 
-默认安装到 `~/.local/bin/forge`，同时安装 `forge-support-bundle`，并把 shell 集成、内置 workflow 和欢迎 Notebook 安装到 `~/.local/share/forge/`。配置使用 `0600`。脚本支持 `DESTDIR`、`XDG_CONFIG_HOME` 和 `CARGO_TARGET_DIR`；使用非默认 prefix 时可通过 `FORGE_ASSET_DIR` / `FORGE_WORKFLOW_DIR` 指向对应的 `share/forge` 目录。卸载默认保留用户配置、状态与历史：
+无参数源码安装沿用 `~/.cargo/bin/forge`，显式 `--prefix` 时二进制改为
+`PREFIX/bin/forge`；安装与卸载使用同一规则。脚本同时安装 `forge-support-bundle`，并把
+shell 集成、内置 workflow 和欢迎 Notebook 安装到 `~/.local/share/forge/`。配置使用
+`0600`。脚本支持 `DESTDIR`、`XDG_CONFIG_HOME` 和 `CARGO_TARGET_DIR`；使用非默认 prefix
+时可通过 `FORGE_ASSET_DIR` / `FORGE_WORKFLOW_DIR` 指向对应的 `share/forge` 目录。
+
+`--binary` 输入必须是可读、非符号链接的普通文件。Bash 的初始 no-follow 检查与 open
+本身并非原子操作；只有成功打开且用 GNU `stat` 复核路径和描述符指向同一设备号/inode 后，
+之后替换路径名才不会改变通过 Linux `/proc/self/fd` 复制的 inode。目标文件先在同目录用
+`mktemp` 写完，再由 GNU `mv -T` 原子替换；rename 前失败或退出会清理临时文件并保留旧版。
+rename 是二进制更新的提交点：只保证提交前失败/退出保留旧目标并清理未提交临时文件；
+之后若其他资源安装失败，不会回滚已经提交的二进制。
+支持工具、shell 集成、workflow、Notebook、AppStream 与图标也都在目标目录内先写入
+mode 正确的临时文件，再原子 rename；所有源文件在构建和首次写入前完成预检。
+首次配置用同目录临时文件加无覆盖硬链接原子发布：若另一个进程先创建
+`config.toml`，安装器保留并报告并发赢家。`--binary` 拒绝零字节文件，且不能与显式
+`--backend` 同用。非根 `DESTDIR` 会先折叠重复 `/` 和词法 `.` 段，再从 `/` 起检查其
+完整既存祖先链；任何符号链接都会在安装写入或卸载删除前被拒绝（`--purge-config` 的
+递归根也先整体预检）。这是既存状态预检，不承诺抵御检查后的并发路径替换；普通主机
+安装/卸载不套用这条打包边界策略。`--prefix`、`--bin-dir`、XDG 路径与 `DESTDIR` 必须是
+无控制字符、无词法 `..` 段的绝对路径；运行时路径仍可含空格、Unicode 与 `.` 段。
+卸载默认保留用户配置、状态与历史：
 
 ```bash
 ./scripts/uninstall.sh
 ./scripts/uninstall.sh --purge-config   # 明确删除全部配置和状态
+bash scripts/test-install-paths.sh      # 私有 DESTDIR 安装/卸载合同
 ```
 
 ### 桌面集成（应用列表里的图标）
@@ -178,6 +201,12 @@ forge-support-bundle ~/Desktop
 `--doctor` 除配置语义和运行时依赖外，还检查配置权限、有效轮换备份、写锁、AI provider/密钥存在性、workflow 搜索位置、欢迎 Notebook、历史和 SSH 就绪度；不会发起网络请求。support bundle 使用额外的脱敏诊断模式，只收集权限/大小、计数、非敏感系统特征和选定环境变量的“存在/不存在”，不包含配置、命令/输出、会话内容、密钥、主机名或本地路径。分享前仍应逐项检查归档内容。
 
 配置文件保存后会自动热重载；`Ctrl+Shift+R` 可手动重载。应用内保存会先验证 TOML 与语义、获取进程锁并检查磁盘 revision，再以 `0600` 临时文件同步、原子替换并轮换两份有效备份；冲突、锁超时、无效内容或 I/O 错误会显示原生提示，且不会覆盖磁盘。`--restore-config-backup` 可恢复最近的有效备份。
+
+远程连接在最终 argv、重连、会话恢复和 remote Files probe 边界都会重跑同一个
+应用级 gate（字段/总 argv 字节预算、视觉欺骗字符、目标语义与结构化 OpenSSH
+选项）。`ssh_args` 可以使用 `-p 22`、`-o Name=value` 等选项，但不能塞入第二个
+destination 或提前的 `--`。最多前 128 个 profile 可执行；索引越界或运行态被改坏的
+profile 只显示安全有界诊断，不会 spawn。
 
 日志支持普通级别和标准 target 指令，并输出进程内相对时间、级别与模块名：
 

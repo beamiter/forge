@@ -1103,7 +1103,7 @@ impl UiState {
     }
 
     /// Open a new tab connecting to a saved remote host over ssh.
-    pub(crate) fn connect_remote(&self, host: &crate::config::RemoteHost) -> Terminal {
+    pub(crate) fn connect_remote(&self, host: &crate::config::RemoteHost) -> Option<Terminal> {
         self.connect_remote_with_attempt(host, 0)
     }
 
@@ -1113,7 +1113,7 @@ impl UiState {
         &self,
         host: &crate::config::RemoteHost,
         attempt: u32,
-    ) -> Terminal {
+    ) -> Option<Terminal> {
         self.launch_remote(host, attempt, None, Some(host.name.clone()))
     }
 
@@ -1125,7 +1125,7 @@ impl UiState {
         host: &crate::config::RemoteHost,
         session_id: String,
         tab_name: Option<String>,
-    ) -> Terminal {
+    ) -> Option<Terminal> {
         self.launch_remote(host, 0, Some(session_id), tab_name)
     }
 
@@ -1135,15 +1135,22 @@ impl UiState {
         attempt: u32,
         session_id: Option<String>,
         tab_name: Option<String>,
-    ) -> Terminal {
-        let argv = crate::config::build_remote_argv(host);
+    ) -> Option<Terminal> {
+        let argv = match crate::config::checked_remote_argv(host) {
+            Ok(argv) => argv,
+            Err(message) => {
+                log::warn!("[remote] execution gate rejected a connection: {message}");
+                self.toast_overlay.add_toast(adw::Toast::new(message));
+                return None;
+            }
+        };
         let terminal_mode = remote_tab_terminal_mode(&self.config.borrow().terminal_mode);
         log::info!(
             "[remote] connecting to {} (attempt {})",
             jterm_core::review_input::safe_inline_display(&host.name, 512),
             attempt.saturating_add(1)
         );
-        self.add_tab_with_argv(TabLaunch {
+        Some(self.add_tab_with_argv(TabLaunch {
             working_directory: None,
             tab_name,
             session_id,
@@ -1151,7 +1158,7 @@ impl UiState {
             argv_override: Some(argv),
             remote: Some((host.clone(), attempt)),
             terminal_mode,
-        })
+        }))
     }
 
     /// Mark a remote tab as connected (green badge). Called on first output.
@@ -1971,7 +1978,15 @@ impl UiState {
             // dispatch (insert_action_group + "tab-ctx.*" detailed names) silently
             // fails to activate in this GTK build, so direct connect_clicked closures
             // are used instead.
-            let remote_hosts = ui_for_ctx.config.borrow().remote_hosts.clone();
+            let remote_hosts: Vec<_> = ui_for_ctx
+                .config
+                .borrow()
+                .remote_hosts
+                .iter()
+                .take(crate::config::MAX_REMOTE_HOSTS)
+                .filter(|host| crate::config::validate_remote_host(host).is_ok())
+                .cloned()
+                .collect();
 
             let popover = gtk4::Popover::new();
             popover.set_parent(&strip_btn_for_ctx);
@@ -2168,7 +2183,7 @@ impl UiState {
             }
 
             // Remote connect items
-            for h in remote_hosts.iter() {
+            for h in &remote_hosts {
                 let name = jterm_core::review_input::safe_inline_display(&h.name, 256);
                 let item = make_item(&format!("Remote: {name}"));
                 let popover_c = popover.clone();

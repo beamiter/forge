@@ -1076,14 +1076,22 @@ impl UiState {
     /// active location are left to the notify handler, which performs the
     /// actual switch (a removed host thus falls back to Local).
     pub(crate) fn refresh_file_tree_location_selector(&self) {
-        let hosts = self.config.borrow().remote_hosts.clone();
-        let mut labels = vec![FsLocation::Local.label(&hosts)];
-        labels.extend((0..hosts.len()).map(|index| FsLocation::Remote(index).label(&hosts)));
+        let config = self.config.borrow();
+        let hosts = &config.remote_hosts;
+        let active_count = hosts.len().min(crate::config::MAX_REMOTE_HOSTS);
+        let mut labels = vec![FsLocation::Local.label(hosts)];
+        labels.extend((0..active_count).map(|index| FsLocation::Remote(index).label(hosts)));
         let selected = match &*self.file_tree_location.borrow() {
             FsLocation::Local => 0,
-            FsLocation::Remote(index) if *index < hosts.len() => *index as u32 + 1,
+            FsLocation::Remote(index)
+                if *index < active_count
+                    && crate::config::checked_remote_host(hosts, *index).is_ok() =>
+            {
+                *index as u32 + 1
+            }
             FsLocation::Remote(_) => 0,
         };
+        drop(config);
         let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
         let model = gtk4::StringList::new(&label_refs);
         self.file_tree_location_selector.set_model(Some(&model));

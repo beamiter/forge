@@ -231,11 +231,139 @@ pub(crate) fn remote_field_is_safe(value: &str) -> bool {
         && !jterm_core::review_input::contains_visual_spoofing(value)
 }
 
+const MAX_REMOTE_ARGV_BYTES: usize = 256 * 1024;
+
+/// `ssh_args` is an option vector, not a second destination/command channel.
+/// Accept OpenSSH short options (including attached operands), while rejecting
+/// a bare argument or `--` that would make ssh reinterpret the real target as
+/// remote command text.
+fn remote_ssh_args_are_structured(args: &[String]) -> bool {
+    let mut index = 0;
+    while index < args.len() {
+        let option = args[index].as_str();
+        if option == "--" || !option.starts_with('-') || option.starts_with("--") {
+            return false;
+        }
+        let bytes = option.as_bytes();
+        if bytes.len() < 2 || !bytes[1].is_ascii_alphabetic() {
+            return false;
+        }
+        let flag = bytes[1] as char;
+        let takes_operand = "BbcDEeFIiJLlmOoPpQRSWw".contains(flag);
+        if takes_operand {
+            if bytes.len() == 2 {
+                index += 1;
+                if index >= args.len() {
+                    return false;
+                }
+            }
+        } else if !option[1..]
+            .chars()
+            .all(|value| "46AaCfgKkMNnqTtVvXxYy".contains(value))
+        {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+/// The single application-level execution gate for every remote consumer.
+/// Config validation is advisory; this function is deliberately repeated at
+/// the final argv boundary so a stale snapshot or runtime mutation cannot
+/// bypass byte, visual-spoofing, and semantic checks.
+pub(crate) fn validate_remote_host(host: &RemoteHost) -> Result<(), &'static str> {
+    if !remote_field_is_safe(&host.name) {
+        return Err("Remote profile name is invalid; edit it in Settings or config.toml.");
+    }
+    if !remote_field_is_safe(&host.host)
+        || host.host.starts_with('-')
+        || host.host.chars().any(char::is_whitespace)
+    {
+        return Err("Remote target is invalid; edit it in Settings or config.toml.");
+    }
+    if host.user.as_deref().is_some_and(|user| {
+        !remote_field_is_safe(user) || user.contains('@') || user.chars().any(char::is_whitespace)
+    }) {
+        return Err("Remote user is invalid; edit it in Settings or config.toml.");
+    }
+    if !remote_field_is_safe(&host.remote_shell) {
+        return Err("Remote shell is invalid; edit it in config.toml.");
+    }
+    if host
+        .session
+        .as_deref()
+        .is_some_and(|session| !jterm_core::execution_journal::is_valid_jsh_session_id(session))
+    {
+        return Err("Remote session id is invalid; edit it in config.toml.");
+    }
+    if host.ssh_args.len() > MAX_REMOTE_SSH_ARGS
+        || host.ssh_args.iter().any(|arg| !remote_field_is_safe(arg))
+        || !remote_ssh_args_are_structured(&host.ssh_args)
+    {
+        return Err("Remote SSH options are invalid; edit them in config.toml.");
+    }
+    if host.deploy_artifact.as_deref().is_some_and(|artifact| {
+        !remote_field_is_safe(artifact) || !Path::new(artifact).is_absolute()
+    }) {
+        return Err("Remote deployment artifact is invalid; edit it in config.toml.");
+    }
+    let argv_bytes = host
+        .ssh_args
+        .iter()
+        .try_fold(
+            host.host
+                .len()
+                .saturating_add(host.name.len())
+                .saturating_add(host.remote_shell.len())
+                .saturating_add(host.user.as_deref().map_or(0, str::len))
+                .saturating_add(host.session.as_deref().map_or(0, str::len))
+                .saturating_add(host.deploy_artifact.as_deref().map_or(0, str::len)),
+            |total, argument| total.checked_add(argument.len()),
+        )
+        .unwrap_or(usize::MAX);
+    if argv_bytes > MAX_REMOTE_ARGV_BYTES {
+        return Err("Remote profile exceeds the execution byte budget.");
+    }
+    Ok(())
+}
+
+pub(crate) fn checked_remote_host(
+    hosts: &[RemoteHost],
+    index: usize,
+) -> Result<&RemoteHost, &'static str> {
+    if index >= MAX_REMOTE_HOSTS {
+        return Err("Remote host index exceeds the supported 128-profile limit.");
+    }
+    let host = hosts
+        .get(index)
+        .ok_or("That remote host is no longer configured.")?;
+    validate_remote_host(host)?;
+    Ok(host)
+}
+
 fn setting_text_is_safe(value: &str, max_bytes: usize) -> bool {
     !value.trim().is_empty()
         && value.len() <= max_bytes
         && !value.chars().any(char::is_control)
         && !jterm_core::review_input::contains_visual_spoofing(value)
+}
+
+/// Resolve a textual environment override without letting an invalid override
+/// erase a valid file setting. Values are trimmed before they reach parsers or
+/// UI labels, and both sources pass through the same display-safety boundary.
+fn resolve_setting_text(
+    override_value: Option<String>,
+    configured_value: Option<String>,
+    max_bytes: usize,
+) -> Option<String> {
+    let normalize = |value: String| {
+        let value = value.trim();
+        setting_text_is_safe(value, max_bytes).then(|| value.to_string())
+    };
+    override_value
+        .and_then(&normalize)
+        .or_else(|| configured_value.and_then(normalize))
 }
 
 fn ai_base_url_is_structurally_safe(value: &str) -> bool {
@@ -549,6 +677,13 @@ fn wrap_jsh_argv_in_interactive_bash(jsh_path: &str) -> Option<Vec<String>> {
 
 /// Build the local argv that connects to a remote host via ssh.
 /// Produces e.g. `["ssh", "-t", "-p", "2222", "mm@100.x.x.x", "jsh --session home-main"]`.
+pub(crate) fn checked_remote_argv(host: &RemoteHost) -> Result<Vec<String>, &'static str> {
+    validate_remote_host(host)?;
+    Ok(build_remote_argv(host))
+}
+
+/// Low-level argv construction. Production consumers use
+/// [`checked_remote_argv`] so the gate is immediately adjacent to execution.
 pub(crate) fn build_remote_argv(host: &RemoteHost) -> Vec<String> {
     if host.deploy.is_enabled() {
         match jterm_core::jsh_remote::publish_launcher() {
@@ -1143,7 +1278,10 @@ impl Config {
 // ---------------------------------------------------------------------------
 
 fn env_f64(name: &str) -> Option<f64> {
-    std::env::var(name).ok().and_then(|v| v.parse::<f64>().ok())
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
 }
 
 fn env_u32(name: &str) -> Option<u32> {
@@ -1154,6 +1292,14 @@ fn env_f32(name: &str) -> Option<f32> {
     std::env::var(name)
         .ok()
         .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|value| value.is_finite())
+}
+
+fn finite_clamp_f64(value: Option<f64>, fallback: f64, min: f64, max: f64) -> f64 {
+    value
+        .filter(|value| value.is_finite())
+        .unwrap_or(fallback)
+        .clamp(min, max)
 }
 
 fn env_bool(name: &str) -> Option<bool> {
@@ -1519,7 +1665,14 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
 
     let warn_float_range = |issues: &mut Vec<ConfigIssue>, key: &str, min: f64, max: f64| {
         if let Some(value) = table.get(key).and_then(toml::Value::as_float) {
-            if !(min..=max).contains(&value) {
+            if !value.is_finite() {
+                config_issue(
+                    issues,
+                    Warning,
+                    key,
+                    "must be finite; the safe default will be used",
+                );
+            } else if !(min..=max).contains(&value) {
                 config_issue(
                     issues,
                     Warning,
@@ -2488,7 +2641,7 @@ pub(crate) fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
                 }
                 Some(_) => return None,
             };
-            Some(RemoteHost {
+            let host = RemoteHost {
                 name,
                 host,
                 user,
@@ -2500,7 +2653,9 @@ pub(crate) fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
                 deploy,
                 docker,
                 deploy_artifact,
-            })
+            };
+            validate_remote_host(&host).ok()?;
+            Some(host)
         })
         .collect()
 }
@@ -2562,9 +2717,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let themes = builtin_themes();
 
     // Resolve active theme
-    let theme_name = env_string("FORGE_THEME")
-        .or(fc.theme)
-        .filter(|value| setting_text_is_safe(value, 256))
+    let theme_name = resolve_setting_text(env_string("FORGE_THEME"), fc.theme, 256)
         .unwrap_or_else(|| "default".to_string());
     let theme = themes
         .iter()
@@ -2572,21 +2725,18 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .unwrap_or(&themes[0]);
 
     // Priority: env var > config file > theme default
-    let window_opacity = env_f64("FORGE_OPACITY")
-        .or(fc.opacity)
-        .unwrap_or(0.95)
-        .clamp(0.01, 1.0);
+    let window_opacity = finite_clamp_f64(env_f64("FORGE_OPACITY").or(fc.opacity), 0.95, 0.01, 1.0);
     let terminal_scrollback_lines = env_u32("FORGE_SCROLLBACK")
         .or(fc.scrollback)
         .unwrap_or(5000)
         .min(1_000_000);
-    let default_font_scale = env_f64("FORGE_FONT_SCALE")
-        .or(fc.font_scale)
-        .unwrap_or(1.0)
-        .clamp(0.1, 10.0);
-    let font_desc = env_string("FORGE_FONT")
-        .or(fc.font)
-        .filter(|font| setting_text_is_safe(font, MAX_FONT_DESC_BYTES))
+    let default_font_scale = finite_clamp_f64(
+        env_f64("FORGE_FONT_SCALE").or(fc.font_scale),
+        1.0,
+        0.1,
+        10.0,
+    );
+    let font_desc = resolve_setting_text(env_string("FORGE_FONT"), fc.font, MAX_FONT_DESC_BYTES)
         .unwrap_or_else(|| "Monospace 14".to_string());
 
     let foreground = env_rgba("FORGE_FG")
@@ -2660,18 +2810,14 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     }
     .or(fc.block_compact)
     .unwrap_or(false);
-    let shell = env_string("FORGE_SHELL")
-        .or(fc.shell)
-        .filter(|shell| setting_text_is_safe(shell, MAX_CONFIG_PATH_BYTES));
+    let shell = resolve_setting_text(env_string("FORGE_SHELL"), fc.shell, MAX_CONFIG_PATH_BYTES);
     let startup_commands = fc
         .startup_commands
         .filter(|commands| setting_text_is_safe(commands, MAX_STARTUP_COMMANDS_BYTES));
 
     // Block-first like anvil; VTE remains available for compatibility and
     // safe mode.
-    let terminal_mode_str = env_string("FORGE_MODE")
-        .or(fc.terminal_mode)
-        .filter(|value| setting_text_is_safe(value, 64))
+    let terminal_mode_str = resolve_setting_text(env_string("FORGE_MODE"), fc.terminal_mode, 64)
         .unwrap_or_else(|| "block".to_string());
     let terminal_mode = TerminalMode::parse(&terminal_mode_str).unwrap_or_else(|| {
         log::warn!("Unknown terminal_mode '{terminal_mode_str}', using block");
@@ -2679,9 +2825,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     });
 
     let tab_placement = TabPlacement::parse(
-        &env_string("FORGE_TAB_PLACEMENT")
-            .or(fc.tab_placement)
-            .filter(|value| setting_text_is_safe(value, 64))
+        &resolve_setting_text(env_string("FORGE_TAB_PLACEMENT"), fc.tab_placement, 64)
             .unwrap_or_else(|| "sidebar".to_string()),
     );
     let sidebar_visible = resolve_sidebar_visibility(fc.sidebar_visible, tab_placement);
@@ -2711,14 +2855,16 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let ascii_organism_enabled = env_bool("FORGE_ASCII_ORGANISM_ENABLED")
         .or(fc.ascii_organism_enabled)
         .unwrap_or(false);
-    let ascii_organism_motion = env_string("FORGE_ASCII_ORGANISM_MOTION")
-        .or(fc.ascii_organism_motion)
-        .as_deref()
-        .and_then(OrganismMotion::parse);
-    let requested_provider = env_string("FORGE_AI_PROVIDER")
-        .or(fc.ai_provider)
-        .filter(|value| setting_text_is_safe(value, 64))
-        .unwrap_or_else(|| "anthropic".to_string());
+    let ascii_organism_motion = resolve_setting_text(
+        env_string("FORGE_ASCII_ORGANISM_MOTION"),
+        fc.ascii_organism_motion,
+        64,
+    )
+    .as_deref()
+    .and_then(OrganismMotion::parse);
+    let requested_provider =
+        resolve_setting_text(env_string("FORGE_AI_PROVIDER"), fc.ai_provider, 64)
+            .unwrap_or_else(|| "anthropic".to_string());
     let ai_provider = match requested_provider.trim().to_ascii_lowercase().as_str() {
         "anthropic" | "claude" => "anthropic",
         "openai" | "openai-compatible" | "openai_compatible" => "openai-compatible",
@@ -2734,10 +2880,12 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         "ollama" => ("codellama:7b", "http://localhost:11434"),
         _ => ("claude-sonnet-4-6", "https://api.anthropic.com"),
     };
-    let ai_model = env_string("FORGE_AI_MODEL")
-        .or(fc.ai_model)
-        .filter(|model| setting_text_is_safe(model, MAX_AI_IDENTIFIER_BYTES))
-        .unwrap_or_else(|| default_ai_model.to_string());
+    let ai_model = resolve_setting_text(
+        env_string("FORGE_AI_MODEL"),
+        fc.ai_model,
+        MAX_AI_IDENTIFIER_BYTES,
+    )
+    .unwrap_or_else(|| default_ai_model.to_string());
     let ai_base_url = resolve_ai_base_url(
         env_string("FORGE_AI_BASE_URL").or(fc.ai_base_url),
         default_ai_base_url,
@@ -4189,6 +4337,54 @@ session = "bad/session"
     }
 
     #[test]
+    fn non_finite_presentation_numbers_fall_back_before_clamping() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(finite_clamp_f64(Some(value), 0.95, 0.01, 1.0), 0.95);
+        }
+        assert_eq!(finite_clamp_f64(Some(-1.0), 0.95, 0.01, 1.0), 0.01);
+        assert_eq!(finite_clamp_f64(Some(4.0), 0.95, 0.01, 1.0), 1.0);
+        assert_eq!(finite_clamp_f64(Some(0.7), 0.95, 0.01, 1.0), 0.7);
+
+        let issues = validate_config_contents("opacity = nan\nfont_scale = inf\n").unwrap();
+        for key in ["opacity", "font_scale"] {
+            assert!(issues.iter().any(|issue| {
+                issue.path == key
+                    && issue.level == ConfigIssueLevel::Warning
+                    && issue.message.contains("finite")
+            }));
+        }
+    }
+
+    #[test]
+    fn invalid_text_override_does_not_erase_a_safe_file_setting() {
+        let configured = Some("  Monospace 15  ".to_string());
+        assert_eq!(
+            resolve_setting_text(
+                Some("spoof\u{202e}font".to_string()),
+                configured.clone(),
+                MAX_FONT_DESC_BYTES,
+            )
+            .as_deref(),
+            Some("Monospace 15")
+        );
+        assert_eq!(
+            resolve_setting_text(
+                Some("  JetBrains Mono  ".to_string()),
+                configured,
+                MAX_FONT_DESC_BYTES,
+            )
+            .as_deref(),
+            Some("JetBrains Mono")
+        );
+        assert!(resolve_setting_text(
+            Some("x".repeat(MAX_FONT_DESC_BYTES + 1)),
+            Some("bad\nfont".to_string()),
+            MAX_FONT_DESC_BYTES,
+        )
+        .is_none());
+    }
+
+    #[test]
     fn example_config_mentions_every_supported_top_level_key() {
         let example = include_str!("../config.toml.example");
         for key in KNOWN_CONFIG_KEYS {
@@ -4218,5 +4414,27 @@ session = "bad/session"
         )
         .unwrap();
         assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    #[test]
+    fn execution_gate_rejects_spoofing_unstructured_ssh_args_and_high_indexes() {
+        let valid = host();
+        assert!(checked_remote_argv(&valid).is_ok());
+
+        let mut spoofed = valid.clone();
+        spoofed.name = "trusted\u{202e}host".into();
+        assert!(checked_remote_argv(&spoofed).is_err());
+
+        let mut second_destination = valid.clone();
+        second_destination.ssh_args = vec!["attacker.example".into()];
+        assert!(checked_remote_argv(&second_destination).is_err());
+
+        let mut premature_separator = valid.clone();
+        premature_separator.ssh_args = vec!["--".into()];
+        assert!(checked_remote_argv(&premature_separator).is_err());
+
+        let hosts = vec![valid; MAX_REMOTE_HOSTS + 1];
+        assert!(checked_remote_host(&hosts, MAX_REMOTE_HOSTS - 1).is_ok());
+        assert!(checked_remote_host(&hosts, MAX_REMOTE_HOSTS).is_err());
     }
 }

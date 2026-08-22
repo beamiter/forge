@@ -64,6 +64,7 @@ verify: privacy
 	@RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
 	@cargo build --release --all-features --locked
 	@bash -n scripts/*.sh packaging/*.sh
+	@bash scripts/test-install-paths.sh
 
 package:
 	@cargo build --release --all-features --locked

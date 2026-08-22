@@ -395,8 +395,19 @@ impl UiState {
             return;
         }
 
-        let hosts: Rc<Vec<crate::config::RemoteHost>> =
-            Rc::new(self.config.borrow().remote_hosts.clone());
+        // Validate borrowed runtime objects before cloning or deriving any UI
+        // text. Row activation owns that same validated clone, so filtering an
+        // invalid draft cannot redirect it to another configured host.
+        let hosts: Rc<Vec<crate::config::RemoteHost>> = Rc::new(
+            self.config
+                .borrow()
+                .remote_hosts
+                .iter()
+                .take(crate::config::MAX_REMOTE_HOSTS)
+                .filter(|host| crate::config::validate_remote_host(host).is_ok())
+                .cloned()
+                .collect(),
+        );
         if let Err(message) =
             remote_picker_guard(std::env::var_os("FORGE_SAFE_MODE").is_some(), hosts.len())
         {
@@ -502,8 +513,8 @@ impl UiState {
             let ui = self.clone();
             let hosts = hosts.clone();
             move |idx: usize| {
-                if let Some(h) = hosts.get(idx) {
-                    ui.connect_remote(h);
+                if let Some(host) = hosts.get(idx) {
+                    ui.connect_remote(host);
                 }
             }
         };
@@ -2465,7 +2476,15 @@ impl UiState {
 
             // Plain Popover + Buttons: the GAction-based PopoverMenu dispatch does
             // not fire in this GTK build, so direct connect_clicked closures are used.
-            let remote_hosts = ui.config.borrow().remote_hosts.clone();
+            let remote_hosts: Vec<_> = ui
+                .config
+                .borrow()
+                .remote_hosts
+                .iter()
+                .take(crate::config::MAX_REMOTE_HOSTS)
+                .filter(|host| crate::config::validate_remote_host(host).is_ok())
+                .cloned()
+                .collect();
             let link_uri: Option<String> = term.check_match_at(x, y).0.map(|s| s.to_string());
 
             let popover = gtk4::Popover::new();
@@ -2567,8 +2586,9 @@ impl UiState {
             }
 
             // Remote connect items
-            for h in remote_hosts.iter() {
-                let item = make_item(&format!("Connect: {}", h.name));
+            for h in &remote_hosts {
+                let name = jterm_core::review_input::safe_inline_display(&h.name, 256);
+                let item = make_item(&format!("Connect: {name}"));
                 let popover_c = popover.clone();
                 let ui_remote = ui.clone();
                 let host = h.clone();

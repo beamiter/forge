@@ -50,6 +50,9 @@ fn remote_host_index_for_action(
         return Err("Remote connections are disabled in safe mode.");
     }
     let index = usize::from(index);
+    if index >= crate::config::MAX_REMOTE_HOSTS {
+        return Err("Remote host index exceeds the supported 128-profile limit.");
+    }
     if index >= host_count {
         return Err("That remote host is no longer configured.");
     }
@@ -271,10 +274,16 @@ impl UiState {
             }
             Action::ConnectRemote(index) => {
                 let safe_mode = std::env::var_os("FORGE_SAFE_MODE").is_some();
-                let hosts = self.config.borrow().remote_hosts.clone();
-                match remote_host_index_for_action(index, hosts.len(), safe_mode) {
-                    Ok(index) => {
-                        self.connect_remote(&hosts[index]);
+                let host = {
+                    let config = self.config.borrow();
+                    remote_host_index_for_action(index, config.remote_hosts.len(), safe_mode)
+                        .and_then(|index| {
+                            crate::config::checked_remote_host(&config.remote_hosts, index).cloned()
+                        })
+                };
+                match host {
+                    Ok(host) => {
+                        self.connect_remote(&host);
                     }
                     Err(message) => self.toast_overlay.add_toast(adw::Toast::new(message)),
                 }
@@ -740,6 +749,10 @@ mod tests {
         assert_eq!(
             remote_host_index_for_action(0, 1, true),
             Err("Remote connections are disabled in safe mode.")
+        );
+        assert_eq!(
+            remote_host_index_for_action(128, 200, false),
+            Err("Remote host index exceeds the supported 128-profile limit.")
         );
     }
 

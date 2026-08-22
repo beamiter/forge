@@ -76,13 +76,13 @@ impl FsLocation {
     pub(crate) fn label(&self, hosts: &[RemoteHost]) -> String {
         match self {
             FsLocation::Local => "Local".to_string(),
-            FsLocation::Remote(index) => match hosts.get(*index) {
-                Some(host) => {
+            FsLocation::Remote(index) => match crate::config::checked_remote_host(hosts, *index) {
+                Ok(host) => {
                     let transport = if host.docker { "docker" } else { "ssh" };
                     let name = jterm_core::review_input::safe_inline_display(&host.name, 256);
                     format!("{transport}: {name}")
                 }
-                None => "Remote (removed)".to_string(),
+                Err(_) => "Remote (unavailable)".to_string(),
             },
         }
     }
@@ -326,6 +326,12 @@ fn probe_argv(host: &RemoteHost, op: &str, args: &[&str]) -> Vec<String> {
     argv
 }
 
+fn checked_probe_argv(host: &RemoteHost, op: &str, args: &[&str]) -> io::Result<Vec<String>> {
+    crate::config::validate_remote_host(host)
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    Ok(probe_argv(host, op, args))
+}
+
 /// Spawn a child from an argv vector with the given stdio arrangement.
 fn spawn_argv(
     argv: &[String],
@@ -464,7 +470,7 @@ fn run_probe(
     timeout: Duration,
     max_out: u64,
 ) -> io::Result<Capture> {
-    let argv = probe_argv(host, op, args);
+    let argv = checked_probe_argv(host, op, args)?;
     // The script rides in argv (`sh -c`), so stdin carries no payload here.
     let capture = run_capture(&argv, &[], timeout, max_out)?;
     probe_result(capture)
@@ -960,7 +966,7 @@ pub(crate) fn download_file(
     dst: &Path,
     control: &TransferControl,
 ) -> io::Result<()> {
-    let argv = probe_argv(host, "cat", &[remote_path_arg(src)?]);
+    let argv = checked_probe_argv(host, "cat", &[remote_path_arg(src)?])?;
     stream_download_to_file(
         &argv,
         dst,
@@ -985,7 +991,7 @@ pub(crate) fn upload_file(
     if remote_stat(host, dst)?.is_some() {
         return Err(already_exists(dst));
     }
-    let argv = probe_argv(host, "put", &[remote_path_arg(dst)?]);
+    let argv = checked_probe_argv(host, "put", &[remote_path_arg(dst)?])?;
     stream_upload_to_probe(
         &argv,
         src,
@@ -1004,7 +1010,7 @@ pub(crate) fn download_dir(
     dst: &Path,
     control: &TransferControl,
 ) -> io::Result<()> {
-    let argv = probe_argv(host, "tar", &[remote_path_arg(src)?]);
+    let argv = checked_probe_argv(host, "tar", &[remote_path_arg(src)?])?;
     fail_if_exists(dst)?;
     local_tar_available()?;
     let Some(parent) = dst.parent() else {
@@ -1135,7 +1141,7 @@ pub(crate) fn upload_dir(
     }
     let dst_arg = remote_path_arg(dst)?;
     let local_argv = local_tar_create_argv(src)?;
-    let remote_argv = probe_argv(host, "untar", &[parent_arg, name_arg]);
+    let remote_argv = checked_probe_argv(host, "untar", &[parent_arg, name_arg])?;
     let result = stream_upload_dir(
         &local_argv,
         &remote_argv,
@@ -1447,10 +1453,9 @@ fn remote_host<'a>(
 ) -> io::Result<Option<&'a RemoteHost>> {
     match loc {
         FsLocation::Local => Ok(None),
-        FsLocation::Remote(index) => hosts
-            .get(*index)
+        FsLocation::Remote(index) => crate::config::checked_remote_host(hosts, *index)
             .map(Some)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "remote host was removed")),
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message)),
     }
 }
 
@@ -1509,7 +1514,7 @@ fn parse_stat(stdout: &[u8]) -> io::Result<RemoteStat> {
 /// refusal before streaming; the `put`/`untar` 17 checks remain the atomic
 /// enforcement behind it.
 fn remote_stat(host: &RemoteHost, path: &Path) -> io::Result<Option<RemoteStat>> {
-    let argv = probe_argv(host, "stat", &[remote_path_arg(path)?]);
+    let argv = checked_probe_argv(host, "stat", &[remote_path_arg(path)?])?;
     let capture = run_capture(&argv, &[], PROBE_LIST_TIMEOUT, PROBE_HOME_MAX_OUTPUT)?;
     match capture.status {
         0 => parse_stat(&capture.stdout).map(Some),
@@ -3064,5 +3069,22 @@ mod tests {
         assert_eq!(drop_entry_size(&root.join("missing"), 0), 0);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn production_probe_gate_rejects_invalid_runtime_hosts_before_spawn() {
+        let mut host = host_fixture();
+        host.host = "-oProxyCommand=attacker".to_string();
+        assert_eq!(
+            FsLocation::Remote(0).label(std::slice::from_ref(&host)),
+            "Remote (unavailable)"
+        );
+        let error = checked_probe_argv(&host, "home", &[]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let hosts = vec![host_fixture(); crate::config::MAX_REMOTE_HOSTS + 1];
+        let error =
+            remote_host(&FsLocation::Remote(crate::config::MAX_REMOTE_HOSTS), &hosts).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

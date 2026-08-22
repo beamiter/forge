@@ -102,6 +102,7 @@ jobs:
           shellcheck "${shell_files[@]}"
           scripts/install.sh --help >/dev/null
           scripts/uninstall.sh --help >/dev/null
+          bash scripts/test-install-paths.sh
 
   gtk-display:
     name: GTK display regression
