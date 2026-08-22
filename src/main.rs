@@ -1011,6 +1011,7 @@ pub fn run() -> glib::ExitCode {
             font_scale: font_scale.clone(),
             config_persist_generation: Rc::new(Cell::new(0)),
             font_persist_generation: Rc::new(Cell::new(0)),
+            pending_font_scale: Rc::new(Cell::new(None)),
             window_opacity: window_opacity.clone(),
             shell_argv: shell_argv.clone(),
             config: config.clone(),

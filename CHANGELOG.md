@@ -6,6 +6,33 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Block 模式体验一轮：卡片上一直宣传却没人实现的 `Ctrl+↵ run` 现在真的重跑选中块——
+  仅限本 pane 里用户自己跑过的单行命令，提示符必须空闲，多选/background/会被截断的多行
+  命令一律只回填（右键新增等价的 **Re-run Command**）；模型给出的候选仍然只能
+  Insert for review。历史恢复与撤销清空重建出的卡片终于和新卡片拥有同一套右键菜单——
+  三条挂载路径合并成一个 helper，不会再各自漂移。被信号停止的命令（130 SIGINT、
+  141 SIGPIPE、143 SIGTERM）不再画成硬失败：中性的 `⊘ exit:N · interrupted` 卡片，
+  不进滚动条失败标记、失败跳转和 Failed 过滤，原始退出码在徽章/导出/历史中完整保留，
+  而 SIGSEGV/SIGABRT/SIGQUIT/SIGKILL 这类真故障仍然是红色。命令跑过约 2 秒后，顶部
+  常驻运行状态条（`▶ 命令 用时` + 一键 Stop）不再要求先滚动离开底部才出现。
+- Block 内的搜索与过滤修了三处会骗人的地方：每次查询前先丢掉卡片 VTE 上遗留的选区，
+  否则从上一次命中之下向前搜索会对屏幕上看得见的文字报 "No matches"；卡片因 resize、
+  Expand 或输出过滤被重新灌入后，find 记录的原生游标已经失效，现在会带 render stamp
+  识别并就地重建整轮搜索，而不是报 No matches 或跳错位置；块内过滤框不再是键盘单向门，
+  `Escape` 或再次 `Alt+Shift+F` 即可关闭并把焦点交还提示符，查询文本保留。
+- 一条外来的 OSC 133 `D` 不再替本地命令收尾：`ssh`、`docker exec`、`tmux attach` 或
+  `cat` 一份含这些字节的日志，都会让本地卡片提前结束并盖上远端命令的退出码和耗时。
+  `on_command_end` 现在与 `on_command_start` 的前台判定对称——前台属于别人时拒绝该标记，
+  等 shell 拿回终端后用它自己的 `D`（即真正的退出码）收尾。
+- Block 卡片的四种状态不再互相覆盖：失败、hover、选中、书签曾经全部经由 `box-shadow`
+  和 `background-color` 表达，文件里最后一条同优先级规则通吃——把鼠标移到失败卡片上会洗掉
+  它的红色，给卡片加书签会抹掉它的选中环。书签改用独立的 `background-image` 通道，
+  失败/选中与 hover 的组合各有显式规则，并有单元测试守住"新状态必须写复合规则"。
+- Block 模式的三处主线程开销：完成一条命令时不再为同一个行数把整份 transcript 走第二遍
+  （大输出结束到提示符回来的停顿约减半）；`Ctrl+滚轮` 缩放把一次滚轮串合并成一次控件遍历，
+  被虚拟化的卡片记下目标字号、回到视口时才采用，显示器级样式表在文本没变时不再重装；
+  alt-screen 期间 `Ctrl+Up` 不再选中隐藏卡片、`Delete` 不再删除它们，进入 alt-screen 会清除既有选择。
+
 - Unified 模式现在原生显示 Kitty `a=T` 图片：分块上传保留首块 `r/c/C` 与最终块 cursor，
   nonce 行探针在滚屏、半格滚动和 rewrap 后重新定位图片，ED3/RIS/alt-screen 按可信行边界
   管理生命周期；探针成本按可见行 × 唯一 placement 列有界。Block 的图片预算也统一计入

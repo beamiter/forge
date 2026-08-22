@@ -270,6 +270,7 @@ jsh_update_check = "daily"    # "startup" 每次启动联网；"daily" 复用缓
 | Block 历史 / 跨块搜索 | `Ctrl+Shift+H` / `Ctrl+Shift+G` |
 | workflow / 失败块 / 最早块 | `Ctrl+Shift+M` / `Ctrl+Shift+X` / `Ctrl+Shift+N` |
 | 全选 / 回填 / 清空 Block | `Ctrl+Shift+A` / `Ctrl+Shift+I` / `Ctrl+Shift+K` |
+| 回填 / 重跑选中块 | `Enter` / `Ctrl+Enter` |
 | Block 过滤 / 书签 / 标签栏位置 | `Alt+Shift+F` / `Ctrl+Shift+B` / `Ctrl+Alt+B` |
 | AI 面板 / 询问选中块 | `Ctrl+Alt+Shift+A` / `Ctrl+Shift+Q` |
 | Shell Agent（Block） | `Ctrl+Alt+G` |
@@ -297,7 +298,22 @@ source <(forge --shell-integration bash)
 
 Block 模式与 anvil 保持相同的选择语义：`Ctrl+Up` 从最新块进入选择，`Shift+Up/Down`
 扩展范围，普通 `Up/Down` 移动 active edge，`Enter` 按终端顺序把所有选中命令回填为
-可编辑文本而不执行，`Escape` 取消选择。右键多选区域可批量复制命令、输出或完整块；长 Block 提供顶部/底部跳转与 sticky header，后台异步输出使用独立 Block 样式。
+可编辑文本而不执行，`Escape` 取消选择。`Ctrl+Enter` 直接重跑**单个**选中块的命令
+（右键菜单的 **Re-run Command** 等价）：仅限本 pane 里用户自己已经执行过的单行命令，
+且提示符必须空闲、无未提交输入；多选、后台块和会被截断为首行的多行命令一律拒绝执行，
+只回填。AI / Agent / 命令面板的建议仍然只 **Insert for review**，永不自行提交。
+右键多选区域可批量复制命令、输出或完整块；长 Block 提供顶部/底部跳转与 sticky header，
+后台异步输出使用独立 Block 样式。历史恢复和撤销清空重建的块与新块拥有完全相同的右键菜单。
+
+命令运行超过 2 秒后，顶部会出现常驻的运行状态条（`▶ 命令 用时` 加一键 Stop），
+不必先滚动离开底部才能看到；滚动到历史中时它会立即出现，并在 alt-screen 程序下让位。
+被信号停止的命令（`130` SIGINT、`141` SIGPIPE、`143` SIGTERM）使用独立的 `⊘ interrupted`
+中性样式，不计入失败：滚动条失败标记、`Ctrl+Shift+X` 失败跳转和 Failed 过滤都会跳过它们，
+原始退出码仍完整保留在徽章、导出和历史中。
+
+块内输出过滤（`Alt+Shift+F`）打开后可用 `Escape` 或再次 `Alt+Shift+F` 关闭，
+查询文本会保留、焦点交还提示符。alt-screen 程序运行期间，`Ctrl+Up` 不会进入块选择，
+`Delete` 也不会删除隐藏的块；进入 alt-screen 会清除既有块选择。
 
 后台输出只会在提示符空闲且用户尚未开始编辑时归入独立 Block；一旦输入开始，后续输出保持在当前终端中，避免把 shell 回显、补全或交互输出错误拆块。
 

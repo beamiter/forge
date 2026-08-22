@@ -239,6 +239,32 @@ pub(crate) type VoidCallbacks = Rc<RefCell<Vec<Box<dyn Fn()>>>>;
 mod tests {
     use super::*;
 
+    /// Every card mount path installs a fresh controller set on the outer box,
+    /// including the right-click menu the rebuild paths now also mount. That is
+    /// only safe because a pooled box arrives stripped: otherwise a box reused
+    /// N times would answer one right-click with N popovers.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn a_pooled_card_box_arrives_without_its_previous_controllers() {
+        gtk::init().expect("gtk init");
+        let mut pool = WidgetPool::new();
+        let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let right_click = gtk::GestureClick::new();
+        right_click.set_button(3);
+        widget.add_controller(right_click);
+        widget.add_controller(gtk::EventControllerMotion::new());
+        assert_eq!(widget.observe_controllers().n_items(), 2);
+
+        pool.release(widget);
+        let reused = pool.acquire().expect("the released box is available again");
+
+        assert_eq!(
+            reused.observe_controllers().n_items(),
+            0,
+            "a recycled card box must not carry the previous card's controllers"
+        );
+    }
+
     #[test]
     fn ignores_subpixel_scroll_churn() {
         assert!(!scroll_value_changed(100.0, 100.4));

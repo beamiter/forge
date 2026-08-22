@@ -358,8 +358,10 @@ fn failed_block_marker_fractions(blocks: &VecDeque<BlockData>) -> Vec<f64> {
     failure_marker_fractions_from(blocks.iter().map(|block| {
         (
             block.estimated_height.max(1) as u64,
-            jterm_core::block_contract::classify_completed(Some(&block.cmd), block.exit_code)
-                .is_failed(),
+            // Forge's own outcome, not the shared contract's: a command the
+            // user stopped is not a failure, and ticking the scrollbar for
+            // every `top` and `tail -f` they left buries the real ones.
+            BlockOutcome::classify(Some(&block.cmd), block.exit_code).is_failure(),
         )
     }))
 }
@@ -379,6 +381,32 @@ fn mutate_block_data_and_redraw<R>(
     };
     redraw();
     result
+}
+
+/// The running-command header's text: what is running, and for how long.
+///
+/// Kept as its own function because it is the only status a user gets while a
+/// command is in flight, and the thresholds it switches on (a minute, an hour)
+/// are the kind of thing that silently regresses.
+fn running_header_label(command: &str, elapsed_secs: u64) -> String {
+    let elapsed = if elapsed_secs >= 3600 {
+        format!("{}h{:02}m", elapsed_secs / 3600, (elapsed_secs % 3600) / 60)
+    } else if elapsed_secs >= 60 {
+        format!("{}m{:02}s", elapsed_secs / 60, elapsed_secs % 60)
+    } else {
+        format!("{elapsed_secs}s")
+    };
+    // The same treatment the finished-block sticky header gives its command.
+    // This one is a raw capture of a line the user typed, and it is now shown
+    // while following the bottom as well, so it must not be the one place a
+    // control or bidi character reaches a label verbatim.
+    let command = jterm_core::review_input::safe_inline_display(command.trim(), 512);
+    let command = command.trim();
+    if command.is_empty() {
+        format!("▶  (running)    {elapsed}")
+    } else {
+        format!("▶  {command}    {elapsed}")
+    }
 }
 
 /// Update the jump-to-bottom FAB's label to show an unread-block badge: just the
@@ -1808,6 +1836,158 @@ pub(crate) fn recall_command_at_prompt(
     true
 }
 
+/// Recall a finished command **and submit it**.
+///
+/// This is the one place Block mode writes an Enter of its own, and it exists
+/// because the card's selection hint has always advertised it. It is
+/// deliberately narrower than every other programmatic write:
+///
+/// * The command is one the user already ran in this pane. Nothing suggested
+///   it, so the "insert for review, never execute" rule the AI/Agent/palette
+///   paths live under does not apply — those paths still go through
+///   [`recall_command_at_prompt`] and are untouched.
+/// * The caller admits a single selected card only. Running a multi-card
+///   selection would submit commands the user never looked at individually.
+/// * A command that [`build_command_recall`] had to cut to its first line is
+///   refused outright rather than executed as a truncated prefix. Insertion can
+///   afford truncation because the user still reads the line before pressing
+///   Enter; execution cannot.
+/// * The prompt guards are exactly `recall_command_at_prompt`'s: a running
+///   command, a dirty editor, a pending submission or unresolved typeahead all
+///   refuse, so this can never append to text the user was typing.
+fn submit_recalled_command_at_prompt(
+    ctx: PromptRecallCtx<'_>,
+    state: BlockState,
+    command: &str,
+    bracketed_paste: bool,
+) -> bool {
+    let Some(submission) = rerun_submission(
+        PromptSubmitGuards {
+            state,
+            pty_synced: ctx.pty_synced.get(),
+            submission_pending: ctx.submission_pending.get(),
+            pending_typeahead: ctx.pending_typeahead.get(),
+            fidelity: ctx.typed_cmd_fidelity.get(),
+        },
+        command,
+        bracketed_paste,
+    ) else {
+        return false;
+    };
+    if let Err(error) = ctx.pty.write_bytes(&submission.payload) {
+        ctx.pty
+            .report_write_error("could not queue the re-run command", error);
+        return false;
+    }
+    // `ExactSubmitted`, not `Inexact` as an insertion uses. A re-run is only
+    // admitted from a prompt nothing has touched (`pty_synced` false means no
+    // input has changed this editor), so the shadow really is the whole line —
+    // and it really has been submitted. Claiming less makes the card mint with
+    // "(command capture unavailable)": the shell echoes and runs the line in
+    // the same PTY chunk as OSC 133;C, so the VTE capture is still empty when
+    // the command is resolved and the shadow is the only witness.
+    *ctx.typed_cmd.borrow_mut() = submission.echo_text;
+    ctx.typed_cmd_fidelity
+        .set(TypedShadowFidelity::ExactSubmitted);
+    ctx.pty_synced.set(true);
+    ctx.submission_pending.set(true);
+    true
+}
+
+/// Prompt state a re-run has to clear before it may write anything.
+#[derive(Clone, Copy)]
+struct PromptSubmitGuards {
+    state: BlockState,
+    pty_synced: bool,
+    submission_pending: bool,
+    pending_typeahead: bool,
+    fidelity: TypedShadowFidelity,
+}
+
+struct RerunSubmission {
+    /// Command bytes and the submit CR, as one PTY message.
+    payload: Vec<u8>,
+    /// What the editor shadow may claim the child received.
+    echo_text: String,
+}
+
+/// The exact bytes a re-run may put on the PTY, or `None` when the prompt or
+/// the command itself refuses. Split out from the writing half so the refusal
+/// rules are testable without a live PTY.
+fn rerun_submission(
+    guards: PromptSubmitGuards,
+    command: &str,
+    bracketed_paste: bool,
+) -> Option<RerunSubmission> {
+    if guards.state != BlockState::AwaitingCommand
+        || guards.pty_synced
+        || guards.submission_pending
+        || guards.pending_typeahead
+        || guards.fidelity == TypedShadowFidelity::ExactSubmitted
+    {
+        return None;
+    }
+    // A card with no command (background output) has nothing to run, and
+    // submitting whitespace would mint an empty block. The callers filter this
+    // too; keeping it here means no future caller can skip the check.
+    if command.trim().is_empty() {
+        return None;
+    }
+    // Deliberately unframed, even when the shell advertises bracketed paste.
+    //
+    // Framing exists so a multi-line insertion cannot be read as several
+    // commands, and a re-run is refused below unless it is a single line, so
+    // there is nothing left for a frame to protect. It also actively breaks
+    // this path: readline's bracketed-paste handler is a paste, not a line, so
+    // a `\r` arriving right behind the `ESC[201~` terminator is consumed with
+    // the paste rather than accepting the line — verified against bash, where
+    // the framed form left the prompt empty and ran nothing. Unframed, the
+    // bytes are exactly what typing the command produces, which is what "run it
+    // again" should mean.
+    let _ = bracketed_paste;
+    let paste = build_command_recall(command, false);
+    // A command the encoder had to cut to its first line is refused outright.
+    // Insertion can afford truncation — the user still reads the line before
+    // pressing Enter — but executing a silently truncated prefix cannot be
+    // undone.
+    if paste.is_empty() || paste.risk.truncated_to_first_line {
+        return None;
+    }
+    // One message: the frame's start, body, end and the submit CR must not be
+    // split, or backpressure could accept the command and drop its Enter (or
+    // the reverse). The CR sits outside the bracketed frame on purpose —
+    // readline does not execute a newline contained in a paste.
+    let mut payload = paste.bytes;
+    payload.push(b'\r');
+    Some(RerunSubmission {
+        payload,
+        echo_text: paste.echo_text,
+    })
+}
+
+/// The single card a re-run may act on, or `None` when the selection is not a
+/// lone card carrying a command.
+///
+/// Background cards have no command, and a multi-card selection must never be
+/// executed as a batch — recall still inserts those for the user to read.
+fn lone_rerunnable_selection<'a>(
+    finished: &'a [FinishedBlock],
+    selected: &HashSet<u64>,
+    active: Option<u64>,
+) -> Option<&'a FinishedBlock> {
+    if selected.len() > 1 {
+        return None;
+    }
+    let id = active?;
+    if !selected.is_empty() && !selected.contains(&id) {
+        return None;
+    }
+    finished
+        .iter()
+        .find(|block| block.id == id)
+        .filter(|block| !block.is_background && !block.cmd_text.trim().is_empty())
+}
+
 /// Lines [`truncate_plain_output_for_height`] would report, without building
 /// the string it has to allocate to report them.
 ///
@@ -2830,8 +3010,13 @@ fn popdown_if_alive(popover: &glib::WeakRef<gtk4::Popover>) {
 impl BlockBackend {
     /// Install the right-click context menu on a finished block.
     ///
-    /// Live-finalize path only: `undo_clear_blocks` and history restore
-    /// deliberately rebuild blocks without this menu.
+    /// Reached from the live-finalize path directly and from the two rebuild
+    /// paths (history restore, undo-clear) through
+    /// [`RenderBackend::install_block_context_menu`]. All three must mount it:
+    /// a restored card looks identical to a freshly finished one, so a card
+    /// without a menu reads as a dead right-click, not as a different kind of
+    /// card. Safe to call on a pooled widget — `WidgetPool::release` strips
+    /// every controller before the box is handed out again.
     /// `finished_widget` is the root widget of the finished block; the
     /// right-click gesture attaches there.
     fn install_finished_block_context_menu(
@@ -3104,6 +3289,79 @@ impl BlockBackend {
                     }
                 });
                 vbox.append(&item);
+            }
+
+            // Re-run: the pointer equivalent of Ctrl+Enter. Offered only for a
+            // single card, and only for a command the user already ran here —
+            // the quick-action button beside it keeps its insert-only meaning.
+            if selected_count <= 1 {
+                let item = make_item("Re-run Command");
+                let popover_c = popover.downgrade();
+                let finished_for_run = finished_blocks_for_menu.clone();
+                let selected_ids_for_run = selected_ids_for_menu.clone();
+                let selected_for_run = selected_for_menu.clone();
+                let anchor_for_run = anchor_for_menu.clone();
+                let pty_for_run = pty_for_rerun_menu.clone();
+                let pty_synced_for_run = pty_synced_for_rerun_menu.clone();
+                let bracketed_for_run = bracketed_paste_for_menu.clone();
+                let typed_cmd_for_run = typed_cmd_for_rerun_menu.clone();
+                let typed_cmd_fidelity_for_run = typed_cmd_fidelity_for_rerun_menu.clone();
+                let submission_pending_for_run = submission_pending_for_rerun_menu.clone();
+                let pending_typeahead_for_run = pending_typeahead_for_rerun_menu.clone();
+                let bstate_for_run = bstate_for_rerun_menu.clone();
+                let active_for_run = active_for_rerun_menu.clone();
+                let runnable = finished_blocks_for_menu.upgrade().is_some_and(|finished| {
+                    finished.borrow().iter().any(|block| {
+                        block.id == block_id
+                            && !block.is_background
+                            && !block.cmd_text.trim().is_empty()
+                    })
+                });
+                if runnable {
+                    item.set_sensitive(command_recall_available(bstate_for_rerun_menu.get()));
+                    item.set_tooltip_text(Some(
+                        "Runs this command again; available when the shell prompt is ready",
+                    ));
+                    item.connect_clicked(move |_| {
+                        popdown_if_alive(&popover_c);
+                        let Some(finished_for_run) = finished_for_run.upgrade() else {
+                            return;
+                        };
+                        let finished = finished_for_run.borrow();
+                        let Some(command) = finished
+                            .iter()
+                            .find(|block| block.id == block_id)
+                            .map(|block| block.cmd_text.clone())
+                        else {
+                            return;
+                        };
+                        let submitted = submit_recalled_command_at_prompt(
+                            PromptRecallCtx {
+                                pty: &pty_for_run,
+                                pty_synced: &pty_synced_for_run,
+                                typed_cmd: &typed_cmd_for_run,
+                                typed_cmd_fidelity: &typed_cmd_fidelity_for_run,
+                                submission_pending: &submission_pending_for_run,
+                                pending_typeahead: &pending_typeahead_for_run,
+                            },
+                            bstate_for_run.get(),
+                            &command,
+                            bracketed_for_run.get(),
+                        );
+                        if submitted {
+                            clear_finished_block_selection(
+                                &finished,
+                                &selected_ids_for_run,
+                                &selected_for_run,
+                                &anchor_for_run,
+                            );
+                            if let Some(active_for_run) = active_for_run.upgrade() {
+                                active_for_run.borrow().grab_focus();
+                            }
+                        }
+                    });
+                    vbox.append(&item);
+                }
             }
 
             {
@@ -3522,6 +3780,34 @@ fn take_agent_execution_as_lost(
 fn prompt_boundary_infers_command_end(state: BlockState, owner: PtyForeground) -> bool {
     matches!(state, BlockState::CollectingOutput | BlockState::AltScreen)
         && owner == PtyForeground::Shell
+}
+
+/// Whether an OSC 133 `D` reaching a running command belongs to something
+/// other than this pane's shell, and must therefore not end its block.
+///
+/// `on_command_start` already refuses to count a `C` printed while a foreground
+/// job owns the terminal, precisely so a nested pair cannot consume the shell's
+/// real `D`. Nothing balanced that on this side, and `decide_agent_command_end`
+/// accepts immediately when no agent identity is bound — the ordinary
+/// interactive case. So the FIRST `D` that anything the user ran printed closed
+/// the local card: an interactive `ssh` into a host with its own shell
+/// integration, `docker exec`, `tmux attach`, or simply `cat`ing a log that
+/// contains the bytes. The card took the remote command's exit code and
+/// duration with full `ShellReported` confidence, and the local shell's own
+/// later `D` was then dropped by the state guard.
+///
+/// Refusing here costs nothing in the case that motivated it: `ssh` returns the
+/// terminal before the local shell prints its own `D`, so that marker arrives
+/// with the shell owning the foreground and supplies the *right* exit code.
+///
+/// `Unknown` is deliberately admitted. It is what the probe reports when it
+/// cannot answer at all, and treating that as foreign would drop every exit
+/// code on any system where `tcgetpgrp` fails. This mirrors
+/// `prompt_boundary_infers_command_end`'s stance: a foreground the pane knows
+/// belongs to someone else is not evidence about this command, while an
+/// unanswerable probe leaves the previous behaviour in place.
+fn foreign_foreground_owns_command_end(owner: PtyForeground) -> bool {
+    owner == PtyForeground::Other
 }
 
 /// Authoritative foreground-command lifecycle event emitted at OSC 133 `C`.
@@ -4194,6 +4480,11 @@ struct RecordSearchTarget {
     terminal: Terminal,
     widget: gtk4::Widget,
     uses_live_surface: bool,
+    /// What this record's VTE holds right now. Compared against the value a
+    /// find pass recorded, so a card re-fed or re-windowed since the scan is
+    /// not navigated with a cursor that no longer exists. A backend without a
+    /// per-record snapshot reports the neutral stamp.
+    render_stamp: blocks::RenderStamp,
 }
 
 /// One bounded window inside a native VTE search domain. Windows are ordered
@@ -4223,9 +4514,16 @@ struct BackendSearchSurface {
     /// this is requested grid work, not merely the returned nonblank bytes.
     scanned_bytes: usize,
     /// Clear the native selection/search anchor before entering the selected
-    /// window. Unified shares one persistent cursor across successive queries.
+    /// window. Every backend needs this: Unified shares one persistent cursor
+    /// across successive queries, and a Block card's own VTE likewise keeps the
+    /// previous query's selection (or the user's mouse selection). With
+    /// `initial_wrap: false` a forward step from a stale anchor below the new
+    /// hit finds nothing at all, so the pane reports "No matches" for a query
+    /// the user can see on screen.
     reset_cursor: bool,
     terminal: Terminal,
+    /// What this surface's VTE held at scan time — see [`RecordSearchTarget`].
+    render_stamp: blocks::RenderStamp,
 }
 
 /// Last-resort native search for a persistent surface whose absolute ring
@@ -4790,6 +5088,12 @@ trait RenderBackend {
     fn supports_block_mutation(&self) -> bool {
         true
     }
+    /// Install the finished-card right-click menu on a card that a rebuild path
+    /// mounted outside the live-finalize flow (history restore, undo-clear).
+    /// Those cards are indistinguishable from freshly finished ones to the
+    /// user, so every card-level action must reach them too. Backends without a
+    /// card menu keep the default no-op.
+    fn install_block_context_menu(&self, _widget: &gtk4::Box, _block_id: u64, _long_output: bool) {}
     /// Handle keyboard line scrolling on a backend-owned surface. Returning
     /// true means the outer Block scroller must not also move.
     fn scroll_surface_lines(&self, _lines: i32) -> bool {
@@ -6199,6 +6503,12 @@ impl ReaderCtx {
         if state != BlockState::CollectingOutput && state != BlockState::AltScreen {
             return;
         }
+        // Symmetric with `on_command_start`'s foreign-`C` gate. Returning
+        // before the depth counter is deliberate: an uncounted start must not
+        // be balanced by a counted end.
+        if foreign_foreground_owns_command_end(self.pty_for_init.foreground_owner()) {
+            return;
+        }
         {
             let mut engine = self.engine.borrow_mut();
             if engine.osc133_depth > 0 {
@@ -6689,6 +6999,10 @@ impl RenderBackend for BlockBackend {
         self.active_vte.feed(bytes);
     }
 
+    fn install_block_context_menu(&self, widget: &gtk4::Box, block_id: u64, long_output: bool) {
+        self.install_finished_block_context_menu(widget.clone(), block_id, long_output);
+    }
+
     fn reset_active_surface(&self, preserve_scrollback: bool) {
         self.active_rc.borrow().reset_active(preserve_scrollback);
     }
@@ -6737,6 +7051,7 @@ impl RenderBackend for BlockBackend {
             terminal,
             widget: block.widget().clone().upcast(),
             uses_live_surface: false,
+            render_stamp: block.render_stamp(),
         })
     }
 
@@ -6802,8 +7117,9 @@ impl RenderBackend for BlockBackend {
                         initial_wrap: false,
                     }],
                     scanned_bytes: command_prefix.len(),
-                    reset_cursor: false,
+                    reset_cursor: true,
                     terminal: block.command_vte.clone(),
+                    render_stamp: block.render_stamp(),
                 }
             }) {
                 return BackendSearchBatch {
@@ -6861,8 +7177,9 @@ impl RenderBackend for BlockBackend {
                         initial_wrap: false,
                     }],
                     scanned_bytes: raw_prefix.len(),
-                    reset_cursor: false,
+                    reset_cursor: true,
                     terminal: block.output_vte.clone(),
+                    render_stamp: block.render_stamp(),
                 }
             }) {
                 return BackendSearchBatch {
@@ -6935,6 +7252,11 @@ impl RenderBackend for BlockBackend {
             &self.finished_blocks_for_cb,
             &self.visible_indices_rc,
             &self.fullscreen_rc,
+            BlockSelectionRefs {
+                ids: &self.selected_block_ids_rc,
+                active: &self.selected_block_id_rc,
+                anchor: &self.selection_anchor_id_rc,
+            },
         );
     }
 
@@ -7978,6 +8300,10 @@ impl RenderBackend for UnifiedBackend {
                 scanned_bytes,
                 reset_cursor: true,
                 terminal: self.vte.clone(),
+                // Unified has one persistent surface with no per-record
+                // snapshot to re-feed, so it reports the neutral stamp and its
+                // cursor is never invalidated by this check.
+                render_stamp: blocks::NEUTRAL_RENDER_STAMP,
             }],
             incomplete,
             native_fallback: incomplete.then(native_fallback),
@@ -8820,6 +9146,7 @@ fn enter_fullscreen(
     finished: &Rc<RefCell<Vec<FinishedBlock>>>,
     visible_indices: &Rc<RefCell<std::collections::HashSet<usize>>>,
     fullscreen: &Rc<Cell<bool>>,
+    selection: BlockSelectionRefs<'_>,
 ) {
     if fullscreen.replace(true) {
         return;
@@ -8829,6 +9156,11 @@ fn enter_fullscreen(
     for block in finished.iter() {
         block.widget().set_visible(false);
     }
+    // A selection made before the TUI opened points at cards nobody can see.
+    // Block-only keys that survive into alt-screen would act on it invisibly —
+    // Delete most destructively — so the mode change ends the selection with
+    // the cards it referred to.
+    clear_finished_block_selection(&finished, selection.ids, selection.active, selection.anchor);
 }
 
 /// Restore the block list when the alt-screen app exits, re-applying virtual-scroll
@@ -9215,6 +9547,45 @@ impl KeyCtx {
                 }
             }
 
+            // Ctrl+Enter runs the one selected command — the action the card's
+            // own selection hint has advertised since the hint was written.
+            // Scoped to a single card the user already ran in this pane; see
+            // `submit_recalled_command_at_prompt` for why this is the only
+            // programmatic Enter in Block mode.
+            if ctrl && !shift && !alt && matches!(keyval, Key::Return | Key::KP_Enter) {
+                let finished = finished_blocks_for_key.borrow();
+                let target = {
+                    let selected = selected_block_ids_for_key.borrow();
+                    lone_rerunnable_selection(&finished, &selected, selected_block_id_for_key.get())
+                        .map(|block| block.cmd_text.clone())
+                };
+                if let Some(command) = target {
+                    let submitted = submit_recalled_command_at_prompt(
+                        PromptRecallCtx {
+                            pty: &pty_for_key,
+                            pty_synced: &pty_synced_for_key,
+                            typed_cmd: &typed_cmd_for_key,
+                            typed_cmd_fidelity: &typed_cmd_fidelity_for_key,
+                            submission_pending: &submission_pending_for_key,
+                            pending_typeahead: &pending_typeahead_for_key,
+                        },
+                        bstate_for_key.get(),
+                        &command,
+                        bracketed_paste_for_key.get(),
+                    );
+                    if submitted {
+                        clear_finished_block_selection(
+                            &finished,
+                            &selected_block_ids_for_key,
+                            &selected_block_id_for_key,
+                            &selection_anchor_id_for_key,
+                        );
+                        return glib::Propagation::Stop;
+                    }
+                }
+                return glib::Propagation::Proceed;
+            }
+
             // Enter recalls every selected command in terminal order as one
             // editable multiline buffer. It never steals Enter from a running process.
             if matches!(keyval, Key::Return | Key::KP_Enter) {
@@ -9266,7 +9637,15 @@ impl KeyCtx {
             // Delete removes the selected block from both the document and saved
             // history. This is intentionally unmodified: selection is a visible,
             // explicit mode, while Backspace remains available to the shell.
-            if !ctrl && !shift && !alt && keyval == Key::Delete {
+            // An alt-screen app hides every card, so the mode is not visible
+            // there and the key must reach the app instead — the same gate
+            // Alt+Shift+F and Ctrl+Shift+B already use.
+            if !ctrl
+                && !shift
+                && !alt
+                && keyval == Key::Delete
+                && bstate_for_key.get() != BlockState::AltScreen
+            {
                 if let Some(sel_id) = selected_block_id_for_key.get() {
                     let next_id = remove_finished_block(
                         sel_id,
@@ -10821,7 +11200,24 @@ impl TermView {
                     sticky.set_visible(false);
                     return glib::ControlFlow::Continue;
                 }
-                if !user_scrolled.get() {
+                let running_secs = cmd_running.get().then(|| {
+                    block_start_time
+                        .get()
+                        .and_then(|started| SystemTime::now().duration_since(started).ok())
+                        .map(|elapsed| elapsed.as_secs())
+                        .unwrap_or(0)
+                });
+                // Following the bottom, the live card is right there, so a fast
+                // command needs no banner and a flicker per `ls` would be worse
+                // than nothing. A command still running after this long is one
+                // the user is waiting on: from here they get its elapsed time
+                // and a one-click Stop without having to scroll away first.
+                // Scrolled up, the live card is off-screen entirely and the
+                // banner appears immediately, as it always has.
+                const RUNNING_HEADER_AT_BOTTOM_AFTER_SECS: u64 = 2;
+                let show_while_following =
+                    running_secs.is_some_and(|secs| secs >= RUNNING_HEADER_AT_BOTTOM_AFTER_SECS);
+                if !user_scrolled.get() && !show_while_following {
                     sticky_target.set(None);
                     sticky_jump_bottom.set_visible(false);
                     sticky_stop.set_visible(false);
@@ -10829,7 +11225,7 @@ impl TermView {
                     sticky.set_visible(false);
                     return glib::ControlFlow::Continue;
                 }
-                if cmd_running.get() {
+                if let Some(elapsed) = running_secs {
                     sticky_target.set(None);
                     sticky_jump_bottom.set_visible(false);
                     sticky_stop.set_visible(!minimized);
@@ -10839,24 +11235,7 @@ impl TermView {
                             .is_some_and(|child| child.is_visible()),
                     );
                     let cmd = running_cmd.borrow();
-                    let cmd_disp = cmd.trim();
-                    let elapsed = block_start_time
-                        .get()
-                        .and_then(|st| SystemTime::now().duration_since(st).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let elapsed_str = if elapsed >= 3600 {
-                        format!("{}h{:02}m", elapsed / 3600, (elapsed % 3600) / 60)
-                    } else if elapsed >= 60 {
-                        format!("{}m{:02}s", elapsed / 60, elapsed % 60)
-                    } else {
-                        format!("{}s", elapsed)
-                    };
-                    let label = if cmd_disp.is_empty() {
-                        format!("\u{25b6}  (running)    {}", elapsed_str)
-                    } else {
-                        format!("\u{25b6}  {}    {}", cmd_disp, elapsed_str)
-                    };
+                    let label = running_header_label(cmd.trim(), elapsed);
                     sticky_label.set_text(&label);
                     sticky_label.set_visible(!minimized);
                     sticky.set_visible(true);
@@ -11874,6 +12253,45 @@ impl TermView {
 
     /// Whether Block-card mutations such as Clear/Undo are meaningful for
     /// this pane's backend.
+    /// Attach every card-level behavior to a finished card that a rebuild path
+    /// created — history restore and undo-clear.
+    ///
+    /// Both paths mount cards the user cannot distinguish from freshly
+    /// finished ones, so both must install the same four controller sets. They
+    /// used to duplicate the sequence and had already drifted: neither mounted
+    /// the right-click menu, which made right-click a dead gesture on every
+    /// card above the current session. Keeping one helper is what stops that
+    /// from happening again. Safe on a pooled widget: `WidgetPool::release`
+    /// strips the previous card's controllers before the box is reused.
+    fn mount_rebuilt_block(&self, finished: &FinishedBlock) {
+        finished.connect_actions(
+            &self.active_vte,
+            &self.pty,
+            &self.pty_synced,
+            &self.active,
+            &self.typed_cmd,
+            &self.typed_cmd_fidelity,
+            &self.submission_pending,
+            &self.pending_typeahead,
+            &self.bstate,
+            &self.bracketed_paste,
+        );
+        finished.connect_scroll_forwarding(&self.block_scroll, &self.scroll_debouncer);
+        install_finished_block_selection(
+            finished,
+            &self.active,
+            &self.finished_blocks,
+            &self.selected_block_ids,
+            &self.selected_block_id,
+            &self.selection_anchor_id,
+        );
+        self.render_backend.install_block_context_menu(
+            finished.widget(),
+            finished.id,
+            finished.long_output,
+        );
+    }
+
     pub(crate) fn supports_block_mutation(&self) -> bool {
         self.render_backend.supports_block_mutation()
     }
@@ -12462,6 +12880,13 @@ impl TermView {
         if self.render_backend.scroll_surface_lines(lines) {
             return;
         }
+        // An alt-screen app owns the viewport: every card is hidden and the
+        // document cannot scroll. Entering block selection here would give the
+        // pane an invisible active edge that Delete and the copy actions would
+        // then act on. Matches `select_all_blocks` and `reinput_selected_commands`.
+        if self.fullscreen.get() {
+            return;
+        }
         // Ctrl+Up enters anvil/Warp-style block selection at the newest block.
         {
             let finished = self.finished_blocks.borrow();
@@ -12713,27 +13138,7 @@ impl TermView {
                 finished
                     .widget()
                     .insert_before(&self.block_list, Some(&sibling));
-                finished.connect_actions(
-                    &self.active_vte,
-                    &self.pty,
-                    &self.pty_synced,
-                    &self.active,
-                    &self.typed_cmd,
-                    &self.typed_cmd_fidelity,
-                    &self.submission_pending,
-                    &self.pending_typeahead,
-                    &self.bstate,
-                    &self.bracketed_paste,
-                );
-                finished.connect_scroll_forwarding(&self.block_scroll, &self.scroll_debouncer);
-                install_finished_block_selection(
-                    &finished,
-                    &self.active,
-                    &self.finished_blocks,
-                    &self.selected_block_ids,
-                    &self.selected_block_id,
-                    &self.selection_anchor_id,
-                );
+                self.mount_rebuilt_block(&finished);
                 restored_widgets.push(finished);
             }
         }
@@ -12873,14 +13278,20 @@ impl TermView {
     }
 
     /// Update font scale for VTE terminal and block view CSS.
+    ///
+    /// Only cards the viewport is actually showing pay for it now; virtualized
+    /// cards record the target and adopt it on their way back in (see
+    /// `FinishedBlock::set_font_scale`).
     pub fn set_font_scale(&self, scale: f64) {
         self.active_vte.set_font_scale(scale);
         for block in self.finished_blocks.borrow().iter() {
-            block.command_vte.set_font_scale(scale);
-            block.output_vte.set_font_scale(scale);
+            block.set_font_scale(scale);
         }
         self.config.borrow_mut().default_font_scale = scale;
-        // Regenerate CSS with updated font scale
+        // Regenerate CSS with updated font scale. `install_block_css` compares
+        // the generated stylesheet against the installed one, so panes sharing
+        // this configuration cost one display-wide swap between them, not one
+        // each.
         install_block_css(&self.config.borrow());
     }
 
@@ -13395,6 +13806,246 @@ mod tests {
             BlockState::AwaitingCommand,
             PtyForeground::Shell
         ));
+    }
+
+    /// Handing the viewport to a TUI hides every card. A selection made before
+    /// that must not survive: block-only keys reaching the pane would act on an
+    /// active edge nobody can see, and Delete would destroy a card's recorded
+    /// output with no visible target.
+    /// While a command runs, this label is the only status the pane offers:
+    /// what is running and for how long. It used to appear only once the user
+    /// had scrolled away from the bottom, so the common case — waiting at the
+    /// prompt for a slow build — had no elapsed time and no Stop button at all.
+    #[test]
+    fn the_running_header_says_what_is_running_and_for_how_long() {
+        assert_eq!(
+            super::running_header_label("cargo build", 0),
+            "▶  cargo build    0s"
+        );
+        assert_eq!(
+            super::running_header_label("cargo build", 59),
+            "▶  cargo build    59s"
+        );
+        assert_eq!(
+            super::running_header_label("cargo build", 60),
+            "▶  cargo build    1m00s"
+        );
+        assert_eq!(
+            super::running_header_label("cargo build", 3599),
+            "▶  cargo build    59m59s"
+        );
+        assert_eq!(
+            super::running_header_label("cargo build", 3600),
+            "▶  cargo build    1h00m"
+        );
+        assert_eq!(
+            super::running_header_label("cargo build", 7_384),
+            "▶  cargo build    2h03m"
+        );
+
+        // A command the pane never captured still reports its elapsed time.
+        assert_eq!(
+            super::running_header_label("   ", 12),
+            "▶  (running)    12s"
+        );
+
+        // Raw captured input, rendered safely rather than verbatim.
+        let spoofed = super::running_header_label("echo \u{202e}gnp", 1);
+        assert!(
+            !spoofed.contains('\u{202e}'),
+            "a bidi override must not reach the label: {spoofed}"
+        );
+    }
+
+    fn idle_guards() -> super::PromptSubmitGuards {
+        super::PromptSubmitGuards {
+            state: BlockState::AwaitingCommand,
+            pty_synced: false,
+            submission_pending: false,
+            pending_typeahead: false,
+            fidelity: TypedShadowFidelity::Inexact,
+        }
+    }
+
+    /// The card's selection hint has always read "Ctrl+↵ run". Nothing
+    /// implemented it: the Enter branch ignored modifiers, so Ctrl+Enter
+    /// silently inserted the command and dropped the selection. This pins what
+    /// the key now actually writes.
+    #[test]
+    fn a_rerun_submits_the_bare_command_and_one_enter() {
+        // Both shells: framing is never used, because a `\r` behind
+        // `ESC[201~` is swallowed by readline's paste handler instead of
+        // accepting the line, and a re-run is single-line by construction so a
+        // frame protects nothing.
+        for bracketed_paste in [true, false] {
+            let submission = super::rerun_submission(idle_guards(), "cargo test", bracketed_paste)
+                .expect("an idle prompt admits a single-line re-run");
+
+            assert_eq!(
+                submission.payload, b"cargo test\r",
+                "bracketed_paste={bracketed_paste} must not change what a re-run writes"
+            );
+            assert_eq!(submission.echo_text, "cargo test");
+            assert!(
+                !submission
+                    .payload
+                    .windows(jterm_core::pty_input::PASTE_START.len())
+                    .any(|window| window == jterm_core::pty_input::PASTE_START),
+                "no paste framing may reach the shell"
+            );
+            assert_eq!(
+                submission
+                    .payload
+                    .iter()
+                    .filter(|byte| **byte == b'\r')
+                    .count(),
+                1,
+                "exactly one submit boundary"
+            );
+        }
+    }
+
+    /// Every refusal an execution has that an insertion does not.
+    #[test]
+    fn a_rerun_refuses_anything_it_could_execute_wrongly() {
+        // A prompt that is not idle: the bytes would reach a running program.
+        for state in [
+            BlockState::CollectingOutput,
+            BlockState::AltScreen,
+            BlockState::PostCommand,
+            BlockState::RawFallback,
+            BlockState::Idle,
+        ] {
+            let guards = super::PromptSubmitGuards {
+                state,
+                ..idle_guards()
+            };
+            assert!(
+                super::rerun_submission(guards, "ls", true).is_none(),
+                "{state:?} must not accept a re-run"
+            );
+        }
+
+        // A prompt the user has already touched, in each of the four ways.
+        let dirty = [
+            super::PromptSubmitGuards {
+                pty_synced: true,
+                ..idle_guards()
+            },
+            super::PromptSubmitGuards {
+                submission_pending: true,
+                ..idle_guards()
+            },
+            super::PromptSubmitGuards {
+                pending_typeahead: true,
+                ..idle_guards()
+            },
+            super::PromptSubmitGuards {
+                fidelity: TypedShadowFidelity::ExactSubmitted,
+                ..idle_guards()
+            },
+        ];
+        for guards in dirty {
+            assert!(
+                super::rerun_submission(guards, "ls", true).is_none(),
+                "a prompt that is not clean must not accept a re-run"
+            );
+        }
+
+        // Nothing to run.
+        assert!(super::rerun_submission(idle_guards(), "", true).is_none());
+        assert!(super::rerun_submission(idle_guards(), "   \n ", true).is_none());
+
+        // A command the encoder must cut to its first line. Insertion may
+        // truncate — the user still reads the line — but executing a silently
+        // truncated prefix cannot be undone.
+        let multiline = "echo one\necho two";
+        assert!(
+            super::build_command_recall(multiline, false)
+                .risk
+                .truncated_to_first_line,
+            "the fixture must actually be truncated by the encoder"
+        );
+        assert!(
+            super::rerun_submission(idle_guards(), multiline, false).is_none(),
+            "a truncated command must never be executed"
+        );
+    }
+
+    /// A re-run acts on one card the user pointed at. A multi-card selection
+    /// stays insert-only, and a background card has no command to run.
+    #[test]
+    fn only_a_lone_command_card_is_rerunnable() {
+        use std::collections::HashSet;
+
+        let ids = HashSet::from([7_u64]);
+        assert!(super::lone_rerunnable_selection(&[], &ids, Some(7)).is_none());
+        assert!(super::lone_rerunnable_selection(&[], &HashSet::new(), None).is_none());
+
+        // Two selected cards: refused before any card lookup happens.
+        let many = HashSet::from([7_u64, 8]);
+        assert!(super::lone_rerunnable_selection(&[], &many, Some(8)).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn entering_alt_screen_ends_the_block_selection_it_hides() {
+        use gtk4::prelude::WidgetExt as _;
+
+        gtk4::init().expect("gtk init");
+        let config = crate::config::Config::safe_defaults();
+        let cards: Vec<super::FinishedBlock> = (1..=2)
+            .map(|id| {
+                super::FinishedBlock::new(
+                    id,
+                    "$ ",
+                    "echo hi",
+                    None,
+                    "hi\r\n",
+                    Some(0),
+                    &config,
+                    Some(5),
+                    None,
+                    None,
+                    80,
+                )
+            })
+            .collect();
+        let finished = Rc::new(RefCell::new(cards));
+        let visible: Rc<RefCell<std::collections::HashSet<usize>>> =
+            Rc::new(RefCell::new(std::collections::HashSet::new()));
+        let fullscreen = Rc::new(Cell::new(false));
+        let ids: super::SelectedBlockIds =
+            Rc::new(RefCell::new(std::collections::HashSet::from([1, 2])));
+        let active = Rc::new(Cell::new(Some(2)));
+        let anchor_id = Rc::new(Cell::new(Some(1)));
+
+        super::enter_fullscreen(
+            &finished,
+            &visible,
+            &fullscreen,
+            super::BlockSelectionRefs {
+                ids: &ids,
+                active: &active,
+                anchor: &anchor_id,
+            },
+        );
+
+        assert!(fullscreen.get());
+        assert!(
+            finished
+                .borrow()
+                .iter()
+                .all(|card| !card.widget().is_visible()),
+            "every card is hidden while the alt-screen app owns the viewport"
+        );
+        assert!(ids.borrow().is_empty(), "the selection set must be emptied");
+        assert_eq!(active.get(), None, "no card may stay the active edge");
+        assert_eq!(anchor_id.get(), None, "no card may stay the range anchor");
+        for card in finished.borrow().iter() {
+            assert!(!card.widget().has_css_class("block-selected"));
+            assert!(!card.widget().has_css_class("block-selection-active"));
+        }
     }
 
     #[test]
@@ -15637,9 +16288,7 @@ mod tests {
         let mut top = 0_u64;
         let mut markers = VecDeque::new();
         for block in blocks {
-            if jterm_core::block_contract::classify_completed(Some(&block.cmd), block.exit_code)
-                .is_failed()
-            {
+            if super::BlockOutcome::classify(Some(&block.cmd), block.exit_code).is_failure() {
                 if markers.len() == MAX_FAILURE_MARKERS {
                     markers.pop_front();
                 }
@@ -19906,11 +20555,9 @@ mod tests {
     }
 
     /// The same nested pair on a PTY the shell does not own, where both
-    /// foreground gates fail closed. The nested C is not counted at all — so
-    /// the next D is the shell's as far as the lifecycle can tell, and ends
-    /// the command — and the approved command running through it loses its
-    /// Agent identity twice over: once at that end mark, which no longer
-    /// proves the approved command is what finished, and again at the
+    /// foreground gates fail closed. Neither the nested C nor the nested D is
+    /// counted, so nothing a foreign job prints can end the command; the
+    /// approved command running through it loses its Agent identity at the
     /// finalize, which will not mint a trusted block off the shell's
     /// foreground.
     ///
@@ -19951,17 +20598,42 @@ mod tests {
         harness.feed(command_end(Some(7)));
         assert_eq!(
             harness.bstate.get(),
-            BlockState::PostCommand,
-            "an uncounted nested start leaves the next end to finish the command"
+            BlockState::CollectingOutput,
+            "an end mark printed while someone else owns the terminal is not this command's"
         );
+        assert!(
+            harness.commands_finished.borrow().is_empty(),
+            "no lifecycle completion may be derived from a foreign mark"
+        );
+        assert!(
+            harness.agent_lost.borrow().is_empty(),
+            "a refused mark must not consume the approval either"
+        );
+        assert_eq!(
+            harness.ctx.active_agent_generation_rc.get(),
+            Some(42),
+            "the approval is still bound to the command that is still running"
+        );
+
+        // The shell takes the terminal back and prints its own end mark. That
+        // is the first `D` this command may be finished by, and it carries the
+        // exit code the foreign mark tried to supply.
+        harness.pty.set_test_foreground(PtyForeground::Shell);
+        harness.feed(command_end(Some(0)));
+        assert_eq!(harness.bstate.get(), BlockState::PostCommand);
         assert_eq!(harness.commands_finished.borrow().len(), 1);
+        assert_eq!(
+            harness.commands_finished.borrow()[0].exit_code,
+            Some(0),
+            "the shell's own status, not the one a foreground job printed"
+        );
         assert_eq!(
             harness.agent_lost.borrow().as_slice(),
             &[(
                 42,
                 "terminal ownership or command identifiers could not verify the approved command completion"
             )],
-            "the end mark is accepted for the UI but never for the approval"
+            "the accepted end mark is good enough for the UI, never for the approval"
         );
         assert_eq!(
             harness.ctx.active_agent_generation_rc.get(),
@@ -19970,13 +20642,10 @@ mod tests {
         );
 
         // The other refusal, on the other side of the command. Re-binding here
-        // stands in for the one sequence this fixed-foreground PTY cannot
-        // produce: a shell that owned the terminal at `D` (so the end mark was
-        // accepted with the identity intact) and lost it to a background job
-        // before the next prompt. `active_agent_generation_rc` is the cell
-        // `on_command_start` writes and the finalize reads, so the finalize
-        // sees exactly what that sequence would leave it.
+        // stands in for a shell that owned the terminal at `D` and lost it to
+        // a background job before the next prompt.
         harness.ctx.active_agent_generation_rc.set(Some(43));
+        harness.pty.set_test_foreground(PtyForeground::Other);
         harness.feed(ParserEvent::PromptStart);
 
         assert_eq!(
@@ -19991,12 +20660,70 @@ mod tests {
             harness.blocks_finished.borrow().as_slice(),
             &[FinishedFanOut {
                 command: "run-nested".to_string(),
-                exit_code: Some(7),
+                exit_code: Some(0),
                 output_sample: String::new(),
                 agent_generation: None,
                 blocks_finalized_before: 1,
                 state_at_fan_out: BlockState::PostCommand,
             }]
+        );
+    }
+
+    /// The sequence this gate exists for, with no Agent involved — the
+    /// ordinary interactive case, where `decide_agent_command_end` accepts
+    /// every end mark unconditionally.
+    ///
+    /// `ssh host` into a machine whose shell also emits OSC 133 closed the
+    /// local card the moment the FIRST remote command finished, stamping it
+    /// with that remote command's exit code and `ShellReported` confidence.
+    /// The local shell's own end mark then arrived to a state guard that
+    /// dropped it. The same happened for `docker exec`, `tmux attach`, and for
+    /// `cat`ing any file containing the bytes.
+    #[test]
+    fn a_remote_shells_end_mark_does_not_close_the_local_command() {
+        let harness = ReaderHarness::new();
+        harness.backend.render_row(3, "user@host $ ");
+
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("user@host $ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.backend.render_row(3, "user@host $ ssh remote");
+        harness.feed(command_start(None));
+        assert_eq!(harness.bstate.get(), BlockState::CollectingOutput);
+
+        // ssh takes the terminal, and the remote shell's own marks arrive as
+        // ordinary output bytes.
+        harness.pty.set_test_foreground(PtyForeground::Other);
+        harness.feed(command_start(Some("remote-one")));
+        harness.feed(command_end(Some(7)));
+        harness.feed(command_start(Some("remote-two")));
+        harness.feed(command_end(Some(3)));
+        assert_eq!(
+            harness.bstate.get(),
+            BlockState::CollectingOutput,
+            "the local ssh command is still running"
+        );
+        assert!(harness.commands_finished.borrow().is_empty());
+        assert!(harness.backend.finalized().is_empty());
+
+        // ssh exits, the local shell has the terminal again and reports the
+        // status of the command the user actually ran.
+        harness.pty.set_test_foreground(PtyForeground::Shell);
+        harness.feed(command_end(Some(255)));
+        harness.feed(ParserEvent::PromptStart);
+
+        let finalized = harness.backend.finalized();
+        assert_eq!(finalized.len(), 1);
+        let Call::FinalizeBlock(record) = &finalized[0] else {
+            panic!("the ssh command must finalize exactly one card: {finalized:?}");
+        };
+        assert_eq!(record.command, "ssh remote");
+        assert_eq!(
+            record.exit_code,
+            Some(255),
+            "the card reports ssh's status, not a remote command's"
         );
     }
 

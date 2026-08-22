@@ -335,12 +335,32 @@ reducer、不新增落盘字段；repo 无法验证或身份切换中时使用�
 
 - `Ctrl+Up` 从最新块进入选择；普通 `Up/Down` 移动 active edge，`Shift+Up/Down` 扩展范围。
 - `Enter` 或 `Ctrl+Shift+I` 按终端顺序回填所有选中命令，不自动执行；`Escape` 清除选择。
+- `Ctrl+Enter`（或右键 **Re-run Command**）重跑单个选中块的命令。这是 Block 模式唯一会
+  自行发送 Enter 的路径，条件很窄：只针对本 pane 中用户自己已经运行过的单行命令，
+  提示符必须空闲、无未提交输入、无待处理 typeahead；多选、background 块和会被截断为首行的
+  多行命令一律只回填不执行。模型给出的候选（AI、Agent、命令面板 `?`）仍然只能
+  **Insert for review**。
+- alt-screen 程序运行期间，`Ctrl+Up` 不进入块选择、`Delete` 不删除隐藏块；进入 alt-screen
+  会清除既有块选择，避免快捷键作用在看不见的卡片上。
 - `Ctrl+Shift+B` 收藏 active 块，`Ctrl+,` / `Ctrl+.` 在收藏块之间跳转。
 - 多选右键可批量复制命令、输出、完整块或回填命令；复制按界面顺序合并。
 - 长块提供顶部/底部导航与 sticky header，后台异步输出使用独立 Block 样式。
+- 块内输出过滤 `Alt+Shift+F` 打开后，`Escape` 或再次 `Alt+Shift+F` 可关闭：查询文本保留，
+  焦点交还实时提示符。
+- 历史恢复和撤销清空重建出来的块与新块拥有完全相同的右键菜单。
 - 完成块同时受 `max_visible_blocks` 和每 pane 128 MiB 估算内存预算约束；预算包含 ANSI 原文、重复显示副本、VTE/控件与图片，超限时从最旧块开始淘汰，最新块始终保留。每个完成 VTE 最多保留 1,048,576 个 cells（最多 4096 列），因此极端长输出只在界面中保留有界终端窗口；这一几何裁剪不会再额外影响复制/导出中已捕获的文本（最多 8 MiB）。Block Kitty 图片每块最多 64 张；Unified 图片使用同样的 16 MiB/64-placement 上限，超出可见网格的几何会明确拒绝而非静默缩放。
 
 命令运行中或 alt-screen TUI 活跃时，Enter 和应用所需按键继续发送给前台进程，不会误触发旧块回填。
+
+命令运行超过约 2 秒后，pane 顶部出现常驻运行状态条：`▶ 命令 用时`，计时每秒推进，
+并带一键 Stop。滚动到历史中时它立即出现（此时实时卡片已不可见），alt-screen 程序活跃时让位。
+瞬时命令不会让它闪现。
+
+退出状态区分「失败」与「被停止」：`130`（SIGINT，包括 Ctrl+C 和状态条的 Stop）、
+`141`（SIGPIPE）和 `143`（SIGTERM）显示为中性的 `⊘` 卡片与 `exit:N · interrupted` 徽章，
+不参与滚动条失败标记、`Ctrl+Shift+X` 失败跳转和 Failed 过滤；原始退出码在徽章、导出和历史里
+完整保留，因此按精确 exit code 过滤仍能找到它们。SIGSEGV、SIGABRT、SIGQUIT、SIGKILL
+这类真正的故障仍然是红色失败。
 
 ## 6. 统一命令面板、历史与 workflow
 

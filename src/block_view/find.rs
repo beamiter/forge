@@ -29,7 +29,10 @@ fn outcome_matches_filters(
     {
         return false;
     }
-    !filters.failed_only || matches!(outcome, BlockOutcome::Failure(_))
+    // `Interrupted` deliberately does not match: "show failures" must not fill
+    // up with commands the user stopped on purpose. Filtering by an exact
+    // `exit_code` still finds them, because the raw code is preserved.
+    !filters.failed_only || outcome.is_failure()
 }
 
 /// Stop common queries from turning a bounded output history into unbounded
@@ -76,6 +79,13 @@ pub(crate) struct FindSurface {
     /// for ordinary oldest-first surfaces it is occurrence zero. `None` means
     /// the counted set is partial and navigation may not cross that boundary.
     wrap_before: Option<usize>,
+    /// What the surface's VTE held when this pass scanned it. A re-feed drops
+    /// the native selection `vte_cursor` names and a re-window moves every row,
+    /// so stepping across either silently selects a different hit than the
+    /// counter reports. Compared before each native step. Surfaces without a
+    /// per-record snapshot (the live VTE, Unified's one persistent surface)
+    /// carry the neutral stamp and are never invalidated by it.
+    render_stamp: super::blocks::RenderStamp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -716,6 +726,7 @@ impl TermView {
                     complete: !plan.incomplete,
                     initial_wrap: plan.initial_wrap,
                     wrap_before: plan.wrap_before,
+                    render_stamp: backend_surface.render_stamp,
                 });
                 total += plan.count;
                 if plan.reached_limit {
@@ -767,6 +778,7 @@ impl TermView {
                         complete: false,
                         initial_wrap: false,
                         wrap_before: None,
+                        render_stamp: super::blocks::NEUTRAL_RENDER_STAMP,
                     });
                     total = 1;
                 }
@@ -811,6 +823,7 @@ impl TermView {
                     complete: true,
                     initial_wrap: false,
                     wrap_before: Some(0),
+                    render_stamp: super::blocks::NEUTRAL_RENDER_STAMP,
                 });
                 total += live.count;
             }
@@ -949,6 +962,15 @@ impl TermView {
             else {
                 return false;
             };
+            // The card was re-fed or re-windowed since this pass scanned it —
+            // a pane resize, an Expand, or an output filter. `vte.reset` at a
+            // re-feed drops the selection this surface's cursor names, and a
+            // re-window moves every row, so a single native step from here
+            // lands somewhere the counter does not describe. Refuse: the
+            // caller re-runs the pass against what the card holds now.
+            if target.render_stamp != surface.render_stamp {
+                return false;
+            }
             target.terminal
         };
         vte.search_set_wrap_around(wrap_once);
@@ -1320,6 +1342,12 @@ pub(super) fn clear_find_state(
     };
     for vte in highlighted_terminals {
         vte.search_set_regex(None::<&vte4::Regex>, 0);
+        // Dropping the regex leaves the last hit selected. On a per-card VTE
+        // that selection is also the native search anchor, so a surface that
+        // stops matching would both keep a stray highlight and steer the next
+        // query. Only terminals this search itself highlighted are touched, so
+        // an unrelated mouse selection elsewhere survives.
+        vte.unselect_all();
     }
     // The UI's no-record fallback installs a regex directly on the live VTE,
     // outside `FindState`; always clear it before a new structured pass too.
@@ -1354,6 +1382,37 @@ mod tests {
             complete,
             initial_wrap: false,
             wrap_before: complete.then_some(0),
+            render_stamp: crate::block_view::blocks::NEUTRAL_RENDER_STAMP,
+        }
+    }
+
+    /// A card that was re-fed or re-windowed since the pass scanned it can no
+    /// longer be stepped from the cursor the pass recorded: the re-feed's
+    /// `vte.reset` drops the native selection, and a re-window moves every row.
+    /// The surface carries the stamp it was scanned at so the step can tell.
+    #[test]
+    fn a_surface_remembers_which_render_it_was_counted_against() {
+        let scanned = surface(3, true);
+        assert_eq!(
+            scanned.render_stamp,
+            crate::block_view::blocks::NEUTRAL_RENDER_STAMP,
+            "a surface with no per-record snapshot is never invalidated by the check"
+        );
+
+        // What the three re-feed paths change. `output_render_stamp` clamps
+        // both row counts to at least one, so none of them can produce the
+        // neutral stamp and accidentally compare equal to a live surface.
+        let at_scan = crate::block_view::blocks::output_render_stamp_for_test(80, 40, 24, 7);
+        for moved in [
+            crate::block_view::blocks::output_render_stamp_for_test(100, 40, 24, 7), // resize
+            crate::block_view::blocks::output_render_stamp_for_test(80, 40, 5000, 7), // expand
+            crate::block_view::blocks::output_render_stamp_for_test(80, 12, 24, 8),  // filter
+        ] {
+            assert_ne!(
+                at_scan, moved,
+                "a re-render must be distinguishable from the render that was counted"
+            );
+            assert_ne!(moved, crate::block_view::blocks::NEUTRAL_RENDER_STAMP);
         }
     }
 
@@ -1642,6 +1701,75 @@ mod tests {
             native_cursor_action(&block, 0, FindDirection::Next),
             Some(NativeCursorAction::Step { wrap_once: false })
         );
+    }
+
+    /// A Block card's own VTE keeps the previous query's selection, and that
+    /// selection is the native search anchor. Every Block search window is
+    /// built with `initial_wrap: false`, so a forward step from an anchor that
+    /// sits *below* the new hit finds nothing at all — the pane reports "No
+    /// matches" for text the user can see. This pins the exact call sequence
+    /// `find_in_blocks` performs for a card surface, against the sequence it
+    /// used to perform.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn a_card_vte_must_drop_its_previous_anchor_before_a_fresh_query() {
+        use gtk4::prelude::*;
+        use std::time::Duration;
+        use vte4::TerminalExt;
+
+        gtk4::init().expect("gtk init");
+        let terminal = vte4::Terminal::new();
+        terminal.set_size(32, 8);
+        terminal.set_scrollback_lines(0);
+        let window = gtk4::Window::new();
+        window.set_child(Some(&terminal));
+        window.present();
+        terminal.feed(b"alpha-hit\r\n");
+        for index in 0..4 {
+            terminal.feed(format!("filler-{index}\r\n").as_bytes());
+        }
+        terminal.feed(b"omega-hit\r\n");
+        let context = gtk4::glib::MainContext::default();
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(150) {
+            while context.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        // First query: lands on the LATER row, leaving the anchor there.
+        let omega = vte4::Regex::for_search("omega-hit", VTE_SEARCH_FLAGS).unwrap();
+        terminal.unselect_all();
+        terminal.search_set_regex(Some(&omega), 0);
+        terminal.search_set_wrap_around(false);
+        assert!(terminal.search_find_next(), "the fixture must match once");
+
+        // The old sequence: `clear_find_state` dropped the regex but left the
+        // selection, then the new query stepped forward from it.
+        let alpha = vte4::Regex::for_search("alpha-hit", VTE_SEARCH_FLAGS).unwrap();
+        terminal.search_set_regex(None::<&vte4::Regex>, 0);
+        terminal.search_set_regex(Some(&alpha), 0);
+        terminal.search_set_wrap_around(false);
+        assert!(
+            !terminal.search_find_next(),
+            "the fixture must reproduce the stale-anchor miss it is guarding"
+        );
+
+        // The sequence in force now: the anchor is dropped first.
+        terminal.search_set_regex(None::<&vte4::Regex>, 0);
+        terminal.unselect_all();
+        terminal.search_set_regex(Some(&alpha), 0);
+        terminal.search_set_wrap_around(false);
+        assert!(
+            terminal.search_find_next(),
+            "a fresh query must reach a hit above the previous one"
+        );
+        let selected = terminal
+            .text_selected(vte4::Format::Text)
+            .map(|text| text.to_string())
+            .unwrap_or_default();
+        assert_eq!(selected, "alpha-hit");
+        window.close();
+        while context.iteration(false) {}
     }
 
     /// VTE keeps its search anchor/selection across regex changes. When the

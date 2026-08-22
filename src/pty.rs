@@ -98,8 +98,13 @@ pub struct OwnedPty {
     /// PTY pair has no session, so the real `tcgetpgrp` probe could only ever
     /// return [`PtyForeground::Unknown`]; tests that exercise a foreground
     /// decision record the answer they mean instead.
+    ///
+    /// Mutable, because ownership genuinely moves during a command: an
+    /// interactive `ssh` owns the terminal while it runs and hands it back
+    /// before the local shell prints its own prompt marks. A test that cannot
+    /// model that hand-back can only assert one half of a foreground rule.
     #[cfg(test)]
-    test_foreground: Option<PtyForeground>,
+    test_foreground: std::sync::Mutex<Option<PtyForeground>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -796,7 +801,7 @@ impl OwnedPty {
                     #[cfg(test)]
                     test_slave: None,
                     #[cfg(test)]
-                    test_foreground: None,
+                    test_foreground: std::sync::Mutex::new(None),
                 })
             }
             Err(error) => Err(io::Error::other(error)),
@@ -840,7 +845,11 @@ impl OwnedPty {
         // probe below could only answer `Unknown`. Compiled out of every
         // non-test build together with the field it reads.
         #[cfg(test)]
-        if let Some(recorded) = self.test_foreground {
+        if let Some(recorded) = *self
+            .test_foreground
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
             return recorded;
         }
         let fd = self.master_fd_raw();
@@ -1444,8 +1453,18 @@ impl OwnedPty {
             shell_bracketed_paste: AtomicBool::new(false),
             shell_integration_token: None,
             test_slave: Some(slave),
-            test_foreground: Some(foreground),
+            test_foreground: std::sync::Mutex::new(Some(foreground)),
         })
+    }
+
+    /// Move terminal ownership, the way a foreground job returning control
+    /// does. Test-only counterpart of [`OwnedPty::foreground_owner`].
+    #[cfg(test)]
+    pub(crate) fn set_test_foreground(&self, foreground: PtyForeground) {
+        *self
+            .test_foreground
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(foreground);
     }
 
     /// Read whatever the master side has already been written, waiting up to

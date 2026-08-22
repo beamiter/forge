@@ -180,6 +180,12 @@ pub(crate) struct UiState {
     /// Generation token for the debounced font-scale config write. Ctrl+wheel
     /// emits a step per notch, so only the last step in a burst reaches disk.
     pub(crate) font_persist_generation: Rc<Cell<u64>>,
+    /// Font scale a coalesced sweep has yet to apply to the widget tree. One
+    /// wheel gesture delivers a burst of 0.025 notches; applying every one of
+    /// them re-measures every VTE in every pane for a scale the user passed
+    /// through in a few milliseconds. `Some` means a sweep is already queued
+    /// and only needs its target updated.
+    pub(crate) pending_font_scale: Rc<Cell<Option<f64>>>,
     pub(crate) window_opacity: Rc<Cell<f64>>,
     pub(crate) shell_argv: Rc<RefCell<Vec<String>>>,
     pub(crate) config: Rc<RefCell<Config>>,

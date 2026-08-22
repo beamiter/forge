@@ -154,6 +154,51 @@ pub(crate) fn chrono_local_offset_secs() -> i64 {
 // ─── CSS ──────────────────────────────────────────────────────────────────────
 
 pub(crate) fn install_block_css(config: &Config) {
+    let css = block_css(config);
+
+    thread_local! {
+        static BLOCK_CSS_PROVIDER: RefCell<Option<gtk4::CssProvider>> = const { RefCell::new(None) };
+        /// The stylesheet currently installed. The provider is display-wide and
+        /// every pane installs the same one, so a window with four Block panes
+        /// used to parse and swap it four times per font-zoom notch — each swap
+        /// a full style invalidation of every widget on the display. Panes call
+        /// this whenever their own config changes; only a change in the
+        /// generated text is worth acting on.
+        static BLOCK_CSS_TEXT: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    if BLOCK_CSS_TEXT.with(|cell| cell.borrow().as_deref() == Some(css.as_str())) {
+        return;
+    }
+
+    let provider = gtk4::CssProvider::new();
+    provider.load_from_string(&css);
+    let Some(display) = gtk4::gdk::Display::default() else {
+        // No display (headless / CI). Nothing to style.
+        return;
+    };
+
+    BLOCK_CSS_PROVIDER.with(|cell| {
+        let mut prev = cell.borrow_mut();
+        if let Some(old) = prev.take() {
+            gtk4::style_context_remove_provider_for_display(&display, &old);
+        }
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        *prev = Some(provider);
+    });
+    BLOCK_CSS_TEXT.with(|cell| *cell.borrow_mut() = Some(css));
+}
+
+/// Build the pane stylesheet for `config`.
+///
+/// Separated from installing it so the cascade — which state class wins which
+/// property when a card is failed *and* hovered *and* bookmarked — can be
+/// asserted without a display.
+pub(crate) fn block_css(config: &Config) -> String {
     let bg = &config.background;
     let semantic = config.semantic_colors();
     let fg = &semantic.foreground;
@@ -312,13 +357,33 @@ pub(crate) fn install_block_css(config: &Config) {
         .block-success {{
             border-color: {ok_stripe};
         }}
+        /* Outcome, hover, selection and bookmark are four INDEPENDENT states a
+           single card can hold at once, so they must not all express themselves
+           through `box-shadow` and `background-color`: five single-class rules
+           declaring the same property means the last one in this file wins and
+           the other three states silently vanish. Hovering a failed card used
+           to swap its red wash for the neutral hover wash — the card stopped
+           looking failed exactly while the pointer was on it.
+
+           The division of labour now: outcome owns the border stripe and the
+           background COLOUR, bookmark owns a background IMAGE bar (a separate
+           property, so it can never erase a ring), hover and selection share
+           `box-shadow`, and every combination that a user can actually produce
+           gets an explicit compound rule below. */
         .block-failed {{
             border-color: {err_stripe};
             background-color: rgba({err_r},{err_g},{err_b},0.11);
-            box-shadow: inset 2px 0 0 0 {err_stripe};
         }}
         .block-unknown {{
             border-color: {warn_stripe};
+        }}
+        /* Stopped, not broken. A muted stripe and no background wash: these
+           cards must recede so the genuinely failed ones stand out. */
+        .block-interrupted {{
+            border-color: rgba({fg_r},{fg_g},{fg_b},0.35);
+        }}
+        .block-interrupted.block-hovered {{
+            outline-color: rgba({fg_r},{fg_g},{fg_b},0.22);
         }}
         .block-hovered {{
             background-color: rgba({fg_r},{fg_g},{fg_b},0.05);
@@ -326,6 +391,14 @@ pub(crate) fn install_block_css(config: &Config) {
                is exactly the mixed-colour case the mesh fallback exists for. */
             outline-color: rgba({fg_r},{fg_g},{fg_b},0.16);
             box-shadow: 0 4px 14px rgba(0,0,0,0.22);
+        }}
+        /* Pointing at a failed card deepens its red instead of neutralising it. */
+        .block-failed.block-hovered {{
+            background-color: rgba({err_r},{err_g},{err_b},0.17);
+            outline-color: rgba({err_r},{err_g},{err_b},0.34);
+        }}
+        .block-unknown.block-hovered {{
+            outline-color: rgba({warn_r},{warn_g},{warn_b},0.30);
         }}
         /* The inset rings are anchored to the PADDING box, which moved one pixel
            outward when the top/right/bottom border became a layout-free
@@ -342,6 +415,18 @@ pub(crate) fn install_block_css(config: &Config) {
             border-color: rgba({acc_r},{acc_g},{acc_b},0.92);
             outline-color: rgba({acc_r},{acc_g},{acc_b},0.92);
             box-shadow: inset 0 0 0 3px {accent}, 0 0 0 1px rgba({acc_r},{acc_g},{acc_b},0.55);
+        }}
+        /* A selected card under the pointer keeps BOTH its ring and the hover
+           lift; `box-shadow` is one property, so the combination has to be
+           written out rather than inherited from either rule alone. */
+        .block-selected.block-hovered {{
+            box-shadow: inset 0 0 0 2px rgba({acc_r},{acc_g},{acc_b},0.65),
+                        0 4px 14px rgba(0,0,0,0.22);
+        }}
+        .block-selected.block-selection-active.block-hovered {{
+            box-shadow: inset 0 0 0 3px {accent},
+                        0 0 0 1px rgba({acc_r},{acc_g},{acc_b},0.55),
+                        0 4px 14px rgba(0,0,0,0.22);
         }}
         /* Same split as `.block-finished`: one border colour so GTK never builds
            a corner mesh, ring on `outline`, and the layout the removed border
@@ -374,6 +459,17 @@ pub(crate) fn install_block_css(config: &Config) {
         .block-status-background {{
             color: {accent};
         }}
+        .block-status-interrupted {{
+            color: {dim_fg};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.14);
+            border-radius: 999px;
+            min-width: 16px;
+            min-height: 16px;
+            padding: 1px 5px;
+            font-family: "{font_family}";
+            font-size: 0.82em;
+            font-weight: bold;
+        }}
         .block-status-unknown {{
             color: {warn_hex};
             background-color: rgba({warn_r},{warn_g},{warn_b},0.18);
@@ -384,6 +480,15 @@ pub(crate) fn install_block_css(config: &Config) {
             font-family: "{font_family}";
             font-size: 0.82em;
             font-weight: bold;
+        }}
+        .block-exit-interrupted {{
+            color: {dim_fg};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.10);
+            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.22);
+            border-radius: 999px;
+            font-family: "{font_family}";
+            font-size: 0.78em;
+            padding: 1px 8px;
         }}
         .block-exit-unknown {{
             color: {warn_hex};
@@ -678,8 +783,19 @@ pub(crate) fn install_block_css(config: &Config) {
             font-size: 0.82em;
             margin-right: 2px;
         }}
+        /* The bookmark bar rides `background-image`, not `box-shadow`. As a
+           box-shadow it was the last single-class rule in the file, so
+           bookmarking a card erased its selection ring and its hover lift.
+           A gradient stop is a channel nothing else in this stylesheet uses,
+           and it composites over whichever background-colour the card's
+           outcome or selection state chose. */
         .block-bookmarked {{
-            box-shadow: inset 3px 0 0 0 {warn_hex};
+            background-image: linear-gradient(
+                to right,
+                {warn_hex} 0px,
+                {warn_hex} 3px,
+                transparent 3px
+            );
         }}
         .block-chip-git {{
             color: {accent};
@@ -971,36 +1087,140 @@ pub(crate) fn install_block_css(config: &Config) {
         }}
         "#,
     );
-
-    thread_local! {
-        static BLOCK_CSS_PROVIDER: RefCell<Option<gtk4::CssProvider>> = const { RefCell::new(None) };
-    }
-
-    let provider = gtk4::CssProvider::new();
-    provider.load_from_string(&css);
-    let Some(display) = gtk4::gdk::Display::default() else {
-        // No display (headless / CI). Nothing to style.
-        return;
-    };
-
-    BLOCK_CSS_PROVIDER.with(|cell| {
-        let mut prev = cell.borrow_mut();
-        if let Some(old) = prev.take() {
-            gtk4::style_context_remove_provider_for_display(&display, &old);
-        }
-        gtk4::style_context_add_provider_for_display(
-            &display,
-            &provider,
-            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-        *prev = Some(provider);
-    });
+    css
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{git_branch_for, shorten_path_with_home, MAX_GIT_POINTER_BYTES};
+    use super::{block_css, git_branch_for, shorten_path_with_home, MAX_GIT_POINTER_BYTES};
     use std::path::Path;
+
+    /// Collect the declarations of one rule, keyed by its exact selector text.
+    fn rule_body<'a>(css: &'a str, selector: &str) -> &'a str {
+        let needle = format!("\n        {selector} {{\n");
+        let start = css
+            .find(&needle)
+            .unwrap_or_else(|| panic!("stylesheet has no `{selector}` rule"))
+            + needle.len();
+        let end = start
+            + css[start..]
+                .find("\n        }")
+                .unwrap_or_else(|| panic!("`{selector}` rule is unterminated"));
+        &css[start..end]
+    }
+
+    fn selectors_declaring<'a>(css: &'a str, property: &str) -> Vec<&'a str> {
+        let mut out = Vec::new();
+        let mut rest = css;
+        while let Some(open) = rest.find(" {\n") {
+            let selector = rest[..open].rsplit('\n').next().unwrap_or("").trim();
+            let body_start = open + " {\n".len();
+            let Some(close) = rest[body_start..].find("\n        }") else {
+                break;
+            };
+            let body = &rest[body_start..body_start + close];
+            if body
+                .lines()
+                .any(|line| line.trim_start().starts_with(&format!("{property}:")))
+            {
+                out.push(selector);
+            }
+            rest = &rest[body_start + close + 1..];
+        }
+        out
+    }
+
+    /// A stylesheet GTK cannot parse fails silently: the provider keeps the
+    /// rules before the error and drops the rest, so a typo in a card rule
+    /// shows up as missing chrome rather than as an error.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn the_generated_stylesheet_parses_without_error() {
+        use std::cell::RefCell as StdRefCell;
+        use std::rc::Rc;
+
+        gtk4::init().expect("gtk init");
+        let config = crate::config::Config::safe_defaults();
+        let errors: Rc<StdRefCell<Vec<String>>> = Rc::new(StdRefCell::new(Vec::new()));
+        let provider = gtk4::CssProvider::new();
+        {
+            let errors = errors.clone();
+            provider.connect_parsing_error(move |_, section, error| {
+                errors
+                    .borrow_mut()
+                    .push(format!("{}: {error}", section.to_str()));
+            });
+        }
+        provider.load_from_string(&block_css(&config));
+        let errors = errors.borrow();
+        assert!(errors.is_empty(), "stylesheet parse errors: {errors:?}");
+    }
+
+    /// Outcome, hover, selection and bookmark are four independent states one
+    /// card can hold simultaneously. When they all expressed themselves through
+    /// `box-shadow`, the last single-class rule in the file won and the others
+    /// vanished: hovering a failed card removed its red, and bookmarking a
+    /// selected card removed its ring. Every combination a user can produce
+    /// must have a rule that says what it looks like.
+    #[test]
+    fn independent_card_states_do_not_overwrite_each_other() {
+        let config = crate::config::Config::safe_defaults();
+        let css = block_css(&config);
+
+        // The bookmark bar left `box-shadow` entirely.
+        let bookmarked = rule_body(&css, ".block-bookmarked");
+        assert!(
+            !bookmarked.contains("box-shadow"),
+            "the bookmark bar must not compete for box-shadow: {bookmarked}"
+        );
+        assert!(bookmarked.contains("background-image"));
+
+        // The failure wash survives hover, and reads stronger rather than
+        // being replaced by the neutral hover wash.
+        let failed = rule_body(&css, ".block-failed");
+        let failed_hovered = rule_body(&css, ".block-failed.block-hovered");
+        assert!(failed.contains("background-color"));
+        assert!(
+            failed_hovered.contains("background-color"),
+            "a hovered failed card must restate its own wash: {failed_hovered}"
+        );
+        assert!(
+            !failed.contains("box-shadow"),
+            "the failure stripe is the border, not a second inset shadow"
+        );
+
+        // A hovered selection keeps both the ring and the lift.
+        for selector in [
+            ".block-selected.block-hovered",
+            ".block-selected.block-selection-active.block-hovered",
+        ] {
+            let body = rule_body(&css, selector);
+            assert!(
+                body.contains("inset") && body.contains("14px"),
+                "`{selector}` must carry the ring AND the hover elevation: {body}"
+            );
+        }
+
+        // Nothing else may quietly join the box-shadow contest. Scoped to the
+        // finished card: `.block-active` is the live surface, a different
+        // widget that never carries hover/selection/bookmark classes.
+        let mut owners = selectors_declaring(&css, "box-shadow");
+        owners.retain(|selector| {
+            selector.starts_with(".block-") && !selector.contains(".block-active")
+        });
+        owners.sort_unstable();
+        assert_eq!(
+            owners,
+            vec![
+                ".block-hovered",
+                ".block-selected",
+                ".block-selected.block-hovered",
+                ".block-selected.block-selection-active",
+                ".block-selected.block-selection-active.block-hovered",
+            ],
+            "a new card state must declare a compound rule, not a bare box-shadow"
+        );
+    }
 
     fn test_root(label: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(

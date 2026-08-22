@@ -8,8 +8,8 @@
 use super::completed_block_retention_plan;
 use super::zone_history;
 use super::{
-    estimated_finished_block_height_for_text, install_finished_block_selection, next_block_id,
-    BlockData, FinishedBlock, TermView, MAX_COMPLETED_BLOCK_RETAINED_BYTES,
+    estimated_finished_block_height_for_text, next_block_id, BlockData, FinishedBlock, TermView,
+    MAX_COMPLETED_BLOCK_RETAINED_BYTES,
 };
 use crate::persistence::{self, PersistenceKey};
 use gtk4::glib;
@@ -2550,27 +2550,7 @@ impl TermView {
                 finished
                     .widget()
                     .insert_before(&self.block_list, Some(&sibling));
-                finished.connect_actions(
-                    &self.active_vte,
-                    &self.pty,
-                    &self.pty_synced,
-                    &self.active,
-                    &self.typed_cmd,
-                    &self.typed_cmd_fidelity,
-                    &self.submission_pending,
-                    &self.pending_typeahead,
-                    &self.bstate,
-                    &self.bracketed_paste,
-                );
-                finished.connect_scroll_forwarding(&self.block_scroll, &self.scroll_debouncer);
-                install_finished_block_selection(
-                    &finished,
-                    &self.active,
-                    &self.finished_blocks,
-                    &self.selected_block_ids,
-                    &self.selected_block_id,
-                    &self.selection_anchor_id,
-                );
+                self.mount_rebuilt_block(&finished);
                 restored_widgets.push(finished);
             }
         }

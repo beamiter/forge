@@ -142,9 +142,25 @@ impl UiState {
     /// Ctrl+wheel path, and the settings dialog; all three emit bursts (a held
     /// key, a wheel notch train, a dragged SpinRow) that must not rewrite the
     /// config file once per step.
+    ///
+    /// Coalesced: one Ctrl+scroll gesture delivers a train of 0.025 notches,
+    /// and applying each one walked every pane and re-measured every VTE in it
+    /// for a scale that was superseded milliseconds later. The scale the user
+    /// is aiming at is recorded immediately — so anything reading it sees the
+    /// live value — and the expensive widget sweep runs once, on the idle after
+    /// the burst has been dispatched.
     pub(crate) fn apply_font_scale(&self, new_scale: f64) {
-        self.set_font_scale_all(new_scale);
+        self.font_scale.set(new_scale);
         self.config.borrow_mut().default_font_scale = new_scale;
+
+        if claim_font_scale_sweep(&self.pending_font_scale, new_scale) {
+            let ui = self.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(scale) = ui.pending_font_scale.take() {
+                    ui.set_font_scale_all(scale);
+                }
+            });
+        }
         let generation = self.font_persist_generation.get().wrapping_add(1);
         self.font_persist_generation.set(generation);
         let ui = self.clone();
@@ -667,10 +683,44 @@ impl UiState {
     }
 }
 
+/// Record the scale a coalesced font-zoom sweep should apply, and report
+/// whether this call has to start that sweep.
+///
+/// `true` exactly once per burst: the first notch schedules the idle, every
+/// later notch only moves the target that idle will read.
+fn claim_font_scale_sweep(pending: &Cell<Option<f64>>, scale: f64) -> bool {
+    pending.replace(Some(scale)).is_none()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::reload_matches_live_revision;
+    use super::{claim_font_scale_sweep, reload_matches_live_revision};
     use crate::config_store::ConfigRevision;
+    use std::cell::Cell;
+
+    /// A wheel gesture arrives as a train of 0.025 notches. Exactly one of them
+    /// may schedule the widget sweep, and the sweep must run at the scale the
+    /// user actually stopped on.
+    #[test]
+    fn a_font_zoom_burst_schedules_exactly_one_sweep() {
+        let pending: Cell<Option<f64>> = Cell::new(None);
+
+        assert!(claim_font_scale_sweep(&pending, 1.025));
+        for scale in [1.05, 1.075, 1.1] {
+            assert!(
+                !claim_font_scale_sweep(&pending, scale),
+                "a queued sweep is retargeted, never duplicated"
+            );
+        }
+        assert_eq!(
+            pending.take(),
+            Some(1.1),
+            "the sweep applies the last scale in the burst"
+        );
+
+        // The next gesture, after the idle consumed the target, schedules again.
+        assert!(claim_font_scale_sweep(&pending, 1.125));
+    }
 
     #[test]
     fn reload_skips_matching_present_revision() {

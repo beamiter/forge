@@ -472,10 +472,40 @@ pub(crate) enum BlockOutcome {
     Background,
     Success,
     Failure(i32),
+    /// The command was stopped rather than having failed on its own: a signal
+    /// the user (or Forge's own Stop button) sent, or a consumer that closed
+    /// the pipe. See [`BlockOutcome::interrupt_signal`].
+    Interrupted(i32),
     Unknown,
 }
 
 impl BlockOutcome {
+    /// Exit statuses that mean "this was stopped", not "this went wrong".
+    ///
+    /// Painting these as hard failures floods a long session with red at
+    /// exactly the moments the user was in control: leaving `top`, ending a
+    /// `tail -f`, cutting a runaway test short. Forge manufactures the case
+    /// itself, too: the live card's Stop button writes `\x03`, so the block it
+    /// produces was interrupted by Forge's own UI.
+    ///
+    /// `128 + signal`, restricted to the three signals that carry no fault:
+    /// SIGINT (Ctrl+C), SIGPIPE (the reader went away, as in `... | head`) and
+    /// SIGTERM (an orderly stop request). Faults keep their failure styling:
+    /// SIGSEGV, SIGABRT and SIGQUIT are real crashes, and SIGKILL is usually
+    /// the OOM killer, all of which the user needs to see in red.
+    ///
+    /// A script that genuinely exits 130 for its own reasons is misread here.
+    /// The raw code stays visible in the badge, in export and in history for
+    /// exactly that reason.
+    const fn interrupt_signal(exit_code: i32) -> Option<&'static str> {
+        match exit_code {
+            130 => Some("SIGINT"),
+            141 => Some("SIGPIPE"),
+            143 => Some("SIGTERM"),
+            _ => None,
+        }
+    }
+
     /// Translate the shared semantic contract into Forge's renderer-owned UI
     /// enum. `resolved_command` must be the final command after Forge's
     /// metadata/screen fallback, never the optional field from a raw OSC mark.
@@ -485,24 +515,44 @@ impl BlockOutcome {
         match jterm_core::block_contract::classify_completed(resolved_command, exit_code) {
             CompletedBlockOutcome::Background => Self::Background,
             CompletedBlockOutcome::Success => Self::Success,
+            CompletedBlockOutcome::Failed(code) if Self::interrupt_signal(code).is_some() => {
+                Self::Interrupted(code)
+            }
             CompletedBlockOutcome::Failed(code) => Self::Failure(code),
             CompletedBlockOutcome::Unknown => Self::Unknown,
         }
     }
 
+    /// Whether this outcome counts as a failure for the scrollbar ticks, the
+    /// Failed filter and failure navigation.
+    pub(crate) const fn is_failure(self) -> bool {
+        matches!(self, Self::Failure(_))
+    }
+
     pub(crate) const fn reported_exit_code(self) -> Option<i32> {
         match self {
             Self::Success => Some(0),
-            Self::Failure(code) => Some(code),
+            Self::Failure(code) | Self::Interrupted(code) => Some(code),
             Self::Background | Self::Unknown => None,
         }
     }
+
+    /// Every value `stripe_css_class` can return. The card pool clears all of
+    /// them before reusing a widget, so the two must not drift apart.
+    const STRIPE_CSS_CLASSES: [&'static str; 5] = [
+        "block-background",
+        "block-success",
+        "block-failed",
+        "block-interrupted",
+        "block-unknown",
+    ];
 
     fn stripe_css_class(self) -> &'static str {
         match self {
             Self::Background => "block-background",
             Self::Success => "block-success",
             Self::Failure(_) => "block-failed",
+            Self::Interrupted(_) => "block-interrupted",
             Self::Unknown => "block-unknown",
         }
     }
@@ -513,6 +563,7 @@ impl BlockOutcome {
             Self::Background => "↻",
             Self::Success => "✓",
             Self::Failure(_) => "✕",
+            Self::Interrupted(_) => "⊘",
             Self::Unknown => "?",
         }
     }
@@ -522,6 +573,7 @@ impl BlockOutcome {
             Self::Background => "Background output",
             Self::Success => "Command succeeded",
             Self::Failure(_) => "Command failed",
+            Self::Interrupted(_) => "Command interrupted",
             Self::Unknown => "Command exit status unavailable",
         }
     }
@@ -531,6 +583,7 @@ impl BlockOutcome {
             Self::Background => "block-status-background",
             Self::Success => "block-status-ok",
             Self::Failure(_) => "block-status-bad",
+            Self::Interrupted(_) => "block-status-interrupted",
             Self::Unknown => "block-status-unknown",
         }
     }
@@ -602,6 +655,13 @@ pub(crate) struct FinishedBlock {
     pub(crate) selection_hint: gtk4::Label,
     /// Toggle the output filter while preserving the current query.
     pub(crate) toggle_filter: Rc<dyn Fn()>,
+    /// Late-bound "hand keyboard focus back to the live prompt" action.
+    /// The card is built before it knows which pane owns it, so
+    /// [`FinishedBlock::connect_actions`] fills this in. Used when the filter
+    /// row closes itself from the keyboard: hiding the focused entry without
+    /// this would strand focus, and stranded focus is exactly where Block-only
+    /// keys stop working.
+    restore_live_focus: LateBoundAction,
     /// Re-fit the output to the pane's current height. See
     /// [`FinishedBlock::refit_output_to_viewport`].
     refit_output: Rc<dyn Fn() -> Option<i32>>,
@@ -609,6 +669,17 @@ pub(crate) struct FinishedBlock {
     /// Kept separate from the render stamp because equal row counts do not
     /// prove that VTE already contains the right text or geometry.
     visual_rows_cache: Rc<Cell<Option<OutputVisualRowsCacheEntry>>>,
+    /// What the output VTE currently holds. A find pass records this with each
+    /// surface it scans; a resize, an expand or a filter changes it, and the
+    /// recorded native search cursor for that surface is then meaningless.
+    render_stamp: Rc<Cell<RenderStamp>>,
+    /// Font scale a virtualized card has not adopted yet. Ctrl+scroll emits a
+    /// notch every 0.025, and each one used to reset the font metrics of two
+    /// VTEs on every retained card — including the ones virtualization had
+    /// already hidden, which cannot show the result. Off-screen cards record
+    /// the target instead and apply it on their way back into the viewport,
+    /// before the map-time render measures anything.
+    pending_font_scale: Rc<Cell<Option<f64>>>,
     displayed_generation: Rc<Cell<u64>>,
     /// Warp-style jump affordance for oversized output.
     pub(crate) jump_bottom_btn: gtk4::Button,
@@ -648,8 +719,11 @@ impl Clone for FinishedBlock {
             action_box: self.action_box.clone(),
             selection_hint: self.selection_hint.clone(),
             toggle_filter: self.toggle_filter.clone(),
+            restore_live_focus: self.restore_live_focus.clone(),
             refit_output: self.refit_output.clone(),
             visual_rows_cache: self.visual_rows_cache.clone(),
+            render_stamp: self.render_stamp.clone(),
+            pending_font_scale: self.pending_font_scale.clone(),
             displayed_generation: self.displayed_generation.clone(),
             jump_bottom_btn: self.jump_bottom_btn.clone(),
             bookmark_star: self.bookmark_star.clone(),
@@ -1102,6 +1176,18 @@ fn output_render_stamp(cols: i64, output_rows: i64, cap: i64, generation: u64) -
     )
 }
 
+/// Test-only view of [`output_render_stamp`], so the find module can pin what
+/// a re-render actually changes without duplicating the packing rule.
+#[cfg(test)]
+pub(crate) fn output_render_stamp_for_test(
+    cols: i64,
+    output_rows: i64,
+    cap: i64,
+    generation: u64,
+) -> RenderStamp {
+    output_render_stamp(cols, output_rows, cap, generation)
+}
+
 fn fitted_output_rows_for_viewport(
     viewport_rows: Option<i64>,
     fallback_rows: i64,
@@ -1337,6 +1423,40 @@ pub(crate) fn estimated_finished_block_height_for_rows(
     )
 }
 
+/// Keyboard affordances shown on the active edge of a block selection. Every
+/// entry must be a real binding: `Ctrl+↵ run` sat here for a long time with
+/// nothing implementing it, so a user who tried it silently lost their
+/// selection instead of running anything.
+const SELECTION_HINT: &str = "↵ recall  ·  Ctrl+↵ run  ·  Del remove  ·  Esc cancel";
+
+/// Late-bound action a card can be handed after construction. `None` until the
+/// pane that owns the card supplies it.
+type LateBoundAction = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+/// The same, held weakly: used where the holder must not keep the action (and
+/// through it the card's state) alive.
+type LateBoundWeakAction = Rc<RefCell<Option<std::rc::Weak<dyn Fn()>>>>;
+
+/// Whether a key pressed inside a card's filter entry should close the filter.
+///
+/// Escape is the universal dismissal, and Alt+Shift+F is the shortcut that
+/// opened the row — it lives on the pane's live-VTE controller, so while the
+/// entry holds focus it never reaches the pane and has to be answered here.
+/// Everything else (including Ctrl chords and plain typing) belongs to the
+/// entry.
+fn filter_row_key_closes(keyval: gtk4::gdk::Key, modifiers: gtk4::gdk::ModifierType) -> bool {
+    use gtk4::gdk::{Key, ModifierType};
+
+    if keyval == Key::Escape {
+        return !modifiers.intersects(
+            ModifierType::CONTROL_MASK | ModifierType::ALT_MASK | ModifierType::SUPER_MASK,
+        );
+    }
+    matches!(keyval, Key::f | Key::F)
+        && modifiers.contains(ModifierType::ALT_MASK)
+        && modifiers.contains(ModifierType::SHIFT_MASK)
+        && !modifiers.contains(ModifierType::CONTROL_MASK)
+}
+
 fn flash_button_icon(btn: &gtk4::Button, icon_name: &'static str, tooltip: &'static str) {
     let old_icon_name = btn.icon_name().map(|name| name.to_string());
     let old_tooltip = btn.tooltip_text().map(|s| s.to_string());
@@ -1376,7 +1496,18 @@ fn finished_snapshot_stream(display_text: &str) -> Vec<u8> {
 /// carriage-return redraws, combining/wide glyphs, tabs, and soft wrapping.
 /// `(effective_cols, visible_rows, fits, generation)` — see
 /// [`stamp_change_needs_refeed`] for which half is content and which geometry.
-type RenderStamp = (i64, i64, bool, u64);
+/// Identity of what a card's output VTE currently holds: wrap columns, visible
+/// rows, whether the whole document fits, and which displayed text generation
+/// produced it. Two equal stamps mean the parsed ring and the window onto it
+/// are both unchanged; any difference means a re-feed or a re-window happened,
+/// which moves every match position inside that VTE.
+pub(crate) type RenderStamp = (i64, i64, bool, u64);
+
+/// The stamp a surface reports when it has no per-record snapshot to
+/// invalidate. It is the value a freshly constructed card starts from, and it
+/// is never produced by `output_render_stamp` (which clamps both row counts to
+/// at least 1), so a real card can never accidentally compare equal to it.
+pub(crate) const NEUTRAL_RENDER_STAMP: RenderStamp = (0, 0, false, 0);
 
 /// Whether a render-stamp change means the bytes in VTE are wrong, or only the
 /// window onto them.
@@ -1653,10 +1784,23 @@ impl FinishedBlock {
             .max(3);
         let current_viewport_cap = Rc::new(Cell::new(viewport_cap));
         let long_output = output_rows > viewport_cap;
-        let virtualized_height = Rc::new(Cell::new(estimated_finished_block_height_for_text(
+        // The row count above is the only walk this constructor needs. The
+        // `_for_text` estimator would repeat the same unicode-width pass over a
+        // transcript that can be megabytes, right at the moment the prompt is
+        // waiting to come back. Reuse the count, mapping it onto that
+        // estimator's own convention: output that trims to nothing contributes
+        // zero rows, anything else contributes at least one. Getting that
+        // mapping wrong gives a background card a phantom row and makes a card
+        // sitting on the virtualization boundary alternate heights.
+        let estimator_output_rows = if output.trim().is_empty() {
+            0
+        } else {
+            output_rows.max(1)
+        };
+        let virtualized_height = Rc::new(Cell::new(estimated_finished_block_height_for_rows(
             config,
             &display_cmd,
-            output,
+            estimator_output_rows,
             cols,
         )));
         let virtualized = Rc::new(Cell::new(false));
@@ -1672,10 +1816,13 @@ impl FinishedBlock {
             reused.remove_css_class("block-selected");
             reused.remove_css_class("block-selection-active");
             reused.remove_css_class("block-bookmarked");
-            reused.remove_css_class("block-success");
-            reused.remove_css_class("block-failed");
-            reused.remove_css_class("block-unknown");
-            reused.remove_css_class("block-background");
+            // Every outcome stripe class, from the same list the outcome
+            // itself picks from: a pooled card that kept a stale stripe would
+            // wear two, and CSS would resolve that by source order rather than
+            // by what this card actually did.
+            for stripe in BlockOutcome::STRIPE_CSS_CLASSES {
+                reused.remove_css_class(stripe);
+            }
             reused.remove_css_class("block-compact");
             reused
         } else {
@@ -1832,6 +1979,18 @@ impl FinishedBlock {
                 badge.add_css_class("block-exit-bad");
                 header_row.append(&badge);
             }
+            BlockOutcome::Interrupted(code) => {
+                // Keep the raw code: a script that exits 130 on its own is
+                // classified as interrupted here, and the number is how the
+                // user tells the two apart.
+                let signal = BlockOutcome::interrupt_signal(code).unwrap_or("signal");
+                let badge = gtk4::Label::new(Some(&format!("exit:{code} · interrupted")));
+                badge.set_tooltip_text(Some(&format!(
+                    "128 + signal number: stopped by {signal}, not a command failure"
+                )));
+                badge.add_css_class("block-exit-interrupted");
+                header_row.append(&badge);
+            }
             BlockOutcome::Unknown => {
                 let badge = gtk4::Label::new(Some("exit:?"));
                 badge.set_tooltip_text(Some(UNKNOWN_EXIT_TOOLTIP));
@@ -1843,13 +2002,15 @@ impl FinishedBlock {
 
         // Selected blocks behave like a lightweight navigation mode. Keep the
         // available keyboard actions visible instead of making users memorize them.
-        let selection_hint = gtk4::Label::new(Some(
-            "↵ recall  ·  Ctrl+↵ run  ·  Del remove  ·  Esc cancel",
-        ));
+        let selection_hint = gtk4::Label::new(Some(SELECTION_HINT));
         selection_hint.add_css_class("block-selection-hint");
         selection_hint.set_visible(false);
         selection_hint.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        selection_hint.set_max_width_chars(38);
+        // `max_width_chars` caps the label's NATURAL width, so a value below
+        // the hint's own length ellipsizes it in every pane, not just narrow
+        // ones — the old 38 hid "Esc cancel" permanently. Ask for the whole
+        // hint and let ellipsize handle genuinely narrow splits.
+        selection_hint.set_max_width_chars(SELECTION_HINT.chars().count() as i32);
         header_row.append(&selection_hint);
 
         // Quick-action buttons (hidden until the block is hovered). Handlers are
@@ -2006,7 +2167,28 @@ impl FinishedBlock {
         // document, re-clamps the scroll, and re-toggles boundary cards —
         // the self-sustaining flicker loop on narrow panes. Cols start at 0
         // (below any real value) so the first map always renders.
-        let render_stamp: Rc<Cell<RenderStamp>> = Rc::new(Cell::new((0, 0, false, 0)));
+        let render_stamp: Rc<Cell<RenderStamp>> = Rc::new(Cell::new(NEUTRAL_RENDER_STAMP));
+        let pending_font_scale: Rc<Cell<Option<f64>>> = Rc::new(Cell::new(None));
+        {
+            // Virtualization hides `content`, so its map is exactly the moment a
+            // card comes back into the viewport. GTK maps a parent before its
+            // children, so the scale is in place before the output VTE's own
+            // map handler measures `char_height` and sizes the card.
+            let pending = pending_font_scale.clone();
+            let command_vte_for_font = command_vte.downgrade();
+            let output_vte_for_font = output_vte.downgrade();
+            content.connect_map(move |_| {
+                let Some(scale) = pending.take() else {
+                    return;
+                };
+                if let Some(vte) = command_vte_for_font.upgrade() {
+                    vte.set_font_scale(scale);
+                }
+                if let Some(vte) = output_vte_for_font.upgrade() {
+                    vte.set_font_scale(scale);
+                }
+            });
+        }
         // Bumped whenever `displayed_output` is replaced (per-block filter), so
         // a stale stamp can never suppress rendering fresh text.
         let displayed_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
@@ -2467,6 +2649,12 @@ impl FinishedBlock {
         // the action box toggles a compact row that narrows the output to lines
         // matching the query, honoring regex / case / invert / context-lines.
         let filter_enabled = Rc::new(Cell::new(false));
+        // Late-bound by `connect_actions`; see the field's documentation.
+        let restore_live_focus: LateBoundAction = Rc::new(RefCell::new(None));
+        // The filter row's own key controller needs the toggle that has not
+        // been built yet. Weak, so the entry's controller cannot keep the
+        // toggle (and through it the card's state) alive after eviction.
+        let filter_toggle_handle: LateBoundWeakAction = Rc::new(RefCell::new(None));
         let toggle_filter = {
             // The filter editor is built on the FIRST toggle, not at card
             // construction. A search entry, three toggles, a spin button and a
@@ -2488,6 +2676,8 @@ impl FinishedBlock {
             let filter_btn_weak = filter_btn.downgrade();
             let jump_bottom_btn = jump_bottom_btn.downgrade();
             let collapsed_summary = collapsed_summary.downgrade();
+            let restore_live_focus_for_row = restore_live_focus.clone();
+            let filter_toggle_for_row = filter_toggle_handle.clone();
             let build_filter_row: Rc<FilterRowBuilder> = {
                 let filter_btn = filter_btn_weak.clone();
                 let full_output = full_output.clone();
@@ -2525,6 +2715,38 @@ impl FinishedBlock {
                     for w in [&regex_tg, &case_tg, &invert_tg] {
                         w.add_css_class("flat");
                         w.add_css_class("block-filter-toggle");
+                    }
+                    // The filter row grabs focus when it opens, and until now
+                    // nothing in it answered a key: the only way out was the
+                    // header button, so a keyboard user who opened the filter
+                    // was stuck inside it. Escape closes it — and so does the
+                    // same Alt+Shift+F that opened it, which otherwise reaches
+                    // the pane controller only while the live VTE has focus.
+                    // Closing keeps the query text (re-opening restores it) and
+                    // hands focus back to the prompt rather than stranding it
+                    // on a hidden entry.
+                    {
+                        let toggle_handle = filter_toggle_for_row.clone();
+                        let restore_focus = restore_live_focus_for_row.clone();
+                        let keys = gtk4::EventControllerKey::new();
+                        keys.connect_key_pressed(move |_, keyval, _, state| {
+                            if !filter_row_key_closes(keyval, state) {
+                                return glib::Propagation::Proceed;
+                            }
+                            let toggle = toggle_handle
+                                .borrow()
+                                .as_ref()
+                                .and_then(std::rc::Weak::upgrade);
+                            let Some(toggle) = toggle else {
+                                return glib::Propagation::Proceed;
+                            };
+                            toggle();
+                            if let Some(restore) = restore_focus.borrow().as_ref() {
+                                restore();
+                            }
+                            glib::Propagation::Stop
+                        });
+                        filter_entry.add_controller(keys);
                     }
                     filter_row.append(&filter_entry);
                     filter_row.append(&regex_tg);
@@ -2834,6 +3056,7 @@ impl FinishedBlock {
                 }
                 apply_now();
             });
+            *filter_toggle_handle.borrow_mut() = Some(Rc::downgrade(&toggle));
             let toggle_for_button = toggle.clone();
             filter_btn.connect_clicked(move |_| toggle_for_button());
             toggle
@@ -2861,8 +3084,11 @@ impl FinishedBlock {
             action_box,
             selection_hint,
             toggle_filter,
+            restore_live_focus,
             refit_output,
             visual_rows_cache,
+            render_stamp,
+            pending_font_scale,
             displayed_generation,
             jump_bottom_btn,
             bookmark_star,
@@ -2904,6 +3130,35 @@ impl FinishedBlock {
             self.widget.set_height_request(-1);
             self.virtualized_height.get().max(1)
         }
+    }
+
+    /// What this card's output VTE currently holds — see [`RenderStamp`].
+    ///
+    /// A find pass records it per surface. If it changes before the pass
+    /// navigates, the native search cursor it was stepping from no longer
+    /// exists: `vte.reset` at re-feed drops the selection, and a re-window
+    /// moves every row. Stepping anyway silently selects the wrong hit while
+    /// the counter keeps counting.
+    pub(crate) fn render_stamp(&self) -> RenderStamp {
+        self.render_stamp.get()
+    }
+
+    /// Adopt a new font scale, or defer it if this card is virtualized.
+    ///
+    /// Ctrl+scroll emits one notch per 0.025, and each notch reached every
+    /// retained card. Resetting a VTE's font metrics forces a re-measure and a
+    /// `queue_resize`; doing that for cards virtualization has already hidden
+    /// buys nothing, because they will be re-measured on their way back in
+    /// anyway. Returns whether the scale was applied now.
+    pub(crate) fn set_font_scale(&self, scale: f64) -> bool {
+        if !self.content.is_mapped() {
+            self.pending_font_scale.set(Some(scale));
+            return false;
+        }
+        self.pending_font_scale.set(None);
+        self.command_vte.set_font_scale(scale);
+        self.output_vte.set_font_scale(scale);
+        true
     }
 
     /// Re-fit this block's output to the space the pane currently offers,
@@ -3045,6 +3300,18 @@ impl FinishedBlock {
         bstate: &Rc<Cell<BlockState>>,
         bracketed_paste: &Rc<Cell<bool>>,
     ) {
+        // Supply the late-bound focus hand-back the filter row needs. Weak on
+        // the live block so a card outliving its pane cannot resurrect it.
+        {
+            let active_for_focus = Rc::downgrade(active);
+            let restore: Rc<dyn Fn()> = Rc::new(move || {
+                if let Some(active) = active_for_focus.upgrade() {
+                    active.borrow().grab_focus();
+                }
+            });
+            *self.restore_live_focus.borrow_mut() = Some(restore);
+        }
+
         let vte_for_cmd = vte.downgrade();
         let cmd_for_copy = self.cmd_text.clone();
         self.copy_cmd_btn.connect_clicked(move |btn| {
@@ -3597,6 +3864,128 @@ mod tests {
         (hits, misses)
     }
 
+    /// `new_with_pool` reuses the output row count it already resolved instead
+    /// of asking `estimated_finished_block_height_for_text` to walk the whole
+    /// transcript a second time. That substitution is only safe while the two
+    /// estimators agree, and they use different conventions for output that
+    /// trims to nothing, so pin the mapping on the cases that distinguish them.
+    #[test]
+    fn precomputed_rows_reproduce_the_text_estimator_exactly() {
+        let config = crate::config::Config::safe_defaults();
+        let cases: [&str; 7] = [
+            "",
+            "   \n\t  ",
+            "one line",
+            "one\ntwo\nthree\n",
+            &"x".repeat(600),
+            "\x1b[31mred\x1b[0m\r\nplain\r\n",
+            "\u{4f60}\u{597d}\u{4e16}\u{754c}\n",
+        ];
+        for cols in [40_i64, 80, 100] {
+            for output in cases {
+                let from_text = super::estimated_finished_block_height_for_text(
+                    &config, "echo hi", output, cols,
+                );
+                // The exact expression `new_with_pool` uses.
+                let rows = if output.trim().is_empty() {
+                    0
+                } else {
+                    super::output_visual_row_count(output, cols).max(1)
+                };
+                let from_rows =
+                    super::estimated_finished_block_height_for_rows(&config, "echo hi", rows, cols);
+                assert_eq!(
+                    from_text, from_rows,
+                    "estimators disagree at cols={cols} for {output:?}"
+                );
+            }
+        }
+    }
+
+    /// The counter proof for the same change: when the caller already holds the
+    /// row count, building the card must not walk the transcript again.
+    /// `finalize_block` pays for exactly one walk; a second one here doubled the
+    /// cost of finishing a large command at the moment the prompt is waiting.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn a_precomputed_card_does_not_rewalk_its_transcript() {
+        gtk4::init().expect("gtk init");
+        let config = crate::config::Config::safe_defaults();
+        let output: String = (1..=400).map(|i| format!("line {i}\r\n")).collect();
+        let cols = 100_i64;
+        let rows = super::output_visual_row_count(&output, cols);
+
+        super::OUTPUT_VISUAL_ROW_COUNT_CALLS.with(|calls| calls.set(0));
+        let _card = super::FinishedBlock::new_with_pool(
+            1,
+            "$ ",
+            "seq 400",
+            None,
+            &output,
+            Some(0),
+            &config,
+            Some(12),
+            None,
+            None,
+            cols,
+            &[],
+            output.len(),
+            None,
+            super::FinishedBlockPrecomputed {
+                output_rows: Some(rows),
+            },
+        );
+        let calls = super::OUTPUT_VISUAL_ROW_COUNT_CALLS.with(Cell::get);
+
+        // The command line is still measured (it is short); the transcript is
+        // not. Before this change the same construction walked the output once
+        // more inside the height estimate.
+        assert!(
+            calls <= 1,
+            "constructing a precomputed card walked the transcript {calls} times"
+        );
+    }
+
+    /// Opening a card's filter row grabs focus into its entry. Until the entry
+    /// answered a key itself, the only way back out was the mouse: Escape was
+    /// inert and Alt+Shift+F lives on the pane's live-VTE controller, which a
+    /// focused entry never reaches.
+    #[test]
+    fn the_filter_entry_answers_only_the_two_keys_that_close_it() {
+        use gtk4::gdk::{Key, ModifierType};
+
+        let alt_shift = ModifierType::ALT_MASK | ModifierType::SHIFT_MASK;
+        assert!(super::filter_row_key_closes(
+            Key::Escape,
+            ModifierType::empty()
+        ));
+        assert!(super::filter_row_key_closes(Key::f, alt_shift));
+        assert!(super::filter_row_key_closes(Key::F, alt_shift));
+
+        // Typing, and every chord the entry itself owns, stays with the entry.
+        assert!(!super::filter_row_key_closes(Key::f, ModifierType::empty()));
+        assert!(!super::filter_row_key_closes(
+            Key::a,
+            ModifierType::CONTROL_MASK
+        ));
+        assert!(!super::filter_row_key_closes(
+            Key::f,
+            ModifierType::ALT_MASK
+        ));
+        assert!(!super::filter_row_key_closes(
+            Key::f,
+            alt_shift | ModifierType::CONTROL_MASK
+        ));
+        assert!(!super::filter_row_key_closes(
+            Key::Escape,
+            ModifierType::CONTROL_MASK
+        ));
+        assert!(!super::filter_row_key_closes(
+            Key::Return,
+            ModifierType::empty()
+        ));
+    }
+
     #[test]
     fn retention_plan_accepts_an_exact_byte_limit() {
         let plan = completed_block_retention_plan(&[(11, 40), (12, 60)], 10, 100);
@@ -3748,8 +4137,14 @@ mod tests {
             BlockOutcome::Success
         );
         assert_eq!(
+            BlockOutcome::classify(Some("cargo test"), Some(1)),
+            BlockOutcome::Failure(1)
+        );
+        // 130 used to arrive here as Failure(130). It is now its own outcome —
+        // see `interrupts_are_not_failures`.
+        assert_eq!(
             BlockOutcome::classify(Some("cargo test"), Some(130)),
-            BlockOutcome::Failure(130)
+            BlockOutcome::Interrupted(130)
         );
         // Background output belongs to no command, so it keeps its own look
         // whatever status is attached.
@@ -3763,6 +4158,64 @@ mod tests {
             BlockOutcome::Background,
             "a raw non-zero status cannot turn background output into a failure"
         );
+    }
+
+    /// Stopping a command is not the same as a command going wrong. Forge
+    /// produces the case itself: the live card's Stop button writes `\x03`, so
+    /// every command a user stops through the UI came back as a red card with
+    /// an `exit:130 SIGINT` badge and a scrollbar failure tick.
+    #[test]
+    fn interrupts_are_not_failures() {
+        for (code, signal) in [(130, "SIGINT"), (141, "SIGPIPE"), (143, "SIGTERM")] {
+            let outcome = BlockOutcome::classify(Some("tail -f log"), Some(code));
+            assert_eq!(
+                outcome,
+                BlockOutcome::Interrupted(code),
+                "{signal} must not read as a command failure"
+            );
+            assert!(!outcome.is_failure());
+            assert_eq!(
+                outcome.reported_exit_code(),
+                Some(code),
+                "the raw status stays available for an exact-code filter"
+            );
+            assert_ne!(outcome.stripe_css_class(), "block-failed");
+            assert_ne!(outcome.status_css_class(), "block-status-bad");
+        }
+
+        // Faults stay red: these are things the user needs to see.
+        for code in [
+            1, 2, 127, 131, /* SIGQUIT */
+            134, /* SIGABRT */
+            137, /* SIGKILL */
+            139, /* SIGSEGV */
+        ] {
+            let outcome = BlockOutcome::classify(Some("./crash"), Some(code));
+            assert_eq!(
+                outcome,
+                BlockOutcome::Failure(code),
+                "exit {code} is a real failure"
+            );
+            assert!(outcome.is_failure());
+        }
+    }
+
+    /// The pool clears stripe classes by list; the list must cover every value
+    /// the outcome can actually produce, or a recycled card wears two stripes.
+    #[test]
+    fn every_outcome_stripe_class_is_cleared_by_the_pool() {
+        for outcome in [
+            BlockOutcome::Background,
+            BlockOutcome::Success,
+            BlockOutcome::Failure(1),
+            BlockOutcome::Interrupted(130),
+            BlockOutcome::Unknown,
+        ] {
+            assert!(
+                BlockOutcome::STRIPE_CSS_CLASSES.contains(&outcome.stripe_css_class()),
+                "{outcome:?} uses a stripe class the pool never removes"
+            );
+        }
     }
 
     #[test]

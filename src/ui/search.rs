@@ -195,7 +195,11 @@ impl UiState {
                     return;
                 }
                 FindNavigationResult::Invalidated => {
-                    self.search_status.set_text("No matches");
+                    // The card set moved under the search: a pane resize, an
+                    // Expand, a filter, or a block that was removed. Rebuild
+                    // the pass from the query the entry still holds instead of
+                    // reporting "No matches" for text that is still on screen.
+                    self.search_apply();
                     return;
                 }
                 FindNavigationResult::Inactive => {}
@@ -219,7 +223,8 @@ impl UiState {
                     return;
                 }
                 FindNavigationResult::Invalidated => {
-                    self.search_status.set_text("No matches");
+                    // See `search_next`: rebuild rather than claim no matches.
+                    self.search_apply();
                     return;
                 }
                 FindNavigationResult::Inactive => {}
