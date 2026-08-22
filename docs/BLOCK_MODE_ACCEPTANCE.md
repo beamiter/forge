@@ -31,6 +31,12 @@ seq 1 300
   会被截断为首行的多行命令、提示符忙或已有未提交输入时都必须拒绝执行，也不得改动输入区。
 - **状态提示真实性**：选中块显示的 `↵ recall · Ctrl+↵ run · Del remove · Esc cancel`
   四项必须全部可见且全部真实可用（不能被省略号截掉）。
+- **焦点落在卡片上时快捷键仍然有效**：在某个完成块的输出里拖选一段文本（键盘焦点因此
+  留在该卡片），随后 `Ctrl+Up` 必须能进入块选择，`Up/Down` 移动 active edge，
+  `PageUp/PageDown`、`Home/End` 滚动历史，`Ctrl+Shift+B` 切换书签，`Alt+Shift+F` 打开过滤。
+  有选中块时 `Enter` 回填、`Ctrl+Enter` 重跑、`Delete` 删除、`Escape` 清除选择；
+  **没有**选中块时这三个键仍然把焦点交还提示符。任何普通打字都必须把焦点带回提示符，
+  并且不能被块处理器吃掉（块内过滤输入框和弹出菜单内的按键始终归它们自己）。
 - **右键多选**：检查 `Copy Commands`、`Copy Outputs`、`Copy Blocks`、`Insert Commands at Prompt` 的顺序与内容。
 - **右键块操作**：检查 `Scroll to Top of Block`、`Jump to Bottom of Block`、输出过滤以及 `Bookmark Block` / `Remove Bookmark`。
 - **清空**：`Ctrl+Shift+K` 同时清除块、选择、书签、搜索、未读徽标、虚拟滚动范围与持久化历史；当前提示符仍可输入。

@@ -9322,6 +9322,26 @@ fn stranded_focus_key_recovers(keyval: gtk4::gdk::Key, modifiers: gtk4::gdk::Mod
     )
 }
 
+/// Keys a visible block selection owns, even when focus has been stranded on a
+/// card.
+///
+/// The active edge of a selection displays `SELECTION_HINT`, which promises
+/// exactly these actions. But `stranded_focus_key_recovers` admits Enter,
+/// Delete and Escape, and the refocus controller runs before the block key
+/// handler — so after a click into history those three keys spent themselves
+/// handing focus back to the prompt and the hint was lying again. While a
+/// selection is on screen its own keys win; with no selection the refocus
+/// meaning is the right one and is left untouched.
+fn selection_owns_key(has_selection: bool, keyval: gtk4::gdk::Key) -> bool {
+    use gtk4::gdk::Key;
+
+    has_selection
+        && matches!(
+            keyval,
+            Key::Return | Key::KP_Enter | Key::ISO_Enter | Key::Delete | Key::Escape
+        )
+}
+
 /// Focused widgets that own their keystrokes even though they live inside the
 /// block pane: text entries (the per-block output filter row, search entries),
 /// popover contents (command correction, context menus), and buttons for their
@@ -9345,10 +9365,39 @@ fn focused_widget_keeps_key(focused: &gtk4::Widget, keyval: gtk4::gdk::Key) -> b
     false
 }
 
+/// Where a [`KeyCtx`] controller is mounted, and therefore which key presses it
+/// may answer.
+///
+/// The block key surface used to exist only on the live VTE. But a finished
+/// card's snapshot VTEs and header buttons are click-focusable, so the
+/// documented gesture of drag-selecting text inside a card's output leaves
+/// keyboard focus there — and from that moment every Block-only key did
+/// nothing at all: arrows, PageUp/Down, Home/End, Delete, Escape, bookmark
+/// jumps, the filter shortcut. `stranded_focus_key_recovers` deliberately
+/// excludes exactly those keys so they can keep "whatever scroll or selection
+/// meaning they have", which was none.
+///
+/// The same handler is therefore mounted twice: once on the live VTE, and once
+/// on the pane root as a fallback that only runs while focus sits somewhere
+/// inside this pane that is not the live surface.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyScope {
+    /// Mounted on the live VTE. Every branch applies; the VTE has focus.
+    LiveSurface,
+    /// Mounted on the pane root. Declines unless focus has been stranded on a
+    /// finished card, so it can never take a key from the live surface, from a
+    /// text entry, or from a popover.
+    StrandedFocus,
+}
+
 /// Captures the handles the live-VTE key handler needs. With the VTE owning line
 /// editing + IME natively (anvil model), this is reduced to a Capture-phase
 /// navigation / copy-paste / block-selection handler; printable keys and editing
 /// fall through to the VTE.
+///
+/// Clone-able because it is mounted twice; see [`KeyScope`]. Every field is a
+/// shared handle, so both mounts observe and mutate the same pane state.
+#[derive(Clone)]
 struct KeyCtx {
     pty_for_key: Rc<OwnedPty>,
     /// Kitty keyboard protocol: the flags in effect, and the last key pressed
@@ -9374,10 +9423,13 @@ struct KeyCtx {
     visible_indices_for_key: Rc<RefCell<std::collections::HashSet<usize>>>,
     failure_marker_redraw_for_key: FailureMarkerRedraw,
     bstate_for_key: Rc<Cell<BlockState>>,
+    /// Pane root, used by the [`KeyScope::StrandedFocus`] mount to ask the
+    /// window where focus actually is.
+    root_for_key: glib::WeakRef<gtk4::Box>,
 }
 
 impl KeyCtx {
-    fn connect(self, key_ctrl: &gtk4::EventControllerKey) {
+    fn connect(self, key_ctrl: &gtk4::EventControllerKey, scope: KeyScope) {
         let KeyCtx {
             pty_for_key,
             kitty_flags_for_key,
@@ -9401,27 +9453,56 @@ impl KeyCtx {
             visible_indices_for_key,
             failure_marker_redraw_for_key,
             bstate_for_key,
+            root_for_key,
         } = self;
         key_ctrl.connect_key_pressed(move |controller, keyval, keycode, modifiers| {
             use gtk4::gdk::Key;
+            // The root mount is a fallback for focus that clicked into history.
+            // It must never take a key the live surface, a text entry, a
+            // popover or a focused button would have handled — including the
+            // kitty recording below, which exists only to rewrite bytes the
+            // live VTE is about to emit.
+            if scope == KeyScope::StrandedFocus {
+                let Some(active_vte) = active_vte_for_key.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                if active_vte.has_focus() {
+                    return glib::Propagation::Proceed;
+                }
+                let focused = root_for_key
+                    .upgrade()
+                    .and_then(|root| root.root())
+                    .and_then(|window| window.focus());
+                let Some(focused) = focused else {
+                    return glib::Propagation::Proceed;
+                };
+                if focused_widget_keeps_key(&focused, keyval) {
+                    return glib::Propagation::Proceed;
+                }
+                // Focus is stranded on a card. Fall through to the ordinary
+                // branches below, which is the whole point of this mount.
+            }
             // Kitty keyboard protocol: remember what was pressed so the commit
             // handler can replace the legacy bytes VTE is about to emit for it.
             // Recording only — the key still reaches VTE and its input method,
             // which is what keeps IME composition, Esc-cancels-preedit and
-            // Ctrl+Space intact while a kitty client runs.
-            kitty_last_key_for_key.set(
-                (kitty_flags_for_key.get() & kitty_keyboard::DISAMBIGUATE != 0).then(|| {
-                    let display = controller.widget().map(|widget| widget.display());
-                    // The event's own layout group, so a multi-layout user is
-                    // not reported the first installed layout's letters.
-                    let layout = controller
-                        .current_event()
-                        .and_then(|event| event.downcast::<gtk4::gdk::KeyEvent>().ok())
-                        .map(|event| event.layout())
-                        .unwrap_or(0);
-                    kitty_key_event(keyval, keycode, layout, modifiers, display.as_ref())
-                }),
-            );
+            // Ctrl+Space intact while a kitty client runs. Skipped on the root
+            // mount: no VTE commit can follow a key the live surface never saw.
+            if scope == KeyScope::LiveSurface {
+                kitty_last_key_for_key.set(
+                    (kitty_flags_for_key.get() & kitty_keyboard::DISAMBIGUATE != 0).then(|| {
+                        let display = controller.widget().map(|widget| widget.display());
+                        // The event's own layout group, so a multi-layout user is
+                        // not reported the first installed layout's letters.
+                        let layout = controller
+                            .current_event()
+                            .and_then(|event| event.downcast::<gtk4::gdk::KeyEvent>().ok())
+                            .map(|event| event.layout())
+                            .unwrap_or(0);
+                        kitty_key_event(keyval, keycode, layout, modifiers, display.as_ref())
+                    }),
+                );
+            }
             let Some(active_vte_for_key) = active_vte_for_key.upgrade() else {
                 return glib::Propagation::Proceed;
             };
@@ -11475,11 +11556,13 @@ impl TermView {
             let jump_fab_for_refocus = jump_fab.clone();
             let unread_for_refocus = unread_count.clone();
             let root_for_refocus = root.clone();
+            let selected_for_refocus = selected_block_id.clone();
             let refocus_key = gtk4::EventControllerKey::new();
             refocus_key.set_propagation_phase(gtk4::PropagationPhase::Capture);
             refocus_key.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
                 if active_vte_for_refocus.has_focus()
                     || !stranded_focus_key_recovers(keyval, modifiers)
+                    || selection_owns_key(selected_for_refocus.get().is_some(), keyval)
                 {
                     return glib::Propagation::Proceed;
                 }
@@ -11520,7 +11603,7 @@ impl TermView {
             let key_ctrl = gtk4::EventControllerKey::new();
             key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
 
-            KeyCtx {
+            let key_ctx = KeyCtx {
                 pty_for_key,
                 kitty_flags_for_key: kitty_flags.clone(),
                 kitty_last_key_for_key: kitty_last_key.clone(),
@@ -11543,9 +11626,21 @@ impl TermView {
                 visible_indices_for_key: visible_indices.clone(),
                 failure_marker_redraw_for_key: failure_marker_redraw.clone(),
                 bstate_for_key: bstate.clone(),
-            }
-            .connect(&key_ctrl);
+                root_for_key: root.downgrade(),
+            };
 
+            // Two mounts of one handler, see `KeyScope`. The root mount is
+            // added after `refocus_key` so a typing-shaped key still hands
+            // focus back to the prompt rather than being answered here; the
+            // two key sets are disjoint, but the ordering makes that explicit.
+            let stranded_ctrl = gtk4::EventControllerKey::new();
+            stranded_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            key_ctx
+                .clone()
+                .connect(&stranded_ctrl, KeyScope::StrandedFocus);
+            root.add_controller(stranded_ctrl);
+
+            key_ctx.connect(&key_ctrl, KeyScope::LiveSurface);
             active_vte.add_controller(key_ctrl);
         }
 
@@ -13855,6 +13950,89 @@ mod tests {
             !spoofed.contains('\u{202e}'),
             "a bidi override must not reach the label: {spoofed}"
         );
+    }
+
+    /// A click into history — the documented drag-select-to-copy gesture —
+    /// strands keyboard focus on a card, and from there every Block-only key
+    /// used to do nothing: the whole key surface was mounted on the live VTE
+    /// alone. The handler is mounted twice now; these pin the two predicates
+    /// that decide when the second mount may answer.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn a_stranded_focus_mount_declines_only_what_the_focused_widget_owns() {
+        use gtk4::gdk::Key;
+        use gtk4::prelude::*;
+
+        gtk4::init().expect("gtk init");
+
+        // A card's snapshot VTE is click-focusable and owns no keys, so the
+        // root mount answers for it. This is the case the whole mount exists
+        // for.
+        let card_vte: gtk4::Widget = vte4::Terminal::new().upcast();
+        for key in [Key::Up, Key::Down, Key::Delete, Key::Escape, Key::Return] {
+            assert!(
+                !super::focused_widget_keeps_key(&card_vte, key),
+                "{key:?} must reach the block handler from a focused card"
+            );
+        }
+
+        // The card's own filter entry keeps every key, including the ones the
+        // block handler would otherwise claim.
+        let entry: gtk4::Widget = gtk4::SearchEntry::new().upcast();
+        for key in [Key::Up, Key::Delete, Key::Escape, Key::Return, Key::a] {
+            assert!(
+                super::focused_widget_keeps_key(&entry, key),
+                "a text entry must keep {key:?}"
+            );
+        }
+
+        // A focused button keeps its activation keys and nothing else.
+        let button: gtk4::Widget = gtk4::Button::new().upcast();
+        assert!(super::focused_widget_keeps_key(&button, Key::Return));
+        assert!(super::focused_widget_keeps_key(&button, Key::space));
+        assert!(!super::focused_widget_keeps_key(&button, Key::Up));
+    }
+
+    /// The refocus controller runs before the block handler and admits Enter,
+    /// Delete and Escape — the three actions a visible selection hint
+    /// promises. With a selection on screen those keys belong to the
+    /// selection; without one, handing focus back is still the right meaning.
+    #[test]
+    fn a_visible_selection_owns_the_keys_its_hint_advertises() {
+        use gtk4::gdk::{Key, ModifierType};
+
+        for key in [
+            Key::Return,
+            Key::KP_Enter,
+            Key::ISO_Enter,
+            Key::Delete,
+            Key::Escape,
+        ] {
+            assert!(
+                super::selection_owns_key(true, key),
+                "{key:?} is on the selection hint and must reach the selection"
+            );
+            assert!(
+                !super::selection_owns_key(false, key),
+                "with no selection {key:?} keeps its refocus meaning"
+            );
+            // Each one really is a key the refocus controller would otherwise
+            // consume; that overlap is why this predicate exists.
+            assert!(super::stranded_focus_key_recovers(
+                key,
+                ModifierType::empty()
+            ));
+        }
+
+        // Navigation keys are already declined by the refocus controller, so
+        // they need no exception here.
+        for key in [Key::Up, Key::Down, Key::Page_Up, Key::Home, Key::End] {
+            assert!(!super::selection_owns_key(true, key));
+            assert!(!super::stranded_focus_key_recovers(
+                key,
+                ModifierType::empty()
+            ));
+        }
     }
 
     fn idle_guards() -> super::PromptSubmitGuards {

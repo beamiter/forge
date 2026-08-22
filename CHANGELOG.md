@@ -6,6 +6,14 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- 在块内拖选文本（复制用的那个手势）之后，键盘焦点会留在那张卡片上——从那一刻起
+  所有 Block 快捷键都失效：方向键、`PageUp/PageDown`、`Home/End`、`Delete`、书签跳转、
+  过滤快捷键全部没反应，因为整个键面只挂在实时 VTE 一个控件上，而
+  `stranded_focus_key_recovers` 恰恰把这些键排除在"打字才交还焦点"之外。同一个处理器
+  现在挂两处：实时 VTE 一份，pane root 一份，后者只在焦点确实落在本 pane 的卡片上
+  （不是实时终端、不是文本输入框、不是弹出菜单）时才接管。有选中块时
+  `Enter`/`Ctrl+Enter`/`Delete`/`Escape` 归选择所有——卡片提示条正好承诺这四个动作；
+  没有选中块时它们保持原来的"交还焦点"含义。
 - Block 模式体验一轮：卡片上一直宣传却没人实现的 `Ctrl+↵ run` 现在真的重跑选中块——
   仅限本 pane 里用户自己跑过的单行命令，提示符必须空闲，多选/background/会被截断的多行
   命令一律只回填（右键新增等价的 **Re-run Command**）；模型给出的候选仍然只能

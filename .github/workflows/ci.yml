@@ -159,6 +159,7 @@ jobs:
             block_view::scroll::tests::a_pooled_card_box_arrives_without_its_previous_controllers
             block_view::tests::entering_alt_screen_ends_the_block_selection_it_hides
             block_view::css::tests::the_generated_stylesheet_parses_without_error
+            block_view::tests::a_stranded_focus_mount_declines_only_what_the_focused_widget_owns
           "
           for test in $tests; do
             dbus-run-session -- \
