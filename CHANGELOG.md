@@ -6,6 +6,13 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- 折叠终于能批量操作：命令面板新增 **Collapse all blocks** / **Expand all blocks** /
+  **Collapse or expand block**（后者作用于选中块，没有选中时作用于最新块）。此前折叠只存在于
+  每张卡片自己的 chevron 上——TermView 根本够不着它——所以整理一段两百条命令的会话意味着
+  两百次点击。折叠同时会缩小该卡片在虚拟画布上的记录高度，否则收起输出后画布尺寸不变，
+  滚动条会描述一段没有内容的空间；整批折叠只做一次布局，不是每张一次。三个动作与 Undo 一样
+  默认不占快捷键，可在 `[keybindings]` 中绑定。折叠状态目前不跨重启保存
+  （历史格式是 rkyv，需要新的 schema，留作后续）。
 - `Delete` 现在删除整个选区并且可撤销。它是 Block 里唯一会销毁命令输出记录的操作，而且很容易
   触到——任何 `Ctrl+Up` 都会进入选择模式，卡片提示条本身就写着 `Del remove`——但只有清空有撤销。
   撤销槽改成带类型的单级槽，清空的路径原样不动，删除走新的按 id 归位恢复：被删的卡片回到

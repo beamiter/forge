@@ -390,6 +390,28 @@ impl UiState {
                     }
                 }
             }
+            Action::CollapseAllBlocks | Action::ExpandAllBlocks => {
+                let collapse = action == Action::CollapseAllBlocks;
+                log::info!(
+                    "{} all finished blocks",
+                    if collapse { "Collapse" } else { "Expand" }
+                );
+                if let Some(term_view) = self.current_term_view() {
+                    let count = term_view.set_all_blocks_collapsed(collapse);
+                    if count > 0 {
+                        let plural = if count == 1 { "" } else { "s" };
+                        let verb = if collapse { "Collapsed" } else { "Expanded" };
+                        self.toast_overlay
+                            .add_toast(adw::Toast::new(&format!("{verb} {count} block{plural}.")));
+                    }
+                }
+            }
+            Action::ToggleBlockCollapsed => {
+                log::info!("Toggle block output");
+                if let Some(term_view) = self.current_term_view() {
+                    term_view.toggle_selected_block_collapsed();
+                }
+            }
             Action::UndoClearBlocks => {
                 log::info!("Undo clear finished blocks");
                 if let Some(term_view) = self.current_term_view() {

@@ -40,6 +40,10 @@ seq 1 300
 - **右键多选**：检查 `Copy Commands`、`Copy Outputs`、`Copy Blocks`、`Insert Commands at Prompt` 的顺序与内容。
 - **右键块操作**：检查 `Scroll to Top of Block`、`Jump to Bottom of Block`、输出过滤以及 `Bookmark Block` / `Remove Bookmark`。
 - **清空**：`Ctrl+Shift+K` 同时清除块、选择、书签、搜索、未读徽标、虚拟滚动范围与持久化历史；当前提示符仍可输入。
+- **批量折叠**：制造若干条有输出的命令后，用命令面板执行 **Collapse all blocks**：
+  每张卡片都只剩 header + 命令 + "N lines hidden" 摘要，chevron 变为 `▶`，
+  滚动条长度必须随之缩短（不能留下没有内容的空白）。**Expand all blocks** 应完整还原。
+  **Collapse or expand block** 只作用于选中块，没有选中时作用于最新块。
 - **删除与撤销**：用 `Shift+Up` 选中一段范围后按 `Delete`，整段应一次删除。随后再跑一条新命令，
   执行 **Undo removing blocks**（`F5` 或命令面板）：删除的块必须回到它们原来的位置（中间），
   时间戳与退出状态不变，而不是被放到最前面。撤销槽是单级的：删除之后再清空，撤销只还原清空。

@@ -83,6 +83,12 @@ pub(crate) enum Action {
     ClearBlocks,
     /// Restore the most recently cleared set of finished blocks.
     UndoClearBlocks,
+    /// Fold every finished block's output away.
+    CollapseAllBlocks,
+    /// Unfold every finished block's output.
+    ExpandAllBlocks,
+    /// Fold or unfold the selected block (or the newest one).
+    ToggleBlockCollapsed,
     /// Put selected commands back into the live editor in terminal order.
     ReinputSelectedCommands,
     JumpToPrevPinned,
@@ -196,6 +202,9 @@ impl Action {
             Action::SelectAllBlocks => "Select all blocks",
             Action::ClearBlocks => "Clear blocks",
             Action::UndoClearBlocks => "Undo removing blocks",
+            Action::CollapseAllBlocks => "Collapse all blocks",
+            Action::ExpandAllBlocks => "Expand all blocks",
+            Action::ToggleBlockCollapsed => "Collapse or expand block",
             Action::ReinputSelectedCommands => "Reinput selected commands",
             Action::JumpToPrevPinned => "Jump to previous bookmarked block",
             Action::JumpToNextPinned => "Jump to next bookmarked block",
@@ -280,6 +289,9 @@ impl Action {
             Action::SelectAllBlocks => Some("select_all_blocks"),
             Action::ClearBlocks => Some("clear_blocks"),
             Action::UndoClearBlocks => Some("undo_clear_blocks"),
+            Action::CollapseAllBlocks => Some("collapse_all_blocks"),
+            Action::ExpandAllBlocks => Some("expand_all_blocks"),
+            Action::ToggleBlockCollapsed => Some("toggle_block_collapsed"),
             Action::ReinputSelectedCommands => Some("reinput_selected_commands"),
             Action::JumpToPrevPinned => Some("jump_to_prev_pinned"),
             Action::JumpToNextPinned => Some("jump_to_next_pinned"),
@@ -361,6 +373,9 @@ impl Action {
             Action::SelectAllBlocks,
             Action::ClearBlocks,
             Action::UndoClearBlocks,
+            Action::CollapseAllBlocks,
+            Action::ExpandAllBlocks,
+            Action::ToggleBlockCollapsed,
             Action::ReinputSelectedCommands,
             Action::JumpToPrevPinned,
             Action::JumpToNextPinned,
@@ -730,6 +745,11 @@ mod tests {
             Action::UndoClearBlocks,
             Action::JumpToPrevFailed,
             Action::JumpToNextFailed,
+            // Folding is a triage gesture, not a hot key: reachable from the
+            // palette and bindable in TOML, like the rest of this list.
+            Action::CollapseAllBlocks,
+            Action::ExpandAllBlocks,
+            Action::ToggleBlockCollapsed,
             // anvil leaves session export chordless too; both GTK terminals
             // reach it from the command palette only.
             Action::ExportSessionMarkdown,
@@ -1224,6 +1244,9 @@ mod tests {
             Action::UndoClearBlocks,
             Action::JumpToPrevFailed,
             Action::JumpToNextFailed,
+            Action::CollapseAllBlocks,
+            Action::ExpandAllBlocks,
+            Action::ToggleBlockCollapsed,
         ] {
             assert!(map.binding_display(&action).is_empty());
         }
@@ -1232,6 +1255,9 @@ mod tests {
 undo_clear_blocks = "F5"
 jump_to_prev_failed = "F6"
 jump_to_next_failed = "F7"
+collapse_all_blocks = "F8"
+expand_all_blocks = "F9"
+toggle_block_collapsed = "F10"
 "#
         .parse::<toml::Table>()
         .unwrap();
@@ -1239,6 +1265,18 @@ jump_to_next_failed = "F7"
         assert_eq!(
             map.lookup(&parse("F5").unwrap()),
             Some(Action::UndoClearBlocks)
+        );
+        assert_eq!(
+            map.lookup(&parse("F8").unwrap()),
+            Some(Action::CollapseAllBlocks)
+        );
+        assert_eq!(
+            map.lookup(&parse("F9").unwrap()),
+            Some(Action::ExpandAllBlocks)
+        );
+        assert_eq!(
+            map.lookup(&parse("F10").unwrap()),
+            Some(Action::ToggleBlockCollapsed)
         );
         assert_eq!(
             map.lookup(&parse("F6").unwrap()),

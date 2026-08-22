@@ -655,6 +655,14 @@ pub(crate) struct FinishedBlock {
     pub(crate) selection_hint: gtk4::Label,
     /// Toggle the output filter while preserving the current query.
     pub(crate) toggle_filter: Rc<dyn Fn()>,
+    /// Fold or unfold this card's output. Stored, like `toggle_filter`, so the
+    /// pane can drive it in bulk: triaging a long session should not mean one
+    /// chevron click per card.
+    set_collapsed: Rc<dyn Fn(bool)>,
+    /// The card's folded state. The collapsed summary's visibility is the one
+    /// signal that is also correct for image-only cards, whose output VTE stays
+    /// hidden while expanded.
+    collapsed_summary: gtk4::Button,
     /// Late-bound "hand keyboard focus back to the live prompt" action.
     /// The card is built before it knows which pane owns it, so
     /// [`FinishedBlock::connect_actions`] fills this in. Used when the filter
@@ -719,6 +727,8 @@ impl Clone for FinishedBlock {
             action_box: self.action_box.clone(),
             selection_hint: self.selection_hint.clone(),
             toggle_filter: self.toggle_filter.clone(),
+            set_collapsed: self.set_collapsed.clone(),
+            collapsed_summary: self.collapsed_summary.clone(),
             restore_live_focus: self.restore_live_focus.clone(),
             refit_output: self.refit_output.clone(),
             visual_rows_cache: self.visual_rows_cache.clone(),
@@ -3145,6 +3155,8 @@ impl FinishedBlock {
             action_box,
             selection_hint,
             toggle_filter,
+            set_collapsed,
+            collapsed_summary,
             restore_live_focus,
             refit_output,
             visual_rows_cache,
@@ -3191,6 +3203,24 @@ impl FinishedBlock {
             self.widget.set_height_request(-1);
             self.virtualized_height.get().max(1)
         }
+    }
+
+    /// Whether this card's output is folded away.
+    pub(crate) fn is_collapsed(&self) -> bool {
+        use gtk4::prelude::WidgetExt as _;
+        self.collapsed_summary.is_visible()
+    }
+
+    /// Fold or unfold this card's output, reporting whether anything moved.
+    ///
+    /// The pane uses the answer to skip the layout pass entirely when a bulk
+    /// collapse found nothing to do.
+    pub(crate) fn set_collapsed(&self, collapsed: bool) -> bool {
+        if self.is_collapsed() == collapsed {
+            return false;
+        }
+        (self.set_collapsed)(collapsed);
+        true
     }
 
     /// What this card's output VTE currently holds — see [`RenderStamp`].

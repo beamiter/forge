@@ -273,6 +273,11 @@ mod tests {
             Action::UndoClearBlocks,
             Action::JumpToPrevFailed,
             Action::JumpToNextFailed,
+            // Folding is only reachable per card, by its chevron. These are how
+            // a keyboard user triages a long session at all.
+            Action::CollapseAllBlocks,
+            Action::ExpandAllBlocks,
+            Action::ToggleBlockCollapsed,
         ] {
             let entries = gather(
                 &Query {
