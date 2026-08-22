@@ -6,6 +6,11 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- `Delete` 现在删除整个选区并且可撤销。它是 Block 里唯一会销毁命令输出记录的操作，而且很容易
+  触到——任何 `Ctrl+Up` 都会进入选择模式，卡片提示条本身就写着 `Del remove`——但只有清空有撤销。
+  撤销槽改成带类型的单级槽，清空的路径原样不动，删除走新的按 id 归位恢复：被删的卡片回到
+  它们在文档中的原位（文档顺序即 id 顺序），即使期间又跑了新命令。用 `Shift+Up` 建立的范围
+  一次按键删除、一次撤销恢复。动作名相应改成 **Undo removing blocks**。
 - 卡片头部不再在鼠标下抖动：快捷操作按钮组原先在 hover 时才出现，它位于 header 的
   弹性空白之后，所以每次指针划过一张卡片，右侧的时间戳/耗时/exit 徽章都会横向滑动
   按钮组的整个宽度。按钮组现在始终占位、只做淡入淡出（淡出时不可点击也不吃 Tab 焦点），

@@ -271,6 +271,7 @@ jsh_update_check = "daily"    # "startup" 每次启动联网；"daily" 复用缓
 | workflow / 失败块 / 最早块 | `Ctrl+Shift+M` / `Ctrl+Shift+X` / `Ctrl+Shift+N` |
 | 全选 / 回填 / 清空 Block | `Ctrl+Shift+A` / `Ctrl+Shift+I` / `Ctrl+Shift+K` |
 | 回填 / 重跑选中块 | `Enter` / `Ctrl+Enter` |
+| 删除选中块 / 撤销移除 | `Delete` / `F5` |
 | Block 过滤 / 书签 / 标签栏位置 | `Alt+Shift+F` / `Ctrl+Shift+B` / `Ctrl+Alt+B` |
 | AI 面板 / 询问选中块 | `Ctrl+Alt+Shift+A` / `Ctrl+Shift+Q` |
 | Shell Agent（Block） | `Ctrl+Alt+G` |
@@ -302,6 +303,9 @@ Block 模式与 anvil 保持相同的选择语义：`Ctrl+Up` 从最新块进入
 （右键菜单的 **Re-run Command** 等价）：仅限本 pane 里用户自己已经执行过的单行命令，
 且提示符必须空闲、无未提交输入；多选、后台块和会被截断为首行的多行命令一律拒绝执行，
 只回填。AI / Agent / 命令面板的建议仍然只 **Insert for review**，永不自行提交。
+`Delete` 删除**整个选区**（不只是 active edge），并且可撤销：`F5`（**Undo removing blocks**）
+把它们放回按 id 该在的位置——即使期间又跑过新命令，删掉的块也回到中间而不是被塞到最前面。
+撤销槽是单级的：一次新的移除（删除或清空）会替换掉上一次。
 右键多选区域可批量复制命令、输出或完整块；长 Block 提供顶部/底部跳转与 sticky header，
 后台异步输出使用独立 Block 样式。历史恢复和撤销清空重建的块与新块拥有完全相同的右键菜单。
 

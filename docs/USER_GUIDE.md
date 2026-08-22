@@ -342,6 +342,9 @@ reducer、不新增落盘字段；repo 无法验证或身份切换中时使用�
   **Insert for review**。
 - alt-screen 程序运行期间，`Ctrl+Up` 不进入块选择、`Delete` 不删除隐藏块；进入 alt-screen
   会清除既有块选择，避免快捷键作用在看不见的卡片上。
+- `Delete` 删除整个选区，一次按键即可移除用 `Shift+Up/Down` 建立的整段范围；
+  `F5`（**Undo removing blocks**）把它们放回按 id 该在的位置，因此期间新跑的命令不会把
+  恢复的块挤到最前面。撤销槽是单级的：删除和清空共用它，新的一次移除会替换上一次。
 - `Ctrl+Shift+B` 收藏 active 块，`Ctrl+,` / `Ctrl+.` 在收藏块之间跳转。
 - 多选右键可批量复制命令、输出、完整块或回填命令；复制按界面顺序合并。
 - 长块提供顶部/底部导航与 sticky header，后台异步输出使用独立 Block 样式。

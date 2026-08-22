@@ -376,7 +376,7 @@ impl UiState {
                     if count > 0 {
                         let plural = if count == 1 { "" } else { "s" };
                         let message = format!(
-                            "Cleared {count} block{plural} — \"Undo clear blocks\" restores them."
+                            "Cleared {count} block{plural} — \"Undo removing blocks\" restores them."
                         );
                         self.toast_overlay.add_toast(adw::Toast::new(&message));
                     } else if !term_view.supports_block_mutation() {
@@ -395,10 +395,10 @@ impl UiState {
                 if let Some(term_view) = self.current_term_view() {
                     let count = term_view.undo_clear_blocks();
                     let message = if count == 0 {
-                        "No cleared blocks to restore.".to_string()
+                        "No removed blocks to restore.".to_string()
                     } else {
                         let plural = if count == 1 { "" } else { "s" };
-                        format!("Restored {count} cleared block{plural}.")
+                        format!("Restored {count} removed block{plural}.")
                     };
                     self.toast_overlay.add_toast(adw::Toast::new(&message));
                 }

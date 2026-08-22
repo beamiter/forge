@@ -195,7 +195,7 @@ impl Action {
             Action::ClearBlockFilter => "Jump to oldest block",
             Action::SelectAllBlocks => "Select all blocks",
             Action::ClearBlocks => "Clear blocks",
-            Action::UndoClearBlocks => "Undo clear blocks",
+            Action::UndoClearBlocks => "Undo removing blocks",
             Action::ReinputSelectedCommands => "Reinput selected commands",
             Action::JumpToPrevPinned => "Jump to previous bookmarked block",
             Action::JumpToNextPinned => "Jump to next bookmarked block",

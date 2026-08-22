@@ -40,6 +40,9 @@ seq 1 300
 - **右键多选**：检查 `Copy Commands`、`Copy Outputs`、`Copy Blocks`、`Insert Commands at Prompt` 的顺序与内容。
 - **右键块操作**：检查 `Scroll to Top of Block`、`Jump to Bottom of Block`、输出过滤以及 `Bookmark Block` / `Remove Bookmark`。
 - **清空**：`Ctrl+Shift+K` 同时清除块、选择、书签、搜索、未读徽标、虚拟滚动范围与持久化历史；当前提示符仍可输入。
+- **删除与撤销**：用 `Shift+Up` 选中一段范围后按 `Delete`，整段应一次删除。随后再跑一条新命令，
+  执行 **Undo removing blocks**（`F5` 或命令面板）：删除的块必须回到它们原来的位置（中间），
+  时间戳与退出状态不变，而不是被放到最前面。撤销槽是单级的：删除之后再清空，撤销只还原清空。
 - **后台输出**：未开始编辑时，异步输出形成无命令的 `Background output` 块；开始编辑后输出保持在输入区，不误拆块。
 - **中断不是失败**：`sh -c 'exit 130'`、`exit 141`、`exit 143` 产生中性的 `⊘` 卡片和
   `exit:N · interrupted` 徽章，没有红色描边；滚动条失败标记、`Ctrl+Shift+X` 失败跳转和

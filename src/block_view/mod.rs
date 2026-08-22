@@ -1736,6 +1736,41 @@ fn take_stash_for_undo<T>(stash: &mut Vec<T>, fullscreen: bool) -> Vec<T> {
     }
 }
 
+/// What the last removal took, and therefore how Undo has to put it back.
+///
+/// Clear-all removes a prefix (everything), so restoring is a prepend and the
+/// original path stays exactly as it was. A Delete takes cards from anywhere in
+/// the document, so restoring has to place each one where its id says it
+/// belongs — document order is id order, since ids are minted monotonically and
+/// restored history is renumbered into the same sequence.
+enum RemovedBlocks {
+    Cleared(Vec<BlockData>),
+    Deleted(Vec<BlockData>),
+}
+
+impl RemovedBlocks {
+    fn len(&self) -> usize {
+        match self {
+            Self::Cleared(blocks) | Self::Deleted(blocks) => blocks.len(),
+        }
+    }
+}
+
+/// Where a restored block belongs among the cards that are currently mounted.
+///
+/// Document order is id order, so the block goes immediately before the first
+/// card with a higher id — or at the end when every live card is older.
+fn restore_position_by_id(live_ids: impl IntoIterator<Item = u64>, restored_id: u64) -> usize {
+    let mut position = 0usize;
+    for id in live_ids {
+        if id > restored_id {
+            return position;
+        }
+        position += 1;
+    }
+    position
+}
+
 fn prepend_in_order<T>(current: &mut VecDeque<T>, older: Vec<T>) {
     for item in older.into_iter().rev() {
         current.push_front(item);
@@ -2721,11 +2756,60 @@ fn scroll_selected_finished_block_edge(
     true
 }
 
+#[derive(Clone, Copy)]
 struct BlockRemovalRefs<'a> {
     selection: BlockSelectionRefs<'a>,
     bookmarks: &'a Rc<RefCell<std::collections::HashSet<u64>>>,
     visible_indices: &'a Rc<RefCell<std::collections::HashSet<usize>>>,
     failure_marker_redraw: &'a dyn Fn(),
+}
+
+/// Delete cards and hand what they held to Undo.
+///
+/// Delete is the one Block action that destroys a command's recorded output,
+/// and it is easy to reach: any `Ctrl+Up` enters selection mode and the card's
+/// own hint offers `Del remove`. Clear-all has always been undoable; this makes
+/// Delete undoable through the same single-level slot, and takes the whole
+/// selection at once so removing a range is one keystroke rather than one per
+/// card. Returns the id the selection should move to.
+#[allow(clippy::too_many_arguments)]
+fn delete_finished_blocks(
+    ids: &[u64],
+    removed_blocks: &Rc<RefCell<Option<RemovedBlocks>>>,
+    finished_blocks: &Rc<RefCell<Vec<FinishedBlock>>>,
+    block_data: &Rc<RefCell<VecDeque<BlockData>>>,
+    block_list: &gtk4::Box,
+    find_state: &Rc<RefCell<FindState>>,
+    active_vte: &Terminal,
+    refs: BlockRemovalRefs<'_>,
+) -> Option<u64> {
+    // Snapshot before removing: `remove_finished_block` drops the metadata, and
+    // the metadata is the whole of what Undo needs to rebuild a card.
+    let removed: Vec<BlockData> = {
+        let blocks = block_data.borrow();
+        blocks
+            .iter()
+            .filter(|block| ids.contains(&block.id))
+            .cloned()
+            .collect()
+    };
+    let mut next_selection = None;
+    for id in ids {
+        next_selection = remove_finished_block(
+            *id,
+            finished_blocks,
+            block_data,
+            block_list,
+            find_state,
+            active_vte,
+            refs,
+        )
+        .or(next_selection);
+    }
+    if !removed.is_empty() {
+        *removed_blocks.borrow_mut() = Some(RemovedBlocks::Deleted(removed));
+    }
+    next_selection
 }
 
 fn plan_completed_block_retention_with_restored(
@@ -3047,6 +3131,7 @@ impl BlockBackend {
         let visible_for_menu = self.visible_indices_rc.clone();
         let failure_marker_redraw_for_menu = self.failure_marker_redraw.clone();
         let find_state_for_menu = self.find_state_for_cb.clone();
+        let removed_blocks_for_menu = self.removed_blocks_for_cb.clone();
         let ask_ai_cbs_for_menu = self.ask_ai_cbs.clone();
 
         let right_click = gtk4::GestureClick::new();
@@ -3508,6 +3593,7 @@ impl BlockBackend {
                 let failure_marker_redraw_for_delete = failure_marker_redraw_for_menu.clone();
                 let find_state_for_delete = find_state_for_menu.clone();
                 let active_vte_for_delete = vte_for_copy.clone();
+                let removed_blocks_for_delete = removed_blocks_for_menu.clone();
                 let block_id_del = block_id;
                 item.connect_clicked(move |_| {
                     popdown_if_alive(&popover_c);
@@ -3517,8 +3603,9 @@ impl BlockBackend {
                     ) else {
                         return;
                     };
-                    let _ = remove_finished_block(
-                        block_id_del,
+                    let _ = delete_finished_blocks(
+                        &[block_id_del],
+                        &removed_blocks_for_delete,
                         &finished_blocks_for_delete,
                         &block_data_for_delete,
                         &block_list_for_delete,
@@ -4326,7 +4413,11 @@ pub struct TermView {
     failure_marker_redraw: FailureMarkerRedraw,
     /// One in-memory generation removed by Clear. Persisted history follows
     /// whichever side (cleared or restored) is currently visible.
-    cleared_blocks: RefCell<Vec<BlockData>>,
+    /// The one removal that Undo can put back. Single-level by design: a new
+    /// removal replaces it, whichever kind either was. Shared, because Delete
+    /// happens inside the key handler and the card menu while Undo is a
+    /// `TermView` action.
+    removed_blocks: Rc<RefCell<Option<RemovedBlocks>>>,
     finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
     /// Current OSC 10/11/12 overrides, also applied to restored snapshots.
     dynamic_colors: Rc<Cell<DynamicColors>>,
@@ -5403,6 +5494,9 @@ struct BlockBackend {
     /// Same PTY as the `ReaderCtx` clone: geometry sync here, replies and
     /// foreground queries engine-side.
     pty_for_init: Rc<OwnedPty>,
+    /// Undo's single-level slot, shared with `TermView`: the card menu's
+    /// Delete writes what it took here.
+    removed_blocks_for_cb: Rc<RefCell<Option<RemovedBlocks>>>,
     /// Menu-only ("Ask AI about this block"); the block-finished and
     /// agent-execution-lost fan-outs are engine policy and live on
     /// [`ReaderCtx`] alone.
@@ -9426,6 +9520,8 @@ struct KeyCtx {
     /// Pane root, used by the [`KeyScope::StrandedFocus`] mount to ask the
     /// window where focus actually is.
     root_for_key: glib::WeakRef<gtk4::Box>,
+    /// Undo's single-level slot; Delete writes what it took here.
+    removed_blocks_for_key: Rc<RefCell<Option<RemovedBlocks>>>,
 }
 
 impl KeyCtx {
@@ -9454,6 +9550,7 @@ impl KeyCtx {
             failure_marker_redraw_for_key,
             bstate_for_key,
             root_for_key,
+            removed_blocks_for_key,
         } = self;
         key_ctrl.connect_key_pressed(move |controller, keyval, keycode, modifiers| {
             use gtk4::gdk::Key;
@@ -9726,43 +9823,57 @@ impl KeyCtx {
                 && !alt
                 && keyval == Key::Delete
                 && bstate_for_key.get() != BlockState::AltScreen
+                && selected_block_id_for_key.get().is_some()
             {
-                if let Some(sel_id) = selected_block_id_for_key.get() {
-                    let next_id = remove_finished_block(
-                        sel_id,
-                        &finished_blocks_for_key,
-                        &block_data_for_key,
-                        &block_list_for_key,
-                        &find_state_for_key,
-                        &active_vte_for_key,
-                        BlockRemovalRefs {
-                            selection: BlockSelectionRefs {
-                                ids: &selected_block_ids_for_key,
-                                active: &selected_block_id_for_key,
-                                anchor: &selection_anchor_id_for_key,
-                            },
-                            bookmarks: &bookmarks_for_key,
-                            visible_indices: &visible_indices_for_key,
-                            failure_marker_redraw: failure_marker_redraw_for_key.as_ref(),
-                        },
-                    );
+                // The whole selection, in document order: deleting a range
+                // the user built with Shift+Up is one keystroke and one
+                // undo entry, not one of each per card.
+                let doomed: Vec<u64> = {
+                    let selected = selected_block_ids_for_key.borrow();
+                    let active = selected_block_id_for_key.get();
                     let finished = finished_blocks_for_key.borrow();
-                    if selected_block_ids_for_key.borrow().is_empty() {
-                        replace_finished_block_selection(
-                            &finished,
-                            &selected_block_ids_for_key,
-                            &selected_block_id_for_key,
-                            &selection_anchor_id_for_key,
-                            next_id,
-                        );
-                    }
-                    if let Some(next_id) = selected_block_id_for_key.get().or(next_id) {
-                        if let Some(block) = finished.iter().find(|block| block.id == next_id) {
-                            scroll_finished_block_into_view(&block_scroll_for_key, block);
-                        }
-                    }
-                    return glib::Propagation::Stop;
+                    let ids: Vec<u64> = finished
+                        .iter()
+                        .map(|block| block.id)
+                        .filter(|id| selected.contains(id) || active == Some(*id))
+                        .collect();
+                    ids
+                };
+                let next_id = delete_finished_blocks(
+                    &doomed,
+                    &removed_blocks_for_key,
+                    &finished_blocks_for_key,
+                    &block_data_for_key,
+                    &block_list_for_key,
+                    &find_state_for_key,
+                    &active_vte_for_key,
+                    BlockRemovalRefs {
+                        selection: BlockSelectionRefs {
+                            ids: &selected_block_ids_for_key,
+                            active: &selected_block_id_for_key,
+                            anchor: &selection_anchor_id_for_key,
+                        },
+                        bookmarks: &bookmarks_for_key,
+                        visible_indices: &visible_indices_for_key,
+                        failure_marker_redraw: failure_marker_redraw_for_key.as_ref(),
+                    },
+                );
+                let finished = finished_blocks_for_key.borrow();
+                if selected_block_ids_for_key.borrow().is_empty() {
+                    replace_finished_block_selection(
+                        &finished,
+                        &selected_block_ids_for_key,
+                        &selected_block_id_for_key,
+                        &selection_anchor_id_for_key,
+                        next_id,
+                    );
                 }
+                if let Some(next_id) = selected_block_id_for_key.get().or(next_id) {
+                    if let Some(block) = finished.iter().find(|block| block.id == next_id) {
+                        scroll_finished_block_into_view(&block_scroll_for_key, block);
+                    }
+                }
+                return glib::Propagation::Stop;
             }
 
             // Escape clears the block selection (when one is active).
@@ -10311,6 +10422,11 @@ impl TermView {
             });
         }
         scroll_overlay.add_overlay(&failure_markers);
+        // The single-level Undo slot. Written by Clear and by Delete (which
+        // happens inside the key handler and the card menu), read by
+        // `undo_clear_blocks`.
+        let removed_blocks: Rc<RefCell<Option<RemovedBlocks>>> = Rc::new(RefCell::new(None));
+
         let failure_marker_redraw: FailureMarkerRedraw = {
             let failure_markers = failure_markers.downgrade();
             Rc::new(move || {
@@ -10913,6 +11029,7 @@ impl TermView {
                     finished_blocks_for_cb,
                     widget_pool_for_cb,
                     find_state_for_cb: find_state.clone(),
+                    removed_blocks_for_cb: removed_blocks.clone(),
                     visible_indices_rc,
                     fullscreen_rc,
                     selected_block_ids_rc: selected_block_ids.clone(),
@@ -11589,6 +11706,7 @@ impl TermView {
         // ── Keyboard navigation / copy-paste (Capture phase) ──────────────
         {
             let pty_for_key = pty.clone();
+            let removed_blocks_for_key = removed_blocks.clone();
             let typed_cmd_for_key = typed_cmd.clone();
             let typed_cmd_fidelity_for_key = typed_cmd_fidelity.clone();
             let submission_pending_for_key = submission_pending.clone();
@@ -11627,6 +11745,7 @@ impl TermView {
                 failure_marker_redraw_for_key: failure_marker_redraw.clone(),
                 bstate_for_key: bstate.clone(),
                 root_for_key: root.downgrade(),
+                removed_blocks_for_key,
             };
 
             // Two mounts of one handler, see `KeyScope`. The root mount is
@@ -11910,7 +12029,7 @@ impl TermView {
             config: config_shared,
             block_data: block_data_rc,
             failure_marker_redraw,
-            cleared_blocks: RefCell::new(Vec::new()),
+            removed_blocks: removed_blocks.clone(),
             finished_blocks: finished_blocks_rc,
             dynamic_colors,
             widget_pool: widget_pool.clone(),
@@ -13110,7 +13229,7 @@ impl TermView {
             self.failure_marker_redraw.as_ref(),
             |blocks| blocks.drain(..).collect(),
         );
-        let cleared_count = replace_nonempty_stash(&mut self.cleared_blocks.borrow_mut(), cleared);
+        let cleared_count = self.stash_removed_blocks(RemovedBlocks::Cleared(cleared));
         self.bookmarks.borrow_mut().clear();
         self.visible_indices.borrow_mut().clear();
         self.selected_block_ids.borrow_mut().clear();
@@ -13135,11 +13254,145 @@ impl TermView {
         cleared_count
     }
 
-    /// Restore the most recently cleared generation before blocks created
-    /// since Clear. The slot is intentionally single-level.
+    /// Put deleted cards back where their ids say they belong.
+    ///
+    /// Unlike a Clear generation these came from anywhere in the document, so
+    /// each one is placed by id rather than prepended. The virtualization index
+    /// set is rebuilt from the viewport afterwards instead of being shifted:
+    /// after insertions at arbitrary positions the old indices describe nothing.
+    fn restore_deleted_blocks(&self, mut restored: Vec<BlockData>) -> usize {
+        if restored.is_empty() || !self.supports_block_mutation() {
+            return 0;
+        }
+        // Undo inserts cards and may evict a live prefix. Invalidate
+        // index-based search metadata before either structural change.
+        self.clear_find();
+        restored.sort_by_key(|block| block.id);
+
+        let fallback_cols = self.active.borrow().grid_cols() as i64;
+        let restored_len = restored.len();
+        {
+            let config = self.config.borrow();
+            for block in restored {
+                let cols = if block.cols > 0 {
+                    block.cols as i64
+                } else {
+                    fallback_cols
+                };
+                let position = restore_position_by_id(
+                    self.finished_blocks.borrow().iter().map(|card| card.id),
+                    block.id,
+                );
+                let finished = FinishedBlock::new(
+                    block.id,
+                    &block.prompt,
+                    &block.cmd,
+                    block.cmd_markup.as_deref(),
+                    &block.output,
+                    block.exit_code,
+                    &config,
+                    block.duration_ms,
+                    block.end_time_ms,
+                    block.cwd.as_deref(),
+                    cols,
+                );
+                apply_dynamic_colors_to_finished(&finished, self.dynamic_colors.get());
+                // The card that will follow this one, or the live block when
+                // every mounted card is older.
+                let sibling = self
+                    .finished_blocks
+                    .borrow()
+                    .get(position)
+                    .map(|card| card.widget().clone().upcast::<gtk4::Widget>())
+                    .unwrap_or_else(|| {
+                        self.active
+                            .borrow()
+                            .widget()
+                            .clone()
+                            .upcast::<gtk4::Widget>()
+                    });
+                finished
+                    .widget()
+                    .insert_before(&self.block_list, Some(&sibling));
+                self.mount_rebuilt_block(&finished);
+                self.finished_blocks.borrow_mut().insert(position, finished);
+                let mut block = block;
+                block.estimated_height = estimated_finished_block_height_for_text(
+                    &config,
+                    &block.cmd,
+                    &block.output,
+                    cols,
+                );
+                mutate_block_data_and_redraw(
+                    &self.block_data,
+                    self.failure_marker_redraw.as_ref(),
+                    |blocks| blocks.insert(position, block),
+                );
+            }
+        }
+
+        // Restoring can push the pane back over its budget; evict from the
+        // oldest end exactly as a new block would.
+        let max_blocks = self.config.borrow().max_visible_blocks as usize;
+        let retention_plan = {
+            let finished = self.finished_blocks.borrow();
+            plan_completed_block_retention_with_restored(&[], &finished, max_blocks)
+        };
+        log_completed_block_retention("restoring deleted blocks", retention_plan);
+        evict_finished_block_prefix(
+            retention_plan.evict_prefix,
+            &self.finished_blocks,
+            &self.block_data,
+            &self.block_list,
+            &self.widget_pool,
+            BlockRemovalRefs {
+                selection: BlockSelectionRefs {
+                    ids: &self.selected_block_ids,
+                    active: &self.selected_block_id,
+                    anchor: &self.selection_anchor_id,
+                },
+                bookmarks: &self.bookmarks,
+                visible_indices: &self.visible_indices,
+                failure_marker_redraw: self.failure_marker_redraw.as_ref(),
+            },
+        );
+
+        self.visible_indices.borrow_mut().clear();
+        self.update_viewport();
+        self.update_block_visibility();
+        self.block_list.queue_allocate();
+        if let Err(err) = self.save_history() {
+            log::warn!("save restored deleted blocks: {err}");
+        }
+        restored_len.min(self.finished_blocks.borrow().len())
+    }
+
+    /// Record what a removal took, replacing whatever Undo was holding.
+    ///
+    /// An empty removal leaves the previous entry alone, so a no-op Clear on an
+    /// already-empty pane cannot silently discard a real undo.
+    fn stash_removed_blocks(&self, removed: RemovedBlocks) -> usize {
+        let count = removed.len();
+        if count > 0 {
+            *self.removed_blocks.borrow_mut() = Some(removed);
+        }
+        count
+    }
+
+    /// Put the most recent removal back — a Clear generation or a Delete,
+    /// whichever happened last. The slot is intentionally single-level.
     pub fn undo_clear_blocks(&self) -> usize {
-        let mut restored =
-            take_stash_for_undo(&mut self.cleared_blocks.borrow_mut(), self.fullscreen.get());
+        // Alt-screen applications own the pane. Refusing must leave the stash
+        // intact so Undo still works after the application exits.
+        if self.fullscreen.get() {
+            return 0;
+        }
+        let removed = self.removed_blocks.borrow_mut().take();
+        let mut restored = match removed {
+            Some(RemovedBlocks::Cleared(blocks)) => blocks,
+            Some(RemovedBlocks::Deleted(blocks)) => return self.restore_deleted_blocks(blocks),
+            None => return 0,
+        };
         if restored.is_empty() {
             return 0;
         }
@@ -14033,6 +14286,37 @@ mod tests {
                 ModifierType::empty()
             ));
         }
+    }
+
+    /// Deleted cards go back where their ids say they belong. Document order is
+    /// id order, so a card removed from the middle returns to the middle even
+    /// if newer commands ran in the meantime — the Clear path's prepend would
+    /// have put it at the top.
+    #[test]
+    fn a_restored_block_lands_where_its_id_belongs() {
+        // Live document ids, ascending, as the pane always holds them.
+        let live = [10_u64, 20, 30];
+
+        assert_eq!(super::restore_position_by_id(live, 5), 0, "older than all");
+        assert_eq!(super::restore_position_by_id(live, 15), 1);
+        assert_eq!(super::restore_position_by_id(live, 25), 2);
+        assert_eq!(
+            super::restore_position_by_id(live, 40),
+            3,
+            "newer than all: appended after the last card"
+        );
+
+        // An empty pane takes everything at the front, which is what makes the
+        // Clear generation's prepend and this one agree.
+        assert_eq!(super::restore_position_by_id([], 7), 0);
+
+        // Restoring several in ascending order keeps their relative order.
+        let mut document: Vec<u64> = live.to_vec();
+        for id in [15_u64, 16, 25] {
+            let position = super::restore_position_by_id(document.iter().copied(), id);
+            document.insert(position, id);
+        }
+        assert_eq!(document, vec![10, 15, 16, 20, 25, 30]);
     }
 
     fn idle_guards() -> super::PromptSubmitGuards {
