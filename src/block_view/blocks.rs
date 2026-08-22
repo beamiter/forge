@@ -1429,12 +1429,46 @@ pub(crate) fn estimated_finished_block_height_for_rows(
 /// selection instead of running anything.
 const SELECTION_HINT: &str = "↵ recall  ·  Ctrl+↵ run  ·  Del remove  ·  Esc cancel";
 
+/// Natural-width cap for the right-hand metadata run (timestamp, duration,
+/// exit badge). Wide enough that these never ellipsize at ordinary pane
+/// widths, and small enough that a narrow split makes them yield instead of
+/// forcing the header past the pane's own width.
+const HEADER_META_MAX_CHARS: i32 = 22;
+
+/// Left gutter shared by a card's output rows and the summaries that stand in
+/// for them.
+///
+/// It matches `.block-prompt-chevron`'s `margin-left`, so the chevron — the
+/// card's column zero — and the output's column zero share one edge, the way a
+/// prompt and its output do in a real terminal. Before this the output VTE sat
+/// at zero, hard against the status stripe and left of the chevron, while the
+/// collapsed summary and the image strip sat at 18px, so folding a card shifted
+/// its text sideways.
+///
+/// It costs the output VTE these pixels, which at typical cell widths is about
+/// one column. A finished card is already clamped to whatever width the pane
+/// offers it (`effective_render_cols`) and already re-wraps relative to the
+/// live surface, so this narrows an existing clamp rather than introducing one.
+const BLOCK_GUTTER_PX: i32 = 10;
+
 /// Late-bound action a card can be handed after construction. `None` until the
 /// pane that owns the card supplies it.
 type LateBoundAction = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 /// The same, held weakly: used where the holder must not keep the action (and
 /// through it the card's state) alive.
 type LateBoundWeakAction = Rc<RefCell<Option<std::rc::Weak<dyn Fn()>>>>;
+
+/// Fade a card's quick-action strip in or out without changing its allocation.
+///
+/// The strip must keep its width in both states: the header's hexpanding
+/// spacer sits immediately before the metadata run, so a strip that appears
+/// and disappears drags the timestamp, duration and exit badge sideways with
+/// it. Insensitive while faded so the invisible buttons take neither pointer
+/// nor keyboard focus.
+pub(crate) fn reveal_block_actions(action_box: &gtk4::Box, revealed: bool) {
+    action_box.set_opacity(if revealed { 1.0 } else { 0.0 });
+    action_box.set_sensitive(revealed);
+}
 
 /// Whether a key pressed inside a card's filter entry should close the filter.
 ///
@@ -1936,6 +1970,25 @@ impl FinishedBlock {
             }
         }
 
+        // Selected blocks behave like a lightweight navigation mode. Keep the
+        // available keyboard actions visible instead of making users memorize
+        // them.
+        //
+        // Placed BEFORE the spacer on purpose: appearing here eats the
+        // spacer's slack, while appearing after it would push the whole
+        // timestamp/duration/exit column sideways every time the selection
+        // moved.
+        let selection_hint = gtk4::Label::new(Some(SELECTION_HINT));
+        selection_hint.add_css_class("block-selection-hint");
+        selection_hint.set_visible(false);
+        selection_hint.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        // `max_width_chars` caps the label's NATURAL width, so a value below
+        // the hint's own length ellipsizes it in every pane, not just narrow
+        // ones — the old 38 hid "Esc cancel" permanently. Ask for the whole
+        // hint and let ellipsize handle genuinely narrow splits.
+        selection_hint.set_max_width_chars(SELECTION_HINT.chars().count() as i32);
+        header_row.append(&selection_hint);
+
         // Spacer
         let spacer = gtk4::Box::new(Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
@@ -1952,6 +2005,12 @@ impl FinishedBlock {
             let ts_label = gtk4::Label::new(Some(&label));
             ts_label.add_css_class("block-header-label");
             ts_label.set_tooltip_text(Some(&tooltip));
+            // Every other chip in this row ellipsizes; these did not, so in a
+            // narrow split the metadata run pushed the whole header wider than
+            // the pane instead of yielding. The tooltip already carries the
+            // full value.
+            ts_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            ts_label.set_max_width_chars(HEADER_META_MAX_CHARS);
             header_row.append(&ts_label);
         }
 
@@ -1959,6 +2018,8 @@ impl FinishedBlock {
         if let Some(dur_ms) = duration_ms {
             let dur_label = gtk4::Label::new(Some(&format_block_duration(dur_ms)));
             dur_label.add_css_class("block-meta-badge");
+            dur_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            dur_label.set_max_width_chars(HEADER_META_MAX_CHARS);
             header_row.append(&dur_label);
         }
 
@@ -1977,6 +2038,8 @@ impl FinishedBlock {
                     None => gtk4::Label::new(Some(&format!("exit:{code}"))),
                 };
                 badge.add_css_class("block-exit-bad");
+                badge.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                badge.set_max_width_chars(HEADER_META_MAX_CHARS);
                 header_row.append(&badge);
             }
             BlockOutcome::Interrupted(code) => {
@@ -1989,34 +2052,31 @@ impl FinishedBlock {
                     "128 + signal number: stopped by {signal}, not a command failure"
                 )));
                 badge.add_css_class("block-exit-interrupted");
+                badge.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                badge.set_max_width_chars(HEADER_META_MAX_CHARS);
                 header_row.append(&badge);
             }
             BlockOutcome::Unknown => {
                 let badge = gtk4::Label::new(Some("exit:?"));
                 badge.set_tooltip_text(Some(UNKNOWN_EXIT_TOOLTIP));
                 badge.add_css_class("block-exit-unknown");
+                badge.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                badge.set_max_width_chars(HEADER_META_MAX_CHARS);
                 header_row.append(&badge);
             }
             BlockOutcome::Success | BlockOutcome::Background => {}
         }
 
-        // Selected blocks behave like a lightweight navigation mode. Keep the
-        // available keyboard actions visible instead of making users memorize them.
-        let selection_hint = gtk4::Label::new(Some(SELECTION_HINT));
-        selection_hint.add_css_class("block-selection-hint");
-        selection_hint.set_visible(false);
-        selection_hint.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        // `max_width_chars` caps the label's NATURAL width, so a value below
-        // the hint's own length ellipsizes it in every pane, not just narrow
-        // ones — the old 38 hid "Esc cancel" permanently. Ask for the whole
-        // hint and let ellipsize handle genuinely narrow splits.
-        selection_hint.set_max_width_chars(SELECTION_HINT.chars().count() as i32);
-        header_row.append(&selection_hint);
-
-        // Quick-action buttons (hidden until the block is hovered). Handlers are
-        // wired by the caller, which has access to the clipboard + active block.
+        // Quick-action buttons, revealed on hover. The strip stays ALLOCATED at
+        // all times and only fades: hiding it let the header's hexpanding
+        // spacer grow, which slid the timestamp/duration/exit column sideways
+        // by the strip's whole width every time the pointer crossed a card —
+        // the metadata shimmered under the mouse in a way that made a long
+        // history hard to read. Insensitive while faded, so an invisible
+        // button can take neither a click nor Tab focus.
         let action_box = gtk4::Box::new(Orientation::Horizontal, 2);
-        action_box.set_visible(false);
+        action_box.set_opacity(0.0);
+        action_box.set_sensitive(false);
         // Small gap between the meta badges (timestamp/duration/exit) on the
         // right and the action button group, so they read as separate units
         // rather than one undifferentiated cluster.
@@ -2071,7 +2131,7 @@ impl FinishedBlock {
                 return;
             };
             outer_for_enter.add_css_class("block-hovered");
-            action_box_for_enter.set_visible(true);
+            reveal_block_actions(&action_box_for_enter, true);
         });
         let outer_for_leave = outer.downgrade();
         let action_box_for_leave = action_box.downgrade();
@@ -2084,7 +2144,7 @@ impl FinishedBlock {
             outer_for_leave.remove_css_class("block-hovered");
             // Only the active edge of a multi-selection owns persistent actions.
             if !outer_for_leave.has_css_class("block-selection-active") {
-                action_box_for_leave.set_visible(false);
+                reveal_block_actions(&action_box_for_leave, false);
             }
         });
         outer.add_controller(hover_ctrl);
@@ -2474,6 +2534,7 @@ impl FinishedBlock {
         // colors users see in regular VTE mode.
         let output_box = gtk4::Box::new(Orientation::Horizontal, 0);
         output_box.set_hexpand(true);
+        output_box.set_margin_start(BLOCK_GUTTER_PX);
         output_box.append(&output_vte);
         let output_scrollbar =
             gtk4::Scrollbar::new(Orientation::Vertical, output_vte.vadjustment().as_ref());
@@ -2510,7 +2571,7 @@ impl FinishedBlock {
         } else {
             let ib = gtk4::Box::new(Orientation::Vertical, 4);
             ib.add_css_class("block-images");
-            ib.set_margin_start(18);
+            ib.set_margin_start(BLOCK_GUTTER_PX);
             ib.set_margin_end(8);
             ib.set_margin_bottom(4);
             for tex in images {
@@ -2536,7 +2597,7 @@ impl FinishedBlock {
         collapsed_summary.add_css_class("block-output-summary");
         collapsed_summary.add_css_class("flat");
         collapsed_summary.set_halign(gtk4::Align::Start);
-        collapsed_summary.set_margin_start(18);
+        collapsed_summary.set_margin_start(BLOCK_GUTTER_PX);
         collapsed_summary.set_margin_end(8);
         collapsed_summary.set_margin_bottom(4);
         collapsed_summary.set_tooltip_text(Some("Show block output"));
@@ -3900,6 +3961,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The pointer crossing a card must not move its metadata. The quick-action
+    /// strip sits after the header's hexpanding spacer, so revealing it used to
+    /// steal that width and slide the timestamp, duration and exit badge
+    /// sideways by the strip's whole width — on every card the mouse passed
+    /// over.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn revealing_a_cards_actions_does_not_move_its_metadata() {
+        use gtk4::prelude::*;
+
+        gtk4::init().expect("gtk init");
+        let config = crate::config::Config::safe_defaults();
+        let card = super::FinishedBlock::new(
+            1,
+            "$ ",
+            "cargo test",
+            None,
+            "ok\r\n",
+            Some(1),
+            &config,
+            Some(1234),
+            Some(1_700_000_000_000),
+            Some("/home/user/project"),
+            80,
+        );
+
+        let faded = card.header_row.measure(gtk4::Orientation::Horizontal, -1);
+        super::reveal_block_actions(&card.action_box, true);
+        let revealed = card.header_row.measure(gtk4::Orientation::Horizontal, -1);
+
+        assert_eq!(
+            (faded.0, faded.1),
+            (revealed.0, revealed.1),
+            "the action strip must keep its allocation in both states"
+        );
+        assert!(card.action_box.is_sensitive());
+        super::reveal_block_actions(&card.action_box, false);
+        assert!(
+            !card.action_box.is_sensitive(),
+            "a faded strip must take neither a click nor Tab focus"
+        );
+    }
+
+    /// The selection hint appears and disappears as the active edge moves. It
+    /// belongs on the spacer's left, where showing it eats slack; on the right
+    /// it would push the whole metadata run sideways instead.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn the_selection_hint_sits_on_the_spacers_left() {
+        use gtk4::prelude::*;
+
+        gtk4::init().expect("gtk init");
+        let config = crate::config::Config::safe_defaults();
+        let card = super::FinishedBlock::new(
+            1,
+            "$ ",
+            "cargo test",
+            None,
+            "ok\r\n",
+            Some(0),
+            &config,
+            Some(5),
+            Some(1_700_000_000_000),
+            None,
+            80,
+        );
+
+        let mut hint_index = None;
+        let mut spacer_index = None;
+        let mut index = 0;
+        let mut child = card.header_row.first_child();
+        while let Some(widget) = child {
+            if widget == card.selection_hint.clone().upcast::<gtk4::Widget>() {
+                hint_index = Some(index);
+            } else if spacer_index.is_none() && widget.hexpands() {
+                spacer_index = Some(index);
+            }
+            child = widget.next_sibling();
+            index += 1;
+        }
+
+        let hint_index = hint_index.expect("the header carries a selection hint");
+        let spacer_index = spacer_index.expect("the header carries an expanding spacer");
+        assert!(
+            hint_index < spacer_index,
+            "hint at {hint_index} must precede the spacer at {spacer_index}"
+        );
     }
 
     /// The counter proof for the same change: when the caller already holds the

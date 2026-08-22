@@ -1136,6 +1136,7 @@ impl UiState {
                             &pattern,
                             is_regex,
                             hit.is_output,
+                            hit.occurrence,
                         );
                     }
                     CrossBlockJumpOutcome::KeepOpen => {

@@ -495,6 +495,30 @@ pub struct CrossBlockHit {
     pub line_no: usize,
     pub line_text: String,
     pub cmd_preview: String,
+    /// Zero-based index of this hit's FIRST match among all matches on this
+    /// record's surface, counted in reading order.
+    ///
+    /// The palette row shows a line number, but activating it used to install
+    /// the regex and step VTE's cursor exactly once from wherever its previous
+    /// jump had left it — so a row saying `out L482` landed on whatever hit
+    /// came next, and activating the same row twice walked forward through the
+    /// block. This is what turns the displayed line back into a position VTE
+    /// can be driven to. Counted in matches rather than lines because that is
+    /// what VTE's cursor steps over: one line can hold several.
+    pub occurrence: usize,
+}
+
+/// How many times a jump may step VTE's search cursor to reach the occurrence
+/// a palette row names.
+///
+/// PCRE2 stepping runs on the GTK main thread, so a record whose surface holds
+/// an enormous number of matches must not be able to stall the UI on one
+/// activation. Past the cap the jump lands on the surface's first hit, which
+/// still shows the right record — the row's own line number remains the honest
+/// description of where the match is.
+fn bounded_occurrence_steps(occurrence: usize) -> usize {
+    const MAX_JUMP_STEPS: usize = 4_096;
+    occurrence.saturating_add(1).min(MAX_JUMP_STEPS)
 }
 
 /// Trim a line to a reasonable display width — the palette row is one
@@ -1073,34 +1097,44 @@ impl TermView {
             let cmd_preview = command_preview(command);
 
             // Cmd surface — usually 1 line, but multiline commands exist.
+            // `occurrence` counts matches, not matching lines, because that is
+            // the unit VTE's search cursor advances by.
+            let mut occurrence = 0usize;
             for (ln_idx, line) in command.lines().enumerate() {
                 if hits.len() >= max_hits {
                     break;
                 }
-                if re.is_match(line) {
+                let matches = re.find_iter(line).count();
+                if matches > 0 {
                     hits.push(CrossBlockHit {
                         block_id: record.id(),
                         is_output: false,
                         line_no: ln_idx + 1,
                         line_text: snippet(line),
                         cmd_preview: cmd_preview.clone(),
+                        occurrence,
                     });
                 }
+                occurrence = occurrence.saturating_add(matches);
             }
 
+            let mut occurrence = 0usize;
             for (ln_idx, line) in record.output().unwrap_or("").lines().enumerate() {
                 if hits.len() >= max_hits {
                     break;
                 }
-                if re.is_match(line) {
+                let matches = re.find_iter(line).count();
+                if matches > 0 {
                     hits.push(CrossBlockHit {
                         block_id: record.id(),
                         is_output: true,
                         line_no: ln_idx + 1,
                         line_text: snippet(line),
                         cmd_preview: cmd_preview.clone(),
+                        occurrence,
                     });
                 }
+                occurrence = occurrence.saturating_add(matches);
             }
         }
         Ok(hits)
@@ -1227,17 +1261,23 @@ impl TermView {
         })
     }
 
-    /// Light up the chosen block's command/output VTE with a PCRE2 search
-    /// for `pattern` and advance its internal search cursor to the first
-    /// hit. Other blocks keep whatever highlight state they had — this is
-    /// the "jump to this hit" companion for `cross_block_search`. Returns
-    /// `false` when the id is unknown or the pattern can't compile.
+    /// Light up the chosen block's command/output VTE with a PCRE2 search for
+    /// `pattern` and put its internal search cursor on `occurrence` — the hit
+    /// the palette row the user activated actually names. Other blocks keep
+    /// whatever highlight state they had; this is the "jump to this hit"
+    /// companion for `cross_block_search`. Returns `false` when the id is
+    /// unknown or the pattern can't compile.
+    ///
+    /// The cursor is re-established from a cleared selection every time, so
+    /// activating one row repeatedly lands in the same place instead of
+    /// walking forward through the block.
     pub fn focus_match_in_block(
         &self,
         block_id: u64,
         pattern: &str,
         is_regex: bool,
         is_output: bool,
+        occurrence: usize,
     ) -> bool {
         if pattern.is_empty() {
             return false;
@@ -1262,9 +1302,21 @@ impl TermView {
             return false;
         };
         let vte = target.terminal;
+        // Start from nothing selected and refuse to wrap, so the step count
+        // below is measured from the top of the surface rather than from the
+        // previous jump's leftover cursor.
+        vte.unselect_all();
         vte.search_set_regex(Some(&vte_re), 0);
-        vte.search_set_wrap_around(true);
-        if !vte.search_find_next() {
+        vte.search_set_wrap_around(false);
+        let steps = bounded_occurrence_steps(occurrence);
+        let mut reached = false;
+        for _ in 0..steps {
+            if !vte.search_find_next() {
+                break;
+            }
+            reached = true;
+        }
+        if !reached {
             vte.search_set_regex(None::<&vte4::Regex>, 0);
             return false;
         }
@@ -1384,6 +1436,56 @@ mod tests {
             wrap_before: complete.then_some(0),
             render_stamp: crate::block_view::blocks::NEUTRAL_RENDER_STAMP,
         }
+    }
+
+    /// A palette row shows a line number, and activating it must land there.
+    /// The jump drives VTE's cursor by stepping, and VTE steps over MATCHES,
+    /// so a row's position has to be counted in matches — a line holding three
+    /// of them advances the cursor three times, not once.
+    #[test]
+    fn a_cross_block_hit_counts_matches_not_matching_lines() {
+        let re = regex::RegexBuilder::new("ab")
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        let surface = "ab
+nothing
+ab ab ab
+tail ab";
+
+        let mut occurrence = 0usize;
+        let mut hits = Vec::new();
+        for (index, line) in surface.lines().enumerate() {
+            let matches = re.find_iter(line).count();
+            if matches > 0 {
+                hits.push((index + 1, occurrence));
+            }
+            occurrence += matches;
+        }
+
+        assert_eq!(
+            hits,
+            vec![(1, 0), (3, 1), (4, 4)],
+            "each hit names the index of the FIRST match on its line"
+        );
+        assert_eq!(occurrence, 5, "five matches across the surface");
+    }
+
+    /// Stepping runs on the GTK main thread, so one activation must not be
+    /// able to walk an unbounded number of matches.
+    #[test]
+    fn a_jump_bounds_how_far_it_will_step() {
+        assert_eq!(
+            super::bounded_occurrence_steps(0),
+            1,
+            "the first hit is one step"
+        );
+        assert_eq!(super::bounded_occurrence_steps(41), 42);
+        assert_eq!(
+            super::bounded_occurrence_steps(usize::MAX),
+            4_096,
+            "a pathological surface falls back to the cap, not to a stall"
+        );
     }
 
     /// A card that was re-fed or re-windowed since the pass scanned it can no

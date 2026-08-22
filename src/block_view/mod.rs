@@ -2340,11 +2340,11 @@ fn sync_finished_block_selection(
         block.selection_hint.set_visible(is_active);
         if is_active {
             block.widget().add_css_class("block-selection-active");
-            block.action_box.set_visible(true);
+            blocks::reveal_block_actions(&block.action_box, true);
         } else {
             block.widget().remove_css_class("block-selection-active");
             if !block.widget().has_css_class("block-hovered") {
-                block.action_box.set_visible(false);
+                blocks::reveal_block_actions(&block.action_box, false);
             }
         }
     }

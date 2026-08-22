@@ -160,6 +160,8 @@ jobs:
             block_view::tests::entering_alt_screen_ends_the_block_selection_it_hides
             block_view::css::tests::the_generated_stylesheet_parses_without_error
             block_view::tests::a_stranded_focus_mount_declines_only_what_the_focused_widget_owns
+            block_view::blocks::tests::revealing_a_cards_actions_does_not_move_its_metadata
+            block_view::blocks::tests::the_selection_hint_sits_on_the_spacers_left
           "
           for test in $tests; do
             dbus-run-session -- \
