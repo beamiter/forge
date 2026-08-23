@@ -6,6 +6,15 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- 四个一直叫 "Filter" 的动作终于真的在过滤。`apply_failed_filter` 之流此前全是纯跳转，
+  `clear_block_filter` 就是滚到顶，而过滤引擎 `matching_record_ids` 挂着 `#[allow(dead_code)]`
+  从没被用过——三百条命令之后，一次一跳并不是看清发生了什么的方式。
+  **Show only failed / slow / bookmarked blocks** 现在收窄整个块流：不匹配的卡片整体隐藏，
+  并且记录高度归零，所以虚拟画布跟着缩短而不是留下一片空白；`Up/Down` 选择跳过它们，
+  `Ctrl+Shift+A` 只选可见的，落在隐藏卡片上的选择会被清除；过滤期间新完成的命令在挂载时就地
+  判定一次，不匹配就不会冒出来。**Show all blocks** 恢复全部（没有过滤时保持原来的
+  「跳到最早的块」）。被信号停止的命令不算失败，因此不会出现在 failed 过滤里。
+  逐个跳转仍由 `Ctrl+Shift+X` / 书签跳转负责，动作名相应改成 "Show only …" / "Show all blocks"。
 - 折叠终于能批量操作：命令面板新增 **Collapse all blocks** / **Expand all blocks** /
   **Collapse or expand block**（后者作用于选中块，没有选中时作用于最新块）。此前折叠只存在于
   每张卡片自己的 chevron 上——TermView 根本够不着它——所以整理一段两百条命令的会话意味着

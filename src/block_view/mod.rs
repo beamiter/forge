@@ -409,6 +409,12 @@ fn running_header_label(command: &str, elapsed_secs: u64) -> String {
     }
 }
 
+/// What "slow" means for the Slow filter and the slow-block jump.
+///
+/// One constant so the filter and the navigation cannot disagree about which
+/// cards they are talking about.
+const SLOW_BLOCK_THRESHOLD_MS: u64 = 1_000;
+
 /// A card's virtualization height for the folded state it is in.
 ///
 /// A folded card shows its header and command and nothing else, so its
@@ -1759,6 +1765,35 @@ fn take_stash_for_undo<T>(stash: &mut Vec<T>, fullscreen: bool) -> Vec<T> {
     }
 }
 
+/// A narrowing applied to the whole card stream.
+///
+/// The four `Filter*` actions have always been named for this and have always
+/// only jumped: `apply_failed_filter` and friends were pure navigation and
+/// `clear_block_filter` was a scroll to the top, while the filter engine
+/// (`matching_record_ids`) sat unused behind `#[allow(dead_code)]`. After three
+/// hundred commands, stepping one jump at a time is not a way to see what
+/// happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockFilterKind {
+    /// Commands that genuinely failed. Interrupted ones are excluded, for the
+    /// same reason they carry no failure stripe: the user stopped them.
+    Failed,
+    /// Commands at or above the slow threshold.
+    Slow,
+    /// Bookmarked cards.
+    Bookmarked,
+}
+
+impl BlockFilterKind {
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::Failed => "failed",
+            Self::Slow => "slow",
+            Self::Bookmarked => "bookmarked",
+        }
+    }
+}
+
 /// What the last removal took, and therefore how Undo has to put it back.
 ///
 /// Clear-all removes a prefix (everything), so restoring is a prepend and the
@@ -2684,6 +2719,42 @@ fn scroll_history_to_edge(scroll: &ScrolledWindow, bottom: bool) {
     });
 }
 
+/// The cards a selection may land on: the ones the pane is actually showing.
+///
+/// With a filter applied, walking raw indices would step onto hidden cards and
+/// give the keyboard an invisible active edge — the same hazard the alt-screen
+/// guards exist to prevent.
+fn selectable_positions(finished: &[FinishedBlock]) -> Vec<usize> {
+    finished
+        .iter()
+        .enumerate()
+        .filter(|(_, card)| !card.is_filtered_out())
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Step one place through `positions`, in `direction`, from the place holding
+/// `current`. `None` current means "enter from the end" going up, and refuses
+/// going down.
+fn step_selectable(positions: &[usize], current: Option<usize>, direction: i32) -> Option<usize> {
+    if positions.is_empty() {
+        return None;
+    }
+    let here = current.and_then(|index| positions.iter().position(|slot| *slot == index));
+    if direction < 0 {
+        match here {
+            None => positions.last().copied(),
+            Some(0) => positions.first().copied(),
+            Some(index) => positions.get(index - 1).copied(),
+        }
+    } else {
+        match here {
+            None => None,
+            Some(index) => positions.get(index + 1).copied(),
+        }
+    }
+}
+
 fn move_finished_block_selection(
     finished: &[FinishedBlock],
     selected_block_ids: &SelectedBlockIds,
@@ -2698,19 +2769,14 @@ fn move_finished_block_selection(
     let current = selected_block_id
         .get()
         .and_then(|id| finished.iter().position(|block| block.id == id));
-    let target = if direction < 0 {
-        match current {
-            None => Some(finished.len() - 1),
-            Some(0) => Some(0),
-            Some(index) => Some(index - 1),
-        }
-    } else {
-        match current {
-            None => return false,
-            Some(index) if index + 1 >= finished.len() => None,
-            Some(index) => Some(index + 1),
-        }
-    };
+    let positions = selectable_positions(finished);
+    if positions.is_empty() {
+        return false;
+    }
+    if direction > 0 && current.is_none() {
+        return false;
+    }
+    let target = step_selectable(&positions, current, direction);
     let target_id = target.and_then(|index| finished.get(index).map(|block| block.id));
     replace_finished_block_selection(
         finished,
@@ -2744,11 +2810,8 @@ fn extend_finished_block_selection(
     else {
         return false;
     };
-    let target = if direction < 0 {
-        current.saturating_sub(1)
-    } else {
-        (current + 1).min(finished.len() - 1)
-    };
+    let positions = selectable_positions(finished);
+    let target = step_selectable(&positions, Some(current), direction).unwrap_or(current);
     let Some(block) = finished.get(target) else {
         return false;
     };
@@ -4441,6 +4504,10 @@ pub struct TermView {
     /// happens inside the key handler and the card menu while Undo is a
     /// `TermView` action.
     removed_blocks: Rc<RefCell<Option<RemovedBlocks>>>,
+    /// The narrowing applied to the card stream, if any. Shared with the
+    /// backend so a card minted or rebuilt while a filter is on is tested
+    /// once, as it is mounted, rather than by rescanning the whole document.
+    block_filter: Rc<Cell<Option<BlockFilterKind>>>,
     finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
     /// Current OSC 10/11/12 overrides, also applied to restored snapshots.
     dynamic_colors: Rc<Cell<DynamicColors>>,
@@ -5520,6 +5587,9 @@ struct BlockBackend {
     /// Undo's single-level slot, shared with `TermView`: the card menu's
     /// Delete writes what it took here.
     removed_blocks_for_cb: Rc<RefCell<Option<RemovedBlocks>>>,
+    /// The pane's narrowing, read when a freshly finished card is mounted so it
+    /// does not appear in a stream the user narrowed away from it.
+    block_filter_for_cb: Rc<Cell<Option<BlockFilterKind>>>,
     /// Menu-only ("Ask AI about this block"); the block-finished and
     /// agent-execution-lost fan-outs are engine policy and live on
     /// [`ReaderCtx`] alone.
@@ -7712,6 +7782,24 @@ impl RenderBackend for BlockBackend {
         );
         finished_clone.connect_scroll_forwarding(&self.block_scroll_rc, &self.scroll_debouncer);
 
+        // A card minted into a narrowed stream is tested once, here. A failure
+        // filter that started showing successes again the moment one finished
+        // would not be a filter.
+        if let Some(kind) = self.block_filter_for_cb.get() {
+            let belongs = match kind {
+                BlockFilterKind::Bookmarked => {
+                    self.bookmarks_for_cb.borrow().contains(&finished_clone.id)
+                }
+                BlockFilterKind::Failed => {
+                    BlockOutcome::classify(Some(cmd), record.exit_code).is_failure()
+                }
+                BlockFilterKind::Slow => record
+                    .duration_ms
+                    .is_some_and(|ms| ms >= SLOW_BLOCK_THRESHOLD_MS),
+            };
+            finished_clone.set_filtered_out(!belongs);
+        }
+
         self.finished_blocks_for_cb.borrow_mut().push(finished);
 
         let notification_threshold = {
@@ -9293,8 +9381,10 @@ fn exit_fullscreen(
     let _visible = visible_indices.borrow();
     for block in finished.borrow().iter() {
         // The outer placeholder remains part of the history document; each card's
-        // content remembers whether virtual scrolling had unmapped it.
-        block.widget().set_visible(true);
+        // content remembers whether virtual scrolling had unmapped it. A card the
+        // pane's filter is hiding stays hidden: the alt-screen app borrowed the
+        // viewport, it did not clear the filter.
+        block.widget().set_visible(!block.is_filtered_out());
     }
 }
 
@@ -10449,6 +10539,9 @@ impl TermView {
         // happens inside the key handler and the card menu), read by
         // `undo_clear_blocks`.
         let removed_blocks: Rc<RefCell<Option<RemovedBlocks>>> = Rc::new(RefCell::new(None));
+        // The pane-level narrowing. Shared with the backend so a newly minted
+        // card is tested as it is mounted.
+        let block_filter: Rc<Cell<Option<BlockFilterKind>>> = Rc::new(Cell::new(None));
 
         let failure_marker_redraw: FailureMarkerRedraw = {
             let failure_markers = failure_markers.downgrade();
@@ -11053,6 +11146,7 @@ impl TermView {
                     widget_pool_for_cb,
                     find_state_for_cb: find_state.clone(),
                     removed_blocks_for_cb: removed_blocks.clone(),
+                    block_filter_for_cb: block_filter.clone(),
                     visible_indices_rc,
                     fullscreen_rc,
                     selected_block_ids_rc: selected_block_ids.clone(),
@@ -12053,6 +12147,7 @@ impl TermView {
             block_data: block_data_rc,
             failure_marker_redraw,
             removed_blocks: removed_blocks.clone(),
+            block_filter: block_filter.clone(),
             finished_blocks: finished_blocks_rc,
             dynamic_colors,
             widget_pool: widget_pool.clone(),
@@ -12501,6 +12596,11 @@ impl TermView {
     /// from happening again. Safe on a pooled widget: `WidgetPool::release`
     /// strips the previous card's controllers before the box is reused.
     fn mount_rebuilt_block(&self, finished: &FinishedBlock) {
+        // A card rebuilt into a narrowed stream is tested once, here, rather
+        // than by rescanning the document on the next visibility pass.
+        if let Some(kind) = self.block_filter.get() {
+            finished.set_filtered_out(!self.block_matches_filter(kind, finished.id));
+        }
         finished.connect_actions(
             &self.active_vte,
             &self.pty,
@@ -13237,16 +13337,24 @@ impl TermView {
         }
         self.cross_selection.clear_all();
         let finished = self.finished_blocks.borrow();
-        let (Some(first), Some(last)) = (finished.first(), finished.last()) else {
+        // Only what the pane is showing: "select all" of a narrowed stream means
+        // the cards on screen, not the ones the filter hid — and the range's two
+        // ends have to be visible cards too.
+        let shown: Vec<u64> = finished
+            .iter()
+            .filter(|block| !block.is_filtered_out())
+            .map(|block| block.id)
+            .collect();
+        let (Some(first), Some(last)) = (shown.first().copied(), shown.last().copied()) else {
             return;
         };
         {
             let mut selected = self.selected_block_ids.borrow_mut();
             selected.clear();
-            selected.extend(finished.iter().map(|block| block.id));
+            selected.extend(shown.iter().copied());
         }
-        self.selection_anchor_id.set(Some(first.id));
-        self.selected_block_id.set(Some(last.id));
+        self.selection_anchor_id.set(Some(first));
+        self.selected_block_id.set(Some(last));
         sync_finished_block_selection(&finished, &self.selected_block_ids, &self.selected_block_id);
         self.active.borrow().grab_focus();
     }
@@ -13618,6 +13726,117 @@ impl TermView {
         restored_len
     }
 
+    /// Whether a card belongs in the stream under `kind`.
+    fn block_matches_filter(&self, kind: BlockFilterKind, block_id: u64) -> bool {
+        match kind {
+            BlockFilterKind::Bookmarked => self.bookmarks.borrow().contains(&block_id),
+            BlockFilterKind::Failed => self.get_failed_blocks().contains(&block_id),
+            BlockFilterKind::Slow => self
+                .get_slow_blocks(SLOW_BLOCK_THRESHOLD_MS)
+                .contains(&block_id),
+        }
+    }
+
+    /// Narrow the card stream to `kind`, returning how many of how many cards
+    /// remain — or `None` when the pane keeps no cards to narrow.
+    ///
+    /// A hidden card contributes no height: its widget is hidden outright, and
+    /// its recorded height goes to zero so the virtualization canvas shrinks
+    /// with it. Leaving the heights alone would keep the scrollbar describing
+    /// output the pane is no longer showing.
+    pub(crate) fn apply_block_filter(&self, kind: BlockFilterKind) -> Option<(usize, usize)> {
+        if self.fullscreen.get() || !self.render_backend.supports_block_mutation() {
+            return None;
+        }
+        let matching: std::collections::HashSet<u64> = match kind {
+            BlockFilterKind::Bookmarked => self.bookmarks.borrow().iter().copied().collect(),
+            BlockFilterKind::Failed => self.get_failed_blocks().into_iter().collect(),
+            BlockFilterKind::Slow => self
+                .get_slow_blocks(SLOW_BLOCK_THRESHOLD_MS)
+                .into_iter()
+                .collect(),
+        };
+        self.block_filter.set(Some(kind));
+        let (shown, total) = self.apply_filter_visibility(|id| matching.contains(&id));
+        // A selection left on a hidden card would give the keyboard an invisible
+        // active edge, exactly what the alt-screen guards exist to prevent.
+        self.drop_selection_outside_filter();
+        self.refresh_filtered_layout();
+        (total > 0).then_some((shown, total))
+    }
+
+    /// Show the whole stream again.
+    pub fn clear_block_filter(&self) {
+        if self.block_filter.take().is_none() {
+            // No narrowing to clear: keep the historical meaning of this action
+            // and take the user to the oldest card.
+            self.scroll_to_block(0);
+            return;
+        }
+        self.apply_filter_visibility(|_| true);
+        self.refresh_filtered_layout();
+    }
+
+    /// Apply `keep` to every card, returning (kept, total).
+    ///
+    /// The zeroed heights are in-memory only in effect: a snapshot written
+    /// while a filter is on carries them, and `apply_loaded_history` recomputes
+    /// every restored card's height from its text, so a restart cannot inherit
+    /// a collapsed canvas from a filter that is no longer applied.
+    fn apply_filter_visibility(&self, keep: impl Fn(u64) -> bool) -> (usize, usize) {
+        let finished = self.finished_blocks.borrow();
+        let config = self.config.borrow();
+        let fallback_cols = self.active.borrow().grid_cols() as i64;
+        let mut block_data = self.block_data.borrow_mut();
+        let mut shown = 0usize;
+        for (index, card) in finished.iter().enumerate() {
+            let kept = keep(card.id);
+            if kept {
+                shown += 1;
+            }
+            card.set_filtered_out(!kept);
+            let Some(data) = block_data.get_mut(index) else {
+                continue;
+            };
+            data.estimated_height = if kept {
+                collapsed_aware_block_height(&config, data, card.is_collapsed(), fallback_cols)
+            } else {
+                0
+            };
+        }
+        (shown, finished.len())
+    }
+
+    /// Drop any selected card the current filter is hiding.
+    fn drop_selection_outside_filter(&self) {
+        let finished = self.finished_blocks.borrow();
+        let hidden: Vec<u64> = finished
+            .iter()
+            .filter(|card| card.is_filtered_out())
+            .map(|card| card.id)
+            .collect();
+        if hidden.is_empty() {
+            return;
+        }
+        remove_finished_blocks_from_selection(
+            &finished,
+            &self.selected_block_ids,
+            &self.selected_block_id,
+            &self.selection_anchor_id,
+            &hidden,
+        );
+    }
+
+    /// One layout pass after a filter change, not one per card.
+    fn refresh_filtered_layout(&self) {
+        self.clear_find();
+        (self.failure_marker_redraw)();
+        self.visible_indices.borrow_mut().clear();
+        self.update_viewport();
+        self.update_block_visibility();
+        self.block_list.queue_allocate();
+    }
+
     pub(crate) fn apply_failed_filter(&self) -> RecordNavigationResult {
         let Some(record_id) = self.get_failed_blocks().first().copied() else {
             return RecordNavigationResult::NoMatchingRecord;
@@ -13626,7 +13845,11 @@ impl TermView {
     }
 
     pub(crate) fn apply_slow_filter(&self) -> RecordNavigationResult {
-        let Some(record_id) = self.get_slow_blocks(1000).first().copied() else {
+        let Some(record_id) = self
+            .get_slow_blocks(SLOW_BLOCK_THRESHOLD_MS)
+            .first()
+            .copied()
+        else {
             return RecordNavigationResult::NoMatchingRecord;
         };
         self.navigate_to_record_id(record_id, false)
@@ -13644,10 +13867,6 @@ impl TermView {
             drop(finished);
             self.scroll_to_block(idx);
         }
-    }
-
-    pub fn clear_block_filter(&self) {
-        self.scroll_to_block(0);
     }
 
     pub fn jump_to_pinned(&self, direction: i32) {
@@ -13783,7 +14002,7 @@ impl TermView {
         let finished_len = self.finished_blocks.borrow().len();
         let block_data_len = self.block_data.borrow().len();
         let failed = self.get_failed_blocks().len();
-        let slow = self.get_slow_blocks(1000).len();
+        let slow = self.get_slow_blocks(SLOW_BLOCK_THRESHOLD_MS).len();
         let total_output_bytes: usize = self
             .block_data
             .borrow()
@@ -14416,6 +14635,37 @@ mod tests {
             document.insert(position, id);
         }
         assert_eq!(document, vec![10, 15, 16, 20, 25, 30]);
+    }
+
+    /// With a filter on, Up/Down must walk the cards the pane is showing. Raw
+    /// index arithmetic would step onto hidden ones and give the keyboard an
+    /// active edge nobody can see.
+    #[test]
+    fn selection_steps_over_the_cards_a_filter_hid() {
+        // Cards 0..6 with 1, 3 and 4 hidden by a filter.
+        let shown = [0_usize, 2, 5, 6];
+
+        // Entering from nothing, going up, lands on the newest SHOWN card.
+        assert_eq!(super::step_selectable(&shown, None, -1), Some(6));
+        // Going down with nothing selected refuses, as it always has.
+        assert_eq!(super::step_selectable(&shown, None, 1), None);
+
+        // Stepping skips the hidden run rather than landing in it.
+        assert_eq!(super::step_selectable(&shown, Some(5), -1), Some(2));
+        assert_eq!(super::step_selectable(&shown, Some(2), -1), Some(0));
+        assert_eq!(super::step_selectable(&shown, Some(2), 1), Some(5));
+
+        // The ends hold: up at the oldest stays, down at the newest stops.
+        assert_eq!(super::step_selectable(&shown, Some(0), -1), Some(0));
+        assert_eq!(super::step_selectable(&shown, Some(6), 1), None);
+
+        // A current position that is itself hidden is not on the walk, so it
+        // behaves like entering fresh.
+        assert_eq!(super::step_selectable(&shown, Some(3), -1), Some(6));
+
+        // Nothing shown: nothing to step to, in either direction.
+        assert_eq!(super::step_selectable(&[], None, -1), None);
+        assert_eq!(super::step_selectable(&[], Some(0), 1), None);
     }
 
     /// Folding has to shrink the card's recorded height as well as hide its

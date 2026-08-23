@@ -663,6 +663,14 @@ pub(crate) struct FinishedBlock {
     /// signal that is also correct for image-only cards, whose output VTE stays
     /// hidden while expanded.
     collapsed_summary: gtk4::Button,
+    /// Hidden because the pane is narrowed to a subset of the stream.
+    ///
+    /// Distinct from virtualization (which hides a card's content while keeping
+    /// a measured placeholder, so the document keeps its size) and from the
+    /// alt-screen hand-off (which hides everything temporarily): a filtered-out
+    /// card must contribute no height at all, and must stay hidden when the
+    /// alt-screen app gives the viewport back.
+    filtered_out: Rc<Cell<bool>>,
     /// Late-bound "hand keyboard focus back to the live prompt" action.
     /// The card is built before it knows which pane owns it, so
     /// [`FinishedBlock::connect_actions`] fills this in. Used when the filter
@@ -729,6 +737,7 @@ impl Clone for FinishedBlock {
             toggle_filter: self.toggle_filter.clone(),
             set_collapsed: self.set_collapsed.clone(),
             collapsed_summary: self.collapsed_summary.clone(),
+            filtered_out: self.filtered_out.clone(),
             restore_live_focus: self.restore_live_focus.clone(),
             refit_output: self.refit_output.clone(),
             visual_rows_cache: self.visual_rows_cache.clone(),
@@ -3157,6 +3166,7 @@ impl FinishedBlock {
             toggle_filter,
             set_collapsed,
             collapsed_summary,
+            filtered_out: Rc::new(Cell::new(false)),
             restore_live_focus,
             refit_output,
             visual_rows_cache,
@@ -3203,6 +3213,28 @@ impl FinishedBlock {
             self.widget.set_height_request(-1);
             self.virtualized_height.get().max(1)
         }
+    }
+
+    /// Whether a pane-level filter is hiding this card.
+    pub(crate) fn is_filtered_out(&self) -> bool {
+        self.filtered_out.get()
+    }
+
+    /// Hide or show this card for a pane-level filter, reporting whether
+    /// anything moved.
+    ///
+    /// Sets the OUTER widget's visibility, which is what makes the card
+    /// contribute nothing to the document — a virtualized card still holds a
+    /// measured placeholder, and that is the difference between "off-screen"
+    /// and "filtered away".
+    pub(crate) fn set_filtered_out(&self, filtered_out: bool) -> bool {
+        use gtk4::prelude::WidgetExt as _;
+
+        if self.filtered_out.replace(filtered_out) == filtered_out {
+            return false;
+        }
+        self.widget.set_visible(!filtered_out);
+        true
     }
 
     /// Whether this card's output is folded away.

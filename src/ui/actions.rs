@@ -1,4 +1,5 @@
 //! actions — UiState methods extracted from ui (mechanical split, no logic changes)
+use crate::block_view::BlockFilterKind;
 use adw::prelude::*;
 use gtk4::glib;
 use gtk4::Orientation;
@@ -339,26 +340,35 @@ impl UiState {
             Action::ToggleTabPlacement => {
                 self.toggle_tab_placement();
             }
-            Action::FilterFailedBlocks => {
-                log::info!("Jump to first failed block");
+            Action::FilterFailedBlocks | Action::FilterSlowBlocks | Action::FilterPinnedBlocks => {
+                let kind = match action {
+                    Action::FilterSlowBlocks => BlockFilterKind::Slow,
+                    Action::FilterPinnedBlocks => BlockFilterKind::Bookmarked,
+                    _ => BlockFilterKind::Failed,
+                };
+                log::info!("Narrow blocks to {kind:?}");
                 if let Some(term_view) = self.current_term_view() {
-                    self.report_record_navigation(term_view.apply_failed_filter());
-                }
-            }
-            Action::FilterSlowBlocks => {
-                log::info!("Jump to first slow block");
-                if let Some(term_view) = self.current_term_view() {
-                    self.report_record_navigation(term_view.apply_slow_filter());
-                }
-            }
-            Action::FilterPinnedBlocks => {
-                log::info!("Jump to first bookmarked block");
-                if let Some(term_view) = self.current_term_view() {
-                    term_view.apply_pinned_filter();
+                    match term_view.apply_block_filter(kind) {
+                        Some((0, _)) => {
+                            // Nothing matched, so the pane would go blank. Say so
+                            // and leave the stream as it was.
+                            term_view.clear_block_filter();
+                            self.toast_overlay.add_toast(adw::Toast::new(&format!(
+                                "No {} blocks in this pane.",
+                                kind.describe()
+                            )));
+                        }
+                        Some((shown, total)) => {
+                            self.toast_overlay.add_toast(adw::Toast::new(&format!(
+                                "Showing {shown} of {total} blocks — \"Show all blocks\" restores the rest."
+                            )));
+                        }
+                        None => {}
+                    }
                 }
             }
             Action::ClearBlockFilter => {
-                log::info!("Jump to oldest block");
+                log::info!("Show all blocks");
                 if let Some(term_view) = self.current_term_view() {
                     term_view.clear_block_filter();
                 }

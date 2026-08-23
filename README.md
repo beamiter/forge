@@ -306,6 +306,10 @@ Block 模式与 anvil 保持相同的选择语义：`Ctrl+Up` 从最新块进入
 `Delete` 删除**整个选区**（不只是 active edge），并且可撤销：命令面板里的
 **Undo removing blocks** 把它们放回按 id 该在的位置——即使期间又跑过新命令，删掉的块也回到
 中间而不是被塞到最前面。撤销槽是单级的：一次新的移除（删除或清空）会替换掉上一次。
+**Show only failed blocks** / **Show only slow blocks** / **Show only bookmarked blocks** 会真正
+收窄块流：不匹配的卡片被隐藏且不再占据虚拟画布高度（滚动条随之变短），选择用的方向键会跳过
+它们，过滤期间新完成的命令若不匹配也不会冒出来；**Show all blocks** 恢复全部。被信号停止的
+命令不算失败，因此不会出现在 failed 过滤里。
 **Collapse all blocks** / **Expand all blocks** / **Collapse or expand block** 同样在命令面板里，
 用于快速收拢一长串输出；这三个和 Undo 一样默认不占快捷键，可在 `[keybindings]` 里自行绑定
 （`collapse_all_blocks`、`expand_all_blocks`、`toggle_block_collapsed`、`undo_clear_blocks`）。

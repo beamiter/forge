@@ -345,6 +345,11 @@ reducer、不新增落盘字段；repo 无法验证或身份切换中时使用�
 - `Delete` 删除整个选区，一次按键即可移除用 `Shift+Up/Down` 建立的整段范围；命令面板中的
   **Undo removing blocks** 把它们放回按 id 该在的位置，因此期间新跑的命令不会把恢复的块挤到
   最前面。撤销槽是单级的：删除和清空共用它，新的一次移除会替换上一次。
+- **Show only failed blocks** / **Show only slow blocks**（≥1s）/ **Show only bookmarked blocks**
+  把块流收窄到匹配的卡片：不匹配的被隐藏且不再占据虚拟画布高度，`Up/Down` 选择会跳过它们，
+  `Ctrl+Shift+A` 只选中可见的，过滤期间新完成且不匹配的命令也不会出现。**Show all blocks** 恢复
+  全部（没有过滤时它保持原来的「跳到最早的块」含义）。被信号停止的命令不计入 failed。
+  逐个跳转仍由 `Ctrl+Shift+X` 和书签跳转负责。
 - **Collapse all blocks** / **Expand all blocks** 一次收起或展开全部完成块的输出，
   **Collapse or expand block** 只作用于选中块（没有选中时作用于最新块）。折叠会同时缩小该块在
   虚拟画布上的高度，因此滚动条长度与实际内容一致。这三个动作和 Undo 一样默认不占快捷键，

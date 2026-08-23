@@ -40,6 +40,11 @@ seq 1 300
 - **右键多选**：检查 `Copy Commands`、`Copy Outputs`、`Copy Blocks`、`Insert Commands at Prompt` 的顺序与内容。
 - **右键块操作**：检查 `Scroll to Top of Block`、`Jump to Bottom of Block`、输出过滤以及 `Bookmark Block` / `Remove Bookmark`。
 - **清空**：`Ctrl+Shift+K` 同时清除块、选择、书签、搜索、未读徽标、虚拟滚动范围与持久化历史；当前提示符仍可输入。
+- **收窄块流**：制造成功、失败、被中断（exit 130）各若干后执行 **Show only failed blocks**：
+  只剩真正失败的卡片，中断的和成功的都消失，滚动条随之变短且没有残留空白；此时再跑一条成功命令，
+  它**不得**出现。`Up/Down` 只在可见卡片间移动，`Ctrl+Shift+A` 只选中可见的。
+  **Show all blocks** 必须完整恢复（含过滤期间产生的那条）。没有过滤时 **Show all blocks**
+  保持「跳到最早的块」。进入 alt-screen 再退出，被过滤掉的卡片必须仍然隐藏。
 - **批量折叠**：制造若干条有输出的命令后，用命令面板执行 **Collapse all blocks**：
   每张卡片都只剩 header + 命令 + "N lines hidden" 摘要，chevron 变为 `▶`，
   滚动条长度必须随之缩短（不能留下没有内容的空白）。**Expand all blocks** 应完整还原。
