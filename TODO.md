@@ -11,9 +11,10 @@
 
 ## P2 · 正确性与体验
 
-- [ ] Finished VTE 因 resize、filter、expand 或重新渲染而 reset 时统一使 `FindState` 失效，避免旧 cursor/count 继续导航。
+- [x] Finished VTE 因 resize、filter、expand 或重新渲染而 reset 时统一使 `FindState` 失效；每个 surface 记录 render stamp，连单命中/边界不移动的导航也会先校验并用保留查询重建。
 - [ ] 对齐 live block 的搜索数据源与 VTE 实际缓冲区，避免 prompt、command 和保留 scrollback 导致 Rust 计数与 PCRE2 选中项错位。
-- [ ] 跨块搜索记录 surface 内 occurrence/line，并移到可取消 worker；选择第 N 个结果必须定位到第 N 个命中，扫描不得阻塞 GTK 主线程。
+- [x] 跨块搜索记录 surface 内 occurrence/line，选择结果会从 surface 顶部精确步进到对应命中；超过 4096 步或中途耗尽时 fail closed，不再高亮较早的错误命中。
+- [ ] 将跨块搜索扫描移到可取消 worker，避免大历史扫描阻塞 GTK 主线程。
 - [ ] 为 per-session history 设计可证明所有权的安全 GC：依据 state manifest 与 active/restorable session 集合清理；禁止恢复基于文件名或 mtime 的猜测式删除。
 - [ ] 当 history 因预算、损坏或 revision 冲突进入 fail-closed 时提供明确的 Reload/Retry 入口和持久状态提示。
 - [ ] 文件树根目录或子目录扫描失败时显示可聚焦错误、Retry 与 toast，区分空目录和权限/I/O 错误。

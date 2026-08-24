@@ -327,6 +327,18 @@ fn normalize_loaded_block_ids(blocks: &mut VecDeque<BlockData>, counter: &Atomic
     repaired
 }
 
+/// Height a card contributes to the filtered document. Zero is intentional:
+/// pane-level filtering hides the outer widget and removes that card from the
+/// scroll geometry. Other non-positive values are defensive legacy/corruption
+/// fallbacks and retain the historical one-pixel floor.
+fn block_document_height(estimated_height: i32) -> i32 {
+    if estimated_height == 0 {
+        0
+    } else {
+        estimated_height.max(1)
+    }
+}
+
 /// Approximate each failed command's vertical position on the complete history
 /// track. Keep only the newest marks so an unusually long retained session
 /// cannot turn one tiny Cairo overlay into unbounded draw work.
@@ -336,13 +348,13 @@ fn failure_marker_fractions_from(records: impl IntoIterator<Item = (u64, bool)>)
     let mut total_height = 0_u64;
     let mut marker_tops = VecDeque::new();
     for (height, failed) in records {
-        if failed {
+        if failed && height > 0 {
             if marker_tops.len() == MAX_FAILURE_MARKERS {
                 marker_tops.pop_front();
             }
             marker_tops.push_back(total_height);
         }
-        total_height = total_height.saturating_add(height.max(1));
+        total_height = total_height.saturating_add(height);
     }
     if total_height == 0 {
         return Vec::new();
@@ -357,7 +369,7 @@ fn failure_marker_fractions_from(records: impl IntoIterator<Item = (u64, bool)>)
 fn failed_block_marker_fractions(blocks: &VecDeque<BlockData>) -> Vec<f64> {
     failure_marker_fractions_from(blocks.iter().map(|block| {
         (
-            block.estimated_height.max(1) as u64,
+            block_document_height(block.estimated_height) as u64,
             // Forge's own outcome, not the shared contract's: a command the
             // user stopped is not a failure, and ticking the scrollbar for
             // every `top` and `tail -f` they left buries the real ones.
@@ -1794,6 +1806,29 @@ impl BlockFilterKind {
     }
 }
 
+/// Toggle one bookmark and report both its new membership and, when the pane
+/// is narrowed to bookmarks, whether its card belongs in the visible stream.
+/// Keeping this transition pure makes the menu and keyboard entry points share
+/// exactly the same filter semantics.
+fn toggle_bookmark_membership(
+    bookmarks: &mut HashSet<u64>,
+    block_id: u64,
+    active_filter: Option<BlockFilterKind>,
+) -> (bool, Option<bool>) {
+    let now_bookmarked = if bookmarks.remove(&block_id) {
+        false
+    } else {
+        bookmarks.insert(block_id);
+        true
+    };
+    (
+        now_bookmarked,
+        (active_filter == Some(BlockFilterKind::Bookmarked)).then_some(now_bookmarked),
+    )
+}
+
+type BookmarkToggle = Rc<dyn Fn(u64)>;
+
 /// What the last removal took, and therefore how Undo has to put it back.
 ///
 /// Clear-all removes a prefix (everything), so restoring is a prepend and the
@@ -3214,6 +3249,7 @@ impl BlockBackend {
         let selected_for_menu = self.selected_block_id_rc.clone();
         let anchor_for_menu = self.selection_anchor_id_rc.clone();
         let bookmarks_for_menu = self.bookmarks_for_cb.clone();
+        let toggle_bookmark_for_menu = self.toggle_bookmark.clone();
         let visible_for_menu = self.visible_indices_rc.clone();
         let failure_marker_redraw_for_menu = self.failure_marker_redraw.clone();
         let find_state_for_menu = self.find_state_for_cb.clone();
@@ -3595,30 +3631,10 @@ impl BlockBackend {
                     "Bookmark Block"
                 });
                 let popover_c = popover.downgrade();
-                let finished = finished_blocks_for_menu.clone();
-                let bookmarks = bookmarks_for_menu.clone();
+                let toggle_bookmark = toggle_bookmark_for_menu.clone();
                 item.connect_clicked(move |_| {
                     popdown_if_alive(&popover_c);
-                    let Some(finished) = finished.upgrade() else {
-                        return;
-                    };
-                    let finished = finished.borrow();
-                    let Some(block) = finished.iter().find(|b| b.id == block_id) else {
-                        return;
-                    };
-                    let mut marks = bookmarks.borrow_mut();
-                    let now_bookmarked = if marks.remove(&block_id) {
-                        false
-                    } else {
-                        marks.insert(block_id);
-                        true
-                    };
-                    block.bookmark_star.set_visible(now_bookmarked);
-                    if now_bookmarked {
-                        block.widget().add_css_class("block-bookmarked");
-                    } else {
-                        block.widget().remove_css_class("block-bookmarked");
-                    }
+                    toggle_bookmark(block_id);
                 });
                 vbox.append(&item);
             }
@@ -5570,6 +5586,9 @@ struct BlockBackend {
     selected_block_id_rc: Rc<Cell<Option<u64>>>,
     selection_anchor_id_rc: Rc<Cell<Option<u64>>>,
     bookmarks_for_cb: Rc<RefCell<std::collections::HashSet<u64>>>,
+    /// Shared menu/keyboard transition, including reconciliation of an active
+    /// Bookmarked pane filter.
+    toggle_bookmark: BookmarkToggle,
     block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
     unread_count_rc: Rc<Cell<u32>>,
     /// Switches the live surface between compact prompt and full-screen
@@ -7798,6 +7817,12 @@ impl RenderBackend for BlockBackend {
                     .is_some_and(|ms| ms >= SLOW_BLOCK_THRESHOLD_MS),
             };
             finished_clone.set_filtered_out(!belongs);
+            if !belongs {
+                if let Some(data) = self.block_data_for_cb.borrow_mut().back_mut() {
+                    debug_assert_eq!(data.id, finished_clone.id);
+                    data.estimated_height = 0;
+                }
+            }
         }
 
         self.finished_blocks_for_cb.borrow_mut().push(finished);
@@ -9130,7 +9155,10 @@ fn compute_viewport_state(
     let mut last = 0;
     for (i, block) in block_data.iter().enumerate() {
         let block_top = y;
-        let block_bottom = y.saturating_add(block.estimated_height.max(1));
+        let block_bottom = y.saturating_add(block_document_height(block.estimated_height));
+        if block_bottom == block_top {
+            continue;
+        }
         if first.is_none() && block_bottom > visible_top {
             first = Some(i);
         }
@@ -9168,7 +9196,10 @@ fn compute_viewport_state_pair(
 
     for (i, block) in block_data.iter().enumerate() {
         let block_top = y;
-        let block_bottom = y.saturating_add(block.estimated_height.max(1));
+        let block_bottom = y.saturating_add(block_document_height(block.estimated_height));
+        if block_bottom == block_top {
+            continue;
+        }
         if strict_first.is_none() && block_bottom > strict_top {
             strict_first = Some(i);
         }
@@ -9314,13 +9345,37 @@ fn stable_visible_indices(
     next
 }
 
+/// Remove indices that do not name a renderable card. Kept independent of GTK
+/// so the filtered-document/virtualization boundary has direct regression
+/// coverage.
+fn retain_renderable_indices(
+    indices: &mut std::collections::HashSet<usize>,
+    card_count: usize,
+    mut is_filtered_out: impl FnMut(usize) -> bool,
+) {
+    indices.retain(|index| *index < card_count && !is_filtered_out(*index));
+}
+
 fn apply_visible_indices(
     finished: &[FinishedBlock],
     block_data: &mut VecDeque<BlockData>,
     visible: &mut std::collections::HashSet<usize>,
-    new_visible: std::collections::HashSet<usize>,
+    mut new_visible: std::collections::HashSet<usize>,
 ) {
+    // A filtered card is absent from the document, not merely off-screen.
+    // Keep its zero height and its previous virtualization state: calling
+    // `set_virtualized` here would restore a measured placeholder height and
+    // make the pixel→index model diverge from GTK's hidden widget tree.
+    retain_renderable_indices(&mut new_visible, finished.len(), |index| {
+        finished[index].is_filtered_out()
+    });
     for (i, block) in finished.iter().enumerate() {
+        if block.is_filtered_out() {
+            if let Some(data) = block_data.get_mut(i) {
+                data.estimated_height = 0;
+            }
+            continue;
+        }
         let should_render = new_visible.contains(&i);
         let height = block.set_virtualized(!should_render);
         if !should_render {
@@ -9627,6 +9682,7 @@ struct KeyCtx {
     selection_anchor_id_for_key: Rc<Cell<Option<u64>>>,
     block_scroll_for_key: glib::WeakRef<ScrolledWindow>,
     bookmarks_for_key: Rc<RefCell<std::collections::HashSet<u64>>>,
+    toggle_bookmark_for_key: BookmarkToggle,
     visible_indices_for_key: Rc<RefCell<std::collections::HashSet<usize>>>,
     failure_marker_redraw_for_key: FailureMarkerRedraw,
     bstate_for_key: Rc<Cell<BlockState>>,
@@ -9659,6 +9715,7 @@ impl KeyCtx {
             selection_anchor_id_for_key,
             block_scroll_for_key,
             bookmarks_for_key,
+            toggle_bookmark_for_key,
             visible_indices_for_key,
             failure_marker_redraw_for_key,
             bstate_for_key,
@@ -10035,20 +10092,9 @@ impl KeyCtx {
             {
                 if let Some(sel_id) = selected_block_id_for_key.get() {
                     let finished = finished_blocks_for_key.borrow();
-                    if let Some(block) = finished.iter().find(|b| b.id == sel_id) {
-                        let mut marks = bookmarks_for_key.borrow_mut();
-                        let now_marked = if marks.remove(&sel_id) {
-                            false
-                        } else {
-                            marks.insert(sel_id);
-                            true
-                        };
-                        block.bookmark_star.set_visible(now_marked);
-                        if now_marked {
-                            block.widget().add_css_class("block-bookmarked");
-                        } else {
-                            block.widget().remove_css_class("block-bookmarked");
-                        }
+                    if finished.iter().any(|block| block.id == sel_id) {
+                        drop(finished);
+                        toggle_bookmark_for_key(sel_id);
                         return glib::Propagation::Stop;
                     }
                 }
@@ -10980,6 +11026,10 @@ impl TermView {
         let block_start_time: Rc<Cell<Option<SystemTime>>> = Rc::new(Cell::new(None));
         let visible_indices: Rc<RefCell<std::collections::HashSet<usize>>> =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
+        let viewport: Rc<RefCell<ViewportState>> = Rc::new(RefCell::new(ViewportState {
+            first_visible: 0,
+            last_visible: 0,
+        }));
         let current_cwd: Rc<RefCell<String>> = Rc::new(RefCell::new(cwd.unwrap_or("").to_string()));
 
         // CWD updates come from VTE's native OSC 7 signal (the parser passes
@@ -11030,6 +11080,121 @@ impl TermView {
         // flags (mouse/focus reporting) are NOT live: ParserConfig below
         // snapshots them at construction.
         let config_shared: Rc<RefCell<Config>> = Rc::new(RefCell::new(config.clone()));
+
+        // One bookmark state transition for every entry point. In particular,
+        // an active Bookmarked filter must react immediately: removing a mark
+        // hides its card and adding one restores the card plus its document
+        // height. Weak widget/list handles keep card menu controllers from
+        // retaining their own pane tree.
+        let toggle_bookmark: BookmarkToggle = {
+            let bookmarks = block_bookmarks.clone();
+            let block_filter = block_filter.clone();
+            let finished = Rc::downgrade(&finished_blocks_rc);
+            let block_data = block_data_rc.clone();
+            let active = Rc::downgrade(&active);
+            let config = config_shared.clone();
+            let selected_ids = selected_block_ids.clone();
+            let selected = selected_block_id.clone();
+            let anchor = selection_anchor_id.clone();
+            let find_state = Rc::downgrade(&find_state);
+            let active_vte = active_vte.downgrade();
+            let visible = visible_indices.clone();
+            let viewport = viewport.clone();
+            let scroll = block_scroll.downgrade();
+            let block_list = block_list.downgrade();
+            let redraw = failure_marker_redraw.clone();
+            Rc::new(move |block_id| {
+                let Some(finished) = finished.upgrade() else {
+                    return;
+                };
+                let finished_ref = finished.borrow();
+                let Some(index) = finished_ref.iter().position(|card| card.id == block_id) else {
+                    return;
+                };
+                let active_filter = block_filter.get();
+                let (now_bookmarked, filtered_keep) = toggle_bookmark_membership(
+                    &mut bookmarks.borrow_mut(),
+                    block_id,
+                    active_filter,
+                );
+                let card = &finished_ref[index];
+                card.bookmark_star.set_visible(now_bookmarked);
+                if now_bookmarked {
+                    card.widget().add_css_class("block-bookmarked");
+                } else {
+                    card.widget().remove_css_class("block-bookmarked");
+                }
+
+                if let Some(keep) = filtered_keep {
+                    card.set_filtered_out(!keep);
+                    if let Some(data) = block_data.borrow_mut().get_mut(index) {
+                        data.estimated_height = if keep {
+                            let fallback_cols =
+                                active.upgrade().map_or(data.cols as i64, |active| {
+                                    active.borrow().grid_cols() as i64
+                                });
+                            collapsed_aware_block_height(
+                                &config.borrow(),
+                                data,
+                                card.is_collapsed(),
+                                fallback_cols,
+                            )
+                        } else {
+                            0
+                        };
+                    }
+                    if !keep {
+                        remove_finished_block_from_selection(
+                            &finished_ref,
+                            &selected_ids,
+                            &selected,
+                            &anchor,
+                            block_id,
+                        );
+                    }
+                }
+                drop(finished_ref);
+
+                if filtered_keep.is_none() {
+                    return;
+                }
+                if let (Some(find_state), Some(active_vte)) =
+                    (find_state.upgrade(), active_vte.upgrade())
+                {
+                    find::clear_find_state(find_state.as_ref(), &active_vte);
+                }
+                redraw();
+
+                // Re-run the viewport model now, not on a hoped-for future
+                // adjustment signal: an upper-only change is intentionally
+                // ignored by the ordinary resize listener.
+                let (Some(scroll), Some(block_list)) = (scroll.upgrade(), block_list.upgrade())
+                else {
+                    return;
+                };
+                let adjustment = scroll.vadjustment();
+                let next = {
+                    let data = block_data.borrow();
+                    viewport_state_for_scroll(
+                        &data,
+                        adjustment.value(),
+                        adjustment.page_size(),
+                        config.borrow().virtual_scroll_margin,
+                    )
+                };
+                let Some(next) = next else {
+                    block_list.queue_allocate();
+                    return;
+                };
+                *viewport.borrow_mut() = next.clone();
+                let new_visible = visible_indices_for_viewport(&next);
+                let finished_ref = finished.borrow();
+                let mut visible_ref = visible.borrow_mut();
+                let mut data = block_data.borrow_mut();
+                apply_visible_indices(&finished_ref, &mut data, &mut visible_ref, new_visible);
+                block_list.queue_allocate();
+            })
+        };
 
         // ── Wire PTY → parser → block events ─────────────────────────────
         let render_backend_for_view: Rc<RefCell<Option<Rc<dyn RenderBackend>>>> =
@@ -11153,6 +11318,7 @@ impl TermView {
                     selected_block_id_rc: selected_block_id.clone(),
                     selection_anchor_id_rc: selection_anchor_id.clone(),
                     bookmarks_for_cb: block_bookmarks.clone(),
+                    toggle_bookmark: toggle_bookmark.clone(),
                     block_data_for_cb,
                     unread_count_rc: unread_count.clone(),
                     layout_active_surface: layout_active_surface.clone(),
@@ -11858,6 +12024,7 @@ impl TermView {
                 selection_anchor_id_for_key,
                 block_scroll_for_key: block_scroll_for_key.downgrade(),
                 bookmarks_for_key: block_bookmarks.clone(),
+                toggle_bookmark_for_key: toggle_bookmark.clone(),
                 visible_indices_for_key: visible_indices.clone(),
                 failure_marker_redraw_for_key: failure_marker_redraw.clone(),
                 bstate_for_key: bstate.clone(),
@@ -12151,10 +12318,7 @@ impl TermView {
             finished_blocks: finished_blocks_rc,
             dynamic_colors,
             widget_pool: widget_pool.clone(),
-            viewport: Rc::new(RefCell::new(ViewportState {
-                first_visible: 0,
-                last_visible: 0,
-            })),
+            viewport,
             visible_indices,
             selected_block_ids,
             selected_block_id,
@@ -13277,8 +13441,11 @@ impl TermView {
                 }
                 moved += 1;
                 if let Some(data) = block_data.get_mut(index) {
-                    data.estimated_height =
-                        collapsed_aware_block_height(&config, data, collapsed, fallback_cols);
+                    data.estimated_height = if card.is_filtered_out() {
+                        0
+                    } else {
+                        collapsed_aware_block_height(&config, data, collapsed, fallback_cols)
+                    };
                 }
             }
             moved
@@ -13303,7 +13470,7 @@ impl TermView {
             let selected = self.selected_block_id.get();
             let Some(index) = selected
                 .and_then(|id| finished.iter().position(|card| card.id == id))
-                .or_else(|| finished.len().checked_sub(1))
+                .or_else(|| finished.iter().rposition(|card| !card.is_filtered_out()))
             else {
                 return false;
             };
@@ -13316,8 +13483,11 @@ impl TermView {
             let fallback_cols = self.active.borrow().grid_cols() as i64;
             let mut block_data = self.block_data.borrow_mut();
             if let Some(data) = block_data.get_mut(index) {
-                data.estimated_height =
-                    collapsed_aware_block_height(&config, data, collapsed, fallback_cols);
+                data.estimated_height = if card.is_filtered_out() {
+                    0
+                } else {
+                    collapsed_aware_block_height(&config, data, collapsed, fallback_cols)
+                };
             }
             true
         };
@@ -13565,9 +13735,13 @@ impl TermView {
         );
 
         self.visible_indices.borrow_mut().clear();
-        self.update_viewport();
-        self.update_block_visibility();
-        self.block_list.queue_allocate();
+        if let Some(kind) = self.block_filter.get() {
+            let _ = self.apply_block_filter(kind);
+        } else {
+            self.update_viewport();
+            self.update_block_visibility();
+            self.block_list.queue_allocate();
+        }
         if let Err(err) = self.save_history() {
             log::warn!("save restored deleted blocks: {err}");
         }
@@ -13714,9 +13888,13 @@ impl TermView {
             .map(|index| index.saturating_add(restored_len))
             .collect();
         *self.visible_indices.borrow_mut() = shifted;
-        self.update_viewport();
-        self.update_block_visibility();
-        self.block_list.queue_allocate();
+        if let Some(kind) = self.block_filter.get() {
+            let _ = self.apply_block_filter(kind);
+        } else {
+            self.update_viewport();
+            self.update_block_visibility();
+            self.block_list.queue_allocate();
+        }
         if !self.user_scrolled_up.get() {
             self.reveal_live_input();
         }
@@ -14013,7 +14191,7 @@ impl TermView {
             .block_data
             .borrow()
             .iter()
-            .map(|block| i64::from(block.estimated_height.max(1)))
+            .map(|block| i64::from(block_document_height(block.estimated_height)))
             .sum();
         let viewport = self.viewport.borrow().clone();
         let visible = self.visible_indices.borrow().len();
@@ -17137,10 +17315,24 @@ mod tests {
         assert!((markers[1_023] - 1_024.0 / 1_025.0).abs() < f64::EPSILON);
     }
 
+    #[test]
+    fn filtered_failures_take_no_space_and_emit_no_scrollbar_marker() {
+        let markers = failure_marker_fractions_from([
+            (0, true),
+            (0, true),
+            (10, false),
+            (0, true),
+            (20, true),
+        ]);
+
+        assert_eq!(markers.len(), 1, "hidden failures have no visible marker");
+        assert!((markers[0] - 1.0 / 3.0).abs() < f64::EPSILON);
+    }
+
     fn legacy_failed_block_marker_fractions(blocks: &VecDeque<BlockData>) -> Vec<f64> {
         const MAX_FAILURE_MARKERS: usize = 1_024;
         let total_height = blocks.iter().fold(0_u64, |total, block| {
-            total.saturating_add(block.estimated_height.max(1) as u64)
+            total.saturating_add(super::block_document_height(block.estimated_height) as u64)
         });
         if total_height == 0 {
             return Vec::new();
@@ -17149,13 +17341,16 @@ mod tests {
         let mut top = 0_u64;
         let mut markers = VecDeque::new();
         for block in blocks {
-            if super::BlockOutcome::classify(Some(&block.cmd), block.exit_code).is_failure() {
+            let height = super::block_document_height(block.estimated_height) as u64;
+            if height > 0
+                && super::BlockOutcome::classify(Some(&block.cmd), block.exit_code).is_failure()
+            {
                 if markers.len() == MAX_FAILURE_MARKERS {
                     markers.pop_front();
                 }
                 markers.push_back((top as f64 / total_height as f64).clamp(0.0, 1.0));
             }
-            top = top.saturating_add(block.estimated_height.max(1) as u64);
+            top = top.saturating_add(height);
         }
         markers.into()
     }
@@ -17306,6 +17501,80 @@ mod tests {
 
         assert_eq!(vp.first_visible, 1);
         assert_eq!(vp.last_visible, 2);
+    }
+
+    #[test]
+    fn filtered_prefix_and_middle_cards_do_not_shift_viewport_geometry() {
+        let blocks: VecDeque<BlockData> = [0, 0, 10, 0, 20, 0, 30]
+            .into_iter()
+            .map(block_with_height)
+            .collect();
+
+        let prefix = compute_viewport_state(&blocks, 0, 5);
+        assert_eq!(
+            (prefix.first_visible, prefix.last_visible),
+            (2, 2),
+            "zero-height prefix cards are absent from the document"
+        );
+
+        let middle = compute_viewport_state(&blocks, 12, 25);
+        assert_eq!(
+            (middle.first_visible, middle.last_visible),
+            (4, 4),
+            "zero-height middle cards neither consume pixels nor become visible"
+        );
+
+        let (strict, loose) = super::compute_viewport_state_pair(&blocks, 12, 25, 0, 5);
+        assert_eq!(
+            (strict.first_visible, strict.last_visible),
+            (middle.first_visible, middle.last_visible)
+        );
+        assert_eq!(
+            (loose.first_visible, loose.last_visible),
+            (2, 2),
+            "the fused hysteresis scan uses the same filtered geometry"
+        );
+    }
+
+    #[test]
+    fn visibility_never_reintroduces_filtered_or_out_of_range_indices() {
+        let mut indices = HashSet::from([0, 1, 2, 3, 99]);
+        let filtered = [true, false, true, false];
+
+        super::retain_renderable_indices(&mut indices, filtered.len(), |index| filtered[index]);
+
+        assert_eq!(indices, HashSet::from([1, 3]));
+    }
+
+    #[test]
+    fn bookmark_mutation_reconciles_an_active_bookmark_filter() {
+        let mut bookmarks = HashSet::new();
+
+        assert_eq!(
+            super::toggle_bookmark_membership(
+                &mut bookmarks,
+                7,
+                Some(super::BlockFilterKind::Bookmarked),
+            ),
+            (true, Some(true))
+        );
+        assert_eq!(
+            super::toggle_bookmark_membership(
+                &mut bookmarks,
+                7,
+                Some(super::BlockFilterKind::Bookmarked),
+            ),
+            (false, Some(false))
+        );
+        assert_eq!(
+            super::toggle_bookmark_membership(
+                &mut bookmarks,
+                9,
+                Some(super::BlockFilterKind::Failed),
+            ),
+            (true, None),
+            "other filters are unaffected by bookmark membership"
+        );
     }
 
     #[test]

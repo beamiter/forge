@@ -37,7 +37,12 @@ All notable user-visible and operational changes are recorded here.
   装上正则并从上一次跳转留下的选区往前走一步，所以落点是"下一个命中"，重复激活同一行
   还会一路向后走。结果行现在带着自己在该 surface 中的命中序号（按命中数计，不是按行数：
   一行里的三个命中会让 VTE 的游标走三步），跳转从清空的选区开始按序号定位，步数有上限，
-  因此同一行重复激活总是落在同一处。
+  因此同一行重复激活总是落在同一处。超过 4096 次原生步进或中途找不到完整 occurrence
+  时会拒绝高亮，不再悄悄落到更早的错误命中。
+- Block 过滤的几何与状态现在保持同一个真相：高度为零的隐藏卡片不会被视口索引重新算作
+  一像素，也不会被虚拟化回写出占位高度或画出失败标记；前缀和中间的连续隐藏卡片都不再
+  推偏像素→卡片映射。在 **Show only bookmarked blocks** 中通过右键或快捷键移除书签会立即
+  隐藏该卡片、清理隐藏选择并重算布局，而不是留在已不满足过滤条件的流里。
 - 在块内拖选文本（复制用的那个手势）之后，键盘焦点会留在那张卡片上——从那一刻起
   所有 Block 快捷键都失效：方向键、`PageUp/PageDown`、`Home/End`、`Delete`、书签跳转、
   过滤快捷键全部没反应，因为整个键面只挂在实时 VTE 一个控件上，而
@@ -60,6 +65,9 @@ All notable user-visible and operational changes are recorded here.
   Expand 或输出过滤被重新灌入后，find 记录的原生游标已经失效，现在会带 render stamp
   识别并就地重建整轮搜索，而不是报 No matches 或跳错位置；块内过滤框不再是键盘单向门，
   `Escape` 或再次 `Alt+Shift+F` 即可关闭并把焦点交还提示符，查询文本保留。
+- 共享核心升级到 `jterm_core` `0f47569`，采用 AI origin、endpoint、credential、no-proxy
+  与请求边界的最新校验。该核心固定 `jagent` `fcb9768`，Forge 的直接依赖保持同一 revision，
+  避免一个进程链接两份同版本但不同 source identity 的 `jagent`。
 - 一条外来的 OSC 133 `D` 不再替本地命令收尾：`ssh`、`docker exec`、`tmux attach` 或
   `cat` 一份含这些字节的日志，都会让本地卡片提前结束并盖上远端命令的退出码和耗时。
   `on_command_end` 现在与 `on_command_start` 的前台判定对称——前台属于别人时拒绝该标记，

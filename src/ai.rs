@@ -61,27 +61,31 @@ mod tests {
     }
 
     #[test]
-    fn api_key_file_resolution_prefers_env_and_ignores_blanks() {
+    fn api_key_file_resolution_preserves_exact_values_for_validation() {
         // Neutral identity ⇒ JTERM_ prefix; no other test reads this variable.
         let var = "JTERM_AI_API_KEY_FILE";
         std::env::set_var(var, " /run/probe.key ");
         assert_eq!(
             api_key_file_env_override(),
-            Some("/run/probe.key".to_string())
+            Some(" /run/probe.key ".to_string())
         );
         assert_eq!(
             resolve_api_key_file(Some("/cfg/ai.key")),
-            Some("/run/probe.key".to_string())
+            Some(" /run/probe.key ".to_string())
         );
         std::env::set_var(var, "   ");
-        assert_eq!(api_key_file_env_override(), None);
+        assert_eq!(api_key_file_env_override(), Some("   ".to_string()));
         assert_eq!(
             resolve_api_key_file(Some(" /cfg/ai.key ")),
-            Some("/cfg/ai.key".to_string())
+            Some("   ".to_string())
         );
-        assert_eq!(resolve_api_key_file(Some("   ")), None);
-        assert_eq!(resolve_api_key_file(None), None);
         std::env::remove_var(var);
+        assert_eq!(
+            resolve_api_key_file(Some(" /cfg/ai.key ")),
+            Some(" /cfg/ai.key ".to_string())
+        );
+        assert_eq!(resolve_api_key_file(Some("")), None);
+        assert_eq!(resolve_api_key_file(None), None);
     }
 
     #[test]

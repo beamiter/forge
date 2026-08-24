@@ -474,6 +474,23 @@ fn native_cursor_action(
     Some(NativeCursorAction::Step { wrap_once })
 }
 
+/// Resolve a logical move only while it still names the render VTE was counted
+/// against. This guard deliberately precedes `AlreadySelected`: a one-hit pass
+/// can otherwise keep reporting its stale highlight forever without taking a
+/// native step that would notice the card was re-fed.
+fn validated_native_cursor_action(
+    surface: &FindSurface,
+    occurrence: usize,
+    direction: FindDirection,
+    current_render_stamp: Option<super::blocks::RenderStamp>,
+) -> Option<NativeCursorAction> {
+    let render_is_current = (surface.is_live && surface.block_id == 0)
+        || current_render_stamp.is_some_and(|stamp| stamp == surface.render_stamp);
+    render_is_current
+        .then(|| native_cursor_action(surface, occurrence, direction))
+        .flatten()
+}
+
 fn find_progress(state: &FindState) -> Option<FindProgress> {
     (!state.surfaces.is_empty() && state.total > 0).then_some(FindProgress {
         current: state.cursor.global + 1,
@@ -513,12 +530,21 @@ pub struct CrossBlockHit {
 ///
 /// PCRE2 stepping runs on the GTK main thread, so a record whose surface holds
 /// an enormous number of matches must not be able to stall the UI on one
-/// activation. Past the cap the jump lands on the surface's first hit, which
-/// still shows the right record — the row's own line number remains the honest
-/// description of where the match is.
-fn bounded_occurrence_steps(occurrence: usize) -> usize {
+/// activation. A result beyond the cap fails closed: selecting an earlier hit
+/// in the right record would still be a wrong jump and is worse than declining
+/// to leave a highlight.
+fn bounded_occurrence_steps(occurrence: usize) -> Option<usize> {
     const MAX_JUMP_STEPS: usize = 4_096;
-    occurrence.saturating_add(1).min(MAX_JUMP_STEPS)
+    occurrence
+        .checked_add(1)
+        .filter(|steps| *steps <= MAX_JUMP_STEPS)
+}
+
+/// Execute the complete bounded jump. `all` short-circuits on the first native
+/// miss, so a surface that contains fewer matches than the scan recorded can
+/// never turn a partial walk into a successful (but wrong) highlight.
+fn step_to_occurrence_exact(occurrence: usize, mut step: impl FnMut() -> bool) -> bool {
+    bounded_occurrence_steps(occurrence).is_some_and(|steps| (0..steps).all(|_| step()))
 }
 
 /// Trim a line to a reasonable display width — the palette row is one
@@ -926,6 +952,10 @@ impl TermView {
             (current, next, current_progress)
         };
         if next == current {
+            if !self.focus_surface_occurrence(next.surface, next.occurrence, direction) {
+                self.clear_find();
+                return FindNavigationResult::Invalidated;
+            }
             return FindNavigationResult::Progress(current_progress);
         }
 
@@ -971,14 +1001,8 @@ impl TermView {
             };
             surface.clone()
         };
-        let wrap_once = match native_cursor_action(&surface, occurrence, direction) {
-            Some(NativeCursorAction::AlreadySelected) => return true,
-            Some(NativeCursorAction::Step { wrap_once }) => wrap_once,
-            None => return false,
-        };
-
-        let vte = if surface.is_live && surface.block_id == 0 {
-            self.active_vte.clone()
+        let (vte, current_render_stamp) = if surface.is_live && surface.block_id == 0 {
+            (self.active_vte.clone(), None)
         } else {
             let Some(target) = self
                 .render_backend
@@ -992,10 +1016,17 @@ impl TermView {
             // re-window moves every row, so a single native step from here
             // lands somewhere the counter does not describe. Refuse: the
             // caller re-runs the pass against what the card holds now.
-            if target.render_stamp != surface.render_stamp {
-                return false;
-            }
-            target.terminal
+            (target.terminal, Some(target.render_stamp))
+        };
+        let wrap_once = match validated_native_cursor_action(
+            &surface,
+            occurrence,
+            direction,
+            current_render_stamp,
+        ) {
+            Some(NativeCursorAction::AlreadySelected) => return true,
+            Some(NativeCursorAction::Step { wrap_once }) => wrap_once,
+            None => return false,
         };
         vte.search_set_wrap_around(wrap_once);
         let found = match direction {
@@ -1308,15 +1339,7 @@ impl TermView {
         vte.unselect_all();
         vte.search_set_regex(Some(&vte_re), 0);
         vte.search_set_wrap_around(false);
-        let steps = bounded_occurrence_steps(occurrence);
-        let mut reached = false;
-        for _ in 0..steps {
-            if !vte.search_find_next() {
-                break;
-            }
-            reached = true;
-        }
-        if !reached {
+        if !step_to_occurrence_exact(occurrence, || vte.search_find_next()) {
             vte.search_set_regex(None::<&vte4::Regex>, 0);
             return false;
         }
@@ -1477,14 +1500,29 @@ tail ab";
     fn a_jump_bounds_how_far_it_will_step() {
         assert_eq!(
             super::bounded_occurrence_steps(0),
-            1,
+            Some(1),
             "the first hit is one step"
         );
-        assert_eq!(super::bounded_occurrence_steps(41), 42);
+        assert_eq!(super::bounded_occurrence_steps(41), Some(42));
+        assert_eq!(super::bounded_occurrence_steps(4_095), Some(4_096));
         assert_eq!(
-            super::bounded_occurrence_steps(usize::MAX),
-            4_096,
-            "a pathological surface falls back to the cap, not to a stall"
+            super::bounded_occurrence_steps(4_096),
+            None,
+            "a result beyond the work cap must fail closed, not land early"
+        );
+        assert_eq!(super::bounded_occurrence_steps(usize::MAX), None);
+    }
+
+    #[test]
+    fn a_jump_fails_when_any_native_step_is_exhausted() {
+        let mut outcomes = [true, false, true].into_iter();
+        assert!(!super::step_to_occurrence_exact(2, || outcomes
+            .next()
+            .unwrap_or(false)));
+        assert_eq!(
+            outcomes.next(),
+            Some(true),
+            "the exact jump stops at the first miss instead of claiming success"
         );
     }
 
@@ -1516,6 +1554,30 @@ tail ab";
             );
             assert_ne!(moved, crate::block_view::blocks::NEUTRAL_RENDER_STAMP);
         }
+    }
+
+    #[test]
+    fn an_already_selected_one_hit_surface_still_invalidates_after_refeed() {
+        let at_scan = crate::block_view::blocks::output_render_stamp_for_test(80, 40, 24, 7);
+        let after_refeed = crate::block_view::blocks::output_render_stamp_for_test(100, 40, 24, 7);
+        let mut one_hit = surface(1, true);
+        one_hit.render_stamp = at_scan;
+        one_hit.vte_cursor = Some(0);
+
+        assert_eq!(
+            super::validated_native_cursor_action(&one_hit, 0, FindDirection::Next, Some(at_scan),),
+            Some(NativeCursorAction::AlreadySelected)
+        );
+        assert_eq!(
+            super::validated_native_cursor_action(
+                &one_hit,
+                0,
+                FindDirection::Next,
+                Some(after_refeed),
+            ),
+            None,
+            "the unchanged logical edge must not hide a stale native cursor"
+        );
     }
 
     fn step(

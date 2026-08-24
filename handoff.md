@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-21 (exactly-once command lifecycle closure)
+Updated: 2026-08-24 (Block/Unified search and filtered-document correctness)
 
 This working tree contains the nine-round "Evolve ASCII organism" series
 (`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
@@ -18,6 +18,16 @@ every round (attribution races, a Drop panic on a fired glib source, a
 saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
+
+- **Search/filter correctness and core repin (2026-08-24)**: card search
+  surfaces now validate their render stamp before every outcome, including an
+  already-selected one-hit edge, and palette occurrence jumps fail closed when
+  the exact match cannot be reached within 4096 native steps. Filtered cards
+  remain zero-height through viewport, virtualization, and failure-marker
+  calculations; bookmark mutation reconciles an active Bookmarked filter from
+  both menu and keyboard paths. The app pins published `jterm_core` `0f47569`;
+  its transitive `jagent` `fcb9768` is also the direct Forge pin, avoiding
+  duplicate crate identities.
 
 - **Exactly-once command lifecycle closure (2026-08-21)**: Block and Unified
   now share one observer-side `C -> finish` latch. An accepted `D` consumes it

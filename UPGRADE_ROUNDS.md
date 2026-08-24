@@ -4,8 +4,8 @@ This ledger records the independently testable increments in the current
 upgrade pass. It is intentionally tied to behavior and regression evidence,
 not commits.
 
-Rounds 1–10 record the preceding pass; this pass's additional twenty rounds
-are numbered 11–30.
+Rounds 1–10 record the preceding pass; this pass's additional twenty-one rounds
+are numbered 11–31.
 
 1. **Install/uninstall symmetry** — no-argument uninstall now targets the same
    historical `~/.cargo/bin` location as no-argument install; explicit prefixes
@@ -82,6 +82,11 @@ are numbered 11–30.
     and cap executable rows without mutating configuration.
 30. **Consumer regression evidence** — config and remote-fs tests exercise
     spoofing, semantic argv confusion, high indexes, and pre-spawn rejection.
+31. **Search/filter state identity** — exact cross-block occurrence jumps and
+    retained-query rebuilds fail closed when a card render changes; filtered
+    zero-height cards stay absent from viewport, virtualization, and marker
+    geometry, while bookmark mutations reconcile the active filter. Cargo and
+    Nix consume the same published hardened-core revision.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, and the repository-wide Rust
