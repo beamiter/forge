@@ -34,6 +34,14 @@ All notable user-visible and operational changes are recorded here.
   paste 支持时会显示原因、响铃并消费按键，不再把同一个 Enter 泄漏给实时编辑器；多选回填不会再悄悄
   只保留首条命令。卡片 header 按钮仍遵循 GTK 可访问性，聚焦按钮上的普通 Return/Space 会激活
   按钮，只有显式 `Ctrl+Enter` 进入 Block 重跑。
+- Block 历史回填不再把内存中的空输入 shadow 当作空提示符证明：选区 Enter、卡片插入按钮、右键菜单
+  和公开 reinput 动作全部通过同一个可见编辑器边界，要求 PromptEnd anchor 已稳定、光标仍在 anchor、
+  光标后的可见 suffix 可证明为空，且没有正在验证的 Agent/外部提交。shell hook 或 readline redraw
+  留下的未跟踪文本因此不会再被 `Ctrl+U + history` 合并；拒绝路径保持零 PTY 写入，右键插入项也只在
+  这套完整门禁通过时启用。
+- Block 选区的临时拒绝状态现在拥有独立的稳定提示与 generation；连续按下相同或不同的拒绝动作会刷新
+  完整可见时长，旧 timer 不会提前撤下新消息，也不会把上一条拒绝永久恢复回来。淡出的卡片快捷操作区
+  同时关闭 GTK pointer targeting，触摸或无 hover 点击不再落入透明控件形成 header 死区。
 - Block 卡片池现在在统一的 release 边界拆除旧 VTE 子树、事件控制器和 tooltip，再只复用轻量
   外壳；复用初始化会恢复可见性，过滤或 alt-screen 隐藏过的旧壳不会让下一张完成卡片消失；
   容量淘汰、清空及池已满路径都不会把历史 scrollback 或旧卡回调留在内存账本之外。

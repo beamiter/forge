@@ -4,8 +4,8 @@ This ledger records the independently testable increments in the current
 upgrade pass. It is intentionally tied to behavior and regression evidence,
 not commits.
 
-Rounds 1–10 record the preceding pass; this pass's additional forty-one rounds
-are numbered 11–51.
+Rounds 1–10 record the preceding pass; this pass's additional forty-three rounds
+are numbered 11–53.
 
 1. **Install/uninstall symmetry** — no-argument uninstall now targets the same
    historical `~/.cargo/bin` location as no-argument install; explicit prefixes
@@ -160,6 +160,15 @@ are numbered 11–51.
     selection hints report the selected count and distinguish recall from recall
     all without claiming prompt readiness, while refused Enter and Ctrl+Enter
     briefly expose the actual reason before restoring the available actions.
+52. **Verified history insertion** — every Block recall entry point now proves
+    the live editor is visibly empty at the settled PromptEnd anchor before it
+    writes `Ctrl+U` or history bytes; dirty shadows, moved cursors, unknown
+    suffixes and in-flight reviewed submissions fail with zero PTY output, and
+    context-menu sensitivity comes from that same proof.
+53. **Generation-owned selection feedback** — repeated refusal flashes refresh
+    their full lifetime and only the newest status can restore the steady action
+    legend; faded quick actions also leave GTK pointer targeting, eliminating a
+    transparent header dead zone for touch and no-hover input.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, and the repository-wide Rust

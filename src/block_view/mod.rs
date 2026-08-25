@@ -2096,21 +2096,12 @@ fn step_marked_record_ids(
     step_marked_indices(&marked_indices, current, direction).map(|index| record_ids[index])
 }
 
-pub(crate) struct PromptRecallCtx<'a> {
-    pub(crate) pty: &'a OwnedPty,
-    pub(crate) pty_synced: &'a Cell<bool>,
-    pub(crate) typed_cmd: &'a RefCell<String>,
-    pub(crate) typed_cmd_fidelity: &'a Cell<TypedShadowFidelity>,
-    pub(crate) submission_pending: &'a Cell<bool>,
-    pub(crate) pending_typeahead: &'a Cell<bool>,
-}
-
 fn recall_selected_commands_at_prompt(
-    ctx: PromptRecallCtx<'_>,
-    state: BlockState,
+    submission: &VerifiedSubmissionCtx,
     finished: &[FinishedBlock],
     selected: &HashSet<u64>,
     bracketed_paste: bool,
+    suggestion_rgb: [u8; 3],
 ) -> bool {
     let command = selected_command_text(
         finished
@@ -2126,45 +2117,12 @@ fn recall_selected_commands_at_prompt(
     if !selected_command_recall_is_lossless(&command, bracketed_paste) {
         return false;
     }
-    recall_command_at_prompt(ctx, state, &command, bracketed_paste)
+    submission.try_recall_command(&command, bracketed_paste, suggestion_rgb)
 }
 
 fn selected_command_recall_is_lossless(command: &str, bracketed_paste: bool) -> bool {
     let paste = build_command_recall(command, bracketed_paste);
     !paste.is_empty() && !paste.risk.truncated_to_first_line
-}
-
-/// Ask the shell editor to recall text without executing it. `Ctrl+U` is only a
-/// conventional kill-to-BOL binding, not a portable whole-buffer replacement;
-/// the shadow is therefore always inexact and can never override VTE capture.
-pub(crate) fn recall_command_at_prompt(
-    ctx: PromptRecallCtx<'_>,
-    state: BlockState,
-    command: &str,
-    bracketed_paste: bool,
-) -> bool {
-    if state != BlockState::AwaitingCommand
-        || ctx.pty_synced.get()
-        || ctx.submission_pending.get()
-        || ctx.pending_typeahead.get()
-        || ctx.typed_cmd_fidelity.get() == TypedShadowFidelity::ExactSubmitted
-    {
-        return false;
-    }
-    let paste = build_command_recall(command, bracketed_paste);
-    if paste.is_empty() {
-        return false;
-    }
-    // One write: the frame's start, body and end must not be split.
-    if let Err(error) = ctx.pty.write_bytes(&paste.bytes) {
-        ctx.pty
-            .report_write_error("could not queue recalled command", error);
-        return false;
-    }
-    *ctx.typed_cmd.borrow_mut() = paste.echo_text;
-    ctx.typed_cmd_fidelity.set(TypedShadowFidelity::Inexact);
-    ctx.pty_synced.set(true);
-    true
 }
 
 /// Prompt state a re-run has to clear before it may write anything.
@@ -2653,23 +2611,15 @@ fn selection_refusal_hint(action: SelectionAction, refusal: SelectionActionRefus
 }
 
 fn prompt_recall_refusal(
-    guards: PromptSubmitGuards,
-    typed_command_empty: bool,
+    submission: &VerifiedSubmissionCtx,
     command: &str,
     bracketed_paste: bool,
+    suggestion_rgb: [u8; 3],
 ) -> SelectionActionRefusal {
     if !selected_command_recall_is_lossless(command, bracketed_paste) {
         return SelectionActionRefusal::UnsafeRecall;
     }
-    let status = classify_command_prompt_status(
-        guards.state,
-        false,
-        guards.submission_pending
-            || guards.pending_typeahead
-            || guards.fidelity == TypedShadowFidelity::ExactSubmitted,
-        guards.pty_synced,
-        typed_command_empty,
-    );
+    let status = submission.recall_refusal_status(suggestion_rgb);
     if status != CommandPromptStatus::Ready {
         SelectionActionRefusal::Prompt(status)
     } else {
@@ -2682,29 +2632,46 @@ fn flash_finished_selection_refusal(
     active_id: Option<u64>,
     message: String,
 ) {
-    let Some(label) = active_id.and_then(|id| {
-        finished
-            .iter()
-            .find(|block| block.id == id)
-            .map(|block| block.selection_hint.clone())
-    }) else {
+    flash_finished_selection_refusal_for(
+        finished,
+        active_id,
+        message,
+        std::time::Duration::from_millis(1_400),
+    );
+}
+
+fn flash_finished_selection_refusal_for(
+    finished: &[FinishedBlock],
+    active_id: Option<u64>,
+    message: String,
+    visible_for: std::time::Duration,
+) {
+    let Some(block) = active_id.and_then(|id| finished.iter().find(|block| block.id == id)) else {
         return;
     };
-    let steady_hint = label.text().to_string();
+    let label = block.selection_hint.clone();
+    let steady_hint = {
+        let mut steady = block.selection_hint_steady.borrow_mut();
+        if steady.is_empty() {
+            *steady = label.text().to_string();
+        }
+        steady.clone()
+    };
+    let generation = block.selection_feedback_generation.get().wrapping_add(1);
+    block.selection_feedback_generation.set(generation);
     label.set_text(&message);
     label.set_tooltip_text(Some(&message));
     label.update_property(&[gtk4::accessible::Property::Label(&message)]);
 
     let label_for_restore = label.downgrade();
-    glib::timeout_add_local_once(std::time::Duration::from_millis(1400), move || {
+    let current_generation = block.selection_feedback_generation.clone();
+    glib::timeout_add_local_once(visible_for, move || {
+        if current_generation.get() != generation {
+            return;
+        }
         let Some(label) = label_for_restore.upgrade() else {
             return;
         };
-        // A selection move or a newer status owns the label now; an old timer
-        // must not overwrite it.
-        if label.text().as_str() != message {
-            return;
-        }
         label.set_text(&steady_hint);
         label.set_tooltip_text(None);
         label.update_property(&[gtk4::accessible::Property::Label(&steady_hint)]);
@@ -2735,6 +2702,9 @@ fn sync_finished_block_selection(
         });
     let hint = finished_selection_hint(selected.len(), can_recall, active_command_is_rerunnable);
     for block in finished {
+        block
+            .selection_feedback_generation
+            .set(block.selection_feedback_generation.get().wrapping_add(1));
         let is_selected = selected.contains(&block.id);
         if is_selected {
             block.widget().add_css_class("block-selected");
@@ -2744,10 +2714,14 @@ fn sync_finished_block_selection(
 
         let is_active = active == Some(block.id);
         if is_active {
+            *block.selection_hint_steady.borrow_mut() = hint.clone();
             block.selection_hint.set_text(&hint);
+            block.selection_hint.set_tooltip_text(None);
             block
                 .selection_hint
                 .update_property(&[gtk4::accessible::Property::Label(&hint)]);
+        } else {
+            block.selection_hint_steady.borrow_mut().clear();
         }
         block.selection_hint.set_visible(is_active);
         if is_active {
@@ -3517,15 +3491,8 @@ impl BlockBackend {
         let finished_blocks_for_menu = Rc::downgrade(&self.finished_blocks_for_cb);
         let block_list_for_menu = self.block_list_rc.downgrade();
         let vte_for_copy = self.active_vte.downgrade();
-        let pty_for_rerun_menu = self.pty_for_init.clone();
-        let pty_synced_for_rerun_menu = self.pty_synced_rc.clone();
         let active_for_rerun_menu = Rc::downgrade(&self.active_rc);
-        let bstate_for_rerun_menu = self.bstate_rc.clone();
         let bracketed_paste_for_menu = self.bracketed_paste_rc.clone();
-        let typed_cmd_for_rerun_menu = self.typed_cmd_rc.clone();
-        let typed_cmd_fidelity_for_rerun_menu = self.typed_cmd_fidelity_rc.clone();
-        let submission_pending_for_rerun_menu = self.submission_pending_rc.clone();
-        let pending_typeahead_for_rerun_menu = self.pending_typeahead_rc.clone();
         let verified_submission_for_menu = self.verified_submission_for_rerun.clone();
         let config_for_menu = self.config_for_cb.clone();
         let selected_ids_for_menu = self.selected_block_ids_rc.clone();
@@ -3732,17 +3699,28 @@ impl BlockBackend {
                 let selected_ids_for_rerun = selected_ids_for_menu.clone();
                 let selected_for_rerun = selected_for_menu.clone();
                 let anchor_for_rerun = anchor_for_menu.clone();
-                let pty_for_action = pty_for_rerun_menu.clone();
-                let pty_synced_for_action = pty_synced_for_rerun_menu.clone();
                 let bracketed_for_action = bracketed_paste_for_menu.clone();
-                let typed_cmd_for_action = typed_cmd_for_rerun_menu.clone();
-                let typed_cmd_fidelity_for_action = typed_cmd_fidelity_for_rerun_menu.clone();
-                let submission_pending_for_action = submission_pending_for_rerun_menu.clone();
-                let pending_typeahead_for_action = pending_typeahead_for_rerun_menu.clone();
-                let bstate_for_action = bstate_for_rerun_menu.clone();
+                let verified_submission_for_action = verified_submission_for_menu.clone();
+                let config_for_action = config_for_menu.clone();
                 let active_for_action = active_for_rerun_menu.clone();
-                item.set_sensitive(command_recall_available(bstate_for_rerun_menu.get()));
-                item.set_tooltip_text(Some("Available when the shell prompt is ready"));
+                let command = {
+                    let finished = finished_blocks.borrow();
+                    let selected = selected_ids_for_menu.borrow();
+                    selected_command_text(
+                        finished
+                            .iter()
+                            .map(|block| (block.id, block.cmd_text.as_str())),
+                        &selected,
+                    )
+                };
+                let suggestion = click_cursor::suggestion_rgb(&config_for_menu.borrow().palette);
+                item.set_sensitive(
+                    selected_command_recall_is_lossless(&command, bracketed_paste_for_menu.get())
+                        && verified_submission_for_menu.can_recall_command(suggestion),
+                );
+                item.set_tooltip_text(Some(
+                    "Inserts only at a visibly empty, verified shell prompt",
+                ));
                 item.connect_clicked(move |_| {
                     popdown_if_alive(&popover_c);
                     let Some(finished_for_rerun) = finished_for_rerun.upgrade() else {
@@ -3751,19 +3729,14 @@ impl BlockBackend {
                     let finished = finished_for_rerun.borrow();
                     let recalled = {
                         let selected = selected_ids_for_rerun.borrow();
+                        let suggestion =
+                            click_cursor::suggestion_rgb(&config_for_action.borrow().palette);
                         recall_selected_commands_at_prompt(
-                            PromptRecallCtx {
-                                pty: &pty_for_action,
-                                pty_synced: &pty_synced_for_action,
-                                typed_cmd: &typed_cmd_for_action,
-                                typed_cmd_fidelity: &typed_cmd_fidelity_for_action,
-                                submission_pending: &submission_pending_for_action,
-                                pending_typeahead: &pending_typeahead_for_action,
-                            },
-                            bstate_for_action.get(),
+                            &verified_submission_for_action,
                             &finished,
                             &selected,
                             bracketed_for_action.get(),
+                            suggestion,
                         )
                     };
                     if recalled {
@@ -4504,11 +4477,14 @@ impl VerifiedSubmissionCtx {
             .prompt_anchor(self.prompt_end_pos.get(), self.prompt_anchor_rows.get())
     }
 
-    /// Admit a direct history re-run only while the live shell editor is
-    /// synchronously proven empty. The shared submission path then inserts the
-    /// command without Enter, verifies its exact stable render, and admits CR
-    /// in phase two; history provenance never weakens that race boundary.
-    fn historical_rerun_is_ready(&self, command: &str, suggestion_rgb: [u8; 3]) -> bool {
+    /// The shared visible-editor proof for history actions. Recall and direct
+    /// re-run used to disagree here: re-run checked the PromptEnd anchor and
+    /// the rendered suffix, while recall trusted only the in-memory input
+    /// shadow before writing `Ctrl+U`. A shell hook or readline redraw can
+    /// create input without crossing that shadow, and `Ctrl+U` only kills from
+    /// the cursor to BOL, so an unseen suffix could survive and merge with the
+    /// recalled command.
+    fn history_editor_is_ready(&self, suggestion_rgb: [u8; 3]) -> bool {
         if self.source_id.borrow().is_some()
             || self.completion.borrow().is_some()
             || self.pending_agent_generation.get().is_some()
@@ -4519,9 +4495,99 @@ impl VerifiedSubmissionCtx {
             || self.submission_pending.get()
             || self.pending_typeahead.get()
             || !self.typed_cmd.borrow().is_empty()
+            || self.typed_cmd_fidelity.get() == TypedShadowFidelity::ExactSubmitted
             || self.external_submission.borrow().is_some()
             || self.external_submission_generation.get().is_some()
             || self.reviewed_submission_tainted.get()
+        {
+            return false;
+        }
+        let anchor = self.current_anchor();
+        self.surface.cursor_position() == anchor
+            && self.surface.suffix_is_empty(suggestion_rgb) == Some(true)
+    }
+
+    fn can_recall_command(&self, suggestion_rgb: [u8; 3]) -> bool {
+        self.history_editor_is_ready(suggestion_rgb)
+    }
+
+    /// Recall history only into a synchronously proven empty editor. This is
+    /// insert-only, so it deliberately does not require foreground-process
+    /// ownership; unlike a re-run, no Enter is admitted. The visible editor
+    /// proof and every in-flight reviewed-submission guard are still shared.
+    fn try_recall_command(
+        &self,
+        command: &str,
+        bracketed_paste: bool,
+        suggestion_rgb: [u8; 3],
+    ) -> bool {
+        if !self.can_recall_command(suggestion_rgb) {
+            return false;
+        }
+        let paste = build_command_recall(command, bracketed_paste);
+        if paste.is_empty() {
+            return false;
+        }
+        // One write: the kill-to-BOL prefix, body and optional paste frame may
+        // not be split around another producer.
+        if let Err(error) = self.pty.write_bytes(&paste.bytes) {
+            self.pty
+                .report_write_error("could not queue recalled command", error);
+            return false;
+        }
+        *self.typed_cmd.borrow_mut() = paste.echo_text;
+        // `Ctrl+U` is conventional, not a portable whole-buffer replacement;
+        // keep the shadow below exact-command authority after insertion.
+        self.typed_cmd_fidelity.set(TypedShadowFidelity::Inexact);
+        self.idle_input_dirty.set(true);
+        self.pty_synced.set(true);
+        self.accepted_input_generation
+            .set(self.accepted_input_generation.get().wrapping_add(1));
+        true
+    }
+
+    /// Explain a strict recall refusal using the same vocabulary as Agent and
+    /// re-run feedback. This translates the proof; it never admits bytes.
+    fn recall_refusal_status(&self, suggestion_rgb: [u8; 3]) -> CommandPromptStatus {
+        let status = classify_command_prompt_status(
+            self.bstate.get(),
+            false,
+            self.idle_input_dirty.get()
+                || self.submission_pending.get()
+                || self.pending_typeahead.get()
+                || self.source_id.borrow().is_some()
+                || self.completion.borrow().is_some()
+                || self.pending_agent_generation.get().is_some()
+                || self.external_submission.borrow().is_some()
+                || self.external_submission_generation.get().is_some()
+                || self.reviewed_submission_tainted.get()
+                || self.typed_cmd_fidelity.get() == TypedShadowFidelity::ExactSubmitted,
+            self.pty_synced.get(),
+            self.typed_cmd.borrow().is_empty(),
+        );
+        if status != CommandPromptStatus::Ready {
+            return status;
+        }
+        if !self.prompt_anchor_ready.get() {
+            return CommandPromptStatus::Initializing;
+        }
+        let anchor = self.current_anchor();
+        if self.surface.cursor_position() != anchor
+            || self.surface.suffix_is_empty(suggestion_rgb) != Some(true)
+        {
+            CommandPromptStatus::HasInput
+        } else {
+            // A generation may have changed between action and feedback.
+            CommandPromptStatus::Ready
+        }
+    }
+
+    /// Admit a direct history re-run only while the live shell editor is
+    /// synchronously proven empty. The shared submission path then inserts the
+    /// command without Enter, verifies its exact stable render, and admits CR
+    /// in phase two; history provenance never weakens that race boundary.
+    fn historical_rerun_is_ready(&self, command: &str, suggestion_rgb: [u8; 3]) -> bool {
+        if !self.history_editor_is_ready(suggestion_rgb)
             || self.pty.foreground_owner() != PtyForeground::Shell
         {
             return false;
@@ -4539,9 +4605,7 @@ impl VerifiedSubmissionCtx {
         ) {
             return false;
         }
-        let anchor = self.current_anchor();
-        self.surface.cursor_position() == anchor
-            && self.surface.suffix_is_empty(suggestion_rgb) == Some(true)
+        true
     }
 
     fn can_submit_historical_rerun(&self, command: &str, suggestion_rgb: [u8; 3]) -> bool {
@@ -6008,16 +6072,8 @@ struct BlockBackend {
     ask_ai_cbs: AskAiCallbacks,
     /// Shared with `TermView` so Drop can remove a still-armed settling tick.
     prompt_anchor_tick_id_rc: Rc<RefCell<Option<gtk4::TickCallbackId>>>,
-    // Lifecycle cells rebound by finished-block actions / the context menu.
-    bstate_rc: Rc<Cell<BlockState>>,
-    typed_cmd_rc: Rc<RefCell<String>>,
-    typed_cmd_fidelity_rc: Rc<Cell<TypedShadowFidelity>>,
-    submission_pending_rc: Rc<Cell<bool>>,
-    pending_typeahead_rc: Rc<Cell<bool>>,
     bracketed_paste_rc: Rc<Cell<bool>>,
-    pty_synced_rc: Rc<Cell<bool>>,
-    /// Shared proof boundary for context-menu history re-runs. Insert-only
-    /// actions keep their more permissive recall path.
+    /// Shared proof boundary for every card-level history insertion and re-run.
     verified_submission_for_rerun: VerifiedSubmissionCtx,
     /// Kitty graphics (APC G) — multi-chunk uploads assemble here; completed
     /// textures wait against the running command until its block finishes.
@@ -8208,14 +8264,9 @@ impl RenderBackend for BlockBackend {
 
         finished_clone.connect_actions(
             &self.active_vte,
-            &self.pty_for_init,
-            &self.pty_synced_rc,
+            &self.verified_submission_for_rerun,
+            &self.config_for_cb,
             &self.active_rc,
-            &self.typed_cmd_rc,
-            &self.typed_cmd_fidelity_rc,
-            &self.submission_pending_rc,
-            &self.pending_typeahead_rc,
-            &self.bstate_rc,
             &self.bracketed_paste_rc,
         );
         finished_clone.connect_scroll_forwarding(&self.block_scroll_rc, &self.scroll_debouncer);
@@ -10151,7 +10202,6 @@ enum KeyScope {
 /// shared handle, so both mounts observe and mutate the same pane state.
 #[derive(Clone)]
 struct KeyCtx {
-    pty_for_key: Rc<OwnedPty>,
     /// Kitty keyboard protocol: the flags in effect, and the last key pressed
     /// so the commit handler can replace the legacy bytes VTE emits for it.
     kitty_flags_for_key: Rc<Cell<u8>>,
@@ -10160,9 +10210,6 @@ struct KeyCtx {
     pty_synced_for_key: Rc<Cell<bool>>,
     bracketed_paste_for_key: Rc<Cell<bool>>,
     typed_cmd_for_key: Rc<RefCell<String>>,
-    typed_cmd_fidelity_for_key: Rc<Cell<TypedShadowFidelity>>,
-    submission_pending_for_key: Rc<Cell<bool>>,
-    pending_typeahead_for_key: Rc<Cell<bool>>,
     verified_submission_for_key: VerifiedSubmissionCtx,
     config_for_key: Rc<RefCell<Config>>,
     finished_blocks_for_key: Weak<RefCell<Vec<FinishedBlock>>>,
@@ -10188,16 +10235,12 @@ struct KeyCtx {
 impl KeyCtx {
     fn connect(self, key_ctrl: &gtk4::EventControllerKey, scope: KeyScope) {
         let KeyCtx {
-            pty_for_key,
             kitty_flags_for_key,
             kitty_last_key_for_key,
             active_vte_for_key,
             pty_synced_for_key,
             bracketed_paste_for_key,
             typed_cmd_for_key,
-            typed_cmd_fidelity_for_key,
-            submission_pending_for_key,
-            pending_typeahead_for_key,
             verified_submission_for_key,
             config_for_key,
             finished_blocks_for_key,
@@ -10460,19 +10503,14 @@ impl KeyCtx {
                     let finished = finished_blocks_for_key.borrow();
                     let recalled = {
                         let selected = selected_block_ids_for_key.borrow();
+                        let suggestion =
+                            click_cursor::suggestion_rgb(&config_for_key.borrow().palette);
                         recall_selected_commands_at_prompt(
-                            PromptRecallCtx {
-                                pty: &pty_for_key,
-                                pty_synced: &pty_synced_for_key,
-                                typed_cmd: &typed_cmd_for_key,
-                                typed_cmd_fidelity: &typed_cmd_fidelity_for_key,
-                                submission_pending: &submission_pending_for_key,
-                                pending_typeahead: &pending_typeahead_for_key,
-                            },
-                            bstate_for_key.get(),
+                            &verified_submission_for_key,
                             &finished,
                             &selected,
                             bracketed_paste_for_key.get(),
+                            suggestion,
                         )
                     };
                     if recalled {
@@ -10494,17 +10532,12 @@ impl KeyCtx {
                             &selected,
                         )
                     };
+                    let suggestion = click_cursor::suggestion_rgb(&config_for_key.borrow().palette);
                     let refusal = prompt_recall_refusal(
-                        PromptSubmitGuards {
-                            state: bstate_for_key.get(),
-                            pty_synced: pty_synced_for_key.get(),
-                            submission_pending: submission_pending_for_key.get(),
-                            pending_typeahead: pending_typeahead_for_key.get(),
-                            fidelity: typed_cmd_fidelity_for_key.get(),
-                        },
-                        typed_cmd_for_key.borrow().trim().is_empty(),
+                        &verified_submission_for_key,
                         &command,
                         bracketed_paste_for_key.get(),
+                        suggestion,
                     );
                     flash_finished_selection_refusal(
                         &finished,
@@ -11919,13 +11952,7 @@ impl TermView {
                     pty_for_init: pty_for_init.clone(),
                     ask_ai_cbs: ask_ai_callbacks.clone(),
                     prompt_anchor_tick_id_rc: prompt_anchor_tick_id.clone(),
-                    bstate_rc: bstate_rc.clone(),
-                    typed_cmd_rc: typed_cmd_rc.clone(),
-                    typed_cmd_fidelity_rc: typed_cmd_fidelity_rc.clone(),
-                    submission_pending_rc: submission_pending_rc.clone(),
-                    pending_typeahead_rc: pending_typeahead_rc.clone(),
                     bracketed_paste_rc: bracketed_paste_rc.clone(),
-                    pty_synced_rc: pty_synced_rc.clone(),
                     verified_submission_for_rerun: verified_submission.clone(),
                     kitty_assembler: RefCell::new(kitty_graphics::Assembler::new()),
                     kitty_pending_images: RefCell::new(Vec::new()),
@@ -12587,12 +12614,8 @@ impl TermView {
 
         // ── Keyboard navigation / copy-paste (Capture phase) ──────────────
         {
-            let pty_for_key = pty.clone();
             let removed_blocks_for_key = removed_blocks.clone();
             let typed_cmd_for_key = typed_cmd.clone();
-            let typed_cmd_fidelity_for_key = typed_cmd_fidelity.clone();
-            let submission_pending_for_key = submission_pending.clone();
-            let pending_typeahead_for_key = pending_typeahead.clone();
             let finished_blocks_for_key = Rc::downgrade(&finished_blocks_rc);
             let block_data_for_key = block_data_rc.clone();
             let block_list_for_key = block_list.clone();
@@ -12604,16 +12627,12 @@ impl TermView {
             key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
 
             let key_ctx = KeyCtx {
-                pty_for_key,
                 kitty_flags_for_key: kitty_flags.clone(),
                 kitty_last_key_for_key: kitty_last_key.clone(),
                 active_vte_for_key: active_vte.downgrade(),
                 pty_synced_for_key: pty_synced.clone(),
                 bracketed_paste_for_key: bracketed_paste.clone(),
                 typed_cmd_for_key,
-                typed_cmd_fidelity_for_key,
-                submission_pending_for_key,
-                pending_typeahead_for_key,
                 verified_submission_for_key: verified_submission.clone(),
                 config_for_key: config_shared.clone(),
                 finished_blocks_for_key,
@@ -13370,14 +13389,9 @@ impl TermView {
         }
         finished.connect_actions(
             &self.active_vte,
-            &self.pty,
-            &self.pty_synced,
+            &self.verified_submission,
+            &self.config,
             &self.active,
-            &self.typed_cmd,
-            &self.typed_cmd_fidelity,
-            &self.submission_pending,
-            &self.pending_typeahead,
-            &self.bstate,
             &self.bracketed_paste,
         );
         finished.connect_scroll_forwarding(&self.block_scroll, &self.scroll_debouncer);
@@ -14303,19 +14317,13 @@ impl TermView {
         let finished = self.finished_blocks.borrow();
         let recalled = {
             let selected = self.selected_block_ids.borrow();
+            let suggestion = click_cursor::suggestion_rgb(&self.config.borrow().palette);
             recall_selected_commands_at_prompt(
-                PromptRecallCtx {
-                    pty: &self.pty,
-                    pty_synced: &self.pty_synced,
-                    typed_cmd: &self.typed_cmd,
-                    typed_cmd_fidelity: &self.typed_cmd_fidelity,
-                    submission_pending: &self.submission_pending,
-                    pending_typeahead: &self.pending_typeahead,
-                },
-                self.bstate.get(),
+                &self.verified_submission,
                 &finished,
                 &selected,
                 self.bracketed_paste.get(),
+                suggestion,
             )
         };
         if recalled {
@@ -15644,10 +15652,7 @@ mod tests {
 
     #[test]
     fn a_refused_selection_action_names_the_gate_and_the_non_action() {
-        use super::{
-            BlockState, CommandPromptStatus, SelectionAction, SelectionActionRefusal,
-            TypedShadowFidelity,
-        };
+        use super::{CommandPromptStatus, SelectionAction, SelectionActionRefusal};
 
         assert_eq!(
             super::selection_refusal_hint(
@@ -15670,41 +15675,11 @@ mod tests {
             ),
             "Esc cancel  ·  Selection cannot be recalled safely  ·  nothing recalled"
         );
-        assert_eq!(
-            super::prompt_recall_refusal(
-                super::PromptSubmitGuards {
-                    state: BlockState::CollectingOutput,
-                    pty_synced: false,
-                    submission_pending: false,
-                    pending_typeahead: false,
-                    fidelity: TypedShadowFidelity::ExactOpen,
-                },
-                true,
-                "cargo test",
-                true,
-            ),
-            SelectionActionRefusal::Prompt(CommandPromptStatus::Running)
-        );
-        assert_eq!(
-            super::prompt_recall_refusal(
-                super::PromptSubmitGuards {
-                    state: BlockState::AwaitingCommand,
-                    pty_synced: true,
-                    submission_pending: false,
-                    pending_typeahead: false,
-                    fidelity: TypedShadowFidelity::Inexact,
-                },
-                false,
-                "cargo test",
-                true,
-            ),
-            SelectionActionRefusal::Prompt(CommandPromptStatus::HasInput)
-        );
     }
 
     #[test]
     #[ignore = "requires DISPLAY"]
-    fn a_refusal_flash_is_visible_and_exposed_as_status_text() {
+    fn a_refusal_flash_is_visible_exposed_and_restores_only_the_latest_status() {
         use gtk4::prelude::*;
 
         gtk4::init().expect("gtk init");
@@ -15722,14 +15697,16 @@ mod tests {
             None,
             80,
         );
-        card.selection_hint.set_text(super::SELECTION_HINT_RUN);
-        card.selection_hint.set_visible(true);
+        let selected = Rc::new(RefCell::new(HashSet::from([91])));
+        let active = Rc::new(Cell::new(Some(91)));
+        super::sync_finished_block_selection(std::slice::from_ref(&card), &selected, &active);
         let message = "Esc cancel  ·  Prompt has input  ·  nothing run".to_string();
 
-        super::flash_finished_selection_refusal(
+        super::flash_finished_selection_refusal_for(
             std::slice::from_ref(&card),
             Some(91),
             message.clone(),
+            std::time::Duration::from_millis(30),
         );
 
         assert_eq!(card.selection_hint.text().as_str(), message);
@@ -15742,12 +15719,40 @@ mod tests {
             gtk4::AccessibleRole::Status
         );
 
-        let loop_ = gtk4::glib::MainLoop::new(None, false);
-        let quit = loop_.clone();
-        gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
-            quit.quit();
-        });
-        loop_.run();
+        let run_for = |millis| {
+            let loop_ = gtk4::glib::MainLoop::new(None, false);
+            let quit = loop_.clone();
+            gtk4::glib::timeout_add_local_once(
+                std::time::Duration::from_millis(millis),
+                move || quit.quit(),
+            );
+            loop_.run();
+        };
+
+        // Repeating the same refusal refreshes its full lifetime. The old
+        // timeout must not restore the steady legend underneath the new one.
+        run_for(10);
+        super::flash_finished_selection_refusal_for(
+            std::slice::from_ref(&card),
+            Some(91),
+            message.clone(),
+            std::time::Duration::from_millis(70),
+        );
+        run_for(30);
+        assert_eq!(card.selection_hint.text().as_str(), message);
+
+        // A different, newer refusal owns the eventual restoration too. The
+        // second timeout used to restore the first transient message forever.
+        let newer = "Esc cancel  ·  Command running  ·  nothing recalled".to_string();
+        super::flash_finished_selection_refusal_for(
+            std::slice::from_ref(&card),
+            Some(91),
+            newer.clone(),
+            std::time::Duration::from_millis(70),
+        );
+        run_for(40);
+        assert_eq!(card.selection_hint.text().as_str(), newer);
+        run_for(40);
         assert_eq!(
             card.selection_hint.text().as_str(),
             super::SELECTION_HINT_RUN
@@ -23447,6 +23452,82 @@ mod tests {
                 .reads()
                 .contains(&SurfaceRead::SuffixIsEmpty));
         }
+    }
+
+    #[test]
+    fn history_recall_writes_nothing_over_dirty_or_unverified_editor_state() {
+        let harness = ReaderHarness::new();
+        let anchor = harness.arm_verified_prompt();
+        let _ = harness.pty.drain_test_slave(PTY_REPLY_WAIT);
+
+        harness.ctx.typed_cmd_rc.borrow_mut().push_str("echo KEEP");
+        harness.ctx.idle_input_dirty_rc.set(true);
+        assert!(!harness.ctx.verified_submission.try_recall_command(
+            "echo history",
+            true,
+            [0, 0, 0],
+        ));
+        assert_eq!(&*harness.ctx.typed_cmd_rc.borrow(), "echo KEEP");
+        assert!(
+            harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty(),
+            "a dirty-editor refusal must write neither Ctrl+U nor history bytes"
+        );
+
+        harness.ctx.typed_cmd_rc.borrow_mut().clear();
+        harness.ctx.idle_input_dirty_rc.set(false);
+        harness.surface.cursor.set((anchor.0 + 1, anchor.1));
+        assert!(!harness.ctx.verified_submission.try_recall_command(
+            "echo history",
+            true,
+            [0, 0, 0],
+        ));
+        assert_eq!(
+            harness
+                .ctx
+                .verified_submission
+                .recall_refusal_status([0, 0, 0]),
+            CommandPromptStatus::HasInput,
+        );
+        assert!(harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+
+        harness.surface.cursor.set(anchor);
+        harness.surface.suffix_is_empty.set(Some(false));
+        assert!(!harness.ctx.verified_submission.try_recall_command(
+            "echo history",
+            true,
+            [0, 0, 0],
+        ));
+        assert!(
+            harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty(),
+            "a visible suffix must survive untouched instead of being merged"
+        );
+    }
+
+    #[test]
+    fn history_recall_updates_every_editor_guard_after_verified_insertion() {
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        let _ = harness.pty.drain_test_slave(PTY_REPLY_WAIT);
+        let generation = harness.ctx.accepted_input_generation_rc.get();
+
+        assert!(harness.ctx.verified_submission.try_recall_command(
+            "echo history",
+            false,
+            [0, 0, 0],
+        ));
+        let expected = super::build_command_recall("echo history", false);
+        assert_eq!(harness.pty.drain_test_slave(PTY_REPLY_WAIT), expected.bytes);
+        assert_eq!(&*harness.ctx.typed_cmd_rc.borrow(), "echo history");
+        assert_eq!(
+            harness.ctx.typed_cmd_fidelity_rc.get(),
+            TypedShadowFidelity::Inexact,
+        );
+        assert!(harness.ctx.idle_input_dirty_rc.get());
+        assert!(harness.ctx.pty_synced_rc.get());
+        assert_eq!(
+            harness.ctx.accepted_input_generation_rc.get(),
+            generation.wrapping_add(1),
+        );
     }
 
     #[test]

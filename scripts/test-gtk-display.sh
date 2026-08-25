@@ -67,7 +67,7 @@ tests=(
     block_view::tests::a_stranded_focus_mount_declines_only_what_the_focused_widget_owns
     block_view::blocks::tests::revealing_a_cards_actions_does_not_move_its_metadata
     block_view::blocks::tests::the_selection_hint_sits_on_the_spacers_left
-    block_view::tests::a_refusal_flash_is_visible_and_exposed_as_status_text
+    block_view::tests::a_refusal_flash_is_visible_exposed_and_restores_only_the_latest_status
     block_view::tests::late_inline_notice_adopts_the_panes_current_density
     block_view::tests::dock_mount_refuses_a_widget_another_region_owns
     block_view::tests::unified_search_capture_real_vte_uses_half_open_column_boundary

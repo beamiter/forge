@@ -658,6 +658,13 @@ pub(crate) struct FinishedBlock {
     pub(crate) action_box: gtk4::Box,
     /// Keyboard affordances shown only while this block is selected.
     pub(crate) selection_hint: gtk4::Label,
+    /// Persistent selection legend kept separate from transient refusal text.
+    /// A second refusal may arrive before the first timeout; restoring from
+    /// the label itself would then preserve the first refusal indefinitely.
+    pub(crate) selection_hint_steady: Rc<RefCell<String>>,
+    /// Invalidates older refusal timeouts after another status or selection
+    /// transition takes ownership of the label.
+    pub(crate) selection_feedback_generation: Rc<Cell<u64>>,
     /// Toggle the output filter while preserving the current query.
     pub(crate) toggle_filter: Rc<dyn Fn()>,
     /// Fold or unfold this card's output. Stored, like `toggle_filter`, so the
@@ -742,6 +749,8 @@ impl Clone for FinishedBlock {
             header_row: self.header_row.clone(),
             action_box: self.action_box.clone(),
             selection_hint: self.selection_hint.clone(),
+            selection_hint_steady: self.selection_hint_steady.clone(),
+            selection_feedback_generation: self.selection_feedback_generation.clone(),
             toggle_filter: self.toggle_filter.clone(),
             set_collapsed: self.set_collapsed.clone(),
             collapsed_summary: self.collapsed_summary.clone(),
@@ -1515,9 +1524,12 @@ type LateBoundWeakAction = Rc<RefCell<Option<std::rc::Weak<dyn Fn()>>>>;
 /// spacer sits immediately before the metadata run, so a strip that appears
 /// and disappears drags the timestamp, duration and exit badge sideways with
 /// it. Insensitive while faded so the invisible buttons take neither pointer
-/// nor keyboard focus.
+/// nor keyboard focus. `can_target` must move with the visual state too: an
+/// opacity-zero child that remains pickable creates a transparent dead zone in
+/// the card header for touch and other no-hover input.
 pub(crate) fn reveal_block_actions(action_box: &gtk4::Box, revealed: bool) {
     action_box.set_opacity(if revealed { 1.0 } else { 0.0 });
+    action_box.set_can_target(revealed);
     action_box.set_sensitive(revealed);
 }
 
@@ -2248,8 +2260,7 @@ impl FinishedBlock {
         // history hard to read. Insensitive while faded, so an invisible
         // button can take neither a click nor Tab focus.
         let action_box = gtk4::Box::new(Orientation::Horizontal, 2);
-        action_box.set_opacity(0.0);
-        action_box.set_sensitive(false);
+        reveal_block_actions(&action_box, false);
         // Small gap between the meta badges (timestamp/duration/exit) on the
         // right and the action button group, so they read as separate units
         // rather than one undifferentiated cluster.
@@ -3320,6 +3331,8 @@ impl FinishedBlock {
             header_row,
             action_box,
             selection_hint,
+            selection_hint_steady: Rc::new(RefCell::new(String::new())),
+            selection_feedback_generation: Rc::new(Cell::new(0)),
             toggle_filter,
             set_collapsed,
             collapsed_summary,
@@ -3615,18 +3628,12 @@ impl FinishedBlock {
     /// Wire the hover quick-action buttons (copy command, copy output, re-run).
     /// Kept separate from construction because handlers need the clipboard, PTY,
     /// and active block, which only the owning `TermView` has.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn connect_actions(
+    pub(super) fn connect_actions(
         &self,
         vte: &Terminal,
-        pty: &Rc<crate::pty::OwnedPty>,
-        pty_synced: &Rc<Cell<bool>>,
+        verified_submission: &super::VerifiedSubmissionCtx,
+        config: &Rc<RefCell<Config>>,
         active: &Rc<RefCell<ActiveBlock>>,
-        typed_cmd: &Rc<RefCell<String>>,
-        typed_cmd_fidelity: &Rc<Cell<super::TypedShadowFidelity>>,
-        submission_pending: &Rc<Cell<bool>>,
-        pending_typeahead: &Rc<Cell<bool>>,
-        bstate: &Rc<Cell<BlockState>>,
         bracketed_paste: &Rc<Cell<bool>>,
     ) {
         // Supply the late-bound focus hand-back the filter row needs. Weak on
@@ -3669,29 +3676,17 @@ impl FinishedBlock {
             flash_button_icon(btn, "object-select-symbolic", "Output copied");
         });
 
-        let pty_for_rerun = Rc::clone(pty);
-        let pty_synced_for_rerun = pty_synced.clone();
+        let verified_submission_for_rerun = verified_submission.clone();
+        let config_for_rerun = config.clone();
         let active_for_rerun = Rc::downgrade(active);
-        let typed_cmd_for_rerun = typed_cmd.clone();
-        let typed_cmd_fidelity_for_rerun = typed_cmd_fidelity.clone();
-        let submission_pending_for_rerun = submission_pending.clone();
-        let pending_typeahead_for_rerun = pending_typeahead.clone();
-        let bstate_for_rerun = bstate.clone();
         let bracketed_for_rerun = bracketed_paste.clone();
         let cmd_for_rerun = self.cmd_text.clone();
         self.rerun_btn.connect_clicked(move |btn| {
-            if recall_command_at_prompt(
-                PromptRecallCtx {
-                    pty: &pty_for_rerun,
-                    pty_synced: &pty_synced_for_rerun,
-                    typed_cmd: &typed_cmd_for_rerun,
-                    typed_cmd_fidelity: &typed_cmd_fidelity_for_rerun,
-                    submission_pending: &submission_pending_for_rerun,
-                    pending_typeahead: &pending_typeahead_for_rerun,
-                },
-                bstate_for_rerun.get(),
+            let suggestion = click_cursor::suggestion_rgb(&config_for_rerun.borrow().palette);
+            if verified_submission_for_rerun.try_recall_command(
                 &cmd_for_rerun,
                 bracketed_for_rerun.get(),
+                suggestion,
             ) {
                 if let Some(active_for_rerun) = active_for_rerun.upgrade() {
                     active_for_rerun.borrow().grab_focus();
@@ -4143,13 +4138,6 @@ pub(crate) enum BlockState {
     RawFallback,
 }
 
-/// Recalling a finished command is safe only while the shell is sitting at a
-/// prompt. In every other state, writing command bytes would feed the currently
-/// running process (or vim/less) instead of the shell line editor.
-pub(crate) fn command_recall_available(state: BlockState) -> bool {
-    state == BlockState::AwaitingCommand
-}
-
 /// Replace the current shell edit buffer with a recalled command, optionally
 /// submitting it. Returns whether the command had to be cut to its first line.
 ///
@@ -4184,12 +4172,11 @@ pub(crate) fn write_recalled_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        block_clipboard_text, collapsed_output_summary, command_recall_available,
-        completed_block_retention_plan, estimated_completed_block_retained_bytes,
-        exit_code_for_shared_surface, filter_output_lines, live_organism_alt_transition,
-        live_organism_is_visible, terminal_grid_units_upper_bound, terminalize_line_breaks,
-        BlockData, BlockLifecycleHealth, BlockOutcome, BlockState, FinishedBlock,
-        UNKNOWN_EXIT_NOTE, UNKNOWN_EXIT_SENTINEL,
+        block_clipboard_text, collapsed_output_summary, completed_block_retention_plan,
+        estimated_completed_block_retained_bytes, exit_code_for_shared_surface,
+        filter_output_lines, live_organism_alt_transition, live_organism_is_visible,
+        terminal_grid_units_upper_bound, terminalize_line_breaks, BlockData, BlockLifecycleHealth,
+        BlockOutcome, FinishedBlock, UNKNOWN_EXIT_NOTE, UNKNOWN_EXIT_SENTINEL,
     };
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
@@ -4500,10 +4487,15 @@ mod tests {
             "the action strip must keep its allocation in both states"
         );
         assert!(card.action_box.is_sensitive());
+        assert!(card.action_box.can_target());
         super::reveal_block_actions(&card.action_box, false);
         assert!(
             !card.action_box.is_sensitive(),
             "a faded strip must take neither a click nor Tab focus"
+        );
+        assert!(
+            !card.action_box.can_target(),
+            "a faded strip must not leave a transparent pointer dead zone"
         );
     }
 
@@ -5019,21 +5011,6 @@ mod tests {
         assert_eq!(block_clipboard_text("echo ok", "ok", false), "echo ok\nok");
         assert_eq!(block_clipboard_text("echo ok", "ok", true), "ok");
         assert_eq!(block_clipboard_text("pwd", "", false), "pwd");
-    }
-
-    #[test]
-    fn command_recall_is_only_available_at_the_prompt() {
-        assert!(command_recall_available(BlockState::AwaitingCommand));
-        for state in [
-            BlockState::Idle,
-            BlockState::CollectingPrompt,
-            BlockState::CollectingOutput,
-            BlockState::AltScreen,
-            BlockState::PostCommand,
-            BlockState::RawFallback,
-        ] {
-            assert!(!command_recall_available(state), "{state:?}");
-        }
     }
 
     /// Recall is insertion-only: no readline/zle binding is a portable

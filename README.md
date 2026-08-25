@@ -317,7 +317,9 @@ source <(forge --shell-integration bash)
 
 Block 模式与 anvil 保持相同的选择语义：`Ctrl+Up` 从最新块进入选择，`Shift+Up/Down`
 扩展范围，普通 `Up/Down` 移动 active edge，`Enter` 按终端顺序把所有选中命令回填为
-可编辑文本而不执行，`Escape` 取消选择。`Ctrl+Enter` 直接重跑**单个**选中块的命令
+可编辑文本而不执行，`Escape` 取消选择。回填也必须证明提示符 anchor 已稳定、光标仍在 anchor、
+可见 suffix 为空且没有正在验证的 Agent/外部提交；键盘、卡片按钮、右键菜单和 reinput API 共用
+这套边界，拒绝时不会发送 `Ctrl+U` 或历史文本。`Ctrl+Enter` 直接重跑**单个**选中块的命令
 （右键菜单的 **Re-run Command** 等价）：仅限本 pane 里用户自己已经执行过的单行命令，
 并且必须同时证明提示符锚点已稳定、光标仍在锚点、可见后缀为空、没有用户/Agent/外部提交，
 且 PTY 前台所有权已回到 shell；右键项的启用状态与键盘执行共用这套门禁。
@@ -329,7 +331,9 @@ CR，从而覆盖“同步检查为空、异步回显却已有输入”的竞态
 `↵ recall all`；只有可安全重跑的单选才显示 `Ctrl+↵ run`，其他选区不会宣传不存在的动作。
 为降低误删，紧凑提示不宣传 `Delete`，但删除能力与单级撤销保持不变。
 选区中的拒绝会消费普通 `Enter` 或 `Ctrl+Enter`，短暂显示 busy、dirty、多选或命令不安全等可见
-原因并响铃，然后恢复动作提示；同一个 Enter 不会继续交给实时 VTE。
+原因并响铃，然后恢复动作提示；连续拒绝会刷新提示时长，旧状态不会提前覆盖新状态；同一个 Enter
+不会继续交给实时 VTE。淡出的卡片快捷操作区也不参与 pointer hit-test，因此触摸 header 不会命中
+看不见的按钮。
 含控制符、嵌入 paste marker 或任何经 sanitizer 改写的历史命令也保持只回填审阅。
 AI / Agent / 命令面板的建议仍然只 **Insert for review**，永不自行提交。
 `Delete` 删除**整个选区**（不只是 active edge），并且可撤销：命令面板里的
