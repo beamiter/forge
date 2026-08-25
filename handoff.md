@@ -20,11 +20,15 @@ saturation hole in a validate invariant); do not skip it.
 ## Completed since the previous handoff
 
 - **Core-owned Agent claim durability (2026-08-25)**: Forge now pins
-  `jterm_core` `852d33d` and its matching `jagent` `2570e5e`. Core durably
+  `jterm_core` `21437ba` and its matching `jagent` `a462ec8`. Core durably
   syncs retirement of the public Agent snapshot name before exposing a live
   session and owns post-consumption cleanup. Forge therefore removed its
   redundant post-`Restored` directory-sync failure gate, which could otherwise
   discard a session after core had already consumed its only snapshot. The
+  compatibility re-exports for the legacy read/remove/best-effort claim helpers
+  remain in one narrowly scoped `#[allow(deprecated)]` use so downstream source
+  paths do not break before a major release; Forge's own panel uses only the
+  typed, durability-owning claim path. The
   direct and transitive `jagent` pins remain identical; encoded provider,
   streaming, text-action, and native-tool JSON now reject duplicate members.
 
@@ -39,8 +43,8 @@ saturation hole in a validate invariant); do not skip it.
   the exact match cannot be reached within 4096 native steps. Filtered cards
   remain zero-height through viewport, virtualization, and failure-marker
   calculations; bookmark mutation reconciles an active Bookmarked filter from
-  both menu and keyboard paths. The app pins published `jterm_core` `852d33d`;
-  its transitive `jagent` `2570e5e` is also the direct Forge pin, avoiding
+  both menu and keyboard paths. The app pins published `jterm_core` `21437ba`;
+  its transitive `jagent` `a462ec8` is also the direct Forge pin, avoiding
   duplicate crate identities.
 
 - **Exactly-once command lifecycle closure (2026-08-21)**: Block and Unified
@@ -386,7 +390,7 @@ stimulus; big celebrations and speech belong to the human's own commands.
 ### Helper-runner consolidation: done
 
 Forge now pins `jterm_core`
-`852d33d197d3a46becc76a3b85c13f981506a61c`. The app-owned helper
+`21437ba6f0cb85e74d4ce2a03ef1857de2c55d9d`. The app-owned helper
 runners are migrated. `src/host.rs` is now a thin shim
 over `jterm_core::host` (`pub use` + `APP_ID` + `interactive_bash_path`) whose
 only local code is `pub(crate) helper_command`, kept for the two callers
@@ -437,7 +441,7 @@ doctor and correction probes.
   wider spoof set), `pty_input` (`AdmittedInput`), and `execution_journal`
   (`output_capture_enabled`) were upstreamed and the local copies deleted.
 - Core-ahead modules: none left — the hardened `jterm_core::agent` session
-  wrapper is adopted (current pin `852d33d`; only core's additive
+  wrapper is adopted (current pin `21437ba`; only core's additive
   `AgentSessionEpoch` remains unused, forge's own `task_epoch` plumbing
   covers the same ground), and `child_env`'s inherited-environment freeze is
   wired (`app::run` captures first, `pty.rs` uses `envp_from_captured`, and

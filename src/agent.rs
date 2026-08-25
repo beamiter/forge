@@ -10,9 +10,14 @@
 //! snapshot parent lock) lives in `ui::agent_panel`.
 
 pub use jterm_core::agent::{
-    claim_session_file, is_auto_approvable, is_dangerous, parse_action, read_snapshot_file,
-    remove_snapshot_file, sample_observation, try_claim_session_file, write_snapshot_file,
-    AgentSession, AgentSessionEpoch, AgentSessionSnapshot, AgentSnapshotError, AgentState,
-    ApprovedCommand, CancellationToken, ModelOutcome, ParseError, ParsedAction, ProposalId,
-    ProposalStatus, SessionClaim, SessionError, Turn, MAX_AGENT_SNAPSHOT_JSON_BYTES,
+    is_auto_approvable, is_dangerous, parse_action, sample_observation, try_claim_session_file,
+    write_snapshot_file, AgentSession, AgentSessionEpoch, AgentSessionSnapshot, AgentSnapshotError,
+    AgentState, ApprovedCommand, CancellationToken, ModelOutcome, ParseError, ParsedAction,
+    ProposalId, ProposalStatus, SessionClaim, SessionError, Turn, MAX_AGENT_SNAPSHOT_JSON_BYTES,
 };
+
+// Forge historically exposed these core helpers through `crate::agent`.
+// Keep that source-compatible surface while all live restore code uses the
+// typed, durability-owning claim above.
+#[allow(deprecated)]
+pub use jterm_core::agent::{claim_session_file, read_snapshot_file, remove_snapshot_file};

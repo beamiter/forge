@@ -6,6 +6,11 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Agent session persistence is synchronized to `jterm_core` `21437ba` and
+  `jagent` `a462ec8`, so the typed restore path owns its durability boundary.
+  The three legacy snapshot helpers remain narrowly re-exported for source
+  compatibility under their upstream deprecations; production code does not
+  use them, and removal is reserved for a future breaking release.
 - 空白 Block pane 现在显示一次性的可访问提示，说明完成命令会成为可复用卡片，并提示 header
   选择、右键操作和 `Ctrl+Shift+G` 搜索；首次接受用户输入、首块完成或历史恢复后永久撤下，
   不会覆盖用户已经开始的首条长命令。提示是不可点击、
