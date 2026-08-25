@@ -310,16 +310,10 @@ fn restore_agent_snapshot(
 /// Atomically claim, validate, restore, and consume the persisted session
 /// exactly once while holding Forge's configuration namespace lock. Several
 /// forge processes can open concurrently; only the process that wins the core
-/// claim receives the session. Invalid evidence is moved aside under its
-/// private claim name for inspection instead of being deleted or replayed.
+/// claim receives the session. Core durably retires the public name before it
+/// exposes a restored session; invalid evidence remains under its private
+/// claim name for inspection instead of being deleted or replayed.
 fn load_agent_snapshot(path: &std::path::Path) -> Option<AgentSession> {
-    load_agent_snapshot_with_sync(path, crate::config_store::sync_config_parent)
-}
-
-fn load_agent_snapshot_with_sync(
-    path: &std::path::Path,
-    sync_parent: impl FnOnce(&std::path::Path) -> Result<(), crate::config_store::ConfigWriteError>,
-) -> Option<AgentSession> {
     let _parent_lock = match crate::config_store::PrivateParentLock::acquire(path) {
         Ok(lock) => lock,
         Err(error) => {
@@ -329,16 +323,7 @@ fn load_agent_snapshot_with_sync(
     };
     match crate::agent::try_claim_session_file(path) {
         Ok(crate::agent::SessionClaim::Vacant) => None,
-        Ok(crate::agent::SessionClaim::Restored(session)) => {
-            if let Err(error) = sync_parent(path) {
-                log::warn!(
-                    "agent: snapshot claim for {} was not durable: {error}",
-                    path.display()
-                );
-                return None;
-            }
-            Some(session)
-        }
+        Ok(crate::agent::SessionClaim::Restored(session)) => Some(session),
         Ok(crate::agent::SessionClaim::Quarantined {
             path: quarantined,
             error,
@@ -348,12 +333,6 @@ fn load_agent_snapshot_with_sync(
                 path.display(),
                 quarantined.display()
             );
-            if let Err(sync_error) = sync_parent(path) {
-                log::warn!(
-                    "agent: snapshot quarantine for {} was not durable: {sync_error}",
-                    path.display()
-                );
-            }
             None
         }
         Err(error) => {

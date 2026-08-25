@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-24 (Block/Unified search and filtered-document correctness)
+Updated: 2026-08-25 (shared session identity and durable Agent claims)
 
 This working tree contains the nine-round "Evolve ASCII organism" series
 (`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
@@ -19,14 +19,28 @@ saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
 
+- **Core-owned Agent claim durability (2026-08-25)**: Forge now pins
+  `jterm_core` `852d33d` and its matching `jagent` `2570e5e`. Core durably
+  syncs retirement of the public Agent snapshot name before exposing a live
+  session and owns post-consumption cleanup. Forge therefore removed its
+  redundant post-`Restored` directory-sync failure gate, which could otherwise
+  discard a session after core had already consumed its only snapshot. The
+  direct and transitive `jagent` pins remain identical; encoded provider,
+  streaming, text-action, and native-tool JSON now reject duplicate members.
+
+- **Shared workspace pane identity (2026-08-25)**: restored pane `sid` values
+  now use `jterm_core`'s exact 1..=128-byte ASCII `[A-Za-z0-9_-]` contract.
+  Valid 128-byte identities survive intact; dotted, Unicode, control-bearing,
+  and oversized snapshot values are regenerated before pane routing.
+
 - **Search/filter correctness and core repin (2026-08-24)**: card search
   surfaces now validate their render stamp before every outcome, including an
   already-selected one-hit edge, and palette occurrence jumps fail closed when
   the exact match cannot be reached within 4096 native steps. Filtered cards
   remain zero-height through viewport, virtualization, and failure-marker
   calculations; bookmark mutation reconciles an active Bookmarked filter from
-  both menu and keyboard paths. The app pins published `jterm_core` `0f47569`;
-  its transitive `jagent` `fcb9768` is also the direct Forge pin, avoiding
+  both menu and keyboard paths. The app pins published `jterm_core` `852d33d`;
+  its transitive `jagent` `2570e5e` is also the direct Forge pin, avoiding
   duplicate crate identities.
 
 - **Exactly-once command lifecycle closure (2026-08-21)**: Block and Unified
@@ -371,8 +385,8 @@ stimulus; big celebrations and speech belong to the human's own commands.
 
 ### Helper-runner consolidation: done
 
-Both apps now pin `jterm_core`
-`cf0dd2c9cd369c1d8113eadde0ec6254d3fb81b1`. The app-owned helper
+Forge now pins `jterm_core`
+`852d33d197d3a46becc76a3b85c13f981506a61c`. The app-owned helper
 runners are migrated. `src/host.rs` is now a thin shim
 over `jterm_core::host` (`pub use` + `APP_ID` + `interactive_bash_path`) whose
 only local code is `pub(crate) helper_command`, kept for the two callers
@@ -423,7 +437,7 @@ doctor and correction probes.
   wider spoof set), `pty_input` (`AdmittedInput`), and `execution_journal`
   (`output_capture_enabled`) were upstreamed and the local copies deleted.
 - Core-ahead modules: none left — the hardened `jterm_core::agent` session
-  wrapper is adopted (pin `cf0dd2c`; only core's additive
+  wrapper is adopted (current pin `852d33d`; only core's additive
   `AgentSessionEpoch` remains unused, forge's own `task_epoch` plumbing
   covers the same ground), and `child_env`'s inherited-environment freeze is
   wired (`app::run` captures first, `pty.rs` uses `envp_from_captured`, and

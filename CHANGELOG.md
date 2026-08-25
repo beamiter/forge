@@ -115,9 +115,12 @@ All notable user-visible and operational changes are recorded here.
   Expand 或输出过滤被重新灌入后，find 记录的原生游标已经失效，现在会带 render stamp
   识别并就地重建整轮搜索，而不是报 No matches 或跳错位置；块内过滤框不再是键盘单向门，
   `Escape` 或再次 `Alt+Shift+F` 即可关闭并把焦点交还提示符，查询文本保留。
-- 共享核心升级到 `jterm_core` `0f47569`，采用 AI origin、endpoint、credential、no-proxy
-  与请求边界的最新校验。该核心固定 `jagent` `fcb9768`，Forge 的直接依赖保持同一 revision，
-  避免一个进程链接两份同版本但不同 source identity 的 `jagent`。
+- 共享核心升级到 `jterm_core` `852d33d`，采用 AI origin、endpoint、credential、no-proxy
+  与请求边界的最新校验，并由 core 在 Agent snapshot 公共名退休后、live session 暴露前完成
+  目录 durability barrier。Forge 删除旧 pin 所需的外层同步失败门，避免 snapshot 已消费后又
+  丢弃恢复出的 session。该核心固定 `jagent` `2570e5e`，Forge 的直接依赖保持同一 revision；
+  provider response、stream frame、文本 action 与 native-tool JSON 均拒绝重复 object member，
+  同时避免一个进程链接两份同版本但不同 source identity 的 `jagent`。
 - 一条外来的 OSC 133 `D` 不再替本地命令收尾：`ssh`、`docker exec`、`tmux attach` 或
   `cat` 一份含这些字节的日志，都会让本地卡片提前结束并盖上远端命令的退出码和耗时。
   `on_command_end` 现在与 `on_command_start` 的前台判定对称——前台属于别人时拒绝该标记，

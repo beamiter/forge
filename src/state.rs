@@ -51,7 +51,6 @@ const MAX_RESTORED_PANES_PER_TAB: usize = 16;
 const MAX_RESTORED_PANES_TOTAL: usize = 64;
 const MAX_RESTORED_TAB_NAME_BYTES: usize = 4 * 1024;
 const MAX_RESTORED_CWD_BYTES: usize = 4 * 1024;
-const MAX_RESTORED_SESSION_ID_BYTES: usize = 96;
 /// A private state directory normally contains only the retained snapshots.
 /// Bound even corrupted/same-user namespaces so startup and shutdown cannot
 /// allocate or stat an attacker-controlled number of entries.
@@ -1159,15 +1158,11 @@ fn normalize_pane_layout_bounded(layout: &mut PaneLayout, limit: usize) -> Optio
                 {
                     return None;
                 }
-                if sid.is_empty()
-                    || sid.len() > MAX_RESTORED_SESSION_ID_BYTES
-                    || !sid.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-                    })
-                {
+                if !jterm_core::execution_journal::is_valid_jsh_session_id(sid) {
                     // Session ids are fed to the shell bootstrap and become
-                    // history filenames. Preserve the tab, but never retain a
-                    // user-edited identifier containing control/shell bytes.
+                    // history routing keys. Preserve the tab, but never retain
+                    // an identifier outside the exact grammar those consumers
+                    // share with jsh.
                     *sid = generate_session_id();
                 }
                 if cmds.as_ref().is_some_and(|argv| {
@@ -1925,6 +1920,19 @@ mod tests {
         )
     }
 
+    fn restored_test_sid(input: &str) -> String {
+        let mut layout = test_leaf(0);
+        let PaneLayout::Leaf { sid, .. } = &mut layout else {
+            unreachable!("test_leaf always returns a leaf")
+        };
+        *sid = input.to_string();
+        let (_, tabs) = parse_tabs_state(&layout_tab_line("sid", &layout));
+        let PaneLayout::Leaf { sid, .. } = &tabs[0].1 else {
+            panic!("expected a leaf")
+        };
+        sid.clone()
+    }
+
     #[test]
     fn parses_snapshot_owner_pid() {
         assert_eq!(
@@ -2569,24 +2577,24 @@ mod tests {
 
     #[test]
     fn restore_sanitizes_session_ids_and_rejects_oversized_fields() {
-        let invalid_sid = PaneLayout::Leaf {
-            dir: "/tmp".into(),
-            sid: "safe'\nrun-local".into(),
-            cwd_external: false,
-            remote_name: None,
-            custom_title: None,
-            private_title: None,
-            cmds: None,
-            pinned: None,
-        };
-        let (_, tabs) = parse_tabs_state(&layout_tab_line("safe", &invalid_sid));
-        let PaneLayout::Leaf { sid, .. } = &tabs[0].1 else {
-            panic!("expected a leaf");
-        };
+        let sid = restored_test_sid("safe'\nrun-local");
         assert_ne!(sid, "safe'\nrun-local");
         assert!(sid
             .bytes()
             .all(|byte| byte.is_ascii_digit() || byte == b'-'));
+
+        let max_session_id = "s".repeat(jterm_core::execution_journal::MAX_JSH_SESSION_ID_BYTES);
+        assert_eq!(restored_test_sid(&max_session_id), max_session_id);
+
+        for invalid in [
+            "session.with.dots".to_string(),
+            "雪".to_string(),
+            "s".repeat(jterm_core::execution_journal::MAX_JSH_SESSION_ID_BYTES + 1),
+        ] {
+            let sid = restored_test_sid(&invalid);
+            assert_ne!(sid, invalid);
+            assert!(jterm_core::execution_journal::is_valid_jsh_session_id(&sid));
+        }
 
         let oversized_dir = PaneLayout::Leaf {
             dir: "x".repeat(MAX_RESTORED_CWD_BYTES + 1),
