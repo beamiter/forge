@@ -294,6 +294,12 @@ AI provider、model、endpoint 和 API key 均可在 Settings 的 **AI & Agent**
 
 命令面板使用模糊匹配；输入 `>` 只看动作、`@` 只看 JSONL 历史、`:` 只看 workflow、`?` 提交自然语言命令请求。历史和 workflow 只写入当前编辑行；`?` 请求会绑定当前 Block pane，在块流中显示可 Stop/Retry/Regenerate 的审阅卡，并携带可见的 selected Block 不可信上下文。它与命令纠正、Shell Agent proposal 共用可编辑、复制、动态风险提示的审阅逻辑，主操作只会 **Insert for review**，不会执行。所有审阅式插入都拒绝 CR、LF、Tab、NUL 和终端控制字符，避免多行条目越过“不提交”边界。`Ctrl+Alt+G` 或顶部栏的 **Agent** 开关会打开绑定当前 Block pane 的 Shell Agent；若打开时已选中 finished Block，它会作为可见、可移除的不可信上下文附加。Agent 显示目标、provider/model、shell、回合进度、activity 与实时 prompt readiness，可单独 Stop/Retry 当前模型请求，并可切换持久化的 typo-like 命令纠正。严格 JSON proposal 可复制、编辑、Reject、**Insert only** 或逐条 **Approve & Run**；Insert only 只回填普通 shell 编辑行并在 Agent 上下文记录“未执行”，危险命令执行仍需第二次确认。完成块的退出码和截断输出随后回灌到下一轮；`done` 后可用 **Follow up** 保留上下文追问，回合耗尽后可用 **New task** 在同一 pane 重置 Agent transcript 与预算。
 
+全新的 Block pane 在没有完成块、也没有恢复到历史块时，会显示一次性使用提示：完成的命令会成为
+可复用卡片，点击 header 选择，右键查看更多操作，`Ctrl+Shift+G` 跨块搜索。第一张卡片完成或历史
+恢复后提示永久撤下；清空、过滤或容量淘汰到空也不会在同一 pane 重播。它是不可点击且不参与测量
+的浮层，不占用实时提示符的 PTY 行数；alt-screen 接管时暂时隐藏、退出后恢复，因而不会遮住
+首次启动的 TUI。Unified 与传统 VTE 模式不显示。
+
 若希望 Block 准确记录命令边界、退出码和 cwd，可加载内置 shell 集成：
 
 ```bash
@@ -301,13 +307,28 @@ source <(forge --shell-integration bash)
 ```
 
 也可从已安装的 `share/forge/shell-integration/` 加载 bash、zsh、fish 或 PowerShell 脚本。
+若支持的交互式 shell 在启动宽限后仍未发送 OSC 133，Block 会在提示符旁显示原位说明和针对
+该 shell 的一行加载命令，可直接复制；随后手动加载集成并出现首个 marker 时，说明会自动撤下。
+手动关闭后只保留轻量的 late-marker 监听，不会继续持有整棵 GTK 卡片。
+只有通过生命周期与 PTY 前台门禁的 marker 才能撤下说明；伪 marker 不会把状态误报为健康。
+`jsh`（自带 marker）、`-c`/PowerShell 单命令或脚本、禁用/替换默认 rc 的 shell、ssh/docker
+会话与其他 wrapper 不会显示无法修复当前会话的本地 rc 建议。
 
 Block 模式与 anvil 保持相同的选择语义：`Ctrl+Up` 从最新块进入选择，`Shift+Up/Down`
 扩展范围，普通 `Up/Down` 移动 active edge，`Enter` 按终端顺序把所有选中命令回填为
 可编辑文本而不执行，`Escape` 取消选择。`Ctrl+Enter` 直接重跑**单个**选中块的命令
 （右键菜单的 **Re-run Command** 等价）：仅限本 pane 里用户自己已经执行过的单行命令，
-且提示符必须空闲、无未提交输入；多选、后台块和会被截断为首行的多行命令一律拒绝执行，
-只回填。AI / Agent / 命令面板的建议仍然只 **Insert for review**，永不自行提交。
+并且必须同时证明提示符锚点已稳定、光标仍在锚点、可见后缀为空、没有用户/Agent/外部提交，
+且 PTY 前台所有权已回到 shell；右键项的启用状态与键盘执行共用这套门禁。
+通过门禁后也不会立即提交：Forge 先插入命令，等待 VTE 稳定显示字节一致的完整文本，再单独发送
+CR，从而覆盖“同步检查为空、异步回显却已有输入”的竞态。
+多选、后台块和会被截断为首行的多行命令一律拒绝执行，仍可按普通 `Enter` 回填审阅。
+多选回填需要 shell 的 bracketed-paste 支持；否则整次拒绝并响铃，不会静默丢掉首行之后的命令。
+卡片提示以 `Prompt ready` 明示动作前提，并随选区能力变化：只有可安全重跑的单选才显示 `Ctrl+↵ run`，其他选区不会宣传
+不存在的动作；为降低误删，紧凑提示不宣传 `Delete`，但删除能力与单级撤销保持不变。
+选区中的拒绝会消费普通 `Enter` 或 `Ctrl+Enter` 并响铃，不会把同一个 Enter 继续交给实时 VTE；
+含控制符、嵌入 paste marker 或任何经 sanitizer 改写的历史命令也保持只回填审阅。
+AI / Agent / 命令面板的建议仍然只 **Insert for review**，永不自行提交。
 `Delete` 删除**整个选区**（不只是 active edge），并且可撤销：命令面板里的
 **Undo removing blocks** 把它们放回按 id 该在的位置——即使期间又跑过新命令，删掉的块也回到
 中间而不是被塞到最前面。撤销槽是单级的：一次新的移除（删除或清空）会替换掉上一次。
@@ -327,6 +348,8 @@ Block 模式与 anvil 保持相同的选择语义：`Ctrl+Up` 从最新块进入
 被信号停止的命令（`130` SIGINT、`141` SIGPIPE、`143` SIGTERM）使用独立的 `⊘ interrupted`
 中性样式，不计入失败：滚动条失败标记、`Ctrl+Shift+X` 失败跳转和 Failed 过滤都会跳过它们，
 原始退出码仍完整保留在徽章、导出和历史中。
+生命周期由历史恢复、缺失结束 marker 推断或仍不完整时，卡片头部会显示
+`recovered` / `inferred` / `incomplete` chip；健康记录与普通后台输出不显示额外状态。
 
 块内输出过滤（`Alt+Shift+F`）打开后可用 `Escape` 或再次 `Alt+Shift+F` 关闭，
 查询文本会保留、焦点交还提示符。alt-screen 程序运行期间，`Ctrl+Up` 不会进入块选择，
@@ -336,6 +359,8 @@ Block 模式与 anvil 保持相同的选择语义：`Ctrl+Up` 从最新块进入
 依然可用：方向键、`PageUp/PageDown`、`Home/End`、`Ctrl+Up` 进入选择、书签跳转、
 `Alt+Shift+F` 过滤都照常工作；有选中块时 `Enter`/`Ctrl+Enter`/`Delete`/`Escape`
 按卡片提示条的字面意思执行，没有选中块时它们仍然把焦点交还实时提示符。
+若焦点位于卡片 header 按钮，普通 Return/Space 仍按 GTK 约定激活该按钮；`Ctrl+Enter` 才是
+明确交给 Block 的重跑手势。
 普通打字始终把焦点带回提示符。
 
 后台输出只会在提示符空闲且用户尚未开始编辑时归入独立 Block；一旦输入开始，后续输出保持在当前终端中，避免把 shell 回显、补全或交互输出错误拆块。

@@ -39,6 +39,7 @@ mod export;
 mod find;
 mod history;
 mod kitty_graphics;
+mod onboarding;
 #[allow(dead_code)]
 mod palette;
 mod scroll;
@@ -53,6 +54,7 @@ pub(crate) use cross_selection::*;
 pub(crate) use css::*;
 pub(crate) use export::SessionExportFormat;
 pub(crate) use find::*;
+use onboarding::BlockOnboarding;
 #[allow(unused_imports)]
 pub(crate) use palette::*;
 pub(crate) use scroll::*;
@@ -784,19 +786,207 @@ fn shell_argv_uses_jsh(argv: &[String]) -> bool {
     })
 }
 
+/// A `-c` / `--command` argv runs one command and exits. It never reaches an
+/// interactive prompt, so nothing that depends on prompt lifecycle applies.
+fn shell_argv_runs_one_command(argv: &[String]) -> bool {
+    let Some(shell) = argv
+        .first()
+        .and_then(|argument| std::path::Path::new(argument).file_name())
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    let options = argv
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--");
+    if shell.eq_ignore_ascii_case("pwsh") || shell.eq_ignore_ascii_case("powershell") {
+        return options.into_iter().any(|argument| {
+            [
+                "-command",
+                "--command",
+                "-c",
+                "-commandwithargs",
+                "-cwa",
+                "-encodedcommand",
+                "-e",
+                "-ec",
+                "-file",
+                "-f",
+            ]
+            .iter()
+            .any(|option| argument.eq_ignore_ascii_case(option))
+        });
+    }
+    options.into_iter().any(|argument| {
+        argument == "--command"
+            || argument.starts_with("--command=")
+            || (argument.starts_with('-')
+                && !argument.starts_with("--")
+                && argument[1..].bytes().any(|byte| byte == b'c'))
+            || (shell == "zsh"
+                && argument.starts_with('-')
+                && !argument.starts_with("--")
+                && argument[1..].bytes().any(|byte| byte == b't'))
+    })
+}
+
+/// Startup options which deliberately skip or replace the rc file named by
+/// [`ShellIntegrationHint`]. Pointing at the default file in those sessions
+/// would offer a fix that cannot affect the current shell.
+fn shell_argv_bypasses_default_rc(argv: &[String]) -> bool {
+    let Some(shell) = argv
+        .first()
+        .and_then(|argument| std::path::Path::new(argument).file_name())
+        .and_then(|name| name.to_str())
+    else {
+        return true;
+    };
+    let arguments = &argv[1..];
+    if arguments
+        .iter()
+        .position(|argument| argument == "--")
+        .is_some_and(|index| index + 1 < arguments.len())
+    {
+        return true;
+    }
+    let options = arguments
+        .iter()
+        .take_while(|argument| argument.as_str() != "--")
+        .collect::<Vec<_>>();
+    match shell {
+        "bash" => {
+            options.iter().any(|argument| {
+                matches!(
+                    argument.as_str(),
+                    "--norc" | "--rcfile" | "--init-file" | "-l" | "--login" | "--posix"
+                ) || argument.starts_with("--rcfile=")
+                    || argument.starts_with("--init-file=")
+                    || (argument.starts_with('-')
+                        && !argument.starts_with("--")
+                        && argument[1..].bytes().any(|byte| byte == b'n'))
+            }) || options.iter().any(|argument| !argument.starts_with('-'))
+        }
+        "zsh" => {
+            let explicit_no_rcs = options.windows(2).any(|pair| {
+                (pair[0].as_str() == "-o" && pair[1].eq_ignore_ascii_case("norcs"))
+                    || (pair[0].as_str() == "+o" && pair[1].eq_ignore_ascii_case("rcs"))
+            });
+            explicit_no_rcs
+                || options.iter().any(|argument| {
+                    matches!(argument.as_str(), "--no-rcs" | "--no_rcs" | "--norcs")
+                        || argument.eq_ignore_ascii_case("-onorcs")
+                        || argument.eq_ignore_ascii_case("+orcs")
+                        || (argument.starts_with('-')
+                            && !argument.starts_with("--")
+                            && argument[1..]
+                                .bytes()
+                                .any(|byte| matches!(byte, b'f' | b'n')))
+                })
+                || options.iter().any(|argument| !argument.starts_with('-'))
+        }
+        "fish" => {
+            let mut index = 0usize;
+            while index < options.len() {
+                let argument = options[index].as_str();
+                if matches!(argument, "-C" | "--init-command") {
+                    index = index.saturating_add(2);
+                    continue;
+                }
+                if argument.starts_with("--init-command=") {
+                    index += 1;
+                    continue;
+                }
+                if matches!(argument, "-N" | "--no-config" | "-n" | "--no-execute")
+                    || !argument.starts_with('-')
+                {
+                    return true;
+                }
+                index += 1;
+            }
+            false
+        }
+        "pwsh" | "powershell" => {
+            options.iter().any(|argument| {
+                [
+                    "-noprofile",
+                    "-nop",
+                    "-noninteractive",
+                    "-noni",
+                    "-sshservermode",
+                    "-sshs",
+                    "-configurationfile",
+                    "-config",
+                ]
+                .iter()
+                .any(|option| argument.eq_ignore_ascii_case(option))
+            }) || options.iter().any(|argument| !argument.starts_with('-'))
+        }
+        _ => false,
+    }
+}
+
 fn shell_argv_supports_agent_ids(argv: &[String]) -> bool {
     let direct_shell = argv
         .first()
         .and_then(|argument| std::path::Path::new(argument).file_name())
         .and_then(|name| name.to_str())
         .is_some_and(|name| matches!(name, "bash" | "zsh"));
-    let runs_one_command = argv.iter().skip(1).any(|argument| {
-        argument == "--command"
-            || (argument.starts_with('-')
-                && !argument.starts_with("--")
-                && argument[1..].bytes().any(|byte| byte == b'c'))
-    });
-    direct_shell && !runs_one_command && !shell_argv_uses_jsh(argv)
+    direct_shell && !shell_argv_runs_one_command(argv) && !shell_argv_uses_jsh(argv)
+}
+
+/// How to make a shell emit the marks block mode is built on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShellIntegrationHint {
+    shell: &'static str,
+    /// The line that loads the integration for this shell.
+    load: &'static str,
+    /// Where that line belongs so it survives the next session.
+    rc: &'static str,
+}
+
+/// The one-line fix for a pane whose shell never emits OSC 133, or `None` when
+/// there is nothing honest to offer.
+///
+/// `None` for anything but a direct interactive bash/zsh/fish/pwsh: `jsh`
+/// carries the marks itself, an `ssh` or `docker` pane is someone else's shell
+/// on someone else's machine, a `-c` pane runs one command and exits, and
+/// behind a wrapper we cannot name the rc file that would need the line.
+fn shell_integration_hint(argv: &[String]) -> Option<ShellIntegrationHint> {
+    if shell_argv_uses_jsh(argv)
+        || shell_argv_runs_one_command(argv)
+        || shell_argv_bypasses_default_rc(argv)
+    {
+        return None;
+    }
+    let shell = argv
+        .first()
+        .and_then(|argument| std::path::Path::new(argument).file_name())
+        .and_then(|name| name.to_str())?;
+    let (shell, load, rc) = match shell {
+        "bash" => (
+            "bash",
+            "source <(forge --shell-integration bash)",
+            "~/.bashrc",
+        ),
+        "zsh" => (
+            "zsh",
+            "source <(forge --shell-integration zsh)",
+            "${ZDOTDIR:-$HOME}/.zshrc",
+        ),
+        "fish" => (
+            "fish",
+            "forge --shell-integration fish | source",
+            "~/.config/fish/config.fish",
+        ),
+        "pwsh" | "powershell" => (
+            "pwsh",
+            "forge --shell-integration pwsh | Out-String | Invoke-Expression",
+            "$PROFILE",
+        ),
+        _ => return None,
+    };
+    Some(ShellIntegrationHint { shell, load, rc })
 }
 
 fn bounded_command_text(command: &str) -> String {
@@ -1928,7 +2118,20 @@ fn recall_selected_commands_at_prompt(
             .map(|block| (block.id, block.cmd_text.as_str())),
         selected,
     );
+    // A shell without bracketed-paste support would make the generic recall
+    // encoder keep only the first line. That fallback is useful for an
+    // explicitly recalled single command, but silently dropping the rest of a
+    // multi-card selection violates the selection contract. Refuse it as one
+    // atomic action instead.
+    if !selected_command_recall_is_lossless(&command, bracketed_paste) {
+        return false;
+    }
     recall_command_at_prompt(ctx, state, &command, bracketed_paste)
+}
+
+fn selected_command_recall_is_lossless(command: &str, bracketed_paste: bool) -> bool {
+    let paste = build_command_recall(command, bracketed_paste);
+    !paste.is_empty() && !paste.risk.truncated_to_first_line
 }
 
 /// Ask the shell editor to recall text without executing it. `Ctrl+U` is only a
@@ -1964,64 +2167,6 @@ pub(crate) fn recall_command_at_prompt(
     true
 }
 
-/// Recall a finished command **and submit it**.
-///
-/// This is the one place Block mode writes an Enter of its own, and it exists
-/// because the card's selection hint has always advertised it. It is
-/// deliberately narrower than every other programmatic write:
-///
-/// * The command is one the user already ran in this pane. Nothing suggested
-///   it, so the "insert for review, never execute" rule the AI/Agent/palette
-///   paths live under does not apply — those paths still go through
-///   [`recall_command_at_prompt`] and are untouched.
-/// * The caller admits a single selected card only. Running a multi-card
-///   selection would submit commands the user never looked at individually.
-/// * A command that [`build_command_recall`] had to cut to its first line is
-///   refused outright rather than executed as a truncated prefix. Insertion can
-///   afford truncation because the user still reads the line before pressing
-///   Enter; execution cannot.
-/// * The prompt guards are exactly `recall_command_at_prompt`'s: a running
-///   command, a dirty editor, a pending submission or unresolved typeahead all
-///   refuse, so this can never append to text the user was typing.
-fn submit_recalled_command_at_prompt(
-    ctx: PromptRecallCtx<'_>,
-    state: BlockState,
-    command: &str,
-    bracketed_paste: bool,
-) -> bool {
-    let Some(submission) = rerun_submission(
-        PromptSubmitGuards {
-            state,
-            pty_synced: ctx.pty_synced.get(),
-            submission_pending: ctx.submission_pending.get(),
-            pending_typeahead: ctx.pending_typeahead.get(),
-            fidelity: ctx.typed_cmd_fidelity.get(),
-        },
-        command,
-        bracketed_paste,
-    ) else {
-        return false;
-    };
-    if let Err(error) = ctx.pty.write_bytes(&submission.payload) {
-        ctx.pty
-            .report_write_error("could not queue the re-run command", error);
-        return false;
-    }
-    // `ExactSubmitted`, not `Inexact` as an insertion uses. A re-run is only
-    // admitted from a prompt nothing has touched (`pty_synced` false means no
-    // input has changed this editor), so the shadow really is the whole line —
-    // and it really has been submitted. Claiming less makes the card mint with
-    // "(command capture unavailable)": the shell echoes and runs the line in
-    // the same PTY chunk as OSC 133;C, so the VTE capture is still empty when
-    // the command is resolved and the shadow is the only witness.
-    *ctx.typed_cmd.borrow_mut() = submission.echo_text;
-    ctx.typed_cmd_fidelity
-        .set(TypedShadowFidelity::ExactSubmitted);
-    ctx.pty_synced.set(true);
-    ctx.submission_pending.set(true);
-    true
-}
-
 /// Prompt state a re-run has to clear before it may write anything.
 #[derive(Clone, Copy)]
 struct PromptSubmitGuards {
@@ -2032,34 +2177,41 @@ struct PromptSubmitGuards {
     fidelity: TypedShadowFidelity,
 }
 
-struct RerunSubmission {
-    /// Command bytes and the submit CR, as one PTY message.
-    payload: Vec<u8>,
-    /// What the editor shadow may claim the child received.
-    echo_text: String,
+/// The unframed, byte-identical history payload eligible for direct execution.
+/// Insertion may sanitize text because the user can review the result; this
+/// helper is shared by the visible hint and the execution boundary so neither
+/// can promise a command the other would rewrite or truncate.
+fn historical_rerun_paste(command: &str) -> Option<Paste> {
+    if command.trim().is_empty()
+        || command == TRUNCATED_COMMAND_PLACEHOLDER
+        || command == UNAVAILABLE_COMMAND_PLACEHOLDER
+    {
+        return None;
+    }
+    let paste = build_command_recall(command, false);
+    (!paste.is_empty()
+        && !paste.risk.truncated_to_first_line
+        && !paste.risk.had_controls
+        && !paste.risk.had_embedded_paste_marker
+        && paste.echo_text == command
+        && paste.bytes.as_slice() == command.as_bytes())
+    .then_some(paste)
 }
 
-/// The exact bytes a re-run may put on the PTY, or `None` when the prompt or
-/// the command itself refuses. Split out from the writing half so the refusal
-/// rules are testable without a live PTY.
-fn rerun_submission(
-    guards: PromptSubmitGuards,
-    command: &str,
-    bracketed_paste: bool,
-) -> Option<RerunSubmission> {
+fn historical_command_is_rerunnable(command: &str) -> bool {
+    historical_rerun_paste(command).is_some()
+}
+
+/// Whether a history command may enter the shared two-phase verified-submission
+/// boundary. Split out so every refusal remains testable without GTK or a PTY.
+fn rerun_is_admissible(guards: PromptSubmitGuards, command: &str, bracketed_paste: bool) -> bool {
     if guards.state != BlockState::AwaitingCommand
         || guards.pty_synced
         || guards.submission_pending
         || guards.pending_typeahead
         || guards.fidelity == TypedShadowFidelity::ExactSubmitted
     {
-        return None;
-    }
-    // A card with no command (background output) has nothing to run, and
-    // submitting whitespace would mint an empty block. The callers filter this
-    // too; keeping it here means no future caller can skip the check.
-    if command.trim().is_empty() {
-        return None;
+        return false;
     }
     // Deliberately unframed, even when the shell advertises bracketed paste.
     //
@@ -2073,24 +2225,7 @@ fn rerun_submission(
     // bytes are exactly what typing the command produces, which is what "run it
     // again" should mean.
     let _ = bracketed_paste;
-    let paste = build_command_recall(command, false);
-    // A command the encoder had to cut to its first line is refused outright.
-    // Insertion can afford truncation — the user still reads the line before
-    // pressing Enter — but executing a silently truncated prefix cannot be
-    // undone.
-    if paste.is_empty() || paste.risk.truncated_to_first_line {
-        return None;
-    }
-    // One message: the frame's start, body, end and the submit CR must not be
-    // split, or backpressure could accept the command and drop its Enter (or
-    // the reverse). The CR sits outside the bracketed frame on purpose —
-    // readline does not execute a newline contained in a paste.
-    let mut payload = paste.bytes;
-    payload.push(b'\r');
-    Some(RerunSubmission {
-        payload,
-        echo_text: paste.echo_text,
-    })
+    historical_rerun_paste(command).is_some()
 }
 
 /// The single card a re-run may act on, or `None` when the selection is not a
@@ -2103,17 +2238,34 @@ fn lone_rerunnable_selection<'a>(
     selected: &HashSet<u64>,
     active: Option<u64>,
 ) -> Option<&'a FinishedBlock> {
-    if selected.len() > 1 {
+    if selected.len() != 1 {
         return None;
     }
     let id = active?;
-    if !selected.is_empty() && !selected.contains(&id) {
+    if !selected.contains(&id) {
         return None;
     }
     finished
         .iter()
         .find(|block| block.id == id)
-        .filter(|block| !block.is_background && !block.cmd_text.trim().is_empty())
+        .filter(|block| !block.is_background && historical_command_is_rerunnable(&block.cmd_text))
+}
+
+/// Ctrl+Enter belongs to Block while a card selection is active, even when
+/// the requested re-run is refused. Letting a rejected key propagate would
+/// hand the same Enter to the live VTE and submit unrelated editor contents.
+fn block_selection_owns_ctrl_enter(active: Option<u64>, selected_count: usize) -> bool {
+    active.is_some() || selected_count > 0
+}
+
+fn block_selection_owns_plain_enter(
+    keyval: gtk4::gdk::Key,
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+) -> bool {
+    use gtk4::gdk::Key;
+    !ctrl && !shift && !alt && matches!(keyval, Key::Return | Key::KP_Enter | Key::ISO_Enter)
 }
 
 /// Lines [`truncate_plain_output_for_height`] would report, without building
@@ -2446,6 +2598,24 @@ struct BlockSelectionRefs<'a> {
     anchor: &'a Rc<Cell<Option<u64>>>,
 }
 
+/// Text for the active selection edge. This is a capability matrix, not a
+/// static cheat-sheet: multi/background selections never advertise direct
+/// execution, and destructive removal remains intentionally absent even though
+/// Delete is still supported and undoable.
+fn finished_selection_hint(
+    selected_count: usize,
+    can_recall: bool,
+    active_command_is_rerunnable: bool,
+) -> &'static str {
+    if selected_count == 1 && can_recall && active_command_is_rerunnable {
+        SELECTION_HINT_RUN
+    } else if can_recall {
+        SELECTION_HINT_RECALL
+    } else {
+        SELECTION_HINT_REMOVE
+    }
+}
+
 /// Apply the multi-selection model to every finished block. All selected blocks
 /// get a light outline; the active edge owns the stronger outline, keyboard hint,
 /// and persistent quick actions.
@@ -2456,6 +2626,19 @@ fn sync_finished_block_selection(
 ) {
     let selected = selected_block_ids.borrow();
     let active = selected_block_id.get();
+    let recalled = selected_command_text(
+        finished
+            .iter()
+            .map(|block| (block.id, block.cmd_text.as_str())),
+        &selected,
+    );
+    let can_recall = !recalled.is_empty() && !build_command_recall(&recalled, true).is_empty();
+    let active_command_is_rerunnable = active
+        .and_then(|id| finished.iter().find(|block| block.id == id))
+        .is_some_and(|block| {
+            !block.is_background && historical_command_is_rerunnable(&block.cmd_text)
+        });
+    let hint = finished_selection_hint(selected.len(), can_recall, active_command_is_rerunnable);
     for block in finished {
         let is_selected = selected.contains(&block.id);
         if is_selected {
@@ -2465,6 +2648,9 @@ fn sync_finished_block_selection(
         }
 
         let is_active = active == Some(block.id);
+        if is_active {
+            block.selection_hint.set_text(hint);
+        }
         block.selection_hint.set_visible(is_active);
         if is_active {
             block.widget().add_css_class("block-selection-active");
@@ -2888,9 +3074,9 @@ struct BlockRemovalRefs<'a> {
 /// Delete cards and hand what they held to Undo.
 ///
 /// Delete is the one Block action that destroys a command's recorded output,
-/// and it is easy to reach: any `Ctrl+Up` enters selection mode and the card's
-/// own hint offers `Del remove`. Clear-all has always been undoable; this makes
-/// Delete undoable through the same single-level slot, and takes the whole
+/// and it is easy to reach once `Ctrl+Up` enters selection mode. The compact
+/// hint deliberately does not advertise it; this boundary keeps it undoable
+/// through the same single-level slot as Clear-all and takes the whole
 /// selection at once so removing a range is one keystroke rather than one per
 /// card. Returns the id the selection should move to.
 #[allow(clippy::too_many_arguments)]
@@ -2984,13 +3170,10 @@ fn log_completed_block_retention(context: &str, plan: CompletedBlockRetentionPla
     }
 }
 
-/// Strip the heavyweight child tree before pooling the reusable outer card.
-/// Otherwise an evicted VTE and its scrollback remain retained by WidgetPool
-/// and sit outside the completed-block byte ledger.
+/// Route evicted cards through the pool's teardown boundary. Keeping teardown
+/// inside `WidgetPool::release` makes every caller obey the same VTE/controller
+/// ownership rule, including future removal paths.
 fn recycle_finished_block_outer(widget_pool: &Rc<RefCell<WidgetPool>>, widget: gtk4::Box) {
-    while let Some(child) = widget.first_child() {
-        widget.remove(&child);
-    }
     widget_pool.borrow_mut().release(widget);
 }
 
@@ -3245,6 +3428,8 @@ impl BlockBackend {
         let typed_cmd_fidelity_for_rerun_menu = self.typed_cmd_fidelity_rc.clone();
         let submission_pending_for_rerun_menu = self.submission_pending_rc.clone();
         let pending_typeahead_for_rerun_menu = self.pending_typeahead_rc.clone();
+        let verified_submission_for_menu = self.verified_submission_for_rerun.clone();
+        let config_for_menu = self.config_for_cb.clone();
         let selected_ids_for_menu = self.selected_block_ids_rc.clone();
         let selected_for_menu = self.selected_block_id_rc.clone();
         let anchor_for_menu = self.selection_anchor_id_rc.clone();
@@ -3508,26 +3693,28 @@ impl BlockBackend {
                 let selected_ids_for_run = selected_ids_for_menu.clone();
                 let selected_for_run = selected_for_menu.clone();
                 let anchor_for_run = anchor_for_menu.clone();
-                let pty_for_run = pty_for_rerun_menu.clone();
-                let pty_synced_for_run = pty_synced_for_rerun_menu.clone();
-                let bracketed_for_run = bracketed_paste_for_menu.clone();
-                let typed_cmd_for_run = typed_cmd_for_rerun_menu.clone();
-                let typed_cmd_fidelity_for_run = typed_cmd_fidelity_for_rerun_menu.clone();
-                let submission_pending_for_run = submission_pending_for_rerun_menu.clone();
-                let pending_typeahead_for_run = pending_typeahead_for_rerun_menu.clone();
-                let bstate_for_run = bstate_for_rerun_menu.clone();
+                let verified_submission_for_run = verified_submission_for_menu.clone();
+                let config_for_run = config_for_menu.clone();
                 let active_for_run = active_for_rerun_menu.clone();
-                let runnable = finished_blocks_for_menu.upgrade().is_some_and(|finished| {
-                    finished.borrow().iter().any(|block| {
-                        block.id == block_id
-                            && !block.is_background
-                            && !block.cmd_text.trim().is_empty()
-                    })
+                let error_bell_for_run = vte_for_copy.downgrade();
+                let command = finished_blocks_for_menu.upgrade().and_then(|finished| {
+                    finished
+                        .borrow()
+                        .iter()
+                        .find(|block| block.id == block_id && !block.is_background)
+                        .map(|block| block.cmd_text.clone())
                 });
-                if runnable {
-                    item.set_sensitive(command_recall_available(bstate_for_rerun_menu.get()));
+                if let Some(command) =
+                    command.filter(|command| historical_command_is_rerunnable(command))
+                {
+                    let suggestion =
+                        click_cursor::suggestion_rgb(&config_for_menu.borrow().palette);
+                    item.set_sensitive(
+                        verified_submission_for_menu
+                            .can_submit_historical_rerun(&command, suggestion),
+                    );
                     item.set_tooltip_text(Some(
-                        "Runs this command again; available when the shell prompt is ready",
+                        "Runs this command again only at a verified empty shell prompt",
                     ));
                     item.connect_clicked(move |_| {
                         popdown_if_alive(&popover_c);
@@ -3542,19 +3729,10 @@ impl BlockBackend {
                         else {
                             return;
                         };
-                        let submitted = submit_recalled_command_at_prompt(
-                            PromptRecallCtx {
-                                pty: &pty_for_run,
-                                pty_synced: &pty_synced_for_run,
-                                typed_cmd: &typed_cmd_for_run,
-                                typed_cmd_fidelity: &typed_cmd_fidelity_for_run,
-                                submission_pending: &submission_pending_for_run,
-                                pending_typeahead: &pending_typeahead_for_run,
-                            },
-                            bstate_for_run.get(),
-                            &command,
-                            bracketed_for_run.get(),
-                        );
+                        let suggestion =
+                            click_cursor::suggestion_rgb(&config_for_run.borrow().palette);
+                        let submitted = verified_submission_for_run
+                            .try_submit_historical_rerun(&command, suggestion);
                         if submitted {
                             clear_finished_block_selection(
                                 &finished,
@@ -3565,6 +3743,8 @@ impl BlockBackend {
                             if let Some(active_for_run) = active_for_run.upgrade() {
                                 active_for_run.borrow().grab_focus();
                             }
+                        } else if let Some(vte) = error_bell_for_run.upgrade() {
+                            vte.error_bell();
                         }
                     });
                     vbox.append(&item);
@@ -3745,6 +3925,12 @@ impl BlockBackend {
 /// (the part a finished block actually shows). 8 MiB comfortably covers any normal
 /// command's output.
 const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
+/// How often the shell-integration watch re-checks. It stops permanently once
+/// the first OSC 133 marker appears.
+const SHELL_INTEGRATION_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Give slow login/rc startup two polls before treating RawFallback as final.
+const SHELL_INTEGRATION_GRACE_POLLS: u32 = 2;
 
 /// Visual floor for the live prompt/editor while no command owns the screen.
 /// This does not become the PTY's row count: the child always receives the full
@@ -4220,6 +4406,62 @@ impl VerifiedSubmissionCtx {
             .prompt_anchor(self.prompt_end_pos.get(), self.prompt_anchor_rows.get())
     }
 
+    /// Admit a direct history re-run only while the live shell editor is
+    /// synchronously proven empty. The shared submission path then inserts the
+    /// command without Enter, verifies its exact stable render, and admits CR
+    /// in phase two; history provenance never weakens that race boundary.
+    fn historical_rerun_is_ready(&self, command: &str, suggestion_rgb: [u8; 3]) -> bool {
+        if self.source_id.borrow().is_some()
+            || self.completion.borrow().is_some()
+            || self.pending_agent_generation.get().is_some()
+            || self.bstate.get() != BlockState::AwaitingCommand
+            || !self.prompt_anchor_ready.get()
+            || self.idle_input_dirty.get()
+            || self.pty_synced.get()
+            || self.submission_pending.get()
+            || self.pending_typeahead.get()
+            || !self.typed_cmd.borrow().is_empty()
+            || self.external_submission.borrow().is_some()
+            || self.external_submission_generation.get().is_some()
+            || self.reviewed_submission_tainted.get()
+            || self.pty.foreground_owner() != PtyForeground::Shell
+        {
+            return false;
+        }
+        if !rerun_is_admissible(
+            PromptSubmitGuards {
+                state: self.bstate.get(),
+                pty_synced: self.pty_synced.get(),
+                submission_pending: self.submission_pending.get(),
+                pending_typeahead: self.pending_typeahead.get(),
+                fidelity: self.typed_cmd_fidelity.get(),
+            },
+            command,
+            false,
+        ) {
+            return false;
+        }
+        let anchor = self.current_anchor();
+        self.surface.cursor_position() == anchor
+            && self.surface.suffix_is_empty(suggestion_rgb) == Some(true)
+    }
+
+    fn can_submit_historical_rerun(&self, command: &str, suggestion_rgb: [u8; 3]) -> bool {
+        self.historical_rerun_is_ready(command, suggestion_rgb)
+    }
+
+    fn try_submit_historical_rerun(&self, command: &str, suggestion_rgb: [u8; 3]) -> bool {
+        if !self.historical_rerun_is_ready(command, suggestion_rgb) {
+            return false;
+        }
+        // Re-use the reviewed two-phase boundary: insert without Enter, wait
+        // for a generation-stable exact render, and only then send CR. A shell
+        // redraw/prefill already queued but not yet painted therefore fails the
+        // visible identity check instead of receiving `history + CR` behind an
+        // unseen prefix.
+        self.begin(command, None, suggestion_rgb).is_ok()
+    }
+
     fn fail(&self, generation: Option<u64>, reason: &'static str) {
         self.typed_cmd_fidelity.set(TypedShadowFidelity::Inexact);
         if let Some(generation) = generation {
@@ -4422,6 +4664,9 @@ pub struct TermView {
     pane_header: crate::ui::PaneHeader,
     block_scroll: ScrolledWindow,
     block_list: gtk4::Box,
+    /// Pane-local, one-shot guidance for an empty Block document. It is a
+    /// non-measuring overlay and never participates in card/notice ownership.
+    block_onboarding: BlockOnboarding,
     /// Space-occupying card region below the surface. Used by a backend whose
     /// document cannot scroll to a mounted card; empty and hidden otherwise.
     notice_dock: gtk4::Box,
@@ -4571,6 +4816,9 @@ pub struct TermView {
     /// Tracks per-VTE selections so a drag that crosses block boundaries can be
     /// copied as one contiguous string via Ctrl+Shift+C.
     cross_selection: Rc<CrossSelection>,
+    /// Engine-owned latch set by the first OSC 133 prompt/command marker. The
+    /// first-use notice watches it so a late `source` removes the warning.
+    ftcs_seen: Rc<Cell<bool>>,
     command_started_callbacks: CommandStartedCallbacks,
     command_finished_callbacks: CommandFinishedCallbacks,
     block_finished_callbacks: BlockFinishedCallbacks,
@@ -5578,6 +5826,9 @@ struct BlockBackend {
     scroll_debouncer: ScrollDebouncer,
     failure_marker_redraw: FailureMarkerRedraw,
     finished_blocks_for_cb: Rc<RefCell<Vec<FinishedBlock>>>,
+    /// Shared with `TermView` and the async history loader. A real completed
+    /// card permanently retires the pane's empty-state guidance.
+    block_onboarding: BlockOnboarding,
     widget_pool_for_cb: Rc<RefCell<WidgetPool>>,
     find_state_for_cb: Rc<RefCell<FindState>>,
     visible_indices_rc: Rc<RefCell<std::collections::HashSet<usize>>>,
@@ -5623,6 +5874,9 @@ struct BlockBackend {
     pending_typeahead_rc: Rc<Cell<bool>>,
     bracketed_paste_rc: Rc<Cell<bool>>,
     pty_synced_rc: Rc<Cell<bool>>,
+    /// Shared proof boundary for context-menu history re-runs. Insert-only
+    /// actions keep their more permissive recall path.
+    verified_submission_for_rerun: VerifiedSubmissionCtx,
     /// Kitty graphics (APC G) — multi-chunk uploads assemble here; completed
     /// textures wait against the running command until its block finishes.
     /// The byte counter enforces the shared per-block budget so a runaway
@@ -5648,6 +5902,7 @@ struct ReaderCtx {
     /// Every widget/surface effect and query goes through this seam.
     backend: Rc<dyn RenderBackend>,
     bstate_rc: Rc<Cell<BlockState>>,
+    ftcs_seen_rc: Rc<Cell<bool>>,
     engine: RefCell<EngineState>,
     /// Bounded raw-output ring for the running command — engine-owned shared
     /// state, deliberately NOT a backend query: the reader appends during
@@ -6068,6 +6323,9 @@ impl ReaderCtx {
         // the inference gate and Agent finalization disagree about who emitted
         // this same marker.
         let foreground_owner = self.pty_for_init.foreground_owner();
+        if state == BlockState::RawFallback && foreground_owner != PtyForeground::Shell {
+            return;
+        }
         if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
             // A is an inference boundary only after the interactive shell has
             // regained the PTY. Child output can forge OSC 133 bytes but cannot
@@ -6131,6 +6389,10 @@ impl ReaderCtx {
                 emit_command_finished(&self.command_finished_cbs, event);
             }
         }
+        // Latch only after the lifecycle/foreground guard accepted this A.
+        // A foreground program can print marker-shaped bytes as ordinary
+        // output; that must not permanently hide the integration repair UI.
+        self.ftcs_seen_rc.set(true);
         if state == BlockState::AwaitingCommand && self.external_submission_rc.borrow().is_some() {
             take_agent_execution_as_lost(
                 &self.external_submission_generation_rc,
@@ -6535,6 +6797,7 @@ impl ReaderCtx {
                 // consume the shell's eventual real D.
                 return;
             }
+            self.ftcs_seen_rc.set(true);
             let mut engine = self.engine.borrow_mut();
             engine.osc133_depth += 1;
             return;
@@ -6542,6 +6805,9 @@ impl ReaderCtx {
         if state != BlockState::AwaitingCommand {
             return;
         }
+        // Invalid-state/nested C markers above are rejected before they can
+        // claim shell-integration health for this pane.
+        self.ftcs_seen_rc.set(true);
         let mut command_meta = PendingCommandMeta::from_command_start_with_token(
             meta,
             &self.engine.borrow().shell_integration_token,
@@ -7462,6 +7728,7 @@ impl RenderBackend for BlockBackend {
     }
 
     fn enter_fullscreen(&self) {
+        self.block_onboarding.set_surface_suspended(true);
         enter_fullscreen(
             &self.finished_blocks_for_cb,
             &self.visible_indices_rc,
@@ -7480,6 +7747,7 @@ impl RenderBackend for BlockBackend {
             &self.visible_indices_rc,
             &self.fullscreen_rc,
         );
+        self.block_onboarding.set_surface_suspended(false);
     }
 
     fn kitty_feed(&self, payload: &[u8]) -> kitty_graphics::FeedStatus {
@@ -7769,9 +8037,10 @@ impl RenderBackend for BlockBackend {
                 output_rows: Some(output_rows),
             },
         );
-        if let Some(notice) = record.lifecycle_notice() {
-            finished.widget().set_tooltip_text(Some(&notice));
-        }
+        finished.set_lifecycle(
+            record.lifecycle_health(),
+            record.lifecycle_notice().as_deref(),
+        );
         // A block finishing after an app recolored the
         // terminal must not pop in with static theme
         // colors next to the recolored live VTE.
@@ -7834,6 +8103,7 @@ impl RenderBackend for BlockBackend {
         }
 
         self.finished_blocks_for_cb.borrow_mut().push(finished);
+        self.block_onboarding.finished_block_observed();
 
         let notification_threshold = {
             let cfg = self.config_for_cb.borrow();
@@ -9637,8 +9907,8 @@ fn stranded_focus_key_recovers(keyval: gtk4::gdk::Key, modifiers: gtk4::gdk::Mod
 /// Keys a visible block selection owns, even when focus has been stranded on a
 /// card.
 ///
-/// The active edge of a selection displays `SELECTION_HINT`, which promises
-/// exactly these actions. But `stranded_focus_key_recovers` admits Enter,
+/// The active edge of a selection displays a capability-specific hint, whose
+/// actions are drawn from these keys. But `stranded_focus_key_recovers` admits Enter,
 /// Delete and Escape, and the refocus controller runs before the block key
 /// handler — so after a click into history those three keys spent themselves
 /// handing focus back to the prompt and the hint was lying again. While a
@@ -9654,11 +9924,27 @@ fn selection_owns_key(has_selection: bool, keyval: gtk4::gdk::Key) -> bool {
         )
 }
 
+fn widget_is_within(widget: &gtk4::Widget, ancestor: &gtk4::Widget) -> bool {
+    let mut current = Some(widget.clone());
+    while let Some(candidate) = current {
+        if candidate == *ancestor {
+            return true;
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
 /// Focused widgets that own their keystrokes even though they live inside the
 /// block pane: text entries (the per-block output filter row, search entries),
 /// popover contents (command correction, context menus), and buttons for their
 /// activation keys.
-fn focused_widget_keeps_key(focused: &gtk4::Widget, keyval: gtk4::gdk::Key) -> bool {
+fn focused_widget_keeps_key(
+    focused: &gtk4::Widget,
+    keyval: gtk4::gdk::Key,
+    modifiers: gtk4::gdk::ModifierType,
+    _has_block_selection: bool,
+) -> bool {
     use gtk4::gdk::Key;
 
     if focused.is::<gtk4::Editable>() || focused.is::<gtk4::TextView>() {
@@ -9667,11 +9953,23 @@ fn focused_widget_keeps_key(focused: &gtk4::Widget, keyval: gtk4::gdk::Key) -> b
     if focused.ancestor(gtk4::Popover::static_type()).is_some() {
         return true;
     }
-    if matches!(
-        keyval,
-        Key::Return | Key::KP_Enter | Key::ISO_Enter | Key::space
-    ) && (focused.is::<gtk4::Button>() || focused.is::<gtk4::CheckButton>())
+    let modified_activation = modifiers.intersects(
+        gtk4::gdk::ModifierType::CONTROL_MASK
+            | gtk4::gdk::ModifierType::ALT_MASK
+            | gtk4::gdk::ModifierType::SUPER_MASK
+            | gtk4::gdk::ModifierType::META_MASK,
+    );
+    if !modified_activation
+        && matches!(
+            keyval,
+            Key::Return | Key::KP_Enter | Key::ISO_Enter | Key::space
+        )
+        && (focused.is::<gtk4::Button>() || focused.is::<gtk4::CheckButton>())
     {
+        // Preserve GTK's keyboard-accessibility contract: an unmodified
+        // Return or Space activates the focused header control. Ctrl+Return is
+        // modified, so it still falls through to Block's explicit re-run
+        // chord while selection mode is active.
         return true;
     }
     false
@@ -9723,6 +10021,8 @@ struct KeyCtx {
     typed_cmd_fidelity_for_key: Rc<Cell<TypedShadowFidelity>>,
     submission_pending_for_key: Rc<Cell<bool>>,
     pending_typeahead_for_key: Rc<Cell<bool>>,
+    verified_submission_for_key: VerifiedSubmissionCtx,
+    config_for_key: Rc<RefCell<Config>>,
     finished_blocks_for_key: Weak<RefCell<Vec<FinishedBlock>>>,
     find_state_for_key: Rc<RefCell<FindState>>,
     block_data_for_key: Rc<RefCell<VecDeque<BlockData>>>,
@@ -9756,6 +10056,8 @@ impl KeyCtx {
             typed_cmd_fidelity_for_key,
             submission_pending_for_key,
             pending_typeahead_for_key,
+            verified_submission_for_key,
+            config_for_key,
             finished_blocks_for_key,
             find_state_for_key,
             block_data_for_key,
@@ -9774,11 +10076,12 @@ impl KeyCtx {
         } = self;
         key_ctrl.connect_key_pressed(move |controller, keyval, keycode, modifiers| {
             use gtk4::gdk::Key;
+            let Some(finished_blocks_for_key) = finished_blocks_for_key.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
             // The root mount is a fallback for focus that clicked into history.
-            // It must never take a key the live surface, a text entry, a
-            // popover or a focused button would have handled — including the
-            // kitty recording below, which exists only to rewrite bytes the
-            // live VTE is about to emit.
+            // It must never take a key from the live surface, another pane
+            // region, a text entry, a popover, or a button activation.
             if scope == KeyScope::StrandedFocus {
                 let Some(active_vte) = active_vte_for_key.upgrade() else {
                     return glib::Propagation::Proceed;
@@ -9793,7 +10096,19 @@ impl KeyCtx {
                 let Some(focused) = focused else {
                     return glib::Propagation::Proceed;
                 };
-                if focused_widget_keeps_key(&focused, keyval) {
+                let focus_is_in_finished_block = finished_blocks_for_key
+                    .borrow()
+                    .iter()
+                    .any(|block| widget_is_within(&focused, block.widget().upcast_ref()));
+                if !focus_is_in_finished_block {
+                    return glib::Propagation::Proceed;
+                }
+                if focused_widget_keeps_key(
+                    &focused,
+                    keyval,
+                    modifiers,
+                    selected_block_id_for_key.get().is_some(),
+                ) {
                     return glib::Propagation::Proceed;
                 }
                 // Focus is stranded on a card. Fall through to the ordinary
@@ -9827,9 +10142,6 @@ impl KeyCtx {
                 return glib::Propagation::Proceed;
             };
             let Some(block_scroll_for_key) = block_scroll_for_key.upgrade() else {
-                return glib::Propagation::Proceed;
-            };
-            let Some(finished_blocks_for_key) = finished_blocks_for_key.upgrade() else {
                 return glib::Propagation::Proceed;
             };
             let ctrl = modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
@@ -9946,11 +10258,19 @@ impl KeyCtx {
             }
 
             // Ctrl+Enter runs the one selected command — the action the card's
-            // own selection hint has advertised since the hint was written.
-            // Scoped to a single card the user already ran in this pane; see
-            // `submit_recalled_command_at_prompt` for why this is the only
-            // programmatic Enter in Block mode.
-            if ctrl && !shift && !alt && matches!(keyval, Key::Return | Key::KP_Enter) {
+            // own selection hint advertises when the selected history payload
+            // is byte-identical and safe. The final authority is the shared
+            // verified-empty prompt boundary below.
+            if ctrl
+                && !shift
+                && !alt
+                && matches!(keyval, Key::Return | Key::KP_Enter | Key::ISO_Enter)
+            {
+                let selected_count = selected_block_ids_for_key.borrow().len();
+                if !block_selection_owns_ctrl_enter(selected_block_id_for_key.get(), selected_count)
+                {
+                    return glib::Propagation::Proceed;
+                }
                 let finished = finished_blocks_for_key.borrow();
                 let target = {
                     let selected = selected_block_ids_for_key.borrow();
@@ -9958,19 +10278,9 @@ impl KeyCtx {
                         .map(|block| block.cmd_text.clone())
                 };
                 if let Some(command) = target {
-                    let submitted = submit_recalled_command_at_prompt(
-                        PromptRecallCtx {
-                            pty: &pty_for_key,
-                            pty_synced: &pty_synced_for_key,
-                            typed_cmd: &typed_cmd_for_key,
-                            typed_cmd_fidelity: &typed_cmd_fidelity_for_key,
-                            submission_pending: &submission_pending_for_key,
-                            pending_typeahead: &pending_typeahead_for_key,
-                        },
-                        bstate_for_key.get(),
-                        &command,
-                        bracketed_paste_for_key.get(),
-                    );
+                    let suggestion = click_cursor::suggestion_rgb(&config_for_key.borrow().palette);
+                    let submitted = verified_submission_for_key
+                        .try_submit_historical_rerun(&command, suggestion);
                     if submitted {
                         clear_finished_block_selection(
                             &finished,
@@ -9978,30 +10288,24 @@ impl KeyCtx {
                             &selected_block_id_for_key,
                             &selection_anchor_id_for_key,
                         );
+                        active_vte_for_key.grab_focus();
                         return glib::Propagation::Stop;
                     }
                 }
-                return glib::Propagation::Proceed;
+                // Selection mode owns this key even when the prompt is dirty,
+                // busy, the selection is a batch/background block, or the
+                // command sanitizer would rewrite it. Never let the refused
+                // Enter fall through to VTE and submit unrelated input.
+                active_vte_for_key.error_bell();
+                return glib::Propagation::Stop;
             }
 
             // Enter recalls every selected command in terminal order as one
-            // editable multiline buffer. It never steals Enter from a running process.
-            if matches!(keyval, Key::Return | Key::KP_Enter) {
+            // editable multiline buffer. Once selection mode is visible, a
+            // refusal is consumed instead of leaking Enter to another owner.
+            if block_selection_owns_plain_enter(keyval, ctrl, shift, alt) {
                 if selected_block_id_for_key.get().is_some() {
                     let finished = finished_blocks_for_key.borrow();
-                    // Programmatic paste/Agent input does not pass through this
-                    // controller. If it has already dirtied the editor, Enter must
-                    // submit the visible line rather than replacing it with a
-                    // previously selected command.
-                    if pty_synced_for_key.get() || !typed_cmd_for_key.borrow().is_empty() {
-                        clear_finished_block_selection(
-                            &finished,
-                            &selected_block_ids_for_key,
-                            &selected_block_id_for_key,
-                            &selection_anchor_id_for_key,
-                        );
-                        return glib::Propagation::Proceed;
-                    }
                     let recalled = {
                         let selected = selected_block_ids_for_key.borrow();
                         recall_selected_commands_at_prompt(
@@ -10026,8 +10330,15 @@ impl KeyCtx {
                             &selected_block_id_for_key,
                             &selection_anchor_id_for_key,
                         );
+                        active_vte_for_key.grab_focus();
                         return glib::Propagation::Stop;
                     }
+                    // A visible selection owns the advertised Enter action.
+                    // If the prompt is busy/dirty, bracketed paste is missing,
+                    // or the selected text is unsafe, never pass the same key
+                    // through to VTE where it could submit unrelated input.
+                    active_vte_for_key.error_bell();
+                    return glib::Propagation::Stop;
                 }
                 return glib::Propagation::Proceed;
             }
@@ -10551,6 +10862,10 @@ impl TermView {
         scroll_overlay.set_child(Some(&block_scroll));
         scroll_overlay.add_overlay(&sticky_bar);
         scroll_overlay.add_overlay(&jump_fab);
+        let block_onboarding = BlockOnboarding::attach(
+            &scroll_overlay,
+            matches!(mode, crate::config::TerminalMode::Block),
+        );
         root.append(&scroll_overlay);
 
         // Cards dock BELOW the surface as a sibling that takes space, not as
@@ -10578,6 +10893,7 @@ impl TermView {
 
         // ── Shared state ──────────────────────────────────────────────────
         let bstate = Rc::new(Cell::new(BlockState::Idle));
+        let ftcs_seen = Rc::new(Cell::new(false));
 
         // Keystroke-shadow command line. The authoritative command text is read
         // off the VTE at CommandStart; this remains a best-effort fallback when
@@ -11399,6 +11715,7 @@ impl TermView {
                     scroll_debouncer: scroll_debouncer.clone(),
                     failure_marker_redraw: failure_marker_redraw.clone(),
                     finished_blocks_for_cb,
+                    block_onboarding: block_onboarding.clone(),
                     widget_pool_for_cb,
                     find_state_for_cb: find_state.clone(),
                     removed_blocks_for_cb: removed_blocks.clone(),
@@ -11425,6 +11742,7 @@ impl TermView {
                     pending_typeahead_rc: pending_typeahead_rc.clone(),
                     bracketed_paste_rc: bracketed_paste_rc.clone(),
                     pty_synced_rc: pty_synced_rc.clone(),
+                    verified_submission_for_rerun: verified_submission.clone(),
                     kitty_assembler: RefCell::new(kitty_graphics::Assembler::new()),
                     kitty_pending_images: RefCell::new(Vec::new()),
                     kitty_pending_bytes: Cell::new(0),
@@ -11435,6 +11753,7 @@ impl TermView {
             ReaderCtx {
                 backend,
                 bstate_rc,
+                ftcs_seen_rc: ftcs_seen.clone(),
                 kitty_keyboard_rc: kitty_keyboard.clone(),
                 kitty_flags_rc: kitty_flags.clone(),
                 engine: RefCell::new(EngineState {
@@ -12061,7 +12380,12 @@ impl TermView {
                 else {
                     return glib::Propagation::Proceed;
                 };
-                if focused_widget_keeps_key(&focused, keyval) {
+                if focused_widget_keeps_key(
+                    &focused,
+                    keyval,
+                    modifiers,
+                    selected_for_refocus.get().is_some(),
+                ) {
                     return glib::Propagation::Proceed;
                 }
                 focus_terminal(&active_vte_for_refocus);
@@ -12106,6 +12430,8 @@ impl TermView {
                 typed_cmd_fidelity_for_key,
                 submission_pending_for_key,
                 pending_typeahead_for_key,
+                verified_submission_for_key: verified_submission.clone(),
+                config_for_key: config_shared.clone(),
                 finished_blocks_for_key,
                 find_state_for_key: find_state.clone(),
                 block_data_for_key,
@@ -12364,6 +12690,7 @@ impl TermView {
             pane_header,
             block_scroll,
             block_list,
+            block_onboarding,
             notice_dock,
             jump_fab: jump_fab.clone(),
             unread_count: unread_count.clone(),
@@ -12426,6 +12753,7 @@ impl TermView {
             sticky_timer_id: RefCell::new(Some(sticky_timer_id)),
             sticky_organism_slot,
             cross_selection,
+            ftcs_seen,
             command_started_callbacks,
             command_finished_callbacks,
             block_finished_callbacks,
@@ -12886,6 +13214,156 @@ impl TermView {
 
     pub(crate) fn supports_block_mutation(&self) -> bool {
         self.render_backend.supports_block_mutation()
+    }
+
+    /// Show a standing, in-pane explanation when a supported interactive shell
+    /// reaches RawFallback without ever emitting the OSC 133 boundaries Block
+    /// mode needs. A late integration marker removes the card automatically.
+    pub(crate) fn arm_shell_integration_notice(view: &Rc<Self>, shell_argv: &[String]) {
+        let Some(hint) = shell_integration_hint(shell_argv) else {
+            return;
+        };
+        let weak = Rc::downgrade(view);
+        // The timer watches for a late marker, but must not own a dismissed GTK
+        // subtree for the remaining pane lifetime.
+        let card: RefCell<Option<glib::WeakRef<gtk4::Widget>>> = RefCell::new(None);
+        let dismissed = Rc::new(Cell::new(false));
+        let polls = Cell::new(0u32);
+        glib::timeout_add_local(SHELL_INTEGRATION_POLL, move || {
+            let Some(view) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if view.ftcs_seen.get() {
+                if let Some(card) = card.borrow_mut().take().and_then(|card| card.upgrade()) {
+                    view.remove_inline_notice(&card);
+                }
+                return glib::ControlFlow::Break;
+            }
+            if dismissed.get() || card.borrow().is_some() {
+                // Mounted or dismissed: keep only the lightweight late-marker
+                // watch alive. Both states retain at most a weak widget handle.
+                return glib::ControlFlow::Continue;
+            }
+            polls.set(polls.get().saturating_add(1));
+            if polls.get() < SHELL_INTEGRATION_GRACE_POLLS {
+                return glib::ControlFlow::Continue;
+            }
+            if view.bstate.get() != BlockState::RawFallback {
+                return glib::ControlFlow::Continue;
+            }
+            let widget = view.build_shell_integration_notice(hint, dismissed.clone());
+            if !view.dock_inline_notice(&widget) {
+                return glib::ControlFlow::Break;
+            }
+            *card.borrow_mut() = Some(widget.downgrade());
+            glib::ControlFlow::Continue
+        });
+    }
+
+    /// Build the actionable card mounted by [`Self::arm_shell_integration_notice`].
+    fn build_shell_integration_notice(
+        self: &Rc<Self>,
+        hint: ShellIntegrationHint,
+        dismissed: Rc<Cell<bool>>,
+    ) -> gtk4::Widget {
+        let compact = self.config.borrow().block_compact;
+        let root = gtk4::Box::new(Orientation::Vertical, 4);
+        root.add_css_class("block-finished");
+        root.add_css_class("block-assistant");
+        root.add_css_class("block-integration-notice");
+        root.set_hexpand(true);
+        root.set_vexpand(false);
+        if compact {
+            root.add_css_class("block-compact");
+            root.set_margin_top(1);
+            root.set_margin_bottom(1);
+            root.set_margin_start(4);
+            root.set_margin_end(4);
+        } else {
+            root.set_margin_top(4);
+            root.set_margin_bottom(4);
+            root.set_margin_start(8);
+            root.set_margin_end(8);
+        }
+
+        let header = gtk4::Box::new(Orientation::Horizontal, 8);
+        header.add_css_class("block-header");
+        header.set_margin_start(12);
+        header.set_margin_end(8);
+        header.set_margin_top(6);
+        header.set_margin_bottom(2);
+        let icon = gtk4::Image::from_icon_name("dialog-information-symbolic");
+        icon.add_css_class("assistant-card-icon");
+        let title = gtk4::Label::new(Some("No blocks: this shell is not marking commands"));
+        title.add_css_class("assistant-card-title");
+        title.set_halign(gtk4::Align::Start);
+        title.set_hexpand(true);
+        title.set_xalign(0.0);
+        let dismiss = gtk4::Button::from_icon_name("window-close-symbolic");
+        dismiss.add_css_class("flat");
+        dismiss.set_tooltip_text(Some("Dismiss"));
+        dismiss.update_property(&[gtk4::accessible::Property::Label("Dismiss")]);
+        header.append(&icon);
+        header.append(&title);
+        header.append(&dismiss);
+        root.append(&header);
+
+        let body = gtk4::Label::new(Some(&format!(
+            "Block mode splits output into cards using the OSC 133 marks a shell \
+             emits around each command. This pane's {} is not sending them, so \
+             commands, exit codes and durations cannot be separated. Add this \
+             line to {}:",
+            hint.shell, hint.rc
+        )));
+        body.add_css_class("block-header-label");
+        body.set_wrap(true);
+        body.set_xalign(0.0);
+        body.set_margin_start(12);
+        body.set_margin_end(12);
+        root.append(&body);
+
+        let load = gtk4::Label::new(Some(hint.load));
+        load.add_css_class("integration-notice-code");
+        load.set_selectable(true);
+        load.set_wrap(true);
+        load.set_xalign(0.0);
+        load.set_margin_start(12);
+        load.set_margin_end(12);
+        load.set_margin_top(4);
+        root.append(&load);
+
+        let actions = gtk4::Box::new(Orientation::Horizontal, 8);
+        actions.set_halign(gtk4::Align::End);
+        actions.set_margin_end(12);
+        actions.set_margin_top(6);
+        actions.set_margin_bottom(8);
+        let copy = gtk4::Button::with_label("Copy Command");
+        copy.add_css_class("flat");
+        copy.update_property(&[gtk4::accessible::Property::Label(
+            "Copy shell integration command",
+        )]);
+        {
+            let clipboard_vte = self.active_vte.clone();
+            copy.connect_clicked(move |button| {
+                clipboard_vte.clipboard().set_text(hint.load);
+                button.set_label("Copied");
+            });
+        }
+        actions.append(&copy);
+        root.append(&actions);
+
+        let widget: gtk4::Widget = root.upcast();
+        {
+            let weak = Rc::downgrade(self);
+            let card = widget.downgrade();
+            dismiss.connect_clicked(move |_| {
+                dismissed.set(true);
+                if let (Some(view), Some(card)) = (weak.upgrade(), card.upgrade()) {
+                    view.remove_inline_notice(&card);
+                }
+            });
+        }
+        widget
     }
 
     /// Insert a transient notice card (e.g. an AI command-correction proposal
@@ -13696,11 +14174,6 @@ impl TermView {
         let mut pool = self.widget_pool.borrow_mut();
         for widget in widgets {
             self.block_list.remove(&widget);
-            // Pool only the lightweight outer shell. Keeping its VTE children
-            // would retain completed-block scrollback outside the byte budget.
-            while let Some(child) = widget.first_child() {
-                widget.remove(&child);
-            }
             pool.release(widget);
         }
         drop(pool);
@@ -13776,6 +14249,10 @@ impl TermView {
                     block.end_time_ms,
                     block.cwd.as_deref(),
                     cols,
+                );
+                finished.set_lifecycle(
+                    block.lifecycle_health(),
+                    block.lifecycle_notice().as_deref(),
                 );
                 apply_dynamic_colors_to_finished(&finished, self.dynamic_colors.get());
                 // The card that will follow this one, or the live block when
@@ -13966,6 +14443,10 @@ impl TermView {
                     block.end_time_ms,
                     block.cwd.as_deref(),
                     cols,
+                );
+                finished.set_lifecycle(
+                    block.lifecycle_health(),
+                    block.lifecycle_notice().as_deref(),
                 );
                 apply_dynamic_colors_to_finished(&finished, self.dynamic_colors.get());
                 finished
@@ -14506,18 +14987,19 @@ mod tests {
         resolve_submitted_command, reviewed_pre_command_bytes_are_identity_neutral,
         reviewed_submission_matches, screen_relative_cpr_row, scroll_delta_to_reveal,
         selected_blocks_markdown, selected_command_text, selected_id_range,
-        shell_argv_supports_agent_ids, shell_argv_uses_jsh, should_buffer_background_output,
-        stable_visible_indices, step_marked_indices, step_marked_record_ids, strip_ansi,
-        strip_ansi_with_clear_detect, take_background_output, take_stash_for_undo,
-        truncate_plain_output_for_height, verified_editor_contains_exact_command,
-        viewport_page_size_changed, viewport_state_for_scroll, viewport_state_pair_for_scroll,
-        visible_indices_for_viewport, AgentCommandEndDecision, AltScreenCallbacks,
-        AltScreenTransition, AnchorAbandoned, AnchorTickExit, BlockData, BlockState,
-        BoundedByteRing, BoundedClipboardAccumulator, CommandFinishedEvent, CommandIdCorrelation,
-        CommandMeta, CommandPromptStatus, CommandStartedEvent, DynamicColors, HumanInputKind,
-        InputOrigin, PendingCommandMeta, PostPromptFeed, TypedShadowFidelity, ViewportState,
-        MAX_COMMAND_CAPTURE_BYTES, MAX_JOURNAL_OUTPUT_BYTES, MAX_PROMPT_CAPTURE_BYTES,
-        MAX_RAW_OUTPUT_BYTES, MAX_SELECTED_CLIPBOARD_BYTES, TERMINAL_RESET_INVALIDATED_SUBMISSION,
+        shell_argv_supports_agent_ids, shell_argv_uses_jsh, shell_integration_hint,
+        should_buffer_background_output, stable_visible_indices, step_marked_indices,
+        step_marked_record_ids, strip_ansi, strip_ansi_with_clear_detect, take_background_output,
+        take_stash_for_undo, truncate_plain_output_for_height,
+        verified_editor_contains_exact_command, viewport_page_size_changed,
+        viewport_state_for_scroll, viewport_state_pair_for_scroll, visible_indices_for_viewport,
+        AgentCommandEndDecision, AltScreenCallbacks, AltScreenTransition, AnchorAbandoned,
+        AnchorTickExit, BlockData, BlockState, BoundedByteRing, BoundedClipboardAccumulator,
+        CommandFinishedEvent, CommandIdCorrelation, CommandMeta, CommandPromptStatus,
+        CommandStartedEvent, DynamicColors, HumanInputKind, InputOrigin, PendingCommandMeta,
+        PostPromptFeed, TypedShadowFidelity, ViewportState, MAX_COMMAND_CAPTURE_BYTES,
+        MAX_JOURNAL_OUTPUT_BYTES, MAX_PROMPT_CAPTURE_BYTES, MAX_RAW_OUTPUT_BYTES,
+        MAX_SELECTED_CLIPBOARD_BYTES, TERMINAL_RESET_INVALIDATED_SUBMISSION,
         TRUNCATED_COMMAND_PLACEHOLDER, UNAVAILABLE_COMMAND_PLACEHOLDER,
         VERIFIED_SUBMISSION_MAX_POLLS, ZONE_MARKER_CLOSE,
     };
@@ -14833,7 +15315,7 @@ mod tests {
     #[test]
     #[ignore = "requires DISPLAY"]
     fn a_stranded_focus_mount_declines_only_what_the_focused_widget_owns() {
-        use gtk4::gdk::Key;
+        use gtk4::gdk::{Key, ModifierType};
         use gtk4::prelude::*;
 
         gtk4::init().expect("gtk init");
@@ -14844,7 +15326,7 @@ mod tests {
         let card_vte: gtk4::Widget = vte4::Terminal::new().upcast();
         for key in [Key::Up, Key::Down, Key::Delete, Key::Escape, Key::Return] {
             assert!(
-                !super::focused_widget_keeps_key(&card_vte, key),
+                !super::focused_widget_keeps_key(&card_vte, key, ModifierType::empty(), true),
                 "{key:?} must reach the block handler from a focused card"
             );
         }
@@ -14854,16 +15336,44 @@ mod tests {
         let entry: gtk4::Widget = gtk4::SearchEntry::new().upcast();
         for key in [Key::Up, Key::Delete, Key::Escape, Key::Return, Key::a] {
             assert!(
-                super::focused_widget_keeps_key(&entry, key),
+                super::focused_widget_keeps_key(&entry, key, ModifierType::empty(), true),
                 "a text entry must keep {key:?}"
             );
         }
 
-        // A focused button keeps its activation keys and nothing else.
+        // A focused button keeps ordinary GTK activation even when its card is
+        // selected. Ctrl+Enter remains Block's explicit modified chord.
         let button: gtk4::Widget = gtk4::Button::new().upcast();
-        assert!(super::focused_widget_keeps_key(&button, Key::Return));
-        assert!(super::focused_widget_keeps_key(&button, Key::space));
-        assert!(!super::focused_widget_keeps_key(&button, Key::Up));
+        assert!(super::focused_widget_keeps_key(
+            &button,
+            Key::Return,
+            ModifierType::empty(),
+            false,
+        ));
+        assert!(super::focused_widget_keeps_key(
+            &button,
+            Key::Return,
+            ModifierType::empty(),
+            true,
+        ));
+        assert!(!super::focused_widget_keeps_key(
+            &button,
+            Key::Return,
+            ModifierType::CONTROL_MASK,
+            true,
+        ));
+        assert!(super::focused_widget_keeps_key(
+            &button,
+            Key::space,
+            ModifierType::empty(),
+            true,
+        ));
+        assert!(!super::focused_widget_keeps_key(
+            &button,
+            Key::Up,
+            ModifierType::empty(),
+            true,
+        ));
     }
 
     /// The refocus controller runs before the block handler and admits Enter,
@@ -14905,6 +15415,39 @@ mod tests {
                 key,
                 ModifierType::empty()
             ));
+        }
+    }
+
+    #[test]
+    fn the_selection_hint_only_names_actions_available_for_that_selection() {
+        assert_eq!(
+            super::finished_selection_hint(1, true, true),
+            super::SELECTION_HINT_RUN
+        );
+        assert_eq!(
+            super::finished_selection_hint(2, true, true),
+            super::SELECTION_HINT_RECALL,
+            "multi-selection is insert-only"
+        );
+        assert_eq!(
+            super::finished_selection_hint(1, true, false),
+            super::SELECTION_HINT_RECALL,
+            "a multiline or sanitized command remains recall-only"
+        );
+        assert_eq!(
+            super::finished_selection_hint(1, false, false),
+            super::SELECTION_HINT_REMOVE,
+            "a background-only selection only advertises cancellation"
+        );
+        for hint in [
+            super::SELECTION_HINT_RUN,
+            super::SELECTION_HINT_RECALL,
+            super::SELECTION_HINT_REMOVE,
+        ] {
+            assert!(
+                !hint.contains("Del"),
+                "the compact hint must not advertise destructive deletion"
+            );
         }
     }
 
@@ -15030,41 +15573,14 @@ mod tests {
         }
     }
 
-    /// The card's selection hint has always read "Ctrl+↵ run". Nothing
-    /// implemented it: the Enter branch ignored modifiers, so Ctrl+Enter
-    /// silently inserted the command and dropped the selection. This pins what
-    /// the key now actually writes.
     #[test]
-    fn a_rerun_submits_the_bare_command_and_one_enter() {
-        // Both shells: framing is never used, because a `\r` behind
-        // `ESC[201~` is swallowed by readline's paste handler instead of
-        // accepting the line, and a re-run is single-line by construction so a
-        // frame protects nothing.
+    fn a_safe_rerun_is_admitted_with_or_without_bracketed_paste() {
         for bracketed_paste in [true, false] {
-            let submission = super::rerun_submission(idle_guards(), "cargo test", bracketed_paste)
-                .expect("an idle prompt admits a single-line re-run");
-
-            assert_eq!(
-                submission.payload, b"cargo test\r",
-                "bracketed_paste={bracketed_paste} must not change what a re-run writes"
-            );
-            assert_eq!(submission.echo_text, "cargo test");
-            assert!(
-                !submission
-                    .payload
-                    .windows(jterm_core::pty_input::PASTE_START.len())
-                    .any(|window| window == jterm_core::pty_input::PASTE_START),
-                "no paste framing may reach the shell"
-            );
-            assert_eq!(
-                submission
-                    .payload
-                    .iter()
-                    .filter(|byte| **byte == b'\r')
-                    .count(),
-                1,
-                "exactly one submit boundary"
-            );
+            assert!(super::rerun_is_admissible(
+                idle_guards(),
+                "cargo test",
+                bracketed_paste
+            ));
         }
     }
 
@@ -15084,7 +15600,7 @@ mod tests {
                 ..idle_guards()
             };
             assert!(
-                super::rerun_submission(guards, "ls", true).is_none(),
+                !super::rerun_is_admissible(guards, "ls", true),
                 "{state:?} must not accept a re-run"
             );
         }
@@ -15110,14 +15626,14 @@ mod tests {
         ];
         for guards in dirty {
             assert!(
-                super::rerun_submission(guards, "ls", true).is_none(),
+                !super::rerun_is_admissible(guards, "ls", true),
                 "a prompt that is not clean must not accept a re-run"
             );
         }
 
         // Nothing to run.
-        assert!(super::rerun_submission(idle_guards(), "", true).is_none());
-        assert!(super::rerun_submission(idle_guards(), "   \n ", true).is_none());
+        assert!(!super::rerun_is_admissible(idle_guards(), "", true));
+        assert!(!super::rerun_is_admissible(idle_guards(), "   \n ", true));
 
         // A command the encoder must cut to its first line. Insertion may
         // truncate — the user still reads the line — but executing a silently
@@ -15130,9 +15646,82 @@ mod tests {
             "the fixture must actually be truncated by the encoder"
         );
         assert!(
-            super::rerun_submission(idle_guards(), multiline, false).is_none(),
+            !super::rerun_is_admissible(idle_guards(), multiline, false),
             "a truncated command must never be executed"
         );
+
+        // Sanitization is acceptable for insertion because the changed text is
+        // visible before Enter. A one-click re-run must remain byte-identical
+        // to the history command instead of executing a cleaned-up surprise.
+        for rewritten in [
+            "echo \x1b[31mred",
+            "printf docs\x1b[201~oops",
+            "printf trailing-newline\n",
+            "printf\0argument",
+        ] {
+            let paste = super::build_command_recall(rewritten, false);
+            assert!(
+                paste.risk.had_controls
+                    || paste.risk.had_embedded_paste_marker
+                    || paste.echo_text != rewritten,
+                "fixture must exercise a sanitizer rewrite: {rewritten:?}"
+            );
+            assert!(
+                !super::rerun_is_admissible(idle_guards(), rewritten, false),
+                "sanitizer-rewritten history must stay insert-only: {rewritten:?}"
+            );
+        }
+        for placeholder in [
+            super::TRUNCATED_COMMAND_PLACEHOLDER,
+            super::UNAVAILABLE_COMMAND_PLACEHOLDER,
+        ] {
+            assert!(
+                !super::rerun_is_admissible(idle_guards(), placeholder, false),
+                "an internal capture placeholder must never become shell input"
+            );
+        }
+    }
+
+    #[test]
+    fn selection_mode_always_consumes_ctrl_enter_even_when_rerun_refuses() {
+        assert!(!super::block_selection_owns_ctrl_enter(None, 0));
+        assert!(super::block_selection_owns_ctrl_enter(Some(7), 1));
+        assert!(
+            super::block_selection_owns_ctrl_enter(None, 1),
+            "even a transiently inconsistent selection set must fail closed"
+        );
+
+        let busy = super::PromptSubmitGuards {
+            state: BlockState::CollectingOutput,
+            ..idle_guards()
+        };
+        assert!(!super::rerun_is_admissible(busy, "ls", false));
+        assert!(
+            super::block_selection_owns_ctrl_enter(Some(7), 1),
+            "a refusal while selected must remain Block-owned, never reach VTE"
+        );
+    }
+
+    #[test]
+    fn only_unmodified_enter_owns_history_recall() {
+        use gtk4::gdk::Key;
+        assert!(super::block_selection_owns_plain_enter(
+            Key::Return,
+            false,
+            false,
+            false
+        ));
+        for (ctrl, shift, alt) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, false),
+        ] {
+            assert!(
+                !super::block_selection_owns_plain_enter(Key::Return, ctrl, shift, alt),
+                "modified Enter must remain available to the focused surface"
+            );
+        }
     }
 
     /// A re-run acts on one card the user pointed at. A multi-card selection
@@ -16920,6 +17509,109 @@ mod tests {
             &ready
         ));
         assert!(ready.get());
+    }
+
+    #[test]
+    fn shell_integration_notice_only_offers_honest_direct_shell_fixes() {
+        let argv = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>()
+        };
+        for (command, shell, rc, load) in [
+            (
+                "/bin/bash",
+                "bash",
+                "~/.bashrc",
+                "source <(forge --shell-integration bash)",
+            ),
+            (
+                "zsh",
+                "zsh",
+                "${ZDOTDIR:-$HOME}/.zshrc",
+                "source <(forge --shell-integration zsh)",
+            ),
+            (
+                "/usr/bin/fish",
+                "fish",
+                "~/.config/fish/config.fish",
+                "forge --shell-integration fish | source",
+            ),
+            (
+                "pwsh",
+                "pwsh",
+                "$PROFILE",
+                "forge --shell-integration pwsh | Out-String | Invoke-Expression",
+            ),
+        ] {
+            let hint = shell_integration_hint(&argv(&[command])).expect(command);
+            assert_eq!(hint.shell, shell);
+            assert_eq!(hint.rc, rc);
+            assert_eq!(hint.load, load);
+        }
+        assert!(shell_integration_hint(&argv(&["bash", "-i"])).is_some());
+        assert!(shell_integration_hint(&argv(&["bash", "-C", "-i"])).is_some());
+        assert!(shell_integration_hint(&argv(&["zsh", "-i"])).is_some());
+        assert!(shell_integration_hint(&argv(&["fish", "-i"])).is_some());
+        assert!(shell_integration_hint(&argv(&["fish", "-C", "set -g fish_greeting"])).is_some());
+        assert!(shell_integration_hint(&argv(&["pwsh", "-Interactive"])).is_some());
+        assert!(!super::shell_argv_runs_one_command(&argv(&[
+            "pwsh",
+            "-ExecutionPolicy",
+            "Bypass",
+        ])));
+        assert_eq!(
+            shell_integration_hint(&argv(&["/usr/bin/powershell"]))
+                .expect("powershell alias")
+                .shell,
+            "pwsh"
+        );
+
+        for unsupported in [
+            argv(&["jsh"]),
+            argv(&["/usr/local/bin/jsh", "-l"]),
+            argv(&["bash", "-c", "ls"]),
+            argv(&["bash", "--command", "ls"]),
+            argv(&["bash", "-lc", "ls"]),
+            argv(&["bash", "--norc"]),
+            argv(&["bash", "--rcfile", "/tmp/custom.bashrc"]),
+            argv(&["bash", "--init-file=/tmp/custom.bashrc"]),
+            argv(&["bash", "--posix"]),
+            argv(&["bash", "--", "script.sh"]),
+            argv(&["bash", "script.sh"]),
+            argv(&["bash", "-l"]),
+            argv(&["zsh", "-f"]),
+            argv(&["zsh", "-o", "norcs"]),
+            argv(&["zsh", "+o", "rcs"]),
+            argv(&["zsh", "--no_rcs"]),
+            argv(&["zsh", "-t"]),
+            argv(&["zsh", "script.zsh"]),
+            argv(&["fish", "--no-config"]),
+            argv(&["fish", "--command=echo ok"]),
+            argv(&["fish", "--no-execute"]),
+            argv(&["fish", "script.fish"]),
+            argv(&["pwsh", "-NoProfile"]),
+            argv(&["pwsh", "-NonInteractive"]),
+            argv(&["pwsh", "-SSHServerMode"]),
+            argv(&["pwsh", "-CommandWithArgs", "Get-Location"]),
+            argv(&["pwsh", "-Command", "Get-Location"]),
+            argv(&["powershell", "--Command", "Get-Location"]),
+            argv(&["pwsh", "-EncodedCommand", "ZQB4AGkAdAA="]),
+            argv(&["pwsh", "-File", "profile.ps1"]),
+            argv(&["pwsh", "profile.ps1"]),
+            argv(&["ssh", "build-host"]),
+            argv(&["docker", "exec", "-it", "box", "bash"]),
+            argv(&["flatpak-spawn", "--host", "bash"]),
+            argv(&["sh"]),
+            Vec::new(),
+        ] {
+            assert_eq!(
+                shell_integration_hint(&unsupported),
+                None,
+                "{unsupported:?}"
+            );
+        }
     }
 
     #[test]
@@ -18871,6 +19563,22 @@ mod tests {
     }
 
     #[test]
+    fn selected_multiline_recall_refuses_any_lossy_first_line_fallback() {
+        assert!(super::selected_command_recall_is_lossless(
+            "printf one\nprintf two",
+            true,
+        ));
+        assert!(!super::selected_command_recall_is_lossless(
+            "printf one\nprintf two",
+            false,
+        ));
+        assert!(super::selected_command_recall_is_lossless(
+            "printf one",
+            false,
+        ));
+    }
+
+    #[test]
     fn captured_command_recall_strips_controls_and_rejects_visual_spoofing() {
         let paste = build_command_recall("echo \x1b[31mred", true);
         assert_eq!(paste.echo_text, "echo [31mred");
@@ -19926,6 +20634,7 @@ mod tests {
             let ctx = ReaderCtx {
                 backend: backend.clone(),
                 bstate_rc: bstate.clone(),
+                ftcs_seen_rc: Rc::new(Cell::new(false)),
                 engine: RefCell::new(EngineState {
                     prev_state: BlockState::Idle,
                     osc133_depth: 0,
@@ -20105,6 +20814,44 @@ mod tests {
 
     fn bytes(text: &str) -> ParserEvent {
         ParserEvent::Bytes(text.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn integration_health_latches_only_after_marker_acceptance() {
+        // Raw fallback is exactly where the repair notice is visible. Marker-
+        // shaped bytes from a foreground program must not dismiss it; the
+        // shell's own late A may do so when integration is loaded manually.
+        let raw = ReaderHarness::with_foreground(PtyForeground::Other);
+        raw.bstate.set(BlockState::RawFallback);
+        raw.feed(ParserEvent::PromptStart);
+        assert!(!raw.ctx.ftcs_seen_rc.get());
+        raw.pty.set_test_foreground(PtyForeground::Shell);
+        raw.feed(ParserEvent::PromptStart);
+        assert!(raw.ctx.ftcs_seen_rc.get());
+
+        // Nested C follows the existing foreground-ownership trust gate.
+        let nested = ReaderHarness::with_foreground(PtyForeground::Other);
+        nested.bstate.set(BlockState::CollectingOutput);
+        nested.feed(command_start(Some("spoofed")));
+        assert!(!nested.ctx.ftcs_seen_rc.get());
+        assert_eq!(nested.ctx.engine.borrow().osc133_depth, 0);
+        nested.pty.set_test_foreground(PtyForeground::Shell);
+        nested.feed(command_start(Some("nested")));
+        assert!(nested.ctx.ftcs_seen_rc.get());
+        assert_eq!(nested.ctx.engine.borrow().osc133_depth, 1);
+
+        // An invalid lifecycle state rejects C before health is latched.
+        let invalid = ReaderHarness::new();
+        invalid.feed(command_start(None));
+        assert!(!invalid.ctx.ftcs_seen_rc.get());
+
+        // AwaitingCommand is the normal C state. Do not add a foreground
+        // snapshot here: by GTK dispatch time a fast command may already own
+        // the PTY even though the shell emitted the accepted marker.
+        let normal = ReaderHarness::with_foreground(PtyForeground::Other);
+        normal.bstate.set(BlockState::AwaitingCommand);
+        normal.feed(command_start(Some("true")));
+        assert!(normal.ctx.ftcs_seen_rc.get());
     }
 
     /// A whole foreground command — prompt, submission, output, exit, next
@@ -22395,6 +23142,151 @@ mod tests {
                 .surface
                 .reads()
                 .contains(&SurfaceRead::SuffixIsEmpty));
+        }
+    }
+
+    #[test]
+    fn a_history_rerun_inserts_without_enter_until_the_render_is_verified() {
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+
+        assert!(harness
+            .ctx
+            .verified_submission
+            .try_submit_historical_rerun("printf SAFE", [0, 0, 0]));
+        assert_eq!(
+            harness.pty.drain_test_slave(PTY_REPLY_WAIT),
+            b"printf SAFE",
+            "phase one must never send Enter with the historical text"
+        );
+        assert_eq!(&*harness.ctx.typed_cmd_rc.borrow(), "printf SAFE");
+        assert_eq!(
+            harness.ctx.typed_cmd_fidelity_rc.get(),
+            TypedShadowFidelity::ExactOpen
+        );
+        assert!(harness.ctx.idle_input_dirty_rc.get());
+        assert!(harness.ctx.pty_synced_rc.get());
+        assert!(!harness.ctx.submission_pending_rc.get());
+        assert!(harness.ctx.external_submission_rc.borrow().is_none());
+        assert_eq!(harness.ctx.external_submission_generation_rc.get(), None);
+        assert!(harness.ctx.verified_submission.source_id.borrow().is_some());
+
+        harness
+            .ctx
+            .verified_submission
+            .invalidate_for_terminal_reset();
+    }
+
+    #[test]
+    fn a_history_rerun_fails_closed_for_every_unverified_prompt_witness() {
+        #[derive(Clone, Copy, Debug)]
+        enum Refusal {
+            WrongState,
+            UnsettledAnchor,
+            DirtyEditor,
+            SyncedEditor,
+            PendingSubmission,
+            PendingTypeahead,
+            TypedShadow,
+            ReviewedSubmission,
+            ReviewedCompletion,
+            AgentVerification,
+            ForegroundJob,
+            CursorMoved,
+            UnknownSuffix,
+            UnsafeCommand,
+        }
+
+        let harness = ReaderHarness::new();
+        let anchor = harness.arm_verified_prompt();
+        for refusal in [
+            Refusal::WrongState,
+            Refusal::UnsettledAnchor,
+            Refusal::DirtyEditor,
+            Refusal::SyncedEditor,
+            Refusal::PendingSubmission,
+            Refusal::PendingTypeahead,
+            Refusal::TypedShadow,
+            Refusal::ReviewedSubmission,
+            Refusal::ReviewedCompletion,
+            Refusal::AgentVerification,
+            Refusal::ForegroundJob,
+            Refusal::CursorMoved,
+            Refusal::UnknownSuffix,
+            Refusal::UnsafeCommand,
+        ] {
+            harness.bstate.set(BlockState::AwaitingCommand);
+            harness.ctx.prompt_anchor_ready_rc.set(true);
+            harness.ctx.idle_input_dirty_rc.set(false);
+            harness.ctx.pty_synced_rc.set(false);
+            harness.ctx.submission_pending_rc.set(false);
+            harness.ctx.pending_typeahead_rc.set(false);
+            harness.ctx.typed_cmd_rc.borrow_mut().clear();
+            harness
+                .ctx
+                .typed_cmd_fidelity_rc
+                .set(TypedShadowFidelity::ExactOpen);
+            harness.ctx.external_submission_rc.borrow_mut().take();
+            harness.ctx.external_submission_generation_rc.set(None);
+            harness.ctx.reviewed_submission_tainted_rc.set(false);
+            harness
+                .ctx
+                .verified_submission
+                .completion
+                .borrow_mut()
+                .take();
+            harness
+                .ctx
+                .verified_submission
+                .pending_agent_generation
+                .set(None);
+            harness.pty.set_test_foreground(PtyForeground::Shell);
+            harness.surface.cursor.set(anchor);
+            harness.surface.suffix_is_empty.set(Some(true));
+            let mut command = "printf SAFE";
+
+            match refusal {
+                Refusal::WrongState => harness.bstate.set(BlockState::CollectingOutput),
+                Refusal::UnsettledAnchor => harness.ctx.prompt_anchor_ready_rc.set(false),
+                Refusal::DirtyEditor => harness.ctx.idle_input_dirty_rc.set(true),
+                Refusal::SyncedEditor => harness.ctx.pty_synced_rc.set(true),
+                Refusal::PendingSubmission => harness.ctx.submission_pending_rc.set(true),
+                Refusal::PendingTypeahead => harness.ctx.pending_typeahead_rc.set(true),
+                Refusal::TypedShadow => {
+                    *harness.ctx.typed_cmd_rc.borrow_mut() = "unseen prefix".to_string()
+                }
+                Refusal::ReviewedSubmission => {
+                    *harness.ctx.external_submission_rc.borrow_mut() = Some("reviewed".to_string())
+                }
+                Refusal::ReviewedCompletion => {
+                    *harness.ctx.verified_submission.completion.borrow_mut() =
+                        Some(Box::new(|_| {}))
+                }
+                Refusal::AgentVerification => harness
+                    .ctx
+                    .verified_submission
+                    .pending_agent_generation
+                    .set(Some(7)),
+                Refusal::ForegroundJob => harness.pty.set_test_foreground(PtyForeground::Other),
+                Refusal::CursorMoved => harness.surface.cursor.set((anchor.0 + 1, anchor.1)),
+                Refusal::UnknownSuffix => harness.surface.suffix_is_empty.set(None),
+                Refusal::UnsafeCommand => command = "printf SAFE\nprintf SECOND",
+            }
+
+            assert!(
+                !harness
+                    .ctx
+                    .verified_submission
+                    .try_submit_historical_rerun(command, [0, 0, 0]),
+                "{refusal:?} must refuse"
+            );
+            assert_eq!(
+                harness
+                    .pty
+                    .drain_test_slave(std::time::Duration::from_millis(5)),
+                b"",
+                "{refusal:?} must write no PTY bytes"
+            );
         }
     }
 }

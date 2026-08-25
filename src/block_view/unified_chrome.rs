@@ -122,15 +122,9 @@ impl ZoneChromeRecord {
                 None => "exit:?".to_owned(),
             }
         };
-        let status = if self.is_background {
-            status
-        } else {
-            match self.lifecycle_health {
-                super::BlockLifecycleHealth::Healthy => status,
-                super::BlockLifecycleHealth::Recovered => format!("{status} · recovered"),
-                super::BlockLifecycleHealth::Degraded => format!("{status} · inferred"),
-                super::BlockLifecycleHealth::Incomplete => format!("{status} · incomplete"),
-            }
+        let status = match lifecycle_badge(self.lifecycle_health).filter(|_| !self.is_background) {
+            Some(badge) => format!("{status} · {badge}"),
+            None => status,
         };
         self.duration_ms.map_or(status.clone(), |duration| {
             format!(
@@ -138,6 +132,17 @@ impl ZoneChromeRecord {
                 super::blocks::format_block_duration(duration)
             )
         })
+    }
+}
+
+/// One word for a record whose lifecycle is not fully trusted, or `None` when
+/// it is. Block's card chip and Unified's status line share this vocabulary.
+pub(super) fn lifecycle_badge(health: super::BlockLifecycleHealth) -> Option<&'static str> {
+    match health {
+        super::BlockLifecycleHealth::Healthy => None,
+        super::BlockLifecycleHealth::Recovered => Some("recovered"),
+        super::BlockLifecycleHealth::Degraded => Some("inferred"),
+        super::BlockLifecycleHealth::Incomplete => Some("incomplete"),
     }
 }
 

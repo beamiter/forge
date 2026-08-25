@@ -6,6 +6,34 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- 空白 Block pane 现在显示一次性的可访问提示，说明完成命令会成为可复用卡片，并提示 header
+  选择、右键操作和 `Ctrl+Shift+G` 搜索；首块完成或历史恢复后永久撤下。提示是不可点击、
+  不参与测量的独立浮层，不占用 live PTY 网格，也不会出现在 Unified/VTE 或争用 AI/集成提示；
+  alt-screen 接管期间会暂时隐藏，退出后才恢复，不遮住首次启动的 TUI。
+- Block 模式若在启动宽限后确认进入 RawFallback，会在提示符旁原位说明缺少 OSC 133，针对
+  bash、zsh、fish 与 PowerShell 给出可复制的一行加载命令；jsh、`-c`、ssh/docker 和 wrapper
+  不会收到误导建议，稍后手动加载集成并出现 marker 时提示会自动撤下；手动关闭后 watcher
+  只保留弱引用，不再把已离开界面的 GTK 子树留到 pane 销毁。被生命周期/前台门禁拒绝的伪
+  marker 不再提前撤下说明；禁用/替换默认 rc、PowerShell 单命令或脚本 argv 也不再收到无效建议。
+- 恢复、推断或不完整的命令生命周期不再藏在整张卡片容易被子控件遮住的 tooltip 中：卡片头部
+  现在显示可访问的 `recovered` / `inferred` / `incomplete` chip，健康记录和后台输出保持安静。
+- Block 卡片的三个高频动作不再共用含混图标：复制命令、复制输出、插入提示符分别使用
+  command-copy、document/output 与 insert glyph，并保留准确的 tooltip 和可访问名称。
+- Block 选区中的 `Ctrl+Enter` 现在即使因 busy/dirty、多选、后台块或不安全命令而拒绝重跑，
+  也会消费按键并响铃，不再让同一个 Enter 落入实时 VTE 后意外提交当前输入；任何被 sanitizer
+  去控制符、移除嵌入 paste marker 或改写文本的历史命令都只允许回填审阅，不能一键执行。
+  键盘与右键重跑现在共用严格的可见空提示符证明（稳定 anchor、空 suffix、无 Agent/外部提交、
+  shell 持有 PTY 前台）；命令先只插入，VTE 稳定渲染为字节一致的完整文本后才发送 CR，消除
+  同步空检查与异步回显之间的竞态。选中提示会明确标注 `Prompt ready`，并按单选/多选/后台/
+  命令安全性动态显示真实可用动作，并像
+  anvil 一样不在高频提示中宣传破坏性的 `Delete`（快捷键及撤销能力保持不变）。
+- 可见 Block 选区现在也拥有普通 `Enter`：提示符 busy/dirty、文本不安全或多选缺少 bracketed
+  paste 支持时会响铃并消费按键，不再把同一个 Enter 泄漏给实时编辑器；多选回填不会再悄悄
+  只保留首条命令。卡片 header 按钮仍遵循 GTK 可访问性，聚焦按钮上的普通 Return/Space 会激活
+  按钮，只有显式 `Ctrl+Enter` 进入 Block 重跑。
+- Block 卡片池现在在统一的 release 边界拆除旧 VTE 子树、事件控制器和 tooltip，再只复用轻量
+  外壳；复用初始化会恢复可见性，过滤或 alt-screen 隐藏过的旧壳不会让下一张完成卡片消失；
+  容量淘汰、清空及池已满路径都不会把历史 scrollback 或旧卡回调留在内存账本之外。
 - 运行中切换 `block_compact` 会立即重排既有 Block 卡片与输入区，不再只影响随后新建的卡片；
   Git 分支 chip 使用 64 项有界的 HEAD 定位器缓存，每张卡安全重读 HEAD，使分支切换立即可见；
   非仓库目录仅短暂负缓存 200 ms，避免恢复长会话时在 GTK 主线程重复向上遍历目录。
@@ -34,7 +62,7 @@ All notable user-visible and operational changes are recorded here.
   默认不占快捷键，可在 `[keybindings]` 中绑定。折叠状态目前不跨重启保存
   （历史格式是 rkyv，需要新的 schema，留作后续）。
 - `Delete` 现在删除整个选区并且可撤销。它是 Block 里唯一会销毁命令输出记录的操作，而且很容易
-  触到——任何 `Ctrl+Up` 都会进入选择模式，卡片提示条本身就写着 `Del remove`——但只有清空有撤销。
+  触到——任何 `Ctrl+Up` 都会进入选择模式——但此前只有清空有撤销。
   撤销槽改成带类型的单级槽，清空的路径原样不动，删除走新的按 id 归位恢复：被删的卡片回到
   它们在文档中的原位（文档顺序即 id 顺序），即使期间又跑了新命令。用 `Shift+Up` 建立的范围
   一次按键删除、一次撤销恢复。动作名相应改成 **Undo removing blocks**。
@@ -60,7 +88,7 @@ All notable user-visible and operational changes are recorded here.
   `stranded_focus_key_recovers` 恰恰把这些键排除在"打字才交还焦点"之外。同一个处理器
   现在挂两处：实时 VTE 一份，pane root 一份，后者只在焦点确实落在本 pane 的卡片上
   （不是实时终端、不是文本输入框、不是弹出菜单）时才接管。有选中块时
-  `Enter`/`Ctrl+Enter`/`Delete`/`Escape` 归选择所有——卡片提示条正好承诺这四个动作；
+  `Enter`/`Ctrl+Enter`/`Delete`/`Escape` 归选择所有；紧凑提示只展示当前安全的高频动作，
   没有选中块时它们保持原来的"交还焦点"含义。
 - Block 模式体验一轮：卡片上一直宣传却没人实现的 `Ctrl+↵ run` 现在真的重跑选中块——
   仅限本 pane 里用户自己跑过的单行命令，提示符必须空闲，多选/background/会被截断的多行

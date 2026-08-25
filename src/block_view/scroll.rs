@@ -207,15 +207,22 @@ impl WidgetPool {
         self.available.pop()
     }
 
-    pub(crate) fn release(&mut self, widget: gtk::Box) {
-        if self.available.len() >= self.max_pool_size {
-            return;
+    fn teardown(widget: &gtk::Box) {
+        // Pool only the lightweight outer shell. A completed card's child tree
+        // owns two VTEs and their private scrollback; retaining up to twenty of
+        // those here would put evicted output outside the completed-block memory
+        // ledger and make long-session RSS depend on old pool contents.
+        // Clear the text as well as the enable bit. Merely disabling tooltips
+        // leaves the previous card's string stored on a shell that can later be
+        // enabled again.
+        widget.set_tooltip_text(None);
+        while let Some(child) = widget.first_child() {
+            widget.remove(&child);
         }
 
-        // Finished-block controllers capture the old block id and action
-        // handles. Reusing the outer box without removing them causes stale
-        // callbacks and stacks duplicate hover/right-click handlers on every
-        // recycle. The new FinishedBlock installs a fresh controller set.
+        // Finished-block controllers capture the old block id, action handles
+        // and sometimes the old VTEs. Tear them down even when the pool is full
+        // and this outer shell will be dropped instead of recycled.
         let controllers = widget.observe_controllers();
         while let Some(controller) = controllers.item(0) {
             let Ok(controller) = controller.downcast::<gtk::EventController>() else {
@@ -223,8 +230,13 @@ impl WidgetPool {
             };
             widget.remove_controller(&controller);
         }
+    }
 
-        self.available.push(widget);
+    pub(crate) fn release(&mut self, widget: gtk::Box) {
+        Self::teardown(&widget);
+        if self.available.len() < self.max_pool_size {
+            self.available.push(widget);
+        }
     }
 }
 
@@ -239,29 +251,118 @@ pub(crate) type VoidCallbacks = Rc<RefCell<Vec<Box<dyn Fn()>>>>;
 mod tests {
     use super::*;
 
-    /// Every card mount path installs a fresh controller set on the outer box,
-    /// including the right-click menu the rebuild paths now also mount. That is
-    /// only safe because a pooled box arrives stripped: otherwise a box reused
-    /// N times would answer one right-click with N popovers.
+    /// Every card mount path installs a fresh child tree and controller set on
+    /// the outer box. Recycling only that lightweight shell keeps stale VTE
+    /// scrollback out of both the pool and the completed-block memory budget.
     #[test]
     #[ignore = "requires DISPLAY"]
-    fn a_pooled_card_box_arrives_without_its_previous_controllers() {
+    fn widget_pool_releases_heavy_children_and_stale_controllers() {
         gtk::init().expect("gtk init");
         let mut pool = WidgetPool::new();
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        widget.append(&gtk::Label::new(Some("heavy child stand-in")));
+        widget.set_tooltip_text(Some("stale lifecycle warning"));
         let right_click = gtk::GestureClick::new();
         right_click.set_button(3);
         widget.add_controller(right_click);
         widget.add_controller(gtk::EventControllerMotion::new());
+        assert!(widget.first_child().is_some());
         assert_eq!(widget.observe_controllers().n_items(), 2);
 
         pool.release(widget);
         let reused = pool.acquire().expect("the released box is available again");
 
+        assert!(reused.first_child().is_none());
+        assert!(
+            !reused.has_tooltip(),
+            "a recycled card must not inherit the previous card's lifecycle warning"
+        );
+        assert_eq!(reused.tooltip_text(), None);
         assert_eq!(
             reused.observe_controllers().n_items(),
             0,
             "a recycled card box must not carry the previous card's controllers"
+        );
+
+        // Teardown is unconditional: reaching the pool limit must not leave a
+        // dropped shell's heavy descendants alive until some unrelated owner
+        // happens to disappear.
+        let dropped = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        dropped.append(&gtk::Label::new(Some("full-pool child stand-in")));
+        dropped.add_controller(gtk::GestureClick::new());
+        let dropped_probe = dropped.clone();
+        pool.max_pool_size = 0;
+        pool.release(dropped);
+        assert!(dropped_probe.first_child().is_none());
+        assert_eq!(dropped_probe.observe_controllers().n_items(), 0);
+        assert!(pool.acquire().is_none());
+
+        // Use a real completed card as the ownership proof. Once its child tree
+        // and closures are gone, the output VTE's weak reference must expire.
+        // Hide it through the same pane-filter path that exposed the stale GTK
+        // visibility bug, then rebuild a matching card from that exact shell.
+        let mut card_pool = WidgetPool::new();
+        let config = crate::config::Config::safe_defaults();
+        let block = crate::block_view::FinishedBlock::new(
+            77,
+            "$ ",
+            "printf test",
+            None,
+            "test\n",
+            Some(0),
+            &config,
+            Some(1),
+            None,
+            None,
+            80,
+        );
+        assert!(block.set_filtered_out(true));
+        assert!(!block.widget().is_visible());
+        let output_vte = block.output_vte.downgrade();
+        let outer = block.widget.clone();
+        block.connect_scroll_forwarding(
+            &gtk::ScrolledWindow::new(),
+            &ScrollDebouncer::with_scroll_lock(
+                Rc::new(Cell::new(false)),
+                Rc::new(Cell::new(false)),
+            ),
+        );
+        drop(block);
+        card_pool.release(outer);
+        assert!(output_vte.upgrade().is_none());
+
+        let recycled = card_pool
+            .acquire()
+            .expect("the hidden finished-card shell is available again");
+        assert!(!recycled.is_visible());
+        let rebuilt = crate::block_view::FinishedBlock::new_with_pool(
+            78,
+            "$ ",
+            "printf rebuilt",
+            None,
+            "rebuilt\n",
+            Some(0),
+            &config,
+            Some(1),
+            None,
+            None,
+            80,
+            &[],
+            "rebuilt\n".len(),
+            Some(recycled),
+            crate::block_view::FinishedBlockPrecomputed::default(),
+        );
+        assert!(
+            rebuilt.widget().is_visible(),
+            "a fresh card must not inherit its pooled shell's hidden state"
+        );
+        assert!(
+            !rebuilt.set_filtered_out(false),
+            "a card matching the active pane filter already has fresh false model state"
+        );
+        assert!(
+            rebuilt.widget().is_visible(),
+            "the matching-filter no-op must agree with the recycled GTK property"
         );
     }
 

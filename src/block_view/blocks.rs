@@ -706,6 +706,8 @@ pub(crate) struct FinishedBlock {
     pub(crate) jump_bottom_btn: gtk4::Button,
     pub(crate) bookmark_star: gtk4::Label,
     pub(crate) status_icon: gtk4::Label,
+    /// Header chip naming an untrusted completion; hidden on healthy/background records.
+    lifecycle_chip: gtk4::Label,
     /// Column count the output VTE is sized to — needed for re-feed (filter).
     pub(crate) cols: i64,
     /// Visible rows allocated to this full-height finished block.
@@ -753,6 +755,7 @@ impl Clone for FinishedBlock {
             jump_bottom_btn: self.jump_bottom_btn.clone(),
             bookmark_star: self.bookmark_star.clone(),
             status_icon: self.status_icon.clone(),
+            lifecycle_chip: self.lifecycle_chip.clone(),
             cols: self.cols,
             viewport_cap: self.viewport_cap,
             long_output: self.long_output,
@@ -1468,11 +1471,13 @@ pub(crate) fn estimated_finished_block_height_for_rows(
     )
 }
 
-/// Keyboard affordances shown on the active edge of a block selection. Every
-/// entry must be a real binding: `Ctrl+↵ run` sat here for a long time with
-/// nothing implementing it, so a user who tried it silently lost their
-/// selection instead of running anything.
-const SELECTION_HINT: &str = "↵ recall  ·  Ctrl+↵ run  ·  Del remove  ·  Esc cancel";
+/// Keyboard affordances shown on the active edge of a block selection. The
+/// selection synchronizer chooses the truthful capability row for the current
+/// shape. Destructive Delete remains available and undoable, but is omitted
+/// from this high-frequency hint; Escape remains visible for every selection.
+pub(crate) const SELECTION_HINT_RUN: &str = "Prompt ready: ↵ recall  ·  Ctrl+↵ run  ·  Esc cancel";
+pub(crate) const SELECTION_HINT_RECALL: &str = "Prompt ready: ↵ recall  ·  Esc cancel";
+pub(crate) const SELECTION_HINT_REMOVE: &str = "Esc cancel";
 
 /// Natural-width cap for the right-hand metadata run (timestamp, duration,
 /// exit badge). Wide enough that these never ellipsize at ordinary pane
@@ -2014,6 +2019,11 @@ impl FinishedBlock {
             while let Some(child) = reused.first_child() {
                 reused.remove(&child);
             }
+            // Filtering and alt-screen hand-off hide the outer shell itself.
+            // The new card's `filtered_out` model starts false, so a matching
+            // pane filter deliberately no-ops when it applies false below; make
+            // the recycled GTK property agree with that fresh model first.
+            reused.set_visible(true);
             reused.remove_css_class("block-hovered");
             reused.remove_css_class("block-selected");
             reused.remove_css_class("block-selection-active");
@@ -2095,6 +2105,17 @@ impl FinishedBlock {
             header_row.append(&chip);
         }
 
+        // Completion provenance must be visible without hunting for a card-level
+        // tooltip, which header children can shadow. The full explanation stays
+        // on this dedicated, accessible chip.
+        let lifecycle_chip = gtk4::Label::new(None);
+        lifecycle_chip.add_css_class("block-lifecycle-chip");
+        lifecycle_chip.set_halign(gtk4::Align::Start);
+        lifecycle_chip.set_max_width_chars(14);
+        lifecycle_chip.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        lifecycle_chip.set_visible(false);
+        header_row.append(&lifecycle_chip);
+
         // Context chips (Warp-style): cwd pill + git-branch pill.
         if let Some(cwd_path) = cwd {
             let shortened =
@@ -2124,7 +2145,7 @@ impl FinishedBlock {
         // spacer's slack, while appearing after it would push the whole
         // timestamp/duration/exit column sideways every time the selection
         // moved.
-        let selection_hint = gtk4::Label::new(Some(SELECTION_HINT));
+        let selection_hint = gtk4::Label::new(None);
         selection_hint.add_css_class("block-selection-hint");
         selection_hint.set_visible(false);
         selection_hint.set_ellipsize(gtk4::pango::EllipsizeMode::End);
@@ -2132,7 +2153,7 @@ impl FinishedBlock {
         // the hint's own length ellipsizes it in every pane, not just narrow
         // ones — the old 38 hid "Esc cancel" permanently. Ask for the whole
         // hint and let ellipsize handle genuinely narrow splits.
-        selection_hint.set_max_width_chars(SELECTION_HINT.chars().count() as i32);
+        selection_hint.set_max_width_chars(SELECTION_HINT_RUN.chars().count() as i32);
         header_row.append(&selection_hint);
 
         // Spacer
@@ -2230,10 +2251,10 @@ impl FinishedBlock {
         let copy_cmd_btn = gtk4::Button::from_icon_name("edit-copy-symbolic");
         copy_cmd_btn.set_tooltip_text(Some("Copy command"));
         copy_cmd_btn.update_property(&[gtk4::accessible::Property::Label("Copy command")]);
-        let copy_output_btn = gtk4::Button::from_icon_name("edit-copy-symbolic");
+        let copy_output_btn = gtk4::Button::from_icon_name("text-x-generic-symbolic");
         copy_output_btn.set_tooltip_text(Some("Copy output"));
         copy_output_btn.update_property(&[gtk4::accessible::Property::Label("Copy output")]);
-        let rerun_btn = gtk4::Button::from_icon_name("edit-redo-symbolic");
+        let rerun_btn = gtk4::Button::from_icon_name("insert-text-symbolic");
         rerun_btn.set_tooltip_text(Some("Insert command at prompt"));
         rerun_btn.update_property(&[gtk4::accessible::Property::Label(
             "Insert command at prompt",
@@ -3306,6 +3327,7 @@ impl FinishedBlock {
             jump_bottom_btn,
             bookmark_star,
             status_icon,
+            lifecycle_chip,
             cols,
             viewport_cap,
             long_output,
@@ -3319,6 +3341,25 @@ impl FinishedBlock {
 
     pub(crate) fn widget(&self) -> &gtk4::Box {
         &self.widget
+    }
+
+    /// Show lifecycle provenance only when the completion is not fully trusted.
+    /// Background output has no command completion to qualify.
+    pub(crate) fn set_lifecycle(&self, health: BlockLifecycleHealth, notice: Option<&str>) {
+        let badge = super::unified_chrome::lifecycle_badge(health).filter(|_| !self.is_background);
+        match badge {
+            Some(badge) => {
+                self.lifecycle_chip.set_text(badge);
+                self.lifecycle_chip.set_tooltip_text(notice);
+                self.lifecycle_chip
+                    .update_property(&[gtk4::accessible::Property::Label(notice.unwrap_or(badge))]);
+                self.lifecycle_chip.set_visible(true);
+            }
+            None => {
+                self.lifecycle_chip.set_visible(false);
+                self.lifecycle_chip.set_tooltip_text(None);
+            }
+        }
     }
 
     /// Switch this card between the normal and compact densities in place and
@@ -4141,7 +4182,8 @@ mod tests {
         completed_block_retention_plan, estimated_completed_block_retained_bytes,
         exit_code_for_shared_surface, filter_output_lines, live_organism_alt_transition,
         live_organism_is_visible, terminal_grid_units_upper_bound, terminalize_line_breaks,
-        BlockData, BlockOutcome, BlockState, UNKNOWN_EXIT_NOTE, UNKNOWN_EXIT_SENTINEL,
+        BlockData, BlockLifecycleHealth, BlockOutcome, BlockState, FinishedBlock,
+        UNKNOWN_EXIT_NOTE, UNKNOWN_EXIT_SENTINEL,
     };
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
@@ -4156,6 +4198,66 @@ mod tests {
         let hits = super::OUTPUT_VISUAL_ROWS_CACHE_HITS.with(Cell::get);
         let misses = super::OUTPUT_VISUAL_ROWS_CACHE_MISSES.with(Cell::get);
         (hits, misses)
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn lifecycle_chip_and_quick_actions_expose_truthful_status() {
+        use gtk4::prelude::*;
+
+        gtk4::init().expect("gtk init");
+        let config = crate::config::Config::safe_defaults();
+        let block = FinishedBlock::new(
+            6,
+            "$ ",
+            "make",
+            None,
+            "built\n",
+            Some(0),
+            &config,
+            None,
+            None,
+            None,
+            80,
+        );
+
+        assert_eq!(
+            block.copy_cmd_btn.icon_name().as_deref(),
+            Some("edit-copy-symbolic")
+        );
+        assert_eq!(
+            block.copy_output_btn.icon_name().as_deref(),
+            Some("text-x-generic-symbolic")
+        );
+        assert_eq!(
+            block.rerun_btn.icon_name().as_deref(),
+            Some("insert-text-symbolic")
+        );
+
+        block.set_lifecycle(BlockLifecycleHealth::Healthy, None);
+        assert!(!block.lifecycle_chip.is_visible());
+        for (health, badge) in [
+            (BlockLifecycleHealth::Recovered, "recovered"),
+            (BlockLifecycleHealth::Degraded, "inferred"),
+            (BlockLifecycleHealth::Incomplete, "incomplete"),
+        ] {
+            block.set_lifecycle(health, Some("completion provenance is not authoritative"));
+            assert!(block.lifecycle_chip.is_visible());
+            assert_eq!(block.lifecycle_chip.text(), badge);
+            assert_eq!(
+                block.lifecycle_chip.tooltip_text().as_deref(),
+                Some("completion provenance is not authoritative")
+            );
+        }
+        block.set_lifecycle(BlockLifecycleHealth::Healthy, None);
+        assert!(!block.lifecycle_chip.is_visible());
+        assert_eq!(block.lifecycle_chip.tooltip_text(), None);
+
+        let background = FinishedBlock::new(
+            7, "$ ", "", None, "async\n", None, &config, None, None, None, 80,
+        );
+        background.set_lifecycle(BlockLifecycleHealth::Incomplete, Some("no end marker"));
+        assert!(!background.lifecycle_chip.is_visible());
     }
 
     /// `new_with_pool` reuses the output row count it already resolved instead

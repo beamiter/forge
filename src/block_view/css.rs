@@ -463,6 +463,24 @@ pub(crate) fn block_css(config: &Config) -> String {
         .block-list {{
             background-color: {bg_hex};
         }}
+        .block-onboarding {{
+            color: {dim_fg};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.055);
+            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.12);
+            border-radius: 10px;
+            padding: 10px 14px;
+        }}
+        .block-onboarding-title {{
+            color: {fg_hex};
+            font-family: "{font_family}";
+            font-size: 0.92em;
+            font-weight: bold;
+        }}
+        .block-onboarding-body {{
+            color: {dim_fg};
+            font-family: "{font_family}";
+            font-size: 0.78em;
+        }}
         .notice-dock {{
             background-color: {bg_hex};
             border-top: 1px solid rgba({fg_r},{fg_g},{fg_b},0.14);
@@ -660,6 +678,18 @@ pub(crate) fn block_css(config: &Config) -> String {
         .block-correction, .command-suggestion, .command-review-standalone {{
             border-color: rgba({acc_r},{acc_g},{acc_b},0.85);
             background-color: rgba({acc_r},{acc_g},{acc_b},0.05);
+        }}
+        .block-integration-notice {{
+            border-color: rgba({warn_r},{warn_g},{warn_b},0.85);
+            background-color: rgba({warn_r},{warn_g},{warn_b},0.06);
+        }}
+        .integration-notice-code {{
+            color: {accent};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.07);
+            border-radius: 6px;
+            font-family: "{font_family}";
+            font-size: 0.92em;
+            padding: 6px 10px;
         }}
         .block-agent {{
             border-color: rgba({agent_r},{agent_g},{agent_b},0.85);
@@ -958,6 +988,15 @@ pub(crate) fn block_css(config: &Config) -> String {
             color: {accent};
             background-color: rgba({acc_r},{acc_g},{acc_b},0.10);
             border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.22);
+            border-radius: 999px;
+            font-family: "{font_family}";
+            font-size: 0.78em;
+            padding: 1px 9px;
+        }}
+        .block-lifecycle-chip {{
+            color: {warn_hex};
+            background-color: rgba({warn_r},{warn_g},{warn_b},0.12);
+            border: 1px solid rgba({warn_r},{warn_g},{warn_b},0.35);
             border-radius: 999px;
             font-family: "{font_family}";
             font-size: 0.78em;

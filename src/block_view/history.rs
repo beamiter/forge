@@ -2344,6 +2344,7 @@ impl TermView {
         // rows would land under output they precede.
         if !self.render_backend.persists_block_history() {
             self.restore_zone_history();
+            self.resolve_block_onboarding_after_history();
             return;
         }
         let (path_opt, compress, load_limit) = {
@@ -2358,12 +2359,14 @@ impl TermView {
             )
         };
         let Some(path) = path_opt else {
+            self.resolve_block_onboarding_after_history();
             return;
         };
         let base = match absolute_history_path(&path) {
             Ok(path) => path,
             Err(error) => {
                 log::warn!("refusing invalid Block history path: {error}");
+                self.resolve_block_onboarding_after_history();
                 return;
             }
         };
@@ -2397,6 +2400,7 @@ impl TermView {
                 return glib::ControlFlow::Break;
             };
             if load_for_poll.discarded.load(Ordering::Acquire) {
+                view.resolve_block_onboarding_after_history();
                 view.history_load_poll_id.borrow_mut().take();
                 return glib::ControlFlow::Break;
             }
@@ -2405,6 +2409,7 @@ impl TermView {
                     if load_for_poll.applied.load(Ordering::Acquire)
                         || load_for_poll.discarded.load(Ordering::Acquire) =>
                 {
+                    view.resolve_block_onboarding_after_history();
                     view.history_load_poll_id.borrow_mut().take();
                     glib::ControlFlow::Break
                 }
@@ -2415,6 +2420,7 @@ impl TermView {
                     if !load_for_poll.discarded.load(Ordering::Acquire) {
                         view.apply_loaded_history(&loaded);
                     }
+                    view.resolve_block_onboarding_after_history();
                     load_for_poll.mark_applied_and_consume();
                     view.history_load_poll_id.borrow_mut().take();
                     glib::ControlFlow::Break
@@ -2424,6 +2430,7 @@ impl TermView {
                     // A later save may still succeed (for example, a removable
                     // drive was remounted). Pre-load shutdown saves preserve the
                     // unreadable file; subsequent user mutations may retry it.
+                    view.resolve_block_onboarding_after_history();
                     load_for_poll.mark_applied_and_consume();
                     view.history_load_poll_id.borrow_mut().take();
                     glib::ControlFlow::Break
@@ -2431,6 +2438,14 @@ impl TermView {
             }
         });
         *self.history_load_poll_id.borrow_mut() = Some(source);
+    }
+
+    /// Close the construction-time empty-state gate from every history-load
+    /// terminal path. A live completion may have won while I/O was pending, so
+    /// inspect the applied document rather than trusting the load outcome.
+    fn resolve_block_onboarding_after_history(&self) {
+        self.block_onboarding
+            .history_resolved(!self.finished_blocks.borrow().is_empty());
     }
 
     fn apply_loaded_history(&self, loaded: &LoadedHistory) {
@@ -2544,9 +2559,10 @@ impl TermView {
                     block.cwd.as_deref(),
                     cols,
                 );
-                if let Some(notice) = block.lifecycle_notice() {
-                    finished.widget().set_tooltip_text(Some(&notice));
-                }
+                finished.set_lifecycle(
+                    block.lifecycle_health(),
+                    block.lifecycle_notice().as_deref(),
+                );
                 finished
                     .widget()
                     .insert_before(&self.block_list, Some(&sibling));

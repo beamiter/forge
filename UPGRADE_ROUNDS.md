@@ -4,8 +4,8 @@ This ledger records the independently testable increments in the current
 upgrade pass. It is intentionally tied to behavior and regression evidence,
 not commits.
 
-Rounds 1–10 record the preceding pass; this pass's additional twenty-seven rounds
-are numbered 11–37.
+Rounds 1–10 record the preceding pass; this pass's additional forty rounds are
+numbered 11–50.
 
 1. **Install/uninstall symmetry** — no-argument uninstall now targets the same
    historical `~/.cargo/bin` location as no-argument install; explicit prefixes
@@ -105,6 +105,56 @@ are numbered 11–37.
 37. **Composable result states** — outcome owns the stripe/wash, selection owns
     its accent ring, hover owns elevation, and compound failed-selection rules
     retain all three signals at once.
+38. **Recoverable Block first use** — after the RawFallback grace period, direct
+    interactive bash/zsh/fish/pwsh panes show a docked, copyable integration fix;
+    jsh, one-shot, remote and wrapped argv stay silent, while a late OSC marker
+    removes the notice in place.
+39. **Visible lifecycle provenance** — recovered, inferred and incomplete
+    completions wear a dedicated accessible header chip across live, history and
+    undo rebuilds; healthy and background records remain uncluttered.
+40. **Truthful quick actions** — command copy, output copy and prompt insertion
+    use three distinct semantic icons instead of two identical copy glyphs and a
+    misleading rerun glyph.
+41. **Selection-owned re-run refusal** — Ctrl+Enter remains consumed while a
+    Block selection exists even when execution is refused, and history commands
+    rewritten by control/paste-marker sanitization stay insert-only.
+42. **One-shot Block orientation** — an empty Block pane exposes card selection,
+    context actions, and cross-block search without measuring or intercepting the
+    live surface; a completion or restored history dismisses it permanently,
+    while Unified/VTE and inline-notice ownership remain untouched.
+43. **Bounded card-shell ownership** — every WidgetPool release tears down the
+    old VTE subtree, controllers and tooltip before either pooling or dropping
+    the shell, keeping evicted scrollback and stale callbacks inside the same
+    completed-block memory boundary on clear, retention and pool-full paths.
+44. **Capability-shaped selection affordance** — the selected-card hint exposes
+    direct run only for one byte-identical foreground command, while multi,
+    background and sanitized selections retain only the safe actions they can
+    honor; destructive Delete remains available and undoable but is deliberately
+    not advertised, and the same key surface survives finished-header focus.
+45. **Verified history execution** — keyboard and context-menu re-run share the
+    settled-anchor, empty-suffix, clean-editor, no-Agent and foreground-shell
+    proof boundary; every refusal is consumed before the live VTE can submit a
+    different line, then the command is inserted first and CR is admitted only
+    after VTE renders the exact stable text.
+46. **No hidden widget state across lifetimes** — pooled card shells restore
+    visibility after filter/alt-screen hiding, while a dismissed shell-integration
+    notice leaves only weak handles in its late-marker watch instead of retaining
+    the removed GTK subtree.
+47. **Selection-key truth boundary** — a visible selection owns plain Enter as
+    well as Ctrl+Enter; a busy, dirty, unsafe or unsupported recall now rings and
+    stops instead of submitting unrelated live-editor contents, and its hint says
+    up front that prompt readiness is required.
+48. **Lossless batch recall and accessible chrome** — multi-card recall refuses
+    shells whose lack of bracketed paste would silently keep only the first
+    command, while unmodified Return/Space continue to activate a focused GTK
+    header button and only the explicit Ctrl+Enter chord reaches Block re-run.
+49. **Surface-aware orientation** — first-use guidance suspends for alternate-
+    screen ownership and returns afterward, so the overlay can never cover the
+    first full-screen TUI merely because no command card has completed yet.
+50. **Trusted integration repair dismissal** — rejected lifecycle markers cannot
+    latch the shell-integration notice as healthy, and one-shot or rc-bypassing
+    bash/zsh/fish/PowerShell argv receive no default-profile instruction that
+    cannot repair their current session.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, and the repository-wide Rust

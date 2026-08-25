@@ -59,9 +59,11 @@ tests=(
     block_view::find::tests::unified_bounded_and_native_fallback_prefer_visible_match_with_huge_old_scrollback
     block_view::find::tests::unified_complete_windows_step_visible_then_wrapped_history_on_real_vte
     block_view::blocks::tests::a_precomputed_card_does_not_rewalk_its_transcript
-    block_view::scroll::tests::a_pooled_card_box_arrives_without_its_previous_controllers
+    block_view::blocks::tests::lifecycle_chip_and_quick_actions_expose_truthful_status
+    block_view::scroll::tests::widget_pool_releases_heavy_children_and_stale_controllers
     block_view::tests::entering_alt_screen_ends_the_block_selection_it_hides
     block_view::css::tests::the_generated_stylesheet_parses_without_error
+    block_view::onboarding::tests::block_onboarding_overlay_is_non_measuring_and_non_targetable
     block_view::tests::a_stranded_focus_mount_declines_only_what_the_focused_widget_owns
     block_view::blocks::tests::revealing_a_cards_actions_does_not_move_its_metadata
     block_view::blocks::tests::the_selection_hint_sits_on_the_spacers_left

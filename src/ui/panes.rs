@@ -268,6 +268,9 @@ impl UiState {
             Some(&sid),
             initial_commands,
         )?);
+        if matches!(mode, crate::config::TerminalMode::Block) {
+            TermView::arm_shell_integration_notice(&view, shell_argv.as_slice());
+        }
         drop(shell_argv);
         view.start_history_load();
 

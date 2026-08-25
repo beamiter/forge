@@ -1398,6 +1398,9 @@ impl UiState {
                     match term_view {
                         Ok(term_view) => {
                             let term_view = Rc::new(term_view);
+                            if matches!(terminal_mode, crate::config::TerminalMode::Block) {
+                                TermView::arm_shell_integration_notice(&term_view, shell_argv);
+                            }
                             term_view.start_history_load();
                             let terminal = term_view.vte().clone();
                             (PaneLeaf::Block(term_view), terminal)
