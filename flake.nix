@@ -122,6 +122,10 @@
               cargo-deny
               cargo-watch
               shellcheck
+              dbus
+              xorg-server
+              xauth
+              xvfb-run
 
               gtk4
               glib

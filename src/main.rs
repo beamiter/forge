@@ -1067,6 +1067,7 @@ pub fn run() -> glib::ExitCode {
             organism_life,
             agent_toggle: agent_toggle.clone(),
             config_save_error_visible: Rc::new(Cell::new(false)),
+            safe_mode_config_notice_visible: Rc::new(Cell::new(false)),
             keybinding_map: Rc::new(RefCell::new(keybinding_map)),
             zoom_state: Rc::new(RefCell::new(None)),
             scrollbar_css: CssProvider::new(),

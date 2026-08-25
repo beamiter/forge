@@ -133,41 +133,8 @@ jobs:
         with:
           shared-key: gtk-display
 
-      - name: Run display-backed diagnostic regression
-        env:
-          RUST_TEST_THREADS: "1"
-        run: |
-          dbus-run-session -- \
-            xvfb-run -a cargo test --lib --all-features --locked \
-              block_view::blocks::tests::diag_short_ls_block_geometry -- \
-              --ignored --exact --nocapture
-
-      # Display-backed behavior regressions. These pin real GTK/VTE semantics
-      # the headless suite cannot reach, so each one is named explicitly rather
-      # than swept up by `--ignored` (which would also run the manual
-      # microbenchmarks in the same modules).
-      - name: Run display-backed behavior regressions
-        env:
-          RUST_TEST_THREADS: "1"
-        run: |
-          set -euo pipefail
-          tests="
-            block_view::find::tests::a_card_vte_must_drop_its_previous_anchor_before_a_fresh_query
-            block_view::find::tests::unified_vte_fresh_query_reaches_scrollback_before_a_prior_match
-            block_view::find::tests::unified_bounded_and_native_fallback_prefer_visible_match_with_huge_old_scrollback
-            block_view::blocks::tests::a_precomputed_card_does_not_rewalk_its_transcript
-            block_view::scroll::tests::a_pooled_card_box_arrives_without_its_previous_controllers
-            block_view::tests::entering_alt_screen_ends_the_block_selection_it_hides
-            block_view::css::tests::the_generated_stylesheet_parses_without_error
-            block_view::tests::a_stranded_focus_mount_declines_only_what_the_focused_widget_owns
-            block_view::blocks::tests::revealing_a_cards_actions_does_not_move_its_metadata
-            block_view::blocks::tests::the_selection_hint_sits_on_the_spacers_left
-          "
-          for test in $tests; do
-            dbus-run-session -- \
-              xvfb-run -a cargo test --lib --all-features --locked \
-                "$test" -- --ignored --exact --nocapture
-          done
+      - name: Run display-backed GTK/VTE regressions
+        run: bash scripts/test-gtk-display.sh
 
   clippy:
     name: Clippy

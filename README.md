@@ -48,12 +48,18 @@ GTK4 栈必须足够新（glib >= 2.80、pango >= 1.52、gtk4 >= 4.14、libadwai
 ```bash
 make verify
 make security
+make test-display
 ```
 
-`make verify` 运行格式、测试、Clippy、Rustdoc、release 构建、shell 语法和已跟踪文本隐私
-检查；`make security` 运行 RustSec、依赖策略/许可证/来源门禁、重复依赖审计与 ShellCheck，
-需要本机已安装 `cargo-audit`、`cargo-deny` 和 `shellcheck`。只需运行轻量隐私检查时可使用
-`make privacy`。
+`make verify` 运行格式、测试、独立 Xvfb 下的真实 GTK/VTE 回归、Clippy、Rustdoc、
+release 构建、shell 语法和已跟踪文本隐私
+检查；`make security` 运行 RustSec、依赖策略/许可证/来源门禁、重复依赖审计与 ShellCheck。
+两者现在都自动进入锁定的 Nix 开发环境，不会意外使用系统中过旧的 GTK/VTE；
+`make test-display` 会在独立 Xvfb 会话中逐项运行真实 GTK/VTE 回归。只需运行轻量隐私
+检查时可使用 `make privacy`。
+
+`make package` 刻意使用宿主 Cargo 与系统 GTK/VTE 开发库：发行归档按兼容系统的动态库
+ABI 分发，不能把 Nix store 解释器/RPATH 烘进裸二进制。日常构建和验收仍使用上面的 Nix 门禁。
 
 安装脚本默认优先使用 Nix；没有 Nix 时自动退回 Cargo，并且不会覆盖已有配置：
 
@@ -125,12 +131,11 @@ X11 `WM_CLASS` 取自程序名而非 application ID，写成 application ID 会�
 一个没有图标的重复条目。
 
 `nix build` / `nix run` 分别构建和启动 flake 中的默认 package/app，
-`nix flake check` 验证同一 package。也可为已有 release binary 生成确定性、
-带 SHA-256 的本地安装归档：
+`nix flake check` 验证同一 package。离开 `nix develop` 后，可用宿主系统工具链生成
+确定性、带 SHA-256 的本地安装归档：
 
 ```bash
-cargo build --release --all-features --locked
-./scripts/package-release.sh target/release/forge
+make package
 (cd target/dist && sha256sum --check *.sha256)
 ```
 

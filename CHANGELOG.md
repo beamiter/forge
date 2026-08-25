@@ -6,6 +6,17 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- 运行中切换 `block_compact` 会立即重排既有 Block 卡片与输入区，不再只影响随后新建的卡片；
+  Git 分支 chip 使用 64 项有界的 HEAD 定位器缓存，每张卡安全重读 HEAD，使分支切换立即可见；
+  非仓库目录仅短暂负缓存 200 ms，避免恢复长会话时在 GTK 主线程重复向上遍历目录。
+- 安全模式下调整设置仍只作用于当前窗口，但反馈改为去重的非阻塞 toast，不再用确认对话框
+  打断设置操作。
+- `make verify` 与 `make security` 统一进入锁定的 Nix 工具链；真实 GTK/VTE 回归由 CI、
+  `make verify` 与 `make test-display` 共用的独立 D-Bus/Xvfb runner 执行。发行包继续用
+  系统 GTK/VTE 工具链构建，避免把 `/nix/store` 解释器写进宣称可移植的裸二进制。
+- 外层 shell 的 OSC 生命周期事件现在每个事件只采样一次 PTY 前台所有者；ssh、tmux、
+  docker 等子进程发出的同名标记不会污染本地命令深度。失败结果、选中环和悬停抬升也可
+  同时表达，不再由后出现的 CSS 状态覆盖前一种语义。
 - 四个一直叫 "Filter" 的动作终于真的在过滤。`apply_failed_filter` 之流此前全是纯跳转，
   `clear_block_filter` 就是滚到顶，而过滤引擎 `matching_record_ids` 挂着 `#[allow(dead_code)]`
   从没被用过——三百条命令之后，一次一跳并不是看清发生了什么的方式。

@@ -18,7 +18,7 @@ SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null ||
 [[ -n "${TARGET}" ]] || { printf 'Error: cannot determine Rust target.\n' >&2; exit 1; }
 [[ -x "${BINARY}" ]] || {
     printf 'Error: release binary not found or not executable: %s\n' "${BINARY}" >&2
-    printf 'Run cargo build --release --all-features --locked first.\n' >&2
+    printf "Run 'make package' outside a Nix shell, or pass an explicit system-linked release binary.\n" >&2
     exit 1
 }
 

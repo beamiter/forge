@@ -31,6 +31,23 @@ fn reload_matches_live_revision(
 }
 
 impl UiState {
+    fn show_safe_mode_config_notice(&self) {
+        // Safe mode deliberately refuses persistence; that is informational,
+        // not an error that should block the settings surface. Its guard is
+        // deliberately separate from save/reload errors: an informational
+        // toast must never hide an actionable failure dialog.
+        if self.safe_mode_config_notice_visible.replace(true) {
+            return;
+        }
+        let toast = adw::Toast::new(
+            "Safe mode: this change applies only to the current window and will not be saved.",
+        );
+        toast.set_timeout(4);
+        let visible = self.safe_mode_config_notice_visible.clone();
+        toast.connect_dismissed(move |_| visible.set(false));
+        self.toast_overlay.add_toast(toast);
+    }
+
     pub(crate) fn show_config_error(&self, title: &str, message: &str) {
         if self.config_save_error_visible.replace(true) {
             return;
@@ -59,10 +76,7 @@ impl UiState {
     fn schedule_config_persist(&self, show_safe_mode_notice: bool) {
         if std::env::var_os("FORGE_SAFE_MODE").is_some() {
             if show_safe_mode_notice {
-                self.show_config_error(
-                    "Temporary safe-mode setting",
-                    "This change applies only to the current window and will not be saved.",
-                );
+                self.show_safe_mode_config_notice();
             }
             return;
         }
@@ -79,10 +93,7 @@ impl UiState {
     fn persist_config_now(&self, show_safe_mode_notice: bool, allow_sync_fallback: bool) {
         if std::env::var_os("FORGE_SAFE_MODE").is_some() {
             if show_safe_mode_notice {
-                self.show_config_error(
-                    "Temporary safe-mode setting",
-                    "This change applies only to the current window and will not be saved.",
-                );
+                self.show_safe_mode_config_notice();
             }
             return;
         }

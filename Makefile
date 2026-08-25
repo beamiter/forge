@@ -1,7 +1,7 @@
 # forge Makefile
 # Convenience wrapper for common development tasks
 
-.PHONY: help build run test check fmt clippy privacy security verify package support-bundle clean install dev watch benchmark debug
+.PHONY: help build run test test-display check fmt clippy privacy security verify package support-bundle clean install dev watch benchmark debug
 
 help:
 	@echo "forge Development Commands"
@@ -15,6 +15,7 @@ help:
 	@echo ""
 	@echo "Quality Commands:"
 	@echo "  make test       - Run all tests"
+	@echo "  make test-display - Run explicit GTK/VTE regressions under Xvfb"
 	@echo "  make check      - Check code without building"
 	@echo "  make fmt        - Format code"
 	@echo "  make clippy     - Lint code"
@@ -42,6 +43,9 @@ run:
 test:
 	@./scripts/dev.sh test
 
+test-display:
+	@./scripts/dev.sh test-display
+
 check:
 	@./scripts/dev.sh check
 
@@ -55,20 +59,13 @@ privacy:
 	@./scripts/privacy-check.sh
 
 security:
-	@./scripts/security-check.sh
+	@./scripts/dev.sh security
 
-verify: privacy
-	@cargo fmt --all -- --check
-	@cargo test --all-features --locked
-	@cargo clippy --all-targets --all-features --locked -- -D warnings
-	@RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
-	@cargo build --release --all-features --locked
-	@bash -n scripts/*.sh packaging/*.sh
-	@bash scripts/test-install-paths.sh
+verify:
+	@./scripts/dev.sh verify
 
 package:
-	@cargo build --release --all-features --locked
-	@./scripts/package-release.sh target/release/forge
+	@./scripts/dev.sh package
 
 support-bundle:
 	@./scripts/support-bundle.sh

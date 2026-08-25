@@ -288,6 +288,9 @@ pub(crate) struct UiState {
     /// Suppresses a storm of identical persistence alerts while a continuous
     /// setting (opacity/font size) emits multiple change notifications.
     pub(crate) config_save_error_visible: Rc<Cell<bool>>,
+    /// Deduplicates safe-mode informational toasts without suppressing a real
+    /// persistence or reload error that happens while the toast is visible.
+    pub(crate) safe_mode_config_notice_visible: Rc<Cell<bool>>,
     pub(crate) keybinding_map: Rc<RefCell<KeybindingMap>>,
     pub(crate) zoom_state: Rc<RefCell<Option<ZoomState>>>,
     pub(crate) scrollbar_css: CssProvider,

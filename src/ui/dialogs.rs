@@ -38,6 +38,13 @@ const CROSS_BLOCK_SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 /// virtualized model, regardless of the much larger on-disk retention limit.
 const HISTORY_PALETTE_ROW_LIMIT: usize = 500;
 
+/// `AdwPreferencesGroup:title` is rendered as Pango markup. Escape every
+/// caller-provided title so ordinary characters such as `&` stay visible and
+/// cannot make GTK reject the label as malformed markup.
+fn preferences_group_title(title: &str) -> glib::GString {
+    glib::markup_escape_text(title)
+}
+
 fn remote_picker_guard(safe_mode: bool, host_count: usize) -> Result<(), &'static str> {
     if safe_mode {
         Err("Remote connections are disabled in safe mode.")
@@ -1380,7 +1387,7 @@ impl UiState {
             };
             for (section, rows) in sections {
                 let group = adw::PreferencesGroup::new();
-                group.set_title(&section);
+                group.set_title(preferences_group_title(&section).as_str());
                 for (key, value) in rows {
                     let row = adw::ActionRow::builder().title(key.as_str()).build();
                     let value_label = Label::new(Some(&value));
@@ -1449,7 +1456,7 @@ impl UiState {
 
         let page = adw::PreferencesPage::new();
         let group = adw::PreferencesGroup::new();
-        group.set_title("Appearance");
+        group.set_title(preferences_group_title("Appearance").as_str());
 
         let config = self.config.borrow();
 
@@ -1540,7 +1547,7 @@ impl UiState {
         group.add(&scrollback_row);
 
         let terminal_group = adw::PreferencesGroup::new();
-        terminal_group.set_title("Terminal & Blocks");
+        terminal_group.set_title(preferences_group_title("Terminal & Blocks").as_str());
         let terminal_mode_model =
             gtk4::StringList::new(&["Block", "VTE compatibility", "Unified (experimental)"]);
         let terminal_mode_row = adw::ComboRow::builder()
@@ -1598,7 +1605,7 @@ impl UiState {
         terminal_group.add(&ascii_organism_motion_row);
 
         let privacy_group = adw::PreferencesGroup::new();
-        privacy_group.set_title("Features & Privacy");
+        privacy_group.set_title(preferences_group_title("Features & Privacy").as_str());
         let notifications_row = adw::SwitchRow::builder()
             .title("Long-command Notifications")
             .active(config.notify_long_blocks)
@@ -1615,7 +1622,7 @@ impl UiState {
         privacy_group.add(&remote_clipboard_row);
 
         let ai_group = adw::PreferencesGroup::new();
-        ai_group.set_title("AI & Agent");
+        ai_group.set_title(preferences_group_title("AI & Agent").as_str());
         ai_group.set_description(Some(
             "Environment variables take priority. Keys entered here are stored in a private ai.key file, never in config.toml",
         ));
@@ -1738,7 +1745,7 @@ impl UiState {
         ai_group.add(&redact_row);
 
         let remote_group = adw::PreferencesGroup::new();
-        remote_group.set_title("Remote Hosts");
+        remote_group.set_title(preferences_group_title("Remote Hosts").as_str());
         remote_group.set_description(Some(
             "Targets for the Ctrl+Shift+S picker. Advanced fields (ssh_args, session, deploy_artifact) are edited in config.toml",
         ));
@@ -3067,7 +3074,7 @@ mod tests {
         cross_block_jump_outcome, cross_block_search_dialog_title, cross_block_search_idle_status,
         cross_block_search_jump_unavailable_status, cross_block_search_pending_status,
         cross_block_search_query_error, cross_block_search_status_for_match_count,
-        record_snapshot_dialog_title, record_snapshot_status_line,
+        preferences_group_title, record_snapshot_dialog_title, record_snapshot_status_line,
         record_snapshot_unavailable_message, remote_picker_guard, CrossBlockJumpOutcome,
         CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
@@ -3084,6 +3091,14 @@ mod tests {
             Err("No remote hosts are configured. Add one in Settings → Remote Hosts.")
         );
         assert!(remote_picker_guard(false, 1).is_ok());
+    }
+
+    #[test]
+    fn preferences_group_titles_escape_pango_markup() {
+        assert_eq!(
+            preferences_group_title("AI & Agent <safe>").as_str(),
+            "AI &amp; Agent &lt;safe&gt;"
+        );
     }
 
     /// The palette must dispatch on the whole navigation ladder, not on

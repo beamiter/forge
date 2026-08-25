@@ -6,6 +6,7 @@ use crate::terminal::open_uri;
 use gtk4::Orientation;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::rc::Rc;
 use vte4::Terminal;
 use vte4::TerminalExt;
@@ -621,6 +622,10 @@ pub(crate) struct FinishedBlock {
     content: gtk4::Box,
     virtualized_height: Rc<Cell<i32>>,
     virtualized: Rc<Cell<bool>>,
+    /// Density which [`Self::virtualized_height`] currently describes. Kept
+    /// beside the height so a live switch can translate an already-measured
+    /// placeholder without walking the card's transcript again.
+    compact: Rc<Cell<bool>>,
     pub(crate) prompt_text: String,
     /// Read-only VTE displaying the executed command line (single-row typically).
     pub(crate) command_vte: vte4::Terminal,
@@ -720,6 +725,7 @@ impl Clone for FinishedBlock {
             content: self.content.clone(),
             virtualized_height: self.virtualized_height.clone(),
             virtualized: self.virtualized.clone(),
+            compact: self.compact.clone(),
             prompt_text: self.prompt_text.clone(),
             command_vte: self.command_vte.clone(),
             output_vte: self.output_vte.clone(),
@@ -1367,13 +1373,32 @@ pub(crate) fn estimated_cell_height_px(config: &Config) -> i32 {
 /// structural rows explicit is important for virtualization: an extra phantom
 /// row makes a card at the viewport boundary alternate between its measured and
 /// placeholder heights.
-fn finished_block_height_for_rows(cell_height_px: i32, command_rows: i64, output_rows: i64) -> i32 {
+/// Non-terminal vertical chrome in a finished card. The ten-pixel difference
+/// is exactly the density switch's imperative geometry: outer top/bottom
+/// margins shrink by six pixels and header top/bottom margins by four.
+const FINISHED_CARD_ROOMY_VCHROME_PX: i32 = 34;
+const FINISHED_CARD_COMPACT_VCHROME_PX: i32 = 24;
+
+const fn finished_card_vchrome_px(compact: bool) -> i32 {
+    if compact {
+        FINISHED_CARD_COMPACT_VCHROME_PX
+    } else {
+        FINISHED_CARD_ROOMY_VCHROME_PX
+    }
+}
+
+fn finished_block_height_for_rows(
+    cell_height_px: i32,
+    command_rows: i64,
+    output_rows: i64,
+    compact: bool,
+) -> i32 {
     let rows = 1i64
         .saturating_add(command_rows.max(0))
         .saturating_add(output_rows.max(0))
         .clamp(1, i32::MAX as i64) as i32;
     rows.saturating_mul(cell_height_px.max(1))
-        .saturating_add(34)
+        .saturating_add(finished_card_vchrome_px(compact))
 }
 
 /// Virtualization metadata must follow terminal visual rows rather than logical
@@ -1439,6 +1464,7 @@ pub(crate) fn estimated_finished_block_height_for_rows(
         estimated_cell_height_px(config),
         command_rows,
         visible_output_rows,
+        config.block_compact,
     )
 }
 
@@ -1695,6 +1721,128 @@ fn finished_command_bytes(display_cmd: &str) -> Vec<u8> {
     terminalize_line_breaks(&highlighted)
 }
 
+/// Outer margins and density class of a finished card.
+///
+/// Construction and the live setter share this so a pane cannot end up with
+/// half its cards at one density and half at the other; the CSS side of the
+/// same switch keys off the `block-compact` class set here.
+fn apply_card_density(outer: &gtk4::Box, compact: bool) {
+    if compact {
+        outer.add_css_class("block-compact");
+        outer.set_margin_top(1);
+        outer.set_margin_bottom(1);
+        outer.set_margin_start(4);
+        outer.set_margin_end(4);
+    } else {
+        outer.remove_css_class("block-compact");
+        outer.set_margin_top(4);
+        outer.set_margin_bottom(4);
+        outer.set_margin_start(8);
+        outer.set_margin_end(8);
+    }
+}
+
+/// Header-strip margins for the same two densities. See [`apply_card_density`].
+fn apply_header_density(header_row: &gtk4::Box, compact: bool) {
+    if compact {
+        header_row.set_margin_start(8);
+        header_row.set_margin_end(6);
+        header_row.set_margin_top(3);
+        header_row.set_margin_bottom(1);
+    } else {
+        header_row.set_margin_start(12);
+        header_row.set_margin_end(8);
+        header_row.set_margin_top(6);
+        header_row.set_margin_bottom(2);
+    }
+}
+
+fn apply_review_body_density(body: &gtk4::Widget, compact: bool) {
+    let side = if compact { 8 } else { 12 };
+    body.set_margin_start(side);
+    body.set_margin_end(side);
+    body.set_margin_top(2);
+    body.set_margin_bottom(if compact { 7 } else { 11 });
+}
+
+fn apply_agent_body_density(body: &gtk4::Widget, compact: bool) {
+    let side = if compact { 8 } else { 12 };
+    body.set_margin_start(side);
+    body.set_margin_end(side);
+    body.set_margin_top(2);
+    body.set_margin_bottom(if compact { 6 } else { 10 });
+}
+
+/// Update one mounted assistant notice without knowing which UI subsystem
+/// created it. Correction, suggestion and Agent cards deliberately share these
+/// stable CSS roles; walking only a `block-assistant` root leaves ordinary
+/// finished cards and the independently-sized organism card alone.
+pub(crate) fn apply_inline_assistant_density(root: &gtk4::Widget, compact: bool) -> bool {
+    if !root.has_css_class("block-assistant") {
+        return false;
+    }
+    let Ok(outer) = root.clone().downcast::<gtk4::Box>() else {
+        return false;
+    };
+    apply_card_density(&outer, compact);
+
+    // The hand-built suggestion and Agent-session bodies predate the shared
+    // command-review roles. They are the sole non-header Box directly under
+    // their respective roots.
+    if outer.has_css_class("command-suggestion") || outer.has_css_class("block-agent") {
+        let mut child = outer.first_child();
+        while let Some(widget) = child {
+            let next = widget.next_sibling();
+            if !widget.has_css_class("block-header") && widget.is::<gtk4::Box>() {
+                if outer.has_css_class("command-suggestion") {
+                    apply_review_body_density(&widget, compact);
+                } else {
+                    apply_agent_body_density(&widget, compact);
+                }
+            }
+            child = next;
+        }
+    }
+
+    fn walk(widget: &gtk4::Widget, compact: bool) {
+        if widget.has_css_class("block-header") || widget.has_css_class("command-review-header") {
+            if let Some(header) = widget.downcast_ref::<gtk4::Box>() {
+                apply_header_density(header, compact);
+            }
+        }
+        if widget.has_css_class("command-review-body") {
+            apply_review_body_density(widget, compact);
+        } else if widget.has_css_class("agent-msg-body") {
+            apply_agent_body_density(widget, compact);
+        }
+
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            let next = current.next_sibling();
+            walk(&current, compact);
+            child = next;
+        }
+    }
+    walk(root, compact);
+    true
+}
+
+/// Keep finished-card widgets, fixed virtualization placeholders and their
+/// parallel metadata document on one density in one indexed pass.
+pub(crate) fn apply_finished_card_density(
+    finished: &[FinishedBlock],
+    block_data: &mut VecDeque<BlockData>,
+    compact: bool,
+) {
+    debug_assert_eq!(finished.len(), block_data.len());
+    for (card, data) in finished.iter().zip(block_data.iter_mut()) {
+        let height = card.set_compact(compact);
+        if !card.is_filtered_out() {
+            data.estimated_height = height;
+        }
+    }
+}
+
 impl FinishedBlock {
     fn with_cached_stripped_output<R>(
         full_output: &Rc<RefCell<String>>,
@@ -1857,6 +2005,7 @@ impl FinishedBlock {
             cols,
         )));
         let virtualized = Rc::new(Cell::new(false));
+        let compact = Rc::new(Cell::new(config.block_compact));
         let capture_rows = output_rows
             .max(config.truncation_threshold_lines as i64)
             .max(4096);
@@ -1892,19 +2041,7 @@ impl FinishedBlock {
         // height. New block state starts non-virtualized, so reset that GTK
         // request explicitly instead of inheriting the previous card's geometry.
         outer.set_height_request(-1);
-        if config.block_compact {
-            outer.add_css_class("block-compact");
-            outer.set_margin_top(1);
-            outer.set_margin_bottom(1);
-            outer.set_margin_start(4);
-            outer.set_margin_end(4);
-        } else {
-            outer.remove_css_class("block-compact");
-            outer.set_margin_top(4);
-            outer.set_margin_bottom(4);
-            outer.set_margin_start(8);
-            outer.set_margin_end(8);
-        }
+        apply_card_density(&outer, config.block_compact);
 
         let content = gtk4::Box::new(Orientation::Vertical, 0);
         content.set_hexpand(true);
@@ -1929,17 +2066,7 @@ impl FinishedBlock {
         } else {
             "Click to select · Shift-click range · Ctrl+Shift-click toggle · Enter recalls"
         }));
-        if config.block_compact {
-            header_row.set_margin_start(8);
-            header_row.set_margin_end(6);
-            header_row.set_margin_top(3);
-            header_row.set_margin_bottom(1);
-        } else {
-            header_row.set_margin_start(12);
-            header_row.set_margin_end(8);
-            header_row.set_margin_top(6);
-            header_row.set_margin_bottom(2);
-        }
+        apply_header_density(&header_row, config.block_compact);
 
         // Bookmark marker, hidden until the block is bookmarked. Use a normal
         // Unicode glyph so the default UI does not depend on a Nerd Font.
@@ -2449,6 +2576,7 @@ impl FinishedBlock {
             let stamp_for_refit = render_stamp.clone();
             let generation_for_refit = displayed_generation.clone();
             let visual_rows_cache_for_refit = visual_rows_cache.clone();
+            let compact_for_refit = compact.clone();
             let max_expanded_cap_for_refit = max_expanded_cap;
             Rc::new(move || {
                 let (Some(output_vte), Some(expand_btn), Some(jump_btn)) = (
@@ -2534,6 +2662,7 @@ impl FinishedBlock {
                     cell_height,
                     command_rows,
                     if has_output { visible_rows } else { 0 },
+                    compact_for_refit.get(),
                 ))
             })
         };
@@ -3149,6 +3278,7 @@ impl FinishedBlock {
             content,
             virtualized_height,
             virtualized,
+            compact,
             prompt_text: prompt.to_string(),
             command_vte,
             output_vte,
@@ -3191,17 +3321,46 @@ impl FinishedBlock {
         &self.widget
     }
 
+    /// Switch this card between the normal and compact densities in place and
+    /// return the height its virtualization placeholder must contribute.
+    pub(crate) fn set_compact(&self, compact: bool) -> i32 {
+        let previous = self.compact.replace(compact);
+        if previous != compact {
+            let delta = finished_card_vchrome_px(compact)
+                .saturating_sub(finished_card_vchrome_px(previous));
+            let height = self.virtualized_height.get().saturating_add(delta).max(1);
+            self.virtualized_height.set(height);
+            if self.virtualized.get() {
+                self.widget.set_height_request(height);
+            }
+        }
+        apply_card_density(&self.widget, compact);
+        apply_header_density(&self.header_row, compact);
+        self.virtualized_height.get().max(1)
+    }
+
     /// Unmap expensive VTE content while preserving the card's measured height.
     /// Returning the placeholder height lets the caller keep virtualization
     /// metadata synchronized with the actual GTK allocation.
     pub(crate) fn set_virtualized(&self, virtualized: bool) -> i32 {
+        self.set_virtualized_with_measurement(virtualized, true)
+    }
+
+    /// Density switches already translated the saved height before GTK has
+    /// allocated the new margins. Their immediate visibility reconciliation
+    /// must not sample the still-old allocation back over that new model.
+    pub(crate) fn set_virtualized_preserving_height(&self, virtualized: bool) -> i32 {
+        self.set_virtualized_with_measurement(virtualized, false)
+    }
+
+    fn set_virtualized_with_measurement(&self, virtualized: bool, measure_allocation: bool) -> i32 {
         if self.virtualized.replace(virtualized) == virtualized {
             return self.virtualized_height.get().max(1);
         }
 
         if virtualized {
             let allocated = self.widget.height();
-            if allocated > 1 {
+            if measure_allocation && allocated > 1 {
                 self.virtualized_height.set(allocated);
             }
             let height = self.virtualized_height.get().max(1);
@@ -3860,6 +4019,16 @@ impl ActiveBlock {
         &self.widget
     }
 
+    /// Switch the live input cell's density. Unified's holder carries
+    /// `block-fullscreen` instead and is left alone by its caller.
+    pub(crate) fn set_compact(&self, compact: bool) {
+        if compact {
+            self.widget.add_css_class("block-compact");
+        } else {
+            self.widget.remove_css_class("block-compact");
+        }
+    }
+
     pub(crate) fn grab_focus(&self) {
         self.active_vte.grab_focus();
     }
@@ -3974,7 +4143,9 @@ mod tests {
         live_organism_is_visible, terminal_grid_units_upper_bound, terminalize_line_breaks,
         BlockData, BlockOutcome, BlockState, UNKNOWN_EXIT_NOTE, UNKNOWN_EXIT_SENTINEL,
     };
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+    use std::rc::Rc;
 
     fn reset_visual_row_cache_counters() {
         super::OUTPUT_VISUAL_ROWS_CACHE_HITS.with(|hits| hits.set(0));
@@ -4022,6 +4193,166 @@ mod tests {
                     "estimators disagree at cols={cols} for {output:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn block_density_switches_on_widgets_that_already_exist() {
+        use gtk4::prelude::*;
+
+        gtk4::init().expect("gtk init");
+        let config = crate::config::Config::safe_defaults();
+        assert!(
+            !config.block_compact,
+            "the default density is the roomy one"
+        );
+        let block = super::FinishedBlock::new(
+            4,
+            "$ ",
+            "echo density",
+            None,
+            "density\n",
+            Some(0),
+            &config,
+            None,
+            None,
+            None,
+            80,
+        );
+
+        // Card margins are GTK properties, not CSS, so the class alone proves
+        // nothing. Pin both the compact transition and the exact round-trip
+        // back to the construction-time roomy geometry.
+        let roomy = (
+            block.widget().margin_top(),
+            block.widget().margin_start(),
+            block.header_row.margin_start(),
+            block.header_row.margin_top(),
+        );
+        assert!(!block.widget().has_css_class("block-compact"));
+
+        // Virtualize before switching: this is the state whose explicit
+        // height request and parallel BlockData model used to stay roomy.
+        let roomy_placeholder = block.set_virtualized(true);
+        let mut block_data = VecDeque::from([block_with_exit(Some(0))]);
+        block_data[0].estimated_height = roomy_placeholder;
+        super::apply_finished_card_density(std::slice::from_ref(&block), &mut block_data, true);
+        let compact_placeholder = roomy_placeholder - 10;
+        assert_eq!(block_data[0].estimated_height, compact_placeholder);
+        assert_eq!(block.widget().height_request(), compact_placeholder);
+        let compact = (
+            block.widget().margin_top(),
+            block.widget().margin_start(),
+            block.header_row.margin_start(),
+            block.header_row.margin_top(),
+        );
+        assert!(block.widget().has_css_class("block-compact"));
+        assert!(
+            compact.0 < roomy.0
+                && compact.1 < roomy.1
+                && compact.2 < roomy.2
+                && compact.3 < roomy.3,
+            "compact must tighten every margin: {compact:?} vs {roomy:?}"
+        );
+
+        super::apply_finished_card_density(std::slice::from_ref(&block), &mut block_data, false);
+        assert_eq!(block_data[0].estimated_height, roomy_placeholder);
+        assert_eq!(block.widget().height_request(), roomy_placeholder);
+        assert!(!block.widget().has_css_class("block-compact"));
+        assert_eq!(
+            (
+                block.widget().margin_top(),
+                block.widget().margin_start(),
+                block.header_row.margin_start(),
+                block.header_row.margin_top(),
+            ),
+            roomy,
+            "switching back must restore construction's own margins"
+        );
+
+        // A density change can move the viewport boundary before GTK has
+        // allocated the new margins. The density-specific visibility pass
+        // must virtualize from the translated model, not capture the old
+        // roomy allocation on its way out.
+        assert_eq!(block.set_virtualized(false), roomy_placeholder);
+        super::apply_finished_card_density(std::slice::from_ref(&block), &mut block_data, true);
+        let mut visible = std::collections::HashSet::from([0]);
+        super::super::apply_visible_indices_preserving_heights(
+            std::slice::from_ref(&block),
+            &mut block_data,
+            &mut visible,
+            std::collections::HashSet::new(),
+        );
+        assert!(visible.is_empty());
+        assert_eq!(block_data[0].estimated_height, compact_placeholder);
+        assert_eq!(block.widget().height_request(), compact_placeholder);
+
+        // A filter removes the card from the document. Its private placeholder
+        // still adopts the density for a later reveal, but zero is retained in
+        // the metadata stream while it is absent.
+        assert!(block.set_filtered_out(true));
+        block_data[0].estimated_height = 0;
+        super::apply_finished_card_density(std::slice::from_ref(&block), &mut block_data, true);
+        assert_eq!(block_data[0].estimated_height, 0);
+        assert_eq!(block.widget().height_request(), compact_placeholder);
+
+        // The live input cell carries density as a class; its height comes
+        // from `BLOCK_ACTIVE_COMPACT_VCHROME_PX` via that class.
+        let raw_output = Rc::new(RefCell::new(super::BoundedByteRing::new(1024)));
+        let live = super::ActiveBlock::new(&config, raw_output);
+        assert!(!live.widget().has_css_class("block-compact"));
+        live.set_compact(true);
+        assert!(live.widget().has_css_class("block-compact"));
+        live.set_compact(false);
+        assert!(!live.widget().has_css_class("block-compact"));
+
+        // Existing correction/review, suggestion and Agent notice trees are
+        // not FinishedBlocks. Their stable assistant roles are enough to
+        // update the imperative outer/header/body margins in place.
+        for (role, body_class, compact_bottom) in [
+            ("command-review-standalone", Some("command-review-body"), 7),
+            ("command-suggestion", None, 7),
+            ("block-agent", None, 6),
+        ] {
+            let assistant = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            assistant.add_css_class("block-finished");
+            assistant.add_css_class("block-assistant");
+            assistant.add_css_class(role);
+            assistant.set_margin_top(4);
+            assistant.set_margin_start(8);
+            let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+            header.add_css_class("block-header");
+            header.set_margin_top(6);
+            header.set_margin_start(12);
+            assistant.append(&header);
+            let body = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            if let Some(body_class) = body_class {
+                body.add_css_class(body_class);
+            }
+            body.set_margin_start(12);
+            body.set_margin_bottom(11);
+            assistant.append(&body);
+
+            assert!(super::apply_inline_assistant_density(
+                assistant.upcast_ref(),
+                true
+            ));
+            assert!(assistant.has_css_class("block-compact"));
+            assert_eq!(assistant.margin_top(), 1);
+            assert_eq!(header.margin_start(), 8);
+            assert_eq!(header.margin_top(), 3);
+            assert_eq!(body.margin_start(), 8);
+            assert_eq!(body.margin_bottom(), compact_bottom);
+
+            assert!(super::apply_inline_assistant_density(
+                assistant.upcast_ref(),
+                false
+            ));
+            assert!(!assistant.has_css_class("block-compact"));
+            assert_eq!(assistant.margin_top(), 4);
+            assert_eq!(header.margin_start(), 12);
+            assert_eq!(body.margin_start(), 12);
         }
     }
 
@@ -4773,18 +5104,28 @@ mod tests {
         // go through this formula: if they diverge, a resize shifts every
         // block below it in the virtualized document.
         assert_eq!(
-            super::finished_block_height_for_rows(20, 1, 10),
+            super::finished_block_height_for_rows(20, 1, 10, false),
             12 * 20 + 34
         );
-        assert_eq!(super::finished_block_height_for_rows(20, 1, 1), 3 * 20 + 34);
-        assert_eq!(super::finished_block_height_for_rows(0, 1, 1), 3 + 34);
+        assert_eq!(
+            super::finished_block_height_for_rows(20, 1, 1, false),
+            3 * 20 + 34
+        );
+        assert_eq!(
+            super::finished_block_height_for_rows(20, 1, 1, true),
+            3 * 20 + 24
+        );
+        assert_eq!(
+            super::finished_block_height_for_rows(0, 1, 1, false),
+            3 + 34
+        );
     }
 
     #[test]
     fn card_height_omits_rows_for_hidden_surfaces() {
-        let background = super::finished_block_height_for_rows(20, 0, 1);
-        let command_with_output = super::finished_block_height_for_rows(20, 1, 1);
-        let command_without_output = super::finished_block_height_for_rows(20, 1, 0);
+        let background = super::finished_block_height_for_rows(20, 0, 1, false);
+        let command_with_output = super::finished_block_height_for_rows(20, 1, 1, false);
+        let command_without_output = super::finished_block_height_for_rows(20, 1, 0, false);
 
         assert_eq!(background, 2 * 20 + 34);
         assert_eq!(command_without_output, 2 * 20 + 34);

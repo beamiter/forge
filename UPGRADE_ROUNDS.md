@@ -4,8 +4,8 @@ This ledger records the independently testable increments in the current
 upgrade pass. It is intentionally tied to behavior and regression evidence,
 not commits.
 
-Rounds 1–10 record the preceding pass; this pass's additional twenty-one rounds
-are numbered 11–31.
+Rounds 1–10 record the preceding pass; this pass's additional twenty-seven rounds
+are numbered 11–37.
 
 1. **Install/uninstall symmetry** — no-argument uninstall now targets the same
    historical `~/.cargo/bin` location as no-argument install; explicit prefixes
@@ -87,6 +87,24 @@ are numbered 11–31.
     zero-height cards stay absent from viewport, virtualization, and marker
     geometry, while bookmark mutations reconcile the active filter. Cargo and
     Nix consume the same published hardened-core revision.
+32. **Live density propagation** — `block_compact` reloads update existing
+    finished cards and the live cell in place, then perform one layout and PTY
+    geometry synchronization per affected pane.
+33. **Fresh bounded branch chips** — repeated cards share a 64-entry
+    `cwd → HEAD` locator LRU and reread HEAD safely for every card, so branch
+    switches are immediate; only negative lookups live for 200 milliseconds.
+34. **Nonblocking safe-mode feedback** — memory-only setting changes use one
+    deduplicated toast instead of an alert dialog that interrupts the settings
+    workflow.
+35. **Pinned local and display gates** — verification and security targets
+    enter the flake toolchain, while explicit GTK/VTE tests share an isolated
+    D-Bus/Xvfb runner between CI, `make verify`, and `make test-display`.
+36. **Single-snapshot OSC ownership** — prompt-start and command-end each
+    sample the PTY foreground owner once, rejecting foreign child-process C/D
+    markers without a second probe racing to a different answer.
+37. **Composable result states** — outcome owns the stripe/wash, selection owns
+    its accent ring, hover owns elevation, and compound failed-selection rules
+    retain all three signals at once.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, and the repository-wide Rust

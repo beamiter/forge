@@ -6062,12 +6062,18 @@ impl ReaderCtx {
         // this A marker and B for every prompt.
         self.agent_execution_supported_rc.set(false);
         let mut state = self.bstate_rc.get();
+        // One OSC 133 A event gets one foreground-ownership observation. The
+        // shell can hand the PTY to queued input independently of this GTK
+        // dispatch, so probing again after mutating lifecycle state could make
+        // the inference gate and Agent finalization disagree about who emitted
+        // this same marker.
+        let foreground_owner = self.pty_for_init.foreground_owner();
         if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
             // A is an inference boundary only after the interactive shell has
             // regained the PTY. Child output can forge OSC 133 bytes but cannot
             // simultaneously own the shell's process group. Unknown probe
             // results fail closed instead of contaminating the next block.
-            if !prompt_boundary_infers_command_end(state, self.pty_for_init.foreground_owner()) {
+            if !prompt_boundary_infers_command_end(state, foreground_owner) {
                 return;
             }
             take_agent_execution_as_lost(
@@ -6353,9 +6359,7 @@ impl ReaderCtx {
             // PTY foreground when its block is finalized, or the binding is
             // dropped as lost (same fail-closed rule as the guards above).
             let agent_generation = match agent_generation {
-                Some(generation)
-                    if self.pty_for_init.foreground_owner() != PtyForeground::Shell =>
-                {
+                Some(generation) if foreground_owner != PtyForeground::Shell => {
                     emit_agent_execution_lost(
                         &self.agent_execution_lost_cbs,
                         generation,
@@ -6709,10 +6713,14 @@ impl ReaderCtx {
         if state != BlockState::CollectingOutput && state != BlockState::AltScreen {
             return;
         }
+        // Snapshot once for this D. In particular, do not pass the foreign
+        // marker gate under one ownership answer and then run Agent arbitration
+        // under a second answer after the shell has handed the PTY elsewhere.
+        let foreground_owner = self.pty_for_init.foreground_owner();
         // Symmetric with `on_command_start`'s foreign-`C` gate. Returning
         // before the depth counter is deliberate: an uncounted start must not
         // be balanced by a counted end.
-        if foreign_foreground_owns_command_end(self.pty_for_init.foreground_owner()) {
+        if foreign_foreground_owns_command_end(foreground_owner) {
             return;
         }
         {
@@ -6729,7 +6737,7 @@ impl ReaderCtx {
             .command_end_correlation(meta);
         match decide_agent_command_end(
             self.active_agent_generation_rc.get().is_some(),
-            self.pty_for_init.foreground_owner(),
+            foreground_owner,
             self.pending_typeahead_rc.get(),
             id_correlation,
         ) {
@@ -8184,6 +8192,22 @@ fn dock_mount_decision(parent: Option<&gtk4::Widget>, dock: &gtk4::Widget) -> Do
     }
 }
 
+/// A transient assistant card can be constructed before it knows which pane
+/// will own it. Normalize its imperative margins at the mount boundary using
+/// that pane's current configuration, not the density it happened to be built
+/// with.
+fn prepare_inline_notice_for_mount(
+    widget: &gtk4::Widget,
+    config: &Config,
+    decision: DockMount,
+) -> bool {
+    if decision == DockMount::Refuse {
+        return false;
+    }
+    apply_inline_assistant_density(widget, config.block_compact);
+    true
+}
+
 /// Append a completed record to the Unified zone table, dropping the oldest
 /// entries past
 /// `max_zones`.
@@ -9360,7 +9384,29 @@ fn apply_visible_indices(
     finished: &[FinishedBlock],
     block_data: &mut VecDeque<BlockData>,
     visible: &mut std::collections::HashSet<usize>,
+    new_visible: std::collections::HashSet<usize>,
+) {
+    apply_visible_indices_with_measurement(finished, block_data, visible, new_visible, true);
+}
+
+/// The same visibility transition immediately after a density change. GTK has
+/// only queued the new margins at this point, so sampling widget allocations
+/// would write the old density straight back over the translated placeholders.
+fn apply_visible_indices_preserving_heights(
+    finished: &[FinishedBlock],
+    block_data: &mut VecDeque<BlockData>,
+    visible: &mut std::collections::HashSet<usize>,
+    new_visible: std::collections::HashSet<usize>,
+) {
+    apply_visible_indices_with_measurement(finished, block_data, visible, new_visible, false);
+}
+
+fn apply_visible_indices_with_measurement(
+    finished: &[FinishedBlock],
+    block_data: &mut VecDeque<BlockData>,
+    visible: &mut std::collections::HashSet<usize>,
     mut new_visible: std::collections::HashSet<usize>,
+    measure_allocations: bool,
 ) {
     // A filtered card is absent from the document, not merely off-screen.
     // Keep its zero height and its previous virtualization state: calling
@@ -9377,12 +9423,16 @@ fn apply_visible_indices(
             continue;
         }
         let should_render = new_visible.contains(&i);
-        let height = block.set_virtualized(!should_render);
+        let height = if measure_allocations {
+            block.set_virtualized(!should_render)
+        } else {
+            block.set_virtualized_preserving_height(!should_render)
+        };
         if !should_render {
             if let Some(data) = block_data.get_mut(i) {
                 data.estimated_height = height;
             }
-        } else {
+        } else if measure_allocations {
             // Keep the metadata document converged to real allocations for
             // rendered cards too. The font-metric estimate drifts from the
             // pixels GTK actually allocates, and the pixel→index mapping in
@@ -10181,7 +10231,48 @@ impl TermView {
     /// events. Parser flags (mouse/focus reporting) are snapshotted into
     /// ParserConfig at pane construction and are NOT affected.
     pub(crate) fn reload_config(&self, config: &Config) {
+        let density_changed = self.config.borrow().block_compact != config.block_compact;
         *self.config.borrow_mut() = config.clone();
+        if density_changed {
+            self.apply_block_density(config.block_compact);
+        }
+    }
+
+    /// Switch every card in this pane, and the live input cell, to the
+    /// requested density.
+    ///
+    /// Card margins are imperative GTK properties, so replacing the shared
+    /// config alone cannot update widgets which already exist. Refit the pane
+    /// once after all cards change, then publish the live surface's new grid to
+    /// the child once rather than doing either operation per card.
+    pub(crate) fn apply_block_density(&self, compact: bool) {
+        // Inline correction, suggestion and Agent cards are deliberately not
+        // FinishedBlocks. Update the mounted assistant roots in both possible
+        // regions; Unified docks them below its full-screen surface.
+        for container in [&self.block_list, &self.notice_dock] {
+            let mut child = container.first_child();
+            while let Some(widget) = child {
+                let next = widget.next_sibling();
+                apply_inline_assistant_density(&widget, compact);
+                child = next;
+            }
+        }
+
+        if self.render_backend.supports_block_mutation() {
+            self.active.borrow().set_compact(compact);
+            {
+                let finished = self.finished_blocks.borrow();
+                let mut block_data = self.block_data.borrow_mut();
+                apply_finished_card_density(&finished, &mut block_data, compact);
+            }
+            self.update_viewport();
+            self.update_block_visibility_preserving_heights();
+            self.block_list.queue_allocate();
+        }
+        self.notice_dock.queue_allocate();
+        // `sync_geometry_to_pty` performs the one live-surface layout before it
+        // publishes the grid, so do not invoke that layout twice here.
+        self.render_backend.sync_geometry_to_pty();
     }
 
     /// `mode` is the render backend this pane must use, decided by the caller
@@ -12826,17 +12917,23 @@ impl TermView {
             );
             return false;
         }
+        let block_list_widget: &gtk4::Widget = self.block_list.upcast_ref();
+        let mount = dock_mount_decision(widget.parent().as_ref(), block_list_widget);
+        if !prepare_inline_notice_for_mount(widget, &self.config.borrow(), mount) {
+            return false;
+        }
         let active_widget = self.active.borrow().widget().clone();
-        let already_inserted = widget
-            .parent()
-            .is_some_and(|parent| parent == *self.block_list.upcast_ref::<gtk4::Widget>());
-        if already_inserted {
-            let anchor = active_widget.prev_sibling();
-            if anchor.as_ref() != Some(widget) {
-                self.block_list.reorder_child_after(widget, anchor.as_ref());
+        match mount {
+            DockMount::Keep => {
+                let anchor = active_widget.prev_sibling();
+                if anchor.as_ref() != Some(widget) {
+                    self.block_list.reorder_child_after(widget, anchor.as_ref());
+                }
             }
-        } else {
-            widget.insert_before(&self.block_list, Some(&active_widget));
+            DockMount::Append => {
+                widget.insert_before(&self.block_list, Some(&active_widget));
+            }
+            DockMount::Refuse => unreachable!("refused before density normalization"),
         }
         self.block_list.queue_allocate();
         self.scroll_debouncer
@@ -12850,8 +12947,14 @@ impl TermView {
     /// document, and the dock is always next to the prompt.
     fn dock_inline_notice(&self, widget: &gtk4::Widget) -> bool {
         let dock_widget: &gtk4::Widget = self.notice_dock.upcast_ref();
-        match dock_mount_decision(widget.parent().as_ref(), dock_widget) {
-            DockMount::Refuse => false,
+        let mount = dock_mount_decision(widget.parent().as_ref(), dock_widget);
+        // Some notices can call this boundary directly. Normalize only after
+        // confirming the dock can Keep/Append; a rejected external widget must
+        // not acquire this pane's CSS class or imperative margins.
+        if !prepare_inline_notice_for_mount(widget, &self.config.borrow(), mount) {
+            return false;
+        }
+        match mount {
             DockMount::Keep => {
                 self.notice_dock.set_visible(true);
                 self.relayout_after_dock_change();
@@ -12863,6 +12966,7 @@ impl TermView {
                 self.relayout_after_dock_change();
                 true
             }
+            DockMount::Refuse => unreachable!("refused before density normalization"),
         }
     }
 
@@ -14168,6 +14272,26 @@ impl TermView {
             &self.block_data,
             self.failure_marker_redraw.as_ref(),
             |block_data| apply_visible_indices(&finished, block_data, &mut visible, new_visible),
+        );
+    }
+
+    fn update_block_visibility_preserving_heights(&self) {
+        let vp = self.viewport.borrow().clone();
+        let new_visible = visible_indices_for_viewport(&vp);
+
+        let finished = self.finished_blocks.borrow();
+        let mut visible = self.visible_indices.borrow_mut();
+        mutate_block_data_and_redraw(
+            &self.block_data,
+            self.failure_marker_redraw.as_ref(),
+            |block_data| {
+                apply_visible_indices_preserving_heights(
+                    &finished,
+                    block_data,
+                    &mut visible,
+                    new_visible,
+                )
+            },
         );
     }
 
@@ -15587,6 +15711,82 @@ mod tests {
         );
     }
 
+    /// A card may be built under the old density and mounted only after this
+    /// pane switched to compact. Both the scrolling block-list boundary and
+    /// the dock/direct-integration boundary must reconcile it at ownership
+    /// admission time.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn late_inline_notice_adopts_the_panes_current_density() {
+        use gtk4::prelude::*;
+
+        gtk4::init().expect("gtk init");
+        let block_list = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let block_list_widget: &gtk4::Widget = block_list.upcast_ref();
+        let notice = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        notice.add_css_class("block-finished");
+        notice.add_css_class("block-assistant");
+        notice.add_css_class("command-review-standalone");
+        notice.set_margin_top(4);
+        notice.set_margin_start(8);
+        let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        header.add_css_class("block-header");
+        header.set_margin_top(6);
+        header.set_margin_start(12);
+        notice.append(&header);
+        let body = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        body.add_css_class("command-review-body");
+        body.set_margin_start(12);
+        body.set_margin_bottom(11);
+        notice.append(&body);
+
+        let mut config = Config::safe_defaults();
+        config.block_compact = true;
+        let block_list_mount = dock_mount_decision(notice.parent().as_ref(), block_list_widget);
+        assert_eq!(block_list_mount, DockMount::Append);
+        assert!(super::prepare_inline_notice_for_mount(
+            notice.upcast_ref(),
+            &config,
+            block_list_mount,
+        ));
+        assert!(notice.has_css_class("block-compact"));
+        assert_eq!(notice.margin_top(), 1);
+        assert_eq!(notice.margin_start(), 4);
+        assert_eq!(header.margin_top(), 3);
+        assert_eq!(header.margin_start(), 8);
+        assert_eq!(body.margin_start(), 8);
+        assert_eq!(body.margin_bottom(), 7);
+
+        // A direct integration card follows the dock boundary without first
+        // passing through `insert_inline_notice`.
+        let dock = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let dock_widget: &gtk4::Widget = dock.upcast_ref();
+        let integration = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        integration.add_css_class("block-finished");
+        integration.add_css_class("block-assistant");
+        integration.add_css_class("block-integration-notice");
+        integration.set_margin_top(4);
+        integration.set_margin_start(8);
+        let integration_header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        integration_header.add_css_class("block-header");
+        integration_header.set_margin_top(6);
+        integration_header.set_margin_start(12);
+        integration.append(&integration_header);
+
+        let dock_mount = dock_mount_decision(integration.parent().as_ref(), dock_widget);
+        assert_eq!(dock_mount, DockMount::Append);
+        assert!(super::prepare_inline_notice_for_mount(
+            integration.upcast_ref(),
+            &config,
+            dock_mount,
+        ));
+        assert!(integration.has_css_class("block-compact"));
+        assert_eq!(integration.margin_top(), 1);
+        assert_eq!(integration.margin_start(), 4);
+        assert_eq!(integration_header.margin_top(), 3);
+        assert_eq!(integration_header.margin_start(), 8);
+    }
+
     /// The dock must never reparent a widget another region still owns: GTK
     /// would warn and the card would end up in neither place.
     #[test]
@@ -15621,6 +15821,25 @@ mod tests {
             DockMount::Refuse,
             "a card the scrolling document owns is refused, not stolen"
         );
+
+        // Rejection is observational: a compact pane must not repaint or move
+        // a roomy assistant widget which another container still owns.
+        let rejected = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        rejected.add_css_class("block-assistant");
+        rejected.set_margin_top(4);
+        rejected.set_margin_start(8);
+        elsewhere.append(&rejected);
+        let decision = dock_mount_decision(rejected.parent().as_ref(), dock_widget);
+        let mut compact = Config::safe_defaults();
+        compact.block_compact = true;
+        assert!(!super::prepare_inline_notice_for_mount(
+            rejected.upcast_ref(),
+            &compact,
+            decision,
+        ));
+        assert!(!rejected.has_css_class("block-compact"));
+        assert_eq!(rejected.margin_top(), 4);
+        assert_eq!(rejected.margin_start(), 8);
     }
 
     #[test]
@@ -21831,6 +22050,11 @@ mod tests {
         harness.feed(command_start(Some("remote-two")));
         harness.feed(command_end(Some(3)));
         assert_eq!(
+            harness.ctx.engine.borrow().osc133_depth,
+            0,
+            "foreign C/D pairs must not consume the local shell's real D"
+        );
+        assert_eq!(
             harness.bstate.get(),
             BlockState::CollectingOutput,
             "the local ssh command is still running"
@@ -21842,6 +22066,12 @@ mod tests {
         // status of the command the user actually ran.
         harness.pty.set_test_foreground(PtyForeground::Shell);
         harness.feed(command_end(Some(255)));
+        assert_eq!(harness.bstate.get(), BlockState::PostCommand);
+        assert_eq!(harness.commands_finished.borrow().len(), 1);
+        assert!(
+            harness.backend.finalized().is_empty(),
+            "the real D completes lifecycle observers; its following A finalizes the card"
+        );
         harness.feed(ParserEvent::PromptStart);
 
         let finalized = harness.backend.finalized();
