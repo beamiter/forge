@@ -295,8 +295,9 @@ AI provider、model、endpoint 和 API key 均可在 Settings 的 **AI & Agent**
 命令面板使用模糊匹配；输入 `>` 只看动作、`@` 只看 JSONL 历史、`:` 只看 workflow、`?` 提交自然语言命令请求。历史和 workflow 只写入当前编辑行；`?` 请求会绑定当前 Block pane，在块流中显示可 Stop/Retry/Regenerate 的审阅卡，并携带可见的 selected Block 不可信上下文。它与命令纠正、Shell Agent proposal 共用可编辑、复制、动态风险提示的审阅逻辑，主操作只会 **Insert for review**，不会执行。所有审阅式插入都拒绝 CR、LF、Tab、NUL 和终端控制字符，避免多行条目越过“不提交”边界。`Ctrl+Alt+G` 或顶部栏的 **Agent** 开关会打开绑定当前 Block pane 的 Shell Agent；若打开时已选中 finished Block，它会作为可见、可移除的不可信上下文附加。Agent 显示目标、provider/model、shell、回合进度、activity 与实时 prompt readiness，可单独 Stop/Retry 当前模型请求，并可切换持久化的 typo-like 命令纠正。严格 JSON proposal 可复制、编辑、Reject、**Insert only** 或逐条 **Approve & Run**；Insert only 只回填普通 shell 编辑行并在 Agent 上下文记录“未执行”，危险命令执行仍需第二次确认。完成块的退出码和截断输出随后回灌到下一轮；`done` 后可用 **Follow up** 保留上下文追问，回合耗尽后可用 **New task** 在同一 pane 重置 Agent transcript 与预算。
 
 全新的 Block pane 在没有完成块、也没有恢复到历史块时，会显示一次性使用提示：完成的命令会成为
-可复用卡片，点击 header 选择，右键查看更多操作，`Ctrl+Shift+G` 跨块搜索。第一张卡片完成或历史
-恢复后提示永久撤下；清空、过滤或容量淘汰到空也不会在同一 pane 重播。它是不可点击且不参与测量
+可复用卡片，点击 header 选择，右键查看更多操作，`Ctrl+Shift+G` 跨块搜索。首次被终端接受的
+用户输入、第一张卡片完成或历史恢复后，提示都会永久撤下；清空、过滤或容量淘汰到空也不会在同一
+pane 重播。它是不可点击且不参与测量
 的浮层，不占用实时提示符的 PTY 行数；alt-screen 接管时暂时隐藏、退出后恢复，因而不会遮住
 首次启动的 TUI。Unified 与传统 VTE 模式不显示。
 
@@ -324,9 +325,11 @@ Block 模式与 anvil 保持相同的选择语义：`Ctrl+Up` 从最新块进入
 CR，从而覆盖“同步检查为空、异步回显却已有输入”的竞态。
 多选、后台块和会被截断为首行的多行命令一律拒绝执行，仍可按普通 `Enter` 回填审阅。
 多选回填需要 shell 的 bracketed-paste 支持；否则整次拒绝并响铃，不会静默丢掉首行之后的命令。
-卡片提示以 `Prompt ready` 明示动作前提，并随选区能力变化：只有可安全重跑的单选才显示 `Ctrl+↵ run`，其他选区不会宣传
-不存在的动作；为降低误删，紧凑提示不宣传 `Delete`，但删除能力与单级撤销保持不变。
-选区中的拒绝会消费普通 `Enter` 或 `Ctrl+Enter` 并响铃，不会把同一个 Enter 继续交给实时 VTE；
+卡片提示不再静态声称提示符已就绪：它会显示当前选中数量，单选使用 `↵ recall`，多选明确使用
+`↵ recall all`；只有可安全重跑的单选才显示 `Ctrl+↵ run`，其他选区不会宣传不存在的动作。
+为降低误删，紧凑提示不宣传 `Delete`，但删除能力与单级撤销保持不变。
+选区中的拒绝会消费普通 `Enter` 或 `Ctrl+Enter`，短暂显示 busy、dirty、多选或命令不安全等可见
+原因并响铃，然后恢复动作提示；同一个 Enter 不会继续交给实时 VTE。
 含控制符、嵌入 paste marker 或任何经 sanitizer 改写的历史命令也保持只回填审阅。
 AI / Agent / 命令面板的建议仍然只 **Insert for review**，永不自行提交。
 `Delete` 删除**整个选区**（不只是 active edge），并且可撤销：命令面板里的

@@ -1475,9 +1475,10 @@ pub(crate) fn estimated_finished_block_height_for_rows(
 /// selection synchronizer chooses the truthful capability row for the current
 /// shape. Destructive Delete remains available and undoable, but is omitted
 /// from this high-frequency hint; Escape remains visible for every selection.
-pub(crate) const SELECTION_HINT_RUN: &str = "Prompt ready: ↵ recall  ·  Ctrl+↵ run  ·  Esc cancel";
-pub(crate) const SELECTION_HINT_RECALL: &str = "Prompt ready: ↵ recall  ·  Esc cancel";
+pub(crate) const SELECTION_HINT_RUN: &str = "Esc cancel  ·  ↵ recall  ·  Ctrl+↵ run";
+pub(crate) const SELECTION_HINT_RECALL: &str = "Esc cancel  ·  ↵ recall";
 pub(crate) const SELECTION_HINT_REMOVE: &str = "Esc cancel";
+pub(crate) const SELECTION_HINT_MIN_CHARS: i32 = 14;
 
 /// Natural-width cap for the right-hand metadata run (timestamp, duration,
 /// exit badge). Wide enough that these never ellipsize at ordinary pane
@@ -2153,7 +2154,12 @@ impl FinishedBlock {
         // the hint's own length ellipsizes it in every pane, not just narrow
         // ones — the old 38 hid "Esc cancel" permanently. Ask for the whole
         // hint and let ellipsize handle genuinely narrow splits.
-        selection_hint.set_max_width_chars(SELECTION_HINT_RUN.chars().count() as i32);
+        // Multi-selection adds a short count ("12 selected") to this run.
+        // Keep Escape first so a narrow split preserves the exit affordance
+        // when Pango ellipsizes the trailing actions.
+        selection_hint.set_width_chars(SELECTION_HINT_MIN_CHARS);
+        selection_hint.set_max_width_chars(52);
+        selection_hint.set_accessible_role(gtk4::AccessibleRole::Status);
         header_row.append(&selection_hint);
 
         // Spacer
@@ -4544,6 +4550,11 @@ mod tests {
         assert!(
             hint_index < spacer_index,
             "hint at {hint_index} must precede the spacer at {spacer_index}"
+        );
+        assert_eq!(
+            card.selection_hint.width_chars(),
+            super::SELECTION_HINT_MIN_CHARS,
+            "a narrow header must reserve the complete Escape affordance"
         );
     }
 

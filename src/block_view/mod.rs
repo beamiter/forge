@@ -2606,14 +2606,109 @@ fn finished_selection_hint(
     selected_count: usize,
     can_recall: bool,
     active_command_is_rerunnable: bool,
-) -> &'static str {
+) -> String {
     if selected_count == 1 && can_recall && active_command_is_rerunnable {
-        SELECTION_HINT_RUN
+        SELECTION_HINT_RUN.to_string()
+    } else if selected_count > 1 && can_recall {
+        format!("Esc cancel  ·  {selected_count} selected  ·  ↵ recall all")
     } else if can_recall {
-        SELECTION_HINT_RECALL
+        SELECTION_HINT_RECALL.to_string()
+    } else if selected_count > 1 {
+        format!("Esc cancel  ·  {selected_count} selected")
     } else {
-        SELECTION_HINT_REMOVE
+        SELECTION_HINT_REMOVE.to_string()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionAction {
+    Recall,
+    Run,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionActionRefusal {
+    Prompt(CommandPromptStatus),
+    UnsafeRecall,
+    NotRunnable,
+    PromptChanged,
+}
+
+/// A refusal is part of the selection interaction, not a terminal bell side
+/// effect. Put the escape route first (so it survives narrow-pane ellipsis),
+/// name the concrete gate, and state that no bytes were admitted.
+fn selection_refusal_hint(action: SelectionAction, refusal: SelectionActionRefusal) -> String {
+    let consequence = match action {
+        SelectionAction::Recall => "nothing recalled",
+        SelectionAction::Run => "nothing run",
+    };
+    let reason = match refusal {
+        SelectionActionRefusal::Prompt(CommandPromptStatus::Ready)
+        | SelectionActionRefusal::PromptChanged => "Prompt changed",
+        SelectionActionRefusal::Prompt(status) => status.short_label(),
+        SelectionActionRefusal::UnsafeRecall => "Selection cannot be recalled safely",
+        SelectionActionRefusal::NotRunnable => "Select one runnable command",
+    };
+    format!("Esc cancel  ·  {reason}  ·  {consequence}")
+}
+
+fn prompt_recall_refusal(
+    guards: PromptSubmitGuards,
+    typed_command_empty: bool,
+    command: &str,
+    bracketed_paste: bool,
+) -> SelectionActionRefusal {
+    if !selected_command_recall_is_lossless(command, bracketed_paste) {
+        return SelectionActionRefusal::UnsafeRecall;
+    }
+    let status = classify_command_prompt_status(
+        guards.state,
+        false,
+        guards.submission_pending
+            || guards.pending_typeahead
+            || guards.fidelity == TypedShadowFidelity::ExactSubmitted,
+        guards.pty_synced,
+        typed_command_empty,
+    );
+    if status != CommandPromptStatus::Ready {
+        SelectionActionRefusal::Prompt(status)
+    } else {
+        SelectionActionRefusal::PromptChanged
+    }
+}
+
+fn flash_finished_selection_refusal(
+    finished: &[FinishedBlock],
+    active_id: Option<u64>,
+    message: String,
+) {
+    let Some(label) = active_id.and_then(|id| {
+        finished
+            .iter()
+            .find(|block| block.id == id)
+            .map(|block| block.selection_hint.clone())
+    }) else {
+        return;
+    };
+    let steady_hint = label.text().to_string();
+    label.set_text(&message);
+    label.set_tooltip_text(Some(&message));
+    label.update_property(&[gtk4::accessible::Property::Label(&message)]);
+
+    let label_for_restore = label.downgrade();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(1400), move || {
+        let Some(label) = label_for_restore.upgrade() else {
+            return;
+        };
+        // A selection move or a newer status owns the label now; an old timer
+        // must not overwrite it.
+        if label.text().as_str() != message {
+            return;
+        }
+        label.set_text(&steady_hint);
+        label.set_tooltip_text(None);
+        label.update_property(&[gtk4::accessible::Property::Label(&steady_hint)]);
+    });
 }
 
 /// Apply the multi-selection model to every finished block. All selected blocks
@@ -2649,7 +2744,10 @@ fn sync_finished_block_selection(
 
         let is_active = active == Some(block.id);
         if is_active {
-            block.selection_hint.set_text(hint);
+            block.selection_hint.set_text(&hint);
+            block
+                .selection_hint
+                .update_property(&[gtk4::accessible::Property::Label(&hint)]);
         }
         block.selection_hint.set_visible(is_active);
         if is_active {
@@ -4448,6 +4546,50 @@ impl VerifiedSubmissionCtx {
 
     fn can_submit_historical_rerun(&self, command: &str, suggestion_rgb: [u8; 3]) -> bool {
         self.historical_rerun_is_ready(command, suggestion_rgb)
+    }
+
+    /// Best user-facing explanation after the strict history re-run boundary
+    /// declines a command. This deliberately does not make the decision —
+    /// `historical_rerun_is_ready` remains the sole authority — it translates
+    /// the same guards into the prompt-state vocabulary used elsewhere.
+    fn historical_rerun_refusal_status(&self, suggestion_rgb: [u8; 3]) -> CommandPromptStatus {
+        let status = classify_command_prompt_status(
+            self.bstate.get(),
+            false,
+            self.idle_input_dirty.get()
+                || self.submission_pending.get()
+                || self.pending_typeahead.get()
+                || self.source_id.borrow().is_some()
+                || self.completion.borrow().is_some()
+                || self.pending_agent_generation.get().is_some()
+                || self.external_submission.borrow().is_some()
+                || self.external_submission_generation.get().is_some()
+                || self.reviewed_submission_tainted.get(),
+            self.pty_synced.get(),
+            self.typed_cmd.borrow().is_empty(),
+        );
+        if status != CommandPromptStatus::Ready {
+            return status;
+        }
+        if !self.prompt_anchor_ready.get() {
+            return CommandPromptStatus::Initializing;
+        }
+        match self.pty.foreground_owner() {
+            PtyForeground::Other => CommandPromptStatus::Running,
+            PtyForeground::Unknown => CommandPromptStatus::ShellIntegrationUnavailable,
+            PtyForeground::Shell => {
+                let anchor = self.current_anchor();
+                if self.surface.cursor_position() != anchor
+                    || self.surface.suffix_is_empty(suggestion_rgb) != Some(true)
+                {
+                    CommandPromptStatus::HasInput
+                } else {
+                    // The surface was clean when feedback was sampled, so a
+                    // just-lost generation/read-back race is the useful state.
+                    CommandPromptStatus::Ready
+                }
+            }
+        }
     }
 
     fn try_submit_historical_rerun(&self, command: &str, suggestion_rgb: [u8; 3]) -> bool {
@@ -10277,7 +10419,7 @@ impl KeyCtx {
                     lone_rerunnable_selection(&finished, &selected, selected_block_id_for_key.get())
                         .map(|block| block.cmd_text.clone())
                 };
-                if let Some(command) = target {
+                let refusal = if let Some(command) = target {
                     let suggestion = click_cursor::suggestion_rgb(&config_for_key.borrow().palette);
                     let submitted = verified_submission_for_key
                         .try_submit_historical_rerun(&command, suggestion);
@@ -10291,11 +10433,21 @@ impl KeyCtx {
                         active_vte_for_key.grab_focus();
                         return glib::Propagation::Stop;
                     }
-                }
+                    SelectionActionRefusal::Prompt(
+                        verified_submission_for_key.historical_rerun_refusal_status(suggestion),
+                    )
+                } else {
+                    SelectionActionRefusal::NotRunnable
+                };
                 // Selection mode owns this key even when the prompt is dirty,
                 // busy, the selection is a batch/background block, or the
                 // command sanitizer would rewrite it. Never let the refused
                 // Enter fall through to VTE and submit unrelated input.
+                flash_finished_selection_refusal(
+                    &finished,
+                    selected_block_id_for_key.get(),
+                    selection_refusal_hint(SelectionAction::Run, refusal),
+                );
                 active_vte_for_key.error_bell();
                 return glib::Propagation::Stop;
             }
@@ -10333,6 +10485,32 @@ impl KeyCtx {
                         active_vte_for_key.grab_focus();
                         return glib::Propagation::Stop;
                     }
+                    let command = {
+                        let selected = selected_block_ids_for_key.borrow();
+                        selected_command_text(
+                            finished
+                                .iter()
+                                .map(|block| (block.id, block.cmd_text.as_str())),
+                            &selected,
+                        )
+                    };
+                    let refusal = prompt_recall_refusal(
+                        PromptSubmitGuards {
+                            state: bstate_for_key.get(),
+                            pty_synced: pty_synced_for_key.get(),
+                            submission_pending: submission_pending_for_key.get(),
+                            pending_typeahead: pending_typeahead_for_key.get(),
+                            fidelity: typed_cmd_fidelity_for_key.get(),
+                        },
+                        typed_cmd_for_key.borrow().trim().is_empty(),
+                        &command,
+                        bracketed_paste_for_key.get(),
+                    );
+                    flash_finished_selection_refusal(
+                        &finished,
+                        selected_block_id_for_key.get(),
+                        selection_refusal_hint(SelectionAction::Recall, refusal),
+                    );
                     // A visible selection owns the advertised Enter action.
                     // If the prompt is busy/dirty, bracketed paste is missing,
                     // or the selected text is unsafe, never pass the same key
@@ -11295,6 +11473,12 @@ impl TermView {
         let title_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
         let activity_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
         let human_input_callbacks: HumanInputCallbacks = Rc::new(RefCell::new(vec![]));
+        {
+            let onboarding = block_onboarding.clone();
+            human_input_callbacks
+                .borrow_mut()
+                .push(Box::new(move |_| onboarding.human_input_observed()));
+        }
         let alt_screen_callbacks: AltScreenCallbacks = Rc::new(RefCell::new(vec![]));
         let command_started_callbacks: CommandStartedCallbacks = Rc::new(RefCell::new(vec![]));
         let command_finished_callbacks: CommandFinishedCallbacks = Rc::new(RefCell::new(vec![]));
@@ -15426,8 +15610,8 @@ mod tests {
         );
         assert_eq!(
             super::finished_selection_hint(2, true, true),
-            super::SELECTION_HINT_RECALL,
-            "multi-selection is insert-only"
+            "Esc cancel  ·  2 selected  ·  ↵ recall all",
+            "multi-selection names its extent and insert-all action"
         );
         assert_eq!(
             super::finished_selection_hint(1, true, false),
@@ -15439,16 +15623,136 @@ mod tests {
             super::SELECTION_HINT_REMOVE,
             "a background-only selection only advertises cancellation"
         );
+        assert_eq!(
+            super::finished_selection_hint(3, false, false),
+            "Esc cancel  ·  3 selected",
+            "an unavailable batch still makes its selection extent explicit"
+        );
         for hint in [
             super::SELECTION_HINT_RUN,
             super::SELECTION_HINT_RECALL,
             super::SELECTION_HINT_REMOVE,
         ] {
+            assert!(hint.starts_with("Esc cancel"));
+            assert!(!hint.contains("Prompt ready"));
             assert!(
                 !hint.contains("Del"),
                 "the compact hint must not advertise destructive deletion"
             );
         }
+    }
+
+    #[test]
+    fn a_refused_selection_action_names_the_gate_and_the_non_action() {
+        use super::{
+            BlockState, CommandPromptStatus, SelectionAction, SelectionActionRefusal,
+            TypedShadowFidelity,
+        };
+
+        assert_eq!(
+            super::selection_refusal_hint(
+                SelectionAction::Run,
+                SelectionActionRefusal::Prompt(CommandPromptStatus::HasInput),
+            ),
+            "Esc cancel  ·  Prompt has input  ·  nothing run"
+        );
+        assert_eq!(
+            super::selection_refusal_hint(
+                SelectionAction::Recall,
+                SelectionActionRefusal::Prompt(CommandPromptStatus::Running),
+            ),
+            "Esc cancel  ·  Command running  ·  nothing recalled"
+        );
+        assert_eq!(
+            super::selection_refusal_hint(
+                SelectionAction::Recall,
+                SelectionActionRefusal::UnsafeRecall,
+            ),
+            "Esc cancel  ·  Selection cannot be recalled safely  ·  nothing recalled"
+        );
+        assert_eq!(
+            super::prompt_recall_refusal(
+                super::PromptSubmitGuards {
+                    state: BlockState::CollectingOutput,
+                    pty_synced: false,
+                    submission_pending: false,
+                    pending_typeahead: false,
+                    fidelity: TypedShadowFidelity::ExactOpen,
+                },
+                true,
+                "cargo test",
+                true,
+            ),
+            SelectionActionRefusal::Prompt(CommandPromptStatus::Running)
+        );
+        assert_eq!(
+            super::prompt_recall_refusal(
+                super::PromptSubmitGuards {
+                    state: BlockState::AwaitingCommand,
+                    pty_synced: true,
+                    submission_pending: false,
+                    pending_typeahead: false,
+                    fidelity: TypedShadowFidelity::Inexact,
+                },
+                false,
+                "cargo test",
+                true,
+            ),
+            SelectionActionRefusal::Prompt(CommandPromptStatus::HasInput)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn a_refusal_flash_is_visible_and_exposed_as_status_text() {
+        use gtk4::prelude::*;
+
+        gtk4::init().expect("gtk init");
+        let config = crate::config::Config::safe_defaults();
+        let card = super::FinishedBlock::new(
+            91,
+            "$ ",
+            "cargo test",
+            None,
+            "ok\r\n",
+            Some(0),
+            &config,
+            Some(5),
+            Some(1_700_000_000_000),
+            None,
+            80,
+        );
+        card.selection_hint.set_text(super::SELECTION_HINT_RUN);
+        card.selection_hint.set_visible(true);
+        let message = "Esc cancel  ·  Prompt has input  ·  nothing run".to_string();
+
+        super::flash_finished_selection_refusal(
+            std::slice::from_ref(&card),
+            Some(91),
+            message.clone(),
+        );
+
+        assert_eq!(card.selection_hint.text().as_str(), message);
+        assert_eq!(
+            card.selection_hint.tooltip_text().as_deref(),
+            Some(message.as_str())
+        );
+        assert_eq!(
+            card.selection_hint.accessible_role(),
+            gtk4::AccessibleRole::Status
+        );
+
+        let loop_ = gtk4::glib::MainLoop::new(None, false);
+        let quit = loop_.clone();
+        gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+            quit.quit();
+        });
+        loop_.run();
+        assert_eq!(
+            card.selection_hint.text().as_str(),
+            super::SELECTION_HINT_RUN
+        );
+        assert_eq!(card.selection_hint.tooltip_text(), None);
     }
 
     /// Deleted cards go back where their ids say they belong. Document order is

@@ -4,8 +4,8 @@ This ledger records the independently testable increments in the current
 upgrade pass. It is intentionally tied to behavior and regression evidence,
 not commits.
 
-Rounds 1–10 record the preceding pass; this pass's additional forty rounds are
-numbered 11–50.
+Rounds 1–10 record the preceding pass; this pass's additional forty-one rounds
+are numbered 11–51.
 
 1. **Install/uninstall symmetry** — no-argument uninstall now targets the same
    historical `~/.cargo/bin` location as no-argument install; explicit prefixes
@@ -155,6 +155,11 @@ numbered 11–50.
     latch the shell-integration notice as healthy, and one-shot or rc-bypassing
     bash/zsh/fish/PowerShell argv receive no default-profile instruction that
     cannot repair their current session.
+51. **Input-aware, truthful Block guidance** — first accepted human input retires
+    the one-shot orientation overlay before it can cover a long initial command;
+    selection hints report the selected count and distinguish recall from recall
+    all without claiming prompt readiness, while refused Enter and Ctrl+Enter
+    briefly expose the actual reason before restoring the available actions.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, and the repository-wide Rust

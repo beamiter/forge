@@ -7,7 +7,8 @@ All notable user-visible and operational changes are recorded here.
 ### Highlights
 
 - 空白 Block pane 现在显示一次性的可访问提示，说明完成命令会成为可复用卡片，并提示 header
-  选择、右键操作和 `Ctrl+Shift+G` 搜索；首块完成或历史恢复后永久撤下。提示是不可点击、
+  选择、右键操作和 `Ctrl+Shift+G` 搜索；首次接受用户输入、首块完成或历史恢复后永久撤下，
+  不会覆盖用户已经开始的首条长命令。提示是不可点击、
   不参与测量的独立浮层，不占用 live PTY 网格，也不会出现在 Unified/VTE 或争用 AI/集成提示；
   alt-screen 接管期间会暂时隐藏，退出后才恢复，不遮住首次启动的 TUI。
 - Block 模式若在启动宽限后确认进入 RawFallback，会在提示符旁原位说明缺少 OSC 133，针对
@@ -20,15 +21,17 @@ All notable user-visible and operational changes are recorded here.
 - Block 卡片的三个高频动作不再共用含混图标：复制命令、复制输出、插入提示符分别使用
   command-copy、document/output 与 insert glyph，并保留准确的 tooltip 和可访问名称。
 - Block 选区中的 `Ctrl+Enter` 现在即使因 busy/dirty、多选、后台块或不安全命令而拒绝重跑，
-  也会消费按键并响铃，不再让同一个 Enter 落入实时 VTE 后意外提交当前输入；任何被 sanitizer
+  也会消费按键、响铃并短暂显示可见拒绝原因，不再让同一个 Enter 落入实时 VTE 后意外提交
+  当前输入；任何被 sanitizer
   去控制符、移除嵌入 paste marker 或改写文本的历史命令都只允许回填审阅，不能一键执行。
   键盘与右键重跑现在共用严格的可见空提示符证明（稳定 anchor、空 suffix、无 Agent/外部提交、
   shell 持有 PTY 前台）；命令先只插入，VTE 稳定渲染为字节一致的完整文本后才发送 CR，消除
-  同步空检查与异步回显之间的竞态。选中提示会明确标注 `Prompt ready`，并按单选/多选/后台/
-  命令安全性动态显示真实可用动作，并像
+  同步空检查与异步回显之间的竞态。选中提示不再静态声称提示符已就绪，而是显示选中数量，
+  以 `recall` / `recall all` 区分单选与多选，并按后台/命令安全性动态显示真实可用动作；普通
+  `Enter` 的拒绝同样短暂显示原因。提示也像
   anvil 一样不在高频提示中宣传破坏性的 `Delete`（快捷键及撤销能力保持不变）。
 - 可见 Block 选区现在也拥有普通 `Enter`：提示符 busy/dirty、文本不安全或多选缺少 bracketed
-  paste 支持时会响铃并消费按键，不再把同一个 Enter 泄漏给实时编辑器；多选回填不会再悄悄
+  paste 支持时会显示原因、响铃并消费按键，不再把同一个 Enter 泄漏给实时编辑器；多选回填不会再悄悄
   只保留首条命令。卡片 header 按钮仍遵循 GTK 可访问性，聚焦按钮上的普通 Return/Space 会激活
   按钮，只有显式 `Ctrl+Enter` 进入 Block 重跑。
 - Block 卡片池现在在统一的 release 边界拆除旧 VTE 子树、事件控制器和 tooltip，再只复用轻量
