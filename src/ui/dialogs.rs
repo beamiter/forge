@@ -62,7 +62,7 @@ fn cross_block_search_dialog_title() -> &'static str {
 }
 
 fn cross_block_search_idle_status() -> &'static str {
-    "Type to search. Shift+Enter jumps and advances; Ctrl+Shift+U resets."
+    "Type to search. F5 refreshes; Shift+Enter jumps and advances; Ctrl+Shift+U resets."
 }
 
 fn cross_block_search_pending_status() -> &'static str {
@@ -1371,9 +1371,10 @@ impl UiState {
         // opened. Probe only the cheap finalized-record identity and keep the
         // selected stable hit while rebuilding after completion/retention
         // churn. Query text and terminal output are not cloned by the probe.
+        let observed_version = Rc::new(Cell::new(term_view.cross_block_search_version()));
         let refresh_source = {
             let term_view = term_view.clone();
-            let observed_version = Rc::new(Cell::new(term_view.cross_block_search_version()));
+            let observed_version = observed_version.clone();
             let schedule_rebuild = schedule_rebuild.clone();
             glib::timeout_add_local(CROSS_BLOCK_SEARCH_REFRESH_INTERVAL, move || {
                 let current = term_view.cross_block_search_version();
@@ -1469,6 +1470,9 @@ impl UiState {
         let whole_word_toggle_for_key = whole_word_toggle.clone();
         let scope_dropdown_for_key = scope_dropdown.clone();
         let reset_button_for_key = reset_button.clone();
+        let term_view_for_key = term_view.clone();
+        let observed_version_for_key = observed_version.clone();
+        let schedule_refresh_for_key = schedule_rebuild.clone();
         key_controller.connect_key_pressed(move |_, keyval, _, state| {
             if keyval == Key::Escape
                 || (matches!(keyval, Key::G | Key::g)
@@ -1478,6 +1482,16 @@ impl UiState {
                 if let Some(d) = dialog_to_close {
                     d.force_close();
                 }
+                return true.into();
+            }
+            if keyval == Key::F5 {
+                // A manual rebuild may be useful even when record identity is
+                // unchanged (for example after metadata state changed). Mark
+                // the current version observed so the poller cannot enqueue a
+                // redundant second rebuild immediately afterwards.
+                observed_version_for_key.set(term_view_for_key.cross_block_search_version());
+                schedule_refresh_for_key(true);
+                filter_entry_for_key.grab_focus();
                 return true.into();
             }
             if state.contains(ModifierType::CONTROL_MASK) {
@@ -3501,7 +3515,7 @@ mod tests {
         assert_eq!(cross_block_search_dialog_title(), "Search Blocks");
         assert_eq!(
             cross_block_search_idle_status(),
-            "Type to search. Shift+Enter jumps and advances; Ctrl+Shift+U resets."
+            "Type to search. F5 refreshes; Shift+Enter jumps and advances; Ctrl+Shift+U resets."
         );
         assert_eq!(cross_block_search_pending_status(), "Searching blocks…");
         assert_eq!(cross_block_search_refresh_status(), "Refreshing blocks…");
