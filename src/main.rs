@@ -1053,6 +1053,7 @@ pub fn run() -> glib::ExitCode {
             remote_picker_dialog: Rc::new(RefCell::new(None)),
             history_palette_dialog: Rc::new(RefCell::new(None)),
             cross_block_search_dialog: Rc::new(RefCell::new(None)),
+            cross_block_search_memory: Rc::new(RefCell::new(Default::default())),
             workflows_palette_dialog: Rc::new(RefCell::new(None)),
             settings_dialog: Rc::new(RefCell::new(None)),
             debug_dashboard_dialog: Rc::new(RefCell::new(None)),

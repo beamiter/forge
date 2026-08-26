@@ -252,6 +252,9 @@ pub(crate) struct UiState {
     pub(crate) remote_picker_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) history_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) cross_block_search_dialog: Rc<RefCell<Option<adw::Dialog>>>,
+    /// Window-lifetime, memory-only search intent; never persisted in config
+    /// or workspace snapshots.
+    pub(crate) cross_block_search_memory: Rc<RefCell<dialogs::CrossBlockSearchMemory>>,
     pub(crate) workflows_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) settings_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
     pub(crate) debug_dashboard_dialog: Rc<RefCell<Option<adw::Dialog>>>,
