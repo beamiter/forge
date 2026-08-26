@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 4.3)
+Updated: 2026-08-26 (Block Search 4.4)
 
 This working tree contains the nine-round "Evolve ASCII organism" series
 (`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
@@ -18,6 +18,15 @@ every round (attribution races, a Drop panic on a fired glib source, a
 saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
+
+- **Block Search 4.4 (2026-08-26)**: the capture-phase picker key router now
+  confirms only when focus belongs to the query editor or a result row. Every
+  other focused widget receives `Return`/`KP_Enter` normally — including
+  Refresh/Reset, scope and filter controls, row bookmark stars, and
+  `AdwHeaderBar`'s implicit Close button — instead of jumping and closing on
+  an unrelated selected result. Query/list confirmation and Shift+Enter
+  advance semantics remain unchanged; pure routing and DISPLAY-backed GTK
+  focus-classification regressions cover both sides of the allowlist.
 
 - **Block Search 4.3 (2026-08-26)**: exact VTE occurrence jumps now roll back
   transactionally when any native step fails, removing both the search regex

@@ -169,6 +169,42 @@ enum CrossBlockBookmarkKeyDecision {
     Propagate,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrossBlockEnterKeyRoute {
+    Propagate,
+    ConfirmResult,
+    Other,
+}
+
+/// Only the query and a result row opt into picker-wide confirmation. This
+/// allowlist makes every other focusable widget safe by default, including
+/// AdwHeaderBar's implicit window Close control and controls added later.
+fn cross_block_enter_key_route(key: Key, confirmation_focused: bool) -> CrossBlockEnterKeyRoute {
+    if !matches!(key, Key::Return | Key::KP_Enter) {
+        CrossBlockEnterKeyRoute::Other
+    } else if confirmation_focused {
+        CrossBlockEnterKeyRoute::ConfirmResult
+    } else {
+        CrossBlockEnterKeyRoute::Propagate
+    }
+}
+
+fn cross_block_focus_confirms_result(
+    focused: Option<&gtk4::Widget>,
+    query: &gtk4::SearchEntry,
+    results: &gtk4::ListBox,
+) -> bool {
+    let Some(focused) = focused else {
+        return false;
+    };
+    let query = query.upcast_ref::<gtk4::Widget>();
+    let results = results.upcast_ref::<gtk4::Widget>();
+    focused == query
+        || focused.is_ancestor(query)
+        || focused == results
+        || (focused.is::<gtk4::ListBoxRow>() && focused.is_ancestor(results))
+}
+
 /// Claim an action-like physical B press through release. A valid chord toggles
 /// once; auto-repeat and modifier-release repeats remain consumed. Plain text B
 /// remains fully repeatable in the query entry.
@@ -2163,27 +2199,40 @@ impl UiState {
                     return true.into();
                 }
             }
-            if matches!(keyval, Key::Return | Key::KP_Enter) {
-                if let Some(row) = list_box_for_key.selected_row() {
-                    let idx = row.index() as usize;
-                    let outcome = jump_for_key(idx);
-                    if cross_block_should_step(outcome, state.contains(ModifierType::SHIFT_MASK)) {
-                        if let Some(next) = cross_block_selection_index(
-                            Some(idx),
-                            hits_for_key.borrow().len(),
-                            CrossBlockSelectionMove::Next,
+            let focused = filter_entry_for_key.root().and_then(|root| root.focus());
+            let confirmation_focused = cross_block_focus_confirms_result(
+                focused.as_ref(),
+                &filter_entry_for_key,
+                &list_box_for_key,
+            );
+            match cross_block_enter_key_route(keyval, confirmation_focused) {
+                CrossBlockEnterKeyRoute::Propagate => return false.into(),
+                CrossBlockEnterKeyRoute::ConfirmResult => {
+                    if let Some(row) = list_box_for_key.selected_row() {
+                        let idx = row.index() as usize;
+                        let outcome = jump_for_key(idx);
+                        if cross_block_should_step(
+                            outcome,
+                            state.contains(ModifierType::SHIFT_MASK),
                         ) {
-                            if let Some(next_row) = list_box_for_key.row_at_index(next as i32) {
-                                list_box_for_key.select_row(Some(&next_row));
-                                scroll_cross_block_row_into_view(&scrolled_for_key, &next_row);
+                            if let Some(next) = cross_block_selection_index(
+                                Some(idx),
+                                hits_for_key.borrow().len(),
+                                CrossBlockSelectionMove::Next,
+                            ) {
+                                if let Some(next_row) = list_box_for_key.row_at_index(next as i32) {
+                                    list_box_for_key.select_row(Some(&next_row));
+                                    scroll_cross_block_row_into_view(&scrolled_for_key, &next_row);
+                                }
                             }
+                            filter_entry_for_key.grab_focus();
+                        } else {
+                            apply_for_key(outcome);
                         }
-                        filter_entry_for_key.grab_focus();
-                    } else {
-                        apply_for_key(outcome);
                     }
+                    return true.into();
                 }
-                return true.into();
+                CrossBlockEnterKeyRoute::Other => {}
             }
             let movement = match keyval {
                 Key::Home | Key::KP_Home => CrossBlockSelectionMove::First,
@@ -4109,7 +4158,8 @@ mod tests {
     use super::{
         clear_cross_block_search_dialog_claim, cross_block_bookmark_confirmation,
         cross_block_bookmark_copy, cross_block_bookmark_unavailable_status,
-        cross_block_bookmarked_empty_status, cross_block_jump_outcome,
+        cross_block_bookmarked_empty_status, cross_block_enter_key_route,
+        cross_block_focus_confirms_result, cross_block_jump_outcome,
         cross_block_refresh_selection_index, cross_block_search_compact_layout,
         cross_block_search_dialog_for_close, cross_block_search_dialog_title,
         cross_block_search_has_intent, cross_block_search_idle_status,
@@ -4119,10 +4169,10 @@ mod tests {
         cross_block_search_refresh_status, cross_block_search_status, cross_block_selection_index,
         cross_block_should_step, preferences_group_title, record_snapshot_dialog_title,
         record_snapshot_status_line, record_snapshot_unavailable_message, remote_picker_guard,
-        CrossBlockBookmarkKeyDecision, CrossBlockBookmarkKeyLatch, CrossBlockJumpOutcome,
-        CrossBlockRefreshFrameDecision, CrossBlockRefreshFrameGate, CrossBlockRefreshKeyDecision,
-        CrossBlockRefreshKeyLatch, CrossBlockSelectionAnchor, CrossBlockSelectionMove,
-        CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
+        CrossBlockBookmarkKeyDecision, CrossBlockBookmarkKeyLatch, CrossBlockEnterKeyRoute,
+        CrossBlockJumpOutcome, CrossBlockRefreshFrameDecision, CrossBlockRefreshFrameGate,
+        CrossBlockRefreshKeyDecision, CrossBlockRefreshKeyLatch, CrossBlockSelectionAnchor,
+        CrossBlockSelectionMove, CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
     use crate::block_view::{
         BookmarkedSearchEmptyReason, CrossBlockHit, CrossBlockSearchOptions, CrossBlockSearchScope,
@@ -4222,6 +4272,72 @@ mod tests {
             cross_block_search_jump_unavailable_status(),
             "This result is searchable, but its exact terminal location is not available yet."
         );
+    }
+
+    #[test]
+    fn cross_block_only_confirmation_focus_routes_enter_to_the_selected_result() {
+        use gtk4::gdk::Key;
+
+        for key in [Key::Return, Key::KP_Enter] {
+            assert_eq!(
+                cross_block_enter_key_route(key, true),
+                CrossBlockEnterKeyRoute::ConfirmResult,
+                "query and result-list focus preserve picker confirmation"
+            );
+            assert_eq!(
+                cross_block_enter_key_route(key, false),
+                CrossBlockEnterKeyRoute::Propagate,
+                "every other focused widget, including header controls, owns Enter"
+            );
+        }
+        assert_eq!(
+            cross_block_enter_key_route(Key::space, true),
+            CrossBlockEnterKeyRoute::Other,
+            "non-Enter keys keep their normal widget routing"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn cross_block_enter_focus_classifier_allows_query_and_row_but_not_nested_or_header_controls() {
+        use gtk4::prelude::*;
+
+        gtk4::init().expect("GTK display");
+        let query = gtk4::SearchEntry::new();
+        let results = gtk4::ListBox::new();
+        let row = gtk4::ListBoxRow::new();
+        let bookmark = gtk4::ToggleButton::new();
+        row.set_child(Some(&bookmark));
+        results.append(&row);
+        let close = gtk4::Button::from_icon_name("window-close-symbolic");
+        let query_delegate = query.first_child().expect("SearchEntry text delegate");
+
+        assert!(cross_block_focus_confirms_result(
+            Some(query.upcast_ref()),
+            &query,
+            &results
+        ));
+        assert!(cross_block_focus_confirms_result(
+            Some(&query_delegate),
+            &query,
+            &results
+        ));
+        assert!(cross_block_focus_confirms_result(
+            Some(row.upcast_ref()),
+            &query,
+            &results
+        ));
+        assert!(!cross_block_focus_confirms_result(
+            Some(bookmark.upcast_ref()),
+            &query,
+            &results
+        ));
+        assert!(!cross_block_focus_confirms_result(
+            Some(close.upcast_ref()),
+            &query,
+            &results
+        ));
+        assert!(!cross_block_focus_confirms_result(None, &query, &results));
     }
 
     #[test]
