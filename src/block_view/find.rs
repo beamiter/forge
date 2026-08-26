@@ -14,7 +14,8 @@ use vte4::TerminalExt;
 
 use super::{
     contains_case_insensitive, replace_finished_block_selection, BackendRecordRef,
-    BackendSearchWindow, BlockFilters, BlockOutcome, TermView, MAX_ZONE_SNAPSHOT_BYTES,
+    BackendSearchWindow, BlockFilters, BlockOutcome, BookmarkState, TermView,
+    MAX_ZONE_SNAPSHOT_BYTES,
 };
 
 fn outcome_matches_filters(
@@ -597,18 +598,33 @@ pub struct CrossBlockSearchVersion {
     len: usize,
     oldest: Option<u64>,
     newest: Option<u64>,
+    bookmark_revision: u64,
 }
 
-fn cross_block_search_version(ids: impl IntoIterator<Item = u64>) -> CrossBlockSearchVersion {
-    ids.into_iter()
-        .fold(CrossBlockSearchVersion::default(), |mut version, id| {
-            if version.len == 0 {
-                version.oldest = Some(id);
-            }
-            version.len = version.len.saturating_add(1);
-            version.newest = Some(id);
-            version
-        })
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BookmarkedSearchEmptyReason {
+    NoRetainedBookmarks,
+    MetadataMismatch,
+    NoRetainedTextInScope,
+    QueryNoMatches,
+}
+
+fn cross_block_search_version(
+    ids: impl IntoIterator<Item = u64>,
+    bookmark_revision: u64,
+) -> CrossBlockSearchVersion {
+    let mut version =
+        ids.into_iter()
+            .fold(CrossBlockSearchVersion::default(), |mut version, id| {
+                if version.len == 0 {
+                    version.oldest = Some(id);
+                }
+                version.len = version.len.saturating_add(1);
+                version.newest = Some(id);
+                version
+            });
+    version.bookmark_revision = bookmark_revision;
+    version
 }
 
 fn cross_block_pattern(pattern: &str, options: CrossBlockSearchOptions) -> String {
@@ -737,16 +753,21 @@ fn has_command_lifecycle_filters(filters: &BlockFilters) -> bool {
         || filters.slow_only
 }
 
-fn record_matches_filters(record: BackendRecordRef<'_>, filters: &BlockFilters) -> bool {
+fn record_matches_filters(
+    record: BackendRecordRef<'_>,
+    filters: &BlockFilters,
+    is_bookmarked: bool,
+) -> bool {
     let is_background = record.is_background();
-    (!filters.background_only || is_background)
+    (!filters.bookmarked_only || is_bookmarked)
+        && (!filters.background_only || is_background)
         && (!is_background || !has_command_lifecycle_filters(filters))
         && record_outcome_matches_filters(record, filters)
         && duration_matches(record.duration_ms(), filters)
 }
 
 fn has_metadata_filters(filters: &BlockFilters) -> bool {
-    has_command_lifecycle_filters(filters) || filters.background_only
+    has_command_lifecycle_filters(filters) || filters.background_only || filters.bookmarked_only
 }
 
 fn first_meaningful_line(text: &str) -> Option<(usize, &str)> {
@@ -793,19 +814,63 @@ fn metadata_filter_hits<'a>(
     scope: CrossBlockSearchScope,
     max_hits: usize,
     filters: &BlockFilters,
+    bookmarks: &BookmarkState,
 ) -> Vec<CrossBlockHit> {
     records
         .into_iter()
-        .filter(|record| record_matches_filters(*record, filters))
+        .filter(|record| record_matches_filters(*record, filters, bookmarks.contains(record.id())))
         .filter_map(|record| metadata_filter_hit(record, scope))
         .take(max_hits)
         .collect()
+}
+
+fn bookmarked_search_empty_reason<'a>(
+    records: impl IntoIterator<Item = BackendRecordRef<'a>>,
+    query: &str,
+    scope: CrossBlockSearchScope,
+    filters: &BlockFilters,
+    bookmarks: &BookmarkState,
+) -> Option<BookmarkedSearchEmptyReason> {
+    if !filters.bookmarked_only {
+        return None;
+    }
+
+    let mut has_retained_bookmark = false;
+    let mut has_metadata_match = false;
+    let mut has_scoped_text = false;
+    for record in records {
+        if !bookmarks.contains(record.id()) {
+            continue;
+        }
+        has_retained_bookmark = true;
+        if !record_matches_filters(record, filters, true) {
+            continue;
+        }
+        has_metadata_match = true;
+        if metadata_filter_hit(record, scope).is_some() {
+            has_scoped_text = true;
+            break;
+        }
+    }
+
+    if !has_retained_bookmark {
+        Some(BookmarkedSearchEmptyReason::NoRetainedBookmarks)
+    } else if !has_metadata_match {
+        Some(BookmarkedSearchEmptyReason::MetadataMismatch)
+    } else if !has_scoped_text {
+        Some(BookmarkedSearchEmptyReason::NoRetainedTextInScope)
+    } else if !query.is_empty() {
+        Some(BookmarkedSearchEmptyReason::QueryNoMatches)
+    } else {
+        None
+    }
 }
 
 fn matching_record_ids<'a>(
     records: impl IntoIterator<Item = BackendRecordRef<'a>>,
     query: &str,
     filters: &BlockFilters,
+    bookmarks: &BookmarkState,
 ) -> Vec<u64> {
     let q = query.to_lowercase();
     let q_bytes = q.as_bytes();
@@ -842,7 +907,7 @@ fn matching_record_ids<'a>(
             // Both predicates use the completed, resolved-command outcome.
             // In particular, background output never matches a raw status
             // attached by a producer, while Unknown matches no exact code.
-            if !record_matches_filters(record, filters) {
+            if !record_matches_filters(record, filters, bookmarks.contains(record.id())) {
                 return None;
             }
 
@@ -894,8 +959,9 @@ impl TermView {
     /// cloned; callers can poll this and rebuild only when finalized record
     /// identity actually changes.
     pub fn cross_block_search_version(&self) -> CrossBlockSearchVersion {
+        let bookmark_revision = self.bookmarks.borrow().revision();
         let records = self.render_backend.records();
-        cross_block_search_version(records.iter().map(|record| record.id()))
+        cross_block_search_version(records.iter().map(|record| record.id()), bookmark_revision)
     }
 
     /// Search blocks for a query string (case-insensitive).
@@ -906,8 +972,37 @@ impl TermView {
 
     /// Search completed records with optional filters, returning stable ids.
     pub fn search_blocks_with_filters(&self, query: &str, filters: &BlockFilters) -> Vec<u64> {
+        let bookmarks = self.bookmarks.borrow();
         let records = self.render_backend.records();
-        matching_record_ids(records.iter(), query, filters)
+        matching_record_ids(records.iter(), query, filters, &bookmarks)
+    }
+
+    /// Runtime-only membership for result-row state. Record ids are scoped to
+    /// this pane and never serialized.
+    pub(crate) fn is_record_bookmarked(&self, record_id: u64) -> bool {
+        self.bookmarks.borrow().contains(record_id)
+    }
+
+    /// Toggle a live completed record through the backend-neutral transition.
+    /// The preflight prevents a stale picker row from minting an orphan id.
+    pub(crate) fn toggle_record_bookmark(&self, record_id: u64) -> Option<bool> {
+        let record_is_live = {
+            let records = self.render_backend.records();
+            records.iter().any(|record| record.id() == record_id)
+        };
+        record_is_live.then_some(())?;
+        (self.toggle_bookmark)(record_id)
+    }
+
+    pub(crate) fn bookmarked_search_empty_reason(
+        &self,
+        query: &str,
+        scope: CrossBlockSearchScope,
+        filters: &BlockFilters,
+    ) -> Option<BookmarkedSearchEmptyReason> {
+        let bookmarks = self.bookmarks.borrow();
+        let records = self.render_backend.records();
+        bookmarked_search_empty_reason(records.iter(), query, scope, filters, &bookmarks)
     }
 
     /// Highlight occurrences of `query` across the finished blocks and focus
@@ -1349,12 +1444,14 @@ impl TermView {
             if !has_metadata_filters(filters) {
                 return Ok(Vec::new());
             }
+            let bookmarks = self.bookmarks.borrow();
             let records = self.render_backend.records();
             return Ok(metadata_filter_hits(
                 records.iter(),
                 scope,
                 max_hits,
                 filters,
+                &bookmarks,
             ));
         }
 
@@ -1366,6 +1463,7 @@ impl TermView {
             .build()
             .map_err(|e| format!("{e}"))?;
 
+        let bookmarks = self.bookmarks.borrow();
         let records = self.render_backend.records();
         let mut hits: Vec<CrossBlockHit> = Vec::new();
 
@@ -1376,7 +1474,7 @@ impl TermView {
             // Metadata predicates run before this record contributes any
             // command/output hit, so an excluded record cannot spend the
             // bounded result budget and starve a later eligible record.
-            if !record_matches_filters(record, filters) {
+            if !record_matches_filters(record, filters, bookmarks.contains(record.id())) {
                 continue;
             }
             let command = record.command();
@@ -1678,19 +1776,20 @@ pub(super) fn clear_find_state(
 #[cfg(test)]
 mod tests {
     use super::{
-        add_snapshot_jump_fallbacks, bounded_match_count, command_preview, cross_block_match_count,
-        cross_block_pattern, cross_block_search_version, duration_matches,
-        focus_one_native_forward_match, has_metadata_filters, matching_record_ids,
-        metadata_filter_hits, metadata_record_snapshot_view, native_cursor_action,
-        outcome_matches_filters, plan_matching_windows, record_matches_filters, regex_consumption,
-        snippet, step_compressed_cursor, unresolved_record_target_result, utf8_prefix,
-        vte_cross_block_pattern, CrossBlockSearchOptions, CrossBlockSearchScope, FindCursor,
+        add_snapshot_jump_fallbacks, bookmarked_search_empty_reason, bounded_match_count,
+        command_preview, cross_block_match_count, cross_block_pattern, cross_block_search_version,
+        duration_matches, focus_one_native_forward_match, has_metadata_filters,
+        matching_record_ids, metadata_filter_hits, metadata_record_snapshot_view,
+        native_cursor_action, outcome_matches_filters, plan_matching_windows,
+        record_matches_filters, regex_consumption, snippet, step_compressed_cursor,
+        unresolved_record_target_result, utf8_prefix, vte_cross_block_pattern,
+        BookmarkedSearchEmptyReason, CrossBlockSearchOptions, CrossBlockSearchScope, FindCursor,
         FindDirection, FindScanBudget, FindSurface, NativeCursorAction, RecordNavigationResult,
         RecordSnapshotView, RegexConsumption, VTE_SEARCH_FLAGS,
     };
     use crate::block_view::{
-        BackendRecordRef, BackendSearchWindow, BlockData, BlockFilters, CompletedCommandRecord,
-        ZoneOutputSnapshot,
+        BackendRecordRef, BackendSearchWindow, BlockData, BlockFilters, BookmarkState,
+        CompletedCommandRecord, ZoneOutputSnapshot,
     };
     use std::collections::HashSet;
     use std::time::Instant;
@@ -1712,19 +1811,24 @@ mod tests {
 
     #[test]
     fn cross_block_version_detects_same_length_retention_rotation() {
-        let empty = cross_block_search_version([]);
+        let empty = cross_block_search_version([], 0);
         assert_eq!(empty.len, 0);
         assert_eq!(empty.oldest, None);
         assert_eq!(empty.newest, None);
 
-        let before = cross_block_search_version([7, 8, 9]);
-        let after = cross_block_search_version([8, 9, 10]);
+        let before = cross_block_search_version([7, 8, 9], 0);
+        let after = cross_block_search_version([8, 9, 10], 0);
         assert_eq!(before.len, after.len);
         assert_eq!(before.oldest, Some(7));
         assert_eq!(before.newest, Some(9));
         assert_eq!(after.oldest, Some(8));
         assert_eq!(after.newest, Some(10));
         assert_ne!(before, after);
+        assert_ne!(
+            before,
+            cross_block_search_version([7, 8, 9], 1),
+            "bookmark churn must invalidate an already-open picker"
+        );
     }
 
     /// A palette row shows a line number, and activating it must land there.
@@ -2432,6 +2536,10 @@ tail ab";
             background_only: true,
             ..Default::default()
         }));
+        assert!(has_metadata_filters(&BlockFilters {
+            bookmarked_only: true,
+            ..Default::default()
+        }));
         assert!(!has_metadata_filters(&BlockFilters::default()));
         assert!(!duration_matches(None, &filters));
     }
@@ -2525,11 +2633,11 @@ tail ab";
             assert_eq!(record.command(), "");
             assert_eq!(record.exit_code(), None);
             assert_eq!(record.duration_ms(), None);
-            assert!(record_matches_filters(record, &background));
-            assert!(!record_matches_filters(record, &failed));
-            assert!(!record_matches_filters(record, &exact));
-            assert!(!record_matches_filters(record, &slow_background));
-            assert!(!record_matches_filters(record, &bounded_background));
+            assert!(record_matches_filters(record, &background, false));
+            assert!(!record_matches_filters(record, &failed, false));
+            assert!(!record_matches_filters(record, &exact, false));
+            assert!(!record_matches_filters(record, &slow_background, false));
+            assert!(!record_matches_filters(record, &bounded_background, false));
         }
 
         let retained = ZoneOutputSnapshot {
@@ -2547,6 +2655,7 @@ tail ab";
             CrossBlockSearchScope::Command,
             1,
             &background,
+            &BookmarkState::default(),
         )
         .is_empty());
         let hits = metadata_filter_hits(
@@ -2554,6 +2663,7 @@ tail ab";
             CrossBlockSearchScope::All,
             1,
             &background,
+            &BookmarkState::default(),
         );
         assert_eq!(hits.len(), 1);
         assert!(hits[0].is_output);
@@ -2612,16 +2722,21 @@ tail ab";
         assert_eq!(record.command(), "");
         assert_eq!(record.exit_code(), Some(7));
         assert_eq!(record.duration_ms(), Some(2_000));
-        assert!(record_matches_filters(record, &exact));
-        assert!(record_matches_filters(record, &failed));
-        assert!(record_matches_filters(record, &slow));
-        assert!(!record_matches_filters(record, &background));
+        assert!(record_matches_filters(record, &exact, false));
+        assert!(record_matches_filters(record, &failed, false));
+        assert!(record_matches_filters(record, &slow, false));
+        assert!(!record_matches_filters(record, &background, false));
 
-        assert!(
-            metadata_filter_hits([record], CrossBlockSearchScope::Command, 1, &failed,).is_empty()
-        );
+        assert!(metadata_filter_hits(
+            [record],
+            CrossBlockSearchScope::Command,
+            1,
+            &failed,
+            &BookmarkState::default(),
+        )
+        .is_empty());
         for scope in [CrossBlockSearchScope::All, CrossBlockSearchScope::Output] {
-            let hits = metadata_filter_hits([record], scope, 1, &failed);
+            let hits = metadata_filter_hits([record], scope, 1, &failed, &BookmarkState::default());
             assert_eq!(hits.len(), 1);
             assert!(hits[0].is_output);
             assert_eq!(hits[0].line_text, "retained foreground output");
@@ -2635,6 +2750,7 @@ tail ab";
             CrossBlockSearchScope::All,
             1,
             &failed,
+            &BookmarkState::default(),
         )
         .is_empty());
 
@@ -2654,13 +2770,14 @@ tail ab";
                 record: &interrupted,
                 snapshot: None,
             };
-            assert!(!record_matches_filters(interrupted_record, &failed));
+            assert!(!record_matches_filters(interrupted_record, &failed, false));
             assert!(record_matches_filters(
                 interrupted_record,
                 &BlockFilters {
                     exit_code: Some(exit_code),
                     ..Default::default()
-                }
+                },
+                false,
             ));
         }
     }
@@ -2709,8 +2826,14 @@ tail ab";
             ..Default::default()
         };
 
-        assert_eq!(matching_record_ids(records(), "", &failed), [91]);
-        assert_eq!(matching_record_ids(records(), "", &slow), [7]);
+        assert_eq!(
+            matching_record_ids(records(), "", &failed, &BookmarkState::default()),
+            [91]
+        );
+        assert_eq!(
+            matching_record_ids(records(), "", &slow, &BookmarkState::default()),
+            [7]
+        );
         assert_eq!(
             unresolved_record_target_result(records(), 91),
             RecordNavigationResult::LocationUnavailable
@@ -2753,7 +2876,13 @@ tail ab";
                 snapshot: None,
             })
         };
-        let hits = metadata_filter_hits(records(), CrossBlockSearchScope::All, 1, &filters);
+        let hits = metadata_filter_hits(
+            records(),
+            CrossBlockSearchScope::All,
+            1,
+            &filters,
+            &BookmarkState::default(),
+        );
         assert_eq!(
             hits.iter().map(|hit| hit.block_id).collect::<Vec<_>>(),
             [3],
@@ -2762,8 +2891,240 @@ tail ab";
         let hit = &hits[0];
         assert_eq!(hit.block_id, 3);
         assert_eq!(hit.line_text, "needle");
-        assert!(
-            metadata_filter_hits(records(), CrossBlockSearchScope::Output, 1, &filters).is_empty()
+        assert!(metadata_filter_hits(
+            records(),
+            CrossBlockSearchScope::Output,
+            1,
+            &filters,
+            &BookmarkState::default(),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn bookmarked_filter_is_backend_neutral_and_composes_before_scope_and_cap() {
+        let block = |id, cmd: &str, output: &str, exit_code, duration_ms| BlockData {
+            id,
+            prompt: String::new(),
+            cmd: cmd.to_string(),
+            cmd_markup: None,
+            output: output.to_string(),
+            exit_code,
+            lifecycle_schema: crate::block_view::blocks::BLOCK_LIFECYCLE_SCHEMA,
+            completion_provenance: super::super::CompletionProvenance::ShellReported.into(),
+            start_mark_seen: !cmd.trim().is_empty(),
+            estimated_height: 1,
+            line_count: 1,
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms,
+            cwd: None,
+            cols: 80,
+        };
+        let unmarked_block = block(1, "first", "first output", Some(7), Some(2_000));
+        let marked_block = block(3, "", "background output", Some(9), Some(9_000));
+        let marked_metadata = CompletedCommandRecord {
+            id: 2,
+            cmd: "marked failed".to_string(),
+            exit_code: Some(7),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(2_000),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
+        };
+        let metadata_output = ZoneOutputSnapshot {
+            plain: "metadata output".to_string(),
+            truncated: false,
+        };
+        let records = || {
+            [
+                BackendRecordRef::Block(&unmarked_block),
+                BackendRecordRef::Metadata {
+                    record: &marked_metadata,
+                    snapshot: Some(&metadata_output),
+                },
+                BackendRecordRef::Block(&marked_block),
+            ]
+            .into_iter()
+        };
+        let mut bookmarks = BookmarkState::default();
+        bookmarks.toggle(2);
+        bookmarks.toggle(3);
+
+        let bookmarked = BlockFilters {
+            bookmarked_only: true,
+            ..Default::default()
+        };
+        let hits = metadata_filter_hits(
+            records(),
+            CrossBlockSearchScope::All,
+            1,
+            &bookmarked,
+            &bookmarks,
+        );
+        assert_eq!(
+            hits.iter().map(|hit| hit.block_id).collect::<Vec<_>>(),
+            [2],
+            "an earlier unbookmarked record cannot spend the one-hit cap"
+        );
+
+        let bookmarked_failed_slow = BlockFilters {
+            bookmarked_only: true,
+            failed_only: true,
+            slow_only: true,
+            slow_threshold_ms: 1_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            matching_record_ids(records(), "", &bookmarked_failed_slow, &bookmarks),
+            [2],
+            "bookmark, failure, and duration predicates compose with AND"
+        );
+
+        let bookmarked_background = BlockFilters {
+            bookmarked_only: true,
+            background_only: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            matching_record_ids(records(), "", &bookmarked_background, &bookmarks),
+            [3],
+            "BlockData commandlessness remains the Block backend's background identity"
+        );
+        assert!(metadata_filter_hits(
+            records(),
+            CrossBlockSearchScope::Command,
+            1,
+            &bookmarked_background,
+            &bookmarks,
+        )
+        .is_empty());
+
+        let impossible = BlockFilters {
+            bookmarked_only: true,
+            background_only: true,
+            failed_only: true,
+            ..Default::default()
+        };
+        assert!(matching_record_ids(records(), "", &impossible, &bookmarks).is_empty());
+    }
+
+    #[test]
+    fn bookmarked_empty_reason_distinguishes_retention_filters_scope_and_query() {
+        let foreground = CompletedCommandRecord {
+            id: 1,
+            cmd: "echo retained".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(20),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
+        };
+        let background = CompletedCommandRecord {
+            id: 2,
+            cmd: String::new(),
+            exit_code: None,
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            is_background: true,
+            completion_provenance: super::super::CompletionProvenance::Unknown,
+            start_mark_seen: false,
+        };
+        let background_output = ZoneOutputSnapshot {
+            plain: "retained output".to_string(),
+            truncated: false,
+        };
+        let records = || {
+            [
+                BackendRecordRef::Metadata {
+                    record: &foreground,
+                    snapshot: None,
+                },
+                BackendRecordRef::Metadata {
+                    record: &background,
+                    snapshot: Some(&background_output),
+                },
+            ]
+            .into_iter()
+        };
+        let bookmarked = BlockFilters {
+            bookmarked_only: true,
+            ..Default::default()
+        };
+        let mut bookmarks = BookmarkState::default();
+        bookmarks.toggle(99);
+        assert_eq!(
+            bookmarked_search_empty_reason(
+                records(),
+                "",
+                CrossBlockSearchScope::All,
+                &bookmarked,
+                &bookmarks,
+            ),
+            Some(BookmarkedSearchEmptyReason::NoRetainedBookmarks)
+        );
+
+        bookmarks.toggle(1);
+        let failed = BlockFilters {
+            bookmarked_only: true,
+            failed_only: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            bookmarked_search_empty_reason(
+                records(),
+                "",
+                CrossBlockSearchScope::All,
+                &failed,
+                &bookmarks,
+            ),
+            Some(BookmarkedSearchEmptyReason::MetadataMismatch)
+        );
+
+        bookmarks.toggle(2);
+        let only_background = BlockFilters {
+            bookmarked_only: true,
+            background_only: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            bookmarked_search_empty_reason(
+                records(),
+                "",
+                CrossBlockSearchScope::Command,
+                &only_background,
+                &bookmarks,
+            ),
+            Some(BookmarkedSearchEmptyReason::NoRetainedTextInScope)
+        );
+        assert_eq!(
+            bookmarked_search_empty_reason(
+                records(),
+                "needle",
+                CrossBlockSearchScope::All,
+                &bookmarked,
+                &bookmarks,
+            ),
+            Some(BookmarkedSearchEmptyReason::QueryNoMatches)
+        );
+        assert_eq!(
+            bookmarked_search_empty_reason(
+                records(),
+                "",
+                CrossBlockSearchScope::All,
+                &bookmarked,
+                &bookmarks,
+            ),
+            None,
+            "a scoped representative exists, so an empty query cannot be empty"
         );
     }
 
@@ -2826,17 +3187,22 @@ tail ab";
         };
 
         for scope in [CrossBlockSearchScope::All, CrossBlockSearchScope::Output] {
-            let hits = metadata_filter_hits(records(), scope, 1, &filters);
+            let hits =
+                metadata_filter_hits(records(), scope, 1, &filters, &BookmarkState::default());
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].block_id, 4);
             assert!(hits[0].is_output);
             assert_eq!(hits[0].line_no, 2);
             assert_eq!(hits[0].line_text, "retained background");
         }
-        assert!(
-            metadata_filter_hits(records(), CrossBlockSearchScope::Command, 10, &filters)
-                .is_empty()
-        );
+        assert!(metadata_filter_hits(
+            records(),
+            CrossBlockSearchScope::Command,
+            10,
+            &filters,
+            &BookmarkState::default(),
+        )
+        .is_empty());
         assert!(metadata_filter_hits(
             [BackendRecordRef::Metadata {
                 record: &metadata[2],
@@ -2845,6 +3211,7 @@ tail ab";
             CrossBlockSearchScope::All,
             10,
             &filters,
+            &BookmarkState::default(),
         )
         .is_empty());
 
@@ -2867,14 +3234,24 @@ tail ab";
             cols: 80,
         };
         let block_record = || [BackendRecordRef::Block(&block)];
-        let hits = metadata_filter_hits(block_record(), CrossBlockSearchScope::All, 1, &filters);
+        let hits = metadata_filter_hits(
+            block_record(),
+            CrossBlockSearchScope::All,
+            1,
+            &filters,
+            &BookmarkState::default(),
+        );
         assert_eq!(hits.len(), 1);
         assert!(hits[0].is_output);
         assert_eq!(hits[0].line_text, "retained block background");
-        assert!(
-            metadata_filter_hits(block_record(), CrossBlockSearchScope::Command, 1, &filters,)
-                .is_empty()
-        );
+        assert!(metadata_filter_hits(
+            block_record(),
+            CrossBlockSearchScope::Command,
+            1,
+            &filters,
+            &BookmarkState::default(),
+        )
+        .is_empty());
 
         let background_and_slow = BlockFilters {
             background_only: true,
@@ -2887,6 +3264,7 @@ tail ab";
             CrossBlockSearchScope::All,
             1,
             &background_and_slow,
+            &BookmarkState::default(),
         )
         .is_empty());
     }
@@ -2929,12 +3307,22 @@ tail ab";
         };
 
         assert_eq!(
-            matching_record_ids(records(), "needle", &BlockFilters::default()),
+            matching_record_ids(
+                records(),
+                "needle",
+                &BlockFilters::default(),
+                &BookmarkState::default(),
+            ),
             [1, 2],
             "id 1 matches by snapshot output, id 2 by command only"
         );
         assert_eq!(
-            matching_record_ids(records(), "haystack", &BlockFilters::default()),
+            matching_record_ids(
+                records(),
+                "haystack",
+                &BlockFilters::default(),
+                &BookmarkState::default(),
+            ),
             [1],
             "the evicted record no longer matches by output content"
         );

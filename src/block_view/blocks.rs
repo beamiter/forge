@@ -622,6 +622,7 @@ pub struct BlockFilters {
     pub failed_only: bool,
     pub slow_only: bool,
     pub background_only: bool,
+    pub bookmarked_only: bool,
     pub slow_threshold_ms: u64,
     pub use_regex: bool,
 }

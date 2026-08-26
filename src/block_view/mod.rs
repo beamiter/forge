@@ -2001,23 +2001,94 @@ impl BlockFilterKind {
 /// Keeping this transition pure makes the menu and keyboard entry points share
 /// exactly the same filter semantics.
 fn toggle_bookmark_membership(
-    bookmarks: &mut HashSet<u64>,
+    bookmarks: &mut BookmarkState,
     block_id: u64,
     active_filter: Option<BlockFilterKind>,
 ) -> (bool, Option<bool>) {
-    let now_bookmarked = if bookmarks.remove(&block_id) {
-        false
-    } else {
-        bookmarks.insert(block_id);
-        true
-    };
+    let now_bookmarked = bookmarks.toggle(block_id);
     (
         now_bookmarked,
         (active_filter == Some(BlockFilterKind::Bookmarked)).then_some(now_bookmarked),
     )
 }
 
-type BookmarkToggle = Rc<dyn Fn(u64)>;
+/// Pane-local bookmark membership. Runtime record ids are intentionally never
+/// serialized; the revision lets an already-open picker observe membership
+/// changes without cloning the set on every lightweight version probe.
+#[derive(Debug, Default)]
+struct BookmarkState {
+    ids: HashSet<u64>,
+    revision: u64,
+}
+
+impl BookmarkState {
+    fn contains(&self, id: u64) -> bool {
+        self.ids.contains(&id)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &u64> {
+        self.ids.iter()
+    }
+
+    fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Returns the new membership.
+    fn toggle(&mut self, id: u64) -> bool {
+        let now_bookmarked = if self.ids.remove(&id) {
+            false
+        } else {
+            self.ids.insert(id);
+            true
+        };
+        self.bump_revision();
+        now_bookmarked
+    }
+
+    fn remove(&mut self, id: u64) -> bool {
+        let removed = self.ids.remove(&id);
+        if removed {
+            self.bump_revision();
+        }
+        removed
+    }
+
+    fn remove_all(&mut self, ids: impl IntoIterator<Item = u64>) -> usize {
+        let mut removed = 0usize;
+        for id in ids {
+            removed += usize::from(self.ids.remove(&id));
+        }
+        if removed > 0 {
+            self.bump_revision();
+        }
+        removed
+    }
+
+    fn clear(&mut self) -> usize {
+        let removed = self.ids.len();
+        if removed > 0 {
+            self.ids.clear();
+            self.bump_revision();
+        }
+        removed
+    }
+
+    fn bump_revision(&mut self) {
+        self.revision = self.revision.saturating_add(1);
+    }
+}
+
+type SharedBookmarks = Rc<RefCell<BookmarkState>>;
+type BookmarkToggle = Rc<dyn Fn(u64) -> Option<bool>>;
+
+fn prune_retired_bookmarks(bookmarks: &mut BookmarkState, retired_ids: &[u64]) -> usize {
+    bookmarks.remove_all(retired_ids.iter().copied())
+}
 
 /// What the last removal took, and therefore how Undo has to put it back.
 ///
@@ -3138,7 +3209,7 @@ fn scroll_selected_finished_block_edge(
 #[derive(Clone, Copy)]
 struct BlockRemovalRefs<'a> {
     selection: BlockSelectionRefs<'a>,
-    bookmarks: &'a Rc<RefCell<std::collections::HashSet<u64>>>,
+    bookmarks: &'a SharedBookmarks,
     visible_indices: &'a Rc<RefCell<std::collections::HashSet<usize>>>,
     failure_marker_redraw: &'a dyn Fn(),
 }
@@ -3282,12 +3353,9 @@ fn evict_finished_block_prefix(
         refs.selection.anchor,
         &evicted_ids,
     );
-    {
-        let mut bookmarks = refs.bookmarks.borrow_mut();
-        for id in &evicted_ids {
-            bookmarks.remove(id);
-        }
-    }
+    refs.bookmarks
+        .borrow_mut()
+        .remove_all(evicted_ids.iter().copied());
     {
         let mut visible = refs.visible_indices.borrow_mut();
         *visible = visible
@@ -3340,7 +3408,7 @@ fn remove_finished_block(
     mutate_block_data_and_redraw(block_data, refs.failure_marker_redraw, |blocks| {
         blocks.retain(|block| block.id != block_id);
     });
-    refs.bookmarks.borrow_mut().remove(&block_id);
+    refs.bookmarks.borrow_mut().remove(block_id);
     // Virtual-scroll visibility is index-based, so shift every surviving index
     // above the removed position down by one.
     let mut visible = refs.visible_indices.borrow_mut();
@@ -3875,7 +3943,7 @@ impl BlockBackend {
                 vbox.append(&item);
             }
             {
-                let bookmarked = bookmarks_for_menu.borrow().contains(&block_id);
+                let bookmarked = bookmarks_for_menu.borrow().contains(block_id);
                 let item = make_item(if bookmarked {
                     "Remove Bookmark"
                 } else {
@@ -4989,7 +5057,10 @@ pub struct TermView {
     /// the record this view last navigated to, so next/previous can advance.
     navigated_record_id: Cell<Option<u64>>,
     selection_anchor_id: Rc<Cell<Option<u64>>>,
-    bookmarks: Rc<RefCell<std::collections::HashSet<u64>>>,
+    bookmarks: SharedBookmarks,
+    /// Shared backend-neutral transition. It validates/synchronizes Block card
+    /// chrome and also accepts live Unified metadata ids.
+    toggle_bookmark: BookmarkToggle,
     /// Find-within-blocks state: every match across the finished blocks plus a
     /// cursor into it, so Ctrl+F highlights all hits and Next/Prev step through
     /// them (Warp's FindWithinBlock). Tags are stripped on close via clear_find.
@@ -6058,7 +6129,7 @@ struct BlockBackend {
     selected_block_ids_rc: SelectedBlockIds,
     selected_block_id_rc: Rc<Cell<Option<u64>>>,
     selection_anchor_id_rc: Rc<Cell<Option<u64>>>,
-    bookmarks_for_cb: Rc<RefCell<std::collections::HashSet<u64>>>,
+    bookmarks_for_cb: SharedBookmarks,
     /// Shared menu/keyboard transition, including reconciliation of an active
     /// Bookmarked pane filter.
     toggle_bookmark: BookmarkToggle,
@@ -8293,7 +8364,7 @@ impl RenderBackend for BlockBackend {
         if let Some(kind) = self.block_filter_for_cb.get() {
             let belongs = match kind {
                 BlockFilterKind::Bookmarked => {
-                    self.bookmarks_for_cb.borrow().contains(&finished_clone.id)
+                    self.bookmarks_for_cb.borrow().contains(finished_clone.id)
                 }
                 BlockFilterKind::Failed => {
                     BlockOutcome::classify(Some(cmd), record.exit_code).is_failure()
@@ -8781,6 +8852,9 @@ struct UnifiedBackend {
     /// bounded output snapshot captured at finalize; the terminal text
     /// remains on `vte`, so no finished widget is mounted.
     zones: Rc<RefCell<UnifiedZoneStore>>,
+    /// Pane-local runtime bookmark state shared with TermView and the picker.
+    /// Only record-table retirement prunes ids; snapshot/chrome eviction does not.
+    bookmarks: SharedBookmarks,
     /// Per-pane, fail-closed marker state. Its bytes are fed directly to VTE
     /// inside this backend, so they never enter prompt/command/output capture.
     zone_marker: Rc<RefCell<ZoneMarkerInjector>>,
@@ -9107,6 +9181,7 @@ impl RenderBackend for UnifiedBackend {
                 }
                 store.enforce_snapshot_budget(MAX_TOTAL_SNAPSHOT_BYTES);
                 drop(store);
+                prune_retired_bookmarks(&mut self.bookmarks.borrow_mut(), &retired);
                 self.chrome.retire_ids(&retired);
             }
             restored += 1;
@@ -9188,6 +9263,7 @@ impl RenderBackend for UnifiedBackend {
             zones.enforce_snapshot_budget(MAX_TOTAL_SNAPSHOT_BYTES);
             retired
         };
+        prune_retired_bookmarks(&mut self.bookmarks.borrow_mut(), &retired_record_ids);
         self.chrome.retire_ids(&retired_record_ids);
         self.chrome.enforce_limit(max_zones);
         self.chrome
@@ -10236,7 +10312,7 @@ struct KeyCtx {
     selected_block_id_for_key: Rc<Cell<Option<u64>>>,
     selection_anchor_id_for_key: Rc<Cell<Option<u64>>>,
     block_scroll_for_key: glib::WeakRef<ScrolledWindow>,
-    bookmarks_for_key: Rc<RefCell<std::collections::HashSet<u64>>>,
+    bookmarks_for_key: SharedBookmarks,
     toggle_bookmark_for_key: BookmarkToggle,
     visible_indices_for_key: Rc<RefCell<std::collections::HashSet<usize>>>,
     failure_marker_redraw_for_key: FailureMarkerRedraw,
@@ -10703,7 +10779,7 @@ impl KeyCtx {
                 let marked_idx: Vec<usize> = finished
                     .iter()
                     .enumerate()
-                    .filter(|(_, b)| marks.contains(&b.id))
+                    .filter(|(_, b)| marks.contains(b.id))
                     .map(|(i, _)| i)
                     .collect();
                 if marked_idx.is_empty() {
@@ -11591,8 +11667,7 @@ impl TermView {
         let selection_anchor_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         // Bookmarked block ids (in-memory for the session). Toggled with Ctrl+Shift+B;
         // navigated with Ctrl+,/Ctrl+.. Not persisted (avoids an rkyv schema bump).
-        let block_bookmarks: Rc<RefCell<std::collections::HashSet<u64>>> =
-            Rc::new(RefCell::new(std::collections::HashSet::new()));
+        let block_bookmarks: SharedBookmarks = Rc::new(RefCell::new(BookmarkState::default()));
         {
             let target = sticky_target_id.clone();
             let finished = finished_blocks_rc.clone();
@@ -11728,6 +11803,8 @@ impl TermView {
         // retaining their own pane tree.
         let toggle_bookmark: BookmarkToggle = {
             let bookmarks = block_bookmarks.clone();
+            let unified_records = unified_records.clone();
+            let is_unified = unified;
             let block_filter = block_filter.clone();
             let finished = Rc::downgrade(&finished_blocks_rc);
             let block_data = block_data_rc.clone();
@@ -11744,13 +11821,17 @@ impl TermView {
             let block_list = block_list.downgrade();
             let redraw = failure_marker_redraw.clone();
             Rc::new(move |block_id| {
-                let Some(finished) = finished.upgrade() else {
-                    return;
-                };
+                if is_unified {
+                    let exists = unified_records
+                        .borrow()
+                        .records
+                        .iter()
+                        .any(|record| record.id == block_id);
+                    return exists.then(|| bookmarks.borrow_mut().toggle(block_id));
+                }
+                let finished = finished.upgrade()?;
                 let finished_ref = finished.borrow();
-                let Some(index) = finished_ref.iter().position(|card| card.id == block_id) else {
-                    return;
-                };
+                let index = finished_ref.iter().position(|card| card.id == block_id)?;
                 let active_filter = block_filter.get();
                 let (now_bookmarked, filtered_keep) = toggle_bookmark_membership(
                     &mut bookmarks.borrow_mut(),
@@ -11796,7 +11877,7 @@ impl TermView {
                 drop(finished_ref);
 
                 if filtered_keep.is_none() {
-                    return;
+                    return Some(now_bookmarked);
                 }
                 if let (Some(find_state), Some(active_vte)) =
                     (find_state.upgrade(), active_vte.upgrade())
@@ -11810,7 +11891,7 @@ impl TermView {
                 // ignored by the ordinary resize listener.
                 let (Some(scroll), Some(block_list)) = (scroll.upgrade(), block_list.upgrade())
                 else {
-                    return;
+                    return Some(now_bookmarked);
                 };
                 let adjustment = scroll.vadjustment();
                 let next = {
@@ -11824,7 +11905,7 @@ impl TermView {
                 };
                 let Some(next) = next else {
                     block_list.queue_allocate();
-                    return;
+                    return Some(now_bookmarked);
                 };
                 *viewport.borrow_mut() = next.clone();
                 let new_visible = visible_indices_for_viewport(&next);
@@ -11833,6 +11914,7 @@ impl TermView {
                 let mut data = block_data.borrow_mut();
                 apply_visible_indices(&finished_ref, &mut data, &mut visible_ref, new_visible);
                 block_list.queue_allocate();
+                Some(now_bookmarked)
             })
         };
 
@@ -11930,6 +12012,7 @@ impl TermView {
                     prompt_anchor_tick_id_rc: prompt_anchor_tick_id.clone(),
                     find_state_for_cb: find_state.clone(),
                     zones: unified_records.clone(),
+                    bookmarks: block_bookmarks.clone(),
                     zone_marker,
                     chrome,
                     image_layer,
@@ -12962,6 +13045,7 @@ impl TermView {
             navigated_record_id: Cell::new(None),
             selection_anchor_id,
             bookmarks: block_bookmarks,
+            toggle_bookmark,
             find_state,
             current_cwd: current_cwd.clone(),
             session_id: session_id_owned,
@@ -14700,7 +14784,7 @@ impl TermView {
     /// Whether a card belongs in the stream under `kind`.
     fn block_matches_filter(&self, kind: BlockFilterKind, block_id: u64) -> bool {
         match kind {
-            BlockFilterKind::Bookmarked => self.bookmarks.borrow().contains(&block_id),
+            BlockFilterKind::Bookmarked => self.bookmarks.borrow().contains(block_id),
             BlockFilterKind::Failed => self.get_failed_blocks().contains(&block_id),
             BlockFilterKind::Slow => self
                 .get_slow_blocks(SLOW_BLOCK_THRESHOLD_MS)
@@ -14832,7 +14916,7 @@ impl TermView {
         if let Some((idx, _)) = finished
             .iter()
             .enumerate()
-            .find(|(_, block)| bookmarks.contains(&block.id))
+            .find(|(_, block)| bookmarks.contains(block.id))
         {
             drop(bookmarks);
             drop(finished);
@@ -14849,7 +14933,7 @@ impl TermView {
         let marked: Vec<usize> = finished
             .iter()
             .enumerate()
-            .filter(|(_, block)| bookmarks.contains(&block.id))
+            .filter(|(_, block)| bookmarks.contains(block.id))
             .map(|(idx, _)| idx)
             .collect();
         if marked.is_empty() {
@@ -16211,6 +16295,48 @@ mod tests {
         record_unified_zone(&mut zones, record(4, "fourth"), 0);
         assert_eq!(zones.records.len(), 1);
         assert_eq!(zones.records[0].id, 4);
+    }
+
+    #[test]
+    fn unified_bookmarks_follow_record_retention_not_snapshot_eviction() {
+        let record = |id: u64| CompletedCommandRecord {
+            id,
+            cmd: format!("command-{id}"),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
+        };
+        let mut zones = UnifiedZoneStore::new();
+        record_unified_zone(&mut zones, record(1), 2);
+        zones.insert_snapshot(
+            1,
+            ZoneOutputSnapshot {
+                plain: "retained output".to_string(),
+                truncated: false,
+            },
+        );
+        record_unified_zone(&mut zones, record(2), 2);
+
+        let mut bookmarks = super::BookmarkState::default();
+        bookmarks.toggle(1);
+        bookmarks.toggle(2);
+        let revision_before_snapshot_eviction = bookmarks.revision();
+        zones.enforce_snapshot_budget(0);
+        assert!(bookmarks.contains(1));
+        assert!(bookmarks.contains(2));
+        assert_eq!(bookmarks.revision(), revision_before_snapshot_eviction);
+
+        let retired = record_unified_zone(&mut zones, record(3), 2);
+        assert_eq!(retired, [1]);
+        assert_eq!(super::prune_retired_bookmarks(&mut bookmarks, &retired), 1);
+        assert!(!bookmarks.contains(1));
+        assert!(bookmarks.contains(2));
+        assert_eq!(bookmarks.revision(), revision_before_snapshot_eviction + 1);
     }
 
     /// The global budget only ever removes snapshot BYTES, oldest record
@@ -18784,7 +18910,7 @@ mod tests {
 
     #[test]
     fn bookmark_mutation_reconciles_an_active_bookmark_filter() {
-        let mut bookmarks = HashSet::new();
+        let mut bookmarks = super::BookmarkState::default();
 
         assert_eq!(
             super::toggle_bookmark_membership(
@@ -18811,6 +18937,32 @@ mod tests {
             (true, None),
             "other filters are unaffected by bookmark membership"
         );
+    }
+
+    #[test]
+    fn bookmark_revision_changes_once_per_real_set_mutation() {
+        let mut bookmarks = super::BookmarkState::default();
+        assert_eq!(bookmarks.revision(), 0);
+
+        assert!(bookmarks.toggle(7));
+        assert_eq!(bookmarks.revision(), 1);
+        assert!(!bookmarks.remove(99));
+        assert_eq!(
+            bookmarks.revision(),
+            1,
+            "a no-op removal cannot churn search"
+        );
+
+        assert!(bookmarks.toggle(9));
+        assert_eq!(bookmarks.revision(), 2);
+        assert_eq!(bookmarks.remove_all([7, 9, 100]), 2);
+        assert_eq!(
+            bookmarks.revision(),
+            3,
+            "one bulk retirement is one observable revision"
+        );
+        assert_eq!(bookmarks.clear(), 0);
+        assert_eq!(bookmarks.revision(), 3);
     }
 
     #[test]

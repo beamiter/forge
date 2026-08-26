@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 4.1)
+Updated: 2026-08-26 (Block Search 4.2)
 
 This working tree contains the nine-round "Evolve ASCII organism" series
 (`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
@@ -18,6 +18,18 @@ every round (attribution races, a Drop panic on a fired glib source, a
 saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
+
+- **Block Search 4.2 (2026-08-26)**: Cross Block Search now has a Reset-aware
+  Bookmarked metadata toggle that composes with Failed/Slow/Background before
+  scope and the 500-hit cap, including empty-query browsing. A pane-local,
+  runtime-only `BookmarkState` centralizes membership and a monotonic revision;
+  both Block and Unified results can toggle it from an accessible row star or
+  selected-hit `Ctrl+Shift+B`. The physical-keycode latch suppresses repeat and
+  modifier-release leakage, while successful toggles preserve selection and
+  rebuild all duplicate rows. Block reuses its card toggle so star/CSS and an
+  active Bookmarked card filter stay synchronized. Unified prunes only record
+  ids actually retired by `record_unified_zone`; snapshot/chrome eviction does
+  not remove membership. Nothing is serialized or restored.
 
 - **Block Search 4.1 (2026-08-26)**: the GTK metadata row now includes a
   process-local, Reset-aware Background filter. Block records use

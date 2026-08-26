@@ -1394,7 +1394,7 @@ pub fn run() -> glib::ExitCode {
 
             let action = chord.as_ref().and_then(|chord| {
                 let bindings = ui_clone.keybinding_map.borrow();
-                bindings.lookup(&chord).or_else(|| {
+                bindings.lookup(chord).or_else(|| {
                     // Alt modifies Copy into "copy block output". The binding
                     // map is intentionally exact, so retry only this one
                     // documented variant without Alt instead of making every

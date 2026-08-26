@@ -342,11 +342,13 @@ reducer、不新增落盘字段；repo 无法验证或身份切换中时使用�
 `PageUp/PageDown` 每次移动十条。列表会跟随选择滚动，但焦点仍留在查询框。
 `Enter` 定位后关闭面板；`Shift+Enter` 成功定位实时终端结果后保持面板并自动选中下一条。
 快照结果仍进入快照窗口，已经失效的结果不会关闭或前进。
-再次打开会恢复本进程内上次有效的查询、匹配选项、范围及 Failed/Slow 筛选（不会写入配置或会话
-快照）；`Ctrl+U` 只清空查询，**Reset** 或 `Ctrl+Shift+U` 一次恢复查询、匹配开关、范围及两个
+再次打开会恢复本进程内上次有效的查询、匹配选项、范围及 Failed/Slow/Bookmarked/Background
+筛选（不会写入配置或会话快照）；`Ctrl+U` 只清空查询，**Reset** 或 `Ctrl+Shift+U` 一次恢复
+查询、匹配开关、范围及四个
 元数据筛选的默认值。超过 8 KiB
 的无效查询不会进入这份内存；鼠标修改控件后焦点会自动回到查询框，可直接继续输入。
-打开期间会以 500 ms 的轻量版本探针感知新完成块与 retention 轮换，再防抖更新结果；仍存在的
+打开期间会以 500 ms 的轻量版本探针感知新完成块、retention 轮换与 bookmark revision，再防抖
+更新结果；仍存在的
 稳定命中保持选中，探针本身不复制命令或输出文本。
 Block Search 3.8 在该命中已被淘汰时回退到最接近的原排名，避免刷新后跳到列表顶部；主动修改
 查询、匹配选项或范围仍会明确从第一项重新开始。按 `F5` 可立即重建当前索引而不改变查询意图
@@ -374,6 +376,14 @@ Block Search 4.1 新增 **Background** 元数据筛选。传统 Block 以后台�
 合成占位结果。筛选与范围继续在 500 条上限之前执行。该开关参与进程内记忆、关闭/重开和 Reset。
 Cross Block Search 的关闭动画期间仍由当前 dialog 占用唯一 slot；其自身 `closed` 到达后才释放，
 快速关闭、松键、再按打开不会让旧回调清除新面板。
+Block Search 4.2 新增 **Bookmarked** 元数据筛选。它与 Failed、Slow、Background 按 AND
+组合，筛选与范围都在 500 条上限之前执行；空查询也可浏览当前 pane 的书签。每个结果行都显示
+`☆` / `★` 切换按钮，或在选中结果上按 `Ctrl+Shift+B`；一次物理按键只切换一次，长按和中途
+松开修饰键不会反复切换或把 `b` 写进查询框。Block 卡片星标、CSS、Bookmarked 卡片筛选和搜索
+结果使用同一集中状态，Unified 结果也能创建书签。书签集合只存在于当前 pane 的运行期内，不会
+写入配置、历史或 session restore；Reset 只关闭 Bookmarked 搜索筛选而不删除集合。打开的面板
+通过 bookmark revision 自动刷新；Unified 只有在真实记录被 retention 淘汰时才清理对应 id，
+输出快照或 chrome marker 淘汰不会丢失书签。
 
 选择语义与 anvil 对齐：
 
