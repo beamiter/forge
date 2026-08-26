@@ -33,6 +33,7 @@ type RemoteHostEditTarget = (usize, String);
 const CROSS_BLOCK_SEARCH_LIMIT: usize = 500;
 const CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES: usize = 8 * 1024;
 const CROSS_BLOCK_SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
+const CROSS_BLOCK_SEARCH_PAGE_STEP: usize = 10;
 /// A ListBox owns one widget tree per row; unlike ListView it does not recycle
 /// off-screen rows. Keep this palette intentionally small until it moves to a
 /// virtualized model, regardless of the much larger on-disk retention limit.
@@ -72,14 +73,82 @@ fn cross_block_search_query_error(query: &str) -> Option<&'static str> {
         .then_some("Query is too long (maximum 8 KiB).")
 }
 
-fn cross_block_search_status_for_match_count(total: usize) -> String {
+fn cross_block_search_status(total: usize, selected: Option<usize>) -> String {
     if total == 0 {
         "No matches.".to_string()
-    } else if total == CROSS_BLOCK_SEARCH_LIMIT {
-        format!("{CROSS_BLOCK_SEARCH_LIMIT} matches (capped) — refine your query.")
     } else {
-        format!("{total} matches")
+        let noun = if total == 1 { "match" } else { "matches" };
+        let position = selected
+            .filter(|index| *index < total)
+            .map(|index| format!("{} of ", index + 1))
+            .unwrap_or_default();
+        if total == CROSS_BLOCK_SEARCH_LIMIT {
+            format!("{position}{total} {noun} (capped) — refine your query.")
+        } else {
+            format!("{position}{total} {noun}")
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrossBlockSelectionMove {
+    First,
+    Previous,
+    Next,
+    PagePrevious,
+    PageNext,
+    Last,
+}
+
+fn cross_block_selection_index(
+    current: Option<usize>,
+    total: usize,
+    movement: CrossBlockSelectionMove,
+) -> Option<usize> {
+    if total == 0 {
+        return None;
+    }
+    let Some(current) = current.filter(|index| *index < total) else {
+        return Some(match movement {
+            CrossBlockSelectionMove::Previous | CrossBlockSelectionMove::Last => total - 1,
+            _ => 0,
+        });
+    };
+    Some(match movement {
+        CrossBlockSelectionMove::First => 0,
+        CrossBlockSelectionMove::Previous => (current + total - 1) % total,
+        CrossBlockSelectionMove::Next => (current + 1) % total,
+        CrossBlockSelectionMove::PagePrevious => {
+            current.saturating_sub(CROSS_BLOCK_SEARCH_PAGE_STEP)
+        }
+        CrossBlockSelectionMove::PageNext => current
+            .saturating_add(CROSS_BLOCK_SEARCH_PAGE_STEP)
+            .min(total - 1),
+        CrossBlockSelectionMove::Last => total - 1,
+    })
+}
+
+/// Keep keyboard selection visible while focus remains in the query entry.
+fn scroll_cross_block_row_into_view(scrolled: &gtk4::ScrolledWindow, row: &impl IsA<gtk4::Widget>) {
+    let Some(bounds) = row.compute_bounds(scrolled) else {
+        return;
+    };
+    let adjustment = scrolled.vadjustment();
+    let page = adjustment.page_size();
+    let top = bounds.y() as f64;
+    let bottom = top + bounds.height() as f64;
+    let shift = if top < 0.0 {
+        top
+    } else if bottom > page {
+        bottom - page
+    } else {
+        return;
+    };
+    let target = (adjustment.value() + shift).clamp(
+        adjustment.lower(),
+        (adjustment.upper() - page).max(adjustment.lower()),
+    );
+    adjustment.set_value(target);
 }
 
 fn cross_block_search_jump_unavailable_status() -> &'static str {
@@ -1008,6 +1077,18 @@ impl UiState {
         let pending_rebuild: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
         let search_generation = Rc::new(Cell::new(0u64));
 
+        {
+            let hits = hits.clone();
+            let status_label = status_label.clone();
+            list_box.connect_row_selected(move |_, row| {
+                let total = hits.borrow().len();
+                status_label.set_text(&cross_block_search_status(
+                    total,
+                    row.map(|row| row.index() as usize),
+                ));
+            });
+        }
+
         let rebuild = {
             let term_view = term_view.clone();
             let list_box = list_box.clone();
@@ -1048,7 +1129,7 @@ impl UiState {
                 ) {
                     Ok(results) => {
                         let total = results.len();
-                        status_label.set_text(&cross_block_search_status_for_match_count(total));
+                        status_label.set_text(&cross_block_search_status(total, None));
                         let jumpable = term_view.jumpable_search_hits(&results);
                         for hit in results.iter() {
                             let can_jump = jumpable.contains(&(hit.block_id, hit.is_output));
@@ -1226,6 +1307,8 @@ impl UiState {
         key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let dialog_ref = self.cross_block_search_dialog.clone();
         let list_box_for_key = list_box.clone();
+        let scrolled_for_key = scrolled.clone();
+        let hits_for_key = hits.clone();
         let jump_for_key = jump.clone();
         let apply_for_key = apply_jump_outcome.clone();
         let case_toggle_for_key = case_toggle.clone();
@@ -1269,39 +1352,27 @@ impl UiState {
                 }
                 return true.into();
             }
-            if keyval == Key::Down {
-                let current = list_box_for_key
-                    .selected_row()
-                    .map(|r| r.index())
-                    .unwrap_or(-1);
-                let mut next = current + 1;
-                while let Some(row) = list_box_for_key.row_at_index(next) {
-                    if row.is_visible() {
-                        list_box_for_key.select_row(Some(&row));
-                        break;
-                    }
-                    next += 1;
+            let movement = match keyval {
+                Key::Home | Key::KP_Home => CrossBlockSelectionMove::First,
+                Key::Up => CrossBlockSelectionMove::Previous,
+                Key::Down => CrossBlockSelectionMove::Next,
+                Key::Page_Up => CrossBlockSelectionMove::PagePrevious,
+                Key::Page_Down => CrossBlockSelectionMove::PageNext,
+                Key::End | Key::KP_End => CrossBlockSelectionMove::Last,
+                _ => return false.into(),
+            };
+            let current = list_box_for_key
+                .selected_row()
+                .map(|row| row.index() as usize);
+            if let Some(next) =
+                cross_block_selection_index(current, hits_for_key.borrow().len(), movement)
+            {
+                if let Some(row) = list_box_for_key.row_at_index(next as i32) {
+                    list_box_for_key.select_row(Some(&row));
+                    scroll_cross_block_row_into_view(&scrolled_for_key, &row);
                 }
-                return true.into();
             }
-            if keyval == Key::Up {
-                let current = list_box_for_key
-                    .selected_row()
-                    .map(|r| r.index())
-                    .unwrap_or(0);
-                let mut prev = current - 1;
-                while prev >= 0 {
-                    if let Some(row) = list_box_for_key.row_at_index(prev) {
-                        if row.is_visible() {
-                            list_box_for_key.select_row(Some(&row));
-                            break;
-                        }
-                    }
-                    prev -= 1;
-                }
-                return true.into();
-            }
-            false.into()
+            true.into()
         });
         dialog.add_controller(key_controller);
 
@@ -3141,10 +3212,10 @@ mod tests {
     use super::{
         cross_block_jump_outcome, cross_block_search_dialog_title, cross_block_search_idle_status,
         cross_block_search_jump_unavailable_status, cross_block_search_pending_status,
-        cross_block_search_query_error, cross_block_search_status_for_match_count,
+        cross_block_search_query_error, cross_block_search_status, cross_block_selection_index,
         preferences_group_title, record_snapshot_dialog_title, record_snapshot_status_line,
         record_snapshot_unavailable_message, remote_picker_guard, CrossBlockJumpOutcome,
-        CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
+        CrossBlockSelectionMove, CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
     use crate::block_view::{RecordNavigationResult, RecordSnapshotView};
 
@@ -3201,15 +3272,56 @@ mod tests {
             "Type to search across blocks."
         );
         assert_eq!(cross_block_search_pending_status(), "Searching blocks…");
-        assert_eq!(cross_block_search_status_for_match_count(0), "No matches.");
+        assert_eq!(cross_block_search_status(0, None), "No matches.");
         assert_eq!(
-            cross_block_search_status_for_match_count(CROSS_BLOCK_SEARCH_LIMIT),
+            cross_block_search_status(CROSS_BLOCK_SEARCH_LIMIT, None),
             "500 matches (capped) — refine your query."
         );
-        assert_eq!(cross_block_search_status_for_match_count(37), "37 matches");
+        assert_eq!(cross_block_search_status(37, None), "37 matches");
+        assert_eq!(cross_block_search_status(1, Some(0)), "1 of 1 match");
+        assert_eq!(
+            cross_block_search_status(CROSS_BLOCK_SEARCH_LIMIT, Some(36)),
+            "37 of 500 matches (capped) — refine your query."
+        );
         assert_eq!(
             cross_block_search_jump_unavailable_status(),
             "This result is searchable, but its exact terminal location is not available yet."
+        );
+    }
+
+    #[test]
+    fn cross_block_selection_wraps_and_pages_within_bounds() {
+        use CrossBlockSelectionMove as Move;
+
+        assert_eq!(cross_block_selection_index(None, 0, Move::Next), None);
+        assert_eq!(cross_block_selection_index(None, 37, Move::Next), Some(0));
+        assert_eq!(
+            cross_block_selection_index(None, 37, Move::Previous),
+            Some(36)
+        );
+        assert_eq!(
+            cross_block_selection_index(Some(36), 37, Move::Next),
+            Some(0)
+        );
+        assert_eq!(
+            cross_block_selection_index(Some(0), 37, Move::Previous),
+            Some(36)
+        );
+        assert_eq!(
+            cross_block_selection_index(Some(21), 37, Move::First),
+            Some(0)
+        );
+        assert_eq!(
+            cross_block_selection_index(Some(2), 37, Move::Last),
+            Some(36)
+        );
+        assert_eq!(
+            cross_block_selection_index(Some(23), 37, Move::PagePrevious),
+            Some(13)
+        );
+        assert_eq!(
+            cross_block_selection_index(Some(31), 37, Move::PageNext),
+            Some(36)
         );
     }
 
