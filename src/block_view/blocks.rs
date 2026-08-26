@@ -524,6 +524,19 @@ impl BlockOutcome {
         }
     }
 
+    /// Classify a record whose owning backend has already established that it
+    /// represents a command lifecycle. This deliberately does not inspect
+    /// command text: metadata identity remains authoritative even if a legacy
+    /// foreground record has lost that display field.
+    pub(crate) fn classify_foreground(exit_code: Option<i32>) -> Self {
+        match exit_code {
+            Some(0) => Self::Success,
+            Some(code) if Self::interrupt_signal(code).is_some() => Self::Interrupted(code),
+            Some(code) => Self::Failure(code),
+            None => Self::Unknown,
+        }
+    }
+
     /// Whether this outcome counts as a failure for the scrollbar ticks, the
     /// Failed filter and failure navigation.
     pub(crate) const fn is_failure(self) -> bool {
@@ -608,6 +621,7 @@ pub struct BlockFilters {
     pub max_duration_ms: Option<u64>,
     pub failed_only: bool,
     pub slow_only: bool,
+    pub background_only: bool,
     pub slow_threshold_ms: u64,
     pub use_regex: bool,
 }

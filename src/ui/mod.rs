@@ -3,7 +3,7 @@ use gtk4::Notebook;
 use gtk4::{CssProvider, ScrolledWindow, SearchBar, SearchEntry, Stack, ToggleButton};
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use vte4::Terminal;
@@ -67,6 +67,56 @@ pub(crate) const FONT_PERSIST_DEBOUNCE: std::time::Duration = std::time::Duratio
 pub(crate) const CONFIG_PERSIST_DEBOUNCE: std::time::Duration =
     std::time::Duration::from_millis(250);
 pub(crate) const CONFIG_PERSIST_OPERATION: &str = "Save settings";
+
+/// One configured `block:search` key press can toggle the picker at most once.
+///
+/// `AdwDialog` is a widget overlay inside the application window, so its key
+/// events normally traverse the window's capture controller first. Keep this
+/// state on [`UiState`] rather than on either controller: the opener press is
+/// then visible to the dialog controller as a defensive fallback, and the
+/// matching physical release can clear it no matter which surface owns focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CrossBlockSearchToggleRoute {
+    Open,
+    Close,
+    SuppressRepeat,
+    Proceed,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CrossBlockSearchToggleLatch {
+    held_keycodes: HashSet<u32>,
+}
+
+impl CrossBlockSearchToggleLatch {
+    pub(crate) fn press(
+        &mut self,
+        keycode: u32,
+        is_toggle: bool,
+        dialog_open: bool,
+    ) -> CrossBlockSearchToggleRoute {
+        if !self.held_keycodes.insert(keycode) {
+            CrossBlockSearchToggleRoute::SuppressRepeat
+        } else if !is_toggle {
+            // Ordinary keys must keep their normal repeat behavior. Only a
+            // physical key that first matched the toggle belongs in the latch.
+            self.held_keycodes.remove(&keycode);
+            CrossBlockSearchToggleRoute::Proceed
+        } else if dialog_open {
+            CrossBlockSearchToggleRoute::Close
+        } else {
+            CrossBlockSearchToggleRoute::Open
+        }
+    }
+
+    pub(crate) fn release(&mut self, keycode: u32) {
+        self.held_keycodes.remove(&keycode);
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.held_keycodes.clear();
+    }
+}
 
 pub(crate) struct ZoomState {
     pub(crate) swap: ZoomPageSwap,
@@ -252,6 +302,10 @@ pub(crate) struct UiState {
     pub(crate) remote_picker_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) history_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) cross_block_search_dialog: Rc<RefCell<Option<adw::Dialog>>>,
+    /// Window/dialog-shared physical-key latch for the configurable picker
+    /// toggle. It deliberately survives dialog close until key release so a
+    /// repeat cannot reopen a picker that the fresh press just closed.
+    pub(crate) cross_block_search_toggle_latch: Rc<RefCell<CrossBlockSearchToggleLatch>>,
     /// Window-lifetime, memory-only search intent; never persisted in config
     /// or workspace snapshots.
     pub(crate) cross_block_search_memory: Rc<RefCell<dialogs::CrossBlockSearchMemory>>,
@@ -311,4 +365,65 @@ pub(crate) struct UiState {
     /// Suppresses divider notifications caused by restoring a configured
     /// width; only user-driven positions should flow back into Config.
     pub(crate) ai_panel_width_restoring: Rc<Cell<bool>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CrossBlockSearchToggleLatch, CrossBlockSearchToggleRoute};
+
+    #[test]
+    fn cross_block_search_toggle_routes_once_per_physical_press() {
+        use CrossBlockSearchToggleRoute::{Close, Open, Proceed, SuppressRepeat};
+
+        let mut latch = CrossBlockSearchToggleLatch::default();
+        assert_eq!(latch.press(42, true, false), Open);
+        assert_eq!(
+            latch.press(42, true, true),
+            SuppressRepeat,
+            "the opener's first repeat must not close the new dialog"
+        );
+        assert_eq!(
+            latch.press(42, false, true),
+            SuppressRepeat,
+            "dropping the toggle modifiers must not leak a repeated character"
+        );
+
+        latch.release(42);
+        assert_eq!(latch.press(42, true, true), Close);
+        assert_eq!(
+            latch.press(42, true, false),
+            SuppressRepeat,
+            "a repeat after close must not reopen the dialog"
+        );
+
+        latch.release(42);
+        assert_eq!(
+            latch.press(42, true, true),
+            Close,
+            "until closed releases the slot, a fresh press must close the claimed dialog again"
+        );
+        latch.release(42);
+        assert_eq!(latch.press(42, false, false), Proceed);
+        assert_eq!(
+            latch.press(42, false, false),
+            Proceed,
+            "fresh non-toggle repeats retain ordinary input semantics"
+        );
+        assert_eq!(latch.press(42, true, false), Open);
+    }
+
+    #[test]
+    fn cross_block_search_toggle_tracks_physical_keycodes_and_resets_on_deactivate() {
+        use CrossBlockSearchToggleRoute::{Close, Open, SuppressRepeat};
+
+        let mut latch = CrossBlockSearchToggleLatch::default();
+        assert_eq!(latch.press(7, true, false), Open);
+        assert_eq!(latch.press(8, true, true), Close);
+        assert_eq!(latch.press(7, true, true), SuppressRepeat);
+        latch.release(8);
+        assert_eq!(latch.press(8, true, false), Open);
+
+        latch.reset();
+        assert_eq!(latch.press(7, true, true), Close);
+    }
 }

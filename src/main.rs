@@ -64,7 +64,7 @@ fn shortcut_modifiers(state: ModifierType) -> ModifierType {
 /// - Letters and symbols go through `Key::to_unicode()` and are lowercased,
 ///   matching the chord core's storage invariant.
 /// - `F1`..`F24` are recognized via the keysym name.
-fn chord_from_gdk(keyval: Key, state: ModifierType) -> Option<Chord> {
+pub(crate) fn chord_from_gdk(keyval: Key, state: ModifierType) -> Option<Chord> {
     let masked = shortcut_modifiers(state);
     let mods = Mods {
         ctrl: masked.contains(ModifierType::CONTROL_MASK),
@@ -1053,6 +1053,7 @@ pub fn run() -> glib::ExitCode {
             remote_picker_dialog: Rc::new(RefCell::new(None)),
             history_palette_dialog: Rc::new(RefCell::new(None)),
             cross_block_search_dialog: Rc::new(RefCell::new(None)),
+            cross_block_search_toggle_latch: Rc::new(RefCell::new(Default::default())),
             cross_block_search_memory: Rc::new(RefCell::new(Default::default())),
             workflows_palette_dialog: Rc::new(RefCell::new(None)),
             settings_dialog: Rc::new(RefCell::new(None)),
@@ -1384,18 +1385,14 @@ pub fn run() -> glib::ExitCode {
             // Composer Enter semantics must win over optional user-defined
             // global bindings. The focused TextView controller also gives IME
             // candidate confirmation first refusal.
-            if ui_clone.ai_panel.handles_enter_key()
+            let composer_owns_enter = ui_clone.ai_panel.handles_enter_key()
                 && matches!(keyval, Key::Return | Key::KP_Enter)
-            {
-                return false.into();
-            }
+            ;
             // The gdk edge folds the event into the shared chord form
             // (masked modifiers, ISO_Left_Tab → Tab, lowercased unicode).
-            let Some(chord) = chord_from_gdk(keyval, state) else {
-                return false.into();
-            };
+            let chord = chord_from_gdk(keyval, state);
 
-            let action = {
+            let action = chord.as_ref().and_then(|chord| {
                 let bindings = ui_clone.keybinding_map.borrow();
                 bindings.lookup(&chord).or_else(|| {
                     // Alt modifies Copy into "copy block output". The binding
@@ -1416,6 +1413,39 @@ pub fn run() -> glib::ExitCode {
                         None
                     }
                 })
+            });
+
+            // Route every press through the physical-key latch after resolving
+            // its current chord. Once a key opened/closed Block Search, later
+            // repeats remain consumed even if Ctrl/Shift are released and the
+            // same hardware key no longer resolves to the toggle action.
+            let dialog_open = ui_clone.cross_block_search_dialog.borrow().is_some();
+            let toggle_route = ui_clone
+                .cross_block_search_toggle_latch
+                .borrow_mut()
+                .press(
+                    keycode,
+                    !composer_owns_enter && action == Some(Action::CrossBlockSearch),
+                    dialog_open,
+                );
+            match toggle_route {
+                ui::CrossBlockSearchToggleRoute::Open => {
+                    ui_clone.show_cross_block_search();
+                    return true.into();
+                }
+                ui::CrossBlockSearchToggleRoute::Close => {
+                    ui_clone.close_cross_block_search();
+                    return true.into();
+                }
+                ui::CrossBlockSearchToggleRoute::SuppressRepeat => return true.into(),
+                ui::CrossBlockSearchToggleRoute::Proceed => {}
+            }
+
+            if composer_owns_enter {
+                return false.into();
+            }
+            let Some(chord) = chord else {
+                return false.into();
             };
 
             if let Some(action) = action {
@@ -1461,6 +1491,7 @@ pub fn run() -> glib::ExitCode {
                         ui_clone.execute_action(action);
                         return true.into();
                     }
+                    Action::CrossBlockSearch => unreachable!("toggle action was routed above"),
                     _ => {
                         ui_clone.execute_action(action);
                         return true.into();
@@ -1473,7 +1504,11 @@ pub fn run() -> glib::ExitCode {
 
         let pending_for_release = pending_focus_shortcut.clone();
         let ui_for_release = ui.clone();
+        let cross_block_toggle_for_release = ui.cross_block_search_toggle_latch.clone();
         key_controller.connect_key_released(move |_, _, keycode, _| {
+            cross_block_toggle_for_release
+                .borrow_mut()
+                .release(keycode);
             if let Some(pending) = pending_for_release.borrow_mut().as_mut() {
                 pending.key_released(keycode);
             }
@@ -1486,10 +1521,14 @@ pub fn run() -> glib::ExitCode {
         });
 
         let pending_for_deactivate = pending_focus_shortcut.clone();
+        let cross_block_toggle_for_deactivate = ui.cross_block_search_toggle_latch.clone();
         let ui_for_window_presence = ui.clone();
         window.connect_is_active_notify(move |window| {
             if !window.is_active() {
                 pending_for_deactivate.borrow_mut().take();
+                // A compositor/window-manager focus change may drop the
+                // physical release; never strand this window's toggle latch.
+                cross_block_toggle_for_deactivate.borrow_mut().reset();
             }
             ui_for_window_presence.sync_organism_presence();
         });

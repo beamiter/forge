@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search metadata parity)
+Updated: 2026-08-26 (Block Search 4.1)
 
 This working tree contains the nine-round "Evolve ASCII organism" series
 (`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
@@ -18,6 +18,35 @@ every round (attribution races, a Drop panic on a fired glib source, a
 saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
+
+- **Block Search 4.1 (2026-08-26)**: the GTK metadata row now includes a
+  process-local, Reset-aware Background filter. Block records use
+  `BlockData::is_background()` while Unified records use their explicit
+  metadata bit; the search adapter normalizes background command, exit status,
+  and duration to absent, making command-lifecycle predicates mutually
+  exclusive even for contradictory legacy fields. Empty-query Cmd produces no
+  synthetic row; All/Out use only the first meaningful line of real retained
+  output, and filter plus scope eligibility precede the result cap. The compact
+  rows remain inside real automatic horizontal overflow with unchanged Tab
+  order. Cross Block close paths now retain the single dialog-slot claim until
+  the owning `closed` callback, which also identity-guards memory persistence;
+  a fast close/release/open sequence cannot create or later lose a replacement.
+
+- **Block Search 4.0 (2026-08-26)**: the window capture controller now routes
+  the configured `block:search` action through a hardware-keycode latch shared
+  with the in-dialog fallback. The opener toggles once, repeats are consumed
+  through physical release even if chord modifiers are released mid-press, a
+  fresh press still closes, and window deactivation clears a release that the
+  compositor may have dropped. The GTK title bar now
+  keeps only Refresh and Reset; matching/scope and metadata filters occupy two
+  compact rows inside explicit automatic horizontal overflow, so theme/font
+  growth in narrow windows remains scroll- and Tab-reachable without clipping and
+  still leaves a dedicated metadata row for Background parity. Manual refresh
+  sets and explicitly announces `Refreshing blocks…`, crosses one complete
+  painted frame, then runs
+  the synchronous selection-preserving rebuild on the next tick. A newer
+  intent or click cancels the superseded frame callback, and query refocus plus
+  the existing F5 modifier/release semantics remain unchanged.
 
 - **Block Search metadata parity (2026-08-26)**: Forge now exposes the
   existing Failed and Slow record predicates in the GTK palette, persists them

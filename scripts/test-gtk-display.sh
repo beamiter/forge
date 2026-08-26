@@ -52,6 +52,8 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    ui::dialogs::tests::cross_block_search_compact_rows_are_inside_horizontal_scroller
+    ui::dialogs::tests::cross_block_search_close_borrows_the_gtk_dialog_without_releasing_its_slot
     block_view::blocks::tests::diag_short_ls_block_geometry
     block_view::blocks::tests::block_density_switches_on_widgets_that_already_exist
     block_view::find::tests::a_card_vte_must_drop_its_previous_anchor_before_a_fresh_query

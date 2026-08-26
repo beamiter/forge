@@ -35,6 +35,8 @@ const CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES: usize = 8 * 1024;
 const CROSS_BLOCK_SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 const CROSS_BLOCK_SEARCH_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const CROSS_BLOCK_SEARCH_PAGE_STEP: usize = 10;
+const CROSS_BLOCK_SEARCH_CONTROLS_MARGIN: i32 = 12;
+const CROSS_BLOCK_SEARCH_CONTROL_SPACING: i32 = 6;
 /// A ListBox owns one widget tree per row; unlike ListView it does not recycle
 /// off-screen rows. Keep this palette intentionally small until it moves to a
 /// virtualized model, regardless of the much larger on-disk retention limit.
@@ -131,13 +133,94 @@ impl CrossBlockRefreshKeyLatch {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrossBlockRefreshFrameDecision {
+    PaintStatus,
+    Rebuild,
+}
+
+/// A manual rebuild waits across one complete frame-clock interval. The first
+/// tick deliberately does no work, allowing the already-updated status label
+/// to paint and be announced; the second tick may perform the synchronous
+/// bounded scan without making “Refreshing blocks…” an unobservable transient.
+#[derive(Debug, Default)]
+struct CrossBlockRefreshFrameGate {
+    status_frame_seen: bool,
+}
+
+impl CrossBlockRefreshFrameGate {
+    fn tick(&mut self) -> CrossBlockRefreshFrameDecision {
+        if std::mem::replace(&mut self.status_frame_seen, true) {
+            CrossBlockRefreshFrameDecision::Rebuild
+        } else {
+            CrossBlockRefreshFrameDecision::PaintStatus
+        }
+    }
+}
+
 fn cross_block_search_query_error(query: &str) -> Option<&'static str> {
     (query.len() > CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES)
         .then_some("Query is too long (maximum 8 KiB).")
 }
 
-fn cross_block_search_has_intent(query: &str, failed_only: bool, slow_only: bool) -> bool {
-    !query.is_empty() || failed_only || slow_only
+fn cross_block_search_has_intent(
+    query: &str,
+    failed_only: bool,
+    slow_only: bool,
+    background_only: bool,
+) -> bool {
+    !query.is_empty() || failed_only || slow_only || background_only
+}
+
+fn cross_block_search_compact_layout(
+    matching_row: &gtk4::Box,
+    filter_row: &gtk4::Box,
+) -> ScrolledWindow {
+    // Theme, font, translation and accessibility scaling all change natural
+    // widget widths. Never infer reachability from guessed pixels: preserve
+    // the two semantic rows and expose any excess width through a real GTK
+    // horizontal adjustment; vertical overflow belongs to the result list.
+    let compact_controls = gtk4::Box::new(Orientation::Vertical, 4);
+    compact_controls.add_css_class("toolbar");
+    compact_controls.set_margin_start(CROSS_BLOCK_SEARCH_CONTROLS_MARGIN);
+    compact_controls.set_margin_end(CROSS_BLOCK_SEARCH_CONTROLS_MARGIN);
+    compact_controls.set_margin_top(4);
+    compact_controls.set_margin_bottom(4);
+    compact_controls.append(matching_row);
+    compact_controls.append(filter_row);
+
+    let compact_scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Automatic)
+        .vscrollbar_policy(gtk4::PolicyType::Never)
+        .child(&compact_controls)
+        .build();
+    compact_scroll.set_propagate_natural_height(true);
+    compact_scroll
+}
+
+/// Keep the current dialog claimed until its own `closed` signal; callers must
+/// not depend on whether `force_close` emits that signal synchronously. This
+/// closes the fast close/release/open window for a second instance.
+fn cross_block_search_dialog_for_close(
+    dialog_ref: &RefCell<Option<adw::Dialog>>,
+) -> Option<adw::Dialog> {
+    dialog_ref.borrow().clone()
+}
+
+fn clear_cross_block_search_dialog_claim<T: PartialEq>(
+    dialog_ref: &RefCell<Option<T>>,
+    closed: &T,
+) -> bool {
+    let mut claimed = dialog_ref.borrow_mut();
+    if claimed
+        .as_ref()
+        .is_some_and(|claimed_dialog| claimed_dialog == closed)
+    {
+        *claimed = None;
+        true
+    } else {
+        false
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -147,6 +230,7 @@ pub(crate) struct CrossBlockSearchMemory {
     scope: crate::block_view::CrossBlockSearchScope,
     failed_only: bool,
     slow_only: bool,
+    background_only: bool,
 }
 
 fn cross_block_search_memory(
@@ -155,6 +239,7 @@ fn cross_block_search_memory(
     scope: crate::block_view::CrossBlockSearchScope,
     failed_only: bool,
     slow_only: bool,
+    background_only: bool,
 ) -> CrossBlockSearchMemory {
     CrossBlockSearchMemory {
         // An invalid oversized query stays visible until close, but retaining
@@ -168,6 +253,7 @@ fn cross_block_search_memory(
         scope,
         failed_only,
         slow_only,
+        background_only,
     }
 }
 
@@ -1120,10 +1206,18 @@ impl UiState {
     /// Default mode is case-insensitive substring; ".*" toggle switches to
     /// regex. Hit count is capped at 500 to keep the palette responsive on
     /// massive scrollbacks (`cargo build` etc.).
-    pub(crate) fn show_cross_block_search(&self) {
-        let dialog_to_close = self.cross_block_search_dialog.borrow_mut().take();
+    pub(crate) fn close_cross_block_search(&self) -> bool {
+        let dialog_to_close = cross_block_search_dialog_for_close(&self.cross_block_search_dialog);
         if let Some(dialog) = dialog_to_close {
             dialog.force_close();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn show_cross_block_search(&self) {
+        if self.close_cross_block_search() {
             return;
         }
 
@@ -1164,10 +1258,6 @@ impl UiState {
         reset_button.set_tooltip_text(Some("Reset query, matching options, scope, and filters"));
         header_bar.pack_start(&refresh_button);
         header_bar.pack_start(&reset_button);
-        header_bar.pack_end(&scope_dropdown);
-        header_bar.pack_end(&whole_word_toggle);
-        header_bar.pack_end(&regex_toggle);
-        header_bar.pack_end(&case_toggle);
         let failed_toggle = gtk4::ToggleButton::builder()
             .label("Failed")
             .tooltip_text("Only genuinely failed blocks (not user-interrupted commands)")
@@ -1176,8 +1266,37 @@ impl UiState {
             .label("Slow")
             .tooltip_text("Only blocks that ran at least as long as the slow-block threshold")
             .build();
-        header_bar.pack_end(&slow_toggle);
-        header_bar.pack_end(&failed_toggle);
+        let background_toggle = gtk4::ToggleButton::builder()
+            .label("Background")
+            .tooltip_text("Only commandless output emitted while the prompt was idle")
+            .build();
+
+        // Keep only the two actions beside the title. The previous single-line
+        // HeaderBar accumulated controls whose natural width could push targets
+        // off-screen. Two compact content rows keep matching/scope and metadata
+        // controls in stable Tab order inside actual horizontal overflow.
+        let matching_row =
+            gtk4::Box::new(Orientation::Horizontal, CROSS_BLOCK_SEARCH_CONTROL_SPACING);
+        let matching_label = Label::new(Some("Match"));
+        matching_label.add_css_class("dim-label");
+        matching_row.append(&matching_label);
+        matching_row.append(&case_toggle);
+        matching_row.append(&regex_toggle);
+        matching_row.append(&whole_word_toggle);
+        let scope_label = Label::new(Some("Scope"));
+        scope_label.add_css_class("dim-label");
+        matching_row.append(&scope_label);
+        matching_row.append(&scope_dropdown);
+
+        let filter_row =
+            gtk4::Box::new(Orientation::Horizontal, CROSS_BLOCK_SEARCH_CONTROL_SPACING);
+        let filter_label = Label::new(Some("Filter"));
+        filter_label.add_css_class("dim-label");
+        filter_row.append(&filter_label);
+        filter_row.append(&failed_toggle);
+        filter_row.append(&slow_toggle);
+        filter_row.append(&background_toggle);
+        let compact_scroll = cross_block_search_compact_layout(&matching_row, &filter_row);
 
         let filter_entry = SearchEntry::new();
         filter_entry.set_placeholder_text(Some("Search across blocks…"));
@@ -1188,6 +1307,7 @@ impl UiState {
         scope_dropdown.set_selected(remembered.scope.index());
         failed_toggle.set_active(remembered.failed_only);
         slow_toggle.set_active(remembered.slow_only);
+        background_toggle.set_active(remembered.background_only);
         filter_entry.set_text(&remembered.query);
 
         let list_box = ListBox::new();
@@ -1222,6 +1342,7 @@ impl UiState {
 
         let toolbar_view = adw::ToolbarView::new();
         toolbar_view.add_top_bar(&header_bar);
+        toolbar_view.add_top_bar(&compact_scroll);
         toolbar_view.set_content(Some(&search_box));
         dialog.set_child(Some(&toolbar_view));
 
@@ -1233,6 +1354,8 @@ impl UiState {
         let retained_hit: Rc<RefCell<Option<CrossBlockSelectionAnchor>>> =
             Rc::new(RefCell::new(None));
         let pending_rebuild: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        let pending_manual_refresh: Rc<RefCell<Option<gtk4::TickCallbackId>>> =
+            Rc::new(RefCell::new(None));
         let search_generation = Rc::new(Cell::new(0u64));
 
         {
@@ -1259,6 +1382,7 @@ impl UiState {
             let scope_dropdown = scope_dropdown.clone();
             let failed_toggle = failed_toggle.clone();
             let slow_toggle = slow_toggle.clone();
+            let background_toggle = background_toggle.clone();
             let retained_hit = retained_hit.clone();
             Rc::new(move || {
                 let query = filter_entry.text().to_string();
@@ -1285,11 +1409,17 @@ impl UiState {
                 let filters = crate::block_view::BlockFilters {
                     failed_only: failed_toggle.is_active(),
                     slow_only: slow_toggle.is_active(),
+                    background_only: background_toggle.is_active(),
                     slow_threshold_ms: crate::block_view::SLOW_BLOCK_THRESHOLD_MS,
                     ..Default::default()
                 };
                 clear_list_box(&list_box);
-                if !cross_block_search_has_intent(&query, filters.failed_only, filters.slow_only) {
+                if !cross_block_search_has_intent(
+                    &query,
+                    filters.failed_only,
+                    filters.slow_only,
+                    filters.background_only,
+                ) {
                     hits.borrow_mut().clear();
                     status_label.set_text(cross_block_search_idle_status());
                     return;
@@ -1349,6 +1479,7 @@ impl UiState {
 
         let schedule_rebuild = {
             let pending_rebuild = pending_rebuild.clone();
+            let pending_manual_refresh = pending_manual_refresh.clone();
             let search_generation = search_generation.clone();
             let rebuild = rebuild.clone();
             let hits = hits.clone();
@@ -1358,11 +1489,15 @@ impl UiState {
             let retained_hit = retained_hit.clone();
             let failed_toggle = failed_toggle.clone();
             let slow_toggle = slow_toggle.clone();
+            let background_toggle = background_toggle.clone();
             Rc::new(move |preserve_selection: bool| {
                 let generation = search_generation.get().wrapping_add(1);
                 search_generation.set(generation);
                 if let Some(source) = pending_rebuild.borrow_mut().take() {
                     source.remove();
+                }
+                if let Some(tick) = pending_manual_refresh.borrow_mut().take() {
+                    tick.remove();
                 }
 
                 *retained_hit.borrow_mut() = if preserve_selection {
@@ -1380,6 +1515,7 @@ impl UiState {
                     filter_entry.text().as_str(),
                     failed_toggle.is_active(),
                     slow_toggle.is_active(),
+                    background_toggle.is_active(),
                 ) {
                     clear_list_box(&list_box);
                     hits.borrow_mut().clear();
@@ -1463,6 +1599,12 @@ impl UiState {
             rebuild_for_filter(false);
             filter_entry_for_filter.grab_focus();
         });
+        let rebuild_for_filter = schedule_rebuild.clone();
+        let filter_entry_for_filter = filter_entry.clone();
+        background_toggle.connect_toggled(move |_| {
+            rebuild_for_filter(false);
+            filter_entry_for_filter.grab_focus();
+        });
 
         {
             let filter_entry = filter_entry.clone();
@@ -1472,6 +1614,7 @@ impl UiState {
             let scope_dropdown = scope_dropdown.clone();
             let failed_toggle = failed_toggle.clone();
             let slow_toggle = slow_toggle.clone();
+            let background_toggle = background_toggle.clone();
             reset_button.connect_clicked(move |_| {
                 filter_entry.set_text("");
                 case_toggle.set_active(false);
@@ -1480,6 +1623,7 @@ impl UiState {
                 scope_dropdown.set_selected(crate::block_view::CrossBlockSearchScope::All.index());
                 failed_toggle.set_active(false);
                 slow_toggle.set_active(false);
+                background_toggle.set_active(false);
                 filter_entry.grab_focus();
             });
         }
@@ -1493,6 +1637,7 @@ impl UiState {
             let term_view = term_view.clone();
             let observed_version = observed_version.clone();
             let pending_rebuild = pending_rebuild.clone();
+            let pending_manual_refresh = pending_manual_refresh.clone();
             let search_generation = search_generation.clone();
             let retained_hit = retained_hit.clone();
             let list_box = list_box.clone();
@@ -1503,11 +1648,15 @@ impl UiState {
             refresh_button.connect_clicked(move |_| {
                 // The button is the single manual-refresh path. Synchronize
                 // the cheap probe first, cancel any pending debounced intent,
-                // retain the stable row, and rebuild on this main-loop turn.
+                // retain the stable row, then cross one painted frame before
+                // rebuilding synchronously.
                 observed_version.set(term_view.cross_block_search_version());
                 search_generation.set(search_generation.get().wrapping_add(1));
                 if let Some(source) = pending_rebuild.borrow_mut().take() {
                     source.remove();
+                }
+                if let Some(tick) = pending_manual_refresh.borrow_mut().take() {
+                    tick.remove();
                 }
                 *retained_hit.borrow_mut() = list_box.selected_row().and_then(|row| {
                     let index = row.index() as usize;
@@ -1516,9 +1665,35 @@ impl UiState {
                         .cloned()
                         .map(|hit| CrossBlockSelectionAnchor { hit, index })
                 });
-                status_label.set_text(cross_block_search_refresh_status());
-                rebuild();
+                let refresh_status = cross_block_search_refresh_status();
+                status_label.set_text(refresh_status);
+                status_label.announce(refresh_status, gtk4::AccessibleAnnouncementPriority::Medium);
                 filter_entry.grab_focus();
+
+                // Tick 1 permits the status update above to paint. Tick 2
+                // performs the synchronous rebuild; generation and explicit
+                // cancellation prevent a delayed manual refresh from racing a
+                // newer query/filter intent or a second click.
+                let generation = search_generation.get();
+                let frame_gate = Rc::new(RefCell::new(CrossBlockRefreshFrameGate::default()));
+                let frame_gate_for_tick = frame_gate.clone();
+                let pending_clear = pending_manual_refresh.clone();
+                let pending_slot = pending_manual_refresh.clone();
+                let search_generation_for_tick = search_generation.clone();
+                let rebuild_for_tick = rebuild.clone();
+                let tick = status_label.add_tick_callback(move |_, _| {
+                    match frame_gate_for_tick.borrow_mut().tick() {
+                        CrossBlockRefreshFrameDecision::PaintStatus => glib::ControlFlow::Continue,
+                        CrossBlockRefreshFrameDecision::Rebuild => {
+                            if search_generation_for_tick.get() == generation {
+                                rebuild_for_tick();
+                            }
+                            pending_clear.borrow_mut().take();
+                            glib::ControlFlow::Break
+                        }
+                    }
+                });
+                *pending_slot.borrow_mut() = Some(tick);
             });
         }
         let refresh_source = {
@@ -1622,14 +1797,35 @@ impl UiState {
         let scope_dropdown_for_key = scope_dropdown.clone();
         let reset_button_for_key = reset_button.clone();
         let refresh_button_for_key = refresh_button.clone();
+        let toggle_key_latch_for_press = self.cross_block_search_toggle_latch.clone();
+        let keybinding_map_for_key = self.keybinding_map.clone();
         let refresh_key_latch = Rc::new(RefCell::new(CrossBlockRefreshKeyLatch::default()));
         let refresh_key_latch_for_press = refresh_key_latch.clone();
-        key_controller.connect_key_pressed(move |_, keyval, _, state| {
-            if keyval == Key::Escape
-                || (matches!(keyval, Key::G | Key::g)
-                    && state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK))
+        key_controller.connect_key_pressed(move |_, keyval, keycode, state| {
+            let is_toggle = crate::app::chord_from_gdk(keyval, state).is_some_and(|chord| {
+                keybinding_map_for_key.borrow().lookup(&chord) == Some(Action::CrossBlockSearch)
+            });
+            // Normally the ancestor window controller gets here first. If a
+            // platform routes directly to the overlay, query the same physical
+            // latch on every press: a held opener stays consumed even after its
+            // modifiers are released and its current chord becomes plain text.
+            match toggle_key_latch_for_press
+                .borrow_mut()
+                .press(keycode, is_toggle, true)
             {
-                let dialog_to_close = dialog_ref.borrow_mut().take();
+                CrossBlockSearchToggleRoute::Close => {
+                    let dialog_to_close = cross_block_search_dialog_for_close(&dialog_ref);
+                    if let Some(d) = dialog_to_close {
+                        d.force_close();
+                    }
+                    return true.into();
+                }
+                CrossBlockSearchToggleRoute::Open => return true.into(),
+                CrossBlockSearchToggleRoute::SuppressRepeat => return true.into(),
+                CrossBlockSearchToggleRoute::Proceed => {}
+            }
+            if keyval == Key::Escape {
+                let dialog_to_close = cross_block_search_dialog_for_close(&dialog_ref);
                 if let Some(d) = dialog_to_close {
                     d.force_close();
                 }
@@ -1721,8 +1917,10 @@ impl UiState {
             true.into()
         });
         let refresh_key_latch_for_release = refresh_key_latch.clone();
-        key_controller.connect_key_released(move |_, keyval, _, _| {
+        let toggle_key_latch_for_release = self.cross_block_search_toggle_latch.clone();
+        key_controller.connect_key_released(move |_, keyval, keycode, _| {
             refresh_key_latch_for_release.borrow_mut().release(keyval);
+            toggle_key_latch_for_release.borrow_mut().release(keycode);
         });
         dialog.add_controller(key_controller);
         let refresh_focus = gtk4::EventControllerFocus::new();
@@ -1736,6 +1934,7 @@ impl UiState {
 
         let dialog_ref = self.cross_block_search_dialog.clone();
         let pending_rebuild_for_close = pending_rebuild.clone();
+        let pending_manual_refresh_for_close = pending_manual_refresh.clone();
         let refresh_source_for_close = refresh_source.clone();
         let memory_for_close = self.cross_block_search_memory.clone();
         let filter_entry_for_close = filter_entry.clone();
@@ -1745,27 +1944,36 @@ impl UiState {
         let scope_dropdown_for_close = scope_dropdown.clone();
         let failed_toggle_for_close = failed_toggle.clone();
         let slow_toggle_for_close = slow_toggle.clone();
-        dialog.connect_closed(move |_| {
+        let background_toggle_for_close = background_toggle.clone();
+        dialog.connect_closed(move |closed_dialog| {
             if let Some(source) = refresh_source_for_close.borrow_mut().take() {
                 source.remove();
             }
             if let Some(source) = pending_rebuild_for_close.borrow_mut().take() {
                 source.remove();
             }
-            *memory_for_close.borrow_mut() = cross_block_search_memory(
-                filter_entry_for_close.text().as_str(),
-                crate::block_view::CrossBlockSearchOptions {
-                    case_sensitive: case_toggle_for_close.is_active(),
-                    regex: regex_toggle_for_close.is_active(),
-                    whole_word: whole_word_toggle_for_close.is_active(),
-                },
-                crate::block_view::CrossBlockSearchScope::from_index(
-                    scope_dropdown_for_close.selected(),
-                ),
-                failed_toggle_for_close.is_active(),
-                slow_toggle_for_close.is_active(),
-            );
-            *dialog_ref.borrow_mut() = None;
+            if let Some(tick) = pending_manual_refresh_for_close.borrow_mut().take() {
+                tick.remove();
+            }
+            // Only the dialog that still owns the slot may persist intent.
+            // A defensive stale callback must neither clear a replacement nor
+            // overwrite its eventual memory with old controls.
+            if clear_cross_block_search_dialog_claim(&dialog_ref, closed_dialog) {
+                *memory_for_close.borrow_mut() = cross_block_search_memory(
+                    filter_entry_for_close.text().as_str(),
+                    crate::block_view::CrossBlockSearchOptions {
+                        case_sensitive: case_toggle_for_close.is_active(),
+                        regex: regex_toggle_for_close.is_active(),
+                        whole_word: whole_word_toggle_for_close.is_active(),
+                    },
+                    crate::block_view::CrossBlockSearchScope::from_index(
+                        scope_dropdown_for_close.selected(),
+                    ),
+                    failed_toggle_for_close.is_active(),
+                    slow_toggle_for_close.is_active(),
+                    background_toggle_for_close.is_active(),
+                );
+            }
         });
 
         *self.cross_block_search_dialog.borrow_mut() = Some(dialog.clone());
@@ -1774,6 +1982,7 @@ impl UiState {
             &remembered.query,
             remembered.failed_only,
             remembered.slow_only,
+            remembered.background_only,
         ) {
             schedule_rebuild(false);
         }
@@ -3600,17 +3809,19 @@ impl UiState {
 #[cfg(test)]
 mod tests {
     use super::{
-        cross_block_jump_outcome, cross_block_refresh_selection_index,
-        cross_block_search_dialog_title, cross_block_search_has_intent,
-        cross_block_search_idle_status, cross_block_search_is_plain_refresh_key,
-        cross_block_search_jump_unavailable_status, cross_block_search_memory,
-        cross_block_search_pending_status, cross_block_search_query_error,
-        cross_block_search_refresh_status, cross_block_search_status, cross_block_selection_index,
-        cross_block_should_step, preferences_group_title, record_snapshot_dialog_title,
-        record_snapshot_status_line, record_snapshot_unavailable_message, remote_picker_guard,
-        CrossBlockJumpOutcome, CrossBlockRefreshKeyDecision, CrossBlockRefreshKeyLatch,
-        CrossBlockSelectionAnchor, CrossBlockSelectionMove, CROSS_BLOCK_SEARCH_LIMIT,
-        CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
+        clear_cross_block_search_dialog_claim, cross_block_jump_outcome,
+        cross_block_refresh_selection_index, cross_block_search_compact_layout,
+        cross_block_search_dialog_for_close, cross_block_search_dialog_title,
+        cross_block_search_has_intent, cross_block_search_idle_status,
+        cross_block_search_is_plain_refresh_key, cross_block_search_jump_unavailable_status,
+        cross_block_search_memory, cross_block_search_pending_status,
+        cross_block_search_query_error, cross_block_search_refresh_status,
+        cross_block_search_status, cross_block_selection_index, cross_block_should_step,
+        preferences_group_title, record_snapshot_dialog_title, record_snapshot_status_line,
+        record_snapshot_unavailable_message, remote_picker_guard, CrossBlockJumpOutcome,
+        CrossBlockRefreshFrameDecision, CrossBlockRefreshFrameGate, CrossBlockRefreshKeyDecision,
+        CrossBlockRefreshKeyLatch, CrossBlockSelectionAnchor, CrossBlockSelectionMove,
+        CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
     use crate::block_view::{
         CrossBlockHit, CrossBlockSearchOptions, CrossBlockSearchScope, RecordNavigationResult,
@@ -3795,6 +4006,90 @@ mod tests {
     }
 
     #[test]
+    fn cross_block_search_manual_refresh_crosses_a_painted_frame_before_rebuild() {
+        use CrossBlockRefreshFrameDecision::{PaintStatus, Rebuild};
+
+        let mut gate = CrossBlockRefreshFrameGate::default();
+        assert_eq!(
+            gate.tick(),
+            PaintStatus,
+            "the first frame must leave Refreshing blocks visible"
+        );
+        assert_eq!(gate.tick(), Rebuild);
+        assert_eq!(
+            gate.tick(),
+            Rebuild,
+            "a completed gate must never regress to its paint stage"
+        );
+    }
+
+    #[test]
+    fn cross_block_search_closed_callback_only_releases_its_own_claim() {
+        let slot = std::cell::RefCell::new(Some(2_u8));
+
+        assert!(!clear_cross_block_search_dialog_claim(&slot, &1));
+        assert_eq!(
+            *slot.borrow(),
+            Some(2),
+            "a stale close cannot clear a replacement"
+        );
+        assert!(clear_cross_block_search_dialog_claim(&slot, &2));
+        assert_eq!(*slot.borrow(), None);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn cross_block_search_close_borrows_the_gtk_dialog_without_releasing_its_slot() {
+        gtk4::init().expect("GTK display");
+        let old_dialog = libadwaita::Dialog::new();
+        let replacement = libadwaita::Dialog::new();
+        let slot = std::cell::RefCell::new(Some(old_dialog.clone()));
+
+        let closing = cross_block_search_dialog_for_close(&slot).expect("claimed dialog");
+        assert_eq!(closing, old_dialog);
+        assert_eq!(slot.borrow().as_ref(), Some(&old_dialog));
+
+        // A replacement cannot occur through production while the old claim
+        // remains, but keep the callback identity-safe against future paths.
+        *slot.borrow_mut() = Some(replacement.clone());
+        assert!(!clear_cross_block_search_dialog_claim(&slot, &old_dialog));
+        assert_eq!(slot.borrow().as_ref(), Some(&replacement));
+        assert!(clear_cross_block_search_dialog_claim(&slot, &replacement));
+        assert!(slot.borrow().is_none());
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn cross_block_search_compact_rows_are_inside_horizontal_scroller() {
+        use gtk4::prelude::*;
+
+        gtk4::init().expect("GTK display");
+        let matching_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        let filter_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        let scroller = cross_block_search_compact_layout(&matching_row, &filter_row);
+
+        assert_eq!(
+            scroller.policy(),
+            (gtk4::PolicyType::Automatic, gtk4::PolicyType::Never),
+            "theme/font growth must scroll horizontally instead of clipping controls"
+        );
+        let viewport = scroller
+            .child()
+            .and_downcast::<gtk4::Viewport>()
+            .expect("GTK must provide a viewport for the non-scrollable rows");
+        let controls = viewport
+            .child()
+            .and_downcast::<gtk4::Box>()
+            .expect("viewport must directly own the compact rows");
+        assert_eq!(controls.orientation(), gtk4::Orientation::Vertical);
+        let first = controls.first_child().expect("matching row");
+        assert_eq!(first, matching_row.clone().upcast::<gtk4::Widget>());
+        let second = first.next_sibling().expect("filter row");
+        assert_eq!(second, filter_row.clone().upcast::<gtk4::Widget>());
+        assert!(second.next_sibling().is_none(), "exactly two compact rows");
+    }
+
+    #[test]
     fn cross_block_selection_wraps_and_pages_within_bounds() {
         use CrossBlockSelectionMove as Move;
 
@@ -3919,11 +4214,12 @@ mod tests {
 
     #[test]
     fn cross_block_search_metadata_filters_are_intent_without_text() {
-        assert!(!cross_block_search_has_intent("", false, false));
-        assert!(cross_block_search_has_intent("needle", false, false));
-        assert!(cross_block_search_has_intent("", true, false));
-        assert!(cross_block_search_has_intent("", false, true));
-        assert!(cross_block_search_has_intent("", true, true));
+        assert!(!cross_block_search_has_intent("", false, false, false));
+        assert!(cross_block_search_has_intent("needle", false, false, false));
+        assert!(cross_block_search_has_intent("", true, false, false));
+        assert!(cross_block_search_has_intent("", false, true, false));
+        assert!(cross_block_search_has_intent("", false, false, true));
+        assert!(cross_block_search_has_intent("", true, true, true));
     }
 
     #[test]
@@ -3933,13 +4229,20 @@ mod tests {
             regex: true,
             whole_word: true,
         };
-        let remembered =
-            cross_block_search_memory("needle", options, CrossBlockSearchScope::Output, true, true);
+        let remembered = cross_block_search_memory(
+            "needle",
+            options,
+            CrossBlockSearchScope::Output,
+            true,
+            true,
+            true,
+        );
         assert_eq!(remembered.query, "needle");
         assert_eq!(remembered.options, options);
         assert_eq!(remembered.scope, CrossBlockSearchScope::Output);
         assert!(remembered.failed_only);
         assert!(remembered.slow_only);
+        assert!(remembered.background_only);
 
         let oversized = cross_block_search_memory(
             &"x".repeat(CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES + 1),
@@ -3947,11 +4250,14 @@ mod tests {
             CrossBlockSearchScope::Command,
             true,
             false,
+            true,
         );
         assert!(oversized.query.is_empty());
         assert_eq!(oversized.options, options);
         assert_eq!(oversized.scope, CrossBlockSearchScope::Command);
         assert!(oversized.failed_only);
         assert!(!oversized.slow_only);
+        assert!(oversized.background_only);
+        assert!(!super::CrossBlockSearchMemory::default().background_only);
     }
 }
