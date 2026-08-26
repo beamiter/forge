@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-25 (shared session identity and durable Agent claims)
+Updated: 2026-08-26 (Block Search 3.1)
 
 This working tree contains the nine-round "Evolve ASCII organism" series
 (`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
@@ -18,6 +18,18 @@ every round (attribution races, a Drop panic on a fired glib source, a
 saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
+
+- **Block Search 3.1 (2026-08-26)**: `All / Cmd / Out` scopes now restrict
+  cross-block scanning before the 500-hit cap, so an excluded surface cannot
+  starve the requested one. The GTK dropdown and `Ctrl+O` cycle rescan the
+  retained records without changing activated VTE highlight semantics.
+
+- **Block Search 3.0 (2026-08-26)**: cross-block search now composes `Aa`
+  case sensitivity, bounded regex, and Unicode whole-word matching. The GTK
+  result scan and activated VTE/PCRE2 highlight carry one typed options value,
+  so a row cannot be found case-sensitively or as a whole word and then jump
+  under the old case-insensitive substring semantics. `Ctrl+I`, `Ctrl+R`, and
+  `Ctrl+W` keep every control keyboard reachable while the query retains focus.
 
 - **Core-owned Agent claim durability (2026-08-25)**: Forge now pins
   `jterm_core` `21437ba` and its matching `jagent` `a462ec8`. Core durably

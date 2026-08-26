@@ -946,7 +946,20 @@ impl UiState {
             .label(".*")
             .tooltip_text("Treat the query as a regular expression")
             .build();
+        let case_toggle = gtk4::ToggleButton::builder()
+            .label("Aa")
+            .tooltip_text("Match case")
+            .build();
+        let whole_word_toggle = gtk4::ToggleButton::builder()
+            .label("W")
+            .tooltip_text("Match whole words")
+            .build();
+        let scope_dropdown = gtk4::DropDown::from_strings(&["All", "Cmd", "Out"]);
+        scope_dropdown.set_tooltip_text(Some("Search all text, commands only, or output only"));
+        header_bar.pack_end(&scope_dropdown);
+        header_bar.pack_end(&whole_word_toggle);
         header_bar.pack_end(&regex_toggle);
+        header_bar.pack_end(&case_toggle);
 
         let filter_entry = SearchEntry::new();
         filter_entry.set_placeholder_text(Some("Search across blocks…"));
@@ -1002,9 +1015,16 @@ impl UiState {
             let status_label = status_label.clone();
             let filter_entry = filter_entry.clone();
             let regex_toggle = regex_toggle.clone();
+            let case_toggle = case_toggle.clone();
+            let whole_word_toggle = whole_word_toggle.clone();
+            let scope_dropdown = scope_dropdown.clone();
             Rc::new(move || {
                 let query = filter_entry.text().to_string();
-                let is_regex = regex_toggle.is_active();
+                let options = crate::block_view::CrossBlockSearchOptions {
+                    case_sensitive: case_toggle.is_active(),
+                    regex: regex_toggle.is_active(),
+                    whole_word: whole_word_toggle.is_active(),
+                };
 
                 clear_list_box(&list_box);
                 if query.is_empty() {
@@ -1018,7 +1038,14 @@ impl UiState {
                     return;
                 }
 
-                match term_view.cross_block_search(&query, is_regex, CROSS_BLOCK_SEARCH_LIMIT) {
+                let scope =
+                    crate::block_view::CrossBlockSearchScope::from_index(scope_dropdown.selected());
+                match term_view.cross_block_search_in_scope(
+                    &query,
+                    options,
+                    scope,
+                    CROSS_BLOCK_SEARCH_LIMIT,
+                ) {
                     Ok(results) => {
                         let total = results.len();
                         status_label.set_text(&cross_block_search_status_for_match_count(total));
@@ -1113,6 +1140,18 @@ impl UiState {
         regex_toggle.connect_toggled(move |_| {
             rebuild_for_toggle();
         });
+        let rebuild_for_toggle = schedule_rebuild.clone();
+        case_toggle.connect_toggled(move |_| {
+            rebuild_for_toggle();
+        });
+        let rebuild_for_toggle = schedule_rebuild.clone();
+        whole_word_toggle.connect_toggled(move |_| {
+            rebuild_for_toggle();
+        });
+        let rebuild_for_scope = schedule_rebuild.clone();
+        scope_dropdown.connect_selected_notify(move |_| {
+            rebuild_for_scope();
+        });
 
         // Jump-to-hit: take the target record's best available surface AND
         // turn on its per-VTE search highlight at the matching hit. Closes the
@@ -1122,10 +1161,16 @@ impl UiState {
             let hits = hits.clone();
             let filter_entry = filter_entry.clone();
             let regex_toggle = regex_toggle.clone();
+            let case_toggle = case_toggle.clone();
+            let whole_word_toggle = whole_word_toggle.clone();
             let status_label = status_label.clone();
             move |idx: usize| -> CrossBlockJumpOutcome {
                 let pattern = filter_entry.text().to_string();
-                let is_regex = regex_toggle.is_active();
+                let options = crate::block_view::CrossBlockSearchOptions {
+                    case_sensitive: case_toggle.is_active(),
+                    regex: regex_toggle.is_active(),
+                    whole_word: whole_word_toggle.is_active(),
+                };
                 let hit = match hits.borrow().get(idx) {
                     Some(h) => h.clone(),
                     None => return CrossBlockJumpOutcome::KeepOpen,
@@ -1141,7 +1186,7 @@ impl UiState {
                         term_view.focus_match_in_block(
                             hit.block_id,
                             &pattern,
-                            is_regex,
+                            options,
                             hit.is_output,
                             hit.occurrence,
                         );
@@ -1183,6 +1228,10 @@ impl UiState {
         let list_box_for_key = list_box.clone();
         let jump_for_key = jump.clone();
         let apply_for_key = apply_jump_outcome.clone();
+        let case_toggle_for_key = case_toggle.clone();
+        let regex_toggle_for_key = regex_toggle.clone();
+        let whole_word_toggle_for_key = whole_word_toggle.clone();
+        let scope_dropdown_for_key = scope_dropdown.clone();
         key_controller.connect_key_pressed(move |_, keyval, _, state| {
             if keyval == Key::Escape
                 || (matches!(keyval, Key::G | Key::g)
@@ -1193,6 +1242,25 @@ impl UiState {
                     d.force_close();
                 }
                 return true.into();
+            }
+            if state.contains(ModifierType::CONTROL_MASK) {
+                let toggle = match keyval {
+                    Key::i | Key::I => Some(&case_toggle_for_key),
+                    Key::r | Key::R => Some(&regex_toggle_for_key),
+                    Key::w | Key::W => Some(&whole_word_toggle_for_key),
+                    _ => None,
+                };
+                if let Some(toggle) = toggle {
+                    toggle.set_active(!toggle.is_active());
+                    return true.into();
+                }
+                if matches!(keyval, Key::o | Key::O) {
+                    let scope = crate::block_view::CrossBlockSearchScope::from_index(
+                        scope_dropdown_for_key.selected(),
+                    );
+                    scope_dropdown_for_key.set_selected(scope.cycled().index());
+                    return true.into();
+                }
             }
             if matches!(keyval, Key::Return | Key::KP_Enter) {
                 if let Some(row) = list_box_for_key.selected_row() {

@@ -331,6 +331,11 @@ reducer、不新增落盘字段；repo 无法验证或身份切换中时使用�
 | Shell Agent | `Ctrl+Alt+G` |
 | 全选 / 回填 / 清空 | `Ctrl+Shift+A` / `Ctrl+Shift+I` / `Ctrl+Shift+K` |
 
+跨块搜索的 `Aa`、`.*`、`W` 分别控制区分大小写、正则和 Unicode 整词匹配，亦可用
+`Ctrl+I`、`Ctrl+R`、`Ctrl+W` 切换。三个选项可组合，结果列表和跳转后的 VTE 高亮不会
+使用不同的查询语义。范围下拉框的 `All / Cmd / Out` 分别搜索全部文本、仅命令或仅输出；
+`Ctrl+O` 可循环切换，且范围在 500 条命中上限之前应用。
+
 选择语义与 anvil 对齐：
 
 - `Ctrl+Up` 从最新块进入选择；普通 `Up/Down` 移动 active edge，`Shift+Up/Down` 扩展范围。
