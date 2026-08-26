@@ -61,7 +61,7 @@ fn cross_block_search_dialog_title() -> &'static str {
 }
 
 fn cross_block_search_idle_status() -> &'static str {
-    "Type to search across blocks. Shift+Enter jumps and advances."
+    "Type to search. Shift+Enter jumps and advances; Ctrl+Shift+U resets."
 }
 
 fn cross_block_search_pending_status() -> &'static str {
@@ -1058,6 +1058,9 @@ impl UiState {
             .build();
         let scope_dropdown = gtk4::DropDown::from_strings(&["All", "Cmd", "Out"]);
         scope_dropdown.set_tooltip_text(Some("Search all text, commands only, or output only"));
+        let reset_button = gtk4::Button::with_label("Reset");
+        reset_button.set_tooltip_text(Some("Reset query, matching options, and scope"));
+        header_bar.pack_start(&reset_button);
         header_bar.pack_end(&scope_dropdown);
         header_bar.pack_end(&whole_word_toggle);
         header_bar.pack_end(&regex_toggle);
@@ -1256,21 +1259,45 @@ impl UiState {
         });
 
         let rebuild_for_toggle = schedule_rebuild.clone();
+        let filter_entry_for_toggle = filter_entry.clone();
         regex_toggle.connect_toggled(move |_| {
             rebuild_for_toggle();
+            filter_entry_for_toggle.grab_focus();
         });
         let rebuild_for_toggle = schedule_rebuild.clone();
+        let filter_entry_for_toggle = filter_entry.clone();
         case_toggle.connect_toggled(move |_| {
             rebuild_for_toggle();
+            filter_entry_for_toggle.grab_focus();
         });
         let rebuild_for_toggle = schedule_rebuild.clone();
+        let filter_entry_for_toggle = filter_entry.clone();
         whole_word_toggle.connect_toggled(move |_| {
             rebuild_for_toggle();
+            filter_entry_for_toggle.grab_focus();
         });
         let rebuild_for_scope = schedule_rebuild.clone();
+        let filter_entry_for_scope = filter_entry.clone();
         scope_dropdown.connect_selected_notify(move |_| {
             rebuild_for_scope();
+            filter_entry_for_scope.grab_focus();
         });
+
+        {
+            let filter_entry = filter_entry.clone();
+            let case_toggle = case_toggle.clone();
+            let regex_toggle = regex_toggle.clone();
+            let whole_word_toggle = whole_word_toggle.clone();
+            let scope_dropdown = scope_dropdown.clone();
+            reset_button.connect_clicked(move |_| {
+                filter_entry.set_text("");
+                case_toggle.set_active(false);
+                regex_toggle.set_active(false);
+                whole_word_toggle.set_active(false);
+                scope_dropdown.set_selected(crate::block_view::CrossBlockSearchScope::All.index());
+                filter_entry.grab_focus();
+            });
+        }
 
         // Jump-to-hit: take the target record's best available surface AND
         // turn on its per-VTE search highlight at the matching hit. Plain
@@ -1354,6 +1381,7 @@ impl UiState {
         let regex_toggle_for_key = regex_toggle.clone();
         let whole_word_toggle_for_key = whole_word_toggle.clone();
         let scope_dropdown_for_key = scope_dropdown.clone();
+        let reset_button_for_key = reset_button.clone();
         key_controller.connect_key_pressed(move |_, keyval, _, state| {
             if keyval == Key::Escape
                 || (matches!(keyval, Key::G | Key::g)
@@ -1367,8 +1395,12 @@ impl UiState {
             }
             if state.contains(ModifierType::CONTROL_MASK) {
                 if matches!(keyval, Key::u | Key::U) {
-                    filter_entry_for_key.set_text("");
-                    filter_entry_for_key.grab_focus();
+                    if state.contains(ModifierType::SHIFT_MASK) {
+                        reset_button_for_key.emit_clicked();
+                    } else {
+                        filter_entry_for_key.set_text("");
+                        filter_entry_for_key.grab_focus();
+                    }
                     return true.into();
                 }
                 let toggle = match keyval {
@@ -1464,7 +1496,7 @@ impl UiState {
         *self.cross_block_search_dialog.borrow_mut() = Some(dialog.clone());
         dialog.present(Some(&self.window));
         if !remembered.query.is_empty() {
-            rebuild();
+            schedule_rebuild();
         }
         filter_entry.grab_focus();
     }
@@ -3364,7 +3396,7 @@ mod tests {
         assert_eq!(cross_block_search_dialog_title(), "Search Blocks");
         assert_eq!(
             cross_block_search_idle_status(),
-            "Type to search across blocks. Shift+Enter jumps and advances."
+            "Type to search. Shift+Enter jumps and advances; Ctrl+Shift+U resets."
         );
         assert_eq!(cross_block_search_pending_status(), "Searching blocks…");
         assert_eq!(cross_block_search_status(0, None), "No matches.");
