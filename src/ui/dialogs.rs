@@ -33,6 +33,7 @@ type RemoteHostEditTarget = (usize, String);
 const CROSS_BLOCK_SEARCH_LIMIT: usize = 500;
 const CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES: usize = 8 * 1024;
 const CROSS_BLOCK_SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
+const CROSS_BLOCK_SEARCH_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const CROSS_BLOCK_SEARCH_PAGE_STEP: usize = 10;
 /// A ListBox owns one widget tree per row; unlike ListView it does not recycle
 /// off-screen rows. Keep this palette intentionally small until it moves to a
@@ -66,6 +67,10 @@ fn cross_block_search_idle_status() -> &'static str {
 
 fn cross_block_search_pending_status() -> &'static str {
     "Searching blocks…"
+}
+
+fn cross_block_search_refresh_status() -> &'static str {
+    "Refreshing blocks…"
 }
 
 fn cross_block_search_query_error(query: &str) -> Option<&'static str> {
@@ -1115,6 +1120,8 @@ impl UiState {
         // keystroke / regex-toggle change.
         let hits: Rc<RefCell<Vec<crate::block_view::CrossBlockHit>>> =
             Rc::new(RefCell::new(Vec::new()));
+        let retained_hit: Rc<RefCell<Option<crate::block_view::CrossBlockHit>>> =
+            Rc::new(RefCell::new(None));
         let pending_rebuild: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
         let search_generation = Rc::new(Cell::new(0u64));
 
@@ -1140,8 +1147,10 @@ impl UiState {
             let case_toggle = case_toggle.clone();
             let whole_word_toggle = whole_word_toggle.clone();
             let scope_dropdown = scope_dropdown.clone();
+            let retained_hit = retained_hit.clone();
             Rc::new(move || {
                 let query = filter_entry.text().to_string();
+                let retained_hit = retained_hit.borrow_mut().take();
                 let options = crate::block_view::CrossBlockSearchOptions {
                     case_sensitive: case_toggle.is_active(),
                     regex: regex_toggle.is_active(),
@@ -1190,9 +1199,12 @@ impl UiState {
                                 .build();
                             list_box.append(&row);
                         }
+                        let selected = retained_hit
+                            .and_then(|retained| results.iter().position(|hit| hit == &retained))
+                            .unwrap_or(0);
                         *hits.borrow_mut() = results;
-                        if let Some(first_row) = list_box.row_at_index(0) {
-                            list_box.select_row(Some(&first_row));
+                        if let Some(row) = list_box.row_at_index(selected as i32) {
+                            list_box.select_row(Some(&row));
                         }
                     }
                     Err(e) => {
@@ -1212,25 +1224,41 @@ impl UiState {
             let list_box = list_box.clone();
             let status_label = status_label.clone();
             let filter_entry = filter_entry.clone();
-            Rc::new(move || {
+            let retained_hit = retained_hit.clone();
+            Rc::new(move |preserve_selection: bool| {
                 let generation = search_generation.get().wrapping_add(1);
                 search_generation.set(generation);
                 if let Some(source) = pending_rebuild.borrow_mut().take() {
                     source.remove();
                 }
 
-                clear_list_box(&list_box);
-                hits.borrow_mut().clear();
+                *retained_hit.borrow_mut() = if preserve_selection {
+                    list_box
+                        .selected_row()
+                        .and_then(|row| hits.borrow().get(row.index() as usize).cloned())
+                } else {
+                    None
+                };
                 if filter_entry.text().is_empty() {
+                    clear_list_box(&list_box);
+                    hits.borrow_mut().clear();
                     status_label.set_text(cross_block_search_idle_status());
                     return;
                 }
                 if let Some(message) = cross_block_search_query_error(filter_entry.text().as_str())
                 {
+                    clear_list_box(&list_box);
+                    hits.borrow_mut().clear();
                     status_label.set_text(message);
                     return;
                 }
-                status_label.set_text(cross_block_search_pending_status());
+                if preserve_selection {
+                    status_label.set_text(cross_block_search_refresh_status());
+                } else {
+                    clear_list_box(&list_box);
+                    hits.borrow_mut().clear();
+                    status_label.set_text(cross_block_search_pending_status());
+                }
 
                 let pending_rebuild = pending_rebuild.clone();
                 let search_generation = search_generation.clone();
@@ -1255,31 +1283,31 @@ impl UiState {
 
         let rebuild_for_change = schedule_rebuild.clone();
         filter_entry.connect_search_changed(move |_| {
-            rebuild_for_change();
+            rebuild_for_change(false);
         });
 
         let rebuild_for_toggle = schedule_rebuild.clone();
         let filter_entry_for_toggle = filter_entry.clone();
         regex_toggle.connect_toggled(move |_| {
-            rebuild_for_toggle();
+            rebuild_for_toggle(false);
             filter_entry_for_toggle.grab_focus();
         });
         let rebuild_for_toggle = schedule_rebuild.clone();
         let filter_entry_for_toggle = filter_entry.clone();
         case_toggle.connect_toggled(move |_| {
-            rebuild_for_toggle();
+            rebuild_for_toggle(false);
             filter_entry_for_toggle.grab_focus();
         });
         let rebuild_for_toggle = schedule_rebuild.clone();
         let filter_entry_for_toggle = filter_entry.clone();
         whole_word_toggle.connect_toggled(move |_| {
-            rebuild_for_toggle();
+            rebuild_for_toggle(false);
             filter_entry_for_toggle.grab_focus();
         });
         let rebuild_for_scope = schedule_rebuild.clone();
         let filter_entry_for_scope = filter_entry.clone();
         scope_dropdown.connect_selected_notify(move |_| {
-            rebuild_for_scope();
+            rebuild_for_scope(false);
             filter_entry_for_scope.grab_focus();
         });
 
@@ -1298,6 +1326,25 @@ impl UiState {
                 filter_entry.grab_focus();
             });
         }
+
+        // Forge/Anvil dialogs are otherwise snapshots of the moment they
+        // opened. Probe only the cheap finalized-record identity and keep the
+        // selected stable hit while rebuilding after completion/retention
+        // churn. Query text and terminal output are not cloned by the probe.
+        let refresh_source = {
+            let term_view = term_view.clone();
+            let observed_version = Rc::new(Cell::new(term_view.cross_block_search_version()));
+            let schedule_rebuild = schedule_rebuild.clone();
+            glib::timeout_add_local(CROSS_BLOCK_SEARCH_REFRESH_INTERVAL, move || {
+                let current = term_view.cross_block_search_version();
+                if current != observed_version.get() {
+                    observed_version.set(current);
+                    schedule_rebuild(true);
+                }
+                glib::ControlFlow::Continue
+            })
+        };
+        let refresh_source = Rc::new(RefCell::new(Some(refresh_source)));
 
         // Jump-to-hit: take the target record's best available surface AND
         // turn on its per-VTE search highlight at the matching hit. Plain
@@ -1469,6 +1516,7 @@ impl UiState {
 
         let dialog_ref = self.cross_block_search_dialog.clone();
         let pending_rebuild_for_close = pending_rebuild.clone();
+        let refresh_source_for_close = refresh_source.clone();
         let memory_for_close = self.cross_block_search_memory.clone();
         let filter_entry_for_close = filter_entry.clone();
         let case_toggle_for_close = case_toggle.clone();
@@ -1476,6 +1524,9 @@ impl UiState {
         let whole_word_toggle_for_close = whole_word_toggle.clone();
         let scope_dropdown_for_close = scope_dropdown.clone();
         dialog.connect_closed(move |_| {
+            if let Some(source) = refresh_source_for_close.borrow_mut().take() {
+                source.remove();
+            }
             if let Some(source) = pending_rebuild_for_close.borrow_mut().take() {
                 source.remove();
             }
@@ -1496,7 +1547,7 @@ impl UiState {
         *self.cross_block_search_dialog.borrow_mut() = Some(dialog.clone());
         dialog.present(Some(&self.window));
         if !remembered.query.is_empty() {
-            schedule_rebuild();
+            schedule_rebuild(false);
         }
         filter_entry.grab_focus();
     }
@@ -3324,10 +3375,11 @@ mod tests {
         cross_block_jump_outcome, cross_block_search_dialog_title, cross_block_search_idle_status,
         cross_block_search_jump_unavailable_status, cross_block_search_memory,
         cross_block_search_pending_status, cross_block_search_query_error,
-        cross_block_search_status, cross_block_selection_index, cross_block_should_step,
-        preferences_group_title, record_snapshot_dialog_title, record_snapshot_status_line,
-        record_snapshot_unavailable_message, remote_picker_guard, CrossBlockJumpOutcome,
-        CrossBlockSelectionMove, CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
+        cross_block_search_refresh_status, cross_block_search_status, cross_block_selection_index,
+        cross_block_should_step, preferences_group_title, record_snapshot_dialog_title,
+        record_snapshot_status_line, record_snapshot_unavailable_message, remote_picker_guard,
+        CrossBlockJumpOutcome, CrossBlockSelectionMove, CROSS_BLOCK_SEARCH_LIMIT,
+        CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
     use crate::block_view::{
         CrossBlockSearchOptions, CrossBlockSearchScope, RecordNavigationResult, RecordSnapshotView,
@@ -3399,6 +3451,7 @@ mod tests {
             "Type to search. Shift+Enter jumps and advances; Ctrl+Shift+U resets."
         );
         assert_eq!(cross_block_search_pending_status(), "Searching blocks…");
+        assert_eq!(cross_block_search_refresh_status(), "Refreshing blocks…");
         assert_eq!(cross_block_search_status(0, None), "No matches.");
         assert_eq!(
             cross_block_search_status(CROSS_BLOCK_SEARCH_LIMIT, None),
