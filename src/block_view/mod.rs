@@ -427,7 +427,7 @@ fn running_header_label(command: &str, elapsed_secs: u64) -> String {
 ///
 /// One constant so the filter and the navigation cannot disagree about which
 /// cards they are talking about.
-const SLOW_BLOCK_THRESHOLD_MS: u64 = 1_000;
+pub(crate) const SLOW_BLOCK_THRESHOLD_MS: u64 = 1_000;
 
 /// A card's virtualization height for the folded state it is in.
 ///

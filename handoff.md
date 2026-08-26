@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 3.3)
+Updated: 2026-08-26 (Block Search metadata parity)
 
 This working tree contains the nine-round "Evolve ASCII organism" series
 (`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
@@ -18,6 +18,23 @@ every round (attribution races, a Drop panic on a fired glib source, a
 saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
+
+- **Block Search metadata parity (2026-08-26)**: Forge now exposes the
+  existing Failed and Slow record predicates in the GTK palette, persists them
+  with the other process-local search intent, and clears them through Reset.
+  Either filter works with an empty text query by yielding one representative
+  row per eligible retained block; predicates run before the 500-hit cap, and
+  filter-only activation navigates without installing an empty VTE matcher.
+
+- **Block Search 3.9 (2026-08-26)**: the GTK search header now exposes a
+  pointer-accessible refresh button with an accessible action name and `F5`
+  shortcut. Clicking it, or pressing unmodified F5, synchronizes the automatic
+  version probe, cancels pending debounce, and immediately performs the same
+  selection-preserving rebuild before returning focus to the query. F5 with
+  Ctrl/Shift/Alt/Super/Hyper/Meta continues propagating unchanged. A physical
+  F5 press is latched until release, so auto-repeat cannot rebuild repeatedly
+  and releasing a chord modifier while F5 remains held cannot trigger refresh;
+  leaving the dialog focus domain resets the latch if GTK drops the release.
 
 - **Block Search 3.3 (2026-08-26)**: Shift+Enter now reveals a live terminal
   hit, keeps the GTK palette open, restores query focus, and advances only
