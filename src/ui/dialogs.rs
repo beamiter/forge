@@ -61,7 +61,7 @@ fn cross_block_search_dialog_title() -> &'static str {
 }
 
 fn cross_block_search_idle_status() -> &'static str {
-    "Type to search across blocks."
+    "Type to search across blocks. Shift+Enter jumps and advances."
 }
 
 fn cross_block_search_pending_status() -> &'static str {
@@ -176,6 +176,13 @@ fn cross_block_jump_outcome(result: RecordNavigationResult) -> CrossBlockJumpOut
             CrossBlockJumpOutcome::KeepOpen
         }
     }
+}
+
+/// Continuous review is possible only after an exact live terminal jump.
+/// Snapshot-only results still open their snapshot dialog, and unavailable
+/// results stay selected with their error status instead of silently moving.
+fn cross_block_should_step(outcome: CrossBlockJumpOutcome, requested: bool) -> bool {
+    requested && outcome == CrossBlockJumpOutcome::Close
 }
 
 fn record_snapshot_dialog_title() -> &'static str {
@@ -1235,8 +1242,8 @@ impl UiState {
         });
 
         // Jump-to-hit: take the target record's best available surface AND
-        // turn on its per-VTE search highlight at the matching hit. Closes the
-        // palette so the user lands on the record they picked.
+        // turn on its per-VTE search highlight at the matching hit. Plain
+        // activation closes; Shift+Enter can keep a successful live jump open.
         let jump = {
             let term_view = term_view.clone();
             let hits = hits.clone();
@@ -1309,6 +1316,7 @@ impl UiState {
         let list_box_for_key = list_box.clone();
         let scrolled_for_key = scrolled.clone();
         let hits_for_key = hits.clone();
+        let filter_entry_for_key = filter_entry.clone();
         let jump_for_key = jump.clone();
         let apply_for_key = apply_jump_outcome.clone();
         let case_toggle_for_key = case_toggle.clone();
@@ -1348,7 +1356,22 @@ impl UiState {
             if matches!(keyval, Key::Return | Key::KP_Enter) {
                 if let Some(row) = list_box_for_key.selected_row() {
                     let idx = row.index() as usize;
-                    apply_for_key(jump_for_key(idx));
+                    let outcome = jump_for_key(idx);
+                    if cross_block_should_step(outcome, state.contains(ModifierType::SHIFT_MASK)) {
+                        if let Some(next) = cross_block_selection_index(
+                            Some(idx),
+                            hits_for_key.borrow().len(),
+                            CrossBlockSelectionMove::Next,
+                        ) {
+                            if let Some(next_row) = list_box_for_key.row_at_index(next as i32) {
+                                list_box_for_key.select_row(Some(&next_row));
+                                scroll_cross_block_row_into_view(&scrolled_for_key, &next_row);
+                            }
+                        }
+                        filter_entry_for_key.grab_focus();
+                    } else {
+                        apply_for_key(outcome);
+                    }
                 }
                 return true.into();
             }
@@ -3213,9 +3236,10 @@ mod tests {
         cross_block_jump_outcome, cross_block_search_dialog_title, cross_block_search_idle_status,
         cross_block_search_jump_unavailable_status, cross_block_search_pending_status,
         cross_block_search_query_error, cross_block_search_status, cross_block_selection_index,
-        preferences_group_title, record_snapshot_dialog_title, record_snapshot_status_line,
-        record_snapshot_unavailable_message, remote_picker_guard, CrossBlockJumpOutcome,
-        CrossBlockSelectionMove, CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
+        cross_block_should_step, preferences_group_title, record_snapshot_dialog_title,
+        record_snapshot_status_line, record_snapshot_unavailable_message, remote_picker_guard,
+        CrossBlockJumpOutcome, CrossBlockSelectionMove, CROSS_BLOCK_SEARCH_LIMIT,
+        CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
     use crate::block_view::{RecordNavigationResult, RecordSnapshotView};
 
@@ -3262,6 +3286,19 @@ mod tests {
             cross_block_jump_outcome(RecordNavigationResult::NoMatchingRecord),
             CrossBlockJumpOutcome::KeepOpen
         );
+        assert!(cross_block_should_step(CrossBlockJumpOutcome::Close, true));
+        assert!(!cross_block_should_step(
+            CrossBlockJumpOutcome::Close,
+            false
+        ));
+        assert!(!cross_block_should_step(
+            CrossBlockJumpOutcome::ShowSnapshot(42),
+            true
+        ));
+        assert!(!cross_block_should_step(
+            CrossBlockJumpOutcome::KeepOpen,
+            true
+        ));
     }
 
     #[test]
@@ -3269,7 +3306,7 @@ mod tests {
         assert_eq!(cross_block_search_dialog_title(), "Search Blocks");
         assert_eq!(
             cross_block_search_idle_status(),
-            "Type to search across blocks."
+            "Type to search across blocks. Shift+Enter jumps and advances."
         );
         assert_eq!(cross_block_search_pending_status(), "Searching blocks…");
         assert_eq!(cross_block_search_status(0, None), "No matches.");

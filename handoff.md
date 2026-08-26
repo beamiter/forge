@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 3.2)
+Updated: 2026-08-26 (Block Search 3.3)
 
 This working tree contains the nine-round "Evolve ASCII organism" series
 (`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
@@ -18,6 +18,11 @@ every round (attribution races, a Drop panic on a fired glib source, a
 saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
+
+- **Block Search 3.3 (2026-08-26)**: Shift+Enter now reveals a live terminal
+  hit, keeps the GTK palette open, restores query focus, and advances only
+  after that successful reveal. Snapshot-only hits still open their snapshot;
+  unavailable hits retain selection and diagnostics instead of fake-stepping.
 
 - **Block Search 3.2 (2026-08-26)**: result navigation now wraps with arrows,
   jumps to either edge with Home/End, pages ten rows with PageUp/PageDown, and
