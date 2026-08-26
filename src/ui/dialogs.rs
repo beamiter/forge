@@ -158,6 +158,29 @@ fn cross_block_selection_index(
     })
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CrossBlockSelectionAnchor {
+    hit: crate::block_view::CrossBlockHit,
+    index: usize,
+}
+
+/// Restore an open picker's highlight after a record-version refresh. Exact
+/// stable identity wins; if retention removed that row, keep the nearest
+/// surviving rank instead of disorientingly jumping all the way to the top.
+/// A new search intent passes no anchor and deliberately starts at row zero.
+fn cross_block_refresh_selection_index(
+    results: &[crate::block_view::CrossBlockHit],
+    anchor: Option<&CrossBlockSelectionAnchor>,
+) -> usize {
+    if results.is_empty() {
+        return 0;
+    }
+    anchor
+        .and_then(|anchor| results.iter().position(|hit| hit == &anchor.hit))
+        .or_else(|| anchor.map(|anchor| anchor.index.min(results.len() - 1)))
+        .unwrap_or(0)
+}
+
 /// Keep keyboard selection visible while focus remains in the query entry.
 fn scroll_cross_block_row_into_view(scrolled: &gtk4::ScrolledWindow, row: &impl IsA<gtk4::Widget>) {
     let Some(bounds) = row.compute_bounds(scrolled) else {
@@ -1120,7 +1143,7 @@ impl UiState {
         // keystroke / regex-toggle change.
         let hits: Rc<RefCell<Vec<crate::block_view::CrossBlockHit>>> =
             Rc::new(RefCell::new(Vec::new()));
-        let retained_hit: Rc<RefCell<Option<crate::block_view::CrossBlockHit>>> =
+        let retained_hit: Rc<RefCell<Option<CrossBlockSelectionAnchor>>> =
             Rc::new(RefCell::new(None));
         let pending_rebuild: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
         let search_generation = Rc::new(Cell::new(0u64));
@@ -1150,7 +1173,21 @@ impl UiState {
             let retained_hit = retained_hit.clone();
             Rc::new(move || {
                 let query = filter_entry.text().to_string();
-                let retained_hit = retained_hit.borrow_mut().take();
+                // Navigation remains available while the short refresh
+                // debounce runs. Re-snapshot at execution time so a Down/Up
+                // pressed during that window wins over the earlier anchor.
+                let retained_hit = retained_hit.borrow_mut().take().map(|scheduled| {
+                    list_box
+                        .selected_row()
+                        .and_then(|row| {
+                            let index = row.index() as usize;
+                            hits.borrow()
+                                .get(index)
+                                .cloned()
+                                .map(|hit| CrossBlockSelectionAnchor { hit, index })
+                        })
+                        .unwrap_or(scheduled)
+                });
                 let options = crate::block_view::CrossBlockSearchOptions {
                     case_sensitive: case_toggle.is_active(),
                     regex: regex_toggle.is_active(),
@@ -1199,9 +1236,8 @@ impl UiState {
                                 .build();
                             list_box.append(&row);
                         }
-                        let selected = retained_hit
-                            .and_then(|retained| results.iter().position(|hit| hit == &retained))
-                            .unwrap_or(0);
+                        let selected =
+                            cross_block_refresh_selection_index(&results, retained_hit.as_ref());
                         *hits.borrow_mut() = results;
                         if let Some(row) = list_box.row_at_index(selected as i32) {
                             list_box.select_row(Some(&row));
@@ -1233,9 +1269,13 @@ impl UiState {
                 }
 
                 *retained_hit.borrow_mut() = if preserve_selection {
-                    list_box
-                        .selected_row()
-                        .and_then(|row| hits.borrow().get(row.index() as usize).cloned())
+                    list_box.selected_row().and_then(|row| {
+                        let index = row.index() as usize;
+                        hits.borrow()
+                            .get(index)
+                            .cloned()
+                            .map(|hit| CrossBlockSelectionAnchor { hit, index })
+                    })
                 } else {
                     None
                 };
@@ -3372,18 +3412,31 @@ impl UiState {
 #[cfg(test)]
 mod tests {
     use super::{
-        cross_block_jump_outcome, cross_block_search_dialog_title, cross_block_search_idle_status,
+        cross_block_jump_outcome, cross_block_refresh_selection_index,
+        cross_block_search_dialog_title, cross_block_search_idle_status,
         cross_block_search_jump_unavailable_status, cross_block_search_memory,
         cross_block_search_pending_status, cross_block_search_query_error,
         cross_block_search_refresh_status, cross_block_search_status, cross_block_selection_index,
         cross_block_should_step, preferences_group_title, record_snapshot_dialog_title,
         record_snapshot_status_line, record_snapshot_unavailable_message, remote_picker_guard,
-        CrossBlockJumpOutcome, CrossBlockSelectionMove, CROSS_BLOCK_SEARCH_LIMIT,
-        CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
+        CrossBlockJumpOutcome, CrossBlockSelectionAnchor, CrossBlockSelectionMove,
+        CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
     use crate::block_view::{
-        CrossBlockSearchOptions, CrossBlockSearchScope, RecordNavigationResult, RecordSnapshotView,
+        CrossBlockHit, CrossBlockSearchOptions, CrossBlockSearchScope, RecordNavigationResult,
+        RecordSnapshotView,
     };
+
+    fn cross_block_hit(block_id: u64) -> CrossBlockHit {
+        CrossBlockHit {
+            block_id,
+            is_output: true,
+            line_no: 1,
+            line_text: format!("hit {block_id}"),
+            cmd_preview: "cargo test".to_string(),
+            occurrence: 0,
+        }
+    }
 
     #[test]
     fn remote_picker_reports_safe_mode_and_empty_config() {
@@ -3503,6 +3556,41 @@ mod tests {
             cross_block_selection_index(Some(31), 37, Move::PageNext),
             Some(36)
         );
+    }
+
+    #[test]
+    fn cross_block_refresh_preserves_identity_then_nearest_rank() {
+        let selected = cross_block_hit(2);
+        let anchor = CrossBlockSelectionAnchor {
+            hit: selected.clone(),
+            index: 1,
+        };
+        assert_eq!(
+            cross_block_refresh_selection_index(
+                &[cross_block_hit(4), cross_block_hit(3), selected],
+                Some(&anchor),
+            ),
+            2,
+            "the same stable hit wins even when its rank moves"
+        );
+        assert_eq!(
+            cross_block_refresh_selection_index(
+                &[cross_block_hit(4), cross_block_hit(3)],
+                Some(&anchor),
+            ),
+            1,
+            "an evicted hit keeps the closest surviving rank"
+        );
+        assert_eq!(
+            cross_block_refresh_selection_index(&[cross_block_hit(4)], Some(&anchor)),
+            0
+        );
+        assert_eq!(
+            cross_block_refresh_selection_index(&[cross_block_hit(4)], None),
+            0,
+            "a new intent deliberately starts at the top"
+        );
+        assert_eq!(cross_block_refresh_selection_index(&[], Some(&anchor)), 0);
     }
 
     /// The snapshot dialog's header values come from the completed record;
