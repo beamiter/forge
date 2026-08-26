@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 4.2)
+Updated: 2026-08-26 (Block Search 4.3)
 
 This working tree contains the nine-round "Evolve ASCII organism" series
 (`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
@@ -18,6 +18,12 @@ every round (attribution races, a Drop panic on a fired glib source, a
 saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
+
+- **Block Search 4.3 (2026-08-26)**: exact VTE occurrence jumps now roll back
+  transactionally when any native step fails, removing both the search regex
+  and VTE's partial selection so an unavailable target cannot leave a wrong
+  match highlighted. A real DISPLAY-backed VTE regression covers two
+  successful steps followed by a failed third occurrence.
 
 - **Block Search 4.2 (2026-08-26)**: Cross Block Search now has a Reset-aware
   Bookmarked metadata toggle that composes with Failed/Slow/Background before
