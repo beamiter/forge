@@ -124,6 +124,24 @@ fn safe_file_label(value: &str) -> String {
 
 struct ActiveScan;
 
+impl ActiveScan {
+    /// Take one scan slot, waiting until another scan releases its own. The
+    /// cap bounds concurrent ssh/docker subprocesses; it must never reject
+    /// user actions, so contention parks the worker thread instead of failing
+    /// the request.
+    fn acquire() -> Self {
+        loop {
+            let taken = ACTIVE_SCANS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_CONCURRENT_SCANS).then_some(active + 1)
+            });
+            if taken.is_ok() {
+                return Self;
+            }
+            std::thread::sleep(SCAN_POLL_INTERVAL);
+        }
+    }
+}
+
 impl Drop for ActiveScan {
     fn drop(&mut self) {
         ACTIVE_SCANS.fetch_sub(1, Ordering::AcqRel);
@@ -131,6 +149,21 @@ impl Drop for ActiveScan {
 }
 
 struct ActiveFsOp;
+
+impl ActiveFsOp {
+    /// Same wait-for-a-slot policy as scans, on the smaller fs-op budget.
+    fn acquire() -> Self {
+        loop {
+            let taken = ACTIVE_FS_OPS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_CONCURRENT_FS_OPS).then_some(active + 1)
+            });
+            if taken.is_ok() {
+                return Self;
+            }
+            std::thread::sleep(SCAN_POLL_INTERVAL);
+        }
+    }
+}
 
 impl Drop for ActiveFsOp {
     fn drop(&mut self) {
@@ -175,22 +208,13 @@ fn request_dir_scan<F>(
 where
     F: FnOnce(io::Result<Vec<FileEntry>>) + 'static,
 {
-    ACTIVE_SCANS
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-            (active < MAX_CONCURRENT_SCANS).then_some(active + 1)
-        })
-        .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "file-tree scan limit reached"))?;
     let (tx, rx) = mpsc::sync_channel(1);
-    if let Err(error) = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("forge-file-tree-scan".to_string())
         .spawn(move || {
-            let _active = ActiveScan;
+            let _active = ActiveScan::acquire();
             let _ = tx.send(scan_entries(&loc, &hosts, &overlay, &dir));
-        })
-    {
-        ACTIVE_SCANS.fetch_sub(1, Ordering::AcqRel);
-        return Err(error);
-    }
+        })?;
     poll_worker(rx, apply, "file-tree scan worker disconnected");
     Ok(())
 }
@@ -203,22 +227,13 @@ where
     F: FnOnce(io::Result<T>) + 'static,
     W: FnOnce() -> io::Result<T> + Send + 'static,
 {
-    ACTIVE_FS_OPS
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-            (active < MAX_CONCURRENT_FS_OPS).then_some(active + 1)
-        })
-        .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "file operation limit reached"))?;
     let (tx, rx) = mpsc::sync_channel(1);
-    if let Err(error) = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("forge-file-tree-op".to_string())
         .spawn(move || {
-            let _active = ActiveFsOp;
+            let _active = ActiveFsOp::acquire();
             let _ = tx.send(work());
-        })
-    {
-        ACTIVE_FS_OPS.fetch_sub(1, Ordering::AcqRel);
-        return Err(error);
-    }
+        })?;
     poll_worker(rx, apply, "file operation worker disconnected");
     Ok(())
 }
@@ -3499,6 +3514,43 @@ mod tests {
         assert!(compact.starts_with("ssh: root@dsw"));
         assert!(compact.ends_with("aliyuncs.com (temporary)"));
         assert!(compact.contains('…'));
+    }
+
+    #[test]
+    fn scan_slot_waits_for_a_free_slot_instead_of_failing() {
+        let held: Vec<ActiveScan> = (0..MAX_CONCURRENT_SCANS)
+            .map(|_| ActiveScan::acquire())
+            .collect();
+        let (tx, rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _active = ActiveScan::acquire();
+            tx.send(()).expect("waiter reports its acquisition");
+        });
+
+        // Every slot is held, so the queued acquire must still be parked.
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(held);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("a freed slot lets the queued scan proceed");
+        waiter.join().expect("waiter thread finishes");
+    }
+
+    #[test]
+    fn fs_op_slot_waits_for_a_free_slot_instead_of_failing() {
+        let held: Vec<ActiveFsOp> = (0..MAX_CONCURRENT_FS_OPS)
+            .map(|_| ActiveFsOp::acquire())
+            .collect();
+        let (tx, rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _active = ActiveFsOp::acquire();
+            tx.send(()).expect("waiter reports its acquisition");
+        });
+
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(held);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("a freed slot lets the queued file operation proceed");
+        waiter.join().expect("waiter thread finishes");
     }
 
     #[test]
