@@ -390,7 +390,9 @@ fn checked_probe_argv(host: &RemoteHost, op: &str, args: &[&str]) -> io::Result<
     Ok(probe_argv(host, op, args))
 }
 
-/// Spawn a child from an argv vector with the given stdio arrangement.
+/// Spawn a child from an argv vector with the given stdio arrangement. On
+/// Unix the child leads its own process group, so [`kill_tree`] can reap the
+/// probe and anything it forked (a remote tar, a relay pipeline) in one call.
 fn spawn_argv(
     argv: &[String],
     stdin: Stdio,
@@ -403,17 +405,41 @@ fn spawn_argv(
             "empty probe argv",
         ));
     };
-    Command::new(program)
-        .args(args)
-        .stdin(stdin)
-        .stdout(stdout)
-        .stderr(stderr)
-        .spawn()
+    let mut command = Command::new(program);
+    command.args(args).stdin(stdin).stdout(stdout).stderr(stderr);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Own process group, led by the child: one group kill below reaps the
+        // probe and every descendant that did not setsid away.
+        command.process_group(0);
+    }
+    command.spawn()
 }
 
-/// Poll `child` to exit, killing and reaping it past the deadline. The
-/// calling worker thread doubles as the watchdog, so a hung ssh or stopped
-/// container cannot pin the thread forever.
+/// Send SIGKILL to `child`'s whole process group (Unix; `spawn_argv` made the
+/// child lead it), so a probe that forked — `rm -rf` mid-run, a remote tar —
+/// cannot survive the watchdog and hold the pipes open.
+fn kill_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        // SAFETY: one kill call on the group the child was made to lead at
+        // spawn; the pid came from a live Child handle.
+        nix::libc::kill(-(child.id() as i32), nix::libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+}
+
+/// Kill `child`'s whole process group and reap the direct child.
+fn kill_tree(child: &mut std::process::Child) {
+    kill_process_group(child);
+    let _ = child.wait();
+}
+
+/// Poll `child` to exit, killing its whole process group and reaping it past
+/// the deadline. The calling worker thread doubles as the watchdog, so a hung
+/// ssh or stopped container cannot pin the thread forever.
 fn wait_with_timeout(
     child: &mut std::process::Child,
     timeout: Duration,
@@ -424,8 +450,7 @@ fn wait_with_timeout(
             return Ok(status);
         }
         if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait(); // reap the killed child
+            kill_tree(child);
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "remote-fs probe timed out",
@@ -438,7 +463,8 @@ fn wait_with_timeout(
 /// Run a child to completion with piped stdio, bounded output and a hard
 /// timeout. `stdin_bytes` is the child's whole stdin (a `put`/`untar`
 /// payload, or nothing for the other ops); stdout/stderr are captured
-/// bounded.
+/// bounded, and a stream that overflows `max_out` fails the whole capture
+/// rather than being mistaken for a complete one.
 fn run_capture(
     argv: &[String],
     stdin_bytes: &[u8],
@@ -462,9 +488,15 @@ fn run_capture(
     let stderr_reader = spawn_bounded_reader(child.stderr.take(), max_out);
 
     let status = wait_with_timeout(&mut child, timeout);
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
+    let (stdout, stdout_truncated) = stdout_reader.join().unwrap_or_default();
+    let (stderr, stderr_truncated) = stderr_reader.join().unwrap_or_default();
     let status = status?;
+    if stdout_truncated || stderr_truncated {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("remote-fs probe produced more than {max_out} bytes of output"),
+        ));
+    }
     Ok(Capture {
         status: status.code().unwrap_or(-1),
         stdout,
@@ -472,19 +504,30 @@ fn run_capture(
     })
 }
 
-/// Read a child pipe on its own thread, capped at `max_out` bytes. Once the
-/// limit is reached the reader stops consuming; a child that keeps writing
-/// then blocks on a full pipe until the watchdog kills it.
-fn spawn_bounded_reader<R>(pipe: Option<R>, max_out: u64) -> std::thread::JoinHandle<Vec<u8>>
+/// Read a child pipe on its own thread, capped at `max_out` bytes. Overflow
+/// keeps draining into the void so the child is never wedged on a full pipe;
+/// the caller treats the returned `truncated` flag as an error (or ignores it
+/// for purely diagnostic stderr on streaming transfers).
+fn spawn_bounded_reader<R>(
+    pipe: Option<R>,
+    max_out: u64,
+) -> std::thread::JoinHandle<(Vec<u8>, bool)>
 where
     R: Read + Send + 'static,
 {
     std::thread::spawn(move || {
         let mut buffer = Vec::new();
-        if let Some(pipe) = pipe {
-            let _ = pipe.take(max_out).read_to_end(&mut buffer);
+        let Some(pipe) = pipe else {
+            return (buffer, false);
+        };
+        let mut limited = pipe.take(max_out + 1);
+        if limited.read_to_end(&mut buffer).is_err() || buffer.len() as u64 <= max_out {
+            return (buffer, false);
         }
-        buffer
+        buffer.truncate(max_out as usize);
+        let mut rest = limited.into_inner();
+        let _ = io::copy(&mut rest, &mut io::sink());
+        (buffer, true)
     })
 }
 
@@ -688,7 +731,8 @@ impl Drop for TempFileGuard {
 /// kills the child outright — a finished pump means the payload has moved
 /// but the child may still be flushing it (`put` renames after stdin EOF),
 /// so a successful pump keeps waiting for a natural exit until the deadline.
-/// A cancelled token kills exactly like the timeout: same kill, same reap.
+/// A cancelled token kills exactly like the timeout: same group kill, same
+/// reap.
 fn watchdog_streaming_child(
     child: &mut std::process::Child,
     rx: &mpsc::Receiver<io::Result<()>>,
@@ -703,7 +747,7 @@ fn watchdog_streaming_child(
                 if outcome.is_err() {
                     // The pump gave up: the child is stuck on a full pipe or
                     // a dead peer — kill it rather than waiting it out.
-                    let _ = child.kill();
+                    kill_process_group(child);
                     let status = child
                         .wait()
                         .map(|status| status.code().unwrap_or(-1))
@@ -729,15 +773,13 @@ fn watchdog_streaming_child(
             Err(error) => return (-1, Err(error)),
         }
         if token.is_cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_tree(child);
             // Let the pump observe the dead child and wind down.
             let _ = rx.recv();
             return (-1, Err(cancelled_error()));
         }
         if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_tree(child);
             let _ = rx.recv();
             return (
                 -1,
@@ -835,7 +877,7 @@ fn stream_download_to_file(
     if control.token.is_cancelled() {
         return Err(cancelled_error());
     }
-    probe_status_result(status, stderr_reader.join().unwrap_or_default())?;
+    probe_status_result(status, stderr_reader.join().unwrap_or_default().0)?;
     outcome?;
     finalize_download(&temp, dst)?;
     temp_guard.disarm();
@@ -921,7 +963,7 @@ fn stream_upload_to_probe(
     if control.token.is_cancelled() {
         return Err(cancelled_error());
     }
-    probe_status_result(status, stderr_reader.join().unwrap_or_default())?;
+    probe_status_result(status, stderr_reader.join().unwrap_or_default().0)?;
     outcome?;
     Ok(())
 }
@@ -1000,7 +1042,7 @@ fn pump_capped(
     if result.is_ok() {
         report_progress_final(&control.progress, total);
     } else {
-        let _ = source_child.kill();
+        kill_process_group(&mut source_child);
     }
     // Reap the producer; after EOF it exits on its own, after a failure the
     // kill above needs a wait to collect.
@@ -1141,9 +1183,9 @@ fn stream_download_dir(
     if control.token.is_cancelled() {
         return Err(cancelled_error());
     }
-    probe_status_result(status, remote_stderr.join().unwrap_or_default())?;
+    probe_status_result(status, remote_stderr.join().unwrap_or_default().0)?;
     outcome?;
-    let local_err = String::from_utf8_lossy(&local_stderr.join().unwrap_or_default())
+    let local_err = String::from_utf8_lossy(&local_stderr.join().unwrap_or_default().0)
         .trim()
         .to_string();
     if !local_err.is_empty() {
@@ -1258,9 +1300,9 @@ fn stream_upload_dir(
     if control.token.is_cancelled() {
         return Err(cancelled_error());
     }
-    probe_status_result(status, remote_stderr.join().unwrap_or_default())?;
+    probe_status_result(status, remote_stderr.join().unwrap_or_default().0)?;
     outcome?;
-    let local_err = String::from_utf8_lossy(&local_stderr.join().unwrap_or_default())
+    let local_err = String::from_utf8_lossy(&local_stderr.join().unwrap_or_default().0)
         .trim()
         .to_string();
     if !local_err.is_empty() {
@@ -2229,7 +2271,8 @@ fn fail_if_exists(path: &Path) -> io::Result<()> {
 /// `std::fs::copy` (which carries permissions). There is deliberately no
 /// entry cap here — a user-invoked copy must not silently truncate — but the
 /// recursion depth is bounded so a pathological tree fails instead of
-/// exhausting the worker stack.
+/// exhausting the worker stack, and a directory can never be copied into
+/// itself (caught canonically at depth 0, so symlink aliases of `src` count).
 fn copy_recursive(src: &Path, dst: &Path, depth: usize) -> io::Result<()> {
     if depth >= MAX_COPY_DEPTH {
         return Err(io::Error::new(
@@ -2239,6 +2282,27 @@ fn copy_recursive(src: &Path, dst: &Path, depth: usize) -> io::Result<()> {
     }
     let metadata = std::fs::symlink_metadata(src)?;
     if metadata.is_dir() {
+        if depth == 0 {
+            // Without this, pasting `/a` into `/a/b` recurses into the copy
+            // it is creating until MAX_COPY_DEPTH trips. Canonicalize both
+            // sides so a symlinked spelling of `src` cannot sneak past.
+            let canonical = src.canonicalize()?;
+            let dst_parent = dst
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("/"))
+                .canonicalize()
+                .unwrap_or_else(|_| dst.parent().map(Path::to_path_buf).unwrap_or_default());
+            if dst_parent
+                .join(dst.file_name().unwrap_or_default())
+                .starts_with(&canonical)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot copy a directory into itself",
+                ));
+            }
+        }
         std::fs::create_dir(dst)?;
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
@@ -2531,13 +2595,38 @@ mod tests {
         assert_eq!(capture.status, 3);
         assert_eq!(capture.stdout, b"hello");
 
-        let capture =
-            run_capture(&argv("yes truncated"), b"", Duration::from_secs(5), 128).unwrap();
-        assert!(capture.stdout.len() <= 128);
+        // A flood past the cap fails closed: the overflow is drained so the
+        // child still exits, then the capture reports truncation instead of
+        // handing back a silent prefix.
+        let error = run_capture(
+            &argv("yes flooded | head -c 100000"),
+            b"",
+            Duration::from_secs(10),
+            4096,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
         let error =
             run_capture(&argv("sleep 30"), b"", Duration::from_millis(150), 64).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn run_capture_kills_the_whole_process_group_on_timeout() {
+        // The backgrounded `sleep` would survive a plain `child.kill()` of the
+        // shell and keep the stdout pipe open; the group kill must reap it
+        // together with the probe.
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 30 & wait".to_string(),
+        ];
+        let started = std::time::Instant::now();
+        let error = run_capture(&argv, b"", Duration::from_millis(200), 64).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        // A surviving `sleep` would pin the joined pipe readers for its 30s.
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]
@@ -2621,6 +2710,37 @@ mod tests {
             delete(&local, hosts, Path::new("/")).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_copy_refuses_a_directory_into_itself() {
+        let root = unique_temp_dir("copy-self");
+        let hosts: &[RemoteHost] = &[];
+        let local = FsLocation::Local;
+        create_dir(&local, hosts, &root.join("sub")).unwrap();
+        create_file(&local, hosts, &root.join("sub/one.txt")).unwrap();
+
+        // Direct: pasting `sub` into its own subdirectory must fail up front,
+        // not recurse into the copy it is creating.
+        assert_eq!(
+            copy(&local, hosts, &root.join("sub"), &root.join("sub/inside"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        // A symlinked spelling of the destination parent resolves to the same
+        // directory and must not sneak past the canonicalized guard.
+        std::os::unix::fs::symlink(root.join("sub"), root.join("alias")).unwrap();
+        assert_eq!(
+            copy(&local, hosts, &root.join("sub"), &root.join("alias/inside"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        // Both refusals fired before anything was created.
+        assert!(!root.join("sub/inside").exists());
 
         let _ = std::fs::remove_dir_all(root);
     }

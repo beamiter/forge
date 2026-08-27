@@ -33,6 +33,35 @@ const MAX_NOTEBOOK_TEXT_BYTES: usize = 256 * 1024;
 const MAX_NOTEBOOK_CELL_SOURCE_BYTES: usize = 256 * 1024;
 const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// A cell emitting output faster than GTK can paint yields the poll tick
+/// after this many events instead of draining the whole queue in one go, so
+/// the UI thread stays responsive under an output flood.
+const MAX_OUTPUT_EVENTS_PER_TICK: usize = 32;
+/// Process-wide ceiling on simultaneously running cell workers, so a "run
+/// all" over many cells cannot spawn an unbounded set of interpreters.
+const MAX_CONCURRENT_CELL_WORKERS: usize = 8;
+static ACTIVE_CELL_WORKERS: AtomicI32 = AtomicI32::new(0);
+
+/// RAII slot in the cell-worker concurrency ceiling: held by the worker
+/// thread for its whole lifetime, released automatically when it ends.
+struct CellWorkerPermit;
+
+impl CellWorkerPermit {
+    fn acquire() -> Option<Self> {
+        ACTIVE_CELL_WORKERS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_CONCURRENT_CELL_WORKERS as i32).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for CellWorkerPermit {
+    fn drop(&mut self) {
+        ACTIVE_CELL_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 pub use jterm_core::notebook_text::{parse_segments, render_text_to_pango, Segment};
 
@@ -313,7 +342,17 @@ fn spawn_cell_worker(spec: CommandSpec, handle: &CellHandle) -> mpsc::Receiver<W
     let cancelled = handle.cancelled.clone();
     let pgid = handle.pgid.clone();
 
+    // Refuse to pile up workers past the concurrency ceiling; the cell fails
+    // immediately with a clear reason instead of queueing silently.
+    let Some(permit) = CellWorkerPermit::acquire() else {
+        let _ = sender.try_send(WorkerEvent::Done(CellOutcome::Failed(format!(
+            "at most {MAX_CONCURRENT_CELL_WORKERS} notebook cells may run concurrently"
+        ))));
+        return receiver;
+    };
+
     std::thread::spawn(move || {
+        let _permit = permit;
         let host_bridge = crate::host::is_flatpak();
         let cwd_for_bridge = spec.cwd.to_string_lossy().into_owned();
         let executable_argv =
@@ -746,6 +785,9 @@ impl CellController {
                 return glib::ControlFlow::Break;
             };
 
+            // Cap the events drained per tick: an output flood defers the
+            // rest to the next tick instead of starving the main loop.
+            let mut processed = 0usize;
             loop {
                 match receiver.try_recv() {
                     Ok(WorkerEvent::Started(_)) => {}
@@ -755,12 +797,20 @@ impl CellController {
                                 truncated = true;
                                 cell.stderr.append("\n[output truncated]\n");
                             }
+                            processed += 1;
+                            if processed >= MAX_OUTPUT_EVENTS_PER_TICK {
+                                return glib::ControlFlow::Continue;
+                            }
                             continue;
                         }
                         let remaining = MAX_OUTPUT_BYTES - bytes_seen;
                         let count = bytes.len().min(remaining);
                         bytes_seen += count;
                         cell.append_output(stream, &bytes[..count]);
+                        processed += 1;
+                        if processed >= MAX_OUTPUT_EVENTS_PER_TICK {
+                            return glib::ControlFlow::Continue;
+                        }
                     }
                     Ok(WorkerEvent::Done(outcome)) => {
                         let is_current = cell
@@ -1212,6 +1262,30 @@ mod tests {
         assert!(is_notebook_path(Path::new("demo.jtnb.md")));
         assert!(!is_notebook_path(Path::new("demo.md")));
         assert!(!is_notebook_path(Path::new("demo.jtnb.md.bak")));
+    }
+
+    #[test]
+    fn cell_worker_permit_caps_concurrency_and_releases_on_drop() {
+        // Other tests may hold a couple of permits at the same time, so this
+        // asserts the ceiling triggers within MAX_CONCURRENT_CELL_WORKERS
+        // acquisitions rather than at an exact count.
+        let mut held = Vec::new();
+        let exhausted = loop {
+            match CellWorkerPermit::acquire() {
+                Some(permit) => held.push(permit),
+                None => break true,
+            }
+            if held.len() > MAX_CONCURRENT_CELL_WORKERS {
+                break false;
+            }
+        };
+        assert!(exhausted, "acquisition must stop at the concurrency ceiling");
+        assert!(held.len() <= MAX_CONCURRENT_CELL_WORKERS);
+        drop(held);
+        assert!(
+            CellWorkerPermit::acquire().is_some(),
+            "dropped permits must release their slots"
+        );
     }
 
     #[test]
