@@ -1254,8 +1254,20 @@ fn abort_spawn(lifecycle: &ChildLifecycle, error: io::Error) -> io::Error {
 /// child of this process, so the kernel cannot have handed the number to
 /// anybody else, and no lifecycle exists yet to route through. Blocking is
 /// fine — the caller is already returning an error out of `spawn`.
+///
+/// A child that already ran `setsid` leads its own group, and that group can
+/// hold more than the shell — background jobs, a relay pipeline. The whole
+/// group must go down with it, so nothing outlives a failed spawn; the
+/// `getpgid` guard is what keeps the group signal from ever reaching this
+/// process' own group while the child is still between fork and `setsid`.
 fn kill_and_reap_unreferenced(child: Pid) {
-    let _ = nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL);
+    let pid = child.as_raw();
+    unsafe {
+        if libc::getpgid(pid) == pid {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+        libc::kill(pid, libc::SIGKILL);
+    }
     let _ = nix::sys::wait::waitpid(child, None);
 }
 
@@ -2133,6 +2145,82 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// `kill_and_reap_unreferenced` runs while the child may already lead its
+    /// own group; the fixture is the same `sh -c "sleep 30 & wait"` shape the
+    /// remote_fs timeout test uses to prove a background job cannot outlive
+    /// its leader's kill.
+    #[test]
+    fn kill_and_reap_unreferenced_takes_the_whole_group_down() {
+        use std::os::unix::process::CommandExt as _;
+
+        let pid_file = std::env::temp_dir().join(format!(
+            "forge-pty-group-kill-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let command = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
+        let child = unsafe {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .pre_exec(|| {
+                    // Match the spawn path: the child leads its own session
+                    // and process group before the exec.
+                    if libc::setsid() < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                })
+                .spawn()
+                .expect("spawn the group fixture")
+        };
+        let leader = Pid::from_raw(child.id() as i32);
+
+        // Wait until the background job exists and its pid is on disk.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let background = loop {
+            if let Ok(contents) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = contents.trim().parse::<i32>() {
+                    break pid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the fixture never reported its background job"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            unsafe { libc::getpgid(background) },
+            leader.as_raw(),
+            "the fixture's background job must share the leader's process group"
+        );
+
+        kill_and_reap_unreferenced(leader);
+        let _ = std::fs::remove_file(&pid_file);
+
+        assert!(
+            matches!(
+                nix::sys::wait::waitpid(leader, None),
+                Err(nix::errno::Errno::ECHILD)
+            ),
+            "the leader must already be reaped"
+        );
+        // SIGKILL reaches the whole group at once; only init's reap of the
+        // orphaned zombie may lag, so give the disappearance a bounded wait.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(background, 0) } == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the background job survived the leader's group kill"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
