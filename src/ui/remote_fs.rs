@@ -93,15 +93,20 @@ impl FsLocation {
 /// the paste into streaming transfers (download, upload, or temp-relayed
 /// remote-to-remote hops). A cut deletes only the sources whose transfer
 /// actually succeeded.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FsClipboard {
+    /// Monotonic identity of the user Copy/Cut action that created this
+    /// payload. Slow paste completions may retire only the same intent; the
+    /// numeric location can legitimately change when an exact profile is
+    /// reordered.
+    pub(crate) intent_id: u64,
     pub(crate) loc: FsLocation,
     pub(crate) items: Vec<FsClipboardItem>,
     pub(crate) cut: bool,
 }
 
 /// One clipboard entry: the source path and whether it is a directory.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FsClipboardItem {
     pub(crate) path: PathBuf,
     pub(crate) is_dir: bool,

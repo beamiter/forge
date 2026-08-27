@@ -517,6 +517,8 @@ multiplex = true
 
 `Ctrl+Shift+S` 打开主机选择器。连接复用由 OpenSSH ControlMaster 完成，异常断开按上限退避重连；用户正常退出不会重连。
 
+Files 侧边栏顶部也可以直接选择 `ssh: 名称` / `docker: 名称` 浏览目标文件系统；选择器旁的终端按钮可立即进入该 profile。本地位置会精确在当前文件树根目录新开标签，远端位置从 profile 的默认目录启动（远端启动器没有通用的“指定 cwd”契约）。连接前的 home 探测不会阻塞 GTK；失败会显示原因并回到 Local，重新选择即可重试。配置增删、编辑或重排后，Forge 只按完整 profile 身份保留/重映射已经打开的远端树和文件剪贴板；目标身份不再唯一可证时会清理旧状态，绝不会让同一个数字索引悄悄指向另一台机器。若新建、重命名或删除确认框打开期间又切换了根目录/目标，旧操作会要求重新打开，不会把旧绝对路径交给新的后端。
+
 `deploy` 决定目标机器上没有 jsh 时怎么办：`"off"`（默认）直接运行 `remote_shell`，取到什么算什么；`"persist"` 和 `"incognito"` 会把一份 jsh 送过去，前者在对方 `$HOME` 留下 dot-files 和二进制缓存（重连免传输），后者用退出即删的沙箱 HOME。Block、cwd 跟踪和退出码都来自 jsh，所以对端只有 `sh` 时不开 deploy 会静默丢掉这些。
 
 `docker = true` 时 `host` 是**正在运行的**容器名，走 `docker exec` 而不是 ssh，`user` 变成容器内的用户（`-u`）；`ssh_args`、`multiplex`、`login_shell` 对容器无意义，会被忽略。容器默认以 root 运行，而旧版 jsh 在 root 下会把 `/usr/bin/git` 和 `/usr/bin/bash` 判为不可信 helper，于是 git 补全、git 提示符和 `.bashrc` 导入在容器里静默消失。容器标签页请搭配修复过这一点的 jsh（jsh CHANGELOG 中的 “a root shell trusts the system helpers it could write”）。

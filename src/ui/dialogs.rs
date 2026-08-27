@@ -3242,8 +3242,9 @@ impl UiState {
                         if response != "remove" {
                             return;
                         }
-                        {
+                        let previous_hosts = {
                             let mut config = ui_for_response.config.borrow_mut();
+                            let previous_hosts = config.remote_hosts.clone();
                             // The index can go stale if the file was reloaded
                             // behind the panel; fall back to matching the name.
                             match config.remote_hosts.get(index) {
@@ -3252,7 +3253,9 @@ impl UiState {
                                 }
                                 _ => config.remote_hosts.retain(|h| h.name != name),
                             }
-                        }
+                            previous_hosts
+                        };
+                        ui_for_response.reconcile_file_tree_remote_hosts(&previous_hosts);
                         ui_for_response.persist_config();
                         let populate = populate_ref.borrow().clone();
                         if let Some(populate) = populate {
@@ -3532,8 +3535,9 @@ impl UiState {
                     error_label.set_visible(true);
                 }
                 Ok((target, new_host)) => {
-                    {
+                    let previous_hosts = {
                         let mut config = ui.config.borrow_mut();
+                        let previous_hosts = config.remote_hosts.clone();
                         match target {
                             // Replaced in place so the host keeps its position
                             // in the picker; remove-then-push would move it to
@@ -3543,7 +3547,9 @@ impl UiState {
                             }
                             _ => config.remote_hosts.push(new_host),
                         }
-                    }
+                        previous_hosts
+                    };
+                    ui.reconcile_file_tree_remote_hosts(&previous_hosts);
                     ui.persist_config();
                     let populate = populate.borrow().clone();
                     if let Some(populate) = populate {

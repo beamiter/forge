@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 4.4)
+Updated: 2026-08-27 (Files Remote Bridge 4.5)
 
 This working tree contains the nine-round "Evolve ASCII organism" series
 (`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
@@ -18,6 +18,28 @@ every round (attribution races, a Drop panic on a fired glib source, a
 saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
+
+- **Files Remote Bridge 4.5 (2026-08-27)**: the Files header now has a
+  keyboard-focusable, explicitly labelled terminal action. Local opens at the
+  visible tree root; an SSH/Docker location opens the same validated managed
+  profile at its remote-shell default directory. Remote home discovery moved
+  from GTK to the bounded file-op worker, with generation/location rejection
+  for late answers and a visible Local fallback on failure. Index-backed tree
+  and clipboard locations are reconciled across Settings edits and config
+  reload by exact full-profile identity: unique reorders remap; removal,
+  replacement, or ambiguity fails closed to Local so old rows can never be
+  applied to a different target. Dropdown rebuild notifications are suppressed;
+  menu/name/delete intents revalidate their originating generation/location;
+  and operation completions refresh only the generation/location they started
+  from. Every Copy/Cut has a monotonic intent token: delayed Paste resolves the
+  token through the live reconciled clipboard, and a slow cut can retire only
+  its own intent (even when a newer intent has identical paths, or the same
+  profile moved index). Managed-tab OSC 7 following first distinguishes the
+  focused local/remote split leaf, then requires one validated current profile
+  match instead of trusting a display name; only restored tabs carry the
+  explicit saved-session identity exception through reconnect. Pure regressions
+  cover reorder, removal, replacement, invalid/ambiguous profiles, Local
+  identity, stale delayed actions, clipboard ABA, and managed-tab replacement.
 
 - **Block Search 4.4 (2026-08-26)**: the capture-phase picker key router now
   confirms only when focus belongs to the query editor or a result row. Every

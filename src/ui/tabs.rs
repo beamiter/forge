@@ -26,7 +26,9 @@ struct TabLaunch {
     session_id: Option<String>,
     initial_commands: crate::terminal::InitialCommands,
     argv_override: Option<Vec<String>>,
-    remote: Option<(crate::config::RemoteHost, u32)>,
+    /// Frozen host, reconnect attempt, and whether workspace restore replaced
+    /// only the profile session id with the saved tab session.
+    remote: Option<(crate::config::RemoteHost, u32, bool)>,
     terminal_mode: crate::config::TerminalMode,
 }
 
@@ -1104,7 +1106,7 @@ impl UiState {
 
     /// Open a new tab connecting to a saved remote host over ssh.
     pub(crate) fn connect_remote(&self, host: &crate::config::RemoteHost) -> Option<Terminal> {
-        self.connect_remote_with_attempt(host, 0)
+        self.connect_remote_with_attempt(host, 0, false)
     }
 
     /// Like `connect_remote`, but seeds the new tab's reconnect-backoff counter.
@@ -1113,8 +1115,15 @@ impl UiState {
         &self,
         host: &crate::config::RemoteHost,
         attempt: u32,
+        profile_session_overridden: bool,
     ) -> Option<Terminal> {
-        self.launch_remote(host, attempt, None, Some(host.name.clone()))
+        self.launch_remote(
+            host,
+            attempt,
+            None,
+            Some(host.name.clone()),
+            profile_session_overridden,
+        )
     }
 
     /// Restore a managed remote through the same direct-argv path as a fresh
@@ -1126,7 +1135,7 @@ impl UiState {
         session_id: String,
         tab_name: Option<String>,
     ) -> Option<Terminal> {
-        self.launch_remote(host, 0, Some(session_id), tab_name)
+        self.launch_remote(host, 0, Some(session_id), tab_name, true)
     }
 
     fn launch_remote(
@@ -1135,6 +1144,7 @@ impl UiState {
         attempt: u32,
         session_id: Option<String>,
         tab_name: Option<String>,
+        profile_session_overridden: bool,
     ) -> Option<Terminal> {
         let argv = match crate::config::checked_remote_argv(host) {
             Ok(argv) => argv,
@@ -1156,7 +1166,7 @@ impl UiState {
             session_id,
             initial_commands: crate::terminal::InitialCommands::default(),
             argv_override: Some(argv),
-            remote: Some((host.clone(), attempt)),
+            remote: Some((host.clone(), attempt, profile_session_overridden)),
             terminal_mode,
         }))
     }
@@ -1243,6 +1253,7 @@ impl UiState {
         self.set_tab_conn_status(tab_num, ConnStatus::Disconnected);
 
         let host = conn.host.clone();
+        let profile_session_overridden = conn.profile_session_overridden;
         let connection_identity = conn.identity;
         log::info!(
             "[remote] '{}' (tab {}) disconnected (exit {}); reconnecting in {}s (attempt {})",
@@ -1314,7 +1325,12 @@ impl UiState {
                 );
                 return glib::ControlFlow::Continue;
             }
-            ui.do_reconnect(current_tab_num, &host, next_attempt);
+            ui.do_reconnect(
+                current_tab_num,
+                &host,
+                next_attempt,
+                profile_session_overridden,
+            );
             glib::ControlFlow::Break
         });
     }
@@ -1323,7 +1339,13 @@ impl UiState {
     /// tab's notebook slot (preserving position), then remove the dead page. The
     /// rebuilt argv reuses the host's baked-in `--session` id so jsh restores the
     /// snapshot.
-    fn do_reconnect(&self, dead_tab_num: u32, host: &crate::config::RemoteHost, attempt: u32) {
+    fn do_reconnect(
+        &self,
+        dead_tab_num: u32,
+        host: &crate::config::RemoteHost,
+        attempt: u32,
+        profile_session_overridden: bool,
+    ) {
         let dead_name = format!("tab-{}", dead_tab_num);
         let dead_idx = (0..self.notebook.n_pages()).find(|&i| {
             self.notebook
@@ -1338,7 +1360,7 @@ impl UiState {
 
         // Insert the replacement right after the dead page.
         self.notebook.set_current_page(Some(dead_idx));
-        self.connect_remote_with_attempt(host, attempt);
+        self.connect_remote_with_attempt(host, attempt, profile_session_overridden);
 
         // Remove the now-stale dead page (still at dead_idx); position is preserved.
         self.tab_connections.borrow_mut().remove(&dead_tab_num);
@@ -1442,12 +1464,13 @@ impl UiState {
         // number or leave orphaned session/connection records.
         self.tab_counter.set(tab_num + 1);
         self.session_ids.borrow_mut().insert(tab_num, sid.clone());
-        if let Some((host, attempt)) = &remote {
+        if let Some((host, attempt, profile_session_overridden)) = &remote {
             self.tab_connections.borrow_mut().insert(
                 tab_num,
                 TabConnection {
                     identity: tab_num,
                     host: host.clone(),
+                    profile_session_overridden: *profile_session_overridden,
                     status: ConnStatus::Connecting,
                     attempt: *attempt,
                     spawn_at: std::time::Instant::now(),
@@ -1743,7 +1766,7 @@ impl UiState {
         view_type.attach_to(&term_wrapper_widget);
         view_type.set_session_id(&sid);
         view_type.set_remote(is_remote);
-        if let Some((host, _)) = remote.as_ref() {
+        if let Some((host, _, _)) = remote.as_ref() {
             view_type.set_managed_remote_name(&host.name);
             if let Some(session_id) = host.session.as_deref().filter(|session_id| {
                 jterm_core::execution_journal::is_valid_jsh_session_id(session_id)

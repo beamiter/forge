@@ -141,6 +141,10 @@ pub(crate) struct TabConnection {
     /// The host this tab connects to — used to rebuild the same argv (and thus
     /// the same remote `--session` id) on reconnect.
     pub(crate) host: crate::config::RemoteHost,
+    /// Workspace restore deliberately replaces the configured profile session
+    /// with the saved tab session. Only those connections may ignore `session`
+    /// while matching the live tab back to a current filesystem profile.
+    pub(crate) profile_session_overridden: bool,
     pub(crate) status: ConnStatus,
     /// Reconnect backoff counter; a session that stayed up long enough resets it.
     pub(crate) attempt: u32,
@@ -282,6 +286,9 @@ pub(crate) struct UiState {
     /// Location selector in the file-tree header; rebuilt when the hosts list
     /// or the current location changes.
     pub(crate) file_tree_location_selector: gtk4::DropDown,
+    /// Suppress intermediate `selected` notifications while replacing the
+    /// dropdown model; those are not user requests to switch filesystems.
+    pub(crate) file_tree_location_selector_syncing: Rc<Cell<bool>>,
     /// Type-to-filter row under the file-tree header (hidden until toggled).
     pub(crate) file_tree_filter_bar: gtk4::Box,
     pub(crate) file_tree_filter_entry: gtk4::Entry,
@@ -290,6 +297,9 @@ pub(crate) struct UiState {
     /// Sidebar cut/copy payload for file operations; paste is offered only
     /// while the clipboard location matches the tree location.
     pub(crate) file_tree_clipboard: Rc<RefCell<Option<FsClipboard>>>,
+    /// Allocates a distinct identity for every user Copy/Cut action so an old
+    /// async paste cannot consume a newer, even byte-identical, payload.
+    pub(crate) file_tree_clipboard_intent: Rc<Cell<u64>>,
     pub(crate) tab_search_entry: SearchEntry,
     pub(crate) selected_tabs: Rc<RefCell<Vec<String>>>,
     /// Global identity/generation for one native tab drag. Delayed hover work

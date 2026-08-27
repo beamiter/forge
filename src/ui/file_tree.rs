@@ -186,10 +186,11 @@ where
 
 /// Run one blocking file operation (create/rename/delete/copy) on a worker
 /// thread, bounded separately from scans, and deliver the outcome to `apply`.
-fn request_fs_op<F, W>(work: W, apply: F) -> io::Result<()>
+fn request_fs_op<T, F, W>(work: W, apply: F) -> io::Result<()>
 where
-    F: FnOnce(io::Result<()>) + 'static,
-    W: FnOnce() -> io::Result<()> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce(io::Result<T>) + 'static,
+    W: FnOnce() -> io::Result<T> + Send + 'static,
 {
     ACTIVE_FS_OPS
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
@@ -925,7 +926,111 @@ pub(crate) fn build_file_tree_widgets(
     (model, file_tree)
 }
 
+/// Keep an index-backed remote location bound to the exact profile it meant
+/// before a configuration edit. Reordering is harmless; replacement,
+/// removal, or an ambiguous duplicate fails closed instead of silently
+/// redirecting old tree rows and clipboard paths to another machine.
+fn remap_remote_location(
+    location: &FsLocation,
+    previous_hosts: &[RemoteHost],
+    current_hosts: &[RemoteHost],
+) -> Option<FsLocation> {
+    let FsLocation::Remote(previous_index) = location else {
+        return Some(FsLocation::Local);
+    };
+    if *previous_index >= crate::config::MAX_REMOTE_HOSTS {
+        return None;
+    }
+    let profile = previous_hosts.get(*previous_index)?;
+    let mut matches = current_hosts
+        .iter()
+        .take(crate::config::MAX_REMOTE_HOSTS)
+        .enumerate()
+        .filter_map(|(index, candidate)| (candidate == profile).then_some(index));
+    let index = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    crate::config::checked_remote_host(current_hosts, index).ok()?;
+    Some(FsLocation::Remote(index))
+}
+
+/// Resolve the concrete profile a live managed tab was launched from without
+/// trusting its display name. Restored tabs intentionally replace only the
+/// profile's jsh session id with the saved tab id. That exception is explicit;
+/// fresh connections still compare every field. In both modes every
+/// filesystem-authority field and remaining profile policy must match exactly
+/// once and the current candidate must pass the execution gate.
+fn unique_remote_connection_profile_index(
+    connected: &RemoteHost,
+    current_hosts: &[RemoteHost],
+    profile_session_overridden: bool,
+) -> Option<usize> {
+    let mut matches = current_hosts
+        .iter()
+        .take(crate::config::MAX_REMOTE_HOSTS)
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            let same_profile = if profile_session_overridden {
+                let mut normalized = connected.clone();
+                normalized.session = candidate.session.clone();
+                &normalized == candidate
+            } else {
+                connected == candidate
+            };
+            (same_profile && crate::config::validate_remote_host(candidate).is_ok())
+                .then_some(index)
+        });
+    let index = matches.next()?;
+    matches.next().is_none().then_some(index)
+}
+
+fn file_tree_context_matches(
+    expected_generation: u64,
+    expected_location: &FsLocation,
+    current_generation: u64,
+    current_location: &FsLocation,
+) -> bool {
+    expected_generation == current_generation && expected_location == current_location
+}
+
+/// A completed cut clears only the user intent it started from. Payload value
+/// equality is insufficient: a later Copy/Cut may deliberately select the
+/// same paths, while an exact remote-profile reorder may change only `loc` on
+/// the original intent.
+fn clear_clipboard_if_intent_matches(
+    slot: &mut Option<FsClipboard>,
+    expected_intent_id: u64,
+) -> bool {
+    if slot.as_ref().map(|clipboard| clipboard.intent_id) != Some(expected_intent_id) {
+        return false;
+    }
+    *slot = None;
+    true
+}
+
+fn clipboard_for_intent(
+    slot: &Option<FsClipboard>,
+    expected_intent_id: u64,
+) -> Option<FsClipboard> {
+    slot.as_ref()
+        .filter(|clipboard| clipboard.intent_id == expected_intent_id)
+        .cloned()
+}
+
 impl UiState {
+    fn next_file_tree_clipboard_intent(&self) -> Option<u64> {
+        let current = self.file_tree_clipboard_intent.get();
+        let Some(next) = current.checked_add(1) else {
+            self.toast_overlay.add_toast(adw::Toast::new(
+                "Copy/Cut is unavailable because its intent counter is exhausted",
+            ));
+            return None;
+        };
+        self.file_tree_clipboard_intent.set(next);
+        Some(next)
+    }
+
     /// Set up the initial file tree root (current tab cwd, else $HOME).
     pub(crate) fn init_file_tree(&self) {
         let start = self
@@ -1005,31 +1110,183 @@ impl UiState {
 
     /// Switch the tree to another filesystem (local disk or one of the
     /// configured remote hosts) and root it at that location's start
-    /// directory. On failure the previous location stays active.
+    /// directory. Remote home discovery runs off the GTK thread; a failure
+    /// returns to Local so Refresh never retries a local-looking path against
+    /// the failed remote target.
     pub(crate) fn set_file_tree_location(&self, location: FsLocation) {
         if *self.file_tree_location.borrow() == location {
             return;
         }
         let hosts = self.config.borrow().remote_hosts.clone();
-        match remote_fs::start_dir(&location, &hosts) {
-            Ok(root) => {
-                *self.file_tree_location.borrow_mut() = location;
-                // Reflect programmatic switches (remote-tab follow) in the
-                // header selector; the notify handler ignores no-op selections.
-                self.refresh_file_tree_location_selector();
-                self.set_file_tree_root(root);
+        if location == FsLocation::Local {
+            *self.file_tree_location.borrow_mut() = FsLocation::Local;
+            self.refresh_file_tree_location_selector();
+            let root = remote_fs::start_dir(&FsLocation::Local, &hosts)
+                .or_else(|_| home_dir().ok_or_else(|| io::Error::other("home is unavailable")))
+                .unwrap_or_else(|_| PathBuf::from("/"));
+            self.set_file_tree_root(root);
+            return;
+        }
+
+        *self.file_tree_location.borrow_mut() = location.clone();
+        let generation = self.file_tree_model.reset();
+        *self.file_tree_root.borrow_mut() = PathBuf::new();
+        let label = location.label(&hosts);
+        self.file_tree_root_label
+            .set_text(&format!("Connecting to {label}…"));
+        self.file_tree_root_label
+            .set_tooltip_text(Some("Resolving the remote start directory"));
+        self.refresh_file_tree_location_selector();
+
+        let ui = self.clone();
+        let expected_location = location.clone();
+        let location_for_work = location.clone();
+        let hosts_for_work = hosts.clone();
+        let apply = move |result: io::Result<PathBuf>| {
+            if ui.file_tree_model.generation.get() != generation
+                || *ui.file_tree_location.borrow() != expected_location
+            {
+                return;
             }
-            Err(error) => {
-                let label = location.label(&hosts);
-                log::warn!("failed to resolve start directory for {label}: {error}");
-                let error = jterm_core::review_input::safe_inline_display(&error.to_string(), 512);
-                self.toast_overlay
-                    .add_toast(adw::Toast::new(&format!("Cannot open {label}: {error}")));
-                // The user may have picked the failing location in the
-                // selector; snap its selection back to the active location.
-                self.refresh_file_tree_location_selector();
+            match result {
+                Ok(root) => ui.set_file_tree_root(root),
+                Err(error) => ui.fail_file_tree_location_change(&expected_location, &error),
+            }
+        };
+        if let Err(error) = request_fs_op(
+            move || remote_fs::start_dir(&location_for_work, &hosts_for_work),
+            apply,
+        ) {
+            self.fail_file_tree_location_change(&location, &error);
+        }
+    }
+
+    fn fail_file_tree_location_change(&self, location: &FsLocation, error: &io::Error) {
+        if *self.file_tree_location.borrow() != *location {
+            return;
+        }
+        let hosts = self.config.borrow().remote_hosts.clone();
+        let label = location.label(&hosts);
+        log::warn!("failed to resolve start directory for {label}: {error}");
+        let detail = jterm_core::review_input::safe_inline_display(&error.to_string(), 512);
+        *self.file_tree_location.borrow_mut() = FsLocation::Local;
+        self.refresh_file_tree_location_selector();
+        let root = home_dir().unwrap_or_else(|| PathBuf::from("/"));
+        self.set_file_tree_root(root);
+        self.toast_overlay
+            .add_toast(adw::Toast::new(&format!("Cannot open {label}: {detail}")));
+    }
+
+    /// Reconcile the tree and its clipboard after `remote_hosts` changes.
+    /// Exact profiles may move to another index; anything else returns the
+    /// visible tree to Local and drops clipboard paths whose target identity
+    /// can no longer be proven.
+    pub(crate) fn reconcile_file_tree_remote_hosts(&self, previous_hosts: &[RemoteHost]) {
+        let current_hosts = self.config.borrow().remote_hosts.clone();
+
+        {
+            let mut clipboard = self.file_tree_clipboard.borrow_mut();
+            if let Some(payload) = clipboard.as_mut() {
+                match remap_remote_location(&payload.loc, previous_hosts, &current_hosts) {
+                    Some(location) => payload.loc = location,
+                    None => *clipboard = None,
+                }
             }
         }
+
+        let previous_location = self.file_tree_location.borrow().clone();
+        match remap_remote_location(&previous_location, previous_hosts, &current_hosts) {
+            Some(location) => {
+                if location == previous_location {
+                    self.refresh_file_tree_location_selector();
+                } else {
+                    let root = self.file_tree_root.borrow().clone();
+                    if root.as_os_str().is_empty() {
+                        // A home probe queued with the old index will be
+                        // discarded by its location check; start a fresh one
+                        // against the exact profile's new index.
+                        *self.file_tree_location.borrow_mut() = FsLocation::Local;
+                        self.set_file_tree_location(location);
+                    } else {
+                        *self.file_tree_location.borrow_mut() = location;
+                        self.refresh_file_tree_location_selector();
+                        self.set_file_tree_root(root);
+                    }
+                }
+            }
+            None => {
+                *self.file_tree_location.borrow_mut() = FsLocation::Local;
+                self.refresh_file_tree_location_selector();
+                let root = home_dir().unwrap_or_else(|| PathBuf::from("/"));
+                self.set_file_tree_root(root);
+                self.toast_overlay.add_toast(adw::Toast::new(
+                    "Remote file-tree target changed; returned to Local",
+                ));
+            }
+        }
+    }
+
+    /// Bridge the filesystem browser to a terminal in one action. Local opens
+    /// exactly at the visible root. A remote location opens its managed SSH or
+    /// Docker profile; the remote shell chooses its configured/default start
+    /// directory because that launcher has no portable cwd contract.
+    pub(crate) fn open_file_tree_terminal(&self) {
+        match self.file_tree_location.borrow().clone() {
+            FsLocation::Local => {
+                let root = self.file_tree_root.borrow().clone();
+                if root.as_os_str().is_empty() {
+                    self.toast_overlay
+                        .add_toast(adw::Toast::new("The file-tree location is still loading"));
+                    return;
+                }
+                let Some(cwd) = root.to_str() else {
+                    self.toast_overlay.add_toast(adw::Toast::new(
+                        "This directory cannot cross the terminal's UTF-8 cwd boundary",
+                    ));
+                    return;
+                };
+                let startup = self.config.borrow().startup_commands.clone();
+                self.add_new_tab(
+                    Some(cwd.to_string()),
+                    None,
+                    None,
+                    crate::terminal::InitialCommands::from_config(startup.as_deref()),
+                );
+            }
+            FsLocation::Remote(index) => {
+                let host = {
+                    let config = self.config.borrow();
+                    crate::config::checked_remote_host(&config.remote_hosts, index).cloned()
+                };
+                match host {
+                    Ok(host) => {
+                        self.connect_remote(&host);
+                    }
+                    Err(message) => {
+                        self.toast_overlay.add_toast(adw::Toast::new(message));
+                    }
+                }
+            }
+        }
+    }
+
+    fn file_tree_context_is_current(&self, generation: u64, location: &FsLocation) -> bool {
+        file_tree_context_matches(
+            generation,
+            location,
+            self.file_tree_model.generation.get(),
+            &self.file_tree_location.borrow(),
+        )
+    }
+
+    fn require_current_file_tree_context(&self, generation: u64, location: &FsLocation) -> bool {
+        if self.file_tree_context_is_current(generation, location) {
+            return true;
+        }
+        self.toast_overlay.add_toast(adw::Toast::new(
+            "The file-tree location changed; reopen the action",
+        ));
+        false
     }
 
     /// Toggle the type-to-filter row open/closed. Closing clears the query,
@@ -1072,9 +1329,9 @@ impl UiState {
     }
 
     /// Rebuild the location selector's entries from the configured hosts and
-    /// re-select the active location. Selection changes that do not match the
-    /// active location are left to the notify handler, which performs the
-    /// actual switch (a removed host thus falls back to Local).
+    /// re-select the active location. Model replacement may emit intermediate
+    /// selections, so the notify handler is explicitly suppressed until both
+    /// the model and selected index are coherent.
     pub(crate) fn refresh_file_tree_location_selector(&self) {
         let config = self.config.borrow();
         let hosts = &config.remote_hosts;
@@ -1094,17 +1351,20 @@ impl UiState {
         drop(config);
         let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
         let model = gtk4::StringList::new(&label_refs);
+        self.file_tree_location_selector_syncing.set(true);
         self.file_tree_location_selector.set_model(Some(&model));
         self.file_tree_location_selector.set_selected(selected);
+        self.file_tree_location_selector_syncing.set(false);
     }
 
-    /// React to the header location selector. Guarded against rebuilds: a
-    /// selection matching the active location is a no-op, so repopulating the
-    /// model can never retrigger a switch.
+    /// React to a user selection in the header location dropdown.
     pub(crate) fn connect_file_tree_location_selector(&self) {
         let ui = self.clone();
         self.file_tree_location_selector
             .connect_selected_notify(move |selector| {
+                if ui.file_tree_location_selector_syncing.get() {
+                    return;
+                }
                 let index = selector.selected();
                 if index == gtk4::INVALID_LIST_POSITION {
                     return;
@@ -1121,21 +1381,18 @@ impl UiState {
             });
     }
 
-    /// The index into `config.remote_hosts` of the host the active tab is
-    /// connected to, when that tab is a forge-managed remote session.
-    fn current_tab_remote_host_index(&self) -> Option<usize> {
+    /// The frozen profile for the active managed remote tab. Keeping this
+    /// separate from profile resolution lets callers distinguish a local tab
+    /// from a remote tab whose profile was removed or became ambiguous; the
+    /// latter must not fall through to the ssh client's local `/proc` cwd.
+    fn current_tab_remote_connection(&self) -> Option<TabConnection> {
         let page_num = self.notebook.current_page()?;
         let page = self.notebook.nth_page(Some(page_num))?;
         let tab_num = page
             .widget_name()
             .strip_prefix("tab-")
             .and_then(|value| value.parse::<u32>().ok())?;
-        let connection = self.tab_connections.borrow().get(&tab_num)?.clone();
-        let config = self.config.borrow();
-        config
-            .remote_hosts
-            .iter()
-            .position(|host| host.name == connection.host.name)
+        self.tab_connections.borrow().get(&tab_num).cloned()
     }
 
     /// Jump the file tree to the active tab's working directory. A remote
@@ -1143,7 +1400,25 @@ impl UiState {
     /// host, rooted at the reported directory; one that reports nothing
     /// leaves the tree alone, exactly as before.
     pub(crate) fn file_tree_goto_current_cwd(&self) {
-        if let Some(index) = self.current_tab_remote_host_index() {
+        let Some(active_leaf) = self.current_pane_leaf() else {
+            return;
+        };
+        if active_leaf.is_remote() {
+            let Some(connection) = self.current_tab_remote_connection() else {
+                // A remote pane without its managed connection record has no
+                // authority that can safely interpret an OSC 7 path.
+                return;
+            };
+            let Some(index) = unique_remote_connection_profile_index(
+                &connection.host,
+                &self.config.borrow().remote_hosts,
+                connection.profile_session_overridden,
+            ) else {
+                // The tab is still managed remote, but its current profile is
+                // no longer provably unique. Keep the tree where it is rather
+                // than treating ssh's local process cwd as a safe fallback.
+                return;
+            };
             // Only the OSC 7 report is trusted here: the /proc fallback in
             // `terminal_working_directory` would resolve the ssh client's
             // LOCAL cwd, which is not a path on the remote host.
@@ -1451,6 +1726,7 @@ impl UiState {
         // menus: the GAction-based PopoverMenu dispatch does not fire in this
         // GTK build, so direct connect_clicked closures are used.
         let location = self.file_tree_location.borrow().clone();
+        let context_generation = self.file_tree_model.generation.get();
         let selected = self.file_tree_model.selected_entries();
         let target_with_pos = target.clone().and_then(|(_, entry)| {
             self.file_tree_model
@@ -1506,8 +1782,12 @@ impl UiState {
             let popover_c = popover.clone();
             let ui = self.clone();
             let dir = target_dir.clone();
+            let expected_location = location.clone();
             item.connect_clicked(move |_| {
                 popover_c.popdown();
+                if !ui.require_current_file_tree_context(context_generation, &expected_location) {
+                    return;
+                }
                 ui.present_file_tree_name_dialog(kind, dir.clone(), None);
             });
             vbox.append(&item);
@@ -1519,8 +1799,13 @@ impl UiState {
             if let Some(entry) = entries.first().cloned().filter(|_| !multi) {
                 let popover_c = popover.clone();
                 let ui = self.clone();
+                let expected_location = location.clone();
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
+                    if !ui.require_current_file_tree_context(context_generation, &expected_location)
+                    {
+                        return;
+                    }
                     let dir = entry
                         .path
                         .parent()
@@ -1548,8 +1833,13 @@ impl UiState {
                 let popover_c = popover.clone();
                 let ui = self.clone();
                 let entries = entries.clone();
+                let expected_location = location.clone();
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
+                    if !ui.require_current_file_tree_context(context_generation, &expected_location)
+                    {
+                        return;
+                    }
                     ui.confirm_file_tree_delete(entries.clone());
                 });
             }
@@ -1564,9 +1854,18 @@ impl UiState {
                 let ui = self.clone();
                 let location = location.clone();
                 let entries = entries.clone();
+                let expected_location = location.clone();
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
+                    if !ui.require_current_file_tree_context(context_generation, &expected_location)
+                    {
+                        return;
+                    }
+                    let Some(intent_id) = ui.next_file_tree_clipboard_intent() else {
+                        return;
+                    };
                     *ui.file_tree_clipboard.borrow_mut() = Some(FsClipboard {
+                        intent_id,
                         loc: location.clone(),
                         items: entries
                             .iter()
@@ -1591,8 +1890,13 @@ impl UiState {
                 let popover_c = popover.clone();
                 let ui = self.clone();
                 let entries = entries.clone();
+                let expected_location = location.clone();
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
+                    if !ui.require_current_file_tree_context(context_generation, &expected_location)
+                    {
+                        return;
+                    }
                     let mut texts = Vec::with_capacity(entries.len());
                     for entry in &entries {
                         match copy_path_payload(&entry.path) {
@@ -1647,9 +1951,30 @@ impl UiState {
                 let popover_c = popover.clone();
                 let ui = self.clone();
                 let dir = target_dir.clone();
+                let expected_location = location.clone();
+                let expected_clipboard_intent = clip.intent_id;
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
-                    ui.paste_file_tree_clipboard(clip.clone(), dir.clone());
+                    if !ui.require_current_file_tree_context(context_generation, &expected_location)
+                    {
+                        return;
+                    }
+                    // The menu may outlive a config reload or a newer
+                    // Copy/Cut. Resolve the frozen intent through the live
+                    // clipboard so a removed source profile cannot be
+                    // reinterpreted at the same numeric index. Exact profile
+                    // reorders preserve the token and contribute the remapped
+                    // location here.
+                    let current_clipboard = clipboard_for_intent(
+                        &ui.file_tree_clipboard.borrow(),
+                        expected_clipboard_intent,
+                    );
+                    let Some(current_clipboard) = current_clipboard else {
+                        ui.toast_overlay
+                            .add_toast(adw::Toast::new("The file clipboard changed; reopen Paste"));
+                        return;
+                    };
+                    ui.paste_file_tree_clipboard(current_clipboard, dir.clone());
                 });
             }
             vbox.append(&item);
@@ -1659,8 +1984,12 @@ impl UiState {
             let item = make_item("Refresh");
             let popover_c = popover.clone();
             let ui = self.clone();
+            let expected_location = location;
             item.connect_clicked(move |_| {
                 popover_c.popdown();
+                if !ui.require_current_file_tree_context(context_generation, &expected_location) {
+                    return;
+                }
                 // In-place re-list: expanded rows stay expanded.
                 let root = ui.file_tree_root.borrow().clone();
                 ui.refresh_dir_listing(&root);
@@ -1681,6 +2010,8 @@ impl UiState {
         dir: PathBuf,
         existing: Option<FileEntry>,
     ) {
+        let expected_generation = self.file_tree_model.generation.get();
+        let expected_location = self.file_tree_location.borrow().clone();
         let dialog = adw::Dialog::builder()
             .title(kind.title())
             .content_width(360)
@@ -1732,6 +2063,12 @@ impl UiState {
         let ui = self.clone();
         let dialog_for_confirm = dialog.clone();
         confirm_btn.connect_clicked(move |_| {
+            if !ui.file_tree_context_is_current(expected_generation, &expected_location) {
+                error_label
+                    .set_text("The file-tree location changed; close and reopen this action.");
+                error_label.set_visible(true);
+                return;
+            }
             let name = name_row.text();
             if let Err(message) = remote_fs::validate_new_name(&name) {
                 error_label.set_text(message);
@@ -1789,6 +2126,8 @@ impl UiState {
         if entries.is_empty() {
             return;
         }
+        let expected_generation = self.file_tree_model.generation.get();
+        let expected_location = self.file_tree_location.borrow().clone();
         let (title, detail) = delete_confirmation_text(&entries);
         let dialog = adw::AlertDialog::new(Some(&title), Some(&detail));
         dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
@@ -1798,6 +2137,9 @@ impl UiState {
         let ui = self.clone();
         dialog.connect_response(None, move |_, response| {
             if response != "delete" {
+                return;
+            }
+            if !ui.require_current_file_tree_context(expected_generation, &expected_location) {
                 return;
             }
             // The response closure is Fn: clone the entry list into the
@@ -1957,6 +2299,7 @@ impl UiState {
             let loc = location.clone();
             let ui = self.clone();
             let ui_for_success = self.clone();
+            let clipboard_to_clear = clip.clone();
             self.execute_fs_op(
                 "Paste",
                 None,
@@ -2016,7 +2359,11 @@ impl UiState {
                                 .add_toast(adw::Toast::new(&summary));
                         }
                         None if cut => {
-                            *ui.file_tree_clipboard.borrow_mut() = None;
+                            let mut clipboard = ui.file_tree_clipboard.borrow_mut();
+                            clear_clipboard_if_intent_matches(
+                                &mut clipboard,
+                                clipboard_to_clear.intent_id,
+                            );
                         }
                         None => {}
                     }
@@ -2072,6 +2419,7 @@ impl UiState {
         let to = location.clone();
         let ui = self.clone();
         let ui_for_success = self.clone();
+        let clipboard_to_clear = clip.clone();
         self.execute_fs_op(
             verb,
             Some(busy),
@@ -2177,7 +2525,11 @@ impl UiState {
                             .add_toast(adw::Toast::new(&summary));
                     }
                     None if cut => {
-                        *ui.file_tree_clipboard.borrow_mut() = None;
+                        let mut clipboard = ui.file_tree_clipboard.borrow_mut();
+                        clear_clipboard_if_intent_matches(
+                            &mut clipboard,
+                            clipboard_to_clear.intent_id,
+                        );
                     }
                     None => {}
                 }
@@ -2245,16 +2597,22 @@ impl UiState {
         S: FnOnce() + 'static,
     {
         let ui = self.clone();
+        let expected_generation = self.file_tree_model.generation.get();
+        let expected_location = self.file_tree_location.borrow().clone();
         let busy_for_apply = busy.clone();
         let apply = move |result: io::Result<()>| {
             if let Some(busy) = &busy_for_apply {
                 busy.dismiss();
             }
+            let still_visible = ui.file_tree_model.generation.get() == expected_generation
+                && *ui.file_tree_location.borrow() == expected_location;
             match result {
                 Ok(()) => {
                     on_success();
-                    for dir in &affected {
-                        ui.refresh_dir_listing(dir);
+                    if still_visible {
+                        for dir in &affected {
+                            ui.refresh_dir_listing(dir);
+                        }
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {
@@ -2262,8 +2620,10 @@ impl UiState {
                     // warning in the log. Work completed before the cancel
                     // still becomes visible, so refresh like a success would.
                     log::info!("sidebar {verb} cancelled");
-                    for dir in &affected {
-                        ui.refresh_dir_listing(dir);
+                    if still_visible {
+                        for dir in &affected {
+                            ui.refresh_dir_listing(dir);
+                        }
                     }
                     ui.toast_overlay.add_toast(adw::Toast::new("Cancelled"));
                 }
@@ -2431,6 +2791,191 @@ fn copy_path_payload(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn remote_profile(name: &str, target: &str) -> RemoteHost {
+        RemoteHost {
+            name: name.to_string(),
+            host: target.to_string(),
+            user: Some("dev".to_string()),
+            docker: false,
+            deploy_artifact: None,
+            remote_shell: "jsh".to_string(),
+            session: None,
+            ssh_args: Vec::new(),
+            login_shell: true,
+            multiplex: true,
+            deploy: jterm_core::jsh_remote::Deploy::Off,
+        }
+    }
+
+    #[test]
+    fn remote_location_remaps_only_the_exact_unique_profile() {
+        let alpha = remote_profile("alpha", "alpha.example");
+        let beta = remote_profile("beta", "beta.example");
+        let previous = vec![alpha.clone(), beta.clone()];
+
+        assert_eq!(
+            remap_remote_location(
+                &FsLocation::Remote(0),
+                &previous,
+                &[beta.clone(), alpha.clone()],
+            ),
+            Some(FsLocation::Remote(1))
+        );
+        assert_eq!(
+            remap_remote_location(
+                &FsLocation::Remote(0),
+                &previous,
+                std::slice::from_ref(&beta),
+            ),
+            None
+        );
+
+        let mut edited = alpha.clone();
+        edited.host = "replacement.example".to_string();
+        assert_eq!(
+            remap_remote_location(&FsLocation::Remote(0), &previous, &[edited, beta]),
+            None
+        );
+        assert_eq!(
+            remap_remote_location(&FsLocation::Remote(0), &previous, &[alpha.clone(), alpha],),
+            None
+        );
+        assert_eq!(
+            remap_remote_location(&FsLocation::Local, &previous, &[]),
+            Some(FsLocation::Local)
+        );
+
+        let mut invalid = remote_profile("invalid", "-not-a-target");
+        let invalid_previous = vec![invalid.clone()];
+        assert_eq!(
+            remap_remote_location(
+                &FsLocation::Remote(0),
+                &invalid_previous,
+                std::slice::from_ref(&invalid),
+            ),
+            None
+        );
+        invalid.host = "valid.example".to_string();
+        assert_eq!(
+            remap_remote_location(
+                &FsLocation::Remote(crate::config::MAX_REMOTE_HOSTS),
+                &invalid_previous,
+                &[invalid],
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn managed_tab_follow_requires_one_exact_profile_except_for_saved_session() {
+        let alpha = remote_profile("alpha", "alpha.example");
+        let beta = remote_profile("beta", "beta.example");
+        let mut restored_connection = alpha.clone();
+        restored_connection.session = Some("saved-tab-session".to_string());
+
+        assert_eq!(
+            unique_remote_connection_profile_index(
+                &restored_connection,
+                &[beta.clone(), alpha.clone()],
+                true,
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            unique_remote_connection_profile_index(
+                &restored_connection,
+                std::slice::from_ref(&alpha),
+                false,
+            ),
+            None,
+            "a fresh connection receives no session-identity exemption"
+        );
+
+        let mut same_name_replacement = alpha.clone();
+        same_name_replacement.host = "replacement.example".to_string();
+        assert_eq!(
+            unique_remote_connection_profile_index(
+                &restored_connection,
+                &[same_name_replacement],
+                true,
+            ),
+            None,
+            "a live tab name must not redirect its OSC 7 cwd to a replacement target"
+        );
+        assert_eq!(
+            unique_remote_connection_profile_index(
+                &restored_connection,
+                &[alpha.clone(), alpha],
+                true,
+            ),
+            None,
+            "ambiguous duplicate profiles fail closed"
+        );
+    }
+
+    #[test]
+    fn delayed_file_tree_actions_require_the_same_generation_and_location() {
+        assert!(file_tree_context_matches(
+            7,
+            &FsLocation::Remote(2),
+            7,
+            &FsLocation::Remote(2),
+        ));
+        assert!(!file_tree_context_matches(
+            7,
+            &FsLocation::Remote(2),
+            8,
+            &FsLocation::Remote(2),
+        ));
+        assert!(!file_tree_context_matches(
+            7,
+            &FsLocation::Remote(2),
+            7,
+            &FsLocation::Local,
+        ));
+    }
+
+    #[test]
+    fn completed_cut_retires_only_its_original_clipboard_intent() {
+        let original = FsClipboard {
+            intent_id: 7,
+            loc: FsLocation::Remote(0),
+            items: vec![remote_fs::FsClipboardItem {
+                path: PathBuf::from("/old"),
+                is_dir: false,
+            }],
+            cut: true,
+        };
+        let newer = FsClipboard {
+            intent_id: 8,
+            ..original.clone()
+        };
+        let mut slot = Some(newer.clone());
+        assert!(clipboard_for_intent(&slot, original.intent_id).is_none());
+        assert!(!clear_clipboard_if_intent_matches(
+            &mut slot,
+            original.intent_id
+        ));
+        assert_eq!(slot, Some(newer));
+
+        // Reordering the exact remote profile changes its numeric location,
+        // but it is still the same clipboard intent and must be retired.
+        let mut remapped_original = original.clone();
+        remapped_original.loc = FsLocation::Remote(3);
+        let mut slot = Some(remapped_original);
+        assert_eq!(
+            clipboard_for_intent(&slot, original.intent_id)
+                .expect("the live remapped payload resolves")
+                .loc,
+            FsLocation::Remote(3)
+        );
+        assert!(clear_clipboard_if_intent_matches(
+            &mut slot,
+            original.intent_id
+        ));
+        assert!(slot.is_none());
+    }
 
     #[test]
     fn entries_sort_directories_first_then_by_name() {

@@ -649,14 +649,17 @@ impl UiState {
         let sidebar_view = new_config.sidebar_view;
         let sidebar_visible = new_config.sidebar_visible;
         let ai_visible = new_config.ai_enabled && new_config.ai_panel_visible;
+        let previous_remote_hosts = self.config.borrow().remote_hosts.clone();
 
         // New panes/tabs immediately use a changed shell; all other config is
         // replaced as one coherent snapshot instead of retaining stale fields.
         *self.shell_argv.borrow_mut() = choose_shell_argv(new_config.shell.as_deref());
         *self.config.borrow_mut() = new_config;
 
-        // The remote host list may have changed; reflect it in the file tree.
-        self.refresh_file_tree_location_selector();
+        // Preserve an index-backed tree location only when its exact profile
+        // still exists. A reorder is remapped; replacement/removal returns to
+        // Local instead of redirecting already-visible rows to another host.
+        self.reconcile_file_tree_remote_hosts(&previous_remote_hosts);
 
         // TermView owns a shared clone used by long-lived callbacks. Refresh it
         // as well so behavior changes do not require reopening block tabs.

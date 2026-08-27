@@ -213,6 +213,12 @@ forge-support-bundle ~/Desktop
 destination 或提前的 `--`。最多前 128 个 profile 可执行；索引越界或运行态被改坏的
 profile 只显示安全有界诊断，不会 spawn。
 
+Files 侧边栏的位置选择器可直接浏览 `Local`、`ssh: …` 与 `docker: …`；旁边的
+终端按钮把“浏览”接到“进入”：本地在当前树根新开标签，远端通过同一受管 profile
+建立 SSH/Docker 会话（由远端 shell 决定默认目录）。远端 home 探测在后台进行，失败
+会明确回到 Local。热重载或设置改动会按完整 profile 身份重映射位置和剪贴板；不能证明
+仍是同一目标时会清掉旧远端状态，而不会把旧路径静默指向另一台主机或容器。
+
 日志支持普通级别和标准 target 指令，并输出进程内相对时间、级别与模块名：
 
 ```bash

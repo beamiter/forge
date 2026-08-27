@@ -863,6 +863,22 @@ pub fn run() -> glib::ExitCode {
         let file_tree_location_selector = ui::build_file_tree_location_selector();
         file_tree_header.append(&file_tree_location_selector);
 
+        // One-step bridge from the browsed filesystem to a terminal. Local
+        // starts at the visible root; SSH/Docker locations open their managed
+        // profile (whose remote shell owns its start-directory policy).
+        let file_tree_terminal_btn =
+            gtk4::Button::from_icon_name("utilities-terminal-symbolic");
+        file_tree_terminal_btn.set_focus_on_click(false);
+        file_tree_terminal_btn.set_focusable(true);
+        file_tree_terminal_btn.set_tooltip_text(Some(
+            "Open terminal for this location (remote profiles open at their configured start)",
+        ));
+        file_tree_terminal_btn.update_property(&[gtk4::accessible::Property::Label(
+            "Open terminal for file tree location",
+        )]);
+        file_tree_terminal_btn.add_css_class("flat");
+        file_tree_header.append(&file_tree_terminal_btn);
+
         // Inline type-to-filter row, hidden until toggled; Esc closes it.
         let file_tree_filter_entry = gtk4::Entry::new();
         file_tree_filter_entry.set_placeholder_text(Some("Filter loaded names…"));
@@ -1041,7 +1057,9 @@ pub fn run() -> glib::ExitCode {
             file_tree_root_label: file_tree_root_label.clone(),
             file_tree_location: file_tree_location.clone(),
             file_tree_location_selector: file_tree_location_selector.clone(),
+            file_tree_location_selector_syncing: Rc::new(Cell::new(false)),
             file_tree_clipboard: Rc::new(RefCell::new(None)),
+            file_tree_clipboard_intent: Rc::new(Cell::new(0)),
             file_tree_filter_bar: file_tree_filter_bar.clone(),
             file_tree_filter_entry: file_tree_filter_entry.clone(),
             file_tree_filter_toggle: file_tree_filter_toggle.clone(),
@@ -1218,6 +1236,11 @@ pub fn run() -> glib::ExitCode {
         // Wire the file-tree location selector and fill it for the first time.
         ui.connect_file_tree_location_selector();
         ui.refresh_file_tree_location_selector();
+
+        let ui_for_ft_terminal = ui.clone();
+        file_tree_terminal_btn.connect_clicked(move |_| {
+            ui_for_ft_terminal.open_file_tree_terminal();
+        });
 
         // Wire the type-to-filter row and its header toggle.
         ui.connect_file_tree_filter_bar();
