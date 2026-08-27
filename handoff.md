@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-27 (Files Remote Bridge 4.5)
+Updated: 2026-08-27 (Foreground SSH → Remote Files 4.6)
 
 This working tree contains the nine-round "Evolve ASCII organism" series
 (`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
@@ -18,6 +18,30 @@ every round (attribution races, a Drop panic on a fired glib source, a
 saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
+
+- **Foreground SSH → Remote Files 4.6 (2026-08-27)**: the existing single
+  window heartbeat now observes the active leaf's real foreground process tree
+  through `jterm_core::process::observed_ssh_command`, so Block, Unified and
+  VTE recognize direct SSH and provenance-checked jsh upgrade launchers without
+  trusting terminal text or OSC lifecycle completeness. The shared parser
+  rejects remote commands and side-effecting/unreplayable options.
+  Forge prefers one validated configured filesystem authority, otherwise
+  embeds an immutable `FsLocation::Transient(RemoteHostConfig)` marked
+  temporary in the selector. Remote home discovery stages off-thread while
+  the existing tree remains intact; publication requires the same monotonic
+  follow token, active pane/session/foreground target, tab-focus generation,
+  file-operation intent/count, tree generation, location/root, exact config
+  remap and freshly recomputed transport uniqueness. Success reveals Files without
+  persisting a preference, failure offers Retry, unsupported SSH offers the
+  profile selector, and SSH exit never forces an already-open tree to Local.
+  Explicit and provenance-derived ControlPaths live only in immutable execution
+  overlays (probe, scan, operation, clipboard and both transfer endpoints),
+  while stable saved/transient identity ignores them. Equivalent saved and
+  temporary endpoints paste through direct copy/rename instead of a relay.
+  Transient locations use the same final Forge execution gate; their terminal
+  bridge is plain interactive SSH with no assumed remote jsh command. Long
+  endpoints use bounded middle elision in the selector while their sanitized
+  full value remains available as a tooltip.
 
 - **Files Remote Bridge 4.5 (2026-08-27)**: the Files header now has a
   keyboard-focusable, explicitly labelled terminal action. Local opens at the

@@ -28,8 +28,15 @@ struct TabLaunch {
     argv_override: Option<Vec<String>>,
     /// Frozen host, reconnect attempt, and whether workspace restore replaced
     /// only the profile session id with the saved tab session.
-    remote: Option<(crate::config::RemoteHost, u32, bool)>,
+    remote: Option<RemoteLaunch>,
     terminal_mode: crate::config::TerminalMode,
+}
+
+struct RemoteLaunch {
+    host: crate::config::RemoteHost,
+    attempt: u32,
+    profile_session_overridden: bool,
+    plain_ssh_overlay: Option<super::remote_fs::FsExecutionOverlay>,
 }
 
 type TitleChangedCallback = Box<dyn Fn(&str)>;
@@ -1109,6 +1116,61 @@ impl UiState {
         self.connect_remote_with_attempt(host, 0, false)
     }
 
+    /// Open an observed, memory-only target as ordinary interactive SSH. It
+    /// deliberately sends no `jsh` remote command; the observed server need
+    /// not have any Forge tooling installed. The pane is still marked remote
+    /// and reconnects through the same validated argv shape.
+    pub(crate) fn connect_transient_plain_ssh(
+        &self,
+        target: &jterm_core::jsh_remote::RemoteHostConfig,
+        overlay: &super::remote_fs::FsExecutionOverlay,
+    ) -> Option<Terminal> {
+        let (host, _) = match super::remote_fs::plain_interactive_ssh_argv(target, overlay) {
+            Ok(value) => value,
+            Err(error) => {
+                let detail = jterm_core::review_input::safe_inline_display(&error.to_string(), 512);
+                self.toast_overlay.add_toast(adw::Toast::new(&format!(
+                    "Cannot open temporary SSH target: {detail}"
+                )));
+                return None;
+            }
+        };
+        self.connect_plain_ssh_with_attempt(&host, overlay, 0)
+    }
+
+    fn connect_plain_ssh_with_attempt(
+        &self,
+        host: &crate::config::RemoteHost,
+        overlay: &super::remote_fs::FsExecutionOverlay,
+        attempt: u32,
+    ) -> Option<Terminal> {
+        let argv = match super::remote_fs::plain_interactive_ssh_argv_for_host(host, overlay) {
+            Ok(argv) => argv,
+            Err(error) => {
+                let detail = jterm_core::review_input::safe_inline_display(&error.to_string(), 512);
+                self.toast_overlay.add_toast(adw::Toast::new(&format!(
+                    "Cannot open temporary SSH target: {detail}"
+                )));
+                return None;
+            }
+        };
+        let terminal_mode = remote_tab_terminal_mode(&self.config.borrow().terminal_mode);
+        Some(self.add_tab_with_argv(TabLaunch {
+            working_directory: None,
+            tab_name: Some(format!("ssh: {} (temporary)", host.name)),
+            session_id: None,
+            initial_commands: crate::terminal::InitialCommands::default(),
+            argv_override: Some(argv),
+            remote: Some(RemoteLaunch {
+                host: host.clone(),
+                attempt,
+                profile_session_overridden: false,
+                plain_ssh_overlay: Some(overlay.clone()),
+            }),
+            terminal_mode,
+        }))
+    }
+
     /// Like `connect_remote`, but seeds the new tab's reconnect-backoff counter.
     /// Used by auto-reconnect to carry the attempt count across respawns.
     fn connect_remote_with_attempt(
@@ -1166,7 +1228,12 @@ impl UiState {
             session_id,
             initial_commands: crate::terminal::InitialCommands::default(),
             argv_override: Some(argv),
-            remote: Some((host.clone(), attempt, profile_session_overridden)),
+            remote: Some(RemoteLaunch {
+                host: host.clone(),
+                attempt,
+                profile_session_overridden,
+                plain_ssh_overlay: None,
+            }),
             terminal_mode,
         }))
     }
@@ -1254,6 +1321,7 @@ impl UiState {
 
         let host = conn.host.clone();
         let profile_session_overridden = conn.profile_session_overridden;
+        let plain_ssh_overlay = conn.plain_ssh_overlay.clone();
         let connection_identity = conn.identity;
         log::info!(
             "[remote] '{}' (tab {}) disconnected (exit {}); reconnecting in {}s (attempt {})",
@@ -1330,6 +1398,7 @@ impl UiState {
                 &host,
                 next_attempt,
                 profile_session_overridden,
+                plain_ssh_overlay.as_ref(),
             );
             glib::ControlFlow::Break
         });
@@ -1345,6 +1414,7 @@ impl UiState {
         host: &crate::config::RemoteHost,
         attempt: u32,
         profile_session_overridden: bool,
+        plain_ssh_overlay: Option<&super::remote_fs::FsExecutionOverlay>,
     ) {
         let dead_name = format!("tab-{}", dead_tab_num);
         let dead_idx = (0..self.notebook.n_pages()).find(|&i| {
@@ -1360,7 +1430,11 @@ impl UiState {
 
         // Insert the replacement right after the dead page.
         self.notebook.set_current_page(Some(dead_idx));
-        self.connect_remote_with_attempt(host, attempt, profile_session_overridden);
+        if let Some(overlay) = plain_ssh_overlay {
+            self.connect_plain_ssh_with_attempt(host, overlay, attempt);
+        } else {
+            self.connect_remote_with_attempt(host, attempt, profile_session_overridden);
+        }
 
         // Remove the now-stale dead page (still at dead_idx); position is preserved.
         self.tab_connections.borrow_mut().remove(&dead_tab_num);
@@ -1464,15 +1538,16 @@ impl UiState {
         // number or leave orphaned session/connection records.
         self.tab_counter.set(tab_num + 1);
         self.session_ids.borrow_mut().insert(tab_num, sid.clone());
-        if let Some((host, attempt, profile_session_overridden)) = &remote {
+        if let Some(remote) = &remote {
             self.tab_connections.borrow_mut().insert(
                 tab_num,
                 TabConnection {
                     identity: tab_num,
-                    host: host.clone(),
-                    profile_session_overridden: *profile_session_overridden,
+                    host: remote.host.clone(),
+                    profile_session_overridden: remote.profile_session_overridden,
+                    plain_ssh_overlay: remote.plain_ssh_overlay.clone(),
                     status: ConnStatus::Connecting,
-                    attempt: *attempt,
+                    attempt: remote.attempt,
                     spawn_at: std::time::Instant::now(),
                 },
             );
@@ -1766,9 +1841,9 @@ impl UiState {
         view_type.attach_to(&term_wrapper_widget);
         view_type.set_session_id(&sid);
         view_type.set_remote(is_remote);
-        if let Some((host, _, _)) = remote.as_ref() {
-            view_type.set_managed_remote_name(&host.name);
-            if let Some(session_id) = host.session.as_deref().filter(|session_id| {
+        if let Some(remote) = remote.as_ref() {
+            view_type.set_managed_remote_name(&remote.host.name);
+            if let Some(session_id) = remote.host.session.as_deref().filter(|session_id| {
                 jterm_core::execution_journal::is_valid_jsh_session_id(session_id)
             }) {
                 view_type.set_managed_remote_session_id(session_id);

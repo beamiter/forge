@@ -635,6 +635,7 @@ impl UiState {
 
     /// Apply sidebar visibility and optionally persist the user's choice.
     pub(crate) fn set_sidebar_visible(&self, visible: bool, persist: bool) {
+        self.invalidate_file_tree_remote_follow();
         self.sidebar.set_visible(visible);
         if persist {
             self.config.borrow_mut().sidebar_visible = visible;

@@ -35,10 +35,11 @@ use std::sync::mpsc;
 use std::time::Duration;
 use vte4::TerminalExt;
 
-use super::remote_fs::{self, FsClipboard, FsEntry, FsLocation};
+use super::remote_fs::{self, FsClipboard, FsEntry, FsExecutionOverlay, FsLocation};
 use super::*;
 use crate::config::RemoteHost;
 use crate::terminal::terminal_working_directory;
+use jterm_core::jsh_remote::RemoteHostConfig;
 
 const SCAN_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const MAX_FILE_LABEL_BYTES: usize = 512;
@@ -48,6 +49,10 @@ static ACTIVE_SCANS: AtomicUsize = AtomicUsize::new(0);
 /// context-menu actions cannot crowd out directory scans.
 const MAX_CONCURRENT_FS_OPS: usize = 4;
 static ACTIVE_FS_OPS: AtomicUsize = AtomicUsize::new(0);
+/// Header space is scarce. Forty-eight characters retain the recognizable
+/// `root@dsw…aliyuncs.com (temporary)` ends while a tooltip carries the whole
+/// sanitized endpoint.
+const MAX_LOCATION_LABEL_CHARS: usize = 48;
 
 // Re-exported so the existing tests keep one obvious name for the listing cap.
 #[cfg(test)]
@@ -84,11 +89,16 @@ fn sort_entries(entries: &mut [FileEntry]) {
 /// through `scan_entries` for any location.
 #[cfg(test)]
 fn scan_dir(dir: &Path) -> io::Result<Vec<FileEntry>> {
-    scan_entries(&FsLocation::Local, &[], dir)
+    scan_entries(&FsLocation::Local, &[], &FsExecutionOverlay::default(), dir)
 }
 
-fn scan_entries(loc: &FsLocation, hosts: &[RemoteHost], dir: &Path) -> io::Result<Vec<FileEntry>> {
-    remote_fs::list_dir(loc, hosts, dir)
+fn scan_entries(
+    loc: &FsLocation,
+    hosts: &[RemoteHost],
+    overlay: &FsExecutionOverlay,
+    dir: &Path,
+) -> io::Result<Vec<FileEntry>> {
+    remote_fs::list_dir_with_overlay(loc, hosts, overlay, dir)
         .map(|entries| entries.into_iter().map(FileEntry::from).collect())
 }
 
@@ -158,6 +168,7 @@ fn poll_worker<T: 'static>(
 fn request_dir_scan<F>(
     loc: FsLocation,
     hosts: Vec<RemoteHost>,
+    overlay: FsExecutionOverlay,
     dir: PathBuf,
     apply: F,
 ) -> io::Result<()>
@@ -174,7 +185,7 @@ where
         .name("forge-file-tree-scan".to_string())
         .spawn(move || {
             let _active = ActiveScan;
-            let _ = tx.send(scan_entries(&loc, &hosts, &dir));
+            let _ = tx.send(scan_entries(&loc, &hosts, &overlay, &dir));
         })
     {
         ACTIVE_SCANS.fetch_sub(1, Ordering::AcqRel);
@@ -249,6 +260,9 @@ pub(crate) struct FileTreeModel {
     /// Browsed filesystem, shared with UiState; scans snapshot it at request
     /// time and stale results are dropped when it has moved on.
     location: Rc<RefCell<FsLocation>>,
+    /// Ephemeral connection material, snapshotted with every scan but kept
+    /// outside `location` so it cannot affect target identity.
+    execution_overlay: Rc<RefCell<FsExecutionOverlay>>,
     /// Host list source; each scan snapshots `remote_hosts` so a mid-scan
     /// config reload cannot redirect an in-flight listing at another host.
     config: Rc<RefCell<crate::config::Config>>,
@@ -269,7 +283,11 @@ struct FilterState {
 const MAX_CHILD_STORES: usize = 512;
 
 impl FileTreeModel {
-    fn new(location: Rc<RefCell<FsLocation>>, config: Rc<RefCell<crate::config::Config>>) -> Self {
+    fn new(
+        location: Rc<RefCell<FsLocation>>,
+        execution_overlay: Rc<RefCell<FsExecutionOverlay>>,
+        config: Rc<RefCell<crate::config::Config>>,
+    ) -> Self {
         let root_store = gio::ListStore::new::<glib::BoxedAnyObject>();
         let generation = Rc::new(Cell::new(0_u64));
         let child_stores = Rc::new(RefCell::new(std::collections::HashMap::new()));
@@ -293,6 +311,7 @@ impl FileTreeModel {
         let tree_model = TreeListModel::new(root_store.clone(), false, false, {
             let generation = generation.clone();
             let location = location.clone();
+            let execution_overlay = execution_overlay.clone();
             let config = config.clone();
             let child_stores = child_stores.clone();
             // A scan completing while the filter is active re-evaluates the
@@ -322,7 +341,9 @@ impl FileTreeModel {
                 let generation_for_scan = generation.clone();
                 let expected_generation = generation.get();
                 let scan_location = location.borrow().clone();
+                let scan_overlay = execution_overlay.borrow().clone();
                 let location_for_scan = location.clone();
+                let overlay_for_scan = execution_overlay.clone();
                 let scan_hosts = config.borrow().remote_hosts.clone();
                 let path_for_result = path.clone();
                 let path_for_error = path.clone();
@@ -330,12 +351,19 @@ impl FileTreeModel {
                 let filter_for_scan = filter.clone();
                 let root_store_for_filter = root_store_for_filter.clone();
                 let child_stores_for_filter = child_stores.clone();
-                if let Err(error) =
-                    request_dir_scan(scan_location.clone(), scan_hosts, path, move |result| {
+                if let Err(error) = request_dir_scan(
+                    scan_location.clone(),
+                    scan_hosts,
+                    scan_overlay.clone(),
+                    path,
+                    move |result| {
                         if generation_for_scan.get() != expected_generation {
                             return;
                         }
                         if *location_for_scan.borrow() != scan_location {
+                            return;
+                        }
+                        if *overlay_for_scan.borrow() != scan_overlay {
                             return;
                         }
                         match result {
@@ -353,8 +381,8 @@ impl FileTreeModel {
                                 path_for_result.display()
                             ),
                         }
-                    })
-                {
+                    },
+                ) {
                     log::warn!(
                         "failed to start directory scan for {}: {error}",
                         path_for_error.display()
@@ -386,6 +414,7 @@ impl FileTreeModel {
             child_stores,
             generation,
             location,
+            execution_overlay,
             config,
         }
     }
@@ -823,9 +852,10 @@ fn delete_confirmation_text(entries: &[FileEntry]) -> (String, String) {
 /// Build the modern GTK4 list-model file browser.
 pub(crate) fn build_file_tree_widgets(
     location: Rc<RefCell<FsLocation>>,
+    execution_overlay: Rc<RefCell<FsExecutionOverlay>>,
     config: Rc<RefCell<crate::config::Config>>,
 ) -> (FileTreeModel, ListView) {
-    let model = FileTreeModel::new(location, config);
+    let model = FileTreeModel::new(location, execution_overlay, config);
     let factory = SignalListItemFactory::new();
 
     factory.connect_setup(|_, object| {
@@ -935,8 +965,14 @@ fn remap_remote_location(
     previous_hosts: &[RemoteHost],
     current_hosts: &[RemoteHost],
 ) -> Option<FsLocation> {
-    let FsLocation::Remote(previous_index) = location else {
-        return Some(FsLocation::Local);
+    let previous_index = match location {
+        FsLocation::Local => return Some(FsLocation::Local),
+        FsLocation::Transient(target) => {
+            return remote_fs::transient_remote_host(target)
+                .is_ok()
+                .then(|| location.clone())
+        }
+        FsLocation::Remote(previous_index) => previous_index,
     };
     if *previous_index >= crate::config::MAX_REMOTE_HOSTS {
         return None;
@@ -1018,6 +1054,76 @@ fn clipboard_for_intent(
         .cloned()
 }
 
+/// An observed SSH process does not carry a Forge profile name or launch-only
+/// policy. Match exactly the fields the file-tree probe actually executes,
+/// and only when that authority is unique in the current validated config.
+/// Session/deploy/remote-shell settings cannot affect a sidecar filesystem
+/// probe and therefore must not prevent a saved endpoint from being reused.
+fn unique_observed_profile_index(target: &RemoteHostConfig, hosts: &[RemoteHost]) -> Option<usize> {
+    remote_fs::transient_remote_host(target).ok()?;
+    let mut matches = hosts
+        .iter()
+        .take(crate::config::MAX_REMOTE_HOSTS)
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            (!candidate.docker
+                && candidate.host == target.host
+                && candidate.user == target.user
+                && remote_fs::stable_ssh_args(&candidate.ssh_args)
+                    .is_ok_and(|args| args == target.ssh_args)
+                && crate::config::validate_remote_host(candidate).is_ok())
+            .then_some(index)
+        });
+    let index = matches.next()?;
+    matches.next().is_none().then_some(index)
+}
+
+fn observed_target_location(target: &RemoteHostConfig, hosts: &[RemoteHost]) -> FsLocation {
+    unique_observed_profile_index(target, hosts)
+        .map(FsLocation::Remote)
+        .unwrap_or_else(|| FsLocation::Transient(target.clone()))
+}
+
+/// Equality at the filesystem transport boundary. Saved-profile policy and
+/// the transient/saved representation do not change which account and SSH
+/// option vector the tree addresses.
+fn location_matches_observed_target(
+    location: &FsLocation,
+    target: &RemoteHostConfig,
+    hosts: &[RemoteHost],
+) -> bool {
+    match location {
+        FsLocation::Local => false,
+        FsLocation::Transient(current) => current == target,
+        FsLocation::Remote(index) => {
+            crate::config::checked_remote_host(hosts, *index).is_ok_and(|host| {
+                !host.docker
+                    && host.host == target.host
+                    && host.user == target.user
+                    && remote_fs::stable_ssh_args(&host.ssh_args)
+                        .is_ok_and(|args| args == target.ssh_args)
+            })
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteFollowContext {
+    intent: u64,
+    operation_intent: u64,
+    tree_generation: u64,
+    tab_focus_generation: u64,
+    source_focus_serial: u64,
+    location: FsLocation,
+    root: PathBuf,
+}
+
+impl RemoteFollowContext {
+    fn matches(&self, current: &Self) -> bool {
+        self == current
+    }
+}
+
 impl UiState {
     fn next_file_tree_clipboard_intent(&self) -> Option<u64> {
         let current = self.file_tree_clipboard_intent.get();
@@ -1029,6 +1135,361 @@ impl UiState {
         };
         self.file_tree_clipboard_intent.set(next);
         Some(next)
+    }
+
+    fn next_file_tree_remote_follow_intent(&self) -> Option<u64> {
+        let current = self.file_tree_remote_follow_intent.get();
+        let Some(next) = current.checked_add(1) else {
+            self.toast_overlay.add_toast(adw::Toast::new(
+                "Automatic Remote Files is unavailable because its intent counter is exhausted",
+            ));
+            return None;
+        };
+        self.file_tree_remote_follow_intent.set(next);
+        Some(next)
+    }
+
+    pub(crate) fn invalidate_file_tree_remote_follow(&self) {
+        let _ = self.next_file_tree_remote_follow_intent();
+    }
+
+    /// Read the active pane's actual process tree. No terminal bytes, prompt
+    /// text, OSC metadata, or generic shell-command reconstruction participate
+    /// in this authority decision; Core also verifies jsh launcher provenance.
+    fn current_observed_ssh_command(
+        &self,
+    ) -> Option<(String, u64, jterm_core::process::ObservedSshCommand)> {
+        let leaf = self.current_pane_leaf()?;
+        if leaf.is_remote() {
+            return None;
+        }
+        let session = leaf.session_id()?;
+        let focus_serial = leaf.focus_serial();
+        Some((session, focus_serial, leaf.observed_ssh_command()?))
+    }
+
+    fn observed_ssh_identity_is_current(
+        &self,
+        source_session: &str,
+        source_argv: &[String],
+        target: &RemoteHostConfig,
+        execution_overlay: Option<&FsExecutionOverlay>,
+    ) -> bool {
+        self.current_observed_ssh_command()
+            .is_some_and(|(session, _, command)| {
+                let current = match command.target {
+                    jterm_core::jsh_remote::ObservedSshTarget::Target(target) => {
+                        remote_fs::observed_target_and_overlay(
+                            target,
+                            command.reusable_control_path,
+                        )
+                        .ok()
+                    }
+                    _ => None,
+                };
+                session == source_session
+                    && command.argv == source_argv
+                    && current
+                        .as_ref()
+                        .is_some_and(|(current_target, current_overlay)| {
+                            current_target == target
+                                && execution_overlay
+                                    .is_none_or(|expected| current_overlay == expected)
+                        })
+            })
+    }
+
+    fn show_remote_follow_unsupported(&self, reason: &'static str) {
+        let reason = jterm_core::review_input::safe_inline_display(reason, 512);
+        let toast = adw::Toast::new(&format!("Remote Files did not follow SSH: {reason}"));
+        toast.set_button_label(Some("Choose Profile"));
+        let ui = self.clone();
+        toast.connect_button_clicked(move |_| {
+            ui.set_sidebar_visible(true, false);
+            ui.apply_sidebar_view(crate::config::SidebarView::Files, false);
+            ui.file_tree_location_selector.grab_focus();
+        });
+        self.toast_overlay.add_toast(toast);
+    }
+
+    fn show_remote_follow_failure(
+        &self,
+        source_session: String,
+        source_argv: Vec<String>,
+        target: RemoteHostConfig,
+        error: io::Error,
+    ) {
+        let name = jterm_core::review_input::safe_inline_display(target.display_name(), 256);
+        let detail = jterm_core::review_input::safe_inline_display(&error.to_string(), 512);
+        let toast = adw::Toast::new(&format!("Cannot open Remote Files for {name}: {detail}"));
+        toast.set_button_label(Some("Retry"));
+        let ui = self.clone();
+        toast.connect_button_clicked(move |_| {
+            let current = ui.current_observed_ssh_command();
+            if ui.observed_ssh_identity_is_current(&source_session, &source_argv, &target, None) {
+                let Some((session, _, command)) = current else {
+                    return;
+                };
+                // Use the freshly observed execution overlay: the socket can
+                // become available between the failed probe and this click.
+                ui.stage_observed_remote_files(session, command);
+            } else {
+                ui.toast_overlay.add_toast(adw::Toast::new(
+                    "That SSH process is no longer active; reconnect and retry",
+                ));
+            }
+        });
+        self.toast_overlay.add_toast(toast);
+    }
+
+    fn stage_observed_remote_files(
+        &self,
+        source_session: String,
+        command: jterm_core::process::ObservedSshCommand,
+    ) {
+        if std::env::var_os("FORGE_SAFE_MODE").is_some() {
+            return;
+        }
+        let jterm_core::process::ObservedSshCommand {
+            argv: source_argv,
+            target,
+            reusable_control_path,
+        } = command;
+        let jterm_core::jsh_remote::ObservedSshTarget::Target(raw_target) = target else {
+            return;
+        };
+        let (target, overlay) =
+            match remote_fs::observed_target_and_overlay(raw_target.clone(), reusable_control_path)
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    self.show_remote_follow_failure(source_session, source_argv, raw_target, error);
+                    return;
+                }
+            };
+        if !self.observed_ssh_identity_is_current(
+            &source_session,
+            &source_argv,
+            &target,
+            Some(&overlay),
+        ) {
+            return;
+        }
+        if self.file_tree_active_operations.get() != 0 {
+            // The observation stays consumed. A user file operation is an
+            // explicit cancellation boundary, not permission to retry this
+            // same process automatically when that operation finishes.
+            return;
+        }
+        let Some(operation_intent) = self.file_tree_operation_intent.get() else {
+            return;
+        };
+        let Some(source_leaf) = self.current_pane_leaf() else {
+            return;
+        };
+        let source_focus_serial = source_leaf.focus_serial();
+        let source_root = source_leaf.root_widget().downgrade();
+        let hosts = self.config.borrow().remote_hosts.clone();
+        let location = observed_target_location(&target, &hosts);
+        if let Err(error) = remote_fs::transient_remote_host(&target) {
+            self.show_remote_follow_failure(source_session, source_argv, target, error);
+            return;
+        }
+
+        // Re-running SSH for a target the user is already browsing still
+        // probes the newly observed socket before replacing execution state.
+        // On success the visible root/rows/expansion stay intact; only the
+        // location representation and overlay are upgraded, which also makes
+        // every older in-flight scan fail its immutable snapshot check.
+        let same_target =
+            location_matches_observed_target(&self.file_tree_location.borrow(), &target, &hosts)
+                && !self.file_tree_root.borrow().as_os_str().is_empty();
+
+        let Some(intent) = self.next_file_tree_remote_follow_intent() else {
+            return;
+        };
+        let expected_context = RemoteFollowContext {
+            intent,
+            operation_intent,
+            tree_generation: self.file_tree_model.generation.get(),
+            tab_focus_generation: self.tab_focus_generation.get(),
+            source_focus_serial,
+            location: self.file_tree_location.borrow().clone(),
+            root: self.file_tree_root.borrow().clone(),
+        };
+        let location_for_work = location.clone();
+        let hosts_for_work = hosts.clone();
+        let ui = self.clone();
+        let source_for_apply = source_session.clone();
+        let argv_for_apply = source_argv.clone();
+        let target_for_apply = target.clone();
+        let overlay_for_apply = overlay.clone();
+        let apply = move |result: io::Result<PathBuf>| {
+            if std::env::var_os("FORGE_SAFE_MODE").is_some() {
+                return;
+            }
+            let Some(source_root) = source_root.upgrade() else {
+                return;
+            };
+            let operation_changed = Some(expected_context.operation_intent)
+                != ui.file_tree_operation_intent.get()
+                || ui.file_tree_active_operations.get() != 0;
+            if operation_changed {
+                // Keep the exact observation deduplicated. Retry remains
+                // available explicitly on failures; a new focus epoch or a
+                // genuinely new process argv will stage a fresh probe.
+                return;
+            }
+            let Some(current_operation_intent) = ui.file_tree_operation_intent.get() else {
+                return;
+            };
+            let current_context = RemoteFollowContext {
+                intent: ui.file_tree_remote_follow_intent.get(),
+                operation_intent: current_operation_intent,
+                tree_generation: ui.file_tree_model.generation.get(),
+                tab_focus_generation: ui.tab_focus_generation.get(),
+                source_focus_serial: ui.current_pane_leaf().map_or(0, |leaf| leaf.focus_serial()),
+                location: ui.file_tree_location.borrow().clone(),
+                root: ui.file_tree_root.borrow().clone(),
+            };
+            if !expected_context.matches(&current_context)
+                || !ui.observed_ssh_identity_is_current(
+                    &source_for_apply,
+                    &argv_for_apply,
+                    &target_for_apply,
+                    Some(&overlay_for_apply),
+                )
+                || ui
+                    .current_pane_leaf()
+                    .is_none_or(|leaf| leaf.root_widget() != source_root)
+            {
+                return;
+            }
+
+            match result {
+                Ok(root) => {
+                    let current_hosts = ui.config.borrow().remote_hosts.clone();
+                    let Some(current_location) =
+                        remap_remote_location(&location, &hosts, &current_hosts)
+                    else {
+                        ui.show_remote_follow_failure(
+                            source_for_apply,
+                            argv_for_apply,
+                            target_for_apply,
+                            io::Error::other(
+                                "the matching Remote Host profile changed; retry to use its current identity",
+                            ),
+                        );
+                        return;
+                    };
+                    // Recompute transport uniqueness at commit time too. A new
+                    // same-transport/different-policy profile must turn a
+                    // previously unique saved match into a transient target,
+                    // never publish the old managed identity.
+                    if current_location
+                        != observed_target_location(&target_for_apply, &current_hosts)
+                    {
+                        ui.show_remote_follow_failure(
+                            source_for_apply,
+                            argv_for_apply,
+                            target_for_apply,
+                            io::Error::other(
+                                "the matching Remote Host profiles changed; retry to resolve the current target",
+                            ),
+                        );
+                        return;
+                    }
+                    *ui.file_tree_location.borrow_mut() = current_location;
+                    *ui.file_tree_execution_overlay.borrow_mut() = overlay_for_apply;
+                    ui.refresh_file_tree_location_selector();
+                    if !same_target {
+                        ui.set_file_tree_root(root);
+                    }
+                    ui.set_sidebar_visible(true, false);
+                    ui.apply_sidebar_view(crate::config::SidebarView::Files, false);
+                }
+                Err(error) => ui.show_remote_follow_failure(
+                    source_for_apply,
+                    argv_for_apply,
+                    target_for_apply,
+                    error,
+                ),
+            }
+        };
+        if let Err(error) = request_fs_op(
+            move || {
+                remote_fs::start_dir_with_overlay(&location_for_work, &hosts_for_work, &overlay)
+            },
+            apply,
+        ) {
+            self.show_remote_follow_failure(source_session, source_argv, target, error);
+        }
+    }
+
+    /// Called by the existing single window heartbeat. It observes only the
+    /// active pane and deduplicates its exact `/proc` argv, so all terminal
+    /// render backends gain the behavior without a timer per pane or any
+    /// dependency on shell-integration lifecycle completeness.
+    pub(crate) fn poll_file_tree_remote_follow(&self) {
+        if std::env::var_os("FORGE_SAFE_MODE").is_some() {
+            if self
+                .file_tree_remote_follow_observed
+                .borrow_mut()
+                .take()
+                .is_some()
+            {
+                self.invalidate_file_tree_remote_follow();
+            }
+            return;
+        }
+        if self.file_tree_active_operations.get() != 0
+            || self.file_tree_operation_intent.get().is_none()
+        {
+            return;
+        }
+        let Some((session, source_focus_serial, command)) = self.current_observed_ssh_command()
+        else {
+            if self
+                .file_tree_remote_follow_observed
+                .borrow_mut()
+                .take()
+                .is_some()
+            {
+                self.invalidate_file_tree_remote_follow();
+            }
+            return;
+        };
+        let argv = command.argv.clone();
+        let tab_focus_generation = self.tab_focus_generation.get();
+        if self
+            .file_tree_remote_follow_observed
+            .borrow()
+            .as_ref()
+            .is_some_and(|seen| {
+                seen.matches(&session, &argv, tab_focus_generation, source_focus_serial)
+            })
+        {
+            return;
+        }
+        *self.file_tree_remote_follow_observed.borrow_mut() =
+            Some(crate::ui::FileTreeRemoteObservation {
+                source_session: session.clone(),
+                argv,
+                tab_focus_generation,
+                source_focus_serial,
+            });
+        // A changed foreground process invalidates any probe queued for its
+        // predecessor before this new observation can start another one.
+        self.invalidate_file_tree_remote_follow();
+        match &command.target {
+            jterm_core::jsh_remote::ObservedSshTarget::NotSsh => {}
+            jterm_core::jsh_remote::ObservedSshTarget::Unsupported(reason) => {
+                self.show_remote_follow_unsupported(reason);
+            }
+            jterm_core::jsh_remote::ObservedSshTarget::Target(_) => {
+                self.stage_observed_remote_files(session, command);
+            }
+        }
     }
 
     /// Set up the initial file tree root (current tab cwd, else $HOME).
@@ -1047,6 +1508,10 @@ impl UiState {
     /// Rebuild the tree with `root` at the top. Results from older scans are
     /// ignored, so rapid cwd changes cannot repopulate the browser with stale data.
     pub(crate) fn set_file_tree_root(&self, root: PathBuf) {
+        // Root changes are user/navigation authority too. Advancing the
+        // independent follow token closes the theoretical generation-wrap ABA
+        // and ensures a staged SSH probe can never steal the tree afterward.
+        self.invalidate_file_tree_remote_follow();
         let generation = self.file_tree_model.reset();
         let location = self.file_tree_location.borrow().clone();
         self.file_tree_root_label
@@ -1063,38 +1528,52 @@ impl UiState {
         let toast_overlay = self.toast_overlay.clone();
         let scan_hosts = self.config.borrow().remote_hosts.clone();
         let scan_location = location.clone();
+        let scan_overlay = self.file_tree_execution_overlay.borrow().clone();
         let location_for_scan = self.file_tree_location.clone();
-        if let Err(error) = request_dir_scan(location, scan_hosts, root, move |result| {
-            if *active_root.borrow() != expected_root {
-                return;
-            }
-            // A location switch after this scan was queued makes its entries
-            // meaningless for the tree now on screen.
-            if *location_for_scan.borrow() != scan_location {
-                return;
-            }
-            match result {
-                Ok(entries) => {
-                    model.replace_root(generation, entries);
+        let overlay_for_scan = self.file_tree_execution_overlay.clone();
+        if let Err(error) = request_dir_scan(
+            location,
+            scan_hosts,
+            scan_overlay.clone(),
+            root,
+            move |result| {
+                if *active_root.borrow() != expected_root {
+                    return;
                 }
-                Err(error) => {
-                    log::warn!(
-                        "failed to scan file-tree root {}: {error}",
-                        expected_root.display()
-                    );
-                    // An empty directory and an unreadable directory must not
-                    // look identical. `replace_root` doubles as a generation
-                    // check so a late failure cannot toast for a newer scan.
-                    if model.replace_root(generation, Vec::new()) {
-                        let path = root_display_label(&scan_location, &expected_root);
-                        let error =
-                            jterm_core::review_input::safe_inline_display(&error.to_string(), 512);
-                        toast_overlay
-                            .add_toast(adw::Toast::new(&format!("Cannot open {path}: {error}")));
+                // A location switch after this scan was queued makes its entries
+                // meaningless for the tree now on screen.
+                if *location_for_scan.borrow() != scan_location {
+                    return;
+                }
+                if *overlay_for_scan.borrow() != scan_overlay {
+                    return;
+                }
+                match result {
+                    Ok(entries) => {
+                        model.replace_root(generation, entries);
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "failed to scan file-tree root {}: {error}",
+                            expected_root.display()
+                        );
+                        // An empty directory and an unreadable directory must not
+                        // look identical. `replace_root` doubles as a generation
+                        // check so a late failure cannot toast for a newer scan.
+                        if model.replace_root(generation, Vec::new()) {
+                            let path = root_display_label(&scan_location, &expected_root);
+                            let error = jterm_core::review_input::safe_inline_display(
+                                &error.to_string(),
+                                512,
+                            );
+                            toast_overlay.add_toast(adw::Toast::new(&format!(
+                                "Cannot open {path}: {error}"
+                            )));
+                        }
                     }
                 }
-            }
-        }) {
+            },
+        ) {
             log::warn!("failed to start file-tree scan: {error}");
             // The start error is synchronous, but still respect the current
             // generation in case this function is re-entered by UI callbacks.
@@ -1117,13 +1596,21 @@ impl UiState {
         if *self.file_tree_location.borrow() == location {
             return;
         }
+        // Selector/navigation changes choose stable authority explicitly; an
+        // accelerator observed for a previous SSH process must not follow the
+        // user onto that new endpoint.
+        *self.file_tree_execution_overlay.borrow_mut() = FsExecutionOverlay::default();
         let hosts = self.config.borrow().remote_hosts.clone();
         if location == FsLocation::Local {
             *self.file_tree_location.borrow_mut() = FsLocation::Local;
             self.refresh_file_tree_location_selector();
-            let root = remote_fs::start_dir(&FsLocation::Local, &hosts)
-                .or_else(|_| home_dir().ok_or_else(|| io::Error::other("home is unavailable")))
-                .unwrap_or_else(|_| PathBuf::from("/"));
+            let root = remote_fs::start_dir_with_overlay(
+                &FsLocation::Local,
+                &hosts,
+                &FsExecutionOverlay::default(),
+            )
+            .or_else(|_| home_dir().ok_or_else(|| io::Error::other("home is unavailable")))
+            .unwrap_or_else(|_| PathBuf::from("/"));
             self.set_file_tree_root(root);
             return;
         }
@@ -1154,7 +1641,13 @@ impl UiState {
             }
         };
         if let Err(error) = request_fs_op(
-            move || remote_fs::start_dir(&location_for_work, &hosts_for_work),
+            move || {
+                remote_fs::start_dir_with_overlay(
+                    &location_for_work,
+                    &hosts_for_work,
+                    &FsExecutionOverlay::default(),
+                )
+            },
             apply,
         ) {
             self.fail_file_tree_location_change(&location, &error);
@@ -1170,6 +1663,7 @@ impl UiState {
         log::warn!("failed to resolve start directory for {label}: {error}");
         let detail = jterm_core::review_input::safe_inline_display(&error.to_string(), 512);
         *self.file_tree_location.borrow_mut() = FsLocation::Local;
+        *self.file_tree_execution_overlay.borrow_mut() = FsExecutionOverlay::default();
         self.refresh_file_tree_location_selector();
         let root = home_dir().unwrap_or_else(|| PathBuf::from("/"));
         self.set_file_tree_root(root);
@@ -1216,6 +1710,7 @@ impl UiState {
             }
             None => {
                 *self.file_tree_location.borrow_mut() = FsLocation::Local;
+                *self.file_tree_execution_overlay.borrow_mut() = FsExecutionOverlay::default();
                 self.refresh_file_tree_location_selector();
                 let root = home_dir().unwrap_or_else(|| PathBuf::from("/"));
                 self.set_file_tree_root(root);
@@ -1266,6 +1761,10 @@ impl UiState {
                         self.toast_overlay.add_toast(adw::Toast::new(message));
                     }
                 }
+            }
+            FsLocation::Transient(target) => {
+                let overlay = self.file_tree_execution_overlay.borrow().clone();
+                self.connect_transient_plain_ssh(&target, &overlay);
             }
         }
     }
@@ -1338,6 +1837,9 @@ impl UiState {
         let active_count = hosts.len().min(crate::config::MAX_REMOTE_HOSTS);
         let mut labels = vec![FsLocation::Local.label(hosts)];
         labels.extend((0..active_count).map(|index| FsLocation::Remote(index).label(hosts)));
+        if let FsLocation::Transient(target) = &*self.file_tree_location.borrow() {
+            labels.push(FsLocation::Transient(target.clone()).label(hosts));
+        }
         let selected = match &*self.file_tree_location.borrow() {
             FsLocation::Local => 0,
             FsLocation::Remote(index)
@@ -1347,13 +1849,20 @@ impl UiState {
                 *index as u32 + 1
             }
             FsLocation::Remote(_) => 0,
+            FsLocation::Transient(_) => active_count as u32 + 1,
         };
+        let selected_tooltip = labels
+            .get(selected as usize)
+            .cloned()
+            .unwrap_or_else(|| "Choose which filesystem to browse".to_string());
         drop(config);
         let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
         let model = gtk4::StringList::new(&label_refs);
         self.file_tree_location_selector_syncing.set(true);
         self.file_tree_location_selector.set_model(Some(&model));
         self.file_tree_location_selector.set_selected(selected);
+        self.file_tree_location_selector
+            .set_tooltip_text(Some(&selected_tooltip));
         self.file_tree_location_selector_syncing.set(false);
     }
 
@@ -1369,10 +1878,27 @@ impl UiState {
                 if index == gtk4::INVALID_LIST_POSITION {
                     return;
                 }
-                let location = if index == 0 {
-                    FsLocation::Local
-                } else {
-                    FsLocation::Remote((index - 1) as usize)
+                let location = match index as usize {
+                    0 => FsLocation::Local,
+                    selected
+                        if selected
+                            <= ui
+                                .config
+                                .borrow()
+                                .remote_hosts
+                                .len()
+                                .min(crate::config::MAX_REMOTE_HOSTS) =>
+                    {
+                        FsLocation::Remote(selected - 1)
+                    }
+                    _ => {
+                        let current = ui.file_tree_location.borrow().clone();
+                        if matches!(current, FsLocation::Transient(_)) {
+                            current
+                        } else {
+                            return;
+                        }
+                    }
                 };
                 if *ui.file_tree_location.borrow() == location {
                     return;
@@ -1432,6 +1958,7 @@ impl UiState {
                 if *self.file_tree_location.borrow() != location
                     || *self.file_tree_root.borrow() != cwd
                 {
+                    *self.file_tree_execution_overlay.borrow_mut() = FsExecutionOverlay::default();
                     *self.file_tree_location.borrow_mut() = location;
                     self.refresh_file_tree_location_selector();
                     self.set_file_tree_root(cwd);
@@ -1448,6 +1975,7 @@ impl UiState {
         match cwd {
             Some(dir) => {
                 if *self.file_tree_location.borrow() != FsLocation::Local {
+                    *self.file_tree_execution_overlay.borrow_mut() = FsExecutionOverlay::default();
                     *self.file_tree_location.borrow_mut() = FsLocation::Local;
                     self.refresh_file_tree_location_selector();
                 }
@@ -1586,6 +2114,7 @@ impl UiState {
     /// exactly like a cross-location paste.
     fn import_dropped_paths(&self, paths: Vec<PathBuf>, target_dir: PathBuf) {
         let location = self.file_tree_location.borrow().clone();
+        let overlay = self.file_tree_execution_overlay.borrow().clone();
         let hosts = self.config.borrow().remote_hosts.clone();
         let (items, action, total_bytes) =
             match remote_fs::plan_drop(&paths, &location, &target_dir) {
@@ -1604,9 +2133,10 @@ impl UiState {
             remote_fs::DropAction::Copy => ("Copy", "Copying"),
             remote_fs::DropAction::Upload => ("Upload", "Uploading"),
         };
-        let target_desc = match &location {
-            FsLocation::Local => display_path(&target_dir),
-            FsLocation::Remote(_) => location.label(&hosts),
+        let target_desc = if location.is_remote() {
+            location.label(&hosts)
+        } else {
+            display_path(&target_dir)
         };
         let title = format!("{verb_ing} {count} items to {target_desc}…");
 
@@ -1668,11 +2198,13 @@ impl UiState {
                         remote_fs::DropAction::Copy => {
                             remote_fs::copy(&FsLocation::Local, &[], &item.src, &item.dst)
                         }
-                        remote_fs::DropAction::Upload => remote_fs::transfer(
+                        remote_fs::DropAction::Upload => remote_fs::transfer_with_overlays(
                             &FsLocation::Local,
+                            &FsExecutionOverlay::default(),
                             &hosts,
                             &item.src,
                             &to,
+                            &overlay,
                             &item.dst,
                             item.is_dir,
                             &item_control,
@@ -1867,6 +2399,7 @@ impl UiState {
                     *ui.file_tree_clipboard.borrow_mut() = Some(FsClipboard {
                         intent_id,
                         loc: location.clone(),
+                        overlay: ui.file_tree_execution_overlay.borrow().clone(),
                         items: entries
                             .iter()
                             .map(|entry| remote_fs::FsClipboardItem {
@@ -1920,10 +2453,10 @@ impl UiState {
             // Cross-location paste is a streaming transfer: label it so the
             // direction is visible before committing to it.
             let clipboard = self.file_tree_clipboard.borrow().clone();
-            let label = match clipboard
-                .as_ref()
-                .and_then(|clip| remote_fs::transfer_plan(&clip.loc, &location))
-            {
+            let transfer_hosts = self.config.borrow().remote_hosts.clone();
+            let label = match clipboard.as_ref().and_then(|clip| {
+                remote_fs::transfer_plan_with_hosts(&clip.loc, &location, &transfer_hosts)
+            }) {
                 Some(remote_fs::TransferPlan::Download) => "Paste (download)",
                 Some(remote_fs::TransferPlan::Upload) => "Paste (upload)",
                 Some(remote_fs::TransferPlan::Relay) => "Paste (via local relay)",
@@ -2076,6 +2609,7 @@ impl UiState {
                 return;
             }
             let location = ui.file_tree_location.borrow().clone();
+            let overlay = ui.file_tree_execution_overlay.borrow().clone();
             let hosts = ui.config.borrow().remote_hosts.clone();
             match kind {
                 NameDialogKind::NewFile | NameDialogKind::NewFolder => {
@@ -2086,9 +2620,13 @@ impl UiState {
                         vec![dir.clone()],
                         move || {
                             if kind == NameDialogKind::NewFile {
-                                remote_fs::create_file(&location, &hosts, &path)
+                                remote_fs::create_file_with_overlay(
+                                    &location, &hosts, &overlay, &path,
+                                )
                             } else {
-                                remote_fs::create_dir(&location, &hosts, &path)
+                                remote_fs::create_dir_with_overlay(
+                                    &location, &hosts, &overlay, &path,
+                                )
                             }
                         },
                         || {},
@@ -2106,7 +2644,11 @@ impl UiState {
                             kind.verb(),
                             None,
                             vec![dir.clone()],
-                            move || remote_fs::rename(&location, &hosts, &src, &dst),
+                            move || {
+                                remote_fs::rename_with_overlay(
+                                    &location, &hosts, &overlay, &src, &dst,
+                                )
+                            },
                             || {},
                         );
                     }
@@ -2146,6 +2688,7 @@ impl UiState {
             // one-shot worker.
             let entries = entries.clone();
             let location = ui.file_tree_location.borrow().clone();
+            let overlay = ui.file_tree_execution_overlay.borrow().clone();
             let hosts = ui.config.borrow().remote_hosts.clone();
             let total = entries.len();
             let mut affected: Vec<PathBuf> = Vec::new();
@@ -2167,7 +2710,9 @@ impl UiState {
                 affected,
                 move || {
                     for entry in &entries {
-                        if let Err(error) = remote_fs::delete(&location, &hosts, &entry.path) {
+                        if let Err(error) =
+                            remote_fs::delete_with_overlay(&location, &hosts, &overlay, &entry.path)
+                        {
                             let name =
                                 jterm_core::review_input::safe_inline_display(&entry.name, 256);
                             let detail = jterm_core::review_input::safe_inline_display(
@@ -2265,6 +2810,7 @@ impl UiState {
     /// clears only when a cut-paste fully succeeded.
     fn paste_file_tree_clipboard(&self, clip: FsClipboard, target_dir: PathBuf) {
         let location = self.file_tree_location.borrow().clone();
+        let to_overlay = self.file_tree_execution_overlay.borrow().clone();
         let hosts = self.config.borrow().remote_hosts.clone();
         let cut = clip.cut;
         let total_items = clip.items.len();
@@ -2272,6 +2818,7 @@ impl UiState {
         // relays report transferred bytes only.
         let from = clip.loc.clone();
         let measure = from == FsLocation::Local;
+        let same_filesystem = remote_fs::same_filesystem(&from, &location, &hosts);
         let plan_items = plan_paste(
             &clip.items,
             &target_dir,
@@ -2279,7 +2826,7 @@ impl UiState {
             measure,
         );
 
-        if clip.loc == location {
+        if same_filesystem {
             // Same-location batch: per-item rename/copy, summary at the end.
             let mut affected: Vec<PathBuf> = vec![target_dir.clone()];
             if cut {
@@ -2296,7 +2843,20 @@ impl UiState {
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let failures_for_work = failures.clone();
             let failures_for_success = failures.clone();
-            let loc = location.clone();
+            // A saved and temporary representation can name the same remote
+            // namespace. Prefer a live current socket, then a live clipboard
+            // socket, then whichever saved profile can carry its configured
+            // ControlPath. Every item uses this one immutable endpoint for
+            // both source and destination, so cut is a direct rename.
+            let (loc, operation_overlay) = remote_fs::same_filesystem_execution_endpoint(
+                &from,
+                &clip.overlay,
+                &location,
+                &to_overlay,
+                &hosts,
+            );
+            let loc = loc.clone();
+            let operation_overlay = operation_overlay.clone();
             let ui = self.clone();
             let ui_for_success = self.clone();
             let clipboard_to_clear = clip.clone();
@@ -2329,9 +2889,21 @@ impl UiState {
                             continue;
                         }
                         let result = if cut {
-                            remote_fs::rename(&loc, &hosts, &item.src, &item.dst)
+                            remote_fs::rename_with_overlay(
+                                &loc,
+                                &hosts,
+                                &operation_overlay,
+                                &item.src,
+                                &item.dst,
+                            )
                         } else {
-                            remote_fs::copy(&loc, &hosts, &item.src, &item.dst)
+                            remote_fs::copy_with_overlay(
+                                &loc,
+                                &hosts,
+                                &operation_overlay,
+                                &item.src,
+                                &item.dst,
+                            )
                         };
                         if let Err(error) = result {
                             let detail = jterm_core::review_input::safe_inline_display(
@@ -2374,7 +2946,7 @@ impl UiState {
 
         // Cross-location batch: per-item streaming transfers with cumulative
         // progress, cancellation, and per-item failure collection.
-        let plan = remote_fs::transfer_plan(&from, &location);
+        let plan = remote_fs::transfer_plan_with_hosts(&from, &location, &hosts);
         let verb: &'static str = if cut {
             "Move"
         } else {
@@ -2467,11 +3039,13 @@ impl UiState {
                             },
                         ))),
                     };
-                    match remote_fs::transfer(
+                    match remote_fs::transfer_with_overlays(
                         &from,
+                        &clip.overlay,
                         &hosts,
                         &item.src,
                         &to,
+                        &to_overlay,
                         &item.dst,
                         item.is_dir,
                         &item_control,
@@ -2481,7 +3055,12 @@ impl UiState {
                             // actually succeeded.
                             if cut {
                                 if let Err(error) =
-                                    remote_fs::delete(&from, &hosts, &item.src)
+                                    remote_fs::delete_with_overlay(
+                                        &from,
+                                        &hosts,
+                                        &clip.overlay,
+                                        &item.src,
+                                    )
                                 {
                                     let detail =
                                         jterm_core::review_input::safe_inline_display(
@@ -2551,30 +3130,38 @@ impl UiState {
         };
         let location = self.file_tree_location.borrow().clone();
         let hosts = self.config.borrow().remote_hosts.clone();
+        let overlay = self.file_tree_execution_overlay.borrow().clone();
         let generation = self.file_tree_model.generation.get();
         let generation_for_scan = self.file_tree_model.generation.clone();
         let location_for_scan = self.file_tree_location.clone();
+        let overlay_for_scan = self.file_tree_execution_overlay.clone();
         let scan_location = location.clone();
+        let scan_overlay = overlay.clone();
         let model_for_refresh = self.file_tree_model.clone();
         let dir_for_error = dir.to_path_buf();
-        if let Err(error) = request_dir_scan(location, hosts, dir.to_path_buf(), move |result| {
-            if generation_for_scan.get() != generation {
-                return;
-            }
-            if *location_for_scan.borrow() != scan_location {
-                return;
-            }
-            match result {
-                Ok(entries) => {
-                    update_store_in_place(&store, entries);
-                    model_for_refresh.reapply_filter();
+        if let Err(error) =
+            request_dir_scan(location, hosts, overlay, dir.to_path_buf(), move |result| {
+                if generation_for_scan.get() != generation {
+                    return;
                 }
-                Err(error) => log::warn!(
-                    "failed to refresh directory {}: {error}",
-                    dir_for_error.display()
-                ),
-            }
-        }) {
+                if *location_for_scan.borrow() != scan_location {
+                    return;
+                }
+                if *overlay_for_scan.borrow() != scan_overlay {
+                    return;
+                }
+                match result {
+                    Ok(entries) => {
+                        update_store_in_place(&store, entries);
+                        model_for_refresh.reapply_filter();
+                    }
+                    Err(error) => log::warn!(
+                        "failed to refresh directory {}: {error}",
+                        dir_for_error.display()
+                    ),
+                }
+            })
+        {
             log::warn!(
                 "failed to start directory refresh for {}: {error}",
                 dir.display()
@@ -2596,11 +3183,25 @@ impl UiState {
         W: FnOnce() -> io::Result<()> + Send + 'static,
         S: FnOnce() + 'static,
     {
+        if let Some(current) = self.file_tree_operation_intent.get() {
+            let next = current.checked_add(1);
+            self.file_tree_operation_intent.set(next);
+            if next.is_none() {
+                self.toast_overlay.add_toast(adw::Toast::new(
+                    "Automatic Remote Files was disabled after its operation counter was exhausted",
+                ));
+                self.invalidate_file_tree_remote_follow();
+            }
+        }
+        self.file_tree_active_operations
+            .set(self.file_tree_active_operations.get().saturating_add(1));
         let ui = self.clone();
         let expected_generation = self.file_tree_model.generation.get();
         let expected_location = self.file_tree_location.borrow().clone();
         let busy_for_apply = busy.clone();
         let apply = move |result: io::Result<()>| {
+            ui.file_tree_active_operations
+                .set(ui.file_tree_active_operations.get().saturating_sub(1));
             if let Some(busy) = &busy_for_apply {
                 busy.dismiss();
             }
@@ -2640,6 +3241,8 @@ impl UiState {
             }
         };
         if let Err(error) = request_fs_op(work, apply) {
+            self.file_tree_active_operations
+                .set(self.file_tree_active_operations.get().saturating_sub(1));
             if let Some(busy) = &busy {
                 busy.dismiss();
             }
@@ -2755,10 +3358,76 @@ pub(crate) fn build_file_tree_location_selector() -> gtk4::DropDown {
     let selector = gtk4::DropDown::default();
     selector.set_tooltip_text(Some("Choose which filesystem to browse"));
     selector.add_css_class("flat");
+    selector.set_hexpand(false);
+    selector.set_factory(Some(&file_tree_location_label_factory()));
+    selector.set_list_factory(Some(&file_tree_location_label_factory()));
     selector.update_property(&[gtk4::accessible::Property::Label(
         "Choose file tree location",
     )]);
     selector
+}
+
+fn middle_elide_location_label(label: &str) -> String {
+    let count = label.chars().count();
+    if count <= MAX_LOCATION_LABEL_CHARS {
+        return label.to_string();
+    }
+    let remaining = MAX_LOCATION_LABEL_CHARS - 1;
+    // Give the suffix the odd spare character: cloud-provider domains and
+    // the `(temporary)` status are especially useful at the right edge.
+    let left = remaining / 2;
+    let right = remaining - left;
+    let mut compact = String::with_capacity(label.len().min(MAX_LOCATION_LABEL_CHARS * 4));
+    compact.extend(label.chars().take(left));
+    compact.push('…');
+    compact.extend(label.chars().skip(count - right));
+    compact
+}
+
+fn file_tree_location_label_factory() -> SignalListItemFactory {
+    let factory = SignalListItemFactory::new();
+    factory.connect_setup(|_, object| {
+        let Some(list_item) = object.downcast_ref::<gtk4::ListItem>() else {
+            return;
+        };
+        let label = gtk4::Label::new(None);
+        label.set_xalign(0.0);
+        label.set_max_width_chars(MAX_LOCATION_LABEL_CHARS as i32);
+        label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+        list_item.set_child(Some(&label));
+    });
+    factory.connect_bind(|_, object| {
+        let Some(list_item) = object.downcast_ref::<gtk4::ListItem>() else {
+            return;
+        };
+        let Some(label) = list_item
+            .child()
+            .and_then(|child| child.downcast::<gtk4::Label>().ok())
+        else {
+            return;
+        };
+        let Some(string) = list_item
+            .item()
+            .and_then(|item| item.downcast::<gtk4::StringObject>().ok())
+        else {
+            return;
+        };
+        let full = string.string();
+        label.set_text(&middle_elide_location_label(&full));
+        label.set_tooltip_text(Some(&full));
+    });
+    factory.connect_unbind(|_, object| {
+        let Some(label) = object
+            .downcast_ref::<gtk4::ListItem>()
+            .and_then(gtk4::ListItem::child)
+            .and_then(|child| child.downcast::<gtk4::Label>().ok())
+        else {
+            return;
+        };
+        label.set_text("");
+        label.set_tooltip_text(None);
+    });
+    factory
 }
 
 /// Abbreviate the home directory to `~` for the header label.
@@ -2806,6 +3475,257 @@ mod tests {
             multiplex: true,
             deploy: jterm_core::jsh_remote::Deploy::Off,
         }
+    }
+
+    fn observed_target(target: &str) -> RemoteHostConfig {
+        RemoteHostConfig {
+            name: format!("dev@{target}"),
+            host: target.to_string(),
+            user: Some("dev".to_string()),
+            docker: false,
+            remote_shell: "jsh".to_string(),
+            session: None,
+            ssh_args: vec!["-p".to_string(), "2222".to_string()],
+            deploy: "off".to_string(),
+            deploy_artifact: None,
+        }
+    }
+
+    #[test]
+    fn long_dsw_location_label_keeps_identifying_prefix_and_suffix() {
+        let full = "ssh: root@dsw-notebook-dsw-l8rnh0wm7vs81o7z6j-22.vpc-0jlbz3pri2042fd5xw2ov.instance-forward.dsw.cn-wulanchabu.aliyuncs.com (temporary)";
+        let compact = middle_elide_location_label(full);
+        assert!(compact.chars().count() <= MAX_LOCATION_LABEL_CHARS);
+        assert!(compact.starts_with("ssh: root@dsw"));
+        assert!(compact.ends_with("aliyuncs.com (temporary)"));
+        assert!(compact.contains('…'));
+    }
+
+    #[test]
+    fn observed_ssh_prefers_one_valid_configured_filesystem_authority() {
+        let target = observed_target("build.example");
+        let mut matching = remote_profile("saved", "build.example");
+        matching.ssh_args = target.ssh_args.clone();
+        let other = remote_profile("other", "other.example");
+        assert_eq!(
+            observed_target_location(&target, &[other, matching]),
+            FsLocation::Remote(1)
+        );
+    }
+
+    #[test]
+    fn observed_process_argv_for_user_ssh_command_becomes_a_temporary_location() {
+        let argv = ["ssh", "root@dsw-notebook.example.com", "-p", "22"].map(str::to_string);
+        let jterm_core::jsh_remote::ObservedSshTarget::Target(target) =
+            jterm_core::jsh_remote::observed_ssh_target(&argv)
+        else {
+            panic!("expected an interactive SSH target");
+        };
+        assert_eq!(target.host, "dsw-notebook.example.com");
+        assert_eq!(target.user.as_deref(), Some("root"));
+        assert_eq!(target.ssh_args, ["-p", "22"]);
+        assert_eq!(
+            observed_target_location(&target, &[]),
+            FsLocation::Transient(target)
+        );
+    }
+
+    #[test]
+    fn actual_jsh_upgrade_launcher_keeps_socket_out_of_target_identity() {
+        let argv = [
+            "/bin/sh",
+            "/home/alice/.cache/jsh/jsh-remote.sh",
+            "--persist",
+            "--local-jsh",
+            "/home/alice/.local/bin/jsh",
+            "root@dsw-notebook-dsw-l8rnh0wm7vs81o7z6j-22.vpc.example.com",
+            "--",
+            "-p",
+            "22",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        let raw_target = match jterm_core::jsh_remote::observed_ssh_target(&argv) {
+            jterm_core::jsh_remote::ObservedSshTarget::Target(target) => target,
+            other => panic!("expected launcher target, got {other:?}"),
+        };
+        let command = jterm_core::process::ObservedSshCommand {
+            argv: argv.clone(),
+            target: jterm_core::jsh_remote::ObservedSshTarget::Target(raw_target),
+            reusable_control_path: Some("/run/user/1000/anvil/cm-%C".to_string()),
+        };
+        let jterm_core::process::ObservedSshCommand {
+            target: jterm_core::jsh_remote::ObservedSshTarget::Target(raw_target),
+            reusable_control_path,
+            ..
+        } = command
+        else {
+            unreachable!()
+        };
+        let (target, overlay) =
+            remote_fs::observed_target_and_overlay(raw_target, reusable_control_path).unwrap();
+        assert_eq!(target.user.as_deref(), Some("root"));
+        assert_eq!(target.ssh_args, ["-p", "22"]);
+        assert_eq!(
+            observed_target_location(&target, &[]),
+            FsLocation::Transient(target.clone())
+        );
+
+        let (_, plain) = remote_fs::plain_interactive_ssh_argv(&target, &overlay).unwrap();
+        assert_eq!(plain[0..2], ["ssh", "-t"]);
+        assert!(plain
+            .windows(2)
+            .any(|pair| { pair == ["-S".to_string(), "/run/user/1000/anvil/cm-%C".to_string()] }));
+        assert_eq!(
+            plain.last().map(String::as_str),
+            Some("root@dsw-notebook-dsw-l8rnh0wm7vs81o7z6j-22.vpc.example.com")
+        );
+        assert_eq!(plain.len(), 8, "plain SSH must not append a remote command");
+    }
+
+    #[test]
+    fn explicit_control_path_is_execution_only_and_saved_matching_ignores_it() {
+        let argv = [
+            "ssh",
+            "-S",
+            "/run/user/1000/live-cm",
+            "-p",
+            "2222",
+            "dev@build.example",
+        ]
+        .map(str::to_string);
+        let raw_target = match jterm_core::jsh_remote::observed_ssh_target(&argv) {
+            jterm_core::jsh_remote::ObservedSshTarget::Target(target) => target,
+            other => panic!("expected SSH target, got {other:?}"),
+        };
+        assert!(raw_target.ssh_args.windows(2).any(|pair| pair[0] == "-S"));
+        let (target, overlay) = remote_fs::observed_target_and_overlay(raw_target, None).unwrap();
+        assert_eq!(target.ssh_args, ["-p", "2222"]);
+
+        let mut saved = remote_profile("saved", "build.example");
+        saved.ssh_args = vec![
+            "-p".to_string(),
+            "2222".to_string(),
+            "-o".to_string(),
+            "ControlPath=/run/user/1000/saved-cm".to_string(),
+        ];
+        assert_eq!(
+            observed_target_location(&target, &[saved]),
+            FsLocation::Remote(0)
+        );
+        let (_, plain) = remote_fs::plain_interactive_ssh_argv(&target, &overlay).unwrap();
+        assert!(plain
+            .windows(2)
+            .any(|pair| { pair == ["-S".to_string(), "/run/user/1000/live-cm".to_string()] }));
+    }
+
+    #[test]
+    fn observed_ssh_uses_immutable_transient_for_missing_or_ambiguous_profiles() {
+        let target = observed_target("build.example");
+        let mut first = remote_profile("first", "build.example");
+        first.ssh_args = target.ssh_args.clone();
+        let mut second = first.clone();
+        second.name = "second".to_string();
+
+        assert_eq!(
+            observed_target_location(&target, &[]),
+            FsLocation::Transient(target.clone())
+        );
+        assert_eq!(
+            observed_target_location(&target, &[first, second]),
+            FsLocation::Transient(target)
+        );
+    }
+
+    #[test]
+    fn transient_locations_survive_unrelated_config_reconciliation() {
+        let target = observed_target("build.example");
+        let location = FsLocation::Transient(target);
+        assert_eq!(
+            remap_remote_location(
+                &location,
+                &[remote_profile("old", "old.example")],
+                &[remote_profile("new", "new.example")],
+            ),
+            Some(location)
+        );
+    }
+
+    #[test]
+    fn remote_follow_commit_requires_token_and_unchanged_user_navigation() {
+        let location = FsLocation::Local;
+        let root = Path::new("/work");
+        let expected = RemoteFollowContext {
+            intent: 7,
+            operation_intent: 9,
+            tree_generation: 11,
+            tab_focus_generation: 13,
+            source_focus_serial: 17,
+            location: location.clone(),
+            root: root.to_path_buf(),
+        };
+        assert!(expected.matches(&expected));
+
+        for stale in [
+            RemoteFollowContext {
+                intent: 8,
+                ..expected.clone()
+            },
+            RemoteFollowContext {
+                operation_intent: 10,
+                ..expected.clone()
+            },
+            RemoteFollowContext {
+                tree_generation: 12,
+                ..expected.clone()
+            },
+            RemoteFollowContext {
+                tab_focus_generation: 14,
+                ..expected.clone()
+            },
+            RemoteFollowContext {
+                source_focus_serial: 18,
+                ..expected.clone()
+            },
+            RemoteFollowContext {
+                location: FsLocation::Remote(0),
+                ..expected.clone()
+            },
+            RemoteFollowContext {
+                root: PathBuf::from("/elsewhere"),
+                ..expected.clone()
+            },
+        ] {
+            assert!(!expected.matches(&stale));
+        }
+    }
+
+    #[test]
+    fn remote_follow_dedupe_rearms_for_focus_aba_but_not_file_operations() {
+        let argv = ["ssh", "dev@build.example"].map(str::to_string).to_vec();
+        let observed = crate::ui::FileTreeRemoteObservation {
+            source_session: "pane-a".to_string(),
+            argv: argv.clone(),
+            tab_focus_generation: 41,
+            source_focus_serial: 43,
+        };
+
+        // An unrelated Files operation advances its own intent but must leave
+        // this exact process consumed, preventing an implicit retry afterward.
+        let _operation_intent_after_user_action = 10_u64;
+        assert!(observed.matches("pane-a", &argv, 41, 43));
+
+        // Returning to pane A after even a fast A -> B -> A focus round trip
+        // carries a new epoch and therefore permits a fresh staged probe.
+        assert!(!observed.matches("pane-a", &argv, 42, 43));
+        assert!(!observed.matches("pane-a", &argv, 41, 44));
+        assert!(!observed.matches("pane-b", &argv, 41, 43));
+        assert!(!observed.matches(
+            "pane-a",
+            &["ssh", "dev@other.example"].map(str::to_string),
+            41,
+            43,
+        ));
     }
 
     #[test]
@@ -2941,6 +3861,7 @@ mod tests {
         let original = FsClipboard {
             intent_id: 7,
             loc: FsLocation::Remote(0),
+            overlay: FsExecutionOverlay::default(),
             items: vec![remote_fs::FsClipboardItem {
                 path: PathBuf::from("/old"),
                 is_dir: false,

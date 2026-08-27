@@ -519,6 +519,10 @@ multiplex = true
 
 Files 侧边栏顶部也可以直接选择 `ssh: 名称` / `docker: 名称` 浏览目标文件系统；选择器旁的终端按钮可立即进入该 profile。本地位置会精确在当前文件树根目录新开标签，远端位置从 profile 的默认目录启动（远端启动器没有通用的“指定 cwd”契约）。连接前的 home 探测不会阻塞 GTK；失败会显示原因并回到 Local，重新选择即可重试。配置增删、编辑或重排后，Forge 只按完整 profile 身份保留/重映射已经打开的远端树和文件剪贴板；目标身份不再唯一可证时会清理旧状态，绝不会让同一个数字索引悄悄指向另一台机器。若新建、重命名或删除确认框打开期间又切换了根目录/目标，旧操作会要求重新打开，不会把旧绝对路径交给新的后端。
 
+直接在终端执行交互式 `ssh root@example.com -p 22` 也会自动进入对应远端文件树。这个便利功能覆盖 Block、Unified 和 VTE，但它只通过 `jterm_core::process::observed_ssh_command` 读取 `/proc` 中真实前台进程树（也能识别来源验证通过的 jsh SSH 升级 launcher），不信任终端输出或 OSC 133 的命令字符串。Forge 会优先复用唯一匹配的已保存 profile；没有唯一匹配时创建仅驻留内存、在位置选择器中标为 `temporary` 的 SSH 目标。显式 `-S` / `ControlPath` 及 jsh 派生的复用 socket 只进入不可变的执行快照，不参与 saved/temporary 身份和唯一性判断，并贯穿目录扫描、文件操作、剪贴板和传输；同一目标的两种表示也按同一文件系统处理，不会误走远端到远端 relay。后台 home 探测成功之前，当前文件树不会被清空或切走；完成时还会复核 SSH 仍在同一标签和焦点代际运行、自动跟随 token、配置身份、用户导航及文件操作 generation。失败通知会在点击重试时重新检查实时进程和 socket；不支持安全复用的参数可跳到 Files profile 选择器。退出 SSH 后远端树保持在原位，方便继续使用独立的无交互 probe，不会突然跳回 Local。`temporary` 位置旁的终端按钮运行普通交互式 SSH（不附加远端命令），因此不要求目标机器安装 jsh。
+
+超长 DSW endpoint 在位置下拉项中从中间省略，保留 `root@dsw…aliyuncs.com` 这类可辨识前后缀；悬停可查看经过安全显示处理的完整目标。
+
 `deploy` 决定目标机器上没有 jsh 时怎么办：`"off"`（默认）直接运行 `remote_shell`，取到什么算什么；`"persist"` 和 `"incognito"` 会把一份 jsh 送过去，前者在对方 `$HOME` 留下 dot-files 和二进制缓存（重连免传输），后者用退出即删的沙箱 HOME。Block、cwd 跟踪和退出码都来自 jsh，所以对端只有 `sh` 时不开 deploy 会静默丢掉这些。
 
 `docker = true` 时 `host` 是**正在运行的**容器名，走 `docker exec` 而不是 ssh，`user` 变成容器内的用户（`-u`）；`ssh_args`、`multiplex`、`login_shell` 对容器无意义，会被忽略。容器默认以 root 运行，而旧版 jsh 在 root 下会把 `/usr/bin/git` 和 `/usr/bin/bash` 判为不可信 helper，于是 git 补全、git 提示符和 `.bashrc` 导入在容器里静默消失。容器标签页请搭配修复过这一点的 jsh（jsh CHANGELOG 中的 “a root shell trusts the system helpers it could write”）。

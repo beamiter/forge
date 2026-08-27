@@ -248,6 +248,14 @@ impl PaneLeaf {
         crate::process::restorable_command(pty_fd, shell_pid)
     }
 
+    /// Observe SSH at the real process boundary, including provenance-checked
+    /// jsh deployment launchers that a generic restorable-command probe cannot
+    /// safely reconstruct.
+    pub(crate) fn observed_ssh_command(&self) -> Option<crate::process::ObservedSshCommand> {
+        let (pty_fd, shell_pid) = self.process_probe();
+        crate::process::observed_ssh_command(pty_fd, shell_pid)
+    }
+
     pub(crate) fn foreground_process_name(&self) -> Option<String> {
         let (pty_fd, shell_pid) = self.process_probe();
         crate::process::foreground_process_name(pty_fd, shell_pid)

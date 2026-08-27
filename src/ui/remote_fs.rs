@@ -31,6 +31,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::config::RemoteHost;
+use jterm_core::jsh_remote::RemoteHostConfig;
 
 /// Hard cap on entries per directory listing, shared with the local scanner.
 pub(crate) const MAX_DIRECTORY_ENTRIES: usize = 4_096;
@@ -63,14 +64,48 @@ const MAX_COPY_DEPTH: usize = 64;
 /// Which filesystem the sidebar is browsing. `Remote` indexes into
 /// `config.remote_hosts`; the index is resolved against a snapshot of the
 /// host list taken when an operation starts, so a mid-scan config reload
-/// cannot silently redirect it at another host.
+/// cannot silently redirect it at another host. `Transient` is an immutable,
+/// memory-only SSH target observed at the foreground-process boundary. It is
+/// embedded rather than assigned a synthetic profile index so config edits can
+/// never redirect an in-flight operation to another machine.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum FsLocation {
     Local,
     Remote(usize),
+    Transient(RemoteHostConfig),
+}
+
+/// Ephemeral connection material discovered at the live process boundary.
+///
+/// This is deliberately separate from [`FsLocation`]: the latter is the
+/// stable filesystem authority used for profile matching, config reconcile,
+/// equality and stale-callback checks.  A reusable jsh ControlPath is only an
+/// execution accelerator and must never turn into saved/transient identity.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FsExecutionOverlay {
+    /// Complete SSH option vector when process observation supplied an
+    /// explicit or derived ControlPath. Its non-ControlPath projection must
+    /// equal the stable target's option vector before execution.
+    ssh_args: Option<Vec<String>>,
+}
+
+impl FsExecutionOverlay {
+    fn from_ssh_args(ssh_args: Vec<String>) -> Self {
+        Self {
+            ssh_args: Some(ssh_args),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ssh_args.is_none()
+    }
 }
 
 impl FsLocation {
+    pub(crate) fn is_remote(&self) -> bool {
+        !matches!(self, FsLocation::Local)
+    }
+
     /// Short label for the location selector: `Local`, or the host name
     /// prefixed by its transport (`ssh: ` / `docker: `).
     pub(crate) fn label(&self, hosts: &[RemoteHost]) -> String {
@@ -79,11 +114,25 @@ impl FsLocation {
             FsLocation::Remote(index) => match crate::config::checked_remote_host(hosts, *index) {
                 Ok(host) => {
                     let transport = if host.docker { "docker" } else { "ssh" };
-                    let name = jterm_core::review_input::safe_inline_display(&host.name, 256);
-                    format!("{transport}: {name}")
+                    let name = jterm_core::review_input::safe_inline_display(&host.name, 1024);
+                    let destination = match &host.user {
+                        Some(user) => format!("{user}@{}", host.host),
+                        None => host.host.clone(),
+                    };
+                    let destination =
+                        jterm_core::review_input::safe_inline_display(&destination, 1024);
+                    if name == destination {
+                        format!("{transport}: {destination}")
+                    } else {
+                        format!("{transport}: {name} — {destination}")
+                    }
                 }
                 Err(_) => "Remote (unavailable)".to_string(),
             },
+            FsLocation::Transient(host) => {
+                let name = jterm_core::review_input::safe_inline_display(host.display_name(), 1024);
+                format!("ssh: {name} (temporary)")
+            }
         }
     }
 }
@@ -101,6 +150,10 @@ pub(crate) struct FsClipboard {
     /// reordered.
     pub(crate) intent_id: u64,
     pub(crate) loc: FsLocation,
+    /// Frozen execution accelerator for the clipboard source. It travels with
+    /// the source snapshot so navigating the visible tree cannot redirect a
+    /// later download/relay or silently drop the socket that made it usable.
+    pub(crate) overlay: FsExecutionOverlay,
     pub(crate) items: Vec<FsClipboardItem>,
     pub(crate) cut: bool,
 }
@@ -1228,16 +1281,110 @@ pub(crate) enum TransferPlan {
     Relay,
 }
 
+#[derive(PartialEq, Eq)]
+enum FilesystemIdentity {
+    Local,
+    Remote {
+        docker: bool,
+        host: String,
+        user: Option<String>,
+        stable_ssh_args: Vec<String>,
+    },
+}
+
+fn filesystem_identity(loc: &FsLocation, hosts: &[RemoteHost]) -> io::Result<FilesystemIdentity> {
+    let Some(host) = remote_host(loc, hosts)? else {
+        return Ok(FilesystemIdentity::Local);
+    };
+    Ok(FilesystemIdentity::Remote {
+        docker: host.docker,
+        host: host.host,
+        user: host.user,
+        stable_ssh_args: if host.docker {
+            Vec::new()
+        } else {
+            stable_ssh_args(&host.ssh_args)?
+        },
+    })
+}
+
+/// Whether two saved/transient representations address the same filesystem
+/// namespace. ControlPath is intentionally absent from this identity; it is
+/// selected separately as execution material for a same-target paste.
+pub(crate) fn same_filesystem(from: &FsLocation, to: &FsLocation, hosts: &[RemoteHost]) -> bool {
+    filesystem_identity(from, hosts)
+        .and_then(|from| filesystem_identity(to, hosts).map(|to| from == to))
+        .unwrap_or(false)
+}
+
+fn location_has_configured_control_path(loc: &FsLocation, hosts: &[RemoteHost]) -> bool {
+    remote_host(loc, hosts)
+        .ok()
+        .flatten()
+        .filter(|host| !host.docker)
+        .is_some_and(|host| {
+            ssh_args_without_control_path(&host.ssh_args).is_ok_and(|(_, removed)| removed)
+        })
+}
+
+/// Choose one immutable execution endpoint for a direct copy/rename between
+/// two representations of the same filesystem. A process-observed socket is
+/// strongest, followed by an explicit ControlPath baked into either saved
+/// profile. This is intentionally independent from namespace identity: the
+/// socket is used for execution without turning paste into a cross-host relay.
+pub(crate) fn same_filesystem_execution_endpoint<'a>(
+    from: &'a FsLocation,
+    from_overlay: &'a FsExecutionOverlay,
+    to: &'a FsLocation,
+    to_overlay: &'a FsExecutionOverlay,
+    hosts: &[RemoteHost],
+) -> (&'a FsLocation, &'a FsExecutionOverlay) {
+    debug_assert!(same_filesystem(from, to, hosts));
+    if !to_overlay.is_empty() {
+        return (to, to_overlay);
+    }
+    if !from_overlay.is_empty() {
+        return (from, from_overlay);
+    }
+    if location_has_configured_control_path(to, hosts) {
+        return (to, to_overlay);
+    }
+    if location_has_configured_control_path(from, hosts) {
+        return (from, from_overlay);
+    }
+    if matches!(to, FsLocation::Remote(_)) {
+        (to, to_overlay)
+    } else {
+        (from, from_overlay)
+    }
+}
+
 pub(crate) fn transfer_plan(from: &FsLocation, to: &FsLocation) -> Option<TransferPlan> {
     if from == to {
         return None;
     }
-    Some(match (from, to) {
-        (FsLocation::Remote(_), FsLocation::Local) => TransferPlan::Download,
-        (FsLocation::Local, FsLocation::Remote(_)) => TransferPlan::Upload,
-        (FsLocation::Remote(_), FsLocation::Remote(_)) => TransferPlan::Relay,
+    Some(match (from.is_remote(), to.is_remote()) {
+        (true, false) => TransferPlan::Download,
+        (false, true) => TransferPlan::Upload,
+        (true, true) => TransferPlan::Relay,
         // `from == to` was rejected above, so both-Local cannot reach here.
-        (FsLocation::Local, FsLocation::Local) => unreachable!(),
+        (false, false) => unreachable!(),
+    })
+}
+
+pub(crate) fn transfer_plan_with_hosts(
+    from: &FsLocation,
+    to: &FsLocation,
+    hosts: &[RemoteHost],
+) -> Option<TransferPlan> {
+    if same_filesystem(from, to, hosts) {
+        return None;
+    }
+    Some(match (from.is_remote(), to.is_remote()) {
+        (true, false) => TransferPlan::Download,
+        (false, true) => TransferPlan::Upload,
+        (true, true) => TransferPlan::Relay,
+        (false, false) => unreachable!(),
     })
 }
 
@@ -1254,23 +1401,51 @@ pub(crate) fn transfer(
     is_dir: bool,
     control: &TransferControl,
 ) -> io::Result<()> {
-    match (remote_host(from, hosts)?, remote_host(to, hosts)?) {
+    transfer_with_overlays(
+        from,
+        &FsExecutionOverlay::default(),
+        hosts,
+        src,
+        to,
+        &FsExecutionOverlay::default(),
+        dst,
+        is_dir,
+        control,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // One immutable authority + path per leg, plus item metadata/control.
+pub(crate) fn transfer_with_overlays(
+    from: &FsLocation,
+    from_overlay: &FsExecutionOverlay,
+    hosts: &[RemoteHost],
+    src: &Path,
+    to: &FsLocation,
+    to_overlay: &FsExecutionOverlay,
+    dst: &Path,
+    is_dir: bool,
+    control: &TransferControl,
+) -> io::Result<()> {
+    match (
+        remote_host_with_overlay(from, hosts, from_overlay)?,
+        remote_host_with_overlay(to, hosts, to_overlay)?,
+    ) {
         (Some(src_host), None) => {
             if is_dir {
-                download_dir(src_host, src, dst, control)
+                download_dir(&src_host, src, dst, control)
             } else {
-                download_file(src_host, src, dst, control)
+                download_file(&src_host, src, dst, control)
             }
         }
         (None, Some(dst_host)) => {
             if is_dir {
-                upload_dir(dst_host, src, dst, control)
+                upload_dir(&dst_host, src, dst, control)
             } else {
-                upload_file(dst_host, src, dst, control)
+                upload_file(&dst_host, src, dst, control)
             }
         }
         (Some(src_host), Some(dst_host)) => {
-            transfer_relay(src_host, src, dst_host, dst, is_dir, control)
+            transfer_relay(&src_host, src, &dst_host, dst, is_dir, control)
         }
         (None, None) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1407,9 +1582,10 @@ pub(crate) fn plan_drop(paths: &[PathBuf], target: &FsLocation, target_dir: &Pat
             "Too many items dropped at once ({MAX_DROP_ITEMS} maximum)."
         ));
     }
-    let action = match target {
-        FsLocation::Local => DropAction::Copy,
-        FsLocation::Remote(_) => DropAction::Upload,
+    let action = if target.is_remote() {
+        DropAction::Upload
+    } else {
+        DropAction::Copy
     };
     let mut items = Vec::with_capacity(paths.len());
     let mut total_bytes = 0_u64;
@@ -1450,18 +1626,225 @@ pub(crate) fn plan_drop(paths: &[PathBuf], target: &FsLocation, target_dir: &Pat
     }
 }
 
+/// Convert the shared, process-observed target into Forge's older launch model
+/// and run Forge's stricter final execution gate. Fields unrelated to file
+/// probes are deliberately pinned to inert defaults: a temporary Files target
+/// never deploys a shell or acquires a resumable session as a side effect.
+pub(crate) fn transient_remote_host(target: &RemoteHostConfig) -> io::Result<RemoteHost> {
+    target
+        .validate()
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    if target.docker {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "an observed SSH target cannot use the Docker transport",
+        ));
+    }
+    let host = RemoteHost {
+        name: target.display_name().to_string(),
+        host: target.host.clone(),
+        user: target.user.clone(),
+        docker: false,
+        deploy_artifact: None,
+        remote_shell: "jsh".to_string(),
+        session: None,
+        ssh_args: target.ssh_args.clone(),
+        login_shell: true,
+        multiplex: false,
+        deploy: jterm_core::jsh_remote::Deploy::Off,
+    };
+    crate::config::validate_remote_host(&host)
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    Ok(host)
+}
+
 /// Resolve a location against the snapshot of configured hosts taken when the
-/// operation was queued.
-fn remote_host<'a>(
-    loc: &FsLocation,
-    hosts: &'a [RemoteHost],
-) -> io::Result<Option<&'a RemoteHost>> {
+/// operation was queued. Returning an owned profile keeps the configured and
+/// transient paths identical below this authority boundary and avoids lending
+/// an index whose meaning a later config reload could change.
+fn remote_host(loc: &FsLocation, hosts: &[RemoteHost]) -> io::Result<Option<RemoteHost>> {
     match loc {
         FsLocation::Local => Ok(None),
         FsLocation::Remote(index) => crate::config::checked_remote_host(hosts, *index)
+            .cloned()
             .map(Some)
             .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message)),
+        FsLocation::Transient(target) => transient_remote_host(target).map(Some),
     }
+}
+
+fn ssh_args_without_control_path(args: &[String]) -> io::Result<(Vec<String>, bool)> {
+    let mut stable = Vec::with_capacity(args.len());
+    let mut removed = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "-S" {
+            if args.get(index + 1).is_none_or(String::is_empty) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SSH ControlPath option has no value",
+                ));
+            }
+            removed = true;
+            index += 2;
+            continue;
+        }
+        if argument.starts_with("-S") && argument.len() > 2 {
+            removed = true;
+            index += 1;
+            continue;
+        }
+        if argument == "-o" {
+            let option = args.get(index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "SSH -o option has no value")
+            })?;
+            if option
+                .split_once('=')
+                .map_or(option.as_str(), |(key, _)| key)
+                .eq_ignore_ascii_case("controlpath")
+            {
+                removed = true;
+            } else {
+                stable.push(argument.clone());
+                stable.push(option.clone());
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(option) = argument.strip_prefix("-o") {
+            if option
+                .split_once('=')
+                .map_or(option, |(key, _)| key)
+                .eq_ignore_ascii_case("controlpath")
+            {
+                removed = true;
+                index += 1;
+                continue;
+            }
+        }
+        stable.push(argument.clone());
+        index += 1;
+    }
+    Ok((stable, removed))
+}
+
+pub(crate) fn stable_ssh_args(args: &[String]) -> io::Result<Vec<String>> {
+    ssh_args_without_control_path(args).map(|(stable, _)| stable)
+}
+
+fn reusable_control_path_is_safe(path: &str) -> bool {
+    Path::new(path).is_absolute()
+        && path.len() <= 512
+        && !path.chars().any(|character| {
+            character.is_whitespace()
+                || character.is_control()
+                || jterm_core::review_input::is_visual_spoofing_character(character)
+        })
+}
+
+/// Normalize an observed target into stable identity plus an execution-only
+/// SSH option snapshot. Direct `-S` / `-o ControlPath=…` options and Core's
+/// provenance-derived jsh socket take the same path, while every other SSH
+/// option remains part of identity and must match at execution.
+pub(crate) fn observed_target_and_overlay(
+    mut target: RemoteHostConfig,
+    reusable_control_path: Option<String>,
+) -> io::Result<(RemoteHostConfig, FsExecutionOverlay)> {
+    let mut execution_args = target.ssh_args.clone();
+    let (stable_args, explicit_control_path) = ssh_args_without_control_path(&execution_args)?;
+    if let Some(path) = reusable_control_path {
+        if explicit_control_path || !reusable_control_path_is_safe(&path) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the observed SSH control socket cannot be safely reused",
+            ));
+        }
+        execution_args.push("-S".to_string());
+        execution_args.push(path);
+    }
+    target.ssh_args = stable_args;
+    target
+        .validate()
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    let overlay = if execution_args == target.ssh_args {
+        FsExecutionOverlay::default()
+    } else {
+        FsExecutionOverlay::from_ssh_args(execution_args)
+    };
+    Ok((target, overlay))
+}
+
+/// Resolve stable authority first, then apply transient connection material to
+/// the owned execution snapshot. The final Forge execution gate is repeated
+/// after the overlay so neither a stale socket path nor argument-budget growth
+/// can bypass validation.
+fn remote_host_with_overlay(
+    loc: &FsLocation,
+    hosts: &[RemoteHost],
+    overlay: &FsExecutionOverlay,
+) -> io::Result<Option<RemoteHost>> {
+    let Some(host) = remote_host(loc, hosts)? else {
+        return Ok(None);
+    };
+    apply_execution_overlay(host, overlay).map(Some)
+}
+
+fn apply_execution_overlay(
+    mut host: RemoteHost,
+    overlay: &FsExecutionOverlay,
+) -> io::Result<RemoteHost> {
+    if let Some(execution_args) = overlay.ssh_args.as_ref() {
+        let stable_host_args = stable_ssh_args(&host.ssh_args)?;
+        let (stable_execution_args, has_control_path) =
+            ssh_args_without_control_path(execution_args)?;
+        if host.docker || !has_control_path || stable_host_args != stable_execution_args {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the observed SSH control socket cannot be safely reused",
+            ));
+        }
+        host.ssh_args = execution_args.clone();
+    }
+    crate::config::validate_remote_host(&host)
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    Ok(host)
+}
+
+/// Build a plain interactive SSH argv for the temporary Files terminal bridge.
+/// There is intentionally no remote command: unlike saved Forge profiles, an
+/// observed ad-hoc target must not assume jsh exists on the far side.
+pub(crate) fn plain_interactive_ssh_argv(
+    target: &RemoteHostConfig,
+    overlay: &FsExecutionOverlay,
+) -> io::Result<(RemoteHost, Vec<String>)> {
+    let host = transient_remote_host(target)?;
+    let argv = plain_interactive_ssh_argv_for_host(&host, overlay)?;
+    Ok((host, argv))
+}
+
+pub(crate) fn plain_interactive_ssh_argv_for_host(
+    host: &RemoteHost,
+    overlay: &FsExecutionOverlay,
+) -> io::Result<Vec<String>> {
+    crate::config::validate_remote_host(host)
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    if host.docker {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "plain SSH cannot target a Docker profile",
+        ));
+    }
+    let execution_host = apply_execution_overlay(host.clone(), overlay)?;
+    let destination = match &execution_host.user {
+        Some(user) => format!("{user}@{}", execution_host.host),
+        None => execution_host.host.clone(),
+    };
+    let mut argv = vec!["ssh".to_string(), "-t".to_string()];
+    argv.extend(execution_host.ssh_args.iter().cloned());
+    argv.push("--".to_string());
+    argv.push(destination);
+    Ok(argv)
 }
 
 /// Remote probe operands must be absolute UTF-8 paths; anything else is
@@ -1542,12 +1925,26 @@ fn already_exists(path: &Path) -> io::Error {
 /// The directory the tree opens on for a location: the local behavior
 /// ($HOME, else `/`) unchanged, or the remote account's home via the probe.
 pub(crate) fn start_dir(loc: &FsLocation, hosts: &[RemoteHost]) -> io::Result<PathBuf> {
-    match remote_host(loc, hosts)? {
+    start_dir_with_overlay(loc, hosts, &FsExecutionOverlay::default())
+}
+
+pub(crate) fn start_dir_with_overlay(
+    loc: &FsLocation,
+    hosts: &[RemoteHost],
+    overlay: &FsExecutionOverlay,
+) -> io::Result<PathBuf> {
+    match remote_host_with_overlay(loc, hosts, overlay)? {
         None => Ok(std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/"))),
         Some(host) => {
-            let capture = run_probe(host, "home", &[], PROBE_LIST_TIMEOUT, PROBE_HOME_MAX_OUTPUT)?;
+            let capture = run_probe(
+                &host,
+                "home",
+                &[],
+                PROBE_LIST_TIMEOUT,
+                PROBE_HOME_MAX_OUTPUT,
+            )?;
             parse_home(&capture.stdout)
         }
     }
@@ -1581,11 +1978,20 @@ pub(crate) fn list_dir(
     hosts: &[RemoteHost],
     dir: &Path,
 ) -> io::Result<Vec<FsEntry>> {
-    match remote_host(loc, hosts)? {
+    list_dir_with_overlay(loc, hosts, &FsExecutionOverlay::default(), dir)
+}
+
+pub(crate) fn list_dir_with_overlay(
+    loc: &FsLocation,
+    hosts: &[RemoteHost],
+    overlay: &FsExecutionOverlay,
+    dir: &Path,
+) -> io::Result<Vec<FsEntry>> {
+    match remote_host_with_overlay(loc, hosts, overlay)? {
         None => list_dir_local(dir),
         Some(host) => {
             let capture = run_probe(
-                host,
+                &host,
                 "list",
                 &[remote_path_arg(dir)?],
                 PROBE_LIST_TIMEOUT,
@@ -1654,11 +2060,20 @@ fn parse_list(bytes: &[u8], dir: &Path) -> Vec<FsEntry> {
 }
 
 pub(crate) fn create_dir(loc: &FsLocation, hosts: &[RemoteHost], path: &Path) -> io::Result<()> {
-    match remote_host(loc, hosts)? {
+    create_dir_with_overlay(loc, hosts, &FsExecutionOverlay::default(), path)
+}
+
+pub(crate) fn create_dir_with_overlay(
+    loc: &FsLocation,
+    hosts: &[RemoteHost],
+    overlay: &FsExecutionOverlay,
+    path: &Path,
+) -> io::Result<()> {
+    match remote_host_with_overlay(loc, hosts, overlay)? {
         // `create_dir` already fails with AlreadyExists when `path` exists.
         None => std::fs::create_dir(path),
         Some(host) => run_probe(
-            host,
+            &host,
             "mkdir",
             &[remote_path_arg(path)?],
             PROBE_OP_TIMEOUT,
@@ -1669,14 +2084,23 @@ pub(crate) fn create_dir(loc: &FsLocation, hosts: &[RemoteHost], path: &Path) ->
 }
 
 pub(crate) fn create_file(loc: &FsLocation, hosts: &[RemoteHost], path: &Path) -> io::Result<()> {
-    match remote_host(loc, hosts)? {
+    create_file_with_overlay(loc, hosts, &FsExecutionOverlay::default(), path)
+}
+
+pub(crate) fn create_file_with_overlay(
+    loc: &FsLocation,
+    hosts: &[RemoteHost],
+    overlay: &FsExecutionOverlay,
+    path: &Path,
+) -> io::Result<()> {
+    match remote_host_with_overlay(loc, hosts, overlay)? {
         None => std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(path)
             .map(|_| ()),
         Some(host) => run_probe(
-            host,
+            &host,
             "mkfile",
             &[remote_path_arg(path)?],
             PROBE_OP_TIMEOUT,
@@ -1687,13 +2111,22 @@ pub(crate) fn create_file(loc: &FsLocation, hosts: &[RemoteHost], path: &Path) -
 }
 
 pub(crate) fn delete(loc: &FsLocation, hosts: &[RemoteHost], path: &Path) -> io::Result<()> {
+    delete_with_overlay(loc, hosts, &FsExecutionOverlay::default(), path)
+}
+
+pub(crate) fn delete_with_overlay(
+    loc: &FsLocation,
+    hosts: &[RemoteHost],
+    overlay: &FsExecutionOverlay,
+    path: &Path,
+) -> io::Result<()> {
     if path == Path::new("/") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "refusing to delete the filesystem root",
         ));
     }
-    match remote_host(loc, hosts)? {
+    match remote_host_with_overlay(loc, hosts, overlay)? {
         // `symlink_metadata` does not follow links: a symlink to a directory
         // takes the `remove_file` branch instead of recursing into its target.
         None => {
@@ -1704,7 +2137,7 @@ pub(crate) fn delete(loc: &FsLocation, hosts: &[RemoteHost], path: &Path) -> io:
             }
         }
         Some(host) => run_probe(
-            host,
+            &host,
             "rm",
             &[remote_path_arg(path)?],
             PROBE_OP_TIMEOUT,
@@ -1720,13 +2153,23 @@ pub(crate) fn rename(
     src: &Path,
     dst: &Path,
 ) -> io::Result<()> {
-    match remote_host(loc, hosts)? {
+    rename_with_overlay(loc, hosts, &FsExecutionOverlay::default(), src, dst)
+}
+
+pub(crate) fn rename_with_overlay(
+    loc: &FsLocation,
+    hosts: &[RemoteHost],
+    overlay: &FsExecutionOverlay,
+    src: &Path,
+    dst: &Path,
+) -> io::Result<()> {
+    match remote_host_with_overlay(loc, hosts, overlay)? {
         None => {
             fail_if_exists(dst)?;
             std::fs::rename(src, dst)
         }
         Some(host) => run_probe(
-            host,
+            &host,
             "mv",
             &[remote_path_arg(src)?, remote_path_arg(dst)?],
             PROBE_OP_TIMEOUT,
@@ -1742,13 +2185,23 @@ pub(crate) fn copy(
     src: &Path,
     dst: &Path,
 ) -> io::Result<()> {
-    match remote_host(loc, hosts)? {
+    copy_with_overlay(loc, hosts, &FsExecutionOverlay::default(), src, dst)
+}
+
+pub(crate) fn copy_with_overlay(
+    loc: &FsLocation,
+    hosts: &[RemoteHost],
+    overlay: &FsExecutionOverlay,
+    src: &Path,
+    dst: &Path,
+) -> io::Result<()> {
+    match remote_host_with_overlay(loc, hosts, overlay)? {
         None => {
             fail_if_exists(dst)?;
             copy_recursive(src, dst, 0)
         }
         Some(host) => run_probe(
-            host,
+            &host,
             "cp",
             &[remote_path_arg(src)?, remote_path_arg(dst)?],
             PROBE_OP_TIMEOUT,
@@ -1844,6 +2297,20 @@ mod tests {
             login_shell: true,
             multiplex: true,
             deploy: jterm_core::jsh_remote::Deploy::Off,
+        }
+    }
+
+    fn transient_fixture() -> RemoteHostConfig {
+        RemoteHostConfig {
+            name: "alice@dev.example.com".to_string(),
+            host: "dev.example.com".to_string(),
+            user: Some("alice".to_string()),
+            docker: false,
+            remote_shell: "jsh".to_string(),
+            session: None,
+            ssh_args: vec!["-p".to_string(), "2222".to_string()],
+            deploy: "off".to_string(),
+            deploy_artifact: None,
         }
     }
 
@@ -3091,5 +3558,148 @@ mod tests {
         let error =
             remote_host(&FsLocation::Remote(crate::config::MAX_REMOTE_HOSTS), &hosts).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn transient_targets_use_the_same_final_execution_gate() {
+        let target = transient_fixture();
+        let location = FsLocation::Transient(target.clone());
+        assert_eq!(
+            location.label(&[]),
+            "ssh: alice@dev.example.com (temporary)"
+        );
+        let resolved = remote_host(&location, &[]).unwrap().unwrap();
+        assert_eq!(resolved.host, "dev.example.com");
+        assert_eq!(resolved.user.as_deref(), Some("alice"));
+        assert_eq!(resolved.ssh_args, ["-p", "2222"]);
+        assert!(!resolved.multiplex);
+
+        let mut unsafe_target = target;
+        unsafe_target.ssh_args = vec!["--".to_string()];
+        let error = remote_host(&FsLocation::Transient(unsafe_target), &[]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn transient_locations_participate_in_transfer_plans_as_remote() {
+        let transient = FsLocation::Transient(transient_fixture());
+        assert_eq!(
+            transfer_plan(&FsLocation::Local, &transient),
+            Some(TransferPlan::Upload)
+        );
+        assert_eq!(
+            transfer_plan(&transient, &FsLocation::Local),
+            Some(TransferPlan::Download)
+        );
+        let other = FsLocation::Transient(RemoteHostConfig {
+            host: "other.example.com".to_string(),
+            name: "other.example.com".to_string(),
+            ..transient_fixture()
+        });
+        assert_eq!(transfer_plan(&transient, &other), Some(TransferPlan::Relay));
+    }
+
+    #[test]
+    fn saved_and_temporary_control_paths_share_one_filesystem_namespace() {
+        let target = transient_fixture();
+        let transient = FsLocation::Transient(target.clone());
+        let mut saved = host_fixture();
+        saved.ssh_args.extend([
+            "-o".to_string(),
+            "ControlPath=/run/user/1000/saved-cm".to_string(),
+        ]);
+        let hosts = vec![saved];
+        assert!(same_filesystem(&transient, &FsLocation::Remote(0), &hosts));
+        assert_eq!(
+            transfer_plan_with_hosts(&transient, &FsLocation::Remote(0), &hosts),
+            None,
+            "same-host paste must use copy/rename instead of a relay"
+        );
+
+        let raw_target = RemoteHostConfig {
+            ssh_args: vec![
+                "-p".to_string(),
+                "2222".to_string(),
+                "-S".to_string(),
+                "/run/user/1000/live-cm".to_string(),
+            ],
+            ..target
+        };
+        let (stable_target, overlay) = observed_target_and_overlay(raw_target, None).unwrap();
+        assert_eq!(stable_target.ssh_args, ["-p", "2222"]);
+        let execution = remote_host_with_overlay(&FsLocation::Remote(0), &hosts, &overlay)
+            .unwrap()
+            .unwrap();
+        assert!(execution
+            .ssh_args
+            .windows(2)
+            .any(|pair| { pair == ["-S".to_string(), "/run/user/1000/live-cm".to_string()] }));
+        assert!(!execution
+            .ssh_args
+            .iter()
+            .any(|arg| arg.contains("saved-cm")));
+
+        let (jsh_target, jsh_overlay) = observed_target_and_overlay(
+            transient_fixture(),
+            Some("/run/user/1000/current-jsh-cm".to_string()),
+        )
+        .unwrap();
+        assert_eq!(jsh_target.ssh_args, ["-p", "2222"]);
+        let jsh_execution = remote_host_with_overlay(&FsLocation::Remote(0), &hosts, &jsh_overlay)
+            .unwrap()
+            .unwrap();
+        assert!(jsh_execution.ssh_args.windows(2).any(|pair| {
+            pair == [
+                "-S".to_string(),
+                "/run/user/1000/current-jsh-cm".to_string(),
+            ]
+        }));
+        assert!(!jsh_execution
+            .ssh_args
+            .iter()
+            .any(|arg| arg.contains("saved-cm")));
+
+        let live_location = FsLocation::Transient(stable_target);
+        let saved_location = FsLocation::Remote(0);
+        let empty = FsExecutionOverlay::default();
+        let (selected_location, selected_overlay) = same_filesystem_execution_endpoint(
+            &live_location,
+            &overlay,
+            &saved_location,
+            &empty,
+            &hosts,
+        );
+        assert_eq!(selected_location, &live_location);
+        assert_eq!(selected_overlay, &overlay);
+
+        let (selected_location, selected_overlay) = same_filesystem_execution_endpoint(
+            &saved_location,
+            &empty,
+            &live_location,
+            &overlay,
+            &hosts,
+        );
+        assert_eq!(selected_location, &live_location);
+        assert_eq!(selected_overlay, &overlay);
+
+        let mut saved_without_socket = host_fixture();
+        saved_without_socket.name = "saved without socket".to_string();
+        let two_saved_hosts = vec![hosts[0].clone(), saved_without_socket];
+        let source_with_socket = FsLocation::Remote(0);
+        let destination_without_socket = FsLocation::Remote(1);
+        assert!(same_filesystem(
+            &source_with_socket,
+            &destination_without_socket,
+            &two_saved_hosts,
+        ));
+        let (selected_location, selected_overlay) = same_filesystem_execution_endpoint(
+            &source_with_socket,
+            &empty,
+            &destination_without_socket,
+            &empty,
+            &two_saved_hosts,
+        );
+        assert_eq!(selected_location, &source_with_socket);
+        assert!(selected_overlay.is_empty());
     }
 }

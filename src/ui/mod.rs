@@ -58,7 +58,7 @@ pub(crate) use pane_tree_edit::{
     detach_leaf_and_promote, detach_leaf_for_zoom, plan_existing_leaf_split, restore_zoomed_leaf,
     ZoomPageSwap,
 };
-pub(crate) use remote_fs::{FsClipboard, FsLocation};
+pub(crate) use remote_fs::{FsClipboard, FsExecutionOverlay, FsLocation};
 
 /// Quiet period after the last font-scale step before the config is written.
 pub(crate) const FONT_PERSIST_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
@@ -67,6 +67,34 @@ pub(crate) const FONT_PERSIST_DEBOUNCE: std::time::Duration = std::time::Duratio
 pub(crate) const CONFIG_PERSIST_DEBOUNCE: std::time::Duration =
     std::time::Duration::from_millis(250);
 pub(crate) const CONFIG_PERSIST_OPERATION: &str = "Save settings";
+
+/// Exact process observation already handled by the Files follower. The focus
+/// epoch is part of deduplication: A -> B -> A must stage a fresh probe even
+/// when A's session/argv never changed, while Files/chrome intent changes keep
+/// the same observation consumed and therefore cannot cause an automatic
+/// retry after deliberately cancelling a probe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FileTreeRemoteObservation {
+    pub(crate) source_session: String,
+    pub(crate) argv: Vec<String>,
+    pub(crate) tab_focus_generation: u64,
+    pub(crate) source_focus_serial: u64,
+}
+
+impl FileTreeRemoteObservation {
+    pub(crate) fn matches(
+        &self,
+        source_session: &str,
+        argv: &[String],
+        tab_focus_generation: u64,
+        source_focus_serial: u64,
+    ) -> bool {
+        self.source_session == source_session
+            && self.argv == argv
+            && self.tab_focus_generation == tab_focus_generation
+            && self.source_focus_serial == source_focus_serial
+    }
+}
 
 /// One configured `block:search` key press can toggle the picker at most once.
 ///
@@ -145,6 +173,10 @@ pub(crate) struct TabConnection {
     /// with the saved tab session. Only those connections may ignore `session`
     /// while matching the live tab back to a current filesystem profile.
     pub(crate) profile_session_overridden: bool,
+    /// `Some` identifies a temporary plain-interactive SSH launch and freezes
+    /// its execution-only socket overlay for reconnect. Saved managed remotes
+    /// remain `None` and rebuild through their configured jsh launcher.
+    pub(crate) plain_ssh_overlay: Option<remote_fs::FsExecutionOverlay>,
     pub(crate) status: ConnStatus,
     /// Reconnect backoff counter; a session that stayed up long enough resets it.
     pub(crate) attempt: u32,
@@ -283,6 +315,10 @@ pub(crate) struct UiState {
     /// Which filesystem the file tree browses (local disk or one of the
     /// configured ssh/docker remote hosts).
     pub(crate) file_tree_location: Rc<RefCell<FsLocation>>,
+    /// Execution-only material for the visible filesystem endpoint. Stable
+    /// location identity never includes this overlay; every scan/operation
+    /// takes an immutable clone alongside its location/host snapshot.
+    pub(crate) file_tree_execution_overlay: Rc<RefCell<remote_fs::FsExecutionOverlay>>,
     /// Location selector in the file-tree header; rebuilt when the hosts list
     /// or the current location changes.
     pub(crate) file_tree_location_selector: gtk4::DropDown,
@@ -300,6 +336,20 @@ pub(crate) struct UiState {
     /// Allocates a distinct identity for every user Copy/Cut action so an old
     /// async paste cannot consume a newer, even byte-identical, payload.
     pub(crate) file_tree_clipboard_intent: Rc<Cell<u64>>,
+    /// Monotonic user file-operation intent and a live-operation count. A
+    /// staged SSH home probe may not replace the tree across either boundary.
+    /// `None` permanently disables auto-follow after theoretical exhaustion
+    /// without disabling file operations themselves.
+    pub(crate) file_tree_operation_intent: Rc<Cell<Option<u64>>>,
+    pub(crate) file_tree_active_operations: Rc<Cell<u32>>,
+    /// Monotonic identity of the latest foreground-SSH follow attempt. A slow
+    /// home probe may publish only while this token, the source pane, and the
+    /// user's file-tree navigation generation all still match.
+    pub(crate) file_tree_remote_follow_intent: Rc<Cell<u64>>,
+    /// Last real foreground argv observed for one pane session. Keeping argv
+    /// boundaries (rather than command text) both deduplicates the 1s window
+    /// heartbeat and lets the same SSH command trigger again after it exits.
+    pub(crate) file_tree_remote_follow_observed: Rc<RefCell<Option<FileTreeRemoteObservation>>>,
     pub(crate) tab_search_entry: SearchEntry,
     pub(crate) selected_tabs: Rc<RefCell<Vec<String>>>,
     /// Global identity/generation for one native tab drag. Delayed hover work

@@ -61,6 +61,7 @@ impl UiState {
     /// Show one sidebar view (tab list vs file tree) and reflect it in the
     /// segmented buttons. When `persist`, remember the choice in config.
     pub(crate) fn apply_sidebar_view(&self, view: SidebarView, persist: bool) {
+        self.invalidate_file_tree_remote_follow();
         match view {
             SidebarView::Tabs => self.sidebar_stack.set_visible_child_name("tabs"),
             SidebarView::Files => {

@@ -808,8 +808,12 @@ pub fn run() -> glib::ExitCode {
 
         // File tree section (header + tree), shown in the sidebar.
         let file_tree_location = Rc::new(RefCell::new(ui::FsLocation::Local));
-        let (file_tree_model, file_tree) =
-            ui::build_file_tree_widgets(file_tree_location.clone(), config.clone());
+        let file_tree_execution_overlay = Rc::new(RefCell::new(ui::FsExecutionOverlay::default()));
+        let (file_tree_model, file_tree) = ui::build_file_tree_widgets(
+            file_tree_location.clone(),
+            file_tree_execution_overlay.clone(),
+            config.clone(),
+        );
 
         let file_tree_scroll = ScrolledWindow::new();
         file_tree_scroll.set_hexpand(false);
@@ -1056,10 +1060,15 @@ pub fn run() -> glib::ExitCode {
             file_tree_root: Rc::new(RefCell::new(std::path::PathBuf::new())),
             file_tree_root_label: file_tree_root_label.clone(),
             file_tree_location: file_tree_location.clone(),
+            file_tree_execution_overlay: file_tree_execution_overlay.clone(),
             file_tree_location_selector: file_tree_location_selector.clone(),
             file_tree_location_selector_syncing: Rc::new(Cell::new(false)),
             file_tree_clipboard: Rc::new(RefCell::new(None)),
             file_tree_clipboard_intent: Rc::new(Cell::new(0)),
+            file_tree_operation_intent: Rc::new(Cell::new(Some(0))),
+            file_tree_active_operations: Rc::new(Cell::new(0)),
+            file_tree_remote_follow_intent: Rc::new(Cell::new(0)),
+            file_tree_remote_follow_observed: Rc::new(RefCell::new(None)),
             file_tree_filter_bar: file_tree_filter_bar.clone(),
             file_tree_filter_entry: file_tree_filter_entry.clone(),
             file_tree_filter_toggle: file_tree_filter_toggle.clone(),
@@ -1844,6 +1853,7 @@ pub fn run() -> glib::ExitCode {
             let mut refresh_processes = false;
             glib::timeout_add_seconds_local(1, move || {
                 ui.refresh_pane_headers();
+                ui.poll_file_tree_remote_follow();
                 // Process badges historically refreshed every two seconds.
                 // Keep that cadence while sharing one window timer, so moving
                 // the work out of per-tab sources does not double /proc reads.

@@ -219,6 +219,19 @@ Files 侧边栏的位置选择器可直接浏览 `Local`、`ssh: …` 与 `docke
 会明确回到 Local。热重载或设置改动会按完整 profile 身份重映射位置和剪贴板；不能证明
 仍是同一目标时会清掉旧远端状态，而不会把旧路径静默指向另一台主机或容器。
 
+在任一 Block、Unified 或 VTE 标签中启动交互式 `ssh user@host -p port` 时，Forge
+也会通过 `jterm_core::process::observed_ssh_command` 从操作系统报告的真实前台进程树
+识别目标（包括来源验证通过的 jsh SSH 升级 launcher）；不会解析提示符、OSC 命令文本
+或重新解释 shell 字符串。唯一匹配的已保存 profile 优先，否则使用带 `temporary` 标记的
+内存目标。远端 home 探测成功前保留现有文件树；成功且标签、SSH 进程、配置身份和用户
+导航/文件操作 generation 均未变化时才自动展开 Files。显式或 jsh 派生的 ControlPath
+只保存在扫描、操作、剪贴板和传输的执行快照中，不参与 profile 身份；saved/temporary
+表示同一目标时粘贴也不会误走本地 relay。失败提供会重新检查实时进程的重试，SSH 退出
+不会强制切回 Local。temporary 位置的终端按钮启动普通交互式 SSH，不假定远端装有
+jsh。超长 DSW 等 endpoint 会在选择器中安全地中间省略、保留可辨识的用户/主机前后缀，
+悬停仍可查看完整目标。带远端命令或无法安全复用的 SSH 选项会明确拒绝自动跟随，并可
+转到 profile 选择器。
+
 日志支持普通级别和标准 target 指令，并输出进程内相对时间、级别与模块名：
 
 ```bash
