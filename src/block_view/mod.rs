@@ -443,7 +443,10 @@ struct StickyScanInputs {
 /// afterwards only when the fingerprint moved. NaN-safe in the conservative
 /// direction — a NaN adjustment value never equals itself, so it rescans
 /// every pass exactly like the ungated timer did.
-fn sticky_scan_inputs_changed(previous: Option<StickyScanInputs>, current: StickyScanInputs) -> bool {
+fn sticky_scan_inputs_changed(
+    previous: Option<StickyScanInputs>,
+    current: StickyScanInputs,
+) -> bool {
     previous != Some(current)
 }
 
@@ -1271,14 +1274,18 @@ fn bounded_journal_output(output: &str) -> (String, bool) {
     (output[start..].to_string(), true)
 }
 
-/// The command line a block records.
+/// The command line a block records, with the exactness provenance of the
+/// resolution.
 ///
 /// The shell's own metadata wins: it is what the shell parsed, whereas the
 /// reconstruction is scraped off the rendered screen, where a redraw, a wrapped
 /// line or an accepted autosuggestion can all make the text differ from what
 /// ran. The reconstruction stays as the fallback for shells that emit the bare
 /// FinalTerm mark with no parameters.
-fn resolve_command_for_block(meta: &CommandMeta, reconstructed: &str) -> String {
+fn resolve_command_for_block(
+    meta: &CommandMeta,
+    reconstructed: &str,
+) -> (String, CommandTextSource) {
     if let Some(command) = meta.command.as_deref().map(str::trim) {
         if !command.is_empty()
             && command.len() <= MAX_COMMAND_CAPTURE_BYTES
@@ -1287,17 +1294,25 @@ fn resolve_command_for_block(meta: &CommandMeta, reconstructed: &str) -> String 
                 .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
             && !jterm_core::review_input::contains_noncontrol_visual_spoofing(command)
         {
-            return command.to_string();
+            return (command.to_string(), CommandTextSource::ShellReported);
         }
     }
     let reconstructed = reconstructed.trim();
     if !reconstructed.is_empty() {
-        return bounded_command_text(reconstructed);
+        let source = if meta.command_truncated {
+            CommandTextSource::ScreenAfterTruncation
+        } else {
+            CommandTextSource::Screen
+        };
+        return (bounded_command_text(reconstructed), source);
     }
     if meta.command_truncated {
-        return TRUNCATED_COMMAND_PLACEHOLDER.to_string();
+        return (
+            TRUNCATED_COMMAND_PLACEHOLDER.to_string(),
+            CommandTextSource::ScreenAfterTruncation,
+        );
     }
-    String::new()
+    (String::new(), CommandTextSource::Screen)
 }
 
 /// forge truncates a multiline payload to its first line when the shell has not
@@ -4218,6 +4233,20 @@ impl InputOrigin {
     }
 }
 
+/// Exactness of a finished command's recorded text. Agent-task evidence must
+/// never present a screen scrape as shell-reported text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommandTextSource {
+    /// The shell attached the command line to its OSC 133 `C` packet (jsh does).
+    ShellReported,
+    /// The shell had a command line but exceeded the packet budget, so only the
+    /// screen scrape is left. Distinct from [`Self::Screen`]: a command really
+    /// did run, so an empty capture must not be read as "no command".
+    ScreenAfterTruncation,
+    /// The shell emits bare marks, so the screen is the only source there is.
+    Screen,
+}
+
 /// The identity and outcome of one completed command. Rendering-only values
 /// (prompt text, captured output, terminal columns and height estimates) are
 /// deliberately absent: Unified retains this record — with at most a bounded
@@ -4235,6 +4264,9 @@ struct CompletedCommandRecord {
     cwd: Option<String>,
     is_background: bool,
     completion_provenance: CompletionProvenance,
+    /// Exactness of `cmd` as resolved at the accepted C mark. Agent-task
+    /// evidence must never present a screen scrape as shell-reported text.
+    command_source: CommandTextSource,
     start_mark_seen: bool,
 }
 
@@ -5198,6 +5230,11 @@ struct EngineState {
     /// How the current command's completion boundary was established. Reset
     /// at C, promoted only by an accepted D or a foreground-shell A recovery.
     pending_completion_provenance: CompletionProvenance,
+    /// Provenance of the current command's text, set at the same accepted C
+    /// that resolves the command line and consumed into the finished record.
+    /// Defaults to (and resets to) the non-exact screen source so a command
+    /// whose start marker was never accepted can never look shell-reported.
+    pending_command_source: CommandTextSource,
     /// Exactly-once observer half of an accepted C lifecycle. Armed only by C,
     /// consumed by the first accepted D or trusted-A recovery, and cleared by
     /// RIS. This is deliberately separate from `cmd_running_rc`: renderer/UI
@@ -6882,6 +6919,17 @@ impl ReaderCtx {
                 start_time_ms = None;
             }
 
+            // Background output was never a command, so it keeps the
+            // conservative screen source; a real command takes the provenance
+            // its accepted C recorded and resets the slot to non-exact.
+            let command_source = if is_background {
+                CommandTextSource::Screen
+            } else {
+                std::mem::replace(
+                    &mut self.engine.borrow_mut().pending_command_source,
+                    CommandTextSource::Screen,
+                )
+            };
             // Single id shared by the completed record and, in Block mode,
             // the serializable BlockData and GTK FinishedBlock.
             let block_id = zone_plan
@@ -6897,6 +6945,7 @@ impl ReaderCtx {
                 cwd: block_cwd,
                 is_background,
                 completion_provenance,
+                command_source,
                 start_mark_seen: !is_background,
             };
             let payload = LazyBlockRenderPayload::new(prompt, captured_output);
@@ -7254,14 +7303,21 @@ impl ReaderCtx {
                 agent_generation.is_some(),
             )
         };
-        let mut submitted_command = resolve_command_for_block(meta, &reconstructed_command);
+        let (mut submitted_command, mut command_source) =
+            resolve_command_for_block(meta, &reconstructed_command);
         if !reviewed_identity_matches
             && external_submission
                 .as_deref()
                 .is_some_and(|approved| submitted_command == approved)
         {
             submitted_command = UNAVAILABLE_COMMAND_PLACEHOLDER.to_string();
+            // The rendered identity failed the review check: the placeholder
+            // is not the shell's report and must never pose as exact.
+            command_source = CommandTextSource::Screen;
         }
+        // The exactness provenance rides the same accepted-C authority as the
+        // resolved text: only this site may mark a command shell-reported.
+        self.engine.borrow_mut().pending_command_source = command_source;
         self.submission_pending_rc.set(false);
         self.engine.borrow_mut().vte_typed_cmd = submitted_command.clone();
         *self.running_cmd_rc.borrow_mut() = submitted_command.clone();
@@ -8259,6 +8315,8 @@ impl RenderBackend for BlockBackend {
             duration_ms: record.duration_ms,
             cwd: record.cwd.clone(),
             cols: cols.clamp(1, u16::MAX as i64) as u16,
+            command_exact: record.command_source == CommandTextSource::ShellReported,
+            command_truncated: record.command_source == CommandTextSource::ScreenAfterTruncation,
         };
         let max_blocks = self.config_for_cb.borrow().max_visible_blocks as usize;
         let newest_estimated_bytes = {
@@ -12104,6 +12162,7 @@ impl TermView {
                     command_start_instant: None,
                     pending_exit_code: None,
                     pending_completion_provenance: CompletionProvenance::Unknown,
+                    pending_command_source: CommandTextSource::Screen,
                     command_finished_event_pending: false,
                     pending_command_meta: PendingCommandMeta::default(),
                     pending_zone: None,
@@ -12416,9 +12475,9 @@ impl TermView {
             let fullscreen = fullscreen.clone();
             // Last fingerprinted scan inputs plus the candidate they produced;
             // see `StickyScanInputs`. Lives only in this closure.
-            let sticky_scan_state: Rc<
-                RefCell<Option<(StickyScanInputs, Option<(u64, String, bool)>)>>,
-            > = Rc::new(RefCell::new(None));
+            type StickyScanState =
+                Rc<RefCell<Option<(StickyScanInputs, Option<(u64, String, bool)>)>>>;
+            let sticky_scan_state: StickyScanState = Rc::new(RefCell::new(None));
             glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
                 if sticky.parent().is_none() {
                     return glib::ControlFlow::Break;
@@ -15384,6 +15443,65 @@ impl TermView {
         let data = self.block_data.borrow();
         block_context_for_id(&finished, &data, id, lines_per_side)
     }
+
+    /// Snapshot the selected finished block as agent-task evidence, preserving
+    /// the command-text provenance the task preflight gates on. Unlike
+    /// [`Self::selected_block_context`] (AI chat), a block whose command came
+    /// from a screen scrape reports `command_exact == false` and can never
+    /// anchor a validation rerun. Returns `None` when no block is selected.
+    pub fn selected_block_agent_evidence(
+        &self,
+        lines_per_side: usize,
+    ) -> Option<BlockAgentEvidence> {
+        let id = self.selected_block_id.get()?;
+        let finished = self.finished_blocks.borrow();
+        let block = finished.iter().find(|b| b.id == id)?;
+        let data = self.block_data.borrow();
+        let bd = data.iter().find(|b| b.id == id);
+
+        let output_total_bytes = block.with_stripped_output(|s| s.len());
+        let output =
+            block.with_stripped_output(|s| crate::ai::truncate_for_context(s, lines_per_side));
+        let output_truncated = output.contains("lines elided") || output.contains("bytes elided");
+        let to_time = |ms: Option<u64>| {
+            ms.map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms))
+        };
+        Some(BlockAgentEvidence {
+            block_id: id,
+            command: (!block.cmd_text.trim().is_empty()).then(|| block.cmd_text.clone()),
+            command_exact: bd.is_some_and(|b| b.command_exact),
+            command_truncated: bd.is_some_and(|b| b.command_truncated),
+            cwd: bd.and_then(|b| b.cwd.clone()),
+            exit_code: bd.and_then(|b| b.exit_code),
+            duration_ms: bd.and_then(|b| b.duration_ms),
+            output_text: output,
+            output_available: true,
+            output_truncated,
+            output_total_bytes,
+            is_background: block.is_background,
+            started_at: to_time(bd.and_then(|b| b.start_time_ms)),
+            finished_at: to_time(bd.and_then(|b| b.end_time_ms)),
+        })
+    }
+}
+
+/// Owned evidence snapshot of one selected finished block, shaped for
+/// conversion into `agent_task::SemanticCommandContext` at the app layer.
+pub struct BlockAgentEvidence {
+    pub(crate) block_id: u64,
+    pub(crate) command: Option<String>,
+    pub(crate) command_exact: bool,
+    pub(crate) command_truncated: bool,
+    pub(crate) cwd: Option<String>,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) duration_ms: Option<u64>,
+    pub(crate) output_text: String,
+    pub(crate) output_available: bool,
+    pub(crate) output_truncated: bool,
+    pub(crate) output_total_bytes: usize,
+    pub(crate) is_background: bool,
+    pub(crate) started_at: Option<std::time::SystemTime>,
+    pub(crate) finished_at: Option<std::time::SystemTime>,
 }
 
 #[cfg(test)]
@@ -15412,20 +15530,18 @@ mod tests {
         shell_argv_supports_agent_ids, shell_argv_uses_jsh, shell_integration_hint,
         should_buffer_background_output, stable_visible_indices, step_marked_indices,
         step_marked_record_ids, sticky_scan_inputs_changed, strip_ansi,
-        strip_ansi_with_clear_detect, take_background_output,
-        take_stash_for_undo, truncate_plain_output_for_height,
-        verified_editor_contains_exact_command, viewport_page_size_changed,
-        viewport_state_for_scroll, viewport_state_pair_for_scroll, visible_indices_for_viewport,
-        AgentCommandEndDecision, AltScreenCallbacks, AltScreenTransition, AnchorAbandoned,
-        AnchorTickExit, BlockData, BlockState, BoundedByteRing, BoundedClipboardAccumulator,
-        CommandFinishedEvent, CommandIdCorrelation, CommandMeta, CommandPromptStatus,
-        CommandStartedEvent, DynamicColors, HumanInputKind, InputOrigin, PendingCommandMeta,
-        PostPromptFeed, StickyScanInputs, TypedShadowFidelity, ViewportState,
-        MAX_COMMAND_CAPTURE_BYTES,
-        MAX_JOURNAL_OUTPUT_BYTES, MAX_PROMPT_CAPTURE_BYTES, MAX_RAW_OUTPUT_BYTES,
-        MAX_SELECTED_CLIPBOARD_BYTES, TERMINAL_RESET_INVALIDATED_SUBMISSION,
-        TRUNCATED_COMMAND_PLACEHOLDER, UNAVAILABLE_COMMAND_PLACEHOLDER,
-        VERIFIED_SUBMISSION_MAX_POLLS, ZONE_MARKER_CLOSE,
+        strip_ansi_with_clear_detect, take_background_output, take_stash_for_undo,
+        truncate_plain_output_for_height, verified_editor_contains_exact_command,
+        viewport_page_size_changed, viewport_state_for_scroll, viewport_state_pair_for_scroll,
+        visible_indices_for_viewport, AgentCommandEndDecision, AltScreenCallbacks,
+        AltScreenTransition, AnchorAbandoned, AnchorTickExit, BlockData, BlockState,
+        BoundedByteRing, BoundedClipboardAccumulator, CommandFinishedEvent, CommandIdCorrelation,
+        CommandMeta, CommandPromptStatus, CommandStartedEvent, DynamicColors, HumanInputKind,
+        InputOrigin, PendingCommandMeta, PostPromptFeed, StickyScanInputs, TypedShadowFidelity,
+        ViewportState, MAX_COMMAND_CAPTURE_BYTES, MAX_JOURNAL_OUTPUT_BYTES,
+        MAX_PROMPT_CAPTURE_BYTES, MAX_RAW_OUTPUT_BYTES, MAX_SELECTED_CLIPBOARD_BYTES,
+        TERMINAL_RESET_INVALIDATED_SUBMISSION, TRUNCATED_COMMAND_PLACEHOLDER,
+        UNAVAILABLE_COMMAND_PLACEHOLDER, VERIFIED_SUBMISSION_MAX_POLLS, ZONE_MARKER_CLOSE,
     };
     // The reader-dispatch harness at the bottom of this module: the two
     // rendering seams, the lifecycle context they serve, and the engine state
@@ -16078,6 +16194,8 @@ mod tests {
             duration_ms: Some(5),
             cwd: None,
             cols: 80,
+            command_exact: false,
+            command_truncated: false,
         };
 
         let expanded = super::collapsed_aware_block_height(&config, &data, false, 80);
@@ -16390,6 +16508,7 @@ mod tests {
             cwd: Some("/tmp/work".to_string()),
             is_background: false,
             completion_provenance: super::CompletionProvenance::ShellReported,
+            command_source: super::CommandTextSource::Screen,
             start_mark_seen: true,
         };
 
@@ -16441,6 +16560,7 @@ mod tests {
             cwd: None,
             is_background: false,
             completion_provenance: super::CompletionProvenance::ShellReported,
+            command_source: super::CommandTextSource::Screen,
             start_mark_seen: true,
         };
         let mut zones = UnifiedZoneStore::new();
@@ -16486,6 +16606,7 @@ mod tests {
             cwd: None,
             is_background: false,
             completion_provenance: super::CompletionProvenance::ShellReported,
+            command_source: super::CommandTextSource::Screen,
             start_mark_seen: true,
         };
         let mut zones = UnifiedZoneStore::new();
@@ -17917,7 +18038,10 @@ mod tests {
         };
         assert_eq!(
             resolve_command_for_block(&meta, "git stat"),
-            "git status --short"
+            (
+                "git status --short".to_string(),
+                super::CommandTextSource::ShellReported
+            )
         );
     }
 
@@ -17925,8 +18049,14 @@ mod tests {
     #[test]
     fn bare_mark_falls_back_to_the_reconstruction() {
         let meta = CommandMeta::default();
-        assert_eq!(resolve_command_for_block(&meta, "  ls -la "), "ls -la");
-        assert_eq!(resolve_command_for_block(&meta, "   "), "");
+        assert_eq!(
+            resolve_command_for_block(&meta, "  ls -la "),
+            ("ls -la".to_string(), super::CommandTextSource::Screen)
+        );
+        assert_eq!(
+            resolve_command_for_block(&meta, "   "),
+            (String::new(), super::CommandTextSource::Screen)
+        );
     }
 
     /// `cmd_truncated=1` is its own case: the shell *had* a command line and said
@@ -17941,9 +18071,18 @@ mod tests {
         };
         assert_eq!(
             resolve_command_for_block(&meta, ""),
-            TRUNCATED_COMMAND_PLACEHOLDER
+            (
+                TRUNCATED_COMMAND_PLACEHOLDER.to_string(),
+                super::CommandTextSource::ScreenAfterTruncation
+            )
         );
-        assert_eq!(resolve_command_for_block(&meta, "ls"), "ls");
+        assert_eq!(
+            resolve_command_for_block(&meta, "ls"),
+            (
+                "ls".to_string(),
+                super::CommandTextSource::ScreenAfterTruncation
+            )
+        );
     }
 
     /// jsh attaches the duration to `D` and the id to `C`; folding the two marks
@@ -18300,13 +18439,16 @@ mod tests {
         };
         assert_eq!(
             resolve_command_for_block(&hidden, "echo visible"),
-            "echo visible"
+            ("echo visible".to_string(), super::CommandTextSource::Screen)
         );
         let oversized = CommandMeta {
             command: Some("x".repeat(MAX_COMMAND_CAPTURE_BYTES + 1)),
             ..CommandMeta::default()
         };
-        assert_eq!(resolve_command_for_block(&oversized, ""), "");
+        assert_eq!(
+            resolve_command_for_block(&oversized, ""),
+            (String::new(), super::CommandTextSource::Screen)
+        );
     }
 
     #[test]
@@ -18704,6 +18846,8 @@ mod tests {
             duration_ms: None,
             cwd: None,
             cols: 0,
+            command_exact: false,
+            command_truncated: false,
         }
     }
 
@@ -19223,17 +19367,35 @@ mod tests {
         // Every field is load-bearing: scroll position, rolled-up card
         // heights, viewport extent, block census, and the bar's own height.
         for moved in [
-            StickyScanInputs { value: 121.0, ..inputs },
-            StickyScanInputs { upper: 4_100.0, ..inputs },
-            StickyScanInputs { page_size: 601.0, ..inputs },
-            StickyScanInputs { blocks: 8, ..inputs },
-            StickyScanInputs { bar_height: 56, ..inputs },
+            StickyScanInputs {
+                value: 121.0,
+                ..inputs
+            },
+            StickyScanInputs {
+                upper: 4_100.0,
+                ..inputs
+            },
+            StickyScanInputs {
+                page_size: 601.0,
+                ..inputs
+            },
+            StickyScanInputs {
+                blocks: 8,
+                ..inputs
+            },
+            StickyScanInputs {
+                bar_height: 56,
+                ..inputs
+            },
         ] {
             assert!(sticky_scan_inputs_changed(Some(inputs), moved));
         }
         // A NaN from a half-configured adjustment must never wedge the cache:
         // it fails equality and falls back to the old scan-every-pass behavior.
-        let nan = StickyScanInputs { value: f64::NAN, ..inputs };
+        let nan = StickyScanInputs {
+            value: f64::NAN,
+            ..inputs
+        };
         assert!(sticky_scan_inputs_changed(Some(nan), nan));
     }
 
@@ -20796,6 +20958,8 @@ mod tests {
                 duration_ms: record.duration_ms,
                 cwd: record.cwd.clone(),
                 cols: cols.clamp(1, u16::MAX as i64) as u16,
+                command_exact: false,
+                command_truncated: false,
             };
             self.records.borrow_mut().push_back(block_data);
             self.record(Call::FinalizeBlock(FinalizeRecord {
@@ -21285,6 +21449,7 @@ mod tests {
                     command_start_instant: None,
                     pending_exit_code: None,
                     pending_completion_provenance: super::CompletionProvenance::Unknown,
+                    pending_command_source: super::CommandTextSource::Screen,
                     command_finished_event_pending: false,
                     pending_command_meta: PendingCommandMeta::default(),
                     pending_zone: None,

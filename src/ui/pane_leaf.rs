@@ -22,6 +22,8 @@ const PANE_REMOTE_DATA_KEY: &str = "terminal-remote-pane";
 const PANE_REMOTE_NAME_DATA_KEY: &str = "terminal-managed-remote-name";
 const PANE_REMOTE_SESSION_ID_DATA_KEY: &str = "terminal-managed-remote-session-id";
 const PANE_FOCUS_SERIAL_DATA_KEY: &str = "terminal-pane-focus-serial";
+const PANE_TASK_ROLE_DATA_KEY: &str = "terminal-agent-task-role";
+const PANE_TASK_SESSION_ID_DATA_KEY: &str = "terminal-agent-task-session-id";
 static NEXT_PANE_FOCUS_SERIAL: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -239,6 +241,42 @@ impl PaneLeaf {
         unsafe {
             self.root_widget()
                 .data::<String>(PANE_REMOTE_SESSION_ID_DATA_KEY)
+                .map(|value| value.as_ref().clone())
+        }
+    }
+
+    /// Mark this leaf as hosting a native agent task terminal (the codex CLI
+    /// or a validation rerun). Task terminals exist only at runtime: their
+    /// task metadata is never persisted, so session snapshots exclude the
+    /// whole tab instead of restoring a stray shell inside the task worktree.
+    pub(crate) fn set_task_role(&self, role: crate::agent_task::TaskTerminalRole) {
+        unsafe {
+            self.root_widget()
+                .set_data::<crate::agent_task::TaskTerminalRole>(PANE_TASK_ROLE_DATA_KEY, role);
+        }
+    }
+
+    pub(crate) fn task_role(&self) -> Option<crate::agent_task::TaskTerminalRole> {
+        unsafe {
+            self.root_widget()
+                .data::<crate::agent_task::TaskTerminalRole>(PANE_TASK_ROLE_DATA_KEY)
+                .map(|value| *value.as_ref())
+        }
+    }
+
+    /// Stable synthetic session identity binding this pane to its task in the
+    /// task manager (`forge-<pid>-<pane_serial>`). `None` for ordinary panes.
+    pub(crate) fn set_task_session_id(&self, session_id: &str) {
+        unsafe {
+            self.root_widget()
+                .set_data::<String>(PANE_TASK_SESSION_ID_DATA_KEY, session_id.to_owned());
+        }
+    }
+
+    pub(crate) fn task_session_id(&self) -> Option<String> {
+        unsafe {
+            self.root_widget()
+                .data::<String>(PANE_TASK_SESSION_ID_DATA_KEY)
                 .map(|value| value.as_ref().clone())
         }
     }

@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 pub mod agent;
+pub(crate) mod agent_task;
+pub(crate) mod agent_task_ui;
 pub mod ai;
 pub mod block_view;
 pub mod cli;
@@ -251,6 +253,7 @@ pub mod redact {
     pub use jterm_core::redact::*;
 }
 pub mod jsh_install;
+pub(crate) mod review_text;
 pub mod state;
 pub mod terminal;
 pub mod workflows;

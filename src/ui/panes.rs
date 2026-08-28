@@ -192,6 +192,8 @@ impl UiState {
             working_directory,
             Some(&sid),
             initial_commands,
+            Vec::new(),
+            None,
         ));
         drop(shell_argv);
 

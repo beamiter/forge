@@ -952,6 +952,14 @@ pub fn run() -> glib::ExitCode {
         // existing sidebar / notebook layout. Built always; visibility is
         // controlled by adding/removing it as `ai_paned`'s end_child.
         let ai_panel_widget = ui::AiPanel::build(config.clone());
+        // Both right-side panels share the `ai_paned` end slot through one
+        // stack: the persisted width/visibility behavior stays identical for
+        // AI Chats, and Tasks rides the same chrome without its own config.
+        let tasks_panel_widget = ui::TasksPanel::build();
+        let side_stack = gtk4::Stack::new();
+        side_stack.add_named(&ai_panel_widget.root, Some("chats"));
+        side_stack.add_named(&tasks_panel_widget.root, Some("tasks"));
+        side_stack.set_visible_child_name("chats");
         let ai_paned = gtk4::Paned::new(Orientation::Horizontal);
         ai_paned.set_vexpand(true);
         ai_paned.set_wide_handle(true);
@@ -965,7 +973,7 @@ pub fn run() -> glib::ExitCode {
             config.ai_enabled && config.ai_panel_visible
         };
         if ai_initially_visible {
-            ai_paned.set_end_child(Some(&ai_panel_widget.root));
+            ai_paned.set_end_child(Some(&side_stack));
         }
 
         let content_box = gtk4::Paned::new(Orientation::Horizontal);
@@ -1103,6 +1111,9 @@ pub fn run() -> glib::ExitCode {
             session_ids: Rc::new(RefCell::new(HashMap::new())),
             tab_connections: Rc::new(RefCell::new(HashMap::new())),
             ai_panel: ai_panel_widget.clone(),
+            side_stack: side_stack.clone(),
+            tasks_panel: tasks_panel_widget.clone(),
+            agent_tasks: Rc::new(RefCell::new(ui::AgentTaskDomain::new())),
             ai_paned: ai_paned.clone(),
             ai_panel_visible: Rc::new(Cell::new(ai_initially_visible)),
             ai_panel_width_restoring: Rc::new(Cell::new(false)),
@@ -1118,12 +1129,22 @@ pub fn run() -> glib::ExitCode {
             toast_overlay.add_toast(toast);
         }
 
+        // The agent Tasks panel stages actions; the app layer resolves them
+        // against the live task domain at execution time.
+        {
+            let ui_for_tasks = Rc::downgrade(&ui);
+            ui.tasks_panel.connect_action(move |action| {
+                if let Some(ui) = ui_for_tasks.upgrade() {
+                    ui.execute_task_panel_action(action);
+                }
+            });
+        }
+
         // Background persistence failures arrive from a Send-only worker.
         // Polling a bounded queue keeps GTK objects on the main thread and
         // turns otherwise invisible fsync/permission failures into one concise
         // toast per affected operation.
-        let persistence_toasts = toast_overlay.downgrade();
-        let ui_for_persistence = Rc::downgrade(&ui);
+        let persistence_toasts = toast_overlay.downgrade();        let ui_for_persistence = Rc::downgrade(&ui);
         let ai_panel_for_persistence = ui.ai_panel.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
             let Some(overlay) = persistence_toasts.upgrade() else {

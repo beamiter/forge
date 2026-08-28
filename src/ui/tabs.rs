@@ -30,6 +30,15 @@ struct TabLaunch {
     /// only the profile session id with the saved tab session.
     remote: Option<RemoteLaunch>,
     terminal_mode: crate::config::TerminalMode,
+    /// Native agent task terminal extras: environment overlays (validation
+    /// no-rc pins) and a one-shot spawn-resolved hook releasing the launch-time
+    /// cwd descriptor. `None` for ordinary shells.
+    task: Option<TaskSpawnExtras>,
+}
+
+struct TaskSpawnExtras {
+    env_extra: Vec<(String, String)>,
+    on_launched: Option<Box<dyn FnOnce()>>,
 }
 
 struct RemoteLaunch {
@@ -377,12 +386,37 @@ impl UiState {
 
     /// Handle a terminal exiting: collapse its split or close the whole tab.
     pub(crate) fn handle_terminal_exited(&self, term_widget: &gtk4::Widget) {
+        self.handle_terminal_exited_with_code(term_widget, None);
+    }
+
+    /// Exit handling with the observed child status when the caller has one.
+    ///
+    /// A task terminal's exit is authoritative task evidence; the task model
+    /// consumes it before the pane collapses. A call without a code (structural
+    /// close paths) is the close half of ember's exit/closed split instead.
+    pub(crate) fn handle_terminal_exited_with_code(
+        &self,
+        term_widget: &gtk4::Widget,
+        exit_code: Option<i32>,
+    ) {
+        let leaf_root = pane_leaf_root_of(term_widget).unwrap_or_else(|| term_widget.clone());
+        if let Some(leaf) = PaneLeaf::from_widget(&leaf_root) {
+            if leaf.task_role().is_some() {
+                match exit_code {
+                    Some(code) => {
+                        self.note_task_terminal_exited(&leaf, code);
+                    }
+                    None => {
+                        self.note_task_terminal_closed(&leaf);
+                    }
+                }
+            }
+        }
+
         // A zoom swap temporarily removes the sibling tree from the Notebook.
         // Restore it before collapsing the exited leaf; merely dropping the
         // swap would lose the still-running sibling and its PTY.
         self.restore_zoom_before_close();
-
-        let leaf_root = pane_leaf_root_of(term_widget).unwrap_or_else(|| term_widget.clone());
 
         if let Some(sibling) = detach_leaf_and_promote(&self.notebook, &leaf_root) {
             let _detached = PaneLeaf::detach_from(&leaf_root);
@@ -409,6 +443,15 @@ impl UiState {
         let pane_leaves = PaneNode::from_widget(&widget)
             .map(|node| node.leaves())
             .unwrap_or_default();
+        // Closing a task-terminal tab without a process-exit signal is the
+        // close half of ember's exit/closed split: the task model records the
+        // terminal as closed (a running validation becomes Cancelled, never
+        // silently Passed) before the leaves are torn down.
+        for leaf in &pane_leaves {
+            if leaf.task_role().is_some() {
+                self.note_task_terminal_closed(leaf);
+            }
+        }
         // Kill shell processes and remove the strip button for the current page
         if !kill_widget_child_processes(&widget) {
             let mut terms = Vec::new();
@@ -1071,6 +1114,7 @@ impl UiState {
             argv_override: None,
             remote: None,
             terminal_mode,
+            task: None,
         })
     }
 
@@ -1091,6 +1135,7 @@ impl UiState {
             argv_override: Some(argv),
             remote: None,
             terminal_mode,
+            task: None,
         })
     }
 
@@ -1108,7 +1153,42 @@ impl UiState {
             argv_override: Some(argv),
             remote: None,
             terminal_mode: crate::config::TerminalMode::Vte,
+            task: None,
         })
+    }
+
+    /// Launch an explicit argv in its own named tab as a native agent task
+    /// terminal, in conventional VTE mode. The pane is marked with its task
+    /// role so the task manager can bind it and the session snapshot prunes
+    /// the whole tab; the synthetic session identity is attached by the caller
+    /// once the leaf exists. Returns the marked leaf, or `None` when the leaf
+    /// could not be resolved after spawn.
+    pub(crate) fn add_task_terminal_tab(
+        &self,
+        title: &str,
+        argv: Vec<String>,
+        working_directory: Option<String>,
+        env_extra: Vec<(String, String)>,
+        role: crate::agent_task::TaskTerminalRole,
+        on_launched: Option<Box<dyn FnOnce()>>,
+    ) -> Option<PaneLeaf> {
+        let terminal = self.add_tab_with_argv(TabLaunch {
+            working_directory,
+            tab_name: Some(title.to_string()),
+            session_id: None,
+            initial_commands: crate::terminal::InitialCommands::default(),
+            argv_override: Some(argv),
+            remote: None,
+            terminal_mode: crate::config::TerminalMode::Vte,
+            task: Some(TaskSpawnExtras {
+                env_extra,
+                on_launched,
+            }),
+        });
+        let leaf_root = pane_leaf_root_of(terminal.upcast_ref())?;
+        let leaf = PaneLeaf::from_widget(&leaf_root)?;
+        leaf.set_task_role(role);
+        Some(leaf)
     }
 
     /// Open a new tab connecting to a saved remote host over ssh.
@@ -1168,6 +1248,7 @@ impl UiState {
                 plain_ssh_overlay: Some(overlay.clone()),
             }),
             terminal_mode,
+            task: None,
         }))
     }
 
@@ -1235,6 +1316,7 @@ impl UiState {
                 plain_ssh_overlay: None,
             }),
             terminal_mode,
+            task: None,
         }))
     }
 
@@ -1458,6 +1540,7 @@ impl UiState {
             argv_override,
             remote,
             terminal_mode,
+            task,
         } = launch;
         let tab_num = self.tab_counter.get();
 
@@ -1507,12 +1590,17 @@ impl UiState {
                                 &error,
                                 "Opened a conventional terminal instead.",
                             );
+                            let (env_extra, on_launched) = task
+                                .map(|extras| (extras.env_extra, extras.on_launched))
+                                .unwrap_or_default();
                             let vte_view = Rc::new(VteTerminalView::new(
                                 self.config.clone(),
                                 shell_argv,
                                 working_directory.as_deref(),
                                 Some(&sid),
                                 initial_commands.as_slice(),
+                                env_extra,
+                                on_launched,
                             ));
                             let terminal = vte_view.vte().clone();
                             (PaneLeaf::Vte(vte_view), terminal)
@@ -1520,12 +1608,17 @@ impl UiState {
                     }
                 }
                 crate::config::TerminalMode::Vte => {
+                    let (env_extra, on_launched) = task
+                        .map(|extras| (extras.env_extra, extras.on_launched))
+                        .unwrap_or_default();
                     let vte_view = Rc::new(VteTerminalView::new(
                         self.config.clone(),
                         shell_argv,
                         working_directory.as_deref(),
                         Some(&sid),
                         initial_commands.as_slice(),
+                        env_extra,
+                        on_launched,
                     ));
                     let terminal = vte_view.vte().clone();
                     (PaneLeaf::Vte(vte_view), terminal)
@@ -1595,7 +1688,7 @@ impl UiState {
                                 .remove(&current_tab_num);
                             ui_for_exit.clear_tab_conn_status(current_tab_num);
                         }
-                        ui_for_exit.handle_terminal_exited(&root);
+                        ui_for_exit.handle_terminal_exited_with_code(&root, Some(code));
                     }
                 });
 
@@ -1656,7 +1749,7 @@ impl UiState {
                                 .remove(&current_tab_num);
                             ui_for_exit.clear_tab_conn_status(current_tab_num);
                         }
-                        ui_for_exit.handle_terminal_exited(&root);
+                        ui_for_exit.handle_terminal_exited_with_code(&root, Some(code));
                     }
                 });
             }

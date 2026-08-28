@@ -111,6 +111,9 @@ pub(crate) enum Action {
     AskAiAboutSelectedBlock,
     /// Open the approval-gated multi-turn shell Agent for the active Block pane.
     OpenAgent,
+    /// Show or hide the native Codex agent Tasks panel (isolated-worktree
+    /// tasks). Ctrl+Alt+Shift+T by default; requires `agent_tasks_enabled`.
+    ToggleTasksPanel,
     /// Open a fuzzy palette over this tab's finished-block command history.
     /// Enter pastes the selected command into the live input cell.
     HistoryPalette,
@@ -217,6 +220,7 @@ impl Action {
             Action::OpenAiPanel => "Open AI panel",
             Action::AskAiAboutSelectedBlock => "Ask AI about selected block",
             Action::OpenAgent => "Open shell Agent",
+            Action::ToggleTasksPanel => "Toggle agent Tasks panel",
             Action::HistoryPalette => "Command history palette",
             Action::CrossBlockSearch => "Search blocks (substring/regex)",
             Action::WorkflowsPalette => "Workflows palette",
@@ -304,6 +308,7 @@ impl Action {
             Action::OpenAiPanel => None,
             Action::AskAiAboutSelectedBlock => Some("ask_ai_about_selected_block"),
             Action::OpenAgent => Some("open_agent"),
+            Action::ToggleTasksPanel => Some("toggle_tasks_panel"),
             Action::HistoryPalette => Some("history_palette"),
             Action::CrossBlockSearch => Some("cross_block_search"),
             Action::WorkflowsPalette => Some("workflows_palette"),
@@ -387,6 +392,7 @@ impl Action {
             Action::ToggleAiPanel,
             Action::AskAiAboutSelectedBlock,
             Action::OpenAgent,
+            Action::ToggleTasksPanel,
             Action::HistoryPalette,
             Action::CrossBlockSearch,
             Action::WorkflowsPalette,
@@ -504,6 +510,7 @@ impl KeybindingMap {
         bind("Ctrl+Alt+Shift+A", Action::ToggleAiPanel);
         bind("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock);
         bind("Ctrl+Alt+G", Action::OpenAgent);
+        bind("Ctrl+Alt+Shift+T", Action::ToggleTasksPanel);
         // Ctrl+R is consumed by bash readline in the live VTE, so the chord
         // for our block-history palette is Ctrl+Shift+H ("history").
         bind("Ctrl+Shift+H", Action::HistoryPalette);
@@ -947,6 +954,7 @@ mod tests {
             ("Ctrl+Alt+Shift+A", Action::ToggleAiPanel),
             ("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock),
             ("Ctrl+Alt+G", Action::OpenAgent),
+            ("Ctrl+Alt+Shift+T", Action::ToggleTasksPanel),
             // Block-history palette (Ctrl+R is bash readline, so we use Ctrl+Shift+H).
             ("Ctrl+Shift+H", Action::HistoryPalette),
             // Cross-block search palette.

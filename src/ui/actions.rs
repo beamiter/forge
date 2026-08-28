@@ -484,6 +484,10 @@ impl UiState {
                 self.ask_ai_about_selected_block();
             }
             Action::OpenAgent => self.toggle_agent_panel(),
+            Action::ToggleTasksPanel => {
+                log::debug!("Toggle agent Tasks panel");
+                self.toggle_tasks_panel();
+            }
             Action::HistoryPalette => {
                 log::debug!("Show history palette");
                 self.show_unified_command_palette(crate::palette::PaletteMode::History);
@@ -509,13 +513,15 @@ impl UiState {
     /// layout instead of only changing the next-launch state.
     pub(crate) fn set_ai_panel_visible(&self, visible: bool, persist: bool) {
         let visible = visible && self.config.borrow().ai_enabled;
-        let attached = self.ai_paned.end_child().is_some();
         let config_changed = self.config.borrow().ai_panel_visible != visible;
-        if self.ai_panel_visible.get() == visible && attached == visible {
+        if self.ai_panel_visible.get() == visible {
             self.config.borrow_mut().ai_panel_visible = visible;
             if visible {
                 self.restore_ai_panel_width();
             }
+            // The Tasks panel may own the shared slot even when this call is
+            // a no-op for the AI side.
+            self.sync_side_panel();
             if persist && config_changed {
                 self.persist_config();
             }
@@ -527,15 +533,42 @@ impl UiState {
             self.capture_ai_panel_width();
         }
         self.ai_panel_visible.set(visible);
+        self.sync_side_panel();
         if visible {
-            self.ai_paned.set_end_child(Some(&self.ai_panel.root));
             self.restore_ai_panel_width();
-        } else {
-            self.ai_paned.set_end_child(None::<&gtk4::Widget>);
         }
         self.config.borrow_mut().ai_panel_visible = visible;
         if persist {
             self.persist_config();
+        }
+    }
+
+    /// Apply the combined right-side panel state: the shared stack is attached
+    /// when either panel wants the slot, and the Tasks panel takes the page
+    /// while it is open (the AI preference survives underneath).
+    pub(crate) fn sync_side_panel(&self) {
+        let tasks = self.agent_tasks.borrow().panel_visible;
+        let chats = self.ai_panel_visible.get();
+        if tasks || chats {
+            self.side_stack
+                .set_visible_child_name(if tasks { "tasks" } else { "chats" });
+            if self.ai_paned.end_child().is_none() {
+                self.ai_paned.set_end_child(Some(&self.side_stack));
+                // Attaching after both panels were closed loses the Paned
+                // position; reapply the configured share like the AI path
+                // does (the tasks panel has no width config of its own).
+                self.ai_panel_width_restoring.set(true);
+                let requested_width = self.config.borrow().ai_panel_width;
+                apply_ai_panel_width(&self.ai_paned, requested_width);
+                let paned = self.ai_paned.clone();
+                let restoring = self.ai_panel_width_restoring.clone();
+                glib::idle_add_local_once(move || {
+                    apply_ai_panel_width(&paned, requested_width);
+                    glib::idle_add_local_once(move || restoring.set(false));
+                });
+            }
+        } else {
+            self.ai_paned.set_end_child(None::<&gtk4::Widget>);
         }
     }
 

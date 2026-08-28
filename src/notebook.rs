@@ -1279,7 +1279,10 @@ mod tests {
                 break false;
             }
         };
-        assert!(exhausted, "acquisition must stop at the concurrency ceiling");
+        assert!(
+            exhausted,
+            "acquisition must stop at the concurrency ceiling"
+        );
         assert!(held.len() <= MAX_CONCURRENT_CELL_WORKERS);
         drop(held);
         assert!(

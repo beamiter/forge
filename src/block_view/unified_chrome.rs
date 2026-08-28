@@ -1876,6 +1876,7 @@ mod tests {
                     cwd: None,
                     is_background: false,
                     completion_provenance: super::super::CompletionProvenance::ShellReported,
+                    command_source: super::super::CommandTextSource::Screen,
                     start_mark_seen: true,
                 },
                 100,

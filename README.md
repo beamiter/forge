@@ -299,6 +299,7 @@ jsh_update_check = "daily"    # "startup" 每次启动联网；"daily" 复用缓
 | Block 过滤 / 书签 / 标签栏位置 | `Alt+Shift+F` / `Ctrl+Shift+B` / `Ctrl+Alt+B` |
 | AI 面板 / 询问选中块 | `Ctrl+Alt+Shift+A` / `Ctrl+Shift+Q` |
 | Shell Agent（Block） | `Ctrl+Alt+G` |
+| Agent 任务面板（需 `agent_tasks_enabled`） | `Ctrl+Alt+Shift+T` |
 | 字号增 / 减 / 复位 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
 
 命令面板中的应用动作及其当前绑定可在 `Ctrl+Shift+P` 中搜索；这些动作可在

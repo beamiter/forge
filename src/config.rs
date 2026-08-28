@@ -879,6 +879,16 @@ pub struct Config {
     /// Agent mode can be disabled independently while leaving chat and
     /// natural-language command generation available.
     pub(crate) agent_enabled: bool,
+    /// Allow the native Codex agent Tasks panel (isolated-worktree tasks
+    /// driven through the contained app-server). Default off, matching
+    /// ember's experimental rollout posture: a security surface this size
+    /// stays opt-in until it has seen real-world mileage. File-only toggle.
+    pub(crate) agent_tasks_enabled: bool,
+    /// Explicit consent to attach command/terminal evidence to provider
+    /// prompts. Required (together with `ai_enabled`) before a native Codex
+    /// task may start or receive follow-up turns; default off so no terminal
+    /// content leaves the machine without an explicit opt-in. File-only.
+    pub(crate) ai_share_command_context: bool,
     /// Maximum number of model replies in one Agent session.
     pub(crate) agent_max_turns: u32,
     /// Retired compatibility setting. It is still parsed so old configs remain
@@ -1004,6 +1014,8 @@ impl Config {
             ascii_organism_motion: None,
             ai_enabled: false,
             agent_enabled: false,
+            agent_tasks_enabled: false,
+            ai_share_command_context: false,
             agent_max_turns: 20,
             agent_auto_approve_readonly: false,
             command_correction_enabled: false,
@@ -1462,6 +1474,8 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "ascii_organism_motion",
     "ai_enabled",
     "agent_enabled",
+    "agent_tasks_enabled",
+    "ai_share_command_context",
     "agent_max_turns",
     "agent_auto_approve_readonly",
     "command_correction_enabled",
@@ -1603,6 +1617,8 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
         "sidebar_visible",
         "ai_enabled",
         "agent_enabled",
+        "agent_tasks_enabled",
+        "ai_share_command_context",
         "agent_auto_approve_readonly",
         "command_correction_enabled",
         "ai_panel_visible",
@@ -2253,6 +2269,8 @@ struct FileConfig {
     ascii_organism_motion: Option<String>,
     ai_enabled: Option<bool>,
     agent_enabled: Option<bool>,
+    agent_tasks_enabled: Option<bool>,
+    ai_share_command_context: Option<bool>,
     agent_max_turns: Option<u32>,
     agent_auto_approve_readonly: Option<bool>,
     command_correction_enabled: Option<bool>,
@@ -2493,6 +2511,10 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
             .map(str::to_string),
         ai_enabled: table.get("ai_enabled").and_then(|v| v.as_bool()),
         agent_enabled: table.get("agent_enabled").and_then(|v| v.as_bool()),
+        agent_tasks_enabled: table.get("agent_tasks_enabled").and_then(|v| v.as_bool()),
+        ai_share_command_context: table
+            .get("ai_share_command_context")
+            .and_then(|v| v.as_bool()),
         agent_max_turns: table_u32(&table, "agent_max_turns"),
         agent_auto_approve_readonly: table
             .get("agent_auto_approve_readonly")
@@ -2836,6 +2858,16 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let agent_enabled = env_bool("FORGE_AGENT_ENABLED")
         .or(fc.agent_enabled)
         .unwrap_or(true);
+    // Fail-closed by design: the contained-agent surface and the sharing
+    // of terminal evidence with a provider both stay off until the user
+    // opts in (ember's `experimental_task_sidebar` /
+    // `ai_share_command_context` defaults).
+    let agent_tasks_enabled = env_bool("FORGE_AGENT_TASKS_ENABLED")
+        .or(fc.agent_tasks_enabled)
+        .unwrap_or(false);
+    let ai_share_command_context = env_bool("FORGE_AI_SHARE_COMMAND_CONTEXT")
+        .or(fc.ai_share_command_context)
+        .unwrap_or(false);
     let agent_max_turns = env_u32("FORGE_AGENT_MAX_TURNS")
         .or(fc.agent_max_turns)
         .unwrap_or(20)
@@ -2949,6 +2981,8 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         ascii_organism_motion,
         ai_enabled,
         agent_enabled,
+        agent_tasks_enabled,
+        ai_share_command_context,
         agent_max_turns,
         agent_auto_approve_readonly,
         command_correction_enabled,

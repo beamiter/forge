@@ -108,9 +108,12 @@ notify_long_block_threshold_ms = 10000
 #           FORGE_COMMAND_CORRECTION_ENABLED、FORGE_AI_API_KEY、
 #           FORGE_AI_API_KEY_FILE、FORGE_AI_PROVIDER、FORGE_AI_MODEL、
 #           FORGE_AI_BASE_URL、FORGE_AI_MAX_TOKENS、FORGE_AI_STREAM、
-#           FORGE_AI_REDACT_SECRETS
+#           FORGE_AI_REDACT_SECRETS、FORGE_AGENT_TASKS_ENABLED、
+#           FORGE_AI_SHARE_COMMAND_CONTEXT
 ai_enabled = true
 agent_enabled = true          # Ctrl+Alt+G；仅绑定当前 Block pane
+agent_tasks_enabled = false   # Ctrl+Alt+Shift+T；原生 Codex 任务面板（隔离 worktree），默认关闭需显式启用
+ai_share_command_context = false # 允许把命令/终端证据随 provider prompt 发送；默认关闭，需显式同意
 agent_max_turns = 20          # 1 .. 100；每条命令可编辑且始终需要单独批准
 agent_auto_approve_readonly = false # 已停用的兼容键；所有 proposal 现在都必须逐条批准
 command_correction_enabled = true # typo-like Block 命令失败后提供可审阅的 AI/本地纠正

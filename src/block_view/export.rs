@@ -417,6 +417,7 @@ mod tests {
                 cwd: Some("/work/forge".to_string()),
                 is_background: false,
                 completion_provenance: super::super::CompletionProvenance::ShellReported,
+                command_source: super::super::CommandTextSource::Screen,
                 start_mark_seen: true,
             },
             CompletedCommandRecord {
@@ -429,6 +430,7 @@ mod tests {
                 cwd: None,
                 is_background: false,
                 completion_provenance: super::super::CompletionProvenance::BoundaryInferred,
+                command_source: super::super::CommandTextSource::Screen,
                 start_mark_seen: true,
             },
             CompletedCommandRecord {
@@ -441,6 +443,7 @@ mod tests {
                 cwd: Some("/work/forge".to_string()),
                 is_background: true,
                 completion_provenance: super::super::CompletionProvenance::Unknown,
+                command_source: super::super::CommandTextSource::Screen,
                 start_mark_seen: false,
             },
         ]);
@@ -516,6 +519,7 @@ mod tests {
             cwd: Some("/work/forge".to_string()),
             is_background: false,
             completion_provenance: super::super::CompletionProvenance::BoundaryInferred,
+            command_source: super::super::CommandTextSource::Screen,
             start_mark_seen: true,
         };
         let unknown_json: serde_json::Value =
@@ -549,6 +553,7 @@ mod tests {
             cwd: Some("/work/forge".to_string()),
             is_background: true,
             completion_provenance: super::super::CompletionProvenance::Unknown,
+            command_source: super::super::CommandTextSource::Screen,
             start_mark_seen: false,
         };
         let markdown = record_markdown(BackendRecordRef::Metadata {
@@ -580,6 +585,7 @@ mod tests {
             cwd: None,
             is_background: false,
             completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
             start_mark_seen: true,
         };
         let snapshot = ZoneOutputSnapshot {
@@ -622,6 +628,7 @@ mod tests {
             cwd: None,
             is_background: false,
             completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
             start_mark_seen: true,
         };
         let snapshot = ZoneOutputSnapshot {
@@ -660,6 +667,7 @@ mod tests {
             cwd: None,
             is_background: false,
             completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
             start_mark_seen: true,
         });
         store.insert_snapshot(
@@ -710,6 +718,7 @@ mod tests {
             cwd: None,
             is_background: false,
             completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
             start_mark_seen: true,
         };
         let snapshot = ZoneOutputSnapshot {

@@ -680,11 +680,11 @@ impl UiState {
         self.sync_bottom_bar_visibility();
 
         self.ai_panel_visible.set(ai_visible);
+        // One attach/detach funnel: the side stack holds both right-side
+        // panels, and the Tasks panel keeps its page while it is open.
+        self.sync_side_panel();
         if ai_visible {
-            self.ai_paned.set_end_child(Some(&self.ai_panel.root));
             self.restore_ai_panel_width();
-        } else {
-            self.ai_paned.set_end_child(None::<&gtk4::Widget>);
         }
         self.ai_panel.refresh_config_display();
         self.ai_panel.refresh_persisted_privacy();

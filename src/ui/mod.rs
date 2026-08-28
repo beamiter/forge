@@ -39,6 +39,8 @@ mod session;
 mod sidebar_tabs;
 mod tab_strip;
 mod tabs;
+mod task_ops;
+mod tasks_panel;
 mod zoom;
 
 pub(crate) use agent_panel::{AgentHandle, AgentUiLifetime};
@@ -59,6 +61,8 @@ pub(crate) use pane_tree_edit::{
     ZoomPageSwap,
 };
 pub(crate) use remote_fs::{FsClipboard, FsExecutionOverlay, FsLocation};
+pub(crate) use task_ops::AgentTaskDomain;
+pub(crate) use tasks_panel::TasksPanel;
 
 /// Quiet period after the last font-scale step before the config is written.
 pub(crate) const FONT_PERSIST_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
@@ -418,6 +422,16 @@ pub(crate) struct UiState {
     /// Right-side AI chat panel. Always built; visibility lives in the
     /// outer `ai_paned` (and `config.ai_panel_visible` for persistence).
     pub(crate) ai_panel: AiPanel,
+    /// Right-side stack holding the AI Chats panel and the agent Tasks panel;
+    /// it is the `ai_paned` end child while either panel is open, so both
+    /// share the persisted width.
+    pub(crate) side_stack: Stack,
+    /// Native Codex agent Tasks panel. Always built like the AI panel; the
+    /// opt-in `agent_tasks_enabled` config flag gates its actions instead.
+    pub(crate) tasks_panel: TasksPanel,
+    /// Window-owned native agent task domain (task reducer, app-server
+    /// runtime, diff worker, panel preference).
+    pub(crate) agent_tasks: Rc<RefCell<AgentTaskDomain>>,
     /// Horizontal Paned that puts the AI panel to the right of the notebook
     /// area. Toggling visibility flips the end child + resize start_child.
     pub(crate) ai_paned: gtk4::Paned,

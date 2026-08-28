@@ -406,7 +406,11 @@ fn spawn_argv(
         ));
     };
     let mut command = Command::new(program);
-    command.args(args).stdin(stdin).stdout(stdout).stderr(stderr);
+    command
+        .args(args)
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(stderr);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

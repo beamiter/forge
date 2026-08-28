@@ -2643,6 +2643,8 @@ tail ab";
             duration_ms: Some(2_000),
             cwd: None,
             cols: 80,
+            command_exact: false,
+            command_truncated: false,
         };
         let metadata = CompletedCommandRecord {
             id: 2,
@@ -2656,6 +2658,7 @@ tail ab";
             cwd: None,
             is_background: true,
             completion_provenance: super::super::CompletionProvenance::Unknown,
+            command_source: super::super::CommandTextSource::Screen,
             start_mark_seen: false,
         };
         let records = [
@@ -2752,6 +2755,7 @@ tail ab";
             cwd: None,
             is_background: false,
             completion_provenance: super::super::CompletionProvenance::Unknown,
+            command_source: super::super::CommandTextSource::Screen,
             start_mark_seen: false,
         };
         let retained = ZoneOutputSnapshot {
@@ -2857,6 +2861,7 @@ tail ab";
                 cwd: None,
                 is_background: false,
                 completion_provenance: super::super::CompletionProvenance::ShellReported,
+                command_source: super::super::CommandTextSource::Screen,
                 start_mark_seen: true,
             },
             CompletedCommandRecord {
@@ -2869,6 +2874,7 @@ tail ab";
                 cwd: None,
                 is_background: false,
                 completion_provenance: super::super::CompletionProvenance::ShellReported,
+                command_source: super::super::CommandTextSource::Screen,
                 start_mark_seen: true,
             },
         ];
@@ -2918,6 +2924,7 @@ tail ab";
             cwd: None,
             is_background: false,
             completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
             start_mark_seen: true,
         };
         let metadata = [
@@ -2982,6 +2989,8 @@ tail ab";
             duration_ms,
             cwd: None,
             cols: 80,
+            command_exact: false,
+            command_truncated: false,
         };
         let unmarked_block = block(1, "first", "first output", Some(7), Some(2_000));
         let marked_block = block(3, "", "background output", Some(9), Some(9_000));
@@ -2995,6 +3004,7 @@ tail ab";
             cwd: None,
             is_background: false,
             completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
             start_mark_seen: true,
         };
         let metadata_output = ZoneOutputSnapshot {
@@ -3086,6 +3096,7 @@ tail ab";
             cwd: None,
             is_background: false,
             completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
             start_mark_seen: true,
         };
         let background = CompletedCommandRecord {
@@ -3098,6 +3109,7 @@ tail ab";
             cwd: None,
             is_background: true,
             completion_provenance: super::super::CompletionProvenance::Unknown,
+            command_source: super::super::CommandTextSource::Screen,
             start_mark_seen: false,
         };
         let background_output = ZoneOutputSnapshot {
@@ -3202,6 +3214,7 @@ tail ab";
             cwd: None,
             is_background,
             completion_provenance: super::super::CompletionProvenance::Unknown,
+            command_source: super::super::CommandTextSource::Screen,
             start_mark_seen: !is_background,
         };
         let metadata = [
@@ -3294,6 +3307,8 @@ tail ab";
             duration_ms: None,
             cwd: None,
             cols: 80,
+            command_exact: false,
+            command_truncated: false,
         };
         let block_record = || [BackendRecordRef::Block(&block)];
         let hits = metadata_filter_hits(
@@ -3346,6 +3361,7 @@ tail ab";
             cwd: None,
             is_background: false,
             completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
             start_mark_seen: true,
         };
         let with_snapshot = record(1, "cargo test");
@@ -3411,6 +3427,7 @@ tail ab";
             cwd: None,
             is_background: false,
             completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
             start_mark_seen: true,
         };
         let evicted = CompletedCommandRecord {

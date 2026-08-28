@@ -785,6 +785,43 @@ pub(crate) fn session_snapshot_counts() -> (usize, usize) {
     )
 }
 
+/// Whether any pane in this tab's split tree hosts a native agent task
+/// terminal (the codex CLI or a validation rerun). The walk mirrors
+/// [`serialize_pane_layout`]: `Paned` nodes recurse, anything else is a leaf
+/// whose `PaneLeaf` marker decides.
+fn widget_hosts_task_terminal(widget: &gtk4::Widget) -> bool {
+    if let Some(paned) = widget.downcast_ref::<Paned>() {
+        return paned
+            .start_child()
+            .is_some_and(|child| widget_hosts_task_terminal(&child))
+            || paned
+                .end_child()
+                .is_some_and(|child| widget_hosts_task_terminal(&child));
+    }
+    PaneLeaf::from_widget(widget).is_some_and(|leaf| leaf.task_role().is_some())
+}
+
+/// Select which tabs survive snapshot capture when some hold task terminals.
+///
+/// Task terminals (native agent / validation reruns) exist only at runtime:
+/// their task metadata is never persisted, and a restored pane would be an
+/// ordinary shell that happens to land inside the task worktree — an easy
+/// footgun. The save side therefore drops every tab containing a task pane as
+/// a whole, exactly like ember's `sessions_snapshot_for_persistence`, instead
+/// of resurrecting it. Returns the kept tab indices in original order plus
+/// the active index remapped into the kept list (falling back to the first
+/// survivor, and to 0 when nothing survives, which restores as the explicit
+/// empty tombstone).
+pub(crate) fn pruned_snapshot_tabs(tab_is_task: &[bool], active: usize) -> (Vec<usize>, usize) {
+    let kept: Vec<usize> = tab_is_task
+        .iter()
+        .enumerate()
+        .filter_map(|(index, is_task)| (!*is_task).then_some(index))
+        .collect();
+    let remapped = kept.iter().position(|&index| index == active).unwrap_or(0);
+    (kept, remapped)
+}
+
 /// Pane layout structure for serialization
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -1680,13 +1717,33 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
         );
         return;
     }
-    let mut lines: Vec<String> = Vec::with_capacity((n_pages as usize) + 2);
-    if let Some(current) = notebook.current_page() {
-        lines.push(format!("current_page={current}"));
+    // Tabs containing task terminals (native agent / validation reruns) are
+    // excluded as a whole: their task metadata is runtime-only, and a
+    // restored pane would become an ordinary shell that happens to land
+    // inside the task worktree. Interactive tabs keep their original
+    // relative order and `current_page` is remapped onto the survivors.
+    let tab_is_task: Vec<bool> = (0..n_pages)
+        .map(|index| {
+            notebook
+                .nth_page(Some(index))
+                .is_some_and(|widget| widget_hosts_task_terminal(&widget))
+        })
+        .collect();
+    let active = notebook
+        .current_page()
+        .and_then(|page| usize::try_from(page).ok())
+        .unwrap_or(0);
+    let (kept_tabs, remapped_current) = pruned_snapshot_tabs(&tab_is_task, active);
+    let mut lines: Vec<String> = Vec::with_capacity(kept_tabs.len() + 2);
+    if !kept_tabs.is_empty() && notebook.current_page().is_some() {
+        lines.push(format!("current_page={remapped_current}"));
     }
     let mut total_panes = 0usize;
 
-    for i in 0..n_pages {
+    for i in kept_tabs
+        .iter()
+        .filter_map(|&index| u32::try_from(index).ok())
+    {
         let Some(widget) = notebook.nth_page(Some(i)) else {
             continue;
         };
@@ -1831,6 +1888,40 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pruned_snapshot_tabs_keep_interactive_order_and_remap_active() {
+        // No task tabs: the selection is the identity.
+        assert_eq!(
+            pruned_snapshot_tabs(&[false, false, false], 2),
+            (vec![0, 1, 2], 2)
+        );
+        // A task tab in the middle is dropped; later tabs shift down.
+        assert_eq!(
+            pruned_snapshot_tabs(&[false, true, false, false], 3),
+            (vec![0, 2, 3], 2)
+        );
+        // Leading task tab: everything shifts and the active tab follows.
+        assert_eq!(
+            pruned_snapshot_tabs(&[true, false, false], 2),
+            (vec![1, 2], 1)
+        );
+    }
+
+    #[test]
+    fn pruned_snapshot_tabs_fall_back_when_active_was_pruned() {
+        // The active tab itself holds a task terminal: fall back to the first
+        // survivor rather than pointing past the kept list.
+        assert_eq!(
+            pruned_snapshot_tabs(&[false, true, false], 1),
+            (vec![0, 2], 0)
+        );
+        // Everything is a task tab: nothing survives and the snapshot becomes
+        // the explicit empty tombstone the restore path already understands.
+        assert_eq!(pruned_snapshot_tabs(&[true, true], 1), (Vec::new(), 0));
+        // Degenerate empty input stays empty.
+        assert_eq!(pruned_snapshot_tabs(&[], 0), (Vec::new(), 0));
+    }
 
     fn conversation_snapshot(question: &str, answer: &str) -> crate::ai::ConversationSnapshot {
         let history = vec![

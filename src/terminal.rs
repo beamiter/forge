@@ -213,6 +213,8 @@ impl VteTerminalView {
         working_directory: Option<&str>,
         session_id: Option<&str>,
         initial_commands: &[String],
+        env_extra: Vec<(String, String)>,
+        on_launched: Option<Box<dyn FnOnce()>>,
     ) -> Self {
         // Create Terminal widget
         let terminal = create_terminal(&config.borrow());
@@ -311,6 +313,8 @@ impl VteTerminalView {
             working_directory,
             session_id,
             initial_commands,
+            env_extra,
+            on_launched,
         );
 
         VteTerminalView {
@@ -545,6 +549,8 @@ pub(crate) fn spawn_shell(
     working_directory: Option<&str>,
     session_id: Option<&str>,
     initial_commands: &[String],
+    env_extra: Vec<(String, String)>,
+    on_launched: Option<Box<dyn FnOnce()>>,
 ) {
     // Append --session <id> to argv when restoring a session (only for jsh)
     let mut argv_vec: Vec<String> = argv_owned.to_vec();
@@ -563,12 +569,20 @@ pub(crate) fn spawn_shell(
             argv_vec.push(sid.to_string());
         }
     }
+    // Extra `KEY=value` pairs overlaid on the frozen child environment. Empty
+    // for ordinary shells; task terminals use it to pin validation children to
+    // no-rc startup files. The pairs must reach both a native child (through
+    // the frozen envv) and a flatpak-spawn host wrapper (through wrap_argv).
+    let env_extra_pairs: Vec<(&str, &str)> = env_extra
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
     let home = std::env::var("HOME").ok();
     let requested_working_directory = working_directory.or(home.as_deref());
     // The terminal identity must reach both a native child and a shell launched
     // by `flatpak-spawn --host`; the latter needs it encoded in the wrapper argv,
     // which `wrap_argv` now builds from the same shared policy.
-    let argv_vec = crate::host::wrap_argv(&argv_vec, requested_working_directory, &[]);
+    let argv_vec = crate::host::wrap_argv(&argv_vec, requested_working_directory, &env_extra_pairs);
     let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
 
     // The child gets the complete environment frozen at launch (see
@@ -581,10 +595,10 @@ pub(crate) fn spawn_shell(
     // strip the whole parent environment.
     let child_identity = jterm_core::child_env::ChildEnv::from_identity();
     let (envv_owned, frozen) =
-        match jterm_core::child_env::vte_envv_from_captured(&child_identity, &[]) {
+        match jterm_core::child_env::vte_envv_from_captured(&child_identity, &env_extra_pairs) {
             Ok(envv) => (envv, true),
             Err(err) => {
-                match jterm_core::child_env::envp_from_captured(&child_identity, &[]) {
+                match jterm_core::child_env::envp_from_captured(&child_identity, &env_extra_pairs) {
                     Ok(block) => {
                         // The frozen block exists but `vte_envv_from_captured`
                         // rejected it: some inherited name or value is not
@@ -610,7 +624,10 @@ pub(crate) fn spawn_shell(
                         log::warn!(
                             "no frozen launch environment; VTE inherits the live one: {err}"
                         );
-                        (jterm_core::child_env::vte_envv(&child_identity, &[]), false)
+                        (
+                            jterm_core::child_env::vte_envv(&child_identity, &env_extra_pairs),
+                            false,
+                        )
                     }
                 }
             }
@@ -645,6 +662,13 @@ pub(crate) fn spawn_shell(
         cancellable,
         move |res| {
             log::debug!("spawn_async: {res:?}");
+            // The spawn resolved one way or the other: the child (on success)
+            // has already entered its working directory through the path it
+            // was handed, so launch-time pins may be released now. Runs on
+            // failure too — the pin must not leak on a failed spawn.
+            if let Some(on_launched) = on_launched {
+                on_launched();
+            }
             if let Ok(pid) = res {
                 let pid_i32: i32 = pid.into_glib();
                 // VTE spawned this child through glib, and glib's child watch
