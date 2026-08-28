@@ -1562,7 +1562,7 @@ impl AiPanel {
         self.send_with_context(user_text, None, true, true);
     }
 
-    pub(crate) fn ask_about_block(&self, ctx: BlockContext) {
+    pub(crate) fn ask_about_block(&self, ctx: BlockContext, intent: ai::BlockAiIntent) {
         if self.store.borrow().active_archived() {
             if self.store.borrow_mut().new_chat().is_err() {
                 self.show_error_status(
@@ -1577,11 +1577,9 @@ impl AiPanel {
             self.sync_active_status();
             return;
         }
-        let prompt = if ctx.exit_code == 0 {
-            "Explain what this command does and what its output means."
-        } else {
-            "This command failed. Diagnose the error and suggest a fix."
-        };
+        // The question is a fixed constant per intent; the untrusted
+        // command/output travel only inside the framed context envelope.
+        let prompt = ai::seeded_block_question(intent, ctx.exit_code);
         self.show_chat_page();
         self.send_with_context(prompt.to_string(), Some(ctx), false, false);
     }

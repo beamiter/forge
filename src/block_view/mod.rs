@@ -2319,6 +2319,71 @@ fn lone_rerunnable_selection<'a>(
         .filter(|block| !block.is_background && historical_command_is_rerunnable(&block.cmd_text))
 }
 
+/// Whether a finished block's context menu shows the failed-block section
+/// (ember/frost family: Fix/Explain/Retry). Only an explicitly reported
+/// non-zero exit with a real command qualifies — background output and an
+/// unknown status are never reclassified as failures.
+fn failed_block_section_visible(command: &str, exit_code: Option<i32>) -> bool {
+    jterm_core::block_contract::classify_completed(Some(command), exit_code).is_failed()
+}
+
+/// frost's `verified_local_command_cwd` (ember's rule, verbatim). An
+/// execution-authorizing action needs an independently observed local shell
+/// cwd: OSC 7/133 cwd values are self-reported by whatever runs in the PTY, so
+/// `recorded` (the block's own cwd) must be an absolute path equal to the
+/// shell process's current directory, and to the terminal's latest reported
+/// cwd when one exists. SSH/tmux-style wrappers fail closed because their
+/// local process cwd does not describe the reported workspace.
+fn verified_local_command_cwd(
+    recorded: &str,
+    reported: Option<&str>,
+    process: Option<&str>,
+) -> bool {
+    let recorded = std::path::Path::new(recorded);
+    recorded.is_absolute()
+        && process.is_some_and(|process| std::path::Path::new(process) == recorded)
+        && reported.is_none_or(|reported| std::path::Path::new(reported) == recorded)
+}
+
+/// Why the failed-block menu's guarded Retry is unavailable, or `None` when it
+/// may be offered. Mirrors ember's `rerun_disabled_reason` order (plural,
+/// truncated, inexact) and then composes frost's `retry_replay_disabled_reason`
+/// provenance rules: only the exact shell-reported command may be re-run, and
+/// its recorded cwd must match an independently observed local shell cwd.
+/// Prompt ownership (idle shell, clean editor) is re-checked live by the
+/// verified-submission boundary at the moment of dispatch.
+fn failed_block_retry_disabled_reason(
+    plural: bool,
+    command: &str,
+    command_exact: bool,
+    command_truncated: bool,
+    recorded_cwd: Option<&str>,
+    reported_cwd: Option<&str>,
+    process_cwd: Option<&str>,
+) -> Option<&'static str> {
+    if plural {
+        // Running a range would execute commands the user reviewed only as a
+        // list. Recall stays the batch path (ember's rule, same vocabulary).
+        return Some("Select a single block to run it again");
+    }
+    if command_truncated {
+        return Some("The recorded command was shortened and cannot be re-run");
+    }
+    if !command_exact {
+        return Some("The shell did not provide exact command metadata");
+    }
+    if !historical_command_is_rerunnable(command) {
+        return Some("The recorded command cannot be re-run exactly");
+    }
+    let Some(recorded) = recorded_cwd.filter(|cwd| !cwd.trim().is_empty()) else {
+        return Some("The command working directory is unavailable");
+    };
+    if !verified_local_command_cwd(recorded, reported_cwd, process_cwd) {
+        return Some("The shell's current directory differs from the command's recorded directory");
+    }
+    None
+}
+
 /// Ctrl+Enter belongs to Block while a card selection is active, even when
 /// the requested re-run is refused. Letting a rejected key propagate would
 /// hand the same Enter to the live VTE and submit unrelated editor contents.
@@ -3612,6 +3677,8 @@ impl BlockBackend {
         let find_state_for_menu = self.find_state_for_cb.clone();
         let removed_blocks_for_menu = self.removed_blocks_for_cb.clone();
         let ask_ai_cbs_for_menu = self.ask_ai_cbs.clone();
+        let fix_block_cbs_for_menu = self.fix_block_with_agent_cbs.clone();
+        let current_cwd_for_menu = self.current_cwd_for_menu.clone();
 
         let right_click = gtk4::GestureClick::new();
         right_click.set_button(3);
@@ -3697,27 +3764,193 @@ impl BlockBackend {
                 vbox.append(&item);
             }
 
+            // One bounded evidence snapshot shared by every chat-bound item in
+            // this menu: the 80-line head/tail window, the unknown-exit note,
+            // and the truncation flag are identical for Ask and Explain. (The
+            // sibling Fix action carries no payload — the app re-derives
+            // authoritative evidence from the emitting pane's live selection.)
+            let clicked_ai_context: Rc<dyn Fn() -> Option<crate::ai::BlockContext>> = {
+                let finished_for_ai = Rc::downgrade(&finished_blocks);
+                let block_data_for_ai = block_data_for_export.clone();
+                Rc::new(move || {
+                    let finished_for_ai = finished_for_ai.upgrade()?;
+                    let finished = finished_for_ai.borrow();
+                    let data = block_data_for_ai.borrow();
+                    block_context_for_id(&finished, &data, block_id, 80)
+                })
+            };
             {
                 let item = make_item("Ask AI About Block");
                 let popover_c = popover.downgrade();
-                let finished_for_ai = Rc::downgrade(&finished_blocks);
-                let block_data_for_ai = block_data_for_export.clone();
+                let context_for_ai = clicked_ai_context.clone();
                 let callbacks_for_ai = ask_ai_cbs_for_menu.clone();
                 item.connect_clicked(move |_| {
                     popdown_if_alive(&popover_c);
-                    let Some(finished_for_ai) = finished_for_ai.upgrade() else {
-                        return;
-                    };
-                    let finished = finished_for_ai.borrow();
-                    let data = block_data_for_ai.borrow();
-                    let Some(context) = block_context_for_id(&finished, &data, block_id, 80) else {
+                    let Some(context) = context_for_ai() else {
                         return;
                     };
                     for callback in callbacks_for_ai.borrow().iter() {
-                        callback(context.clone());
+                        callback(context.clone(), crate::ai::BlockAiIntent::Ask);
                     }
                 });
                 vbox.append(&item);
+            }
+
+            // Failed completed blocks expose the ember/frost action chain: a
+            // fresh Fix agent task, a read-only Explain in the AI panel, and a
+            // guarded Retry. The menu pre-computes only what the renderer
+            // owns; every dispatch re-checks its guards against live state.
+            let (clicked_cmd, clicked_exit, clicked_exact, clicked_truncated, clicked_cwd) = {
+                let cmd = finished_blocks
+                    .borrow()
+                    .iter()
+                    .find(|block| block.id == block_id)
+                    .map(|block| block.cmd_text.clone())
+                    .unwrap_or_default();
+                let data = block_data_for_export.borrow();
+                match data.iter().find(|block| block.id == block_id) {
+                    Some(record) => (
+                        cmd,
+                        record.exit_code,
+                        record.command_exact,
+                        record.command_truncated,
+                        record.cwd.clone(),
+                    ),
+                    None => (cmd, None, false, false, None),
+                }
+            };
+            if failed_block_section_visible(&clicked_cmd, clicked_exit) {
+                {
+                    let item = make_item("Fix with Agent");
+                    let popover_c = popover.downgrade();
+                    let callbacks_for_fix = fix_block_cbs_for_menu.clone();
+                    item.connect_clicked(move |_| {
+                        popdown_if_alive(&popover_c);
+                        for callback in callbacks_for_fix.borrow().iter() {
+                            callback();
+                        }
+                    });
+                    vbox.append(&item);
+                }
+                {
+                    let item = make_item("Explain with AI");
+                    let popover_c = popover.downgrade();
+                    let context_for_ai = clicked_ai_context.clone();
+                    let callbacks_for_ai = ask_ai_cbs_for_menu.clone();
+                    item.connect_clicked(move |_| {
+                        popdown_if_alive(&popover_c);
+                        let Some(context) = context_for_ai() else {
+                            return;
+                        };
+                        for callback in callbacks_for_ai.borrow().iter() {
+                            callback(context.clone(), crate::ai::BlockAiIntent::Explain);
+                        }
+                    });
+                    vbox.append(&item);
+                }
+                {
+                    let item = make_item("Retry");
+                    let retry_disabled = {
+                        let process_cwd = verified_submission_for_menu.shell_process_cwd();
+                        let reported = current_cwd_for_menu.borrow();
+                        let reported = (!reported.trim().is_empty()).then_some(reported.as_str());
+                        failed_block_retry_disabled_reason(
+                            selected_count > 1,
+                            &clicked_cmd,
+                            clicked_exact,
+                            clicked_truncated,
+                            clicked_cwd.as_deref(),
+                            reported,
+                            process_cwd.as_deref(),
+                        )
+                    };
+                    item.set_sensitive(retry_disabled.is_none());
+                    if let Some(reason) = retry_disabled {
+                        item.set_tooltip_text(Some(reason));
+                        item.update_property(&[gtk4::accessible::Property::Description(reason)]);
+                    }
+                    let popover_c = popover.downgrade();
+                    let finished_for_retry = finished_blocks_for_menu.clone();
+                    let block_data_for_retry = block_data_for_export.clone();
+                    let current_cwd_for_retry = current_cwd_for_menu.clone();
+                    let verified_submission_for_retry = verified_submission_for_menu.clone();
+                    let config_for_retry = config_for_menu.clone();
+                    let selected_ids_for_retry = selected_ids_for_menu.clone();
+                    let selected_for_retry = selected_for_menu.clone();
+                    let anchor_for_retry = anchor_for_menu.clone();
+                    let active_for_retry = active_for_rerun_menu.clone();
+                    let vte_for_retry = vte_for_copy.downgrade();
+                    let clicked_cmd_for_retry = clicked_cmd.clone();
+                    item.connect_clicked(move |_| {
+                        popdown_if_alive(&popover_c);
+                        let Some(finished_for_retry) = finished_for_retry.upgrade() else {
+                            return;
+                        };
+                        let finished = finished_for_retry.borrow();
+                        let suggestion =
+                            click_cursor::suggestion_rgb(&config_for_retry.borrow().palette);
+                        // Re-derive every guard live at dispatch: the prompt,
+                        // the shell cwd and even the card's record may have
+                        // changed while the menu was open.
+                        let guard_refusal = {
+                            let data = block_data_for_retry.borrow();
+                            match data.iter().find(|block| block.id == block_id) {
+                                // Evicted while the menu was open: refuse
+                                // loudly rather than run nothing silently.
+                                None => Some("The block is no longer available"),
+                                Some(record) => {
+                                    let process_cwd =
+                                        verified_submission_for_retry.shell_process_cwd();
+                                    let reported = current_cwd_for_retry.borrow();
+                                    let reported =
+                                        (!reported.trim().is_empty()).then_some(reported.as_str());
+                                    failed_block_retry_disabled_reason(
+                                        selected_ids_for_retry.borrow().len() > 1,
+                                        &clicked_cmd_for_retry,
+                                        record.command_exact,
+                                        record.command_truncated,
+                                        record.cwd.as_deref(),
+                                        reported,
+                                        process_cwd.as_deref(),
+                                    )
+                                }
+                            }
+                        };
+                        let submitted = guard_refusal.is_none()
+                            && verified_submission_for_retry
+                                .try_submit_historical_rerun(&clicked_cmd_for_retry, suggestion);
+                        if submitted {
+                            clear_finished_block_selection(
+                                &finished,
+                                &selected_ids_for_retry,
+                                &selected_for_retry,
+                                &anchor_for_retry,
+                            );
+                            if let Some(active_for_retry) = active_for_retry.upgrade() {
+                                active_for_retry.borrow().grab_focus();
+                            }
+                        } else {
+                            let message = guard_refusal.map(str::to_string).unwrap_or_else(|| {
+                                selection_refusal_hint(
+                                    SelectionAction::Run,
+                                    SelectionActionRefusal::Prompt(
+                                        verified_submission_for_retry
+                                            .historical_rerun_refusal_status(suggestion),
+                                    ),
+                                )
+                            });
+                            flash_finished_selection_refusal(
+                                &finished,
+                                selected_for_retry.get(),
+                                message,
+                            );
+                            if let Some(vte_for_retry) = vte_for_retry.upgrade() {
+                                vte_for_retry.error_bell();
+                            }
+                        }
+                    });
+                    vbox.append(&item);
+                }
             }
 
             {
@@ -4405,7 +4638,8 @@ type CommandStartedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandStartedEvent)>>>
 type CommandFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandFinishedEvent)>>>>;
 type HumanInputCallbacks = Rc<RefCell<Vec<Box<dyn Fn(HumanInputKind)>>>>;
 type AltScreenCallbacks = Rc<RefCell<Vec<Box<dyn Fn(AltScreenTransition)>>>>;
-type AskAiCallbacks = Rc<RefCell<Vec<Box<dyn Fn(crate::ai::BlockContext)>>>>;
+type AskAiCallbacks =
+    Rc<RefCell<Vec<Box<dyn Fn(crate::ai::BlockContext, crate::ai::BlockAiIntent)>>>>;
 
 fn block_context_for_id(
     finished: &[FinishedBlock],
@@ -4633,6 +4867,13 @@ impl VerifiedSubmissionCtx {
 
     fn can_recall_command(&self, suggestion_rgb: [u8; 3]) -> bool {
         self.history_editor_is_ready(suggestion_rgb)
+    }
+
+    /// Independently observed cwd of the shell child (`/proc`), for the
+    /// failed-block Retry's provenance check — the process leg of
+    /// [`verified_local_command_cwd`].
+    fn shell_process_cwd(&self) -> Option<String> {
+        jterm_core::process::process_cwd(self.pty.pid_i32())
     }
 
     /// Recall history only into a synchronously proven empty editor. This is
@@ -5158,6 +5399,7 @@ pub struct TermView {
     command_finished_callbacks: CommandFinishedCallbacks,
     block_finished_callbacks: BlockFinishedCallbacks,
     ask_ai_callbacks: AskAiCallbacks,
+    fix_block_with_agent_callbacks: VoidCallbacks,
     agent_execution_lost_callbacks: AgentExecutionLostCallbacks,
     /// Verified Agent generation of the running command, set at CommandStart.
     /// Exposed read-only so the organism can tell whose command is running.
@@ -6216,10 +6458,17 @@ struct BlockBackend {
     /// The pane's narrowing, read when a freshly finished card is mounted so it
     /// does not appear in a stream the user narrowed away from it.
     block_filter_for_cb: Rc<Cell<Option<BlockFilterKind>>>,
-    /// Menu-only ("Ask AI about this block"); the block-finished and
-    /// agent-execution-lost fan-outs are engine policy and live on
-    /// [`ReaderCtx`] alone.
+    /// Menu-only ("Ask AI about this block" / "Explain with AI"); the
+    /// block-finished and agent-execution-lost fan-outs are engine policy and
+    /// live on [`ReaderCtx`] alone.
     ask_ai_cbs: AskAiCallbacks,
+    /// Menu-only ("Fix with Agent" on a failed block). Carries no payload: the
+    /// app re-derives the evidence from the emitting pane's live selection.
+    fix_block_with_agent_cbs: VoidCallbacks,
+    /// Same shared cell as the `ReaderCtx` clone: the latest OSC 7 cwd report,
+    /// read by the failed-block Retry guard as its self-reported leg ("" when
+    /// nothing was ever reported).
+    current_cwd_for_menu: Rc<RefCell<String>>,
     /// Shared with `TermView` so Drop can remove a still-armed settling tick.
     prompt_anchor_tick_id_rc: Rc<RefCell<Option<gtk4::TickCallbackId>>>,
     bracketed_paste_rc: Rc<Cell<bool>>,
@@ -11693,6 +11942,7 @@ impl TermView {
         let command_finished_callbacks: CommandFinishedCallbacks = Rc::new(RefCell::new(vec![]));
         let block_finished_callbacks: BlockFinishedCallbacks = Rc::new(RefCell::new(vec![]));
         let ask_ai_callbacks: AskAiCallbacks = Rc::new(RefCell::new(vec![]));
+        let fix_block_with_agent_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
         let agent_execution_lost_callbacks: AgentExecutionLostCallbacks =
             Rc::new(RefCell::new(vec![]));
         let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -12134,6 +12384,8 @@ impl TermView {
                     dynamic_colors_rc: dynamic_colors.clone(),
                     pty_for_init: pty_for_init.clone(),
                     ask_ai_cbs: ask_ai_callbacks.clone(),
+                    fix_block_with_agent_cbs: fix_block_with_agent_callbacks.clone(),
+                    current_cwd_for_menu: current_cwd.clone(),
                     prompt_anchor_tick_id_rc: prompt_anchor_tick_id.clone(),
                     bracketed_paste_rc: bracketed_paste_rc.clone(),
                     verified_submission_for_rerun: verified_submission.clone(),
@@ -13176,6 +13428,7 @@ impl TermView {
             command_finished_callbacks,
             block_finished_callbacks,
             ask_ai_callbacks,
+            fix_block_with_agent_callbacks,
             agent_execution_lost_callbacks,
             active_agent_generation: active_agent_generation.clone(),
             verified_submission,
@@ -14425,9 +14678,21 @@ impl TermView {
 
     pub(crate) fn connect_ask_ai_about_block<F>(&self, f: F)
     where
-        F: Fn(crate::ai::BlockContext) + 'static,
+        F: Fn(crate::ai::BlockContext, crate::ai::BlockAiIntent) + 'static,
     {
         self.ask_ai_callbacks.borrow_mut().push(Box::new(f));
+    }
+
+    /// Menu-only failed-block Fix: the emitting pane's identity is recovered by
+    /// the app from the view this view-level callback was registered on, so the
+    /// callback itself carries nothing.
+    pub(crate) fn connect_fix_block_with_agent<F>(&self, f: F)
+    where
+        F: Fn() + 'static,
+    {
+        self.fix_block_with_agent_callbacks
+            .borrow_mut()
+            .push(Box::new(f));
     }
 
     /// Reveal the live input when its tab becomes active.
@@ -15956,6 +16221,150 @@ mod tests {
                 ModifierType::empty()
             ));
         }
+    }
+
+    #[test]
+    fn the_failed_block_section_only_marks_reported_failures() {
+        assert!(super::failed_block_section_visible("false", Some(1)));
+        assert!(super::failed_block_section_visible("cargo test", Some(101)));
+        // Success and unknown status are never reclassified as failures, and
+        // background output (blank command) trumps even a non-zero exit.
+        assert!(!super::failed_block_section_visible("cargo test", Some(0)));
+        assert!(!super::failed_block_section_visible("cargo test", None));
+        assert!(!super::failed_block_section_visible("", Some(1)));
+        assert!(!super::failed_block_section_visible("   ", Some(1)));
+    }
+
+    #[test]
+    fn retry_cwd_verification_requires_an_independent_process_match() {
+        // frost's verified_local_command_cwd pins, verbatim.
+        assert!(super::verified_local_command_cwd(
+            "/work/app",
+            Some("/work/app"),
+            Some("/work/app")
+        ));
+        assert!(super::verified_local_command_cwd(
+            "/work/app",
+            None,
+            Some("/work/app")
+        ));
+        assert!(!super::verified_local_command_cwd(
+            "/work/app",
+            Some("/elsewhere"),
+            Some("/work/app")
+        ));
+        assert!(!super::verified_local_command_cwd("/work/app", None, None));
+        assert!(!super::verified_local_command_cwd(
+            "/work/app",
+            Some("/work/app"),
+            Some("/elsewhere")
+        ));
+        // A relative recorded cwd can never authorize execution.
+        assert!(!super::verified_local_command_cwd(
+            "work/app",
+            Some("work/app"),
+            Some("work/app")
+        ));
+    }
+
+    #[test]
+    fn the_failed_block_retry_reason_ladders_every_guard() {
+        let eligible = super::failed_block_retry_disabled_reason(
+            false,
+            "cargo test",
+            true,
+            false,
+            Some("/work/app"),
+            Some("/work/app"),
+            Some("/work/app"),
+        );
+        assert_eq!(eligible, None);
+        assert_eq!(
+            super::failed_block_retry_disabled_reason(
+                true,
+                "cargo test",
+                true,
+                false,
+                Some("/work/app"),
+                Some("/work/app"),
+                Some("/work/app"),
+            ),
+            Some("Select a single block to run it again")
+        );
+        assert_eq!(
+            super::failed_block_retry_disabled_reason(
+                false,
+                "cargo test",
+                true,
+                true,
+                Some("/work/app"),
+                Some("/work/app"),
+                Some("/work/app"),
+            ),
+            Some("The recorded command was shortened and cannot be re-run")
+        );
+        assert_eq!(
+            super::failed_block_retry_disabled_reason(
+                false,
+                "cargo test",
+                false,
+                false,
+                Some("/work/app"),
+                Some("/work/app"),
+                Some("/work/app"),
+            ),
+            Some("The shell did not provide exact command metadata")
+        );
+        assert_eq!(
+            super::failed_block_retry_disabled_reason(
+                false,
+                "printf one\nprintf two",
+                true,
+                false,
+                Some("/work/app"),
+                Some("/work/app"),
+                Some("/work/app"),
+            ),
+            Some("The recorded command cannot be re-run exactly")
+        );
+        assert_eq!(
+            super::failed_block_retry_disabled_reason(
+                false,
+                "cargo test",
+                true,
+                false,
+                None,
+                Some("/work/app"),
+                Some("/work/app"),
+            ),
+            Some("The command working directory is unavailable")
+        );
+        // The cwd legs refuse a moved shell, an unobservable process cwd
+        // (SSH/tmux wrapper), and a conflicting OSC report alike.
+        assert_eq!(
+            super::failed_block_retry_disabled_reason(
+                false,
+                "cargo test",
+                true,
+                false,
+                Some("/work/app"),
+                Some("/elsewhere"),
+                Some("/work/app"),
+            ),
+            Some("The shell's current directory differs from the command's recorded directory")
+        );
+        assert_eq!(
+            super::failed_block_retry_disabled_reason(
+                false,
+                "cargo test",
+                true,
+                false,
+                Some("/work/app"),
+                None,
+                None,
+            ),
+            Some("The shell's current directory differs from the command's recorded directory")
+        );
     }
 
     #[test]

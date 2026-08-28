@@ -21,6 +21,41 @@ pub use jterm_core::ai::{
     MAX_PERSISTED_CHATS,
 };
 
+/// Which AI action a finished block's context menu asked for. `Ask` keeps the
+/// panel's long-standing opening question; `Explain` is the family's
+/// failed-block Explain (ember's `AgentTaskIntent::Explain`, frost's
+/// `FailedBlockAgentIntent::Explain`) routed into forge's read-only block-chat
+/// panel. The sibling Fix action does not travel this channel: it creates an
+/// agent task instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockAiIntent {
+    Ask,
+    Explain,
+}
+
+/// The fixed opening question seeded into the AI panel alongside a block's
+/// context. Every variant is a compile-time constant: the command and output
+/// are untrusted PTY evidence and travel only inside the framed `BlockContext`
+/// envelope, never interpolated into the instruction where model-looking text
+/// could impersonate forge (ember/frost's rule).
+pub(crate) fn seeded_block_question(intent: BlockAiIntent, exit_code: i32) -> &'static str {
+    match intent {
+        BlockAiIntent::Ask => {
+            if exit_code == 0 {
+                "Explain what this command does and what its output means."
+            } else {
+                "This command failed. Diagnose the error and suggest a fix."
+            }
+        }
+        // frost's wording, adapted only to the panel's "this command"
+        // vocabulary: the chat panel cannot change files, so the request is
+        // read-only by construction.
+        BlockAiIntent::Explain => {
+            "Explain this failed command: identify the root cause, cite the relevant evidence in its captured output, and propose the smallest safe next step. Do not propose changes unless I ask."
+        }
+    }
+}
+
 /// Build the hardened shared AI client from forge's application-owned config.
 /// The config carries only a credential path; key material is resolved inside
 /// the shared client and is never copied into persistent configuration state.
@@ -128,6 +163,35 @@ mod tests {
                 "{provider} {endpoint}: {error}"
             );
             assert!(!error.to_string().contains(endpoint));
+        }
+    }
+
+    #[test]
+    fn seeded_questions_are_fixed_strings_with_no_block_interpolation() {
+        // The Ask defaults are the panel's long-standing behavior and must not
+        // drift: success explains, anything else (including the -1 unknown
+        // sentinel) diagnoses.
+        assert_eq!(
+            seeded_block_question(BlockAiIntent::Ask, 0),
+            "Explain what this command does and what its output means."
+        );
+        assert_eq!(
+            seeded_block_question(BlockAiIntent::Ask, 1),
+            "This command failed. Diagnose the error and suggest a fix."
+        );
+        assert_eq!(
+            seeded_block_question(BlockAiIntent::Ask, -1),
+            "This command failed. Diagnose the error and suggest a fix."
+        );
+        let explain = seeded_block_question(BlockAiIntent::Explain, 2);
+        assert!(explain.contains("root cause"));
+        assert!(explain.contains("Do not propose changes unless I ask."));
+        // A failed block whose output begs to be quoted still gets the bare
+        // constant: evidence stays inside the framed context envelope.
+        for intent in [BlockAiIntent::Ask, BlockAiIntent::Explain] {
+            let question = seeded_block_question(intent, 1);
+            assert!(!question.contains("rm -rf"));
+            assert!(!question.contains("{cmd}"));
         }
     }
 }

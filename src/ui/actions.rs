@@ -670,17 +670,37 @@ impl UiState {
             );
             return;
         };
-        self.ask_ai_about_block_context(ctx);
+        self.ask_ai_about_block_context(ctx, crate::ai::BlockAiIntent::Ask);
     }
 
     pub(crate) fn connect_block_ai_action(&self, term_view: &Rc<TermView>) {
         let ui = self.clone();
-        term_view.connect_ask_ai_about_block(move |context| {
-            ui.ask_ai_about_block_context(context);
+        term_view.connect_ask_ai_about_block(move |context, intent| {
+            ui.ask_ai_about_block_context(context, intent);
+        });
+        let ui = self.clone();
+        let root_for_fix = term_view.widget().downgrade();
+        term_view.connect_fix_block_with_agent(move || {
+            // The menu click can come from a background pane: resolve the
+            // emitting pane from its own widget rather than trusting focus.
+            let Some(root) = root_for_fix.upgrade() else {
+                return;
+            };
+            let Some(leaf) = PaneLeaf::from_widget(&root) else {
+                ui.toast_overlay.add_toast(adw::Toast::new(
+                    "The block's terminal pane is no longer available",
+                ));
+                return;
+            };
+            ui.fix_block_with_agent(&leaf);
         });
     }
 
-    fn ask_ai_about_block_context(&self, ctx: crate::ai::BlockContext) {
+    fn ask_ai_about_block_context(
+        &self,
+        ctx: crate::ai::BlockContext,
+        intent: crate::ai::BlockAiIntent,
+    ) {
         if !self.config.borrow().ai_enabled {
             self.show_ai_error("AI features are disabled in Settings or safe mode.");
             return;
@@ -688,7 +708,7 @@ impl UiState {
         if !self.ai_panel_visible.get() {
             self.toggle_ai_panel();
         }
-        self.ai_panel.ask_about_block(ctx);
+        self.ai_panel.ask_about_block(ctx, intent);
     }
 
     /// Write the active Block pane's session to disk and tell the user where it

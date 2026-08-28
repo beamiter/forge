@@ -459,14 +459,40 @@ impl UiState {
     /// sharing consent gates nothing here because no provider is contacted
     /// until Start Codex.
     fn create_task_from_block(&self) {
-        if self.agent_tasks.borrow().pending_task_creation.is_some() {
-            self.task_toast("Another task worktree is still being created");
-            return;
-        }
         let Some(leaf) = self.active_pane_leaf() else {
             self.task_toast("No active terminal pane");
             return;
         };
+        self.create_task_from_block_in_leaf(&leaf, false);
+    }
+
+    /// The failed-block menu's Fix action (ember's `FixWithAgent`): create the
+    /// worktree task for the failed block right-clicked in `leaf`, rather than
+    /// whatever pane happens to be active. The Tasks panel's own opt-in gate
+    /// applies unchanged — safe mode loads safe defaults, which keep
+    /// `agent_tasks_enabled` false and land on the same toast — plus a
+    /// failed-outcome recheck at dispatch. No provider is contacted until the
+    /// user starts Codex, so the `ai_share_command_context` consent posture
+    /// stays exactly where the native prompt gate already put it.
+    pub(crate) fn fix_block_with_agent(&self, leaf: &PaneLeaf) {
+        if !self.config.borrow().agent_tasks_enabled {
+            self.task_toast(
+                "Agent tasks are opt-in: set agent_tasks_enabled = true in the config file first",
+            );
+            return;
+        }
+        self.create_task_from_block_in_leaf(leaf, true);
+    }
+
+    /// Shared task creation from one pane's selected block. `require_failed`
+    /// is the block menu's Fix gate: only a genuinely failed command block
+    /// may anchor a fix task, re-checked here because the menu's visibility
+    /// gate is renderer-side and could be stale by dispatch time.
+    fn create_task_from_block_in_leaf(&self, leaf: &PaneLeaf, require_failed: bool) {
+        if self.agent_tasks.borrow().pending_task_creation.is_some() {
+            self.task_toast("Another task worktree is still being created");
+            return;
+        }
         let Some(view) = leaf.block_view() else {
             self.task_toast("Select a finished block in a Block-mode pane to create an agent task");
             return;
@@ -475,6 +501,16 @@ impl UiState {
             self.task_toast("Select a finished block in a Block-mode pane to create an agent task");
             return;
         };
+        if require_failed
+            && !jterm_core::block_contract::classify_completed(
+                evidence.command.as_deref(),
+                evidence.exit_code,
+            )
+            .is_failed()
+        {
+            self.task_toast("Fix tasks are available for failed command blocks");
+            return;
+        }
         if let Some(reason) = crate::agent_task::context::block_agent_context_disabled_reason(
             evidence.command.as_deref(),
             evidence.command_exact,
@@ -486,7 +522,7 @@ impl UiState {
             return;
         }
         let source_shell = self.shell_argv.borrow().first().cloned();
-        let Some(context) = semantic_context_from_evidence(&leaf, evidence, source_shell) else {
+        let Some(context) = semantic_context_from_evidence(leaf, evidence, source_shell) else {
             self.task_toast("Cannot create an agent task: the pane has no verified shell session");
             return;
         };
