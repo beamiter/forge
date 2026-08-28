@@ -335,7 +335,7 @@ fn validate_workflow(workflow: &Workflow) -> bool {
 }
 
 fn parse_yaml_workflow(source: &str, source_path: &Path) -> Option<Workflow> {
-    let raw: YamlWorkflow = match serde_yaml::from_str(source) {
+    let raw: YamlWorkflow = match serde_yaml_ng::from_str(source) {
         Ok(raw) => raw,
         Err(err) => {
             log::warn!(

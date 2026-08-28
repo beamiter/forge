@@ -37,7 +37,7 @@ zstd = "0.13"
 regex = "1"
 regex-syntax = "0.8"
 fuzzy-matcher = "0.3"
-serde_yaml = "0.9"
+serde_yaml_ng = "0.10"
 unicode-width = "0.2"
 gtk4 = { version = "0.11.4", features = ["v4_14"] }
 gdk4 = { version = "0.11.4", features = ["v4_14"] }
