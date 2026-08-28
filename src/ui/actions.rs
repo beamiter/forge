@@ -307,6 +307,12 @@ impl UiState {
             Action::TogglePaneZoom => {
                 self.toggle_pane_zoom();
             }
+            Action::EqualizePanes => {
+                self.equalize_panes();
+            }
+            Action::SwapPanes => {
+                self.swap_active_pane_with_next();
+            }
             Action::MovePaneToNewTab => {
                 self.move_pane_to_new_tab();
             }

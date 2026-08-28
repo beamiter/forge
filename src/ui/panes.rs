@@ -95,6 +95,16 @@ fn nearest_directional_index(
         .map(|(index, _)| index)
 }
 
+/// The pane `focused` should swap with: the next entry in visual order,
+/// wrapping. `None` when there is no other pane to exchange with.
+fn swap_target_in_visual_order(leaf_count: usize, focused: usize) -> Option<usize> {
+    if focused >= leaf_count {
+        return None;
+    }
+    let next = (focused + 1) % leaf_count;
+    (next != focused).then_some(next)
+}
+
 /// Run all fallible pane preparation before allowing any structural mutation.
 /// Keeping this boundary explicit makes split's no-partial-commit guarantee
 /// independently testable with an injected constructor failure.
@@ -139,17 +149,47 @@ fn rebalance_pane_tree(widget: &gtk4::Widget) {
     rebalance_pane_tree(&end);
 }
 
-fn schedule_pane_rebalance(page: gtk4::Widget) {
-    // The first idle runs after the new Paned enters the widget tree. A second
-    // pass catches nested panes whose allocation changes because an ancestor
-    // divider moved during the first pass.
+/// Set every divider in the tree to an even split of its own extent. Unlike
+/// the split-time rebalance this does not weight by leaf count: a nested
+/// subtree receives the same half as a single leaf, matching ember's
+/// PaneEqualize.
+fn equalize_pane_tree(widget: &gtk4::Widget) {
+    let Ok(paned) = widget.clone().downcast::<Paned>() else {
+        return;
+    };
+    let Some(start) = paned.start_child() else {
+        return;
+    };
+    let Some(end) = paned.end_child() else {
+        return;
+    };
+    let extent = if paned.orientation() == Orientation::Horizontal {
+        paned.width()
+    } else {
+        paned.height()
+    };
+    if let Some(position) = balanced_split_position(extent, 1, 1) {
+        paned.set_position(position);
+    }
+    equalize_pane_tree(&start);
+    equalize_pane_tree(&end);
+}
+
+/// Run `walk` twice on successive idles. The first pass observes the current
+/// allocation, and moving an ancestor divider changes nested allocations, so a
+/// second pass settles descendants.
+fn schedule_two_pass_tree_walk(page: gtk4::Widget, walk: fn(&gtk4::Widget)) {
     gtk4::glib::idle_add_local_once(move || {
-        rebalance_pane_tree(&page);
+        walk(&page);
         let page = page.clone();
         gtk4::glib::idle_add_local_once(move || {
-            rebalance_pane_tree(&page);
+            walk(&page);
         });
     });
+}
+
+fn schedule_pane_rebalance(page: gtk4::Widget) {
+    schedule_two_pass_tree_walk(page, rebalance_pane_tree);
 }
 
 impl UiState {
@@ -788,6 +828,45 @@ impl UiState {
         true
     }
 
+    /// Exchange the focused pane with the next one in visual order, wrapping
+    /// at the end (tmux-style `swap-pane`, frost's PaneSwap). Geometry stays
+    /// put and focus follows the moved pane, exactly like the header drag
+    /// swap, whose guards (same-tab leaves, unique session ids) apply here
+    /// unchanged.
+    pub(crate) fn swap_active_pane_with_next(&self) {
+        let Some(page_widget) = self
+            .notebook
+            .current_page()
+            .and_then(|page| self.notebook.nth_page(Some(page)))
+        else {
+            return;
+        };
+        let Some(node) = PaneNode::from_widget(&page_widget) else {
+            return;
+        };
+        // `leaves()` walks the tree start-child first, so its order is the
+        // visual order this swap cycles through.
+        let leaves = node.leaves();
+        let Some(focused) = node.active_leaf() else {
+            return;
+        };
+        let focused_root = focused.root_widget();
+        let Some(position) = leaves
+            .iter()
+            .position(|leaf| leaf.root_widget() == focused_root)
+        else {
+            return;
+        };
+        let Some(target) = swap_target_in_visual_order(leaves.len(), position) else {
+            return;
+        };
+        let (Some(dragged), Some(target)) = (focused.session_id(), leaves[target].session_id())
+        else {
+            return;
+        };
+        self.swap_panes_by_session(&dragged, &target);
+    }
+
     pub(crate) fn split_current(&self, orientation: Orientation) {
         let Some(page_num) = self.notebook.current_page() else {
             return;
@@ -987,6 +1066,45 @@ impl UiState {
         }
     }
 
+    /// Reset every split divider in the focused tab so each split's two
+    /// children share it evenly, matching ember's PaneEqualize: the whole tree
+    /// is equalized, not just the focused pane's nearest split. No-op for a
+    /// single pane.
+    pub(crate) fn equalize_panes(&self) {
+        let Some(page_widget) = self
+            .notebook
+            .current_page()
+            .and_then(|page| self.notebook.nth_page(Some(page)))
+        else {
+            return;
+        };
+        // The real tree is detached while this tab is pane-zoomed; restore it
+        // first so the equalize lands on the splits the user actually arranged.
+        // A zoom belonging to another tab leaves this page's tree intact.
+        let zoomed_here = self
+            .zoom_state
+            .borrow()
+            .as_ref()
+            .is_some_and(|state| state.swap.zoomed_page == page_widget);
+        if zoomed_here {
+            self.toggle_pane_zoom();
+        }
+        let Some(page_widget) = self
+            .notebook
+            .current_page()
+            .and_then(|page| self.notebook.nth_page(Some(page)))
+        else {
+            return;
+        };
+        let Some(node) = PaneNode::from_widget(&page_widget) else {
+            return;
+        };
+        if !node.is_split() {
+            return;
+        }
+        schedule_two_pass_tree_walk(page_widget, equalize_pane_tree);
+    }
+
     pub(crate) fn focus_pane_directional(&self, direction: Direction) {
         log::debug!("focus_pane_directional: {direction:?}");
         let Some(page_num) = self.notebook.current_page() else {
@@ -1059,7 +1177,10 @@ impl UiState {
 
 #[cfg(test)]
 mod tests {
-    use super::{balanced_split_position, nearest_directional_index, prepare_then_commit};
+    use super::{
+        balanced_split_position, equalize_pane_tree, nearest_directional_index,
+        prepare_then_commit, swap_target_in_visual_order,
+    };
     use crate::keybindings::Direction;
     use std::cell::Cell;
 
@@ -1098,6 +1219,65 @@ mod tests {
         assert_eq!(balanced_split_position(0, 1, 1), None);
         assert_eq!(balanced_split_position(100, 0, 1), None);
         assert_eq!(balanced_split_position(100, 1, 0), None);
+    }
+
+    #[test]
+    fn equalize_halves_every_split_regardless_of_nesting() {
+        // Ember's PaneEqualize gives each split's two children an even share of
+        // that split's own extent, so A | (B | C) equalizes to halves at both
+        // dividers — not the leaf-weighted 1/3 slots of the split-time
+        // rebalance.
+        assert_eq!(balanced_split_position(1_200, 1, 1), Some(600));
+        let nested = balanced_split_position(1_200 - 600, 1, 1).unwrap();
+        assert_eq!([600, nested, 1_200 - 600 - nested], [600, 300, 300]);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn equalize_without_allocation_leaves_the_tree_untouched() {
+        use gtk4::prelude::*;
+
+        if gtk4::init().is_err() {
+            // Pure coverage still runs on headless builders; the live GTK
+            // boundary is exercised whenever a display backend exists.
+            return;
+        }
+
+        let root = gtk4::Paned::new(gtk4::Orientation::Horizontal);
+        let nested = gtk4::Paned::new(gtk4::Orientation::Vertical);
+        let leaf_a = gtk4::Button::with_label("a");
+        let leaf_b = gtk4::Button::with_label("b");
+        let leaf_c = gtk4::Button::with_label("c");
+        nested.set_start_child(Some(&leaf_b));
+        nested.set_end_child(Some(&leaf_c));
+        root.set_start_child(Some(&leaf_a));
+        root.set_end_child(Some(&nested));
+
+        // An unrealized tree has zero extent, so every divider stays put and
+        // the walk must not disturb the structure.
+        let root_widget = root.clone().upcast::<gtk4::Widget>();
+        let nested_widget = nested.clone().upcast::<gtk4::Widget>();
+        let leaf_a_widget = leaf_a.clone().upcast::<gtk4::Widget>();
+        let leaf_b_widget = leaf_b.clone().upcast::<gtk4::Widget>();
+        let leaf_c_widget = leaf_c.clone().upcast::<gtk4::Widget>();
+        equalize_pane_tree(&root_widget);
+        assert_eq!(root.position(), 0);
+        assert_eq!(nested.position(), 0);
+        assert_eq!(root.start_child().as_ref(), Some(&leaf_a_widget));
+        assert_eq!(root.end_child().as_ref(), Some(&nested_widget));
+        assert_eq!(nested.start_child().as_ref(), Some(&leaf_b_widget));
+        assert_eq!(nested.end_child().as_ref(), Some(&leaf_c_widget));
+    }
+
+    #[test]
+    fn swap_target_is_the_next_pane_in_visual_order_with_wraparound() {
+        assert_eq!(swap_target_in_visual_order(3, 0), Some(1));
+        assert_eq!(swap_target_in_visual_order(3, 1), Some(2));
+        assert_eq!(swap_target_in_visual_order(3, 2), Some(0));
+        // A single visible pane has no exchange partner.
+        assert_eq!(swap_target_in_visual_order(1, 0), None);
+        // A pane missing from the order cannot be swapped at all.
+        assert_eq!(swap_target_in_visual_order(2, 2), None);
     }
 
     #[test]
