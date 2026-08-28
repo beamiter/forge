@@ -423,6 +423,30 @@ fn running_header_label(command: &str, elapsed_secs: u64) -> String {
     }
 }
 
+/// Cheap scalar fingerprint of everything the finished-block sticky-candidate
+/// scan reads. The scan walks two widget bounds per finished card; its result
+/// can only move with the scroll geometry (`value`/`upper`/`page_size` —
+/// `upper` rolls up every card-height change), the finished-block census, or
+/// the bar's own height (its occlusion threshold shifts when the label
+/// wraps). The 250 ms refresh compares these scalars and re-runs the widget
+/// walk only when one of them did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StickyScanInputs {
+    value: f64,
+    upper: f64,
+    page_size: f64,
+    blocks: usize,
+    bar_height: i32,
+}
+
+/// Whether the sticky-candidate scan must re-run: always on the first pass,
+/// afterwards only when the fingerprint moved. NaN-safe in the conservative
+/// direction — a NaN adjustment value never equals itself, so it rescans
+/// every pass exactly like the ungated timer did.
+fn sticky_scan_inputs_changed(previous: Option<StickyScanInputs>, current: StickyScanInputs) -> bool {
+    previous != Some(current)
+}
+
 /// What "slow" means for the Slow filter and the slow-block jump.
 ///
 /// One constant so the filter and the navigation cannot disagree about which
@@ -5079,10 +5103,12 @@ pub struct TermView {
     persist_history_on_drop: Cell<bool>,
     /// Main-thread poll applying a completed history load to GTK widgets.
     history_load_poll_id: RefCell<Option<glib::SourceId>>,
-    /// Per-frame resize tick installed on `active_vte`. Held so it can be removed on
-    /// Drop — otherwise the callback runs forever and keeps its Rc captures
-    /// (pty/active/vte/vte_box) alive past tab close.
-    resize_tick_id: RefCell<Option<gtk4::TickCallbackId>>,
+    /// Slot of the settling resize tick installed on `active_vte`, shared with
+    /// the arming closure so a geometry signal installs at most one tick and
+    /// the tick clears the slot when it stands down. Removed on Drop —
+    /// otherwise a pane closed mid-settle would keep the callback's Rc
+    /// captures (pty/active/vte/vte_box) alive past tab close.
+    resize_tick_id: Rc<RefCell<Option<gtk4::TickCallbackId>>>,
     /// Periodic sticky-header refresh. Remove it explicitly on tab close so its
     /// GTK captures cannot retain a detached block tree.
     sticky_timer_id: RefCell<Option<glib::SourceId>>,
@@ -9529,8 +9555,8 @@ impl ReaderCtx {
 /// but terminal geometry remains identical to regular VTE mode. Used at state
 /// transitions where the child needs to see a correct winsize on its very first
 /// read — `top` queries TIOCGWINSZ before painting, less/vim do the same.
-/// Without the synchronous push the per-frame resize tick would catch up only
-/// on the next frame, racing with the child.
+/// Without the synchronous push the settling resize tick would catch up only
+/// after the next geometry signal, racing with the child.
 fn sync_active_to_pty(
     layout_active_surface: &Rc<dyn Fn()>,
     vte: &Terminal,
@@ -12388,6 +12414,11 @@ impl TermView {
             let finished = finished_blocks_rc.clone();
             let scroll = block_scroll.clone();
             let fullscreen = fullscreen.clone();
+            // Last fingerprinted scan inputs plus the candidate they produced;
+            // see `StickyScanInputs`. Lives only in this closure.
+            let sticky_scan_state: Rc<
+                RefCell<Option<(StickyScanInputs, Option<(u64, String, bool)>)>>,
+            > = Rc::new(RefCell::new(None));
             glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
                 if sticky.parent().is_none() {
                     return glib::ControlFlow::Break;
@@ -12443,24 +12474,49 @@ impl TermView {
                     return glib::ControlFlow::Continue;
                 }
                 let sticky_height = sticky.height().max(1) as f32;
-                let candidate = finished.borrow().iter().find_map(|block| {
-                    let header = block.header_row.compute_bounds(&scroll)?;
-                    let card = block.widget().compute_bounds(&scroll)?;
-                    let header_bottom = header.y() + header.height();
-                    let card_bottom = card.y() + card.height();
-                    if header_bottom <= 0.0 && card_bottom > sticky_height + 4.0 {
-                        let command = block
-                            .cmd_text
-                            .lines()
-                            .next()
-                            .unwrap_or("")
-                            .trim()
-                            .to_string();
-                        Some((block.id, command, block.long_output))
-                    } else {
-                        None
+                // Re-run the widget walk only when one of its inputs moved;
+                // between changes the cached candidate stays valid and the
+                // pass costs a few scalar reads instead of two
+                // `compute_bounds` per finished card.
+                let inputs = StickyScanInputs {
+                    value: scroll.vadjustment().value(),
+                    upper: scroll.vadjustment().upper(),
+                    page_size: scroll.vadjustment().page_size(),
+                    blocks: finished.borrow().len(),
+                    bar_height: sticky.height(),
+                };
+                let candidate = {
+                    let mut scan_state = sticky_scan_state.borrow_mut();
+                    match scan_state.as_ref() {
+                        Some((previous, cached))
+                            if !sticky_scan_inputs_changed(Some(*previous), inputs) =>
+                        {
+                            cached.clone()
+                        }
+                        _ => {
+                            let candidate = finished.borrow().iter().find_map(|block| {
+                                let header = block.header_row.compute_bounds(&scroll)?;
+                                let card = block.widget().compute_bounds(&scroll)?;
+                                let header_bottom = header.y() + header.height();
+                                let card_bottom = card.y() + card.height();
+                                if header_bottom <= 0.0 && card_bottom > sticky_height + 4.0 {
+                                    let command = block
+                                        .cmd_text
+                                        .lines()
+                                        .next()
+                                        .unwrap_or("")
+                                        .trim()
+                                        .to_string();
+                                    Some((block.id, command, block.long_output))
+                                } else {
+                                    None
+                                }
+                            });
+                            *scan_state = Some((inputs, candidate.clone()));
+                            candidate
+                        }
                     }
-                });
+                };
                 if let Some((id, command, long_output)) = candidate {
                     sticky_target.set(Some(id));
                     sticky_organism.set_visible(false);
@@ -13052,7 +13108,7 @@ impl TermView {
             history_load: Arc::new(history::HistoryLoadShared::default()),
             persist_history_on_drop: Cell::new(true),
             history_load_poll_id: RefCell::new(None),
-            resize_tick_id: RefCell::new(None),
+            resize_tick_id: Rc::new(RefCell::new(None)),
             sticky_timer_id: RefCell::new(Some(sticky_timer_id)),
             sticky_organism_slot,
             cross_selection,
@@ -13197,45 +13253,119 @@ impl TermView {
     /// Keep PTY geometry synchronized with the real pane viewport, independent
     /// of the compact/full visual state of the live VTE. FTCS transitions also
     /// push TIOCSWINSZ synchronously so apps never see a stale first layout.
+    ///
+    /// The geometry pass below is the one the permanent frame-clock tick used
+    /// to run. What changed is only when it runs: a lifetime tick kept the
+    /// frame clock ticking at display refresh rate even at an idle prompt, so
+    /// the signals that can move the pane now arm a settling tick instead, and
+    /// that tick stands down after the first frame in which neither the pane
+    /// pixels nor the grid moved. Every poll reads absolute geometry, so a
+    /// change that lands while the tick is dormant is picked up whole by the
+    /// next armed poll — nothing accumulates.
     fn install_resize_tick(&self) {
         let pty_for_resize = self.pty.clone();
         let resize_generation = self.pty_resize_generation.clone();
         let scroll_for_resize = self.block_scroll.downgrade();
         let backend_for_resize = Rc::downgrade(&self.render_backend);
         let clip_for_resize = self.active.borrow().live_clip().downgrade();
+        let vte_for_resize = self.active_vte.downgrade();
         let last: Rc<Cell<(u16, u16)>> = Rc::new(Cell::new((0, 0)));
         let last_pane: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((0, 0)));
-        let tick_id = self.active_vte.add_tick_callback(move |vte, _clock| {
-            let Some(scroll_for_resize) = scroll_for_resize.upgrade() else {
-                return glib::ControlFlow::Break;
+        let tick_slot = self.resize_tick_id.clone();
+        let arm: Rc<dyn Fn()> = Rc::new(move || {
+            // Already settling: the running tick reads absolute geometry on
+            // every poll, so it observes this change without a second tick.
+            if tick_slot.borrow().is_some() {
+                return;
+            }
+            let Some(vte_for_tick) = vte_for_resize.upgrade() else {
+                return;
             };
-            // The live terminal is sized by an explicit pixel request (it lives
-            // in a `gtk4::Fixed` and cannot expand into the pane on its own),
-            // and a resized pane at an idle prompt produces no
-            // `contents-changed` to re-run the layout. Watch the pane from the
-            // frame clock so the grid — and therefore the winsize read below —
-            // follows the window.
-            if let Some(clip) = clip_for_resize.upgrade() {
-                let pane = (
-                    clip.width(),
-                    scroll_for_resize.vadjustment().page_size() as i32,
-                );
-                if pane != last_pane.get() && pane.0 > 0 {
-                    last_pane.set(pane);
-                    if let Some(backend) = backend_for_resize.upgrade() {
-                        backend.layout_active_surface();
+            let tick_slot_for_tick = tick_slot.clone();
+            // Shadow the armer's captures so the poll body stays verbatim.
+            let pty_for_resize = pty_for_resize.clone();
+            let resize_generation = resize_generation.clone();
+            let scroll_for_resize = scroll_for_resize.clone();
+            let backend_for_resize = backend_for_resize.clone();
+            let clip_for_resize = clip_for_resize.clone();
+            let last = last.clone();
+            let last_pane = last_pane.clone();
+            let tick_id = vte_for_tick.add_tick_callback(move |vte, _clock| {
+                let Some(scroll_for_resize) = scroll_for_resize.upgrade() else {
+                    tick_slot_for_tick.borrow_mut().take();
+                    return glib::ControlFlow::Break;
+                };
+                let mut settling = false;
+                // The live terminal is sized by an explicit pixel request (it
+                // lives in a `gtk4::Fixed` and cannot expand into the pane on
+                // its own), and a resized pane at an idle prompt produces no
+                // `contents-changed` to re-run the layout. Apply the pane the
+                // last frame allocated so the grid — and therefore the winsize
+                // read below — follows the window.
+                if let Some(clip) = clip_for_resize.upgrade() {
+                    let pane = (
+                        clip.width(),
+                        scroll_for_resize.vadjustment().page_size() as i32,
+                    );
+                    if pane != last_pane.get() && pane.0 > 0 {
+                        last_pane.set(pane);
+                        settling = true;
+                        if let Some(backend) = backend_for_resize.upgrade() {
+                            backend.layout_active_surface();
+                        }
                     }
                 }
-            }
-            let (cols, rows) = pty_grid_size(vte, &scroll_for_resize);
-            if cols > 0 && rows > 0 && (cols, rows) != last.get() {
-                last.set((cols, rows));
-                resize_generation.set(resize_generation.get().wrapping_add(1));
-                pty_for_resize.resize(cols, rows);
-            }
-            glib::ControlFlow::Continue
+                let (cols, rows) = pty_grid_size(vte, &scroll_for_resize);
+                if cols > 0 && rows > 0 && (cols, rows) != last.get() {
+                    last.set((cols, rows));
+                    settling = true;
+                    resize_generation.set(resize_generation.get().wrapping_add(1));
+                    pty_for_resize.resize(cols, rows);
+                }
+                if !settling {
+                    // A full frame with no pane- or grid-level movement: the
+                    // change that armed this tick has been applied end to end.
+                    // Hand the frame clock back; the next geometry signal
+                    // re-arms it.
+                    tick_slot_for_tick.borrow_mut().take();
+                    return glib::ControlFlow::Break;
+                }
+                glib::ControlFlow::Continue
+            });
+            *tick_slot.borrow_mut() = Some(tick_id);
         });
-        *self.resize_tick_id.borrow_mut() = Some(tick_id);
+        // Arm from every signal that can move the pane grid. The adjustments'
+        // page sizes cover window resizes, pane splits and scrollbar
+        // appearance; the VTE's cell metrics cover font and zoom changes (a
+        // font change moves the grid without touching either page size);
+        // (re)mapping covers tab switches and first show, where geometry may
+        // have moved while the pane was hidden and an unchanged adjustment
+        // fires no notify.
+        {
+            let arm = arm.clone();
+            self.block_scroll
+                .vadjustment()
+                .connect_page_size_notify(move |_| arm());
+        }
+        {
+            let arm = arm.clone();
+            self.block_scroll
+                .hadjustment()
+                .connect_page_size_notify(move |_| arm());
+        }
+        {
+            let arm = arm.clone();
+            self.active_vte
+                .connect_char_size_changed(move |_, _, _| arm());
+        }
+        {
+            let arm = arm.clone();
+            self.block_scroll.connect_map(move |_| arm());
+        }
+        // The permanent tick this replaces started polling at install time;
+        // the first armed poll likewise waits for the first mapped frame and
+        // applies the initial geometry before standing down.
+        arm();
     }
 
     /// Root GTK widget to embed in the notebook page.
@@ -15281,7 +15411,8 @@ mod tests {
         selected_blocks_markdown, selected_command_text, selected_id_range,
         shell_argv_supports_agent_ids, shell_argv_uses_jsh, shell_integration_hint,
         should_buffer_background_output, stable_visible_indices, step_marked_indices,
-        step_marked_record_ids, strip_ansi, strip_ansi_with_clear_detect, take_background_output,
+        step_marked_record_ids, sticky_scan_inputs_changed, strip_ansi,
+        strip_ansi_with_clear_detect, take_background_output,
         take_stash_for_undo, truncate_plain_output_for_height,
         verified_editor_contains_exact_command, viewport_page_size_changed,
         viewport_state_for_scroll, viewport_state_pair_for_scroll, visible_indices_for_viewport,
@@ -15289,7 +15420,8 @@ mod tests {
         AnchorTickExit, BlockData, BlockState, BoundedByteRing, BoundedClipboardAccumulator,
         CommandFinishedEvent, CommandIdCorrelation, CommandMeta, CommandPromptStatus,
         CommandStartedEvent, DynamicColors, HumanInputKind, InputOrigin, PendingCommandMeta,
-        PostPromptFeed, TypedShadowFidelity, ViewportState, MAX_COMMAND_CAPTURE_BYTES,
+        PostPromptFeed, StickyScanInputs, TypedShadowFidelity, ViewportState,
+        MAX_COMMAND_CAPTURE_BYTES,
         MAX_JOURNAL_OUTPUT_BYTES, MAX_PROMPT_CAPTURE_BYTES, MAX_RAW_OUTPUT_BYTES,
         MAX_SELECTED_CLIPBOARD_BYTES, TERMINAL_RESET_INVALIDATED_SUBMISSION,
         TRUNCATED_COMMAND_PLACEHOLDER, UNAVAILABLE_COMMAND_PLACEHOLDER,
@@ -19074,6 +19206,35 @@ mod tests {
         assert!(!viewport_page_size_changed(&last_page_size, 300.4));
         assert!(viewport_page_size_changed(&last_page_size, 301.0));
         assert!(!viewport_page_size_changed(&last_page_size, f64::NAN));
+    }
+
+    #[test]
+    fn sticky_scan_inputs_gate_the_widget_walk() {
+        let inputs = StickyScanInputs {
+            value: 120.0,
+            upper: 4_000.0,
+            page_size: 600.0,
+            blocks: 7,
+            bar_height: 28,
+        };
+        // First pass always scans; an unchanged fingerprint never does.
+        assert!(sticky_scan_inputs_changed(None, inputs));
+        assert!(!sticky_scan_inputs_changed(Some(inputs), inputs));
+        // Every field is load-bearing: scroll position, rolled-up card
+        // heights, viewport extent, block census, and the bar's own height.
+        for moved in [
+            StickyScanInputs { value: 121.0, ..inputs },
+            StickyScanInputs { upper: 4_100.0, ..inputs },
+            StickyScanInputs { page_size: 601.0, ..inputs },
+            StickyScanInputs { blocks: 8, ..inputs },
+            StickyScanInputs { bar_height: 56, ..inputs },
+        ] {
+            assert!(sticky_scan_inputs_changed(Some(inputs), moved));
+        }
+        // A NaN from a half-configured adjustment must never wedge the cache:
+        // it fails equality and falls back to the old scan-every-pass behavior.
+        let nan = StickyScanInputs { value: f64::NAN, ..inputs };
+        assert!(sticky_scan_inputs_changed(Some(nan), nan));
     }
 
     #[test]
