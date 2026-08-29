@@ -311,6 +311,26 @@ All notable user-visible and operational changes are recorded here.
 
 ### Changed
 
+- workflow 子系统（TOML/YAML「保存的带参命令」库：发现、有界读取、两种格式的解析、校验、模板引擎与参数填写模型）迁移到共享库 `jterm_core::workflows` 并删除本地副本：`src/workflows.rs` 从 801 行缩到 288 行的策略 shim，`src/` 合计 +532 / −885（另涉及 `ui/dialogs.rs`、`ui/command_palette.rs`、`palette.rs`、`cli.rs`）。四个终端此前各自维护同一套引擎（anvil 772+144+248、forge 801、ember 867+284、frost 827+316 行），而且**读的是同一批目录里的同一批文件**——所以「哪个终端肯加载这份文件」的差异，等价于「同一个文件在不同终端里含义不同」。核心模块（rev `790d06a`）为 3185 行、73 个用例。forge 这边保留的只有真正属于它的四项决定：目录段 `forge`、由它派生的 `FORGE_WORKFLOW_DIR`、XDG 后端（glib，而不是 `dirs` crate）和列表顺序（按名称字母序），外加源码树 tier——`env!("CARGO_MANIFEST_DIR")` 在编译期相对**正在编译的 crate** 展开，放进 core 会让四个应用一起指向 `jterm_core/scripts/workflows`。
+
+  **本轮最大的用户可见变化，且四个终端共有：文件里没有声明 `default` 的参数不能再留空。** 留空（或只填空白）时插入被拒绝并报 `missing values: <名字>`，而不是把空字符串替换进模板——`kill -9 {pid}` 在 Pid 一栏没填时不会再往提示符里插入 `kill -9 `。参数对话框在按下 Insert 之前就用 “Still needs a value: …” 列出仍然空着的行。声明了 `default` 的参数（包括 `default = ""`）依旧可以渲染成空：**「空值有没有意义」由文件说了算**——把一个有默认值的字段清空仍是一次有意的空值，把一个没有默认值的字段清空则是缺值。这条守卫 anvil、ember、frost 三家都写了单元测试，四家都失效：每个界面在打开对话框时把每个声明的参数预填成 `""`，`render()` 里的判断因此永远够不到。现在规则同时落在 `render()`（直接检查 values map，调用方预填也绕不过去）和 `ArgsForm`（用 Unset / Supplied 两个状态在类型层面承载这个区别）。forge 甚至不可能实现过这条守卫：它的 `WorkflowArg::default` 是 `String`，「没有默认值」和「默认值是空串」是同一个值；共享 schema 用的是 `Option<String>`。
+
+  其余行为变化：零参数 workflow 现在也走 `render()`。forge 此前在两个激活点（统一命令面板的 accept 与 workflow 面板的 pick）把 `workflow.command` 原样写进 pane，所以它自己文档里写明的 `{{ }}` 字面花括号转义在那条路径上从未生效，模板也从未经过校验——`curl -X POST -d '{{"env":"prod"}}'` 现在插入为 `-d '{"env":"prod"}'`，而不是保留双花括号。`{{ service }}`（占位符名两侧有空格）现在与 `{{service}}` 一样绑定：forge 是唯一不 trim 占位符名的副本，任何按 mustache 习惯书写的共享库在它这里都会把 `{ service }` 字面渲染进命令。`awk '{{print $1}' file` 现在原样往返：未闭合的 `{{` 此前按两字节跳过，被悄悄改写成 `awk '{print $1}' file`——一个不同的、可执行的 awk 程序。名字带首尾空格的参数声明（`name = "pid "`）此前能加载、能通过校验、匹配不到任何占位符，用户在那一行输入的内容被静默丢弃，现在整份文件拒绝。被跳过的文件终于有日志：超限、符号链接、非 UTF-8、解析失败或校验失败都会打印 `workflows: skipping <路径>: <原因>`（路径与原因都经 `safe_inline_display` 净化）；forge 此前在有界读取里构造好错误字符串又丢掉（`let Ok(contents) = read_bounded_workflow(&path) else { continue };`、`toml::from_str(..).ok()?`），被拒的文件就这样从面板消失，且不留任何一行日志。「No workflows yet」提示不再打印一个 loader 自己都不会去读的相对目录。统一命令面板激活 workflow 不再重新扫盘：forge 此前为每次激活在 GTK 主循环上再跑一遍完整的五层 `load_all()`，而列表就是刚刚走同一条路径建出来的；现在在建表时的那份快照里解析（每次打开面板仍扫一次盘，见 `handoff.md` 的未完成项）。`--doctor` 的 workflow 计数改用 loader 自己的有界遍历（`workflow_files_in` + `load_one`），不再本地重写一份 `toml|yaml|yml` 判据，doctor 与面板不会再对「哪些文件算候选」给出不同答案。
+
+  `Ctrl+Shift+M` 的 workflow 面板改用共享的 `WorkflowPicker`，因此过滤行为变了：从「name + description + command + tags 全部小写后做子串匹配」改为对同一批字段做模糊匹配并按得分重排（得分相同保持库序），而且最多绘制 15 行。forge 是家族里唯一把命令模板也纳入检索的成员，这一点保留（`PickerPolicy::new(15, true)`），所以 `lsof` 仍能召回 kill-port。上下键现在在这份过滤后的列表上移动，不再靠跳过不可见行；查询框会剔除控制字符并截断到 4 KiB。行文本经 `safe_inline_display` 净化后再绘制。
+
+  内置示例库同步为四个终端逐字节一致。此前 6 份里有 5 份不同，其中 `find-large-files.yaml` 的差异是实质性的：同一个名字 “Find large files”，forge 是 `find . -type f -printf …`（一个参数、只搜当前目录），其余三家是 `find {{dir}} -type f -size +{{min_size}} …`（三个参数、可配根目录与大小阈值）。去重按名字且先到先得，所以同一份共享库在 forge 里会解析成另一条命令，正好抵消了共享格式本身的意义。tag 也一并统一（forge 的 `[net, debug]` 对其余三家的 `[network, diagnostics]`，因此 `network` 在 forge 里能召回 ssh-tunnel、在别处召不回）。另外 `docker-tail-logs.yaml` 给必填的 `container` 参数写了 `default: ""`——在新契约下那是一次**显式声明的空值**，本轮的守卫恰好不会在应用自己附带的例子上触发，而会插入 `docker logs -f --tail 100 `；该行已删除，`container` 现在是真正的必填参数。
+
+- **升级须知：一部分今天能加载的 workflow 文件在本次升级后将不再加载。** forge 的 TOML 解析器是手写在 `toml::Table` 上的，每个字段都走 `as_str().unwrap_or("")` / `filter_map(as_str)`，类型不对的值被抹掉、文件照常加载。两种格式现在统一走 serde derive，类型不符即拒绝整份文件并给出指明问题的消息：
+
+  - `default = 3000`（端口忘了加引号，最自然的一种笔误）此前变成空字符串，对话框里 Port 一栏是空的，按 Insert 会把 `lsof -ti tcp: | xargs -r kill -TERM` 送到提示符上。这是本轮修掉的 forge 在这个界面上最严重的缺陷，也是这次收紧的直接理由。
+  - `tags = ["net", 1]` 此前静默丢掉非字符串元素后照常加载。
+  - `[[args]]` 少写 `name` 此前静默丢掉那个参数，模板里对应的占位符于是原样留在插入的命令里。
+  - YAML 里参数名为空此前同样是静默丢弃该参数；现在与同样内容写成 TOML 时一致地拒绝整份文件。
+  - 命令模板为空、全是空白，或含有不可见 / 双向控制字符，现在拒绝（此前 `contains_visual_spoofing` 只作用于 name、description 和 tags）。
+
+  其余三个终端本来就拒绝上述全部文件，因此这是 forge 向家族规则靠拢，而不是新增限制。升级后如果面板里少了条目，用 `FORGE_LOG=warn forge` 或 `forge --doctor` 查看 `workflows: skipping <路径>: <原因>`——在此之前这些文件是无声消失的。
+
 - AI 命令纠错（typo-like 失败后的可审阅纠正）迁移到共享库 `jterm_core::command_correction` 并删除本地副本：`src/ui/command_correction.rs` 从 2148 行缩到 888 行的 UI/策略 shim。四个终端此前各自维护同一套流程（anvil 1817、forge 2148、ember 2335、frost 1552，共 7852 行，其中引擎部分不含任何 GTK 代码），现在合并为一份 3937 行（含测试）的实现，四个应用合计减少 6294 行。分类、token 提取、typo 排序、安全门、provider prompt、严格 JSON 应答解析、helper 解析、有界探测、两级求解与请求 epoch 状态机全部上移；forge 保留的是自己的界面：能到达嵌套分屏叶子的 Notebook 挂载层、50 ms GLib 轮询、块流中的内联审阅卡，以及唯一一个兄弟项目都没有的 tracked submission（已验证命令保持可见且不可交互，直到 `CommandStart` 证明身份为止，证明未到达则撤销 organism assist pulse）。
 
   **本轮最大的用户可见变化：`ai_share_command_context` 关闭时（这是默认值），命令纠错不再联系 AI provider。** 失败的命令、工作目录与至多 8 KiB 终端输出不再离开本机。forge 一直发布这个开关、把它写进文档、并要求在启动原生 Codex 任务前打开它，却唯独在这个负载最大的界面上从未查询过它。本地可验证的纠正（APT 索引、可执行文件 PATH、目标自己打印的建议）完全不受影响，证据从来没有离开过机器；已经打开该开关的用户没有任何变化。依赖 AI 纠错的用户请在 `config.toml` 中设置 `ai_share_command_context = true`（或 `FORGE_AI_SHARE_COMMAND_CONTEXT=1`）。
@@ -397,6 +417,8 @@ All notable user-visible and operational changes are recorded here.
 - Block 模式的动态颜色查询（OSC 10/11/12 `?`）不再返回过期的主题色：应用通过 OSC 10/11/12 设置前景/背景/光标色后（主题切换工具、vim `background=` 探测等；原始字节仍照常透传，live VTE 原生变色），共享解析器现在发出 `ColorSet`/`ColorReset` 事件，每个 pane 据此跟踪动态覆盖值——支持 `#RRGGBB` 十六进制、X11 `rgb:R/G/B`（每通道 1–4 位十六进制，按 XParseColor 语义缩放）与颜色名，无法解析的值忽略——后续查询以既有的 `rgb:RRRR/GGGG/BBBB` 格式回答动态值，OSC 110/111/112 复位后回落到主题色。动态前景/背景生效期间新完成的 Block 快照 VTE 也叠加同一覆盖色，不再与已变色的 live 视图形成明显割裂。
 
 ### Security
+
+- workflow 加载的两处薄弱点随迁移关闭，两处都只在 forge 存在：命令模板此前只检查长度和 `review_input::validate`，从不做 `contains_visual_spoofing`（只有 name、description、tags 做），带 bidi 覆盖或默认忽略字符的命令因此可以加载并预填进审阅编辑行；现在与其他字段同规则，任何一项不合格就拒绝整份文件。用户目录此前由 `HOME` 推导并 `unwrap_or_default()`，`HOME` 未设置时 forge 会去扫 `./.config/forge/workflows`——克隆一个含该目录的仓库、在其中启动 forge，仓库里的文件就成了优先级最高的 workflow 层；现在改用 `glib::user_config_dir()`，任何非绝对路径的答案都视为查不到并跳过该层，绝不相对进程 CWD 解析。符号链接的 workflow 文件继续由 `O_NOFOLLOW` 拒绝（forge 原本就是如此，家族其余成员现在与之一致）。
 
 - 命令纠错的三个安全漏洞随迁移一并关闭（每个都只在部分副本中存在，因此合并本身就是修复动作）：
 

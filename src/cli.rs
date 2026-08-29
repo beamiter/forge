@@ -66,7 +66,6 @@ struct ParsedArgs {
 }
 
 static LAUNCH_OPTIONS: OnceLock<LaunchOptions> = OnceLock::new();
-const MAX_WORKFLOW_DISCOVERY_ENTRIES: usize = 4_096;
 
 pub(crate) fn launch_options() -> &'static LaunchOptions {
     LAUNCH_OPTIONS.get_or_init(LaunchOptions::default)
@@ -588,34 +587,29 @@ fn executable_available(executable: &str, flatpak: bool) -> bool {
     }
 }
 
-fn workflow_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "toml" | "yaml" | "yml"
-            )
-        })
-}
-
+/// Doctor's view of the workflow library: how many load, how many search
+/// locations are readable, and how many candidate files were refused.
+///
+/// The walk is the loader's own (`workflow_files_in` plus `load_one`), not a
+/// second copy of it: the extension predicate and the per-directory caps used
+/// to be re-derived here, and a second implementation of an on-disk contract
+/// inside one app is how the next divergence starts.
 fn workflow_discovery() -> (usize, usize, usize, usize) {
     let dirs = crate::workflows::workflow_dirs();
     let mut existing_dirs = 0;
     let mut candidate_files = 0;
     let mut parsed_files = 0;
     for dir in &dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else {
+        if std::fs::read_dir(dir).is_err() {
             continue;
-        };
+        }
         existing_dirs += 1;
-        candidate_files += entries
-            .take(MAX_WORKFLOW_DISCOVERY_ENTRIES)
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-            .filter(|entry| workflow_file(&entry.path()))
+        let candidates = crate::workflows::workflow_files_in(dir);
+        candidate_files += candidates.len();
+        parsed_files += candidates
+            .iter()
+            .filter(|path| crate::workflows::load_one(path).is_ok())
             .count();
-        parsed_files += crate::workflows::load_all_from(dir).len();
     }
     (
         crate::workflows::load_all().len(),

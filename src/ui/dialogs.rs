@@ -43,6 +43,42 @@ const CROSS_BLOCK_SEARCH_CONTROL_SPACING: i32 = 6;
 /// off-screen rows. Keep this palette intentionally small until it moves to a
 /// virtualized model, regardless of the much larger on-disk retention limit.
 const HISTORY_PALETTE_ROW_LIMIT: usize = 500;
+/// The standalone workflow overlay uses the same drawn-row/navigation cap as
+/// ember and frost. Forge keeps command-template search enabled because that
+/// is its established recall behaviour; the policy is explicit rather than
+/// an uncapped `ListBox` built from every on-disk entry.
+const WORKFLOW_PALETTE_POLICY: crate::workflows::PickerPolicy =
+    crate::workflows::PickerPolicy::new(15, true);
+const WORKFLOW_PALETTE_LABEL_BYTES: usize = 256;
+const WORKFLOW_PALETTE_PREVIEW_BYTES: usize = 4 * 1024;
+
+fn render_workflow_palette_rows(list: &ListBox, workflows: &[crate::workflows::Workflow]) {
+    while let Some(row) = list.row_at_index(0) {
+        list.remove(&row);
+    }
+    for workflow in workflows {
+        let title = jterm_core::review_input::safe_inline_display(
+            &workflow.name,
+            WORKFLOW_PALETTE_LABEL_BYTES,
+        );
+        let subtitle = if workflow.description.is_empty() {
+            &workflow.command
+        } else {
+            &workflow.description
+        };
+        let subtitle =
+            jterm_core::review_input::safe_inline_display(subtitle, WORKFLOW_PALETTE_PREVIEW_BYTES);
+        let row = adw::ActionRow::builder()
+            .title(&title)
+            .subtitle(&subtitle)
+            .activatable(true)
+            .build();
+        list.append(&row);
+    }
+    if let Some(first_row) = list.row_at_index(0) {
+        list.select_row(Some(&first_row));
+    }
+}
 
 /// `AdwPreferencesGroup:title` is rendered as Pango markup. Escape every
 /// caller-provided title so ordinary characters such as `&` stay visible and
@@ -3739,19 +3775,23 @@ impl UiState {
             return;
         };
 
-        let workflows: Rc<Vec<crate::workflows::Workflow>> = Rc::new(crate::workflows::load_all());
+        let workflows = crate::workflows::load_all();
         if workflows.is_empty() {
-            log::debug!(
-                "[workflows] no workflows in {}",
-                crate::workflows::workflows_dir().display()
-            );
+            // `None` when no absolute user config directory resolves, which is
+            // also when the loader skips that tier: the hint must never name a
+            // directory the loader would not read.
+            let user_dir = crate::workflows::user_workflow_dir();
+            let target = user_dir
+                .as_ref()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_else(|| "your user configuration directory".to_string());
+            log::debug!("[workflows] no workflows in {target}");
             // Toast-like hint via a one-shot message dialog. Otherwise the
             // user gets no feedback at all and concludes the chord is dead.
             let dialog = adw::MessageDialog::builder()
                 .heading("No workflows yet")
                 .body(format!(
-                    "Add `*.toml`, `*.yaml`, or `*.yml` workflow files to:\n\n{}",
-                    crate::workflows::workflows_dir().display()
+                    "Add `*.toml`, `*.yaml`, or `*.yml` workflow files to:\n\n{target}"
                 ))
                 .build();
             dialog.add_response("ok", "OK");
@@ -3778,39 +3818,12 @@ impl UiState {
         list_box.set_margin_end(12);
         list_box.set_margin_bottom(12);
 
-        // Haystack = name + description + command, all lowercased.
-        let haystacks: Rc<Vec<String>> = Rc::new(
-            workflows
-                .iter()
-                .map(|w| {
-                    format!(
-                        "{} {} {} {}",
-                        w.name,
-                        w.description,
-                        w.command,
-                        w.tags.join(" ")
-                    )
-                    .to_lowercase()
-                })
-                .collect(),
-        );
-
-        for wf in workflows.iter() {
-            let subtitle = if wf.description.is_empty() {
-                wf.command.clone()
-            } else {
-                wf.description.clone()
-            };
-            let row = adw::ActionRow::builder()
-                .title(&wf.name)
-                .subtitle(&subtitle)
-                .activatable(true)
-                .build();
-            list_box.append(&row);
-        }
-        if let Some(first_row) = list_box.row_at_index(0) {
-            list_box.select_row(Some(&first_row));
-        }
+        let picker = Rc::new(RefCell::new(crate::workflows::WorkflowPicker::new(
+            workflows,
+            WORKFLOW_PALETTE_POLICY,
+        )));
+        let visible: Vec<_> = picker.borrow().filtered().into_iter().cloned().collect();
+        render_workflow_palette_rows(&list_box, &visible);
 
         let scrolled = ScrolledWindow::builder()
             .hexpand(true)
@@ -3832,36 +3845,44 @@ impl UiState {
         dialog.set_child(Some(&toolbar_view));
 
         let list_box_for_filter = list_box.clone();
-        let haystacks_for_filter = haystacks.clone();
+        let picker_for_filter = picker.clone();
         filter_entry.connect_search_changed(move |entry| {
-            let query = entry.text().to_string().to_lowercase();
-            let mut first_visible: Option<gtk4::ListBoxRow> = None;
-            for (idx, hay) in haystacks_for_filter.iter().enumerate() {
-                if let Some(row) = list_box_for_filter.row_at_index(idx as i32) {
-                    let visible = query.is_empty() || hay.contains(&query);
-                    row.set_visible(visible);
-                    if visible && first_visible.is_none() {
-                        first_visible = Some(row);
-                    }
-                }
+            let normalized = {
+                let mut picker = picker_for_filter.borrow_mut();
+                picker.set_query(entry.text().to_string());
+                picker.query().to_string()
+            };
+            if entry.text().as_str() != normalized {
+                // `set_text` emits this signal again; the normalized second
+                // pass reaches the rendering branch and terminates.
+                entry.set_text(&normalized);
+                return;
             }
-            if let Some(row) = first_visible {
-                list_box_for_filter.select_row(Some(&row));
-            }
+            let visible: Vec<_> = picker_for_filter
+                .borrow()
+                .filtered()
+                .into_iter()
+                .cloned()
+                .collect();
+            render_workflow_palette_rows(&list_box_for_filter, &visible);
         });
 
         // Pick is the only verb here: either write the command directly
-        // (no args) or hand off to the args dialog. Cloning the Vec is
-        // cheap relative to the dialog work that follows.
-        let workflows_for_pick = workflows.clone();
+        // (no args) or hand off to the args dialog. The row index resolves
+        // against the same filtered snapshot the shared picker drew.
+        let picker_for_pick = picker.clone();
         let ui_self = self.clone();
         let pane_for_pick = pane.clone();
         let pick = Rc::new(move |idx: usize| {
-            let Some(wf) = workflows_for_pick.get(idx).cloned() else {
+            let Some(wf) = picker_for_pick.borrow().workflow_at_filtered(idx).cloned() else {
                 return;
             };
             if wf.args.is_empty() {
-                ui_self.insert_review_text(&pane_for_pick, &wf.command);
+                // Through the template engine, like every other workflow: the
+                // raw-template shortcut that used to live here is what made
+                // forge's own literal-brace escape a no-op for zero-argument
+                // workflows.
+                ui_self.insert_workflow(&pane_for_pick, &wf);
             } else {
                 ui_self.show_workflow_args_dialog(wf, pane_for_pick.clone());
             }
@@ -3881,6 +3902,7 @@ impl UiState {
         let list_box_for_key = list_box.clone();
         let dialog_for_key = dialog.clone();
         let pick_for_key = pick.clone();
+        let picker_for_key = picker.clone();
         key_controller.connect_key_pressed(move |_, keyval, _, state| {
             if keyval == Key::Escape
                 || (matches!(keyval, Key::M | Key::m)
@@ -3900,35 +3922,23 @@ impl UiState {
                 }
                 return true.into();
             }
-            if keyval == Key::Down {
+            if matches!(keyval, Key::Down | Key::Up) {
                 let current = list_box_for_key
                     .selected_row()
-                    .map(|r| r.index())
-                    .unwrap_or(-1);
-                let mut next = current + 1;
-                while let Some(row) = list_box_for_key.row_at_index(next) {
-                    if row.is_visible() {
-                        list_box_for_key.select_row(Some(&row));
-                        break;
-                    }
-                    next += 1;
-                }
-                return true.into();
-            }
-            if keyval == Key::Up {
-                let current = list_box_for_key
-                    .selected_row()
-                    .map(|r| r.index())
+                    .map(|row| row.index() as usize)
                     .unwrap_or(0);
-                let mut prev = current - 1;
-                while prev >= 0 {
-                    if let Some(row) = list_box_for_key.row_at_index(prev) {
-                        if row.is_visible() {
-                            list_box_for_key.select_row(Some(&row));
-                            break;
-                        }
+                let next = {
+                    let mut picker = picker_for_key.borrow_mut();
+                    picker.select(current);
+                    if keyval == Key::Down {
+                        picker.select_next();
+                    } else {
+                        picker.select_prev();
                     }
-                    prev -= 1;
+                    picker.selected()
+                };
+                if let Some(row) = list_box_for_key.row_at_index(next as i32) {
+                    list_box_for_key.select_row(Some(&row));
                 }
                 return true.into();
             }
@@ -3946,10 +3956,21 @@ impl UiState {
         filter_entry.grab_focus();
     }
 
-    /// Modal arg-entry dialog for a workflow. One Entry per arg, default
-    /// pre-filled; "Insert command" substitutes and writes the resolved command into
-    /// the live PTY (without a trailing newline — user reviews and hits
-    /// Enter). Cancel/Escape exits without touching the terminal.
+    /// Modal arg-entry dialog for a workflow. One row per argument, seeded
+    /// from its declared default; "Insert command" renders and writes the
+    /// resolved command into the live PTY (without a trailing newline — the
+    /// user reviews and hits Enter). Cancel/Escape exits without touching the
+    /// terminal.
+    ///
+    /// The fill state is a [`crate::workflows::ArgsForm`], not a
+    /// `Vec<(String, Entry)>`, because the distinction it carries is the whole
+    /// point: an argument whose file declares **no default** starts *unset*,
+    /// not pre-seeded with `""`. Every UI in this family used to seed every
+    /// declared argument with the empty string, which made `render()`'s
+    /// missing-value guard unreachable from all four apps — `kill -9 {pid}`
+    /// with an untouched Pid field inserted `kill -9 ` at the prompt. forge
+    /// could not even have had that guard: its `WorkflowArg::default` was a
+    /// `String`, so "no default" and "empty default" were the same value.
     pub(crate) fn show_workflow_args_dialog(
         &self,
         wf: crate::workflows::Workflow,
@@ -3984,62 +4005,88 @@ impl UiState {
         preview.add_css_class("monospace");
         body.append(&preview);
 
-        // One row per arg.
-        let entries: Rc<RefCell<Vec<(String, gtk4::Entry)>>> = Rc::new(RefCell::new(Vec::new()));
-        for arg in wf.args.iter() {
-            let row = adw::EntryRow::builder()
-                .title(&arg.name)
-                .text(&arg.default)
-                .build();
-            if !arg.description.is_empty() {
-                row.set_tooltip_text(Some(&arg.description));
-            }
-            body.append(&row);
-            // EntryRow doesn't expose a stable `Entry` handle in this
-            // gtk-rs version, so we stash a gtk4::Entry mirror that we
-            // bind two-way. Simpler than digging the inner Entry out.
-            let entry = gtk4::Entry::new();
-            entry.set_text(&arg.default);
-            entry.set_visible(false);
-            body.append(&entry);
-            {
-                let entry_clone = entry.clone();
-                row.connect_changed(move |r| {
-                    entry_clone.set_text(&r.text());
-                });
-            }
-            entries.borrow_mut().push((arg.name.clone(), entry));
-        }
+        // Which rows are still outstanding, named before the user presses
+        // Insert rather than as a failed render afterwards.
+        let outstanding = Label::new(None);
+        outstanding.set_xalign(0.0);
+        outstanding.set_wrap(true);
+        outstanding.add_css_class("dim-label");
 
         let run_btn = gtk4::Button::with_label("Insert command");
         run_btn.add_css_class("suggested-action");
         run_btn.set_halign(gtk4::Align::End);
         run_btn.set_margin_top(8);
+
+        let args = wf.args.clone();
+        let form = Rc::new(RefCell::new(crate::workflows::ArgsForm::new(wf)));
+
+        // The hint is advisory, and the button stays live behind it:
+        // `missing()` is a superset — an argument the template never
+        // references does not block the render — so `render()` remains the one
+        // authority on whether this workflow can be inserted.
+        let refresh_outstanding = Rc::new({
+            let form = form.clone();
+            let outstanding = outstanding.clone();
+            move || {
+                let names = form.borrow().missing().join(", ");
+                outstanding.set_visible(!names.is_empty());
+                if !names.is_empty() {
+                    outstanding.set_text(&format!("Still needs a value: {names}"));
+                }
+            }
+        });
+
+        // One row per argument, seeded from the form so an argument with no
+        // declared default comes up visibly empty *and* unset.
+        for (index, arg) in args.iter().enumerate() {
+            let seed = form.borrow().value(index).to_string();
+            let row = adw::EntryRow::builder()
+                .title(&arg.name)
+                .text(&seed)
+                .build();
+            if !arg.description.is_empty() {
+                row.set_tooltip_text(Some(&arg.description));
+            }
+            let form_for_row = form.clone();
+            let refresh_for_row = refresh_outstanding.clone();
+            row.connect_changed(move |row| {
+                form_for_row.borrow_mut().set(index, row.text().as_str());
+                refresh_for_row();
+            });
+            body.append(&row);
+        }
+
+        body.append(&outstanding);
         body.append(&run_btn);
+        refresh_outstanding();
 
         let toolbar_view = adw::ToolbarView::new();
         toolbar_view.add_top_bar(&header_bar);
         toolbar_view.set_content(Some(&body));
         dialog.set_child(Some(&toolbar_view));
 
-        let entries_for_run = entries.clone();
+        let form_for_run = form.clone();
         let pane_for_run = pane.clone();
         let ui_for_run = self.clone();
         let dialog_for_run = dialog.clone();
-        let template = wf.command.clone();
         run_btn.connect_clicked(move |_| {
-            let bindings: Vec<(String, String)> = entries_for_run
-                .borrow()
-                .iter()
-                .map(|(n, e)| (n.clone(), e.text().to_string()))
-                .collect();
-            match crate::workflows::substitute(&template, &bindings) {
+            // `ArgsForm::render` re-validates the workflow, bounds and checks
+            // every value, and puts the finished text back across
+            // `review_input::validate`. The old path called `substitute`,
+            // which is the lenient seam and validates neither its bindings nor
+            // its output.
+            // Rendered before the match, so no borrow is live across
+            // `force_close()` — tearing the dialog down disposes the rows, and
+            // a row that emitted `changed` on the way out would re-enter the
+            // form mutably.
+            let rendered = form_for_run.borrow().render();
+            match rendered {
                 Ok(resolved) => {
                     dialog_for_run.force_close();
                     ui_for_run.insert_review_text(&pane_for_run, &resolved);
                 }
                 Err(error) => {
-                    log::warn!("refusing unsafe workflow substitution: {error}");
+                    log::warn!("refusing unsafe or incomplete workflow render: {error}");
                     let alert =
                         adw::AlertDialog::new(Some("Command was not inserted"), Some(&error));
                     alert.add_response("ok", "OK");
@@ -4180,6 +4227,7 @@ mod tests {
         CrossBlockJumpOutcome, CrossBlockRefreshFrameDecision, CrossBlockRefreshFrameGate,
         CrossBlockRefreshKeyDecision, CrossBlockRefreshKeyLatch, CrossBlockSelectionAnchor,
         CrossBlockSelectionMove, CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
+        WORKFLOW_PALETTE_POLICY,
     };
     use crate::block_view::{
         BookmarkedSearchEmptyReason, CrossBlockHit, CrossBlockSearchOptions, CrossBlockSearchScope,
@@ -4208,6 +4256,41 @@ mod tests {
             Err("No remote hosts are configured. Add one in Settings → Remote Hosts.")
         );
         assert!(remote_picker_guard(false, 1).is_ok());
+    }
+
+    #[test]
+    fn standalone_workflow_picker_keeps_forge_search_with_a_drawn_row_cap() {
+        assert_eq!(WORKFLOW_PALETTE_POLICY.max_results(), 15);
+        assert!(WORKFLOW_PALETTE_POLICY.search_command());
+
+        let mut entries: Vec<_> = (0..20)
+            .map(|index| crate::workflows::Workflow {
+                name: format!("workflow-{index:02}"),
+                description: String::new(),
+                command: "echo ordinary".to_string(),
+                tags: Vec::new(),
+                shell: None,
+                args: Vec::new(),
+                source_path: None,
+            })
+            .collect();
+        entries[19].command = "lsof -ti tcp:4321".to_string();
+
+        let mut picker = crate::workflows::WorkflowPicker::new(entries, WORKFLOW_PALETTE_POLICY);
+        assert_eq!(picker.filtered().len(), 15);
+        picker.select_prev();
+        assert_eq!(picker.selected(), 14, "navigation wraps within drawn rows");
+        assert!(!picker.select(15), "an undrawn row cannot be selected");
+        assert_eq!(picker.selected(), 14);
+
+        // Forge intentionally retains command-template search. The newline
+        // also observes the widget/programmatic query boundary used by the
+        // actual SearchEntry callback.
+        picker.set_query("lsof\n");
+        assert_eq!(picker.query(), "lsof");
+        assert_eq!(picker.selected(), 0, "query changes reset selection");
+        assert_eq!(picker.filtered().len(), 1);
+        assert_eq!(picker.filtered()[0].name, "workflow-19");
     }
 
     #[test]

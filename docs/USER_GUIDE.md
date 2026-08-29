@@ -446,7 +446,9 @@ Block Search 4.2 新增 **Bookmarked** 元数据筛选。它与 Failed、Slow、
 
 JSONL 历史默认位于 `${XDG_STATE_HOME:-~/.local/state}/forge/history.jsonl`，只保存 command、cwd、exit code 和完成时间，不保存终端输出。文件权限为 `0600`，重复命令按最新记录展示，损坏或超限记录会跳过，文件会按上限压缩。`Ctrl+Shift+H` 面板最多创建最近 500 行，即使磁盘保留上限更高；状态行会明确标出显示边界。
 
-用户 workflow 放在 `~/.config/forge/workflows/`，支持 `.toml`、`.yaml`、`.yml`；也可用 `FORGE_WORKFLOW_DIR` 增加以路径列表表示的目录。用户定义优先于已安装示例，同名项不会被示例覆盖。
+用户 workflow 放在 `~/.config/forge/workflows/`，支持 `.toml`、`.yaml`、`.yml`；也可用 `FORGE_WORKFLOW_DIR` 增加以路径列表表示的目录。搜索顺序为：用户配置目录 → `FORGE_WORKFLOW_DIR` → 用户 data 目录 → 各系统 data 目录 → 源码树示例；去重按名字且先到先得，因此用户定义优先于已安装示例，同名项不会被示例覆盖。用户配置目录解析不到绝对路径时（例如 `HOME` 未设置）该层直接跳过，不会相对当前工作目录解析成 `./.config/forge/workflows`。
+
+格式与加载器与 anvil、ember、frost 共用（`jterm_core::workflows`），同一个文件在四个终端里含义相同。字段类型必须正确，类型不符会拒绝整份文件而不是抹掉坏值后照常加载：`default = 3000`（忘了加引号的端口）、`tags = ["net", 1]`、缺 `name` 的 `[[args]]`、参数名带首尾空格、命令模板为空或含不可见 / 双向控制字符，都属于此类。被跳过的文件会在日志里留下 `workflows: skipping <路径>: <原因>`（超限、符号链接、非 UTF-8、解析失败同理），`forge --doctor` 的 workflow 计数使用同一套遍历，因此 doctor 与面板不会对「哪些文件算候选」给出不同答案。
 
 安装包附带 feature branch、大文件查找、交互式 rebase、SSH 本地端口转发、Docker 日志跟随和端口进程终止示例。所有示例都只生成可编辑的单行命令；选中后不会自动执行，其中会结束进程或建立长连接的模板仍须由用户逐字审阅。
 
@@ -464,10 +466,13 @@ default = "main"
 
 [[args]]
 name = "env"
-default = "staging"
+# 没有 default：这个参数必须填。留空或只填空白时插入会被拒绝并报
+# missing values: env，而不是把空字符串替换进模板。
 ```
 
-YAML 可使用共享格式的 `{{name}}` placeholder。未提供的必填参数不会静默执行，生成内容始终只进入当前 pane 的编辑行。为保证“只插入、不提交”，history、workflow、文件路径和 AI 候选只接受不含 CR、LF、NUL 或其他终端控制字符的单行文本；不安全条目会被拒绝并提示，而不会写入 PTY。
+模板支持 `{name}` 与共享格式的 `{{name}}` 两种 placeholder，占位符名两侧的空格会被忽略（`{{ service }}` 等同于 `{{service}}`）；`{{ }}` 是字面花括号转义，未闭合的 `{{` 原样保留（`awk '{{print $1}' file` 不会被改写）。零参数 workflow 也走同一条渲染路径，因此转义在任何 workflow 上都成立。
+
+**没有声明 `default` 的参数不能留空。** 留空或只填空白时插入被拒绝并报 `missing values: <名字>`，参数对话框在按 Insert 之前就用 “Still needs a value: …” 列出仍然空着的行；`kill -9 {pid}` 在 Pid 一栏没填时不会插入 `kill -9 `。声明了 `default` 的参数（包括 `default = ""`）仍可渲染成空值——「空值有没有意义」由文件说了算：清空一个有默认值的字段是一次有意的空值，清空一个没有默认值的字段是缺值。生成内容始终只进入当前 pane 的编辑行。为保证“只插入、不提交”，history、workflow、文件路径和 AI 候选只接受不含 CR、LF、NUL 或其他终端控制字符的单行文本；不安全条目会被拒绝并提示，而不会写入 PTY。
 
 ## 7. 可执行 Notebook
 
@@ -671,6 +676,7 @@ forge-support-bundle .
 - AI 不可用：检查 `ai_enabled`、provider 对应密钥、base URL 和 `curl`。
 - 欢迎 Notebook 找不到：重新安装资产，或设置 `FORGE_ASSET_DIR=/path/to/share/forge`。
 - workflow 示例找不到：检查 `${prefix}/share/forge/workflows`；非默认 prefix 可设置 `FORGE_WORKFLOW_DIR`。
+- 某个 workflow 文件不出现在面板里：用 `FORGE_LOG=warn forge` 查看 `workflows: skipping <路径>: <原因>`，常见原因是字段类型不符（例如 `default = 3000` 少了引号）、参数名为空或带首尾空格、文件是符号链接。
 - 长命令无通知：检查 `notify_long_blocks`、阈值、`notify-send` 和通知服务。
 - SSH 无目标：添加 `[[remote_hosts]]` 后按 `Ctrl+Shift+S`。
 - 配置修改没生效：先运行 `--check-config`；并发冲突需要重载后再保存。

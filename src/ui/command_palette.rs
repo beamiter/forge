@@ -474,7 +474,36 @@ impl UiState {
         )
     }
 
-    fn accept_palette_entry(&self, entry: Entry) {
+    /// Render a workflow and insert it for review.
+    ///
+    /// The single insertion path for every workflow, zero-argument ones
+    /// included. forge used to write `workflow.command` straight to the pane
+    /// whenever `args` was empty, so the `{{ }}` literal-brace escape its own
+    /// module documents was not applied there — `-d '{{"env":"prod"}}'`
+    /// reached the prompt with the braces still doubled — and the template
+    /// never crossed validation on that path at all.
+    pub(crate) fn insert_workflow(
+        &self,
+        pane: &crate::ui::PaneLeaf,
+        workflow: &crate::workflows::Workflow,
+    ) {
+        match crate::workflows::render(workflow, &std::collections::HashMap::new()) {
+            Ok(command) => {
+                self.insert_review_text(pane, &command);
+            }
+            Err(error) => {
+                log::warn!("refusing unsafe workflow render: {error}");
+                let alert = adw::AlertDialog::new(Some("Command was not inserted"), Some(&error));
+                alert.add_response("ok", "OK");
+                alert.set_default_response(Some("ok"));
+                alert.present(Some(&self.window));
+            }
+        }
+    }
+
+    /// `workflows` is the library this palette listed, not a fresh scan — see
+    /// the `RunWorkflow` arm.
+    fn accept_palette_entry(&self, entry: Entry, workflows: &[crate::workflows::Workflow]) {
         match entry.accept {
             Accept::Action(action) => self.execute_action(action),
             Accept::TypeCommand(command) => {
@@ -492,20 +521,30 @@ impl UiState {
                 self.generate_command_for_review(request);
             }
             Accept::RunWorkflow(path) => {
-                let Some(workflow) = crate::workflows::load_all()
-                    .into_iter()
-                    .find(|workflow| workflow.source_path == path)
+                // The library this palette was built from, not a second full
+                // five-tier disk walk: forge re-ran `load_all()` here on every
+                // activation, on the GTK main loop, having already walked the
+                // same path to populate the list the user just picked from.
+                let Some(workflow) = workflows
+                    .iter()
+                    .find(|workflow| workflow.source_path.as_deref() == Some(path.as_path()))
                 else {
-                    log::warn!("workflow disappeared before activation: {}", path.display());
+                    log::warn!(
+                        "workflow disappeared before activation: {}",
+                        jterm_core::review_input::safe_inline_display(
+                            &path.to_string_lossy(),
+                            crate::workflows::MAX_LOGGED_PATH_BYTES
+                        )
+                    );
                     return;
                 };
                 let Some(pane) = self.current_pane_leaf() else {
                     return;
                 };
                 if workflow.args.is_empty() {
-                    self.insert_review_text(&pane, &workflow.command);
+                    self.insert_workflow(&pane, workflow);
                 } else {
-                    self.show_workflow_args_dialog(workflow, pane);
+                    self.show_workflow_args_dialog(workflow.clone(), pane);
                 }
             }
         }
@@ -820,12 +859,13 @@ impl UiState {
             let ui = self.clone();
             let entries = entries.clone();
             let dialog = dialog.clone();
+            let snapshot = snapshot.clone();
             Rc::new(move |index: usize| {
                 let Some(entry) = entries.borrow().get(index).cloned() else {
                     return;
                 };
                 dialog.force_close();
-                ui.accept_palette_entry(entry);
+                ui.accept_palette_entry(entry, &snapshot.workflows);
             })
         };
         {

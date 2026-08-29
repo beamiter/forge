@@ -119,6 +119,13 @@ pub(crate) fn gather(
 
     if matches!(query.mode, PaletteMode::All | PaletteMode::Workflows) {
         for workflow in workflows {
+            // A row is addressed by the file it came from, because the library
+            // can be rebuilt between listing and activation. A workflow built
+            // in memory carries no path and therefore cannot be listed here —
+            // every workflow the loader returns does.
+            let Some(source_path) = workflow.source_path.clone() else {
+                continue;
+            };
             let tag_text = workflow.tags.join(",");
             let searchable = if tag_text.is_empty() {
                 workflow.description.clone()
@@ -140,7 +147,7 @@ pub(crate) fn gather(
                         searchable
                     }),
                     right: (!tag_text.is_empty()).then(|| format!(":{tag_text}")),
-                    accept: Accept::RunWorkflow(workflow.source_path.clone()),
+                    accept: Accept::RunWorkflow(source_path),
                 },
                 &mut entries,
             );
@@ -389,6 +396,42 @@ mod tests {
 
         assert!(entries[0].label.contains("too large"));
         assert!(matches!(&entries[0].accept, Accept::TypeCommand(text) if text.is_empty()));
+    }
+
+    /// A workflow row is addressed by the file it came from, not by its index
+    /// in a list that a rescan can reorder — and a workflow the loader did not
+    /// stamp with a path (one built in memory) has no address, so it is not
+    /// offered at all.
+    #[test]
+    fn a_workflow_row_is_addressed_by_the_file_it_came_from() {
+        let listed = Workflow {
+            name: "Deploy".to_string(),
+            description: "Ship a service".to_string(),
+            command: "deploy {{service}}".to_string(),
+            tags: vec!["ops".to_string()],
+            shell: None,
+            args: Vec::new(),
+            source_path: Some(PathBuf::from("/w/deploy.toml")),
+        };
+        let pathless = Workflow {
+            name: "In memory".to_string(),
+            source_path: None,
+            ..listed.clone()
+        };
+
+        let entries = gather(
+            &Query::parse(":", PaletteMode::All),
+            &KeybindingMap::from_defaults(),
+            &[],
+            &[listed, pathless],
+            10,
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].label, "\u{2699} Deploy");
+        assert_eq!(entries[0].right.as_deref(), Some(":ops"));
+        assert!(
+            matches!(&entries[0].accept, Accept::RunWorkflow(path) if path == std::path::Path::new("/w/deploy.toml"))
+        );
     }
 
     #[test]

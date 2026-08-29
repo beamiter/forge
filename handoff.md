@@ -1,7 +1,8 @@
 # Engineering handoff
 
-Updated: 2026-08-29 (command correction upstreamed to
-jterm_core::command_correction; helper-trust, pipe and consent holes closed)
+Updated: 2026-08-29 (workflow subsystem upstreamed to jterm_core::workflows;
+the family-wide unfilled-argument guard closed, forge's silent TOML coercion
+removed, the bundled library reconciled with its three siblings)
 
 This working tree contains the nine-round "Evolve ASCII organism" series
 (`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
@@ -19,6 +20,221 @@ every round (attribution races, a Drop panic on a fired glib source, a
 saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
+
+- **Workflow subsystem upstreamed (2026-08-29)**: `src/workflows.rs` is a
+  288-line policy shim over `jterm_core::workflows`, pinned at core rev
+  `790d06a`. It was 801. The four terminals each carried the same TOML/YAML
+  "saved command with parameters" library — anvil 772 + 144 + 248, forge 801,
+  ember 867 + 284, frost 827 + 316 — and the shared module is 3,185 lines
+  across five files with 73 tests. `src/` here is +532 / −885 over five files
+  (`workflows.rs`, `ui/dialogs.rs`, `ui/command_palette.rs`, `palette.rs`,
+  `cli.rs`).
+
+  **These four apps read the same files out of the same directories.** That is
+  what makes this surface different from the chat store or the correction
+  engine: a difference in what one app *accepts* is a difference in what a
+  user's file MEANS depending on which terminal opened it. The divergences
+  were therefore never style.
+
+  **The defect that was in all four.** `render()` is supposed to refuse an
+  argument that declares no default and was left blank, and anvil, ember and
+  frost each unit-test that guard. Every UI in the family pre-seeded each
+  declared argument with `""` when it built the dialog, so it never fired:
+  `kill -9 {pid}` inserted `kill -9 ` when the user tabbed past the field. A
+  guard green in isolation and dead in practice — and this repo's
+  `docs/USER_GUIDE.md` has promised it in writing since `7192e59`
+  (2026-07-16, 280 commits ago): "未提供的必填参数不会静默执行". The contract is now stated once — an empty
+  value is meaningful only if the file says so — and enforced in two places:
+  in `render()`, which applies it to the values map itself so a caller that
+  pre-seeds cannot seed past it, and in `ArgsForm`, which carries `Unset` vs
+  `Supplied` in the type system. Emptying a *defaulted* field stays a
+  deliberate empty value; emptying an *undefaulted* one is a missing value.
+
+  forge could not have implemented that guard at all: its `WorkflowArg::default`
+  was a `String`, so "no default" and "empty default" were the same value. Its
+  YAML front-end actually deserialised `Option<String>` and then destroyed the
+  information at `unwrap_or_default()`; the TOML front-end never had it. The
+  shared schema is `Option<String>`.
+
+  **forge was the outlier lineage**, and every claimed divergence reproduced in
+  `HEAD:src/workflows.rs` before it was deleted:
+
+  - *Type-wrong TOML was repaired, not refused.* The parser was hand-rolled
+    over `toml::Table` with `as_str().unwrap_or("")` and
+    `filter_map(Value::as_str)`. `default = 3000` — an unquoted port, the most
+    natural authoring mistake on this surface — silently became the empty
+    string and the file loaded; the dialog showed a blank Port field and Insert
+    put `lsof -ti tcp: | xargs -r kill -TERM` at the prompt. `tags = ["net", 1]`
+    dropped the bad element; an `[[args]]` entry with no `name` dropped the
+    argument, leaving its placeholder in the inserted command. Both formats go
+    through serde derive now, so all three reject the file with a message
+    naming the problem. The other three already refused all three files.
+  - *Zero-argument workflows skipped `render()`.* `workflow.command` went
+    straight to the pane at both activation sites, so forge's own documented
+    `{{ }}` literal-brace escape did not apply there and the template never
+    crossed validation on that path. The bug lived in `ui/dialogs.rs` and
+    `ui/command_palette.rs`, which is why it is invisible in a diff of
+    `workflows.rs` alone.
+  - *Placeholder names were not trimmed.* `&template[i + 2..close]` raw, so
+    `{{ service }}` — how a mustache-convention shared library is written —
+    rendered `{ service }` literally into the command.
+  - *An unterminated `{{` advanced by two bytes.* `awk '{{print $1}' file`
+    was rewritten to `awk '{print $1}' file`: a different, executable awk
+    program. Core advances by one and re-scans, and computes each opener's
+    matching `}}` by depth so a later pair's close cannot be claimed by an
+    earlier `{{`.
+  - *Descriptive errors were built and discarded.*
+    `let Ok(contents) = read_bounded_workflow(&path) else { continue };` and
+    `toml::from_str(..).ok()?` — an oversized, symlinked, non-UTF-8 or
+    unparseable TOML file vanished from the palette with no log line at all.
+    That silence is why the rest of this list went unnoticed for as long as it
+    did. Every skip now logs `workflows: skipping <path>: <reason>`, both
+    halves through `review_input::safe_inline_display`.
+  - *The user tier could be CWD-relative.* `workflows_dir()` fell back to
+    `std::env::var_os("HOME").unwrap_or_default()`, so with `HOME` unset forge
+    scanned `./.config/forge/workflows`: clone a repository containing that
+    directory, start forge inside it, and its files were the
+    *highest-precedence* workflows. The tier is `glib::user_config_dir()` now
+    and a non-absolute answer is a skipped tier, not a resolved one.
+  - *The command template was never checked for visual spoofing.*
+    `command_is_reviewable` ran only the length bound and
+    `review_input::validate`; `contains_visual_spoofing` was applied to name,
+    description and tags but not to the one field that reaches the prompt.
+
+  **Policy is injected, not hardcoded, because each of these would silently
+  change behaviour for two of the four apps.** `const APP: &str = "forge"`
+  (the `FORGE_WORKFLOW_DIR` override is *derived* from it, so one app cannot
+  read its own directory while honouring another's variable);
+  `const LOAD_ORDER: LoadOrder = LoadOrder::ByName`, which has no `Default`
+  and is pinned at every construction site — anvil and frost list in
+  directory-precedence order, and in all four copies that difference was the
+  presence or absence of one `sort_by` line; a `GlibDirs` `DirSources` impl,
+  because anvil and forge ask glib and ember and frost ask the `dirs` crate,
+  whose fallback chains differ exactly at the edges that matter; and
+  `dev_root()` passed into the spec, because `env!("CARGO_MANIFEST_DIR")`
+  resolves against the *compiling* crate and evaluating it inside jterm_core
+  would point all four apps at `jterm_core/scripts/workflows` — with their
+  bundled-library tests still green, asserting about a directory that does not
+  exist. `SearchPathSpec::for_current_app` was refused in favour of
+  `for_app("forge", ..)`: it reads the process identity, which answers `"jterm"`
+  before `identity::init` and in every test binary.
+
+  **Two changes made by hand after the migration**, both affecting every app
+  equally, both present in this tree:
+
+  - `scripts/workflows/docker-tail-logs.yaml` declared `default: ""` for its
+    required `container` argument. Under the new contract that is an
+    *explicitly declared* empty value, so the round's headline guard would not
+    have fired on the example the apps ship — Insert would have produced
+    `docker logs -f --tail 100 `. The line is gone; `container` is a required
+    argument and the guard now fires on it, which
+    `a_bundled_workflow_renders_from_its_declared_defaults_alone` observes.
+  - forge's bundled library differed from the other three in 5 of its 6 files,
+    and `find-large-files.yaml` differed substantively: under the same name
+    "Find large files", forge shipped
+    `find . -type f -printf '%s %p\n' | …` with one argument, the other three
+    `find {{dir}} -type f -size +{{min_size}} …` with three. Dedup is
+    name-keyed and first-wins, so one shared library resolved to two different
+    commands — which defeats the point of a shared format. Tags diverged too
+    (`[net, debug]` vs `[network, diagnostics]`, so `network` recalled
+    ssh-tunnel in forge and nothing in its siblings). Verified after the fact:
+    `diff -r` against anvil, ember and frost is clean in all three directions.
+
+  **Three adversarial audits ran against the shared module before any app
+  adopted it** and found nine defects in it, five serious. Two lenses
+  independently caught `SearchPathSpec::for_current_app` resolving to the
+  neutral `"jterm"` identity when `identity::init` had not run, which would
+  have changed every directory read — in tests most of all, since they never
+  call init. It returns `Option` now, and the test that had guarded it was
+  itself vacuous: the old assertion held for `"jterm"` too, so it was green
+  precisely when the bug was present. Do not skip that pass on the next
+  extraction.
+
+  Gates, measured in this tree under `nix develop`: `cargo fmt --check` clean,
+  `cargo clippy --offline --locked --all-targets -- -D warnings` clean,
+  `cargo test --offline --locked` 1,443 passing / 33 ignored (display-gated) /
+  0 failing — re-run after `serde_yaml_ng` was dropped, and still green.
+  `Cargo.toml` and `flake.nix` both move to core `790d06a` and
+  `~/.cargo/config.toml` carries no `[patch]`, so `--locked` is against the
+  pushed core rather than a local checkout — unlike the previous two rounds,
+  this one is committable as it stands. `nix build` was not run, so
+  `flake.nix`'s `outputHashes."jterm_core-0.2.0"` for `790d06a` is unverified
+  here; check it before relying on the Nix path.
+
+  User-visible consequences are in `CHANGELOG.md` (Changed, including a
+  standalone upgrade note for the library shrink, and Security), in
+  `README.md`, and in `docs/USER_GUIDE.md` §6 — the missing-value rule belongs
+  in the guide because the guide already promised it.
+
+  Not done:
+
+  - anvil's `RefreshLatch` + background rescan was not adopted. Two of the
+    three `load_all()` calls remain, one per palette open, on the GTK main
+    loop (`ui/command_palette.rs`, `ui/dialogs.rs`); the third — a full
+    five-tier rescan on *every activation*, having already walked the same
+    path to build the list the user just picked from — is gone, resolved in
+    the snapshot the palette was built from. `jterm_core::workflows::RefreshLatch`
+    is exported and ready. forge is the one app in the family with a main loop
+    to block, so this is worth doing.
+  - (Was open, now closed while this handoff was being written.)
+    `serde_yaml_ng` had exactly one user in this crate, the deleted YAML
+    parser; nothing under `src/` or `tests/` mentions it and no lint fires on
+    an unused dependency, so it survived the migration. It has since been
+    dropped from `Cargo.toml` and `Cargo.lock` — the lock now shows it moving
+    from forge's own dependency list into `jterm_core`'s, which is the shape
+    the extraction should produce. The gate was re-run after that change and
+    is still green.
+  - forge's unified command palette (`palette.rs::gather`) still ranks
+    workflows with its own fuzzy path alongside actions and history; only the
+    standalone `Ctrl+Shift+M` overlay uses `WorkflowPicker`. That is fine — the
+    two surfaces have different result budgets — but it means the two ways to
+    reach a workflow in forge rank it differently.
+
+  Claims in the migration report that do not survive this tree, recorded so
+  the next reader does not chase them:
+
+  - It reports `scripts/workflows/` as NOT reconciled, blocked by a
+    permission classifier. It *is* reconciled here (all six files byte-identical
+    to anvil, ember and frost) and `docker-tail-logs.yaml`'s `default: ""` is
+    gone. Both were done by hand afterwards; see above.
+  - It reports `Cargo.toml` left untouched and forge building only through a
+    temporary `[patch]`. Neither holds: `Cargo.toml`, `Cargo.lock` and
+    `flake.nix` all name `790d06a`, there is no `[patch]` in
+    `~/.cargo/config.toml`, and the unused `serde_yaml_ng` line it flagged has
+    also been removed. `--locked` therefore builds against the pushed core.
+  - It reports `WorkflowPicker` as unused by forge. `ui/dialogs.rs` builds one
+    (`PickerPolicy::new(15, true)`), which is a user-visible change the report
+    does not list: the `Ctrl+Shift+M` overlay went from lowercased-substring
+    filtering over every loaded row to skim fuzzy matching re-ranked by score
+    and capped at 15 drawn rows. It is in `CHANGELOG.md`. The command template
+    stays in forge's haystack, which is the knob the report describes.
+  - It reports 1,445 tests. The measured number is 1,443 passing with 33
+    display-gated ignored.
+  - The round brief sizes `jterm_core::workflows` at 2,610 lines / 62 tests.
+    At the pushed rev `790d06a` it is 3,185 lines / 73 tests across five files.
+  - `ui/dialogs.rs`'s new comment says the old path "called `substitute`, which
+    … validates neither its bindings nor its output". True of *core's*
+    `substitute`, not of forge's deleted local one, which validated binding
+    names and values and ran `review_input::validate` on the rendered text. The
+    real gaps in the old dialog path were that it never re-validated the
+    workflow and had no missing-value rule; the zero-argument path bypassed
+    `substitute` entirely. Likewise "its only validation log was
+    `workflows: invalid tag` with no filename" is half right: the field
+    validator did log without a filename, but `command_is_reviewable` and the
+    YAML parse-error arm both logged the sanitised path. What was fully silent
+    was the bounded reader and the TOML parser.
+  - The brief says `ArgsForm` lets a UI "disable Insert before the user sees an
+    error". forge deliberately does not disable it: `missing()` is a superset
+    of what `render()` will actually refuse (an argument the template never
+    references does not block a render), so the hint is advisory and `render()`
+    stays the single authority. Insert remains live and reports
+    `missing values: …` in an alert.
+
+  `UPGRADE_ROUNDS.md` was deliberately not extended. Its last entry is round
+  53 and it has not been touched in 30 commits (`c1daab8`, 2026-08-25); the
+  workspace-identity, agent-restore, Codex-task, chat-store and
+  command-correction rounds all landed without adding to it. Continuing the
+  numbering here would imply a ledger discipline this repo stopped keeping.
 
 - **Command correction upstreamed (2026-08-29)**:
   `src/ui/command_correction.rs` is an 888-line shim (737 production, 151 test)

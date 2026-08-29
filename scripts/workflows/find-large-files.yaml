@@ -1,8 +1,14 @@
-name: Find large files
-description: List the largest files under the current directory
-command: "find . -type f -printf '%s %p\\n' | sort -nr | head -n {{count}}"
-tags: [files, diagnostics]
+name: "Find large files"
+description: "Locate the biggest files under a directory, sorted descending"
+command: "find {{dir}} -type f -size +{{min_size}} -exec du -h {} + | sort -rh | head -n {{count}}"
+tags: [fs, debug]
 args:
+  - name: dir
+    description: "Search root"
+    default: "."
+  - name: min_size
+    description: "Minimum file size (e.g. 100M, 1G)"
+    default: "50M"
   - name: count
-    description: Number of results
+    description: "How many entries to show"
     default: "20"
