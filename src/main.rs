@@ -827,6 +827,27 @@ pub fn run() -> glib::ExitCode {
         file_tree_root_label.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
         file_tree_root_label.add_css_class("file-tree-root");
 
+        let file_tree_path_btn = gtk4::Button::new();
+        file_tree_path_btn.set_child(Some(&file_tree_root_label));
+        file_tree_path_btn.set_hexpand(true);
+        file_tree_path_btn.set_focus_on_click(false);
+        file_tree_path_btn.set_tooltip_text(Some("Open path or choose an ancestor"));
+        file_tree_path_btn
+            .update_property(&[gtk4::accessible::Property::Label("Open filesystem path")]);
+        file_tree_path_btn.add_css_class("flat");
+
+        let file_tree_back_btn = gtk4::Button::from_icon_name("go-previous-symbolic");
+        file_tree_back_btn.set_focus_on_click(false);
+        file_tree_back_btn.set_tooltip_text(Some("Back"));
+        file_tree_back_btn.update_property(&[gtk4::accessible::Property::Label("Back")]);
+        file_tree_back_btn.add_css_class("flat");
+
+        let file_tree_forward_btn = gtk4::Button::from_icon_name("go-next-symbolic");
+        file_tree_forward_btn.set_focus_on_click(false);
+        file_tree_forward_btn.set_tooltip_text(Some("Forward"));
+        file_tree_forward_btn.update_property(&[gtk4::accessible::Property::Label("Forward")]);
+        file_tree_forward_btn.add_css_class("flat");
+
         let file_tree_cwd_btn = gtk4::Button::from_icon_name("go-home-symbolic");
         file_tree_cwd_btn.set_focus_on_click(false);
         file_tree_cwd_btn.set_focusable(true);
@@ -844,10 +865,22 @@ pub fn run() -> glib::ExitCode {
             .update_property(&[gtk4::accessible::Property::Label("Go to parent directory")]);
         file_tree_up_btn.add_css_class("flat");
 
+        let file_tree_home_btn = gtk4::Button::from_icon_name("user-home-symbolic");
+        file_tree_home_btn.set_focus_on_click(false);
+        file_tree_home_btn.set_focusable(true);
+        file_tree_home_btn.set_tooltip_text(Some("Go to filesystem home directory (Alt+Home)"));
+        file_tree_home_btn.update_property(&[gtk4::accessible::Property::Label(
+            "Go to filesystem home directory",
+        )]);
+        file_tree_home_btn.add_css_class("flat");
+
         let file_tree_header = gtk4::Box::new(Orientation::Horizontal, 2);
         file_tree_header.add_css_class("file-tree-header");
-        file_tree_header.append(&file_tree_root_label);
+        file_tree_header.append(&file_tree_back_btn);
+        file_tree_header.append(&file_tree_forward_btn);
+        file_tree_header.append(&file_tree_path_btn);
         file_tree_header.append(&file_tree_up_btn);
+        file_tree_header.append(&file_tree_home_btn);
         file_tree_header.append(&file_tree_cwd_btn);
 
         // Type-to-filter toggle; the inline entry row it opens lives between
@@ -861,6 +894,16 @@ pub fn run() -> glib::ExitCode {
             .update_property(&[gtk4::accessible::Property::Label("Filter files")]);
         file_tree_filter_toggle.add_css_class("flat");
         file_tree_header.append(&file_tree_filter_toggle);
+
+        let file_tree_hidden_toggle = gtk4::ToggleButton::new();
+        file_tree_hidden_toggle.set_icon_name("view-reveal-symbolic");
+        file_tree_hidden_toggle.set_focus_on_click(false);
+        file_tree_hidden_toggle.set_focusable(true);
+        file_tree_hidden_toggle.set_tooltip_text(Some("Show hidden files"));
+        file_tree_hidden_toggle
+            .update_property(&[gtk4::accessible::Property::Label("Show hidden files")]);
+        file_tree_hidden_toggle.add_css_class("flat");
+        file_tree_header.append(&file_tree_hidden_toggle);
 
         // Location selector (Local + configured ssh/docker hosts), filled by
         // UiState::refresh_file_tree_location_selector once UiState exists.
@@ -1067,6 +1110,7 @@ pub fn run() -> glib::ExitCode {
             file_tree_model: file_tree_model.clone(),
             file_tree_root: Rc::new(RefCell::new(std::path::PathBuf::new())),
             file_tree_root_label: file_tree_root_label.clone(),
+            file_tree_navigation: Rc::new(RefCell::new(Default::default())),
             file_tree_location: file_tree_location.clone(),
             file_tree_execution_overlay: file_tree_execution_overlay.clone(),
             file_tree_location_selector: file_tree_location_selector.clone(),
@@ -1259,6 +1303,22 @@ pub fn run() -> glib::ExitCode {
         file_tree_up_btn.connect_clicked(move |_| {
             ui_for_ft_up.file_tree_go_up();
         });
+        let ui_for_ft_back = ui.clone();
+        file_tree_back_btn.connect_clicked(move |_| {
+            ui_for_ft_back.file_tree_go_back();
+        });
+        let ui_for_ft_forward = ui.clone();
+        file_tree_forward_btn.connect_clicked(move |_| {
+            ui_for_ft_forward.file_tree_go_forward();
+        });
+        let ui_for_ft_path = ui.clone();
+        file_tree_path_btn.connect_clicked(move |_| {
+            ui_for_ft_path.present_file_tree_path_dialog();
+        });
+        let ui_for_ft_home = ui.clone();
+        file_tree_home_btn.connect_clicked(move |_| {
+            ui_for_ft_home.file_tree_go_home();
+        });
 
         // Wire file-tree expansion and file activation.
         ui.connect_file_tree_handlers(&file_tree);
@@ -1277,6 +1337,10 @@ pub fn run() -> glib::ExitCode {
         let ui_for_filter_toggle = ui.clone();
         file_tree_filter_toggle.connect_clicked(move |_| {
             ui_for_filter_toggle.toggle_file_tree_filter();
+        });
+        let model_for_hidden_toggle = file_tree_model.clone();
+        file_tree_hidden_toggle.connect_toggled(move |button| {
+            model_for_hidden_toggle.set_show_hidden(button.is_active());
         });
 
         // Wire sidebar Tabs/Files segmented switcher

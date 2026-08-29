@@ -35,13 +35,17 @@ use jterm_core::jsh_remote::RemoteHostConfig;
 
 /// Hard cap on entries per directory listing, shared with the local scanner.
 pub(crate) const MAX_DIRECTORY_ENTRIES: usize = 4_096;
+/// Ask the remote probe for one extra complete pair. Receiving that sentinel
+/// proves the visible `MAX_DIRECTORY_ENTRIES` prefix is truncated without
+/// making the far side enumerate and serialize the rest of a huge directory.
+const REMOTE_LIST_PAIR_LIMIT: usize = MAX_DIRECTORY_ENTRIES + 1;
 /// Hard cap on one transfer payload. Exceeding it aborts the child, unlinks
 /// the partial local file, and errors — never a silently truncated result.
 pub(crate) const MAX_TRANSFER_BYTES: u64 = 512 * 1024 * 1024;
 /// NAME_MAX on every Linux filesystem the sidebar can realistically browse.
 const MAX_ENTRY_NAME_BYTES: usize = 255;
-/// `list` output is bounded: 4096 entries of at most 255 name bytes each,
-/// plus separators, plus headroom for a hostile far side.
+/// `list` output is bounded: 4097 pairs of at most 255 name bytes each, plus
+/// separators and headroom for a hostile far side.
 const PROBE_LIST_MAX_OUTPUT: u64 = 2 * 1024 * 1024;
 const PROBE_HOME_MAX_OUTPUT: u64 = 8 * 1024;
 /// Mutating ops only matter for their stderr, and only a bounded slice of it
@@ -165,13 +169,23 @@ pub(crate) struct FsClipboardItem {
     pub(crate) is_dir: bool,
 }
 
-/// One directory entry, pre-display-sanitization. `name` is lossy-decoded for
-/// display; `path` keeps the exact bytes so operations round-trip.
+/// One directory entry, pre-display-sanitization. Local display names may be
+/// lossy while their `PathBuf` retains exact bytes; remote list names are
+/// accepted only when valid UTF-8 so every row can round-trip through argv.
 #[derive(Clone, Debug)]
 pub(crate) struct FsEntry {
     pub(crate) name: String,
     pub(crate) path: PathBuf,
     pub(crate) is_dir: bool,
+}
+
+/// One bounded directory snapshot. `truncated` is explicit because silently
+/// presenting a 4096-entry prefix as a complete remote directory is unsafe for
+/// subsequent user decisions.
+#[derive(Clone, Debug)]
+pub(crate) struct FsListing {
+    pub(crate) entries: Vec<FsEntry>,
+    pub(crate) truncated: bool,
 }
 
 fn sort_entries(entries: &mut [FsEntry]) {
@@ -184,23 +198,27 @@ fn sort_entries(entries: &mut [FsEntry]) {
 
 /// The far-side probe, invoked as `sh -c "$SCRIPT" probe <op> [args...]` so
 /// the script rides in argv and stdin is free for `put`/`untar` payloads.
-/// Wire protocol v3: `list` prints NUL-separated `<type>,<name>` pairs (types
-/// `d`/`f`/`l`); `cat`/`tar` stream to stdout, `put`/`untar` consume stdin.
+/// Wire protocol v4: `list <dir> <limit>` prints at most `limit` NUL-separated
+/// `<type>,<name>` pairs (types `d`/`f`/`l`); `cat`/`tar` stream to stdout,
+/// `put`/`untar` consume stdin.
 /// `stat` prints one line `<t> <size>` (t in {d,f,l}; size 0 for non-files).
 /// Exit codes are 0 ok, 2 usage/bad path, 3 cannot enter dir / not the
-/// expected kind, 4 operation failed, 17 target exists. The v1 ops
-/// (home/list/mkdir/mkfile/rm/mv/cp) and the v2 ops (cat/put/tar) are
+/// expected kind, 4 operation failed, 17 target exists. The v1 mutation ops
+/// (mkdir/mkfile/rm/mv/cp) and the v2 streaming ops (cat/put/tar) remain
 /// byte-identical to their protocol versions; v3 changes `untar` to take
 /// `<dir> <name>` and refuse an existing `<dir>/<name>` before extracting,
-/// and adds `stat`.
-const PROBE_SCRIPT: &str = r#"# remote-fs probe v3 — runs under `sh -c` as $0=probe, <op> [args...] as $1+.
-# `list` stdout: NUL-separated pairs "<t>\0<name>\0", t in {d,f,l}, names relative.
+/// and adds `stat`. v4 bounds `list` on the far side and classifies symlinks
+/// before directories so a link to a directory is never expandable.
+const PROBE_SCRIPT: &str = r#"# remote-fs probe v4 — runs under `sh -c` as $0=probe, <op> [args...] as $1+.
+# `list <dir> <limit>` stdout: at most limit NUL-separated pairs "<t>\0<name>\0",
+# t in {d,f,l}, names relative. Symlinks are always l, including links to dirs.
 # v2 adds streaming ops: cat (file -> stdout), put (stdin -> new file),
 # tar (dir -> tar on stdout), untar (stdin tar -> existing dir).
 # v3: untar takes <dir> <name> and refuses an existing <dir>/<name> BEFORE
 # extracting (a creator racing between that check and the extraction itself
 # is the documented, microscopic TOCTOU window); new stat op prints
 # one line "<t> <size>", t in {d,f,l}, size = bytes for f, else 0.
+# v4: list requires a positive numeric limit and stops after that many pairs.
 # Exit codes: 0 ok, 2 usage/bad path, 3 cannot enter dir, 4 op failed, 17 target exists.
 set -u
 op=${1:-}
@@ -210,16 +228,21 @@ case "$op" in
     pwd
     ;;
   list)
-    d=${2:-}
+    d=${2:-}; limit=${3:-}
     case "$d" in /*) ;; *) exit 2 ;; esac
+    case "$limit" in ''|*[!0-9]*) exit 2 ;; esac
+    [ "$limit" -gt 0 ] 2>/dev/null || exit 2
     cd "$d" 2>/dev/null || exit 3
+    count=0
     for f in * .[!.]* ..?*; do
-      if [ -d "$f" ]; then t=d
-      elif [ -L "$f" ]; then t=l
+      if [ -L "$f" ]; then t=l
+      elif [ -d "$f" ]; then t=d
       elif [ -e "$f" ]; then t=f
       else continue
       fi
       printf '%s\0%s\0' "$t" "$f"
+      count=$((count + 1))
+      [ "$count" -ge "$limit" ] && break
     done
     ;;
   mkdir)
@@ -448,10 +471,25 @@ fn wait_with_timeout(
     child: &mut std::process::Child,
     timeout: Duration,
 ) -> io::Result<std::process::ExitStatus> {
+    wait_with_timeout_or_cancel(child, timeout, None)
+}
+
+/// Timeout watchdog with optional caller cancellation. Directory scans use
+/// the token to retire a superseded ssh/docker probe immediately; the same
+/// process-group kill path as a timeout prevents descendants retaining pipes.
+fn wait_with_timeout_or_cancel(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    cancel: Option<&CancelToken>,
+) -> io::Result<std::process::ExitStatus> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
+        }
+        if cancel.is_some_and(CancelToken::is_cancelled) {
+            kill_tree(child);
+            return Err(cancelled_error());
         }
         if std::time::Instant::now() >= deadline {
             kill_tree(child);
@@ -475,6 +513,22 @@ fn run_capture(
     timeout: Duration,
     max_out: u64,
 ) -> io::Result<Capture> {
+    run_capture_or_cancel(argv, stdin_bytes, timeout, max_out, None)
+}
+
+fn run_capture_or_cancel(
+    argv: &[String],
+    stdin_bytes: &[u8],
+    timeout: Duration,
+    max_out: u64,
+    cancel: Option<&CancelToken>,
+) -> io::Result<Capture> {
+    // Check immediately before spawn as well as in the watchdog. This is the
+    // important queued-scan boundary: a newer per-path revision must not start
+    // an obsolete ssh/docker subprocess after it finally obtains a worker slot.
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        return Err(cancelled_error());
+    }
     let mut child = spawn_argv(argv, Stdio::piped(), Stdio::piped(), Stdio::piped())?;
 
     // Feed stdin from a helper thread: a child that exits early fails the
@@ -491,7 +545,7 @@ fn run_capture(
     let stdout_reader = spawn_bounded_reader(child.stdout.take(), max_out);
     let stderr_reader = spawn_bounded_reader(child.stderr.take(), max_out);
 
-    let status = wait_with_timeout(&mut child, timeout);
+    let status = wait_with_timeout_or_cancel(&mut child, timeout, cancel);
     let (stdout, stdout_truncated) = stdout_reader.join().unwrap_or_default();
     let (stderr, stderr_truncated) = stderr_reader.join().unwrap_or_default();
     let status = status?;
@@ -575,9 +629,20 @@ fn run_probe(
     timeout: Duration,
     max_out: u64,
 ) -> io::Result<Capture> {
+    run_probe_or_cancel(host, op, args, timeout, max_out, None)
+}
+
+fn run_probe_or_cancel(
+    host: &RemoteHost,
+    op: &str,
+    args: &[&str],
+    timeout: Duration,
+    max_out: u64,
+    cancel: Option<&CancelToken>,
+) -> io::Result<Capture> {
     let argv = checked_probe_argv(host, op, args)?;
     // The script rides in argv (`sh -c`), so stdin carries no payload here.
-    let capture = run_capture(&argv, &[], timeout, max_out)?;
+    let capture = run_capture_or_cancel(&argv, &[], timeout, max_out, cancel)?;
     probe_result(capture)
 }
 
@@ -1327,8 +1392,8 @@ pub(crate) enum TransferPlan {
     Relay,
 }
 
-#[derive(PartialEq, Eq)]
-enum FilesystemIdentity {
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum FilesystemIdentity {
     Local,
     Remote {
         docker: bool,
@@ -1338,7 +1403,10 @@ enum FilesystemIdentity {
     },
 }
 
-fn filesystem_identity(loc: &FsLocation, hosts: &[RemoteHost]) -> io::Result<FilesystemIdentity> {
+pub(crate) fn filesystem_identity(
+    loc: &FsLocation,
+    hosts: &[RemoteHost],
+) -> io::Result<FilesystemIdentity> {
     let Some(host) = remote_host(loc, hosts)? else {
         return Ok(FilesystemIdentity::Local);
     };
@@ -2007,7 +2075,9 @@ fn parse_home(stdout: &[u8]) -> io::Result<PathBuf> {
             "remote home directory not found",
         ));
     }
-    let path = PathBuf::from(String::from_utf8_lossy(line).into_owned());
+    let path = PathBuf::from(std::str::from_utf8(line).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "remote home is not valid UTF-8")
+    })?);
     if !path.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2023,7 +2093,7 @@ pub(crate) fn list_dir(
     loc: &FsLocation,
     hosts: &[RemoteHost],
     dir: &Path,
-) -> io::Result<Vec<FsEntry>> {
+) -> io::Result<FsListing> {
     list_dir_with_overlay(loc, hosts, &FsExecutionOverlay::default(), dir)
 }
 
@@ -2032,28 +2102,54 @@ pub(crate) fn list_dir_with_overlay(
     hosts: &[RemoteHost],
     overlay: &FsExecutionOverlay,
     dir: &Path,
-) -> io::Result<Vec<FsEntry>> {
+) -> io::Result<FsListing> {
+    list_dir_with_overlay_cancel(loc, hosts, overlay, dir, &CancelToken::default())
+}
+
+/// Cancellable listing used by the asynchronous file tree. A superseded scan
+/// is rejected before local enumeration / subprocess spawn and, for a running
+/// remote probe, by the process-group watchdog.
+pub(crate) fn list_dir_with_overlay_cancel(
+    loc: &FsLocation,
+    hosts: &[RemoteHost],
+    overlay: &FsExecutionOverlay,
+    dir: &Path,
+    cancel: &CancelToken,
+) -> io::Result<FsListing> {
+    if cancel.is_cancelled() {
+        return Err(cancelled_error());
+    }
     match remote_host_with_overlay(loc, hosts, overlay)? {
-        None => list_dir_local(dir),
+        None => list_dir_local_cancel(dir, cancel),
         Some(host) => {
-            let capture = run_probe(
+            let limit = REMOTE_LIST_PAIR_LIMIT.to_string();
+            let capture = run_probe_or_cancel(
                 &host,
                 "list",
-                &[remote_path_arg(dir)?],
+                &[remote_path_arg(dir)?, &limit],
                 PROBE_LIST_TIMEOUT,
                 PROBE_LIST_MAX_OUTPUT,
+                Some(cancel),
             )?;
             Ok(parse_list(&capture.stdout, dir))
         }
     }
 }
 
-fn list_dir_local(dir: &Path) -> io::Result<Vec<FsEntry>> {
+fn list_dir_local_cancel(dir: &Path, cancel: &CancelToken) -> io::Result<FsListing> {
+    if cancel.is_cancelled() {
+        return Err(cancelled_error());
+    }
     let mut entries = Vec::with_capacity(256);
-    for entry in std::fs::read_dir(dir)?
-        .take(MAX_DIRECTORY_ENTRIES)
-        .flatten()
-    {
+    let mut truncated = false;
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        if cancel.is_cancelled() {
+            return Err(cancelled_error());
+        }
+        if entries.len() >= MAX_DIRECTORY_ENTRIES {
+            truncated = true;
+            break;
+        }
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
@@ -2064,16 +2160,15 @@ fn list_dir_local(dir: &Path) -> io::Result<Vec<FsEntry>> {
         });
     }
     sort_entries(&mut entries);
-    Ok(entries)
+    Ok(FsListing { entries, truncated })
 }
 
 /// Parse `list` wire bytes: NUL-separated `<type>\0<name>\0` pairs. Malformed
-/// tails, unknown types and empty names are skipped. Wire type `l` (a symlink
-/// to something that is not a directory) maps to file: the tree never expands
-/// it. A symlink to a directory arrives as `d` because the probe's `[ -d ]`
-/// follows links, and expanding it re-lists through the link — that works.
-fn parse_list(bytes: &[u8], dir: &Path) -> Vec<FsEntry> {
-    use std::os::unix::ffi::OsStrExt;
+/// tails, unknown types, invalid UTF-8 and non-basename paths are skipped.
+/// Duplicate names or resolved paths keep only their first valid pair. Wire
+/// type `l` always maps to a non-expandable file, including symlinks to dirs.
+/// Seeing the requested extra pair marks the retained prefix as truncated.
+fn parse_list(bytes: &[u8], dir: &Path) -> FsListing {
     let mut tokens: Vec<&[u8]> = bytes.split(|byte| *byte == 0).collect();
     // The probe terminates every pair with NUL; a final unterminated token
     // means the capture was truncated, so the partial pair is dropped.
@@ -2081,28 +2176,47 @@ fn parse_list(bytes: &[u8], dir: &Path) -> Vec<FsEntry> {
         tokens.pop();
     }
     let mut entries = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
+    let mut seen_paths = std::collections::HashSet::new();
+    let mut complete_pairs = 0usize;
     // chunks_exact ignores a dangling half-pair on its own.
-    for pair in tokens.chunks_exact(2) {
+    for pair in tokens.chunks_exact(2).take(REMOTE_LIST_PAIR_LIMIT) {
+        complete_pairs += 1;
         if entries.len() >= MAX_DIRECTORY_ENTRIES {
-            break;
+            continue;
         }
-        let (kind, name) = (pair[0], pair[1]);
+        let (kind, name_bytes) = (pair[0], pair[1]);
         let is_dir = match kind {
             b"d" => true,
             b"f" | b"l" => false,
             _ => continue,
         };
-        if name.is_empty() {
+        let Ok(name) = std::str::from_utf8(name_bytes) else {
+            continue;
+        };
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.len() > MAX_ENTRY_NAME_BYTES
+            || name.as_bytes().contains(&b'/')
+        {
+            continue;
+        }
+        let path = dir.join(name);
+        if !seen_names.insert(name.to_string()) || !seen_paths.insert(path.clone()) {
             continue;
         }
         entries.push(FsEntry {
-            name: String::from_utf8_lossy(name).into_owned(),
-            path: dir.join(std::ffi::OsStr::from_bytes(name)),
+            name: name.to_string(),
+            path,
             is_dir,
         });
     }
     sort_entries(&mut entries);
-    entries
+    FsListing {
+        entries,
+        truncated: complete_pairs >= REMOTE_LIST_PAIR_LIMIT,
+    }
 }
 
 pub(crate) fn create_dir(loc: &FsLocation, hosts: &[RemoteHost], path: &Path) -> io::Result<()> {
@@ -2409,7 +2523,8 @@ mod tests {
 
     #[test]
     fn ssh_argv_carries_script_in_argv_and_command_in_one_element() {
-        let argv = probe_argv(&host_fixture(), "list", &["/var/log"]);
+        let limit = REMOTE_LIST_PAIR_LIMIT.to_string();
+        let argv = probe_argv(&host_fixture(), "list", &["/var/log", &limit]);
         assert_eq!(
             &argv[..argv.len() - 1],
             &[
@@ -2426,8 +2541,8 @@ mod tests {
         );
         let command = &argv[argv.len() - 1];
         // Script and operands form exactly one argv element; stdin stays free.
-        assert!(command.starts_with("sh -c '# remote-fs probe v3"));
-        assert!(command.ends_with(" probe list '/var/log'"));
+        assert!(command.starts_with("sh -c '# remote-fs probe v4"));
+        assert!(command.ends_with(" probe list '/var/log' '4097'"));
         assert!(command.contains("'\\''"));
     }
 
@@ -2486,64 +2601,80 @@ mod tests {
     }
 
     #[test]
-    fn list_parser_handles_spaces_newlines_and_non_utf8_names() {
+    fn list_parser_keeps_valid_odd_names_and_skips_non_utf8() {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"d\0sub dir\0");
         bytes.extend_from_slice(b"f\0hello.txt\0");
         bytes.extend_from_slice(b"f\0line\nbreak\0");
         bytes.extend_from_slice(b"l\0dangling\0");
         bytes.extend_from_slice(b"f\0bad\xffname\0");
-        let entries = parse_list(&bytes, Path::new("/data"));
-        let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        let listing = parse_list(&bytes, Path::new("/data"));
+        let names: Vec<_> = listing
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
         assert_eq!(
             names,
-            [
-                "sub dir",
-                "bad\u{fffd}name",
-                "dangling",
-                "hello.txt",
-                "line\nbreak"
-            ]
-            .into_iter()
-            .collect::<Vec<_>>()
+            ["sub dir", "dangling", "hello.txt", "line\nbreak"]
+                .into_iter()
+                .collect::<Vec<_>>()
         );
-        assert!(entries[0].is_dir);
-        assert!(!entries[1].is_dir);
+        assert!(!listing.truncated);
+        assert!(listing.entries[0].is_dir);
+        assert!(!listing.entries[1].is_dir);
         // A symlink reports as a file: the tree must not try to expand it.
-        assert_eq!(entries[2].name, "dangling");
-        assert!(!entries[2].is_dir);
-        // Non-UTF8 names keep their exact bytes in the path for round-tripping.
-        use std::os::unix::ffi::OsStrExt;
-        assert_eq!(entries[1].path.as_os_str().as_bytes(), b"/data/bad\xffname");
+        assert_eq!(listing.entries[1].name, "dangling");
+        assert!(!listing.entries[1].is_dir);
+        assert!(listing
+            .entries
+            .iter()
+            .all(|entry| !entry.name.contains('\u{fffd}')));
     }
 
     #[test]
-    fn list_parser_skips_garbage_and_stops_at_the_entry_cap() {
-        // Unknown type, empty name and a truncated trailing pair are dropped.
+    fn list_parser_skips_garbage_non_basenames_and_duplicate_paths() {
+        // Unknown type, empty/dangerous names, a duplicate path and a
+        // truncated trailing pair are dropped.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"x\0what\0");
         bytes.extend_from_slice(b"f\0\0");
         bytes.extend_from_slice(b"f\0ok\0");
+        bytes.extend_from_slice(b"d\0ok\0");
+        bytes.extend_from_slice(b"f\0.\0f\0..\0f\0a/b\0");
         bytes.extend_from_slice(b"d\0truncated");
-        let entries = parse_list(&bytes, Path::new("/d"));
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "ok");
+        let listing = parse_list(&bytes, Path::new("/d"));
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].name, "ok");
+        assert!(!listing.entries[0].is_dir, "the first valid pair wins");
+        assert!(!listing.truncated);
+    }
 
+    #[test]
+    fn list_parser_uses_the_extra_pair_as_a_truncation_sentinel() {
         let mut big = Vec::new();
-        for index in 0..MAX_DIRECTORY_ENTRIES + 16 {
+        for index in 0..MAX_DIRECTORY_ENTRIES {
             big.extend_from_slice(format!("f\0entry-{index}\0").as_bytes());
         }
-        assert_eq!(
-            parse_list(&big, Path::new("/d")).len(),
-            MAX_DIRECTORY_ENTRIES
-        );
+        let complete = parse_list(&big, Path::new("/d"));
+        assert_eq!(complete.entries.len(), MAX_DIRECTORY_ENTRIES);
+        assert!(!complete.truncated);
+
+        big.extend_from_slice(b"f\0one-more\0");
+        let truncated = parse_list(&big, Path::new("/d"));
+        assert_eq!(truncated.entries.len(), MAX_DIRECTORY_ENTRIES);
+        assert!(truncated.truncated);
     }
 
     #[test]
     fn list_parser_sorts_directories_first_then_case_insensitively() {
         let bytes = b"f\0Zulu\0d\0beta\0f\0Alpha\0d\0Able\0".as_slice();
-        let entries = parse_list(bytes, Path::new("/d"));
-        let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        let listing = parse_list(bytes, Path::new("/d"));
+        let names: Vec<_> = listing
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
         assert_eq!(names, ["Able", "beta", "Alpha", "Zulu"]);
     }
 
@@ -2634,6 +2765,38 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_capture_is_rejected_before_subprocess_spawn() {
+        let token = CancelToken::default();
+        token.cancel();
+        // This executable deliberately does not exist. Interrupted proves the
+        // token was checked before `Command::spawn` could return NotFound.
+        let argv = vec!["/forge-test-missing-probe".to_string()];
+        let error = run_capture_or_cancel(&argv, b"", Duration::from_secs(5), 64, Some(&token))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn cancelling_capture_kills_the_running_process_group() {
+        let token = CancelToken::default();
+        let cancel = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            cancel.cancel();
+        });
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 30 & wait".to_string(),
+        ];
+        let started = std::time::Instant::now();
+        let error = run_capture_or_cancel(&argv, b"", Duration::from_secs(30), 64, Some(&token))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
     fn new_name_validation_rejects_unusable_names() {
         assert!(validate_new_name("notes.txt").is_ok());
         assert!(validate_new_name("").is_err());
@@ -2644,6 +2807,22 @@ mod tests {
         assert!(validate_new_name(".").is_err());
         assert!(validate_new_name("..").is_err());
         assert!(validate_new_name("...").is_ok());
+    }
+
+    #[test]
+    fn remote_home_parser_requires_absolute_strict_utf8() {
+        assert_eq!(
+            parse_home(b"/home/dev\n").unwrap(),
+            PathBuf::from("/home/dev")
+        );
+        assert_eq!(
+            parse_home(b"relative\n").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            parse_home(b"/home/\xff\n").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
@@ -2702,6 +2881,7 @@ mod tests {
         // Listing sees the moved directory.
         let names: Vec<_> = list_dir(&local, hosts, &root)
             .unwrap()
+            .entries
             .into_iter()
             .map(|entry| entry.name)
             .collect();
@@ -2796,29 +2976,43 @@ mod tests {
         std::fs::create_dir(root.join("dir")).unwrap();
         std::os::unix::fs::symlink(root.join("dir"), root.join("dir-link")).unwrap();
         let root_arg = root.to_str().unwrap();
+        let limit = REMOTE_LIST_PAIR_LIMIT.to_string();
 
-        let listing = probe_locally("list", &[root_arg]);
+        let listing = probe_locally("list", &[root_arg, &limit]);
         assert_eq!(listing.status, 0);
         let names: Vec<_> = parse_list(&listing.stdout, &root)
+            .entries
             .into_iter()
             .map(|entry| (entry.name, entry.is_dir))
             .collect();
-        // The symlink points at a directory, and the probe's `[ -d ]` follows
-        // it, so it lists as a directory rather than as wire type `l`.
+        // Classification tests -L first, so even a link to a directory is a
+        // non-expandable wire type l.
         assert_eq!(
             names,
             vec![
                 ("dir".to_string(), true),
-                ("dir-link".to_string(), true),
+                ("dir-link".to_string(), false),
                 ("file.txt".to_string(), false),
             ]
         );
 
-        // Relative paths are rejected before anything runs.
-        assert_eq!(probe_locally("list", &["relative/path"]).status, 2);
+        // Relative paths and missing/invalid limits are rejected before the
+        // directory is enumerated.
+        assert_eq!(probe_locally("list", &["relative/path", &limit]).status, 2);
+        assert_eq!(probe_locally("list", &[root_arg]).status, 2);
+        assert_eq!(probe_locally("list", &[root_arg, "0"]).status, 2);
+        assert_eq!(probe_locally("list", &[root_arg, "nope"]).status, 2);
         assert_eq!(
-            probe_locally("list", &[&root.join("missing").to_string_lossy()]).status,
+            probe_locally("list", &[&root.join("missing").to_string_lossy(), &limit]).status,
             3
+        );
+
+        let bounded = probe_locally("list", &[root_arg, "2"]);
+        assert_eq!(bounded.status, 0);
+        assert_eq!(
+            bounded.stdout.split(|byte| *byte == 0).count() - 1,
+            4,
+            "two complete type/name pairs are the hard remote-side limit"
         );
 
         let new_dir = root.join("made").to_string_lossy().into_owned();

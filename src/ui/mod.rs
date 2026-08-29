@@ -49,6 +49,7 @@ pub(crate) use bottom_bar::build_bottom_bar;
 pub(crate) use command_palette::CommandSuggestionHandle;
 pub(crate) use file_tree::{
     build_file_tree_location_selector, build_file_tree_widgets, FileTreeModel,
+    FileTreeNavigationState,
 };
 pub(crate) use organism::{
     pane_token, OrganismActivity, OrganismAgentSignal, OrganismCorrectionSignal, OrganismPresence,
@@ -316,6 +317,7 @@ pub(crate) struct UiState {
     pub(crate) file_tree_model: FileTreeModel,
     pub(crate) file_tree_root: Rc<RefCell<PathBuf>>,
     pub(crate) file_tree_root_label: gtk4::Label,
+    pub(crate) file_tree_navigation: Rc<RefCell<FileTreeNavigationState>>,
     /// Which filesystem the file tree browses (local disk or one of the
     /// configured ssh/docker remote hosts).
     pub(crate) file_tree_location: Rc<RefCell<FsLocation>>,

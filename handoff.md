@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-27 (Foreground SSH → Remote Files 4.6)
+Updated: 2026-08-29 (Remote Files transactional navigation and authority isolation)
 
 This working tree contains the nine-round "Evolve ASCII organism" series
 (`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
@@ -18,6 +18,129 @@ every round (attribution races, a Drop panic on a fired glib source, a
 saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
+
+- **Remote Files transactional navigation and authority isolation (2026-08-29)**:
+  root changes now stage a `NavigationIntent` carrying a monotonic revision,
+  immutable filesystem target and cancellation token. The target listing must
+  succeed and still match both the newest intent and live authority identity
+  before location, execution overlay, root store, selector, snapshot and
+  history commit together. Failure, cancellation, profile mutation and
+  out-of-order completion leave the old root/store/selection/history usable.
+  Choosing the still-committed location explicitly cancels a staged selector
+  change, including the pre-list remote Home probe. That probe freezes the
+  stable filesystem authority and rechecks it against live config before
+  handing its path to navigation, so B's late Home cannot target C after an
+  index reuse. Back/Forward retain at most 64 committed points per stack and mutate
+  only after a successful listing; a newly committed branch clears Forward.
+  Up, Home, Open Folder, cwd follow, profile remap and foreground-SSH follow
+  enter the same transaction. The clickable root title provides a bounded,
+  control/spoof-safe absolute POSIX path entry and exact ancestor breadcrumb
+  targets (dialog UI, not a persistent inline entry).
+  History locations are exact-profile remapped on config reload and unprovable
+  entries are dropped. A committed filesystem-identity guard also makes a
+  retained snapshot read-only if its numeric profile index is reinterpreted;
+  scans, mutations and Open Terminal cannot send old paths to the replacement
+  endpoint while fallback navigation is pending or has failed.
+
+  Scan admission keeps the existing global eight fixed workers/64 queued jobs
+  and weighted Root/Manual/Lazy service, but now keys work by stable filesystem
+  authority, round-robins authorities, caps each remote at two running and 16
+  pending scans, and caps Local at 48 pending. At global saturation the first
+  Root/Manual request from a queue-absent authority displaces the newest,
+  lowest-priority queued request from the most overrepresented other authority.
+  A slow endpoint therefore cannot occupy the global pool or make another
+  authority's first interactive navigation return `WouldBlock`. File
+  mutations moved from one thread per request to four fixed workers plus a
+  32-job hard queue. Per-authority cap/fairness and fs-op saturation have pure
+  regressions.
+
+  Each successful directory snapshot now stores wall completion time for UI
+  age and monotonic completion time for a five-minute remote TTL. While Files
+  is visible, a 30-second tick revalidates at most four visible materialized
+  stale directories with SWR, coalescing pending revisions. Non-cancellation,
+  non-backpressure failures are classified transient/persistent and receive
+  per-authority/path exponential or 30-second cooldown (30-second cap);
+  explicit tree-row Retry bypasses the current cooldown for exactly one
+  attempt. Queue/list/reconcile time, enqueue depth and delta sizes are logged
+  with slow thresholds. The child-store registry is weak so GTK-owned live
+  subtrees preserve identity without the cache pinning evicted subtrees.
+  Regressions cover transactional failure/stale answers/cancellation, bounded
+  branching history, validator/breadcrumbs, authority isolation, cooldown and
+  Retry bypass, monotonic TTL, timing thresholds and weak-cache reclamation.
+
+- **Remote Files bounded scheduling and navigation (2026-08-29)**: the audit
+  found that the former concurrency counter still created one waiting OS thread
+  per scan, collapsed-but-cached directories were skipped by targeted refresh,
+  raw remote diagnostics could reach UI text, retained snapshots had no age,
+  and mutation/navigation selection semantics were incomplete. Directory scans
+  now use eight fixed workers behind a 64-job hard queue. Weighted root/manual/
+  lazy lanes prioritize navigation, guarantee lazy service, let high-priority
+  requests preempt newest lazy work, and physically retire cancelled same-path
+  revisions before they consume queue capacity. Pending state is completed only
+  by the current revision. Pure pressure, preemption, fairness, cancellation and
+  pending regressions pin these bounds.
+
+  Stale-while-revalidate now records the last successful publication time and
+  labels retained snapshots with relative age. Tree/UI errors use stable
+  categories rather than raw SSH/probe stderr, with bounded control/spoof-safe
+  labels. A collapsed materialized store remains refreshable; reconciliation of
+  a vanished/retyped directory cancels and removes all descendant requests,
+  stores, timestamps and selection intents. Ambiguous operation failures also
+  re-list exact affected parents, while successful create/rename selects the new
+  path after the winning reconciliation. Remote home parsing is strict UTF-8;
+  the Files header adds Home, context menus add Open Folder, and ListView-scoped
+  `Alt+Up`, `Alt+Home`, `Alt+Right` provide parent/home/enter navigation without
+  claiming terminal or ordinary list keys. Late home answers are guarded by
+  generation, location, overlay and root. Tests cover error redaction/snapshot
+  age, store delta/subtree boundaries, selection restoration, shortcut
+  modifiers and strict home parsing.
+
+- **Remote Files resilient refresh state (2026-08-29)**: initial child/root
+  listings now render `Loading…` inside the tree; stale-while-revalidate appends
+  `Refreshing…` after the last-good children, and failure replaces only that
+  transient row with bounded `Error: …` plus a focusable, accessible `Retry`
+  button. Successful reconciliation removes the state row and retains surviving
+  object identity/expansion. Per-path scan revisions now own cancellation tokens:
+  issuing a newer revision cancels the older token, queued workers recheck after
+  acquiring their scan slot and immediately before enumeration/spawn, and a
+  running remote list uses the existing process-group watchdog kill path. Bare
+  `F5` is captured only within the Files ListView to refresh the current root;
+  modified F5 and every F5 while terminal focus is outside Files propagate.
+  Regressions cover loading/refresh/error preservation, retryability, queued and
+  pre-spawn cancellation, running process-group cancellation, and the strict F5
+  modifier matrix.
+
+- **Remote Files bounded listing reconciliation (2026-08-29)**: probe protocol
+  v4 gives remote `list` the client-owned `MAX_DIRECTORY_ENTRIES + 1` hard
+  limit and stops its loop at that boundary. The extra complete pair is a
+  conservative truncation sentinel; only the first 4096 valid rows are kept,
+  and root/manual refreshes disclose the bounded prefix. Remote wire names must
+  now be valid UTF-8 basenames, with duplicate names/resolved paths rejected,
+  so a lossy label can never become an unaddressable operation path. The probe
+  classifies `-L` before `-d`, making every symlink (including links to dirs)
+  non-expandable. In-place refresh now explicitly restores only surviving
+  selected paths, clears any drop-hover widget before ListView recycling, and
+  revalidates menu, rename/create and delete-confirmation row identities before
+  delayed work starts. Parser, argv, real-script limit/symlink, selection and
+  delayed-row regressions cover the protocol and reconciliation boundaries.
+
+- **Remote Files latest-wins refresh (2026-08-29)**: every root, lazy child
+  and explicit/operation-triggered directory scan now carries a per-directory
+  revision in addition to the existing tree generation, location and execution
+  overlay snapshot. A newer request for the same remote path rejects an older
+  completion, so a delayed expansion can no longer overwrite a fresher manual
+  or post-mutation listing. Context-menu Refresh now targets the clicked
+  directory (or a file's parent) rather than always re-listing the tree root.
+  Successful refreshes still use the minimal in-place store diff, preserving
+  surviving row identity, loaded descendants and expansion; failures leave the
+  visible snapshot intact. Pure regressions cover out-of-order revisions and
+  child-directory action targeting.
+
+- **Files hidden-entry policy (2026-08-29)**: a focusable, accessible eye
+  toggle now hides dot-prefixed rows by default and reveals them through the
+  existing `FilterListModel`. It never rescans, changes location authority, or
+  discards `TreeListRow` expansion identity; the hidden policy and loaded-name
+  query compose in one predicate while the selection model remains stable.
 
 - **Foreground SSH → Remote Files 4.6 (2026-08-27)**: the existing single
   window heartbeat now observes the active leaf's real foreground process tree

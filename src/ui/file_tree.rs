@@ -27,12 +27,12 @@ use gtk4::prelude::*;
 use gtk4::{gio, glib, ListView, SignalListItemFactory, TreeListModel, TreeListRow};
 use libadwaita as adw;
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 use vte4::TerminalExt;
 
 use super::remote_fs::{self, FsClipboard, FsEntry, FsExecutionOverlay, FsLocation};
@@ -44,11 +44,17 @@ use jterm_core::jsh_remote::RemoteHostConfig;
 const SCAN_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const MAX_FILE_LABEL_BYTES: usize = 512;
 const MAX_CONCURRENT_SCANS: usize = 8;
-static ACTIVE_SCANS: AtomicUsize = AtomicUsize::new(0);
+const MAX_PENDING_SCANS: usize = 64;
+const MAX_PENDING_SCANS_PER_REMOTE_AUTHORITY: usize = 16;
+const MAX_PENDING_SCANS_FOR_LOCAL_AUTHORITY: usize = 48;
+const MAX_PENDING_FS_OPS: usize = 32;
+const MAX_FILE_TREE_HISTORY: usize = 64;
+const MAX_NAVIGATION_PATH_BYTES: usize = 4096;
+const REMOTE_SNAPSHOT_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_TTL_REFRESHES_PER_TICK: usize = 4;
 /// Mutating file operations get their own, smaller bound so a burst of
 /// context-menu actions cannot crowd out directory scans.
 const MAX_CONCURRENT_FS_OPS: usize = 4;
-static ACTIVE_FS_OPS: AtomicUsize = AtomicUsize::new(0);
 /// Header space is scarce. Forty-eight characters retain the recognizable
 /// `root@dsw…aliyuncs.com (temporary)` ends while a tooltip carries the whole
 /// sanitized endpoint.
@@ -63,6 +69,202 @@ struct FileEntry {
     name: String,
     path: PathBuf,
     is_dir: bool,
+    status: Option<DirectoryRowStatus>,
+}
+
+/// Transient directory state rendered as a real row inside the tree. A
+/// refresh appends one of these after the last-good children instead of
+/// clearing them, so failure remains visible without sacrificing expansion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DirectoryRowStatus {
+    Loading,
+    Refreshing {
+        last_good: Option<SystemTime>,
+    },
+    Error {
+        message: String,
+        last_good: Option<SystemTime>,
+    },
+}
+
+impl DirectoryRowStatus {
+    fn label(&self) -> String {
+        match self {
+            Self::Loading => "Loading…".to_string(),
+            Self::Refreshing { last_good } => match last_good {
+                Some(completed) => format!(
+                    "Refreshing… · last updated {}",
+                    snapshot_age(*completed, SystemTime::now())
+                ),
+                None => "Refreshing…".to_string(),
+            },
+            Self::Error { message, last_good } => match last_good {
+                Some(completed) => format!(
+                    "Error: {message} · showing snapshot from {}",
+                    snapshot_age(*completed, SystemTime::now())
+                ),
+                None => format!("Error: {message}"),
+            },
+        }
+    }
+
+    fn is_retryable(&self) -> bool {
+        matches!(self, Self::Error { .. })
+    }
+}
+
+fn snapshot_age(completed: SystemTime, now: SystemTime) -> String {
+    let elapsed = now.duration_since(completed).unwrap_or_default();
+    if elapsed < Duration::from_secs(60) {
+        format!("{}s ago", elapsed.as_secs())
+    } else if elapsed < Duration::from_secs(60 * 60) {
+        format!("{}m ago", elapsed.as_secs() / 60)
+    } else if elapsed < Duration::from_secs(24 * 60 * 60) {
+        format!("{}h ago", elapsed.as_secs() / (60 * 60))
+    } else {
+        format!("{}d ago", elapsed.as_secs() / (24 * 60 * 60))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SnapshotMeta {
+    completed_wall: SystemTime,
+    completed_monotonic: Instant,
+}
+
+impl SnapshotMeta {
+    fn now() -> Self {
+        Self {
+            completed_wall: SystemTime::now(),
+            completed_monotonic: Instant::now(),
+        }
+    }
+}
+
+fn snapshot_meta_is_stale(snapshot: SnapshotMeta, now: Instant) -> bool {
+    now.saturating_duration_since(snapshot.completed_monotonic) >= REMOTE_SNAPSHOT_TTL
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectoryFailureClass {
+    Transient,
+    Persistent,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DirectoryFailureState {
+    class: DirectoryFailureClass,
+    consecutive: u32,
+    retry_not_before: Instant,
+}
+
+fn directory_failure_class(error: &io::Error) -> DirectoryFailureClass {
+    match error.kind() {
+        io::ErrorKind::PermissionDenied
+        | io::ErrorKind::InvalidInput
+        | io::ErrorKind::InvalidData
+        | io::ErrorKind::NotFound => DirectoryFailureClass::Persistent,
+        _ => DirectoryFailureClass::Transient,
+    }
+}
+
+fn directory_failure_delay(class: DirectoryFailureClass, consecutive: u32) -> Duration {
+    match class {
+        DirectoryFailureClass::Persistent => Duration::from_secs(30),
+        DirectoryFailureClass::Transient => {
+            let exponent = consecutive.saturating_sub(1).min(5);
+            Duration::from_secs((1_u64 << exponent).min(30))
+        }
+    }
+}
+
+fn next_directory_failure_state(
+    previous: Option<DirectoryFailureState>,
+    error: &io::Error,
+    now: Instant,
+) -> DirectoryFailureState {
+    let class = directory_failure_class(error);
+    let consecutive = previous
+        .filter(|previous| previous.class == class)
+        .map(|previous| previous.consecutive.saturating_add(1))
+        .unwrap_or(1);
+    DirectoryFailureState {
+        class,
+        consecutive,
+        retry_not_before: now + directory_failure_delay(class, consecutive),
+    }
+}
+
+impl FileEntry {
+    fn directory_status(dir: &Path, status: DirectoryRowStatus) -> Self {
+        Self {
+            name: status.label(),
+            path: dir.to_path_buf(),
+            is_dir: false,
+            status: Some(status),
+        }
+    }
+
+    fn is_item(&self) -> bool {
+        self.status.is_none()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DirectoryScan {
+    entries: Vec<FileEntry>,
+    truncated: bool,
+    timing: ScanTiming,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ScanTiming {
+    queued_for: Duration,
+    listed_for: Duration,
+    queued_depth: usize,
+}
+
+fn entries_remain_current(expected: &[FileEntry], current: &[FileEntry]) -> bool {
+    expected.iter().all(|expected| {
+        expected.is_item()
+            && current.iter().any(|entry| {
+                entry.is_item() && entry.path == expected.path && entry.is_dir == expected.is_dir
+            })
+    })
+}
+
+fn surviving_selected_paths(selected: &[FileEntry], current: &[FileEntry]) -> Vec<PathBuf> {
+    selected
+        .iter()
+        .filter(|selected| {
+            selected.is_item()
+                && current.iter().any(|entry| {
+                    entry.is_item()
+                        && entry.path == selected.path
+                        && entry.is_dir == selected.is_dir
+                })
+        })
+        .map(|entry| entry.path.clone())
+        .collect()
+}
+
+fn selection_paths_after_reconcile(
+    selected: &[FileEntry],
+    current: &[FileEntry],
+    preferred: Option<&[PathBuf]>,
+) -> Vec<PathBuf> {
+    match preferred {
+        Some(paths) => paths
+            .iter()
+            .filter(|path| {
+                current
+                    .iter()
+                    .any(|entry| entry.is_item() && entry.path == path.as_path())
+            })
+            .cloned()
+            .collect(),
+        None => surviving_selected_paths(selected, current),
+    }
 }
 
 impl From<FsEntry> for FileEntry {
@@ -73,7 +275,281 @@ impl From<FsEntry> for FileEntry {
             name: safe_file_label(&entry.name),
             path: entry.path,
             is_dir: entry.is_dir,
+            status: None,
         }
+    }
+}
+
+/// Files owns only bare F5 while focus is inside its ListView. Modified F5
+/// remains available to surrounding application/terminal shortcut handling;
+/// lock/button state is deliberately irrelevant.
+fn file_tree_is_plain_refresh_key(key: gtk4::gdk::Key, state: gtk4::gdk::ModifierType) -> bool {
+    use gtk4::gdk::ModifierType;
+    key == gtk4::gdk::Key::F5
+        && !state.intersects(
+            ModifierType::CONTROL_MASK
+                | ModifierType::SHIFT_MASK
+                | ModifierType::ALT_MASK
+                | ModifierType::SUPER_MASK
+                | ModifierType::HYPER_MASK
+                | ModifierType::META_MASK,
+        )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileTreeNavigationKey {
+    Refresh,
+    Up,
+    Home,
+    EnterDirectory,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileTreeNavigationPoint {
+    location: FsLocation,
+    overlay: FsExecutionOverlay,
+    root: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileTreeNavigationAction {
+    Push,
+    Back,
+    Forward,
+    Replace,
+}
+
+#[derive(Clone)]
+struct FileTreeNavigationRequest {
+    revision: u64,
+    target: FileTreeNavigationPoint,
+    action: FileTreeNavigationAction,
+    cancel: remote_fs::CancelToken,
+}
+
+#[derive(Default)]
+pub(crate) struct FileTreeNavigationState {
+    revision: u64,
+    pending: Option<FileTreeNavigationRequest>,
+    current: Option<FileTreeNavigationPoint>,
+    back: VecDeque<FileTreeNavigationPoint>,
+    forward: VecDeque<FileTreeNavigationPoint>,
+}
+
+impl FileTreeNavigationState {
+    fn push_bounded(
+        history: &mut VecDeque<FileTreeNavigationPoint>,
+        point: FileTreeNavigationPoint,
+    ) {
+        if history.len() == MAX_FILE_TREE_HISTORY {
+            history.pop_front();
+        }
+        history.push_back(point);
+    }
+
+    fn begin(
+        &mut self,
+        target: FileTreeNavigationPoint,
+        action: FileTreeNavigationAction,
+    ) -> FileTreeNavigationRequest {
+        if let Some(previous) = self.pending.take() {
+            previous.cancel.cancel();
+        }
+        self.revision = self.revision.wrapping_add(1);
+        let request = FileTreeNavigationRequest {
+            revision: self.revision,
+            target,
+            action,
+            cancel: remote_fs::CancelToken::default(),
+        };
+        self.pending = Some(request.clone());
+        request
+    }
+
+    fn is_current(&self, request: &FileTreeNavigationRequest) -> bool {
+        self.pending.as_ref().is_some_and(|pending| {
+            pending.revision == request.revision && pending.target == request.target
+        })
+    }
+
+    fn fail(&mut self, request: &FileTreeNavigationRequest) -> bool {
+        if !self.is_current(request) {
+            return false;
+        }
+        self.pending = None;
+        true
+    }
+
+    fn cancel_pending(&mut self) -> bool {
+        let Some(request) = self.pending.take() else {
+            return false;
+        };
+        request.cancel.cancel();
+        true
+    }
+
+    fn commit(&mut self, request: &FileTreeNavigationRequest) -> bool {
+        if !self.is_current(request) {
+            return false;
+        }
+        match request.action {
+            FileTreeNavigationAction::Push => {
+                if let Some(current) = self.current.take() {
+                    if current != request.target {
+                        Self::push_bounded(&mut self.back, current);
+                        self.forward.clear();
+                    }
+                }
+            }
+            FileTreeNavigationAction::Back => {
+                if self.back.back() != Some(&request.target) {
+                    return false;
+                }
+                self.back.pop_back();
+                if let Some(current) = self.current.take() {
+                    Self::push_bounded(&mut self.forward, current);
+                }
+            }
+            FileTreeNavigationAction::Forward => {
+                if self.forward.back() != Some(&request.target) {
+                    return false;
+                }
+                self.forward.pop_back();
+                if let Some(current) = self.current.take() {
+                    Self::push_bounded(&mut self.back, current);
+                }
+            }
+            FileTreeNavigationAction::Replace => {}
+        }
+        self.current = Some(request.target.clone());
+        self.pending = None;
+        true
+    }
+
+    fn install_initial(&mut self, point: FileTreeNavigationPoint) {
+        if let Some(previous) = self.pending.take() {
+            previous.cancel.cancel();
+        }
+        self.revision = self.revision.wrapping_add(1);
+        self.current = Some(point);
+        self.back.clear();
+        self.forward.clear();
+    }
+
+    fn back_target(&self) -> Option<FileTreeNavigationPoint> {
+        self.back.back().cloned()
+    }
+
+    fn forward_target(&self) -> Option<FileTreeNavigationPoint> {
+        self.forward.back().cloned()
+    }
+
+    fn remap_history_locations(
+        &mut self,
+        mut remap: impl FnMut(&FsLocation) -> Option<FsLocation>,
+    ) {
+        let remap_stack =
+            |stack: &mut VecDeque<FileTreeNavigationPoint>,
+             remap: &mut dyn FnMut(&FsLocation) -> Option<FsLocation>| {
+                *stack = std::mem::take(stack)
+                    .into_iter()
+                    .filter_map(|mut point| {
+                        point.location = remap(&point.location)?;
+                        Some(point)
+                    })
+                    .collect();
+            };
+        remap_stack(&mut self.back, &mut remap);
+        remap_stack(&mut self.forward, &mut remap);
+    }
+
+    fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+
+fn validate_absolute_navigation_path(value: &str) -> Result<PathBuf, &'static str> {
+    if value.is_empty() {
+        return Err("Path is required");
+    }
+    if value.len() > MAX_NAVIGATION_PATH_BYTES {
+        return Err("Path is too long");
+    }
+    if value
+        .chars()
+        .any(|ch| ch.is_control() || jterm_core::review_input::is_visual_spoofing_character(ch))
+    {
+        return Err("Path contains hidden or control text");
+    }
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        return Err("Path must be absolute");
+    }
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::Normal(component) => normalized.push(component),
+            std::path::Component::ParentDir => {
+                if normalized == Path::new("/") {
+                    return Err("Path cannot traverse above the filesystem root");
+                }
+                normalized.pop();
+            }
+            std::path::Component::Prefix(_) => return Err("Path must use POSIX syntax"),
+        }
+    }
+    Ok(normalized)
+}
+
+fn navigation_breadcrumbs(path: &Path) -> Vec<PathBuf> {
+    let mut ancestors: Vec<_> = path.ancestors().map(Path::to_path_buf).collect();
+    ancestors.reverse();
+    ancestors
+}
+
+fn file_tree_location_from_selection(
+    index: u32,
+    active_remote_count: usize,
+    current: &FsLocation,
+) -> Option<FsLocation> {
+    if index == gtk4::INVALID_LIST_POSITION {
+        return None;
+    }
+    match index as usize {
+        0 => Some(FsLocation::Local),
+        selected if selected <= active_remote_count => Some(FsLocation::Remote(selected - 1)),
+        _ if matches!(current, FsLocation::Transient(_)) => Some(current.clone()),
+        _ => None,
+    }
+}
+
+/// Shortcuts are captured only by the Files ListView. Ordinary Home/arrow
+/// keys therefore remain GTK selection navigation and terminal shortcuts are
+/// never claimed while the terminal has focus.
+fn file_tree_navigation_key(
+    key: gtk4::gdk::Key,
+    state: gtk4::gdk::ModifierType,
+) -> Option<FileTreeNavigationKey> {
+    use gtk4::gdk::{Key, ModifierType};
+    let modifiers = state
+        & (ModifierType::CONTROL_MASK
+            | ModifierType::SHIFT_MASK
+            | ModifierType::ALT_MASK
+            | ModifierType::SUPER_MASK
+            | ModifierType::HYPER_MASK
+            | ModifierType::META_MASK);
+    if file_tree_is_plain_refresh_key(key, state) {
+        return Some(FileTreeNavigationKey::Refresh);
+    }
+    if modifiers != ModifierType::ALT_MASK {
+        return None;
+    }
+    match key {
+        Key::Up => Some(FileTreeNavigationKey::Up),
+        Key::Home => Some(FileTreeNavigationKey::Home),
+        Key::Right => Some(FileTreeNavigationKey::EnterDirectory),
+        _ => None,
     }
 }
 
@@ -89,7 +565,14 @@ fn sort_entries(entries: &mut [FileEntry]) {
 /// through `scan_entries` for any location.
 #[cfg(test)]
 fn scan_dir(dir: &Path) -> io::Result<Vec<FileEntry>> {
-    scan_entries(&FsLocation::Local, &[], &FsExecutionOverlay::default(), dir)
+    scan_entries(
+        &FsLocation::Local,
+        &[],
+        &FsExecutionOverlay::default(),
+        dir,
+        &remote_fs::CancelToken::default(),
+    )
+    .map(|listing| listing.entries)
 }
 
 fn scan_entries(
@@ -97,9 +580,15 @@ fn scan_entries(
     hosts: &[RemoteHost],
     overlay: &FsExecutionOverlay,
     dir: &Path,
-) -> io::Result<Vec<FileEntry>> {
-    remote_fs::list_dir_with_overlay(loc, hosts, overlay, dir)
-        .map(|entries| entries.into_iter().map(FileEntry::from).collect())
+    cancel: &remote_fs::CancelToken,
+) -> io::Result<DirectoryScan> {
+    remote_fs::list_dir_with_overlay_cancel(loc, hosts, overlay, dir, cancel).map(|listing| {
+        DirectoryScan {
+            entries: listing.entries.into_iter().map(FileEntry::from).collect(),
+            truncated: listing.truncated,
+            timing: ScanTiming::default(),
+        }
+    })
 }
 
 fn safe_file_label(value: &str) -> String {
@@ -122,52 +611,486 @@ fn safe_file_label(value: &str) -> String {
     label
 }
 
-struct ActiveScan;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanPriority {
+    Root,
+    Manual,
+    Lazy,
+}
 
-impl ActiveScan {
-    /// Take one scan slot, waiting until another scan releases its own. The
-    /// cap bounds concurrent ssh/docker subprocesses; it must never reject
-    /// user actions, so contention parks the worker thread instead of failing
-    /// the request.
-    fn acquire() -> Self {
-        loop {
-            let taken = ACTIVE_SCANS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_CONCURRENT_SCANS).then_some(active + 1)
-            });
-            if taken.is_ok() {
-                return Self;
-            }
-            std::thread::sleep(SCAN_POLL_INTERVAL);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectoryRefreshCause {
+    Manual,
+    Retry,
+    AutoTtl,
+}
+
+impl DirectoryRefreshCause {
+    fn priority(self) -> ScanPriority {
+        match self {
+            Self::AutoTtl => ScanPriority::Lazy,
+            Self::Manual | Self::Retry => ScanPriority::Manual,
         }
     }
 }
 
-impl Drop for ActiveScan {
-    fn drop(&mut self) {
-        ACTIVE_SCANS.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-struct ActiveFsOp;
-
-impl ActiveFsOp {
-    /// Same wait-for-a-slot policy as scans, on the smaller fs-op budget.
-    fn acquire() -> Self {
-        loop {
-            let taken = ACTIVE_FS_OPS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_CONCURRENT_FS_OPS).then_some(active + 1)
-            });
-            if taken.is_ok() {
-                return Self;
-            }
-            std::thread::sleep(SCAN_POLL_INTERVAL);
+impl ScanPriority {
+    fn lane(self) -> usize {
+        match self {
+            Self::Root => 0,
+            Self::Manual => 1,
+            Self::Lazy => 2,
         }
     }
 }
 
-impl Drop for ActiveFsOp {
-    fn drop(&mut self) {
-        ACTIVE_FS_OPS.fetch_sub(1, Ordering::AcqRel);
+/// Weighted service order: navigation/root work leads, explicit user refresh
+/// follows, and lazy expansion still receives one guaranteed turn per cycle.
+const SCAN_SERVICE_ORDER: [ScanPriority; 8] = [
+    ScanPriority::Root,
+    ScanPriority::Root,
+    ScanPriority::Manual,
+    ScanPriority::Root,
+    ScanPriority::Manual,
+    ScanPriority::Lazy,
+    ScanPriority::Root,
+    ScanPriority::Manual,
+];
+
+/// Pure bounded priority queue used by the fixed scan workers. A root/manual
+/// request may evict the newest lazy request when full; no priority can starve
+/// because `pop` advances through the weighted service cycle.
+struct ScanQueue<T> {
+    lanes: [VecDeque<T>; 3],
+    capacity: usize,
+    service_turn: usize,
+}
+
+impl<T> ScanQueue<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            lanes: std::array::from_fn(|_| VecDeque::new()),
+            capacity,
+            service_turn: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.lanes.iter().map(VecDeque::len).sum()
+    }
+
+    fn count_where(&self, mut predicate: impl FnMut(&T) -> bool) -> usize {
+        self.lanes
+            .iter()
+            .flatten()
+            .filter(|item| predicate(item))
+            .count()
+    }
+
+    fn push(&mut self, priority: ScanPriority, item: T) -> Result<Option<T>, T> {
+        if self.len() < self.capacity {
+            self.lanes[priority.lane()].push_back(item);
+            return Ok(None);
+        }
+        if priority != ScanPriority::Lazy {
+            if let Some(evicted) = self.lanes[ScanPriority::Lazy.lane()].pop_back() {
+                self.lanes[priority.lane()].push_back(item);
+                return Ok(Some(evicted));
+            }
+        }
+        Err(item)
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        self.pop_where(|_| true)
+    }
+
+    fn pop_where(&mut self, mut predicate: impl FnMut(&T) -> bool) -> Option<T> {
+        for offset in 0..SCAN_SERVICE_ORDER.len() {
+            let turn = (self.service_turn + offset) % SCAN_SERVICE_ORDER.len();
+            let lane = SCAN_SERVICE_ORDER[turn].lane();
+            let position = self.lanes[lane].iter().position(&mut predicate);
+            if let Some(item) = position.and_then(|position| self.lanes[lane].remove(position)) {
+                self.service_turn = (turn + 1) % SCAN_SERVICE_ORDER.len();
+                return Some(item);
+            }
+        }
+        None
+    }
+
+    fn has_where(&self, mut predicate: impl FnMut(&T) -> bool) -> bool {
+        self.lanes.iter().flatten().any(&mut predicate)
+    }
+
+    fn remove_newest_where(
+        &mut self,
+        priorities: &[ScanPriority],
+        mut predicate: impl FnMut(&T) -> bool,
+    ) -> Option<T> {
+        for priority in priorities {
+            let lane = &mut self.lanes[priority.lane()];
+            if let Some(position) = lane.iter().rposition(&mut predicate) {
+                return lane.remove(position);
+            }
+        }
+        None
+    }
+
+    fn remove_where(&mut self, mut predicate: impl FnMut(&T) -> bool) -> Vec<T> {
+        let mut removed = Vec::new();
+        for lane in &mut self.lanes {
+            let mut kept = VecDeque::with_capacity(lane.len());
+            while let Some(item) = lane.pop_front() {
+                if predicate(&item) {
+                    removed.push(item);
+                } else {
+                    kept.push_back(item);
+                }
+            }
+            *lane = kept;
+        }
+        removed
+    }
+}
+
+struct ScanJob {
+    authority: remote_fs::FilesystemIdentity,
+    loc: FsLocation,
+    hosts: Vec<RemoteHost>,
+    overlay: FsExecutionOverlay,
+    dir: PathBuf,
+    cancel: remote_fs::CancelToken,
+    tx: mpsc::SyncSender<io::Result<DirectoryScan>>,
+    enqueued_at: Instant,
+    queued_depth: usize,
+}
+
+impl ScanJob {
+    fn run(self) {
+        let started_at = Instant::now();
+        let result = if self.cancel.is_cancelled() {
+            Err(remote_fs::cancelled_error())
+        } else {
+            scan_entries(
+                &self.loc,
+                &self.hosts,
+                &self.overlay,
+                &self.dir,
+                &self.cancel,
+            )
+        }
+        .map(|mut scan| {
+            scan.timing = ScanTiming {
+                queued_for: started_at.saturating_duration_since(self.enqueued_at),
+                listed_for: started_at.elapsed(),
+                queued_depth: self.queued_depth,
+            };
+            scan
+        });
+        let _ = self.tx.send(result);
+    }
+
+    fn retire(self, error: io::Error) {
+        self.cancel.cancel();
+        let _ = self.tx.send(Err(error));
+    }
+}
+
+struct ScanSchedulerState {
+    queue: ScanQueue<ScanJob>,
+    authority_order: VecDeque<remote_fs::FilesystemIdentity>,
+    running_by_authority: std::collections::HashMap<remote_fs::FilesystemIdentity, usize>,
+}
+
+fn scan_authority_limit(authority: &remote_fs::FilesystemIdentity) -> usize {
+    match authority {
+        remote_fs::FilesystemIdentity::Local => MAX_CONCURRENT_SCANS,
+        remote_fs::FilesystemIdentity::Remote { .. } => 2,
+    }
+}
+
+fn scan_authority_pending_limit(authority: &remote_fs::FilesystemIdentity) -> usize {
+    match authority {
+        remote_fs::FilesystemIdentity::Local => MAX_PENDING_SCANS_FOR_LOCAL_AUTHORITY,
+        remote_fs::FilesystemIdentity::Remote { .. } => MAX_PENDING_SCANS_PER_REMOTE_AUTHORITY,
+    }
+}
+
+impl ScanSchedulerState {
+    fn register_authority(&mut self, authority: &remote_fs::FilesystemIdentity) {
+        if !self.authority_order.contains(authority) {
+            self.authority_order.push_back(authority.clone());
+        }
+    }
+
+    fn prune_authorities(&mut self) {
+        self.authority_order.retain(|authority| {
+            self.running_by_authority
+                .get(authority)
+                .copied()
+                .unwrap_or(0)
+                != 0
+                || self.queue.has_where(|job| &job.authority == authority)
+        });
+        self.running_by_authority.retain(|authority, running| {
+            *running != 0 || self.queue.has_where(|job| &job.authority == authority)
+        });
+    }
+
+    fn evict_for_new_authority_interaction(
+        &mut self,
+        incoming: &remote_fs::FilesystemIdentity,
+    ) -> Option<ScanJob> {
+        let mut counts = std::collections::HashMap::new();
+        for job in self.queue.lanes.iter().flatten() {
+            if &job.authority != incoming {
+                *counts.entry(job.authority.clone()).or_insert(0_usize) += 1;
+            }
+        }
+        let victim = counts
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .max_by_key(|(_, count)| *count)
+            .map(|(authority, _)| authority)?;
+        self.queue.remove_newest_where(
+            &[ScanPriority::Lazy, ScanPriority::Manual, ScanPriority::Root],
+            |job| job.authority == victim,
+        )
+    }
+
+    fn admit(&mut self, priority: ScanPriority, mut job: ScanJob) -> Result<Vec<ScanJob>, ()> {
+        let authority = job.authority.clone();
+        let authority_pending = self
+            .queue
+            .count_where(|queued| queued.authority == authority);
+        let mut evicted = Vec::new();
+        if authority_pending >= scan_authority_pending_limit(&authority) {
+            if priority != ScanPriority::Lazy {
+                if let Some(job) = self
+                    .queue
+                    .remove_newest_where(&[ScanPriority::Lazy], |queued| {
+                        queued.authority == authority
+                    })
+                {
+                    evicted.push(job);
+                } else {
+                    return Err(());
+                }
+            } else {
+                return Err(());
+            }
+        }
+
+        let incoming_has_no_pending = authority_pending == 0;
+        let has_global_lazy = !self.queue.lanes[ScanPriority::Lazy.lane()].is_empty();
+        if self.queue.len() == self.queue.capacity
+            && priority != ScanPriority::Lazy
+            && incoming_has_no_pending
+            && !has_global_lazy
+        {
+            if let Some(job) = self.evict_for_new_authority_interaction(&authority) {
+                evicted.push(job);
+            }
+        }
+
+        job.queued_depth = self.queue.len();
+        self.register_authority(&authority);
+        match self.queue.push(priority, job) {
+            Ok(Some(job)) => {
+                evicted.push(job);
+                Ok(evicted)
+            }
+            Ok(None) => Ok(evicted),
+            Err(_) => Err(()),
+        }
+    }
+
+    fn pop_next(&mut self) -> Option<ScanJob> {
+        let authority_count = self.authority_order.len();
+        for _ in 0..authority_count {
+            let authority = self.authority_order.pop_front()?;
+            self.authority_order.push_back(authority.clone());
+            let running = self
+                .running_by_authority
+                .get(&authority)
+                .copied()
+                .unwrap_or(0);
+            if running >= scan_authority_limit(&authority) {
+                continue;
+            }
+            if let Some(job) = self.queue.pop_where(|job| job.authority == authority) {
+                *self.running_by_authority.entry(authority).or_insert(0) += 1;
+                return Some(job);
+            }
+        }
+        None
+    }
+
+    fn finish(&mut self, authority: &remote_fs::FilesystemIdentity) {
+        if let Some(running) = self.running_by_authority.get_mut(authority) {
+            *running = running.saturating_sub(1);
+        }
+        self.prune_authorities();
+    }
+}
+
+struct ScanScheduler {
+    shared: Arc<(Mutex<ScanSchedulerState>, Condvar)>,
+}
+
+impl ScanScheduler {
+    fn new(worker_count: usize, capacity: usize) -> Self {
+        let shared = Arc::new((
+            Mutex::new(ScanSchedulerState {
+                queue: ScanQueue::new(capacity),
+                authority_order: VecDeque::new(),
+                running_by_authority: std::collections::HashMap::new(),
+            }),
+            Condvar::new(),
+        ));
+        for index in 0..worker_count {
+            let shared = shared.clone();
+            std::thread::Builder::new()
+                .name(format!("forge-file-tree-scan-{index}"))
+                .spawn(move || scan_worker(shared))
+                .expect("file-tree scan worker must start");
+        }
+        Self { shared }
+    }
+
+    fn global() -> &'static Self {
+        static SCHEDULER: OnceLock<ScanScheduler> = OnceLock::new();
+        SCHEDULER.get_or_init(|| Self::new(MAX_CONCURRENT_SCANS, MAX_PENDING_SCANS))
+    }
+
+    fn enqueue(&self, priority: ScanPriority, job: ScanJob) -> io::Result<()> {
+        let (lock, wake) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cancelled = state
+            .queue
+            .remove_where(|queued| queued.cancel.is_cancelled());
+        let admission = state.admit(priority, job);
+        let (evicted, error) = match admission {
+            Ok(evicted) => (evicted, None),
+            Err(()) => (
+                Vec::new(),
+                Some(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "directory scan admission limit reached",
+                )),
+            ),
+        };
+        if error.is_none() {
+            wake.notify_all();
+        }
+        state.prune_authorities();
+        drop(state);
+        for job in cancelled {
+            job.retire(remote_fs::cancelled_error());
+        }
+        for job in evicted {
+            job.retire(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "directory scan was preempted to preserve interactive capacity",
+            ));
+        }
+        match error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn retire_cancelled(&self) {
+        let (lock, wake) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cancelled = state
+            .queue
+            .remove_where(|queued| queued.cancel.is_cancelled());
+        state.prune_authorities();
+        drop(state);
+        for job in cancelled {
+            job.retire(remote_fs::cancelled_error());
+        }
+        wake.notify_all();
+    }
+}
+
+fn scan_worker(shared: Arc<(Mutex<ScanSchedulerState>, Condvar)>) {
+    loop {
+        let job = {
+            let (lock, wake) = &*shared;
+            let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            loop {
+                if let Some(job) = state.pop_next() {
+                    break job;
+                }
+                state = wake
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        };
+        let authority = job.authority.clone();
+        job.run();
+        let (lock, wake) = &*shared;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.finish(&authority);
+        wake.notify_all();
+    }
+}
+
+type FsOpJob = Box<dyn FnOnce() + Send + 'static>;
+
+struct FsOpScheduler {
+    shared: Arc<(Mutex<VecDeque<FsOpJob>>, Condvar)>,
+    capacity: usize,
+}
+
+impl FsOpScheduler {
+    fn new(worker_count: usize, capacity: usize) -> Self {
+        let shared = Arc::new((Mutex::new(VecDeque::<FsOpJob>::new()), Condvar::new()));
+        for index in 0..worker_count {
+            let shared = shared.clone();
+            std::thread::Builder::new()
+                .name(format!("forge-file-tree-op-{index}"))
+                .spawn(move || fs_op_worker(shared))
+                .expect("file-tree operation worker must start");
+        }
+        Self { shared, capacity }
+    }
+
+    fn global() -> &'static Self {
+        static SCHEDULER: OnceLock<FsOpScheduler> = OnceLock::new();
+        SCHEDULER.get_or_init(|| Self::new(MAX_CONCURRENT_FS_OPS, MAX_PENDING_FS_OPS))
+    }
+
+    fn enqueue(&self, job: FsOpJob) -> io::Result<()> {
+        let (lock, wake) = &*self.shared;
+        let mut queue = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if queue.len() >= self.capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "file operation queue is full",
+            ));
+        }
+        queue.push_back(job);
+        wake.notify_one();
+        Ok(())
+    }
+}
+
+fn fs_op_worker(shared: Arc<(Mutex<VecDeque<FsOpJob>>, Condvar)>) {
+    loop {
+        let job = {
+            let (lock, wake) = &*shared;
+            let mut queue = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            while queue.is_empty() {
+                queue = wake
+                    .wait(queue)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            queue.pop_front().expect("non-empty file operation queue")
+        };
+        job();
     }
 }
 
@@ -203,18 +1126,29 @@ fn request_dir_scan<F>(
     hosts: Vec<RemoteHost>,
     overlay: FsExecutionOverlay,
     dir: PathBuf,
+    cancel: remote_fs::CancelToken,
+    priority: ScanPriority,
     apply: F,
 ) -> io::Result<()>
 where
-    F: FnOnce(io::Result<Vec<FileEntry>>) + 'static,
+    F: FnOnce(io::Result<DirectoryScan>) + 'static,
 {
     let (tx, rx) = mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("forge-file-tree-scan".to_string())
-        .spawn(move || {
-            let _active = ActiveScan::acquire();
-            let _ = tx.send(scan_entries(&loc, &hosts, &overlay, &dir));
-        })?;
+    let authority = remote_fs::filesystem_identity(&loc, &hosts)?;
+    ScanScheduler::global().enqueue(
+        priority,
+        ScanJob {
+            authority,
+            loc,
+            hosts,
+            overlay,
+            dir,
+            cancel,
+            tx,
+            enqueued_at: Instant::now(),
+            queued_depth: 0,
+        },
+    )?;
     poll_worker(rx, apply, "file-tree scan worker disconnected");
     Ok(())
 }
@@ -228,12 +1162,9 @@ where
     W: FnOnce() -> io::Result<T> + Send + 'static,
 {
     let (tx, rx) = mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("forge-file-tree-op".to_string())
-        .spawn(move || {
-            let _active = ActiveFsOp::acquire();
-            let _ = tx.send(work());
-        })?;
+    FsOpScheduler::global().enqueue(Box::new(move || {
+        let _ = tx.send(work());
+    }))?;
     poll_worker(rx, apply, "file operation worker disconnected");
     Ok(())
 }
@@ -251,6 +1182,116 @@ fn entry_from_row(row: &TreeListRow) -> Option<FileEntry> {
     Some((*entry).clone())
 }
 
+/// Latest issued scan revision for each directory in the current tree
+/// generation. The tree-wide generation rejects results from an older root or
+/// location; this finer-grained revision also rejects an older refresh of the
+/// same directory when two requests overlap on a slow remote connection.
+#[derive(Clone)]
+struct DirectoryScanRequest {
+    revision: u64,
+    cancel: remote_fs::CancelToken,
+    pending: bool,
+}
+
+type DirectoryScanRevisions = std::collections::HashMap<PathBuf, DirectoryScanRequest>;
+
+fn issue_directory_scan_revision(
+    revisions: &mut DirectoryScanRevisions,
+    dir: &Path,
+) -> DirectoryScanRequest {
+    let revision = revisions
+        .get(dir)
+        .map(|request| request.revision)
+        .unwrap_or(0)
+        .wrapping_add(1);
+    if let Some(previous) = revisions.get(dir) {
+        previous.cancel.cancel();
+    }
+    let request = DirectoryScanRequest {
+        revision,
+        cancel: remote_fs::CancelToken::default(),
+        pending: true,
+    };
+    revisions.insert(dir.to_path_buf(), request.clone());
+    request
+}
+
+fn directory_scan_revision_is_current(
+    revisions: &DirectoryScanRevisions,
+    dir: &Path,
+    revision: u64,
+) -> bool {
+    revisions.get(dir).map(|request| request.revision) == Some(revision)
+}
+
+fn complete_directory_scan_revision(
+    revisions: &mut DirectoryScanRevisions,
+    dir: &Path,
+    revision: u64,
+) -> bool {
+    let Some(request) = revisions.get_mut(dir) else {
+        return false;
+    };
+    if request.revision != revision {
+        return false;
+    }
+    request.pending = false;
+    true
+}
+
+fn directory_scan_revision_is_pending(
+    revisions: &DirectoryScanRevisions,
+    dir: &Path,
+    revision: u64,
+) -> bool {
+    revisions
+        .get(dir)
+        .is_some_and(|request| request.revision == revision && request.pending)
+}
+
+fn cancel_directory_scans(revisions: &DirectoryScanRevisions) {
+    for request in revisions.values() {
+        request.cancel.cancel();
+    }
+}
+
+fn cached_materialized_store(
+    root: &Path,
+    dir: &Path,
+    root_store: &gio::ListStore,
+    child_stores: &std::collections::HashMap<PathBuf, glib::WeakRef<gio::ListStore>>,
+) -> Option<gio::ListStore> {
+    if dir == root {
+        Some(root_store.clone())
+    } else {
+        child_stores.get(dir).and_then(glib::WeakRef::upgrade)
+    }
+}
+
+type DirectoryFailureKey = (remote_fs::FilesystemIdentity, PathBuf);
+
+fn committed_authority_matches(
+    expected: Option<&remote_fs::FilesystemIdentity>,
+    location: &FsLocation,
+    hosts: &[RemoteHost],
+) -> bool {
+    expected.is_some_and(|expected| {
+        remote_fs::filesystem_identity(location, hosts).is_ok_and(|current| &current == expected)
+    })
+}
+
+fn location_home_probe_is_current(
+    expected_guard: u64,
+    current_guard: u64,
+    expected_location: &FsLocation,
+    expected_authority: &remote_fs::FilesystemIdentity,
+    current_hosts: &[RemoteHost],
+) -> bool {
+    expected_guard == current_guard
+        && remote_fs::filesystem_identity(expected_location, current_hosts)
+            .is_ok_and(|current| &current == expected_authority)
+}
+
 /// Owns the root list, flattened tree model, and cancellation generation for the
 /// current sidebar root. Cloning this value only clones the underlying GLib
 /// objects and shared generation counter.
@@ -261,17 +1302,42 @@ pub(crate) struct FileTreeModel {
     /// The multi-selection the ListView runs on; stored here so context-menu
     /// batch operations and the filter wrap can read and swap its model.
     selection: gtk4::MultiSelection,
-    /// Active only while the type-to-filter row is open: wraps `tree_model`
-    /// with the visibility predicate.
+    /// Stable visibility layer over `tree_model`; combines the dotfile policy
+    /// with the optional type-to-filter query.
     filter_model: gtk4::FilterListModel,
     filter: gtk4::CustomFilter,
     filter_state: Rc<RefCell<FilterState>>,
-    /// Every child store the lazy expansion factory has created, by parent
-    /// path — the filter's descendant walk reads it instead of triggering
-    /// new scans. Cleared on reset; bounded so long browsing sessions cannot
-    /// grow it without limit.
-    child_stores: Rc<RefCell<std::collections::HashMap<PathBuf, gio::ListStore>>>,
+    /// Every still-live child store the lazy expansion factory has created,
+    /// by parent path. Weak references let filtering/targeted refresh find
+    /// GTK-owned stores without pinning subtrees that GTK has reclaimed.
+    child_stores: Rc<RefCell<std::collections::HashMap<PathBuf, glib::WeakRef<gio::ListStore>>>>,
+    /// Stable identity of the filesystem that produced the committed rows.
+    /// If an index-backed profile changes before transactional navigation
+    /// commits, old rows remain readable but no scan/mutation can reinterpret
+    /// their paths against the new profile at that numeric index.
+    committed_authority: Rc<RefCell<Option<remote_fs::FilesystemIdentity>>>,
+    /// Completion time of the last successfully published snapshot per path.
+    /// Error/refresh rows expose its age so retained content is never mistaken
+    /// for a fresh remote listing.
+    snapshot_completed: Rc<RefCell<std::collections::HashMap<PathBuf, SnapshotMeta>>>,
+    directory_failures:
+        Rc<RefCell<std::collections::HashMap<DirectoryFailureKey, DirectoryFailureState>>>,
+    /// Paths a successful mutation wants selected after its parent listing is
+    /// reconciled. The intent is consumed only by a successful refresh, so a
+    /// transient remote failure does not lose it.
+    selection_after_refresh: Rc<RefCell<std::collections::HashMap<PathBuf, Vec<PathBuf>>>>,
+    /// Current root duplicated here so a Retry button created by the row
+    /// factory can resolve the root store without capturing the whole UiState.
+    root_path: Rc<RefCell<PathBuf>>,
     generation: Rc<Cell<u64>>,
+    /// Per-directory latest-wins guard inside one tree generation. A manual
+    /// refresh or mutation-triggered refresh supersedes an earlier expansion
+    /// scan without clearing the store that is already on screen.
+    directory_scan_revisions: Rc<RefCell<DirectoryScanRevisions>>,
+    /// The row currently highlighted as an external-file drop target. Any
+    /// listing reconciliation clears it before GTK can recycle a removed row
+    /// widget for a surviving or newly inserted entry.
+    drop_hover: Rc<RefCell<Option<gtk4::Widget>>>,
     /// Browsed filesystem, shared with UiState; scans snapshot it at request
     /// time and stale results are dropped when it has moved on.
     location: Rc<RefCell<FsLocation>>,
@@ -291,11 +1357,12 @@ struct FilterState {
     query: String,
     visible: std::collections::HashSet<PathBuf>,
     filter_expanded: std::collections::HashSet<PathBuf>,
+    show_hidden: bool,
 }
 
-/// Bound on recorded child stores; beyond it the filter simply does not
-/// descend into subtrees expanded later.
-const MAX_CHILD_STORES: usize = 512;
+fn file_name_is_hidden(name: &str) -> bool {
+    name.starts_with('.') && name != "." && name != ".."
+}
 
 impl FileTreeModel {
     fn new(
@@ -305,22 +1372,36 @@ impl FileTreeModel {
     ) -> Self {
         let root_store = gio::ListStore::new::<glib::BoxedAnyObject>();
         let generation = Rc::new(Cell::new(0_u64));
-        let child_stores = Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let child_stores = Rc::new(RefCell::new(std::collections::HashMap::<
+            PathBuf,
+            glib::WeakRef<gio::ListStore>,
+        >::new()));
+        let snapshot_completed = Rc::new(RefCell::new(std::collections::HashMap::<
+            PathBuf,
+            SnapshotMeta,
+        >::new()));
+        let committed_authority = Rc::new(RefCell::new(None));
+        let directory_failures = Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let selection_after_refresh = Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let root_path = Rc::new(RefCell::new(PathBuf::new()));
+        let directory_scan_revisions = Rc::new(RefCell::new(DirectoryScanRevisions::new()));
+        let drop_hover = Rc::new(RefCell::new(None));
         let filter_state = Rc::new(RefCell::new(FilterState::default()));
         let filter = gtk4::CustomFilter::new({
             let filter_state = filter_state.clone();
             move |object| {
                 let state = filter_state.borrow();
-                if state.query.is_empty() {
-                    return true;
-                }
                 let Some(row) = object.downcast_ref::<TreeListRow>() else {
                     return true;
                 };
                 let Some(entry) = entry_from_row(row) else {
                     return false;
                 };
-                state.visible.contains(&entry.path)
+                if !entry.is_item() {
+                    return true;
+                }
+                (state.show_hidden || !file_name_is_hidden(&entry.name))
+                    && (state.query.is_empty() || state.visible.contains(&entry.path))
             }
         });
         let tree_model = TreeListModel::new(root_store.clone(), false, false, {
@@ -329,6 +1410,11 @@ impl FileTreeModel {
             let execution_overlay = execution_overlay.clone();
             let config = config.clone();
             let child_stores = child_stores.clone();
+            let snapshot_completed = snapshot_completed.clone();
+            let committed_authority = committed_authority.clone();
+            let directory_failures = directory_failures.clone();
+            let selection_after_refresh = selection_after_refresh.clone();
+            let directory_scan_revisions = directory_scan_revisions.clone();
             // A scan completing while the filter is active re-evaluates the
             // visible set so user-expanded subtrees get filtered too. These
             // captures point only "downward" (stores, plain state, filter),
@@ -344,33 +1430,51 @@ impl FileTreeModel {
                 }
                 let path = entry.path.clone();
                 drop(entry);
+                let scan_location = location.borrow().clone();
+                let scan_overlay = execution_overlay.borrow().clone();
+                let scan_hosts = config.borrow().remote_hosts.clone();
+                if !committed_authority_matches(
+                    committed_authority.borrow().as_ref(),
+                    &scan_location,
+                    &scan_hosts,
+                ) {
+                    return None;
+                }
 
                 let children = gio::ListStore::new::<glib::BoxedAnyObject>();
                 {
                     let mut map = child_stores.borrow_mut();
-                    if map.len() < MAX_CHILD_STORES {
-                        map.insert(path.clone(), children.clone());
-                    }
+                    map.retain(|_, store| store.upgrade().is_some());
+                    map.insert(path.clone(), children.downgrade());
                 }
+                set_directory_status(&children, &path, DirectoryRowStatus::Loading);
+                let scan_request = issue_directory_scan_revision(
+                    &mut directory_scan_revisions.borrow_mut(),
+                    &path,
+                );
+                let scan_revision = scan_request.revision;
                 let children_for_scan = children.clone();
                 let generation_for_scan = generation.clone();
                 let expected_generation = generation.get();
-                let scan_location = location.borrow().clone();
-                let scan_overlay = execution_overlay.borrow().clone();
                 let location_for_scan = location.clone();
                 let overlay_for_scan = execution_overlay.clone();
-                let scan_hosts = config.borrow().remote_hosts.clone();
                 let path_for_result = path.clone();
                 let path_for_error = path.clone();
                 let filter_state_for_scan = filter_state.clone();
                 let filter_for_scan = filter.clone();
                 let root_store_for_filter = root_store_for_filter.clone();
                 let child_stores_for_filter = child_stores.clone();
+                let snapshots_for_scan = snapshot_completed.clone();
+                let revisions_for_scan = directory_scan_revisions.clone();
+                let selection_for_scan = selection_after_refresh.clone();
+                let failures_for_scan = directory_failures.clone();
                 if let Err(error) = request_dir_scan(
                     scan_location.clone(),
                     scan_hosts,
                     scan_overlay.clone(),
                     path,
+                    scan_request.cancel.clone(),
+                    ScanPriority::Lazy,
                     move |result| {
                         if generation_for_scan.get() != expected_generation {
                             return;
@@ -381,9 +1485,48 @@ impl FileTreeModel {
                         if *overlay_for_scan.borrow() != scan_overlay {
                             return;
                         }
+                        if !directory_scan_revision_is_current(
+                            &revisions_for_scan.borrow(),
+                            &path_for_result,
+                            scan_revision,
+                        ) {
+                            return;
+                        }
+                        complete_directory_scan_revision(
+                            &mut revisions_for_scan.borrow_mut(),
+                            &path_for_result,
+                            scan_revision,
+                        );
                         match result {
-                            Ok(entries) => {
-                                append_entries(&children_for_scan, entries);
+                            Ok(listing) => {
+                                let timing = listing.timing;
+                                let reconcile_started = Instant::now();
+                                snapshots_for_scan
+                                    .borrow_mut()
+                                    .insert(path_for_result.clone(), SnapshotMeta::now());
+                                if listing.truncated {
+                                    log::warn!(
+                                        "directory {} has more than {} entries; showing a bounded prefix",
+                                        path_for_result.display(),
+                                        remote_fs::MAX_DIRECTORY_ENTRIES
+                                    );
+                                }
+                                let delta =
+                                    update_store_in_place(&children_for_scan, listing.entries);
+                                invalidate_removed_subtrees_parts(
+                                    &delta.removed_directories,
+                                    &child_stores_for_filter,
+                                    &snapshots_for_scan,
+                                    &revisions_for_scan,
+                                    &selection_for_scan,
+                                    &failures_for_scan,
+                                );
+                                log_scan_timing(
+                                    &path_for_result,
+                                    timing,
+                                    reconcile_started.elapsed(),
+                                    &delta,
+                                );
                                 reapply_filter_parts(
                                     &root_store_for_filter,
                                     &child_stores_for_filter,
@@ -391,16 +1534,53 @@ impl FileTreeModel {
                                     &filter_for_scan,
                                 );
                             }
-                            Err(error) => log::warn!(
-                                "failed to scan directory {}: {error}",
-                                path_for_result.display()
-                            ),
+                            Err(error) => {
+                                if error.kind() != io::ErrorKind::Interrupted {
+                                    log::warn!(
+                                        "failed to scan directory {}: {error}",
+                                        path_for_result.display()
+                                    );
+                                    set_directory_status(
+                                        &children_for_scan,
+                                        &path_for_result,
+                                        directory_error_status(
+                                            &error,
+                                            snapshots_for_scan
+                                                .borrow()
+                                                .get(&path_for_result)
+                                                .map(|snapshot| snapshot.completed_wall),
+                                        ),
+                                    );
+                                    reapply_filter_parts(
+                                        &root_store_for_filter,
+                                        &child_stores_for_filter,
+                                        &filter_state_for_scan,
+                                        &filter_for_scan,
+                                    );
+                                }
+                            }
                         }
                     },
                 ) {
+                    complete_directory_scan_revision(
+                        &mut directory_scan_revisions.borrow_mut(),
+                        &path_for_error,
+                        scan_revision,
+                    );
                     log::warn!(
                         "failed to start directory scan for {}: {error}",
                         path_for_error.display()
+                    );
+                    set_directory_status(
+                        &children,
+                        &path_for_error,
+                        directory_error_status(
+                            &error,
+                            snapshot_completed
+                                .borrow()
+                                .get(&path_for_error)
+                                .map(|snapshot| snapshot.completed_wall),
+                        ),
                     );
                 }
 
@@ -408,16 +1588,14 @@ impl FileTreeModel {
             }
         });
 
-        let selection = gtk4::MultiSelection::new(Some(tree_model.clone()));
-        // MultiSelection never autoselects; ctrl+click toggles and
-        // shift+click ranges are built in.
-
         // The filter wrap consults a precomputed visible-path set (matches +
-        // ancestors), so TreeListRow identity — and with it expansion state —
-        // is untouched by filtering. The wrap is only installed while a query
-        // is active; clearing removes it and restores the tree model.
+        // ancestors) plus the dotfile preference, so TreeListRow identity —
+        // and with it expansion state — is untouched by either filter.
         let filter_model =
             gtk4::FilterListModel::new(Some(tree_model.clone()), Some(filter.clone()));
+        let selection = gtk4::MultiSelection::new(Some(filter_model.clone()));
+        // MultiSelection never autoselects; ctrl+click toggles and
+        // shift+click ranges are built in.
 
         Self {
             root_store,
@@ -427,7 +1605,14 @@ impl FileTreeModel {
             filter,
             filter_state,
             child_stores,
+            committed_authority,
+            snapshot_completed,
+            directory_failures,
+            selection_after_refresh,
+            root_path,
             generation,
+            directory_scan_revisions,
+            drop_hover,
             location,
             execution_overlay,
             config,
@@ -437,9 +1622,190 @@ impl FileTreeModel {
     fn reset(&self) -> u64 {
         let generation = self.generation.get().wrapping_add(1);
         self.generation.set(generation);
+        self.selection.unselect_all();
         self.root_store.remove_all();
         self.child_stores.borrow_mut().clear();
+        *self.committed_authority.borrow_mut() = None;
+        self.snapshot_completed.borrow_mut().clear();
+        self.directory_failures.borrow_mut().clear();
+        self.selection_after_refresh.borrow_mut().clear();
+        self.root_path.borrow_mut().clear();
+        cancel_directory_scans(&self.directory_scan_revisions.borrow());
+        ScanScheduler::global().retire_cancelled();
+        self.directory_scan_revisions.borrow_mut().clear();
+        set_drop_hover(&self.drop_hover, None);
         generation
+    }
+
+    fn set_committed_authority(&self, authority: remote_fs::FilesystemIdentity) {
+        *self.committed_authority.borrow_mut() = Some(authority);
+    }
+
+    fn committed_authority_is_current(&self) -> bool {
+        committed_authority_matches(
+            self.committed_authority.borrow().as_ref(),
+            &self.location.borrow(),
+            &self.config.borrow().remote_hosts,
+        )
+    }
+
+    fn cancel_pending_scans_preserve_tree(&self) {
+        cancel_directory_scans(&self.directory_scan_revisions.borrow());
+        ScanScheduler::global().retire_cancelled();
+        self.directory_scan_revisions.borrow_mut().clear();
+    }
+
+    fn issue_directory_scan(&self, dir: &Path) -> DirectoryScanRequest {
+        issue_directory_scan_revision(&mut self.directory_scan_revisions.borrow_mut(), dir)
+    }
+
+    fn directory_scan_is_current(&self, dir: &Path, revision: u64) -> bool {
+        directory_scan_revision_is_current(&self.directory_scan_revisions.borrow(), dir, revision)
+    }
+
+    fn complete_directory_scan(&self, dir: &Path, revision: u64) -> bool {
+        complete_directory_scan_revision(
+            &mut self.directory_scan_revisions.borrow_mut(),
+            dir,
+            revision,
+        )
+    }
+
+    fn materialized_entries_are_current(&self, expected: &[FileEntry]) -> bool {
+        if expected.is_empty() {
+            return true;
+        }
+        entries_remain_current(expected, &self.materialized_entries())
+    }
+
+    fn materialized_entries(&self) -> Vec<FileEntry> {
+        (0..self.tree_model.n_items())
+            .filter_map(|position| self.tree_model.row(position))
+            .filter_map(|row| entry_from_row(&row))
+            .filter(FileEntry::is_item)
+            .collect()
+    }
+
+    fn selected_entries_snapshot(&self) -> Vec<FileEntry> {
+        self.selected_entries()
+            .into_iter()
+            .map(|(_, entry)| entry)
+            .collect()
+    }
+
+    fn reconcile_selection(&self, selected_before: &[FileEntry], preferred: Option<&[PathBuf]>) {
+        let current = self.materialized_entries();
+        let survivors = selection_paths_after_reconcile(selected_before, &current, preferred);
+        self.selection.unselect_all();
+        for path in survivors {
+            if let Some(position) = self.flat_position_of(&path) {
+                self.selection.select_item(position, false);
+            }
+        }
+    }
+
+    fn materialized_directory_is_current(&self, root: &Path, dir: &Path) -> bool {
+        dir == root
+            || self.materialized_entries_are_current(&[FileEntry {
+                name: String::new(),
+                path: dir.to_path_buf(),
+                is_dir: true,
+                status: None,
+            }])
+    }
+
+    fn set_root_path(&self, root: &Path) {
+        *self.root_path.borrow_mut() = root.to_path_buf();
+    }
+
+    fn last_good_snapshot(&self, dir: &Path) -> Option<SystemTime> {
+        self.snapshot_completed
+            .borrow()
+            .get(dir)
+            .map(|snapshot| snapshot.completed_wall)
+    }
+
+    fn mark_snapshot_completed(&self, dir: &Path) {
+        self.snapshot_completed
+            .borrow_mut()
+            .insert(dir.to_path_buf(), SnapshotMeta::now());
+    }
+
+    fn snapshot_is_stale(&self, dir: &Path, now: Instant) -> bool {
+        self.snapshot_completed
+            .borrow()
+            .get(dir)
+            .copied()
+            .is_some_and(|snapshot| snapshot_meta_is_stale(snapshot, now))
+    }
+
+    fn directory_scan_is_pending(&self, dir: &Path) -> bool {
+        self.directory_scan_revisions
+            .borrow()
+            .get(dir)
+            .is_some_and(|request| request.pending)
+    }
+
+    fn visible_stale_directories(&self, now: Instant, limit: usize) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let root = self.root_path.borrow().clone();
+        if !root.as_os_str().is_empty()
+            && self.snapshot_is_stale(&root, now)
+            && !self.directory_scan_is_pending(&root)
+        {
+            paths.push(root);
+        }
+        for index in 0..self.tree_model.n_items() {
+            if paths.len() == limit {
+                break;
+            }
+            let Some(row) = self.tree_model.row(index) else {
+                continue;
+            };
+            let Some(entry) = entry_from_row(&row) else {
+                continue;
+            };
+            if entry.is_item()
+                && entry.is_dir
+                && row.is_expanded()
+                && self.snapshot_is_stale(&entry.path, now)
+                && !self.directory_scan_is_pending(&entry.path)
+                && !paths.contains(&entry.path)
+            {
+                paths.push(entry.path);
+            }
+        }
+        paths
+    }
+
+    fn request_selection_after_refresh(&self, dir: &Path, paths: Vec<PathBuf>) {
+        let root = self.root_path.borrow().clone();
+        if self.materialized_children_of(&root, dir).is_none() {
+            return;
+        }
+        self.selection_after_refresh
+            .borrow_mut()
+            .insert(dir.to_path_buf(), paths);
+    }
+
+    fn invalidate_removed_subtrees(&self, removed: &[PathBuf]) {
+        invalidate_removed_subtrees_parts(
+            removed,
+            &self.child_stores,
+            &self.snapshot_completed,
+            &self.directory_scan_revisions,
+            &self.selection_after_refresh,
+            &self.directory_failures,
+        );
+    }
+
+    fn set_root_status(&self, generation: u64, root: &Path, status: DirectoryRowStatus) -> bool {
+        if self.generation.get() != generation || *self.root_path.borrow() != root {
+            return false;
+        }
+        set_directory_status(&self.root_store, root, status);
+        self.reapply_filter();
+        true
     }
 
     fn replace_root(&self, generation: u64, entries: Vec<FileEntry>) -> bool {
@@ -466,12 +1832,14 @@ impl FileTreeModel {
 
     /// The currently materialized ListStore holding `dir`'s children: the
     /// root store when `dir` is the tree root, else the child store of an
-    /// expanded row for `dir`. `None` when `dir` is not visible right now —
-    /// a collapsed or never-expanded row needs no refresh (its cached store
-    /// is reused on re-expansion, the pre-existing TreeListModel behavior).
+    /// expanded or previously expanded row for `dir`. A collapsed cached
+    /// directory remains refreshable; only never-materialized rows return
+    /// `None`.
     fn materialized_children_of(&self, root: &Path, dir: &Path) -> Option<gio::ListStore> {
-        if dir == root {
-            return Some(self.root_store.clone());
+        if let Some(store) =
+            cached_materialized_store(root, dir, &self.root_store, &self.child_stores.borrow())
+        {
+            return Some(store);
         }
         for index in 0..self.tree_model.n_items() {
             let Some(row) = self.tree_model.row(index) else {
@@ -480,7 +1848,7 @@ impl FileTreeModel {
             let Some(entry) = entry_from_row(&row) else {
                 continue;
             };
-            if entry.path == dir && row.is_expanded() {
+            if entry.is_item() && entry.path == dir {
                 return row
                     .children()
                     .and_then(|model| model.downcast::<gio::ListStore>().ok());
@@ -489,9 +1857,192 @@ impl FileTreeModel {
         None
     }
 
+    /// Re-list one already-materialized directory with a visible
+    /// stale-while-revalidate state row. A retry button can call this directly
+    /// through the model, without retaining/cycling the surrounding UiState.
+    fn refresh_directory(&self, dir: &Path, toast_overlay: Option<adw::ToastOverlay>) -> bool {
+        self.refresh_directory_with_cause(dir, toast_overlay, DirectoryRefreshCause::Manual)
+    }
+
+    fn retry_directory(&self, dir: &Path) -> bool {
+        self.refresh_directory_with_cause(dir, None, DirectoryRefreshCause::Retry)
+    }
+
+    fn refresh_directory_with_cause(
+        &self,
+        dir: &Path,
+        toast_overlay: Option<adw::ToastOverlay>,
+        cause: DirectoryRefreshCause,
+    ) -> bool {
+        if !self.committed_authority_is_current() {
+            return false;
+        }
+        let root = self.root_path.borrow().clone();
+        let Some(store) = self.materialized_children_of(&root, dir) else {
+            return false;
+        };
+
+        let location = self.location.borrow().clone();
+        let hosts = self.config.borrow().remote_hosts.clone();
+        let overlay = self.execution_overlay.borrow().clone();
+        let authority = match remote_fs::filesystem_identity(&location, &hosts) {
+            Ok(authority) => authority,
+            Err(error) => {
+                set_directory_status(
+                    &store,
+                    dir,
+                    directory_error_status(&error, self.last_good_snapshot(dir)),
+                );
+                return true;
+            }
+        };
+        let failure_key = (authority, dir.to_path_buf());
+        if let Some(remaining) = directory_refresh_cooldown(
+            cause,
+            &self.directory_failures.borrow(),
+            &failure_key,
+            Instant::now(),
+        ) {
+            set_directory_status(
+                &store,
+                dir,
+                DirectoryRowStatus::Error {
+                    message: retry_wait_label(remaining),
+                    last_good: self.last_good_snapshot(dir),
+                },
+            );
+            self.reapply_filter();
+            return true;
+        }
+        let generation = self.generation.get();
+        let scan_request = self.issue_directory_scan(dir);
+        let scan_revision = scan_request.revision;
+        set_directory_status(
+            &store,
+            dir,
+            DirectoryRowStatus::Refreshing {
+                last_good: self.last_good_snapshot(dir),
+            },
+        );
+        self.reapply_filter();
+
+        let generation_for_scan = self.generation.clone();
+        let location_for_scan = self.location.clone();
+        let overlay_for_scan = self.execution_overlay.clone();
+        let scan_location = location.clone();
+        let scan_overlay = overlay.clone();
+        let model_for_refresh = self.clone();
+        let failure_key_for_scan = failure_key.clone();
+        let dir_for_result = dir.to_path_buf();
+        let store_for_scan = store.clone();
+        let request = request_dir_scan(
+            location,
+            hosts,
+            overlay,
+            dir.to_path_buf(),
+            scan_request.cancel.clone(),
+            cause.priority(),
+            move |result| {
+                if generation_for_scan.get() != generation
+                    || *location_for_scan.borrow() != scan_location
+                    || *overlay_for_scan.borrow() != scan_overlay
+                    || !model_for_refresh.directory_scan_is_current(&dir_for_result, scan_revision)
+                {
+                    return;
+                }
+                model_for_refresh.complete_directory_scan(&dir_for_result, scan_revision);
+                match result {
+                    Ok(listing) => {
+                        let timing = listing.timing;
+                        let reconcile_started = Instant::now();
+                        model_for_refresh
+                            .directory_failures
+                            .borrow_mut()
+                            .remove(&failure_key_for_scan);
+                        model_for_refresh.mark_snapshot_completed(&dir_for_result);
+                        if listing.truncated {
+                            log::warn!(
+                                "directory {} has more than {} entries; showing a bounded prefix",
+                                dir_for_result.display(),
+                                remote_fs::MAX_DIRECTORY_ENTRIES
+                            );
+                            if let Some(toast_overlay) = &toast_overlay {
+                                let path = root_display_label(&scan_location, &dir_for_result);
+                                toast_overlay.add_toast(adw::Toast::new(&format!(
+                                    "{path} has more than {} entries; showing the first {}",
+                                    remote_fs::MAX_DIRECTORY_ENTRIES,
+                                    remote_fs::MAX_DIRECTORY_ENTRIES
+                                )));
+                            }
+                        }
+                        let selected_before = model_for_refresh.selected_entries_snapshot();
+                        let preferred = model_for_refresh
+                            .selection_after_refresh
+                            .borrow_mut()
+                            .remove(&dir_for_result);
+                        set_drop_hover(&model_for_refresh.drop_hover, None);
+                        let delta = update_store_in_place(&store_for_scan, listing.entries);
+                        model_for_refresh.invalidate_removed_subtrees(&delta.removed_directories);
+                        model_for_refresh
+                            .reconcile_selection(&selected_before, preferred.as_deref());
+                        log_scan_timing(
+                            &dir_for_result,
+                            timing,
+                            reconcile_started.elapsed(),
+                            &delta,
+                        );
+                        model_for_refresh.reapply_filter();
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        record_directory_failure(
+                            &mut model_for_refresh.directory_failures.borrow_mut(),
+                            failure_key_for_scan.clone(),
+                            &error,
+                            Instant::now(),
+                        );
+                        log::warn!(
+                            "failed to refresh directory {}: {error}",
+                            dir_for_result.display()
+                        );
+                        set_directory_status(
+                            &store_for_scan,
+                            &dir_for_result,
+                            directory_error_status(
+                                &error,
+                                model_for_refresh.last_good_snapshot(&dir_for_result),
+                            ),
+                        );
+                        model_for_refresh.reapply_filter();
+                    }
+                }
+            },
+        );
+        if let Err(error) = request {
+            self.complete_directory_scan(dir, scan_revision);
+            record_directory_failure(
+                &mut self.directory_failures.borrow_mut(),
+                failure_key,
+                &error,
+                Instant::now(),
+            );
+            log::warn!(
+                "failed to start directory refresh for {}: {error}",
+                dir.display()
+            );
+            set_directory_status(
+                &store,
+                dir,
+                directory_error_status(&error, self.last_good_snapshot(dir)),
+            );
+            self.reapply_filter();
+        }
+        true
+    }
+
     fn row_entry(&self, position: u32) -> Option<(TreeListRow, FileEntry)> {
-        // Read through the selection's current model: while the type-to-
-        // filter row is open, positions index the FilterListModel wrap.
+        // Read through the stable filtered selection model; positions always
+        // index the same FilterListModel even when its predicate changes.
         let model = self.selection.model()?;
         let row = model.item(position)?.downcast::<TreeListRow>().ok()?;
         let entry = entry_from_row(&row)?;
@@ -509,7 +2060,11 @@ impl FileTreeModel {
         }
         positions
             .into_iter()
-            .filter_map(|position| self.row_entry(position).map(|(_, entry)| (position, entry)))
+            .filter_map(|position| {
+                self.row_entry(position)
+                    .filter(|(_, entry)| entry.is_item())
+                    .map(|(_, entry)| (position, entry))
+            })
             .collect()
     }
 
@@ -523,7 +2078,7 @@ impl FileTreeModel {
             else {
                 continue;
             };
-            if entry_from_row(&row).is_some_and(|entry| entry.path == path) {
+            if entry_from_row(&row).is_some_and(|entry| entry.is_item() && entry.path == path) {
                 return Some(index);
             }
         }
@@ -532,8 +2087,8 @@ impl FileTreeModel {
 
     /// Apply the type-to-filter query: recompute the visible path set from
     /// the LOADED stores only (never a new scan), auto-expand materialized
-    /// ancestors of matches, and install the filter wrap. An empty query
-    /// removes the wrap and collapses exactly the rows the filter expanded.
+    /// ancestors of matches, and re-evaluate the stable filter wrap. An empty
+    /// query collapses exactly the rows the name filter expanded.
     fn apply_filter(&self, query: String) {
         if query.is_empty() {
             let expanded = {
@@ -551,27 +2106,31 @@ impl FileTreeModel {
                     }
                 }
             }
-            self.selection.set_model(Some(&self.tree_model));
+            self.filter.changed(gtk4::FilterChange::Different);
             return;
         }
         // Compute the new visible set and publish it before touching the
         // model: expansion and `emit_changed` re-enter the filter closure,
         // which borrows `filter_state` — so no borrow may be held here.
-        let (visible, was_inactive) = {
+        let visible = {
             let roots = store_entries(&self.root_store);
             let visible = {
                 let child_stores = self.child_stores.borrow();
                 collect_visible_paths(
                     &roots,
-                    &|path| child_stores.get(path).map(store_entries),
+                    &|path| {
+                        child_stores
+                            .get(path)
+                            .and_then(glib::WeakRef::upgrade)
+                            .map(|store| store_entries(&store))
+                    },
                     &query,
                 )
             };
             let mut state = self.filter_state.borrow_mut();
-            let was_inactive = state.query.is_empty();
             state.query = query;
             state.visible = visible.clone();
-            (visible, was_inactive)
+            visible
         };
 
         // Auto-expand ancestors of matches — but only rows whose children are
@@ -584,7 +2143,7 @@ impl FileTreeModel {
             let Some(entry) = entry_from_row(&row) else {
                 continue;
             };
-            if !entry.is_dir || !visible.contains(&entry.path) {
+            if !entry.is_item() || !entry.is_dir || !visible.contains(&entry.path) {
                 continue;
             }
             if !row.is_expanded() && row.children().is_some() {
@@ -597,17 +2156,206 @@ impl FileTreeModel {
             .filter_expanded
             .extend(newly_expanded);
 
-        if was_inactive {
-            self.selection.set_model(Some(&self.filter_model));
-        } else {
-            self.filter.changed(gtk4::FilterChange::Different);
-        }
+        self.filter.changed(gtk4::FilterChange::Different);
     }
 
     /// Whether the type-to-filter query is currently active.
     fn filter_is_active(&self) -> bool {
         !self.filter_state.borrow().query.is_empty()
     }
+
+    /// Toggle dot-prefixed rows over the materialized models. This never
+    /// scans, resets the root, or changes remote/file-operation authority.
+    pub(crate) fn set_show_hidden(&self, show_hidden: bool) {
+        {
+            let mut state = self.filter_state.borrow_mut();
+            if state.show_hidden == show_hidden {
+                return;
+            }
+            state.show_hidden = show_hidden;
+        }
+        self.filter.changed(gtk4::FilterChange::Different);
+    }
+}
+
+fn public_directory_error_message(error: &io::Error) -> &'static str {
+    match error.kind() {
+        io::ErrorKind::NotFound => "Directory not found or unavailable",
+        io::ErrorKind::PermissionDenied => "Permission denied",
+        io::ErrorKind::TimedOut => "Connection timed out",
+        io::ErrorKind::WouldBlock => "Too many directory scans are pending; retry",
+        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => {
+            "The remote returned an invalid directory response"
+        }
+        io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::NotConnected
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::UnexpectedEof => "Remote connection failed",
+        _ => "Directory could not be loaded",
+    }
+}
+
+fn public_file_operation_error_message(error: &io::Error) -> &'static str {
+    match error.kind() {
+        io::ErrorKind::AlreadyExists => "An item with this name already exists",
+        io::ErrorKind::NotFound => "The item no longer exists",
+        io::ErrorKind::PermissionDenied => "Permission denied",
+        io::ErrorKind::TimedOut => "The remote operation timed out",
+        io::ErrorKind::WouldBlock => "Too many file operations are pending; retry",
+        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => {
+            "The operation or remote response was invalid"
+        }
+        io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::NotConnected
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::UnexpectedEof => "Remote connection failed",
+        _ => "The operation could not be completed",
+    }
+}
+
+fn unique_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    paths
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
+}
+
+fn directory_error_status(error: &io::Error, last_good: Option<SystemTime>) -> DirectoryRowStatus {
+    // Raw probe/ssh stderr may contain endpoints, option values or other
+    // sensitive diagnostics. It remains in bounded logs; the tree gets only a
+    // stable category, which is valid UTF-8 and bounded by construction.
+    DirectoryRowStatus::Error {
+        message: safe_file_label(public_directory_error_message(error)),
+        last_good,
+    }
+}
+
+fn directory_failure_remaining(
+    failures: &std::collections::HashMap<DirectoryFailureKey, DirectoryFailureState>,
+    key: &DirectoryFailureKey,
+    now: Instant,
+) -> Option<Duration> {
+    failures
+        .get(key)
+        .and_then(|failure| failure.retry_not_before.checked_duration_since(now))
+        .filter(|remaining| !remaining.is_zero())
+}
+
+fn directory_refresh_cooldown(
+    cause: DirectoryRefreshCause,
+    failures: &std::collections::HashMap<DirectoryFailureKey, DirectoryFailureState>,
+    key: &DirectoryFailureKey,
+    now: Instant,
+) -> Option<Duration> {
+    if cause == DirectoryRefreshCause::Retry {
+        None
+    } else {
+        directory_failure_remaining(failures, key, now)
+    }
+}
+
+fn record_directory_failure(
+    failures: &mut std::collections::HashMap<DirectoryFailureKey, DirectoryFailureState>,
+    key: DirectoryFailureKey,
+    error: &io::Error,
+    now: Instant,
+) {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+    ) {
+        return;
+    }
+    let next = next_directory_failure_state(failures.get(&key).copied(), error, now);
+    failures.insert(key, next);
+}
+
+fn retry_wait_label(remaining: Duration) -> String {
+    let seconds = remaining
+        .as_secs()
+        .saturating_add(u64::from(remaining.subsec_nanos() != 0));
+    format!("Retry available in {seconds}s")
+}
+
+/// Replace only the transient state row; every real child retains its object
+/// identity and remains usable while a refresh runs or after it fails.
+fn set_directory_status(store: &gio::ListStore, dir: &Path, status: DirectoryRowStatus) {
+    clear_directory_status(store);
+    store.append(&glib::BoxedAnyObject::new(FileEntry::directory_status(
+        dir, status,
+    )));
+}
+
+fn clear_directory_status(store: &gio::ListStore) {
+    let mut index = store.n_items();
+    while index > 0 {
+        index -= 1;
+        let is_status = store
+            .item(index)
+            .and_then(|item| item.downcast::<glib::BoxedAnyObject>().ok())
+            .is_some_and(|boxed| {
+                boxed
+                    .try_borrow::<FileEntry>()
+                    .is_ok_and(|entry| !entry.is_item())
+            });
+        if is_status {
+            store.remove(index);
+        }
+    }
+}
+
+#[derive(Default, Debug, PartialEq, Eq)]
+struct StoreReconcileDelta {
+    removed_directories: Vec<PathBuf>,
+    removed_rows: usize,
+    inserted_rows: usize,
+}
+
+fn path_is_in_removed_subtree(path: &Path, removed: &[PathBuf]) -> bool {
+    removed.iter().any(|root| path.starts_with(root))
+}
+
+fn invalidate_removed_subtrees_parts(
+    removed: &[PathBuf],
+    child_stores: &Rc<RefCell<std::collections::HashMap<PathBuf, glib::WeakRef<gio::ListStore>>>>,
+    snapshots: &Rc<RefCell<std::collections::HashMap<PathBuf, SnapshotMeta>>>,
+    revisions: &Rc<RefCell<DirectoryScanRevisions>>,
+    selection_after_refresh: &Rc<RefCell<std::collections::HashMap<PathBuf, Vec<PathBuf>>>>,
+    failures: &Rc<RefCell<std::collections::HashMap<DirectoryFailureKey, DirectoryFailureState>>>,
+) {
+    if removed.is_empty() {
+        return;
+    }
+    {
+        let mut revisions = revisions.borrow_mut();
+        revisions.retain(|path, request| {
+            let keep = !path_is_in_removed_subtree(path, removed);
+            if !keep {
+                request.cancel.cancel();
+            }
+            keep
+        });
+    }
+    // Cancelled queued work is removed immediately instead of consuming one
+    // of the bounded queue's physical slots until a worker happens to pop it.
+    ScanScheduler::global().retire_cancelled();
+    child_stores
+        .borrow_mut()
+        .retain(|path, _| !path_is_in_removed_subtree(path, removed));
+    snapshots
+        .borrow_mut()
+        .retain(|path, _| !path_is_in_removed_subtree(path, removed));
+    selection_after_refresh
+        .borrow_mut()
+        .retain(|path, _| !path_is_in_removed_subtree(path, removed));
+    failures
+        .borrow_mut()
+        .retain(|(_, path), _| !path_is_in_removed_subtree(path, removed));
 }
 
 /// Replace a store's contents with the minimal set of removals/insertions so
@@ -615,10 +2363,14 @@ impl FileTreeModel {
 /// expansion state and cached child models. Both the old and new contents
 /// are sorted by the same comparator, so after vanished paths are removed
 /// the survivors already stand at their final positions and newcomers slot
-/// in at their sorted index. This is what lets a mutation refresh exactly
-/// one directory without collapsing unrelated expansion anywhere in the tree.
-fn update_store_in_place(store: &gio::ListStore, entries: Vec<FileEntry>) {
-    let store_entry = |index: u32| -> Option<PathBuf> {
+/// in at their sorted index. A path whose name/type changed is deliberately
+/// replaced so a directory that became a symlink cannot retain expandable
+/// state. This is what lets a mutation refresh exactly one directory without
+/// collapsing unrelated expansion anywhere in the tree.
+fn update_store_in_place(store: &gio::ListStore, entries: Vec<FileEntry>) -> StoreReconcileDelta {
+    clear_directory_status(store);
+    let mut delta = StoreReconcileDelta::default();
+    let store_entry = |index: u32| -> Option<FileEntry> {
         store
             .item(index)
             .and_then(|item| item.downcast::<glib::BoxedAnyObject>().ok())
@@ -626,29 +2378,86 @@ fn update_store_in_place(store: &gio::ListStore, entries: Vec<FileEntry>) {
                 boxed
                     .try_borrow::<FileEntry>()
                     .ok()
-                    .map(|entry| entry.path.clone())
+                    .map(|entry| (*entry).clone())
             })
     };
-    let new_paths: std::collections::HashSet<&Path> =
-        entries.iter().map(|entry| entry.path.as_path()).collect();
+    let new_entries: std::collections::HashMap<&Path, (&str, bool)> = entries
+        .iter()
+        .filter(|entry| entry.is_item())
+        .map(|entry| (entry.path.as_path(), (entry.name.as_str(), entry.is_dir)))
+        .collect();
 
     // Remove vanished rows back-to-front so earlier indices stay valid.
     let mut index = store.n_items();
     while index > 0 {
         index -= 1;
-        match store_entry(index) {
-            Some(path) if new_paths.contains(path.as_path()) => {}
-            _ => store.remove(index),
+        let old_entry = store_entry(index);
+        let keep = old_entry.as_ref().is_some_and(|entry| {
+            new_entries
+                .get(entry.path.as_path())
+                .is_some_and(|(name, is_dir)| *name == entry.name && *is_dir == entry.is_dir)
+        });
+        if !keep {
+            if let Some(entry) = old_entry.filter(|entry| entry.is_item() && entry.is_dir) {
+                delta.removed_directories.push(entry.path);
+            }
+            store.remove(index);
+            delta.removed_rows += 1;
         }
     }
 
-    let survivors: std::collections::HashSet<PathBuf> =
-        (0..store.n_items()).filter_map(store_entry).collect();
+    let survivors: std::collections::HashSet<PathBuf> = (0..store.n_items())
+        .filter_map(store_entry)
+        .map(|entry| entry.path)
+        .collect();
     for (position, entry) in entries.into_iter().enumerate() {
         if !survivors.contains(&entry.path) {
             store.insert(position as u32, &glib::BoxedAnyObject::new(entry));
+            delta.inserted_rows += 1;
         }
     }
+    delta
+}
+
+fn log_scan_timing(
+    dir: &Path,
+    timing: ScanTiming,
+    reconcile_elapsed: Duration,
+    delta: &StoreReconcileDelta,
+) {
+    let path = safe_file_label(&dir.to_string_lossy());
+    let total = timing
+        .queued_for
+        .saturating_add(timing.listed_for)
+        .saturating_add(reconcile_elapsed);
+    if scan_timing_is_slow(timing, reconcile_elapsed) {
+        log::warn!(
+            "slow file-tree scan path={path:?} queue={:?} list={:?} reconcile={:?} depth={} inserted={} removed={} total={:?}",
+            timing.queued_for,
+            timing.listed_for,
+            reconcile_elapsed,
+            timing.queued_depth,
+            delta.inserted_rows,
+            delta.removed_rows,
+            total
+        );
+    } else {
+        log::debug!(
+            "file-tree scan path={path:?} queue={:?} list={:?} reconcile={:?} depth={} inserted={} removed={}",
+            timing.queued_for,
+            timing.listed_for,
+            reconcile_elapsed,
+            timing.queued_depth,
+            delta.inserted_rows,
+            delta.removed_rows
+        );
+    }
+}
+
+fn scan_timing_is_slow(timing: ScanTiming, reconcile_elapsed: Duration) -> bool {
+    timing.queued_for >= Duration::from_secs(1)
+        || timing.listed_for >= Duration::from_secs(2)
+        || reconcile_elapsed >= Duration::from_millis(100)
 }
 
 /// Flatten one store into (name, path, is_dir) triples — the shape the
@@ -663,6 +2472,7 @@ fn store_entries(store: &gio::ListStore) -> Vec<FilterNode> {
                     boxed
                         .try_borrow::<FileEntry>()
                         .ok()
+                        .filter(|entry| entry.is_item())
                         .map(|entry| (entry.name.clone(), entry.path.clone(), entry.is_dir))
                 })
         })
@@ -718,7 +2528,7 @@ fn collect_visible_into(
 /// when a row expands), so no expansion work happens here.
 fn reapply_filter_parts(
     root_store: &gio::ListStore,
-    child_stores: &Rc<RefCell<std::collections::HashMap<PathBuf, gio::ListStore>>>,
+    child_stores: &Rc<RefCell<std::collections::HashMap<PathBuf, glib::WeakRef<gio::ListStore>>>>,
     filter_state: &Rc<RefCell<FilterState>>,
     filter: &gtk4::CustomFilter,
 ) {
@@ -731,7 +2541,12 @@ fn reapply_filter_parts(
         let child_stores = child_stores.borrow();
         collect_visible_paths(
             &roots,
-            &|path| child_stores.get(path).map(store_entries),
+            &|path| {
+                child_stores
+                    .get(path)
+                    .and_then(glib::WeakRef::upgrade)
+                    .map(|store| store_entries(&store))
+            },
             &query,
         )
     };
@@ -770,6 +2585,21 @@ fn resolve_menu_target(
                 (vec![entry], Some(position))
             }
         }
+    }
+}
+
+/// Directory targeted by context actions that operate on children. A
+/// directory row targets itself, a file row targets its parent, and empty
+/// space targets the visible tree root.
+fn directory_action_target(root: &Path, target: Option<&FileEntry>) -> PathBuf {
+    match target {
+        Some(entry) if entry.is_dir => entry.path.clone(),
+        Some(entry) => entry
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.to_path_buf()),
+        None => root.to_path_buf(),
     }
 }
 
@@ -873,25 +2703,59 @@ pub(crate) fn build_file_tree_widgets(
     let model = FileTreeModel::new(location, execution_overlay, config);
     let factory = SignalListItemFactory::new();
 
-    factory.connect_setup(|_, object| {
-        let Some(list_item) = object.downcast_ref::<gtk4::ListItem>() else {
-            return;
-        };
+    factory.connect_setup({
+        let model = model.clone();
+        move |_, object| {
+            let Some(list_item) = object.downcast_ref::<gtk4::ListItem>() else {
+                return;
+            };
 
-        let icon = gtk4::Image::new();
-        icon.set_pixel_size(16);
-        let label = gtk4::Label::new(None);
-        label.set_hexpand(true);
-        label.set_xalign(0.0);
-        label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            let icon = gtk4::Image::new();
+            icon.set_pixel_size(16);
+            let label = gtk4::Label::new(None);
+            label.set_hexpand(true);
+            label.set_xalign(0.0);
+            label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
-        let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-        row_box.append(&icon);
-        row_box.append(&label);
+            let retry = gtk4::Button::with_label("Retry");
+            retry.set_focusable(true);
+            retry.set_tooltip_text(Some("Retry loading this directory"));
+            retry.update_property(&[gtk4::accessible::Property::Label("Retry loading directory")]);
+            retry.add_css_class("flat");
+            retry.set_visible(false);
+            let item = list_item.downgrade();
+            let model_for_retry = model.clone();
+            retry.connect_clicked(move |_| {
+                let Some(list_item) = item.upgrade() else {
+                    return;
+                };
+                let Some(row) = list_item
+                    .item()
+                    .and_then(|item| item.downcast::<TreeListRow>().ok())
+                else {
+                    return;
+                };
+                let Some(entry) = entry_from_row(&row) else {
+                    return;
+                };
+                if entry
+                    .status
+                    .as_ref()
+                    .is_some_and(DirectoryRowStatus::is_retryable)
+                {
+                    model_for_retry.retry_directory(&entry.path);
+                }
+            });
 
-        let expander = gtk4::TreeExpander::new();
-        expander.set_child(Some(&row_box));
-        list_item.set_child(Some(&expander));
+            let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+            row_box.append(&icon);
+            row_box.append(&label);
+            row_box.append(&retry);
+
+            let expander = gtk4::TreeExpander::new();
+            expander.set_child(Some(&row_box));
+            list_item.set_child(Some(&expander));
+        }
     });
 
     factory.connect_bind(|_, object| {
@@ -927,21 +2791,37 @@ pub(crate) fn build_file_tree_widgets(
         else {
             return;
         };
-        let Some(label) = row_box
-            .last_child()
+        let Some(label) = icon
+            .next_sibling()
             .and_then(|child| child.downcast::<gtk4::Label>().ok())
         else {
             return;
         };
+        let Some(retry) = label
+            .next_sibling()
+            .and_then(|child| child.downcast::<gtk4::Button>().ok())
+        else {
+            return;
+        };
 
-        icon.set_icon_name(Some(if entry.is_dir {
-            "folder-symbolic"
-        } else {
-            "text-x-generic-symbolic"
-        }));
+        let icon_name = match &entry.status {
+            Some(DirectoryRowStatus::Loading) => "content-loading-symbolic",
+            Some(DirectoryRowStatus::Refreshing { .. }) => "view-refresh-symbolic",
+            Some(DirectoryRowStatus::Error { .. }) => "dialog-error-symbolic",
+            None if entry.is_dir => "folder-symbolic",
+            None => "text-x-generic-symbolic",
+        };
+        icon.set_icon_name(Some(icon_name));
         label.set_text(&entry.name);
         let path = safe_file_label(&entry.path.to_string_lossy());
         label.set_tooltip_text(Some(&path));
+        let retryable = entry
+            .status
+            .as_ref()
+            .is_some_and(DirectoryRowStatus::is_retryable);
+        retry.set_visible(retryable);
+        list_item.set_selectable(entry.is_item());
+        list_item.set_activatable(entry.is_item() || retryable);
     });
 
     factory.connect_unbind(|_, object| {
@@ -955,6 +2835,8 @@ pub(crate) fn build_file_tree_widgets(
             return;
         };
         expander.set_list_row(None);
+        list_item.set_selectable(true);
+        list_item.set_activatable(true);
     });
 
     // MultiSelection: ctrl+click toggles and shift+click ranges come from
@@ -1235,7 +3117,7 @@ impl UiState {
         error: io::Error,
     ) {
         let name = jterm_core::review_input::safe_inline_display(target.display_name(), 256);
-        let detail = jterm_core::review_input::safe_inline_display(&error.to_string(), 512);
+        let detail = public_directory_error_message(&error);
         let toast = adw::Toast::new(&format!("Cannot open Remote Files for {name}: {detail}"));
         toast.set_button_label(Some("Retry"));
         let ui = self.clone();
@@ -1414,12 +3296,23 @@ impl UiState {
                         );
                         return;
                     }
-                    *ui.file_tree_location.borrow_mut() = current_location;
-                    *ui.file_tree_execution_overlay.borrow_mut() = overlay_for_apply;
-                    ui.refresh_file_tree_location_selector();
-                    if !same_target {
-                        ui.set_file_tree_root(root);
-                    }
+                    let root = if same_target {
+                        ui.file_tree_root.borrow().clone()
+                    } else {
+                        root
+                    };
+                    ui.navigate_file_tree_point(
+                        FileTreeNavigationPoint {
+                            location: current_location,
+                            overlay: overlay_for_apply,
+                            root,
+                        },
+                        if same_target {
+                            FileTreeNavigationAction::Replace
+                        } else {
+                            FileTreeNavigationAction::Push
+                        },
+                    );
                     ui.set_sidebar_visible(true, false);
                     ui.apply_sidebar_view(crate::config::SidebarView::Files, false);
                 }
@@ -1520,15 +3413,63 @@ impl UiState {
         self.set_file_tree_root(start);
     }
 
-    /// Rebuild the tree with `root` at the top. Results from older scans are
-    /// ignored, so rapid cwd changes cannot repopulate the browser with stale data.
+    /// Navigate within the current filesystem. Once a tree exists the target
+    /// listing is staged first; failure or an out-of-order answer leaves the
+    /// current root, rows, selection and history untouched.
     pub(crate) fn set_file_tree_root(&self, root: PathBuf) {
+        if !self.file_tree_root.borrow().as_os_str().is_empty()
+            && !self.file_tree_model.committed_authority_is_current()
+        {
+            self.toast_overlay.add_toast(adw::Toast::new(
+                "The filesystem profile changed; choose a location before navigating",
+            ));
+            return;
+        }
+        let target = FileTreeNavigationPoint {
+            location: self.file_tree_location.borrow().clone(),
+            overlay: self.file_tree_execution_overlay.borrow().clone(),
+            root,
+        };
+        if self.file_tree_root.borrow().as_os_str().is_empty() {
+            self.load_file_tree_root_immediately(target);
+        } else {
+            self.navigate_file_tree_point(target, FileTreeNavigationAction::Push);
+        }
+    }
+
+    fn refresh_file_tree_root_header(&self) {
+        let location = self.file_tree_location.borrow().clone();
+        let root = self.file_tree_root.borrow().clone();
+        if !root.as_os_str().is_empty() && !self.file_tree_model.committed_authority_is_current() {
+            self.file_tree_root_label.set_text(&format!(
+                "Unavailable snapshot: {}",
+                safe_file_label(&root.to_string_lossy())
+            ));
+            self.file_tree_root_label.set_tooltip_text(Some(
+                "The filesystem profile changed; existing rows are read-only until another location commits",
+            ));
+            return;
+        }
+        self.file_tree_root_label
+            .set_text(&root_display_label(&location, &root));
+        let root_tooltip = safe_file_label(&root.to_string_lossy());
+        self.file_tree_root_label
+            .set_tooltip_text(Some(&root_tooltip));
+    }
+
+    fn load_file_tree_root_immediately(&self, target: FileTreeNavigationPoint) {
         // Root changes are user/navigation authority too. Advancing the
         // independent follow token closes the theoretical generation-wrap ABA
         // and ensures a staged SSH probe can never steal the tree afterward.
         self.invalidate_file_tree_remote_follow();
+        *self.file_tree_location.borrow_mut() = target.location.clone();
+        *self.file_tree_execution_overlay.borrow_mut() = target.overlay.clone();
+        self.file_tree_navigation
+            .borrow_mut()
+            .install_initial(target.clone());
         let generation = self.file_tree_model.reset();
-        let location = self.file_tree_location.borrow().clone();
+        let location = target.location.clone();
+        let root = target.root;
         self.file_tree_root_label
             .set_text(&root_display_label(&location, &root));
         let root_tooltip = safe_file_label(&root.to_string_lossy());
@@ -1537,11 +3478,18 @@ impl UiState {
         *self.file_tree_root.borrow_mut() = root.clone();
 
         let model = self.file_tree_model.clone();
+        model.set_root_path(&root);
+        model.set_root_status(generation, &root, DirectoryRowStatus::Loading);
         let model_for_start_error = model.clone();
         let expected_root = root.clone();
+        let scan_request = model.issue_directory_scan(&expected_root);
+        let scan_revision = scan_request.revision;
         let active_root = self.file_tree_root.clone();
         let toast_overlay = self.toast_overlay.clone();
         let scan_hosts = self.config.borrow().remote_hosts.clone();
+        if let Ok(authority) = remote_fs::filesystem_identity(&location, &scan_hosts) {
+            model.set_committed_authority(authority);
+        }
         let scan_location = location.clone();
         let scan_overlay = self.file_tree_execution_overlay.borrow().clone();
         let location_for_scan = self.file_tree_location.clone();
@@ -1551,6 +3499,8 @@ impl UiState {
             scan_hosts,
             scan_overlay.clone(),
             root,
+            scan_request.cancel.clone(),
+            ScanPriority::Root,
             move |result| {
                 if *active_root.borrow() != expected_root {
                     return;
@@ -1563,24 +3513,53 @@ impl UiState {
                 if *overlay_for_scan.borrow() != scan_overlay {
                     return;
                 }
+                if !model.directory_scan_is_current(&expected_root, scan_revision) {
+                    return;
+                }
+                model.complete_directory_scan(&expected_root, scan_revision);
                 match result {
-                    Ok(entries) => {
-                        model.replace_root(generation, entries);
+                    Ok(listing) => {
+                        let timing = listing.timing;
+                        let entry_count = listing.entries.len();
+                        let reconcile_started = Instant::now();
+                        model.mark_snapshot_completed(&expected_root);
+                        if listing.truncated {
+                            let path = root_display_label(&scan_location, &expected_root);
+                            toast_overlay.add_toast(adw::Toast::new(&format!(
+                                "{path} has more than {} entries; showing the first {}",
+                                remote_fs::MAX_DIRECTORY_ENTRIES,
+                                remote_fs::MAX_DIRECTORY_ENTRIES
+                            )));
+                        }
+                        model.replace_root(generation, listing.entries);
+                        log_scan_timing(
+                            &expected_root,
+                            timing,
+                            reconcile_started.elapsed(),
+                            &StoreReconcileDelta {
+                                inserted_rows: entry_count,
+                                ..StoreReconcileDelta::default()
+                            },
+                        );
                     }
                     Err(error) => {
                         log::warn!(
                             "failed to scan file-tree root {}: {error}",
                             expected_root.display()
                         );
-                        // An empty directory and an unreadable directory must not
-                        // look identical. `replace_root` doubles as a generation
-                        // check so a late failure cannot toast for a newer scan.
-                        if model.replace_root(generation, Vec::new()) {
+                        // An empty directory and an unreadable directory must
+                        // not look identical. Publish a retryable tree row;
+                        // refresh failures elsewhere retain last-good rows too.
+                        if model.set_root_status(
+                            generation,
+                            &expected_root,
+                            directory_error_status(
+                                &error,
+                                model.last_good_snapshot(&expected_root),
+                            ),
+                        ) {
                             let path = root_display_label(&scan_location, &expected_root);
-                            let error = jterm_core::review_input::safe_inline_display(
-                                &error.to_string(),
-                                512,
-                            );
+                            let error = public_directory_error_message(&error);
                             toast_overlay.add_toast(adw::Toast::new(&format!(
                                 "Cannot open {path}: {error}"
                             )));
@@ -1589,36 +3568,200 @@ impl UiState {
                 }
             },
         ) {
+            model_for_start_error
+                .complete_directory_scan(&self.file_tree_root.borrow(), scan_revision);
             log::warn!("failed to start file-tree scan: {error}");
             // The start error is synchronous, but still respect the current
             // generation in case this function is re-entered by UI callbacks.
-            if model_for_start_error.replace_root(generation, Vec::new()) {
+            if model_for_start_error.set_root_status(
+                generation,
+                &self.file_tree_root.borrow(),
+                directory_error_status(
+                    &error,
+                    model_for_start_error.last_good_snapshot(&self.file_tree_root.borrow()),
+                ),
+            ) {
                 let location = self.file_tree_location.borrow().clone();
                 let path = root_display_label(&location, &self.file_tree_root.borrow());
-                let error = jterm_core::review_input::safe_inline_display(&error.to_string(), 512);
+                let error = public_directory_error_message(&error);
                 self.toast_overlay
                     .add_toast(adw::Toast::new(&format!("Cannot open {path}: {error}")));
             }
         }
     }
 
+    fn navigate_file_tree_point(
+        &self,
+        target: FileTreeNavigationPoint,
+        action: FileTreeNavigationAction,
+    ) {
+        if !target.root.is_absolute() {
+            self.toast_overlay
+                .add_toast(adw::Toast::new("File-tree paths must be absolute"));
+            return;
+        }
+        self.invalidate_file_tree_remote_follow();
+        let request = self
+            .file_tree_navigation
+            .borrow_mut()
+            .begin(target.clone(), action);
+        let hosts = self.config.borrow().remote_hosts.clone();
+        let expected_authority = match remote_fs::filesystem_identity(&target.location, &hosts) {
+            Ok(authority) => authority,
+            Err(error) => {
+                self.file_tree_navigation.borrow_mut().fail(&request);
+                ScanScheduler::global().retire_cancelled();
+                self.refresh_file_tree_root_header();
+                self.refresh_file_tree_location_selector();
+                let detail = public_directory_error_message(&error);
+                self.toast_overlay
+                    .add_toast(adw::Toast::new(&format!("Cannot open path: {detail}")));
+                return;
+            }
+        };
+        let target_label = root_display_label(&target.location, &target.root);
+        self.file_tree_root_label
+            .set_text(&format!("Opening {target_label}…"));
+        self.file_tree_root_label.set_tooltip_text(Some(
+            "The current tree remains available until navigation succeeds",
+        ));
+
+        let ui = self.clone();
+        let request_for_result = request.clone();
+        let target_for_error = target.clone();
+        let start = request_dir_scan(
+            target.location.clone(),
+            hosts,
+            target.overlay.clone(),
+            target.root.clone(),
+            request.cancel.clone(),
+            ScanPriority::Root,
+            move |result| {
+                if !ui
+                    .file_tree_navigation
+                    .borrow()
+                    .is_current(&request_for_result)
+                {
+                    return;
+                }
+                let live_hosts = ui.config.borrow().remote_hosts.clone();
+                if remote_fs::filesystem_identity(&request_for_result.target.location, &live_hosts)
+                    .ok()
+                    .as_ref()
+                    != Some(&expected_authority)
+                {
+                    ui.file_tree_navigation
+                        .borrow_mut()
+                        .fail(&request_for_result);
+                    ui.refresh_file_tree_root_header();
+                    ui.refresh_file_tree_location_selector();
+                    ui.toast_overlay.add_toast(adw::Toast::new(
+                        "The remote profile changed while navigation was pending",
+                    ));
+                    return;
+                }
+                match result {
+                    Ok(listing) => {
+                        if !ui
+                            .file_tree_navigation
+                            .borrow_mut()
+                            .commit(&request_for_result)
+                        {
+                            return;
+                        }
+                        let reconcile_started = Instant::now();
+                        let generation = ui.file_tree_model.reset();
+                        ui.file_tree_model
+                            .set_committed_authority(expected_authority.clone());
+                        *ui.file_tree_location.borrow_mut() =
+                            request_for_result.target.location.clone();
+                        *ui.file_tree_execution_overlay.borrow_mut() =
+                            request_for_result.target.overlay.clone();
+                        *ui.file_tree_root.borrow_mut() = request_for_result.target.root.clone();
+                        ui.file_tree_model
+                            .set_root_path(&request_for_result.target.root);
+                        ui.file_tree_model
+                            .mark_snapshot_completed(&request_for_result.target.root);
+                        let timing = listing.timing;
+                        let entry_count = listing.entries.len();
+                        ui.file_tree_model.replace_root(generation, listing.entries);
+                        ui.refresh_file_tree_location_selector();
+                        ui.refresh_file_tree_root_header();
+                        let delta = StoreReconcileDelta {
+                            inserted_rows: entry_count,
+                            ..StoreReconcileDelta::default()
+                        };
+                        log_scan_timing(
+                            &request_for_result.target.root,
+                            timing,
+                            reconcile_started.elapsed(),
+                            &delta,
+                        );
+                        if listing.truncated {
+                            ui.toast_overlay.add_toast(adw::Toast::new(&format!(
+                                "{} has more than {} entries; showing the first {}",
+                                root_display_label(
+                                    &request_for_result.target.location,
+                                    &request_for_result.target.root
+                                ),
+                                remote_fs::MAX_DIRECTORY_ENTRIES,
+                                remote_fs::MAX_DIRECTORY_ENTRIES
+                            )));
+                        }
+                    }
+                    Err(error) => {
+                        ui.file_tree_navigation
+                            .borrow_mut()
+                            .fail(&request_for_result);
+                        ui.refresh_file_tree_root_header();
+                        ui.refresh_file_tree_location_selector();
+                        log::warn!(
+                            "failed transactional file-tree navigation to {}: {error}",
+                            request_for_result.target.root.display()
+                        );
+                        let detail = public_directory_error_message(&error);
+                        ui.toast_overlay
+                            .add_toast(adw::Toast::new(&format!("Cannot open path: {detail}")));
+                    }
+                }
+            },
+        );
+        if let Err(error) = start {
+            self.file_tree_navigation.borrow_mut().fail(&request);
+            self.refresh_file_tree_root_header();
+            self.refresh_file_tree_location_selector();
+            log::warn!(
+                "failed to start transactional navigation to {}: {error}",
+                target_for_error.root.display()
+            );
+            let detail = public_directory_error_message(&error);
+            self.toast_overlay
+                .add_toast(adw::Toast::new(&format!("Cannot open path: {detail}")));
+        }
+    }
+
     /// Switch the tree to another filesystem (local disk or one of the
     /// configured remote hosts) and root it at that location's start
-    /// directory. Remote home discovery runs off the GTK thread; a failure
-    /// returns to Local so Refresh never retries a local-looking path against
-    /// the failed remote target.
+    /// directory. Remote home discovery and the first listing are both
+    /// staged; failure leaves the previous filesystem and tree committed.
     pub(crate) fn set_file_tree_location(&self, location: FsLocation) {
         if *self.file_tree_location.borrow() == location {
+            // Choosing the still-committed location is an explicit way to
+            // back out of a staged selector/navigation request. Restore the
+            // selector/header immediately and retire its queued scan.
+            self.invalidate_file_tree_remote_follow();
+            if self.file_tree_navigation.borrow_mut().cancel_pending() {
+                ScanScheduler::global().retire_cancelled();
+            }
+            self.refresh_file_tree_root_header();
+            self.refresh_file_tree_location_selector();
             return;
         }
         // Selector/navigation changes choose stable authority explicitly; an
         // accelerator observed for a previous SSH process must not follow the
         // user onto that new endpoint.
-        *self.file_tree_execution_overlay.borrow_mut() = FsExecutionOverlay::default();
         let hosts = self.config.borrow().remote_hosts.clone();
         if location == FsLocation::Local {
-            *self.file_tree_location.borrow_mut() = FsLocation::Local;
-            self.refresh_file_tree_location_selector();
             let root = remote_fs::start_dir_with_overlay(
                 &FsLocation::Local,
                 &hosts,
@@ -1626,32 +3769,56 @@ impl UiState {
             )
             .or_else(|_| home_dir().ok_or_else(|| io::Error::other("home is unavailable")))
             .unwrap_or_else(|_| PathBuf::from("/"));
-            self.set_file_tree_root(root);
+            self.navigate_file_tree_point(
+                FileTreeNavigationPoint {
+                    location: FsLocation::Local,
+                    overlay: FsExecutionOverlay::default(),
+                    root,
+                },
+                FileTreeNavigationAction::Push,
+            );
             return;
         }
+        let expected_authority = match remote_fs::filesystem_identity(&location, &hosts) {
+            Ok(authority) => authority,
+            Err(error) => {
+                self.fail_file_tree_location_change(&location, &error);
+                return;
+            }
+        };
 
-        *self.file_tree_location.borrow_mut() = location.clone();
-        let generation = self.file_tree_model.reset();
-        *self.file_tree_root.borrow_mut() = PathBuf::new();
         let label = location.label(&hosts);
         self.file_tree_root_label
             .set_text(&format!("Connecting to {label}…"));
         self.file_tree_root_label
             .set_tooltip_text(Some("Resolving the remote start directory"));
-        self.refresh_file_tree_location_selector();
+        self.invalidate_file_tree_remote_follow();
+        let navigation_guard = self.file_tree_remote_follow_intent.get();
 
         let ui = self.clone();
         let expected_location = location.clone();
         let location_for_work = location.clone();
         let hosts_for_work = hosts.clone();
         let apply = move |result: io::Result<PathBuf>| {
-            if ui.file_tree_model.generation.get() != generation
-                || *ui.file_tree_location.borrow() != expected_location
-            {
+            let current_hosts = ui.config.borrow().remote_hosts.clone();
+            if !location_home_probe_is_current(
+                navigation_guard,
+                ui.file_tree_remote_follow_intent.get(),
+                &expected_location,
+                &expected_authority,
+                &current_hosts,
+            ) {
                 return;
             }
             match result {
-                Ok(root) => ui.set_file_tree_root(root),
+                Ok(root) => ui.navigate_file_tree_point(
+                    FileTreeNavigationPoint {
+                        location: expected_location.clone(),
+                        overlay: FsExecutionOverlay::default(),
+                        root,
+                    },
+                    FileTreeNavigationAction::Push,
+                ),
                 Err(error) => ui.fail_file_tree_location_change(&expected_location, &error),
             }
         };
@@ -1670,18 +3837,12 @@ impl UiState {
     }
 
     fn fail_file_tree_location_change(&self, location: &FsLocation, error: &io::Error) {
-        if *self.file_tree_location.borrow() != *location {
-            return;
-        }
         let hosts = self.config.borrow().remote_hosts.clone();
         let label = location.label(&hosts);
         log::warn!("failed to resolve start directory for {label}: {error}");
-        let detail = jterm_core::review_input::safe_inline_display(&error.to_string(), 512);
-        *self.file_tree_location.borrow_mut() = FsLocation::Local;
-        *self.file_tree_execution_overlay.borrow_mut() = FsExecutionOverlay::default();
+        let detail = public_directory_error_message(error);
+        self.refresh_file_tree_root_header();
         self.refresh_file_tree_location_selector();
-        let root = home_dir().unwrap_or_else(|| PathBuf::from("/"));
-        self.set_file_tree_root(root);
         self.toast_overlay
             .add_toast(adw::Toast::new(&format!("Cannot open {label}: {detail}")));
     }
@@ -1702,6 +3863,11 @@ impl UiState {
                 }
             }
         }
+        self.file_tree_navigation
+            .borrow_mut()
+            .remap_history_locations(|location| {
+                remap_remote_location(location, previous_hosts, &current_hosts)
+            });
 
         let previous_location = self.file_tree_location.borrow().clone();
         match remap_remote_location(&previous_location, previous_hosts, &current_hosts) {
@@ -1709,26 +3875,36 @@ impl UiState {
                 if location == previous_location {
                     self.refresh_file_tree_location_selector();
                 } else {
+                    self.file_tree_model.cancel_pending_scans_preserve_tree();
                     let root = self.file_tree_root.borrow().clone();
                     if root.as_os_str().is_empty() {
                         // A home probe queued with the old index will be
                         // discarded by its location check; start a fresh one
                         // against the exact profile's new index.
-                        *self.file_tree_location.borrow_mut() = FsLocation::Local;
                         self.set_file_tree_location(location);
                     } else {
-                        *self.file_tree_location.borrow_mut() = location;
-                        self.refresh_file_tree_location_selector();
-                        self.set_file_tree_root(root);
+                        self.navigate_file_tree_point(
+                            FileTreeNavigationPoint {
+                                location,
+                                overlay: self.file_tree_execution_overlay.borrow().clone(),
+                                root,
+                            },
+                            FileTreeNavigationAction::Replace,
+                        );
                     }
                 }
             }
             None => {
-                *self.file_tree_location.borrow_mut() = FsLocation::Local;
-                *self.file_tree_execution_overlay.borrow_mut() = FsExecutionOverlay::default();
-                self.refresh_file_tree_location_selector();
+                self.file_tree_model.cancel_pending_scans_preserve_tree();
                 let root = home_dir().unwrap_or_else(|| PathBuf::from("/"));
-                self.set_file_tree_root(root);
+                self.navigate_file_tree_point(
+                    FileTreeNavigationPoint {
+                        location: FsLocation::Local,
+                        overlay: FsExecutionOverlay::default(),
+                        root,
+                    },
+                    FileTreeNavigationAction::Replace,
+                );
                 self.toast_overlay.add_toast(adw::Toast::new(
                     "Remote file-tree target changed; returned to Local",
                 ));
@@ -1741,6 +3917,12 @@ impl UiState {
     /// Docker profile; the remote shell chooses its configured/default start
     /// directory because that launcher has no portable cwd contract.
     pub(crate) fn open_file_tree_terminal(&self) {
+        if !self.file_tree_model.committed_authority_is_current() {
+            self.toast_overlay.add_toast(adw::Toast::new(
+                "The filesystem profile changed; choose a location before opening a terminal",
+            ));
+            return;
+        }
         match self.file_tree_location.borrow().clone() {
             FsLocation::Local => {
                 let root = self.file_tree_root.borrow().clone();
@@ -1790,7 +3972,7 @@ impl UiState {
             location,
             self.file_tree_model.generation.get(),
             &self.file_tree_location.borrow(),
-        )
+        ) && self.file_tree_model.committed_authority_is_current()
     }
 
     fn require_current_file_tree_context(&self, generation: u64, location: &FsLocation) -> bool {
@@ -1799,6 +3981,27 @@ impl UiState {
         }
         self.toast_overlay.add_toast(adw::Toast::new(
             "The file-tree location changed; reopen the action",
+        ));
+        false
+    }
+
+    fn require_current_file_tree_entries(
+        &self,
+        generation: u64,
+        location: &FsLocation,
+        entries: &[FileEntry],
+    ) -> bool {
+        if !self.require_current_file_tree_context(generation, location) {
+            return false;
+        }
+        if self
+            .file_tree_model
+            .materialized_entries_are_current(entries)
+        {
+            return true;
+        }
+        self.toast_overlay.add_toast(adw::Toast::new(
+            "A selected file changed or disappeared; reopen the action",
         ));
         false
     }
@@ -1855,21 +4058,31 @@ impl UiState {
         if let FsLocation::Transient(target) = &*self.file_tree_location.borrow() {
             labels.push(FsLocation::Transient(target.clone()).label(hosts));
         }
-        let selected = match &*self.file_tree_location.borrow() {
-            FsLocation::Local => 0,
-            FsLocation::Remote(index)
-                if *index < active_count
-                    && crate::config::checked_remote_host(hosts, *index).is_ok() =>
-            {
-                *index as u32 + 1
+        let authority_current = self.file_tree_root.borrow().as_os_str().is_empty()
+            || self.file_tree_model.committed_authority_is_current();
+        let selected = if authority_current {
+            match &*self.file_tree_location.borrow() {
+                FsLocation::Local => 0,
+                FsLocation::Remote(index)
+                    if *index < active_count
+                        && crate::config::checked_remote_host(hosts, *index).is_ok() =>
+                {
+                    *index as u32 + 1
+                }
+                FsLocation::Remote(_) => gtk4::INVALID_LIST_POSITION,
+                FsLocation::Transient(_) => active_count as u32 + 1,
             }
-            FsLocation::Remote(_) => 0,
-            FsLocation::Transient(_) => active_count as u32 + 1,
+        } else {
+            gtk4::INVALID_LIST_POSITION
         };
-        let selected_tooltip = labels
-            .get(selected as usize)
-            .cloned()
-            .unwrap_or_else(|| "Choose which filesystem to browse".to_string());
+        let selected_tooltip = if authority_current {
+            labels
+                .get(selected as usize)
+                .cloned()
+                .unwrap_or_else(|| "Choose which filesystem to browse".to_string())
+        } else {
+            "The previous filesystem profile changed; choose a location".to_string()
+        };
         drop(config);
         let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
         let model = gtk4::StringList::new(&label_refs);
@@ -1889,35 +4102,23 @@ impl UiState {
                 if ui.file_tree_location_selector_syncing.get() {
                     return;
                 }
-                let index = selector.selected();
-                if index == gtk4::INVALID_LIST_POSITION {
+                let current = ui.file_tree_location.borrow().clone();
+                let active_remote_count = ui
+                    .config
+                    .borrow()
+                    .remote_hosts
+                    .len()
+                    .min(crate::config::MAX_REMOTE_HOSTS);
+                let Some(location) = file_tree_location_from_selection(
+                    selector.selected(),
+                    active_remote_count,
+                    &current,
+                ) else {
                     return;
-                }
-                let location = match index as usize {
-                    0 => FsLocation::Local,
-                    selected
-                        if selected
-                            <= ui
-                                .config
-                                .borrow()
-                                .remote_hosts
-                                .len()
-                                .min(crate::config::MAX_REMOTE_HOSTS) =>
-                    {
-                        FsLocation::Remote(selected - 1)
-                    }
-                    _ => {
-                        let current = ui.file_tree_location.borrow().clone();
-                        if matches!(current, FsLocation::Transient(_)) {
-                            current
-                        } else {
-                            return;
-                        }
-                    }
                 };
-                if *ui.file_tree_location.borrow() == location {
-                    return;
-                }
+                // Dispatch even when `location == current`: the user may be
+                // re-selecting committed A specifically to cancel a staged B
+                // home/list request. The setter owns that cancellation.
                 ui.set_file_tree_location(location);
             });
     }
@@ -1973,10 +4174,14 @@ impl UiState {
                 if *self.file_tree_location.borrow() != location
                     || *self.file_tree_root.borrow() != cwd
                 {
-                    *self.file_tree_execution_overlay.borrow_mut() = FsExecutionOverlay::default();
-                    *self.file_tree_location.borrow_mut() = location;
-                    self.refresh_file_tree_location_selector();
-                    self.set_file_tree_root(cwd);
+                    self.navigate_file_tree_point(
+                        FileTreeNavigationPoint {
+                            location,
+                            overlay: FsExecutionOverlay::default(),
+                            root: cwd,
+                        },
+                        FileTreeNavigationAction::Push,
+                    );
                 }
             }
             return;
@@ -1989,13 +4194,17 @@ impl UiState {
             .filter(|path| path.is_dir());
         match cwd {
             Some(dir) => {
-                if *self.file_tree_location.borrow() != FsLocation::Local {
-                    *self.file_tree_execution_overlay.borrow_mut() = FsExecutionOverlay::default();
-                    *self.file_tree_location.borrow_mut() = FsLocation::Local;
-                    self.refresh_file_tree_location_selector();
-                }
-                if *self.file_tree_root.borrow() != dir {
-                    self.set_file_tree_root(dir);
+                if *self.file_tree_location.borrow() != FsLocation::Local
+                    || *self.file_tree_root.borrow() != dir
+                {
+                    self.navigate_file_tree_point(
+                        FileTreeNavigationPoint {
+                            location: FsLocation::Local,
+                            overlay: FsExecutionOverlay::default(),
+                            root: dir,
+                        },
+                        FileTreeNavigationAction::Push,
+                    );
                 }
             }
             None => {
@@ -2010,12 +4219,185 @@ impl UiState {
         }
     }
 
+    /// Navigate through committed roots; a failed history target leaves both
+    /// stacks and the visible tree untouched.
+    pub(crate) fn file_tree_go_back(&self) {
+        let target = self.file_tree_navigation.borrow().back_target();
+        if let Some(target) = target {
+            self.navigate_file_tree_point(target, FileTreeNavigationAction::Back);
+        }
+    }
+
+    pub(crate) fn file_tree_go_forward(&self) {
+        let target = self.file_tree_navigation.borrow().forward_target();
+        if let Some(target) = target {
+            self.navigate_file_tree_point(target, FileTreeNavigationAction::Forward);
+        }
+    }
+
     /// Move the root up to the parent directory.
     pub(crate) fn file_tree_go_up(&self) {
         let parent = self.file_tree_root.borrow().parent().map(Path::to_path_buf);
         if let Some(parent) = parent {
             self.set_file_tree_root(parent);
         }
+    }
+
+    /// Resolve the selected filesystem's home. Remote home lookup runs off
+    /// the GTK thread and is guarded by generation/location/root snapshots so
+    /// a late probe cannot undo newer navigation.
+    pub(crate) fn file_tree_go_home(&self) {
+        if !self.file_tree_model.committed_authority_is_current() {
+            self.toast_overlay.add_toast(adw::Toast::new(
+                "The filesystem profile changed; choose a location before opening Home",
+            ));
+            return;
+        }
+        let location = self.file_tree_location.borrow().clone();
+        let overlay = self.file_tree_execution_overlay.borrow().clone();
+        let hosts = self.config.borrow().remote_hosts.clone();
+        if location == FsLocation::Local {
+            let home = remote_fs::start_dir_with_overlay(&location, &hosts, &overlay)
+                .unwrap_or_else(|_| PathBuf::from("/"));
+            self.set_file_tree_root(home);
+            return;
+        }
+
+        let expected_generation = self.file_tree_model.generation.get();
+        let expected_navigation_revision = self.file_tree_navigation.borrow().revision();
+        let expected_root = self.file_tree_root.borrow().clone();
+        let ui = self.clone();
+        let location_for_work = location.clone();
+        let overlay_for_work = overlay.clone();
+        let apply = move |result: io::Result<PathBuf>| {
+            if ui.file_tree_model.generation.get() != expected_generation
+                || ui.file_tree_navigation.borrow().revision() != expected_navigation_revision
+                || *ui.file_tree_location.borrow() != location
+                || *ui.file_tree_execution_overlay.borrow() != overlay
+                || *ui.file_tree_root.borrow() != expected_root
+            {
+                return;
+            }
+            match result {
+                Ok(home) => ui.set_file_tree_root(home),
+                Err(error) => {
+                    log::warn!("failed to resolve Remote Files home: {error}");
+                    let detail = public_directory_error_message(&error);
+                    ui.toast_overlay
+                        .add_toast(adw::Toast::new(&format!("Cannot open Home: {detail}")));
+                }
+            }
+        };
+        if let Err(error) = request_fs_op(
+            move || {
+                remote_fs::start_dir_with_overlay(&location_for_work, &hosts, &overlay_for_work)
+            },
+            apply,
+        ) {
+            log::warn!("failed to start Remote Files home lookup: {error}");
+            let detail = public_directory_error_message(&error);
+            self.toast_overlay
+                .add_toast(adw::Toast::new(&format!("Cannot open Home: {detail}")));
+        }
+    }
+
+    pub(crate) fn present_file_tree_path_dialog(&self) {
+        let dialog = adw::Dialog::builder()
+            .title("Open Filesystem Path")
+            .content_width(440)
+            .build();
+        let entry = adw::EntryRow::new();
+        entry.set_title("Absolute path");
+        if let Some(root) = self.file_tree_root.borrow().to_str() {
+            entry.set_text(root);
+        }
+        let error = gtk4::Label::new(None);
+        error.add_css_class("error");
+        error.set_xalign(0.0);
+        error.set_wrap(true);
+        error.set_visible(false);
+
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        content.set_margin_start(12);
+        content.set_margin_end(12);
+        content.set_margin_top(12);
+        content.set_margin_bottom(12);
+        content.append(&entry);
+        content.append(&error);
+
+        let breadcrumbs = gtk4::FlowBox::new();
+        breadcrumbs.set_selection_mode(gtk4::SelectionMode::None);
+        breadcrumbs.set_column_spacing(4);
+        breadcrumbs.set_row_spacing(4);
+        for ancestor in navigation_breadcrumbs(&self.file_tree_root.borrow()) {
+            let label = if ancestor == Path::new("/") {
+                "/".to_string()
+            } else {
+                ancestor
+                    .file_name()
+                    .map(|name| safe_file_label(&name.to_string_lossy()))
+                    .unwrap_or_else(|| "/".to_string())
+            };
+            let button = gtk4::Button::with_label(&label);
+            button.add_css_class("flat");
+            let ui = self.clone();
+            let dialog_for_ancestor = dialog.clone();
+            button.connect_clicked(move |_| {
+                dialog_for_ancestor.close();
+                ui.set_file_tree_root(ancestor.clone());
+            });
+            breadcrumbs.insert(&button, -1);
+        }
+        content.append(&breadcrumbs);
+
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+        let cancel = gtk4::Button::with_label("Cancel");
+        let navigate = gtk4::Button::with_label("Open");
+        navigate.add_css_class("suggested-action");
+        header.pack_start(&cancel);
+        header.pack_end(&navigate);
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&content));
+        dialog.set_child(Some(&toolbar));
+
+        let dialog_for_cancel = dialog.clone();
+        cancel.connect_clicked(move |_| {
+            dialog_for_cancel.close();
+        });
+        let ui = self.clone();
+        let dialog_for_navigate = dialog.clone();
+        navigate.connect_clicked(
+            move |_| match validate_absolute_navigation_path(&entry.text()) {
+                Ok(path) => {
+                    dialog_for_navigate.close();
+                    ui.set_file_tree_root(path);
+                }
+                Err(message) => {
+                    error.set_text(message);
+                    error.set_visible(true);
+                }
+            },
+        );
+        dialog.present(Some(&self.window));
+    }
+
+    fn file_tree_enter_selected_directory(&self) -> bool {
+        let selected = self.file_tree_model.selected_entries_snapshot();
+        let [entry] = selected.as_slice() else {
+            return false;
+        };
+        if !entry.is_dir
+            || !self
+                .file_tree_model
+                .materialized_entries_are_current(std::slice::from_ref(entry))
+        {
+            return false;
+        }
+        self.set_file_tree_root(entry.path.clone());
+        true
     }
 
     /// Connect activation after UiState exists. Directory activation toggles the
@@ -2028,6 +4410,17 @@ impl UiState {
             let Some((row, entry)) = ui.file_tree_model.row_entry(position) else {
                 return;
             };
+            if entry
+                .status
+                .as_ref()
+                .is_some_and(DirectoryRowStatus::is_retryable)
+            {
+                ui.file_tree_model.retry_directory(&entry.path);
+                return;
+            }
+            if !entry.is_item() {
+                return;
+            }
             if entry.is_dir {
                 row.set_expanded(!row.is_expanded());
                 return;
@@ -2050,13 +4443,59 @@ impl UiState {
             }
         });
 
+        // Scope navigation to the Files ListView. The window/terminal never
+        // sees these claimed keys only while focus is within this tree.
+        let refresh_keys = gtk4::EventControllerKey::new();
+        refresh_keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let ui_for_refresh = self.clone();
+        refresh_keys.connect_key_pressed(
+            move |_, keyval, _, state| match file_tree_navigation_key(keyval, state) {
+                Some(FileTreeNavigationKey::Refresh) => {
+                    let root = ui_for_refresh.file_tree_root.borrow().clone();
+                    if !root.as_os_str().is_empty() {
+                        ui_for_refresh.refresh_dir_listing(&root);
+                    }
+                    true.into()
+                }
+                Some(FileTreeNavigationKey::Up) => {
+                    ui_for_refresh.file_tree_go_up();
+                    true.into()
+                }
+                Some(FileTreeNavigationKey::Home) => {
+                    ui_for_refresh.file_tree_go_home();
+                    true.into()
+                }
+                Some(FileTreeNavigationKey::EnterDirectory) => {
+                    ui_for_refresh.file_tree_enter_selected_directory().into()
+                }
+                None => false.into(),
+            },
+        );
+        file_tree.add_controller(refresh_keys);
+
+        // Remote snapshots remain useful while stale; revalidate only visible
+        // materialized directories, in a small batch, and coalesce with any
+        // revision already pending for that path.
+        let tree_for_ttl = file_tree.downgrade();
+        let ui_for_ttl = self.clone();
+        glib::timeout_add_local(Duration::from_secs(30), move || {
+            let Some(tree) = tree_for_ttl.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if tree.is_mapped() {
+                ui_for_ttl.refresh_visible_stale_file_tree_directories();
+            }
+            glib::ControlFlow::Continue
+        });
+
         let right_click = gtk4::GestureClick::new();
         right_click.set_button(3);
         let ui = self.clone();
         let file_tree_for_menu = file_tree.clone();
         right_click.connect_pressed(move |gesture, _n_press, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
-            let target = file_tree_row_at(&file_tree_for_menu, x, y);
+            let target =
+                file_tree_row_at(&file_tree_for_menu, x, y).filter(|(_, entry)| entry.is_item());
             ui.show_file_tree_context_menu(&file_tree_for_menu, x, y, target);
         });
         file_tree.add_controller(right_click);
@@ -2068,7 +4507,7 @@ impl UiState {
             gtk4::gdk::FileList::static_type(),
             gtk4::gdk::DragAction::COPY,
         );
-        let drop_hover: Rc<RefCell<Option<gtk4::Widget>>> = Rc::new(RefCell::new(None));
+        let drop_hover = self.file_tree_model.drop_hover.clone();
         {
             let hover = drop_hover.clone();
             let tree = file_tree.clone();
@@ -2109,6 +4548,7 @@ impl UiState {
                 }
                 let target_dir = match file_tree_row_at(&tree, x, y) {
                     Some((_, entry)) if entry.is_dir => entry.path,
+                    Some((_, entry)) if !entry.is_item() => entry.path,
                     Some((_, entry)) => entry
                         .path
                         .parent()
@@ -2229,8 +4669,7 @@ impl UiState {
                         if error.kind() == io::ErrorKind::Interrupted {
                             return Err(error);
                         }
-                        let detail =
-                            jterm_core::review_input::safe_inline_display(&error.to_string(), 256);
+                        let detail = public_file_operation_error_message(&error);
                         failures_for_work
                             .lock()
                             .unwrap()
@@ -2289,15 +4728,10 @@ impl UiState {
         }
         let has_target = !entries.is_empty();
         let multi = entries.len() > 1;
-        let target_dir = match &target {
-            Some((_, entry)) if entry.is_dir => entry.path.clone(),
-            Some((_, entry)) => entry
-                .path
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| self.file_tree_root.borrow().clone()),
-            None => self.file_tree_root.borrow().clone(),
-        };
+        let target_dir = directory_action_target(
+            &self.file_tree_root.borrow(),
+            target.as_ref().map(|(_, entry)| entry),
+        );
 
         let popover = gtk4::Popover::new();
         popover.set_parent(file_tree);
@@ -2318,6 +4752,31 @@ impl UiState {
             btn
         };
 
+        {
+            let item = make_item("Open Folder");
+            let folder = entries
+                .first()
+                .cloned()
+                .filter(|entry| !multi && entry.is_dir);
+            item.set_sensitive(folder.is_some());
+            if let Some(folder) = folder {
+                let popover_c = popover.clone();
+                let ui = self.clone();
+                let expected_location = location.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    if ui.require_current_file_tree_entries(
+                        context_generation,
+                        &expected_location,
+                        std::slice::from_ref(&folder),
+                    ) {
+                        ui.set_file_tree_root(folder.path.clone());
+                    }
+                });
+            }
+            vbox.append(&item);
+        }
+
         for (label, kind) in [
             ("New File", NameDialogKind::NewFile),
             ("New Folder", NameDialogKind::NewFolder),
@@ -2330,9 +4789,14 @@ impl UiState {
             let ui = self.clone();
             let dir = target_dir.clone();
             let expected_location = location.clone();
+            let expected_entries = entries.clone();
             item.connect_clicked(move |_| {
                 popover_c.popdown();
-                if !ui.require_current_file_tree_context(context_generation, &expected_location) {
+                if !ui.require_current_file_tree_entries(
+                    context_generation,
+                    &expected_location,
+                    &expected_entries,
+                ) {
                     return;
                 }
                 ui.present_file_tree_name_dialog(kind, dir.clone(), None);
@@ -2347,10 +4811,14 @@ impl UiState {
                 let popover_c = popover.clone();
                 let ui = self.clone();
                 let expected_location = location.clone();
+                let expected_entry = entry.clone();
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
-                    if !ui.require_current_file_tree_context(context_generation, &expected_location)
-                    {
+                    if !ui.require_current_file_tree_entries(
+                        context_generation,
+                        &expected_location,
+                        std::slice::from_ref(&expected_entry),
+                    ) {
                         return;
                     }
                     let dir = entry
@@ -2383,8 +4851,11 @@ impl UiState {
                 let expected_location = location.clone();
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
-                    if !ui.require_current_file_tree_context(context_generation, &expected_location)
-                    {
+                    if !ui.require_current_file_tree_entries(
+                        context_generation,
+                        &expected_location,
+                        &entries,
+                    ) {
                         return;
                     }
                     ui.confirm_file_tree_delete(entries.clone());
@@ -2404,8 +4875,11 @@ impl UiState {
                 let expected_location = location.clone();
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
-                    if !ui.require_current_file_tree_context(context_generation, &expected_location)
-                    {
+                    if !ui.require_current_file_tree_entries(
+                        context_generation,
+                        &expected_location,
+                        &entries,
+                    ) {
                         return;
                     }
                     let Some(intent_id) = ui.next_file_tree_clipboard_intent() else {
@@ -2441,8 +4915,11 @@ impl UiState {
                 let expected_location = location.clone();
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
-                    if !ui.require_current_file_tree_context(context_generation, &expected_location)
-                    {
+                    if !ui.require_current_file_tree_entries(
+                        context_generation,
+                        &expected_location,
+                        &entries,
+                    ) {
                         return;
                     }
                     let mut texts = Vec::with_capacity(entries.len());
@@ -2500,11 +4977,15 @@ impl UiState {
                 let ui = self.clone();
                 let dir = target_dir.clone();
                 let expected_location = location.clone();
+                let expected_entries = entries.clone();
                 let expected_clipboard_intent = clip.intent_id;
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
-                    if !ui.require_current_file_tree_context(context_generation, &expected_location)
-                    {
+                    if !ui.require_current_file_tree_entries(
+                        context_generation,
+                        &expected_location,
+                        &expected_entries,
+                    ) {
                         return;
                     }
                     // The menu may outlive a config reload or a newer
@@ -2533,14 +5014,19 @@ impl UiState {
             let popover_c = popover.clone();
             let ui = self.clone();
             let expected_location = location;
+            let dir = target_dir;
+            let expected_entries = entries;
             item.connect_clicked(move |_| {
                 popover_c.popdown();
-                if !ui.require_current_file_tree_context(context_generation, &expected_location) {
+                if !ui.require_current_file_tree_entries(
+                    context_generation,
+                    &expected_location,
+                    &expected_entries,
+                ) {
                     return;
                 }
                 // In-place re-list: expanded rows stay expanded.
-                let root = ui.file_tree_root.borrow().clone();
-                ui.refresh_dir_listing(&root);
+                ui.refresh_dir_listing(&dir);
             });
             vbox.append(&item);
         }
@@ -2617,6 +5103,23 @@ impl UiState {
                 error_label.set_visible(true);
                 return;
             }
+            if !ui
+                .file_tree_model
+                .materialized_directory_is_current(&ui.file_tree_root.borrow(), &dir)
+            {
+                error_label.set_text("The target directory changed; close and reopen this action.");
+                error_label.set_visible(true);
+                return;
+            }
+            if existing.as_ref().is_some_and(|entry| {
+                !ui.file_tree_model
+                    .materialized_entries_are_current(std::slice::from_ref(entry))
+            }) {
+                error_label
+                    .set_text("The item changed or disappeared; close and reopen this action.");
+                error_label.set_visible(true);
+                return;
+            }
             let name = name_row.text();
             if let Err(message) = remote_fs::validate_new_name(&name) {
                 error_label.set_text(message);
@@ -2629,6 +5132,10 @@ impl UiState {
             match kind {
                 NameDialogKind::NewFile | NameDialogKind::NewFolder => {
                     let path = dir.join(name.as_str());
+                    let path_for_work = path.clone();
+                    let ui_for_selection = ui.clone();
+                    let expected_location_for_selection = expected_location.clone();
+                    let dir_for_selection = dir.clone();
                     ui.execute_fs_op(
                         kind.verb(),
                         None,
@@ -2636,15 +5143,33 @@ impl UiState {
                         move || {
                             if kind == NameDialogKind::NewFile {
                                 remote_fs::create_file_with_overlay(
-                                    &location, &hosts, &overlay, &path,
+                                    &location,
+                                    &hosts,
+                                    &overlay,
+                                    &path_for_work,
                                 )
                             } else {
                                 remote_fs::create_dir_with_overlay(
-                                    &location, &hosts, &overlay, &path,
+                                    &location,
+                                    &hosts,
+                                    &overlay,
+                                    &path_for_work,
                                 )
                             }
                         },
-                        || {},
+                        move || {
+                            if ui_for_selection.file_tree_context_is_current(
+                                expected_generation,
+                                &expected_location_for_selection,
+                            ) {
+                                ui_for_selection
+                                    .file_tree_model
+                                    .request_selection_after_refresh(
+                                        &dir_for_selection,
+                                        vec![path],
+                                    );
+                            }
+                        },
                     );
                 }
                 NameDialogKind::Rename => {
@@ -2655,16 +5180,36 @@ impl UiState {
                     let src = entry.path.clone();
                     let dst = dir.join(name.as_str());
                     if dst != src {
+                        let dst_for_work = dst.clone();
+                        let ui_for_selection = ui.clone();
+                        let expected_location_for_selection = expected_location.clone();
+                        let dir_for_selection = dir.clone();
                         ui.execute_fs_op(
                             kind.verb(),
                             None,
                             vec![dir.clone()],
                             move || {
                                 remote_fs::rename_with_overlay(
-                                    &location, &hosts, &overlay, &src, &dst,
+                                    &location,
+                                    &hosts,
+                                    &overlay,
+                                    &src,
+                                    &dst_for_work,
                                 )
                             },
-                            || {},
+                            move || {
+                                if ui_for_selection.file_tree_context_is_current(
+                                    expected_generation,
+                                    &expected_location_for_selection,
+                                ) {
+                                    ui_for_selection
+                                        .file_tree_model
+                                        .request_selection_after_refresh(
+                                            &dir_for_selection,
+                                            vec![dst],
+                                        );
+                                }
+                            },
                         );
                     }
                 }
@@ -2696,7 +5241,11 @@ impl UiState {
             if response != "delete" {
                 return;
             }
-            if !ui.require_current_file_tree_context(expected_generation, &expected_location) {
+            if !ui.require_current_file_tree_entries(
+                expected_generation,
+                &expected_location,
+                &entries,
+            ) {
                 return;
             }
             // The response closure is Fn: clone the entry list into the
@@ -2730,10 +5279,7 @@ impl UiState {
                         {
                             let name =
                                 jterm_core::review_input::safe_inline_display(&entry.name, 256);
-                            let detail = jterm_core::review_input::safe_inline_display(
-                                &error.to_string(),
-                                256,
-                            );
+                            let detail = public_file_operation_error_message(&error);
                             failures_for_work
                                 .lock()
                                 .unwrap()
@@ -2921,10 +5467,7 @@ impl UiState {
                             )
                         };
                         if let Err(error) = result {
-                            let detail = jterm_core::review_input::safe_inline_display(
-                                &error.to_string(),
-                                256,
-                            );
+                            let detail = public_file_operation_error_message(&error);
                             failures_for_work
                                 .lock()
                                 .unwrap()
@@ -3077,11 +5620,7 @@ impl UiState {
                                         &item.src,
                                     )
                                 {
-                                    let detail =
-                                        jterm_core::review_input::safe_inline_display(
-                                            &error.to_string(),
-                                            256,
-                                        );
+                                    let detail = public_file_operation_error_message(&error);
                                     failures_for_work.lock().unwrap().push(format!(
                                         "{name}: transferred, but the source could not be deleted: {detail}"
                                     ));
@@ -3092,10 +5631,7 @@ impl UiState {
                             return Err(error);
                         }
                         Err(error) => {
-                            let detail = jterm_core::review_input::safe_inline_display(
-                                &error.to_string(),
-                                256,
-                            );
+                            let detail = public_file_operation_error_message(&error);
                             failures_for_work
                                 .lock()
                                 .unwrap()
@@ -3134,52 +5670,25 @@ impl UiState {
     /// Re-list one directory into its already-materialized store, in place:
     /// surviving rows keep their TreeListRow identity, so expansion state
     /// and cached child models everywhere else in the tree are untouched.
-    /// Directories that are not currently visible (collapsed or never
-    /// expanded) need no refresh and are skipped.
+    /// A collapsed directory with a cached store is still refreshed; a
+    /// never-materialized directory has no last-good snapshot to invalidate.
     fn refresh_dir_listing(&self, dir: &Path) {
-        let Some(store) = self
-            .file_tree_model
-            .materialized_children_of(&self.file_tree_root.borrow(), dir)
-        else {
+        self.file_tree_model
+            .refresh_directory(dir, Some(self.toast_overlay.clone()));
+    }
+
+    fn refresh_visible_stale_file_tree_directories(&self) {
+        if !self.file_tree_location.borrow().is_remote() {
             return;
-        };
-        let location = self.file_tree_location.borrow().clone();
-        let hosts = self.config.borrow().remote_hosts.clone();
-        let overlay = self.file_tree_execution_overlay.borrow().clone();
-        let generation = self.file_tree_model.generation.get();
-        let generation_for_scan = self.file_tree_model.generation.clone();
-        let location_for_scan = self.file_tree_location.clone();
-        let overlay_for_scan = self.file_tree_execution_overlay.clone();
-        let scan_location = location.clone();
-        let scan_overlay = overlay.clone();
-        let model_for_refresh = self.file_tree_model.clone();
-        let dir_for_error = dir.to_path_buf();
-        if let Err(error) =
-            request_dir_scan(location, hosts, overlay, dir.to_path_buf(), move |result| {
-                if generation_for_scan.get() != generation {
-                    return;
-                }
-                if *location_for_scan.borrow() != scan_location {
-                    return;
-                }
-                if *overlay_for_scan.borrow() != scan_overlay {
-                    return;
-                }
-                match result {
-                    Ok(entries) => {
-                        update_store_in_place(&store, entries);
-                        model_for_refresh.reapply_filter();
-                    }
-                    Err(error) => log::warn!(
-                        "failed to refresh directory {}: {error}",
-                        dir_for_error.display()
-                    ),
-                }
-            })
-        {
-            log::warn!(
-                "failed to start directory refresh for {}: {error}",
-                dir.display()
+        }
+        let candidates = self
+            .file_tree_model
+            .visible_stale_directories(Instant::now(), MAX_TTL_REFRESHES_PER_TICK);
+        for dir in candidates {
+            self.file_tree_model.refresh_directory_with_cause(
+                &dir,
+                Some(self.toast_overlay.clone()),
+                DirectoryRefreshCause::AutoTtl,
             );
         }
     }
@@ -3198,6 +5707,16 @@ impl UiState {
         W: FnOnce() -> io::Result<()> + Send + 'static,
         S: FnOnce() + 'static,
     {
+        if !self.file_tree_model.committed_authority_is_current() {
+            if let Some(busy) = &busy {
+                busy.dismiss();
+            }
+            self.toast_overlay.add_toast(adw::Toast::new(
+                "The filesystem profile changed; choose a location and retry",
+            ));
+            return;
+        }
+        let affected = unique_paths(affected);
         if let Some(current) = self.file_tree_operation_intent.get() {
             let next = current.checked_add(1);
             self.file_tree_operation_intent.set(next);
@@ -3245,11 +5764,16 @@ impl UiState {
                 }
                 Err(error) => {
                     log::warn!("sidebar file operation {verb} failed: {error}");
-                    let detail = if error.kind() == io::ErrorKind::AlreadyExists {
-                        "An item with this name already exists".to_string()
-                    } else {
-                        jterm_core::review_input::safe_inline_display(&error.to_string(), 512)
-                    };
+                    // A remote process may have committed just before its
+                    // connection failed. Re-list exact affected parents even
+                    // on ambiguous failures; last-good content remains on
+                    // screen if that reconciliation also fails.
+                    if still_visible {
+                        for dir in &affected {
+                            ui.refresh_dir_listing(dir);
+                        }
+                    }
+                    let detail = public_file_operation_error_message(&error);
                     ui.toast_overlay
                         .add_toast(adw::Toast::new(&format!("{verb} failed: {detail}")));
                 }
@@ -3262,7 +5786,7 @@ impl UiState {
                 busy.dismiss();
             }
             log::warn!("failed to start sidebar file operation {verb}: {error}");
-            let detail = jterm_core::review_input::safe_inline_display(&error.to_string(), 512);
+            let detail = public_file_operation_error_message(&error);
             self.toast_overlay
                 .add_toast(adw::Toast::new(&format!("{verb} failed: {detail}")));
         }
@@ -3476,6 +6000,45 @@ fn copy_path_payload(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn navigation_point(path: &str) -> FileTreeNavigationPoint {
+        FileTreeNavigationPoint {
+            location: FsLocation::Local,
+            overlay: FsExecutionOverlay::default(),
+            root: PathBuf::from(path),
+        }
+    }
+
+    fn remote_authority(host: &str) -> remote_fs::FilesystemIdentity {
+        remote_fs::FilesystemIdentity::Remote {
+            docker: false,
+            host: host.to_string(),
+            user: Some("dev".to_string()),
+            stable_ssh_args: Vec::new(),
+        }
+    }
+
+    fn queued_scan(authority: remote_fs::FilesystemIdentity, id: usize) -> ScanJob {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        ScanJob {
+            authority,
+            loc: FsLocation::Local,
+            hosts: Vec::new(),
+            overlay: FsExecutionOverlay::default(),
+            dir: PathBuf::from(format!("/{id}")),
+            cancel: remote_fs::CancelToken::default(),
+            tx,
+            enqueued_at: Instant::now(),
+            queued_depth: id,
+        }
+    }
+
+    fn admitted(result: Result<Vec<ScanJob>, ()>) -> Vec<ScanJob> {
+        match result {
+            Ok(evicted) => evicted,
+            Err(_) => panic!("scan should be admitted"),
+        }
+    }
+
     fn remote_profile(name: &str, target: &str) -> RemoteHost {
         RemoteHost {
             name: name.to_string(),
@@ -3517,40 +6080,316 @@ mod tests {
     }
 
     #[test]
-    fn scan_slot_waits_for_a_free_slot_instead_of_failing() {
-        let held: Vec<ActiveScan> = (0..MAX_CONCURRENT_SCANS)
-            .map(|_| ActiveScan::acquire())
-            .collect();
-        let (tx, rx) = mpsc::channel();
-        let waiter = std::thread::spawn(move || {
-            let _active = ActiveScan::acquire();
-            tx.send(()).expect("waiter reports its acquisition");
-        });
+    fn scan_queue_has_hard_backpressure_and_navigation_can_preempt_lazy_work() {
+        let mut queue = ScanQueue::new(2);
+        assert_eq!(queue.push(ScanPriority::Lazy, 1), Ok(None));
+        assert_eq!(queue.push(ScanPriority::Lazy, 2), Ok(None));
+        assert_eq!(queue.push(ScanPriority::Lazy, 3), Err(3));
+        assert_eq!(queue.len(), 2);
 
-        // Every slot is held, so the queued acquire must still be parked.
-        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
-        drop(held);
-        rx.recv_timeout(Duration::from_secs(5))
-            .expect("a freed slot lets the queued scan proceed");
-        waiter.join().expect("waiter thread finishes");
+        assert_eq!(queue.push(ScanPriority::Root, 3), Ok(Some(2)));
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.pop(), Some(3));
+        assert_eq!(queue.pop(), Some(1));
     }
 
     #[test]
-    fn fs_op_slot_waits_for_a_free_slot_instead_of_failing() {
-        let held: Vec<ActiveFsOp> = (0..MAX_CONCURRENT_FS_OPS)
-            .map(|_| ActiveFsOp::acquire())
+    fn scan_queue_weighting_prioritizes_navigation_without_starving_lazy_work() {
+        let mut queue = ScanQueue::new(32);
+        for index in 0..8 {
+            for priority in [ScanPriority::Root, ScanPriority::Manual, ScanPriority::Lazy] {
+                queue.push(priority, (priority, index)).unwrap();
+            }
+        }
+        let served: Vec<_> = (0..SCAN_SERVICE_ORDER.len())
+            .map(|_| queue.pop().expect("all priority lanes remain non-empty").0)
             .collect();
-        let (tx, rx) = mpsc::channel();
-        let waiter = std::thread::spawn(move || {
-            let _active = ActiveFsOp::acquire();
-            tx.send(()).expect("waiter reports its acquisition");
+        assert_eq!(served, SCAN_SERVICE_ORDER);
+        assert!(served.contains(&ScanPriority::Lazy));
+    }
+
+    #[test]
+    fn scan_scheduler_round_robins_authorities_and_caps_each_remote_at_two() {
+        let authority_a = remote_authority("a.example");
+        let authority_b = remote_authority("b.example");
+        let mut state = ScanSchedulerState {
+            queue: ScanQueue::new(16),
+            authority_order: VecDeque::new(),
+            running_by_authority: std::collections::HashMap::new(),
+        };
+        for id in 0..3 {
+            for authority in [&authority_a, &authority_b] {
+                state.register_authority(authority);
+                state
+                    .queue
+                    .push(ScanPriority::Lazy, queued_scan(authority.clone(), id))
+                    .map_err(|_| ())
+                    .unwrap();
+            }
+        }
+
+        let first = state.pop_next().unwrap();
+        let second = state.pop_next().unwrap();
+        let third = state.pop_next().unwrap();
+        let fourth = state.pop_next().unwrap();
+        assert_eq!(first.authority, authority_a);
+        assert_eq!(second.authority, authority_b);
+        assert_eq!(third.authority, authority_a);
+        assert_eq!(fourth.authority, authority_b);
+        assert!(state.pop_next().is_none(), "both authorities are at cap 2");
+
+        state.finish(&authority_a);
+        assert_eq!(state.pop_next().unwrap().authority, authority_a);
+        assert_eq!(scan_authority_limit(&authority_a), 2);
+        assert_eq!(
+            scan_authority_limit(&remote_fs::FilesystemIdentity::Local),
+            MAX_CONCURRENT_SCANS
+        );
+    }
+
+    #[test]
+    fn scan_admission_caps_one_remote_without_blocking_another_root() {
+        let authority_a = remote_authority("a.example");
+        let authority_b = remote_authority("b.example");
+        let mut state = ScanSchedulerState {
+            queue: ScanQueue::new(MAX_PENDING_SCANS),
+            authority_order: VecDeque::new(),
+            running_by_authority: std::collections::HashMap::new(),
+        };
+        for id in 0..MAX_PENDING_SCANS_PER_REMOTE_AUTHORITY {
+            assert!(admitted(
+                state.admit(ScanPriority::Lazy, queued_scan(authority_a.clone(), id),)
+            )
+            .is_empty());
+        }
+        assert!(state
+            .admit(
+                ScanPriority::Lazy,
+                queued_scan(authority_a.clone(), usize::MAX),
+            )
+            .is_err());
+        assert_eq!(
+            state.queue.count_where(|job| job.authority == authority_a),
+            MAX_PENDING_SCANS_PER_REMOTE_AUTHORITY
+        );
+
+        assert!(admitted(state.admit(
+            ScanPriority::Root,
+            queued_scan(authority_b.clone(), usize::MAX - 1),
+        ))
+        .is_empty());
+        assert_eq!(
+            state.queue.count_where(|job| job.authority == authority_b),
+            1,
+            "A's pending burst cannot make B's first Root return WouldBlock"
+        );
+
+        let evicted = admitted(state.admit(
+            ScanPriority::Root,
+            queued_scan(authority_a.clone(), usize::MAX - 2),
+        ));
+        assert_eq!(evicted.len(), 1, "Root replaces A's newest Lazy at its cap");
+        assert_eq!(
+            state.queue.count_where(|job| job.authority == authority_a),
+            MAX_PENDING_SCANS_PER_REMOTE_AUTHORITY
+        );
+    }
+
+    #[test]
+    fn global_saturation_preserves_first_interactive_slot_for_a_new_authority() {
+        let mut state = ScanSchedulerState {
+            queue: ScanQueue::new(MAX_PENDING_SCANS),
+            authority_order: VecDeque::new(),
+            running_by_authority: std::collections::HashMap::new(),
+        };
+        for authority_index in 0..4 {
+            let authority = remote_authority(&format!("{authority_index}.example"));
+            for job_index in 0..MAX_PENDING_SCANS_PER_REMOTE_AUTHORITY {
+                admitted(state.admit(
+                    ScanPriority::Root,
+                    queued_scan(
+                        authority.clone(),
+                        authority_index * MAX_PENDING_SCANS_PER_REMOTE_AUTHORITY + job_index,
+                    ),
+                ));
+            }
+        }
+        assert_eq!(state.queue.len(), MAX_PENDING_SCANS);
+
+        let newcomer = remote_authority("new.example");
+        let evicted = admitted(state.admit(
+            ScanPriority::Root,
+            queued_scan(newcomer.clone(), usize::MAX),
+        ));
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(state.queue.len(), MAX_PENDING_SCANS);
+        assert_eq!(state.queue.count_where(|job| job.authority == newcomer), 1);
+    }
+
+    #[test]
+    fn transactional_navigation_rejects_old_results_and_failure_keeps_commit() {
+        let mut state = FileTreeNavigationState::default();
+        let original = navigation_point("/original");
+        state.install_initial(original.clone());
+
+        let old = state.begin(navigation_point("/slow"), FileTreeNavigationAction::Push);
+        let latest = state.begin(navigation_point("/latest"), FileTreeNavigationAction::Push);
+        assert!(old.cancel.is_cancelled());
+        assert!(!state.commit(&old), "an out-of-order answer is rejected");
+        assert!(state.fail(&latest));
+        assert_eq!(state.current, Some(original));
+        assert!(state.back.is_empty());
+        assert!(state.forward.is_empty());
+        assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn transactional_navigation_history_is_bounded_and_branches_on_commit() {
+        let mut state = FileTreeNavigationState::default();
+        state.install_initial(navigation_point("/0"));
+        for index in 1..=70 {
+            let request = state.begin(
+                navigation_point(&format!("/{index}")),
+                FileTreeNavigationAction::Push,
+            );
+            assert!(state.commit(&request));
+        }
+        assert_eq!(state.back.len(), MAX_FILE_TREE_HISTORY);
+        assert_eq!(state.back.front(), Some(&navigation_point("/6")));
+
+        let back = state.back_target().unwrap();
+        let request = state.begin(back.clone(), FileTreeNavigationAction::Back);
+        assert!(state.commit(&request));
+        assert_eq!(state.current, Some(back));
+        assert_eq!(state.forward_target(), Some(navigation_point("/70")));
+
+        let branch = state.begin(navigation_point("/branch"), FileTreeNavigationAction::Push);
+        assert!(state.commit(&branch));
+        assert!(
+            state.forward.is_empty(),
+            "a committed branch clears Forward"
+        );
+    }
+
+    #[test]
+    fn reselecting_committed_location_dispatches_and_cancels_pending_navigation() {
+        assert_eq!(
+            file_tree_location_from_selection(0, 2, &FsLocation::Local),
+            Some(FsLocation::Local),
+            "the dropdown must dispatch committed A while staged B is pending"
+        );
+        let mut state = FileTreeNavigationState::default();
+        let original = navigation_point("/original");
+        state.install_initial(original.clone());
+        let pending = state.begin(navigation_point("/pending"), FileTreeNavigationAction::Push);
+
+        assert!(state.cancel_pending());
+        assert!(pending.cancel.is_cancelled());
+        assert!(!state.commit(&pending));
+        assert_eq!(state.current, Some(original));
+        assert!(!state.cancel_pending());
+    }
+
+    #[test]
+    fn history_profile_remap_updates_exact_targets_and_drops_unprovable_ones() {
+        let mut state = FileTreeNavigationState::default();
+        let mut saved_zero = navigation_point("/zero");
+        saved_zero.location = FsLocation::Remote(0);
+        let local = navigation_point("/local");
+        let mut removed = navigation_point("/removed");
+        removed.location = FsLocation::Remote(1);
+        state.back = VecDeque::from([saved_zero, local.clone(), removed]);
+
+        state.remap_history_locations(|location| match location {
+            FsLocation::Remote(0) => Some(FsLocation::Remote(7)),
+            FsLocation::Remote(_) => None,
+            _ => Some(location.clone()),
         });
 
-        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
-        drop(held);
-        rx.recv_timeout(Duration::from_secs(5))
-            .expect("a freed slot lets the queued file operation proceed");
-        waiter.join().expect("waiter thread finishes");
+        assert_eq!(state.back.len(), 2);
+        assert_eq!(state.back[0].location, FsLocation::Remote(7));
+        assert_eq!(state.back[1], local);
+    }
+
+    #[test]
+    fn navigation_path_validation_is_absolute_normalized_and_spoof_safe() {
+        assert_eq!(
+            validate_absolute_navigation_path("/srv/./app/../logs"),
+            Ok(PathBuf::from("/srv/logs"))
+        );
+        assert_eq!(
+            navigation_breadcrumbs(Path::new("/srv/logs")),
+            vec![
+                PathBuf::from("/"),
+                PathBuf::from("/srv"),
+                PathBuf::from("/srv/logs")
+            ]
+        );
+        assert!(validate_absolute_navigation_path("relative/path").is_err());
+        assert!(validate_absolute_navigation_path("/../../escape").is_err());
+        assert!(validate_absolute_navigation_path("/safe\nspoof").is_err());
+        assert!(validate_absolute_navigation_path("/safe\u{202e}spoof").is_err());
+        assert!(validate_absolute_navigation_path(&format!(
+            "/{}",
+            "x".repeat(MAX_NAVIGATION_PATH_BYTES)
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn cancelled_queued_scans_are_physically_removed_and_capacity_is_stable() {
+        #[derive(Clone)]
+        struct Queued {
+            token: remote_fs::CancelToken,
+            id: usize,
+        }
+
+        let mut queue = ScanQueue::new(MAX_PENDING_SCANS);
+        let mut tokens = Vec::new();
+        for id in 0..MAX_PENDING_SCANS {
+            let token = remote_fs::CancelToken::default();
+            tokens.push(token.clone());
+            queue
+                .push(ScanPriority::Lazy, Queued { token, id })
+                .map_err(|_| ())
+                .unwrap();
+        }
+        for token in tokens.iter().step_by(2) {
+            token.cancel();
+        }
+        let retired = queue.remove_where(|job| job.token.is_cancelled());
+        assert_eq!(retired.len(), MAX_PENDING_SCANS / 2);
+        assert_eq!(queue.len(), MAX_PENDING_SCANS / 2);
+        assert!(retired.iter().all(|job| job.id % 2 == 0));
+
+        for id in MAX_PENDING_SCANS..10_000 {
+            let token = remote_fs::CancelToken::default();
+            let _ = queue.push(ScanPriority::Lazy, Queued { token, id });
+            assert!(queue.len() <= MAX_PENDING_SCANS);
+        }
+    }
+
+    #[test]
+    fn fs_op_scheduler_uses_fixed_workers_and_hard_queue_backpressure() {
+        let scheduler = FsOpScheduler::new(1, 1);
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        scheduler
+            .enqueue(Box::new(move || {
+                started_tx.send(()).expect("worker reports startup");
+                release_rx.recv().expect("test releases worker");
+            }))
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("fixed worker starts the first operation");
+
+        scheduler.enqueue(Box::new(|| {})).unwrap();
+        let error = scheduler
+            .enqueue(Box::new(|| {}))
+            .expect_err("the bounded queue rejects excess work");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        release_tx.send(()).unwrap();
     }
 
     #[test]
@@ -3563,6 +6402,27 @@ mod tests {
             observed_target_location(&target, &[other, matching]),
             FsLocation::Remote(1)
         );
+    }
+
+    #[test]
+    fn committed_authority_rejects_numeric_profile_reinterpretation() {
+        let original = remote_profile("original", "a.example");
+        let expected =
+            remote_fs::filesystem_identity(&FsLocation::Remote(0), std::slice::from_ref(&original))
+                .unwrap();
+        assert!(committed_authority_matches(
+            Some(&expected),
+            &FsLocation::Remote(0),
+            std::slice::from_ref(&original)
+        ));
+
+        let replacement = remote_profile("replacement", "b.example");
+        assert!(!committed_authority_matches(
+            Some(&expected),
+            &FsLocation::Remote(0),
+            &[replacement]
+        ));
+        assert!(!committed_authority_matches(None, &FsLocation::Local, &[]));
     }
 
     #[test]
@@ -3781,6 +6641,44 @@ mod tests {
     }
 
     #[test]
+    fn pending_location_home_probe_rejects_reused_remote_index() {
+        let profile_b = remote_profile("B", "b.example");
+        let expected_location = FsLocation::Remote(0);
+        let expected_authority =
+            remote_fs::filesystem_identity(&expected_location, std::slice::from_ref(&profile_b))
+                .unwrap();
+        assert!(location_home_probe_is_current(
+            41,
+            41,
+            &expected_location,
+            &expected_authority,
+            std::slice::from_ref(&profile_b),
+        ));
+
+        let profile_c = remote_profile("C", "c.example");
+        assert!(
+            !location_home_probe_is_current(
+                41,
+                41,
+                &expected_location,
+                &expected_authority,
+                &[profile_c],
+            ),
+            "a B home result is inert after Remote(0) is reused for C"
+        );
+        assert!(
+            !location_home_probe_is_current(
+                41,
+                42,
+                &expected_location,
+                &expected_authority,
+                &[profile_b],
+            ),
+            "a newer user/follow intent also retires the probe"
+        );
+    }
+
+    #[test]
     fn remote_location_remaps_only_the_exact_unique_profile() {
         let alpha = remote_profile("alpha", "alpha.example");
         let beta = remote_profile("beta", "beta.example");
@@ -3957,21 +6855,25 @@ mod tests {
                 name: "Zulu.txt".into(),
                 path: PathBuf::from("Zulu.txt"),
                 is_dir: false,
+                status: None,
             },
             FileEntry {
                 name: "beta".into(),
                 path: PathBuf::from("beta"),
                 is_dir: true,
+                status: None,
             },
             FileEntry {
                 name: "Alpha.txt".into(),
                 path: PathBuf::from("Alpha.txt"),
                 is_dir: false,
+                status: None,
             },
             FileEntry {
                 name: "Able".into(),
                 path: PathBuf::from("Able"),
                 is_dir: true,
+                status: None,
             },
         ];
 
@@ -3999,6 +6901,123 @@ mod tests {
     fn file_labels_make_hidden_text_visible_and_stay_bounded() {
         assert_eq!(safe_file_label("safe\u{202e}\x1btxt"), "safe��txt");
         assert!(safe_file_label(&"界".repeat(MAX_FILE_LABEL_BYTES)).len() <= MAX_FILE_LABEL_BYTES);
+    }
+
+    #[test]
+    fn hidden_name_detection_only_matches_dot_prefixed_entries() {
+        assert!(file_name_is_hidden(".git"));
+        assert!(file_name_is_hidden(".env.local"));
+        assert!(!file_name_is_hidden("README.md"));
+        assert!(!file_name_is_hidden("dot.file"));
+        assert!(!file_name_is_hidden("."));
+        assert!(!file_name_is_hidden(".."));
+    }
+
+    #[test]
+    fn file_tree_refresh_owns_only_unmodified_f5() {
+        use gtk4::gdk::{Key, ModifierType};
+        assert!(file_tree_is_plain_refresh_key(
+            Key::F5,
+            ModifierType::empty()
+        ));
+        assert!(file_tree_is_plain_refresh_key(
+            Key::F5,
+            ModifierType::LOCK_MASK | ModifierType::BUTTON1_MASK
+        ));
+        for modifier in [
+            ModifierType::CONTROL_MASK,
+            ModifierType::SHIFT_MASK,
+            ModifierType::ALT_MASK,
+            ModifierType::SUPER_MASK,
+            ModifierType::HYPER_MASK,
+            ModifierType::META_MASK,
+        ] {
+            assert!(!file_tree_is_plain_refresh_key(Key::F5, modifier));
+        }
+        assert!(!file_tree_is_plain_refresh_key(
+            Key::F4,
+            ModifierType::empty()
+        ));
+        assert_eq!(
+            file_tree_navigation_key(Key::F5, ModifierType::empty()),
+            Some(FileTreeNavigationKey::Refresh)
+        );
+        assert_eq!(
+            file_tree_navigation_key(Key::Up, ModifierType::ALT_MASK),
+            Some(FileTreeNavigationKey::Up)
+        );
+        assert_eq!(
+            file_tree_navigation_key(Key::Home, ModifierType::ALT_MASK),
+            Some(FileTreeNavigationKey::Home)
+        );
+        assert_eq!(
+            file_tree_navigation_key(Key::Right, ModifierType::ALT_MASK),
+            Some(FileTreeNavigationKey::EnterDirectory)
+        );
+        assert_eq!(
+            file_tree_navigation_key(Key::Home, ModifierType::empty()),
+            None,
+            "plain Home remains GTK list navigation"
+        );
+        assert_eq!(
+            file_tree_navigation_key(Key::Up, ModifierType::ALT_MASK | ModifierType::CONTROL_MASK),
+            None,
+            "modified shortcuts are not over-claimed"
+        );
+    }
+
+    #[test]
+    fn directory_scan_revisions_accept_only_the_latest_request_per_directory() {
+        let mut revisions = DirectoryScanRevisions::new();
+        let logs = Path::new("/remote/logs");
+        let src = Path::new("/remote/src");
+
+        let old_logs = issue_directory_scan_revision(&mut revisions, logs);
+        let src_revision = issue_directory_scan_revision(&mut revisions, src);
+        let new_logs = issue_directory_scan_revision(&mut revisions, logs);
+
+        assert!(old_logs.cancel.is_cancelled());
+        assert!(!new_logs.cancel.is_cancelled());
+        assert!(!src_revision.cancel.is_cancelled());
+        assert!(!directory_scan_revision_is_current(
+            &revisions,
+            logs,
+            old_logs.revision
+        ));
+        assert!(directory_scan_revision_is_current(
+            &revisions,
+            logs,
+            new_logs.revision
+        ));
+        assert!(directory_scan_revision_is_current(
+            &revisions,
+            src,
+            src_revision.revision
+        ));
+        assert!(directory_scan_revision_is_pending(
+            &revisions,
+            logs,
+            new_logs.revision
+        ));
+        assert!(complete_directory_scan_revision(
+            &mut revisions,
+            logs,
+            new_logs.revision
+        ));
+        assert!(!directory_scan_revision_is_pending(
+            &revisions,
+            logs,
+            new_logs.revision
+        ));
+        assert!(!complete_directory_scan_revision(
+            &mut revisions,
+            logs,
+            old_logs.revision
+        ));
+
+        cancel_directory_scans(&revisions);
+        assert!(new_logs.cancel.is_cancelled());
+        assert!(src_revision.cancel.is_cancelled());
     }
 
     #[test]
@@ -4030,10 +7049,20 @@ mod tests {
                         boxed
                             .try_borrow::<FileEntry>()
                             .ok()
+                            .filter(|entry| entry.is_item())
                             .map(|entry| entry.path.clone())
                     })
             })
             .collect()
+    }
+
+    fn store_entry_for_test(store: &gio::ListStore, index: u32) -> FileEntry {
+        let boxed = store
+            .item(index)
+            .and_then(|item| item.downcast::<glib::BoxedAnyObject>().ok())
+            .expect("test store entry");
+        let entry = boxed.try_borrow::<FileEntry>().expect("FileEntry payload");
+        (*entry).clone()
     }
 
     fn test_entry(path: &str, is_dir: bool) -> FileEntry {
@@ -4041,6 +7070,7 @@ mod tests {
             name: path.to_string(),
             path: PathBuf::from(path),
             is_dir,
+            status: None,
         }
     }
 
@@ -4080,7 +7110,7 @@ mod tests {
         let zulu_item = store.item(4).unwrap();
 
         // New listing: beta removed, delta inserted, files unchanged.
-        update_store_in_place(
+        let delta = update_store_in_place(
             &store,
             vec![
                 test_entry("/p/Able", true),
@@ -4090,6 +7120,7 @@ mod tests {
                 test_entry("/p/Zulu.txt", false),
             ],
         );
+        assert_eq!(delta.removed_directories, vec![PathBuf::from("/p/beta")]);
 
         assert_eq!(
             store_paths(&store),
@@ -4135,6 +7166,387 @@ mod tests {
     }
 
     #[test]
+    fn refresh_status_preserves_last_good_rows_and_error_is_retryable() {
+        let refreshing = DirectoryRowStatus::Refreshing { last_good: None };
+        assert_eq!(DirectoryRowStatus::Loading.label(), "Loading…");
+        assert_eq!(refreshing.label(), "Refreshing…");
+        assert!(!DirectoryRowStatus::Loading.is_retryable());
+        assert!(!refreshing.is_retryable());
+
+        let store = gio::ListStore::new::<glib::BoxedAnyObject>();
+        let first = glib::BoxedAnyObject::new(test_entry("/p/a", false));
+        let second = glib::BoxedAnyObject::new(test_entry("/p/b", true));
+        store.append(&first);
+        store.append(&second);
+
+        set_directory_status(&store, Path::new("/p"), refreshing.clone());
+        assert_eq!(
+            store_paths(&store),
+            [PathBuf::from("/p/a"), PathBuf::from("/p/b")]
+        );
+        assert_eq!(store.n_items(), 3);
+        assert_eq!(store.item(0).unwrap(), first);
+        assert_eq!(store.item(1).unwrap(), second);
+        assert_eq!(store_entry_for_test(&store, 2).status, Some(refreshing));
+
+        set_directory_status(
+            &store,
+            Path::new("/p"),
+            DirectoryRowStatus::Error {
+                message: "Remote connection failed".to_string(),
+                last_good: None,
+            },
+        );
+        assert_eq!(store.n_items(), 3, "the prior status row is replaced");
+        let error = store_entry_for_test(&store, 2);
+        assert!(error
+            .status
+            .as_ref()
+            .is_some_and(DirectoryRowStatus::is_retryable));
+        assert_eq!(store.item(0).unwrap(), first);
+        assert_eq!(store.item(1).unwrap(), second);
+
+        update_store_in_place(
+            &store,
+            vec![test_entry("/p/a", false), test_entry("/p/c", true)],
+        );
+        assert_eq!(store.n_items(), 2, "success removes transient status");
+        assert_eq!(
+            store.item(0).unwrap(),
+            first,
+            "surviving row keeps identity"
+        );
+        assert_eq!(
+            store_paths(&store),
+            [PathBuf::from("/p/a"), PathBuf::from("/p/c")]
+        );
+    }
+
+    #[test]
+    fn snapshot_age_and_public_errors_are_stable_bounded_and_redacted() {
+        let completed = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        assert_eq!(
+            snapshot_age(completed, completed + Duration::from_secs(45)),
+            "45s ago"
+        );
+        assert_eq!(
+            snapshot_age(completed, completed + Duration::from_secs(125)),
+            "2m ago"
+        );
+        assert_eq!(
+            snapshot_age(completed, completed + Duration::from_secs(7_201)),
+            "2h ago"
+        );
+
+        let raw = io::Error::other(format!(
+            "ssh token=secret\n{}",
+            "界".repeat(MAX_FILE_LABEL_BYTES)
+        ));
+        let status = directory_error_status(&raw, Some(completed));
+        let DirectoryRowStatus::Error { message, last_good } = status else {
+            panic!("expected a retryable error status");
+        };
+        assert_eq!(message, "Directory could not be loaded");
+        assert_eq!(last_good, Some(completed));
+        assert!(!message.contains("secret"));
+        assert!(!message.contains('\n'));
+        assert!(message.len() <= MAX_FILE_LABEL_BYTES);
+
+        let invalid = io::Error::new(io::ErrorKind::InvalidData, "password=hidden");
+        assert_eq!(
+            public_directory_error_message(&invalid),
+            "The remote returned an invalid directory response"
+        );
+        assert_eq!(
+            public_file_operation_error_message(&invalid),
+            "The operation or remote response was invalid"
+        );
+    }
+
+    #[test]
+    fn directory_failure_backoff_classifies_caps_and_retry_bypasses_once() {
+        let now = Instant::now();
+        let transient = io::Error::new(io::ErrorKind::ConnectionReset, "endpoint secret");
+        let first = next_directory_failure_state(None, &transient, now);
+        assert_eq!(first.class, DirectoryFailureClass::Transient);
+        assert_eq!(first.consecutive, 1);
+        assert_eq!(
+            first.retry_not_before.duration_since(now),
+            Duration::from_secs(1)
+        );
+        let second = next_directory_failure_state(Some(first), &transient, now);
+        assert_eq!(second.consecutive, 2);
+        assert_eq!(
+            second.retry_not_before.duration_since(now),
+            Duration::from_secs(2)
+        );
+        let capped = next_directory_failure_state(
+            Some(DirectoryFailureState {
+                class: DirectoryFailureClass::Transient,
+                consecutive: 99,
+                retry_not_before: now,
+            }),
+            &transient,
+            now,
+        );
+        assert_eq!(
+            capped.retry_not_before.duration_since(now),
+            Duration::from_secs(30)
+        );
+
+        let key = (remote_authority("retry.example"), PathBuf::from("/srv"));
+        let failures = std::collections::HashMap::from([(key.clone(), first)]);
+        assert_eq!(
+            directory_refresh_cooldown(DirectoryRefreshCause::Manual, &failures, &key, now),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            directory_refresh_cooldown(DirectoryRefreshCause::AutoTtl, &failures, &key, now),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            directory_refresh_cooldown(DirectoryRefreshCause::Retry, &failures, &key, now),
+            None,
+            "the explicit Retry intent gets one immediate attempt"
+        );
+        assert_eq!(
+            directory_refresh_cooldown(
+                DirectoryRefreshCause::Manual,
+                &failures,
+                &key,
+                now + Duration::from_secs(1)
+            ),
+            None,
+            "an expired cooldown no longer renders a zero-second block"
+        );
+
+        let persistent = next_directory_failure_state(
+            Some(second),
+            &io::Error::new(io::ErrorKind::PermissionDenied, "private"),
+            now,
+        );
+        assert_eq!(persistent.class, DirectoryFailureClass::Persistent);
+        assert_eq!(
+            persistent.consecutive, 1,
+            "changing class starts a new series"
+        );
+        assert_eq!(
+            persistent.retry_not_before.duration_since(now),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn cancelled_or_backpressured_scans_do_not_poison_failure_cooldown() {
+        let key = (remote_authority("cancel.example"), PathBuf::from("/srv"));
+        let mut failures = std::collections::HashMap::new();
+        record_directory_failure(
+            &mut failures,
+            key.clone(),
+            &io::Error::new(io::ErrorKind::Interrupted, "superseded"),
+            Instant::now(),
+        );
+        record_directory_failure(
+            &mut failures,
+            key,
+            &io::Error::new(io::ErrorKind::WouldBlock, "queue full"),
+            Instant::now(),
+        );
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn remote_snapshot_ttl_uses_monotonic_completion_time() {
+        let now = Instant::now();
+        let fresh = SnapshotMeta {
+            completed_wall: SystemTime::UNIX_EPOCH,
+            completed_monotonic: now - (REMOTE_SNAPSHOT_TTL - Duration::from_secs(1)),
+        };
+        let stale = SnapshotMeta {
+            completed_wall: SystemTime::now(),
+            completed_monotonic: now - REMOTE_SNAPSHOT_TTL,
+        };
+        assert!(!snapshot_meta_is_stale(fresh, now));
+        assert!(snapshot_meta_is_stale(stale, now));
+    }
+
+    #[test]
+    fn scan_timing_flags_each_latency_budget_independently() {
+        assert!(!scan_timing_is_slow(
+            ScanTiming {
+                queued_for: Duration::from_millis(999),
+                listed_for: Duration::from_millis(1_999),
+                queued_depth: 63,
+            },
+            Duration::from_millis(99)
+        ));
+        assert!(scan_timing_is_slow(
+            ScanTiming {
+                queued_for: Duration::from_secs(1),
+                ..ScanTiming::default()
+            },
+            Duration::ZERO
+        ));
+        assert!(scan_timing_is_slow(
+            ScanTiming {
+                listed_for: Duration::from_secs(2),
+                ..ScanTiming::default()
+            },
+            Duration::ZERO
+        ));
+        assert!(scan_timing_is_slow(
+            ScanTiming::default(),
+            Duration::from_millis(100)
+        ));
+    }
+
+    #[test]
+    fn refresh_selection_keeps_only_paths_that_survive_reconciliation() {
+        let selected = vec![test_entry("/p/a", false), test_entry("/p/b", false)];
+        let current = vec![
+            test_entry("/p/a", false),
+            test_entry("/p/c", false),
+            test_entry("/p/d", false),
+        ];
+
+        assert_eq!(
+            surviving_selected_paths(&selected, &current),
+            vec![PathBuf::from("/p/a")]
+        );
+
+        let retyped = vec![test_entry("/p/a", true), test_entry("/p/b", false)];
+        assert_eq!(
+            surviving_selected_paths(&selected, &retyped),
+            vec![PathBuf::from("/p/b")],
+            "a path retyped from file to directory is a replacement row"
+        );
+
+        let created = vec![PathBuf::from("/p/c")];
+        assert_eq!(
+            selection_paths_after_reconcile(&selected, &current, Some(&created)),
+            created,
+            "successful create/rename selects its reconciled destination"
+        );
+        assert!(selection_paths_after_reconcile(
+            &selected,
+            &current,
+            Some(&[PathBuf::from("/p/missing")])
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn in_place_update_replaces_a_row_when_its_directory_kind_changes() {
+        let store = gio::ListStore::new::<glib::BoxedAnyObject>();
+        store.append(&glib::BoxedAnyObject::new(test_entry("/p/link", true)));
+        let old = store.item(0).unwrap();
+
+        let delta = update_store_in_place(&store, vec![test_entry("/p/link", false)]);
+
+        assert_ne!(store.item(0).unwrap(), old);
+        let entry = store_entry_for_test(&store, 0);
+        assert!(!entry.is_dir, "the refreshed symlink is not expandable");
+        assert_eq!(
+            delta.removed_directories,
+            vec![PathBuf::from("/p/link")],
+            "retyping a directory invalidates its materialized descendants"
+        );
+    }
+
+    #[test]
+    fn removed_directory_invalidation_is_component_aware_and_recursive() {
+        let removed = vec![PathBuf::from("/remote/src")];
+        assert!(path_is_in_removed_subtree(
+            Path::new("/remote/src"),
+            &removed
+        ));
+        assert!(path_is_in_removed_subtree(
+            Path::new("/remote/src/deep/cache"),
+            &removed
+        ));
+        assert!(!path_is_in_removed_subtree(
+            Path::new("/remote/src-old"),
+            &removed
+        ));
+    }
+
+    #[test]
+    fn collapsed_materialized_directory_still_resolves_its_cached_store() {
+        let root_store = gio::ListStore::new::<glib::BoxedAnyObject>();
+        let collapsed_store = gio::ListStore::new::<glib::BoxedAnyObject>();
+        let mut stores = std::collections::HashMap::new();
+        stores.insert(PathBuf::from("/remote/src"), collapsed_store.downgrade());
+
+        assert_eq!(
+            cached_materialized_store(
+                Path::new("/remote"),
+                Path::new("/remote"),
+                &root_store,
+                &stores,
+            ),
+            Some(root_store)
+        );
+        assert_eq!(
+            cached_materialized_store(
+                Path::new("/remote"),
+                Path::new("/remote/src"),
+                &gio::ListStore::new::<glib::BoxedAnyObject>(),
+                &stores,
+            ),
+            Some(collapsed_store)
+        );
+        assert!(cached_materialized_store(
+            Path::new("/remote"),
+            Path::new("/remote/never-opened"),
+            &gio::ListStore::new::<glib::BoxedAnyObject>(),
+            &stores,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn materialized_store_registry_does_not_pin_evicted_subtrees() {
+        let root_store = gio::ListStore::new::<glib::BoxedAnyObject>();
+        let child_store = gio::ListStore::new::<glib::BoxedAnyObject>();
+        let mut stores = std::collections::HashMap::new();
+        stores.insert(PathBuf::from("/remote/src"), child_store.downgrade());
+        assert!(cached_materialized_store(
+            Path::new("/remote"),
+            Path::new("/remote/src"),
+            &root_store,
+            &stores,
+        )
+        .is_some());
+
+        drop(child_store);
+        assert!(cached_materialized_store(
+            Path::new("/remote"),
+            Path::new("/remote/src"),
+            &root_store,
+            &stores,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn delayed_actions_reject_entries_removed_or_retyped_by_refresh() {
+        let file = test_entry("/p/item", false);
+        let sibling = test_entry("/p/sibling", false);
+        assert!(entries_remain_current(
+            std::slice::from_ref(&file),
+            &[file.clone(), sibling.clone()]
+        ));
+        assert!(!entries_remain_current(
+            std::slice::from_ref(&file),
+            std::slice::from_ref(&sibling)
+        ));
+        assert!(!entries_remain_current(
+            std::slice::from_ref(&file),
+            &[test_entry("/p/item", true)]
+        ));
+    }
+
+    #[test]
     fn menu_target_uses_selection_or_collapses_to_the_clicked_row() {
         let a = test_entry("/p/a", false);
         let b = test_entry("/p/b", true);
@@ -4173,6 +7585,23 @@ mod tests {
         let (entries, collapse) = resolve_menu_target(Some((1, b)), &[]);
         assert_eq!(entries.len(), 1);
         assert_eq!(collapse, Some(1));
+    }
+
+    #[test]
+    fn directory_actions_target_the_clicked_child_instead_of_the_tree_root() {
+        let root = Path::new("/remote");
+        let child = test_entry("/remote/project", true);
+        let file = test_entry("/remote/project/main.rs", false);
+
+        assert_eq!(
+            directory_action_target(root, Some(&child)),
+            PathBuf::from("/remote/project")
+        );
+        assert_eq!(
+            directory_action_target(root, Some(&file)),
+            PathBuf::from("/remote/project")
+        );
+        assert_eq!(directory_action_target(root, None), root);
     }
 
     /// A tiny (name, path, is_dir) node for the filter tests.
