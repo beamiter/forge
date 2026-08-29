@@ -4544,8 +4544,15 @@ impl CompletedCommandRecord {
 /// vector preserves registration/fan-out order while letting a metadata-only
 /// pane avoid materializing captured output altogether.
 type MetadataBlockFinishedCallback = Box<dyn Fn(String, Option<i32>, Option<u64>, Option<u64>)>;
+/// The output-consuming shape carries the completion's provenance as its last
+/// argument. It is not a rendering detail: a block closed by boundary
+/// inference attributes stale scrollback and a guessed status to a command, so
+/// an observer that reasons about *why* the command failed — the correction
+/// surface — must be able to refuse anything but a status the shell itself
+/// reported. Passing the enum rather than a pre-digested bool keeps that trust
+/// decision at the observer, where it can be stated and tested.
 type OutputBlockFinishedCallback =
-    Box<dyn Fn(String, Option<i32>, String, Option<u64>, Option<u64>)>;
+    Box<dyn Fn(String, Option<i32>, String, Option<u64>, Option<u64>, CompletionProvenance)>;
 
 enum BlockFinishedCallback {
     Metadata(MetadataBlockFinishedCallback),
@@ -7276,6 +7283,7 @@ impl ReaderCtx {
                                 .clone(),
                             agent_generation,
                             record.duration_ms,
+                            record.completion_provenance,
                         ),
                     }
                 }
@@ -14669,7 +14677,8 @@ impl TermView {
     /// panes with metadata-only observers never materialize output for fan-out.
     pub(crate) fn connect_block_finished_with_output<F>(&self, f: F)
     where
-        F: Fn(String, Option<i32>, String, Option<u64>, Option<u64>) + 'static,
+        F: Fn(String, Option<i32>, String, Option<u64>, Option<u64>, CompletionProvenance)
+            + 'static,
     {
         self.block_finished_callbacks
             .borrow_mut()
@@ -21767,7 +21776,12 @@ mod tests {
                 block_finished_cbs
                     .borrow_mut()
                     .push(BlockFinishedCallback::WithOutput(Box::new(
-                        move |command, exit_code, output_sample, agent_generation, _duration| {
+                        move |command,
+                              exit_code,
+                              output_sample,
+                              agent_generation,
+                              _duration,
+                              _provenance| {
                             seen.borrow_mut().push(FinishedFanOut {
                                 command,
                                 exit_code,

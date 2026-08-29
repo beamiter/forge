@@ -360,6 +360,8 @@ AI provider、model、endpoint 和 API key 均可在 Settings 的 **AI & Agent**
 
 命令面板使用模糊匹配；输入 `>` 只看动作、`@` 只看 JSONL 历史、`:` 只看 workflow、`?` 提交自然语言命令请求。历史和 workflow 只写入当前编辑行；`?` 请求会绑定当前 Block pane，在块流中显示可 Stop/Retry/Regenerate 的审阅卡，并携带可见的 selected Block 不可信上下文。它与命令纠正、Shell Agent proposal 共用可编辑、复制、动态风险提示的审阅逻辑，主操作只会 **Insert for review**，不会执行。所有审阅式插入都拒绝 CR、LF、Tab、NUL 和终端控制字符，避免多行条目越过“不提交”边界。`Ctrl+Alt+G` 或顶部栏的 **Agent** 开关会打开绑定当前 Block pane 的 Shell Agent；若打开时已选中 finished Block，它会作为可见、可移除的不可信上下文附加。Agent 显示目标、provider/model、shell、回合进度、activity 与实时 prompt readiness，可单独 Stop/Retry 当前模型请求，并可切换持久化的 typo-like 命令纠正。严格 JSON proposal 可复制、编辑、Reject、**Insert only** 或逐条 **Approve & Run**；Insert only 只回填普通 shell 编辑行并在 Agent 上下文记录“未执行”，危险命令执行仍需第二次确认。完成块的退出码和截断输出随后回灌到下一轮；`done` 后可用 **Follow up** 保留上下文追问，回合耗尽后可用 **New task** 在同一 pane 重置 Agent transcript 与预算。
 
+命令纠正（`command_correction_enabled`，默认开启）只在 Block 命令以 typo 形状的错误失败后触发，且**只在 shell 自己上报了退出状态时**触发——边界推断、日志恢复或来源未知的完成记录不再弹卡，那些卡片建立在归属错误的旧 scrollback 上。它先尝试不出网的本地证据（APT 索引、可执行文件 `PATH`、目标命令自己打印的建议），只有本地证据无法给出候选时才回落到 AI。**这一步回落受 `ai_share_command_context` 管辖，而该开关默认关闭：默认配置下命令纠正不会联系 AI provider，失败的命令、工作目录与至多 8 KiB 终端输出不会离开本机。** 需要 AI 纠错请显式设置 `ai_share_command_context = true`（或 `FORGE_AI_SHARE_COMMAND_CONTEXT=1`）；本地可验证的纠正在两种设置下都照常工作。候选命令统一通过一道安全门：不得引入原命令没有的 shell 控制符、`sudo`/`su`/`doas`、`ssh`/`mosh`/`scp`/`sftp`，也不得新增“管道进解释器”的阶段（原命令已含管道时也一样，`|  sh`、`| /bin/sh`、`| zsh`、`| python3` 都在内），因此扩大权限或范围的纠正——包括 `apt install sud` → `apt install sudo` 这类善意的——会被拒绝；`ls | gerp foo` → `ls | grep foo` 不受影响。卡片显示 `exit {code} · 证据来源` 徽标，失败命令预览截断到 160 字符；纠正永不自动提交，编辑过的候选一律降级为只插入不执行。`--safe-mode` 关闭 AI 与命令纠正。
+
 全新的 Block pane 在没有完成块、也没有恢复到历史块时，会显示一次性使用提示：完成的命令会成为
 可复用卡片，点击 header 选择，右键查看更多操作，`Ctrl+Shift+G` 跨块搜索。首次被终端接受的
 用户输入、第一张卡片完成或历史恢复后，提示都会永久撤下；清空、过滤或容量淘汰到空也不会在同一
@@ -507,6 +509,8 @@ forge 以 **MIT OR Apache-2.0** 双许可证发布，使用者可任选其一；
 - OSC 52 远程剪贴板写入默认关闭。
 - AI 会话库默认对常见云密钥、PAT、JWT 和私钥进行脱敏，覆盖 active、non-active、archived chat 以及草稿和 Block 上下文。
 - Agent 只支持显式选中的 Block pane；prompt 忙或已有输入时拒绝提交，危险模式会醒目标注，但最终批准仍由用户负责。
+- 命令纠正默认不出网：AI 回落需要显式打开 `ai_share_command_context`，本地证据（APT 索引、`PATH`、目标输出）始终留在本机。发往 provider 的字段全部以 `_untrusted` 键单独标注并在写入前净化，provider 应答有大小上限，超限直接拒绝而不解析。
+- 命令纠正的自动 helper 探测只执行 root 或当前用户拥有、且 group/other 不可写的规范化可执行文件，整条路径的每一级目录同样校验。属于第三方用户、排在 `PATH` 前面的同名程序不会被拉起（这也意味着这类机器上没有可用的本地证据，纠正会直接不出现）；forge 以 root 运行时系统 helper 仍然可用。
 - Agent snapshot 只通过 jagent 的有预算 decoder 进入内存，Forge 再直接审计该 bounded view 的 proposal 连续性、观察生命周期和状态绑定，不会二次走普通 serde collection 解码。
 - 可执行 Notebook 在独立进程组运行，关闭或停止 cell 会终止其进程组；安全模式完全禁用 Notebook 执行。
 - 命令历史只保存 command、cwd、exit code 和完成时间，不保存输出，并限制单条/总文件大小。

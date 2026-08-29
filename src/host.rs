@@ -12,11 +12,24 @@
 //!   names first.
 //! - `helper_command`, which core keeps crate-visible. It mirrors core's
 //!   implementation — trusted canonical resolution and the `/usr/bin:/bin`
-//!   child PATH clamp — so the remaining local callers (the CLI doctor and
-//!   command correction's probes) share core's contract until they migrate
-//!   too. The doctor's bounded probe itself runs through
-//!   [`jterm_core::helper::bounded_command_output`]. Keep this in step with
-//!   `jterm_core::host` when core's changes.
+//!   child PATH clamp — so the remaining local caller (the CLI doctor) shares
+//!   core's contract until it migrates too. The doctor's bounded probe itself
+//!   runs through [`jterm_core::helper::bounded_command_output`]. Keep this in
+//!   step with `jterm_core::host` when core's changes.
+//!
+//!   Command correction no longer routes through it. Its
+//!   `writable_by_current_user` predicate trusts an executable owned by a
+//!   *third* user and refuses every system helper when the terminal itself
+//!   runs as root; `jterm_core::helper::trusted_component` is the corrected
+//!   policy, and `jterm_core::command_correction` uses only that one. The
+//!   doctor's probes are user-invoked and non-automatic, which is why this
+//!   copy is still tolerable there — but it is the last caller, and closing
+//!   it out is the remaining work.
+//! - [`HOST_HELPER_LAUNCHER`], the Flatpak host-side `PATH` re-clamp. The
+//!   correction engine builds its own bridge argv (it will not accept a
+//!   `Command` an app resolved by its own rules), so it names this script
+//!   through `LocalEvidence::Bridged` rather than calling `helper_command`.
+//!   One definition, two builders.
 
 pub use jterm_core::host::*;
 
@@ -34,7 +47,7 @@ const TRUSTED_HELPER_PATH: &str = "/usr/bin:/bin";
 // else is preserved from the sandboxed environment: the jsh install check no
 // longer runs through this launcher — it lives in `jterm_core::jsh_install`,
 // which exports JSH_LOOKUP_PATH for the installer itself.
-const HOST_HELPER_LAUNCHER: &str = r#"set -f
+pub(crate) const HOST_HELPER_LAUNCHER: &str = r#"set -f
 PATH=/usr/bin:/bin
 export PATH
 exec "$0" "$@"
@@ -99,35 +112,20 @@ fn trusted_helper_program(flatpak: bool, name: &str, path: Option<&OsStr>) -> Op
 
 /// Resolve an automatic helper to its canonical, non-user-writable target.
 ///
-/// Returning the canonical path is important: validating a symlink in a
-/// writable PATH directory and then executing the symlink would leave a race
-/// between validation and `execve`. Every namespace component of the resolved
-/// target must also be non-writable by this process's user and by group/other.
+/// Delegates to [`jterm_core::helper::trusted_system_executable`] rather than
+/// keeping a second predicate here. The local copy asked
+/// `mode & 0o022 != 0 || (uid == euid && mode & 0o200 != 0)`, which called a
+/// binary owned by a *third* user trusted — a `test` owned by another account,
+/// mode 0755, ahead of `/usr/bin` on the doctor's PATH was resolved and
+/// spawned — and called every root-owned system binary untrusted when forge
+/// itself runs as root, disabling the doctor's probes in containers. Core's
+/// predicate rejects `owner != 0 && owner != euid` and carves out euid 0
+/// explicitly. The correction surface moved onto core this round; leaving a
+/// weaker second copy behind for the CLI doctor to reuse is how the hole grows
+/// back.
 #[cfg(unix)]
 fn trusted_system_executable(candidate: &Path) -> Option<PathBuf> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    fn writable_by_current_user(metadata: &std::fs::Metadata) -> bool {
-        let mode = metadata.permissions().mode();
-        mode & 0o022 != 0
-            || (metadata.uid() == unsafe { nix::libc::geteuid() } && mode & 0o200 != 0)
-    }
-
-    let canonical = std::fs::canonicalize(candidate).ok()?;
-    let metadata = std::fs::metadata(&canonical).ok()?;
-    if !metadata.is_file()
-        || metadata.permissions().mode() & 0o111 == 0
-        || writable_by_current_user(&metadata)
-    {
-        return None;
-    }
-    for parent in canonical.ancestors().skip(1) {
-        let metadata = std::fs::metadata(parent).ok()?;
-        if !metadata.is_dir() || writable_by_current_user(&metadata) {
-            return None;
-        }
-    }
-    Some(canonical)
+    jterm_core::helper::trusted_system_executable(candidate)
 }
 
 #[cfg(not(unix))]

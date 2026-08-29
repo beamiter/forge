@@ -1,7 +1,7 @@
 # Engineering handoff
 
-Updated: 2026-08-29 (AI chat store upstreamed to jterm_core; AI correction
-and snapshot-line guards)
+Updated: 2026-08-29 (command correction upstreamed to
+jterm_core::command_correction; helper-trust, pipe and consent holes closed)
 
 This working tree contains the nine-round "Evolve ASCII organism" series
 (`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
@@ -19,6 +19,158 @@ every round (attribution races, a Drop panic on a fired glib source, a
 saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
+
+- **Command correction upstreamed (2026-08-29)**:
+  `src/ui/command_correction.rs` is an 888-line shim (737 production, 151 test)
+  over `jterm_core::command_correction`, pinned at core rev `badcce2`. It was
+  2,148. The four terminals each carried a private copy of the same "that
+  command failed, here is a fix" flow — anvil 1,817, forge 2,148, ember 2,335,
+  frost 1,552 — 7,852 lines whose engine half held no toolkit code whatsoever,
+  which is exactly why four copies were free to drift and did. Core's module is
+  3,937 lines including its tests; the four apps shed 6,294 lines between them,
+  `src/` here 1,248 (+437 / −1,685 across four files).
+
+  What went up: classification, token extraction, typo ranking, the safety
+  gate, the provider prompt, the strict-JSON reply parser, helper resolution,
+  the bounded probes, the two-stage resolver and the request epoch machine.
+  What stayed is genuinely forge's: the Notebook attachment layer that reaches
+  nested split leaves, the 50 ms GLib poller that hands a worker result back to
+  the main context, the inline card in the block conversation (inserted above
+  the live prompt and styled like a finished block, not shown as a modal), and
+  the tracked-submission path — the verified command kept present and
+  insensitive until `CommandStart` proves its identity, with the organism
+  assist-pulse revoked if that proof never arrives. No sibling has that last
+  one, and it is the reason this shim is the largest of the four.
+
+  **This surface decides whether a model-proposed command may be offered for
+  execution, so the divergences were not style.** Three were live holes here:
+
+  - *A third user's binary was a trusted system helper.* forge asked
+    `mode & 0o022 != 0 || (uid == euid && mode & 0o200 != 0)` in
+    `host.rs::trusted_system_executable`, and helper resolution reached
+    candidates by scanning the user's own `PATH`. A `bash` owned by another
+    account at mode 0755, earlier in `PATH` than `/usr/bin` on a shared build
+    box, answered "not writable by me" to that predicate and was spawned
+    automatically by any failed command — no prompt, no user action beyond
+    mistyping. Clamping the *child's* `PATH` (which forge did, to
+    `/usr/bin:/bin`) never helped: the helper is itself the hostile binary. The
+    same expression inverts under euid 0, where `uid == euid` holds for every
+    root-owned binary, so a forge in a container or under `sudo` refused every
+    system helper and silently produced no APT- or PATH-verified correction at
+    all. `jterm_core::helper::trusted_component` already answered both halves,
+    and of the four only frost used it.
+  - *A candidate could add a pipe into a shell.* `syntax_markers` asks only
+    whether a marker is PRESENT, so against an original that already contains a
+    pipe, appending `| sh` introduces no new marker and passes the superset
+    check untouched. forge was the only copy that checked at all — and checked
+    as four literal spellings, `["| sh", "|sh", "| bash", "|bash"]`, so
+    `|  sh` (two spaces), `| /bin/sh`, `| zsh` and `| python3` walked past a
+    guard defeated by the space bar. The shared rule splits the pipeline and
+    compares the SET of interpreters its stages run, pinned by a test against
+    jagent's own lexer so the family cannot fork it silently. It deliberately
+    does not refuse every new stage name: `ls | gerp foo` → `ls | grep foo` is
+    the commonest failure this surface exists for.
+  - *The consent switch was not consulted.* forge ships
+    `ai_share_command_context`, documents it as consent to attach command and
+    terminal evidence to provider prompts, and requires it before a native
+    Codex task may start — and then posted exactly that payload from this
+    surface, the one with the largest payload of the lot, without asking. Of
+    the four, only ember honoured it here.
+
+  Three legitimate disagreements became construction-time policy with no
+  `Default` where safety-relevant, following the `BusyChatPolicy` precedent
+  from the chat-store round. `CorrectionPolicy::new` takes all three
+  positionally, so there was no way to compile without answering:
+
+  - `local_evidence_for` (`command_correction.rs:137`). Sandboxed, the process
+    `PATH` describes the sandbox and says nothing about the host where Block
+    commands run, so it is `LocalEvidence::Bridged` with forge's own
+    `flatpak-spawn --host --watch-bus /bin/sh -c <launcher>` argv — forge is
+    the only terminal that can produce host PATH evidence under Flatpak at all
+    (anvil abandons both probe and walk there and so offers no PATH-verified
+    correction). Native, it is `SameNamespace` + `HelperStrategy::TrustedPathScan`,
+    which keeps forge's existing reach on a host whose helpers live outside
+    `/usr/bin`; the scan tries the fixed system candidates first, so it is a
+    superset of `FixedCandidates`, never a weakening. What changed there is the
+    predicate, not the pathname list.
+  - `context_sharing` (`:162`), built per request rather than at startup,
+    because revoking consent must silence the provider fallback for the *next*
+    failed command and not at the next restart.
+  - `PROBE_THREAD_NAME` (`:71`), so a reader stuck on a descendant's pipe is
+    attributable to forge in `ps`/`gdb`.
+
+  One supporting change outside the shim, and it is the right shape rather than
+  a convenience: `connect_block_finished_with_output` now carries the
+  completion's `CompletionProvenance` as a sixth argument
+  (`block_view/mod.rs:4554`). The core requires a `trusted_completion` answer
+  and forge had no way to know it. Passing the enum rather than a pre-digested
+  bool keeps the trust decision at the observer, in `completion_is_trusted`,
+  where it is stated and tested; `agent_panel.rs` ignores it.
+
+  The tests that duplicated the engine are gone with the engine — classification
+  shapes, ranking, `replace_shell_word`, reply parsing, escalation/remote/chain
+  rejection, output sampling, the probe bounds, the epoch machine, the timeout
+  boundary. Five remain, pinning only what forge still owns: the bridge argv is
+  byte-for-byte `crate::host`'s (`HOST_HELPER_LAUNCHER` is now
+  `pub(crate)` for exactly this — one definition, two builders), the native
+  PATH policy, the consent truth table, the provenance rule, and forge's
+  `CompletionFacts` reaching the engine with each of its three suppressions
+  stopping it on its own.
+
+  Gates: forge 1,455 tests, `--locked` against the pushed core; anvil 1,453,
+  ember 2,196, frost 1,006, jterm_core 714.
+
+  **Three adversarial audits ran against the shared module before any app
+  adopted it** and found eight defects in it — including that the merged pipe
+  rule was still forge's four-spelling substring match, carried up verbatim by
+  the merge. All eight were fixed with regression tests that fail when the fix
+  is reverted. Do not skip that pass on the next extraction; the merge of four
+  copies is where a weak one wins by accident.
+
+  User-visible consequences are in `CHANGELOG.md` (Changed and Security) and in
+  `README.md`; the short version is that with `ai_share_command_context` off —
+  the default — no AI-suggested correction is offered any more, locally
+  verified ones (APT index, executable PATH, the target's own suggestion) are
+  unaffected, and a few friendly deterministic corrections (`apt install sud` →
+  `apt install sudo`) are now refused because the gate that lets them through
+  is the same one that read untrusted remote target output.
+
+  Not done, deliberately:
+
+  - `crate::host::helper_command` has one caller left, the CLI doctor
+    (`cli.rs:562`). It no longer carries the weak predicate —
+    `host::trusted_system_executable` now delegates to
+    `jterm_core::helper::trusted_system_executable` and the local
+    `writable_by_current_user` closure is deleted — so the doctor is on the
+    corrected policy today. What remains is a second, thinner resolver
+    (`trusted_helper_program`/`helper_command_for`) that should eventually be
+    the shared one. It is user-invoked and non-automatic, which is why it is
+    tolerable; the situation is recorded in `host.rs`'s module doc (`:13-32`)
+    so it cannot be read as an oversight.
+  - Two Flatpak bridge-launcher resolutions now coexist.
+    `host::flatpak_spawn_program()` (`:80`) falls back to a `PATH` lookup for
+    `flatpak-spawn`; the correction policy's `FLATPAK_SPAWN` deliberately does
+    not, because a bridge that has to be *searched for* is not one this surface
+    should spawn automatically. Both are correct for their callers, but they
+    are not the same rule — know that before unifying them
+    (`command_correction.rs:75-90`).
+  - jterm_core is uncommitted and forge's pin is stale.
+    `jterm_core/src/command_correction.rs` is untracked and jterm_core's
+    `Cargo.toml` gained `fuzzy-matcher`; forge builds only through the
+    temporary `[patch]` in `~/.cargo/config.toml`. `Cargo.toml`'s `rev` and
+    `flake.nix`'s `outputHashes."jterm_core-0.2.0"` here are already written for
+    `badcce2`, so `nix build` stays broken until that revision is actually
+    pushed. Push core first.
+
+  Two claims in the migration report do not survive the diff, recorded here so
+  the next reader does not chase them. The weak `writable_by_current_user`
+  predicate is *not* still in `host.rs`; it was deleted (see above). And
+  `--safe-mode` does *not* run the correction monitor: `Config::safe_defaults()`
+  sets `ai_enabled: false` and `command_correction_enabled: false`
+  (`config.rs:1015-1021`), and `correction_monitor_enabled` requires both, so
+  the monitor may be installed but can never start a request — and safe mode
+  also forces `TerminalMode::Vte`, where there are no Block panes to attach to.
+  forge already matches anvil here; nothing needs adding.
 
 - **AI chat store upstreaming (2026-08-29)**: `src/ui/ai_chat_store.rs` is a
   75-line shim (it was 1,536) over `jterm_core::ai::chat_store`, the union of
