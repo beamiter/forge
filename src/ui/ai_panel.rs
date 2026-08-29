@@ -21,8 +21,8 @@ use gtk4::{
 use libadwaita as adw;
 
 use super::ai_chat_store::{
-    bounded_live_message, ChatStatus, ChatStore, ChatStoreError, ChatSummary, RequestToken,
-    MAX_LIVE_ASSISTANT_MESSAGE_BYTES, MAX_LIVE_MESSAGE_BYTES,
+    bounded_live_message, new_store, restore_store, ChatStatus, ChatStore, ChatStoreError,
+    ChatSummary, RequestToken, MAX_LIVE_MESSAGE_BYTES,
 };
 use crate::ai::{self, BlockContext, Role};
 use crate::config::Config;
@@ -62,54 +62,38 @@ fn try_queue_stream_delta(sender: &std::sync::mpsc::SyncSender<String>, delta: &
     sender.try_send(delta[..end].to_string()).is_ok()
 }
 
-/// Pure accumulation state for one streamed reply. It records every fragment
-/// received from the worker and decides how the visible transcript must
-/// change, so a chat switched away and back mid-stream rematerializes the
-/// full partial text, all without touching GTK.
-#[derive(Debug, Default)]
-struct StreamProgress {
-    accumulated: String,
-}
-
-/// Transcript mutation required after one streamed fragment.
+/// Transcript mutation required after the store accepted one streamed
+/// fragment.
 #[derive(Debug, PartialEq, Eq)]
-enum StreamRender<'a> {
-    /// Nothing visible changes (owner chat hidden, or nothing new to show).
+enum StreamRender {
+    /// Nothing visible changes (nothing new arrived past the store's reply
+    /// budget, or nothing has been received yet).
     None,
     /// Insert a new in-progress assistant row containing everything received
     /// so far: the first visible fragment, or the owner chat became visible
-    /// again after a switch dropped its transient partial row.
-    Materialize(&'a str),
+    /// again after a re-render dropped its transient partial row.
+    Materialize(String),
     /// The in-progress row is already the transcript tail: append only the
-    /// new fragment.
-    Append(&'a str),
+    /// text the row does not hold yet.
+    Append(String),
 }
 
-impl StreamProgress {
-    /// Record `fragment` and decide the transcript update. `can_display` is
-    /// whether the owner chat currently owns the visible transcript and the
-    /// request is still active; `attached` is whether this request's
-    /// in-progress row is already shown as the transcript tail.
-    fn push(&mut self, fragment: &str, can_display: bool, attached: bool) -> StreamRender<'_> {
-        let previous_len = self.accumulated.len();
-        let remaining = MAX_LIVE_ASSISTANT_MESSAGE_BYTES.saturating_sub(previous_len);
-        let mut end = fragment.len().min(remaining);
-        while !fragment.is_char_boundary(end) {
-            end -= 1;
-        }
-        self.accumulated.push_str(&fragment[..end]);
-        if !can_display || self.accumulated.is_empty() {
-            return StreamRender::None;
-        }
-        if attached {
-            if self.accumulated.len() == previous_len {
-                StreamRender::None
-            } else {
-                StreamRender::Append(&self.accumulated[previous_len..])
-            }
-        } else {
-            StreamRender::Materialize(&self.accumulated)
-        }
+/// Decide the transcript update from the owner chat's whole streamed reply.
+///
+/// The accumulator itself is the store's (`push_delta`/`active_partial`), so
+/// the reply survives switching chats and is bounded once, in one place.
+/// `shown` is how many bytes of `partial` the in-progress row already holds,
+/// and `attached` whether that row is the transcript tail at all.
+fn stream_render(partial: &str, shown: usize, attached: bool) -> StreamRender {
+    if partial.is_empty() {
+        return StreamRender::None;
+    }
+    if !attached {
+        return StreamRender::Materialize(partial.to_string());
+    }
+    match partial.get(shown..) {
+        Some(fresh) if !fresh.is_empty() => StreamRender::Append(fresh.to_string()),
+        _ => StreamRender::None,
     }
 }
 
@@ -473,7 +457,7 @@ impl AiPanel {
 
         let panel = Self {
             root,
-            store: Rc::new(RefCell::new(ChatStore::default())),
+            store: Rc::new(RefCell::new(new_store())),
             content_stack,
             library_btn: library_btn.clone(),
             new_chat_btn: new_chat_btn.clone(),
@@ -709,7 +693,7 @@ impl AiPanel {
         let Some(snapshot) = crate::state::get_ai_conversation_snapshot() else {
             return;
         };
-        *self.store.borrow_mut() = ChatStore::restore(snapshot);
+        *self.store.borrow_mut() = restore_store(snapshot);
         let count = self.store.borrow().len();
         self.store.borrow_mut().set_active_info(format!(
             "Restored {count} chat{} for this window.",
@@ -898,6 +882,11 @@ impl AiPanel {
                 self.publish_persisted_conversation();
                 self.show_chat_page();
             }
+            // Newly reachable with the shared store: archiving the last
+            // writable chat while the library is full is refused before it
+            // mutates anything, rather than leaving every chat archived.
+            Err(ChatStoreError::LimitReached) => self
+                .show_error_status("Chat limit reached. Delete a chat before archiving this one."),
             Err(_) => self.show_error_status("Could not update this chat's archive state."),
         }
     }
@@ -957,7 +946,16 @@ impl AiPanel {
                     .cancel_request(token, "Chat deleted.".to_string());
             }
             p.retry_payloads.borrow_mut().remove(&deleted_id);
-            p.store.borrow_mut().delete_active();
+            // Deletion cannot be refused under forge's busy policy (the
+            // in-flight request was cancelled two statements ago), but the
+            // store reports refusals rather than half-applying them, so a
+            // future policy change surfaces here instead of silently
+            // dropping the user's Delete.
+            if let Err(error) = p.store.borrow_mut().delete_active() {
+                log::error!("Could not delete the active AI chat: {error:?}");
+                p.show_error_status("This chat could not be deleted.");
+                return;
+            }
             p.render_active_chat();
             p.publish_persisted_conversation();
             p.show_chat_page();
@@ -994,18 +992,13 @@ impl AiPanel {
         }
         self.chat_row_ids.borrow_mut().clear();
 
-        let query = self.chat_search.text().trim().to_lowercase();
-        let summaries: Vec<_> = self
+        // The store owns the filter (case-insensitive over title and the
+        // already spoof-sanitised preview), so the library rows here cannot
+        // drift from the rows the other terminals show.
+        let summaries = self
             .store
             .borrow()
-            .summaries()
-            .into_iter()
-            .filter(|summary| {
-                query.is_empty()
-                    || summary.title.to_lowercase().contains(&query)
-                    || summary.preview.to_lowercase().contains(&query)
-            })
-            .collect();
+            .summaries_filtered(&self.chat_search.text());
         let active: Vec<_> = summaries
             .iter()
             .filter(|summary| !summary.archived)
@@ -1065,8 +1058,10 @@ impl AiPanel {
         } else {
             summary.preview.clone()
         };
+        // The store already returns a bounded, spoof-sanitised preview, and
+        // every prefix above is a constant, so only the title (which a restored
+        // snapshot supplies) still needs the display filter here.
         let title = jterm_core::review_input::safe_inline_display(&summary.title, 1024);
-        let subtitle = jterm_core::review_input::safe_inline_display(&subtitle, 16 * 1024);
         let row = adw::ActionRow::builder()
             .title(&title)
             .subtitle(&subtitle)
@@ -1106,14 +1101,21 @@ impl AiPanel {
     }
 
     fn render_active_chat(&self) {
-        // A full re-render drops any transient streamed partial row; the next
-        // delta rematerializes it if its owner chat is still the visible one.
+        // A full re-render rebuilds the transcript from the store, including
+        // the in-flight reply's streamed text: a chat switched away and back
+        // shows what has already arrived instead of an empty gap until the
+        // next fragment (which may never come if the stream has gone quiet).
         *self.stream_display.borrow_mut() = None;
-        let (history, draft) = {
+        let (history, draft, streaming) = {
             let store = self.store.borrow();
+            let streaming = store
+                .active_request_token()
+                .filter(|_| !store.active_partial().is_empty())
+                .map(|token| (token, store.active_partial().to_string()));
             (
                 store.active_history().to_vec(),
                 store.active_draft().to_string(),
+                streaming,
             )
         };
         self.convo_buffer.set_text("");
@@ -1122,6 +1124,10 @@ impl AiPanel {
                 Role::User => self.insert_visible("You", "role-user", &turn.text),
                 Role::Assistant => self.insert_visible("Assistant", "role-asst", &turn.text),
             }
+        }
+        if let Some((token, partial)) = streaming {
+            self.insert_visible("Assistant", "role-asst", &partial);
+            *self.stream_display.borrow_mut() = Some(token);
         }
         self.input_buffer.set_text(&draft);
         self.sync_empty_state();
@@ -1709,25 +1715,35 @@ impl AiPanel {
         });
 
         let p = self.clone();
-        let mut progress = StreamProgress::default();
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
             // Bound work per GTK tick even if the producer replenishes the
             // queue while it is being drained.
             for _ in 0..MAX_PENDING_STREAM_DELTAS {
                 match delta_rx.try_recv() {
                     Ok(fragment) => {
-                        // Only the request the store still recognizes as the
-                        // active chat's in-flight epoch may draw; cancelled or
-                        // superseded requests keep accumulating silently.
-                        let can_display = p.store.borrow().active_request_token() == Some(token);
+                        // The store accumulates the partial reply: it applies
+                        // the 256 KiB reply budget in one place, silently
+                        // drops fragments whose request was cancelled,
+                        // superseded or deleted, and reports whether the owner
+                        // chat is the one currently on screen.
                         let attached = *p.stream_display.borrow() == Some(token);
-                        match progress.push(&fragment, can_display, attached) {
+                        let render = {
+                            let mut store = p.store.borrow_mut();
+                            let shown = store.active_partial().len();
+                            match store.push_delta(token, &fragment) {
+                                Some(true) => {
+                                    stream_render(store.active_partial(), shown, attached)
+                                }
+                                _ => StreamRender::None,
+                            }
+                        };
+                        match render {
                             StreamRender::None => {}
                             StreamRender::Materialize(text) => {
-                                p.append_visible("Assistant", "role-asst", text);
+                                p.append_visible("Assistant", "role-asst", &text);
                                 *p.stream_display.borrow_mut() = Some(token);
                             }
-                            StreamRender::Append(text) => p.append_stream_text(text),
+                            StreamRender::Append(text) => p.append_stream_text(&text),
                         }
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty)
@@ -1953,35 +1969,60 @@ mod tests {
     }
 
     #[test]
-    fn stream_progress_appends_visible_fragments_and_rematerializes_after_hiding() {
-        let mut progress = StreamProgress::default();
-        // First visible fragment inserts the in-progress assistant row.
+    fn stream_render_appends_new_text_and_rematerializes_after_hiding() {
+        // Nothing received yet, or a keep-alive that added no bytes.
+        assert_eq!(stream_render("", 0, false), StreamRender::None);
+        assert_eq!(stream_render("Hello", 5, true), StreamRender::None);
+        // The first fragment inserts the in-progress assistant row.
         assert_eq!(
-            progress.push("Hel", true, false),
-            StreamRender::Materialize("Hel")
+            stream_render("Hel", 0, false),
+            StreamRender::Materialize("Hel".into())
         );
-        // While the row is the transcript tail, only new text is appended.
-        assert_eq!(progress.push("lo", true, true), StreamRender::Append("lo"));
-        // Owner chat hidden: fragments accumulate without touching the UI.
-        assert_eq!(progress.push(" wor", false, false), StreamRender::None);
-        // Switching back re-shows the whole partial reply, not just deltas.
+        // While that row is the transcript tail, only new text is appended.
         assert_eq!(
-            progress.push("ld", true, false),
-            StreamRender::Materialize("Hello world")
+            stream_render("Hello", 3, true),
+            StreamRender::Append("lo".into())
         );
-        // Empty keep-alive fragments never mutate an attached row.
-        assert_eq!(progress.push("", true, true), StreamRender::None);
+        // A re-render detaches the row; the whole partial reply comes back,
+        // not just the fragments that arrive afterwards.
+        assert_eq!(
+            stream_render("Hello world", 5, false),
+            StreamRender::Materialize("Hello world".into())
+        );
     }
 
+    /// The panel's contract with the shared store: fragments are accepted
+    /// while the request owns its chat's epoch, drawn only while that chat is
+    /// visible, and re-readable in full after switching back.
     #[test]
-    fn stream_progress_shows_nothing_until_a_nonempty_fragment_arrives() {
-        let mut progress = StreamProgress::default();
-        assert_eq!(progress.push("", true, false), StreamRender::None);
-        assert_eq!(progress.push("", false, false), StreamRender::None);
+    fn streamed_fragments_draw_only_for_the_visible_owner_chat() {
+        let mut store = new_store();
+        let token = store
+            .begin_turn("question".into(), None, "Thinking…".into(), true)
+            .expect("a fresh chat accepts a turn")
+            .token;
+
+        assert_eq!(store.push_delta(token, "Hel"), Some(true));
+        assert_eq!(store.active_partial(), "Hel");
+
+        store.new_chat().expect("a second chat fits");
+        // Hidden owner: the fragment is kept, but the panel must not draw it.
+        assert_eq!(store.push_delta(token, "lo world"), Some(false));
+
+        store.select_chat(token.chat_id);
+        assert_eq!(store.active_partial(), "Hello world");
         assert_eq!(
-            progress.push("first", true, false),
-            StreamRender::Materialize("first")
+            stream_render(store.active_partial(), 0, false),
+            StreamRender::Materialize("Hello world".into())
         );
+
+        // The completed reply replaces the partial, so a re-render cannot show
+        // the streamed text twice.
+        assert_eq!(
+            store.complete_success(token, "Hello world!".into()),
+            Some(true)
+        );
+        assert!(store.active_partial().is_empty());
     }
 
     #[test]
@@ -2006,21 +2047,6 @@ mod tests {
         let retained = large_rx.try_recv().unwrap();
         assert!(retained.len() <= MAX_STREAM_DELTA_BYTES);
         assert!(retained.chars().all(|ch| ch == '界'));
-    }
-
-    #[test]
-    fn stream_progress_never_accumulates_an_unbounded_reply() {
-        let mut progress = StreamProgress::default();
-        let oversized = "x".repeat(MAX_LIVE_ASSISTANT_MESSAGE_BYTES + 100);
-
-        match progress.push(&oversized, true, false) {
-            StreamRender::Materialize(text) => {
-                assert!(text.len() <= MAX_LIVE_ASSISTANT_MESSAGE_BYTES)
-            }
-            other => panic!("expected a materialized bounded reply, got {other:?}"),
-        }
-        assert_eq!(progress.push("ignored", true, true), StreamRender::None);
-        assert!(progress.accumulated.len() <= MAX_LIVE_ASSISTANT_MESSAGE_BYTES);
     }
 
     #[test]

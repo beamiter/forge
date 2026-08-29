@@ -1,6 +1,7 @@
 # Engineering handoff
 
-Updated: 2026-08-29 (Remote Files transactional navigation and authority isolation)
+Updated: 2026-08-29 (AI chat store upstreamed to jterm_core; AI correction
+and snapshot-line guards)
 
 This working tree contains the nine-round "Evolve ASCII organism" series
 (`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
@@ -18,6 +19,135 @@ every round (attribution races, a Drop panic on a fired glib source, a
 saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
+
+- **AI chat store upstreaming (2026-08-29)**: `src/ui/ai_chat_store.rs` is a
+  75-line shim (it was 1,536) over `jterm_core::ai::chat_store`, the union of
+  the four terminals' private copies of the same multi-chat state machine —
+  anvil 786, forge 1,536, ember 903, frost 791, 4,016 lines over the shared
+  `jterm_core::ai::ConversationSnapshot` schema and not one line of toolkit
+  code, diverged in both directions so that no copy was correct on its own.
+  Core's module is 1,888 lines with 47 tests; forge's 27 store tests went
+  upstream with the behavior they pinned, and the shim keeps a single test for
+  the single decision it still owns. `src/` is 1,175 lines lighter, the largest
+  deletion of the four repos.
+
+  What forge sent up: the library-wide 8 MiB live-history budget with real
+  compaction — the per-chat 100-turn and per-reply 256 KiB caps bound a chat,
+  nothing but this bounds a 50-chat library; `snapshot_for_persistence`, which
+  compacts *before* serialising and then syncs the truncation markers back into
+  the live chats; typed `ArchiveOutcome`/`DeleteOutcome`; and draft merges that
+  report what they dropped. The two budgets stay deliberately unequal — live
+  turn text caps at 8 MiB, persistence at 4 MiB under an 8 MiB encoded-JSON
+  ceiling — so `ConversationSnapshot::from_chats` still compacts on the way out
+  and reports it through its flag; `publish_persisted_conversation`
+  (`ai_panel.rs:1350`) consumes both halves exactly as before. What forge took
+  back: in-store streaming, `summaries_filtered`, the prefix rule that makes
+  draft recovery idempotent, and an at-capacity archive guard forge's own copy
+  did not have.
+
+  The panel's streaming accumulator is gone with it. `StreamProgress` owned the
+  partial reply *and* the 256 KiB reply cap; the store now owns both, and
+  `MAX_LIVE_ASSISTANT_MESSAGE_BYTES` has no forge caller at all — the cap exists
+  once. What is left is `stream_render(partial, shown, attached)`
+  (`ai_panel.rs:87`), a pure decision over the store's own partial: `shown` is
+  read before `push_delta`, so `Append` carries only the bytes the transcript
+  tail does not hold yet, and `push_delta`'s `Some(false)` (owner chat not
+  visible) or `None` (cancelled, superseded, deleted) draws nothing. The
+  invariant this buys: `render_active_chat` (`:1103`) now rebuilds the in-flight
+  partial from the store and re-attaches `stream_display`, so a chat switched
+  away and back shows what has already arrived instead of an empty gap until the
+  next fragment — which may never come, if the stream has gone quiet — and
+  `complete_success` clears the partial, so the finished reply cannot be drawn
+  twice. Fragments dropped by the bounded UI queue are still healed by the
+  authoritative final response, unchanged.
+
+  Only the construction-time policy stays local, because it is a panel property
+  and not a store property: `BUSY_POLICY = BusyChatPolicy::Allow`
+  (`ai_chat_store.rs:32`). Archiving or deleting a chat with a request in flight
+  is the one place the four apps genuinely disagree; forge proceeds because
+  every such path cancels first (the Delete dialog cancels before removing the
+  chat, `cancel_all_requests` cancels the whole map at teardown), and the
+  cancelled request's late reply is still discarded on its epoch. Anvil, ember
+  and frost pass `Refuse`, which is core's default. Retry recovery split the
+  same way: forge keeps calling the busy-refusing `recover_retry_payload`, and
+  needs nothing from `recover_retry_payload_detaching` (anvil's shutdown path)
+  because `cancel_all_requests` has already cancelled the request before it
+  recovers the payload. `delete_active` now returns a `Result`; deletion cannot
+  be refused under `Allow`, but the panel reports a refusal instead of silently
+  dropping the user's Delete, so a future policy change surfaces (`:955`).
+
+  Three behavior changes reached the user. Archiving the last un-archived chat
+  with all 50 slots occupied is now refused with a visible "Chat limit reached"
+  status (`:888`) — forge's own copy set `archived = true` and then took the
+  `else if !self.at_capacity()` branch, returning `Ok` with a library in which
+  every chat was archived and no writable chat existed; core checks and refuses
+  before it mutates. Library previews now arrive sanitised from the store
+  (`chat_preview` runs `review_input::safe_inline_display`), so the row builder
+  dropped its own subtitle filter and keeps the filter only on the title, which
+  a restored snapshot supplies; the search query therefore matches the sanitised
+  text, i.e. what is actually on screen. Forge was not exposed to the spoofing
+  hole this closed for three of the four copies — it sanitised at display — but
+  the filtering it hand-rolled in the panel now lives in `summaries_filtered`
+  (`:1001`) with identical trim/lowercase/substring semantics, so the four
+  libraries cannot drift. The draft-merge prefix rule changes nothing in forge
+  today, because the panel holds at most one recoverable payload per chat (a
+  starting request removes the stored retry payload); it removes the dependency
+  of correctness on that call-site discipline.
+
+  Not done, and blocking a commit: `Cargo.toml` still pins `jterm_core`
+  `1f5f0fb`, which does not contain `ai::chat_store`. This tree compiles only
+  through the temporary `[patch]` in `~/.cargo/config.toml` that points
+  `jterm_core` and `jagent` at the local checkouts — that patch is also why the
+  only `Cargo.lock` change is the loss of both `source = "git+…"` lines. Before
+  this round can be committed the pin must move to the core commit that carries
+  `chat_store`, `Cargo.lock` must be regenerated without the patch, and
+  `flake.nix`'s `outputHashes` entry for `jterm_core-0.2.0` updated to match.
+
+- **AI correction guards and snapshot-line quarantine (2026-08-29)**: the
+  family's adversarial audit confirmed three holes in
+  `src/ui/command_correction.rs`, all of them cases where forge's list was
+  shorter than its siblings'. `adds_new_control_syntax` tested one substring at
+  a time over single-character markers, and `"&&"` contains `"&"`: the scan
+  could not tell `a & b` from `a && b`, so `ls | grep foo || rm -rf ~/work` was
+  accepted as a correction for `ls | grep foo` because `|` was already present
+  and `||` was never on the list. It now compares marker *sets* —
+  `syntax_markers` (`:1639`) over `["&&", "||", ";", "|", "&", ">", "<", "$(",
+  "`"]` — and refuses any marker the original does not contain, while a
+  candidate that reuses only the original's own operators is still allowed.
+  `adds_remote_execution` (`:1661`) was missing `mosh`, which opens an
+  interactive session on a host the user never typed exactly as `ssh` does.
+  `classify_failure` (`:1197`) hand-rolled an emptiness/control scan instead of
+  calling `jterm_core::review_input::validate`, which additionally refuses
+  visual spoofing: a command carrying U+202E was classified, embedded in the
+  correction prompt sent to the configured provider, and rendered in the review
+  card's "original" slot. The 16 KiB `MAX_COMMAND_BYTES` bound stays on top of
+  the shared gate, because a correction request is not a bulk review insertion.
+  The same pass widened classification to match the siblings: exit 127 is the
+  POSIX command-not-found status, so an unrecognised shell wording now falls
+  back to the command's first executable (resolved before the tool-suggestion
+  branches, so an explicit suggestion can name the missing executable), and
+  "no such subcommand" joined both unknown-token lists. Five new tests cover
+  the chained-command refusal together with the marker-set allowance that must
+  survive it, `mosh`, the spoofed command (which must also stay unclassified
+  for `should_request_correction` while its unspoofed shape still classifies),
+  exit 127 with and without a privilege prefix, and the cargo wording.
+
+  `src/state.rs` had a quieter version of the same shape: `parse_ai_conversation`
+  returned an `Option`, so "this snapshot has no AI line" and "this snapshot's
+  AI line is unusable here" were the same answer. The window has already claimed
+  those bytes by renaming a `window-*.state` onto its own `.active` name, and
+  the next autosave writes a payload with no `ai_conversation=` line over
+  exactly that path — so a duplicated, oversized or malformed line, or a chat
+  library written by a newer forge pinning a newer snapshot schema, was silently
+  and permanently deleted. The parser now answers
+  `AiConversationLine::{Absent, Parsed, Rejected}` (`:1149`) and
+  `restore_ai_conversation` (`:1215`) quarantines the file on `Rejected`, the
+  same treatment `load_tabs_state`'s unreadable-read arm already applied.
+  Quarantine moves the `.active` file aside even though its tab lines were fine;
+  tab recovery is unaffected because `parse_tabs_state` reads the contents
+  already in memory, and the next save recreates the snapshot. Two regressions
+  pin both directions — an unusable line is moved aside and the tabs still
+  restore; an absent or valid line leaves the file where it is.
 
 - **Remote Files transactional navigation and authority isolation (2026-08-29)**:
   root changes now stage a `NavigationIntent` carrying a monotonic revision,
@@ -699,22 +829,37 @@ doctor and correction probes.
 ### Follow-up migrations (next rounds)
 
 - Forge-ahead local modules to upstream into core rather than delete: none
-  left — `parser` (OSC 7771, erase-scrollback/hard-reset barriers, strict ST
-  termination) was upstreamed and the local copy deleted at pin `73c1411`.
-  Done earlier at pin `592d663`: `review_input` (safe-display helpers,
-  wider spoof set), `pty_input` (`AdmittedInput`), and `execution_journal`
-  (`output_capture_enabled`) were upstreamed and the local copies deleted.
-- Core-ahead modules: none left — the hardened `jterm_core::agent` session
-  wrapper is adopted (current pin `21437ba`; only core's additive
-  `AgentSessionEpoch` remains unused, forge's own `task_epoch` plumbing
-  covers the same ground), and `child_env`'s inherited-environment freeze is
-  wired (`app::run` captures first, `pty.rs` uses `envp_from_captured`, and
-  the VTE spawn pairs `vte_envv_from_captured` with
-  `VTE_SPAWN_NO_PARENT_ENVV`).
-- `src/pty.rs:1579` and `src/state.rs:1953` spawn `sh` directly, outside the
-  helper-runner contract; `src/notebook.rs` long-lived terminal children keep
-  their own wait logic by design (`SupervisedChild` scopes itself to
-  short-lived helpers).
+  left. `ui::ai_chat_store` was the last one and went up this round as
+  `jterm_core::ai::chat_store` (1,536 lines down to a 75-line policy shim; see
+  the entry above), joining `parser` (OSC 7771, erase-scrollback/hard-reset
+  barriers, strict ST termination), upstreamed and deleted locally at pin
+  `73c1411`, and, earlier at pin `592d663`, `review_input` (safe-display
+  helpers, wider spoof set), `pty_input` (`AdmittedInput`) and
+  `execution_journal` (`output_capture_enabled`).
+- Core-ahead modules: `chat_store` lands with two facilities forge
+  deliberately declines — `BusyChatPolicy::Refuse`, which is core's default
+  and the anvil/ember/frost archive/delete semantics, and
+  `recover_retry_payload_detaching`, anvil's shutdown path — because forge's
+  panel cancels the in-flight request before it mutates or recovers anything.
+  Core's additive `AgentSessionEpoch` also remains unused (forge's own
+  `task_epoch` plumbing covers the same ground) on the adopted hardened
+  `jterm_core::agent` session wrapper, and `child_env`'s
+  inherited-environment freeze stays wired (`app::run` captures first,
+  `pty.rs` uses `envp_from_captured`, and the VTE spawn pairs
+  `vte_envv_from_captured` with `VTE_SPAWN_NO_PARENT_ENVV`).
+- Pin bookkeeping, which this round leaves open: the two "done" sections above
+  quote the pin current at their own round (`21437ba`), and `Cargo.toml` pins
+  `1f5f0fb` today — neither carries `ai::chat_store`, so the working tree
+  builds only through a temporary local `[patch]`. Bumping the pin to the core
+  commit that carries the module also means regenerating `Cargo.lock` without
+  that patch (its two dropped `source = "git+…"` lines are the patch's only
+  trace) and refreshing `flake.nix`'s `outputHashes` entry for
+  `jterm_core-0.2.0`.
+- `src/pty.rs:1967` and `src/state.rs:2118` spawn `sh` directly, outside the
+  helper-runner contract — both inside `#[cfg(test)]` helpers, and the line
+  references this bullet used to carry (`1579`/`1953`) had drifted;
+  `src/notebook.rs` long-lived terminal children keep their own wait logic by
+  design (`SupervisedChild` scopes itself to short-lived helpers).
 
 ## Release checks
 

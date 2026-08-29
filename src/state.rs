@@ -1140,10 +1140,39 @@ fn rewrite_existing_ai_conversation(
     Ok((compacted_ai, durable_ai_snapshot))
 }
 
+/// What the optional `ai_conversation=` line of a window snapshot yielded.
+///
+/// `Absent` and `Rejected` both restore no chats, but they must not be handled
+/// the same way: `Rejected` means the bytes on disk hold a chat library this
+/// build cannot read, and the session is about to save over them.
+#[derive(Debug, PartialEq)]
+enum AiConversationLine {
+    /// The snapshot carries no AI line. Nothing to restore, nothing to lose.
+    Absent,
+    /// A well-formed line this build understands.
+    Parsed(Box<crate::ai::ConversationSnapshot>),
+    /// The line is present but unusable here — duplicated, oversized,
+    /// malformed, or written by a newer forge with a newer snapshot schema.
+    Rejected,
+}
+
+#[cfg(test)]
+impl AiConversationLine {
+    /// Test convenience: the snapshot this line yielded, dropping the reason a
+    /// line without one was refused.
+    fn snapshot(self) -> Option<crate::ai::ConversationSnapshot> {
+        match self {
+            Self::Parsed(snapshot) => Some(*snapshot),
+            Self::Absent | Self::Rejected => None,
+        }
+    }
+}
+
 /// Parse the AI payload independently from tabs. Any malformed, duplicated,
-/// unsupported, or oversized value is ignored without affecting tab recovery.
-fn parse_ai_conversation(contents: &str) -> Option<crate::ai::ConversationSnapshot> {
-    let mut parsed = None;
+/// unsupported, or oversized value is reported as [`AiConversationLine::Rejected`]
+/// without affecting tab recovery.
+fn parse_ai_conversation(contents: &str) -> AiConversationLine {
+    let mut parsed = AiConversationLine::Absent;
     let mut found = false;
     for raw_line in contents.lines() {
         let line = raw_line.trim();
@@ -1152,23 +1181,46 @@ fn parse_ai_conversation(contents: &str) -> Option<crate::ai::ConversationSnapsh
         };
         if found {
             log::warn!("Ignoring duplicated AI conversation in window snapshot");
-            return None;
+            return AiConversationLine::Rejected;
         }
         found = true;
         if value.len() > MAX_AI_CONVERSATION_LINE_BYTES {
             log::warn!("Ignoring oversized AI conversation in window snapshot");
-            return None;
+            return AiConversationLine::Rejected;
         }
         let encoded = unescape_tab_state(value);
         match crate::ai::ConversationSnapshot::from_json(&encoded) {
-            Ok(snapshot) => parsed = Some(snapshot),
+            Ok(snapshot) => parsed = AiConversationLine::Parsed(Box::new(snapshot)),
             Err(error) => {
                 log::warn!("Ignoring invalid AI conversation in window snapshot: {error}");
-                return None;
+                return AiConversationLine::Rejected;
             }
         }
     }
     parsed
+}
+
+/// Decide what a readable snapshot's AI line means for this session, moving the
+/// file aside when the line is present but unusable.
+///
+/// The quarantine is the whole point. `parse_tabs_state` cannot fail, so a
+/// damaged tab line still restores as *something*; the AI line has its own
+/// parser that can reject it, and a rejection used to be indistinguishable from
+/// "this snapshot has no chats". The window has already claimed these bytes
+/// under its own `.active` name, and the next autosave writes a payload with no
+/// `ai_conversation=` line over exactly that path — so an interrupted write, or
+/// a library written by a newer forge pinning a newer snapshot schema, was
+/// silently and permanently deleted. Move the bytes aside first and the chats
+/// stay recoverable, exactly as for an unreadable snapshot.
+fn restore_ai_conversation(path: &Path, contents: &str) -> Option<crate::ai::ConversationSnapshot> {
+    match parse_ai_conversation(contents) {
+        AiConversationLine::Parsed(snapshot) => Some(*snapshot),
+        AiConversationLine::Absent => None,
+        AiConversationLine::Rejected => {
+            quarantine_corrupt_snapshot(path);
+            None
+        }
+    }
 }
 
 fn normalize_pane_layout_bounded(layout: &mut PaneLayout, limit: usize) -> Option<usize> {
@@ -1489,12 +1541,12 @@ pub(crate) fn load_tabs_state() -> (Option<u32>, Vec<(Option<String>, PaneLayout
         }
     };
 
-    set_ai_conversation_snapshot(parse_ai_conversation(&contents));
-    // Quarantine covers the read, not the parse: `parse_tabs_state` cannot fail.
-    // Its last arm takes any non-blank line it does not recognise as a legacy
-    // bare-path tab, so damaged-but-readable contents restore as a tab rather
-    // than as an empty window. Every way of *losing* the snapshot goes through
-    // the error arm above.
+    // Tabs need no quarantine: `parse_tabs_state` cannot fail — its last arm
+    // takes any non-blank line it does not recognise as a legacy bare-path tab,
+    // so damaged-but-readable contents restore as a tab rather than as an empty
+    // window. The AI line is the exception, and `restore_ai_conversation`
+    // quarantines the bytes itself when it has to throw a chat library away.
+    set_ai_conversation_snapshot(restore_ai_conversation(&path, &contents));
     let (current_page, tabs) = parse_tabs_state(&contents);
     log::info!("Loaded {} tabs from window snapshot", tabs.len());
     (current_page, tabs)
@@ -2203,7 +2255,7 @@ mod tests {
         let line = ai_conversation_state_line(&snapshot).unwrap();
         let contents = format!("current_page=0\n{line}\ntab=/tmp\n");
 
-        assert_eq!(parse_ai_conversation(&contents), Some(snapshot));
+        assert_eq!(parse_ai_conversation(&contents).snapshot(), Some(snapshot));
         let (current_page, tabs) = parse_tabs_state(&contents);
         assert_eq!(current_page, Some(0));
         assert_eq!(tabs.len(), 1);
@@ -2270,7 +2322,7 @@ mod tests {
         base_lines.insert(1, line.clone());
         let payload = base_lines.join("\n") + "\n";
         assert!(payload.len() <= max_bytes);
-        assert_eq!(parse_ai_conversation(&line), Some(compacted));
+        assert_eq!(parse_ai_conversation(&line).snapshot(), Some(compacted));
     }
 
     #[test]
@@ -2334,7 +2386,10 @@ mod tests {
             "tab=Terminal 1\t/tmp\t123-456\n"
         );
 
-        assert!(parse_ai_conversation(contents).is_none());
+        assert_eq!(
+            parse_ai_conversation(contents),
+            AiConversationLine::Rejected
+        );
         let (current_page, tabs) = parse_tabs_state(contents);
         assert_eq!(current_page, Some(0));
         assert_eq!(tabs.len(), 1);
@@ -2344,10 +2399,85 @@ mod tests {
     fn duplicate_or_future_ai_payload_is_ignored() {
         let snapshot = conversation_snapshot("q", "a");
         let line = ai_conversation_state_line(&snapshot).unwrap();
-        assert!(parse_ai_conversation(&format!("{line}\n{line}\n")).is_none());
+        assert_eq!(
+            parse_ai_conversation(&format!("{line}\n{line}\n")),
+            AiConversationLine::Rejected
+        );
 
         let future = r#"ai_conversation={"version":3,"active_chat_id":1,"chats":[]}"#;
-        assert!(parse_ai_conversation(future).is_none());
+        assert_eq!(parse_ai_conversation(future), AiConversationLine::Rejected);
+    }
+
+    /// A chat library this build cannot read is still the user's only copy, and
+    /// the very next autosave replaces the claimed `.active` file with a payload
+    /// carrying no `ai_conversation=` line at all. Move the bytes aside first —
+    /// the same treatment an unreadable snapshot already gets.
+    #[test]
+    fn unusable_ai_line_is_quarantined_before_the_library_is_dropped() {
+        let directory = temporary_state_dir("quarantine-ai");
+        let path = directory.join("window-1.active");
+        // A snapshot schema this build does not support: what a library written
+        // by a newer forge looks like from here.
+        let contents = concat!(
+            "current_page=0\n",
+            r#"ai_conversation={"version":3,"active_chat_id":1,"chats":[]}"#,
+            "\ntab=Terminal 1\t/tmp\t123-456\n"
+        );
+        fs::write(&path, contents).unwrap();
+
+        assert!(restore_ai_conversation(&path, contents).is_none());
+        assert!(
+            !path.exists(),
+            "the claimed snapshot must not stay where the next save overwrites it"
+        );
+        let quarantined: Vec<PathBuf> = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|entry| is_quarantined_snapshot(entry))
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(fs::read_to_string(&quarantined[0]).unwrap(), contents);
+
+        // Tab recovery is unaffected: it reads the bytes already in memory.
+        let (current_page, tabs) = parse_tabs_state(contents);
+        assert_eq!(current_page, Some(0));
+        assert_eq!(tabs.len(), 1);
+
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A snapshot that never had an AI line is not damage, and a valid one is
+    /// not either: neither may be moved aside.
+    #[test]
+    fn absent_or_valid_ai_line_leaves_the_snapshot_in_place() {
+        let directory = temporary_state_dir("keep-ai");
+        let snapshot = conversation_snapshot("q", "a");
+        let line = ai_conversation_state_line(&snapshot).unwrap();
+
+        for (name, contents, expected) in [
+            (
+                "window-1.active",
+                "current_page=0\ntab=Terminal 1\t/tmp\t123-456\n".to_string(),
+                None,
+            ),
+            (
+                "window-2.active",
+                format!("current_page=0\n{line}\ntab=Terminal 1\t/tmp\t123-456\n"),
+                Some(snapshot.clone()),
+            ),
+        ] {
+            let path = directory.join(name);
+            fs::write(&path, &contents).unwrap();
+            assert_eq!(
+                restore_ai_conversation(&path, &contents),
+                expected,
+                "{name}"
+            );
+            assert!(path.exists(), "{name}");
+        }
+
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
@@ -2364,7 +2494,7 @@ mod tests {
         let claimed = directory.join("window-10-10.active");
         assert!(claim_ready_snapshot_in(&directory, &claimed).is_some());
         let contents = fs::read_to_string(claimed).unwrap();
-        assert_eq!(parse_ai_conversation(&contents), Some(snapshot));
+        assert_eq!(parse_ai_conversation(&contents).snapshot(), Some(snapshot));
         assert_eq!(parse_tabs_state(&contents).1.len(), 1);
         fs::remove_dir_all(directory).unwrap();
     }
@@ -2746,14 +2876,17 @@ mod tests {
         assert!(!compacted);
         assert_eq!(durable, Some(replacement.clone()));
         let replaced = fs::read_to_string(&path).unwrap();
-        assert_eq!(parse_ai_conversation(&replaced), Some(replacement));
+        assert_eq!(
+            parse_ai_conversation(&replaced).snapshot(),
+            Some(replacement)
+        );
         assert_eq!(parse_tabs_state(&replaced).1.len(), 1);
 
         let (compacted, durable) = rewrite_existing_ai_conversation(&path, None).unwrap();
         assert!(!compacted);
         assert_eq!(durable, None);
         let cleared = fs::read_to_string(&path).unwrap();
-        assert!(parse_ai_conversation(&cleared).is_none());
+        assert_eq!(parse_ai_conversation(&cleared), AiConversationLine::Absent);
         assert_eq!(parse_tabs_state(&cleared).1.len(), 1);
         fs::remove_dir_all(root).unwrap();
     }

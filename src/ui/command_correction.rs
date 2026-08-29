@@ -1195,11 +1195,17 @@ fn correction_user_prompt(
 }
 
 fn classify_failure(command: &str, exit_code: i32, output: &str) -> Option<FailureKind> {
+    // The shared review gate opens the classifier in every sibling app, and it
+    // rejects more than a hand-rolled emptiness/control scan does: it also
+    // refuses visual spoofing — bidi overrides and invisible formatting. That is
+    // why it must not be re-implemented here. Without it a command carrying
+    // U+202E was classified, embedded in the correction prompt sent to the
+    // configured provider, and rendered in the card's "original" slot. The
+    // 16 KiB bound stays on top of it because a correction request is not a bulk
+    // review insertion.
     if exit_code == 0
-        || command.trim().is_empty()
         || command.len() > MAX_COMMAND_BYTES
-        || command.contains(['\r', '\n', '\0'])
-        || command.chars().any(|character| character.is_control())
+        || jterm_core::review_input::validate(command).is_err()
     {
         return None;
     }
@@ -1220,7 +1226,17 @@ fn classify_failure(command: &str, exit_code: i32, output: &str) -> Option<Failu
     } else {
         None
     };
-    let command_not_found = extract_command_not_found(output);
+    // Exit 127 is the POSIX "command not found" status. A shell whose wording
+    // `extract_command_not_found` does not recognise still reports it, so the
+    // siblings fall back to the command's first executable word instead of
+    // silently offering nothing. Resolving that fallback here rather than after
+    // the tool-suggestion branch also lets an explicit suggestion name the
+    // missing executable as its offending token.
+    let command_not_found = extract_command_not_found(output).or_else(|| {
+        (exit_code == 127 || output_contains_any(output, &["未找到命令"]))
+            .then(|| first_executable(command))
+            .flatten()
+    });
     let unknown_subcommand = extract_unknown_token(
         output,
         &[
@@ -1229,6 +1245,7 @@ fn classify_failure(command: &str, exit_code: i32, output: &str) -> Option<Failu
             "unrecognized command",
             "invalid choice",
             "is not a git command",
+            "no such subcommand",
             "未知命令",
             "未知子命令",
         ],
@@ -1260,13 +1277,6 @@ fn classify_failure(command: &str, exit_code: i32, output: &str) -> Option<Failu
     if let Some(package) = apt_package {
         return Some(FailureKind::AptPackageNotFound { package });
     }
-    let command_not_found = command_not_found.or_else(|| {
-        if output_contains_any(output, &["未找到命令"]) {
-            first_executable(command)
-        } else {
-            None
-        }
-    });
     if let Some(executable) = command_not_found {
         return Some(FailureKind::CommandNotFound { executable });
     }
@@ -1279,6 +1289,7 @@ fn classify_failure(command: &str, exit_code: i32, output: &str) -> Option<Failu
                 "unrecognized command",
                 "invalid choice",
                 "is not a git command",
+                "no such subcommand",
                 "未知命令",
                 "未知子命令",
             ],
@@ -1617,11 +1628,28 @@ fn adds_privilege_escalation(original: &str, candidate: &str) -> bool {
         .any(|word| candidate_words.contains(*word) && !original_words.contains(*word))
 }
 
+/// The shell control markers a command contains, as the family's shared set.
+///
+/// Collecting into a set instead of testing one substring at a time is what
+/// makes `&&`/`||` decidable. `"&&"` contains `"&"`, so a scan over a list that
+/// omits the doubled operators cannot tell `a & b` from `a && b`: forge's
+/// shorter list accepted `ls | grep foo || rm -rf ~/work` as a correction for
+/// `ls | grep foo`, because the original already contained `|` and `||` was
+/// never on the list. Keep this list identical to anvil/ember/frost.
+fn syntax_markers(command: &str) -> HashSet<&'static str> {
+    ["&&", "||", ";", "|", "&", ">", "<", "$(", "`"]
+        .into_iter()
+        .filter(|marker| command.contains(marker))
+        .collect()
+}
+
 fn adds_new_control_syntax(original: &str, candidate: &str) -> bool {
-    for syntax in ["|", ";", "&", ">", "<", "$(", "`"] {
-        if candidate.contains(syntax) && !original.contains(syntax) {
-            return true;
-        }
+    let original_markers = syntax_markers(original);
+    if syntax_markers(candidate)
+        .iter()
+        .any(|marker| !original_markers.contains(marker))
+    {
+        return true;
     }
     let original_lower = original.to_ascii_lowercase();
     let candidate_lower = candidate.to_ascii_lowercase();
@@ -1633,7 +1661,9 @@ fn adds_new_control_syntax(original: &str, candidate: &str) -> bool {
 fn adds_remote_execution(original: &str, candidate: &str) -> bool {
     let original_words = normalized_words(original);
     let candidate_words = normalized_words(candidate);
-    ["ssh", "scp", "sftp"]
+    // `mosh` belongs here for the same reason as `ssh`: it opens an interactive
+    // session on a host the user never typed. The siblings all carry it.
+    ["ssh", "mosh", "scp", "sftp"]
         .iter()
         .any(|word| candidate_words.contains(*word) && !original_words.contains(*word))
 }
@@ -1998,6 +2028,103 @@ mod tests {
             "curl example.invalid"
         )
         .is_err());
+    }
+
+    /// A correction may not add shell control syntax the user did not type.
+    /// `&&`/`||` are the cases a substring scan over single-character markers
+    /// gets wrong, because the original already contains `&`/`|`.
+    #[test]
+    fn ai_candidate_may_not_add_a_chained_command() {
+        assert!(parse_correction_reply(
+            r#"{"action":"suggest","command":"ls | grep foo || rm -rf ~/work","message":"fallback"}"#,
+            "ls | grep foo"
+        )
+        .is_err());
+        assert!(parse_correction_reply(
+            r#"{"action":"suggest","command":"tail -f log & wait && rm log","message":"chain"}"#,
+            "tail -f log & wait"
+        )
+        .is_err());
+        // The marker set, not the marker count, is what must be preserved: a
+        // candidate that reuses the original's own operators is still allowed.
+        assert_eq!(
+            parse_correction_reply(
+                r#"{"action":"suggest","command":"ls | grep bar","message":"typo"}"#,
+                "ls | grep foo"
+            )
+            .unwrap()
+            .map(|correction| correction.command),
+            Some("ls | grep bar".to_string())
+        );
+    }
+
+    /// `mosh` opens an interactive session on a host the user never typed, so
+    /// it is refused exactly like `ssh`/`scp`/`sftp`.
+    #[test]
+    fn ai_candidate_may_not_add_remote_execution() {
+        for candidate in ["mosh user@host", "ssh user@host", "scp a host:b"] {
+            let reply = json!({
+                "action": "suggest",
+                "command": candidate,
+                "message": "did you mean",
+            })
+            .to_string();
+            assert!(
+                parse_correction_reply(&reply, "mos --version").is_err(),
+                "{candidate}"
+            );
+        }
+    }
+
+    /// A command carrying a bidi override must never be classified: doing so
+    /// would put the spoofed bytes into the prompt sent to the AI provider and
+    /// into the review card's "original" slot.
+    #[test]
+    fn visually_spoofed_command_is_never_classified() {
+        let spoofed = "git\u{202e}sutats";
+        assert!(classify_failure(spoofed, 127, "bash: command not found").is_none());
+        assert!(!should_request_correction(
+            spoofed,
+            1,
+            "git: 'sutats' is not a git command"
+        ));
+        // The unspoofed shape of the same failure still classifies.
+        assert!(should_request_correction(
+            "gitsutats",
+            127,
+            "bash: command not found"
+        ));
+    }
+
+    /// Exit 127 is the POSIX command-not-found status; an unrecognised shell
+    /// wording must still produce a correction rather than silence.
+    #[test]
+    fn unrecognised_shell_wording_still_classifies_exit_127() {
+        assert_eq!(
+            classify_failure("gti status", 127, "gti: no puedo encontrar la orden"),
+            Some(FailureKind::CommandNotFound {
+                executable: "gti".into()
+            })
+        );
+        // A privilege prefix is not the missing executable.
+        assert_eq!(
+            classify_failure("sudo gti status", 127, ""),
+            Some(FailureKind::CommandNotFound {
+                executable: "gti".into()
+            })
+        );
+    }
+
+    /// Cargo and several other tools word an unknown subcommand as "no such
+    /// subcommand"; the siblings all carry that marker.
+    #[test]
+    fn no_such_subcommand_wording_is_classified() {
+        assert_eq!(
+            classify_failure("cargo buld", 101, "error: no such subcommand: `buld`"),
+            Some(FailureKind::UnknownSubcommand {
+                token: Some("buld".into())
+            })
+        );
     }
 
     #[test]
