@@ -204,3 +204,9 @@ quality gates listed in `README.md`.
     The documented maintenance boundary now forbids hand edits and points to
     the same pinned generator and hash-locked Python environment that CI uses
     for its byte-for-byte gate.
+
+59. **One Flatpak source-generation entry point** — local maintenance and CI
+    now share a documented `--check`/`--update` script instead of duplicating a
+    fragile command sequence in workflow YAML. The script owns the generator
+    commit, verifies its SHA-256 before execution, installs only hash-locked
+    Python wheels, updates atomically, and can retain CI's mismatch artifact.

@@ -73,9 +73,17 @@ metadata, builds the bundle, records its SHA-256 checksum, and launches both VTE
 and Block modes under headless X11 and Wayland sessions.
 
 `cargo-sources.json` is generated data and must not be edited by hand. Every
-`Cargo.lock` update must regenerate it with the exact generator commit and
-hash-locked Python environment declared in `.github/workflows/flatpak.yml`.
-CI compares that output byte for byte before starting the bundle build.
+`Cargo.lock` update must regenerate it with the pinned, checksum-verified
+generator and hash-locked Python environment:
+
+```bash
+scripts/update-flatpak-cargo-sources.sh --update
+scripts/update-flatpak-cargo-sources.sh --check
+```
+
+CI calls the same script and compares its output byte for byte before starting
+the bundle build. The script requires `curl`, Git, and either Python venv support
+or `uv`.
 
 ## Install and diagnose
 

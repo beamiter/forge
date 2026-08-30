@@ -9,6 +9,7 @@ on:
       - 'LICENSE*'
       - data/**
       - packaging/flatpak/**
+      - scripts/update-flatpak-cargo-sources.sh
       - scripts/smoke-flatpak.sh
       - src/**
       - .github/workflows/flatpak.yml
@@ -20,6 +21,7 @@ on:
       - 'LICENSE*'
       - data/**
       - packaging/flatpak/**
+      - scripts/update-flatpak-cargo-sources.sh
       - scripts/smoke-flatpak.sh
       - src/**
       - .github/workflows/flatpak.yml
@@ -34,7 +36,6 @@ concurrency:
 
 env:
   APP_ID: io.github.beamiter.forge
-  CARGO_GENERATOR_COMMIT: 737c0085912f9f7dabf9341d4608e2a77a51a73a
 
 jobs:
   build:
@@ -83,20 +84,8 @@ jobs:
         run: |
           set -o pipefail
           {
-            python3 -m venv /tmp/flatpak-cargo-generator
-            # The generator environment is fully pinned because its output is
-            # part of the clean Cargo.lock reproducibility contract.
-            /tmp/flatpak-cargo-generator/bin/pip install --disable-pip-version-check \
-              --only-binary=:all: --require-hashes \
-              --requirement packaging/flatpak/generator-requirements.txt
-            curl --fail --location \
-              --output /tmp/flatpak-cargo-generator.py \
-              "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/${CARGO_GENERATOR_COMMIT}/cargo/flatpak-cargo-generator.py"
-            /tmp/flatpak-cargo-generator/bin/python /tmp/flatpak-cargo-generator.py \
-              Cargo.lock -o /tmp/cargo-sources.json
-            # The pinned generator omits the customary final newline.
-            printf '\n' >> /tmp/cargo-sources.json
-            diff -u packaging/flatpak/cargo-sources.json /tmp/cargo-sources.json
+            scripts/update-flatpak-cargo-sources.sh --check \
+              --output /tmp/cargo-sources.json
           } 2>&1 | tee cargo-sources-verify.log
 
       - name: Stage generated Cargo source manifest
