@@ -23,3 +23,26 @@ updates:
       github-actions:
         patterns:
           - "*"
+
+  - package-ecosystem: cargo
+    directory: /prototypes/ascii-organism
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:27"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 3
+    groups:
+      rust-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: pip
+    directory: /packaging/flatpak
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:37"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 3

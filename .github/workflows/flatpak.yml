@@ -43,7 +43,9 @@ jobs:
     timeout-minutes: 75
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install packaging dependencies
         run: |
@@ -82,11 +84,11 @@ jobs:
           set -o pipefail
           {
             python3 -m venv /tmp/flatpak-cargo-generator
-            # The generator imports these directly; pin them as part of the
-            # generated-file contract so a formatter release cannot make a
-            # clean Cargo.lock fail this reproducibility gate.
+            # The generator environment is fully pinned because its output is
+            # part of the clean Cargo.lock reproducibility contract.
             /tmp/flatpak-cargo-generator/bin/pip install --disable-pip-version-check \
-              aiohttp==3.14.3 tomlkit==0.15.1 pyyaml==6.0.3
+              --only-binary=:all: --require-hashes \
+              --requirement packaging/flatpak/generator-requirements.txt
             curl --fail --location \
               --output /tmp/flatpak-cargo-generator.py \
               "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/${CARGO_GENERATOR_COMMIT}/cargo/flatpak-cargo-generator.py"
@@ -106,7 +108,7 @@ jobs:
 
       - name: Upload Cargo source diagnostics
         if: ${{ always() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: cargo-sources-diagnostics-${{ github.run_id }}
           path: |
@@ -121,12 +123,12 @@ jobs:
 
       - name: Validate desktop metadata and icons
         run: |
-          desktop-file-validate data/${APP_ID}.desktop
-          appstreamcli validate --no-net data/${APP_ID}.metainfo.xml
-          rsvg-convert -w 128 -h 128 data/${APP_ID}.svg > /tmp/icon-128.png
-          rsvg-convert -w 256 -h 256 data/${APP_ID}.svg > /tmp/icon-256.png
-          cmp data/${APP_ID}-128.png /tmp/icon-128.png
-          cmp data/${APP_ID}-256.png /tmp/icon-256.png
+          desktop-file-validate "data/${APP_ID}.desktop"
+          appstreamcli validate --no-net "data/${APP_ID}.metainfo.xml"
+          rsvg-convert -w 128 -h 128 "data/${APP_ID}.svg" > /tmp/icon-128.png
+          rsvg-convert -w 256 -h 256 "data/${APP_ID}.svg" > /tmp/icon-256.png
+          cmp "data/${APP_ID}-128.png" /tmp/icon-128.png
+          cmp "data/${APP_ID}-256.png" /tmp/icon-256.png
 
       - name: Configure Flathub
         run: |
@@ -141,14 +143,14 @@ jobs:
           {
             flatpak-builder --user --install-deps-from=flathub --force-clean \
               --disable-rofiles-fuse --repo=flatpak-repo flatpak-build \
-              packaging/flatpak/${APP_ID}.yml
-            flatpak build-bundle flatpak-repo ${APP_ID}.flatpak ${APP_ID}
-            sha256sum ${APP_ID}.flatpak | tee ${APP_ID}.flatpak.sha256
+              "packaging/flatpak/${APP_ID}.yml"
+            flatpak build-bundle flatpak-repo "${APP_ID}.flatpak" "${APP_ID}"
+            sha256sum "${APP_ID}.flatpak" | tee "${APP_ID}.flatpak.sha256"
           } 2>&1 | tee flatpak-build.log
 
       - name: Upload Flatpak build diagnostics
         if: ${{ always() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: flatpak-build-diagnostics-${{ github.run_id }}
           path: flatpak-build.log
@@ -167,18 +169,18 @@ jobs:
           {
             flatpak --user remote-add --if-not-exists --no-gpg-verify \
               forge-ci "file://${PWD}/flatpak-repo"
-            flatpak --user install -y forge-ci ${APP_ID}
-            flatpak run --command=sh ${APP_ID} -c \
+            flatpak --user install -y forge-ci "${APP_ID}"
+            flatpak run --command=sh "${APP_ID}" -c \
               'test -s /app/share/licenses/io.github.beamiter.forge/LICENSE-MIT && test -s /app/share/licenses/io.github.beamiter.forge/LICENSE-APACHE'
-            flatpak run ${APP_ID} --version
+            flatpak run "${APP_ID}" --version
             # The Flatpak host bridge uses flatpak-spawn over the session bus.
             # Run headless diagnostics inside a bus even when no display exists.
-            dbus-run-session -- flatpak run ${APP_ID} --doctor
+            dbus-run-session -- flatpak run "${APP_ID}" --doctor
           } 2>&1 | tee flatpak-install.log
 
       - name: Upload Flatpak install diagnostics
         if: ${{ always() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: flatpak-install-diagnostics-${{ github.run_id }}
           path: flatpak-install.log
@@ -190,11 +192,11 @@ jobs:
         run: exit 1
 
       - name: Smoke-test X11 and Wayland launches
-        run: dbus-run-session -- scripts/smoke-flatpak.sh ${APP_ID}
+        run: dbus-run-session -- scripts/smoke-flatpak.sh "${APP_ID}"
 
       - name: Upload Flatpak bundle and diagnostics
         if: ${{ always() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: forge-flatpak-${{ github.sha }}
           path: |

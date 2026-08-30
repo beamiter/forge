@@ -20,8 +20,9 @@ jobs:
     timeout-minutes: 50
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Install GTK build dependencies
@@ -32,7 +33,7 @@ jobs:
             libvte-2.91-gtk4-dev libpcre2-dev xvfb
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable
 
       - name: Verify tag matches Cargo version
         run: |
@@ -51,7 +52,7 @@ jobs:
         run: |
           cargo build --release --all-features --locked
           bash scripts/package-release.sh target/release/forge
-          (cd target/dist && sha256sum --check *.sha256)
+          (cd target/dist && sha256sum --check ./*.sha256)
 
       - name: Publish GitHub release
         env:
@@ -67,4 +68,3 @@ jobs:
               --verify-tag --generate-notes \
               --title "forge ${GITHUB_REF_NAME#v}"
           fi
-

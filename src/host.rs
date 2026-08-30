@@ -25,7 +25,7 @@
 //!   doctor's probes are user-invoked and non-automatic, which is why this
 //!   copy is still tolerable there — but it is the last caller, and closing
 //!   it out is the remaining work.
-//! - [`HOST_HELPER_LAUNCHER`], the Flatpak host-side `PATH` re-clamp. The
+//! - `HOST_HELPER_LAUNCHER`, the Flatpak host-side `PATH` re-clamp. The
 //!   correction engine builds its own bridge argv (it will not accept a
 //!   `Command` an app resolved by its own rules), so it names this script
 //!   through `LocalEvidence::Bridged` rather than calling `helper_command`.

@@ -139,7 +139,7 @@ pub fn workflow_dirs() -> Vec<PathBuf> {
 }
 
 /// The whole library, deduplicated by name with the earlier directory winning,
-/// listed in [`LOAD_ORDER`].
+/// listed in `LOAD_ORDER`.
 pub fn load_all() -> Vec<Workflow> {
     jterm_core::workflows::load_all(&workflow_dirs(), LOAD_ORDER)
 }
