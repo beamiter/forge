@@ -18,11 +18,30 @@ CONFIG_SOURCE="${SCRIPT_DIR}/share/doc/forge/config.toml.example"
 BINARY_SOURCE="${SCRIPT_DIR}/bin/forge"
 SUPPORT_SOURCE="${SCRIPT_DIR}/bin/forge-support-bundle"
 DESKTOP_SOURCE="${SCRIPT_DIR}/share/applications/${APP_ID}.desktop"
+METAINFO_SOURCE="${SCRIPT_DIR}/share/metainfo/${APP_ID}.metainfo.xml"
+SVG_SOURCE="${SCRIPT_DIR}/share/icons/hicolor/scalable/apps/${APP_ID}.svg"
+PNG_128_SOURCE="${SCRIPT_DIR}/share/icons/hicolor/128x128/apps/${APP_ID}.png"
+PNG_256_SOURCE="${SCRIPT_DIR}/share/icons/hicolor/256x256/apps/${APP_ID}.png"
+SHELL_SOURCE_DIR="${SCRIPT_DIR}/share/forge/shell-integration"
+WORKFLOW_SOURCE_DIR="${SCRIPT_DIR}/share/forge/workflows"
+WORKFLOW_HELPER_SOURCE="${SCRIPT_DIR}/libexec/install-workflow-assets.sh"
+NOTEBOOK_SOURCE="${SCRIPT_DIR}/share/forge/notebooks/welcome.jtnb.md"
+README_SOURCE="${SCRIPT_DIR}/share/doc/forge/README.md"
+LOCK_SOURCE="${SCRIPT_DIR}/share/doc/forge/Cargo.lock"
+BUILDINFO_SOURCE="${SCRIPT_DIR}/share/doc/forge/BUILDINFO"
+LICENSE_MIT_SOURCE="${SCRIPT_DIR}/share/doc/forge/LICENSE-MIT"
+LICENSE_APACHE_SOURCE="${SCRIPT_DIR}/share/doc/forge/LICENSE-APACHE"
 INSTALL_TEMP=""
 
 die() {
     printf 'forge release install: %s\n' "$*" >&2
     exit 1
+}
+
+require_source_file() {
+    local source="$1"
+    [[ -f "${source}" && -r "${source}" && ! -L "${source}" ]] \
+        || die "required release source is not a readable regular file: ${source}"
 }
 
 cleanup_install_temp() {
@@ -176,6 +195,34 @@ install_config_if_absent() {
     || die "configuration template is not a readable regular file: ${CONFIG_SOURCE}"
 [[ -f "${DESKTOP_SOURCE}" && -r "${DESKTOP_SOURCE}" && ! -L "${DESKTOP_SOURCE}" ]] \
     || die "desktop template is not a readable regular file: ${DESKTOP_SOURCE}"
+for source in \
+    "${METAINFO_SOURCE}" \
+    "${SVG_SOURCE}" \
+    "${PNG_128_SOURCE}" \
+    "${PNG_256_SOURCE}" \
+    "${WORKFLOW_HELPER_SOURCE}" \
+    "${NOTEBOOK_SOURCE}" \
+    "${README_SOURCE}" \
+    "${LOCK_SOURCE}" \
+    "${BUILDINFO_SOURCE}" \
+    "${LICENSE_MIT_SOURCE}" \
+    "${LICENSE_APACHE_SOURCE}"; do
+    require_source_file "${source}"
+done
+[[ -x "${WORKFLOW_HELPER_SOURCE}" ]] \
+    || die "workflow asset helper is not executable: ${WORKFLOW_HELPER_SOURCE}"
+shopt -s nullglob
+SHELL_SOURCES=(
+    "${SHELL_SOURCE_DIR}/README.md"
+    "${SHELL_SOURCE_DIR}/"forge.*
+)
+shopt -u nullglob
+((${#SHELL_SOURCES[@]} >= 5)) \
+    || die "release bundle is missing shell integration assets"
+for source in "${SHELL_SOURCES[@]}"; do
+    require_source_file "${source}"
+done
+bash "${WORKFLOW_HELPER_SOURCE}" --check "${WORKFLOW_SOURCE_DIR}"
 validate_desktop_exec_path "${BIN_DIR}/forge"
 
 printf 'Installing forge for %s...\n' "${USER:-the current user}"
@@ -190,28 +237,30 @@ install_config_if_absent "${CONFIG_SOURCE}" "${CONFIG_DIR}/config.toml"
 # absolute path and publish the rewritten template atomically.
 install_desktop_entry "${DESKTOP_SOURCE}" \
     "${SHARE_DIR}/applications/${APP_ID}.desktop"
-install -Dm0644 "${SCRIPT_DIR}/share/metainfo/${APP_ID}.metainfo.xml" \
+install_file_atomic 0644 "${METAINFO_SOURCE}" \
     "${SHARE_DIR}/metainfo/${APP_ID}.metainfo.xml"
-install -Dm0644 "${SCRIPT_DIR}/share/icons/hicolor/scalable/apps/${APP_ID}.svg" \
+install_file_atomic 0644 "${SVG_SOURCE}" \
     "${SHARE_DIR}/icons/hicolor/scalable/apps/${APP_ID}.svg"
-for size in 128 256; do
-    install -Dm0644 \
-        "${SCRIPT_DIR}/share/icons/hicolor/${size}x${size}/apps/${APP_ID}.png" \
-        "${SHARE_DIR}/icons/hicolor/${size}x${size}/apps/${APP_ID}.png"
-done
+install_file_atomic 0644 "${PNG_128_SOURCE}" \
+    "${SHARE_DIR}/icons/hicolor/128x128/apps/${APP_ID}.png"
+install_file_atomic 0644 "${PNG_256_SOURCE}" \
+    "${SHARE_DIR}/icons/hicolor/256x256/apps/${APP_ID}.png"
 
-install -d -m 0755 "${ASSET_DIR}/shell-integration" "${ASSET_DIR}/workflows"
-install -m 0644 "${SCRIPT_DIR}/share/forge/shell-integration/README.md" \
-    "${SCRIPT_DIR}"/share/forge/shell-integration/forge.* \
-    "${ASSET_DIR}/shell-integration/"
-bash "${SCRIPT_DIR}/libexec/install-workflow-assets.sh" \
-    "${SCRIPT_DIR}/share/forge/workflows" "${ASSET_DIR}/workflows"
-install -Dm0644 "${SCRIPT_DIR}/share/forge/notebooks/welcome.jtnb.md" \
+for source in "${SHELL_SOURCES[@]}"; do
+    install_file_atomic 0644 "${source}" \
+        "${ASSET_DIR}/shell-integration/${source##*/}"
+done
+bash "${WORKFLOW_HELPER_SOURCE}" \
+    "${WORKFLOW_SOURCE_DIR}" "${ASSET_DIR}/workflows"
+install_file_atomic 0644 "${NOTEBOOK_SOURCE}" \
     "${ASSET_DIR}/notebooks/welcome.jtnb.md"
 
-install -Dm0644 "${SCRIPT_DIR}/share/doc/forge/README.md" "${DOC_DIR}/README.md"
-install -Dm0644 "${SCRIPT_DIR}/share/doc/forge/Cargo.lock" "${DOC_DIR}/Cargo.lock"
-install -Dm0644 "${SCRIPT_DIR}/share/doc/forge/BUILDINFO" "${DOC_DIR}/BUILDINFO"
+install_file_atomic 0644 "${README_SOURCE}" "${DOC_DIR}/README.md"
+install_file_atomic 0644 "${CONFIG_SOURCE}" "${DOC_DIR}/config.toml.example"
+install_file_atomic 0644 "${LOCK_SOURCE}" "${DOC_DIR}/Cargo.lock"
+install_file_atomic 0644 "${BUILDINFO_SOURCE}" "${DOC_DIR}/BUILDINFO"
+install_file_atomic 0644 "${LICENSE_MIT_SOURCE}" "${DOC_DIR}/LICENSE-MIT"
+install_file_atomic 0644 "${LICENSE_APACHE_SOURCE}" "${DOC_DIR}/LICENSE-APACHE"
 
 if command -v desktop-file-validate >/dev/null 2>&1; then
     desktop-file-validate "${SHARE_DIR}/applications/${APP_ID}.desktop" || true

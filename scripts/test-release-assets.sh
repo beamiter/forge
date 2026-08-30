@@ -132,6 +132,49 @@ cmp -- "${bundle}/bin/forge-support-bundle" "${installed_support}" \
     || fail "installed release support mode is not 0755"
 [[ "$(stat -c '%a' -- "${installed_config}")" == 600 ]] \
     || fail "first-run release config mode is not 0600"
+PUBLIC_BUNDLE_FILES=(
+    "${bundle}/share/metainfo/io.github.beamiter.forge.metainfo.xml"
+    "${bundle}/share/icons/hicolor/scalable/apps/io.github.beamiter.forge.svg"
+    "${bundle}/share/icons/hicolor/128x128/apps/io.github.beamiter.forge.png"
+    "${bundle}/share/icons/hicolor/256x256/apps/io.github.beamiter.forge.png"
+    "${bundle}/share/forge/shell-integration/README.md"
+    "${bundle}/share/forge/shell-integration/forge.bash"
+    "${bundle}/share/forge/shell-integration/forge.zsh"
+    "${bundle}/share/forge/shell-integration/forge.fish"
+    "${bundle}/share/forge/shell-integration/forge.ps1"
+    "${bundle}/share/forge/notebooks/welcome.jtnb.md"
+    "${bundle}/share/doc/forge/README.md"
+    "${bundle}/share/doc/forge/config.toml.example"
+    "${bundle}/share/doc/forge/Cargo.lock"
+    "${bundle}/share/doc/forge/BUILDINFO"
+    "${bundle}/share/doc/forge/LICENSE-MIT"
+    "${bundle}/share/doc/forge/LICENSE-APACHE"
+)
+PUBLIC_INSTALLED_FILES=(
+    "${home}/.local/share/metainfo/io.github.beamiter.forge.metainfo.xml"
+    "${home}/.local/share/icons/hicolor/scalable/apps/io.github.beamiter.forge.svg"
+    "${home}/.local/share/icons/hicolor/128x128/apps/io.github.beamiter.forge.png"
+    "${home}/.local/share/icons/hicolor/256x256/apps/io.github.beamiter.forge.png"
+    "${home}/.local/share/forge/shell-integration/README.md"
+    "${home}/.local/share/forge/shell-integration/forge.bash"
+    "${home}/.local/share/forge/shell-integration/forge.zsh"
+    "${home}/.local/share/forge/shell-integration/forge.fish"
+    "${home}/.local/share/forge/shell-integration/forge.ps1"
+    "${home}/.local/share/forge/notebooks/welcome.jtnb.md"
+    "${home}/.local/share/doc/forge/README.md"
+    "${home}/.local/share/doc/forge/config.toml.example"
+    "${home}/.local/share/doc/forge/Cargo.lock"
+    "${home}/.local/share/doc/forge/BUILDINFO"
+    "${home}/.local/share/doc/forge/LICENSE-MIT"
+    "${home}/.local/share/doc/forge/LICENSE-APACHE"
+)
+for index in "${!PUBLIC_BUNDLE_FILES[@]}"; do
+    assert_file "installed public release asset" "${PUBLIC_INSTALLED_FILES[index]}"
+    cmp -- "${PUBLIC_BUNDLE_FILES[index]}" "${PUBLIC_INSTALLED_FILES[index]}" \
+        || fail "installed public asset differs from ${PUBLIC_BUNDLE_FILES[index]}"
+    [[ "$(stat -c '%a' -- "${PUBLIC_INSTALLED_FILES[index]}")" == 644 ]] \
+        || fail "installed public release asset mode is not 0644"
+done
 for source in "${WORKFLOW_SOURCES[@]}"; do
     installed="${installed_dir}/${source##*/}"
     assert_file "installed release workflow" "${installed}"
@@ -150,6 +193,9 @@ for source in "${WORKFLOW_SOURCES[@]}"; do
     assert_absent "owned release workflow" "${installed_dir}/${source##*/}"
 done
 assert_file "adjacent user workflow" "${custom}"
+for installed_public in "${PUBLIC_INSTALLED_FILES[@]}"; do
+    assert_absent "owned public release asset" "${installed_public}"
+done
 
 # A caller can still override the wrapper's default: forwarding happens after
 # the injected prefix, so the shared parser's ordinary last-option semantics
@@ -275,6 +321,31 @@ fi
 [[ "$(<"${TEST_ROOT}/invalid-desktop.log")" == \
     *"desktop executable path must not contain '='"* ]] \
     || fail "invalid release desktop path diagnostic was not actionable"
+
+# Every public input is checked before executable replacement. A tampered
+# archive containing a symlinked metainfo source must fail with the old binary
+# untouched.
+broken_bundle="${TEST_ROOT}/broken-bundle"
+cp -a -- "${bundle}" "${broken_bundle}"
+broken_meta="${broken_bundle}/share/metainfo/io.github.beamiter.forge.metainfo.xml"
+rm -f -- "${broken_meta}"
+ln -s -- "${bundle}/share/metainfo/io.github.beamiter.forge.metainfo.xml" \
+    "${broken_meta}"
+broken_home="${TEST_ROOT}/broken-home"
+broken_config_home="${TEST_ROOT}/broken-config"
+broken_binary="${broken_home}/.local/bin/forge"
+mkdir -p "${broken_binary%/*}"
+printf 'old broken-bundle forge\n' >"${broken_binary}"
+if env HOME="${broken_home}" XDG_CONFIG_HOME="${broken_config_home}" \
+    PATH=/usr/bin:/bin USER=forge-assets-test \
+    bash "${broken_bundle}/install.sh" >"${TEST_ROOT}/broken-install.log" 2>&1; then
+    fail "release installer accepted a symlinked public source"
+fi
+[[ "$(<"${broken_binary}")" == 'old broken-bundle forge' ]] \
+    || fail "public-source preflight replaced the old binary"
+[[ "$(<"${TEST_ROOT}/broken-install.log")" == \
+    *"required release source is not a readable regular file"* ]] \
+    || fail "symlinked public-source diagnostic was not actionable"
 
 # Kill the installer after it stages the first executable but before rename.
 # The old binary must survive byte-for-byte and the EXIT trap must clean temp.

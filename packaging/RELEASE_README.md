@@ -38,6 +38,9 @@ Binary and support-tool upgrades are also staged beside their destinations and
 renamed atomically, so an interruption keeps the previous executable intact.
 The desktop entry is validated, safely quotes non-standard HOME paths, and is
 published by the same no-symlink-following rename pattern.
+All remaining public assets are preflighted before executable replacement and
+published as `0644` files atomically; installed documentation includes both
+license texts and the configuration example carried by the archive.
 
 After installation:
 

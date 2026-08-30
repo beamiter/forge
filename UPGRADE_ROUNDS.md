@@ -271,3 +271,11 @@ quality gates listed in `README.md`.
     paths, counts the fields it rewrites, and publishes from a random adjacent
     temporary. E2Es cover a spaced HOME, invalid metacharacter preflight, and a
     hostile final symlink whose outside target must remain unchanged.
+
+69. **Preflighted atomic release resources** — every metainfo, icon, shell,
+    workflow, Notebook, and documentation source is verified before executable
+    replacement; public destinations use adjacent `0644` staging and rename.
+    The installed docs now retain the archive's config example and both license
+    texts, with symmetric uninstall ownership. The E2E byte-compares and
+    mode-checks the whole set, then proves a symlinked source fails before an
+    existing binary changes.
