@@ -191,3 +191,9 @@ quality gates listed in `README.md`.
     updated. The shared form therefore stays genuinely `Unset` instead of being
     immediately rewritten as `Supplied("")`; ordinary user edits still cross
     the callback. A mutation-sensitive app-level test covers both branches.
+
+57. **Smaller direct dependency contract** — unused direct edges for
+    `once_cell`, `bytecheck`, and `gdk4` leave the app manifest. The crates stay
+    transitively locked where core, rkyv, and GTK need them; GTK's `v4_14`
+    feature already propagates the matching GDK API level. Forge no longer
+    claims three APIs that no source, test, example, or build script imports.
