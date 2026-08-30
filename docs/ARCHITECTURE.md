@@ -59,7 +59,7 @@ The lightweight logger supports plain levels and target-specific `RUST_LOG` dire
 
 ## Quality gates
 
-CI runs the tracked-text privacy guard, rustfmt, shell syntax/ShellCheck, the full Rust test suite, a dedicated Xvfb-backed GTK display regression for `diag_short_ls_block_geometry`, strict Clippy, Rustdoc with warnings denied, a release build, and RustSec auditing. Dependabot covers Cargo and GitHub Actions. Pure helpers should have unit tests; GTK behavior that still cannot be automated belongs in the acceptance checklist and pull-request validation notes.
+CI runs the tracked-text privacy guard, rustfmt, shell syntax/ShellCheck, the full Rust test suite, a dedicated Xvfb-backed GTK display regression for `diag_short_ls_block_geometry`, strict Clippy, Rustdoc with warnings denied, a release build, and warnings-denied RustSec auditing of both committed lockfiles. The dependency-policy, RustSec, and shell jobs delegate to the same mode-aware security entry point used locally. Dependabot covers Cargo and GitHub Actions. Pure helpers should have unit tests; GTK behavior that still cannot be automated belongs in the acceptance checklist and pull-request validation notes.
 
 ## Invariants
 

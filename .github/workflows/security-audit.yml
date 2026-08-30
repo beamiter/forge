@@ -6,16 +6,20 @@ on:
     paths:
       - Cargo.toml
       - Cargo.lock
+      - .cargo/audit.toml
       - prototypes/ascii-organism/Cargo.toml
       - prototypes/ascii-organism/Cargo.lock
+      - scripts/security-check.sh
       - .github/workflows/security-audit.yml
   push:
     branches: [master]
     paths:
       - Cargo.toml
       - Cargo.lock
+      - .cargo/audit.toml
       - prototypes/ascii-organism/Cargo.toml
       - prototypes/ascii-organism/Cargo.lock
+      - scripts/security-check.sh
       - .github/workflows/security-audit.yml
   schedule:
     - cron: "17 3 * * 1"
@@ -65,6 +69,4 @@ jobs:
             "[[:space:]]${CARGO_AUDIT_VERSION}$"
 
       - name: Audit both locked dependency graphs
-        run: |
-          cargo audit --file Cargo.lock
-          cargo audit --file prototypes/ascii-organism/Cargo.lock
+        run: scripts/security-check.sh --audit

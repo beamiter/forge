@@ -55,7 +55,7 @@ jobs:
           --locked --force
 
       - name: Enforce dependency policy
-        run: cargo deny --locked check
+        run: scripts/security-check.sh --policy
 
   fmt:
     name: Rustfmt
@@ -109,9 +109,7 @@ jobs:
       - name: Check tracked shell scripts
         run: |
           set -euo pipefail
-          mapfile -t shell_files < <(find scripts packaging -type f -name '*.sh' -print | sort)
-          bash -n "${shell_files[@]}"
-          shellcheck "${shell_files[@]}"
+          scripts/security-check.sh --shell
           scripts/install.sh --help >/dev/null
           scripts/uninstall.sh --help >/dev/null
           bash scripts/test-install-paths.sh

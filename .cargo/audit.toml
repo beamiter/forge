@@ -1,0 +1,5 @@
+# cargo-audit otherwise reports informational advisories but exits successfully.
+# New unmaintained, unsound, notice, or yanked findings must fail the gate.
+[output]
+deny = ["warnings"]
+quiet = false

@@ -210,3 +210,10 @@ quality gates listed in `README.md`.
     fragile command sequence in workflow YAML. The script owns the generator
     commit, verifies its SHA-256 before execution, installs only hash-locked
     Python wheels, updates atomically, and can retain CI's mismatch artifact.
+
+60. **One fail-closed security entry point** — local `--all` and CI's
+    `--policy`, `--audit`, and `--shell` modes now share the same implementation.
+    Both committed lockfiles are proven locked and audited; cargo-audit warnings
+    are errors, so a future unsound, unmaintained, notice, or yanked advisory
+    cannot leave a green job. Shell discovery also owns Bash parsing as well as
+    ShellCheck, eliminating the last duplicated workflow logic.

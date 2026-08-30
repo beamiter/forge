@@ -24,9 +24,10 @@ make security
 
 `make verify` runs formatting, tests, strict Clippy, Rustdoc, the release build,
 shell syntax checks, and the tracked-text privacy guard. `make security` runs the
-locked dependency audit, `cargo deny` source/license policy, duplicate-dependency
-report, and ShellCheck policy; it requires `cargo-audit`, `cargo-deny`, and
-`shellcheck`. Run `make privacy` alone for the fast privacy check. It rejects
+warnings-denied audit of both committed lockfiles, `cargo deny` source/license
+policy, duplicate-dependency report, and ShellCheck policy through the same
+entry point CI invokes; it requires `cargo-audit`, `cargo-deny`, and `shellcheck`.
+Run `make privacy` alone for the fast privacy check. It rejects
 only known personal identifiers; neutral placeholders and RFC 5737 documentation
 addresses remain valid examples.
 
