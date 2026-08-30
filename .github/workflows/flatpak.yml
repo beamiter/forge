@@ -9,6 +9,8 @@ on:
       - 'LICENSE*'
       - data/**
       - packaging/flatpak/**
+      - scripts/install-workflow-assets.sh
+      - scripts/workflows/**
       - scripts/update-flatpak-cargo-sources.sh
       - scripts/smoke-flatpak.sh
       - src/**
@@ -21,6 +23,8 @@ on:
       - 'LICENSE*'
       - data/**
       - packaging/flatpak/**
+      - scripts/install-workflow-assets.sh
+      - scripts/workflows/**
       - scripts/update-flatpak-cargo-sources.sh
       - scripts/smoke-flatpak.sh
       - src/**

@@ -33,6 +33,8 @@ install -Dm0755 "${BINARY}" "${PACKAGE_ROOT}/bin/forge"
 install -Dm0755 scripts/support-bundle.sh "${PACKAGE_ROOT}/bin/forge-support-bundle"
 install -Dm0755 packaging/install-release.sh "${PACKAGE_ROOT}/install.sh"
 install -Dm0755 scripts/uninstall.sh "${PACKAGE_ROOT}/uninstall.sh"
+install -Dm0755 scripts/install-workflow-assets.sh \
+    "${PACKAGE_ROOT}/libexec/install-workflow-assets.sh"
 install -Dm0644 packaging/RELEASE_README.md "${PACKAGE_ROOT}/README.txt"
 printf '%s\n' "${VERSION}" >"${PACKAGE_ROOT}/VERSION"
 
@@ -65,8 +67,8 @@ install -d "${PACKAGE_ROOT}/share/doc/forge"
 install -d "${PACKAGE_ROOT}/share/forge/shell-integration"
 install -m 0644 scripts/shell-integration/README.md scripts/shell-integration/forge.* \
     "${PACKAGE_ROOT}/share/forge/shell-integration/"
-install -d "${PACKAGE_ROOT}/share/forge/workflows"
-install -m 0644 scripts/workflows/*.yaml "${PACKAGE_ROOT}/share/forge/workflows/"
+bash scripts/install-workflow-assets.sh scripts/workflows \
+    "${PACKAGE_ROOT}/share/forge/workflows"
 install -Dm0644 scripts/notebooks/welcome.jtnb.md \
     "${PACKAGE_ROOT}/share/forge/notebooks/welcome.jtnb.md"
 

@@ -81,6 +81,8 @@ shell 集成、内置 workflow 和欢迎 Notebook 安装到 `~/.local/share/forg
 因此不会在删除源码 checkout 后丢失示例或 Notebook。脚本支持 `DESTDIR`、`XDG_CONFIG_HOME`
 和 `CARGO_TARGET_DIR`；使用非默认 prefix 时可通过 `FORGE_ASSET_DIR` /
 `FORGE_WORKFLOW_DIR` 指向对应的 `share/forge` 目录。
+同一套 workflow 资产收集器也用于 Nix、Flatpak 和可重定位 release bundle；发布包回归会实际完成打包、
+解包、私有 HOME 安装与卸载，阻止某个通道退回只复制 `.yaml` 或手写文件名。
 
 `--binary` 输入必须是可读、非符号链接的普通文件。Bash 的初始 no-follow 检查与 open
 本身并非原子操作；只有成功打开且用 GNU `stat` 复核路径和描述符指向同一设备号/inode 后，

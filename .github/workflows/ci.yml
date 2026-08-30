@@ -113,6 +113,7 @@ jobs:
           scripts/install.sh --help >/dev/null
           scripts/uninstall.sh --help >/dev/null
           bash scripts/test-install-paths.sh
+          bash scripts/test-release-assets.sh
 
   gtk-display:
     name: GTK display regression

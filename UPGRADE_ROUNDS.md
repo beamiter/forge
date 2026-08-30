@@ -237,3 +237,11 @@ quality gates listed in `README.md`.
     byte-compares and mode-checks the complete candidate set, proves
     `--no-desktop` still ships it, and makes the deliberately narrow uninstaller
     preserve adjacent user workflows while removing every owned example.
+
+64. **One workflow asset boundary for every release channel** — Nix, Flatpak,
+    the relocatable archive builder, and that archive's installer now invoke
+    one bounded helper that copies all loader-supported extensions atomically.
+    A fixture-binary regression really packages, extracts, installs, and
+    uninstalls the archive, byte-checking the complete library and preserving an
+    adjacent user workflow; Flatpak also rebuilds when the helper or examples
+    change.

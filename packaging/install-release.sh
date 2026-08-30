@@ -69,8 +69,8 @@ install -d -m 0755 "${ASSET_DIR}/shell-integration" "${ASSET_DIR}/workflows"
 install -m 0644 "${SCRIPT_DIR}/share/forge/shell-integration/README.md" \
     "${SCRIPT_DIR}"/share/forge/shell-integration/forge.* \
     "${ASSET_DIR}/shell-integration/"
-install -m 0644 "${SCRIPT_DIR}"/share/forge/workflows/*.yaml \
-    "${ASSET_DIR}/workflows/"
+bash "${SCRIPT_DIR}/libexec/install-workflow-assets.sh" \
+    "${SCRIPT_DIR}/share/forge/workflows" "${ASSET_DIR}/workflows"
 install -Dm0644 "${SCRIPT_DIR}/share/forge/notebooks/welcome.jtnb.md" \
     "${ASSET_DIR}/notebooks/welcome.jtnb.md"
 
@@ -98,4 +98,3 @@ printf '  Support bundle:    %s\n' "${BIN_DIR}/forge-support-bundle"
 printf '  Configuration:     %s\n' "${CONFIG_DIR}/config.toml"
 printf '  Runtime assets:    %s\n' "${ASSET_DIR}"
 printf '\nMake sure %s is in PATH, then run forge --doctor.\n' "${BIN_DIR}"
-

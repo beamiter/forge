@@ -104,12 +104,7 @@ modules:
       - install -Dm0644 scripts/shell-integration/forge.zsh ${FLATPAK_DEST}/share/forge/shell-integration/forge.zsh
       - install -Dm0644 scripts/shell-integration/forge.fish ${FLATPAK_DEST}/share/forge/shell-integration/forge.fish
       - install -Dm0644 scripts/shell-integration/forge.ps1 ${FLATPAK_DEST}/share/forge/shell-integration/forge.ps1
-      - install -Dm0644 scripts/workflows/git-feature.yaml ${FLATPAK_DEST}/share/forge/workflows/git-feature.yaml
-      - install -Dm0644 scripts/workflows/find-large-files.yaml ${FLATPAK_DEST}/share/forge/workflows/find-large-files.yaml
-      - install -Dm0644 scripts/workflows/git-rebase-interactive.yaml ${FLATPAK_DEST}/share/forge/workflows/git-rebase-interactive.yaml
-      - install -Dm0644 scripts/workflows/ssh-tunnel.yaml ${FLATPAK_DEST}/share/forge/workflows/ssh-tunnel.yaml
-      - install -Dm0644 scripts/workflows/docker-tail-logs.yaml ${FLATPAK_DEST}/share/forge/workflows/docker-tail-logs.yaml
-      - install -Dm0644 scripts/workflows/kill-port.yaml ${FLATPAK_DEST}/share/forge/workflows/kill-port.yaml
+      - bash scripts/install-workflow-assets.sh scripts/workflows ${FLATPAK_DEST}/share/forge/workflows
       - install -Dm0644 scripts/notebooks/welcome.jtnb.md ${FLATPAK_DEST}/share/forge/notebooks/welcome.jtnb.md
     sources:
       - type: dir

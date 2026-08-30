@@ -505,24 +505,6 @@ if ((INSTALL_CONFIG == 1)); then
     validate_absolute_path "XDG_CONFIG_HOME" "${CONFIG_HOME}"
 fi
 
-# Install every file format accepted by the shared workflow loader. Nullglob
-# turns an empty source directory into an explicit preflight failure instead
-# of copying a literal wildcard. Keeping this candidate rule beside the
-# bundled-library Rust test means a new valid example cannot be parsed in a
-# checkout yet silently omitted from a native install.
-shopt -s nullglob
-WORKFLOW_SOURCES=(
-    "${REPO_ROOT}/scripts/workflows/"*.toml
-    "${REPO_ROOT}/scripts/workflows/"*.yaml
-    "${REPO_ROOT}/scripts/workflows/"*.yml
-)
-shopt -u nullglob
-((${#WORKFLOW_SOURCES[@]} > 0)) \
-    || die "no bundled workflow sources found under ${REPO_ROOT}/scripts/workflows"
-for source in "${WORKFLOW_SOURCES[@]}"; do
-    require_source_file "${source}"
-done
-
 STAGED_BIN_DIR="${DESTDIR}${BIN_DIR}"
 SHARE_DIR="${DESTDIR}${PREFIX}/share"
 ASSET_DIR="${SHARE_DIR}/forge"
@@ -538,6 +520,7 @@ fi
 # All repository assets are checked before a build or destination mutation.
 for source in \
     "${REPO_ROOT}/scripts/support-bundle.sh" \
+    "${REPO_ROOT}/scripts/install-workflow-assets.sh" \
     "${REPO_ROOT}/scripts/shell-integration/README.md" \
     "${REPO_ROOT}/scripts/shell-integration/forge.bash" \
     "${REPO_ROOT}/scripts/shell-integration/forge.zsh" \
@@ -546,6 +529,9 @@ for source in \
     "${REPO_ROOT}/scripts/notebooks/welcome.jtnb.md"; do
     require_source_file "${source}"
 done
+require_command bash
+bash "${REPO_ROOT}/scripts/install-workflow-assets.sh" --check \
+    "${REPO_ROOT}/scripts/workflows"
 if ((INSTALL_DESKTOP == 1)); then
     require_source_file "${REPO_ROOT}/data/${APP_ID}.desktop"
     require_source_file "${REPO_ROOT}/data/${APP_ID}.metainfo.xml"
@@ -639,9 +625,8 @@ for source in \
     install_file_atomic 0644 "${source}" \
         "${ASSET_DIR}/shell-integration/${source##*/}"
 done
-for source in "${WORKFLOW_SOURCES[@]}"; do
-    install_file_atomic 0644 "${source}" "${ASSET_DIR}/workflows/${source##*/}"
-done
+run bash "${REPO_ROOT}/scripts/install-workflow-assets.sh" \
+    "${REPO_ROOT}/scripts/workflows" "${ASSET_DIR}/workflows"
 install_file_atomic 0644 "${REPO_ROOT}/scripts/notebooks/welcome.jtnb.md" \
     "${ASSET_DIR}/notebooks/welcome.jtnb.md"
 

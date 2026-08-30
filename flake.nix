@@ -81,9 +81,8 @@
               install -m644 scripts/shell-integration/README.md \
                 scripts/shell-integration/forge.* \
                 "$out/share/forge/shell-integration/"
-              install -d "$out/share/forge/workflows"
-              install -m644 scripts/workflows/*.yaml \
-                "$out/share/forge/workflows/"
+              bash scripts/install-workflow-assets.sh scripts/workflows \
+                "$out/share/forge/workflows"
               install -Dm644 scripts/notebooks/welcome.jtnb.md \
                 "$out/share/forge/notebooks/welcome.jtnb.md"
             '';
