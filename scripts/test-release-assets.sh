@@ -214,13 +214,17 @@ assert_absent "dangling configuration target" \
 atomic_home="${TEST_ROOT}/atomic-home"
 atomic_config_home="${TEST_ROOT}/atomic-config"
 atomic_bin="${atomic_home}/.local/bin"
+atomic_desktop="${atomic_home}/.local/share/applications/io.github.beamiter.forge.desktop"
 binary_victim="${TEST_ROOT}/binary-victim"
 support_victim="${TEST_ROOT}/support-victim"
-mkdir -p "${atomic_bin}"
+desktop_victim="${TEST_ROOT}/desktop-victim"
+mkdir -p "${atomic_bin}" "${atomic_desktop%/*}"
 printf 'binary victim\n' >"${binary_victim}"
 printf 'support victim\n' >"${support_victim}"
+printf 'desktop victim\n' >"${desktop_victim}"
 ln -s -- "${binary_victim}" "${atomic_bin}/forge"
 ln -s -- "${support_victim}" "${atomic_bin}/forge-support-bundle"
+ln -s -- "${desktop_victim}" "${atomic_desktop}"
 env HOME="${atomic_home}" XDG_CONFIG_HOME="${atomic_config_home}" \
     PATH=/usr/bin:/bin USER=forge-assets-test \
     bash "${bundle}/install.sh" >/dev/null
@@ -230,6 +234,47 @@ env HOME="${atomic_home}" XDG_CONFIG_HOME="${atomic_config_home}" \
     || fail "release installer followed the binary destination symlink"
 [[ "$(<"${support_victim}")" == 'support victim' ]] \
     || fail "release installer followed the support destination symlink"
+[[ ! -L "${atomic_desktop}" ]] \
+    || fail "release installer retained the desktop destination symlink"
+[[ "$(<"${desktop_victim}")" == 'desktop victim' ]] \
+    || fail "release installer followed the desktop destination symlink"
+
+# Desktop Exec quoting remains valid when the release prefix contains spaces,
+# a backslash, and `$`; both the main entry and action point to the exact
+# installed binary without invoking shell expansion.
+spaced_home="${TEST_ROOT}/release home \\dir $"
+spaced_config_home="${TEST_ROOT}/spaced-config"
+env HOME="${spaced_home}" XDG_CONFIG_HOME="${spaced_config_home}" \
+    PATH=/usr/bin:/bin USER=forge-assets-test \
+    bash "${bundle}/install.sh" >/dev/null
+spaced_desktop="${spaced_home}/.local/share/applications/io.github.beamiter.forge.desktop"
+expected_exec="Exec=\"${TEST_ROOT}"'/release home \\\\dir \\$/.local/bin/forge"'
+[[ "$(grep -Fxc "${expected_exec}" "${spaced_desktop}")" == 2 ]] \
+    || fail "release desktop did not quote both Exec paths"
+expected_try_exec="TryExec=${TEST_ROOT}"'/release home \\dir $/.local/bin/forge'
+grep -Fxq "${expected_try_exec}" "${spaced_desktop}" \
+    || fail "release desktop TryExec does not name the installed binary"
+if command -v desktop-file-validate >/dev/null 2>&1; then
+    desktop-file-validate "${spaced_desktop}"
+fi
+
+# Invalid field metacharacters are rejected before an existing executable can
+# be replaced.
+invalid_home="${TEST_ROOT}/invalid=home"
+invalid_config_home="${TEST_ROOT}/invalid-config"
+invalid_binary="${invalid_home}/.local/bin/forge"
+mkdir -p "${invalid_binary%/*}"
+printf 'old invalid-path forge\n' >"${invalid_binary}"
+if env HOME="${invalid_home}" XDG_CONFIG_HOME="${invalid_config_home}" \
+    PATH=/usr/bin:/bin USER=forge-assets-test \
+    bash "${bundle}/install.sh" >"${TEST_ROOT}/invalid-desktop.log" 2>&1; then
+    fail "release installer accepted '=' in the desktop executable path"
+fi
+[[ "$(<"${invalid_binary}")" == 'old invalid-path forge' ]] \
+    || fail "desktop path preflight replaced the existing binary"
+[[ "$(<"${TEST_ROOT}/invalid-desktop.log")" == \
+    *"desktop executable path must not contain '='"* ]] \
+    || fail "invalid release desktop path diagnostic was not actionable"
 
 # Kill the installer after it stages the first executable but before rename.
 # The old binary must survive byte-for-byte and the EXIT trap must clean temp.

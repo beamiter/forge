@@ -17,6 +17,7 @@ DOC_DIR="${SHARE_DIR}/doc/forge"
 CONFIG_SOURCE="${SCRIPT_DIR}/share/doc/forge/config.toml.example"
 BINARY_SOURCE="${SCRIPT_DIR}/bin/forge"
 SUPPORT_SOURCE="${SCRIPT_DIR}/bin/forge-support-bundle"
+DESKTOP_SOURCE="${SCRIPT_DIR}/share/applications/${APP_ID}.desktop"
 INSTALL_TEMP=""
 
 die() {
@@ -47,6 +48,89 @@ install_file_atomic() {
         || die "cannot stage ${dest}"
     mv -fT -- "${INSTALL_TEMP}" "${dest}" \
         || die "cannot atomically replace ${dest}"
+    INSTALL_TEMP=""
+}
+
+desktop_exec_value() {
+    local remaining="$1" escaped="" character
+    while [[ -n "${remaining}" ]]; do
+        character="${remaining:0:1}"
+        remaining="${remaining:1}"
+        case "${character}" in
+            \\) escaped="${escaped}\\\\\\\\" ;;
+            '"') escaped+='\"' ;;
+            '`') escaped+='\`' ;;
+            '$') escaped+='\\$' ;;
+            *) escaped+="${character}" ;;
+        esac
+    done
+    printf '"%s"' "${escaped}"
+}
+
+desktop_try_exec_value() {
+    local remaining="$1" escaped="" character
+    while [[ -n "${remaining}" ]]; do
+        character="${remaining:0:1}"
+        remaining="${remaining:1}"
+        case "${character}" in
+            \\) escaped="${escaped}\\\\" ;;
+            *) escaped+="${character}" ;;
+        esac
+    done
+    printf '%s' "${escaped}"
+}
+
+validate_desktop_exec_path() {
+    local path="$1"
+    [[ "${path}" != *'='* ]] \
+        || die "desktop executable path must not contain '=': ${path}"
+    [[ "${path}" != *'%'* ]] \
+        || die "desktop executable path must not contain '%': ${path}"
+    if [[ "${path}" =~ [[:cntrl:]] ]]; then
+        die "desktop executable path must not contain control characters"
+    fi
+}
+
+install_desktop_entry() {
+    local source="$1" dest="$2" exec_path exec_value try_exec_value directory basename
+    exec_path="${BIN_DIR}/forge"
+    exec_value="$(desktop_exec_value "${exec_path}")"
+    try_exec_value="$(desktop_try_exec_value "${exec_path}")"
+    directory="${dest%/*}"
+    basename="${dest##*/}"
+    install -d -m 0755 -- "${directory}"
+    INSTALL_TEMP="$(mktemp "${directory}/.${basename}.install.XXXXXX")" \
+        || die "cannot create temporary desktop entry beside ${dest}"
+    if ! FORGE_DESKTOP_EXEC_VALUE="${exec_value}" \
+        FORGE_DESKTOP_TRY_EXEC_VALUE="${try_exec_value}" \
+        awk '
+        BEGIN { exec_count = 0; try_exec_count = 0 }
+        /^Exec=forge([[:space:]]|$)/ {
+            exec_count++
+            eq = index($0, "=")
+            print substr($0, 1, eq) ENVIRON["FORGE_DESKTOP_EXEC_VALUE"] \
+                substr($0, eq + 6)
+            next
+        }
+        /^TryExec=forge([[:space:]]|$)/ {
+            try_exec_count++
+            eq = index($0, "=")
+            print substr($0, 1, eq) ENVIRON["FORGE_DESKTOP_TRY_EXEC_VALUE"] \
+                substr($0, eq + 6)
+            next
+        }
+        /^Exec=/ { exit 45 }
+        /^TryExec=/ { exit 46 }
+        { print }
+        END {
+            if (exec_count < 1 || try_exec_count != 1) exit 44
+        }
+    ' "${source}" >"${INSTALL_TEMP}" \
+        || ! chmod 0644 "${INSTALL_TEMP}" \
+        || ! mv -fT -- "${INSTALL_TEMP}" "${dest}"; then
+        cleanup_install_temp
+        die "cannot atomically install desktop entry at ${dest}"
+    fi
     INSTALL_TEMP=""
 }
 
@@ -90,6 +174,9 @@ install_config_if_absent() {
     || die "${SUPPORT_SOURCE} is not a non-empty executable regular file"
 [[ -f "${CONFIG_SOURCE}" && -r "${CONFIG_SOURCE}" && ! -L "${CONFIG_SOURCE}" ]] \
     || die "configuration template is not a readable regular file: ${CONFIG_SOURCE}"
+[[ -f "${DESKTOP_SOURCE}" && -r "${DESKTOP_SOURCE}" && ! -L "${DESKTOP_SOURCE}" ]] \
+    || die "desktop template is not a readable regular file: ${DESKTOP_SOURCE}"
+validate_desktop_exec_path "${BIN_DIR}/forge"
 
 printf 'Installing forge for %s...\n' "${USER:-the current user}"
 install_file_atomic 0755 "${BINARY_SOURCE}" "${BIN_DIR}/forge"
@@ -99,19 +186,9 @@ install_config_if_absent "${CONFIG_SOURCE}" "${CONFIG_DIR}/config.toml"
 
 # A desktop session fixes its PATH at login, so `Exec=forge` fails TryExec and
 # hides the launcher entry whenever ${BIN_DIR} is missing from that PATH. This
-# bundle always installs per-user, so point the entry at the absolute path.
-install -d -m 0755 "${SHARE_DIR}/applications"
-awk -v exec_path="${BIN_DIR}/forge" '
-    /^Exec=forge([[:space:]]|$)/ || /^TryExec=forge([[:space:]]|$)/ {
-        eq = index($0, "=")
-        print substr($0, 1, eq) exec_path substr($0, eq + 7)
-        next
-    }
-    { print }
-' "${SCRIPT_DIR}/share/applications/${APP_ID}.desktop" \
-    >"${SHARE_DIR}/applications/${APP_ID}.desktop.new"
-chmod 0644 "${SHARE_DIR}/applications/${APP_ID}.desktop.new"
-mv -f -- "${SHARE_DIR}/applications/${APP_ID}.desktop.new" \
+# bundle always installs per-user, so point the entry at the safely escaped
+# absolute path and publish the rewritten template atomically.
+install_desktop_entry "${DESKTOP_SOURCE}" \
     "${SHARE_DIR}/applications/${APP_ID}.desktop"
 install -Dm0644 "${SCRIPT_DIR}/share/metainfo/${APP_ID}.metainfo.xml" \
     "${SHARE_DIR}/metainfo/${APP_ID}.metainfo.xml"

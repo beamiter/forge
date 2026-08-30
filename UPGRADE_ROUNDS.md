@@ -264,3 +264,10 @@ quality gates listed in `README.md`.
     `mv -T`. Hostile final symlinks are replaced without touching their targets;
     a signal-injected E2E kills installation between stage and rename and proves
     the prior binary survives byte-for-byte with no temporary residue.
+
+68. **Atomic, path-safe release desktop entry** — the release installer
+    validates its template and executable path before touching an installed
+    binary, escapes Desktop Entry `Exec`/`TryExec` values for non-standard HOME
+    paths, counts the fields it rewrites, and publishes from a random adjacent
+    temporary. E2Es cover a spaced HOME, invalid metacharacter preflight, and a
+    hostile final symlink whose outside target must remain unchanged.
