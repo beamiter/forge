@@ -34,6 +34,8 @@ and state by default. Add `--purge-config` only when those user files should
 also be removed; explicit `--prefix` / `--bin-dir` overrides are forwarded.
 First-run configuration publication is atomic: an existing file or symlink and
 a configuration created concurrently with installation are never overwritten.
+Binary and support-tool upgrades are also staged beside their destinations and
+renamed atomically, so an interruption keeps the previous executable intact.
 
 After installation:
 

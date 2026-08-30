@@ -258,3 +258,9 @@ quality gates listed in `README.md`.
     atomic hard link. Existing files, dangling symlinks, and a writer that wins
     after the initial check are preserved; controlled-link and symlink E2Es
     prove both branches and require temporary cleanup.
+
+67. **Atomic release executable upgrades** — the bundle preflights both
+    executable sources, stages each beside its destination, and commits with
+    `mv -T`. Hostile final symlinks are replaced without touching their targets;
+    a signal-injected E2E kills installation between stage and rename and proves
+    the prior binary survives byte-for-byte with no temporary residue.

@@ -122,6 +122,14 @@ installed_config="${config_home}/forge/config.toml"
 assert_file "installed release binary" "${installed_binary}"
 assert_file "installed release support tool" "${installed_support}"
 assert_file "installed release config" "${installed_config}"
+cmp -- "${bundle}/bin/forge" "${installed_binary}" \
+    || fail "installed release binary differs from the bundle"
+cmp -- "${bundle}/bin/forge-support-bundle" "${installed_support}" \
+    || fail "installed release support tool differs from the bundle"
+[[ "$(stat -c '%a' -- "${installed_binary}")" == 755 ]] \
+    || fail "installed release binary mode is not 0755"
+[[ "$(stat -c '%a' -- "${installed_support}")" == 755 ]] \
+    || fail "installed release support mode is not 0755"
 [[ "$(stat -c '%a' -- "${installed_config}")" == 600 ]] \
     || fail "first-run release config mode is not 0600"
 for source in "${WORKFLOW_SOURCES[@]}"; do
@@ -201,5 +209,59 @@ env HOME="${linked_home}" XDG_CONFIG_HOME="${linked_config_home}" \
     || fail "release installer replaced a dangling configuration symlink"
 assert_absent "dangling configuration target" \
     "${linked_config%/*}/missing-user-config"
+
+# Final executable symlinks are replaced, never followed into another file.
+atomic_home="${TEST_ROOT}/atomic-home"
+atomic_config_home="${TEST_ROOT}/atomic-config"
+atomic_bin="${atomic_home}/.local/bin"
+binary_victim="${TEST_ROOT}/binary-victim"
+support_victim="${TEST_ROOT}/support-victim"
+mkdir -p "${atomic_bin}"
+printf 'binary victim\n' >"${binary_victim}"
+printf 'support victim\n' >"${support_victim}"
+ln -s -- "${binary_victim}" "${atomic_bin}/forge"
+ln -s -- "${support_victim}" "${atomic_bin}/forge-support-bundle"
+env HOME="${atomic_home}" XDG_CONFIG_HOME="${atomic_config_home}" \
+    PATH=/usr/bin:/bin USER=forge-assets-test \
+    bash "${bundle}/install.sh" >/dev/null
+[[ ! -L "${atomic_bin}/forge" && ! -L "${atomic_bin}/forge-support-bundle" ]] \
+    || fail "release installer retained an executable destination symlink"
+[[ "$(<"${binary_victim}")" == 'binary victim' ]] \
+    || fail "release installer followed the binary destination symlink"
+[[ "$(<"${support_victim}")" == 'support victim' ]] \
+    || fail "release installer followed the support destination symlink"
+
+# Kill the installer after it stages the first executable but before rename.
+# The old binary must survive byte-for-byte and the EXIT trap must clean temp.
+interrupt_home="${TEST_ROOT}/interrupt-home"
+interrupt_config_home="${TEST_ROOT}/interrupt-config"
+interrupt_bin="${interrupt_home}/.local/bin"
+interrupt_tools="${TEST_ROOT}/interrupt-tools"
+mkdir -p "${interrupt_bin}" "${interrupt_tools}"
+printf 'old release forge\n' >"${interrupt_bin}/forge"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'last=""' \
+    'for argument do last="${argument}"; done' \
+    '/usr/bin/install "$@"' \
+    'case "${last}" in *.install.*) kill -TERM "${PPID}" ;; esac' \
+    >"${interrupt_tools}/install"
+chmod 0755 "${interrupt_tools}/install"
+if {
+    env HOME="${interrupt_home}" XDG_CONFIG_HOME="${interrupt_config_home}" \
+        PATH="${interrupt_tools}:/usr/bin:/bin" USER=forge-assets-test \
+        bash "${bundle}/install.sh"
+} >"${TEST_ROOT}/interrupt-install.log" 2>&1; then
+    fail "interrupted release installer unexpectedly succeeded"
+fi
+[[ "$(<"${interrupt_bin}/forge")" == 'old release forge' ]] \
+    || fail "interrupted release install replaced the old binary"
+shopt -s nullglob
+INTERRUPT_TEMPS=("${interrupt_bin}/.forge.install."*)
+shopt -u nullglob
+((${#INTERRUPT_TEMPS[@]} == 0)) \
+    || fail "interrupted release install left a binary temporary"
 
 printf 'release workflow asset contract: ok\n'

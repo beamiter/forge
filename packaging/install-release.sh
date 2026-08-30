@@ -15,6 +15,8 @@ CONFIG_DIR="${CONFIG_HOME}/forge"
 ASSET_DIR="${SHARE_DIR}/forge"
 DOC_DIR="${SHARE_DIR}/doc/forge"
 CONFIG_SOURCE="${SCRIPT_DIR}/share/doc/forge/config.toml.example"
+BINARY_SOURCE="${SCRIPT_DIR}/bin/forge"
+SUPPORT_SOURCE="${SCRIPT_DIR}/bin/forge-support-bundle"
 INSTALL_TEMP=""
 
 die() {
@@ -30,6 +32,23 @@ cleanup_install_temp() {
 }
 
 trap cleanup_install_temp EXIT
+
+# Stage beside the destination and publish with one rename. Reinstalling over
+# a final symlink replaces the link itself, and interruption before the rename
+# leaves the previous executable intact.
+install_file_atomic() {
+    local mode="$1" source="$2" dest="$3" directory basename
+    directory="${dest%/*}"
+    basename="${dest##*/}"
+    install -d -m 0755 -- "${directory}"
+    INSTALL_TEMP="$(mktemp "${directory}/.${basename}.install.XXXXXX")" \
+        || die "cannot create temporary file beside ${dest}"
+    install -m "${mode}" -- "${source}" "${INSTALL_TEMP}" \
+        || die "cannot stage ${dest}"
+    mv -fT -- "${INSTALL_TEMP}" "${dest}" \
+        || die "cannot atomically replace ${dest}"
+    INSTALL_TEMP=""
+}
 
 # Publish first-run configuration without a check-then-copy race. The private
 # temporary and destination share a directory, so link(2) is atomic; EEXIST
@@ -63,15 +82,18 @@ install_config_if_absent() {
 
 [[ -n "${HOME_DIR}" ]] || die "HOME is not set"
 [[ "${CONFIG_HOME}" == /* ]] || die "XDG_CONFIG_HOME must be an absolute path"
-[[ -x "${SCRIPT_DIR}/bin/forge" ]] \
-    || die "${SCRIPT_DIR}/bin/forge is missing or not executable"
+[[ -f "${BINARY_SOURCE}" && -r "${BINARY_SOURCE}" && \
+    -x "${BINARY_SOURCE}" && -s "${BINARY_SOURCE}" && ! -L "${BINARY_SOURCE}" ]] \
+    || die "${BINARY_SOURCE} is not a non-empty executable regular file"
+[[ -f "${SUPPORT_SOURCE}" && -r "${SUPPORT_SOURCE}" && \
+    -x "${SUPPORT_SOURCE}" && -s "${SUPPORT_SOURCE}" && ! -L "${SUPPORT_SOURCE}" ]] \
+    || die "${SUPPORT_SOURCE} is not a non-empty executable regular file"
 [[ -f "${CONFIG_SOURCE}" && -r "${CONFIG_SOURCE}" && ! -L "${CONFIG_SOURCE}" ]] \
     || die "configuration template is not a readable regular file: ${CONFIG_SOURCE}"
 
 printf 'Installing forge for %s...\n' "${USER:-the current user}"
-install -Dm0755 "${SCRIPT_DIR}/bin/forge" "${BIN_DIR}/forge"
-install -Dm0755 "${SCRIPT_DIR}/bin/forge-support-bundle" \
-    "${BIN_DIR}/forge-support-bundle"
+install_file_atomic 0755 "${BINARY_SOURCE}" "${BIN_DIR}/forge"
+install_file_atomic 0755 "${SUPPORT_SOURCE}" "${BIN_DIR}/forge-support-bundle"
 
 install_config_if_absent "${CONFIG_SOURCE}" "${CONFIG_DIR}/config.toml"
 
