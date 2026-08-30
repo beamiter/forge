@@ -197,3 +197,10 @@ quality gates listed in `README.md`.
     transitively locked where core, rkyv, and GTK need them; GTK's `v4_14`
     feature already propagates the matching GDK API level. Forge no longer
     claims three APIs that no source, test, example, or build script imports.
+
+58. **Lock-exact Flatpak source graph** — the committed offline source manifest
+    is regenerated from the shipping `Cargo.lock`, including jagent at
+    `ab7552d`, jterm_core at `f60c507`, and every updated crates.io checksum.
+    The documented maintenance boundary now forbids hand edits and points to
+    the same pinned generator and hash-locked Python environment that CI uses
+    for its byte-for-byte gate.

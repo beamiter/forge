@@ -72,6 +72,11 @@ CI regenerates the Cargo source manifest, validates the desktop and AppStream
 metadata, builds the bundle, records its SHA-256 checksum, and launches both VTE
 and Block modes under headless X11 and Wayland sessions.
 
+`cargo-sources.json` is generated data and must not be edited by hand. Every
+`Cargo.lock` update must regenerate it with the exact generator commit and
+hash-locked Python environment declared in `.github/workflows/flatpak.yml`.
+CI compares that output byte for byte before starting the bundle build.
+
 ## Install and diagnose
 
 ```bash
