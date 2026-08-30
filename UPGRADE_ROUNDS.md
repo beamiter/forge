@@ -173,3 +173,9 @@ are numbered 11–53.
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, and the repository-wide Rust
 quality gates listed in `README.md`.
+
+54. **Reversible workflow arguments** — every parameter row exposes **Reset**,
+    backed by the shared `ArgsForm::clear` contract rather than by assigning an
+    empty string. A defaulted row returns to its declared value; an undefaulted
+    row becomes genuinely unset and is named by the existing required-value
+    hint. The app-level regression pins both branches.

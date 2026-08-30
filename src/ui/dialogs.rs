@@ -4053,6 +4053,29 @@ impl UiState {
                 form_for_row.borrow_mut().set(index, row.text().as_str());
                 refresh_for_row();
             });
+            let reset = gtk4::Button::with_label("Reset");
+            reset.add_css_class("flat");
+            reset.set_valign(gtk4::Align::Center);
+            reset.set_tooltip_text(Some(if arg.default.is_some() {
+                "Restore the workflow's declared default"
+            } else {
+                "Clear this value and mark it as required"
+            }));
+            let form_for_reset = form.clone();
+            let row_for_reset = row.clone();
+            let refresh_for_reset = refresh_outstanding.clone();
+            reset.connect_clicked(move |_| {
+                // Drop the mutable borrow before `set_text`: changing the row
+                // emits `changed`, whose callback borrows the same form.
+                let value = {
+                    let mut form = form_for_reset.borrow_mut();
+                    form.clear(index);
+                    form.value(index).to_string()
+                };
+                row_for_reset.set_text(&value);
+                refresh_for_reset();
+            });
+            row.add_suffix(&reset);
             body.append(&row);
         }
 

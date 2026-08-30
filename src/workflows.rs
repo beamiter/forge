@@ -285,4 +285,38 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn resetting_an_argument_restores_default_or_unset() {
+        let workflow = Workflow {
+            name: "Deploy".to_string(),
+            description: String::new(),
+            command: "deploy {service} --env={env}".to_string(),
+            tags: Vec::new(),
+            shell: None,
+            args: vec![
+                WorkflowArg {
+                    name: "service".to_string(),
+                    description: String::new(),
+                    default: Some("api".to_string()),
+                },
+                WorkflowArg {
+                    name: "env".to_string(),
+                    description: String::new(),
+                    default: None,
+                },
+            ],
+            source_path: None,
+        };
+        let mut form = ArgsForm::new(workflow);
+        form.set(0, "worker");
+        form.set(1, "staging");
+        assert_eq!(form.render().unwrap(), "deploy worker --env=staging");
+
+        form.clear(0);
+        assert_eq!(form.value(0), "api");
+        form.clear(1);
+        assert_eq!(form.missing(), vec!["env"]);
+        assert!(form.render().unwrap_err().contains("missing values: env"));
+    }
 }
