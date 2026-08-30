@@ -47,7 +47,7 @@
 //! `jterm_core::workflows`' module docs for why every UI in the family
 //! defeated that guard.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use jterm_core::workflows::{search_path, DirSources, SearchPathSpec};
 
@@ -92,8 +92,42 @@ impl DirSources for GlibDirs {
     }
 
     fn system_data_dirs(&self) -> Vec<PathBuf> {
-        gtk4::glib::system_data_dirs()
+        installed_fallback_data_dirs()
     }
+}
+
+/// The no-argument installer has always owned `~/.local/share/forge`, even
+/// when the launching desktop exports a custom `XDG_DATA_HOME`. Keep that
+/// established install tree as a compatibility tier between the active user
+/// data directory and system data directories; an explicit non-default prefix
+/// still uses `FORGE_ASSET_DIR` / `FORGE_WORKFLOW_DIR` as documented.
+fn default_install_data_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .map(|home| home.join(".local").join("share"))
+}
+
+fn with_default_install_data_dir(
+    user_data: &Path,
+    mut system_data: Vec<PathBuf>,
+    default_install: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    if let Some(default_install) = default_install.filter(|dir| dir.is_absolute()) {
+        if default_install != user_data && !system_data.contains(&default_install) {
+            system_data.insert(0, default_install);
+        }
+    }
+    system_data
+}
+
+fn installed_fallback_data_dirs() -> Vec<PathBuf> {
+    let user_data = gtk4::glib::user_data_dir();
+    with_default_install_data_dir(
+        &user_data,
+        gtk4::glib::system_data_dirs(),
+        default_install_data_dir(),
+    )
 }
 
 /// The source-tree tier, passed in rather than computed in core:
@@ -162,7 +196,7 @@ pub fn welcome_notebook_path() -> Option<PathBuf> {
             .join("welcome.jtnb.md"),
     );
     candidates.extend(
-        gtk4::glib::system_data_dirs()
+        installed_fallback_data_dirs()
             .into_iter()
             .map(|dir| dir.join(APP).join("notebooks").join("welcome.jtnb.md")),
     );
@@ -240,6 +274,45 @@ mod tests {
             "a relative tier is how forge came to scan ./.config/forge/workflows"
         );
         assert!(dirs.len() <= jterm_core::workflows::MAX_WORKFLOW_DIRECTORIES);
+        if std::env::var_os("FORGE_WORKFLOW_DIR").is_none() {
+            if let Some(default_install) = default_install_data_dir() {
+                assert!(dirs.contains(&default_install.join(APP).join("workflows")));
+            }
+        }
+    }
+
+    #[test]
+    fn a_custom_xdg_home_keeps_the_default_install_tree_before_system_data() {
+        let dirs = with_default_install_data_dir(
+            Path::new("/custom/xdg"),
+            vec![
+                PathBuf::from("/usr/local/share"),
+                PathBuf::from("/usr/share"),
+            ],
+            Some(PathBuf::from("/home/test/.local/share")),
+        );
+        assert_eq!(
+            dirs,
+            [
+                PathBuf::from("/home/test/.local/share"),
+                PathBuf::from("/usr/local/share"),
+                PathBuf::from("/usr/share"),
+            ]
+        );
+
+        let duplicate_user = with_default_install_data_dir(
+            Path::new("/home/test/.local/share"),
+            vec![PathBuf::from("/usr/share")],
+            Some(PathBuf::from("/home/test/.local/share")),
+        );
+        assert_eq!(duplicate_user, [PathBuf::from("/usr/share")]);
+
+        let relative = with_default_install_data_dir(
+            Path::new("/custom/xdg"),
+            vec![PathBuf::from("/usr/share")],
+            Some(PathBuf::from("relative/share")),
+        );
+        assert_eq!(relative, [PathBuf::from("/usr/share")]);
     }
 
     /// Every bundled example must still load under the rules forge now

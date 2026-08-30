@@ -76,8 +76,10 @@ ABI 分发，不能把 Nix store 解释器/RPATH 烘进裸二进制。日常构�
 无参数源码安装沿用 `~/.cargo/bin/forge`，显式 `--prefix` 时二进制改为
 `PREFIX/bin/forge`；安装与卸载使用同一规则。脚本同时安装 `forge-support-bundle`，并把
 shell 集成、内置 workflow 和欢迎 Notebook 安装到 `~/.local/share/forge/`。配置使用
-`0600`。脚本支持 `DESTDIR`、`XDG_CONFIG_HOME` 和 `CARGO_TARGET_DIR`；使用非默认 prefix
-时可通过 `FORGE_ASSET_DIR` / `FORGE_WORKFLOW_DIR` 指向对应的 `share/forge` 目录。
+`0600`。即使桌面设置了自定义 `XDG_DATA_HOME`，运行时也会把这个默认安装位置作为兼容搜索层，
+因此不会在删除源码 checkout 后丢失示例或 Notebook。脚本支持 `DESTDIR`、`XDG_CONFIG_HOME`
+和 `CARGO_TARGET_DIR`；使用非默认 prefix 时可通过 `FORGE_ASSET_DIR` /
+`FORGE_WORKFLOW_DIR` 指向对应的 `share/forge` 目录。
 
 `--binary` 输入必须是可读、非符号链接的普通文件。Bash 的初始 no-follow 检查与 open
 本身并非原子操作；只有成功打开且用 GNU `stat` 复核路径和描述符指向同一设备号/inode 后，

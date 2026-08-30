@@ -446,7 +446,7 @@ Block Search 4.2 新增 **Bookmarked** 元数据筛选。它与 Failed、Slow、
 
 JSONL 历史默认位于 `${XDG_STATE_HOME:-~/.local/state}/forge/history.jsonl`，只保存 command、cwd、exit code 和完成时间，不保存终端输出。文件权限为 `0600`，重复命令按最新记录展示，损坏或超限记录会跳过，文件会按上限压缩。`Ctrl+Shift+H` 面板最多创建最近 500 行，即使磁盘保留上限更高；状态行会明确标出显示边界。
 
-用户 workflow 放在 `~/.config/forge/workflows/`，支持 `.toml`、`.yaml`、`.yml`；也可用 `FORGE_WORKFLOW_DIR` 增加以路径列表表示的目录。搜索顺序为：用户配置目录 → `FORGE_WORKFLOW_DIR` → 用户 data 目录 → 各系统 data 目录 → 源码树示例；去重按名字且先到先得，因此用户定义优先于已安装示例，同名项不会被示例覆盖。用户配置目录解析不到绝对路径时（例如 `HOME` 未设置）该层直接跳过，不会相对当前工作目录解析成 `./.config/forge/workflows`。
+用户 workflow 放在 `~/.config/forge/workflows/`，支持 `.toml`、`.yaml`、`.yml`；也可用 `FORGE_WORKFLOW_DIR` 增加以路径列表表示的目录。搜索顺序为：用户配置目录 → `FORGE_WORKFLOW_DIR` → 用户 data 目录 → 默认安装兼容层 `~/.local/share`（仅当它与 user data 不同时）→ 各系统 data 目录 → 源码树示例；去重按名字且先到先得，因此用户定义优先于已安装示例，同名项不会被示例覆盖。用户配置目录解析不到绝对路径时（例如 `HOME` 未设置）该层直接跳过，不会相对当前工作目录解析成 `./.config/forge/workflows`。
 
 格式与加载器与 anvil、ember、frost 共用（`jterm_core::workflows`），同一个文件在四个终端里含义相同。字段类型必须正确，类型不符会拒绝整份文件而不是抹掉坏值后照常加载：`default = 3000`（忘了加引号的端口）、`tags = ["net", 1]`、缺 `name` 的 `[[args]]`、参数名带首尾空格、命令模板为空或含不可见 / 双向控制字符，都属于此类。被跳过的文件会在日志里留下 `workflows: skipping <路径>: <原因>`（超限、符号链接、非 UTF-8、解析失败同理），`forge --doctor` 的 workflow 计数使用同一套遍历，因此 doctor 与面板不会对「哪些文件算候选」给出不同答案。
 
@@ -656,7 +656,8 @@ toggle_ai_panel = false
 - JSONL 命令历史：`${XDG_STATE_HOME:-~/.local/state}/forge/history.jsonl`，可用配置覆盖。
 - 可选 Block 全量历史：由 `block_history_path` 指定，可能包含输出。
 - 用户 workflow：`~/.config/forge/workflows/*.{toml,yaml,yml}`。
-- 已安装示例与 Notebook：`${prefix}/share/forge/`。
+- 已安装示例与 Notebook：`${prefix}/share/forge/`；默认安装的
+  `~/.local/share/forge/` 在自定义 `XDG_DATA_HOME` 下仍是兼容搜索层。
 
 配置、快照与历史包含敏感工作信息，备份或分享前应主动检查。
 

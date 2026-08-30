@@ -223,3 +223,10 @@ quality gates listed in `README.md`.
     prototype, release, and AI acceptance test commands continue after an
     individual target failure, and every main-crate command includes all
     targets, so one early failure or omitted example cannot hide another.
+
+62. **XDG-safe default asset discovery** — a custom `XDG_DATA_HOME` no longer
+    hides the workflow examples and welcome Notebook installed by the
+    no-argument installer under `~/.local/share/forge`. One deduplicated,
+    absolute compatibility tier sits after active user data and before system
+    data for both consumers; explicit non-default prefixes retain their
+    documented environment overrides.
