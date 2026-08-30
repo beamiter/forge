@@ -19,8 +19,8 @@ if ! command -v cargo-deny >/dev/null 2>&1; then
     exit 1
 fi
 
-cargo deny check
-cargo audit
+cargo deny --locked check
+cargo audit --file Cargo.lock
 cargo tree --locked --duplicates
 
 if ! command -v shellcheck >/dev/null 2>&1; then

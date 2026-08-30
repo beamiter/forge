@@ -53,7 +53,8 @@ make test-display
 
 `make verify` 运行格式、测试、独立 Xvfb 下的真实 GTK/VTE 回归、Clippy、Rustdoc、
 release 构建、shell 语法和已跟踪文本隐私
-检查；`make security` 运行 RustSec、依赖策略/许可证/来源门禁、重复依赖审计与 ShellCheck。
+检查；`make security` 对提交的 `Cargo.lock` 运行 RustSec、依赖策略/许可证/来源门禁、
+重复依赖审计与 ShellCheck，不会在检查过程中解析出另一份依赖图。
 两者现在都自动进入锁定的 Nix 开发环境，不会意外使用系统中过旧的 GTK/VTE；
 `make test-display` 会在独立 Xvfb 会话中逐项运行真实 GTK/VTE 回归。只需运行轻量隐私
 检查时可使用 `make privacy`。

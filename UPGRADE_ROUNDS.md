@@ -179,3 +179,9 @@ quality gates listed in `README.md`.
     empty string. A defaulted row returns to its declared value; an undefaulted
     row becomes genuinely unset and is named by the existing required-value
     hint. The app-level regression pins both branches.
+
+55. **One locked security graph** — the local security entry point now passes
+    `--locked` to cargo-deny and names `Cargo.lock` explicitly for cargo-audit,
+    matching CI and the already-locked metadata/tree checks. A security run can
+    no longer resolve or inspect a dependency graph other than the one being
+    shipped.
