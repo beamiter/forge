@@ -185,3 +185,9 @@ quality gates listed in `README.md`.
     matching CI and the already-locked metadata/tree checks. A security run can
     no longer resolve or inspect a dependency graph other than the one being
     shipped.
+
+56. **Reset survives GTK signal echo** — resetting an undefaulted workflow row
+    now suppresses the synchronous `EntryRow::changed` echo while its widget is
+    updated. The shared form therefore stays genuinely `Unset` instead of being
+    immediately rewritten as `Supplied("")`; ordinary user edits still cross
+    the callback. A mutation-sensitive app-level test covers both branches.

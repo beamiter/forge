@@ -420,6 +420,20 @@ fn clear_cross_block_search_dialog_claim<T: PartialEq>(
     }
 }
 
+/// Mirror a user edit into the shared workflow form, but ignore the synchronous
+/// `changed` signal emitted while Reset is only bringing the widget back in
+/// sync with a state already committed through `ArgsForm::clear`.
+fn record_workflow_arg_entry_change(
+    form: &mut crate::workflows::ArgsForm,
+    index: usize,
+    text: &str,
+    programmatic_sync: bool,
+) {
+    if !programmatic_sync {
+        form.set(index, text);
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CrossBlockSearchMemory {
     query: String,
@@ -4049,8 +4063,15 @@ impl UiState {
             }
             let form_for_row = form.clone();
             let refresh_for_row = refresh_outstanding.clone();
+            let programmatic_sync = Rc::new(Cell::new(false));
+            let sync_for_row = programmatic_sync.clone();
             row.connect_changed(move |row| {
-                form_for_row.borrow_mut().set(index, row.text().as_str());
+                record_workflow_arg_entry_change(
+                    &mut form_for_row.borrow_mut(),
+                    index,
+                    row.text().as_str(),
+                    sync_for_row.get(),
+                );
                 refresh_for_row();
             });
             let reset = gtk4::Button::with_label("Reset");
@@ -4064,6 +4085,7 @@ impl UiState {
             let form_for_reset = form.clone();
             let row_for_reset = row.clone();
             let refresh_for_reset = refresh_outstanding.clone();
+            let sync_for_reset = programmatic_sync.clone();
             reset.connect_clicked(move |_| {
                 // Drop the mutable borrow before `set_text`: changing the row
                 // emits `changed`, whose callback borrows the same form.
@@ -4072,7 +4094,9 @@ impl UiState {
                     form.clear(index);
                     form.value(index).to_string()
                 };
+                let previous = sync_for_reset.replace(true);
                 row_for_reset.set_text(&value);
+                sync_for_reset.set(previous);
                 refresh_for_reset();
             });
             row.add_suffix(&reset);
@@ -4245,17 +4269,18 @@ mod tests {
         cross_block_search_pending_status, cross_block_search_query_error,
         cross_block_search_refresh_status, cross_block_search_status, cross_block_selection_index,
         cross_block_should_step, preferences_group_title, record_snapshot_dialog_title,
-        record_snapshot_status_line, record_snapshot_unavailable_message, remote_picker_guard,
-        CrossBlockBookmarkKeyDecision, CrossBlockBookmarkKeyLatch, CrossBlockEnterKeyRoute,
-        CrossBlockJumpOutcome, CrossBlockRefreshFrameDecision, CrossBlockRefreshFrameGate,
-        CrossBlockRefreshKeyDecision, CrossBlockRefreshKeyLatch, CrossBlockSelectionAnchor,
-        CrossBlockSelectionMove, CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
-        WORKFLOW_PALETTE_POLICY,
+        record_snapshot_status_line, record_snapshot_unavailable_message,
+        record_workflow_arg_entry_change, remote_picker_guard, CrossBlockBookmarkKeyDecision,
+        CrossBlockBookmarkKeyLatch, CrossBlockEnterKeyRoute, CrossBlockJumpOutcome,
+        CrossBlockRefreshFrameDecision, CrossBlockRefreshFrameGate, CrossBlockRefreshKeyDecision,
+        CrossBlockRefreshKeyLatch, CrossBlockSelectionAnchor, CrossBlockSelectionMove,
+        CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES, WORKFLOW_PALETTE_POLICY,
     };
     use crate::block_view::{
         BookmarkedSearchEmptyReason, CrossBlockHit, CrossBlockSearchOptions, CrossBlockSearchScope,
         RecordNavigationResult, RecordSnapshotView,
     };
+    use crate::workflows::{ArgsForm, Workflow, WorkflowArg};
 
     fn cross_block_hit(block_id: u64) -> CrossBlockHit {
         CrossBlockHit {
@@ -4279,6 +4304,38 @@ mod tests {
             Err("No remote hosts are configured. Add one in Settings → Remote Hosts.")
         );
         assert!(remote_picker_guard(false, 1).is_ok());
+    }
+
+    #[test]
+    fn workflow_reset_widget_sync_does_not_turn_unset_into_supplied_empty() {
+        let workflow = Workflow {
+            name: "Run".to_string(),
+            description: String::new(),
+            command: "run {target}".to_string(),
+            tags: Vec::new(),
+            shell: None,
+            args: vec![WorkflowArg {
+                name: "target".to_string(),
+                description: String::new(),
+                default: None,
+            }],
+            source_path: None,
+        };
+        let mut form = ArgsForm::new(workflow);
+        form.set(0, "server");
+        form.clear(0);
+        assert!(!form.is_set(0));
+
+        record_workflow_arg_entry_change(&mut form, 0, "", true);
+        assert!(
+            !form.is_set(0),
+            "the synchronous GTK changed signal must preserve Unset"
+        );
+        record_workflow_arg_entry_change(&mut form, 0, "", false);
+        assert!(
+            form.is_set(0),
+            "a real user edit is still recorded as supplied"
+        );
     }
 
     #[test]
