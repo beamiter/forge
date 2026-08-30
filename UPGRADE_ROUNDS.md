@@ -245,3 +245,10 @@ quality gates listed in `README.md`.
     uninstalls the archive, byte-checking the complete library and preserving an
     adjacent user workflow; Flatpak also rebuilds when the helper or examples
     change.
+
+65. **Symmetric release-bundle uninstall defaults** — the extracted
+    `uninstall.sh` now injects the same `~/.local` prefix that its sibling
+    installer owns, then forwards explicit user overrides to the hardened
+    shared uninstaller. The archive E2E calls the documented no-argument path
+    and proves both the binary and support tool disappear along with owned
+    assets, while configuration and adjacent user workflows remain.

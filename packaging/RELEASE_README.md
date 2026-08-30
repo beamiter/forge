@@ -28,9 +28,10 @@ cd forge-*/
 ./install.sh
 ```
 
-The extracted `./uninstall.sh` removes the binary and installed assets while
-preserving configuration and state by default. Add `--purge-config` only when
-those user files should also be removed.
+The extracted `./uninstall.sh` uses the same `~/.local` default as the bundle
+installer, removes the binary and installed assets, and preserves configuration
+and state by default. Add `--purge-config` only when those user files should
+also be removed; explicit `--prefix` / `--bin-dir` overrides are forwarded.
 
 After installation:
 
@@ -44,4 +45,3 @@ forge
 
 For support, `forge-support-bundle [OUTPUT_DIRECTORY]` creates a
 privacy-preserving archive without network access. Review it before sharing.
-

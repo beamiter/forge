@@ -116,6 +116,12 @@ env HOME="${home}" XDG_CONFIG_HOME="${config_home}" \
     bash "${bundle}/install.sh" >/dev/null
 
 installed_dir="${home}/.local/share/forge/workflows"
+installed_binary="${home}/.local/bin/forge"
+installed_support="${home}/.local/bin/forge-support-bundle"
+installed_config="${config_home}/forge/config.toml"
+assert_file "installed release binary" "${installed_binary}"
+assert_file "installed release support tool" "${installed_support}"
+assert_file "installed release config" "${installed_config}"
 for source in "${WORKFLOW_SOURCES[@]}"; do
     installed="${installed_dir}/${source##*/}"
     assert_file "installed release workflow" "${installed}"
@@ -126,10 +132,26 @@ done
 custom="${installed_dir}/custom-user-workflow.yaml"
 printf 'name: Custom\ncommand: echo custom\n' >"${custom}"
 env HOME="${home}" XDG_CONFIG_HOME="${config_home}" PATH=/usr/bin:/bin \
-    bash "${bundle}/uninstall.sh" --prefix "${home}/.local" >/dev/null
+    bash "${bundle}/uninstall.sh" >/dev/null
+assert_absent "release binary under its default prefix" "${installed_binary}"
+assert_absent "release support tool under its default prefix" "${installed_support}"
+assert_file "release config preserved by default" "${installed_config}"
 for source in "${WORKFLOW_SOURCES[@]}"; do
     assert_absent "owned release workflow" "${installed_dir}/${source##*/}"
 done
 assert_file "adjacent user workflow" "${custom}"
+
+# A caller can still override the wrapper's default: forwarding happens after
+# the injected prefix, so the shared parser's ordinary last-option semantics
+# select the explicit value.
+override_prefix="${TEST_ROOT}/override-prefix"
+mkdir -p "${override_prefix}/bin"
+touch "${override_prefix}/bin/forge"
+override_dry_run="$(
+    env HOME="${home}" PATH=/usr/bin:/bin \
+        bash "${bundle}/uninstall.sh" --prefix "${override_prefix}" --dry-run
+)"
+[[ "${override_dry_run}" == *"${override_prefix}/bin/forge"* ]] \
+    || fail "release uninstaller did not forward an explicit prefix"
 
 printf 'release workflow asset contract: ok\n'
