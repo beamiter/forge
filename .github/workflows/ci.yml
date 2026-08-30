@@ -59,7 +59,7 @@ jobs:
 
   fmt:
     name: Rustfmt
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout repository
@@ -255,7 +255,7 @@ jobs:
           shared-key: tests
 
       - name: Run tests
-        run: cargo test --all-features --locked
+        run: cargo test --all-targets --all-features --locked --no-fail-fast
 
   ascii-organism:
     name: ASCII organism prototype
@@ -288,7 +288,7 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Run tests
-        run: cargo test --all-targets --locked
+        run: cargo test --all-targets --locked --no-fail-fast
 
   release-build:
     name: Release build

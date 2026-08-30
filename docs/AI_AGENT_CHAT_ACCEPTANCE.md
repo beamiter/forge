@@ -102,7 +102,7 @@ Agent 自动执行把用户选择的 shell rc、functions、hooks 与 key bindin
 
 ```bash
 cargo fmt --all -- --check
-cargo test --all-features --locked
+cargo test --all-targets --all-features --locked --no-fail-fast
 cargo clippy --all-targets --all-features --locked -- -D warnings
 ```
 

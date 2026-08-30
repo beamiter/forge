@@ -45,7 +45,7 @@ jobs:
 
       - name: Run release gates
         run: |
-          cargo test --all-features --locked
+          cargo test --all-targets --all-features --locked --no-fail-fast
           cargo clippy --all-targets --all-features --locked -- -D warnings
 
       - name: Build and verify bundle

@@ -217,3 +217,9 @@ quality gates listed in `README.md`.
     are errors, so a future unsound, unmaintained, notice, or yanked advisory
     cannot leave a green job. Shell discovery also owns Bash parsing as well as
     ShellCheck, eliminating the last duplicated workflow logic.
+
+61. **Fixed and exhaustive validation baseline** — the last moving
+    `ubuntu-latest` job now names Ubuntu 24.04 like the rest of CI. Main,
+    prototype, release, and AI acceptance test commands continue after an
+    individual target failure, and every main-crate command includes all
+    targets, so one early failure or omitted example cannot hide another.
