@@ -230,3 +230,10 @@ quality gates listed in `README.md`.
     absolute compatibility tier sits after active user data and before system
     data for both consumers; explicit non-default prefixes retain their
     documented environment overrides.
+
+63. **Loader-complete workflow packaging** — the native installer discovers
+    every bundled `.toml`, `.yaml`, and `.yml` example accepted by the shared
+    loader instead of maintaining a six-name copy. The real DESTDIR contract
+    byte-compares and mode-checks the complete candidate set, proves
+    `--no-desktop` still ships it, and makes the deliberately narrow uninstaller
+    preserve adjacent user workflows while removing every owned example.

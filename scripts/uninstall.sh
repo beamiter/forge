@@ -234,12 +234,19 @@ remove_file "${SHARE_DIR}/forge/shell-integration/forge.bash"
 remove_file "${SHARE_DIR}/forge/shell-integration/forge.zsh"
 remove_file "${SHARE_DIR}/forge/shell-integration/forge.fish"
 remove_file "${SHARE_DIR}/forge/shell-integration/forge.ps1"
-remove_file "${SHARE_DIR}/forge/workflows/git-feature.yaml"
-remove_file "${SHARE_DIR}/forge/workflows/find-large-files.yaml"
-remove_file "${SHARE_DIR}/forge/workflows/git-rebase-interactive.yaml"
-remove_file "${SHARE_DIR}/forge/workflows/ssh-tunnel.yaml"
-remove_file "${SHARE_DIR}/forge/workflows/docker-tail-logs.yaml"
-remove_file "${SHARE_DIR}/forge/workflows/kill-port.yaml"
+# This owned-name list is intentionally explicit: uninstall must not sweep a
+# directory where users may keep adjacent workflows. The install-path contract
+# derives its candidates from the source directory and proves this list stays
+# in sync whenever a bundled example is added or renamed.
+for workflow in \
+    docker-tail-logs.yaml \
+    find-large-files.yaml \
+    git-feature.yaml \
+    git-rebase-interactive.yaml \
+    kill-port.yaml \
+    ssh-tunnel.yaml; do
+    remove_file "${SHARE_DIR}/forge/workflows/${workflow}"
+done
 remove_file "${SHARE_DIR}/forge/notebooks/welcome.jtnb.md"
 remove_file "${SHARE_DIR}/doc/forge/README.md"
 remove_file "${SHARE_DIR}/doc/forge/config.toml.example"

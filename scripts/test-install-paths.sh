@@ -11,6 +11,19 @@ TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/forge-install-paths.XXXXXX")"
 TEST_HOME="${TEST_ROOT}/home"
 TEST_PATH="/usr/bin:/bin"
 
+# Mirror the shared loader's accepted extensions. The installer consumes this
+# complete set; the uninstall assertions below make an explicit owned-name
+# list fail CI instead of drifting when a new bundled example appears.
+shopt -s nullglob
+WORKFLOW_SOURCES=(
+    "${SCRIPT_DIR}/workflows/"*.toml
+    "${SCRIPT_DIR}/workflows/"*.yaml
+    "${SCRIPT_DIR}/workflows/"*.yml
+)
+shopt -u nullglob
+((${#WORKFLOW_SOURCES[@]} >= 6)) \
+    || { printf 'FAIL: expected at least six bundled workflow fixtures\n' >&2; exit 1; }
+
 trap 'rm -rf -- "${TEST_ROOT}"' EXIT
 mkdir -p "${TEST_HOME}"
 
@@ -149,8 +162,13 @@ installed_desktop="${stage}${runtime_share}/applications/${app_id}.desktop"
 installed_metainfo="${stage}${runtime_share}/metainfo/${app_id}.metainfo.xml"
 installed_asset="${stage}${runtime_share}/forge/notebooks/welcome.jtnb.md"
 installed_config="${stage}${config_home}/forge/config.toml"
+installed_workflow_dir="${stage}${runtime_share}/forge/workflows"
+installed_workflows=()
+for source in "${WORKFLOW_SOURCES[@]}"; do
+    installed_workflows+=("${installed_workflow_dir}/${source##*/}")
+done
 for file in "${installed_binary}" "${installed_support}" "${installed_desktop}" \
-    "${installed_asset}" "${installed_config}"; do
+    "${installed_asset}" "${installed_config}" "${installed_workflows[@]}"; do
     assert_regular_file "staged output" "${file}"
 done
 cmp -- "${prebuilt_binary}" "${installed_binary}" \
@@ -158,6 +176,11 @@ cmp -- "${prebuilt_binary}" "${installed_binary}" \
 assert_mode "binary" "${installed_binary}" 755
 assert_mode "desktop" "${installed_desktop}" 644
 assert_mode "config" "${installed_config}" 600
+for index in "${!WORKFLOW_SOURCES[@]}"; do
+    assert_mode "workflow" "${installed_workflows[index]}" 644
+    cmp -- "${WORKFLOW_SOURCES[index]}" "${installed_workflows[index]}" \
+        || fail "installed workflow differs from ${WORKFLOW_SOURCES[index]}"
+done
 
 expected_exec='Exec="/opt/forge release \\\\dir \\$/bin/forge"'
 [[ "$(grep -Fxc "${expected_exec}" "${installed_desktop}")" == 2 ]] \
@@ -199,6 +222,9 @@ env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${stage}" \
 [[ ! -L "${installed_binary}" ]] || fail "binary destination symlink survived reinstall"
 [[ "$(<"${victim}")" == victim ]] || fail "binary install followed destination symlink"
 [[ -L "${installed_config}" ]] || fail "installer replaced a dangling config symlink"
+for installed_workflow in "${installed_workflows[@]}"; do
+    assert_regular_file "workflow retained by --no-desktop install" "${installed_workflow}"
+done
 
 shopt -s nullglob
 binary_temps=("${installed_binary}.install."*)
@@ -209,6 +235,8 @@ shopt -u nullglob
 (( ${#desktop_temps[@]} == 0 )) || fail "desktop temporary files remain"
 (( ${#config_temps[@]} == 0 )) || fail "config temporary files remain"
 
+custom_workflow="${installed_workflow_dir}/custom-user-workflow.yaml"
+printf 'name: Custom\ncommand: echo custom\n' >"${custom_workflow}"
 env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${stage}" \
     XDG_CONFIG_HOME="${config_home}" "${UNINSTALLER}" \
     --prefix "${runtime_prefix}" >/dev/null
@@ -217,6 +245,11 @@ env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${stage}" \
 [[ ! -e "${installed_desktop}" && ! -L "${installed_desktop}" ]] \
     || fail "uninstaller left desktop entry"
 [[ -L "${installed_config}" ]] || fail "uninstaller removed preserved configuration"
+for installed_workflow in "${installed_workflows[@]}"; do
+    [[ ! -e "${installed_workflow}" && ! -L "${installed_workflow}" ]] \
+        || fail "uninstaller left owned workflow: ${installed_workflow}"
+done
+assert_regular_file "adjacent user workflow preserved" "${custom_workflow}"
 
 interrupt_tools="${TEST_ROOT}/interrupt-tools"
 interrupt_stage="${TEST_ROOT}/interrupt-stage"

@@ -75,7 +75,8 @@ ABI 分发，不能把 Nix store 解释器/RPATH 烘进裸二进制。日常构�
 
 无参数源码安装沿用 `~/.cargo/bin/forge`，显式 `--prefix` 时二进制改为
 `PREFIX/bin/forge`；安装与卸载使用同一规则。脚本同时安装 `forge-support-bundle`，并把
-shell 集成、内置 workflow 和欢迎 Notebook 安装到 `~/.local/share/forge/`。配置使用
+shell 集成、内置 workflow 和欢迎 Notebook 安装到 `~/.local/share/forge/`；安装器会自动纳入
+共享加载器接受的全部 `.toml` / `.yaml` / `.yml` 示例，卸载时只移除这些自带文件并保留同目录的用户 workflow。配置使用
 `0600`。即使桌面设置了自定义 `XDG_DATA_HOME`，运行时也会把这个默认安装位置作为兼容搜索层，
 因此不会在删除源码 checkout 后丢失示例或 Notebook。脚本支持 `DESTDIR`、`XDG_CONFIG_HOME`
 和 `CARGO_TARGET_DIR`；使用非默认 prefix 时可通过 `FORGE_ASSET_DIR` /

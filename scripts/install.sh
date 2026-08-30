@@ -505,6 +505,24 @@ if ((INSTALL_CONFIG == 1)); then
     validate_absolute_path "XDG_CONFIG_HOME" "${CONFIG_HOME}"
 fi
 
+# Install every file format accepted by the shared workflow loader. Nullglob
+# turns an empty source directory into an explicit preflight failure instead
+# of copying a literal wildcard. Keeping this candidate rule beside the
+# bundled-library Rust test means a new valid example cannot be parsed in a
+# checkout yet silently omitted from a native install.
+shopt -s nullglob
+WORKFLOW_SOURCES=(
+    "${REPO_ROOT}/scripts/workflows/"*.toml
+    "${REPO_ROOT}/scripts/workflows/"*.yaml
+    "${REPO_ROOT}/scripts/workflows/"*.yml
+)
+shopt -u nullglob
+((${#WORKFLOW_SOURCES[@]} > 0)) \
+    || die "no bundled workflow sources found under ${REPO_ROOT}/scripts/workflows"
+for source in "${WORKFLOW_SOURCES[@]}"; do
+    require_source_file "${source}"
+done
+
 STAGED_BIN_DIR="${DESTDIR}${BIN_DIR}"
 SHARE_DIR="${DESTDIR}${PREFIX}/share"
 ASSET_DIR="${SHARE_DIR}/forge"
@@ -525,12 +543,6 @@ for source in \
     "${REPO_ROOT}/scripts/shell-integration/forge.zsh" \
     "${REPO_ROOT}/scripts/shell-integration/forge.fish" \
     "${REPO_ROOT}/scripts/shell-integration/forge.ps1" \
-    "${REPO_ROOT}/scripts/workflows/git-feature.yaml" \
-    "${REPO_ROOT}/scripts/workflows/find-large-files.yaml" \
-    "${REPO_ROOT}/scripts/workflows/git-rebase-interactive.yaml" \
-    "${REPO_ROOT}/scripts/workflows/ssh-tunnel.yaml" \
-    "${REPO_ROOT}/scripts/workflows/docker-tail-logs.yaml" \
-    "${REPO_ROOT}/scripts/workflows/kill-port.yaml" \
     "${REPO_ROOT}/scripts/notebooks/welcome.jtnb.md"; do
     require_source_file "${source}"
 done
@@ -627,13 +639,7 @@ for source in \
     install_file_atomic 0644 "${source}" \
         "${ASSET_DIR}/shell-integration/${source##*/}"
 done
-for source in \
-    "${REPO_ROOT}/scripts/workflows/git-feature.yaml" \
-    "${REPO_ROOT}/scripts/workflows/find-large-files.yaml" \
-    "${REPO_ROOT}/scripts/workflows/git-rebase-interactive.yaml" \
-    "${REPO_ROOT}/scripts/workflows/ssh-tunnel.yaml" \
-    "${REPO_ROOT}/scripts/workflows/docker-tail-logs.yaml" \
-    "${REPO_ROOT}/scripts/workflows/kill-port.yaml"; do
+for source in "${WORKFLOW_SOURCES[@]}"; do
     install_file_atomic 0644 "${source}" "${ASSET_DIR}/workflows/${source##*/}"
 done
 install_file_atomic 0644 "${REPO_ROOT}/scripts/notebooks/welcome.jtnb.md" \
