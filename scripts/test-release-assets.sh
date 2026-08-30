@@ -122,6 +122,8 @@ installed_config="${config_home}/forge/config.toml"
 assert_file "installed release binary" "${installed_binary}"
 assert_file "installed release support tool" "${installed_support}"
 assert_file "installed release config" "${installed_config}"
+[[ "$(stat -c '%a' -- "${installed_config}")" == 600 ]] \
+    || fail "first-run release config mode is not 0600"
 for source in "${WORKFLOW_SOURCES[@]}"; do
     installed="${installed_dir}/${source##*/}"
     assert_file "installed release workflow" "${installed}"
@@ -153,5 +155,51 @@ override_dry_run="$(
 )"
 [[ "${override_dry_run}" == *"${override_prefix}/bin/forge"* ]] \
     || fail "release uninstaller did not forward an explicit prefix"
+
+# Force another writer to win exactly at link(2). The release installer must
+# preserve that configuration and clean its private staging name.
+race_home="${TEST_ROOT}/race-home"
+race_config_home="${TEST_ROOT}/race-config"
+race_config="${race_config_home}/forge/config.toml"
+race_tools="${TEST_ROOT}/race-tools"
+mkdir -p "${race_home}" "${race_tools}"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'destination=""' \
+    'for argument do destination="${argument}"; done' \
+    'printf "concurrent release config\n" >"${destination}"' \
+    'exec /usr/bin/ln "$@"' \
+    >"${race_tools}/ln"
+chmod 0755 "${race_tools}/ln"
+env HOME="${race_home}" XDG_CONFIG_HOME="${race_config_home}" \
+    PATH="${race_tools}:/usr/bin:/bin" USER=forge-assets-test \
+    bash "${bundle}/install.sh" >"${TEST_ROOT}/race-install.log"
+[[ "$(<"${race_config}")" == 'concurrent release config' ]] \
+    || fail "release installer overwrote a concurrent configuration"
+[[ "$(<"${TEST_ROOT}/race-install.log")" == \
+    *"Keeping concurrently created configuration"* ]] \
+    || fail "release installer did not report the concurrent configuration"
+shopt -s nullglob
+RACE_CONFIG_TEMPS=("${race_config%/*}/.config.toml.install."*)
+shopt -u nullglob
+((${#RACE_CONFIG_TEMPS[@]} == 0)) \
+    || fail "release config race left a temporary file"
+
+# A dangling configuration link is still an existing user choice; do not
+# follow it or replace it during a reinstall.
+linked_home="${TEST_ROOT}/linked-home"
+linked_config_home="${TEST_ROOT}/linked-config"
+linked_config="${linked_config_home}/forge/config.toml"
+mkdir -p "${linked_home}" "${linked_config%/*}"
+ln -s -- missing-user-config "${linked_config}"
+env HOME="${linked_home}" XDG_CONFIG_HOME="${linked_config_home}" \
+    PATH=/usr/bin:/bin USER=forge-assets-test \
+    bash "${bundle}/install.sh" >/dev/null
+[[ -L "${linked_config}" ]] \
+    || fail "release installer replaced a dangling configuration symlink"
+assert_absent "dangling configuration target" \
+    "${linked_config%/*}/missing-user-config"
 
 printf 'release workflow asset contract: ok\n'

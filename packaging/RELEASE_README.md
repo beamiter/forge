@@ -32,6 +32,8 @@ The extracted `./uninstall.sh` uses the same `~/.local` default as the bundle
 installer, removes the binary and installed assets, and preserves configuration
 and state by default. Add `--purge-config` only when those user files should
 also be removed; explicit `--prefix` / `--bin-dir` overrides are forwarded.
+First-run configuration publication is atomic: an existing file or symlink and
+a configuration created concurrently with installation are never overwritten.
 
 After installation:
 

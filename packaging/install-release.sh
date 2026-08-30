@@ -14,30 +14,66 @@ CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME_DIR}/.config}"
 CONFIG_DIR="${CONFIG_HOME}/forge"
 ASSET_DIR="${SHARE_DIR}/forge"
 DOC_DIR="${SHARE_DIR}/doc/forge"
+CONFIG_SOURCE="${SCRIPT_DIR}/share/doc/forge/config.toml.example"
+INSTALL_TEMP=""
 
 die() {
     printf 'forge release install: %s\n' "$*" >&2
     exit 1
 }
 
+cleanup_install_temp() {
+    if [[ -n "${INSTALL_TEMP:-}" ]]; then
+        rm -f -- "${INSTALL_TEMP}"
+        INSTALL_TEMP=""
+    fi
+}
+
+trap cleanup_install_temp EXIT
+
+# Publish first-run configuration without a check-then-copy race. The private
+# temporary and destination share a directory, so link(2) is atomic; EEXIST
+# means an existing file, symlink, or concurrent writer wins and is preserved.
+install_config_if_absent() {
+    local source="$1" dest="$2" directory basename
+    if [[ -e "${dest}" || -L "${dest}" ]]; then
+        printf 'Keeping existing configuration: %s\n' "${dest}"
+        return 0
+    fi
+    directory="${dest%/*}"
+    basename="${dest##*/}"
+    install -d -m 0700 -- "${directory}"
+    INSTALL_TEMP="$(mktemp "${directory}/.${basename}.install.XXXXXX")" \
+        || die "cannot create temporary configuration beside ${dest}"
+    install -m 0600 -- "${source}" "${INSTALL_TEMP}" \
+        || die "cannot stage initial configuration for ${dest}"
+    if ln -- "${INSTALL_TEMP}" "${dest}" 2>/dev/null; then
+        cleanup_install_temp
+        printf 'Created %s\n' "${dest}"
+        return 0
+    fi
+    if [[ -e "${dest}" || -L "${dest}" ]]; then
+        cleanup_install_temp
+        printf 'Keeping concurrently created configuration: %s\n' "${dest}"
+        return 0
+    fi
+    cleanup_install_temp
+    die "cannot atomically create initial configuration at ${dest}"
+}
+
 [[ -n "${HOME_DIR}" ]] || die "HOME is not set"
 [[ "${CONFIG_HOME}" == /* ]] || die "XDG_CONFIG_HOME must be an absolute path"
 [[ -x "${SCRIPT_DIR}/bin/forge" ]] \
     || die "${SCRIPT_DIR}/bin/forge is missing or not executable"
+[[ -f "${CONFIG_SOURCE}" && -r "${CONFIG_SOURCE}" && ! -L "${CONFIG_SOURCE}" ]] \
+    || die "configuration template is not a readable regular file: ${CONFIG_SOURCE}"
 
 printf 'Installing forge for %s...\n' "${USER:-the current user}"
 install -Dm0755 "${SCRIPT_DIR}/bin/forge" "${BIN_DIR}/forge"
 install -Dm0755 "${SCRIPT_DIR}/bin/forge-support-bundle" \
     "${BIN_DIR}/forge-support-bundle"
 
-install -d -m 0700 "${CONFIG_DIR}"
-if [[ ! -e "${CONFIG_DIR}/config.toml" ]]; then
-    install -m 0600 "${SCRIPT_DIR}/share/doc/forge/config.toml.example" \
-        "${CONFIG_DIR}/config.toml"
-    printf 'Created %s\n' "${CONFIG_DIR}/config.toml"
-else
-    printf 'Keeping existing configuration: %s\n' "${CONFIG_DIR}/config.toml"
-fi
+install_config_if_absent "${CONFIG_SOURCE}" "${CONFIG_DIR}/config.toml"
 
 # A desktop session fixes its PATH at login, so `Exec=forge` fails TryExec and
 # hides the launcher entry whenever ${BIN_DIR} is missing from that PATH. This

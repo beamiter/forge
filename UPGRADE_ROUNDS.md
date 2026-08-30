@@ -252,3 +252,9 @@ quality gates listed in `README.md`.
     shared uninstaller. The archive E2E calls the documented no-argument path
     and proves both the binary and support tool disappear along with owned
     assets, while configuration and adjacent user workflows remain.
+
+66. **Race-free release configuration ownership** — first-run bundle install
+    stages a private `0600` config beside its destination and publishes with an
+    atomic hard link. Existing files, dangling symlinks, and a writer that wins
+    after the initial check are preserved; controlled-link and symlink E2Es
+    prove both branches and require temporary cleanup.
