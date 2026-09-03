@@ -3313,8 +3313,6 @@ impl UiState {
                             FileTreeNavigationAction::Push
                         },
                     );
-                    ui.set_sidebar_visible(true, false);
-                    ui.apply_sidebar_view(crate::config::SidebarView::Files, false);
                 }
                 Err(error) => ui.show_remote_follow_failure(
                     source_for_apply,
