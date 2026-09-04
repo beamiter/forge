@@ -10022,6 +10022,49 @@ fn latched_live_origin(previous: Option<i64>, cursor_row: i64) -> i64 {
     previous.map_or(cursor_row, |row| row.min(cursor_row))
 }
 
+/// Rows the shell's prompt area occupies on the live surface right now.
+///
+/// A prompt is not one line. jsh draws its completion menu, its AI explanation
+/// and its signature hint *below* the input, and other shells do the same with
+/// a two-line prompt or `menu-select`. The compact card was sized from the
+/// typed command alone, so all of that was clipped to `MIN_INPUT_ROWS`: a Tab
+/// on `ls` showed four of fifty matches behind the live scrollbar with the rest
+/// of the pane empty underneath.
+///
+/// The grid is a full viewport at the prompt — the same winsize the child was
+/// told about — so the whole overlay is on screen and its lowest row holding
+/// text is the bottom of the prompt area. The scan starts at the adjustment's
+/// lower bound because PromptStart resets the live VTE and erases its
+/// scrollback (`ActiveBlock::reset_active`): that bound *is* the row the prompt
+/// began on. If a prompt ever outgrows the viewport the scan simply saturates
+/// at the grid, which is the largest card the pane can show anyway.
+fn prompt_area_rows(vte: &Terminal, grid_rows: i64) -> i64 {
+    let Some(adjustment) = vte.vadjustment() else {
+        return 1;
+    };
+    let lower = adjustment.lower();
+    if !lower.is_finite() {
+        return 1;
+    }
+    let origin = lower as i64;
+    // A bound that has drifted past the cursor is not a row this prompt drew
+    // on; measuring from it would read rows the ring no longer holds.
+    if origin > vte.cursor_position().1 {
+        return 1;
+    }
+    lowest_drawn_screen_row(vte, origin, 0, grid_rows).map_or(1, |row| row + 1)
+}
+
+/// Height of the compact input card: the typed command, never less than
+/// `MIN_INPUT_ROWS`, never more than the viewport — and never less than what
+/// the shell has actually drawn at this prompt (see [`prompt_area_rows`]).
+fn compact_card_rows(input_rows: i64, drawn_rows: i64, viewport_rows: i64) -> i64 {
+    let floor = (MIN_INPUT_ROWS as i64).min(viewport_rows);
+    input_rows
+        .max(drawn_rows)
+        .clamp(floor, viewport_rows.max(floor))
+}
+
 /// The lowest screen row in `from..grid_rows` that already holds text, if any,
 /// where row `0` is the ring row `origin`.
 ///
@@ -11191,6 +11234,12 @@ impl TermView {
         if density_changed {
             self.apply_block_density(config.block_compact);
         }
+        // The live-card layout reads this from the ActiveBlock rather than the
+        // shared config: it runs on the reader path, where borrowing the config
+        // cell across the pass would outlive that cell's borrow discipline.
+        self.active
+            .borrow()
+            .set_preserve_live_scrollback(config.preserve_live_scrollback);
     }
 
     /// Switch every card in this pane, and the live input cell, to the
@@ -11753,26 +11802,33 @@ impl TermView {
                 };
                 let cols = vte.column_count().max(1);
                 holder.set_visible(true);
-                let compact_rows = {
-                    let input_lines =
-                        1 + typed_cmd.borrow().bytes().filter(|&b| b == b'\n').count() as i64;
-                    let floor = (MIN_INPUT_ROWS as i64).min(viewport_rows);
-                    input_lines.clamp(floor, viewport_rows.max(floor))
-                };
+                let input_rows =
+                    1 + typed_cmd.borrow().bytes().filter(|&b| b == b'\n').count() as i64;
                 let state = bstate.get();
-                // The grid: unchanged. A running command, an alternate-screen
-                // app and the no-integration fallback all get the full viewport
-                // the child was told about through `pty_grid_size`, so absolute
-                // cursor addressing (`top`, `watch`, a plain `clear`) still has
-                // every row it expects to draw into.
-                let target_rows = match state {
-                    BlockState::Idle
-                    | BlockState::CollectingPrompt
-                    | BlockState::AwaitingCommand => compact_rows,
-                    BlockState::CollectingOutput
-                    | BlockState::PostCommand
-                    | BlockState::AltScreen
-                    | BlockState::RawFallback => viewport_rows,
+                let idle = matches!(
+                    state,
+                    BlockState::Idle | BlockState::CollectingPrompt | BlockState::AwaitingCommand
+                );
+                // Where the prompt sits inside the live grid. With the default
+                // reset it starts at the top of a cleared screen, so the card —
+                // which shows the grid's first rows — can cover whatever the
+                // shell drew below the input. With the previous command's
+                // scrollback deliberately kept, the prompt is at the bottom of
+                // the ring instead and the grid stays pinned to the card.
+                let prompt_at_grid_top = active_block
+                    .try_borrow()
+                    .map(|live| !live.preserve_live_scrollback())
+                    .unwrap_or(false);
+                // The grid: a running command, an alternate-screen app and the
+                // no-integration fallback all get the full viewport the child
+                // was told about through `pty_grid_size`, so absolute cursor
+                // addressing (`top`, `watch`, a plain `clear`) still has every
+                // row it expects to draw into — and so does a shell drawing a
+                // completion menu at the prompt.
+                let target_rows = if idle && !prompt_at_grid_top {
+                    compact_card_rows(input_rows, 1, viewport_rows)
+                } else {
+                    viewport_rows
                 };
                 // The card: while a command runs it is only as tall as the
                 // output so far, so the blocks above stay on screen and the
@@ -11824,11 +11880,23 @@ impl TermView {
                         target_rows
                     }
                     _ => {
+                        // Between prompts the live cell collapses to fit the
+                        // typed command (warp-style compact input) — but the
+                        // shell owns more of the screen than the command line
+                        // whenever it draws below the input: a completion menu,
+                        // an AI explanation, a two-line prompt. The card grows
+                        // to cover that and shrinks again when it closes.
+                        let drawn = if prompt_at_grid_top {
+                            prompt_area_rows(&vte, target_rows)
+                        } else {
+                            1
+                        };
+                        let rows = compact_card_rows(input_rows, drawn, viewport_rows);
                         // Preserve the compact input height across
                         // CommandStart. Until output begins, VTE's cursor and
                         // adjustment may belong to different grid generations.
-                        live_rows_high_water.set(target_rows);
-                        target_rows
+                        live_rows_high_water.set(rows);
+                        rows
                     }
                 };
                 let target = (cols, target_rows);
@@ -15917,6 +15985,27 @@ mod tests {
         // A lower sample still wins while the prompt is drawing.
         assert_eq!(super::latched_live_origin(Some(5), 3), 3);
         assert_eq!(super::latched_live_origin(None, 7), 7);
+    }
+
+    #[test]
+    fn the_compact_card_covers_whatever_the_shell_drew_at_the_prompt() {
+        use super::{compact_card_rows, MIN_INPUT_ROWS};
+        // An empty prompt keeps the warp-style floor, whatever it measured.
+        assert_eq!(compact_card_rows(1, 1, 40), MIN_INPUT_ROWS as i64);
+        assert_eq!(compact_card_rows(1, 3, 40), MIN_INPUT_ROWS as i64);
+        // A completion menu below the input is the card's height now: it used
+        // to be clipped to the floor with the rest of the pane left empty.
+        assert_eq!(compact_card_rows(1, 29, 40), 29);
+        // A multi-line command still counts, and the taller of the two wins.
+        assert_eq!(compact_card_rows(12, 3, 40), 12);
+        assert_eq!(compact_card_rows(12, 29, 40), 29);
+        // Neither may push the card past the pane.
+        assert_eq!(compact_card_rows(80, 1, 40), 40);
+        assert_eq!(compact_card_rows(1, 400, 40), 40);
+        // A pane too short for the floor gets the pane, not a card that
+        // overflows it.
+        assert_eq!(compact_card_rows(1, 1, 3), 3);
+        assert_eq!(compact_card_rows(9, 9, 3), 3);
     }
 
     #[test]
