@@ -279,3 +279,95 @@ quality gates listed in `README.md`.
     texts, with symmetric uninstall ownership. The E2E byte-compares and
     mode-checks the whole set, then proves a symlinked source fails before an
     existing binary changes.
+
+70. **Lifecycle-bound journal output on core `9f94f77`** — the repin (core,
+    the direct `jagent` pin, `Cargo.lock`, `deny.toml`, `flake.nix`) lands with
+    `CompletedExecution`'s bare id replaced by an `ExecutionLifecycle` minted
+    only from a complete `C`-mark envelope. `PendingCommandMeta` captures it at
+    `C`, a mismatching `D` clears it with the id, and both provenance filters
+    from the old predicate now apply to the token's own id: the per-pane shell
+    secret never reaches a durable shared file, and a non-`jsh` id never spends
+    a writer slot. Tests cover each of the four identity slots individually,
+    a `D` packet that tries to mint or replace the token, and a complete
+    envelope keyed by the pane secret. Core's two new fixture affordances are
+    taken up in the same round: the correction card's verified direct-run
+    branch is covered for the first time, and the probe reader thread's name is
+    checked through the engine's accessor against a literal.
+
+71. **Config edits that survive the watcher** — a dirty epoch counted on the
+    GTK thread against an atomic mark the persistence worker raises with
+    `fetch_max`, a Skip/Apply/Conflict decision over it and the file revision,
+    and a conflict dialog whose default and Escape both keep the unsaved edit.
+    The destructive answer cancels both debounce generations and the queued
+    font sweep first. The 200 ms/250 ms race is covered as state transitions,
+    with no sleeping.
+
+72. **Config persistence off the UI thread's lock** — the revision slot is read
+    and published inside the advisory file lock and held only for those moves,
+    so the two-second lock spin and every fsync happen outside it; writers stay
+    serialized by the lock that actually orders them. The regression holds the
+    slot and proves the save reaches the file lock anyway, through the existing
+    read-only lock probe; it fails in two seconds against the old ordering.
+
+73. **A reload that cannot be trusted changes nothing** — the second read's
+    recorded error and its revision are both checked against the revision this
+    reload validated before any setting is replaced, so a failed or raced read
+    no longer resets theme, keybindings and remote hosts to defaults silently.
+
+74. **Logarithmic Block viewport resolution** — a Fenwick prefix index over the
+    card document, both viewport edges reduced to one descent, point-patched by
+    the visibility appliers and rebuilt only on a length change or an explicit
+    stale mark from the non-frame writers. Visibility now touches the union of
+    the outgoing and incoming sets instead of every finished card. A counting
+    test bounds the probes at 1k/10k/100k, a property test checks the descent
+    against the from-zero walk it replaced over generated documents, and the
+    microbenchmark reports 102 µs against 52 ns at 50 000 cards.
+
+75. **Git metadata that never blocks and never idles** — the Agent panel's
+    probe and prompt assembly moved into the request thread, and the strip's
+    cache gained a TTL plus explicit invalidation at command completion, so an
+    idle window stops forking one `git status` per second.
+
+76. **No exact record for a self-contradictory packet** — a `C` mark carrying
+    both a command prefix and `cmd_truncated=1` can no longer resolve to
+    `ShellReported`, so the flag that unlocks agent replay is never set for
+    half a command line.
+
+77. **Private staging for remote directory downloads** — extraction moved out
+    of the destination's parent into a `0700` process-owned directory, with a
+    single-expected-top-level check (name and real directory, not a link)
+    before an atomic publish, and a `Drop` guard that removes staging on every
+    path. The regression covers the honest tree, a smuggled sibling dotfile, a
+    renamed top level, a symlinked one, and an empty archive.
+
+78. **A Block-history failure that waits for an answer** — the one fail-closed
+    persistence operation routes to a persistent bar with an explicit Retry
+    instead of an eight-second toast, and Retry reloads the panes whose load
+    failed while re-saving the rest.
+
+79. **Zone history through the shared bounded reader** — `stat`-then-read
+    replaced by `snapshot_file::read_bounded`, which enforces the ceiling on
+    the descriptor it reads and refuses fifos, devices, hard-linked files and
+    files another user can write.
+
+
+80. **Review follow-ups on rounds 74 and 75** — three defects the adversarial
+    pass found in the same working tree, fixed in place. The differential
+    visibility pass (74) only ever visited the union of the outgoing and
+    incoming visible sets, which is exact for a scroll tick and wrong for
+    everything else: a card mounted by a finished command or an undo arrives
+    un-virtualized and is named by neither set, and the filter and undo paths
+    hand the pass an emptied set on purpose. Either way the cards involved
+    stayed laid out in full at heights the document no longer recorded. The
+    obligation to sweep every card now travels on `BlockDocumentIndex`, which
+    already had to rebuild for exactly those reasons, so the per-frame case
+    stays differential and nothing else does. The pass moved behind a
+    `VirtualizableCard` seam so that transition is finally pinned by tests that
+    run without a display. In (75), a finished command invalidated the *focused*
+    pane's directory rather than the pane that ran it, so a command in a
+    background tab or a sibling split left its own pane serving a stale branch
+    for the whole 30 s TTL; the handler now resolves the directory from the view
+    it is installed on. Also in (75), the probe worker cleared the invalidation
+    flag unconditionally, discarding any report that arrived while Git was
+    running — two commands in a row on a slow checkout was enough — so a probe
+    now answers only for the generation it was queued at.

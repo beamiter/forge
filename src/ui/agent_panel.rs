@@ -707,18 +707,13 @@ impl AgentRuntime {
             }
         };
         let cwd = runtime.target.cwd();
-        // Bounded probe (short UI wait, then cached/stale): branch and dirty
-        // state let the model tailor proposals to the repository.
-        let git = crate::git_meta::read(std::path::Path::new(&cwd));
         let system = crate::ai::build_agent_system_prompt();
-        let prompt = crate::ai::agent_user_prompt(
-            &runtime.session.borrow().build_user_prompt(),
-            if cwd.is_empty() { "." } else { &cwd },
-            &runtime.shell,
-            std::env::consts::OS,
-            git.as_ref(),
-            runtime.block_context.borrow().as_ref(),
-        );
+        // Everything the prompt needs, taken here because it lives behind
+        // `RefCell`s this thread owns. The prompt itself is assembled on the
+        // request thread, because the one remaining ingredient is a Git probe.
+        let session_prompt = runtime.session.borrow().build_user_prompt();
+        let shell = runtime.shell.clone();
+        let block_context = runtime.block_context.borrow().clone();
         let session_cancellation = runtime.session.borrow().cancellation_token();
         let request_cancellation = crate::ai::AiCancellationToken::new();
         *runtime.request_cancellation.borrow_mut() = Some(request_cancellation.clone());
@@ -741,6 +736,24 @@ impl AgentRuntime {
 
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
+            if session_cancellation.is_cancelled() {
+                return;
+            }
+            // The blocking probe belongs here, not on the GTK thread. Branch
+            // and dirty state let the model tailor its proposals, but the
+            // bounded reader still waits on a `git` process, and on a FUSE or
+            // network checkout that wait is unbounded in practice — the panel
+            // would freeze on the keystroke that submitted the turn. This
+            // thread is already about to wait on the network.
+            let git = crate::git_meta::read(std::path::Path::new(&cwd));
+            let prompt = crate::ai::agent_user_prompt(
+                &session_prompt,
+                if cwd.is_empty() { "." } else { &cwd },
+                &shell,
+                std::env::consts::OS,
+                git.as_ref(),
+                block_context.as_ref(),
+            );
             if session_cancellation.is_cancelled() {
                 return;
             }

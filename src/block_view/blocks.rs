@@ -4418,9 +4418,11 @@ mod tests {
         assert_eq!(block.set_virtualized(false), roomy_placeholder);
         super::apply_finished_card_density(std::slice::from_ref(&block), &mut block_data, true);
         let mut visible = std::collections::HashSet::from([0]);
+        let mut document_index = super::super::BlockDocumentIndex::default();
         super::super::apply_visible_indices_preserving_heights(
             std::slice::from_ref(&block),
             &mut block_data,
+            &mut document_index,
             &mut visible,
             std::collections::HashSet::new(),
         );

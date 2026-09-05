@@ -23,6 +23,7 @@ mod command_review;
 mod config_apply;
 mod dialogs;
 mod file_tree;
+pub(crate) mod history_notice;
 mod jsh;
 mod layout;
 mod notebooks;
@@ -47,6 +48,7 @@ pub(crate) use agent_panel::{AgentHandle, AgentUiLifetime};
 pub(crate) use ai_panel::AiPanel;
 pub(crate) use bottom_bar::build_bottom_bar;
 pub(crate) use command_palette::CommandSuggestionHandle;
+pub(crate) use config_apply::ConfigDirtyEpoch;
 pub(crate) use file_tree::{
     build_file_tree_location_selector, build_file_tree_widgets, FileTreeModel,
     FileTreeNavigationState,
@@ -414,6 +416,19 @@ pub(crate) struct UiState {
     /// Deduplicates safe-mode informational toasts without suppressing a real
     /// persistence or reload error that happens while the toast is visible.
     pub(crate) safe_mode_config_notice_visible: Rc<Cell<bool>>,
+    /// One save/reload conflict dialog at a time. A single external write can
+    /// deliver several monitor events, and each of them would otherwise stack
+    /// another modal on top of the answer the user is already reading.
+    pub(crate) config_reload_conflict_visible: Rc<Cell<bool>>,
+    /// Persistent Block-history failure bar and its reason label. Held here
+    /// rather than built and forgotten, because the persistence poll raises it
+    /// long after the window was constructed.
+    pub(crate) block_history_notice: gtk4::Box,
+    pub(crate) block_history_notice_label: gtk4::Label,
+    /// Whether the live `Config` holds settings changes the file has not seen.
+    /// Consulted before a reload replaces it, so an edit still inside its
+    /// persist debounce is never discarded without the user being asked.
+    pub(crate) config_dirty: ConfigDirtyEpoch,
     pub(crate) keybinding_map: Rc<RefCell<KeybindingMap>>,
     pub(crate) zoom_state: Rc<RefCell<Option<ZoomState>>>,
     pub(crate) scrollbar_css: CssProvider,

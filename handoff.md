@@ -21,6 +21,235 @@ saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
 
+- **Review follow-ups on the viewport and Git-metadata work (current working
+  tree)**: three defects an adversarial pass found in the two entries below,
+  fixed in the same tree.
+
+  The differential visibility pass visited `new_visible ∪ visible`
+  (`block_view/mod.rs:10693`). That is exact while `visible` still names the
+  cards GTK is laying out in full, which a scroll tick preserves and nothing
+  else does. Two shapes broke it. A card mounted into the list — a command
+  finishing below the viewport, an undo, a history load — arrives
+  un-virtualized from `FinishedBlock::new`, so it is in neither set and nothing
+  ever virtualizes it: it keeps its whole output allocated while the document
+  holds the font-metric estimate it was appended with, and the pixel→card map
+  drifts by the difference for the rest of the session. And
+  `refresh_filtered_layout` (`:15806`) and `restore_deleted_blocks` (`:15518`)
+  clear `visible` on purpose, because after their rewrite the old indices
+  describe nothing — which left whatever was on screen before the filter toggle
+  rendered forever, one screenful per toggle. The obligation to sweep every
+  card now rides on `BlockDocumentIndex::take_full_sweep_due`
+  (`:10290`), set by every rebuild — and a rebuild is already what a length
+  change or an explicit stale mark forces, which is exactly the set of events
+  that can invalidate `visible`. The two clearing callers say it themselves
+  through `require_full_sweep` (`:10301`) rather than leaning on that
+  coincidence. A scroll frame moves no card and marks nothing stale, so it
+  stays differential. The pass now takes `&[C: VirtualizableCard]`
+  (`:10674`) instead of `&[FinishedBlock]`, which is what finally lets the
+  transition be tested: every widget test in this crate is `#[ignore]`d for want
+  of a display, so before this seam the one function that decides what stays
+  laid out was pinned by nothing that runs in the gate.
+
+  The bottom bar invalidated Git state for `current_pane_leaf()`
+  (`ui/bottom_bar.rs:106`) — the active leaf of the *visible* notebook page —
+  even though `connect_bottom_bar_block_status` is installed once per pane. A
+  command finishing in a background tab or a sibling split therefore marked
+  some unrelated directory, and its own pane kept `invalidated == false` and a
+  seconds-old `refreshed_at`, so `probe_is_due` stayed false and the bar showed
+  the old branch for up to the full 30 s TTL — the 1 Hz probe that used to
+  paper over this is precisely what the cache replaced. The handler now
+  resolves the directory from a weak handle to the view it is installed on,
+  through the same `pane_working_directory` the bar itself reads, so the key it
+  marks is the key the next repaint looks up.
+
+  `worker_loop` wrote `invalidated: false` on every completion, so an
+  `invalidate` that arrived while `jterm_core::git_meta::read` was running was
+  discarded and the change it reported waited out the TTL. Running two commands
+  in a row on a large or FUSE-backed checkout is the ordinary way to hit that.
+  A `CacheEntry` now carries a monotonic `invalidations` count and the
+  `probed_at_invalidations` generation its stored answer was queued for
+  (`git_meta.rs:38`); `invalidated()` is the two disagreeing, and a probe can
+  only ever clear the generation it was actually asked about. The request
+  carries that generation, read as late as possible but still before the worker
+  can start Git, so a report landing in the gap costs one redundant probe
+  rather than an answer that claims to cover a change it never saw.
+
+- **Core repin `9f94f77` / jagent `bdc8023`, and journaled output bound to a
+  lifecycle token (current working tree)**: `CompletedExecution` no longer
+  carries a bare `id`. It carries an `ExecutionLifecycle`, a private-field
+  capability whose only constructor takes one complete `CommandMeta` and
+  returns `None` unless `id`, `session_id`, `seq` and `started_at_ms` all
+  arrived on the *same* OSC 133 `C` packet — which is the only mark core's
+  parser now accepts the three identity slots on. So `PendingCommandMeta`
+  (`src/block_view/mod.rs:1083`) mints the token at `C` and nowhere else:
+  `merge_command_end` is untouched and still refuses to let a `D` packet
+  replace the id, and a `D` whose id disagrees now clears the lifecycle as well
+  through one `forget_correlated_identity` (`:1213`), because at that point
+  the token names some other execution's record. `journal_execution_id` became
+  `journal_lifecycle` (`:1205`); both of the provenance filters it carried are
+  preserved and now applied to the token's own id in
+  `journal_lifecycle_provenance_admits` (`:1236`), which is the string that
+  would actually reach disk. Those two filters are: the per-pane
+  shell-integration secret (`pty.rs`, `scripts/shell-integration/forge.*` mint
+  ids as `<token>-<seq>`) must never be written into a durable file every app
+  in this family reads back; and an id jsh did not mint (`jsh-` prefix) has no
+  journal Start to attach to. Journaled output therefore now requires a
+  complete jsh lifecycle envelope: forge's own shims emit `id=` alone, so
+  panes running under `forge.bash`/`.zsh`/`.fish` contribute no output events
+  at all, which is the correct answer rather than a regression — they never had
+  a jsh journal to contribute to.
+
+  Repinned together: `Cargo.toml` (both `jterm_core` and the direct `jagent`
+  pin, which must move as one or cargo resolves two revisions of one package),
+  `Cargo.lock` (regenerated by building, no `path`/`[patch]` residue),
+  `deny.toml`'s two `allow-git` revs, and `flake.nix`'s two `outputHashes`
+  with their rev comments. `CompletionFacts` gained a lifetime and its `output`
+  is now `&'a str`, so `ui/command_correction.rs:330` borrows instead of moving
+  a whole finished block into the gate. jagent's classifier grew from 32 to 54
+  warning classes and reaches the approval cards for free — forge keeps no
+  duplicate danger list to retire (`src/agent.rs` is a pure re-export of
+  `jterm_core::agent::is_dangerous`, and the two call sites at
+  `ui/agent_panel.rs:986` and `ui/command_review.rs:351` use it directly). The
+  two new fixture affordances are taken up as well: `CorrectionCandidate::
+  for_tests` finally covers the correction card's *verified* branch — the one
+  where the primary button says Run and executes — including that an edit to
+  the field moves it back to insert-for-review, and
+  `CorrectionPolicy::probe_thread_name()` pins the reader thread's name against
+  a literal rather than against the constant that was just handed in.
+
+- **Config edits survive an external reload (current working tree)**: the
+  config-file watcher debounces 200 ms (`main.rs:1980`) while a settings edit
+  waits 250 ms (`CONFIG_PERSIST_DEBOUNCE`) or 400 ms for a font step. A reload
+  landing inside that window replaced the whole `Config`, the pending edit
+  with it, and the debounced write then persisted the *reloaded* snapshot — the
+  user's change disappeared with nothing on screen about it. `ConfigDirtyEpoch`
+  (`ui/config_apply.rs:113`) counts UI-originated edits on the GTK thread
+  against an atomic high-water mark the persistence worker raises with
+  `fetch_max` when a write actually commits, so an edit made while a write was
+  in flight stays dirty and a late older write cannot un-save a newer one.
+  `decide_config_reload` (`:73`) turns that into Skip / Apply / Conflict, with
+  Skip outranking Conflict because bytes this window already accounts for are
+  not an external change. A conflict raises a modal whose close and Escape both
+  resolve to keeping the unsaved edit — discarding the user's work is the
+  destructive half and must be asked for out loud — and whose destructive
+  answer cancels both debounce generations and the queued font-zoom sweep
+  before adopting the file, so no armed timer can write the discarded snapshot
+  back afterwards.
+
+- **The GTK thread no longer waits on the config revision mutex (current
+  working tree)**: `save_config_with_path` held `config.persistence_revision`
+  across `ConfigFileLock::acquire`'s two-second spin, the backup rotation and
+  every `fsync`, while `live_config_revision` took the same mutex on every
+  reload decision. `RevisionBinding` (`config_store.rs:1134`) splits the read
+  and the publish out of `write_config_under_lock`, and `save_config_bound`
+  takes the *file* lock first, then reads the expected revision inside it.
+  Writers stay serialized exactly as before — by the advisory lock, which is
+  what actually orders them — while the slot is held only for the two moves.
+  Reading `expected` after the lock is what keeps that safe: the revision this
+  save compares against is the one the previous writer published, not one read
+  seconds earlier. The UI side reads with `try_lock`; contention defers the
+  decision by 20 ms up to four times rather than guessing, because "unknown"
+  reads as "the file moved" and would apply a reload nobody proved was safe.
+
+- **A reload that cannot be trusted keeps the live settings (current working
+  tree)**: `reload_config` reads the file twice — once to take its revision and
+  check its syntax, once inside `load_config`, which is the read that produces
+  the `Config`. `load_file_config` answers a read error with
+  `FileConfig::default()`, so a failed or raced second read replaced the theme,
+  the keybindings, the remote hosts and everything else with defaults and said
+  nothing. `reload_read_failure` (`ui/config_apply.rs:98`) refuses the reload
+  when the loader recorded an error or when the revision it loaded is not the
+  one this reload validated, and says so in the same dialog the other reload
+  refusals use.
+
+- **Block viewport resolution is a tree descent, not a walk (current working
+  tree)**: resolving the strict and hysteresis windows walked `block_data` from
+  card zero on every scroll tick, and `apply_visible_indices` then swept every
+  finished card — with `max_visible_blocks` admitting 100 000, one 60 Hz frame
+  cost as much as the whole retained session. `BlockDocumentIndex`
+  (`block_view/mod.rs:10163`) keeps the same `block_document_height` values in
+  a Fenwick tree; both viewport edges reduce to one primitive,
+  `card_at_document_y`, and zero-height cards (the ones a pane filter removed
+  from the document) can never be its answer because they do not move the
+  prefix. The index is a cache with two rules that between them cover every
+  writer: a structural mutation changes the list's length, which `reconcile`
+  answers with a rebuild; a height written without a length change either
+  patches the tree in the same statement (`set_height`, used by the visibility
+  appliers, the only writers that run per frame) or calls `mark_stale` (the
+  filter, collapse, density and refit paths, none of which run per frame).
+  `apply_visible_indices_with_measurement` now visits only
+  `new_visible ∪ visible`; cards in neither set are already virtualized at the
+  height the document records, because `set_virtualized` returns early with
+  that exact value when the state does not change. Measured at 50 000 cards,
+  scrolled to the bottom: 102 µs per from-zero walk against 52 ns per indexed
+  strict+loose resolution.
+
+- **The Agent panel's Git probe left the GTK thread, and the strip's cache
+  grew a TTL (current working tree)**: `request_model` called the bounded
+  *waiting* reader on the GTK thread, so submitting a turn froze the panel for
+  as long as `git` took — unbounded in practice on a FUSE or network checkout.
+  The probe and the prompt assembly moved into the request thread that was
+  about to wait on the network anyway, which keeps the freshness the model
+  wants and costs the panel nothing. Separately, `read_cached_and_refresh`
+  queued a probe on every call and the bottom bar calls it once a second, so an
+  idle window forked one `git status` per second forever. Cache entries now
+  carry `refreshed_at` and an `invalidated` flag: a finished command
+  invalidates the focused pane's cwd — that is when Git's answer can actually
+  move — and a 30-second ceiling exists only to notice a change made by another
+  window or another terminal.
+
+- **A truncated command packet can no longer be persisted as exact (current
+  working tree)**: `cmdline_url=<prefix>;cmd_truncated=1` resolved to
+  `CommandTextSource::ShellReported`, which is what makes `command_exact` true
+  on the persisted record and unlocks agent replay of the text as written — so
+  a self-contradictory packet handed the agent half a command line to re-run.
+  `resolve_command_for_block` now checks the disclosure first. Core's parser
+  drops `command` on this shape as of the pin this tree builds against
+  (`jterm_core` `4d8c814`, not in the old pin), so the contradiction should no
+  longer arrive; the check stays because these marks come off the PTY, where
+  anything a foreground process printed is indistinguishable from the shell's
+  own output.
+
+- **Remote directory downloads extract into private staging (current working
+  tree, security)**: a download of `~/proj` into `$HOME` piped an untrusted tar
+  straight into the *parent* — `tar xf - -C $HOME` — and validated nothing. A
+  hostile host returns `proj/...` plus ordinary relative siblings, `.bashrc`,
+  `.ssh/authorized_keys`, `.config/forge/config.toml`, and they land. Nothing
+  about those paths is exotic enough for tar to refuse them.
+  `download_dir` now extracts into a `0700`, process-owned staging directory
+  created beside the target with `create_dir` (so it cannot reuse anything
+  already there), checks that the result is exactly one top-level entry, that
+  it is named what was asked for, and that it is a real directory rather than a
+  link pointing wherever the host chose — then publishes with a
+  same-filesystem rename. Staging is removed by a `Drop` guard on every path:
+  on failure it holds the partial extraction, on success an empty shell. The
+  fix is deliberately local to forge; frost has the same bug and owns its own.
+
+- **Block-history fail-closed states wait for an answer (current working
+  tree)**: a history save that refuses — its revision moved, the load it must
+  not overwrite failed, the volume is full, the lock never cleared — arrived as
+  the same eight-second toast every routine persistence failure gets. The one
+  class of failure that needs a decision was the class most likely to be
+  missed. `persistence_failure_surface` (`ui/history_notice.rs`) routes that
+  one operation to a persistent bar with a Retry, and `Retry` asks each Block
+  pane for `retry_history_persistence`: a pane whose *load* failed restarts the
+  load, because saving again would refuse again and must — that refusal is what
+  stops an unreadable file from becoming a licence to overwrite what is really
+  on disk — while every other pane simply saves again. Nothing reports success;
+  the only honest signal is the next failure, which raises the bar through the
+  same path.
+
+- **Zone-history restore reads through the shared bounded reader (current
+  working tree)**: `read_session` did a path-based `stat` and then a separate
+  `read`, so it decided on one file and read whichever file the path named a
+  moment later, and it believed the size it was told. It now calls
+  `jterm_core::snapshot_file::read_bounded`, which checks the open descriptor,
+  caps the read itself, and refuses a fifo (which the old path would have
+  blocked the restoring thread on), a device, a hard-linked file, and one
+  another user can write. Deliberate behaviour change: the oversize error kind
+  moved from `InvalidData` to `FileTooLarge`; no caller branches on it,
+  `restore_zone_history` only logs.
+
 - **Workflow subsystem upstreamed (2026-08-29)**: `src/workflows.rs` is a
   288-line policy shim over `jterm_core::workflows`, pinned at core rev
   `790d06a`. It was 801. The four terminals each carried the same TOML/YAML
@@ -1194,6 +1423,41 @@ with its absolute-path filter) remains untested — pre-existing gap. The host
 shim's `helper_command` lost its biggest consumer (curl) but stays for the
 doctor and correction probes.
 
+### Not done this round, with the reason
+
+- **A provably safe GC for per-session Block-history files** (TODO P2). Still
+  open, and still correct not to guess: `prune_stale_session_histories` is
+  `#[cfg(test)]` precisely because deleting by mtime kills the file of a pane
+  that is open but quiet, and its revisioned next save then fails closed after
+  the data is already gone. The shape the fix needs is a keep-set built from
+  the window-state manifest (`~/.config/forge/windows/window-*.state`, plus the
+  `.ready` generation) unioned with this process's live `session_ids`, matched
+  against candidate filenames by mapping each known session id *forward*
+  through `sanitize_session_component` — never by parsing a filename back into
+  an id. It must abort entirely if any state file fails to parse or the
+  directory listing is truncated, because an incomplete keep-set is
+  indistinguishable from an empty one. The unresolved part is the cross-process
+  race: a second forge that has already written a pane's history but not yet
+  its window-state file owns a file no keep-set knows about. That wants either
+  a startup ordering guarantee (the active state file created before any
+  history save) or an explicitly-documented grace floor, and neither is
+  something to decide in the margin of another change.
+
+- **Moving the cross-block search scan to a cancellable worker** (TODO P2).
+  `cross_block_search_in_scope` (`block_view/find.rs:1449`) regex-scans every
+  retained record's command and output on the GTK thread with no time or byte
+  budget; the `max_hits` cap bounds the *results*, not the scan, so a query
+  that matches nothing still walks the whole retained history. The records are
+  borrowed out of the pane's `RefCell`s, so a real thread would have to copy up
+  to the full retained history to use them — the tractable shape is a resumable
+  slice (`start_at` cursor plus a `FindScanBudget`-style deadline, which
+  `find_in_blocks` already has for its own scan) driven from
+  `glib::idle_add_local` and cancelled by the search generation the dialog
+  already keeps. That is dialog surgery in `ui/dialogs.rs`'s 200-line rebuild
+  closure, and a half-applied version that bounds the scan without driving the
+  continuation would silently truncate results, which is worse than being slow.
+  Left whole for the next round.
+
 ### Follow-up migrations (next rounds)
 
 - Forge-ahead local modules to upstream into core rather than delete: none
@@ -1215,14 +1479,11 @@ doctor and correction probes.
   inherited-environment freeze stays wired (`app::run` captures first,
   `pty.rs` uses `envp_from_captured`, and the VTE spawn pairs
   `vte_envv_from_captured` with `VTE_SPAWN_NO_PARENT_ENVV`).
-- Pin bookkeeping, which this round leaves open: the two "done" sections above
-  quote the pin current at their own round (`21437ba`), and `Cargo.toml` pins
-  `1f5f0fb` today — neither carries `ai::chat_store`, so the working tree
-  builds only through a temporary local `[patch]`. Bumping the pin to the core
-  commit that carries the module also means regenerating `Cargo.lock` without
-  that patch (its two dropped `source = "git+…"` lines are the patch's only
-  trace) and refreshing `flake.nix`'s `outputHashes` entry for
-  `jterm_core-0.2.0`.
+- Pin bookkeeping: closed. The two "done" sections above quote the pin current
+  at their own round (`21437ba`); `Cargo.toml` now pins `9f94f77` with
+  `jagent` at `bdc8023`, `Cargo.lock` was regenerated by building with no
+  `path`/`[patch]` residue, and both `flake.nix` `outputHashes` and both
+  `deny.toml` `allow-git` revs moved with them.
 - `src/pty.rs:1967` and `src/state.rs:2118` spawn `sh` directly, outside the
   helper-runner contract — both inside `#[cfg(test)]` helpers, and the line
   references this bullet used to carry (`1579`/`1953`) had drifted;

@@ -6,6 +6,32 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- `jterm_core` 升级到 `9f94f77`，`jagent` 同步到 `bdc8023`（`Cargo.toml`、`Cargo.lock`、
+  `deny.toml`、`flake.nix` 四处一起移动）。终端上报的命令输出现在必须携带完整的 jsh 生命周期
+  凭证：`id`、`session_id`、`seq`、`started_at_ms` 必须出现在同一个 OSC 133 `C` 包上，凭证只在
+  `C` 处铸造，`D` 只能比对而不能替换；`D` 的 id 不一致时凭证与 id 一起作废。窗格私有的
+  shell 集成口令仍然永远不会写入共享日志文件，非 jsh 铸造的 id 也不会占用写入队列。
+  jagent 的危险命令分类从 32 类增加到 54 类，直接惠及审批卡片。
+- 设置编辑不再被外部重载静默丢弃：新增 dirty epoch，冲突时弹出显式选择（默认与 Esc 都保留
+  未保存的修改），选择“丢弃并重载”会先取消两个 debounce 计时器与排队的字号扫掠，避免被丢弃的
+  快照在重载后被写回。
+- 保存设置时的磁盘 I/O 不再持有 revision mutex：写入者仍由文件锁串行，GTK 线程改用
+  `try_lock` + 有界重试，慢速或被占用的文件系统不再冻结窗口。
+- 重载配置时第二次读取失败或与已校验的 revision 不一致，现在会拒绝重载并给出原因，不再把
+  主题、快捷键与远程主机全部悄悄重置为默认值。
+- Block 视口解析改为前缀索引 + 树内下降，可见集合改为差分更新：5 万张卡片、滚动到底部时，
+  单次解析从 102 µs 降到 52 ns，不再随保留历史线性增长。
+- Agent 面板的 Git 探测移出 GTK 线程；底栏的 Git 元数据缓存获得 TTL 与命令完成时的显式失效，
+  空闲窗口不再每秒 fork 一次 `git status`。
+- `cmd_truncated=1` 与命令前缀同时出现时不再被记录为“精确命令”，Agent 也不会重放半条命令。
+- 安全修复：远程目录下载改为解压到进程私有的 `0700` 暂存目录，校验顶层只有请求的那一个目录
+  （且不是符号链接）后再原子改名发布；恶意主机不能再把 `.bashrc`、`.ssh/authorized_keys`
+  之类的同级文件投递到目标目录的父目录。
+- Block 历史进入 fail-closed 状态时改为常驻提示条并提供显式 Retry；加载失败的窗格会重新加载，
+  其余窗格重新保存。
+- Zone 历史恢复改用 `jterm_core::snapshot_file::read_bounded`，不再 stat 后再读，同时拒绝
+  fifo、设备、硬链接与他人可写的文件。
+
 - Agent session persistence is synchronized to `jterm_core` `21437ba` and
   `jagent` `a462ec8`, so the typed restore path owns its durability boundary.
   The three legacy snapshot helpers remain narrowly re-exported for source

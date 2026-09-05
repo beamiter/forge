@@ -322,12 +322,15 @@ fn attach_term_view(
             // head/tail sample: `output` arrives at the block view's own 32 KiB
             // event bound and must be handed over whole, because sampling it
             // here and again in the prompt builder elides real content twice.
+            // The facts borrow it — `CompletionFacts::output` is a `&str`
+            // precisely so a whole finished block is not copied on the GTK
+            // thread just to be reduced to a bounded sample inside the gate.
             let Some(request) = should_start(
                 monitor_enabled,
                 CompletionFacts {
                     command,
                     exit_code,
-                    output,
+                    output: &output,
                     cwd: Some(view.cwd()),
                     remote,
                     // A generation is bound only to a command the Shell Agent
@@ -738,6 +741,7 @@ fn show_correction_card(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jterm_core::command_correction::{Candidate, CorrectionEvidence, Original};
 
     /// The engine's own behaviour — classification, ranking, the safety gate,
     /// the prompt, the reply parser, the probes, the epoch machine — is covered
@@ -803,6 +807,78 @@ mod tests {
         assert!(search_path.is_empty());
     }
 
+    /// The card's primary button and the action behind it are both
+    /// `run_allowed`, and forge never covered the branch where that is true.
+    /// A verified candidate runs directly; the same candidate stops being
+    /// runnable the moment the field text stops being the resolver's exact
+    /// output, and an unverified one never was — which is what keeps "Run" from
+    /// appearing over text the user has since edited.
+    #[test]
+    fn only_a_verified_untouched_candidate_offers_the_direct_run() {
+        let verified = CorrectionCandidate::for_tests(
+            Original("apt-get install ffmpg"),
+            Candidate("apt-get install ffmpeg"),
+            "APT contains `ffmpeg`.",
+            CorrectionEvidence::AptIndex,
+        )
+        .expect("a verified APT correction is what the production path builds");
+        assert!(verified.evidence().is_verified());
+        assert!(
+            verified.run_allowed(verified.command()),
+            "the card labels this Run and executes it"
+        );
+        assert!(
+            !verified.run_allowed("apt-get install ffmpeg --yes"),
+            "an edited field is inserted for review, never run"
+        );
+
+        // A model reply proves nothing about this host, so its card inserts.
+        let unverified = CorrectionCandidate::for_tests(
+            Original("apt-get install ffmpg"),
+            Candidate("apt-get install ffmpeg"),
+            "The model suggested `ffmpeg`.",
+            CorrectionEvidence::AiUnverified,
+        )
+        .expect("the fixture constructor runs the same validation gate");
+        assert!(!unverified.evidence().is_verified());
+        assert!(!unverified.run_allowed(unverified.command()));
+
+        // The proposal owns the candidate and the live draft together, so
+        // `accept` answers run-versus-insert from the validated form of exactly
+        // the text that will be submitted. That is the invariant
+        // `show_correction_card` leans on to stop a card labelled "Insert for
+        // review" from running the command.
+        let mut proposal = CorrectionProposal::new(verified.clone());
+        assert!(
+            proposal
+                .accept()
+                .expect("the draft is the candidate")
+                .run_directly
+        );
+        proposal.draft_mut().push_str(" --yes");
+        assert!(
+            !proposal
+                .accept()
+                .expect("an edited draft still validates")
+                .run_directly,
+            "an edit must move the card to insert-for-review"
+        );
+    }
+
+    /// The probe's reader thread is named so a stuck reader is attributable to
+    /// forge in `ps`/`gdb`. Checked through the engine's own accessor, against
+    /// a literal: comparing the policy against the constant it was handed
+    /// would hold whatever the policy did with it.
+    #[test]
+    fn the_probe_reader_thread_carries_forges_name() {
+        let policy = CorrectionPolicy::new(
+            LocalEvidence::Unavailable,
+            ContextSharing::Withheld,
+            PROBE_THREAD_NAME,
+        );
+        assert_eq!(policy.probe_thread_name(), "forge-correction-probe-output");
+    }
+
     /// forge shipped the consent switch, required it before starting a Codex
     /// task, and then posted the command, cwd and terminal output from this
     /// surface without consulting it.
@@ -837,7 +913,7 @@ mod tests {
         let facts = || CompletionFacts {
             command: "apt install fmpg".to_string(),
             exit_code: Some(100),
-            output: "E: Unable to locate package fmpg".to_string(),
+            output: "E: Unable to locate package fmpg",
             cwd: Some("/home/user/project".to_string()),
             remote: false,
             agent_issued: false,

@@ -13,14 +13,31 @@ use crate::config::{
 };
 use crate::terminal::collect_terminals;
 
+/// Attempts a reload spends waiting for the persistence worker's short
+/// critical section on the revision slot before it gives up and says so.
+const CONFIG_REVISION_READ_ATTEMPTS: u8 = 4;
+/// Gap between those attempts. The writer holds the slot only for a move, so
+/// one retry is already generous; four bound the wait at 80 ms of idle timer.
+const CONFIG_REVISION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Read the revision this window believes the file holds, without ever waiting.
+///
+/// `None` means the persistence worker holds the slot right now. The GTK thread
+/// must not block on it — that is the whole point of taking the disk I/O out
+/// from under that mutex — and it must not guess either, because guessing
+/// "unknown" reads as "the file moved" and would apply a reload nobody proved
+/// was safe. The caller retries instead.
 fn live_config_revision(
     config: &crate::config::Config,
-) -> Option<crate::config_store::ConfigRevision> {
-    config
-        .persistence_revision
-        .lock()
-        .map(|revision| revision.clone())
-        .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+) -> Option<Option<crate::config_store::ConfigRevision>> {
+    match config.persistence_revision.try_lock() {
+        Ok(revision) => Some(revision.clone()),
+        // A poisoned slot is not contention: the value behind it is still the
+        // last revision a writer published, and refusing every future reload
+        // over it would be worse than reading it.
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner().clone()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
 }
 
 fn reload_matches_live_revision(
@@ -28,6 +45,124 @@ fn reload_matches_live_revision(
     disk_revision: &crate::config_store::ConfigRevision,
 ) -> bool {
     live_revision == Some(disk_revision)
+}
+
+/// What an incoming configuration reload is allowed to do to the live settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigReloadDecision {
+    /// The file already holds the revision this window last read or wrote.
+    Skip,
+    /// The file moved and this window has nothing waiting to be written.
+    Apply,
+    /// The file moved while a UI edit was still inside its debounce. Applying
+    /// would drop that edit on the floor, so the user resolves it.
+    Conflict,
+}
+
+/// Decide a reload against the file's revision and this window's dirty epoch.
+///
+/// `Skip` outranks `Conflict` deliberately: if the bytes on disk are the ones
+/// this window already accounted for, there is no external change to conflict
+/// with, and an unsaved edit simply stays pending.
+fn decide_config_reload(
+    live_revision: Option<&crate::config_store::ConfigRevision>,
+    disk_revision: &crate::config_store::ConfigRevision,
+    unsaved_ui_edits: bool,
+) -> ConfigReloadDecision {
+    if reload_matches_live_revision(live_revision, disk_revision) {
+        ConfigReloadDecision::Skip
+    } else if unsaved_ui_edits {
+        ConfigReloadDecision::Conflict
+    } else {
+        ConfigReloadDecision::Apply
+    }
+}
+
+/// Why an applied reload could not be trusted, or `None` when it can.
+///
+/// `reload_config` reads the file twice: once to take its revision and check
+/// its syntax, and once inside [`load_config`], which is the read that actually
+/// produces the `Config`. They are separate opens with no lock between them, so
+/// the second one can fail outright — `load_file_config` answers a read error
+/// with `FileConfig::default()` — or can land on different bytes after a racing
+/// writer. Either way the old code replaced every live setting: theme,
+/// keybindings, remote hosts and all, silently reverted to defaults or to a
+/// revision nothing had validated. Refuse instead; the live settings stay and
+/// the watcher fires again for whatever the file settles on.
+fn reload_read_failure(
+    load_error: Option<String>,
+    loaded_revision: Option<&crate::config_store::ConfigRevision>,
+    validated_revision: &crate::config_store::ConfigRevision,
+) -> Option<String> {
+    if let Some(reason) = load_error {
+        return Some(reason);
+    }
+    if loaded_revision != Some(validated_revision) {
+        return Some("the file changed again while it was being read".to_string());
+    }
+    None
+}
+
+/// Whether the in-memory configuration holds UI edits the file has not seen.
+///
+/// The window between a settings change and its write is real and wide: a
+/// generic mutation waits [`CONFIG_PERSIST_DEBOUNCE`] (250 ms) and a font step
+/// waits [`FONT_PERSIST_DEBOUNCE`] (400 ms), while the config-file watcher
+/// reloads after only 200 ms of quiet. A reload landing inside that window used
+/// to replace the whole `Config` — the pending edit with it — and the debounced
+/// write then persisted the *reloaded* snapshot, so the user's change vanished
+/// with nothing on screen to say it ever existed.
+///
+/// `edits` counts UI-originated changes on the GTK thread. `persisted` is the
+/// highest edit count a write actually committed; it is an atomic because that
+/// commit happens on the persistence worker thread, and it is raised with
+/// `fetch_max` so a write finishing out of order can never mark a newer edit
+/// clean.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ConfigDirtyEpoch {
+    edits: Rc<Cell<u64>>,
+    persisted: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ConfigDirtyEpoch {
+    /// Record one UI-originated change.
+    pub(crate) fn record_edit(&self) {
+        self.edits.set(self.edits.get().wrapping_add(1));
+    }
+
+    pub(crate) fn has_unsaved_edits(&self) -> bool {
+        self.edits.get() > self.persisted.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// A witness for the snapshot being handed to a writer, moved to whichever
+    /// thread performs the write and redeemed only when that write succeeds.
+    fn commit_handle(&self) -> ConfigPersistCommit {
+        ConfigPersistCommit {
+            epoch: self.edits.get(),
+            persisted: std::sync::Arc::clone(&self.persisted),
+        }
+    }
+
+    /// Abandon every unsaved edit, because the user chose the file's version.
+    fn abandon_unsaved_edits(&self) {
+        self.persisted
+            .store(self.edits.get(), std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Proof that a specific snapshot reached the file.
+struct ConfigPersistCommit {
+    epoch: u64,
+    persisted: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ConfigPersistCommit {
+    /// `fetch_max`, never a plain store: an edit made while this write was in
+    /// flight carries a higher epoch and must stay dirty afterwards.
+    fn commit(self) {
+        self.persisted
+            .fetch_max(self.epoch, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 impl UiState {
@@ -80,6 +215,9 @@ impl UiState {
             }
             return;
         }
+        // Dirty from here, not from the moment the debounce fires: the reload
+        // that would discard this edit can arrive at any point inside the wait.
+        self.config_dirty.record_edit();
         let generation = self.config_persist_generation.get().wrapping_add(1);
         self.config_persist_generation.set(generation);
         let ui = self.clone();
@@ -100,19 +238,26 @@ impl UiState {
         let snapshot = self.config.borrow().clone();
         let path = config_file_path();
         let key = crate::persistence::PersistenceKey::for_path("config", &path);
+        // The witness names the edit this exact snapshot carries. Redeeming it
+        // on the worker thread, immediately after the store published the new
+        // revision, keeps "the file is current" and "nothing is pending" from
+        // being observable in the wrong order by the 200 ms watch debounce.
+        let queued_commit = self.config_dirty.commit_handle();
+        let fallback_commit = self.config_dirty.commit_handle();
         if let Err(error) = crate::persistence::enqueue(key, CONFIG_PERSIST_OPERATION, move || {
             crate::config_store::save_config(&snapshot)
-                .map(|_| ())
+                .map(|_| queued_commit.commit())
                 .map_err(|error| std::io::Error::other(error.to_string()))
         }) {
             if allow_sync_fallback {
-                if let Err(sync_error) = crate::config::save_config(&self.config.borrow()) {
-                    self.show_config_error(
+                match crate::config::save_config(&self.config.borrow()) {
+                    Ok(()) => fallback_commit.commit(),
+                    Err(sync_error) => self.show_config_error(
                         "Settings were not saved",
                         &format!(
                             "{sync_error}\n\nThe in-memory setting is still active. Reload the configuration (Ctrl+Shift+R) before trying again if the file changed elsewhere."
                         ),
-                    );
+                    ),
                 }
                 return;
             }
@@ -163,6 +308,10 @@ impl UiState {
     pub(crate) fn apply_font_scale(&self, new_scale: f64) {
         self.font_scale.set(new_scale);
         self.config.borrow_mut().default_font_scale = new_scale;
+        // The generic persist below is still 400 ms of debounce away, and the
+        // config already differs from the file. Mark it dirty now so a reload
+        // arriving inside a held Ctrl+wheel gesture cannot undo the zoom.
+        self.config_dirty.record_edit();
 
         if claim_font_scale_sweep(&self.pending_font_scale, new_scale) {
             let ui = self.clone();
@@ -562,6 +711,64 @@ impl UiState {
 
     /// Reload configuration from disk and apply changes.
     pub(crate) fn reload_config(&self) {
+        self.reload_config_attempt(CONFIG_REVISION_READ_ATTEMPTS);
+    }
+
+    /// Tell the user their in-window settings and the file have diverged, and
+    /// let them pick which one survives.
+    ///
+    /// Neither answer is taken by default. Escape and the close gesture both
+    /// resolve to keeping the unsaved edit, because discarding a change the
+    /// user made is the destructive half and must be asked for out loud. The
+    /// pending write is then refused by the store's revision check rather than
+    /// silently overwriting the other program's file, which is the explicit
+    /// resolution path the wording points at.
+    fn show_config_reload_conflict(&self, path: &std::path::Path) {
+        if self.config_reload_conflict_visible.replace(true) {
+            return;
+        }
+        let path_display =
+            jterm_core::review_input::safe_inline_display(&path.to_string_lossy(), 2 * 1024);
+        let dialog = adw::AlertDialog::new(
+            Some("Configuration changed on disk"),
+            Some(&format!(
+                "{path_display} was changed elsewhere while this window still had settings waiting to be written.\n\nKeep this window's settings and its pending save will be refused until you reload, so nothing is overwritten without you seeing it. Discard them to take the file's settings instead."
+            )),
+        );
+        dialog.add_response("keep", "Keep My Settings");
+        dialog.add_response("discard", "Discard and Reload");
+        dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("keep"));
+        dialog.set_close_response("keep");
+        let visible = self.config_reload_conflict_visible.clone();
+        let ui = self.clone();
+        dialog.connect_response(None, move |_, response| {
+            visible.set(false);
+            if response == "discard" {
+                ui.discard_unsaved_config_edits_and_reload();
+            }
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    /// Take the file's settings, deliberately losing this window's unsaved ones.
+    fn discard_unsaved_config_edits_and_reload(&self) {
+        // Both debounced writers are cancelled first. A timer still armed would
+        // fire after the reload and write back the very snapshot the user just
+        // chose to discard, turning an explicit answer into a silent reversal.
+        self.config_persist_generation
+            .set(self.config_persist_generation.get().wrapping_add(1));
+        self.font_persist_generation
+            .set(self.font_persist_generation.get().wrapping_add(1));
+        // Likewise the queued font-zoom widget sweep: the reload sets every
+        // pane's scale from the file, and a pending sweep would re-apply the
+        // discarded one to the widgets while the config said otherwise.
+        self.pending_font_scale.set(None);
+        self.config_dirty.abandon_unsaved_edits();
+        self.reload_config();
+    }
+
+    fn reload_config_attempt(&self, attempts_left: u8) {
         if std::env::var_os("FORGE_SAFE_MODE").is_some() {
             let dialog = adw::AlertDialog::new(
                 Some("Configuration reload disabled"),
@@ -573,39 +780,69 @@ impl UiState {
             return;
         }
         let path = config_file_path();
-        let validation = match crate::config_store::read_config_text(&path) {
-            Ok(Some(contents)) => {
-                let disk_revision =
-                    crate::config_store::ConfigRevision::from_bytes(contents.as_bytes());
-                let live_revision = {
-                    let config = self.config.borrow();
-                    live_config_revision(&config)
-                };
-                if reload_matches_live_revision(live_revision.as_ref(), &disk_revision) {
-                    log::debug!(
-                        "Config reload skipped: file matches the current in-memory revision"
-                    );
-                    return;
-                }
-                validate_config_contents(&contents).map_err(|error| {
-                    crate::config::config_syntax_diagnostic(&contents, &error).to_string()
-                })
+        let contents = match crate::config_store::read_config_text(&path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                let path_display = jterm_core::review_input::safe_inline_display(
+                    &path.to_string_lossy(),
+                    2 * 1024,
+                );
+                log::error!("Config reload rejected for {path_display}: {error}");
+                self.show_config_error(
+                    "Configuration reload rejected",
+                    &format!("The current settings remain active. {path_display}: {error}"),
+                );
+                return;
             }
-            Ok(None) => {
-                let disk_revision = crate::config_store::ConfigRevision::missing();
-                let live_revision = {
-                    let config = self.config.borrow();
-                    live_config_revision(&config)
-                };
-                if reload_matches_live_revision(live_revision.as_ref(), &disk_revision) {
-                    log::debug!(
-                        "Config reload skipped: file matches the current in-memory revision"
-                    );
-                    return;
-                }
-                Ok(Vec::new())
+        };
+        let disk_revision = contents
+            .as_deref()
+            .map_or_else(crate::config_store::ConfigRevision::missing, |contents| {
+                crate::config_store::ConfigRevision::from_bytes(contents.as_bytes())
+            });
+        let live_revision = {
+            let config = self.config.borrow();
+            live_config_revision(&config)
+        };
+        let Some(live_revision) = live_revision else {
+            // The persistence worker is inside its short critical section on
+            // the revision slot. Nothing is decided on a guess; come back once
+            // it has published, and say so rather than reloading blind if the
+            // slot somehow stays busy.
+            if attempts_left > 0 {
+                let ui = self.clone();
+                glib::timeout_add_local_once(CONFIG_REVISION_RETRY_DELAY, move || {
+                    ui.reload_config_attempt(attempts_left - 1);
+                });
+            } else {
+                self.show_config_error(
+                    "Configuration reload could not run",
+                    "The settings file is being written right now. The current settings remain active; reload again (Ctrl+Shift+R) once the save has finished.",
+                );
             }
-            Err(error) => Err(error.to_string()),
+            return;
+        };
+        match decide_config_reload(
+            live_revision.as_ref(),
+            &disk_revision,
+            self.config_dirty.has_unsaved_edits(),
+        ) {
+            ConfigReloadDecision::Skip => {
+                log::debug!("Config reload skipped: file matches the current in-memory revision");
+                return;
+            }
+            ConfigReloadDecision::Conflict => {
+                log::warn!("Config reload deferred: unsaved settings would be discarded");
+                self.show_config_reload_conflict(&path);
+                return;
+            }
+            ConfigReloadDecision::Apply => {}
+        }
+        let validation = match contents.as_deref() {
+            Some(contents) => validate_config_contents(contents).map_err(|error| {
+                crate::config::config_syntax_diagnostic(contents, &error).to_string()
+            }),
+            None => Ok(Vec::new()),
         };
         {
             match validation {
@@ -643,6 +880,25 @@ impl UiState {
             }
         }
         let (new_config, _themes, new_keybindings) = load_config();
+        // `load_config` re-read the file. Prove it read the same bytes this
+        // reload validated, and that it read them at all, before any of them
+        // reaches a live setting.
+        if let Some(reason) = reload_read_failure(
+            crate::config::load_error(),
+            live_config_revision(&new_config).flatten().as_ref(),
+            &disk_revision,
+        ) {
+            let path_display =
+                jterm_core::review_input::safe_inline_display(&path.to_string_lossy(), 2 * 1024);
+            log::error!("Config reload abandoned for {path_display}: {reason}");
+            self.show_config_error(
+                "Configuration reload abandoned",
+                &format!(
+                    "The current settings remain active. {path_display}: {reason}. Nothing was reset to its default."
+                ),
+            );
+            return;
+        }
         let opacity = new_config.window_opacity;
         let font_scale = new_config.default_font_scale;
         let tab_placement = new_config.tab_placement;
@@ -708,7 +964,10 @@ fn claim_font_scale_sweep(pending: &Cell<Option<f64>>, scale: f64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_font_scale_sweep, reload_matches_live_revision};
+    use super::{
+        claim_font_scale_sweep, decide_config_reload, reload_matches_live_revision,
+        reload_read_failure, ConfigDirtyEpoch, ConfigReloadDecision,
+    };
     use crate::config_store::ConfigRevision;
     use std::cell::Cell;
 
@@ -754,5 +1013,114 @@ mod tests {
         let disk = ConfigRevision::from_bytes(b"theme = 'dark'\n");
         assert!(!reload_matches_live_revision(Some(&live), &disk));
         assert!(!reload_matches_live_revision(None, &disk));
+    }
+
+    /// The 200 ms watch debounce racing the 250 ms persist debounce, replayed
+    /// as state instead of as sleeps. The reload arrives while the user's edit
+    /// exists only in memory; adopting the file there is what silently threw
+    /// the edit away, and the debounced write then persisted the reloaded
+    /// snapshot so nothing on screen ever mentioned it.
+    #[test]
+    fn an_external_reload_inside_the_persist_debounce_conflicts_instead_of_discarding() {
+        let dirty = ConfigDirtyEpoch::default();
+        let live = ConfigRevision::from_bytes(b"opacity = 0.9\n");
+        let disk = ConfigRevision::from_bytes(b"opacity = 0.5\n");
+
+        // Nothing pending: an external change is adopted, exactly as before.
+        assert!(!dirty.has_unsaved_edits());
+        assert_eq!(
+            decide_config_reload(Some(&live), &disk, dirty.has_unsaved_edits()),
+            ConfigReloadDecision::Apply
+        );
+
+        // t+0 ms: the user changes a setting. Its write is 250 ms away.
+        dirty.record_edit();
+        assert!(dirty.has_unsaved_edits());
+
+        // t+200 ms: the watcher fires for somebody else's write.
+        assert_eq!(
+            decide_config_reload(Some(&live), &disk, dirty.has_unsaved_edits()),
+            ConfigReloadDecision::Conflict
+        );
+        // Bytes this window already accounts for are never a conflict; the
+        // pending edit simply stays pending.
+        assert_eq!(
+            decide_config_reload(Some(&live), &live, dirty.has_unsaved_edits()),
+            ConfigReloadDecision::Skip
+        );
+
+        // t+250 ms: the snapshot reaches the worker. Queued is not written, so
+        // only the worker's success may clear the epoch.
+        let commit = dirty.commit_handle();
+        assert!(dirty.has_unsaved_edits());
+        commit.commit();
+        assert!(!dirty.has_unsaved_edits());
+        assert_eq!(
+            decide_config_reload(Some(&live), &disk, dirty.has_unsaved_edits()),
+            ConfigReloadDecision::Apply
+        );
+    }
+
+    /// A write clears exactly the edit its own snapshot carried. Anything
+    /// changed after that snapshot was taken is still only in memory, and a
+    /// late completion must not walk the clean mark backwards either.
+    #[test]
+    fn a_write_only_clears_the_edit_its_own_snapshot_carried() {
+        let dirty = ConfigDirtyEpoch::default();
+        dirty.record_edit();
+        let in_flight = dirty.commit_handle();
+        dirty.record_edit();
+        in_flight.commit();
+        assert!(
+            dirty.has_unsaved_edits(),
+            "the edit made while the write was in flight is still unsaved"
+        );
+
+        let stale = dirty.commit_handle();
+        dirty.record_edit();
+        dirty.commit_handle().commit();
+        assert!(!dirty.has_unsaved_edits());
+        stale.commit();
+        assert!(
+            !dirty.has_unsaved_edits(),
+            "an older write completing late cannot un-save a newer one"
+        );
+
+        // The conflict dialog's destructive answer, which must leave nothing
+        // pending for the cancelled debounce timers to resurrect.
+        dirty.record_edit();
+        assert!(dirty.has_unsaved_edits());
+        dirty.abandon_unsaved_edits();
+        assert!(!dirty.has_unsaved_edits());
+    }
+
+    /// The reload's second read is the one that produces the `Config`. If it
+    /// fails, `load_file_config` answers with `FileConfig::default()`; if the
+    /// file moved between the two reads, it produces bytes nothing validated.
+    /// Both used to replace every live setting without a word.
+    #[test]
+    fn a_failed_or_raced_second_read_refuses_to_replace_the_live_settings() {
+        let validated = ConfigRevision::from_bytes(b"theme = 'dark'\n");
+        assert_eq!(
+            reload_read_failure(None, Some(&validated), &validated),
+            None
+        );
+
+        assert_eq!(
+            reload_read_failure(
+                Some("/home/u/.config/forge/config.toml: permission denied".to_string()),
+                Some(&validated),
+                &validated
+            )
+            .as_deref(),
+            Some("/home/u/.config/forge/config.toml: permission denied")
+        );
+
+        let raced = ConfigRevision::from_bytes(b"theme = 'light'\n");
+        assert!(reload_read_failure(None, Some(&raced), &validated).is_some());
+        assert!(
+            reload_read_failure(None, None, &validated).is_some(),
+            "a loader that recorded no revision at all proves nothing"
+        );
     }
 }

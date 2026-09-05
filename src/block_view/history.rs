@@ -40,6 +40,36 @@ const MAX_SESSION_COMPONENT_BYTES: usize = 96;
 const HISTORY_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const MAX_SCANNED_HISTORY_DIRECTORY_ENTRIES: usize = 4_096;
+
+/// What answering the Block-history failure bar has to do for one pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryRetryAction {
+    /// The load failed, so the save is refusing on purpose. Saving again would
+    /// refuse again — and must, or an unreadable file would become a licence to
+    /// overwrite whatever is really on disk. Restart the load; the ordinary
+    /// save path resumes from its result.
+    ReloadFirst,
+    /// A full volume, a permission change, a lock that never cleared, a
+    /// revision that moved: a save that can simply be attempted again.
+    SaveAgain,
+}
+
+fn history_retry_action(outcome: &HistoryLoadOutcome) -> HistoryRetryAction {
+    match outcome {
+        HistoryLoadOutcome::Failed { .. } => HistoryRetryAction::ReloadFirst,
+        HistoryLoadOutcome::Idle | HistoryLoadOutcome::Pending | HistoryLoadOutcome::Loaded(_) => {
+            HistoryRetryAction::SaveAgain
+        }
+    }
+}
+
+/// Persistence-worker label for a Block-history save.
+///
+/// Named rather than inline because the window routes this one operation to a
+/// persistent surface with a retry instead of the ordinary eight-second toast:
+/// its failures are fail-closed states that stay stuck until somebody acts, and
+/// a toast that has already faded is not somebody acting.
+pub(crate) const BLOCK_HISTORY_PERSIST_OPERATION: &str = "Save Block history";
 const MAX_HISTORY_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_HISTORY_COMMAND_BYTES: usize = jterm_core::review_input::MAX_REVIEW_INPUT_BYTES;
 const MAX_HISTORY_COMMAND_MARKUP_BYTES: usize = jterm_core::review_input::MAX_REVIEW_INPUT_BYTES;
@@ -2215,6 +2245,24 @@ impl TermView {
         log::debug!("restored {restored} zones from {}", path.display());
     }
 
+    /// Re-attempt whatever this pane's Block history is stuck on.
+    ///
+    /// A save that refused because the *load* failed cannot be fixed by saving
+    /// again — that refusal is the whole point, so an unreadable file never
+    /// becomes an excuse to overwrite whatever is actually on disk. Those panes
+    /// restart the load instead, and the ordinary save path picks up from its
+    /// result. Every other failure (a full disk, a permission change, a lock
+    /// timeout) is a save that can simply be tried again.
+    pub(crate) fn retry_history_persistence(self: &Rc<Self>) -> std::io::Result<()> {
+        match history_retry_action(&self.history_load.outcome()) {
+            HistoryRetryAction::ReloadFirst => {
+                self.start_history_load();
+                Ok(())
+            }
+            HistoryRetryAction::SaveAgain => self.save_history(),
+        }
+    }
+
     /// Snapshot block history on the GTK thread and queue all encoding and
     /// durable file I/O on the shared persistence worker.
     pub fn save_history(&self) -> std::io::Result<()> {
@@ -2263,81 +2311,86 @@ impl TermView {
         let estimated_bytes = estimated_snapshot_retained_bytes(&blocks, blocks.capacity());
         let history_load = Arc::clone(&self.history_load);
         let key = PersistenceKey::for_path("block-history", &path);
-        persistence::enqueue_weighted(key, "Save Block history", estimated_bytes, move || {
-            let _pre_apply_save_lease = pre_apply_save_lease;
-            let loaded_for_save = if _pre_apply_save_lease.is_some() {
-                if history_load.discarded.load(Ordering::Acquire) {
-                    // Clear/teardown queued a replacement snapshot after
-                    // discarding this load. Never let the earlier UI snapshot
-                    // resurrect history that the user just removed.
-                    return Ok(());
-                }
-                match history_load.outcome() {
-                    HistoryLoadOutcome::Loaded(loaded) => Some(loaded),
-                    HistoryLoadOutcome::Failed { kind, message } => {
-                        return Err(io::Error::new(
-                            kind,
-                            format!(
+        persistence::enqueue_weighted(
+            key,
+            BLOCK_HISTORY_PERSIST_OPERATION,
+            estimated_bytes,
+            move || {
+                let _pre_apply_save_lease = pre_apply_save_lease;
+                let loaded_for_save = if _pre_apply_save_lease.is_some() {
+                    if history_load.discarded.load(Ordering::Acquire) {
+                        // Clear/teardown queued a replacement snapshot after
+                        // discarding this load. Never let the earlier UI snapshot
+                        // resurrect history that the user just removed.
+                        return Ok(());
+                    }
+                    match history_load.outcome() {
+                        HistoryLoadOutcome::Loaded(loaded) => Some(loaded),
+                        HistoryLoadOutcome::Failed { kind, message } => {
+                            return Err(io::Error::new(
+                                kind,
+                                format!(
                                 "refusing to overwrite Block history that failed to load: {message}"
                             ),
-                        ));
-                    }
-                    HistoryLoadOutcome::Pending => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            "Block history save reached the worker before its earlier load",
-                        ));
-                    }
-                    HistoryLoadOutcome::Idle => {
-                        return Err(io::Error::new(
+                            ));
+                        }
+                        HistoryLoadOutcome::Pending => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::WouldBlock,
+                                "Block history save reached the worker before its earlier load",
+                            ));
+                        }
+                        HistoryLoadOutcome::Idle => {
+                            return Err(io::Error::new(
                             io::ErrorKind::WouldBlock,
                             "pre-apply Block history outcome was consumed before its save lease",
                         ));
+                        }
                     }
+                } else {
+                    None
+                };
+                let loaded_prefix = loaded_for_save.as_ref().map_or(&[][..], |loaded| {
+                    let available = max_blocks.saturating_sub(blocks.len());
+                    let start = loaded.blocks.len().saturating_sub(available);
+                    &loaded.blocks[start..]
+                });
+                debug_assert!(
+                    estimated_history_save_working_bytes(MAX_HISTORY_SAVE_CANDIDATE_RECORDS)
+                        <= HISTORY_SAVE_WORKING_ESTIMATED_BYTES
+                );
+                let _working_reservation =
+                    persistence::try_reserve_estimated_bytes(HISTORY_SAVE_WORKING_ESTIMATED_BYTES)?;
+                let intent = explicit_replace_epoch.map_or_else(
+                    || HistoryWriteIntent::Revision {
+                        target: history_load.revision(),
+                        legacy: history_load.legacy_authority(),
+                    },
+                    |_| HistoryWriteIntent::ExplicitReplace,
+                );
+                let outcome = write_history_snapshot_with_intent_parts(
+                    &base,
+                    &path,
+                    session_id.as_deref(),
+                    loaded_prefix,
+                    &blocks,
+                    compress,
+                    intent,
+                )?;
+                if let Some(epoch) = explicit_replace_epoch {
+                    history_load.mark_explicit_replace_persisted(epoch);
                 }
-            } else {
-                None
-            };
-            let loaded_prefix = loaded_for_save.as_ref().map_or(&[][..], |loaded| {
-                let available = max_blocks.saturating_sub(blocks.len());
-                let start = loaded.blocks.len().saturating_sub(available);
-                &loaded.blocks[start..]
-            });
-            debug_assert!(
-                estimated_history_save_working_bytes(MAX_HISTORY_SAVE_CANDIDATE_RECORDS)
-                    <= HISTORY_SAVE_WORKING_ESTIMATED_BYTES
-            );
-            let _working_reservation =
-                persistence::try_reserve_estimated_bytes(HISTORY_SAVE_WORKING_ESTIMATED_BYTES)?;
-            let intent = explicit_replace_epoch.map_or_else(
-                || HistoryWriteIntent::Revision {
-                    target: history_load.revision(),
-                    legacy: history_load.legacy_authority(),
-                },
-                |_| HistoryWriteIntent::ExplicitReplace,
-            );
-            let outcome = write_history_snapshot_with_intent_parts(
-                &base,
-                &path,
-                session_id.as_deref(),
-                loaded_prefix,
-                &blocks,
-                compress,
-                intent,
-            )?;
-            if let Some(epoch) = explicit_replace_epoch {
-                history_load.mark_explicit_replace_persisted(epoch);
-            }
-            // Only a complete, revision-matched snapshot grants deletion
-            // authority. Any later mismatch fails closed until reload.
-            history_load.set_revision(outcome.authoritative.then_some(outcome.revision));
-            if outcome.legacy_handled {
-                history_load.set_legacy_authority(LegacyHistoryAuthority::Ignore);
-            } else if let Some(revision) = outcome.legacy_retry_revision {
-                history_load.set_legacy_authority(LegacyHistoryAuthority::Revision(revision));
-            }
-            Ok(())
-        })
+                // Only a complete, revision-matched snapshot grants deletion
+                // authority. Any later mismatch fails closed until reload.
+                history_load.set_revision(outcome.authoritative.then_some(outcome.revision));
+                if outcome.legacy_handled {
+                    history_load.set_legacy_authority(LegacyHistoryAuthority::Ignore);
+                } else if let Some(revision) = outcome.legacy_retry_revision {
+                    history_load.set_legacy_authority(LegacyHistoryAuthority::Revision(revision));
+                }
+                Ok(())
+            },
+        )
     }
 
     /// Load and decode Block history on the shared disk worker, then construct
@@ -2609,14 +2662,15 @@ mod tests {
     use super::{
         absolute_history_path, atomic_write, choose_load_path, decode_block_record,
         decode_zstd_bounded, encode_history_frames_bounded, estimated_history_save_working_bytes,
-        estimated_loaded_block_owned_bytes, history_load_limit, loaded_prefix_for_live,
-        lock_file_name, per_session_history_path, prune_stale_session_histories, push_bounded_back,
-        push_loaded_record_bounded, read_history_records, read_history_snapshot,
-        read_history_snapshot_reserved, read_history_snapshot_with_retained_budget,
-        refresh_loaded_block_ids, snapshot_live_blocks_bounded, write_history_snapshot,
-        write_history_snapshot_with_intent, write_history_snapshot_with_intent_parts, BlockData,
-        HistoryFileLock, HistoryLoadOutcome, HistoryLoadShared, HistoryRevision,
-        HistoryWriteIntent, LegacyHistoryAuthority, LoadedHistory, UndecodablePolicy,
+        estimated_loaded_block_owned_bytes, history_load_limit, history_retry_action,
+        loaded_prefix_for_live, lock_file_name, per_session_history_path,
+        prune_stale_session_histories, push_bounded_back, push_loaded_record_bounded,
+        read_history_records, read_history_snapshot, read_history_snapshot_reserved,
+        read_history_snapshot_with_retained_budget, refresh_loaded_block_ids,
+        snapshot_live_blocks_bounded, write_history_snapshot, write_history_snapshot_with_intent,
+        write_history_snapshot_with_intent_parts, BlockData, HistoryFileLock, HistoryLoadOutcome,
+        HistoryLoadShared, HistoryRetryAction, HistoryRevision, HistoryWriteIntent,
+        LegacyHistoryAuthority, LoadedHistory, UndecodablePolicy,
         HISTORY_LOAD_TRANSIENT_ESTIMATED_BYTES, HISTORY_SAVE_WORKING_ESTIMATED_BYTES,
         MAX_ENCODED_RECORD_BYTES, MAX_HISTORY_COMMAND_BYTES, MAX_HISTORY_FILE_BYTES,
         MAX_HISTORY_SAVE_CANDIDATE_RECORDS,
@@ -3425,6 +3479,42 @@ mod tests {
 
         // No session id (legacy caller): the shared file remains the source.
         assert_eq!(choose_load_path(&base, None), Some(base.clone()));
+    }
+
+    /// The failure bar's Retry has to do different things for different
+    /// fail-closed states. A save refusing because the load failed is the
+    /// refusal working as designed — saving again just refuses again — so that
+    /// pane reloads instead. Everything else is a save worth re-attempting.
+    #[test]
+    fn retrying_a_stuck_pane_reloads_only_when_the_load_is_what_failed() {
+        assert_eq!(
+            history_retry_action(&HistoryLoadOutcome::Failed {
+                kind: io::ErrorKind::InvalidData,
+                message: Arc::from("history frame is corrupt"),
+            }),
+            HistoryRetryAction::ReloadFirst
+        );
+        for (label, resumable) in [
+            ("idle", HistoryLoadOutcome::Idle),
+            ("pending", HistoryLoadOutcome::Pending),
+            (
+                "loaded",
+                HistoryLoadOutcome::Loaded(Arc::new(LoadedHistory {
+                    blocks: Arc::new(Vec::new()),
+                    total_loaded: 0,
+                    target_revision: None,
+                    legacy_authority: LegacyHistoryAuthority::Ignore,
+                    retained_estimated_bytes: 0,
+                    _reservation: None,
+                })),
+            ),
+        ] {
+            assert_eq!(
+                history_retry_action(&resumable),
+                HistoryRetryAction::SaveAgain,
+                "{label}"
+            );
+        }
     }
 
     #[test]

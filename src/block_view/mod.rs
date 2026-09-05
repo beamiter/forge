@@ -23,6 +23,7 @@ use bounded_bytes::BoundedByteRing;
 pub(crate) use jterm_core::block_contract::{
     assess_lifecycle, BlockLifecycleHealth, CompletionProvenance,
 };
+use jterm_core::execution_journal::ExecutionLifecycle;
 use jterm_core::kitty_keyboard::{
     self, KittyKey, KittyKeyboardStacks, Modifiers as KittyModifiers,
 };
@@ -54,6 +55,7 @@ pub(crate) use cross_selection::*;
 pub(crate) use css::*;
 pub(crate) use export::SessionExportFormat;
 pub(crate) use find::*;
+pub(crate) use history::BLOCK_HISTORY_PERSIST_OPERATION;
 use onboarding::BlockOnboarding;
 #[allow(unused_imports)]
 pub(crate) use palette::*;
@@ -1084,6 +1086,11 @@ pub(crate) struct PendingCommandMeta {
     id: Option<String>,
     id_present: bool,
     id_trusted: bool,
+    /// The durable journal capability minted from this command's `C` mark, or
+    /// `None` when the shell did not hand over a complete jsh lifecycle
+    /// envelope. Captured at `C` and never reconstructed later, because the
+    /// three identity slots it needs beyond the id only ever travel on `C`.
+    lifecycle: Option<ExecutionLifecycle>,
     cwd: Option<String>,
     duration_ms: Option<u64>,
 }
@@ -1139,6 +1146,14 @@ impl PendingCommandMeta {
                 .as_deref()
                 .is_some_and(|id| command_id_uses_shell_token(id, token)),
             id,
+            // The journal capability is minted here or never: core's parser
+            // accepts `session_id`, `seq` and `started_at_ms` only on `C`, so
+            // no later packet can complete a partial envelope. Both provenance
+            // filters are applied to the token's own id rather than to the
+            // separately-validated `id` field above, because that is the string
+            // that would actually be written to disk.
+            lifecycle: ExecutionLifecycle::from_command_meta(meta)
+                .filter(|lifecycle| journal_lifecycle_provenance_admits(lifecycle, token)),
             cwd: safe_command_metadata_cwd(meta.cwd.as_deref()),
             duration_ms: meta.duration_ms,
         }
@@ -1182,11 +1197,45 @@ impl PendingCommandMeta {
         }
     }
 
-    fn journal_execution_id(&self) -> Option<&str> {
-        self.id
-            .as_deref()
-            .filter(|id| !self.id_trusted && id.starts_with("jsh-"))
+    /// The capability that lets this command's captured output be attached to
+    /// jsh's on-disk execution record, or `None` when nothing may be written.
+    ///
+    /// Holding one is proof of a complete `C`-mark envelope; the provenance
+    /// filters that decide *whether* forge may write it live in
+    /// [`journal_lifecycle_provenance_admits`] and already ran at `C`.
+    fn journal_lifecycle(&self) -> Option<&ExecutionLifecycle> {
+        self.lifecycle.as_ref()
     }
+
+    /// Drop everything that correlates this block to a shell-side record.
+    ///
+    /// Called when the `D` mark names a different execution than the `C` did:
+    /// at that point neither the id nor the lifecycle describes the command
+    /// that is about to be finalized, and the journal entry the token points at
+    /// belongs to some other execution.
+    fn forget_correlated_identity(&mut self) {
+        self.id = None;
+        self.lifecycle = None;
+    }
+}
+
+/// Whether a complete jsh lifecycle envelope may be carried to the journal.
+///
+/// Two filters survive verbatim from the id-only predicate this replaced, and
+/// both are about provenance rather than well-formedness:
+///
+/// * The private shell-integration token is a per-pane secret handed to the
+///   shell over a pipe (`pty.rs`), and forge's own `forge.bash`/`.zsh`/`.fish`
+///   shims mint their ids as `<token>-<seq>`. Writing one into the execution
+///   journal would publish, in a durable file that every app in this family and
+///   the agent read back, the secret whose whole purpose is to let forge tell
+///   its own marks apart from OSC bytes an arbitrary foreground job printed.
+/// * jsh's own ids are `jsh-…` (`jsh/src/execution.rs::execution_id`). An id
+///   from any other shell has no journal Start to attach to, so submitting it
+///   only spends a slot in the bounded writer queue on a record core will
+///   reject under the journal lock anyway.
+fn journal_lifecycle_provenance_admits(lifecycle: &ExecutionLifecycle, token: &str) -> bool {
+    !command_id_uses_shell_token(lifecycle.id(), token) && lifecycle.id().starts_with("jsh-")
 }
 
 fn safe_command_metadata_cwd(cwd: Option<&str>) -> Option<String> {
@@ -1231,11 +1280,11 @@ const MAX_JOURNAL_OUTPUT_BYTES: usize = 256 * 1024;
 /// item when saturated, so a stalled state directory can never block the GTK
 /// main loop. jsh still owns the command, cwd, exit status and duration events;
 /// only the rendered text is ours to contribute.
-fn submit_captured_output_to_journal(id: String, output: &str) {
+fn submit_captured_output_to_journal(lifecycle: ExecutionLifecycle, output: &str) {
     let (text, truncated) = bounded_journal_output(output);
     if let Err(error) =
         jterm_core::execution_journal::submit(jterm_core::execution_journal::CompletedExecution {
-            id,
+            lifecycle,
             output: text,
             output_available: true,
             truncated,
@@ -1247,13 +1296,13 @@ fn submit_captured_output_to_journal(id: String, output: &str) {
 }
 
 fn submit_lazy_output_to_journal(
-    journal_execution_id: Option<String>,
+    journal_lifecycle: Option<ExecutionLifecycle>,
     capture_enabled: bool,
     payload: &dyn BlockRenderPayloadAccessor,
-    submit: impl FnOnce(String, &str),
+    submit: impl FnOnce(ExecutionLifecycle, &str),
 ) {
-    if let Some(id) = journal_execution_id.filter(|_| capture_enabled) {
-        submit(id, payload.materialize().output_plain.trim());
+    if let Some(lifecycle) = journal_lifecycle.filter(|_| capture_enabled) {
+        submit(lifecycle, payload.materialize().output_plain.trim());
     }
 }
 
@@ -1286,15 +1335,29 @@ fn resolve_command_for_block(
     meta: &CommandMeta,
     reconstructed: &str,
 ) -> (String, CommandTextSource) {
-    if let Some(command) = meta.command.as_deref().map(str::trim) {
-        if !command.is_empty()
-            && command.len() <= MAX_COMMAND_CAPTURE_BYTES
-            && !command
-                .chars()
-                .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
-            && !jterm_core::review_input::contains_noncontrol_visual_spoofing(command)
-        {
-            return (command.to_string(), CommandTextSource::ShellReported);
+    // A packet that both carries a command line and discloses that it was
+    // truncated contradicts itself, and the truncation is the half that must
+    // win: `ShellReported` is what makes `command_exact` true on the persisted
+    // record, and that flag is what lets an agent replay the text unedited.
+    // Believing the prefix would hand it half a command line to re-run.
+    //
+    // Core's parser drops `command` on this shape as of the pin this app
+    // builds against, so the contradiction should no longer arrive here. The
+    // check stays because these marks come off the PTY, where anything a
+    // foreground process printed is indistinguishable from the shell's own
+    // output, and because this function is the last place that can tell the
+    // difference between "exact" and "a prefix".
+    if !meta.command_truncated {
+        if let Some(command) = meta.command.as_deref().map(str::trim) {
+            if !command.is_empty()
+                && command.len() <= MAX_COMMAND_CAPTURE_BYTES
+                && !command
+                    .chars()
+                    .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
+                && !jterm_core::review_input::contains_noncontrol_visual_spoofing(command)
+            {
+                return (command.to_string(), CommandTextSource::ShellReported);
+            }
         }
     }
     let reconstructed = reconstructed.trim();
@@ -5352,6 +5415,9 @@ pub struct TermView {
     dynamic_colors: Rc<Cell<DynamicColors>>,
     widget_pool: Rc<RefCell<WidgetPool>>,
     viewport: Rc<RefCell<ViewportState>>,
+    /// Prefix geometry over `block_data`, so a scroll tick binary-searches the
+    /// pixel→card mapping instead of walking history from card zero.
+    block_document_index: Rc<RefCell<BlockDocumentIndex>>,
     visible_indices: Rc<RefCell<std::collections::HashSet<usize>>>,
     selected_block_ids: SelectedBlockIds,
     selected_block_id: Rc<Cell<Option<u64>>>,
@@ -6446,6 +6512,7 @@ struct BlockBackend {
     /// Bookmarked pane filter.
     toggle_bookmark: BookmarkToggle,
     block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
+    block_document_index_for_cb: Rc<RefCell<BlockDocumentIndex>>,
     unread_count_rc: Rc<Cell<u32>>,
     /// Switches the live surface between compact prompt and full-screen
     /// layouts. PTY geometry is deliberately synchronized separately.
@@ -7134,7 +7201,7 @@ impl ReaderCtx {
             // later and includes our own parse latency.
             let mut duration_ms = command_meta.duration_ms.or(measured_duration_ms);
 
-            let journal_execution_id = command_meta.journal_execution_id().map(str::to_owned);
+            let journal_lifecycle = command_meta.journal_lifecycle().cloned();
             let block_cwd = command_meta.cwd.or_else(|| {
                 let cwd_str = self.current_cwd_for_cb.borrow().clone();
                 if cwd_str.is_empty() {
@@ -7206,13 +7273,14 @@ impl ReaderCtx {
             };
             let payload = LazyBlockRenderPayload::new(prompt, captured_output);
 
-            // jsh owns the command/cwd/status/duration events. A correlated
-            // id identifies the record, while the journal capability confirms
-            // that an output consumer is actually enabled. Both must exist
-            // before this path touches the lazy terminal payload; `submit`
-            // repeats its own boundary check in case the environment changes.
+            // jsh owns the command/cwd/status/duration events. The lifecycle
+            // token names the exact Start generation the terminal observed,
+            // while the capture switch confirms that an output consumer is
+            // actually enabled. Both must exist before this path touches the
+            // lazy terminal payload; `submit` repeats its own boundary check in
+            // case the environment changes.
             submit_lazy_output_to_journal(
-                journal_execution_id,
+                journal_lifecycle,
                 jterm_core::execution_journal::output_capture_enabled(),
                 &payload,
                 submit_captured_output_to_journal,
@@ -7653,7 +7721,10 @@ impl ReaderCtx {
             );
         }
         if id_correlation == CommandIdCorrelation::Mismatch {
-            self.engine.borrow_mut().pending_command_meta.id = None;
+            self.engine
+                .borrow_mut()
+                .pending_command_meta
+                .forget_correlated_identity();
         }
         // Every arbitration above accepted this marker as the real end of the
         // command, so the client that owned the keyboard is gone. Resetting
@@ -8720,6 +8791,10 @@ impl RenderBackend for BlockBackend {
                     debug_assert_eq!(data.id, finished_clone.id);
                     data.estimated_height = 0;
                 }
+                // The append already grew the list, which the prefix index
+                // notices; this later zeroing does not, so say so explicitly
+                // rather than depend on the order of the two.
+                self.block_document_index_for_cb.borrow_mut().mark_stale();
             }
         }
 
@@ -10108,29 +10183,255 @@ fn live_content_extent_for(origin_row: i64, cursor_row: i64, grid_rows: i64) -> 
         .clamp(1, grid_rows.max(1))
 }
 
+/// Cumulative document geometry over the block metadata list.
+///
+/// Resolving the viewport used to walk `block_data` from card zero on every
+/// scroll tick, so one scroll frame cost as much as the entire retained
+/// history — and `max_visible_blocks` admits up to 100 000 cards
+/// (`config.rs`). This holds the same [`block_document_height`] values in a
+/// Fenwick tree, so "which card owns document pixel y" is a descent of the
+/// tree in O(log N) and both viewport edges reduce to two such descents.
+///
+/// It is a cache over `block_data`, kept honest by two rules that between them
+/// cover every writer. Every structural mutation of that list changes its
+/// length, which [`Self::reconcile`] notices and answers with a rebuild. Every
+/// height written *without* a length change either patches this index in the
+/// same statement — [`Self::set_height`], used by the visibility appliers,
+/// which are the only writers that run per scroll frame — or marks it stale
+/// with [`Self::mark_stale`], which the filter, collapse, density and refit
+/// paths do because none of them run per frame and a rebuild there is free.
+///
+/// A rebuild is also the signal [`apply_visible_indices_with_measurement`]
+/// needs: see [`Self::take_full_sweep_due`].
+#[derive(Debug, Default)]
+pub(crate) struct BlockDocumentIndex {
+    /// One [`block_document_height`] per card, mirroring `block_data`.
+    heights: Vec<i32>,
+    /// 1-based Fenwick tree over `heights`. The sums are `i64` so a corrupt or
+    /// extreme stored height cannot overflow the running total a descent
+    /// compares against; the old walk saturated its `i32` accumulator instead,
+    /// which folded every card past the overflow onto one document row.
+    tree: Vec<i64>,
+    stale: bool,
+    /// Whether the next visibility pass owes the whole card list a visit
+    /// rather than only the two visible sets. Set by every rebuild and
+    /// cleared by the pass that honours it; see [`Self::take_full_sweep_due`].
+    full_sweep_due: bool,
+    /// Tree nodes read since the last reset. Test-only: the entire claim this
+    /// type makes is that this stays logarithmic while the document grows, and
+    /// a counter inside the real descent is the only way to check it that a
+    /// later rewrite cannot quietly invalidate.
+    #[cfg(test)]
+    probes: Cell<u32>,
+}
+
+impl BlockDocumentIndex {
+    /// Bring the index up to date. O(1) unless the list changed length or a
+    /// non-frame writer marked it stale, and O(N) exactly then.
+    fn reconcile(&mut self, block_data: &VecDeque<BlockData>) {
+        if self.stale || self.heights.len() != block_data.len() {
+            self.rebuild(block_data);
+        }
+    }
+
+    /// The next [`Self::reconcile`] must rebuild: a height changed under a list
+    /// whose length did not.
+    fn mark_stale(&mut self) {
+        self.stale = true;
+    }
+
+    fn rebuild(&mut self, block_data: &VecDeque<BlockData>) {
+        self.heights.clear();
+        self.heights.extend(
+            block_data
+                .iter()
+                .map(|block| block_document_height(block.estimated_height)),
+        );
+        let count = self.heights.len();
+        self.tree.clear();
+        self.tree.resize(count + 1, 0);
+        for index in 0..count {
+            self.tree[index + 1] += i64::from(self.heights[index]);
+            let parent = index + 1 + lowest_set_bit(index + 1);
+            if parent <= count {
+                let carried = self.tree[index + 1];
+                self.tree[parent] += carried;
+            }
+        }
+        self.stale = false;
+        self.full_sweep_due = true;
+    }
+
+    /// Whether the next visibility pass has to visit every card, consuming the
+    /// obligation.
+    ///
+    /// The pass is differential: it visits the union of the set it is leaving
+    /// and the set it is entering, which is exact only while that first set
+    /// still names the cards GTK is laying out in full. Two things break that,
+    /// and both are exactly the things that force a rebuild above:
+    ///
+    /// * A card mounted into the list — a command finishing, an undo, a
+    ///   history load — arrives un-virtualized (`FinishedBlock::new`), and an
+    ///   insertion renumbers every card after it. A freshly mounted card that
+    ///   no viewport happens to name is then in neither set, so nothing ever
+    ///   virtualizes it: it keeps its whole output allocated while the
+    ///   document holds a font-metric estimate for it, and the pixel→card map
+    ///   this index answers drifts by the difference for the rest of the
+    ///   session.
+    /// * A pass that ran against a set some caller had emptied first — the
+    ///   filter and undo paths do that deliberately, because after their
+    ///   rewrite the old indices describe nothing — would leave whatever was
+    ///   on screen before rendered forever, one screenful per toggle.
+    ///
+    /// Paying a full sweep for those is free in the terms that motivated the
+    /// differential pass: they run on a finished command or a deliberate user
+    /// action, never per scroll frame, and a scroll frame moves no card into
+    /// or out of the list and marks nothing stale.
+    fn take_full_sweep_due(&mut self) -> bool {
+        std::mem::take(&mut self.full_sweep_due)
+    }
+
+    /// Declare that the pane's visible set no longer describes the cards the
+    /// toolkit is laying out, so the next pass may not transition from it.
+    ///
+    /// A rebuild already implies this, and the paths below all force one; they
+    /// say it themselves anyway, because the caller that invalidates the set is
+    /// the one that knows it did, and inferring the obligation from a
+    /// coincidence two calls away is how it goes missing.
+    fn require_full_sweep(&mut self) {
+        self.full_sweep_due = true;
+    }
+
+    /// Record one card's new height without rebuilding.
+    ///
+    /// Callers must pass the same value they wrote into
+    /// `BlockData::estimated_height`, in the same statement: an index that
+    /// disagrees with the list still answers queries, it just answers them
+    /// about a document that no longer exists.
+    fn set_height(&mut self, index: usize, estimated_height: i32) {
+        let count = self.heights.len();
+        let Some(slot) = self.heights.get_mut(index) else {
+            return;
+        };
+        let height = block_document_height(estimated_height);
+        let delta = i64::from(height) - i64::from(*slot);
+        if delta == 0 {
+            return;
+        }
+        *slot = height;
+        let mut node = index + 1;
+        while node <= count {
+            self.tree[node] += delta;
+            node += lowest_set_bit(node);
+        }
+    }
+
+    /// Total document height of every card.
+    fn total(&self) -> i64 {
+        let mut node = self.heights.len();
+        let mut sum = 0;
+        while node > 0 {
+            sum += self.tree[node];
+            node -= lowest_set_bit(node);
+        }
+        sum
+    }
+
+    /// The card that owns document pixel `y`: the first whose bottom edge is
+    /// past it, which is also the first card a viewport starting at `y` shows.
+    /// `None` once `y` has reached the document's own height.
+    ///
+    /// Zero-height cards — the ones a pane filter removed from the document —
+    /// are never the answer, because the descent stops at the last prefix that
+    /// is still within `y` and a zero-height card does not move the prefix.
+    fn card_at_document_y(&self, y: i64) -> Option<usize> {
+        let count = self.heights.len();
+        if count == 0 {
+            return None;
+        }
+        // Above the document is the same question as at its very first pixel:
+        // the answer is the first card that occupies any row at all.
+        let mut remaining = y.max(0);
+        let mut consumed = 0_usize;
+        let mut step = 1_usize << (usize::BITS - 1 - count.leading_zeros());
+        while step > 0 {
+            let next = consumed + step;
+            if next <= count {
+                #[cfg(test)]
+                self.probes.set(self.probes.get() + 1);
+                if self.tree[next] <= remaining {
+                    remaining -= self.tree[next];
+                    consumed = next;
+                }
+            }
+            step >>= 1;
+        }
+        (consumed < count).then_some(consumed)
+    }
+
+    fn viewport_state(&self, visible_top: i32, visible_bottom: i32) -> ViewportState {
+        let total = self.total();
+        let first_visible = self.card_at_document_y(i64::from(visible_top)).unwrap_or(0);
+        // The last card whose top edge is still above the window's bottom is
+        // the one owning the last pixel either the window or the document has,
+        // whichever runs out first.
+        let last_visible = if total == 0 || visible_bottom <= 0 {
+            0
+        } else {
+            self.card_at_document_y(i64::from(visible_bottom).saturating_sub(1).min(total - 1))
+                .unwrap_or(0)
+        };
+        ViewportState {
+            first_visible,
+            last_visible,
+        }
+    }
+}
+
+#[cfg(test)]
+impl BlockDocumentIndex {
+    fn reset_probes(&self) {
+        self.probes.set(0);
+    }
+
+    fn probes(&self) -> u32 {
+        self.probes.get()
+    }
+}
+
+/// The lowest set bit of a Fenwick node index, which is the span it covers.
+const fn lowest_set_bit(node: usize) -> usize {
+    node & node.wrapping_neg()
+}
+
+/// Reference implementation of [`BlockDocumentIndex::viewport_state`]: the
+/// from-zero walk the index replaced, retained so the O(log N) descent can be
+/// checked against it over generated documents instead of only at hand-picked
+/// boundaries.
+#[cfg(test)]
 fn compute_viewport_state(
     block_data: &VecDeque<BlockData>,
     visible_top: i32,
     visible_bottom: i32,
 ) -> ViewportState {
-    let mut y = 0_i32;
+    let mut y = 0_i64;
     let mut first = None;
     let mut last = 0;
     for (i, block) in block_data.iter().enumerate() {
         let block_top = y;
-        let block_bottom = y.saturating_add(block_document_height(block.estimated_height));
+        let block_bottom = y + i64::from(block_document_height(block.estimated_height));
         if block_bottom == block_top {
             continue;
         }
-        if first.is_none() && block_bottom > visible_top {
+        if first.is_none() && block_bottom > i64::from(visible_top) {
             first = Some(i);
         }
-        if block_top < visible_bottom {
+        if block_top < i64::from(visible_bottom) {
             last = i;
         }
         y = block_bottom;
 
-        if first.is_some() && y >= visible_bottom {
+        if first.is_some() && y >= i64::from(visible_bottom) {
             break;
         }
     }
@@ -10142,55 +10443,17 @@ fn compute_viewport_state(
 }
 
 /// Resolve the strict virtualization window and its looser hysteresis window
-/// while walking history once. Both ranges share the same document geometry;
-/// scanning them independently doubles the prefix work on every scroll tick.
+/// from one index. Both ranges share the same document geometry.
 fn compute_viewport_state_pair(
-    block_data: &VecDeque<BlockData>,
+    index: &BlockDocumentIndex,
     strict_top: i32,
     strict_bottom: i32,
     loose_top: i32,
     loose_bottom: i32,
 ) -> (ViewportState, ViewportState) {
-    let mut y = 0_i32;
-    let mut strict_first = None;
-    let mut strict_last = 0;
-    let mut loose_first = None;
-    let mut loose_last = 0;
-
-    for (i, block) in block_data.iter().enumerate() {
-        let block_top = y;
-        let block_bottom = y.saturating_add(block_document_height(block.estimated_height));
-        if block_bottom == block_top {
-            continue;
-        }
-        if strict_first.is_none() && block_bottom > strict_top {
-            strict_first = Some(i);
-        }
-        if block_top < strict_bottom {
-            strict_last = i;
-        }
-        if loose_first.is_none() && block_bottom > loose_top {
-            loose_first = Some(i);
-        }
-        if block_top < loose_bottom {
-            loose_last = i;
-        }
-        y = block_bottom;
-
-        if strict_first.is_some() && loose_first.is_some() && y >= strict_bottom.max(loose_bottom) {
-            break;
-        }
-    }
-
     (
-        ViewportState {
-            first_visible: strict_first.unwrap_or(0),
-            last_visible: strict_last,
-        },
-        ViewportState {
-            first_visible: loose_first.unwrap_or(0),
-            last_visible: loose_last,
-        },
+        index.viewport_state(strict_top, strict_bottom),
+        index.viewport_state(loose_top, loose_bottom),
     )
 }
 
@@ -10225,22 +10488,18 @@ fn viewport_bounds_for_scroll(
 /// boundary, virtualizing every card and leaving only empty placeholders. Keep
 /// the last valid visibility set until the page is mapped and allocated again.
 fn viewport_state_for_scroll(
-    block_data: &VecDeque<BlockData>,
+    index: &BlockDocumentIndex,
     scroll_top: f64,
     viewport_height: f64,
     margin_pages: u32,
 ) -> Option<ViewportState> {
     let (visible_top, visible_bottom) =
         viewport_bounds_for_scroll(scroll_top, viewport_height, margin_pages)?;
-    Some(compute_viewport_state(
-        block_data,
-        visible_top,
-        visible_bottom,
-    ))
+    Some(index.viewport_state(visible_top, visible_bottom))
 }
 
 fn viewport_state_pair_for_scroll(
-    block_data: &VecDeque<BlockData>,
+    index: &BlockDocumentIndex,
     scroll_top: f64,
     viewport_height: f64,
     strict_margin_pages: u32,
@@ -10251,7 +10510,7 @@ fn viewport_state_pair_for_scroll(
     let (loose_top, loose_bottom) =
         viewport_bounds_for_scroll(scroll_top, viewport_height, loose_margin_pages)?;
     Some(compute_viewport_state_pair(
-        block_data,
+        index,
         strict_top,
         strict_bottom,
         loose_top,
@@ -10319,30 +10578,103 @@ fn retain_renderable_indices(
     indices.retain(|index| *index < card_count && !is_filtered_out(*index));
 }
 
-fn apply_visible_indices(
-    finished: &[FinishedBlock],
+/// The part of a finished card that a visibility pass reads and writes.
+///
+/// Named as a trait so the pass below can be exercised without a display. It
+/// is the one place that decides which cards the toolkit lays out in full and
+/// what height the document records for the rest, and getting that transition
+/// subtly wrong shows up not as a crash but as a scrollbar and a pixel→card
+/// map that describe a document nobody is looking at. Every widget test in
+/// this crate is `#[ignore]`d for want of a display, so without this seam the
+/// transition would be pinned by nothing that runs.
+trait VirtualizableCard {
+    /// Whether a pane filter is hiding this card, which makes it absent from
+    /// the document rather than merely off-screen.
+    fn is_filtered_out(&self) -> bool;
+    /// Switch the card between its full layout and its placeholder, returning
+    /// the document height it now occupies. Sampling the live allocation on
+    /// the way out is what keeps that placeholder honest.
+    fn set_virtualized(&self, virtualized: bool) -> i32;
+    /// The same transition without sampling, for the moment after a density
+    /// change when the allocation on screen still belongs to the old density.
+    fn set_virtualized_preserving_height(&self, virtualized: bool) -> i32;
+    /// The height the toolkit is giving this card right now.
+    fn allocated_height(&self) -> i32;
+}
+
+impl VirtualizableCard for FinishedBlock {
+    // Each of these resolves to the card's own inherent method, which takes
+    // precedence over the trait one; the trait adds a seam, not behaviour.
+    fn is_filtered_out(&self) -> bool {
+        FinishedBlock::is_filtered_out(self)
+    }
+
+    fn set_virtualized(&self, virtualized: bool) -> i32 {
+        FinishedBlock::set_virtualized(self, virtualized)
+    }
+
+    fn set_virtualized_preserving_height(&self, virtualized: bool) -> i32 {
+        FinishedBlock::set_virtualized_preserving_height(self, virtualized)
+    }
+
+    fn allocated_height(&self) -> i32 {
+        self.widget().height()
+    }
+}
+
+fn apply_visible_indices<C: VirtualizableCard>(
+    finished: &[C],
     block_data: &mut VecDeque<BlockData>,
+    index: &mut BlockDocumentIndex,
     visible: &mut std::collections::HashSet<usize>,
     new_visible: std::collections::HashSet<usize>,
 ) {
-    apply_visible_indices_with_measurement(finished, block_data, visible, new_visible, true);
+    apply_visible_indices_with_measurement(finished, block_data, index, visible, new_visible, true);
 }
 
 /// The same visibility transition immediately after a density change. GTK has
 /// only queued the new margins at this point, so sampling widget allocations
 /// would write the old density straight back over the translated placeholders.
-fn apply_visible_indices_preserving_heights(
-    finished: &[FinishedBlock],
+fn apply_visible_indices_preserving_heights<C: VirtualizableCard>(
+    finished: &[C],
     block_data: &mut VecDeque<BlockData>,
+    index: &mut BlockDocumentIndex,
     visible: &mut std::collections::HashSet<usize>,
     new_visible: std::collections::HashSet<usize>,
 ) {
-    apply_visible_indices_with_measurement(finished, block_data, visible, new_visible, false);
+    apply_visible_indices_with_measurement(
+        finished,
+        block_data,
+        index,
+        visible,
+        new_visible,
+        false,
+    );
 }
 
-fn apply_visible_indices_with_measurement(
-    finished: &[FinishedBlock],
+/// Move the pane from one visible set to the next, touching only the cards
+/// whose render state can differ between them.
+///
+/// This used to sweep every finished card on every pass, so a scroll tick paid
+/// one `set_virtualized` call and one metadata write per retained command — up
+/// to the 100 000 `max_visible_blocks` admits — to move a boundary that had
+/// shifted by a screenful. Cards in neither set are already virtualized at the
+/// placeholder height the document records for them: `set_virtualized` returns
+/// early with that exact value when the state does not change, so visiting them
+/// wrote back what was already there.
+///
+/// That reasoning holds only while `visible` still names the cards the toolkit
+/// is laying out in full, which a scroll tick preserves and a document that
+/// grew, shrank or was re-measured does not. The index knows which of the two
+/// just happened — it had to rebuild for exactly the same reasons — so the
+/// obligation to sweep everything travels with it rather than being rebuilt
+/// here from a scan nobody could afford. See
+/// [`BlockDocumentIndex::take_full_sweep_due`] for what each of those cases
+/// strands when the pass stays differential through it.
+fn apply_visible_indices_with_measurement<C: VirtualizableCard>(
+    finished: &[C],
     block_data: &mut VecDeque<BlockData>,
+    index: &mut BlockDocumentIndex,
     visible: &mut std::collections::HashSet<usize>,
     mut new_visible: std::collections::HashSet<usize>,
     measure_allocations: bool,
@@ -10354,10 +10686,23 @@ fn apply_visible_indices_with_measurement(
     retain_renderable_indices(&mut new_visible, finished.len(), |index| {
         finished[index].is_filtered_out()
     });
-    for (i, block) in finished.iter().enumerate() {
+    // The union: newly rendered cards, newly virtualized ones, and the ones
+    // that stay rendered and therefore still need their allocation sampled.
+    // A card that has become filtered since the last pass is in the outgoing
+    // set, so its document height still reaches zero here.
+    let touched: Vec<usize> = if index.take_full_sweep_due() {
+        (0..finished.len()).collect()
+    } else {
+        new_visible.union(visible).copied().collect()
+    };
+    for i in touched {
+        let Some(block) = finished.get(i) else {
+            continue;
+        };
         if block.is_filtered_out() {
             if let Some(data) = block_data.get_mut(i) {
                 data.estimated_height = 0;
+                index.set_height(i, 0);
             }
             continue;
         }
@@ -10370,18 +10715,20 @@ fn apply_visible_indices_with_measurement(
         if !should_render {
             if let Some(data) = block_data.get_mut(i) {
                 data.estimated_height = height;
+                index.set_height(i, height);
             }
         } else if measure_allocations {
             // Keep the metadata document converged to real allocations for
             // rendered cards too. The font-metric estimate drifts from the
-            // pixels GTK actually allocates, and the pixel→index mapping in
-            // `compute_viewport_state` accumulates that drift — enough of it
-            // moves the virtualization boundary onto cards that are still on
-            // screen.
-            let allocated = block.widget().height();
+            // pixels GTK actually allocates, and the pixel→index mapping the
+            // document index answers from accumulates that drift — enough of
+            // it moves the virtualization boundary onto cards that are still
+            // on screen.
+            let allocated = block.allocated_height();
             if allocated > 1 {
                 if let Some(data) = block_data.get_mut(i) {
                     data.estimated_height = allocated;
+                    index.set_height(i, allocated);
                 }
             }
         }
@@ -11268,6 +11615,7 @@ impl TermView {
                 let finished = self.finished_blocks.borrow();
                 let mut block_data = self.block_data.borrow_mut();
                 apply_finished_card_density(&finished, &mut block_data, compact);
+                self.block_document_index.borrow_mut().mark_stale();
             }
             self.update_viewport();
             self.update_block_visibility_preserving_heights();
@@ -11636,6 +11984,8 @@ impl TermView {
 
         let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
             Rc::new(RefCell::new(VecDeque::new()));
+        let block_document_index: Rc<RefCell<BlockDocumentIndex>> =
+            Rc::new(RefCell::new(BlockDocumentIndex::default()));
         let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
         let find_state = Rc::new(RefCell::new(FindState::default()));
 
@@ -11759,6 +12109,7 @@ impl TermView {
             let typed_cmd = typed_cmd.clone();
             let finished_for_layout = finished_blocks_rc.clone();
             let block_data_for_layout = block_data_rc.clone();
+            let document_index_for_layout = block_document_index.clone();
             let failure_marker_redraw_for_layout = failure_marker_redraw.clone();
             let last_size_target: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
             // Change detector for the finished-block re-fit. Their cap follows
@@ -11932,6 +12283,7 @@ impl TermView {
                 if resized.is_empty() {
                     return;
                 }
+                document_index_for_layout.borrow_mut().mark_stale();
                 mutate_block_data_and_redraw(
                     &block_data_for_layout,
                     failure_marker_redraw_for_layout.as_ref(),
@@ -12218,6 +12570,7 @@ impl TermView {
             let block_filter = block_filter.clone();
             let finished = Rc::downgrade(&finished_blocks_rc);
             let block_data = block_data_rc.clone();
+            let document_index = block_document_index.clone();
             let active = Rc::downgrade(&active);
             let config = config_shared.clone();
             let selected_ids = selected_block_ids.clone();
@@ -12258,6 +12611,10 @@ impl TermView {
 
                 if let Some(keep) = filtered_keep {
                     card.set_filtered_out(!keep);
+                    // A filter flip changes a height without changing the
+                    // list's length, which is the one shape the prefix index
+                    // cannot notice on its own.
+                    document_index.borrow_mut().mark_stale();
                     if let Some(data) = block_data.borrow_mut().get_mut(index) {
                         data.estimated_height = if keep {
                             let fallback_cols =
@@ -12306,8 +12663,10 @@ impl TermView {
                 let adjustment = scroll.vadjustment();
                 let next = {
                     let data = block_data.borrow();
+                    let mut index = document_index.borrow_mut();
+                    index.reconcile(&data);
                     viewport_state_for_scroll(
-                        &data,
+                        &index,
                         adjustment.value(),
                         adjustment.page_size(),
                         config.borrow().virtual_scroll_margin,
@@ -12322,7 +12681,13 @@ impl TermView {
                 let finished_ref = finished.borrow();
                 let mut visible_ref = visible.borrow_mut();
                 let mut data = block_data.borrow_mut();
-                apply_visible_indices(&finished_ref, &mut data, &mut visible_ref, new_visible);
+                apply_visible_indices(
+                    &finished_ref,
+                    &mut data,
+                    &mut document_index.borrow_mut(),
+                    &mut visible_ref,
+                    new_visible,
+                );
                 block_list.queue_allocate();
                 Some(now_bookmarked)
             })
@@ -12454,6 +12819,7 @@ impl TermView {
                     bookmarks_for_cb: block_bookmarks.clone(),
                     toggle_bookmark: toggle_bookmark.clone(),
                     block_data_for_cb,
+                    block_document_index_for_cb: block_document_index.clone(),
                     unread_count_rc: unread_count.clone(),
                     layout_active_surface: layout_active_surface.clone(),
                     config_for_cb: config_for_cb.clone(),
@@ -13482,6 +13848,7 @@ impl TermView {
             dynamic_colors,
             widget_pool: widget_pool.clone(),
             viewport,
+            block_document_index,
             visible_indices,
             selected_block_ids,
             selected_block_id,
@@ -13531,6 +13898,7 @@ impl TermView {
             let viewport = term_view.viewport.clone();
             let block_scroll = term_view.block_scroll.clone();
             let block_data = term_view.block_data.clone();
+            let document_index = term_view.block_document_index.clone();
             let config = term_view.config.clone();
             let finished_blocks = Rc::downgrade(&term_view.finished_blocks);
             let visible_indices = term_view.visible_indices.clone();
@@ -13559,6 +13927,7 @@ impl TermView {
                 let scroll = block_scroll.clone();
                 let finished = finished_blocks.clone();
                 let block_data = block_data.clone();
+                let document_index = document_index.clone();
                 let config = config.clone();
                 let visible = visible_indices.clone();
                 let fullscreen = fullscreen.clone();
@@ -13576,10 +13945,13 @@ impl TermView {
                     let adj = scroll.vadjustment();
                     let margin = config.borrow().virtual_scroll_margin;
                     let block_data_ref = block_data.borrow();
-                    // Resolve the strict and hysteresis windows in one walk of
-                    // the history prefix; both use the same GTK geometry.
+                    // Resolve the strict and hysteresis windows from one prefix
+                    // index; both use the same GTK geometry, and the index is
+                    // only rebuilt when the document actually moved under it.
+                    let mut index_ref = document_index.borrow_mut();
+                    index_ref.reconcile(&block_data_ref);
                     let Some((next_viewport, loose_viewport)) = viewport_state_pair_for_scroll(
-                        &block_data_ref,
+                        &index_ref,
                         adj.value(),
                         adj.page_size(),
                         margin,
@@ -13587,6 +13959,7 @@ impl TermView {
                     ) else {
                         return;
                     };
+                    drop(index_ref);
                     drop(block_data_ref);
 
                     let new_visible = stable_visible_indices(
@@ -13605,6 +13978,7 @@ impl TermView {
                             apply_visible_indices(
                                 &finished_ref,
                                 block_data,
+                                &mut document_index.borrow_mut(),
                                 &mut visible_ref,
                                 new_visible,
                             );
@@ -14845,12 +15219,14 @@ impl TermView {
             let config = self.config.borrow();
             let fallback_cols = self.active.borrow().grid_cols() as i64;
             let mut block_data = self.block_data.borrow_mut();
+            let mut document_index = self.block_document_index.borrow_mut();
             let mut moved = 0usize;
             for (index, card) in finished.iter().enumerate() {
                 if !card.set_collapsed(collapsed) {
                     continue;
                 }
                 moved += 1;
+                document_index.mark_stale();
                 if let Some(data) = block_data.get_mut(index) {
                     data.estimated_height = if card.is_filtered_out() {
                         0
@@ -14893,6 +15269,7 @@ impl TermView {
             let config = self.config.borrow();
             let fallback_cols = self.active.borrow().grid_cols() as i64;
             let mut block_data = self.block_data.borrow_mut();
+            self.block_document_index.borrow_mut().mark_stale();
             if let Some(data) = block_data.get_mut(index) {
                 data.estimated_height = if card.is_filtered_out() {
                     0
@@ -15139,6 +15516,7 @@ impl TermView {
         );
 
         self.visible_indices.borrow_mut().clear();
+        self.block_document_index.borrow_mut().require_full_sweep();
         if let Some(kind) = self.block_filter.get() {
             let _ = self.apply_block_filter(kind);
         } else {
@@ -15374,6 +15752,9 @@ impl TermView {
         let config = self.config.borrow();
         let fallback_cols = self.active.borrow().grid_cols() as i64;
         let mut block_data = self.block_data.borrow_mut();
+        // Re-filtering rewrites heights across the whole list without changing
+        // its length; the prefix index must be rebuilt from it afterwards.
+        self.block_document_index.borrow_mut().mark_stale();
         let mut shown = 0usize;
         for (index, card) in finished.iter().enumerate() {
             let kept = keep(card.id);
@@ -15417,7 +15798,13 @@ impl TermView {
     fn refresh_filtered_layout(&self) {
         self.clear_find();
         (self.failure_marker_redraw)();
+        // Every card's height was just rewritten and the viewport re-resolved
+        // from the top, so the set is dropped rather than transitioned from.
+        // The pass that follows therefore has to visit every card: the ones
+        // this set named are still laid out in full, and nothing else will
+        // ever name them again.
         self.visible_indices.borrow_mut().clear();
+        self.block_document_index.borrow_mut().require_full_sweep();
         self.update_viewport();
         self.update_block_visibility();
         self.block_list.queue_allocate();
@@ -15551,14 +15938,17 @@ impl TermView {
     pub fn update_viewport(&self) {
         let adj = self.block_scroll.vadjustment();
         let block_data = self.block_data.borrow();
+        let mut index = self.block_document_index.borrow_mut();
+        index.reconcile(&block_data);
         let Some(next_viewport) = viewport_state_for_scroll(
-            &block_data,
+            &index,
             adj.value(),
             adj.page_size(),
             self.config.borrow().virtual_scroll_margin,
         ) else {
             return;
         };
+        drop(index);
         drop(block_data);
 
         let mut vp = self.viewport.borrow_mut();
@@ -15575,7 +15965,15 @@ impl TermView {
         mutate_block_data_and_redraw(
             &self.block_data,
             self.failure_marker_redraw.as_ref(),
-            |block_data| apply_visible_indices(&finished, block_data, &mut visible, new_visible),
+            |block_data| {
+                apply_visible_indices(
+                    &finished,
+                    block_data,
+                    &mut self.block_document_index.borrow_mut(),
+                    &mut visible,
+                    new_visible,
+                )
+            },
         );
     }
 
@@ -15592,6 +15990,7 @@ impl TermView {
                 apply_visible_indices_preserving_heights(
                     &finished,
                     block_data,
+                    &mut self.block_document_index.borrow_mut(),
                     &mut visible,
                     new_visible,
                 )
@@ -15849,41 +16248,43 @@ pub struct BlockAgentEvidence {
 #[cfg(test)]
 mod tests {
     use super::{
-        accept_agent_integration_token, anchor_tick_exit, apply_vte_commit_to_shadow,
-        approved_command_submission_payload, background_output_has_visible_text,
-        bounded_journal_output, build_clipboard_paste, build_command_recall,
-        build_keyboard_query_reply, capture_vte_rows_bounded, capture_vte_search_windows_bounded,
-        classify_command_prompt_status, coalesce_bytes_events, collapse_repaint_output,
-        command_capture_range_is_bounded, command_id_uses_shell_token, compute_viewport_state,
-        decide_agent_command_end, emit_activity, emit_alt_screen_transition, emit_command_finished,
-        emit_command_started, failed_block_marker_fractions, failure_marker_fractions_from,
-        format_color_query_reply, history_edge_navigation_available,
-        input_is_typeahead_for_existing_submission, input_may_survive_into_next_prompt,
-        input_submits_line, live_content_extent_for, live_visible_rows, mounted_jumpable_records,
-        mutate_block_data_and_redraw, next_prompt_shadow_state, normalize_captured_command,
-        normalize_loaded_block_ids, notification_allowed, output_has_vertical_repaint,
-        parse_color_spec, post_prompt_feed, preflight_clipboard_paste, prepend_in_order,
-        prompt_anchor_for_surface, prompt_anchor_may_settle, prompt_layout_reflow_can_reanchor,
-        prompt_surface_is_clean, rebase_prompt_anchor, record_external_input,
-        record_protocol_reply_input, replace_nonempty_stash, resolve_command_for_block,
-        resolve_submitted_command, reviewed_pre_command_bytes_are_identity_neutral,
-        reviewed_submission_matches, screen_relative_cpr_row, scroll_delta_to_reveal,
-        selected_blocks_markdown, selected_command_text, selected_id_range,
-        shell_argv_supports_agent_ids, shell_argv_uses_jsh, shell_integration_hint,
-        should_buffer_background_output, stable_visible_indices, step_marked_indices,
-        step_marked_record_ids, sticky_scan_inputs_changed, strip_ansi,
-        strip_ansi_with_clear_detect, take_background_output, take_stash_for_undo,
-        truncate_plain_output_for_height, verified_editor_contains_exact_command,
-        viewport_page_size_changed, viewport_state_for_scroll, viewport_state_pair_for_scroll,
-        visible_indices_for_viewport, AgentCommandEndDecision, AltScreenCallbacks,
-        AltScreenTransition, AnchorAbandoned, AnchorTickExit, BlockData, BlockState,
-        BoundedByteRing, BoundedClipboardAccumulator, CommandFinishedEvent, CommandIdCorrelation,
-        CommandMeta, CommandPromptStatus, CommandStartedEvent, DynamicColors, HumanInputKind,
-        InputOrigin, PendingCommandMeta, PostPromptFeed, StickyScanInputs, TypedShadowFidelity,
-        ViewportState, MAX_COMMAND_CAPTURE_BYTES, MAX_JOURNAL_OUTPUT_BYTES,
-        MAX_PROMPT_CAPTURE_BYTES, MAX_RAW_OUTPUT_BYTES, MAX_SELECTED_CLIPBOARD_BYTES,
-        TERMINAL_RESET_INVALIDATED_SUBMISSION, TRUNCATED_COMMAND_PLACEHOLDER,
-        UNAVAILABLE_COMMAND_PLACEHOLDER, VERIFIED_SUBMISSION_MAX_POLLS, ZONE_MARKER_CLOSE,
+        accept_agent_integration_token, anchor_tick_exit, apply_visible_indices,
+        apply_vte_commit_to_shadow, approved_command_submission_payload,
+        background_output_has_visible_text, bounded_journal_output, build_clipboard_paste,
+        build_command_recall, build_keyboard_query_reply, capture_vte_rows_bounded,
+        capture_vte_search_windows_bounded, classify_command_prompt_status, coalesce_bytes_events,
+        collapse_repaint_output, command_capture_range_is_bounded, command_id_uses_shell_token,
+        compute_viewport_state, decide_agent_command_end, emit_activity,
+        emit_alt_screen_transition, emit_command_finished, emit_command_started,
+        failed_block_marker_fractions, failure_marker_fractions_from, format_color_query_reply,
+        history_edge_navigation_available, input_is_typeahead_for_existing_submission,
+        input_may_survive_into_next_prompt, input_submits_line,
+        journal_lifecycle_provenance_admits, live_content_extent_for, live_visible_rows,
+        mounted_jumpable_records, mutate_block_data_and_redraw, next_prompt_shadow_state,
+        normalize_captured_command, normalize_loaded_block_ids, notification_allowed,
+        output_has_vertical_repaint, parse_color_spec, post_prompt_feed, preflight_clipboard_paste,
+        prepend_in_order, prompt_anchor_for_surface, prompt_anchor_may_settle,
+        prompt_layout_reflow_can_reanchor, prompt_surface_is_clean, rebase_prompt_anchor,
+        record_external_input, record_protocol_reply_input, replace_nonempty_stash,
+        resolve_command_for_block, resolve_submitted_command,
+        reviewed_pre_command_bytes_are_identity_neutral, reviewed_submission_matches,
+        screen_relative_cpr_row, scroll_delta_to_reveal, selected_blocks_markdown,
+        selected_command_text, selected_id_range, shell_argv_supports_agent_ids,
+        shell_argv_uses_jsh, shell_integration_hint, should_buffer_background_output,
+        stable_visible_indices, step_marked_indices, step_marked_record_ids,
+        sticky_scan_inputs_changed, strip_ansi, strip_ansi_with_clear_detect,
+        take_background_output, take_stash_for_undo, truncate_plain_output_for_height,
+        verified_editor_contains_exact_command, viewport_page_size_changed,
+        viewport_state_for_scroll, viewport_state_pair_for_scroll, visible_indices_for_viewport,
+        AgentCommandEndDecision, AltScreenCallbacks, AltScreenTransition, AnchorAbandoned,
+        AnchorTickExit, BlockData, BlockState, BoundedByteRing, BoundedClipboardAccumulator,
+        CommandFinishedEvent, CommandIdCorrelation, CommandMeta, CommandPromptStatus,
+        CommandStartedEvent, DynamicColors, ExecutionLifecycle, HumanInputKind, InputOrigin,
+        PendingCommandMeta, PostPromptFeed, StickyScanInputs, TypedShadowFidelity, ViewportState,
+        MAX_COMMAND_CAPTURE_BYTES, MAX_JOURNAL_OUTPUT_BYTES, MAX_PROMPT_CAPTURE_BYTES,
+        MAX_RAW_OUTPUT_BYTES, MAX_SELECTED_CLIPBOARD_BYTES, TERMINAL_RESET_INVALIDATED_SUBMISSION,
+        TRUNCATED_COMMAND_PLACEHOLDER, UNAVAILABLE_COMMAND_PLACEHOLDER,
+        VERIFIED_SUBMISSION_MAX_POLLS, ZONE_MARKER_CLOSE,
     };
     // The reader-dispatch harness at the bottom of this module: the two
     // rendering seams, the lifecycle context they serve, and the engine state
@@ -17762,10 +18163,10 @@ mod tests {
             )
         };
 
-        for (id, enabled) in [(None, true), (Some("jsh-id".to_string()), false)] {
+        for (lifecycle, enabled) in [(None, true), (Some(jsh_lifecycle("jsh-id")), false)] {
             let payload = make_payload();
             let mut submitted = false;
-            super::submit_lazy_output_to_journal(id, enabled, &payload, |_, _| {
+            super::submit_lazy_output_to_journal(lifecycle, enabled, &payload, |_, _| {
                 submitted = true;
             });
             assert!(!submitted);
@@ -17775,14 +18176,14 @@ mod tests {
         let payload = make_payload();
         let mut submitted = None;
         super::submit_lazy_output_to_journal(
-            Some("jsh-id".to_string()),
+            Some(jsh_lifecycle("jsh-id")),
             true,
             &payload,
-            |id, text| submitted = Some((id, text.to_string())),
+            |lifecycle, text| submitted = Some((lifecycle, text.to_string())),
         );
         assert_eq!(
             submitted,
-            Some(("jsh-id".to_string(), "journal text".to_string()))
+            Some((jsh_lifecycle("jsh-id"), "journal text".to_string()))
         );
         assert_eq!(payload.materialization_count(), 1);
         assert_eq!(
@@ -18592,6 +18993,45 @@ mod tests {
         );
     }
 
+    /// A packet carrying both a command prefix and `cmd_truncated=1` is
+    /// self-contradictory. `ShellReported` is what makes `command_exact` true
+    /// on the persisted record and unlocks agent replay of the text as written,
+    /// so the prefix must never reach it — whatever else the packet claims.
+    #[test]
+    fn a_truncated_packet_never_reports_its_prefix_as_the_exact_command() {
+        let contradictory = CommandMeta {
+            command: Some("git commit -m \"the first eighty".to_string()),
+            command_truncated: true,
+            ..CommandMeta::default()
+        };
+        assert_eq!(
+            resolve_command_for_block(&contradictory, "git commit -m \"the first eighty bytes\""),
+            (
+                "git commit -m \"the first eighty bytes\"".to_string(),
+                super::CommandTextSource::ScreenAfterTruncation
+            ),
+            "the screen scrape may well be whole; the prefix is known not to be"
+        );
+        assert_eq!(
+            resolve_command_for_block(&contradictory, ""),
+            (
+                TRUNCATED_COMMAND_PLACEHOLDER.to_string(),
+                super::CommandTextSource::ScreenAfterTruncation
+            ),
+            "with nothing on screen the record says so, rather than showing half a command"
+        );
+
+        // The same text without the disclosure is still the exact command.
+        let honest = CommandMeta {
+            command_truncated: false,
+            ..contradictory
+        };
+        assert_eq!(
+            resolve_command_for_block(&honest, "").1,
+            super::CommandTextSource::ShellReported
+        );
+    }
+
     /// jsh attaches the duration to `D` and the id to `C`; folding the two marks
     /// must not let the second one erase what the first carried.
     #[test]
@@ -18665,6 +19105,93 @@ mod tests {
         assert_eq!(rejected.cwd, None);
     }
 
+    /// A jsh `C` mark exactly as the shell emits it: all four identity slots
+    /// on the one packet. Core's parser accepts `session_id`, `seq` and
+    /// `started_at_ms` only on `C`, and `ExecutionLifecycle::from_command_meta`
+    /// refuses anything less, so this is the only shape that mints a token.
+    fn jsh_command_start(id: &str) -> CommandMeta {
+        CommandMeta {
+            id: Some(id.to_string()),
+            session_id: Some("probe-session-1".to_string()),
+            seq: Some(1),
+            started_at_ms: Some(1_788_571_993_465),
+            ..CommandMeta::default()
+        }
+    }
+
+    fn jsh_lifecycle(id: &str) -> ExecutionLifecycle {
+        ExecutionLifecycle::from_command_meta(&jsh_command_start(id))
+            .expect("a complete C envelope mints a lifecycle")
+    }
+
+    /// The journal capability exists only for a complete `C` envelope, and only
+    /// for an id jsh itself minted. Every incomplete or foreign shape here
+    /// would previously have journaled captured output under a bare id.
+    #[test]
+    fn journal_lifecycle_requires_a_complete_jsh_start_envelope() {
+        let start = jsh_command_start("jsh-b8c6-1");
+        let pending = PendingCommandMeta::from_command_start(&start);
+        assert_eq!(
+            pending.journal_lifecycle().map(ExecutionLifecycle::id),
+            Some("jsh-b8c6-1")
+        );
+
+        // Each identity slot is load-bearing on its own: jsh sends all four on
+        // C, so a packet missing one is not jsh's and must not be journaled.
+        for drop_slot in [
+            |meta: &mut CommandMeta| meta.session_id = None,
+            |meta: &mut CommandMeta| meta.seq = None,
+            |meta: &mut CommandMeta| meta.started_at_ms = None,
+            |meta: &mut CommandMeta| meta.id = None,
+        ] {
+            let mut partial = jsh_command_start("jsh-b8c6-1");
+            drop_slot(&mut partial);
+            assert!(
+                PendingCommandMeta::from_command_start(&partial)
+                    .journal_lifecycle()
+                    .is_none(),
+                "a partial C envelope must not mint a journal capability"
+            );
+        }
+
+        // A shell that is not jsh has no journal Start to attach to.
+        assert!(
+            PendingCommandMeta::from_command_start(&jsh_command_start("other-shell-1"))
+                .journal_lifecycle()
+                .is_none()
+        );
+    }
+
+    /// The `D` mark may corroborate the identity, never mint or replace it.
+    /// Core's parser drops the three Start-only slots on `D`, and this pins
+    /// forge's own half of that rule against a hand-built full packet.
+    #[test]
+    fn command_end_neither_mints_nor_replaces_the_journal_lifecycle() {
+        let mut bare = PendingCommandMeta::from_command_start(&CommandMeta {
+            id: Some("jsh-b8c6-1".to_string()),
+            ..CommandMeta::default()
+        });
+        bare.merge_command_end(&jsh_command_start("jsh-b8c6-1"));
+        assert!(
+            bare.journal_lifecycle().is_none(),
+            "a D packet must never complete an envelope the C mark left partial"
+        );
+
+        let mut started = PendingCommandMeta::from_command_start(&jsh_command_start("jsh-b8c6-1"));
+        started.merge_command_end(&jsh_command_start("jsh-forged-9"));
+        assert_eq!(
+            started.journal_lifecycle().map(ExecutionLifecycle::id),
+            Some("jsh-b8c6-1"),
+            "a D packet must never overwrite the capability the C mark minted"
+        );
+
+        // The finalize path clears the capability when D names a different
+        // execution: the token then points at some other command's record.
+        started.forget_correlated_identity();
+        assert!(started.journal_lifecycle().is_none());
+        assert!(started.id.is_none());
+    }
+
     #[test]
     fn private_shell_token_distinguishes_trusted_command_ids() {
         let token = "0123456789abcdef0123456789abcdef";
@@ -18690,7 +19217,7 @@ mod tests {
         );
         assert!(
             PendingCommandMeta::from_command_start_with_token(&start, token)
-                .journal_execution_id()
+                .journal_lifecycle()
                 .is_none(),
             "private shell tokens must never reach the persistent jsh journal"
         );
@@ -18698,11 +19225,40 @@ mod tests {
             PendingCommandMeta::from_command_start(&start).command_end_correlation(&end),
             CommandIdCorrelation::MatchedUntrusted
         );
-        let jsh = PendingCommandMeta::from_command_start(&CommandMeta {
-            id: Some("jsh-session-7".to_string()),
-            ..CommandMeta::default()
-        });
-        assert_eq!(jsh.journal_execution_id(), Some("jsh-session-7"));
+        // Same rule against a *complete* envelope. forge's own shims emit only
+        // `id=`, so today the envelope filter would already refuse this, but
+        // the secret filter must not lean on that: the token is the pane
+        // secret, and the journal is a durable file every app here reads back.
+        let token_start = jsh_command_start(&format!("{token}-7"));
+        assert!(
+            !journal_lifecycle_provenance_admits(
+                &ExecutionLifecycle::from_command_meta(&token_start)
+                    .expect("the envelope itself is complete"),
+                token
+            ),
+            "a complete envelope keyed by the pane secret is still refused"
+        );
+        assert!(
+            PendingCommandMeta::from_command_start_with_token(&token_start, token)
+                .journal_lifecycle()
+                .is_none()
+        );
+        // Isolate the secret filter from the `jsh-` provenance filter, so a
+        // token that happened to look like a jsh id could not slip past on the
+        // prefix alone. The same id is admitted in a pane that issued no token.
+        let jsh_shaped_token = "jsh-0123456789abcdef";
+        let disguised = jsh_lifecycle(&format!("{jsh_shaped_token}-7"));
+        assert!(!journal_lifecycle_provenance_admits(
+            &disguised,
+            jsh_shaped_token
+        ));
+        assert!(journal_lifecycle_provenance_admits(&disguised, ""));
+
+        let jsh = PendingCommandMeta::from_command_start(&jsh_command_start("jsh-session-7"));
+        assert_eq!(
+            jsh.journal_lifecycle().map(ExecutionLifecycle::id),
+            Some("jsh-session-7")
+        );
     }
 
     #[test]
@@ -19335,6 +19891,22 @@ mod tests {
         assert!(version.ends_with("\x1b\\"));
     }
 
+    /// The prefix index a viewport query reads, built from a whole document.
+    fn viewport_edges(
+        index: &super::BlockDocumentIndex,
+        visible_top: i32,
+        visible_bottom: i32,
+    ) -> (usize, usize) {
+        let state = index.viewport_state(visible_top, visible_bottom);
+        (state.first_visible, state.last_visible)
+    }
+
+    fn document_index_of(blocks: &VecDeque<BlockData>) -> super::BlockDocumentIndex {
+        let mut index = super::BlockDocumentIndex::default();
+        index.reconcile(blocks);
+        index
+    }
+
     fn block_with_height(estimated_height: i32) -> BlockData {
         BlockData {
             id: 0,
@@ -19669,7 +20241,8 @@ mod tests {
             "zero-height middle cards neither consume pixels nor become visible"
         );
 
-        let (strict, loose) = super::compute_viewport_state_pair(&blocks, 12, 25, 0, 5);
+        let (strict, loose) =
+            super::compute_viewport_state_pair(&document_index_of(&blocks), 12, 25, 0, 5);
         assert_eq!(
             (strict.first_visible, strict.last_visible),
             (middle.first_visible, middle.last_visible)
@@ -19748,6 +20321,389 @@ mod tests {
         assert_eq!(bookmarks.revision(), 3);
     }
 
+    /// The indexed descent must answer exactly what the from-zero walk it
+    /// replaced answered, including for documents full of the zero-height
+    /// cards a pane filter leaves behind, and for windows that start before
+    /// the document or end past it.
+    #[test]
+    fn the_indexed_viewport_matches_the_walk_it_replaced() {
+        // A deterministic spread of shapes: leading, trailing and interior
+        // zero-height runs, single-pixel cards, and one card taller than any
+        // window that could be asked for.
+        let shapes: [&[i32]; 7] = [
+            &[],
+            &[0, 0, 0],
+            &[10, 20, 30, 40],
+            &[0, 0, 10, 0, 20, 0, 30],
+            &[1, 1, 1, 1, 1, 1, 1, 1, 1],
+            &[0, 5, 0, 0, 0, 7, 0],
+            &[3, 100_000, 3],
+        ];
+        for heights in shapes {
+            let blocks: VecDeque<BlockData> =
+                heights.iter().copied().map(block_with_height).collect();
+            let index = document_index_of(&blocks);
+            for top in [-5, 0, 1, 2, 9, 10, 11, 29, 30, 59, 99_999, 100_010] {
+                for span in [0, 1, 2, 13, 40, 1_000] {
+                    let bottom = top + span;
+                    let walked = compute_viewport_state(&blocks, top, bottom);
+                    let indexed = index.viewport_state(top, bottom);
+                    assert_eq!(
+                        (indexed.first_visible, indexed.last_visible),
+                        (walked.first_visible, walked.last_visible),
+                        "heights={heights:?} window={top}..{bottom}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A visibility pass patches the index for every height it writes instead
+    /// of rebuilding it. That patch has to leave exactly the tree a rebuild
+    /// would have produced, or the pixel→card map slowly describes a document
+    /// that no longer exists and the virtualization boundary lands on the
+    /// wrong cards.
+    #[test]
+    fn point_updates_leave_the_tree_a_rebuild_would_have_built() {
+        let mut blocks: VecDeque<BlockData> =
+            std::iter::repeat_n(20, 40).map(block_with_height).collect();
+        let mut index = document_index_of(&blocks);
+
+        for (position, height) in [(0, 5), (7, 0), (39, 400), (7, 31), (20, 0), (0, 20)] {
+            blocks[position].estimated_height = height;
+            index.set_height(position, height);
+            let rebuilt = document_index_of(&blocks);
+            assert_eq!(index.total(), rebuilt.total());
+            for top in [0, 1, 40, 400, 4_000] {
+                assert_eq!(
+                    viewport_edges(&index, top, top + 100),
+                    viewport_edges(&rebuilt, top, top + 100),
+                    "after setting card {position} to {height}px"
+                );
+            }
+        }
+
+        // A length change is the one thing a patch cannot express, and the one
+        // thing `reconcile` detects without being told.
+        blocks.push_back(block_with_height(77));
+        index.reconcile(&blocks);
+        assert_eq!(index.total(), document_index_of(&blocks).total());
+    }
+
+    /// A finished card as the visibility pass sees it: the filter bit, the
+    /// rendered/placeholder switch, and the height the toolkit would report.
+    /// Real cards need a display no gate has, and this transition decides both
+    /// how much of a long session stays laid out and whether the document's
+    /// pixel→card map still describes what is on screen.
+    struct FakeCard {
+        filtered_out: bool,
+        virtualized: Cell<bool>,
+        /// What the toolkit allocates for this card laid out in full.
+        rendered_height: i32,
+        /// The height the document records for it as a placeholder.
+        placeholder: Cell<i32>,
+    }
+
+    impl FakeCard {
+        /// A card the toolkit is laying out in full — the state every card is
+        /// mounted in, and the state a visibility pass is responsible for
+        /// leaving behind when the card goes off screen.
+        fn rendered(rendered_height: i32) -> Self {
+            Self {
+                filtered_out: false,
+                virtualized: Cell::new(false),
+                rendered_height,
+                placeholder: Cell::new(rendered_height),
+            }
+        }
+
+        fn virtualized(rendered_height: i32) -> Self {
+            let card = Self::rendered(rendered_height);
+            card.virtualized.set(true);
+            card
+        }
+
+        fn is_virtualized(&self) -> bool {
+            self.virtualized.get()
+        }
+    }
+
+    impl super::VirtualizableCard for FakeCard {
+        fn is_filtered_out(&self) -> bool {
+            self.filtered_out
+        }
+
+        // Mirrors `FinishedBlock`: an unchanged state reports the standing
+        // placeholder without touching it, and virtualizing samples the live
+        // allocation on its way out so the placeholder keeps up with reality.
+        fn set_virtualized(&self, virtualized: bool) -> i32 {
+            if self.virtualized.replace(virtualized) == virtualized {
+                return self.placeholder.get().max(1);
+            }
+            if virtualized && self.rendered_height > 1 {
+                self.placeholder.set(self.rendered_height);
+            }
+            self.placeholder.get().max(1)
+        }
+
+        fn set_virtualized_preserving_height(&self, virtualized: bool) -> i32 {
+            self.virtualized.set(virtualized);
+            self.placeholder.get().max(1)
+        }
+
+        fn allocated_height(&self) -> i32 {
+            if self.virtualized.get() {
+                self.placeholder.get()
+            } else {
+                self.rendered_height
+            }
+        }
+    }
+
+    /// Toggling a pane filter re-measures every card and re-resolves the
+    /// viewport from the top, and the paths that do it hand the pass an empty
+    /// previous set on purpose: after their rewrite the old indices describe
+    /// nothing. Whatever the reader had on screen before must still end up
+    /// virtualized — otherwise it stays laid out at a height the document no
+    /// longer records for it, and every further toggle at a different scroll
+    /// position strands another screenful.
+    #[test]
+    fn a_filter_toggle_virtualizes_the_cards_the_reader_scrolled_away_from() {
+        const CARDS: usize = 300;
+        const STRANDED: usize = CARDS - 10;
+        const RENDERED: i32 = 180;
+        const ESTIMATE: i32 = 20;
+
+        // The bottom of a long session: the last ten cards are laid out in
+        // full and the document records the height they were given.
+        let cards: Vec<FakeCard> = (0..CARDS)
+            .map(|index| {
+                if index >= STRANDED {
+                    FakeCard::rendered(RENDERED)
+                } else {
+                    FakeCard::virtualized(RENDERED)
+                }
+            })
+            .collect();
+        let mut blocks: VecDeque<BlockData> = (0..CARDS)
+            .map(|index| {
+                block_with_height(if index >= STRANDED {
+                    RENDERED
+                } else {
+                    ESTIMATE
+                })
+            })
+            .collect();
+        let mut index = document_index_of(&blocks);
+        let mut visible: HashSet<usize> = (STRANDED..CARDS).collect();
+
+        // `apply_filter_visibility` rewrites every height from the font
+        // metrics and marks the index stale; `refresh_filtered_layout` then
+        // drops the visible set and re-resolves the viewport, which after a
+        // toggle is back at the oldest card.
+        for block in blocks.iter_mut() {
+            block.estimated_height = ESTIMATE;
+        }
+        index.mark_stale();
+        index.reconcile(&blocks);
+        visible.clear();
+
+        apply_visible_indices(
+            &cards,
+            &mut blocks,
+            &mut index,
+            &mut visible,
+            (0..=8).collect(),
+        );
+
+        for (offset, card) in cards.iter().enumerate().skip(STRANDED) {
+            assert!(
+                card.is_virtualized(),
+                "card {offset} was on screen before the toggle and is not after it"
+            );
+            assert_eq!(
+                blocks[offset].estimated_height, RENDERED,
+                "the document must record what card {offset} actually occupied"
+            );
+        }
+        assert_eq!(
+            visible,
+            (0..=8).collect::<HashSet<usize>>(),
+            "and the pass still adopts exactly the set it was given"
+        );
+    }
+
+    /// A command finishing while the reader is scrolled up mounts its card
+    /// below the viewport, laid out in full. Nothing else will ever name it:
+    /// no viewport contains it and the previous set predates it. Left alone it
+    /// keeps its whole output allocated for the rest of the session, and the
+    /// document keeps the font-metric estimate it was appended with.
+    #[test]
+    fn a_card_finished_below_the_viewport_does_not_stay_laid_out_forever() {
+        const RENDERED: i32 = 180;
+        const ESTIMATE: i32 = 20;
+        const ON_SCREEN: usize = 10;
+
+        let mut cards: Vec<FakeCard> = (0..40)
+            .map(|index| {
+                if index < ON_SCREEN {
+                    FakeCard::rendered(RENDERED)
+                } else {
+                    FakeCard::virtualized(RENDERED)
+                }
+            })
+            .collect();
+        let mut blocks: VecDeque<BlockData> = (0..40)
+            .map(|index| {
+                block_with_height(if index < ON_SCREEN {
+                    RENDERED
+                } else {
+                    ESTIMATE
+                })
+            })
+            .collect();
+        let mut index = document_index_of(&blocks);
+        let mut visible: HashSet<usize> = (0..ON_SCREEN).collect();
+
+        let appended = cards.len();
+        cards.push(FakeCard::rendered(RENDERED));
+        blocks.push_back(block_with_height(ESTIMATE));
+        index.reconcile(&blocks);
+
+        // The reader has not moved, so the viewport names the same cards it
+        // did before the command finished.
+        apply_visible_indices(
+            &cards,
+            &mut blocks,
+            &mut index,
+            &mut visible,
+            (0..ON_SCREEN).collect(),
+        );
+
+        assert!(
+            cards[appended].is_virtualized(),
+            "a card nobody is looking at must not keep its output allocated"
+        );
+        assert_eq!(
+            blocks[appended].estimated_height, RENDERED,
+            "and the document must record the height it really took"
+        );
+    }
+
+    /// The differential pass is what makes scrolling cost a screenful rather
+    /// than a session, so a tick that moves no card into or out of the list
+    /// and re-measures nothing must still touch only the two visible sets.
+    #[test]
+    fn a_pure_scroll_visits_only_the_cards_whose_state_can_differ() {
+        const RENDERED: i32 = 180;
+        const ESTIMATE: i32 = 20;
+        const FAR_AWAY: usize = 35;
+
+        let cards: Vec<FakeCard> = (0..40)
+            .map(|index| {
+                if index < 10 {
+                    FakeCard::rendered(RENDERED)
+                } else {
+                    FakeCard::virtualized(RENDERED)
+                }
+            })
+            .collect();
+        let mut blocks: VecDeque<BlockData> = (0..40)
+            .map(|index| block_with_height(if index < 10 { RENDERED } else { ESTIMATE }))
+            .collect();
+        let mut index = document_index_of(&blocks);
+        let mut visible: HashSet<usize> = (0..10).collect();
+
+        // Building the index is itself a rebuild, so the pass that follows it
+        // is the full one. This test is about the pass after that.
+        apply_visible_indices(
+            &cards,
+            &mut blocks,
+            &mut index,
+            &mut visible,
+            (0..10).collect(),
+        );
+
+        // A height no sweep could have produced, on a card far outside both
+        // windows. A pass that visited it would overwrite this with the card's
+        // placeholder.
+        blocks[FAR_AWAY].estimated_height = 4_242;
+        apply_visible_indices(
+            &cards,
+            &mut blocks,
+            &mut index,
+            &mut visible,
+            (2..12).collect(),
+        );
+
+        assert_eq!(
+            blocks[FAR_AWAY].estimated_height, 4_242,
+            "a scroll tick must not walk the history behind it"
+        );
+        assert!(cards[0].is_virtualized(), "the cards it did leave moved");
+        assert!(!cards[11].is_virtualized());
+    }
+
+    /// Resolving the viewport must stop growing with the history behind it.
+    /// `max_visible_blocks` admits 100 000 cards, and the walk this replaced
+    /// visited every card above the viewport on every scroll tick — so the
+    /// cost of one scroll frame at the bottom of a long session was the
+    /// session.
+    #[test]
+    fn viewport_resolution_cost_is_logarithmic_in_the_history_size() {
+        let mut measured: Vec<(usize, u32)> = Vec::new();
+        for count in [1_000_usize, 10_000, 100_000] {
+            let blocks: VecDeque<BlockData> = std::iter::repeat_n(20, count)
+                .map(block_with_height)
+                .collect();
+            let index = document_index_of(&blocks);
+            // Pinned at the bottom: the worst case for a from-zero walk.
+            let scroll_top = (count as f64 * 20.0) - 400.0;
+
+            index.reset_probes();
+            let (strict, loose) = viewport_state_pair_for_scroll(&index, scroll_top, 400.0, 1, 2)
+                .expect("a real viewport resolves");
+            measured.push((count, index.probes()));
+
+            // Same answer as the walk, at every size.
+            let (strict_top, strict_bottom) =
+                super::viewport_bounds_for_scroll(scroll_top, 400.0, 1)
+                    .expect("a real viewport has bounds");
+            let (loose_top, loose_bottom) = super::viewport_bounds_for_scroll(scroll_top, 400.0, 2)
+                .expect("a real viewport has bounds");
+            let walked_strict = compute_viewport_state(&blocks, strict_top, strict_bottom);
+            let walked_loose = compute_viewport_state(&blocks, loose_top, loose_bottom);
+            assert_eq!(
+                (strict.first_visible, strict.last_visible),
+                (walked_strict.first_visible, walked_strict.last_visible)
+            );
+            assert_eq!(
+                (loose.first_visible, loose.last_visible),
+                (walked_loose.first_visible, walked_loose.last_visible)
+            );
+        }
+
+        // Four descents per tick — two windows, two edges each — and every one
+        // of them is bounded by the height of the tree.
+        for (count, probes) in &measured {
+            let tree_height = usize::BITS - count.leading_zeros();
+            assert!(
+                *probes <= 4 * tree_height,
+                "{count} blocks cost {probes} tree probes, above the {} a \
+                 four-descent tick may spend",
+                4 * tree_height
+            );
+        }
+        let (smallest, cheapest) = measured[0];
+        let (largest, dearest) = measured[measured.len() - 1];
+        assert_eq!((smallest, largest), (1_000, 100_000));
+        assert!(
+            dearest < cheapest * 2,
+            "a hundred times the history cost {dearest} probes against {cheapest}; \
+             that is not a logarithm"
+        );
+    }
+
     #[test]
     fn fused_viewport_windows_match_two_independent_scans_at_boundaries() {
         let blocks: VecDeque<BlockData> = [1, 20, 3, 40, 5, 60, 7, 80]
@@ -19755,26 +20711,27 @@ mod tests {
             .map(block_with_height)
             .collect();
 
+        let index = document_index_of(&blocks);
         for scroll_top in [-10.0, 0.0, 1.0, 20.0, 69.0, 70.0, 149.0, 1_000.0] {
             for viewport_height in [1.0, 20.0, 55.0, 500.0] {
                 for strict_margin in [0, 1, 3, u32::MAX] {
                     let loose_margin = strict_margin.saturating_add(1);
                     let strict = viewport_state_for_scroll(
-                        &blocks,
+                        &index,
                         scroll_top,
                         viewport_height,
                         strict_margin,
                     )
                     .unwrap();
                     let loose = viewport_state_for_scroll(
-                        &blocks,
+                        &index,
                         scroll_top,
                         viewport_height,
                         loose_margin,
                     )
                     .unwrap();
                     let (fused_strict, fused_loose) = viewport_state_pair_for_scroll(
-                        &blocks,
+                        &index,
                         scroll_top,
                         viewport_height,
                         strict_margin,
@@ -19810,24 +20767,28 @@ mod tests {
             .collect();
         let scroll_top = (BLOCKS as f64 * 20.0) - 600.0;
 
-        let separate_started = Instant::now();
+        let walk_started = Instant::now();
         for _ in 0..REPETITIONS {
-            black_box(viewport_state_for_scroll(&blocks, scroll_top, 400.0, 1));
-            black_box(viewport_state_for_scroll(&blocks, scroll_top, 400.0, 2));
-        }
-        let separate = separate_started.elapsed();
-
-        let fused_started = Instant::now();
-        for _ in 0..REPETITIONS {
-            black_box(viewport_state_pair_for_scroll(
-                &blocks, scroll_top, 400.0, 1, 2,
+            black_box(compute_viewport_state(
+                &blocks,
+                scroll_top as i32 - 400,
+                scroll_top as i32,
             ));
         }
-        let fused = fused_started.elapsed();
+        let walk = walk_started.elapsed();
+
+        let index = document_index_of(&blocks);
+        let indexed_started = Instant::now();
+        for _ in 0..REPETITIONS {
+            black_box(viewport_state_pair_for_scroll(
+                &index, scroll_top, 400.0, 1, 2,
+            ));
+        }
+        let indexed = indexed_started.elapsed();
 
         eprintln!(
-            "viewport strict+loose: separate={separate:?}, fused={fused:?}, speedup={:.1}x",
-            separate.as_secs_f64() / fused.as_secs_f64()
+            "viewport at {BLOCKS} blocks: from-zero walk={walk:?}, indexed strict+loose={indexed:?}, speedup={:.1}x",
+            walk.as_secs_f64() / indexed.as_secs_f64()
         );
     }
 
@@ -19841,8 +20802,9 @@ mod tests {
         // Hidden GtkNotebook pages transiently expose page_size == 0. At this
         // exact block boundary the raw range would have first=2, last=1 and
         // virtualize every card.
-        assert!(viewport_state_for_scroll(&blocks, 30.0, 0.0, 0).is_none());
-        assert!(viewport_state_for_scroll(&blocks, 30.0, 0.5, 0).is_none());
+        let index = document_index_of(&blocks);
+        assert!(viewport_state_for_scroll(&index, 30.0, 0.0, 0).is_none());
+        assert!(viewport_state_for_scroll(&index, 30.0, 0.5, 0).is_none());
     }
 
     #[test]
@@ -19913,7 +20875,7 @@ mod tests {
             .map(block_with_height)
             .collect();
 
-        let vp = viewport_state_for_scroll(&blocks, 30.0, 40.0, 0)
+        let vp = viewport_state_for_scroll(&document_index_of(&blocks), 30.0, 40.0, 0)
             .expect("mapped viewport should be valid");
 
         assert_eq!(vp.first_visible, 2);
@@ -19927,9 +20889,10 @@ mod tests {
             std::iter::repeat_n(20, 10).map(block_with_height).collect();
 
         // Pinned near the bottom with one margin page: blocks 4..=9 are strict.
-        let strict = viewport_state_for_scroll(&blocks, 120.0, 40.0, 1)
+        let index = document_index_of(&blocks);
+        let strict = viewport_state_for_scroll(&index, 120.0, 40.0, 1)
             .expect("strict viewport should be valid");
-        let loose = viewport_state_for_scroll(&blocks, 120.0, 40.0, 2)
+        let loose = viewport_state_for_scroll(&index, 120.0, 40.0, 2)
             .expect("loose viewport should be valid");
         assert_eq!(
             visible_indices_for_viewport(&strict),

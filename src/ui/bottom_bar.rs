@@ -15,7 +15,7 @@ use vte4::TerminalExt as _;
 
 use jterm_core::bottom_bar::{compose, Segment, Snapshot, Tone};
 
-use super::UiState;
+use super::{PaneLeaf, UiState};
 use crate::block_view::TermView;
 
 /// GObject data key on a Block view's root: `(exit_code, duration_ms)` of the
@@ -79,12 +79,36 @@ impl UiState {
     pub(crate) fn connect_bottom_bar_block_status(&self, view: &Rc<TermView>) {
         let ui = self.clone();
         let root = view.widget();
+        // The pane that will run the commands this handler hears about, held
+        // weakly: the handler is owned by that very view, so a strong handle
+        // would keep its PTY and scrollback alive for the life of the process.
+        let source = Rc::downgrade(view);
         view.connect_block_finished(move |_command, exit_code, _agent_generation, duration_ms| {
             unsafe {
                 root.set_data::<(Option<i32>, Option<u64>)>(
                     LAST_BLOCK_STATUS_KEY,
                     (exit_code, duration_ms),
                 );
+            }
+            // A finished command is the moment Git's answer can have moved, so
+            // it is what drives the refresh — not the once-a-second repaint,
+            // which now serves the cached answer for as long as it is fresh.
+            //
+            // The directory that moved is this pane's, which is emphatically
+            // not `current_pane_leaf()`: one handler is installed per pane, and
+            // a command finishing in a background tab or a sibling split fires
+            // here while the focused pane sits in some unrelated repository.
+            // Marking the focused pane instead would leave the pane that
+            // actually changed serving its old branch and dirty flag for the
+            // full `CACHE_TTL`, with no repaint left to correct it — the
+            // once-a-second probe that used to paper over this is exactly what
+            // the cache replaced.
+            if let Some(cwd) = source
+                .upgrade()
+                .map(PaneLeaf::Block)
+                .and_then(|leaf| ui.pane_working_directory(&leaf))
+            {
+                crate::git_meta::invalidate(std::path::Path::new(&cwd));
             }
             ui.refresh_bottom_bar();
         });

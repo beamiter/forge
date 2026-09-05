@@ -229,25 +229,21 @@ pub(super) fn decode_session(bytes: &[u8]) -> io::Result<Vec<PersistedZone>> {
 
 /// Read a bounded zone-history file. A file over the ceiling is refused
 /// without being decoded; a missing file is simply an empty session.
+///
+/// The bound is enforced by the shared reader rather than by a `stat` here.
+/// A path-based `stat` followed by a separate `read` decided on one file and
+/// then read whichever file the path named a moment later, and it believed the
+/// size it was told: a file being appended to between the two calls passed the
+/// ceiling and then delivered more than it declared. `read_bounded` checks the
+/// open descriptor, caps the read itself, and refuses a fifo — which this path
+/// would otherwise have blocked the restoring thread on — a device, a hard-
+/// linked file, and one another user can write.
 pub(super) fn read_session(path: &Path) -> io::Result<Vec<PersistedZone>> {
-    let metadata = match std::fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
-    if !metadata.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "zone history path is not a regular file",
-        ));
+    match jterm_core::snapshot_file::read_bounded(path, MAX_ZONE_HISTORY_FILE_BYTES) {
+        Ok(text) => decode_session(text.as_bytes()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error),
     }
-    if metadata.len() > MAX_ZONE_HISTORY_FILE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "zone history file exceeds its bound",
-        ));
-    }
-    decode_session(&std::fs::read(path)?)
 }
 
 /// Terminal bytes that reconstruct one restored zone above the next prompt.
@@ -528,16 +524,50 @@ mod tests {
         let missing = dir.join("absent.json");
         assert!(read_session(&missing).expect("absent is empty").is_empty());
 
+        // The writer creates this document `0600` (`history::atomic_write`),
+        // and the shared reader refuses anything another user or group can
+        // write — so the fixture has to be written the way the writer writes
+        // it, not at whatever the test runner's umask happens to allow.
         let file = dir.join("zones.json");
+        let write_private = |bytes: &[u8]| {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut handle = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&file)
+                .expect("write");
+            handle.write_all(bytes).expect("write");
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+                .expect("tighten");
+        };
+        use std::os::unix::fs::PermissionsExt as _;
+
         let encoded = encode_session(vec![zone("echo hi", Some("hi"))]).expect("encodes");
-        std::fs::write(&file, &encoded).expect("write");
+        write_private(&encoded);
         let restored = read_session(&file).expect("reads");
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].output.as_deref(), Some("hi"));
 
-        std::fs::write(&file, vec![b'x'; MAX_ZONE_HISTORY_FILE_BYTES as usize + 1]).expect("write");
+        // A document some other user can rewrite is replayed into a terminal,
+        // so it is refused rather than parsed.
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).expect("loosen");
+        assert_eq!(
+            read_session(&file)
+                .expect_err("refuses a world-writable document")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("tighten");
+
+        write_private(&vec![b'x'; MAX_ZONE_HISTORY_FILE_BYTES as usize + 1]);
         let error = read_session(&file).expect_err("refuses an oversized file");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        // Was `InvalidData` while this module measured the file itself. The
+        // shared reader names the ceiling it enforced; no caller branches on
+        // the kind, `restore_zone_history` only logs it.
+        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
 
         let error = read_session(&dir).expect_err("refuses a directory");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);

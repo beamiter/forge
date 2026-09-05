@@ -1149,6 +1149,10 @@ pub fn run() -> glib::ExitCode {
             agent_toggle: agent_toggle.clone(),
             config_save_error_visible: Rc::new(Cell::new(false)),
             safe_mode_config_notice_visible: Rc::new(Cell::new(false)),
+            config_reload_conflict_visible: Rc::new(Cell::new(false)),
+            block_history_notice: gtk4::Box::new(Orientation::Horizontal, 8),
+            block_history_notice_label: gtk4::Label::new(None),
+            config_dirty: ui::ConfigDirtyEpoch::default(),
             keybinding_map: Rc::new(RefCell::new(keybinding_map)),
             zoom_state: Rc::new(RefCell::new(None)),
             scrollbar_css: CssProvider::new(),
@@ -1195,17 +1199,27 @@ pub fn run() -> glib::ExitCode {
                 return glib::ControlFlow::Break;
             };
             for failure in crate::persistence::drain_failures() {
-                if failure.operation == ui::CONFIG_PERSIST_OPERATION {
-                    if let Some(ui) = ui_for_persistence.upgrade() {
-                        ui.show_config_error(
-                            "Settings were not saved",
-                            &format!(
-                                "{}\n\nThe in-memory setting is still active. Reload the configuration (Ctrl+Shift+R) before trying again if the file changed elsewhere.",
-                                failure.error
-                            ),
-                        );
+                use ui::history_notice::PersistenceFailureSurface;
+                match ui::history_notice::persistence_failure_surface(&failure.operation) {
+                    PersistenceFailureSurface::ConfigDialog => {
+                        if let Some(ui) = ui_for_persistence.upgrade() {
+                            ui.show_config_error(
+                                "Settings were not saved",
+                                &format!(
+                                    "{}\n\nThe in-memory setting is still active. Reload the configuration (Ctrl+Shift+R) before trying again if the file changed elsewhere.",
+                                    failure.error
+                                ),
+                            );
+                        }
+                        continue;
                     }
-                    continue;
+                    PersistenceFailureSurface::BlockHistoryBar => {
+                        if let Some(ui) = ui_for_persistence.upgrade() {
+                            ui.show_block_history_failure(&failure.error);
+                        }
+                        continue;
+                    }
+                    PersistenceFailureSurface::Toast => {}
                 }
                 let toast = adw::Toast::new(&format!("{} failed: {}", failure.operation, failure.error));
                 toast.set_timeout(8);
@@ -1232,6 +1246,11 @@ pub fn run() -> glib::ExitCode {
         // machine has no jsh or an old one. The bar builds hidden and reveals
         // itself only if the background check finds something to offer.
         main_box.insert_child_after(&ui.build_jsh_notice(), Some(&top_bar_handle));
+
+        // Block-history failures are fail-closed states, not status blips: the
+        // pane stops saving and stays stopped. They get a bar that survives
+        // until it is answered, placed beside the jsh notice.
+        main_box.insert_child_after(&ui.build_block_history_notice(), Some(&top_bar_handle));
 
         let ui_for_ai_close = Rc::downgrade(&ui);
         ui.ai_panel.connect_close_requested(move || {

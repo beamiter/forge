@@ -1131,14 +1131,79 @@ fn parse_valid_table(path: &Path, bytes: &[u8]) -> Result<toml::Table, ConfigWri
         })
 }
 
+/// Where a save learns the revision it must still be replacing, and where it
+/// publishes the revision it wrote.
+///
+/// A live save shares one slot with every reader of that [`Config`] — the GTK
+/// thread reads it on each reload decision. Both accesses happen inside the
+/// advisory file lock and hold the slot's mutex only for the move itself; the
+/// two-second lock spin, the backup rotation and every `fsync` stay outside it.
+/// Holding it across that I/O is what made a settings change on a slow or
+/// contended filesystem freeze the window for as long as the write took.
+///
+/// Reading `expected` *after* the file lock is what keeps that safe: writers
+/// are still serialized by the lock, so the revision this save compares against
+/// is the one the previous writer published, not one read seconds earlier.
+enum RevisionBinding<'a> {
+    /// A fixed expectation supplied by the caller; the result is returned
+    /// rather than published.
+    Fixed(Option<&'a ConfigRevision>),
+    /// The slot shared with everything holding a clone of this `Config`.
+    Shared(&'a std::sync::Mutex<Option<ConfigRevision>>),
+}
+
+impl RevisionBinding<'_> {
+    fn expected(&self) -> Result<Option<ConfigRevision>, ConfigWriteError> {
+        match self {
+            Self::Fixed(revision) => Ok(revision.map(Clone::clone)),
+            Self::Shared(slot) => slot
+                .lock()
+                .map(|revision| revision.clone())
+                .map_err(|_| ConfigWriteError::Io(REVISION_LOCK_POISONED.into())),
+        }
+    }
+
+    fn publish(&self, revision: &ConfigRevision) -> Result<(), ConfigWriteError> {
+        match self {
+            Self::Fixed(_) => Ok(()),
+            Self::Shared(slot) => slot
+                .lock()
+                .map(|mut slot| *slot = Some(revision.clone()))
+                .map_err(|_| ConfigWriteError::Io(REVISION_LOCK_POISONED.into())),
+        }
+    }
+}
+
+const REVISION_LOCK_POISONED: &str = "configuration revision lock is poisoned";
+
 fn save_config_to_path(
     path: &Path,
     config: &Config,
     expected: Option<&ConfigRevision>,
 ) -> Result<ConfigRevision, ConfigWriteError> {
+    save_config_bound(path, config, &RevisionBinding::Fixed(expected))
+}
+
+fn save_config_bound(
+    path: &Path,
+    config: &Config,
+    binding: &RevisionBinding<'_>,
+) -> Result<ConfigRevision, ConfigWriteError> {
     ensure_config_parent(path)?;
 
     let lock = ConfigFileLock::acquire(path)?;
+    let expected = binding.expected()?;
+    let revision = write_config_under_lock(path, config, &lock, expected.as_ref())?;
+    binding.publish(&revision)?;
+    Ok(revision)
+}
+
+fn write_config_under_lock(
+    path: &Path,
+    config: &Config,
+    lock: &ConfigFileLock,
+    expected: Option<&ConfigRevision>,
+) -> Result<ConfigRevision, ConfigWriteError> {
     let current = read_optional_in_directory(&lock.directory, path)?;
     let actual_revision = revision_from_content(current.as_deref());
     let Some(expected_revision) = expected else {
@@ -1220,13 +1285,11 @@ fn save_config_to_path(
 /// Save using the revision carried by `config`, updating that revision only
 /// after the durable rename succeeds.
 fn save_config_with_path(path: &Path, config: &Config) -> Result<ConfigRevision, ConfigWriteError> {
-    let mut expected = config
-        .persistence_revision
-        .lock()
-        .map_err(|_| ConfigWriteError::Io("configuration revision lock is poisoned".into()))?;
-    let revision = save_config_to_path(path, config, expected.as_ref())?;
-    *expected = Some(revision.clone());
-    Ok(revision)
+    save_config_bound(
+        path,
+        config,
+        &RevisionBinding::Shared(&config.persistence_revision),
+    )
 }
 
 pub(crate) fn save_config(config: &Config) -> Result<ConfigRevision, ConfigWriteError> {
@@ -1554,6 +1617,56 @@ mod tests {
         assert!(!live.join("config.toml").exists());
         drop(guard);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The revision slot is shared with the GTK thread, which reads it on every
+    /// reload decision. A save must therefore take the two-second advisory file
+    /// lock *before* it touches that slot, and must never hold the slot across
+    /// the lock spin, the backup rotation, or an `fsync` — a settings change on
+    /// a contended or slow filesystem would otherwise freeze the window for as
+    /// long as the whole write took.
+    ///
+    /// Deterministic without sleeping on the writer: this test holds the slot,
+    /// so a correctly ordered save parks inside the file lock and the existing
+    /// read-only lock probe reports an active writer. The previous ordering
+    /// took the slot first and would still be waiting with the file untouched.
+    #[test]
+    fn a_save_takes_the_file_lock_before_the_revision_slot() {
+        let directory = temporary_directory("revision-slot-order");
+        let path = directory.join("config.toml");
+        let mut config = default_config();
+        config.window_opacity = 0.42;
+        config.persistence_revision =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(ConfigRevision::missing())));
+        let slot = std::sync::Arc::clone(&config.persistence_revision);
+
+        let held = slot.lock().unwrap();
+        let save_path = path.clone();
+        let saver = std::thread::spawn(move || save_config_with_path(&save_path, &config));
+
+        let deadline = Instant::now() + LOCK_TIMEOUT;
+        while lock_status_for(&path) != ConfigLockStatus::Active {
+            assert!(
+                Instant::now() < deadline,
+                "the save never reached the file lock, so it was still waiting on the revision slot"
+            );
+            std::thread::yield_now();
+        }
+
+        drop(held);
+        let revision = saver
+            .join()
+            .unwrap()
+            .expect("the save completes once the slot is free");
+        assert_eq!(
+            slot.lock().unwrap().as_ref(),
+            Some(&revision),
+            "the written revision is published back into the shared slot"
+        );
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("opacity = 0.42"));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
