@@ -37,7 +37,15 @@ type ProbeResult = Option<RepoMeta>;
 #[derive(Clone)]
 struct CacheEntry {
     result: ProbeResult,
-    refreshed_at: Instant,
+    /// When the probe that produced `result` finished, or `None` for an entry
+    /// no probe has answered for yet.
+    ///
+    /// [`UiGitMetaService::invalidate`] creates such an entry so a report about
+    /// a directory Git has never been asked about still has somewhere to live.
+    /// It is deliberately not `Instant::now()`: that would claim an answer this
+    /// entry does not have, and the whole point of the TTL is that a recent
+    /// answer may be served without asking again.
+    refreshed_at: Option<Instant>,
     /// How many times this window has reported a change in this directory.
     /// Only ever grows; [`Self::invalidated`] reads it against the generation
     /// the stored answer was asked for.
@@ -110,12 +118,31 @@ impl UiGitMetaService {
         self.cache.lock().ok()?.get(path).cloned()
     }
 
-    /// Mark this path's cached probe as owing a refresh. An absent entry is
-    /// already due, so a miss here is not a failure.
+    /// Mark this path's cached probe as owing a refresh.
+    ///
+    /// A path with no entry gets one, holding the report and no answer. It is
+    /// tempting to skip that — an unprobed path is already due — but "no entry"
+    /// and "no probe in flight" are different things, and the first probe of a
+    /// directory is exactly when they come apart: a pane that has just opened
+    /// or just changed directory has asked Git and has nothing back yet, and
+    /// the worker will create the entry when it answers. Dropping the report
+    /// here would let that answer land as if it covered a change it was queued
+    /// before ever hearing about, and a cold repository is the slowest probe
+    /// there is, so this is the likeliest way to lose one — not the rarest.
     fn invalidate(&self, path: &Path) {
         if let Ok(mut cache) = self.cache.lock() {
-            if let Some(entry) = cache.get_mut(path) {
-                entry.invalidations = entry.invalidations.saturating_add(1);
+            match cache.get_mut(path) {
+                Some(entry) => entry.invalidations = entry.invalidations.saturating_add(1),
+                None => insert_bounded(
+                    &mut cache,
+                    path.to_path_buf(),
+                    CacheEntry {
+                        result: None,
+                        refreshed_at: None,
+                        invalidations: 1,
+                        probed_at_invalidations: 0,
+                    },
+                ),
             }
         }
     }
@@ -162,6 +189,21 @@ impl UiGitMetaService {
     }
 }
 
+/// Store `entry` under `path`, dropping some other path first once the map is
+/// at its ceiling.
+///
+/// Both writers share this. The cache is keyed by directory and both a probe
+/// and a bare report can introduce a key, so a session that walks a large tree
+/// would otherwise grow it for the life of the window.
+fn insert_bounded(cache: &mut HashMap<PathBuf, CacheEntry>, path: PathBuf, entry: CacheEntry) {
+    if !cache.contains_key(&path) && cache.len() >= MAX_CACHE_ENTRIES {
+        if let Some(evicted) = cache.keys().next().cloned() {
+            cache.remove(&evicted);
+        }
+    }
+    cache.insert(path, entry);
+}
+
 fn worker_loop(
     requests: mpsc::Receiver<ProbeRequest>,
     cache: &Mutex<HashMap<PathBuf, CacheEntry>>,
@@ -174,23 +216,22 @@ fn worker_loop(
     {
         let result = jterm_core::git_meta::read(&path);
         if let Ok(mut cache) = cache.lock() {
-            if !cache.contains_key(&path) && cache.len() >= MAX_CACHE_ENTRIES {
-                if let Some(evicted) = cache.keys().next().cloned() {
-                    cache.remove(&evicted);
-                }
-            }
             // Carry the running count forward instead of resetting it: an
             // `invalidate` that arrived while Git was running has already
             // pushed it past the generation this probe was asked for, and that
             // gap is the entry's only memory of a change this answer predates.
+            // The entry it reads may be one `invalidate` created for exactly
+            // that purpose, which is why a report never needs an answer to
+            // survive.
             let invalidations = cache
                 .get(&path)
                 .map_or(queued_at_invalidations, |entry| entry.invalidations);
-            cache.insert(
+            insert_bounded(
+                &mut cache,
                 path.clone(),
                 CacheEntry {
                     result,
-                    refreshed_at: Instant::now(),
+                    refreshed_at: Some(Instant::now()),
                     invalidations,
                     probed_at_invalidations: queued_at_invalidations,
                 },
@@ -229,7 +270,9 @@ pub fn read_cached_and_refresh(cwd: &Path) -> Option<RepoMeta> {
     let service = service()?;
     let cached = service.cached(cwd);
     let due = probe_is_due(
-        cached.as_ref().map(|entry| entry.refreshed_at.elapsed()),
+        cached
+            .as_ref()
+            .and_then(|entry| entry.refreshed_at.map(|at| at.elapsed())),
         cached.as_ref().is_some_and(CacheEntry::invalidated),
     );
     if due {
@@ -311,7 +354,7 @@ mod tests {
             path.to_path_buf(),
             CacheEntry {
                 result: None,
-                refreshed_at: Instant::now(),
+                refreshed_at: Some(Instant::now()),
                 invalidations: 0,
                 probed_at_invalidations: 0,
             },
@@ -321,7 +364,7 @@ mod tests {
         let entry = service.cached(path).expect("the previous answer survives");
         assert!(entry.invalidated());
         assert!(probe_is_due(
-            Some(entry.refreshed_at.elapsed()),
+            entry.refreshed_at.map(|at| at.elapsed()),
             entry.invalidated()
         ));
 
@@ -331,10 +374,20 @@ mod tests {
         let queued = request_rx.try_recv().expect("a probe was queued");
         assert_eq!(queued.queued_at_invalidations, 1);
 
-        // Invalidating a path nobody has probed is a no-op, not a panic: the
-        // first read of it is due anyway.
-        service.invalidate(Path::new("/work/never-probed"));
-        assert!(service.cached(Path::new("/work/never-probed")).is_none());
+        // Invalidating a path nobody has probed records the report against an
+        // entry that holds no answer, so a probe already in flight for it
+        // cannot land as though it covered the change. Reporting still never
+        // asks Git itself — only a read does.
+        let never_probed = Path::new("/work/never-probed");
+        service.invalidate(never_probed);
+        let entry = service.cached(never_probed).expect("the report is kept");
+        assert!(entry.result.is_none(), "no answer is invented for it");
+        assert!(entry.refreshed_at.is_none(), "and none is claimed");
+        assert!(entry.invalidated());
+        assert!(probe_is_due(
+            entry.refreshed_at.map(|at| at.elapsed()),
+            entry.invalidated()
+        ));
         assert_eq!(request_rx.try_iter().count(), 0);
     }
 
@@ -354,7 +407,7 @@ mod tests {
             path.clone(),
             CacheEntry {
                 result: None,
-                refreshed_at: Instant::now() - CACHE_TTL,
+                refreshed_at: Some(Instant::now() - CACHE_TTL),
                 // Two commands have finished; the probe in flight was queued
                 // after the first one and knows nothing of the second.
                 invalidations: 2,
@@ -379,7 +432,7 @@ mod tests {
             "the second command's change was reported after this probe started"
         );
         assert!(probe_is_due(
-            Some(entry.refreshed_at.elapsed()),
+            entry.refreshed_at.map(|at| at.elapsed()),
             entry.invalidated()
         ));
         assert!(
@@ -405,9 +458,90 @@ mod tests {
             "an answer covering every reported change is served for the whole TTL"
         );
         assert!(!probe_is_due(
-            Some(entry.refreshed_at.elapsed()),
+            entry.refreshed_at.map(|at| at.elapsed()),
             entry.invalidated()
         ));
+    }
+
+    /// The same race on the first probe of a directory, which is the one a
+    /// pane that has just opened or just changed directory is always in. There
+    /// is no entry to mark then — the worker creates it when Git answers — so
+    /// a report that only marks existing entries is dropped precisely when the
+    /// answer about to land is the one that has to hear it. A cold repository
+    /// is also the slowest probe there is, which makes this the likeliest
+    /// instance of the race rather than an exotic one.
+    #[test]
+    fn a_first_probe_that_raced_an_invalidation_leaves_the_entry_still_owing_one() {
+        // Never a directory, so the shared reader answers `None` without
+        // forking Git; this test is about the bookkeeping around the answer.
+        let path = PathBuf::from("/proc/self/exe/not-a-directory");
+        let (request_tx, request_rx) = mpsc::sync_channel(1);
+        let service = UiGitMetaService {
+            request_tx,
+            cache: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(HashSet::new())),
+        };
+
+        // The bar's first read of a pane that has just opened: nothing cached,
+        // so a probe goes out for generation zero.
+        assert!(service.request(&path));
+        assert!(
+            service.cached(&path).is_none(),
+            "the entry does not exist until Git answers"
+        );
+
+        // Git is still running when the user's command finishes.
+        service.invalidate(&path);
+
+        let queued = request_rx.try_recv().expect("a probe was queued");
+        assert_eq!(queued.queued_at_invalidations, 0);
+        let (worker_tx, worker_rx) = mpsc::sync_channel(1);
+        worker_tx.send(queued).expect("the queue takes one request");
+        drop(worker_tx);
+        worker_loop(worker_rx, &service.cache, &service.pending);
+
+        let entry = service.cached(&path).expect("answered");
+        assert!(
+            entry.invalidated(),
+            "the report arrived after this probe was queued and must outlive it"
+        );
+        assert!(probe_is_due(
+            entry.refreshed_at.map(|at| at.elapsed()),
+            entry.invalidated()
+        ));
+    }
+
+    /// A report may now introduce a cache key, and a window that walks a large
+    /// tree reports one per command in one directory after another. The
+    /// ceiling that bounds the probe path has to bound this one too, or the
+    /// map grows for the life of the window.
+    #[test]
+    fn reports_about_directories_nobody_probed_stay_within_the_cache_ceiling() {
+        let (request_tx, _request_rx) = mpsc::sync_channel(1);
+        let service = UiGitMetaService {
+            request_tx,
+            cache: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(HashSet::new())),
+        };
+
+        for index in 0..MAX_CACHE_ENTRIES * 2 {
+            service.invalidate(Path::new(&format!("/work/repo-{index}")));
+        }
+
+        assert_eq!(service.cache.lock().unwrap().len(), MAX_CACHE_ENTRIES);
+        // Re-reporting a directory already in the map replaces nothing, so the
+        // ceiling is not a reason to forget a change that is still pending.
+        let survivor = service
+            .cache
+            .lock()
+            .unwrap()
+            .keys()
+            .next()
+            .cloned()
+            .expect("the ceiling is not zero");
+        service.invalidate(&survivor);
+        assert_eq!(service.cache.lock().unwrap().len(), MAX_CACHE_ENTRIES);
+        assert_eq!(service.cached(&survivor).unwrap().invalidations, 2);
     }
 
     /// The cache is keyed by directory, which is what makes invalidating the
@@ -428,7 +562,7 @@ mod tests {
                 path.to_path_buf(),
                 CacheEntry {
                     result: None,
-                    refreshed_at: Instant::now(),
+                    refreshed_at: Some(Instant::now()),
                     invalidations: 0,
                     probed_at_invalidations: 0,
                 },

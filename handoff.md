@@ -74,6 +74,20 @@ saturation hole in a validate invariant); do not skip it.
   can start Git, so a report landing in the gap costs one redundant probe
   rather than an answer that claims to cover a change it never saw.
 
+  That covered every path with an entry to mark, and the *first* probe of a
+  directory has none: `invalidate` only bumped an existing `CacheEntry`, and
+  the entry is created by the worker when Git answers. A pane that has just
+  opened, or has just changed directory, sits in exactly that window, and a
+  cold checkout is the slowest probe there is — so the likeliest instance of
+  the race was also the one still dropping its report, and the answer that
+  landed afterwards was served for the whole TTL. `invalidate`
+  (`git_meta.rs:132`) now records the report on an entry that holds no answer,
+  which `worker_loop` carries forward like any other. `refreshed_at` became
+  `Option<Instant>` (`:48`) so such an entry says plainly that nothing has
+  answered for it instead of claiming a probe it never had, and both writers
+  share one `insert_bounded` (`:198`) so a bare report cannot introduce a cache
+  key outside the 256-entry ceiling.
+
 - **Core repin `9f94f77` / jagent `bdc8023`, and journaled output bound to a
   lifecycle token (current working tree)**: `CompletedExecution` no longer
   carries a bare `id`. It carries an `ExecutionLifecycle`, a private-field

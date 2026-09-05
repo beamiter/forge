@@ -371,3 +371,15 @@ quality gates listed in `README.md`.
     flag unconditionally, discarding any report that arrived while Git was
     running — two commands in a row on a slow checkout was enough — so a probe
     now answers only for the generation it was queued at.
+
+81. **A report about a directory Git has not answered for yet** — the
+    generation counter added in (80) lived on the cache entry, and the first
+    probe of a directory has no entry until the worker creates one, so an
+    `invalidate` racing that probe was still dropped. A pane that has just
+    opened or just changed directory is always in that window, and a cold
+    checkout is the slowest probe there is, which made the likeliest instance
+    of the race the one still losing its report for the full 30 s TTL.
+    Reporting now creates an answerless entry to hold the count, `refreshed_at`
+    became optional so such an entry cannot claim a probe it never had, and one
+    bounded insert is shared by both writers so a report cannot grow the cache
+    past its ceiling.
