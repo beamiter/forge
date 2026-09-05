@@ -392,10 +392,10 @@ pub(crate) struct UiState {
     /// Window-shared, repo/day-scoped memory for every native organism body.
     /// `None` means persistence failed closed; the visual reducer remains
     /// usable but must not overwrite the unreadable state file.
-    pub(crate) organism_memory: Rc<RefCell<Option<crate::organism_memory::OrganismMemory>>>,
+    pub(crate) organism_memory: Rc<RefCell<Option<jterm_core::organism_memory::OrganismMemory>>>,
     /// Continuous state is shared across pane-local behavior reducers, so the
     /// last pane to finish cannot overwrite another pane's earlier changes.
-    pub(crate) organism_life: Rc<Cell<crate::organism::LifeState>>,
+    pub(crate) organism_life: Rc<Cell<jterm_core::organism::LifeState>>,
     /// Content-free accept/dismiss pulses from the command-correction card,
     /// shared window-wide like the life state they feed.
     pub(crate) organism_correction: Rc<OrganismCorrectionSignal>,

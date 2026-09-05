@@ -546,7 +546,7 @@ impl AgentRuntime {
         self.sync_controls();
         if self.busy.get() {
             self.organism_agent
-                .note_phase(crate::organism::AgentPulse::Working);
+                .note_phase(jterm_core::organism::AgentPulse::Working);
             if let Some(message) = ready_status {
                 self.set_status(message, true);
             }
@@ -559,13 +559,15 @@ impl AgentRuntime {
             // alternating phases past the dedup.
             AgentState::Ready => None,
             AgentState::AwaitingModel | AgentState::AwaitingObservation { .. } => {
-                Some(crate::organism::AgentPulse::Working)
+                Some(jterm_core::organism::AgentPulse::Working)
             }
-            AgentState::AwaitingApproval { .. } => Some(crate::organism::AgentPulse::AskingReview),
+            AgentState::AwaitingApproval { .. } => {
+                Some(jterm_core::organism::AgentPulse::AskingReview)
+            }
             AgentState::Completed | AgentState::TurnLimitReached => {
-                Some(crate::organism::AgentPulse::Finished)
+                Some(jterm_core::organism::AgentPulse::Finished)
             }
-            AgentState::Cancelled => Some(crate::organism::AgentPulse::Gone),
+            AgentState::Cancelled => Some(jterm_core::organism::AgentPulse::Gone),
         };
         if let Some(pulse) = pulse {
             self.organism_agent.note_phase(pulse);

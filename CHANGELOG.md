@@ -6,6 +6,19 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- `jterm_core` 升级到 `fa256d6`（`Cargo.toml`、`Cargo.lock`、`deny.toml`、`flake.nix` 四处
+  一起移动）。ASCII organism 的三个模块——状态归约器、持久化记忆、注意力仲裁——共约 9,000 行
+  从 forge 删除，改为消费 `jterm_core::organism`、`organism_memory`、`organism_attention`；
+  连同它们的 119 个测试一起上移。行为不变：搬上去的是 forge 自己那份，anvil 侧因批量重命名
+  受损的副本被丢弃而不是带过来。
+  **写入通道现在需要在启动时显式登记**：`app::run` 在 `identity::init` 旁调用
+  `organism_memory::init_scheduler(Box::new(OrganismLane))`，把 organism 的每一次落盘交给
+  forge 自己的持久化 worker。不登记也不会编译失败、也不会丢数据——core 会退回到它自带的
+  写线程——但那条路绕开了 forge 的合并写、准入上限与关闭时的排空统计，运行时完全看不出来，
+  所以由结构性测试而不是编译器来钉住它。关闭序列不变：`flush_pending` 仍在
+  `persistence::shutdown` 之前。
+  记忆文件位置不变（`${XDG_STATE_HOME:-~/.local/state}/forge/ascii-organism-native.json`）：
+  core 对路径不再有意见，由 forge 在 `OrganismMemory::load` 处传入自己的默认路径。
 - `jterm_core` 升级到 `9f94f77`，`jagent` 同步到 `bdc8023`（`Cargo.toml`、`Cargo.lock`、
   `deny.toml`、`flake.nix` 四处一起移动）。终端上报的命令输出现在必须携带完整的 jsh 生命周期
   凭证：`id`、`session_id`、`seq`、`started_at_ms` 必须出现在同一个 OSC 133 `C` 包上，凭证只在

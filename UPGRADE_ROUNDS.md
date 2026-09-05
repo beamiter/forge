@@ -383,3 +383,25 @@ quality gates listed in `README.md`.
     became optional so such an entry cannot claim a probe it never had, and one
     bounded insert is shared by both writers so a report cannot grow the cache
     past its ceiling.
+
+82. **The ASCII organism moves into `jterm_core`** — `organism`,
+    `organism_memory` and `organism_attention` (9,004 lines and their 119
+    tests) are deleted from forge and consumed from core at pin `fa256d6`;
+    forge's copy is the one that went up, so the reducer, the memory schema and
+    the attention arbiter behave exactly as before. The 20 `crate::organism*`
+    call sites were rewritten to `jterm_core::organism*` rather than shimmed,
+    because forge keeps a local `ui::organism` and a same-named alias for a core
+    module would have made the two indistinguishable at the call site.
+    `src/ui/organism.rs` is unchanged. Two narrowings came with the move:
+    `OrganismMemory::load` now takes the app's path (core will not guess one,
+    because a wrong path there fails silently), and `CircadianProfile` is built
+    from a window start instead of a raw bucket mask, so the values whose
+    `session_day` used to panic are no longer expressible. The one step no
+    compiler error catches is the durability lane: `app::run` registers
+    `OrganismLane` — forge's persistence worker — beside `identity::init` and
+    before the first load, and two tests pin it, one driving a real write
+    through the registered lane to disk and one reading forge's own source to
+    prove startup still installs it. Without the registration nothing breaks
+    and nothing is lost; core falls back to a writer thread of its own, outside
+    forge's coalescing, admission bound and shutdown drain, and says so only in
+    a log line.

@@ -21,6 +21,89 @@ saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
 
+- **The ASCII organism moves into core (`jterm_core` `9f94f77` → `fa256d6`)**:
+  `src/organism.rs` (3,322), `src/organism_memory.rs` (5,387) and
+  `src/organism_attention.rs` (295) are deleted — 9,004 lines — and forge now
+  consumes `jterm_core::organism`, `::organism_memory` and
+  `::organism_attention`. forge's copy is the one that went up, so nothing
+  changed on the way: the 119 tests that lived in those three files now run in
+  core, and the `s/Forge/Anvil/` rename damage in anvil's copy was dropped
+  rather than carried across. `src/ui/organism.rs` (5,453 lines) is untouched
+  — it is the GTK surface, not the reducer, and it keeps its name.
+
+  **The call sites were rewritten rather than shimmed.** `lib.rs` already
+  carries four `pub use jterm_core::…` shims (`parser`, `exit_status`,
+  `identity`, `process`), and one more would have kept the diff to three lines.
+  It was still the wrong shape here: there were only 20 `crate::organism*`
+  references outside the deleted files, and forge is the one app in the family
+  that keeps a *local* module called `organism`. A `crate::organism` shim would
+  have put a pretend-local alias for a core module next to a genuinely local
+  one, in the same file — `src/ui/organism.rs` refers to both — with nothing at
+  the call site to say which is which. `jterm_core::organism::Behavior` beside
+  `ui::organism::OrganismActivity` reads correctly without that knowledge. The
+  existing shims earn their keep on the opposite grounds: `process` is a shim
+  because forge *adds* functions to it (`try_shell_quote_path`), and the others
+  are load-bearing for paths that predate the split.
+
+  **The write lane is registered at startup and pinned by a test, because no
+  compiler error catches it.** `OrganismLane` (`main.rs:430`) implements
+  `organism_memory::MemoryScheduler` by handing each `MemoryWrite` to forge's
+  own persistence worker, keyed by `PersistenceKey::for_path(write.kind(),
+  write.path())` so two pending updates to one memory file coalesce and an
+  unrelated write never collapses into them. `app::run` registers it at
+  `main.rs:473`, immediately after `identity::init` and well before the
+  `OrganismMemory::load` at `:1078` — registration is first-call-wins, so a
+  later call would be ignored and every write of that window would quietly take
+  a different route. Quietly is the whole problem: with no lane core falls back
+  to a writer thread of its own, which is correct and bounded and loses
+  nothing, so a missing registration produces no crash, no failed write and no
+  user-visible symptom — only a single log line and a `false` from
+  `scheduler_is_registered()`. Two tests in `main.rs`'s
+  `organism_write_lane` module hold it:
+  `the_registered_lane_carries_an_organism_update_all_the_way_to_disk`
+  (`:2113`) registers the real lane and drives a real event to a real temporary
+  memory file, which also excludes the fallback by construction (it only runs
+  while no lane is registered), so a lane that accepted the write and dropped
+  it would leave the file missing rather than being covered for; and
+  `startup_registers_the_organism_write_lane_beside_identity` (`:2171`) reads
+  forge's own source — truncated at `#[cfg(test)]` so the test cannot satisfy
+  itself — and asserts the registration exists, sits between `identity::init`
+  and the first load, and still routes through `persistence::enqueue`. Both
+  were checked by mutation: deleting the `init_scheduler` line fails the
+  structural test, and replacing the lane body with `Ok(())` fails both.
+
+  Two API changes came with the move, both narrowing what can be expressed.
+  `OrganismMemory::load_default()` is gone — core has no opinion about where an
+  app stores state, because a wrong path there fails *silently* (it loads
+  clean, remembers nothing, reports no error) — so `main.rs:1078` passes
+  `config::default_ascii_organism_memory_path()` explicitly; the file itself
+  has not moved. And `CircadianProfile::from_mask` is replaced by
+  `from_window_start(start_bucket)`: most `u8` masks describe no window at all,
+  and `session_day` `.expect(..)`s that there is exactly one window start, so
+  `from_mask(0)` and the obvious-looking `from_mask(0b1111_1111)` both built
+  values whose public method aborted the process from the GTK thread. forge's
+  three UI test call sites (`ui/organism.rs:4844`, `:4868`, `:4890`) now name
+  the window start that produces the mask each one already asserted — `2` for
+  `0b0001_1100`, `7` for the wrapped night shift `0b1000_0011` — with no mask
+  constructor reintroduced.
+
+  Shutdown is unchanged in shape and slightly different in meaning:
+  `organism_memory::flush_pending(500ms)` stays where it was (`main.rs:1957`),
+  ahead of `persistence::shutdown(3s)`, and that order is now load-bearing
+  rather than incidental — the flush re-publishes every retained queue onto the
+  lane, which *is* the worker being shut down on the next line. Its deadline
+  bounds the call, not the transaction: core returns as soon as the lane
+  accepts and otherwise only joins its own fallback writer, which forge never
+  starts.
+
+  Test count: 1439 lib tests before, 1322 after (`--ignored` steady at 33 both
+  times, so no organism test was among them), plus the unchanged 3 + 18 + 12 in
+  `tests/`. The difference is exactly −119 + 2: a name-level diff of
+  `cargo test --lib -- --list` shows the 119 removed tests are 50 `organism::`,
+  61 `organism_memory::` and 8 `organism_attention::` with nothing else in the
+  set, and the two added are the lane tests above. Nothing outside the three
+  deleted files lost coverage.
+
 - **Review follow-ups on the viewport and Git-metadata work (current working
   tree)**: three defects an adversarial pass found in the two entries below,
   fixed in the same tree.
@@ -1475,13 +1558,16 @@ doctor and correction probes.
 ### Follow-up migrations (next rounds)
 
 - Forge-ahead local modules to upstream into core rather than delete: none
-  left. `ui::ai_chat_store` was the last one and went up this round as
-  `jterm_core::ai::chat_store` (1,536 lines down to a 75-line policy shim; see
-  the entry above), joining `parser` (OSC 7771, erase-scrollback/hard-reset
-  barriers, strict ST termination), upstreamed and deleted locally at pin
-  `73c1411`, and, earlier at pin `592d663`, `review_input` (safe-display
-  helpers, wider spoof set), `pty_input` (`AdmittedInput`) and
-  `execution_journal` (`output_capture_enabled`).
+  left. `organism`, `organism_memory` and `organism_attention` went up this
+  round at pin `fa256d6` and were deleted locally (9,004 lines; see the entry
+  above), joining `ui::ai_chat_store`, which went up the round before as
+  `jterm_core::ai::chat_store` (1,536 lines down to a 75-line policy shim),
+  `parser` (OSC 7771, erase-scrollback/hard-reset barriers, strict ST
+  termination), upstreamed and deleted locally at pin `73c1411`, and, earlier
+  at pin `592d663`, `review_input` (safe-display helpers, wider spoof set),
+  `pty_input` (`AdmittedInput`) and `execution_journal`
+  (`output_capture_enabled`). `src/ui/organism.rs` stays local by design: it is
+  the GTK surface over the shared reducer, and each frontend owns its own.
 - Core-ahead modules: `chat_store` lands with two facilities forge
   deliberately declines — `BusyChatPolicy::Refuse`, which is core's default
   and the anvil/ember/frost archive/delete semantics, and
@@ -1493,11 +1579,15 @@ doctor and correction probes.
   inherited-environment freeze stays wired (`app::run` captures first,
   `pty.rs` uses `envp_from_captured`, and the VTE spawn pairs
   `vte_envv_from_captured` with `VTE_SPAWN_NO_PARENT_ENVV`).
-- Pin bookkeeping: closed. The two "done" sections above quote the pin current
-  at their own round (`21437ba`); `Cargo.toml` now pins `9f94f77` with
-  `jagent` at `bdc8023`, `Cargo.lock` was regenerated by building with no
-  `path`/`[patch]` residue, and both `flake.nix` `outputHashes` and both
-  `deny.toml` `allow-git` revs moved with them.
+  `organism_memory`'s fallback writer thread is core-ahead in the same sense
+  and deliberately unused: forge registers `OrganismLane` at startup, so the
+  fallback exists only as the floor for an app that has not.
+- Pin bookkeeping: closed. The older "done" sections above quote the pin
+  current at their own round (`21437ba`, `9f94f77`); `Cargo.toml` now pins
+  `fa256d6` with `jagent` unchanged at `bdc8023`, `Cargo.lock` was regenerated
+  by building with no `path`/`[patch]` residue, and the `jterm_core` entries in
+  `flake.nix` `outputHashes` (rev comment and hash) and `deny.toml`
+  `allow-git` moved with it — the two `jagent` entries stayed put this round.
 - `src/pty.rs:1967` and `src/state.rs:2118` spawn `sh` directly, outside the
   helper-runner contract — both inside `#[cfg(test)]` helpers, and the line
   references this bullet used to carry (`1579`/`1953`) had drifted;

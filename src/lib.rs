@@ -26,9 +26,6 @@ pub mod identity {
 pub mod keybindings;
 pub mod logging;
 pub mod notebook;
-pub(crate) mod organism;
-pub(crate) mod organism_attention;
-pub(crate) mod organism_memory;
 mod palette;
 mod persistence;
 pub mod process {

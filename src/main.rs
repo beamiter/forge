@@ -419,6 +419,27 @@ fn init_input_method_env() {
     }
 }
 
+/// forge's durability lane for ASCII organism memory.
+///
+/// Core decides *what* each memory update writes and *when* to ask; this
+/// decides *how*: the same background persistence worker that already carries
+/// session snapshots, Block history and the config store. Routing organism
+/// writes through it is what gives them forge's coalescing — two pending
+/// updates to one memory file collapse into one — forge's admission bound, and
+/// forge's shutdown accounting, none of which core can provide for us.
+struct OrganismLane;
+
+impl jterm_core::organism_memory::MemoryScheduler for OrganismLane {
+    fn schedule(&self, write: jterm_core::organism_memory::MemoryWrite) -> std::io::Result<()> {
+        // Read the coalescing key and the content-free failure label out of
+        // `write` before the closure takes ownership of it, so the borrow ends
+        // before the move rather than being extended into the worker.
+        let key = crate::persistence::PersistenceKey::for_path(write.kind(), write.path());
+        let operation = write.operation();
+        crate::persistence::enqueue(key, operation, move || write.run())
+    }
+}
+
 pub fn run() -> glib::ExitCode {
     // Freeze the launch-time environment before CLI parsing writes FORGE_*,
     // before input-method setup rewrites GTK_PATH/GTK_IM_MODULE/XMODIFIERS,
@@ -441,6 +462,15 @@ pub fn run() -> glib::ExitCode {
         // library's version alongside our name.
         app_version: env!("CARGO_PKG_VERSION"),
     });
+    // Lend organism memory forge's persistence worker. Nothing fails to
+    // compile without this and the organism still remembers: core falls back
+    // to a writer thread of its own, correct and bounded but outside forge's
+    // coalescing and outside the shutdown drain below. That makes the omission
+    // invisible at runtime, so it is pinned by the structural test
+    // `startup_registers_the_organism_write_lane_beside_identity` instead of
+    // by the compiler. Registration is first-call-wins, so it must precede the
+    // first `OrganismMemory::load`.
+    jterm_core::organism_memory::init_scheduler(Box::new(OrganismLane));
     if let Some(code) = crate::cli::handle_early_args() {
         return code;
     }
@@ -1045,7 +1075,9 @@ pub fn run() -> glib::ExitCode {
         // config reload followed by a new Block pane can then opt in without
         // silently falling back to volatile state. This is a bounded read and
         // never creates the file.
-        let organism_memory = match crate::organism_memory::OrganismMemory::load_default() {
+        let organism_memory = match jterm_core::organism_memory::OrganismMemory::load(
+            crate::config::default_ascii_organism_memory_path(),
+        ) {
             Ok(memory) => Some(memory),
             Err(error) => {
                 // Fail closed: a corrupt/future/unsafe memory file must not be
@@ -1057,15 +1089,15 @@ pub fn run() -> glib::ExitCode {
         let organism_life = Rc::new(Cell::new(
             organism_memory
                 .as_ref()
-                .map(crate::organism_memory::OrganismMemory::life_state)
+                .map(jterm_core::organism_memory::OrganismMemory::life_state)
                 .unwrap_or_default(),
         ));
         let organism_circadian = organism_memory
             .as_ref()
-            .and_then(|memory| memory.circadian_profile_at(crate::organism_memory::unix_ms()));
+            .and_then(|memory| memory.circadian_profile_at(jterm_core::organism_memory::unix_ms()));
         let organism_growth = organism_memory
             .as_ref()
-            .map(crate::organism_memory::OrganismMemory::growth_progress)
+            .map(jterm_core::organism_memory::OrganismMemory::growth_progress)
             .unwrap_or_default();
 
         // Window-level toast host: transient feedback (e.g. the opacity
@@ -1915,8 +1947,14 @@ pub fn run() -> glib::ExitCode {
             if session_persistence {
                 finalize_tabs_state();
             }
+            // Re-publish every retained organism-memory queue onto the lane
+            // registered at startup, which is the persistence worker shut down
+            // immediately below — so this has to stay ahead of it. The deadline
+            // bounds this call, not the transaction: core returns as soon as
+            // the lane accepts, and only joins its own fallback writer, which
+            // this process never starts.
             if let Err(error) =
-                crate::organism_memory::flush_pending(std::time::Duration::from_millis(500))
+                jterm_core::organism_memory::flush_pending(std::time::Duration::from_millis(500))
             {
                 log::warn!("ASCII organism memory could not be queued for shutdown: {error}");
             }
@@ -2026,6 +2064,170 @@ pub fn run() -> glib::ExitCode {
 #[cfg(test)]
 mod tests {
     use crate::keybindings::Action;
+
+    mod organism_write_lane {
+        //! forge lends core the lane that makes organism memory durable.
+        //!
+        //! Core is correct without one — it falls back to a writer thread of
+        //! its own — so a missing registration produces no compiler error, no
+        //! failed write and no user-visible symptom; the organism just keeps
+        //! remembering off to the side of forge's coalescing, admission bound
+        //! and shutdown drain. Both halves therefore have to be pinned by
+        //! hand: that the lane works, and that startup installs it.
+        use jterm_core::organism::{CommandKind, LifeState};
+        use jterm_core::organism_memory::{
+            scheduler_is_registered, unix_ms, MemoryEvent, OrganismMemory,
+        };
+        use std::path::PathBuf;
+        use std::time::{Duration, Instant};
+
+        fn temporary_state_dir(test_name: &str) -> PathBuf {
+            let directory = std::env::temp_dir().join(format!(
+                "forge-{test_name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            jterm_core::snapshot_file::ensure_private_directory(&directory).unwrap();
+            directory
+        }
+
+        /// forge's own source, for the wiring facts nothing else can observe.
+        fn main_source() -> String {
+            std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+            )
+            .expect("forge's own source is readable from its manifest directory")
+        }
+
+        /// An update core admits reaches disk over forge's persistence worker.
+        ///
+        /// This registers the lane itself, which also excludes core's
+        /// fallback: the fallback writer only runs while no lane is
+        /// registered, so a lane that accepted the write and dropped it would
+        /// leave the memory file missing forever rather than being covered for
+        /// by core.
+        #[test]
+        fn the_registered_lane_carries_an_organism_update_all_the_way_to_disk() {
+            let state_dir = temporary_state_dir("organism-lane");
+            let path = state_dir.join("ascii-organism-native.json");
+            let repo = state_dir.join("repo");
+
+            jterm_core::organism_memory::init_scheduler(Box::new(super::super::OrganismLane));
+            // The observable half of the registration: a doctor command has
+            // nothing else to ask, because the organism remembers either way.
+            assert!(scheduler_is_registered());
+
+            let mut memory = OrganismMemory::load(path.clone()).unwrap();
+            assert!(!path.exists(), "loading must not create the memory file");
+
+            let (_insight, result, retained) =
+                memory.apply_and_enqueue(MemoryEvent::at_ms_for_repo(
+                    unix_ms(),
+                    CommandKind::BuildOrTest,
+                    Some(1),
+                    Some(repo.to_str().unwrap().to_string()),
+                    LifeState::default(),
+                    Some(400),
+                ));
+            result.expect("forge's lane accepts the write");
+            assert!(retained, "an accepted write stays queued until it lands");
+
+            // Accepting is not completing, so wait for the worker rather than
+            // asserting immediately. The bound is generous because it is only
+            // there to fail the test instead of hanging it.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !path.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let stored = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+                panic!(
+                    "the lane never wrote {}: {error}; persistence reported {:?}",
+                    path.display(),
+                    crate::persistence::drain_failures()
+                )
+            });
+            assert!(stored.contains(repo.to_str().unwrap()));
+            assert!(
+                stored.contains("\"build_failures\": 1"),
+                "the queued event must be the one that landed: {stored}"
+            );
+
+            std::fs::remove_dir_all(&state_dir).unwrap();
+        }
+
+        /// Startup installs the lane, beside identity and before the first
+        /// load.
+        ///
+        /// Registration is first-call-wins, so it has to precede the
+        /// `OrganismMemory::load` that opens the file — a later call would be
+        /// ignored and every write of that window would silently take core's
+        /// fallback instead. Neither ordering is observable from inside a test
+        /// process — `run()` starts GTK and does not return until the window
+        /// closes — so the guard is structural.
+        #[test]
+        fn startup_registers_the_organism_write_lane_beside_identity() {
+            let source = main_source();
+            // Stop at this module: its own source mentions every name the
+            // assertions below look for, and it sits after `run()` in the
+            // file, so leaving it in would let a deleted call site be
+            // satisfied by the test that is supposed to catch the deletion.
+            let production = source
+                .split_once("\n#[cfg(test)]\nmod tests {")
+                .expect("forge's unit tests live at the end of the file")
+                .0;
+            let run_body = production
+                .split_once("\npub fn run() -> glib::ExitCode {")
+                .expect("forge has exactly one startup entry point")
+                .1;
+
+            // Built rather than written out, so this test's own source does
+            // not count as one of the call sites it is looking for.
+            let register = format!(
+                "organism_memory::{}(Box::new(OrganismLane))",
+                "init_scheduler"
+            );
+            let registered_at = run_body
+                .find(&register)
+                .unwrap_or_else(|| panic!("run() must call {register}"));
+            let identity_at = run_body
+                .find("identity::init(")
+                .expect("run() initialises the shared identity");
+            let load_at = run_body
+                .find("OrganismMemory::load(")
+                .expect("run() opens the organism memory file");
+
+            assert!(
+                identity_at < registered_at,
+                "the write lane is registered beside identity::init, not before it"
+            );
+            assert!(
+                registered_at < load_at,
+                "a lane registered after the first load is ignored for that window"
+            );
+
+            // The lane forge lends is forge's persistence worker; a lane that
+            // stopped routing through it would keep this whole file compiling
+            // and every organism write would still land, just off the queue
+            // that coalesces and shuts down with the rest of forge's writes.
+            let lane = production
+                .split_once("impl jterm_core::organism_memory::MemoryScheduler for OrganismLane {")
+                .expect("forge implements the scheduler contract exactly once")
+                .1;
+            let lane = &lane[..lane.find("\n}\n").expect("the impl block is closed")];
+            for routed in [
+                "persistence::PersistenceKey::for_path(write.kind(), write.path())",
+                "persistence::enqueue(key, operation, move || write.run())",
+            ] {
+                assert!(
+                    lane.contains(routed),
+                    "the organism lane must be forge's persistence lane: {routed}"
+                );
+            }
+        }
+    }
 
     mod gdk_chord_edge {
         //! The gdk → [`Chord`] translation is pure data (no GTK runtime),

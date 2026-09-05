@@ -16489,7 +16489,7 @@ mod tests {
 
     #[test]
     fn authoritative_finish_events_drive_the_no_llm_reducer_once_each() {
-        use crate::organism::{classify_command, Behavior, NativeOrganism};
+        use jterm_core::organism::{classify_command, Behavior, NativeOrganism};
 
         let callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn(CommandFinishedEvent)>>::new()));
         let organism = Rc::new(RefCell::new(NativeOrganism::default()));
