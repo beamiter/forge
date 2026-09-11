@@ -419,6 +419,16 @@ All notable user-visible and operational changes are recorded here.
 
 ### Fixed
 
+- 上一条修复只在 pane 的第一个提示符上生效：从第二个提示符起（无论上一条命令有没有输出），
+  Tab 补全菜单又被压回六行高的卡片——提示符、匹配计数、分组标题和两个候选，其余全在卡片
+  下沿之外。测量从纵向 adjustment 的下界开始逐行扫描 ring，假定它就是提示符的起始行；但
+  VTE 0.82 的 adjustment 是相对 ring 起点的（`lower` 恒为 0），而 `text_range_format` 用的
+  是随 pane 生命周期不断增长的绝对行号——每次 reset 自带的清屏都会让 ring 前进一整屏——于是
+  扫描读到的全是 reset 早已丢弃的行，一律为空。现在改为一次读取终端当前显示的网格文本
+  （`get_text_format`），按终端此刻实际拥有的行数从底部数到最后一行有字的行：不需要任何坐标
+  换算，也不受 reset 时 VTE 队列里尚未处理的输出尾巴、或 shell 自己的 Ctrl+L 重绘把屏幕顶端
+  下移的影响；软换行的长路径提示符同样计数正确；pane 放大的那一帧卡片也不会被多撑高。每次
+  测量也从最多一屏的逐行查询降为一次调用。
 - 在提示符下按 Tab 弹出的补全菜单不再被压在只有六行高的 live 卡片里。prompt 状态下 live
   网格此前被钉在卡片自己的 `MIN_INPUT_ROWS` 高度上，而子进程通过 `pty_grid_size` 拿到的却
   是整个视口的 winsize：jsh 按视口一半排布的菜单撞进一个六行的终端，大部分直接滚进 live

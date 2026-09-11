@@ -75,6 +75,7 @@ tests=(
     block_view::tests::late_inline_notice_adopts_the_panes_current_density
     block_view::tests::dock_mount_refuses_a_widget_another_region_owns
     block_view::tests::unified_search_capture_real_vte_uses_half_open_column_boundary
+    block_view::tests::real_vte_prompt_area_covers_a_menu_after_the_pane_has_scrolled
     block_view::unified_chrome::tests::real_vte_osc8_row_probe_and_rewrap_smoke
     block_view::unified_chrome::tests::real_vte_non_bottom_anchor_calibrates_and_wide_badge_probe_fails_closed
     block_view::unified_images::tests::real_vte_keeps_nonzero_marker_column_through_narrow_wide_rewrap
