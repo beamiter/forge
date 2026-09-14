@@ -898,9 +898,9 @@ impl UiState {
         });
         button.add_controller(select);
 
-        let ui_for_toggle = self.clone();
-        button.connect_toggled(move |_| {
-            let ui = ui_for_toggle.clone();
+        let ui_for_click_repair = self.clone();
+        button.connect_clicked(move |_| {
+            let ui = ui_for_click_repair.clone();
             glib::idle_add_local_once(move || ui.sync_tab_strip_active(None));
         });
 
@@ -2506,12 +2506,12 @@ impl UiState {
         // which fights the notebook-driven selection: clicking a tab would set
         // it active via switch-page, then the release toggle would clear it,
         // dropping the :checked styling. Re-assert the correct state after the
-        // toggle settles. Scheduling on idle lets the in-progress toggle finish
-        // first; sync only emits `toggled` for buttons that actually change, so
-        // this converges instead of looping.
-        let ui_for_toggle = self.clone();
-        strip_btn.connect_toggled(move |_| {
-            let ui_for_idle = ui_for_toggle.clone();
+        // click settles. Only real clicks need this repair: listening to
+        // `toggled` also queues full-strip rescans for programmatic selection
+        // changes on every Ctrl+PageUp/Down switch.
+        let ui_for_click_repair = self.clone();
+        strip_btn.connect_clicked(move |_| {
+            let ui_for_idle = ui_for_click_repair.clone();
             glib::idle_add_local_once(move || {
                 ui_for_idle.sync_tab_strip_active(None);
             });

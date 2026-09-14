@@ -156,6 +156,18 @@ fn widget_pinned(widget: &gtk4::Widget) -> bool {
     }
 }
 
+pub(super) fn sync_strip_buttons_active(tab_strip: &gtk4::Box, active: u32) {
+    let mut idx = 0u32;
+    let mut child = tab_strip.first_child();
+    while let Some(c) = child {
+        if let Ok(btn) = c.clone().downcast::<ToggleButton>() {
+            btn.set_active(idx == active);
+        }
+        idx += 1;
+        child = c.next_sibling();
+    }
+}
+
 impl UiState {
     /// Route authoritative Block completion to the existing inactive-tab
     /// attention styles. A reported non-zero status is bell-strength; success
@@ -333,16 +345,12 @@ impl UiState {
     /// Update which tab strip button is :checked to match the active notebook page.
     pub(crate) fn sync_tab_strip_active(&self, active_page: Option<u32>) {
         let active = active_page.or(self.notebook.current_page()).unwrap_or(0);
-        let mut idx = 0u32;
-        let mut child = self.tab_strip.first_child();
-        while let Some(c) = child {
-            if let Ok(btn) = c.clone().downcast::<ToggleButton>() {
-                btn.set_active(idx == active);
-            }
-            idx += 1;
-            child = c.next_sibling();
-        }
-        self.refresh_sidebar_tab_mirror();
+        sync_strip_buttons_active(&self.tab_strip, active);
+        let active_name = self
+            .notebook
+            .nth_page(Some(active))
+            .map(|page| page.widget_name());
+        self.sync_sidebar_tab_mirror_active(active_name.as_deref());
     }
 
     /// Show the tab strip wherever the placement says it lives — including a

@@ -52,6 +52,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    ui::sidebar_tabs::tests::many_tab_switches_update_mirror_before_notebook_commits
     ui::dialogs::tests::cross_block_search_compact_rows_are_inside_horizontal_scroller
     ui::dialogs::tests::cross_block_search_close_borrows_the_gtk_dialog_without_releasing_its_slot
     ui::panes::tests::equalize_without_allocation_leaves_the_tree_untouched

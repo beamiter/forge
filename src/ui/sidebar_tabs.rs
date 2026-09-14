@@ -88,11 +88,18 @@ impl UiState {
         }
 
         self.sync_sidebar_tab_mirror_state(&rows);
+        self.sync_sidebar_tab_mirror_active(self.active_page_name().as_deref());
+    }
+
+    /// Selection does not change the mirror's structure, titles or pin state.
+    /// Use the switch-page target; Notebook::current_page is still the old page
+    /// while that signal is being delivered.
+    pub(crate) fn sync_sidebar_tab_mirror_active(&self, active: Option<&str>) {
+        sync_mirror_active(&self.sidebar_tab_mirror, active);
     }
 
     /// Refresh only the parts that change without restructuring the list.
     fn sync_sidebar_tab_mirror_state(&self, rows: &[MirrorRow]) {
-        let active = self.active_page_name();
         let mut child = self.sidebar_tab_mirror.first_child();
         let mut index = 0usize;
         while let Some(widget) = child {
@@ -101,7 +108,6 @@ impl UiState {
             index += 1;
             widget.set_visible(row.visible);
             if let Some(button) = mirror_row_button(&widget) {
-                button.set_active(active.as_deref() == Some(row.page_name.as_str()));
                 if row.pinned {
                     button.add_css_class("tab-pinned");
                 } else {
@@ -160,9 +166,11 @@ impl UiState {
         // user just re-clicked. Put the list back the way the notebook says
         // it should be once the click has been dealt with.
         let ui = self.clone();
-        button.connect_toggled(move |_| {
+        button.connect_clicked(move |_| {
             let ui = ui.clone();
-            glib::idle_add_local_once(move || ui.refresh_sidebar_tab_mirror());
+            glib::idle_add_local_once(move || {
+                ui.sync_sidebar_tab_mirror_active(ui.active_page_name().as_deref());
+            });
         });
 
         let close = gtk4::Button::from_icon_name("window-close-symbolic");
@@ -188,4 +196,96 @@ impl UiState {
 
 fn mirror_row_button(row: &gtk4::Widget) -> Option<ToggleButton> {
     row.first_child()?.downcast::<ToggleButton>().ok()
+}
+
+fn sync_mirror_active(mirror: &gtk4::Box, active: Option<&str>) {
+    let mut child = mirror.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if let Some(button) = mirror_row_button(&widget) {
+            button.set_active(active == Some(widget.widget_name().as_str()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn many_tab_switches_update_mirror_before_notebook_commits() {
+        gtk4::init().expect("GTK display");
+        let notebook = gtk4::Notebook::new();
+        let mirror = gtk4::Box::new(Orientation::Vertical, 0);
+        let strip = gtk4::Box::new(Orientation::Horizontal, 0);
+        let clicks = Rc::new(Cell::new(0));
+        let mut buttons = Vec::new();
+        let mut strip_buttons = Vec::new();
+        for index in 0..64 {
+            let name = format!("tab-{index}");
+            let page = gtk4::Box::new(Orientation::Vertical, 0);
+            page.set_widget_name(&name);
+            notebook.append_page(&page, None::<&gtk4::Widget>);
+            let row = gtk4::Box::new(Orientation::Horizontal, 0);
+            row.set_widget_name(&name);
+            let button = ToggleButton::new();
+            let clicks = clicks.clone();
+            button.connect_clicked(move |_| clicks.set(clicks.get() + 1));
+            row.append(&button);
+            mirror.append(&row);
+            buttons.push(button);
+            let strip_button = ToggleButton::new();
+            strip.append(&strip_button);
+            strip_buttons.push(strip_button);
+        }
+        // Selection-only updates must preserve filtered rows and pin styling.
+        mirror.first_child().unwrap().set_visible(false);
+        buttons[0].add_css_class("tab-pinned");
+        notebook.set_current_page(Some(0));
+        sync_mirror_active(&mirror, Some("tab-0"));
+        let switches = Rc::new(Cell::new(0));
+        let observed_switches = switches.clone();
+        let mirror_for_switch = mirror.clone();
+        let buttons_for_switch = buttons.clone();
+        let correct = Rc::new(Cell::new(true));
+        let correct_for_switch = correct.clone();
+        let handler = notebook.connect_switch_page(move |notebook, page, index| {
+            correct_for_switch
+                .set(correct_for_switch.get() && notebook.current_page() != Some(index));
+            super::super::tab_strip::sync_strip_buttons_active(&strip, index);
+            sync_mirror_active(&mirror_for_switch, Some(page.widget_name().as_str()));
+            // No main-loop/idle drain: the target must already be selected.
+            for (i, button) in buttons_for_switch.iter().enumerate() {
+                correct_for_switch.set(
+                    correct_for_switch.get()
+                        && button.is_active() == (i == index as usize)
+                        && strip_buttons[i].is_active() == (i == index as usize),
+                );
+            }
+            observed_switches.set(observed_switches.get() + 1);
+        });
+        for _ in 0..4 {
+            for index in 1..64 {
+                notebook.set_current_page(Some(index));
+            }
+            for index in (0..63).rev() {
+                notebook.set_current_page(Some(index));
+            }
+        }
+        // Disposal removes pages and emits further switch signals.
+        notebook.disconnect(handler);
+        assert!(
+            correct.get(),
+            "both strips must select the target synchronously"
+        );
+        assert_eq!(switches.get(), 504);
+        assert_eq!(
+            clicks.get(),
+            0,
+            "programmatic switching must not request click repair"
+        );
+        assert!(!mirror.first_child().unwrap().get_visible());
+        assert!(buttons[0].has_css_class("tab-pinned"));
+    }
 }
