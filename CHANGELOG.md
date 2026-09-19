@@ -419,6 +419,31 @@ All notable user-visible and operational changes are recorded here.
 
 ### Fixed
 
+- Block 模式不再对 DA1/DA2/DA3、XTVERSION、DSR 5 与光标位置查询（CPR）各回答两次：实时
+  VTE 自己会通过 `commit` 回答它们，forge 此前还会在解析时再合成一份，抢在 VTE 按流顺序给出的
+  答案之前写入。多出来的那份会让 crossterm 把下一次 `cursor::position()` 读成旧值，而合成的
+  CPR 用的是随 pane 生命周期不断增长的 ring 行号（libvte 0.76 从不重排 ring 编号），codex
+  于是把内联视口画到屏幕之外。现在这六类查询只由 VTE 回答（与 anvil 一致），`CSI ?u` 与
+  `CSI ?4m` 仍由 forge 回答，因为 libvte 两者都不实现。
+- 实时 VTE 自己产生的上报——DECSET 1004 的焦点上报、DECSET 1003 的指针移动、鼠标点击与滚轮、
+  以及对查询的答复——照常转给程序，但不再被当作用户键入：切换窗口（Alt+Tab）不再清除选中的
+  块、不再触发“人工输入”，也不再放开选区暂停而让下一帧重绘冲掉正在复制的选区。光标位置答复
+  与 `Shift+F3`（`CSI 1;2R`）同形，因此只在确有未答复的 CPR 时才按上报处理。
+- `Alt+字母` 与 `Alt+Backspace` 在 claude、codex、kimi 里不再多打出一个字母：libvte 0.76 把
+  Alt 组合键拆成 ESC 与按键两次 `commit`，forge 此前把单独的 ESC 编码成整个 kitty 组合键、
+  再把字母当普通输入送出。现在两半重新合并为一次写入（未启用 kitty 协议时也是一次写入，
+  读端不会把孤立的 ESC 当成 Esc 而打断 Agent 的回合）。
+- 没有 shell 集成（RawFallback）时，程序推入的 kitty 键盘标志此前会被如实回报却从不生效，
+  claude、codex、kimi 因此收到旧式按键，`Shift+Enter` 直接提交而不是换行。现在只要 PTY 前台
+  是程序而非 shell，就按其请求编码；无法判断时仍退回旧式按键。
+- 点进历史卡片（例如复制旧输出）之后，命令运行期间按下的第一个键不再只用来交还焦点：它经实时
+  VTE 自己的控制器（含输入法）送达程序，`Esc` 能直接打断 claude/codex，拼音首字母也不会丢。
+  焦点停在卡片上时，未被 Block 占用的 `Ctrl`/`Alt` 组合键（claude 的 `Ctrl+O`、codex 的
+  `Ctrl+T`、`Alt+B` 等）也会送达程序，而不是落在只读的卡片 VTE 上无声消失。
+- 命令运行期间，焦点在块内过滤框或历史面板搜索框时按 `Ctrl+C`/`Ctrl+D`，不再中断前台程序或
+  向它发送 EOF，这两个键归输入框自己。
+- 选区暂停输出期间，在全屏程序里滚动滚轮会先放开暂停再发送滚轮上报，程序的滚动重绘不再被
+  压住而显得滚轮失灵。
 - 上一条修复只在 pane 的第一个提示符上生效：从第二个提示符起（无论上一条命令有没有输出），
   Tab 补全菜单又被压回六行高的卡片——提示符、匹配计数、分组标题和两个候选，其余全在卡片
   下沿之外。测量从纵向 adjustment 的下界开始逐行扫描 ring，假定它就是提示符的起始行；但

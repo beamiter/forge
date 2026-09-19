@@ -24,9 +24,10 @@ pub(crate) use jterm_core::block_contract::{
 };
 use jterm_core::execution_journal::ExecutionLifecycle;
 use jterm_core::kitty_keyboard::{
-    self, KittyKey, KittyKeyboardStacks, Modifiers as KittyModifiers,
+    self, AltEscapeJoiner, JoinStep, KittyKey, KittyKeyboardStacks, Modifiers as KittyModifiers,
 };
 use jterm_core::pty_input::{self, Paste, PasteModes, PastePolicy, UnbracketedMultiline};
+use jterm_core::terminal_report::{classify_terminal_report, TerminalReport};
 
 mod alt_screen;
 mod ansi;
@@ -2658,6 +2659,28 @@ fn apply_dynamic_colors_to_finished(block: &FinishedBlock, dynamic: DynamicColor
     }
 }
 
+/// The queries libvte answers on its own once the bytes reach it.
+///
+/// The parser reports these *and* passes their bytes through to the live VTE,
+/// which replies through its `commit` signal — PTY or not — and that commit is
+/// forwarded to the shell like any other. Checked against libvte 0.76
+/// (vteseq.cc: DA1, DA2, DA3, DSR 5, CPR and XTVERSION all reply through
+/// `send`): each of these six used to be answered twice, once from
+/// [`build_keyboard_query_reply`] and once from VTE. `CSI ? u` and `CSI ? 4 m`
+/// were answered only from here, because libvte implements neither the kitty
+/// keyboard protocol nor modifyOtherKeys.
+fn vte_answers_query_natively(query: KeyboardProtocolQuery) -> bool {
+    matches!(
+        query,
+        KeyboardProtocolQuery::CursorPosition
+            | KeyboardProtocolQuery::DeviceStatus
+            | KeyboardProtocolQuery::PrimaryDeviceAttributes
+            | KeyboardProtocolQuery::SecondaryDeviceAttributes
+            | KeyboardProtocolQuery::TertiaryDeviceAttributes
+            | KeyboardProtocolQuery::XtVersion
+    )
+}
+
 fn build_keyboard_query_reply(
     query: KeyboardProtocolQuery,
     cursor_col: i64,
@@ -2762,6 +2785,28 @@ fn base_keyval_in_layout(
         .find(|entry| level_zero(entry) && entry.0.group() == layout as i32)
         .or_else(|| entries.iter().find(level_zero))
         .map(|(_, keyval)| *keyval)
+}
+
+/// Whether a commit made in `state` goes through the kitty rewrite: only while
+/// a program, not the shell, owns the keyboard, so a client that died with
+/// flags pushed cannot leave CSI u keys at the prompt.
+///
+/// RawFallback has no OSC 133 marks to say who that is, and the flags a client
+/// pushes there are still applied and reported back (`CSI ? u` answers them),
+/// so gating on the Block states alone told claude, codex and kimi the
+/// protocol was on and then sent them legacy keys — Shift+Enter submitted
+/// instead of inserting a newline. There the PTY's foreground process group
+/// decides; `foreground` is only probed in that state. An unknown owner fails
+/// closed to legacy keys, as before.
+fn kitty_rewrite_applies(state: BlockState, foreground: impl FnOnce() -> PtyForeground) -> bool {
+    match state {
+        BlockState::CollectingOutput | BlockState::AltScreen => true,
+        BlockState::RawFallback => foreground() == PtyForeground::Other,
+        BlockState::Idle
+        | BlockState::CollectingPrompt
+        | BlockState::AwaitingCommand
+        | BlockState::PostCommand => false,
+    }
 }
 
 /// The process-control bytes for Ctrl+C / Ctrl+D under the kitty keyboard
@@ -6277,14 +6322,30 @@ trait RenderBackend {
     /// Cursor position `(col, row)` for the DSR 6 cursor-position report
     /// (`ESC[{row+1};{col+1}R`), in the coordinates the reply is written with.
     ///
-    /// CPR is screen-relative by protocol. Block answers with the text-buffer
-    /// (ring) row anyway — a pre-existing quirk kept so the reply bytes did
-    /// not change under this split — and gets away with it only because its
-    /// ring is wiped at every prompt, which keeps the two spaces within one
-    /// command's output of each other. A backend whose ring is never wiped
-    /// MUST convert (see [`screen_relative_cpr_row`]) or the reported row
-    /// grows without bound for the life of the pane.
+    /// CPR is screen-relative by protocol: an inline-viewport TUI (codex, and
+    /// anything else on ratatui/crossterm) anchors its frame on the reply. Only
+    /// a backend that synthesizes the reply reads this — one whose
+    /// [`Self::live_surface_answers_query`] declines `CursorPosition`. A VTE's
+    /// `cursor_position()` row is a text-buffer (ring) row, which is not
+    /// screen-relative: libvte 0.76 never renumbers its ring (`Ring::reset`
+    /// keeps `m_end`, and every `ESC[2J` appends a screenful), so it climbs for
+    /// the life of the pane, and a reply built from it drew codex off screen.
     fn cursor_position_report(&self) -> (i64, i64);
+    /// Whether the live surface already answers `query` by itself.
+    ///
+    /// Both live backends pass a query's bytes straight through to their VTE,
+    /// which replies natively through `commit`. Synthesizing a second reply
+    /// puts two answers on the shell's input for one question: the client reads
+    /// the first and the leftover shifts every reply after it by one (crossterm
+    /// keeps an unsolicited CPR queued for its next `cursor::position()`). The
+    /// synthesized reply is also out of order: it is written at parse time,
+    /// ahead of VTE's answers to the queries sent before it, and a CPR read
+    /// before VTE has applied the preceding bytes is stale. Backends with no VTE
+    /// behind them (recording, headless tests) still need the synthesized
+    /// reply, which is what the default reports.
+    fn live_surface_answers_query(&self, _query: KeyboardProtocolQuery) -> bool {
+        false
+    }
     /// Rebase the prompt anchor captured at PromptEnd (`provisional`, with
     /// the surface row count `anchor_rows` recorded beside it) onto the
     /// surface as it stands at CommandStart. Anchor cells are in the
@@ -6630,6 +6691,12 @@ struct ReaderCtx {
     /// of the flags in effect that the GTK-side key and commit handlers read.
     kitty_keyboard_rc: Rc<RefCell<KittyKeyboardStacks>>,
     kitty_flags_rc: Rc<Cell<u8>>,
+    /// Cursor position queries left to the live VTE whose answer has not come
+    /// back through `commit` yet. The commit handler reads it to tell VTE's
+    /// CPR from the modified F3 key that shares its shape, and decrements it
+    /// per answer. Zeroed at an accepted PromptStart and at RIS, so a query
+    /// VTE never answered cannot keep claiming Shift+F3 forever.
+    cpr_outstanding_rc: Rc<Cell<u32>>,
     config_for_cb: Rc<RefCell<Config>>,
     dynamic_colors_rc: Rc<Cell<DynamicColors>>,
     parser: Rc<RefCell<Parser>>,
@@ -6746,6 +6813,7 @@ impl ReaderCtx {
 
     fn on_hard_reset(&self) {
         self.reset_kitty_keyboard();
+        self.cpr_outstanding_rc.set(0);
         self.live_extent_force_full_rc.set(true);
         self.release_prompt_fence_before_reset();
 
@@ -7079,6 +7147,10 @@ impl ReaderCtx {
         // client, which never re-pushes, would keep sending CSI u expectations
         // into a terminal that had stopped honouring them.
         self.reset_kitty_keyboard();
+        // Same boundary for the CPR ledger: whatever the last program asked
+        // the live VTE and never got answered no longer makes a modified F3
+        // typed at this prompt look like a report.
+        self.cpr_outstanding_rc.set(0);
         // All rejection/recovery guards above have passed: this PromptStart
         // really ends the prior lifecycle. Clear an ED3/RIS full-card latch
         // before backend finalization resets VTE and can synchronously relayout.
@@ -7913,10 +7985,20 @@ impl ReaderCtx {
     }
 
     fn on_keyboard_protocol_query(&self, query: KeyboardProtocolQuery) {
-        // CPR note: DSR 6 wants screen-relative coordinates; the query is
-        // backend-owned so Block can keep its bug-compatible text-buffer row
-        // (see `RenderBackend::cursor_position_report`) while a correct
-        // backend answers screen-relative without engine changes.
+        // The parser reports the query *and* passes its bytes through to the
+        // live surface. Where that surface answers for itself, a reply from
+        // here would be the second answer to one question, and the client's
+        // next read would return the leftover instead of what it waits for.
+        // The VTE's answer arrives through `commit` a frame or more later, and
+        // a CPR there has the shape of a modified F3 (`CSI 1;2 R`), so count
+        // the ones still owed: the commit handler knows a report by that.
+        if self.backend.live_surface_answers_query(query) {
+            if query == KeyboardProtocolQuery::CursorPosition {
+                self.cpr_outstanding_rc
+                    .set(self.cpr_outstanding_rc.get().saturating_add(1));
+            }
+            return;
+        }
         let (col, row) = self.backend.cursor_position_report();
         let reply = build_keyboard_query_reply(query, col, row, self.kitty_flags_rc.get());
         if let Err(error) = self.pty_for_init.write_bytes(reply.as_bytes()) {
@@ -8539,13 +8621,19 @@ impl RenderBackend for BlockBackend {
     }
 
     fn cursor_position_report(&self) -> (i64, i64) {
-        // Bug-compatible on purpose: VTE's `cursor_position()` row is a
-        // text-buffer (ring) row, and the pre-split code fed exactly this
-        // value into the `ESC[{row+1};{col+1}R` reply. Kept so the reply
-        // bytes do not change under the trait split; the row stays small
-        // because `reset_active` wipes this ring at every prompt. See the CPR
-        // note on `RenderBackend::cursor_position_report`.
+        // Never turned into a reply: this backend leaves DSR 6 to the live VTE
+        // (`live_surface_answers_query`), which answers in screen rows and in
+        // stream order. The ring row here is NOT screen-relative and must not
+        // become one again. `reset_active` does not rewind VTE's row numbering
+        // — it climbs by a screenful per prompt — and rebasing on the vertical
+        // adjustment is no fix on libvte 0.76 either: that adjustment is
+        // ring-relative (lower 0, value 0 with the cursor on ring row 188), so
+        // `screen_relative_cpr_row(row, adj.value())` clamps to the last row.
         self.active_vte.cursor_position()
+    }
+
+    fn live_surface_answers_query(&self, query: KeyboardProtocolQuery) -> bool {
+        vte_answers_query_natively(query)
     }
 
     fn command_capture_anchor(&self, provisional: (i64, i64), anchor_rows: i64) -> (i64, i64) {
@@ -9817,13 +9905,12 @@ impl RenderBackend for UnifiedBackend {
         (self.vte.cursor_position(), self.vte.row_count())
     }
 
-    /// Screen-relative, unlike Block. Block's ring is wiped at every prompt,
-    /// so its text-buffer row never grows far from the screen row; this ring
-    /// is never wiped, so answering with it would mean `ESC[801;1R` a few
-    /// hundred lines into a session and cursor-restore misdraws in fzf,
-    /// powerlevel10k and any ncurses app that saves and restores the
-    /// position. Answering what the protocol actually defines is the only
-    /// option here, and the trait note says so explicitly.
+    /// Screen-relative, as the protocol defines it. Not read for a reply while
+    /// the live VTE answers DSR 6 itself (`live_surface_answers_query`); kept
+    /// correct so a synthesized reply could never again be a ring row, which
+    /// would mean `ESC[801;1R` a few hundred lines into a session and
+    /// cursor-restore misdraws in fzf, powerlevel10k and any ncurses app that
+    /// saves and restores the position.
     fn cursor_position_report(&self) -> (i64, i64) {
         let (col, row) = self.vte.cursor_position();
         let top_row = gtk4::prelude::ScrollableExt::vadjustment(&self.vte)
@@ -9833,6 +9920,10 @@ impl RenderBackend for UnifiedBackend {
             col,
             screen_relative_cpr_row(row, top_row, self.vte.row_count()),
         )
+    }
+
+    fn live_surface_answers_query(&self, query: KeyboardProtocolQuery) -> bool {
+        vte_answers_query_natively(query)
     }
 
     /// The identity, through the shared policy. The provisional anchor was
@@ -9877,8 +9968,12 @@ impl ReaderCtx {
     fn install(self, pty: &Rc<OwnedPty>, live_vte: &Terminal) {
         // Selection-hold triggers that live on the VTE itself (selection
         // cleared, user typed). Wired before the pipeline closure below
-        // captures the shared ctx.
-        self.selection_feed_hold.install_vte_hooks(live_vte);
+        // captures the shared ctx — and before the view connects its own
+        // `commit` handler, which matters: GLib runs handlers in connection
+        // order, so the hold's hook reads the CPR ledger before that handler
+        // settles an answered query out of it.
+        self.selection_feed_hold
+            .install_vte_hooks(live_vte, self.cpr_outstanding_rc.clone());
 
         let ctx = Rc::new(self);
 
@@ -10855,6 +10950,32 @@ fn exit_alt_screen_chrome(
     }
 }
 
+/// Whether the running-command Ctrl+C/Ctrl+D fallback may act on this key
+/// press at all.
+///
+/// The fallback sits on the pane root in the Capture phase, so it sees keys
+/// before whatever has focus inside the pane. A text field there — a card's
+/// output filter, the history palette's search entry — owns its own Ctrl+C
+/// (copy) and Ctrl+D; taking them turned "copy what I typed in the filter"
+/// into an interrupt of the running agent, and Ctrl+D into its EOF.
+fn running_root_control_applies(state: BlockState, focus_takes_text_input: bool) -> bool {
+    matches!(
+        state,
+        BlockState::CollectingOutput | BlockState::PostCommand
+    ) && !focus_takes_text_input
+}
+
+/// Whether the focused widget takes text keys itself: an entry, an editable
+/// text view, or anything inside a popover. A read-only text surface in a card
+/// does not count, so the interrupt rescue this feeds still works from there.
+fn focus_takes_text_input(focused: &gtk4::Widget) -> bool {
+    focused.is::<gtk4::Editable>()
+        || focused
+            .downcast_ref::<gtk4::TextView>()
+            .is_some_and(|view| view.is_editable())
+        || focused.ancestor(gtk4::Popover::static_type()).is_some()
+}
+
 fn running_root_control_bytes(
     keyval: gtk4::gdk::Key,
     modifiers: gtk4::gdk::ModifierType,
@@ -10915,29 +11036,11 @@ fn stranded_focus_key_recovers(keyval: gtk4::gdk::Key, modifiers: gtk4::gdk::Mod
         return false;
     }
 
-    !matches!(
-        keyval,
-        // Modifier presses themselves.
-        Key::Shift_L
-            | Key::Shift_R
-            | Key::Control_L
-            | Key::Control_R
-            | Key::Alt_L
-            | Key::Alt_R
-            | Key::Meta_L
-            | Key::Meta_R
-            | Key::Super_L
-            | Key::Super_R
-            | Key::Hyper_L
-            | Key::Hyper_R
-            | Key::Caps_Lock
-            | Key::Num_Lock
-            | Key::Scroll_Lock
-            | Key::ISO_Level3_Shift
-            | Key::ISO_Level5_Shift
-            | Key::Mode_switch
+    !is_modifier_key(keyval)
+        && !matches!(
+            keyval,
             // Focus navigation.
-            | Key::Tab
+            Key::Tab
             | Key::ISO_Left_Tab
             // Reading/navigation keys.
             | Key::Up
@@ -10957,7 +11060,73 @@ fn stranded_focus_key_recovers(keyval: gtk4::gdk::Key, modifiers: gtk4::gdk::Mod
             | Key::KP_Home
             | Key::KP_End
             | Key::Menu
+        )
+}
+
+/// A modifier key's own press: never typing, and never a chord by itself.
+fn is_modifier_key(keyval: gtk4::gdk::Key) -> bool {
+    use gtk4::gdk::Key;
+
+    matches!(
+        keyval,
+        Key::Shift_L
+            | Key::Shift_R
+            | Key::Control_L
+            | Key::Control_R
+            | Key::Alt_L
+            | Key::Alt_R
+            | Key::Meta_L
+            | Key::Meta_R
+            | Key::Super_L
+            | Key::Super_R
+            | Key::Hyper_L
+            | Key::Hyper_R
+            | Key::Caps_Lock
+            | Key::Num_Lock
+            | Key::Scroll_Lock
+            | Key::ISO_Level3_Shift
+            | Key::ISO_Level5_Shift
+            | Key::Mode_switch
     )
+}
+
+/// Whether the typing key that hands stranded focus back to the live surface
+/// is also delivered there.
+///
+/// It used to be spent on the refocus alone: the Esc that should interrupt
+/// claude or codex right after copying from history, or the first pinyin
+/// letter, simply vanished. Writing the key into the PTY ourselves would
+/// bypass the live VTE's input method, which is why it was consumed.
+/// `EventControllerKey::forward` does not: it runs the event through the live
+/// VTE's own controllers — its IM context and the kitty key recorder included
+/// — exactly once. Only while a program may own the terminal (RawFallback
+/// cannot tell a program from the shell and has no Block prompt to protect);
+/// at a Block prompt the refocus stays the whole meaning, so a stray Enter
+/// cannot submit whatever sits in the editor.
+fn stranded_focus_forwards_key(state: BlockState) -> bool {
+    matches!(
+        state,
+        BlockState::CollectingOutput | BlockState::AltScreen | BlockState::RawFallback
+    )
+}
+
+/// Whether a Ctrl or Alt chord pressed with focus stranded on a finished card
+/// is rescued to the running program.
+///
+/// `stranded_focus_key_recovers` leaves chords alone, so they used to land on
+/// the card's snapshot VTE — input disabled — and vanish: Ctrl+O, Ctrl+R,
+/// Ctrl+T, Alt+B and the rest of what claude, codex and kimi bind. The caller
+/// asks only after every Block-owned chord has had its turn, and window
+/// shortcuts ran before the pane saw the key at all.
+fn stranded_focus_rescues_chord(
+    state: BlockState,
+    keyval: gtk4::gdk::Key,
+    modifiers: gtk4::gdk::ModifierType,
+) -> bool {
+    matches!(state, BlockState::CollectingOutput | BlockState::AltScreen)
+        && modifiers
+            .intersects(gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::ALT_MASK)
+        && !is_modifier_key(keyval)
 }
 
 /// Keys a visible block selection owns, even when focus has been stranded on a
@@ -11056,6 +11225,252 @@ enum KeyScope {
     StrandedFocus,
 }
 
+/// What [`LiveCommitSink::on_commit`] did with one commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveCommitRoute {
+    /// A report libvte generated; written with the reply accounting only.
+    Report(TerminalReport),
+    /// The ESC half of an Alt chord, held for the key's own commit. The
+    /// caller arms [`LiveCommitSink::release_unfinished_alt_chord`] on idle.
+    HeldAltEscape,
+    /// The recorded key's CSI u form went out instead of the legacy bytes.
+    KittyEncoded,
+    /// Written as the user's input, joined with a held ESC if there was one.
+    Typed,
+}
+
+/// Forwards what the live VTE commits to the PTY, with the bookkeeping each
+/// kind of commit needs.
+///
+/// The live VTE has `input_enabled`, so libvte turns keys and IME text into
+/// bytes and hands them over through `commit`. Not all of that is typing:
+/// - libvte's own reports — answers to the queries the parser left to it,
+///   focus reports under DECSET 1004, SGR mouse reports — are written with
+///   the protocol-reply accounting only. Handled as typing, the focus-out
+///   report an Alt+Tab produces cleared a block selection and counted as the
+///   user's input ([`jterm_core::terminal_report`]). They are classified
+///   before anything else, so they never reach the joiner or the rewrite.
+/// - an Alt chord on a letter or Backspace arrives as two commits, ESC and
+///   then the key (VTE 0.76 `feed_child`s the ESC first). They are joined back
+///   into one write ([`AltEscapeJoiner`]); otherwise the lone ESC was
+///   kitty-encoded as the whole chord and the letter typed after it, or, with
+///   no flags, went out as a separate write that a reader could take for Esc.
+/// - everything else is the user's input, kitty-encoded when the foreground
+///   program asked for that.
+///
+/// Shared by the `commit` handler, the idle safety flush of a held ESC, and the
+/// key recorder, which releases a stale held ESC before it records the next
+/// press, so all three write through the same accounting.
+#[derive(Clone)]
+struct LiveCommitSink {
+    pty: Rc<OwnedPty>,
+    bstate: Rc<Cell<BlockState>>,
+    typed_cmd: Rc<RefCell<String>>,
+    typed_cmd_fidelity: Rc<Cell<TypedShadowFidelity>>,
+    submission_pending: Rc<Cell<bool>>,
+    pending_typeahead: Rc<Cell<bool>>,
+    accepted_input_generation: Rc<Cell<u64>>,
+    idle_input_dirty: Rc<Cell<bool>>,
+    pty_synced: Rc<Cell<bool>>,
+    finished_blocks: Weak<RefCell<Vec<FinishedBlock>>>,
+    selected_block_ids: SelectedBlockIds,
+    selected_block_id: Rc<Cell<Option<u64>>>,
+    selection_anchor_id: Rc<Cell<Option<u64>>>,
+    human_input: HumanInputCallbacks,
+    kitty_flags: Rc<Cell<u8>>,
+    /// The key press the recorder saw last, taken by the commit it produced.
+    kitty_last_key: Rc<Cell<Option<(KittyKey, KittyModifiers)>>>,
+    alt_escape: Rc<Cell<AltEscapeJoiner>>,
+    /// See `ReaderCtx::cpr_outstanding_rc`.
+    cpr_outstanding: Rc<Cell<u32>>,
+}
+
+impl LiveCommitSink {
+    fn on_commit(&self, text: &str) -> LiveCommitRoute {
+        let block_state = self.bstate.get();
+        if let Some(report) =
+            classify_terminal_report(text.as_bytes(), self.cpr_outstanding.get() > 0)
+        {
+            if report == TerminalReport::CursorPosition {
+                self.cpr_outstanding
+                    .set(self.cpr_outstanding.get().saturating_sub(1));
+            }
+            self.write_report(text.as_bytes(), block_state);
+            return LiveCommitRoute::Report(report);
+        }
+
+        let key = self.kitty_last_key.take();
+        let mut joiner = self.alt_escape.get();
+        let step = joiner.on_commit(key, text.as_bytes());
+        self.alt_escape.set(joiner);
+        let bytes = match step {
+            JoinStep::Hold => {
+                // The key's own bytes are the next commit, inside this same
+                // key-press dispatch. Keep its record for that commit.
+                self.kitty_last_key.set(key);
+                return LiveCommitRoute::HeldAltEscape;
+            }
+            JoinStep::Emit(bytes) => bytes,
+        };
+
+        // Kitty keyboard protocol: if these are the legacy bytes for the key
+        // the capture handler just recorded, the application asked for the
+        // CSI u form instead. Anything else — composed text, a paste, a key
+        // the IME swallowed — passes unchanged.
+        if let Some((key, mods)) = key {
+            let flags = self.kitty_flags.get();
+            if flags != 0 && kitty_rewrite_applies(block_state, || self.pty.foreground_owner()) {
+                if let Some(encoded) = kitty_keyboard::rewrite_commit(key, mods, &bytes, flags) {
+                    self.write_rewritten(&encoded);
+                    return LiveCommitRoute::KittyEncoded;
+                }
+            }
+        }
+        // ONE write, so an Alt chord's ESC and key reach the reader together.
+        self.write_typed(&bytes, block_state);
+        LiveCommitRoute::Typed
+    }
+
+    /// The idle safety flush armed on a hold. Both halves of a chord commit
+    /// inside one key-press dispatch, so by now the ESC has normally been
+    /// joined and this does nothing; if the key's own commit never came, the
+    /// ESC still reaches the program, and the key press it was recorded for no
+    /// longer waits for a commit.
+    fn release_unfinished_alt_chord(&self) {
+        if self.release_held_alt_escape() {
+            self.kitty_last_key.set(None);
+        }
+    }
+
+    /// Remember the key press the live VTE is about to commit bytes for. Every
+    /// press is recorded, flags or not: the joiner needs to know an ESC
+    /// commit is the Alt half of a chord even when nothing is kitty-encoded.
+    /// A new press also means a held ESC's chord never completed, so that ESC
+    /// goes out first, in order.
+    fn record_key_press(&self, key: (KittyKey, KittyModifiers)) {
+        self.release_held_alt_escape();
+        self.kitty_last_key.set(Some(key));
+    }
+
+    /// Write a held Alt-chord ESC as the lone byte it is. Returns whether one
+    /// was held.
+    fn release_held_alt_escape(&self) -> bool {
+        let mut joiner = self.alt_escape.get();
+        let held = joiner.take_held();
+        self.alt_escape.set(joiner);
+        let Some(escape) = held else {
+            return false;
+        };
+        self.write_typed(escape, self.bstate.get());
+        true
+    }
+
+    /// A report libvte generated: the child's answer or mouse input, never
+    /// the user typing. Accounted exactly like the replies the reader writes.
+    fn write_report(&self, bytes: &[u8], block_state: BlockState) {
+        if let Err(error) = self.pty.write_bytes(bytes) {
+            self.pty
+                .report_write_error("could not queue terminal report", error);
+        } else {
+            record_protocol_reply_input(
+                block_state,
+                &self.typed_cmd_fidelity,
+                &self.idle_input_dirty,
+                &self.pty_synced,
+                &self.submission_pending,
+                &self.pending_typeahead,
+                &self.accepted_input_generation,
+            );
+        }
+    }
+
+    fn write_rewritten(&self, encoded: &[u8]) {
+        if let Err(error) = self.pty.write_bytes(encoded) {
+            self.pty
+                .report_write_error("could not queue terminal input", error);
+        } else {
+            self.accepted_input_generation
+                .set(self.accepted_input_generation.get().wrapping_add(1));
+            emit_accepted_input(&self.human_input, InputOrigin::VteCommit);
+        }
+    }
+
+    fn write_typed(&self, bytes: &[u8], block_state: BlockState) {
+        let awaiting_command = block_state == BlockState::AwaitingCommand;
+        let previous_fidelity = self.typed_cmd_fidelity.get();
+        let previous_submission_pending = self.submission_pending.get();
+        let admitted = match self.pty.write_bytes_admitted(bytes) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                self.pty
+                    .report_write_error("could not queue terminal input", error);
+                return;
+            }
+        };
+        if admitted.wire_bytes == 0 {
+            return;
+        }
+
+        if awaiting_command && admitted.taints_editor() {
+            self.idle_input_dirty.set(true);
+            if admitted.had_framing
+                || admitted
+                    .editor_bytes
+                    .iter()
+                    .any(|&byte| !matches!(byte, b'\r' | b'\n'))
+            {
+                // A later recall must not append to an edited readline
+                // buffer. PromptEnd resets this flag for a new line.
+                self.pty_synced.set(true);
+            }
+
+            // The joined bytes of an Alt chord are ESC plus one commit's text,
+            // so they are still text; anything else is not a shadow update.
+            let exact_text = std::str::from_utf8(bytes)
+                .ok()
+                .filter(|_| !admitted.had_framing && admitted.editor_bytes.as_slice() == bytes);
+            if let Some(text) = exact_text {
+                apply_vte_commit_to_shadow(&mut self.typed_cmd.borrow_mut(), text);
+                self.typed_cmd_fidelity
+                    .set(previous_fidelity.advance(&admitted.editor_bytes));
+            } else {
+                // The central boundary framed, truncated, or stripped this
+                // commit. VTE echo remains authoritative; never let the
+                // pre-filter text repair command identity.
+                self.typed_cmd_fidelity.set(TypedShadowFidelity::Inexact);
+            }
+        }
+
+        if ((block_state != BlockState::AwaitingCommand || previous_submission_pending)
+            && (admitted.has_effective_editor_input() || admitted.had_framing))
+            || admitted.input_after_submission
+        {
+            self.pending_typeahead.set(true);
+        }
+        if admitted.submits_line {
+            self.submission_pending.set(true);
+        }
+        self.accepted_input_generation
+            .set(self.accepted_input_generation.get().wrapping_add(1));
+        emit_accepted_input(&self.human_input, InputOrigin::VteCommit);
+
+        // Only accepted terminal input exits block-selection mode. Otherwise a
+        // saturated queue would mutate UI/editor state even though the shell
+        // never received the keystroke.
+        if self.selected_block_id.get().is_some() {
+            if let Some(finished_blocks) = self.finished_blocks.upgrade() {
+                let finished = finished_blocks.borrow();
+                clear_finished_block_selection(
+                    &finished,
+                    &self.selected_block_ids,
+                    &self.selected_block_id,
+                    &self.selection_anchor_id,
+                );
+            }
+        }
+    }
+}
+
 /// Captures the handles the live-VTE key handler needs. With the VTE owning line
 /// editing + IME natively (anvil model), this is reduced to a Capture-phase
 /// navigation / copy-paste / block-selection handler; printable keys and editing
@@ -11065,10 +11480,9 @@ enum KeyScope {
 /// shared handle, so both mounts observe and mutate the same pane state.
 #[derive(Clone)]
 struct KeyCtx {
-    /// Kitty keyboard protocol: the flags in effect, and the last key pressed
-    /// so the commit handler can replace the legacy bytes VTE emits for it.
-    kitty_flags_for_key: Rc<Cell<u8>>,
-    kitty_last_key_for_key: Rc<Cell<Option<(KittyKey, KittyModifiers)>>>,
+    /// The live surface's commit path, told about every key press so it can
+    /// kitty-encode the bytes VTE emits for it and join a split Alt chord.
+    live_commit_for_key: LiveCommitSink,
     active_vte_for_key: glib::WeakRef<Terminal>,
     pty_synced_for_key: Rc<Cell<bool>>,
     bracketed_paste_for_key: Rc<Cell<bool>>,
@@ -11098,8 +11512,7 @@ struct KeyCtx {
 impl KeyCtx {
     fn connect(self, key_ctrl: &gtk4::EventControllerKey, scope: KeyScope) {
         let KeyCtx {
-            kitty_flags_for_key,
-            kitty_last_key_for_key,
+            live_commit_for_key,
             active_vte_for_key,
             pty_synced_for_key,
             bracketed_paste_for_key,
@@ -11162,26 +11575,31 @@ impl KeyCtx {
                 // Focus is stranded on a card. Fall through to the ordinary
                 // branches below, which is the whole point of this mount.
             }
-            // Kitty keyboard protocol: remember what was pressed so the commit
-            // handler can replace the legacy bytes VTE is about to emit for it.
+            // Remember what was pressed so the commit handler can replace the
+            // legacy bytes VTE is about to emit for it (kitty keyboard
+            // protocol) and put an Alt chord VTE splits in two back together.
             // Recording only — the key still reaches VTE and its input method,
             // which is what keeps IME composition, Esc-cancels-preedit and
             // Ctrl+Space intact while a kitty client runs. Skipped on the root
-            // mount: no VTE commit can follow a key the live surface never saw.
+            // mount: no VTE commit can follow a key the live surface never saw
+            // (a key the root mount rescues is forwarded to the live VTE, and
+            // recorded when this mount sees it there).
             if scope == KeyScope::LiveSurface {
-                kitty_last_key_for_key.set(
-                    (kitty_flags_for_key.get() & kitty_keyboard::DISAMBIGUATE != 0).then(|| {
-                        let display = controller.widget().map(|widget| widget.display());
-                        // The event's own layout group, so a multi-layout user is
-                        // not reported the first installed layout's letters.
-                        let layout = controller
-                            .current_event()
-                            .and_then(|event| event.downcast::<gtk4::gdk::KeyEvent>().ok())
-                            .map(|event| event.layout())
-                            .unwrap_or(0);
-                        kitty_key_event(keyval, keycode, layout, modifiers, display.as_ref())
-                    }),
-                );
+                let display = controller.widget().map(|widget| widget.display());
+                // The event's own layout group, so a multi-layout user is not
+                // reported the first installed layout's letters.
+                let layout = controller
+                    .current_event()
+                    .and_then(|event| event.downcast::<gtk4::gdk::KeyEvent>().ok())
+                    .map(|event| event.layout())
+                    .unwrap_or(0);
+                live_commit_for_key.record_key_press(kitty_key_event(
+                    keyval,
+                    keycode,
+                    layout,
+                    modifiers,
+                    display.as_ref(),
+                ));
             }
             let Some(active_vte_for_key) = active_vte_for_key.upgrade() else {
                 return glib::Propagation::Proceed;
@@ -11599,6 +12017,20 @@ impl KeyCtx {
 
             // Plain Ctrl+P belongs to readline and terminal applications. The
             // app-level Ctrl+Shift+H action owns command-history recall.
+
+            // Focus stranded on a card while a program runs: an unbound Ctrl or
+            // Alt chord is the program's (claude's Ctrl+O, codex's Ctrl+T,
+            // Alt+B word motion) and would otherwise die on the card's
+            // input-disabled snapshot VTE. Last, so every Block-owned chord
+            // above has already had its turn; forwarded through the live VTE's
+            // own controllers, so it is encoded exactly as if typed there.
+            if scope == KeyScope::StrandedFocus
+                && stranded_focus_rescues_chord(bstate_for_key.get(), keyval, modifiers)
+            {
+                focus_terminal(&active_vte_for_key);
+                controller.forward(&active_vte_for_key);
+                return glib::Propagation::Stop;
+            }
 
             // Everything else: let the VTE translate it (printable keys, editing,
             // control sequences, IME) and emit `commit`.
@@ -12457,6 +12889,12 @@ impl TermView {
             Rc::new(RefCell::new(KittyKeyboardStacks::new()));
         let kitty_flags: Rc<Cell<u8>> = Rc::new(Cell::new(0));
         let kitty_last_key: Rc<Cell<Option<(KittyKey, KittyModifiers)>>> = Rc::new(Cell::new(None));
+        // The ESC half of an Alt chord, held until the key's own commit; see
+        // `LiveCommitSink`.
+        let alt_escape: Rc<Cell<AltEscapeJoiner>> = Rc::new(Cell::new(AltEscapeJoiner::new()));
+        // Cursor position queries the live VTE still owes an answer to; see
+        // `ReaderCtx::cpr_outstanding_rc`.
+        let cpr_outstanding: Rc<Cell<u32>> = Rc::new(Cell::new(0));
 
         // Dynamic OSC 10/11/12 colors: the reader updates this shared state and
         // Undo uses it when recreating snapshot VTEs.
@@ -12884,6 +13322,7 @@ impl TermView {
                 ftcs_seen_rc: ftcs_seen.clone(),
                 kitty_keyboard_rc: kitty_keyboard.clone(),
                 kitty_flags_rc: kitty_flags.clone(),
+                cpr_outstanding_rc: cpr_outstanding.clone(),
                 engine: RefCell::new(EngineState {
                     prev_state: BlockState::Idle,
                     osc133_depth: 0,
@@ -13343,124 +13782,36 @@ impl TermView {
         // owns IME natively; its `commit` signal carries the bytes to send. We
         // forward them to the PTY and, while awaiting a command, reconstruct the
         // typed command line so the finalize path can style it into the block.
+        // The same signal also carries libvte's own reports and the two halves
+        // of an Alt chord; `LiveCommitSink` tells them apart.
+        let live_commit = LiveCommitSink {
+            pty: pty.clone(),
+            bstate: bstate.clone(),
+            typed_cmd: typed_cmd.clone(),
+            typed_cmd_fidelity: typed_cmd_fidelity.clone(),
+            submission_pending: submission_pending.clone(),
+            pending_typeahead: pending_typeahead.clone(),
+            accepted_input_generation: accepted_input_generation.clone(),
+            idle_input_dirty: idle_input_dirty.clone(),
+            pty_synced: pty_synced.clone(),
+            finished_blocks: Rc::downgrade(&finished_blocks_rc),
+            selected_block_ids: selected_block_ids.clone(),
+            selected_block_id: selected_block_id.clone(),
+            selection_anchor_id: selection_anchor_id.clone(),
+            human_input: human_input_callbacks.clone(),
+            kitty_flags: kitty_flags.clone(),
+            kitty_last_key: kitty_last_key.clone(),
+            alt_escape: alt_escape.clone(),
+            cpr_outstanding: cpr_outstanding.clone(),
+        };
         {
-            let pty_for_commit = pty.clone();
-            let bstate_for_commit = bstate.clone();
-            let typed_cmd_for_commit = typed_cmd.clone();
-            let typed_cmd_fidelity_for_commit = typed_cmd_fidelity.clone();
-            let submission_pending_for_commit = submission_pending.clone();
-            let pending_typeahead_for_commit = pending_typeahead.clone();
-            let accepted_input_generation_for_commit = accepted_input_generation.clone();
-            let idle_input_dirty_for_commit = idle_input_dirty.clone();
-            let pty_synced_for_commit = pty_synced.clone();
-            let finished_blocks_for_commit = Rc::downgrade(&finished_blocks_rc);
-            let selected_block_ids_for_commit = selected_block_ids.clone();
-            let selected_block_id_for_commit = selected_block_id.clone();
-            let selection_anchor_id_for_commit = selection_anchor_id.clone();
-            let human_input_for_commit = human_input_callbacks.clone();
-            let kitty_flags_for_commit = kitty_flags.clone();
-            let kitty_last_key_for_commit = kitty_last_key.clone();
+            let live_commit = live_commit.clone();
             active_vte.connect_commit(move |_, text, _size| {
-                let block_state = bstate_for_commit.get();
-                // Kitty keyboard protocol: if these are the legacy bytes for
-                // the key the capture handler just recorded, the application
-                // asked for the CSI u form instead. Anything else — composed
-                // text, a paste, a key the IME swallowed — passes unchanged.
-                if let Some((key, mods)) = kitty_last_key_for_commit.replace(None) {
-                    let app_in_foreground = matches!(
-                        block_state,
-                        BlockState::CollectingOutput | BlockState::AltScreen
-                    );
-                    if app_in_foreground {
-                        if let Some(encoded) = kitty_keyboard::rewrite_commit(
-                            key,
-                            mods,
-                            text.as_bytes(),
-                            kitty_flags_for_commit.get(),
-                        ) {
-                            if let Err(error) = pty_for_commit.write_bytes(&encoded) {
-                                pty_for_commit
-                                    .report_write_error("could not queue terminal input", error);
-                            } else {
-                                accepted_input_generation_for_commit.set(
-                                    accepted_input_generation_for_commit.get().wrapping_add(1),
-                                );
-                                emit_accepted_input(
-                                    &human_input_for_commit,
-                                    InputOrigin::VteCommit,
-                                );
-                            }
-                            return;
-                        }
-                    }
-                }
-                let awaiting_command = block_state == BlockState::AwaitingCommand;
-                let previous_fidelity = typed_cmd_fidelity_for_commit.get();
-                let previous_submission_pending = submission_pending_for_commit.get();
-                let admitted = match pty_for_commit.write_bytes_admitted(text.as_bytes()) {
-                    Ok(admitted) => admitted,
-                    Err(error) => {
-                        pty_for_commit.report_write_error("could not queue terminal input", error);
-                        return;
-                    }
-                };
-                if admitted.wire_bytes == 0 {
-                    return;
-                }
-
-                if awaiting_command && admitted.taints_editor() {
-                    idle_input_dirty_for_commit.set(true);
-                    if admitted.had_framing
-                        || admitted
-                            .editor_bytes
-                            .iter()
-                            .any(|&byte| !matches!(byte, b'\r' | b'\n'))
-                    {
-                        // A later recall must not append to an edited readline
-                        // buffer. PromptEnd resets this flag for a new line.
-                        pty_synced_for_commit.set(true);
-                    }
-
-                    let exact = !admitted.had_framing
-                        && admitted.editor_bytes.as_slice() == text.as_bytes();
-                    if exact {
-                        apply_vte_commit_to_shadow(&mut typed_cmd_for_commit.borrow_mut(), text);
-                        typed_cmd_fidelity_for_commit
-                            .set(previous_fidelity.advance(&admitted.editor_bytes));
-                    } else {
-                        // The central boundary framed, truncated, or stripped
-                        // this commit. VTE echo remains authoritative; never let
-                        // the pre-filter text repair command identity.
-                        typed_cmd_fidelity_for_commit.set(TypedShadowFidelity::Inexact);
-                    }
-                }
-
-                if ((block_state != BlockState::AwaitingCommand || previous_submission_pending)
-                    && (admitted.has_effective_editor_input() || admitted.had_framing))
-                    || admitted.input_after_submission
-                {
-                    pending_typeahead_for_commit.set(true);
-                }
-                if admitted.submits_line {
-                    submission_pending_for_commit.set(true);
-                }
-                accepted_input_generation_for_commit
-                    .set(accepted_input_generation_for_commit.get().wrapping_add(1));
-                emit_accepted_input(&human_input_for_commit, InputOrigin::VteCommit);
-
-                // Only accepted terminal input exits block-selection mode.
-                // Otherwise a saturated queue would mutate UI/editor state
-                // even though the shell never received the keystroke.
-                if selected_block_id_for_commit.get().is_some() {
-                    if let Some(finished_blocks_for_commit) = finished_blocks_for_commit.upgrade() {
-                        let finished = finished_blocks_for_commit.borrow();
-                        clear_finished_block_selection(
-                            &finished,
-                            &selected_block_ids_for_commit,
-                            &selected_block_id_for_commit,
-                            &selection_anchor_id_for_commit,
-                        );
-                    }
+                if live_commit.on_commit(text) == LiveCommitRoute::HeldAltEscape {
+                    // A held ESC must never be stranded if the chord's second
+                    // half does not follow.
+                    let live_commit = live_commit.clone();
+                    glib::idle_add_local_once(move || live_commit.release_unfinished_alt_chord());
                 }
             });
         }
@@ -13476,13 +13827,16 @@ impl TermView {
             let kitty_flags_for_root_key = kitty_flags.clone();
             let human_input_for_root_key = human_input_callbacks.clone();
             let hold_for_root_key = selection_feed_hold.clone();
+            let root_for_root_key = root.downgrade();
             let root_key = gtk4::EventControllerKey::new();
             root_key.set_propagation_phase(gtk4::PropagationPhase::Capture);
             root_key.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
-                if !matches!(
-                    bstate_for_root_key.get(),
-                    BlockState::CollectingOutput | BlockState::PostCommand
-                ) {
+                let focus_takes_text = root_for_root_key
+                    .upgrade()
+                    .and_then(|root| root.root())
+                    .and_then(|window| window.focus())
+                    .is_some_and(|focused| focus_takes_text_input(&focused));
+                if !running_root_control_applies(bstate_for_root_key.get(), focus_takes_text) {
                     return glib::Propagation::Proceed;
                 }
 
@@ -13513,12 +13867,15 @@ impl TermView {
         // Read-only snapshot VTEs and header buttons inside finished blocks
         // are click-focusable, so a click into history strands keyboard focus
         // where typing goes nowhere. A typing-shaped key press hands focus
-        // back to the live prompt and re-pins the view to the bottom. The
-        // triggering keystroke is consumed rather than forwarded: replaying it
-        // into the PTY would bypass the live VTE's input-method context and
-        // corrupt CJK composition.
+        // back to the live prompt and re-pins the view to the bottom. While a
+        // program runs, the key is then forwarded through the live VTE's own
+        // controllers (see `stranded_focus_forwards_key`), never written into
+        // the PTY directly: that would bypass the live VTE's input-method
+        // context and corrupt CJK composition. At a Block prompt it is still
+        // consumed by the refocus.
         {
             let active_vte_for_refocus = active_vte.clone();
+            let bstate_for_refocus = bstate.clone();
             let scroll_debouncer_for_refocus = scroll_debouncer.clone();
             let block_scroll_for_refocus = block_scroll.clone();
             let block_list_for_refocus = block_list.clone();
@@ -13528,7 +13885,7 @@ impl TermView {
             let selected_for_refocus = selected_block_id.clone();
             let refocus_key = gtk4::EventControllerKey::new();
             refocus_key.set_propagation_phase(gtk4::PropagationPhase::Capture);
-            refocus_key.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
+            refocus_key.connect_key_pressed(move |controller, keyval, _keycode, modifiers| {
                 if active_vte_for_refocus.has_focus()
                     || !stranded_focus_key_recovers(keyval, modifiers)
                     || selection_owns_key(selected_for_refocus.get().is_some(), keyval)
@@ -13555,6 +13912,9 @@ impl TermView {
                     &block_list_for_refocus,
                     &block_scroll_for_refocus,
                 );
+                if stranded_focus_forwards_key(bstate_for_refocus.get()) {
+                    controller.forward(&active_vte_for_refocus);
+                }
                 glib::Propagation::Stop
             });
             root.add_controller(refocus_key);
@@ -13575,8 +13935,7 @@ impl TermView {
             key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
 
             let key_ctx = KeyCtx {
-                kitty_flags_for_key: kitty_flags.clone(),
-                kitty_last_key_for_key: kitty_last_key.clone(),
+                live_commit_for_key: live_commit.clone(),
                 active_vte_for_key: active_vte.downgrade(),
                 pty_synced_for_key: pty_synced.clone(),
                 bracketed_paste_for_key: bracketed_paste.clone(),
@@ -13729,6 +14088,7 @@ impl TermView {
             let vte_for_scroll = active_vte.downgrade();
             let outer_for_scroll = block_scroll.downgrade();
             let debouncer_for_scroll = scroll_debouncer.clone();
+            let hold_for_scroll = selection_feed_hold.clone();
             let scroll_ctrl = gtk4::EventControllerScroll::new(
                 gtk4::EventControllerScrollFlags::VERTICAL
                     | gtk4::EventControllerScrollFlags::HORIZONTAL,
@@ -13745,7 +14105,14 @@ impl TermView {
                     if let Some(bytes) =
                         encode_mouse_wheel(mouse_mode_for_scroll.get(), dy, col, row)
                     {
-                        match pty_for_scroll.write_bytes(&bytes) {
+                        // The wheel is the user acting on the program, as a
+                        // key is: release a selection hold first, or the
+                        // program's scrolled repaint stays parked and the
+                        // wheel looks dead. Nothing else releases it for
+                        // the wheel — this write never goes through the live
+                        // VTE's `commit`, and the pointer-motion reports that
+                        // do no longer count as input.
+                        hold_for_scroll.flush_then(|| match pty_for_scroll.write_bytes(&bytes) {
                             Ok(()) => record_protocol_reply_input(
                                 bstate_for_scroll.get(),
                                 &fidelity_for_scroll,
@@ -13757,7 +14124,7 @@ impl TermView {
                             ),
                             Err(error) => pty_for_scroll
                                 .report_write_error("could not queue mouse-wheel input", error),
-                        }
+                        });
                     }
                     return glib::Propagation::Stop;
                 }
@@ -16877,6 +17244,143 @@ mod tests {
         }
     }
 
+    /// A click into history used to cost the next key: the refocus took it and
+    /// nothing delivered it. While a program runs it is forwarded now; at a
+    /// Block prompt the refocus stays its whole meaning, so a stray Enter there
+    /// cannot submit the editor.
+    #[test]
+    fn a_stranded_typing_key_reaches_a_running_program_but_not_the_prompt() {
+        for state in [
+            BlockState::CollectingOutput,
+            BlockState::AltScreen,
+            BlockState::RawFallback,
+        ] {
+            assert!(super::stranded_focus_forwards_key(state), "{state:?}");
+        }
+        for state in [
+            BlockState::Idle,
+            BlockState::CollectingPrompt,
+            BlockState::AwaitingCommand,
+            BlockState::PostCommand,
+        ] {
+            assert!(!super::stranded_focus_forwards_key(state), "{state:?}");
+        }
+    }
+
+    /// Ctrl and Alt chords were never typing-shaped, so with focus stranded on
+    /// a card they died on its input-disabled VTE: claude's Ctrl+O, codex's
+    /// Ctrl+T, Alt+B word motion. While a program runs they are rescued; a
+    /// modifier's own press is not a chord, and the prompt is left alone.
+    #[test]
+    fn a_stranded_ctrl_or_alt_chord_is_rescued_only_while_a_program_runs() {
+        use gtk4::gdk::{Key, ModifierType};
+
+        let rescues = super::stranded_focus_rescues_chord;
+        for state in [BlockState::CollectingOutput, BlockState::AltScreen] {
+            assert!(rescues(state, Key::o, ModifierType::CONTROL_MASK));
+            assert!(rescues(state, Key::t, ModifierType::CONTROL_MASK));
+            assert!(rescues(state, Key::b, ModifierType::ALT_MASK));
+            assert!(rescues(
+                state,
+                Key::BackSpace,
+                ModifierType::CONTROL_MASK | ModifierType::ALT_MASK
+            ));
+            assert!(rescues(
+                state,
+                Key::Return,
+                ModifierType::ALT_MASK | ModifierType::SHIFT_MASK
+            ));
+            // Holding the modifier down is not the chord yet.
+            for modifier in [Key::Control_L, Key::Alt_R, Key::ISO_Level3_Shift] {
+                assert!(!rescues(state, modifier, ModifierType::CONTROL_MASK));
+            }
+            // Typing keys are the refocus controller's, not this rescue's.
+            assert!(!rescues(state, Key::o, ModifierType::empty()));
+            assert!(!rescues(state, Key::O, ModifierType::SHIFT_MASK));
+        }
+        for state in [
+            BlockState::AwaitingCommand,
+            BlockState::PostCommand,
+            BlockState::RawFallback,
+            BlockState::Idle,
+        ] {
+            assert!(
+                !rescues(state, Key::o, ModifierType::CONTROL_MASK),
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn modifier_presses_are_neither_typing_nor_chords() {
+        use gtk4::gdk::{Key, ModifierType};
+
+        for key in [
+            Key::Shift_L,
+            Key::Control_R,
+            Key::Alt_L,
+            Key::Super_L,
+            Key::Caps_Lock,
+            Key::ISO_Level3_Shift,
+        ] {
+            assert!(super::is_modifier_key(key), "{key:?}");
+            assert!(!super::stranded_focus_key_recovers(
+                key,
+                ModifierType::empty()
+            ));
+        }
+        for key in [Key::a, Key::Escape, Key::Return, Key::Up, Key::F3] {
+            assert!(!super::is_modifier_key(key), "{key:?}");
+        }
+    }
+
+    /// The running-command Ctrl+C/Ctrl+D fallback sits on the pane root in
+    /// the Capture phase, ahead of the focused widget. A card's filter entry or
+    /// the palette's search field keeps its own copy and EOF keys.
+    #[test]
+    fn the_running_interrupt_fallback_leaves_focused_text_fields_alone() {
+        for state in [BlockState::CollectingOutput, BlockState::PostCommand] {
+            assert!(super::running_root_control_applies(state, false));
+            assert!(!super::running_root_control_applies(state, true));
+        }
+        for state in [
+            BlockState::AwaitingCommand,
+            BlockState::AltScreen,
+            BlockState::RawFallback,
+        ] {
+            assert!(!super::running_root_control_applies(state, false));
+        }
+    }
+
+    /// RawFallback applies and reports kitty flags, so it must encode keys for
+    /// the program that pushed them — but only while that program, not the
+    /// shell, owns the terminal. Unknown fails closed to legacy keys.
+    #[test]
+    fn the_kitty_rewrite_follows_the_foreground_program_without_shell_integration() {
+        use crate::pty::PtyForeground;
+
+        let applies = |state, foreground| super::kitty_rewrite_applies(state, || foreground);
+        assert!(applies(BlockState::RawFallback, PtyForeground::Other));
+        assert!(!applies(BlockState::RawFallback, PtyForeground::Shell));
+        assert!(!applies(BlockState::RawFallback, PtyForeground::Unknown));
+        for state in [BlockState::CollectingOutput, BlockState::AltScreen] {
+            assert!(applies(state, PtyForeground::Shell), "{state:?}");
+        }
+        for state in [
+            BlockState::Idle,
+            BlockState::CollectingPrompt,
+            BlockState::AwaitingCommand,
+            BlockState::PostCommand,
+        ] {
+            assert!(!applies(state, PtyForeground::Other), "{state:?}");
+        }
+        // The Block states never pay for the foreground probe.
+        assert!(super::kitty_rewrite_applies(
+            BlockState::CollectingOutput,
+            || unreachable!("probed outside RawFallback")
+        ));
+    }
+
     #[test]
     fn the_failed_block_section_only_marks_reported_failures() {
         assert!(super::failed_block_section_visible("false", Some(1)));
@@ -17459,6 +17963,97 @@ mod tests {
         // Two selected cards: refused before any card lookup happens.
         let many = HashSet::from([7_u64, 8]);
         assert!(super::lone_rerunnable_selection(&[], &many, Some(8)).is_none());
+    }
+
+    /// End to end on a real pane: libvte 0.76 commits focus reports through
+    /// `commit` although nothing but our handler is behind it — once DECSET
+    /// 1004 is fed, at once for the current focus and then on every focus
+    /// change. The pane passes them on to the program, which asked for them,
+    /// but they are not the user typing: no human-input signal, no block
+    /// selection cleared, and a selection hold parked for a live selection
+    /// stays parked. That is what an Alt+Tab to paste a selection elsewhere
+    /// used to undo.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn a_real_vte_focus_report_reaches_the_program_but_is_not_typing() {
+        use vte4::prelude::*;
+
+        gtk4::init().expect("gtk init");
+        let config = crate::config::load_safe_config().0;
+        let view = super::TermView::new_with_spawner(
+            &config,
+            &crate::config::TerminalMode::Block,
+            &["sh".to_string()],
+            None,
+            None,
+            &[],
+            |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+        )
+        .expect("a Block pane over a test PTY");
+        // Somewhere else for focus to go, as an Alt+Tab or a click would.
+        let elsewhere = gtk4::Entry::new();
+        let layout = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        layout.append(&view.widget());
+        layout.append(&elsewhere);
+        let window = gtk4::Window::builder()
+            .default_width(640)
+            .default_height(480)
+            .child(&layout)
+            .build();
+        window.present();
+        let settle = || {
+            let context = gtk4::glib::MainContext::default();
+            let started = std::time::Instant::now();
+            while started.elapsed() < std::time::Duration::from_millis(200) {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        settle();
+        let typed = Rc::new(Cell::new(0));
+        {
+            let typed = typed.clone();
+            view.connect_human_input(move |_| typed.set(typed.get() + 1));
+        }
+        view.selected_block_id.set(Some(7));
+        // Whatever constructing the pane wrote.
+        view.pty
+            .drain_test_slave(std::time::Duration::from_millis(50));
+
+        view.active_vte.grab_focus();
+        settle();
+        assert!(view.active_vte.has_focus());
+        view.active_vte.feed(b"\x1b[?1004h");
+        settle();
+        assert_eq!(
+            view.pty.drain_test_slave(PTY_REPLY_WAIT),
+            b"\x1b[I",
+            "setting 1004 reports the current focus at once"
+        );
+
+        let hold = view.selection_feed_hold.clone();
+        hold.begin_drag();
+        assert!(hold.try_buffer(b"codex redraw"));
+        hold.end_drag(true);
+
+        elsewhere.grab_focus();
+        settle();
+        assert_eq!(view.pty.drain_test_slave(PTY_REPLY_WAIT), b"\x1b[O");
+        view.active_vte.grab_focus();
+        settle();
+        assert_eq!(view.pty.drain_test_slave(PTY_REPLY_WAIT), b"\x1b[I");
+
+        assert_eq!(typed.get(), 0, "a focus report is not the user typing");
+        assert_eq!(
+            view.selected_block_id.get(),
+            Some(7),
+            "nor does it end block-selection mode"
+        );
+        assert!(
+            hold.try_buffer(b" still parked"),
+            "nor does it release the selection hold"
+        );
+        window.close();
     }
 
     #[test]
@@ -22297,6 +22892,8 @@ mod tests {
         /// recorded, so a test can capture out-of-band state (the PTY reply
         /// queue) at exactly that point.
         admit_probe: RefCell<Option<Box<dyn Fn()>>>,
+        /// Stands in for a VTE behind the backend that answers queries itself.
+        answers_queries_natively: Cell<bool>,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22346,6 +22943,7 @@ mod tests {
                 kitty_status: Cell::new(kitty_graphics::FeedStatus::Pending),
                 settle_anchor_now: Cell::new(true),
                 admit_probe: RefCell::new(None),
+                answers_queries_natively: Cell::new(false),
             })
         }
 
@@ -22668,6 +23266,10 @@ mod tests {
         fn cursor_position_report(&self) -> (i64, i64) {
             self.record(Call::Query(Query::CursorPositionReport));
             self.grid.borrow().cursor
+        }
+
+        fn live_surface_answers_query(&self, query: KeyboardProtocolQuery) -> bool {
+            self.answers_queries_natively.get() && super::vte_answers_query_natively(query)
         }
 
         fn command_capture_anchor(&self, provisional: (i64, i64), anchor_rows: i64) -> (i64, i64) {
@@ -23119,6 +23721,7 @@ mod tests {
                 bracketed_paste_rc: Rc::new(Cell::new(false)),
                 kitty_keyboard_rc: Rc::new(RefCell::new(super::KittyKeyboardStacks::new())),
                 kitty_flags_rc: Rc::new(Cell::new(0)),
+                cpr_outstanding_rc: Rc::new(Cell::new(0)),
                 config_for_cb: config.clone(),
                 dynamic_colors_rc: Rc::new(Cell::new(DynamicColors::default())),
                 parser: Rc::new(RefCell::new(Parser::new())),
@@ -25338,9 +25941,10 @@ mod tests {
     /// reading them. The grid's cursor is deliberately off the diagonal so a
     /// transposed reply is a different string.
     ///
-    /// The read is recorded too: the reply must come from the backend's own
-    /// CPR query, which Block answers differently from `cursor_and_rows` (see
-    /// [`RenderBackend::cursor_position_report`]).
+    /// The read is recorded too: a backend that synthesizes the reply builds
+    /// it from its own CPR query, not from `cursor_and_rows` (see
+    /// [`RenderBackend::cursor_position_report`]). The live backends leave it
+    /// to their VTE instead; see the test below.
     #[test]
     fn a_cursor_position_report_answers_the_cursors_row_then_its_column() {
         let harness = ReaderHarness::new();
@@ -25366,6 +25970,388 @@ mod tests {
             1,
             "a reply the PTY accepted counts as input the shell will see"
         );
+    }
+
+    #[test]
+    fn only_the_queries_libvte_implements_are_left_to_the_live_surface() {
+        for query in [
+            KeyboardProtocolQuery::CursorPosition,
+            KeyboardProtocolQuery::DeviceStatus,
+            KeyboardProtocolQuery::PrimaryDeviceAttributes,
+            KeyboardProtocolQuery::SecondaryDeviceAttributes,
+            KeyboardProtocolQuery::TertiaryDeviceAttributes,
+            KeyboardProtocolQuery::XtVersion,
+        ] {
+            assert!(super::vte_answers_query_natively(query), "{query:?}");
+        }
+        // libvte implements neither the kitty keyboard protocol nor
+        // modifyOtherKeys, so dropping these would answer nothing at all.
+        assert!(!super::vte_answers_query_natively(
+            KeyboardProtocolQuery::KittyQuery
+        ));
+        assert!(!super::vte_answers_query_natively(
+            KeyboardProtocolQuery::ModifyOtherKeysQuery
+        ));
+    }
+
+    /// The parser hands a query's bytes to the live surface as well as
+    /// reporting it, so answering here too would put two replies on the
+    /// shell's input for one question and shift every later reply by one. For
+    /// codex the first CPR was also a ring row far below the grid, and its
+    /// inline viewport landed off screen.
+    #[test]
+    fn reader_dispatch_leaves_vte_answered_queries_to_the_live_surface() {
+        let harness = ReaderHarness::new();
+        harness.backend.answers_queries_natively.set(true);
+        harness.backend.render_row(3, "user@host $ ");
+        for query in [
+            KeyboardProtocolQuery::CursorPosition,
+            KeyboardProtocolQuery::DeviceStatus,
+            KeyboardProtocolQuery::PrimaryDeviceAttributes,
+            KeyboardProtocolQuery::SecondaryDeviceAttributes,
+            KeyboardProtocolQuery::TertiaryDeviceAttributes,
+            KeyboardProtocolQuery::XtVersion,
+        ] {
+            harness.feed(ParserEvent::KeyboardProtocolQuery(query));
+        }
+        assert!(harness.backend.take_calls().is_empty());
+        assert_eq!(
+            harness.ctx.accepted_input_generation_rc.get(),
+            0,
+            "VTE's answer is accounted when it comes back through `commit`"
+        );
+
+        // The two libvte does not implement still need an answer from here,
+        // and theirs are the only bytes on the wire: the PTY is FIFO, so any
+        // reply written for the six above would come first.
+        for (query, reply) in [
+            (KeyboardProtocolQuery::KittyQuery, &b"\x1b[?0u"[..]),
+            (
+                KeyboardProtocolQuery::ModifyOtherKeysQuery,
+                &b"\x1b[>4;0m"[..],
+            ),
+        ] {
+            harness.feed(ParserEvent::KeyboardProtocolQuery(query));
+            assert_eq!(harness.pty.drain_test_slave(PTY_REPLY_WAIT), reply);
+        }
+    }
+
+    /// VTE's CPR answer has the shape of a modified F3 (`CSI 1;2 R` is
+    /// Shift+F3), so the commit path can only call it a report while one is
+    /// owed. The ledger counts the CPR queries left to the live surface and
+    /// forgets them at the boundaries that end whatever program asked.
+    #[test]
+    fn cursor_position_queries_left_to_the_vte_are_counted_until_a_boundary() {
+        let harness = ReaderHarness::new();
+        harness.backend.answers_queries_natively.set(true);
+        let cpr = || {
+            harness.feed(ParserEvent::KeyboardProtocolQuery(
+                KeyboardProtocolQuery::CursorPosition,
+            ))
+        };
+        cpr();
+        cpr();
+        // Only a CPR can collide with a key; the other answers are not owed.
+        harness.feed(ParserEvent::KeyboardProtocolQuery(
+            KeyboardProtocolQuery::PrimaryDeviceAttributes,
+        ));
+        assert_eq!(harness.ctx.cpr_outstanding_rc.get(), 2);
+
+        harness.feed(ParserEvent::PromptStart);
+        assert_eq!(
+            harness.ctx.cpr_outstanding_rc.get(),
+            0,
+            "an accepted prompt ends the program that asked"
+        );
+
+        cpr();
+        assert_eq!(harness.ctx.cpr_outstanding_rc.get(), 1);
+        harness.feed(ParserEvent::HardReset);
+        assert_eq!(harness.ctx.cpr_outstanding_rc.get(), 0);
+
+        // A synthesizing backend answers itself and owes nothing.
+        harness.backend.answers_queries_natively.set(false);
+        cpr();
+        assert_eq!(harness.ctx.cpr_outstanding_rc.get(), 0);
+        assert!(!harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+    }
+
+    /// A [`LiveCommitSink`](super::LiveCommitSink) over a test PTY, with a
+    /// counter on the human-input signal and one selected block, so a test
+    /// can see which commits the pane treats as the user typing.
+    struct CommitHarness {
+        sink: super::LiveCommitSink,
+        pty: Rc<crate::pty::OwnedPty>,
+        human_inputs: Rc<Cell<usize>>,
+        /// Owns the (empty) card list the sink holds weakly, so clearing the
+        /// selection actually runs.
+        _finished: Rc<RefCell<Vec<super::FinishedBlock>>>,
+    }
+
+    impl CommitHarness {
+        fn new(state: BlockState, foreground: PtyForeground) -> Self {
+            let pty =
+                Rc::new(crate::pty::OwnedPty::for_tests(foreground).expect("open a test PTY"));
+            let finished = Rc::new(RefCell::new(Vec::new()));
+            let human_inputs = Rc::new(Cell::new(0));
+            let human_input: super::HumanInputCallbacks = Rc::new(RefCell::new(Vec::new()));
+            {
+                let human_inputs = human_inputs.clone();
+                human_input
+                    .borrow_mut()
+                    .push(Box::new(move |_| human_inputs.set(human_inputs.get() + 1)));
+            }
+            let sink = super::LiveCommitSink {
+                pty: pty.clone(),
+                bstate: Rc::new(Cell::new(state)),
+                typed_cmd: Rc::new(RefCell::new(String::new())),
+                typed_cmd_fidelity: Rc::new(Cell::new(TypedShadowFidelity::ExactOpen)),
+                submission_pending: Rc::new(Cell::new(false)),
+                pending_typeahead: Rc::new(Cell::new(false)),
+                accepted_input_generation: Rc::new(Cell::new(0)),
+                idle_input_dirty: Rc::new(Cell::new(false)),
+                pty_synced: Rc::new(Cell::new(false)),
+                finished_blocks: Rc::downgrade(&finished),
+                selected_block_ids: Rc::new(RefCell::new(HashSet::from([7]))),
+                selected_block_id: Rc::new(Cell::new(Some(7))),
+                selection_anchor_id: Rc::new(Cell::new(Some(7))),
+                human_input,
+                kitty_flags: Rc::new(Cell::new(0)),
+                kitty_last_key: Rc::new(Cell::new(None)),
+                alt_escape: Rc::new(Cell::new(super::AltEscapeJoiner::new())),
+                cpr_outstanding: Rc::new(Cell::new(0)),
+            };
+            Self {
+                sink,
+                pty,
+                human_inputs,
+                _finished: finished,
+            }
+        }
+
+        fn press(&self, key: super::KittyKey, alt: bool, ctrl: bool) {
+            self.sink.record_key_press((
+                key,
+                super::KittyModifiers {
+                    alt,
+                    ctrl,
+                    ..super::KittyModifiers::default()
+                },
+            ));
+        }
+
+        fn written(&self) -> Vec<u8> {
+            self.pty.drain_test_slave(PTY_REPLY_WAIT)
+        }
+    }
+
+    /// DECSET 1004 makes libvte commit `CSI O` on every window deactivation.
+    /// That is the program's input and still reaches it, but it is not the
+    /// user typing: it used to clear a selected block, count as human input and
+    /// release the selection hold on every Alt+Tab.
+    #[test]
+    fn a_focus_report_from_the_live_vte_reaches_the_program_but_is_not_typing() {
+        use super::LiveCommitRoute;
+        use jterm_core::terminal_report::TerminalReport;
+
+        let harness = CommitHarness::new(BlockState::CollectingOutput, PtyForeground::Other);
+        assert_eq!(
+            harness.sink.on_commit("\x1b[O"),
+            LiveCommitRoute::Report(TerminalReport::FocusOut)
+        );
+        assert_eq!(harness.written(), b"\x1b[O");
+        assert_eq!(harness.human_inputs.get(), 0, "not the user typing");
+        assert_eq!(harness.sink.selected_block_id.get(), Some(7));
+        // Accounted as the protocol replies the reader writes are.
+        assert!(harness.sink.pending_typeahead.get());
+        assert_eq!(harness.sink.accepted_input_generation.get(), 1);
+
+        // A pointer move under DECSET 1003 and an answer to a query, likewise.
+        assert_eq!(
+            harness.sink.on_commit("\x1b[<35;10;5M"),
+            LiveCommitRoute::Report(TerminalReport::MouseMotion)
+        );
+        assert_eq!(harness.written(), b"\x1b[<35;10;5M");
+        assert_eq!(
+            harness.sink.on_commit("\x1b[?61;1;21;22c"),
+            LiveCommitRoute::Report(TerminalReport::DeviceAttributes)
+        );
+        assert_eq!(harness.written(), b"\x1b[?61;1;21;22c");
+        assert_eq!(harness.human_inputs.get(), 0);
+        assert_eq!(harness.sink.selected_block_id.get(), Some(7));
+
+        // A key is typing: it counts, and it ends block-selection mode.
+        assert_eq!(harness.sink.on_commit("a"), LiveCommitRoute::Typed);
+        assert_eq!(harness.written(), b"a");
+        assert_eq!(harness.human_inputs.get(), 1);
+        assert_eq!(harness.sink.selected_block_id.get(), None);
+    }
+
+    #[test]
+    fn a_cursor_position_answer_is_a_report_only_while_one_is_owed() {
+        use super::LiveCommitRoute;
+        use jterm_core::terminal_report::TerminalReport;
+
+        let harness = CommitHarness::new(BlockState::CollectingOutput, PtyForeground::Other);
+        // Shift+F3, with no query outstanding.
+        assert_eq!(harness.sink.on_commit("\x1b[1;2R"), LiveCommitRoute::Typed);
+        assert_eq!(harness.written(), b"\x1b[1;2R");
+        assert_eq!(harness.human_inputs.get(), 1);
+
+        harness.sink.cpr_outstanding.set(1);
+        assert_eq!(
+            harness.sink.on_commit("\x1b[5;1R"),
+            LiveCommitRoute::Report(TerminalReport::CursorPosition)
+        );
+        assert_eq!(harness.written(), b"\x1b[5;1R");
+        assert_eq!(
+            harness.sink.cpr_outstanding.get(),
+            0,
+            "the answer settles it"
+        );
+        assert_eq!(harness.human_inputs.get(), 1);
+        assert_eq!(harness.sink.on_commit("\x1b[1;2R"), LiveCommitRoute::Typed);
+        assert_eq!(harness.written(), b"\x1b[1;2R");
+        assert_eq!(harness.human_inputs.get(), 2);
+    }
+
+    /// VTE 0.76 commits Alt+b as ESC and then `b`. Taken one at a time, the
+    /// ESC was kitty-encoded as the whole chord and the `b` typed after it, so
+    /// every Alt shortcut in claude, codex and kimi also typed its letter.
+    #[test]
+    fn an_alt_chord_vte_splits_in_two_goes_out_as_one_key() {
+        use super::{KittyKey, LiveCommitRoute};
+
+        let harness = CommitHarness::new(BlockState::CollectingOutput, PtyForeground::Other);
+        harness
+            .sink
+            .kitty_flags
+            .set(jterm_core::kitty_keyboard::DISAMBIGUATE);
+        harness.press(KittyKey::Unicode('b'), true, false);
+        assert_eq!(
+            harness.sink.on_commit("\x1b"),
+            LiveCommitRoute::HeldAltEscape
+        );
+        assert_eq!(harness.sink.on_commit("b"), LiveCommitRoute::KittyEncoded);
+        assert_eq!(
+            harness.written(),
+            b"\x1b[98;3u",
+            "the chord, and no stray 'b'"
+        );
+        harness.press(KittyKey::Backspace, true, false);
+        assert_eq!(
+            harness.sink.on_commit("\x1b"),
+            LiveCommitRoute::HeldAltEscape
+        );
+        assert_eq!(
+            harness.sink.on_commit("\x7f"),
+            LiveCommitRoute::KittyEncoded
+        );
+        assert_eq!(harness.written(), b"\x1b[127;3u");
+        assert_eq!(harness.human_inputs.get(), 2, "one input per chord");
+
+        // No flags: the legacy chord, in ONE write, never a lone ESC first.
+        harness.sink.kitty_flags.set(0);
+        harness.press(KittyKey::Unicode('f'), true, false);
+        assert_eq!(
+            harness.sink.on_commit("\x1b"),
+            LiveCommitRoute::HeldAltEscape
+        );
+        assert_eq!(harness.sink.on_commit("f"), LiveCommitRoute::Typed);
+        assert_eq!(harness.written(), b"\x1bf");
+
+        // Plain Esc is never held.
+        harness.press(KittyKey::Escape, false, false);
+        assert_eq!(harness.sink.on_commit("\x1b"), LiveCommitRoute::Typed);
+        assert_eq!(harness.written(), b"\x1b");
+    }
+
+    /// Both halves of a chord commit inside one key press, so a held ESC never
+    /// waits in practice. If the second half ever failed to come, the ESC must
+    /// still reach the program, in order, rather than vanish.
+    #[test]
+    fn a_held_alt_escape_is_never_stranded() {
+        use super::{KittyKey, LiveCommitRoute};
+
+        let harness = CommitHarness::new(BlockState::CollectingOutput, PtyForeground::Other);
+        harness.press(KittyKey::Unicode('b'), true, false);
+        assert_eq!(
+            harness.sink.on_commit("\x1b"),
+            LiveCommitRoute::HeldAltEscape
+        );
+        // The next key press releases it before being recorded.
+        harness.press(KittyKey::Unicode('c'), false, false);
+        assert_eq!(harness.written(), b"\x1b");
+        assert_eq!(harness.sink.on_commit("c"), LiveCommitRoute::Typed);
+        assert_eq!(harness.written(), b"c");
+
+        // The idle flush releases it too, and drops the stale key record.
+        harness.press(KittyKey::Unicode('b'), true, false);
+        assert_eq!(
+            harness.sink.on_commit("\x1b"),
+            LiveCommitRoute::HeldAltEscape
+        );
+        harness.sink.release_unfinished_alt_chord();
+        assert_eq!(harness.written(), b"\x1b");
+        assert_eq!(harness.sink.kitty_last_key.get(), None);
+        // With nothing held, the idle flush does nothing at all.
+        harness.sink.release_unfinished_alt_chord();
+        assert_eq!(harness.sink.on_commit("x"), LiveCommitRoute::Typed);
+        assert_eq!(harness.written(), b"x");
+    }
+
+    /// Reports are classified before the joiner ever sees them, so one that
+    /// lands between the halves of a chord neither completes nor breaks it.
+    #[test]
+    fn a_report_between_the_halves_of_an_alt_chord_does_not_join_it() {
+        use super::{KittyKey, LiveCommitRoute};
+        use jterm_core::terminal_report::TerminalReport;
+
+        let harness = CommitHarness::new(BlockState::CollectingOutput, PtyForeground::Other);
+        harness.press(KittyKey::Unicode('b'), true, false);
+        assert_eq!(
+            harness.sink.on_commit("\x1b"),
+            LiveCommitRoute::HeldAltEscape
+        );
+        assert_eq!(
+            harness.sink.on_commit("\x1b[I"),
+            LiveCommitRoute::Report(TerminalReport::FocusIn)
+        );
+        assert_eq!(harness.written(), b"\x1b[I");
+        assert_eq!(harness.sink.on_commit("b"), LiveCommitRoute::Typed);
+        assert_eq!(harness.written(), b"\x1bb");
+    }
+
+    /// Without shell integration the flags a client pushes are applied and
+    /// reported back, so its keys must be encoded too — while it, not the
+    /// shell, owns the terminal.
+    #[test]
+    fn kitty_keys_are_encoded_in_raw_fallback_while_a_program_owns_the_terminal() {
+        use super::{KittyKey, LiveCommitRoute};
+
+        let shift_enter = |harness: &CommitHarness| {
+            harness.sink.record_key_press((
+                KittyKey::Enter,
+                super::KittyModifiers {
+                    shift: true,
+                    ..super::KittyModifiers::default()
+                },
+            ));
+            harness.sink.on_commit("\r")
+        };
+        let harness = CommitHarness::new(BlockState::RawFallback, PtyForeground::Other);
+        harness
+            .sink
+            .kitty_flags
+            .set(jterm_core::kitty_keyboard::DISAMBIGUATE);
+        assert_eq!(shift_enter(&harness), LiveCommitRoute::KittyEncoded);
+        assert_eq!(harness.written(), b"\x1b[13;2u");
+
+        for foreground in [PtyForeground::Shell, PtyForeground::Unknown] {
+            harness.pty.set_test_foreground(foreground);
+            assert_eq!(shift_enter(&harness), LiveCommitRoute::Typed);
+            assert_eq!(harness.written(), b"\r");
+        }
     }
 
     /// OSC 52 read. Forge answers every clipboard *query* with an empty

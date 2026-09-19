@@ -6,14 +6,16 @@
 //! used to be destroyed before it could ever be copied. The fix sits upstream
 //! of VTE: while the user drags a selection over the live VTE, and for as long
 //! as that selection remains visible, incoming PTY chunks are parked instead
-//! of being processed. Copying, typing, clearing the selection, or the bounded
-//! safety cap resumes the feed. A flush replays the parked bytes through the
-//! exact pipeline they were intercepted from, in order, so nothing is lost or
-//! reordered; display is merely deferred.
+//! of being processed. Copying, typing (a click or wheel aimed at the program
+//! counts; the reports libvte sends by itself do not), clearing the selection,
+//! or the bounded safety cap resumes the feed. A flush replays the parked
+//! bytes through the exact pipeline they were intercepted from, in order, so
+//! nothing is lost or reordered; display is merely deferred.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use jterm_core::terminal_report::classify_terminal_report;
 use vte4::TerminalExt;
 
 use super::{BlockState, MouseReportingMode};
@@ -48,6 +50,23 @@ pub(crate) fn feed_hold_eligible(
             | BlockState::RawFallback
     );
     streaming && (mouse == MouseReportingMode::None || shift_held)
+}
+
+/// Whether a live-VTE `commit` counts as the user acting on the program, which
+/// is what releases a hold.
+///
+/// Not every commit is the user. libvte also commits reports of its own: a
+/// focus report under DECSET 1004 on every window (de)activation, a motion
+/// report under 1003 on every pointer move, and its answers to the queries a
+/// program sent. Counted as typing, the Alt+Tab to paste a selection
+/// elsewhere, or the first pointer move after a Shift+drag over claude's
+/// fullscreen UI, released the hold and the next repaint wiped the very
+/// selection it was protecting. Those reports now leave it parked. Keys,
+/// clicks and wheel reports still release it: they are the user acting on the
+/// program, whose response must not stay parked behind the selection.
+pub(crate) fn commit_releases_hold(commit: &[u8], cpr_outstanding: bool) -> bool {
+    !classify_terminal_report(commit, cpr_outstanding)
+        .is_some_and(|report| report.is_passive() || report.is_reply())
 }
 
 pub(crate) struct SelectionFeedHold {
@@ -96,7 +115,15 @@ impl SelectionFeedHold {
     /// The VTE-side triggers that end a hold early: the selection being
     /// cleared (click elsewhere, copy paths that unselect) and the user
     /// typing (frozen output under live input reads as a hang).
-    pub(crate) fn install_vte_hooks(self: &Rc<Self>, vte: &vte4::Terminal) {
+    ///
+    /// `cpr_outstanding` is the pane's count of cursor position queries left
+    /// to the VTE, which is what tells its CPR answer from Shift+F3; see
+    /// [`commit_releases_hold`].
+    pub(crate) fn install_vte_hooks(
+        self: &Rc<Self>,
+        vte: &vte4::Terminal,
+        cpr_outstanding: Rc<Cell<u32>>,
+    ) {
         let weak = Rc::downgrade(self);
         vte.connect_selection_changed(move |vte| {
             if let Some(hold) = weak.upgrade() {
@@ -106,9 +133,11 @@ impl SelectionFeedHold {
             }
         });
         let weak = Rc::downgrade(self);
-        vte.connect_commit(move |_, _, _| {
+        vte.connect_commit(move |_, text, _| {
             if let Some(hold) = weak.upgrade() {
-                hold.flush_now();
+                if commit_releases_hold(text.as_bytes(), cpr_outstanding.get() > 0) {
+                    hold.flush_now();
+                }
             }
         });
     }
@@ -196,7 +225,7 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use super::{feed_hold_eligible, SelectionFeedHold, MAX_PARKED_BYTES};
+    use super::{commit_releases_hold, feed_hold_eligible, SelectionFeedHold, MAX_PARKED_BYTES};
     use crate::block_view::{BlockState, MouseReportingMode};
 
     type FlushLog = Rc<RefCell<Vec<Vec<u8>>>>;
@@ -325,6 +354,65 @@ mod tests {
         hold.flush_now();
         assert!(log.borrow().is_empty());
         assert!(!hold.try_buffer(b"live"));
+    }
+
+    #[test]
+    fn reports_the_vte_sends_by_itself_do_not_release_the_hold() {
+        // Focus reports (Alt+Tab away to paste the selection), bare pointer
+        // motion under DECSET 1003, and every answer to a query.
+        for passive in [
+            &b"\x1b[O"[..],
+            b"\x1b[I",
+            b"\x1b[<35;10;5M",
+            b"\x1b[?61;1;21;22c",
+            b"\x1b[>61;7600;1c",
+            b"\x1b[?2026;4$y",
+            b"\x1bP>|VTE(7600)\x1b\\",
+            b"\x1b[0n",
+        ] {
+            assert!(!commit_releases_hold(passive, false), "{passive:?}");
+        }
+        // A CPR answer only while one is owed; otherwise it is Shift+F3.
+        assert!(!commit_releases_hold(b"\x1b[3;1R", true));
+        assert!(commit_releases_hold(b"\x1b[1;2R", false));
+
+        // The user acting on the program: keys, text, clicks and the wheel.
+        for acting in [
+            &b"a"[..],
+            b"\r",
+            b"\x1b",
+            b"\x1b[A",
+            b"\x1b[Z",
+            b"\x1b[<0;1;1M",
+            b"\x1b[<0;1;1m",
+            b"\x1b[<32;3;4M",
+            b"\x1b[<65;10;20M",
+        ] {
+            assert!(commit_releases_hold(acting, false), "{acting:?}");
+        }
+    }
+
+    #[test]
+    fn a_focus_or_motion_report_keeps_the_feed_parked_and_a_key_releases_it() {
+        let (hold, log) = hold_with_log();
+        hold.begin_drag();
+        assert!(hold.try_buffer(b"codex redraw"));
+        hold.end_drag(true);
+        // What the commit hook does per commit.
+        let commit = |bytes: &[u8]| {
+            if commit_releases_hold(bytes, false) {
+                hold.flush_now();
+            }
+        };
+        commit(b"\x1b[O");
+        commit(b"\x1b[<35;10;5M");
+        assert!(hold.try_buffer(b" still parked"));
+        assert!(log.borrow().is_empty());
+        commit(b"a");
+        assert_eq!(
+            log.borrow().as_slice(),
+            [b"codex redraw still parked".to_vec()]
+        );
     }
 
     #[test]
