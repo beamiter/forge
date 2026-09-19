@@ -21,6 +21,29 @@ saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
 
+- **Agent CLIs in Block mode (2026-09-20, core `33093da`)**: a seven-area audit
+  of how claude (fullscreen/alt-screen on this machine), codex and kimi (inline)
+  and opencode (alt-screen) behave in Block mode, with each finding checked by a
+  second agent, then five fix batches and an adversarial review pass. forge also
+  gains anvil's dfac724 (libvte answers DA/CPR/XTVERSION/DSR itself — the old
+  absolute-ring-row CPR parked codex at the bottom of a blank card from the
+  second command on), a winsize that no longer changes across the alternate
+  screen (`block-alt-screen` is decoration only), a compact running pill that
+  hides while it would cover a full-height agent card, and tab activity driven
+  by output instead of VTE `commit`. Shared pieces live in core:
+  `terminal_report` (libvte's replies, focus and mouse reports arrive through
+  `commit` even without a PTY — they are not typing),
+  `kitty_keyboard::AltEscapeJoiner` (VTE 0.76 commits Alt+key as two commits),
+  `wheel::WheelAccumulator`, the notify policies `bell_should_notify`,
+  `long_block_should_notify` and `attention`, and `screen_replay`, a VTE-
+  faithful screen model (DECSTBM, RI, autowrap, wide cells, bounded history)
+  verified differentially against real libvte 0.76, which finished blocks now
+  use so a codex session keeps its whole transcript. Display tests run headless
+  with `gtk4-broadwayd` when xvfb is missing (GDK_BACKEND=broadway; the broadway
+  socket lives in XDG_RUNTIME_DIR). Left open: the "Earlier output not retained"
+  notice is not persisted in BlockData (needs a history-format field); the flaky
+  parallel test-binary crash in GTK IM-module teardown predates this work.
+
 - **The ASCII organism moves into core (`jterm_core` `9f94f77` → `fa256d6`)**:
   `src/organism.rs` (3,322), `src/organism_memory.rs` (5,387) and
   `src/organism_attention.rs` (295) are deleted — 9,004 lines — and forge now
