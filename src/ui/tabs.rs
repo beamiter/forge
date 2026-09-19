@@ -103,6 +103,19 @@ fn pane_leaf_root_of(widget: &gtk4::Widget) -> Option<gtk4::Widget> {
     None
 }
 
+/// What an OSC 0/2 title does to a tab label: `None` leaves it alone (the
+/// user renamed the tab), an empty title restores `default` (the program is
+/// handing the title back), anything else becomes the label.
+fn tab_label_for_osc_title(title: &str, default: &str, custom: bool) -> Option<String> {
+    if custom {
+        None
+    } else if title.is_empty() {
+        Some(default.to_string())
+    } else {
+        Some(title.to_string())
+    }
+}
+
 pub(super) fn notebook_page_named(notebook: &gtk4::Notebook, name: &str) -> Option<gtk4::Widget> {
     (0..notebook.n_pages()).find_map(|index| {
         notebook
@@ -785,16 +798,31 @@ impl UiState {
                 let header = label.clone();
                 let strip = strip_label.clone();
                 let custom = custom_title.clone();
+                let view_for_default = Rc::downgrade(view);
                 view.connect_title_changed(move |title| {
                     let Some(identity) = identity.upgrade() else {
                         return;
                     };
-                    if identity.widget_name() != expected_name || custom.get() {
+                    if identity.widget_name() != expected_name {
                         return;
                     }
-                    header.set_text(title);
+                    // An empty title hands the label back to the cwd default.
+                    let default = match view_for_default.upgrade() {
+                        Some(view) if title.is_empty() => {
+                            let cwd = jterm_core::review_input::safe_inline_display(
+                                &view.cwd(),
+                                4 * 1024,
+                            );
+                            default_tab_title(tab_num + 1, Some(&cwd))
+                        }
+                        _ => String::new(),
+                    };
+                    let Some(title) = tab_label_for_osc_title(title, &default, custom.get()) else {
+                        return;
+                    };
+                    header.set_text(&title);
                     if !tab_private_title_cell(&identity).is_some_and(|flag| flag.get()) {
-                        strip.set_text(title);
+                        strip.set_text(&title);
                     }
                 });
             }
@@ -1873,7 +1901,11 @@ impl UiState {
         // strip button for every frame loses in-flight click and drag gestures.
         let identity_for_title = view_type.root_widget().downgrade();
         let expected_name_for_title = format!("tab-{tab_num}");
-        let update_title = |connect: &dyn Fn(TitleChangedCallback)| {
+        // An empty title is a program handing the title back (claude and codex
+        // send `OSC 0 ;` on exit): the tab returns to its cwd-derived default
+        // instead of keeping "✳ Claude Code" after the agent is gone.
+        let update_title = |connect: &dyn Fn(TitleChangedCallback),
+                            default_title: Box<dyn Fn() -> String>| {
             let label_for_title = label.clone();
             let strip_btn_label_for_title = strip_btn_label.clone();
             let custom_title_for_title = custom_title.clone();
@@ -1883,26 +1915,53 @@ impl UiState {
                 let Some(identity) = identity_for_title.upgrade() else {
                     return;
                 };
-                if identity.widget_name() != expected_name_for_title
-                    || custom_title_for_title.get()
-                    || label_for_title.text().as_str() == title
-                {
+                if identity.widget_name() != expected_name_for_title {
                     return;
                 }
-                label_for_title.set_text(title);
+                let default = if title.is_empty() {
+                    default_title()
+                } else {
+                    String::new()
+                };
+                let Some(title) =
+                    tab_label_for_osc_title(title, &default, custom_title_for_title.get())
+                else {
+                    return;
+                };
+                if label_for_title.text().as_str() == title {
+                    return;
+                }
+                label_for_title.set_text(&title);
                 if !tab_private_title_cell(&identity).is_some_and(|flag| flag.get()) {
                     if let Some(ref btn_label) = *strip_btn_label_for_title.borrow() {
-                        btn_label.set_text(title);
+                        btn_label.set_text(&title);
                     }
                 }
             }));
         };
         match &view_type {
             PaneLeaf::Block(term_view) => {
-                update_title(&|callback| term_view.connect_title_changed(callback));
+                let view_for_default = Rc::downgrade(term_view);
+                update_title(
+                    &|callback| term_view.connect_title_changed(callback),
+                    Box::new(move || {
+                        let cwd = view_for_default
+                            .upgrade()
+                            .map(|view| {
+                                jterm_core::review_input::safe_inline_display(&view.cwd(), 4 * 1024)
+                            })
+                            .unwrap_or_default();
+                        default_tab_title(tab_index_for_pwd, Some(&cwd))
+                    }),
+                );
             }
             PaneLeaf::Vte(vte_view) => {
-                update_title(&|callback| vte_view.connect_title_changed(callback));
+                // The conventional VTE view never reports an empty title.
+                let dir = working_directory.clone();
+                update_title(
+                    &|callback| vte_view.connect_title_changed(callback),
+                    Box::new(move || default_tab_title(tab_index_for_pwd, dir.as_deref())),
+                );
             }
         }
 
@@ -2118,24 +2177,22 @@ impl UiState {
         // Also name the wrapper widget so we can find the button when removing
         term_wrapper.set_widget_name(&tab_widget_name);
 
-        // Bell signal: flash the tab strip button when bell rings on non-active tab
+        // Bell signal: badge the tab (the current one too while the window is
+        // inactive) and toast an inactive window.
         let ui_for_bell = self.clone();
         let root_for_bell = view_type.root_widget().downgrade();
+        let last_bell_toast = Cell::new(None);
         terminal.connect_bell(move |_| {
             log::debug!("Bell signal received");
             if let Some(root) = root_for_bell.upgrade() {
-                ui_for_bell.mark_tab_bell(&root.widget_name());
+                ui_for_bell.ring_tab_bell(&root, &last_bell_toast);
             }
         });
 
-        // Activity indicator: mark tab when there's output on a non-active tab
-        let ui_for_activity = self.clone();
-        let root_for_activity = view_type.root_widget().downgrade();
-        terminal.connect_commit(move |_, _, _| {
-            if let Some(root) = root_for_activity.upgrade() {
-                ui_for_activity.mark_tab_activity(&root.widget_name());
-            }
-        });
+        // Activity indicator: mark the tab when its pane *outputs*. Not VTE's
+        // `commit`, which is input: agents enable focus reporting, so leaving
+        // their tab alone committed a focus-out report and marked it active.
+        self.connect_tab_activity(&view_type, &view_type.root_widget());
 
         // Double-click to rename on strip button too
         let rename_click_strip = GestureClick::new();
@@ -2557,6 +2614,41 @@ impl UiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VTE's `commit` is the *input* signal: agents enable focus reporting,
+    /// so a tab hooked to it went "active" the moment the user left it, while
+    /// a background agent that really streamed output never marked. Tab
+    /// activity must come from the panes' output activity instead.
+    #[test]
+    fn tab_activity_is_fed_by_output_not_by_vte_input() {
+        let input_signal = concat!("connect_", "commit");
+        for (file, source) in [
+            ("tabs.rs", include_str!("tabs.rs")),
+            ("panes.rs", include_str!("panes.rs")),
+            ("tab_strip.rs", include_str!("tab_strip.rs")),
+        ] {
+            assert!(
+                !source.contains(input_signal),
+                "{file} hooks tab chrome to VTE input"
+            );
+        }
+    }
+
+    /// claude and codex send `OSC 0 ;` (an empty title) on exit. Dropping it
+    /// left "✳ Claude Code" on the tab long after the agent was gone.
+    #[test]
+    fn an_empty_osc_title_restores_the_default_tab_label() {
+        assert_eq!(
+            tab_label_for_osc_title("", "2: ~/projects", false).as_deref(),
+            Some("2: ~/projects")
+        );
+        assert_eq!(
+            tab_label_for_osc_title("✳ Claude Code", "2: ~/projects", false).as_deref(),
+            Some("✳ Claude Code")
+        );
+        assert_eq!(tab_label_for_osc_title("", "2: ~/projects", true), None);
+        assert_eq!(tab_label_for_osc_title("vim", "2: ~/projects", true), None);
+    }
 
     #[test]
     fn plain_enter_and_space_activate_focused_tab_buttons() {

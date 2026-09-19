@@ -489,6 +489,9 @@ pub(crate) enum BlockOutcome {
     Unknown,
 }
 
+/// `128 + SIGTSTP`: the shell's status for a job stopped by Ctrl+Z.
+const SUSPENDED_EXIT_CODE: i32 = 148;
+
 impl BlockOutcome {
     /// Exit statuses that mean "this was stopped", not "this went wrong".
     ///
@@ -504,6 +507,10 @@ impl BlockOutcome {
     /// SIGSEGV, SIGABRT and SIGQUIT are real crashes, and SIGKILL is usually
     /// the OOM killer, all of which the user needs to see in red.
     ///
+    /// SIGTSTP (148, Ctrl+Z) joins them: codex and claude suspend on Ctrl+Z,
+    /// and the shell reports 128 + SIGTSTP when it takes the terminal back.
+    /// The job is suspended, not failed; `fg` resumes it.
+    ///
     /// A script that genuinely exits 130 for its own reasons is misread here.
     /// The raw code stays visible in the badge, in export and in history for
     /// exactly that reason.
@@ -512,8 +519,27 @@ impl BlockOutcome {
             130 => Some("SIGINT"),
             141 => Some("SIGPIPE"),
             143 => Some("SIGTERM"),
+            SUSPENDED_EXIT_CODE => Some("SIGTSTP"),
             _ => None,
         }
+    }
+
+    /// Badge text and tooltip for an [`Self::Interrupted`] status. The raw
+    /// code stays in the text: a script that exits 130 on its own is
+    /// classified as interrupted here, and the number is how the user tells
+    /// the two apart.
+    fn interrupted_badge(code: i32) -> (String, String) {
+        if code == SUSPENDED_EXIT_CODE {
+            return (
+                format!("exit:{code} · suspended"),
+                "Stopped by SIGTSTP — resume with fg".to_string(),
+            );
+        }
+        let signal = Self::interrupt_signal(code).unwrap_or("signal");
+        (
+            format!("exit:{code} · interrupted"),
+            format!("128 + signal number: stopped by {signal}, not a command failure"),
+        )
     }
 
     /// Translate the shared semantic contract into Forge's renderer-owned UI
@@ -596,6 +622,7 @@ impl BlockOutcome {
             Self::Background => "Background output",
             Self::Success => "Command succeeded",
             Self::Failure(_) => "Command failed",
+            Self::Interrupted(SUSPENDED_EXIT_CODE) => "Command suspended",
             Self::Interrupted(_) => "Command interrupted",
             Self::Unknown => "Command exit status unavailable",
         }
@@ -2271,14 +2298,9 @@ impl FinishedBlock {
                 header_row.append(&badge);
             }
             BlockOutcome::Interrupted(code) => {
-                // Keep the raw code: a script that exits 130 on its own is
-                // classified as interrupted here, and the number is how the
-                // user tells the two apart.
-                let signal = BlockOutcome::interrupt_signal(code).unwrap_or("signal");
-                let badge = gtk4::Label::new(Some(&format!("exit:{code} · interrupted")));
-                badge.set_tooltip_text(Some(&format!(
-                    "128 + signal number: stopped by {signal}, not a command failure"
-                )));
+                let (text, tooltip) = BlockOutcome::interrupted_badge(code);
+                let badge = gtk4::Label::new(Some(&text));
+                badge.set_tooltip_text(Some(&tooltip));
                 badge.add_css_class("block-exit-interrupted");
                 badge.set_ellipsize(gtk4::pango::EllipsizeMode::End);
                 badge.set_max_width_chars(HEADER_META_MAX_CHARS);
@@ -4905,7 +4927,8 @@ mod tests {
             assert_ne!(outcome.status_css_class(), "block-status-bad");
         }
 
-        // Faults stay red: these are things the user needs to see.
+        // Faults stay red: these are things the user needs to see. SIGSTOP,
+        // SIGTTIN and SIGTTOU are not Ctrl+Z and keep their plain status.
         for code in [
             1, 2, 127, 131, /* SIGQUIT */
             134, /* SIGABRT */
@@ -4920,6 +4943,30 @@ mod tests {
             );
             assert!(outcome.is_failure());
         }
+    }
+
+    /// Ctrl+Z on codex or claude suspends the job, and the shell reports 148
+    /// (128 + SIGTSTP). That card used to be a red `exit:148` failure that
+    /// the Failed filter and failure navigation then stopped on.
+    #[test]
+    fn a_ctrl_z_suspend_is_not_a_failure() {
+        let outcome = BlockOutcome::classify(Some("codex"), Some(148));
+        assert_eq!(outcome, BlockOutcome::Interrupted(148));
+        assert!(!outcome.is_failure());
+        assert_eq!(outcome.reported_exit_code(), Some(148));
+        assert_eq!(outcome.accessible_label(), "Command suspended");
+        assert_eq!(
+            BlockOutcome::interrupted_badge(148),
+            (
+                "exit:148 · suspended".to_string(),
+                "Stopped by SIGTSTP — resume with fg".to_string()
+            )
+        );
+        assert_eq!(
+            BlockOutcome::interrupted_badge(130).0,
+            "exit:130 · interrupted"
+        );
+        assert!(!BlockOutcome::classify_foreground(Some(148)).is_failure());
     }
 
     /// The pool clears stripe classes by list; the list must cover every value

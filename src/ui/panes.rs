@@ -261,24 +261,16 @@ impl UiState {
         if tab_widget_name.is_some() {
             let ui_for_bell = self.clone();
             let root_for_bell = root.downgrade();
+            let last_bell_toast = Cell::new(None);
             if let PaneLeaf::Vte(view) = &leaf {
                 view.connect_bell(move || {
                     log::debug!("Bell signal received (split)");
                     if let Some(root) = root_for_bell.upgrade() {
-                        ui_for_bell.mark_tab_bell(&root.widget_name());
+                        ui_for_bell.ring_tab_bell(&root, &last_bell_toast);
                     }
                 });
             }
-
-            let ui_for_activity = self.clone();
-            let root_for_activity = root.downgrade();
-            if let PaneLeaf::Vte(view) = &leaf {
-                view.connect_activity(move || {
-                    if let Some(root) = root_for_activity.upgrade() {
-                        ui_for_activity.mark_tab_activity(&root.widget_name());
-                    }
-                });
-            }
+            self.connect_tab_activity(&leaf, &root);
         }
         leaf
     }
@@ -356,21 +348,15 @@ impl UiState {
                 self.connect_block_tab_attention(view, &root);
                 let ui_for_bell = self.clone();
                 let root_for_bell = root.downgrade();
+                let last_bell_toast = Cell::new(None);
                 view.connect_bell(move || {
                     log::debug!("Bell signal received (split)");
                     if let Some(root) = root_for_bell.upgrade() {
-                        ui_for_bell.mark_tab_bell(&root.widget_name());
-                    }
-                });
-
-                let ui_for_activity = self.clone();
-                let root_for_activity = root.downgrade();
-                view.connect_activity(move || {
-                    if let Some(root) = root_for_activity.upgrade() {
-                        ui_for_activity.mark_tab_activity(&root.widget_name());
+                        ui_for_bell.ring_tab_bell(&root, &last_bell_toast);
                     }
                 });
             }
+            self.connect_tab_activity(&leaf, &root);
         }
         Ok(leaf)
     }

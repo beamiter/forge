@@ -62,6 +62,7 @@ tests=(
     block_view::find::tests::unified_vte_fresh_query_reaches_scrollback_before_a_prior_match
     block_view::find::tests::unified_bounded_and_native_fallback_prefer_visible_match_with_huge_old_scrollback
     block_view::find::tests::unified_complete_windows_step_visible_then_wrapped_history_on_real_vte
+    block_view::find::tests::live_find_counts_what_the_live_vte_search_steps_through
     block_view::blocks::tests::a_precomputed_card_does_not_rewalk_its_transcript
     block_view::blocks::tests::lifecycle_chip_and_quick_actions_expose_truthful_status
     block_view::scroll::tests::widget_pool_releases_heavy_children_and_stale_controllers

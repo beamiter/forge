@@ -1697,6 +1697,10 @@ pub fn run() -> glib::ExitCode {
                 // A compositor/window-manager focus change may drop the
                 // physical release; never strand this window's toggle latch.
                 cross_block_toggle_for_deactivate.borrow_mut().reset();
+            } else {
+                // A bell while the window was inactive badged the current
+                // tab too; the user is back, so that badge has done its job.
+                ui_for_window_presence.clear_current_tab_indicators();
             }
             ui_for_window_presence.sync_organism_presence();
         });

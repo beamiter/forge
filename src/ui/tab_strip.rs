@@ -26,6 +26,30 @@ fn command_finish_needs_failure_attention(exit_code: Option<i32>) -> bool {
     exit_code.is_some_and(|code| code != 0)
 }
 
+/// Whether a bell badges its tab. A background tab always shows it. The
+/// current tab shows it too when the window itself is inactive: that is the
+/// usual agent case (start codex or claude, alt-tab to a browser), where the
+/// ringing tab is the current one and a badge on it is the only in-window
+/// trace the bell leaves. Window activation clears it again.
+fn bell_badges_tab(button_active: bool, window_active: bool) -> bool {
+    !button_active || !window_active
+}
+
+/// Body of the desktop toast for a bell from an inactive window. `command` is
+/// the pane's foreground program; the shell itself (or a private tab, whose
+/// program is not shown) gets a generic line.
+fn bell_attention_body(command: Option<&str>) -> String {
+    match command.map(str::trim).filter(|command| !command.is_empty()) {
+        Some(command) => format!("Bell from {command}"),
+        None => "The terminal rang the bell".to_string(),
+    }
+}
+
+/// Leading-edge 100 ms coalescing for tab activity. A streaming agent or a
+/// spinner reports output many times a second, and every report walks the
+/// tab strip; one mark per window is all the indicator can show anyway.
+pub(crate) const TAB_ACTIVITY_COALESCE: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Translate a before/after drop on a target in the original ordering into
 /// the destination index expected after removing the source item.
 fn dropped_tab_index(source: u32, target: u32, after: bool) -> u32 {
@@ -1015,10 +1039,100 @@ impl UiState {
         }
     }
 
+    /// Mark the tab of the pane rooted at `root` on that pane's output
+    /// activity, coalesced (see [`Self::note_tab_activity`]).
+    pub(crate) fn connect_tab_activity(
+        &self,
+        leaf: &super::pane_leaf::PaneLeaf,
+        root: &gtk4::Widget,
+    ) {
+        let ui = self.clone();
+        let root = root.downgrade();
+        let pending = Rc::new(Cell::new(false));
+        let on_activity = move || {
+            if let Some(root) = root.upgrade() {
+                ui.note_tab_activity(&root, &pending);
+            }
+        };
+        match leaf {
+            super::pane_leaf::PaneLeaf::Block(view) => view.connect_activity(on_activity),
+            super::pane_leaf::PaneLeaf::Vte(view) => view.connect_activity(on_activity),
+        }
+    }
+
+    /// Output activity from the pane rooted at `root`, coalesced to one strip
+    /// walk per [`TAB_ACTIVITY_COALESCE`] through the pane's own `pending`
+    /// cell. Callers feed it the view's *output* activity, never VTE's
+    /// `commit`: that signal is input, and focus reports (DECSET 1004, which
+    /// every agent CLI enables) arrive through it the moment a tab is left.
+    pub(crate) fn note_tab_activity(&self, root: &gtk4::Widget, pending: &Rc<Cell<bool>>) {
+        if pending.replace(true) {
+            return;
+        }
+        self.mark_tab_activity(&root.widget_name());
+        let pending = pending.clone();
+        glib::timeout_add_local_once(TAB_ACTIVITY_COALESCE, move || pending.set(false));
+    }
+
+    /// A bell from the pane rooted at `root`. Badges its tab (the current one
+    /// too while the window is inactive) and, when the window is inactive,
+    /// posts one attention toast per pane per
+    /// [`jterm_core::notify::BELL_NOTIFY_MIN_INTERVAL`], tracked in
+    /// `last_toast`. BEL is how codex (by default) and claude (with its
+    /// terminal-bell channel) say "your turn".
+    pub(crate) fn ring_tab_bell(
+        &self,
+        root: &gtk4::Widget,
+        last_toast: &Cell<Option<std::time::Instant>>,
+    ) {
+        let tab_name = root.widget_name();
+        let window_active = self.window.is_active();
+        self.badge_tab_bell(&tab_name, window_active);
+        let now = std::time::Instant::now();
+        if !jterm_core::notify::bell_should_notify(window_active, last_toast.get(), now) {
+            return;
+        }
+        last_toast.set(Some(now));
+        let title = self
+            .find_strip_button(&tab_name)
+            .and_then(|button| unsafe {
+                button
+                    .data::<gtk4::Label>("tab-title-label")
+                    .map(|label| label.as_ref().text().to_string())
+            })
+            .unwrap_or_default();
+        let private = notebook_page_named(&self.notebook, &tab_name)
+            .and_then(|page| tab_private_title_cell(&page))
+            .is_some_and(|flag| flag.get());
+        // Probed only here, at most once per interval: it reads /proc.
+        let command = (!private)
+            .then(|| super::pane_leaf::PaneLeaf::from_widget(root))
+            .flatten()
+            .and_then(|leaf| leaf.foreground_process_name());
+        jterm_core::notify::attention(&title, &bell_attention_body(command.as_deref()));
+    }
+
+    /// Window activation: the user is back, so the current tab's bell badge
+    /// (set while the window was inactive) has done its job.
+    pub(crate) fn clear_current_tab_indicators(&self) {
+        if let Some(page) = self
+            .notebook
+            .current_page()
+            .and_then(|index| self.notebook.nth_page(Some(index)))
+        {
+            self.clear_tab_indicators(page.widget_name().as_str());
+        }
+    }
+
     /// Mark a tab as having received a bell signal.
     pub(crate) fn mark_tab_bell(&self, tab_widget_name: &str) {
+        self.badge_tab_bell(tab_widget_name, true);
+    }
+
+    /// Bell badge on a tab's strip button; see [`bell_badges_tab`].
+    fn badge_tab_bell(&self, tab_widget_name: &str, window_active: bool) {
         if let Some(btn) = self.find_strip_button(tab_widget_name) {
-            if !btn.is_active() {
+            if bell_badges_tab(btn.is_active(), window_active) {
                 btn.add_css_class("tab-bell");
                 btn.add_css_class("tab-bell-flash");
                 // Remove flash animation class after it completes
@@ -1118,9 +1232,9 @@ fn find_pin_icon(btn: &ToggleButton) -> Option<gtk4::Image> {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_finish_needs_failure_attention, dropped_tab_index,
-        dropped_tab_index_in_pinned_partition, resolved_tab_pinned, tab_drag_drop_target_preload,
-        tab_title_matches, tab_width_after_drag,
+        bell_attention_body, bell_badges_tab, command_finish_needs_failure_attention,
+        dropped_tab_index, dropped_tab_index_in_pinned_partition, resolved_tab_pinned,
+        tab_drag_drop_target_preload, tab_title_matches, tab_width_after_drag,
     };
 
     #[test]
@@ -1129,6 +1243,36 @@ mod tests {
         assert!(!command_finish_needs_failure_attention(None));
         assert!(command_finish_needs_failure_attention(Some(1)));
         assert!(command_finish_needs_failure_attention(Some(-1)));
+    }
+
+    /// codex rings BEL when a turn ends, typically after the user alt-tabbed
+    /// away with the agent's tab still current. That tab must badge too, or
+    /// the bell leaves no trace at all.
+    #[test]
+    fn a_bell_badges_the_current_tab_only_while_the_window_is_inactive() {
+        assert!(
+            bell_badges_tab(false, true),
+            "a background tab always badges"
+        );
+        assert!(bell_badges_tab(false, false));
+        assert!(
+            !bell_badges_tab(true, true),
+            "the tab the user is looking at does not"
+        );
+        assert!(
+            bell_badges_tab(true, false),
+            "the current tab of an inactive window does"
+        );
+    }
+
+    #[test]
+    fn bell_toasts_name_the_ringing_program() {
+        assert_eq!(bell_attention_body(Some("codex")), "Bell from codex");
+        assert_eq!(
+            bell_attention_body(Some("  ")),
+            "The terminal rang the bell"
+        );
+        assert_eq!(bell_attention_body(None), "The terminal rang the bell");
     }
 
     #[test]

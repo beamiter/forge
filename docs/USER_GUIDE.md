@@ -313,13 +313,13 @@ reducer、不新增落盘字段；repo 无法验证或身份切换中时使用�
 | 过滤标签 | `Ctrl+Shift+L` |
 | 标签栏位置 | `Ctrl+Alt+B` |
 
-标签支持按落点前后拖放排序、双击重命名、固定、标记、复制和右键菜单。过滤框固定显示在侧栏的 Tabs 视图中；`Ctrl+Shift+L` 会自动打开侧栏、切换到 Tabs 并聚焦过滤框。侧栏在 Tabs 与 Files 之间切换；开关、宽度和视图会持久化。
+标签支持按落点前后拖放排序、双击重命名、固定、标记、复制和右键菜单。后台标签页有输出时显示活动标记，响铃（BEL）时显示响铃标记；窗口未激活时，当前标签页的响铃同样会标记，并弹出一条以标签名为标题的 “Bell from <程序>” 桌面通知（每个面板 30 秒内至多一条），窗口重新激活时清除。codex 默认在回合结束时响铃；Claude Code 需把 `preferredNotifChannel` 设为 `terminal_bell`（或 `ghostty`，发送 forge 直接显示的 OSC 777 通知），见 `config.toml.example`。程序退出时发送空标题（claude、codex 都会），标签恢复为按工作目录生成的默认名；手动重命名过的标签不受影响。过滤框固定显示在侧栏的 Tabs 视图中；`Ctrl+Shift+L` 会自动打开侧栏、切换到 Tabs 并聚焦过滤框。侧栏在 Tabs 与 Files 之间切换；开关、宽度和视图会持久化。
 
 每个进程维护独立 active 快照。正常关闭后才原子发布为 ready；并发窗口不会读取或覆盖彼此 active 状态。后续启动逐个领取最近快照，确认 owner PID 已结束后才回收崩溃遗留的 active 快照，最多保留 32 个 ready 快照。旧版 `tabs.state` 会在首次启动时迁移。
 
 ## 5. 搜索与 Block 操作
 
-`Ctrl+Shift+F` 打开当前标签搜索：普通文本不区分大小写，`/expression/` 使用正则；Enter/Shift+Enter 前后跳转，Escape 关闭。清空输入立即清除 VTE 和 Block 高亮。查询上限为 8 KiB；增量搜索最多检查 4 MiB，并以 12 ms 为 surface 间的停止目标，最多记录 10,000 个命中。达到任一边界时状态栏会显示结果不完整，请缩小关键词。可能产生零宽命中的正则会明确拒绝，避免游标与高亮失去同步。全屏程序（alternate screen）占据 pane 时，搜索只针对正在显示的 live 终端，不统计被隐藏的已完成块。
+`Ctrl+Shift+F` 打开当前标签搜索：普通文本不区分大小写，`/expression/` 使用正则；Enter/Shift+Enter 前后跳转，Escape 关闭。清空输入立即清除 VTE 和 Block 高亮。查询上限为 8 KiB；增量搜索最多检查 4 MiB，并以 12 ms 为 surface 间的停止目标，最多记录 10,000 个命中。达到任一边界时状态栏会显示结果不完整，请缩小关键词。可能产生零宽命中的正则会明确拒绝，避免游标与高亮失去同步。全屏程序（alternate screen）占据 pane 时，搜索只针对正在显示的 live 终端，不统计被隐藏的已完成块。 命令运行期间，live 终端的命中数取自它自己的缓冲区（scrollback 加屏幕），与 Enter 逐个跳转经过的文本一致。
 
 | Block 功能 | 快捷键 |
 |---|---|
@@ -455,7 +455,8 @@ Block Search 4.2 新增 **Bookmarked** 元数据筛选。它与 Failed、Slow、
 退出状态区分「失败」与「被停止」：`130`（SIGINT，包括 Ctrl+C 和状态条的 Stop）、
 `141`（SIGPIPE）和 `143`（SIGTERM）显示为中性的 `⊘` 卡片与 `exit:N · interrupted` 徽章，
 不参与滚动条失败标记、`Ctrl+Shift+X` 失败跳转和 Failed 过滤；原始退出码在徽章、导出和历史里
-完整保留，因此按精确 exit code 过滤仍能找到它们。SIGSEGV、SIGABRT、SIGQUIT、SIGKILL
+完整保留，因此按精确 exit code 过滤仍能找到它们。`Ctrl+Z` 挂起的 `148`（SIGTSTP）同样是中性
+卡片，徽章为 `exit:148 · suspended`，提示用 `fg` 恢复。SIGSEGV、SIGABRT、SIGQUIT、SIGKILL
 这类真正的故障仍然是红色失败。
 
 ## 6. 统一命令面板、历史与 workflow
@@ -703,6 +704,6 @@ forge-support-bundle .
 - 欢迎 Notebook 找不到：重新安装资产，或设置 `FORGE_ASSET_DIR=/path/to/share/forge`。
 - workflow 示例找不到：检查 `${prefix}/share/forge/workflows`；非默认 prefix 可设置 `FORGE_WORKFLOW_DIR`。
 - 某个 workflow 文件不出现在面板里：用 `FORGE_LOG=warn forge` 查看 `workflows: skipping <路径>: <原因>`，常见原因是字段类型不符（例如 `default = 3000` 少了引号）、参数名为空或带首尾空格、文件是符号链接。
-- 长命令无通知：检查 `notify_long_blocks`、阈值、`notify-send` 和通知服务。
+- 长命令无通知：检查 `notify_long_blocks`、阈值、`notify-send` 和通知服务；通知只在窗口未激活或该 pane 不在当前标签页时弹出。
 - SSH 无目标：添加 `[[remote_hosts]]` 后按 `Ctrl+Shift+S`。
 - 配置修改没生效：先运行 `--check-config`；并发冲突需要重载后再保存。

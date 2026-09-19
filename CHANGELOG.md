@@ -499,6 +499,24 @@ All notable user-visible and operational changes are recorded here.
 - 拖放不再只接受图片：任何存在的本地文件或文件夹都会以 shell 引号路径插入（末尾空格、不回车），
   Block pane 经与 `Ctrl+Shift+V` 相同的粘贴编码发送，程序开启括号粘贴时带粘贴边界；拒绝提示
   改为 “Drop rejected: …”。
+- 窗口未激活时响铃（codex 默认在回合结束或需要批准时发 BEL）不再毫无痕迹：当前标签页也会
+  显示响铃标记，并弹出一条以标签名为标题的桌面通知 “Bell from <程序>”（每个面板 30 秒内
+  至多一条）；窗口重新激活时清除该标记。`config.toml.example` 说明了如何让 Claude Code 与
+  Codex 响铃或发送桌面通知。
+- “长命令完成”通知只在窗口未激活或该面板不在当前标签页时弹出：手动结束一个盯着看的三小时
+  claude 会话或 vim 时不再弹出 “✓ claude — Exit 0”。
+- 标签页的活动标记改由面板输出驱动（每 100 ms 至多一次），不再挂在 VTE 的输入信号上：
+  开启焦点上报的 Agent 此前在离开其标签页的一刻就被标为活动，而真正在后台输出的 Agent
+  却要等命令结束才标记。
+- 程序退出时用空标题交还窗口标题（claude、codex 退出时发送 `OSC 0 ;`），标签页恢复为按
+  工作目录生成的默认名，不再一直显示 “✳ Claude Code”。
+- `Ctrl+Z` 挂起 codex、claude 后，退出码 148 的卡片显示为中性的 “exit:148 · suspended”
+  （提示 “Stopped by SIGTSTP — resume with fg”），不再是红色失败，也不再计入 Failed 过滤、
+  失败刻度与失败导航。
+- 命令运行时的查找计数改为读取 live VTE 自己的缓冲区（scrollback 加屏幕），与原生逐个跳转
+  走的是同一份文本：codex 用滚动区域把历史插入内联视口上方，旧的原始字节重放没有滚动区域，
+  这些行会被视口重绘擦掉，于是报出 “No matches” 或 Next 到不了的匹配。VTE 写出失败时仍退回
+  原始字节。
 - 上一条修复只在 pane 的第一个提示符上生效：从第二个提示符起（无论上一条命令有没有输出），
   Tab 补全菜单又被压回六行高的卡片——提示符、匹配计数、分组标题和两个候选，其余全在卡片
   下沿之外。测量从纵向 adjustment 的下界开始逐行扫描 ring，假定它就是提示符的起始行；但

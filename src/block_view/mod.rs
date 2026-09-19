@@ -9127,7 +9127,21 @@ impl RenderBackend for BlockBackend {
                 .then_some(cfg.notify_long_block_threshold_ms)
         };
         if let (Some(threshold), Some(ms)) = (notification_threshold, record.duration_ms) {
-            if ms >= threshold {
+            // Long is not enough: a three-hour agent session the user just
+            // ended by hand, looking at it, must not toast. Only a user who is
+            // elsewhere (inactive window, or this pane on a background tab)
+            // gets one.
+            let window_active = self
+                .block_list_rc
+                .root()
+                .and_downcast::<gtk4::Window>()
+                .is_some_and(|window| window.is_active());
+            if jterm_core::notify::long_block_should_notify(
+                ms,
+                threshold,
+                window_active,
+                self.block_list_rc.is_mapped(),
+            ) {
                 notify_long_block(cmd, record.exit_code, ms);
             }
         }
@@ -13568,13 +13582,13 @@ impl TermView {
         {
             let title_cbs = title_callbacks.clone();
             active_vte.connect_window_title_changed(move |terminal| {
-                if let Some(title) = terminal.window_title() {
-                    let title_str = jterm_core::review_input::safe_inline_display(&title, 512);
-                    if !title_str.is_empty() {
-                        for cb in title_cbs.borrow().iter() {
-                            cb(&title_str);
-                        }
-                    }
+                // An empty title is forwarded too: it is how a program hands
+                // the title back on exit (claude and codex send `OSC 0 ;`),
+                // and the tab then returns to its default label.
+                let title = terminal.window_title().unwrap_or_default();
+                let title_str = jterm_core::review_input::safe_inline_display(&title, 512);
+                for cb in title_cbs.borrow().iter() {
+                    cb(&title_str);
                 }
             });
         }

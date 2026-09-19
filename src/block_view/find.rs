@@ -331,6 +331,29 @@ fn regex_consumption(pattern: &str) -> Result<RegexConsumption, ()> {
     }
 }
 
+/// Text of a live VTE's own buffer, scrollback plus screen: exactly what its
+/// native `search_find_next` walks.
+///
+/// The live surface used to be counted from a replay of the raw byte capture,
+/// which has no screen height, no scroll region and no reverse index. codex
+/// inserts its history above an inline viewport with exactly those (DECSTBM,
+/// then LF or RI inside the region), and VTE pushes the lines that scroll off
+/// the region into scrollback while the replay overwrote them. The count then
+/// disagreed with the steps: matches Next could not reach, and text plainly on
+/// screen reporting none. VTE writes soft-wrapped rows without a newline, so
+/// wrapped text joins the way its search sees it. `None` when VTE cannot write
+/// the dump; callers then fall back to the byte capture.
+pub(crate) fn live_vte_search_text(vte: &vte4::Terminal) -> Option<String> {
+    use gtk4::gio;
+    use gtk4::gio::prelude::*;
+
+    let stream = gio::MemoryOutputStream::new_resizable();
+    vte.write_contents_sync(&stream, vte4::WriteFlags::Default, gio::Cancellable::NONE)
+        .ok()?;
+    stream.close(gio::Cancellable::NONE).ok()?;
+    Some(String::from_utf8_lossy(&stream.steal_as_bytes()).into_owned())
+}
+
 fn bounded_match_count(
     regex: &regex::Regex,
     haystack: &str,
@@ -1175,9 +1198,10 @@ impl TermView {
         }
 
         // The still-running command's output is searchable too (document
-        // order: it sits below every finished block). Counted from the
-        // accumulated raw capture, so only states that accumulate qualify;
-        // VTE's own highlighter paints and steps the on-screen hits.
+        // order: it sits below every finished block). VTE's own highlighter
+        // paints and steps these hits, so they are counted from the live
+        // VTE's own buffer (`live_vte_search_text`): the count must equal
+        // the steps. The raw capture is only a fallback when that dump fails.
         if !match_limited
             && !scan_limited
             && !completed_owns_live_surface
@@ -1186,12 +1210,27 @@ impl TermView {
                 super::BlockState::CollectingOutput | super::BlockState::PostCommand
             )
         {
-            let (live_raw, live_raw_incomplete) = self
-                .active
-                .borrow()
-                .output_text_prefix(scan_budget.remaining_bytes());
-            let live_prefix = scan_budget.take_prefix(&live_raw);
-            let live_text = super::strip_ansi(live_prefix.text);
+            let (live_text, live_raw_incomplete, live_prefix_incomplete) =
+                match live_vte_search_text(&self.active_vte) {
+                    Some(mut dump) => {
+                        let prefix = scan_budget.take_prefix(&dump);
+                        let (kept, incomplete) = (prefix.text.len(), prefix.incomplete);
+                        dump.truncate(kept);
+                        (dump, false, incomplete)
+                    }
+                    None => {
+                        let (live_raw, live_raw_incomplete) = self
+                            .active
+                            .borrow()
+                            .output_text_prefix(scan_budget.remaining_bytes());
+                        let live_prefix = scan_budget.take_prefix(&live_raw);
+                        (
+                            super::strip_ansi(live_prefix.text),
+                            live_raw_incomplete,
+                            live_prefix.incomplete,
+                        )
+                    }
+                };
             let live = bounded_match_count(&re, &live_text, FIND_MATCH_LIMIT.saturating_sub(total));
             if live.count > 0 {
                 self.active_vte.search_set_regex(Some(&vte_re), 0);
@@ -1218,8 +1257,8 @@ impl TermView {
             }
             match_limited = live.reached_limit;
             scan_limited = !match_limited
-                && (live_raw_incomplete || live_prefix.incomplete || scan_budget.time_exhausted());
-            if live.count > 0 && (match_limited || live_raw_incomplete || live_prefix.incomplete) {
+                && (live_raw_incomplete || live_prefix_incomplete || scan_budget.time_exhausted());
+            if live.count > 0 && (match_limited || live_raw_incomplete || live_prefix_incomplete) {
                 surfaces
                     .last_mut()
                     .expect("a matching live surface was just appended")
@@ -2449,6 +2488,98 @@ tail ab";
             .map(|text| text.to_string())
             .unwrap_or_default();
         assert_eq!(selected, "alpha-hit");
+        window.close();
+        while context.iteration(false) {}
+    }
+
+    /// codex's `insert_history_lines`, reduced to its byte shape: the inline
+    /// viewport sits on the bottom `viewport` rows, each history line is
+    /// written into a scroll region ending just above it (`CSI 1;top r`,
+    /// cursor on the region's last row, `\r\n` + line), and the viewport is
+    /// redrawn after. Before that, the viewport is walked down the screen
+    /// with reverse index inside a region below it, as codex does while its
+    /// viewport grows. Generated here so the fixture cannot drift from the
+    /// test that reads it.
+    fn synthetic_codex_insert_history(rows: u16, viewport: u16, lines: usize) -> Vec<u8> {
+        let top = rows - viewport;
+        let mut out = Vec::new();
+        out.extend_from_slice("\x1b[2J\x1b[1;1H\u{203a} composer".as_bytes());
+        // Push the viewport from row 1 down to its home with RI.
+        out.extend_from_slice(format!("\x1b[1;{rows}r\x1b[1;1H").as_bytes());
+        for _ in 0..top {
+            out.extend_from_slice(b"\x1bM");
+        }
+        out.extend_from_slice(b"\x1b[r");
+        for index in 0..lines {
+            out.extend_from_slice(
+                format!("\x1b[1;{top}r\x1b[{top};1H\r\nhistory line {index:04}\x1b[r").as_bytes(),
+            );
+            out.extend_from_slice(
+                format!(
+                    "\x1b[{};1H\x1b[2K\u{2022} Working ({index}s)\x1b[{rows};1H\x1b[2K\u{203a} composer",
+                    top + 1
+                )
+                .as_bytes(),
+            );
+        }
+        out
+    }
+
+    /// The live surface's count comes from the buffer VTE searches, not from
+    /// a replay of the raw bytes. The replay has no scroll region, so on
+    /// codex's history-insertion stream every inserted line landed on the
+    /// viewport's row and was erased by its redraw: it found none of the 150
+    /// lines VTE holds in its scrollback, and Find reported "No matches" for
+    /// text the user could scroll to.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn live_find_counts_what_the_live_vte_search_steps_through() {
+        use gtk4::prelude::*;
+        use std::time::Duration;
+        use vte4::TerminalExt;
+
+        gtk4::init().expect("gtk init");
+        let (rows, lines) = (12u16, 150usize);
+        let terminal = vte4::Terminal::new();
+        terminal.set_size(80, i64::from(rows));
+        terminal.set_scrollback_lines(1_000);
+        let window = gtk4::Window::new();
+        window.set_child(Some(&terminal));
+        window.present();
+        let stream = synthetic_codex_insert_history(rows, 4, lines);
+        terminal.feed(&stream);
+        let context = gtk4::glib::MainContext::default();
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(150) {
+            while context.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let text = super::live_vte_search_text(&terminal).expect("VTE writes its buffer");
+        let re = regex::Regex::new("history line").unwrap();
+        assert_eq!(re.find_iter(&text).count(), lines, "{text}");
+        assert!(text.contains("history line 0000"));
+        assert!(text.contains("history line 0149"));
+
+        // The old count read a replay of the raw capture and came up short.
+        let replayed = super::super::strip_ansi(&String::from_utf8_lossy(&stream));
+        let replayed_count = re.find_iter(&replayed).count();
+        assert!(
+            replayed_count < lines,
+            "the fixture must reproduce the replay's undercount"
+        );
+
+        // And the count is what native stepping reaches.
+        let vte_re = vte4::Regex::for_search("history line", VTE_SEARCH_FLAGS).unwrap();
+        terminal.unselect_all();
+        terminal.search_set_regex(Some(&vte_re), 0);
+        terminal.search_set_wrap_around(false);
+        let mut steps = 0;
+        while terminal.search_find_previous() {
+            steps += 1;
+            assert!(steps <= lines, "native search must stop at the top");
+        }
+        assert_eq!(steps, lines);
         window.close();
         while context.iteration(false) {}
     }
