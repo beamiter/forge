@@ -1356,6 +1356,25 @@ pub(crate) fn scroll_adjustment_by_wheel(adj: &gtk4::Adjustment, dy: f64) -> boo
     true
 }
 
+/// A scroll event's vertical delta in wheel steps. GTK 4.14 on Wayland
+/// delivers touchpad scrolls in surface pixels, and `EventControllerScroll`
+/// converts them only when asked for discrete steps, which these controllers
+/// are not; taken as steps, a 20px swipe moved two pages. A wheel-unit delta
+/// (±1.0 per notch) is returned unchanged.
+pub(crate) fn wheel_steps(dy: f64, surface_unit: bool) -> f64 {
+    if surface_unit {
+        dy / jterm_core::wheel::SURFACE_UNITS_PER_STEP
+    } else {
+        dy
+    }
+}
+
+/// Whether the event being handled by `controller` measures its delta in
+/// surface pixels rather than wheel steps.
+pub(crate) fn scroll_unit_is_surface(controller: &gtk4::EventControllerScroll) -> bool {
+    controller.unit() == gtk4::gdk::ScrollUnit::Surface
+}
+
 pub(crate) fn forward_outer_scroll(outer: &gtk4::ScrolledWindow, dy: f64) {
     let outer_adj = outer.vadjustment();
     let step = outer_adj.step_increment().max(outer_adj.page_size() * 0.1);
@@ -3580,11 +3599,12 @@ impl FinishedBlock {
         command_scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let outer_for_command = outer.downgrade();
         let debouncer_for_command = debouncer.clone();
-        command_scroll.connect_scroll(move |_, _dx, dy| {
+        command_scroll.connect_scroll(move |controller, _dx, dy| {
             let Some(outer_for_command) = outer_for_command.upgrade() else {
                 return glib::Propagation::Proceed;
             };
-            forward_outer_scroll(&outer_for_command, dy);
+            let steps = wheel_steps(dy, scroll_unit_is_surface(controller));
+            forward_outer_scroll(&outer_for_command, steps);
             debouncer_for_command.record_wheel_intent(&outer_for_command);
             glib::Propagation::Stop
         });
@@ -3595,7 +3615,7 @@ impl FinishedBlock {
         let vte = self.output_vte.downgrade();
         let outer_for_vte = outer.downgrade();
         let debouncer_for_vte = debouncer.clone();
-        scroll_ctrl.connect_scroll(move |_, _dx, dy| {
+        scroll_ctrl.connect_scroll(move |controller, _dx, dy| {
             let (Some(vte), Some(outer_for_vte)) = (vte.upgrade(), outer_for_vte.upgrade()) else {
                 return glib::Propagation::Proceed;
             };
@@ -3615,7 +3635,10 @@ impl FinishedBlock {
                 return glib::Propagation::Proceed;
             }
             // Drive the outer ScrolledWindow by one step in the wheel direction.
-            forward_outer_scroll(&outer_for_vte, dy);
+            forward_outer_scroll(
+                &outer_for_vte,
+                wheel_steps(dy, scroll_unit_is_surface(controller)),
+            );
             debouncer_for_vte.record_wheel_intent(&outer_for_vte);
             glib::Propagation::Stop
         });
@@ -3631,18 +3654,19 @@ impl FinishedBlock {
         let vte_for_scrollbar = self.output_vte.downgrade();
         let outer_for_scrollbar = outer.downgrade();
         let debouncer_for_scrollbar = debouncer.clone();
-        scrollbar_scroll.connect_scroll(move |_, _dx, dy| {
+        scrollbar_scroll.connect_scroll(move |controller, _dx, dy| {
+            let steps = wheel_steps(dy, scroll_unit_is_surface(controller));
             let (Some(vte), Some(outer)) =
                 (vte_for_scrollbar.upgrade(), outer_for_scrollbar.upgrade())
             else {
                 return glib::Propagation::Proceed;
             };
             if let Some(inner_adj) = vte.vadjustment() {
-                if scroll_adjustment(&inner_adj, dy) {
+                if scroll_adjustment(&inner_adj, steps) {
                     return glib::Propagation::Stop;
                 }
             }
-            forward_outer_scroll(&outer, dy);
+            forward_outer_scroll(&outer, steps);
             debouncer_for_scrollbar.record_wheel_intent(&outer);
             glib::Propagation::Stop
         });

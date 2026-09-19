@@ -28,6 +28,7 @@ use jterm_core::kitty_keyboard::{
 };
 use jterm_core::pty_input::{self, Paste, PasteModes, PastePolicy, UnbracketedMultiline};
 use jterm_core::terminal_report::{classify_terminal_report, TerminalReport};
+use jterm_core::wheel::WheelAccumulator;
 
 mod alt_screen;
 mod ansi;
@@ -4794,6 +4795,16 @@ fn emit_activity(callbacks: &VoidCallbacks) {
     }
 }
 
+/// Shortest gap between two activity reports for alternate-screen output.
+const ALT_SCREEN_ACTIVITY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Whether alternate-screen output at `now` reports activity, given when it
+/// last did. Coalesced so a full-screen app's frame-rate repaints do not walk
+/// the tab strip on every chunk.
+fn alt_screen_activity_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= ALT_SCREEN_ACTIVITY_INTERVAL)
+}
+
 fn emit_alt_screen_transition(callbacks: &AltScreenCallbacks, transition: AltScreenTransition) {
     for callback in callbacks.borrow().iter() {
         callback(transition);
@@ -5434,7 +5445,7 @@ pub struct TermView {
     activity_callbacks: VoidCallbacks,
     human_input_callbacks: HumanInputCallbacks,
     alt_screen_callbacks: AltScreenCallbacks,
-    mouse_reporting_mode: Rc<Cell<MouseReportingMode>>,
+    mouse_reporting_mode: Rc<Cell<MouseReporting>>,
     /// Whether the shell has enabled DECSET 2004. Clipboard input is written
     /// directly to our PTY, so block mode must apply this wrapper itself.
     bracketed_paste: Rc<Cell<bool>>,
@@ -5499,6 +5510,9 @@ pub struct TermView {
     /// otherwise a pane closed mid-settle would keep the callback's Rc
     /// captures (pty/active/vte/vte_box) alive past tab close.
     resize_tick_id: Rc<RefCell<Option<gtk4::TickCallbackId>>>,
+    /// The winsize the child was last told, shared with the render backend's
+    /// synchronous publisher; see [`PtyWinsize`].
+    pty_winsize: Rc<PtyWinsize>,
     /// Periodic sticky-header refresh. Remove it explicitly on tab close so its
     /// GTK captures cannot retain a detached block tree.
     sticky_timer_id: RefCell<Option<glib::SourceId>>,
@@ -5548,6 +5562,9 @@ impl Drop for TermView {
         if let Some(id) = self.resize_tick_id.borrow_mut().take() {
             id.remove();
         }
+        // The arm closure keeps the PTY and weak widget handles; the backend
+        // shares this record, so release it with the pane.
+        self.pty_winsize.set_settle_arm(None);
         if let Some(id) = self.sticky_timer_id.borrow_mut().take() {
             id.remove();
         }
@@ -6156,6 +6173,13 @@ trait RenderBackend {
     /// touch the running command's output snapshot: the raw-output ring is
     /// engine-owned shared state and the engine clears it explicitly.
     fn reset_active_surface(&self, preserve_scrollback: bool);
+    /// Whether [`Self::reset_active_surface`] resets the live terminal's
+    /// modes (a full VTE reset). Block does so unless the previous command's
+    /// scrollback is kept; a surface that keeps its terminal state must be
+    /// told explicitly when a program's modes stop applying.
+    fn live_surface_reset_at_prompt(&self, preserve_scrollback: bool) -> bool {
+        !preserve_scrollback
+    }
     /// Focus the live surface once the current main-loop turn finishes.
     fn focus_live_deferred(&self);
     /// Lay out the live surface and push the viewport grid to the PTY
@@ -6586,6 +6610,7 @@ struct BlockBackend {
     /// Same PTY as the `ReaderCtx` clone: geometry sync here, replies and
     /// foreground queries engine-side.
     pty_for_init: Rc<OwnedPty>,
+    pty_winsize: Rc<PtyWinsize>,
     /// Undo's single-level slot, shared with `TermView`: the card menu's
     /// Delete writes what it took here.
     removed_blocks_for_cb: Rc<RefCell<Option<RemovedBlocks>>>,
@@ -6685,7 +6710,7 @@ struct ReaderCtx {
     exited_cbs: IntCallbacks,
     activity_cbs: VoidCallbacks,
     alt_screen_cbs: AltScreenCallbacks,
-    mouse_reporting_rc: Rc<Cell<MouseReportingMode>>,
+    mouse_reporting_rc: Rc<Cell<MouseReporting>>,
     bracketed_paste_rc: Rc<Cell<bool>>,
     /// Kitty keyboard protocol flag stacks for the live surface, and a mirror
     /// of the flags in effect that the GTK-side key and commit handlers read.
@@ -6697,6 +6722,13 @@ struct ReaderCtx {
     /// per answer. Zeroed at an accepted PromptStart and at RIS, so a query
     /// VTE never answered cannot keep claiming Shift+F3 forever.
     cpr_outstanding_rc: Rc<Cell<u32>>,
+    /// When alternate-screen output last reported activity; see
+    /// [`alt_screen_activity_due`].
+    alt_screen_activity_at: Cell<Option<std::time::Instant>>,
+    /// Whether a program switched a mouse or focus reporting mode on in the
+    /// live VTE since the last prompt-boundary reset; see
+    /// `reset_mouse_reporting`.
+    live_reporting_modes_set: Cell<bool>,
     config_for_cb: Rc<RefCell<Config>>,
     dynamic_colors_rc: Rc<Cell<DynamicColors>>,
     parser: Rc<RefCell<Parser>>,
@@ -6915,7 +6947,8 @@ impl ReaderCtx {
         self.agent_execution_supported_rc.set(false);
         self.bracketed_paste_rc.set(false);
         self.pty_for_init.set_shell_bracketed_paste(false);
-        self.mouse_reporting_rc.set(MouseReportingMode::None);
+        self.mouse_reporting_rc.set(MouseReporting::OFF);
+        self.live_reporting_modes_set.set(false);
         self.dynamic_colors_rc.set(DynamicColors::default());
     }
 
@@ -6929,19 +6962,17 @@ impl ReaderCtx {
             // approximate a sequence split across chunks.
             self.pty_for_init.set_shell_bracketed_paste(set);
         }
-        // VTE handles paste/cursor/etc. natively from its
-        // own bytes; block_view only needs mouse-reporting
-        // state for wheel suppression in alt-screen apps.
-        let new_mode = match (mode, set) {
-            (1000, true) => Some(MouseReportingMode::Click),
-            (1002, true) => Some(MouseReportingMode::Button),
-            (1003, true) => Some(MouseReportingMode::Motion),
-            (1006, true) => Some(MouseReportingMode::Sgr),
-            (1000 | 1002 | 1003 | 1006, false) => Some(MouseReportingMode::None),
-            _ => None,
-        };
-        if let Some(m) = new_mode {
-            self.mouse_reporting_rc.set(m);
+        // VTE handles paste/cursor/etc. natively from its own bytes;
+        // block_view keeps the mouse modes for the wheel reports it
+        // synthesises and for the gates that must know a program owns the
+        // mouse. Tracking and encoding are separate modes: see
+        // `MouseReporting`.
+        let mut mouse = self.mouse_reporting_rc.get();
+        if mouse.apply_decset(mode, set) {
+            self.mouse_reporting_rc.set(mouse);
+        }
+        if set && is_mouse_or_focus_reporting_mode(mode) {
+            self.live_reporting_modes_set.set(true);
         }
     }
 
@@ -7036,6 +7067,15 @@ impl ReaderCtx {
             BlockState::AltScreen => {
                 // Alt-screen bytes go to the live VTE only — they
                 // are not captured into block output (ephemeral).
+                // They are still output: a background opencode or
+                // claude fullscreen tab is working. A full-screen
+                // app repaints at frame rate, so report it at most
+                // once per interval.
+                let now = std::time::Instant::now();
+                if alt_screen_activity_due(self.alt_screen_activity_at.get(), now) {
+                    self.alt_screen_activity_at.set(Some(now));
+                    emit_activity(&self.activity_cbs);
+                }
                 true
             }
             _ => true,
@@ -7147,6 +7187,8 @@ impl ReaderCtx {
         // client, which never re-pushes, would keep sending CSI u expectations
         // into a terminal that had stopped honouring them.
         self.reset_kitty_keyboard();
+        // And for the mouse modes, under the same guards.
+        self.reset_mouse_reporting();
         // Same boundary for the CPR ledger: whatever the last program asked
         // the live VTE and never got answered no longer makes a modified F3
         // typed at this prompt look like a report.
@@ -7816,6 +7858,9 @@ impl ReaderCtx {
             };
             let leave = format!("\x1b[?{mode}l");
             self.backend.feed_live(leave.as_bytes());
+            // An app that never left its alternate screen never switched its
+            // mouse reporting off either.
+            self.reset_mouse_reporting();
             if let Some(id) = prompt_zone_to_reopen_after_alt(restored_state, pending_zone) {
                 self.backend.begin_prompt_zone(id);
             }
@@ -8070,6 +8115,29 @@ impl ReaderCtx {
             .set(self.kitty_keyboard_rc.borrow().flags());
     }
 
+    /// The program that switched mouse reporting on is gone. A mouse TUI that
+    /// dies without its own reset (claude's fullscreen UI or opencode on
+    /// SIGKILL, OOM, a dropped ssh session) used to leave this pane believing
+    /// reporting was still on: click-to-move stayed vetoed at the prompt, and
+    /// the next alt-screen program without mouse support (less, man) got
+    /// synthesised SGR wheel reports instead of VTE's alternate-scroll arrows.
+    ///
+    /// The live VTE forgets the modes when the prompt's surface reset is a
+    /// full reset. When it is not (kept scrollback, Unified), the modes are
+    /// switched off in the VTE too, or it would keep generating click, motion
+    /// and focus reports into the shell. The shell's own DECSETs after this
+    /// boundary re-enable anything it wants.
+    fn reset_mouse_reporting(&self) {
+        self.mouse_reporting_rc.set(MouseReporting::OFF);
+        if !self.live_reporting_modes_set.replace(false) {
+            return;
+        }
+        let preserve = self.config_for_cb.borrow().preserve_live_scrollback;
+        if !self.backend.live_surface_reset_at_prompt(preserve) {
+            self.backend.feed_live(MOUSE_AND_FOCUS_REPORTING_OFF);
+        }
+    }
+
     /// The shell is back, or the terminal was reset: whatever an application
     /// pushed is forgotten, so a client that exited without popping cannot
     /// leave the prompt receiving CSI u keys.
@@ -8284,6 +8352,7 @@ impl RenderBackend for BlockBackend {
             &self.active_vte,
             &self.block_scroll_rc,
             &self.pty_for_init,
+            &self.pty_winsize,
         );
     }
 
@@ -9347,6 +9416,7 @@ struct UnifiedBackend {
     /// Same PTY as the `ReaderCtx` clone: geometry sync here, replies
     /// engine-side.
     pty_for_init: Rc<OwnedPty>,
+    pty_winsize: Rc<PtyWinsize>,
     /// Shared with `TermView` so Drop can remove a still-armed settling tick.
     prompt_anchor_tick_id_rc: Rc<RefCell<Option<gtk4::TickCallbackId>>>,
     find_state_for_cb: Rc<RefCell<FindState>>,
@@ -9449,6 +9519,11 @@ impl RenderBackend for UnifiedBackend {
         self.feed_live(b"\x1b[0m");
     }
 
+    /// The one terminal is never reset between prompts.
+    fn live_surface_reset_at_prompt(&self, _preserve_scrollback: bool) -> bool {
+        false
+    }
+
     /// Same pane-focus invariant as the block backend: a background pane must
     /// not pull focus back to its live surface just because a prompt arrived.
     fn focus_live_deferred(&self) {
@@ -9469,6 +9544,7 @@ impl RenderBackend for UnifiedBackend {
             &self.vte,
             &self.block_scroll_rc,
             &self.pty_for_init,
+            &self.pty_winsize,
         );
     }
 
@@ -10041,15 +10117,80 @@ impl ReaderCtx {
 /// read — `top` queries TIOCGWINSZ before painting, less/vim do the same.
 /// Without the synchronous push the settling resize tick would catch up only
 /// after the next geometry signal, racing with the child.
+///
+/// Afterwards the settle tick is armed: the column count read here is the
+/// VTE's current one, and a change that moves the card's width (the alt-screen
+/// chrome, a density toggle) only reaches the grid at the next allocation. The
+/// tick publishes that once it lands.
 fn sync_active_to_pty(
     layout_active_surface: &Rc<dyn Fn()>,
     vte: &Terminal,
     scroll: &ScrolledWindow,
     pty: &OwnedPty,
+    winsize: &PtyWinsize,
 ) {
     layout_active_surface();
-    let (cols, rows) = pty_grid_size(vte, scroll);
-    pty.resize(cols, rows);
+    winsize.publish(pty, pty_grid_size(vte, scroll));
+    winsize.arm_settle();
+}
+
+/// The winsize this pane last told its child, shared by every publisher.
+///
+/// Two paths resize the PTY: the synchronous push at state transitions
+/// (`sync_active_to_pty`) and the settle tick that follows the pane's
+/// geometry. They used to deduplicate separately, so after a transition pushed
+/// a transient size the tick — still remembering its own older sample — would
+/// skip the correction and leave the child a size its grid did not have until
+/// the pane really moved. One record means whichever runs last against the
+/// real grid wins.
+struct PtyWinsize {
+    sent: Cell<(u16, u16)>,
+    /// Bumped only when a publish really changed the size: the PromptEnd
+    /// anchor reads any bump as "the prompt was reflowed by a resize".
+    generation: Rc<Cell<u64>>,
+    /// Arms the settle tick; installed once the tick exists.
+    arm: RefCell<Option<Rc<dyn Fn()>>>,
+}
+
+impl PtyWinsize {
+    fn new(generation: Rc<Cell<u64>>) -> Self {
+        Self {
+            sent: Cell::new((0, 0)),
+            generation,
+            arm: RefCell::new(None),
+        }
+    }
+
+    /// Tell the child `sample` unless it already has it. Returns whether the
+    /// PTY was resized.
+    fn publish(&self, pty: &OwnedPty, sample: (u16, u16)) -> bool {
+        let Some((cols, rows)) = winsize_to_publish(self.sent.get(), sample) else {
+            return false;
+        };
+        self.sent.set((cols, rows));
+        self.generation.set(self.generation.get().wrapping_add(1));
+        pty.resize(cols, rows);
+        true
+    }
+
+    fn set_settle_arm(&self, arm: Option<Rc<dyn Fn()>>) {
+        *self.arm.borrow_mut() = arm;
+    }
+
+    fn arm_settle(&self) {
+        // Clone out first: arming may install a tick callback, and nothing in
+        // it must find this slot borrowed.
+        let arm = self.arm.borrow().clone();
+        if let Some(arm) = arm {
+            arm();
+        }
+    }
+}
+
+/// What a winsize publisher sends for a grid sample: nothing for a degenerate
+/// sample or for the size the child already has, the sample otherwise.
+fn winsize_to_publish(sent: (u16, u16), sample: (u16, u16)) -> Option<(u16, u16)> {
+    (sample.0 > 0 && sample.1 > 0 && sample != sent).then_some(sample)
 }
 
 fn pty_grid_size(vte: &Terminal, scroll: &ScrolledWindow) -> (u16, u16) {
@@ -10066,26 +10207,35 @@ fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
     if page <= 1 {
         return None;
     }
-    // Normal active cards reserve margin/border/padding. Alt-screen mode removes
-    // that chrome so vim/less/htop receive every row in the pane.
     let holder = vte
         .ancestor(gtk4::Box::static_type())
         .and_then(|widget| widget.downcast::<gtk4::Box>().ok());
-    let chrome = if holder
-        .as_ref()
-        .is_some_and(|holder| holder.has_css_class("block-fullscreen"))
-    {
+    let chrome = active_card_vchrome_px(|class| {
+        holder
+            .as_ref()
+            .is_some_and(|holder| holder.has_css_class(class))
+    });
+    let usable = (page - chrome).max(cell_h);
+    Some(((usable / cell_h).max(1)) as i64)
+}
+
+/// Vertical pixels the live card's holder spends on margin, border and
+/// padding, given the classes it wears.
+///
+/// Normal and compact cards reserve their density's chrome. Unified's holder
+/// wears `block-fullscreen` for its whole life and has none. A Block-mode
+/// alternate-screen app (`block-alt-screen`) deliberately keeps the running
+/// card's chrome: the grid the app is told about must be the one the command
+/// already had, or every 1049h/l would resize the PTY — and codex answers a
+/// resize by clearing its scrollback and replaying its whole transcript.
+fn active_card_vchrome_px(has_class: impl Fn(&str) -> bool) -> i32 {
+    if has_class("block-fullscreen") {
         0
-    } else if holder
-        .as_ref()
-        .is_some_and(|holder| holder.has_css_class("block-compact"))
-    {
+    } else if has_class("block-compact") {
         css::BLOCK_ACTIVE_COMPACT_VCHROME_PX
     } else {
         css::BLOCK_ACTIVE_VCHROME_PX
-    };
-    let usable = (page - chrome).max(cell_h);
-    Some(((usable / cell_h).max(1)) as i64)
+    }
 }
 
 /// Rows the live card shows while a command is running.
@@ -10137,6 +10287,35 @@ fn live_visible_rows_for_measurement(
         live_visible_rows(next_high_water, viewport_rows),
         next_high_water,
     )
+}
+
+/// The running card while `preserve_live_scrollback` keeps the previous
+/// command's scrollback in the live grid: (visible rows, next high-water).
+///
+/// Growing the grid at CommandStart bottom-aligns the ring (libvte's
+/// `screen_set_size`), so the command's output starts in the grid's last rows
+/// while the card is a clip over its first ones. Cursor travel measured from
+/// the prompt row cannot size that card; the whole viewport can.
+fn preserved_scrollback_running_rows(viewport_rows: i64) -> (i64, i64) {
+    (viewport_rows, viewport_rows)
+}
+
+/// The running card's high-water while the grid is handed whole to an
+/// alternate-screen app or to the no-integration fallback.
+///
+/// The fallback has no command boundary to measure from, so it latches the
+/// full viewport. An alternate screen does not: xterm's 1049/1047 restores the
+/// primary screen exactly as it was on the way in, and the extent measurement
+/// does not run while the alternate screen is up, so the card the inline
+/// command had before (codex before its Ctrl+T transcript, claude classic
+/// before a Ctrl+G editor) is still the right card afterwards. Latching the
+/// viewport there pinned the card to full pane height for the rest of the
+/// command.
+fn high_water_under_full_grid(state: BlockState, previous: i64, viewport_rows: i64) -> i64 {
+    match state {
+        BlockState::AltScreen => previous,
+        _ => viewport_rows,
+    }
 }
 
 /// How many rows of the live grid this command has reached: from the row the
@@ -10920,7 +11099,9 @@ fn enter_alt_screen_chrome(
     jump_fab: &gtk4::Button,
 ) {
     let active = active.borrow();
-    active.widget().add_css_class("block-fullscreen");
+    // Decoration only: the card keeps its margins, padding and border widths,
+    // so the grid — and the winsize the app was given — does not move.
+    active.widget().add_css_class("block-alt-screen");
     // Clear both actual and desired visibility. The alternate-screen
     // override alone would restore the old pre-TUI coordinates synchronously
     // on rmcup; the organism heartbeat must remeasure the primary screen
@@ -10939,7 +11120,7 @@ fn exit_alt_screen_chrome(
     unread: u32,
 ) {
     let active = active.borrow();
-    active.widget().remove_css_class("block-fullscreen");
+    active.widget().remove_css_class("block-alt-screen");
     active.set_live_organism_alt_screen(false);
     sticky.set_visible(false);
     if user_scrolled {
@@ -12427,6 +12608,7 @@ impl TermView {
         let prompt_anchor_rows: Rc<Cell<i64>> = Rc::new(Cell::new(0));
         let prompt_anchor_resize_generation = Rc::new(Cell::new(0u64));
         let pty_resize_generation = Rc::new(Cell::new(0u64));
+        let pty_winsize = Rc::new(PtyWinsize::new(pty_resize_generation.clone()));
         let prompt_anchor_prefix = Rc::new(RefCell::new(String::new()));
         let prompt_anchor_ready = Rc::new(Cell::new(false));
         let prompt_identity_output = Rc::new(Cell::new(false));
@@ -12638,10 +12820,11 @@ impl TermView {
                 // shell drew below the input. With the previous command's
                 // scrollback deliberately kept, the prompt is at the bottom of
                 // the ring instead and the grid stays pinned to the card.
-                let prompt_at_grid_top = active_block
+                let preserve_scrollback = active_block
                     .try_borrow()
-                    .map(|live| !live.preserve_live_scrollback())
-                    .unwrap_or(false);
+                    .ok()
+                    .map(|live| live.preserve_live_scrollback());
+                let prompt_at_grid_top = preserve_scrollback == Some(false);
                 // The grid: a running command, an alternate-screen app and the
                 // no-integration fallback all get the full viewport the child
                 // was told about through `pty_grid_size`, so absolute cursor
@@ -12658,6 +12841,23 @@ impl TermView {
                 // history pans up a row at a time instead of being shoved off
                 // by a page-tall reservation the command may never fill.
                 let visible_rows = match state {
+                    // With the previous command's scrollback kept, growing the
+                    // grid to the viewport bottom-aligns the ring: the prompt,
+                    // and everything the command draws after it, sits in the
+                    // grid's LAST rows while the card clips its first ones. A
+                    // card sized by cursor travel would show the previous
+                    // command's lines and hide the new output — and an inline
+                    // TUI parked at the bottom (codex) would never appear. The
+                    // whole grid is the card instead, as the CHANGELOG promises
+                    // for this mode.
+                    BlockState::CollectingOutput | BlockState::PostCommand
+                        if preserve_scrollback == Some(true) =>
+                    {
+                        let (visible_rows, high_water) =
+                            preserved_scrollback_running_rows(viewport_rows);
+                        live_rows_high_water.set(high_water);
+                        visible_rows
+                    }
                     BlockState::CollectingOutput | BlockState::PostCommand => {
                         let output_started = !live_raw_output_for_layout.borrow().is_empty();
                         let (visible_rows, next_high_water) = live_visible_rows_for_measurement(
@@ -12694,12 +12894,14 @@ impl TermView {
                         live_rows_high_water.set(next_high_water);
                         visible_rows
                     }
-                    // Not running. The next command starts from the prompt's
-                    // height again — except on the way out of a screen
-                    // application, where the restored primary screen is already
-                    // full of content the card has to keep showing.
+                    // A screen application and the no-integration fallback
+                    // own the whole grid while they run.
                     BlockState::AltScreen | BlockState::RawFallback => {
-                        live_rows_high_water.set(viewport_rows);
+                        live_rows_high_water.set(high_water_under_full_grid(
+                            state,
+                            live_rows_high_water.get(),
+                            viewport_rows,
+                        ));
                         target_rows
                     }
                     _ => {
@@ -12876,8 +13078,8 @@ impl TermView {
             agent_execution_lost_callbacks: agent_execution_lost_callbacks.clone(),
             agent_execution_supported: agent_execution_supported.clone(),
         };
-        let mouse_reporting_mode: Rc<Cell<MouseReportingMode>> =
-            Rc::new(Cell::new(MouseReportingMode::None));
+        let mouse_reporting_mode: Rc<Cell<MouseReporting>> =
+            Rc::new(Cell::new(MouseReporting::OFF));
         // Unlike a regular VTE terminal, block mode owns the shell PTY. Keep
         // DECSET 2004 state here so clipboard pastes can be forwarded as one
         // ordered byte stream instead of relying on VTE's unrelated PTY.
@@ -13262,6 +13464,7 @@ impl TermView {
                     layout_active_surface: layout_active_surface.clone(),
                     config_for_cb: config_for_cb.clone(),
                     pty_for_init: pty_for_init.clone(),
+                    pty_winsize: pty_winsize.clone(),
                     prompt_anchor_tick_id_rc: prompt_anchor_tick_id.clone(),
                     find_state_for_cb: find_state.clone(),
                     zones: unified_records.clone(),
@@ -13303,6 +13506,7 @@ impl TermView {
                     config_for_cb: config_for_cb.clone(),
                     dynamic_colors_rc: dynamic_colors.clone(),
                     pty_for_init: pty_for_init.clone(),
+                    pty_winsize: pty_winsize.clone(),
                     ask_ai_cbs: ask_ai_callbacks.clone(),
                     fix_block_with_agent_cbs: fix_block_with_agent_callbacks.clone(),
                     current_cwd_for_menu: current_cwd.clone(),
@@ -13323,6 +13527,8 @@ impl TermView {
                 kitty_keyboard_rc: kitty_keyboard.clone(),
                 kitty_flags_rc: kitty_flags.clone(),
                 cpr_outstanding_rc: cpr_outstanding.clone(),
+                alt_screen_activity_at: Cell::new(None),
+                live_reporting_modes_set: Cell::new(false),
                 engine: RefCell::new(EngineState {
                     prev_state: BlockState::Idle,
                     osc133_depth: 0,
@@ -14040,14 +14246,18 @@ impl TermView {
             },
         );
 
-        // Wheel handling inside an alt-screen + mouse-reporting app (less / vim /
-        // htop). VTE only synthesizes mouse-wheel CSI sequences when it owns the
-        // PTY; ours is fed by our reader, so we synthesize and write the bytes
-        // ourselves. The pointer cell under the cursor is tracked via a motion
-        // controller so the column/row in the report matches what the user sees.
+        // Wheel handling inside an alt-screen + mouse-reporting app (claude's
+        // fullscreen UI, opencode, vim, htop). forge synthesises the wheel
+        // reports itself rather than letting VTE encode them: VTE 0.76 treats
+        // a surface-pixel delta (a Wayland touchpad) as that many notches,
+        // while here every delta is unit-normalised and accumulated into
+        // whole notches, in the encoding the program asked for. The pointer
+        // cell under the cursor is tracked via a motion controller so the
+        // column/row in the report matches what the user sees.
         //
-        // - alt-screen + mouse mode + scroll_reporting_enabled → encode wheel,
-        //   write to PTY, stop propagation (so block_scroll doesn't also scroll).
+        // - alt-screen + mouse mode + scroll_reporting_enabled → encode the
+        //   completed notches (at most MAX_WHEEL_REPORTS_PER_EVENT), write to
+        //   PTY, stop propagation (so block_scroll doesn't also scroll).
         // - alt-screen + mouse mode + !scroll_reporting_enabled → swallow wheel
         //   (user has opted out of mouse-driven paging).
         // - otherwise → let the event bubble to block_scroll for normal scroll.
@@ -14089,22 +14299,43 @@ impl TermView {
             let outer_for_scroll = block_scroll.downgrade();
             let debouncer_for_scroll = scroll_debouncer.clone();
             let hold_for_scroll = selection_feed_hold.clone();
+            // Whole notches owed to the application, carried across scroll
+            // events: touchpads and hi-res wheels deliver fractions of one,
+            // and one report per event scrolled claude or opencode pages at
+            // a time for a gentle swipe. Reset when the gesture ends and
+            // whenever the screen under the pointer changes meaning, so a
+            // remainder never leaks into an unrelated scroll.
+            let wheel_accumulator: Rc<Cell<WheelAccumulator>> =
+                Rc::new(Cell::new(WheelAccumulator::new()));
+            let wheel_accumulator_screen: Rc<Cell<bool>> = Rc::new(Cell::new(false));
             let scroll_ctrl = gtk4::EventControllerScroll::new(
                 gtk4::EventControllerScrollFlags::VERTICAL
                     | gtk4::EventControllerScrollFlags::HORIZONTAL,
             );
             scroll_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
-            scroll_ctrl.connect_scroll(move |_, _dx, dy| {
-                let in_mouse_app = fullscreen_for_scroll.get()
-                    && mouse_mode_for_scroll.get() != MouseReportingMode::None;
+            {
+                let wheel_accumulator = wheel_accumulator.clone();
+                scroll_ctrl.connect_scroll_end(move |_| {
+                    wheel_accumulator.set(WheelAccumulator::new());
+                });
+            }
+            scroll_ctrl.connect_scroll(move |controller, _dx, dy| {
+                let surface_unit = scroll_unit_is_surface(controller);
+                let fullscreen = fullscreen_for_scroll.get();
+                if wheel_accumulator_screen.replace(fullscreen) != fullscreen {
+                    wheel_accumulator.set(WheelAccumulator::new());
+                }
+                let mouse = mouse_mode_for_scroll.get();
+                let in_mouse_app = fullscreen && mouse.is_reporting();
                 if in_mouse_app {
                     if !scroll_enabled {
                         return glib::Propagation::Stop;
                     }
                     let (col, row) = pointer_for_scroll.get();
-                    if let Some(bytes) =
-                        encode_mouse_wheel(mouse_mode_for_scroll.get(), dy, col, row)
-                    {
+                    let mut accumulator = wheel_accumulator.get();
+                    let notches = accumulator.push(dy, surface_unit);
+                    wheel_accumulator.set(accumulator);
+                    if let Some(bytes) = encode_mouse_wheel_notches(mouse, notches, col, row) {
                         // The wheel is the user acting on the program, as a
                         // key is: release a selection hold first, or the
                         // program's scrolled repaint stays parked and the
@@ -14136,6 +14367,7 @@ impl TermView {
                 // While a command streams, its scrollback is a first-class
                 // reading surface: the wheel scrolls the live VTE itself and
                 // hands off to the outer history only at the buffer's edge.
+                let steps = wheel_steps(dy, surface_unit);
                 if matches!(
                     bstate_for_scroll.get(),
                     BlockState::CollectingOutput
@@ -14143,7 +14375,7 @@ impl TermView {
                         | BlockState::RawFallback
                 ) {
                     if let Some(adj) = vte_for_scroll.upgrade().and_then(|vte| vte.vadjustment()) {
-                        if scroll_adjustment_by_wheel(&adj, dy) {
+                        if scroll_adjustment_by_wheel(&adj, steps) {
                             return glib::Propagation::Stop;
                         }
                     }
@@ -14155,7 +14387,7 @@ impl TermView {
                 let Some(outer) = outer_for_scroll.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                forward_outer_scroll(&outer, dy);
+                forward_outer_scroll(&outer, steps);
                 debouncer_for_scroll.record_wheel_intent(&outer);
                 glib::Propagation::Stop
             });
@@ -14172,19 +14404,20 @@ impl TermView {
             let vte_for_scrollbar = active_vte.downgrade();
             let outer_for_scrollbar = block_scroll.downgrade();
             let debouncer_for_scrollbar = scroll_debouncer.clone();
-            scrollbar_scroll.connect_scroll(move |_, _dx, dy| {
+            scrollbar_scroll.connect_scroll(move |controller, _dx, dy| {
+                let steps = wheel_steps(dy, scroll_unit_is_surface(controller));
                 if let Some(adj) = vte_for_scrollbar
                     .upgrade()
                     .and_then(|vte| vte.vadjustment())
                 {
-                    if scroll_adjustment_by_wheel(&adj, dy) {
+                    if scroll_adjustment_by_wheel(&adj, steps) {
                         return glib::Propagation::Stop;
                     }
                 }
                 let Some(outer) = outer_for_scrollbar.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                forward_outer_scroll(&outer, dy);
+                forward_outer_scroll(&outer, steps);
                 debouncer_for_scrollbar.record_wheel_intent(&outer);
                 glib::Propagation::Stop
             });
@@ -14220,6 +14453,7 @@ impl TermView {
             prompt_anchor_rows,
             prompt_anchor_resize_generation,
             pty_resize_generation,
+            pty_winsize,
             prompt_anchor_prefix,
             prompt_anchor_ready,
             prompt_identity_output,
@@ -14433,12 +14667,11 @@ impl TermView {
     /// next armed poll — nothing accumulates.
     fn install_resize_tick(&self) {
         let pty_for_resize = self.pty.clone();
-        let resize_generation = self.pty_resize_generation.clone();
+        let winsize_for_resize = Rc::downgrade(&self.pty_winsize);
         let scroll_for_resize = self.block_scroll.downgrade();
         let backend_for_resize = Rc::downgrade(&self.render_backend);
         let clip_for_resize = self.active.borrow().live_clip().downgrade();
         let vte_for_resize = self.active_vte.downgrade();
-        let last: Rc<Cell<(u16, u16)>> = Rc::new(Cell::new((0, 0)));
         let last_pane: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((0, 0)));
         let tick_slot = self.resize_tick_id.clone();
         let arm: Rc<dyn Fn()> = Rc::new(move || {
@@ -14453,11 +14686,10 @@ impl TermView {
             let tick_slot_for_tick = tick_slot.clone();
             // Shadow the armer's captures so the poll body stays verbatim.
             let pty_for_resize = pty_for_resize.clone();
-            let resize_generation = resize_generation.clone();
+            let winsize_for_tick = winsize_for_resize.clone();
             let scroll_for_resize = scroll_for_resize.clone();
             let backend_for_resize = backend_for_resize.clone();
             let clip_for_resize = clip_for_resize.clone();
-            let last = last.clone();
             let last_pane = last_pane.clone();
             let tick_id = vte_for_tick.add_tick_callback(move |vte, _clock| {
                 let Some(scroll_for_resize) = scroll_for_resize.upgrade() else {
@@ -14484,12 +14716,10 @@ impl TermView {
                         }
                     }
                 }
-                let (cols, rows) = pty_grid_size(vte, &scroll_for_resize);
-                if cols > 0 && rows > 0 && (cols, rows) != last.get() {
-                    last.set((cols, rows));
-                    settling = true;
-                    resize_generation.set(resize_generation.get().wrapping_add(1));
-                    pty_for_resize.resize(cols, rows);
+                if let Some(winsize) = winsize_for_tick.upgrade() {
+                    if winsize.publish(&pty_for_resize, pty_grid_size(vte, &scroll_for_resize)) {
+                        settling = true;
+                    }
                 }
                 if !settling {
                     // A full frame with no pane- or grid-level movement: the
@@ -14531,6 +14761,12 @@ impl TermView {
             let arm = arm.clone();
             self.block_scroll.connect_map(move |_| arm());
         }
+        // And from every synchronous publish (`sync_active_to_pty`): the grid
+        // it read may still be waiting for an allocation — the alt-screen
+        // chrome and a density toggle change the card's width, which moves
+        // none of the signals above — so the tick follows it to the size the
+        // grid actually settles at.
+        self.pty_winsize.set_settle_arm(Some(arm.clone()));
         // The permanent tick this replaces started polling at install time;
         // the first armed poll likewise waits for the first mapped frame and
         // applies the initial geometry before standing down.
@@ -15198,9 +15434,10 @@ impl TermView {
         }
     }
 
-    /// Resize the PTY.
+    /// Resize the PTY, through the same record the pane's own publishers
+    /// deduplicate against.
     pub fn resize(&self, cols: u16, rows: u16) {
-        self.pty.resize(cols, rows);
+        self.pty_winsize.publish(&self.pty, (cols, rows));
     }
 
     /// Kill the child process.
@@ -16708,7 +16945,7 @@ mod tests {
         AgentExecutionLostCallbacks, AnchorSettleArgs, BackendRecords, BackendSearchBatch,
         BlockFinishedCallback, BlockFinishedCallbacks, BlockRenderPayloadAccessor,
         CommandFinishedCallbacks, CommandStartedCallbacks, CompletedCommandRecord, DockMount,
-        EngineState, MouseReportingMode, ReaderCtx, RecordSearchTarget, RenderBackend,
+        EngineState, MouseReporting, ReaderCtx, RecordSearchTarget, RenderBackend,
         SelectionFeedHold, SubmissionSurface, UnifiedZoneStore, VerifiedSubmissionCtx,
         ZoneMarkerInjector, ZoneOutputSnapshot, MAX_TOTAL_SNAPSHOT_BYTES, MAX_ZONE_SNAPSHOT_BYTES,
     };
@@ -16777,6 +17014,114 @@ mod tests {
             super::live_visible_rows_for_measurement(Some(3), true, false, high_water, 40),
             (40, 40)
         );
+    }
+
+    /// An alternate-screen round trip inside a running inline command keeps
+    /// the card the command had: 1049/1047 restore the primary screen as it
+    /// was, so codex after its Ctrl+T transcript is still a ten-row card, not
+    /// a pane-tall one for the rest of the session. The no-integration
+    /// fallback still latches the whole viewport.
+    #[test]
+    fn an_alt_screen_round_trip_keeps_the_running_card_height() {
+        use super::{high_water_under_full_grid, live_visible_rows_for_measurement};
+        // CollectingOutput with six rows drawn so far.
+        let (visible, high_water) = live_visible_rows_for_measurement(Some(6), true, false, 3, 40);
+        assert_eq!((visible, high_water), (6, 6));
+        // Layouts while the alternate screen is up.
+        let mut during_alt = high_water;
+        for _ in 0..3 {
+            during_alt = high_water_under_full_grid(BlockState::AltScreen, during_alt, 40);
+        }
+        assert_eq!(during_alt, 6);
+        // Back on the primary screen the cursor is where it was.
+        assert_eq!(
+            live_visible_rows_for_measurement(Some(6), true, false, during_alt, 40),
+            (6, 6)
+        );
+        assert_eq!(
+            high_water_under_full_grid(BlockState::RawFallback, 6, 40),
+            40
+        );
+    }
+
+    /// With the previous command's scrollback kept, the running card is the
+    /// whole grid: the command's output lands in the grid's bottom rows.
+    #[test]
+    fn kept_scrollback_runs_a_full_page_card() {
+        assert_eq!(super::preserved_scrollback_running_rows(40), (40, 40));
+        assert_eq!(super::preserved_scrollback_running_rows(1), (1, 1));
+    }
+
+    /// The alternate-screen class keeps the running card's chrome in both
+    /// densities, so 1049h/l computes the same rows — and publishes the same
+    /// winsize — as the command already had. Unified's permanent
+    /// `block-fullscreen` holder keeps its zero chrome.
+    #[test]
+    fn alt_screen_chrome_equals_running_chrome_in_both_densities() {
+        use super::active_card_vchrome_px;
+        let chrome = |classes: &[&str]| active_card_vchrome_px(|class| classes.contains(&class));
+        let running = chrome(&["block-active"]);
+        let alt = chrome(&["block-active", "block-alt-screen"]);
+        assert_eq!(running, super::css::BLOCK_ACTIVE_VCHROME_PX);
+        assert_eq!(alt, running);
+        let compact = chrome(&["block-active", "block-compact"]);
+        let compact_alt = chrome(&["block-active", "block-compact", "block-alt-screen"]);
+        assert_eq!(compact, super::css::BLOCK_ACTIVE_COMPACT_VCHROME_PX);
+        assert_eq!(compact_alt, compact);
+        assert_eq!(chrome(&["block-active", "block-fullscreen"]), 0);
+        // Rows follow from chrome alone, so they match at every pane height.
+        for cell_h in [15, 17, 19] {
+            for page in 100..=2000 {
+                for (a, b) in [(running, alt), (compact, compact_alt)] {
+                    assert_eq!(
+                        (page - a).max(cell_h) / cell_h,
+                        (page - b).max(cell_h) / cell_h
+                    );
+                }
+            }
+        }
+    }
+
+    /// One record decides what the child is told, whichever path publishes:
+    /// a transient size pushed by a transition is corrected by the next
+    /// settle sample exactly once, and repeats send nothing.
+    #[test]
+    fn winsize_publisher_sends_each_real_change_once() {
+        use super::winsize_to_publish;
+        let mut sent = (0, 0);
+        let mut published = Vec::new();
+        let mut run = |sample: (u16, u16)| {
+            if let Some(size) = winsize_to_publish(sent, sample) {
+                sent = size;
+                published.push(size);
+            }
+        };
+        // Synchronous push at a transition reads a grid that is two columns
+        // wide of where it settles; the tick then samples the real grid twice.
+        run((122, 40));
+        run((120, 40));
+        run((120, 40));
+        // A later sample equal to what is already published sends nothing.
+        run((120, 40));
+        // Degenerate samples (an unallocated pane) never reach the child.
+        run((0, 40));
+        run((120, 0));
+        assert_eq!(published, vec![(122, 40), (120, 40)]);
+    }
+
+    #[test]
+    fn alt_screen_activity_is_coalesced() {
+        use super::{alt_screen_activity_due, ALT_SCREEN_ACTIVITY_INTERVAL};
+        let t0 = std::time::Instant::now();
+        assert!(alt_screen_activity_due(None, t0));
+        assert!(!alt_screen_activity_due(
+            Some(t0),
+            t0 + std::time::Duration::from_millis(16)
+        ));
+        assert!(alt_screen_activity_due(
+            Some(t0),
+            t0 + ALT_SCREEN_ACTIVITY_INTERVAL
+        ));
     }
 
     #[test]
@@ -18114,6 +18459,40 @@ mod tests {
         for card in finished.borrow().iter() {
             assert!(!card.widget().has_css_class("block-selected"));
             assert!(!card.widget().has_css_class("block-selection-active"));
+        }
+    }
+
+    /// The real alt-screen chrome swaps only the decoration class on the live
+    /// holder: the chrome the grid is computed from is the running card's in
+    /// both densities, and Unified's `block-fullscreen` is never touched.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn alt_screen_chrome_keeps_the_running_cards_geometry() {
+        use gtk4::prelude::WidgetExt as _;
+
+        gtk4::init().expect("gtk init");
+        let config = crate::config::Config::safe_defaults();
+        let raw_output = Rc::new(RefCell::new(super::BoundedByteRing::new(1024)));
+        let active = Rc::new(RefCell::new(super::ActiveBlock::new(&config, raw_output)));
+        let sticky = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        let jump_fab = gtk4::Button::new();
+        let chrome = |active: &Rc<RefCell<super::ActiveBlock>>| {
+            let active = active.borrow();
+            super::active_card_vchrome_px(|class| active.widget().has_css_class(class))
+        };
+        for compact in [false, true] {
+            active.borrow().set_compact(compact);
+            let running = chrome(&active);
+            super::enter_alt_screen_chrome(&active, &sticky, &jump_fab);
+            {
+                let holder = active.borrow();
+                assert!(holder.widget().has_css_class("block-alt-screen"));
+                assert!(!holder.widget().has_css_class("block-fullscreen"));
+            }
+            assert_eq!(chrome(&active), running, "compact={compact}");
+            super::exit_alt_screen_chrome(&active, &sticky, &jump_fab, false, 0);
+            assert!(!active.borrow().widget().has_css_class("block-alt-screen"));
+            assert_eq!(chrome(&active), running, "compact={compact}");
         }
     }
 
@@ -23717,11 +24096,13 @@ mod tests {
                 exited_cbs: Rc::new(RefCell::new(Vec::new())),
                 activity_cbs: Rc::new(RefCell::new(Vec::new())),
                 alt_screen_cbs,
-                mouse_reporting_rc: Rc::new(Cell::new(MouseReportingMode::None)),
+                mouse_reporting_rc: Rc::new(Cell::new(MouseReporting::OFF)),
                 bracketed_paste_rc: Rc::new(Cell::new(false)),
                 kitty_keyboard_rc: Rc::new(RefCell::new(super::KittyKeyboardStacks::new())),
                 kitty_flags_rc: Rc::new(Cell::new(0)),
                 cpr_outstanding_rc: Rc::new(Cell::new(0)),
+                alt_screen_activity_at: Cell::new(None),
+                live_reporting_modes_set: Cell::new(false),
                 config_for_cb: config.clone(),
                 dynamic_colors_rc: Rc::new(Cell::new(DynamicColors::default())),
                 parser: Rc::new(RefCell::new(Parser::new())),
@@ -24199,6 +24580,85 @@ mod tests {
                 &[AltScreenTransition::Entered, AltScreenTransition::Left]
             );
         }
+    }
+
+    /// A mouse TUI that dies inside its alternate screen (SIGKILL, OOM, a
+    /// dropped ssh session) never switches reporting off. The accepted D and
+    /// the next prompt do it for it, and a live VTE that is not reset at the
+    /// prompt (kept scrollback) is told to stop reporting too.
+    #[test]
+    fn mouse_reporting_is_forgotten_when_its_program_is_gone() {
+        for preserve in [false, true] {
+            let harness = ReaderHarness::new();
+            harness.config.borrow_mut().preserve_live_scrollback = preserve;
+            let enable_mouse = [
+                ParserEvent::DecsetMode {
+                    mode: 1006,
+                    set: true,
+                },
+                ParserEvent::DecsetMode {
+                    mode: 1003,
+                    set: true,
+                },
+            ];
+            harness.feed_all([
+                ParserEvent::PromptStart,
+                bytes("$ "),
+                ParserEvent::PromptEnd,
+                command_start(Some("claude")),
+                ParserEvent::AltScreenEnter(1049),
+            ]);
+            harness.feed_all(enable_mouse.clone());
+            assert!(harness.ctx.mouse_reporting_rc.get().is_reporting());
+            harness.backend.live_feed.borrow_mut().clear();
+            harness.feed(command_end(Some(137)));
+            assert_eq!(harness.ctx.mouse_reporting_rc.get(), MouseReporting::OFF);
+            let fed = String::from_utf8_lossy(&harness.backend.live_feed.borrow()).into_owned();
+            assert_eq!(
+                fed.contains("\x1b[?1003l"),
+                preserve,
+                "preserve={preserve}: {fed:?}"
+            );
+
+            // Something re-enables it before the prompt (a late byte, or a
+            // program racing the shell); the accepted A clears it again.
+            harness.feed_all(enable_mouse);
+            harness.backend.live_feed.borrow_mut().clear();
+            harness.feed(ParserEvent::PromptStart);
+            assert_eq!(harness.ctx.mouse_reporting_rc.get(), MouseReporting::OFF);
+            let fed = String::from_utf8_lossy(&harness.backend.live_feed.borrow()).into_owned();
+            assert_eq!(
+                fed.contains("\x1b[?1006l"),
+                preserve,
+                "preserve={preserve}: {fed:?}"
+            );
+        }
+    }
+
+    /// Alternate-screen output is output: a background opencode or claude
+    /// fullscreen tab reports activity, coalesced across frame-rate repaints.
+    #[test]
+    fn alt_screen_output_reports_coalesced_activity() {
+        let harness = ReaderHarness::new();
+        let count = Rc::new(Cell::new(0usize));
+        {
+            let count = count.clone();
+            harness
+                .ctx
+                .activity_cbs
+                .borrow_mut()
+                .push(Box::new(move || count.set(count.get() + 1)));
+        }
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("$ "),
+            ParserEvent::PromptEnd,
+            command_start(Some("opencode")),
+            ParserEvent::AltScreenEnter(1049),
+        ]);
+        let before = count.get();
+        harness.feed_all([bytes("frame 1"), bytes("frame 2"), bytes("frame 3")]);
+        assert_eq!(count.get() - before, 1);
     }
 
     #[test]

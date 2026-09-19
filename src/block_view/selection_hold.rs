@@ -18,7 +18,7 @@ use std::rc::Rc;
 use jterm_core::terminal_report::classify_terminal_report;
 use vte4::TerminalExt;
 
-use super::{BlockState, MouseReportingMode};
+use super::{BlockState, MouseReporting};
 
 /// Replay sink for parked bytes, installed by the PTY reader.
 type FlushFn = Box<dyn Fn(Vec<u8>)>;
@@ -39,7 +39,7 @@ const MAX_PARKED_BYTES: usize = 2 * 1024 * 1024;
 /// forcing a local selection over a mouse-reporting app.
 pub(crate) fn feed_hold_eligible(
     state: BlockState,
-    mouse: MouseReportingMode,
+    mouse: MouseReporting,
     shift_held: bool,
 ) -> bool {
     let streaming = matches!(
@@ -49,7 +49,7 @@ pub(crate) fn feed_hold_eligible(
             | BlockState::AltScreen
             | BlockState::RawFallback
     );
-    streaming && (mouse == MouseReportingMode::None || shift_held)
+    streaming && (!mouse.is_reporting() || shift_held)
 }
 
 /// Whether a live-VTE `commit` counts as the user acting on the program, which
@@ -226,7 +226,14 @@ mod tests {
     use std::rc::Rc;
 
     use super::{commit_releases_hold, feed_hold_eligible, SelectionFeedHold, MAX_PARKED_BYTES};
-    use crate::block_view::{BlockState, MouseReportingMode};
+    use crate::block_view::{BlockState, MouseReporting};
+
+    fn sgr_any_event() -> MouseReporting {
+        let mut mouse = MouseReporting::OFF;
+        mouse.apply_decset(1003, true);
+        mouse.apply_decset(1006, true);
+        mouse
+    }
 
     type FlushLog = Rc<RefCell<Vec<Vec<u8>>>>;
 
@@ -242,46 +249,42 @@ mod tests {
     fn eligibility_requires_streaming_state_without_mouse_reporting() {
         assert!(feed_hold_eligible(
             BlockState::CollectingOutput,
-            MouseReportingMode::None,
+            MouseReporting::OFF,
             false
         ));
         assert!(feed_hold_eligible(
             BlockState::AltScreen,
-            MouseReportingMode::None,
+            MouseReporting::OFF,
             false
         ));
         assert!(feed_hold_eligible(
             BlockState::RawFallback,
-            MouseReportingMode::None,
+            MouseReporting::OFF,
             false
         ));
         assert!(!feed_hold_eligible(
             BlockState::Idle,
-            MouseReportingMode::None,
+            MouseReporting::OFF,
             false
         ));
         assert!(!feed_hold_eligible(
             BlockState::AwaitingCommand,
-            MouseReportingMode::None,
+            MouseReporting::OFF,
             false
         ));
         assert!(!feed_hold_eligible(
             BlockState::CollectingOutput,
-            MouseReportingMode::Sgr,
+            sgr_any_event(),
             false
         ));
         // Shift forces VTE's local selection over a mouse-reporting app; the
         // hold must protect that selection too.
         assert!(feed_hold_eligible(
             BlockState::CollectingOutput,
-            MouseReportingMode::Sgr,
+            sgr_any_event(),
             true
         ));
-        assert!(!feed_hold_eligible(
-            BlockState::Idle,
-            MouseReportingMode::Sgr,
-            true
-        ));
+        assert!(!feed_hold_eligible(BlockState::Idle, sgr_any_event(), true));
     }
 
     #[test]

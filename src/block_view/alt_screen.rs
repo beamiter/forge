@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::terminal::apply_terminal_theme;
 use gtk4::glib;
 use gtk4::prelude::*;
+use jterm_core::parser::{MouseEncoding, MouseMode};
 use vte4::TerminalExt;
 use vte4::{CursorBlinkMode, CursorShape, Format, Terminal};
 
@@ -63,59 +64,186 @@ pub(crate) fn finished_vte_height_px(rows: i64, cell_height: i32) -> i32 {
         .saturating_add(FINISHED_VTE_HEIGHT_SLACK_PX.min(cell - 1))
 }
 
-// ─── Mouse Reporting Mode ─────────────────────────────────────────────────────
+// ─── Mouse Reporting ──────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub(crate) enum MouseReportingMode {
-    /// No mouse reporting (CSI ?1000l, etc.)
-    #[default]
-    None,
-    /// Basic click reporting (CSI ?1000h)
-    Click,
-    /// Button press/release/drag (CSI ?1002h)
-    Button,
-    /// All mouse motion (CSI ?1003h)
-    Motion,
-    /// SGR-style reporting (CSI ?1006h) - modern format
-    Sgr,
+/// Tracking modes, as bits, in libvte's priority order (highest last).
+const MOUSE_TRACK_X10: u8 = 1 << 0; // ?9
+const MOUSE_TRACK_NORMAL: u8 = 1 << 1; // ?1000
+const MOUSE_TRACK_BUTTON: u8 = 1 << 2; // ?1002
+const MOUSE_TRACK_ANY: u8 = 1 << 3; // ?1003
+/// Encodings, as bits.
+const MOUSE_ENC_UTF8: u8 = 1 << 0; // ?1005
+const MOUSE_ENC_SGR: u8 = 1 << 1; // ?1006
+const MOUSE_ENC_URXVT: u8 = 1 << 2; // ?1015
+
+/// DECSET sequence that switches every mouse tracking mode, encoding and focus
+/// report off: what a live VTE that is NOT reset at a prompt boundary is fed
+/// there, so it stops generating reports for a program that is gone.
+pub(crate) const MOUSE_AND_FOCUS_REPORTING_OFF: &[u8] =
+    b"\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l";
+
+/// Whether DEC private `mode` is one [`MOUSE_AND_FOCUS_REPORTING_OFF`]
+/// switches off.
+pub(crate) fn is_mouse_or_focus_reporting_mode(mode: u32) -> bool {
+    matches!(mode, 9 | 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1015)
 }
 
-/// Encode a wheel-scroll event as a mouse-reporting byte sequence appropriate
-/// for `mode`. Returns `None` if the mode has no wheel reporting (e.g. `None`,
-/// or a mode where wheel deltas don't translate).
+/// The mouse reporting the running program asked for: WHICH events it wants
+/// (tracking: `?9`, `?1000`, `?1002`, `?1003`) and HOW they are written
+/// (encoding: `?1005`, `?1006`, `?1015`), kept apart.
 ///
-/// `delta_y` follows the GTK convention (negative = up, positive = down).
+/// They are independent terminal modes, and treating them as one
+/// last-write-wins value got the common orders wrong: htop and ncurses send
+/// `?1006;1000h`, vim `?1006;1000h` then `?1002h`, so the tracking mode arrived
+/// last and the SGR encoding they asked for was forgotten — they got legacy
+/// `ESC [ M` wheel bytes, which ncurses (kmous=`\E[<`) reads as keys. A lone
+/// `?1006h`, conversely, is only an encoding and turns no reporting on.
+///
+/// Every mode is its own bit, like libvte's private-mode set, so this mirrors
+/// the state the live VTE encodes its own click/motion reports from: the
+/// highest enabled tracking mode wins, and switching one off leaves the others.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) struct MouseReporting {
+    tracking: u8,
+    encoding: u8,
+}
+
+impl MouseReporting {
+    /// No tracking mode and the default encoding.
+    pub(crate) const OFF: Self = Self {
+        tracking: 0,
+        encoding: 0,
+    };
+
+    /// Apply one DEC private mode. Returns false for a mode that is not a
+    /// mouse tracking mode or encoding.
+    pub(crate) fn apply_decset(&mut self, mode: u32, set: bool) -> bool {
+        let (field, bit) = match mode {
+            9 => (&mut self.tracking, MOUSE_TRACK_X10),
+            1000 => (&mut self.tracking, MOUSE_TRACK_NORMAL),
+            1002 => (&mut self.tracking, MOUSE_TRACK_BUTTON),
+            1003 => (&mut self.tracking, MOUSE_TRACK_ANY),
+            1005 => (&mut self.encoding, MOUSE_ENC_UTF8),
+            1006 => (&mut self.encoding, MOUSE_ENC_SGR),
+            1015 => (&mut self.encoding, MOUSE_ENC_URXVT),
+            _ => return false,
+        };
+        if set {
+            *field |= bit;
+        } else {
+            *field &= !bit;
+        }
+        true
+    }
+
+    /// Whether the program receives mouse events at all.
+    pub(crate) fn is_reporting(self) -> bool {
+        self.tracking != 0
+    }
+
+    /// The effective tracking mode: the highest one enabled.
+    pub(crate) fn tracking(self) -> MouseMode {
+        if self.tracking & MOUSE_TRACK_ANY != 0 {
+            MouseMode::AnyEvent
+        } else if self.tracking & MOUSE_TRACK_BUTTON != 0 {
+            MouseMode::ButtonEvent
+        } else if self.tracking & MOUSE_TRACK_NORMAL != 0 {
+            MouseMode::Normal
+        } else if self.tracking & MOUSE_TRACK_X10 != 0 {
+            MouseMode::X10
+        } else {
+            MouseMode::None
+        }
+    }
+
+    /// The effective wire encoding. SGR wins over urxvt over UTF-8, as in
+    /// libvte and xterm.
+    pub(crate) fn encoding(self) -> MouseEncoding {
+        if self.encoding & MOUSE_ENC_SGR != 0 {
+            MouseEncoding::Sgr
+        } else if self.encoding & MOUSE_ENC_URXVT != 0 {
+            MouseEncoding::Urxvt
+        } else if self.encoding & MOUSE_ENC_UTF8 != 0 {
+            MouseEncoding::Utf8
+        } else {
+            MouseEncoding::Default
+        }
+    }
+}
+
+/// Most wheel reports one scroll event may send. A single event can carry a
+/// large delta (a fast flick in surface pixels, a driver's coalesced burst);
+/// the application should scroll far, not receive a few hundred reports in
+/// one write.
+pub(crate) const MAX_WHEEL_REPORTS_PER_EVENT: u32 = 10;
+
+/// Encode `notches` whole wheel notches as mouse reports for `reporting`, in
+/// one buffer. Negative notches scroll up (towards history), positive down,
+/// as in GTK. Returns `None` when there is nothing to send: no notch, or no
+/// tracking mode on.
+///
 /// `col` / `row` are 1-based cell coordinates under the pointer; if you don't
 /// have them, pass 1/1 — pagers (less/vim) look at the button code, not the
 /// coordinate.
 ///
-/// VTE 4 normally encodes wheel events itself, but only when it owns the PTY;
-/// forge's live VTE is fed by our own reader so we synthesize the bytes here.
+/// The count is clamped to [`MAX_WHEEL_REPORTS_PER_EVENT`].
+pub(crate) fn encode_mouse_wheel_notches(
+    reporting: MouseReporting,
+    notches: i32,
+    col: i64,
+    row: i64,
+) -> Option<Vec<u8>> {
+    if notches == 0 {
+        return None;
+    }
+    let one = encode_mouse_wheel(reporting, f64::from(notches.signum()), col, row)?;
+    let count = notches.unsigned_abs().min(MAX_WHEEL_REPORTS_PER_EVENT) as usize;
+    Some(one.repeat(count))
+}
+
+/// Encode a wheel-scroll event as a mouse-reporting byte sequence appropriate
+/// for `reporting`. Returns `None` if no tracking mode is on or the delta is 0.
+///
+/// `delta_y` follows the GTK convention (negative = up, positive = down); only
+/// its sign matters — [`encode_mouse_wheel_notches`] is the entry point that
+/// counts notches.
+///
+/// libvte encodes wheel events itself only through its own input path; forge
+/// synthesises them so the count follows the unit-normalised accumulator
+/// (VTE 0.76 treats a surface-pixel delta as that many notches).
 pub(crate) fn encode_mouse_wheel(
-    mode: MouseReportingMode,
+    reporting: MouseReporting,
     delta_y: f64,
     col: i64,
     row: i64,
 ) -> Option<Vec<u8>> {
-    if delta_y == 0.0 {
+    if delta_y == 0.0 || !delta_y.is_finite() || !reporting.is_reporting() {
         return None;
     }
     // Buttons per xterm: 64 = wheel up, 65 = wheel down.
     let button: u32 = if delta_y < 0.0 { 64 } else { 65 };
-    let c = col.max(1);
-    let r = row.max(1);
-    match mode {
-        MouseReportingMode::None => None,
-        MouseReportingMode::Sgr => Some(format!("\x1b[<{};{};{}M", button, c, r).into_bytes()),
-        // X10-style modes encode each field as `value + 32` in a single byte.
-        // Wheel reporting requires at least Button-event tracking (1002), but
-        // xterm's de-facto behavior also forwards wheel under plain Click
-        // (1000), so we emit for any non-None, non-SGR mode.
-        MouseReportingMode::Click | MouseReportingMode::Button | MouseReportingMode::Motion => {
-            // Clamp to the legacy 223-column limit (255 - 32).
+    let c = col.clamp(1, u32::MAX as i64 - 32) as u32;
+    let r = row.clamp(1, u32::MAX as i64 - 32) as u32;
+    match reporting.encoding() {
+        MouseEncoding::Sgr => Some(format!("\x1b[<{button};{c};{r}M").into_bytes()),
+        MouseEncoding::Urxvt => Some(format!("\x1b[{};{c};{r}M", button + 32).into_bytes()),
+        MouseEncoding::Utf8 => {
+            // Each field is `value + 32` as a UTF-8 character; xterm caps the
+            // coordinates at 2015 (2047 - 32).
+            let mut out = b"\x1b[M".to_vec();
+            for value in [button + 32, c.min(2015) + 32, r.min(2015) + 32] {
+                let ch = char::from_u32(value).unwrap_or(' ');
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+            Some(out)
+        }
+        MouseEncoding::Default => {
+            // X10-style fields are single bytes `value + 32`; clamp to the
+            // legacy 223-column limit (255 - 32).
             let cb = (button + 32).min(255) as u8;
-            let cc = (c as u32 + 32).min(255) as u8;
-            let cr = (r as u32 + 32).min(255) as u8;
+            let cc = (c + 32).min(255) as u8;
+            let cr = (r + 32).min(255) as u8;
             Some(vec![0x1b, b'[', b'M', cb, cc, cr])
         }
     }
@@ -589,35 +717,171 @@ mod tests {
         );
     }
 
+    fn reporting(modes: &[u32]) -> MouseReporting {
+        let mut state = MouseReporting::OFF;
+        for &mode in modes {
+            assert!(state.apply_decset(mode, true));
+        }
+        state
+    }
+
     #[test]
     fn sgr_wheel_up_encodes_button_64() {
         // delta_y < 0 → wheel up → button 64 (xterm convention).
-        let seq = encode_mouse_wheel(MouseReportingMode::Sgr, -1.0, 10, 5).unwrap();
+        let seq = encode_mouse_wheel(reporting(&[1000, 1006]), -1.0, 10, 5).unwrap();
         assert_eq!(seq, b"\x1b[<64;10;5M");
     }
 
     #[test]
     fn sgr_wheel_down_encodes_button_65() {
-        let seq = encode_mouse_wheel(MouseReportingMode::Sgr, 1.0, 1, 1).unwrap();
+        let seq = encode_mouse_wheel(reporting(&[1003, 1006]), 1.0, 1, 1).unwrap();
         assert_eq!(seq, b"\x1b[<65;1;1M");
     }
 
     #[test]
     fn x10_wheel_up_uses_value_plus_32() {
-        // Legacy mode: each field encoded as byte = value + 32.
-        let seq = encode_mouse_wheel(MouseReportingMode::Button, -1.0, 1, 1).unwrap();
+        // Legacy encoding: each field encoded as byte = value + 32.
+        let seq = encode_mouse_wheel(reporting(&[1002]), -1.0, 1, 1).unwrap();
         assert_eq!(seq, vec![0x1b, b'[', b'M', 64 + 32, 1 + 32, 1 + 32]);
     }
 
     #[test]
+    fn urxvt_and_utf8_encodings_are_honoured() {
+        let seq = encode_mouse_wheel(reporting(&[1000, 1015]), 1.0, 3, 4).unwrap();
+        assert_eq!(seq, b"\x1b[97;3;4M");
+        let seq = encode_mouse_wheel(reporting(&[1000, 1005]), -1.0, 300, 2).unwrap();
+        let mut expected = b"\x1b[M".to_vec();
+        for ch in [
+            char::from(96u8),
+            char::from_u32(332).unwrap(),
+            char::from(34u8),
+        ] {
+            let mut buf = [0u8; 4];
+            expected.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+        assert_eq!(seq, expected);
+    }
+
+    #[test]
     fn none_mode_returns_no_bytes() {
-        assert!(encode_mouse_wheel(MouseReportingMode::None, -1.0, 1, 1).is_none());
+        assert!(encode_mouse_wheel(MouseReporting::OFF, -1.0, 1, 1).is_none());
+        // An encoding alone is not reporting.
+        assert!(encode_mouse_wheel(reporting(&[1006]), -1.0, 1, 1).is_none());
     }
 
     #[test]
     fn zero_delta_returns_no_bytes() {
         // Spurious 0 delta from GTK shouldn't paginate the app.
-        assert!(encode_mouse_wheel(MouseReportingMode::Sgr, 0.0, 1, 1).is_none());
+        assert!(encode_mouse_wheel(reporting(&[1000, 1006]), 0.0, 1, 1).is_none());
+        assert!(encode_mouse_wheel_notches(reporting(&[1000, 1006]), 0, 1, 1).is_none());
+    }
+
+    #[test]
+    fn tracking_and_encoding_are_independent_modes() {
+        // htop / ncurses: `CSI ?1006;1000h` — the tracking mode arrives after
+        // the encoding and must not erase it.
+        let htop = reporting(&[1006, 1000]);
+        assert_eq!(htop.tracking(), MouseMode::Normal);
+        assert_eq!(htop.encoding(), MouseEncoding::Sgr);
+        assert_eq!(
+            encode_mouse_wheel(htop, 1.0, 2, 3).unwrap(),
+            b"\x1b[<65;2;3M".to_vec()
+        );
+
+        // vim 9: `?1006;1000h` then `?1002h`; turning 1002 back off leaves
+        // 1000, as in libvte's per-mode bits.
+        let mut vim = reporting(&[1006, 1000, 1002]);
+        assert_eq!(vim.tracking(), MouseMode::ButtonEvent);
+        assert_eq!(vim.encoding(), MouseEncoding::Sgr);
+        vim.apply_decset(1002, false);
+        assert_eq!(vim.tracking(), MouseMode::Normal);
+
+        // claude's fullscreen UI and opentui: 1000, 1002, 1003, 1006.
+        let mut claude = reporting(&[1000, 1002, 1003, 1006]);
+        assert_eq!(claude.tracking(), MouseMode::AnyEvent);
+        assert_eq!(claude.encoding(), MouseEncoding::Sgr);
+        // Its clean exit turns each back off.
+        for mode in [1006, 1003, 1002, 1000] {
+            claude.apply_decset(mode, false);
+        }
+        assert_eq!(claude, MouseReporting::OFF);
+        assert!(!claude.is_reporting());
+
+        // SGR outranks urxvt, which outranks UTF-8, whatever the order.
+        assert_eq!(reporting(&[1006, 1015]).encoding(), MouseEncoding::Sgr);
+        assert_eq!(reporting(&[1015, 1005]).encoding(), MouseEncoding::Urxvt);
+
+        let mut other = MouseReporting::OFF;
+        assert!(!other.apply_decset(2004, true));
+        assert!(!other.apply_decset(1004, true));
+        assert_eq!(other, MouseReporting::OFF);
+    }
+
+    /// The encoding the host synthesises follows what the program's DECSETs
+    /// ask for, exactly as jterm_core's parser records them.
+    #[test]
+    fn parser_driven_decsets_produce_the_requested_encoding() {
+        let mut parser = jterm_core::parser::Parser::new();
+        let mut events = Vec::new();
+        parser.feed(b"\x1b[?1006;1000h", &mut events);
+        let mut state = MouseReporting::OFF;
+        for event in &events {
+            if let jterm_core::parser::ParserEvent::DecsetMode { mode, set } = event {
+                state.apply_decset(*mode, *set);
+            }
+        }
+        assert_eq!(state.tracking(), parser.mouse_mode());
+        assert_eq!(state.encoding(), parser.mouse_encoding());
+        assert_eq!(
+            encode_mouse_wheel_notches(state, 1, 7, 9).unwrap(),
+            b"\x1b[<65;7;9M".to_vec()
+        );
+    }
+
+    #[test]
+    fn wheel_notches_repeat_the_report_and_are_clamped_per_event() {
+        let sgr = reporting(&[1003, 1006]);
+        assert_eq!(
+            encode_mouse_wheel_notches(sgr, -2, 1, 1).unwrap(),
+            b"\x1b[<64;1;1M\x1b[<64;1;1M".to_vec()
+        );
+        let burst = encode_mouse_wheel_notches(sgr, 500, 1, 1).unwrap();
+        assert_eq!(
+            burst.len(),
+            b"\x1b[<65;1;1M".len() * MAX_WHEEL_REPORTS_PER_EVENT as usize
+        );
+        assert!(encode_mouse_wheel_notches(MouseReporting::OFF, 3, 1, 1).is_none());
+    }
+
+    #[test]
+    fn the_prompt_boundary_reset_switches_every_mode_off() {
+        let mut parser = jterm_core::parser::Parser::new();
+        let mut events = Vec::new();
+        parser.feed(b"\x1b[?1000;1002;1003;1005;1006;1015;9h", &mut events);
+        let mut state = MouseReporting::OFF;
+        for event in events.drain(..) {
+            if let jterm_core::parser::ParserEvent::DecsetMode { mode, set } = event {
+                state.apply_decset(mode, set);
+            }
+        }
+        assert!(state.is_reporting());
+        parser.feed(MOUSE_AND_FOCUS_REPORTING_OFF, &mut events);
+        for event in events.drain(..) {
+            if let jterm_core::parser::ParserEvent::DecsetMode { mode, set } = event {
+                state.apply_decset(mode, set);
+            }
+        }
+        assert_eq!(state, MouseReporting::OFF);
+        assert_eq!(parser.mouse_mode(), MouseMode::None);
+        for mode in [9, 1000, 1002, 1003, 1004, 1005, 1006, 1015] {
+            let reset = format!("\x1b[?{mode}l");
+            assert!(is_mouse_or_focus_reporting_mode(mode));
+            assert!(MOUSE_AND_FOCUS_REPORTING_OFF
+                .windows(reset.len())
+                .any(|window| window == reset.as_bytes()));
+        }
+        assert!(!is_mouse_or_focus_reporting_mode(2004));
+        assert!(!parser.focus_events());
     }
 
     #[test]

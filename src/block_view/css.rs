@@ -923,6 +923,18 @@ pub(crate) fn block_css(config: &Config) -> String {
         .block-active.block-compact {{
             margin: 1px 4px;
         }}
+        /* A Block-mode alternate-screen app (claude's fullscreen UI, opencode,
+           vim) drops the card's decoration but keeps every margin, padding and
+           border width: the content box must stay byte-identical to the running
+           card in both densities, so 1049h/l republishes the winsize the child
+           already has and sends no SIGWINCH. Unified's permanent full-bleed
+           surface is `.block-fullscreen` below and is a different contract. */
+        .block-active.block-alt-screen {{
+            border-color: transparent;
+            outline-style: none;
+            border-radius: 0;
+            box-shadow: none;
+        }}
         .block-active.block-fullscreen {{
             border: none;
             outline-style: none;
@@ -1332,6 +1344,41 @@ mod tests {
             rest = &rest[body_start + close + 1..];
         }
         out
+    }
+
+    /// A Block-mode alternate-screen app keeps the running card's exact
+    /// content box. Any margin, padding or border width on the alt-screen
+    /// rule would move the grid under the app at 1049h/l, and a moved grid is
+    /// a SIGWINCH: codex answers one with a full transcript replay, claude with
+    /// a full repaint.
+    #[test]
+    fn the_alt_screen_card_drops_decoration_but_not_geometry() {
+        let config = crate::config::Config::safe_defaults();
+        let css = block_css(&config);
+        for property in [
+            "margin",
+            "padding",
+            "border",
+            "border-width",
+            "border-style",
+            "border-left-width",
+            "min-height",
+        ] {
+            let declaring = selectors_declaring(&css, property);
+            assert!(
+                !declaring
+                    .iter()
+                    .any(|selector| selector.contains("block-alt-screen")),
+                "`{property}` must not be overridden for the alt screen: {declaring:?}"
+            );
+        }
+        let alt = rule_body(&css, ".block-active.block-alt-screen");
+        assert!(alt.contains("border-color: transparent"), "{alt}");
+        assert!(alt.contains("outline-style: none"), "{alt}");
+        // Unified's permanent full-bleed contract is untouched.
+        let unified = rule_body(&css, ".block-active.block-fullscreen");
+        assert!(unified.contains("margin: 0"), "{unified}");
+        assert!(unified.contains("padding: 0"), "{unified}");
     }
 
     /// A stylesheet GTK cannot parse fails silently: the provider keeps the

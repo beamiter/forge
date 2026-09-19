@@ -18,7 +18,7 @@ use vte4::TerminalExt;
 
 use super::{
     clear_finished_block_selection, feed_hold_eligible, BlockState, BoundedClipboardAccumulator,
-    ClipboardTextTooLarge, FinishedBlock, MouseReportingMode, SelectedBlockIds, SelectionFeedHold,
+    ClipboardTextTooLarge, FinishedBlock, MouseReporting, SelectedBlockIds, SelectionFeedHold,
 };
 
 pub(crate) struct CrossSelection {
@@ -34,7 +34,7 @@ pub(crate) struct CrossSelection {
     /// repaints can't clear the selection out from under the pointer.
     feed_hold: Rc<SelectionFeedHold>,
     bstate: Rc<Cell<BlockState>>,
-    mouse_reporting: Rc<Cell<MouseReportingMode>>,
+    mouse_reporting: Rc<Cell<MouseReporting>>,
 }
 
 impl CrossSelection {
@@ -48,7 +48,7 @@ impl CrossSelection {
         selection_anchor_id: Rc<Cell<Option<u64>>>,
         feed_hold: Rc<SelectionFeedHold>,
         bstate: Rc<Cell<BlockState>>,
-        mouse_reporting: Rc<Cell<MouseReportingMode>>,
+        mouse_reporting: Rc<Cell<MouseReporting>>,
     ) -> Rc<Self> {
         let this = Rc::new(Self {
             finished_blocks,

@@ -1027,6 +1027,13 @@ impl TermView {
         if query.is_empty() {
             return FindSearchResult::NoMatches;
         }
+        // An alternate-screen app owns the pane and the finished cards are
+        // hidden under it: counting their hits reported matches the user
+        // could not see, and shadowed the app's own screen. Report none, so
+        // the find bar searches the live terminal the user is looking at.
+        if !find_searches_blocks(self.bstate.get()) {
+            return FindSearchResult::NoMatches;
+        }
         let pattern = if use_regex {
             query.to_string()
         } else {
@@ -1263,6 +1270,16 @@ impl TermView {
     }
 
     fn step_find(&self, direction: FindDirection) -> FindNavigationResult {
+        // A pass built over the cards before an alternate-screen app took the
+        // pane must not step through hidden cards; invalidating makes the find
+        // bar rebuild it, which now lands on the live screen.
+        if !find_searches_blocks(self.bstate.get()) {
+            if find_progress(&self.find_state.borrow()).is_none() {
+                return FindNavigationResult::Inactive;
+            }
+            self.clear_find();
+            return FindNavigationResult::Invalidated;
+        }
         let (current, next, current_progress) = {
             let state = self.find_state.borrow();
             let Some(current_progress) = find_progress(&state) else {
@@ -1764,6 +1781,14 @@ pub(super) fn scroll_widget_to_block_scroller_top(
 /// the highlighted terminals while the block list is borrowed, then release
 /// that borrow before calling into GTK so a synchronous signal cannot re-enter
 /// a structural path and panic on the `RefCell`.
+/// Whether find looks at the block document (finished cards plus the running
+/// command's capture) in this state. Not while an alternate-screen app owns
+/// the pane: its screen is the only thing visible, and the live terminal's own
+/// search is what covers it.
+pub(super) fn find_searches_blocks(state: super::BlockState) -> bool {
+    state != super::BlockState::AltScreen
+}
+
 pub(super) fn clear_find_state(
     find_state: &std::cell::RefCell<FindState>,
     active_vte: &vte4::Terminal,
@@ -1819,6 +1844,25 @@ mod tests {
             initial_wrap: false,
             wrap_before: complete.then_some(0),
             render_stamp: crate::block_view::blocks::NEUTRAL_RENDER_STAMP,
+        }
+    }
+
+    /// While an alternate-screen app owns the pane, find leaves the hidden
+    /// finished cards alone so the bar falls through to the live terminal;
+    /// every other state searches the block document.
+    #[test]
+    fn an_alternate_screen_app_scopes_find_to_the_live_screen() {
+        use crate::block_view::BlockState;
+        assert!(!super::find_searches_blocks(BlockState::AltScreen));
+        for state in [
+            BlockState::Idle,
+            BlockState::CollectingPrompt,
+            BlockState::AwaitingCommand,
+            BlockState::CollectingOutput,
+            BlockState::PostCommand,
+            BlockState::RawFallback,
+        ] {
+            assert!(super::find_searches_blocks(state), "{state:?}");
         }
     }
 
