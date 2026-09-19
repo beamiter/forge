@@ -344,6 +344,13 @@ fn regex_consumption(pattern: &str) -> Result<RegexConsumption, ()> {
 /// wrapped text joins the way its search sees it. `None` when VTE cannot write
 /// the dump; callers then fall back to the byte capture.
 pub(crate) fn live_vte_search_text(vte: &vte4::Terminal) -> Option<String> {
+    live_vte_search_text_prefix(vte, usize::MAX)
+}
+
+/// [`live_vte_search_text`], decoding at most about `max_bytes` of the dump:
+/// the text is cut at a character boundary past `max_bytes` (never more than
+/// three bytes past it), so a caller's own budget still sees it was cut.
+fn live_vte_search_text_prefix(vte: &vte4::Terminal, max_bytes: usize) -> Option<String> {
     use gtk4::gio;
     use gtk4::gio::prelude::*;
 
@@ -351,7 +358,34 @@ pub(crate) fn live_vte_search_text(vte: &vte4::Terminal) -> Option<String> {
     vte.write_contents_sync(&stream, vte4::WriteFlags::Default, gio::Cancellable::NONE)
         .ok()?;
     stream.close(gio::Cancellable::NONE).ok()?;
-    Some(String::from_utf8_lossy(&stream.steal_as_bytes()).into_owned())
+    let bytes = stream.steal_as_bytes();
+    let cut = utf8_cut_past(&bytes, max_bytes);
+    Some(String::from_utf8_lossy(&bytes[..cut]).into_owned())
+}
+
+/// The first character boundary at or after `max_bytes + 1` (or the end), so
+/// a cut dump is always longer than `max_bytes` and reads as incomplete.
+fn utf8_cut_past(bytes: &[u8], max_bytes: usize) -> usize {
+    let mut cut = max_bytes.saturating_add(1).min(bytes.len());
+    while cut < bytes.len() && (bytes[cut] & 0xC0) == 0x80 {
+        cut += 1;
+    }
+    cut
+}
+
+/// Whether the live VTE's buffer may be too large to dump for one incremental
+/// search: its rows times its columns (a lower bound on an ASCII dump's size
+/// once rows are full) already exceed what the scan may still read. The dump
+/// is written whole before any budget applies, so a million-line scrollback
+/// used to be copied on every keystroke; the bounded byte capture answers
+/// instead, marked incomplete.
+fn live_dump_exceeds_budget(total_rows: f64, columns: i64, remaining_bytes: usize) -> bool {
+    let rows = if total_rows.is_finite() {
+        total_rows.max(0.0) as u64
+    } else {
+        u64::MAX
+    };
+    rows.saturating_mul(columns.max(1) as u64) > remaining_bytes as u64
 }
 
 fn bounded_match_count(
@@ -1210,27 +1244,39 @@ impl TermView {
                 super::BlockState::CollectingOutput | super::BlockState::PostCommand
             )
         {
-            let (live_text, live_raw_incomplete, live_prefix_incomplete) =
-                match live_vte_search_text(&self.active_vte) {
-                    Some(mut dump) => {
-                        let prefix = scan_budget.take_prefix(&dump);
-                        let (kept, incomplete) = (prefix.text.len(), prefix.incomplete);
-                        dump.truncate(kept);
-                        (dump, false, incomplete)
-                    }
-                    None => {
-                        let (live_raw, live_raw_incomplete) = self
-                            .active
-                            .borrow()
-                            .output_text_prefix(scan_budget.remaining_bytes());
-                        let live_prefix = scan_budget.take_prefix(&live_raw);
-                        (
-                            super::strip_ansi(live_prefix.text),
-                            live_raw_incomplete,
-                            live_prefix.incomplete,
-                        )
-                    }
-                };
+            let dump = if scan_budget.time_exhausted()
+                || live_dump_exceeds_budget(
+                    self.active_vte
+                        .vadjustment()
+                        .map(|adj| adj.upper())
+                        .unwrap_or(f64::INFINITY),
+                    self.active_vte.column_count(),
+                    scan_budget.remaining_bytes(),
+                ) {
+                None
+            } else {
+                live_vte_search_text_prefix(&self.active_vte, scan_budget.remaining_bytes())
+            };
+            let (live_text, live_raw_incomplete, live_prefix_incomplete) = match dump {
+                Some(mut dump) => {
+                    let prefix = scan_budget.take_prefix(&dump);
+                    let (kept, incomplete) = (prefix.text.len(), prefix.incomplete);
+                    dump.truncate(kept);
+                    (dump, false, incomplete)
+                }
+                None => {
+                    let (live_raw, live_raw_incomplete) = self
+                        .active
+                        .borrow()
+                        .output_text_prefix(scan_budget.remaining_bytes());
+                    let live_prefix = scan_budget.take_prefix(&live_raw);
+                    (
+                        super::strip_ansi(live_prefix.text),
+                        live_raw_incomplete,
+                        live_prefix.incomplete,
+                    )
+                }
+            };
             let live = bounded_match_count(&re, &live_text, FIND_MATCH_LIMIT.saturating_sub(total));
             if live.count > 0 {
                 self.active_vte.search_set_regex(Some(&vte_re), 0);
@@ -1889,6 +1935,21 @@ mod tests {
     /// While an alternate-screen app owns the pane, find leaves the hidden
     /// finished cards alone so the bar falls through to the live terminal;
     /// every other state searches the block document.
+    #[test]
+    fn a_huge_live_buffer_is_not_dumped_for_an_incremental_search() {
+        use super::{live_dump_exceeds_budget, utf8_cut_past};
+        assert!(!live_dump_exceeds_budget(5_000.0, 120, 4 * 1024 * 1024));
+        assert!(live_dump_exceeds_budget(1_000_000.0, 120, 4 * 1024 * 1024));
+        assert!(live_dump_exceeds_budget(f64::INFINITY, 80, 4 * 1024 * 1024));
+        assert!(live_dump_exceeds_budget(10.0, 80, 0));
+
+        let text = "ab\u{e9}cd".as_bytes(); // a b [c3 a9] c d
+        assert_eq!(utf8_cut_past(text, usize::MAX), text.len());
+        assert_eq!(utf8_cut_past(text, 10), text.len());
+        assert_eq!(utf8_cut_past(text, 1), 2, "past the budget");
+        assert_eq!(utf8_cut_past(text, 2), 4, "never inside a character");
+    }
+
     #[test]
     fn an_alternate_screen_app_scopes_find_to_the_live_screen() {
         use crate::block_view::BlockState;
@@ -2820,6 +2881,7 @@ tail ab";
             cols: 80,
             command_exact: false,
             command_truncated: false,
+            output_notice: None,
         };
         let metadata = CompletedCommandRecord {
             id: 2,
@@ -3166,6 +3228,7 @@ tail ab";
             cols: 80,
             command_exact: false,
             command_truncated: false,
+            output_notice: None,
         };
         let unmarked_block = block(1, "first", "first output", Some(7), Some(2_000));
         let marked_block = block(3, "", "background output", Some(9), Some(9_000));
@@ -3484,6 +3547,7 @@ tail ab";
             cols: 80,
             command_exact: false,
             command_truncated: false,
+            output_notice: None,
         };
         let block_record = || [BackendRecordRef::Block(&block)];
         let hits = metadata_filter_hits(

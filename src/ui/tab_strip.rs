@@ -22,8 +22,11 @@ fn tab_width_after_drag(start_width: u32, offset_x: f64) -> u32 {
     ) as u32
 }
 
+/// Whether a finished command badges its tab as a failure: exactly what the
+/// card calls a failure. An interrupted or suspended job (130/141/143/148)
+/// reads neutral on its card and gets the ordinary activity mark instead.
 fn command_finish_needs_failure_attention(exit_code: Option<i32>) -> bool {
-    exit_code.is_some_and(|code| code != 0)
+    crate::block_view::BlockOutcome::classify_foreground(exit_code).is_failure()
 }
 
 /// Whether a bell badges its tab. A background tab always shows it. The
@@ -1243,6 +1246,13 @@ mod tests {
         assert!(!command_finish_needs_failure_attention(None));
         assert!(command_finish_needs_failure_attention(Some(1)));
         assert!(command_finish_needs_failure_attention(Some(-1)));
+        for interrupted in [130, 141, 143, 148] {
+            assert!(
+                !command_finish_needs_failure_attention(Some(interrupted)),
+                "{interrupted}"
+            );
+        }
+        assert!(command_finish_needs_failure_attention(Some(137)));
     }
 
     /// codex rings BEL when a turn ends, typically after the user alt-tabbed

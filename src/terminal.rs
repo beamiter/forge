@@ -296,14 +296,14 @@ impl VteTerminalView {
         // Listen for window-title-changed signal
         let title_callbacks_clone = title_callbacks.clone();
         let terminal_for_title = terminal.clone();
+        // An empty title is forwarded too: it is a program handing the title
+        // back (claude and codex send `OSC 0 ;` on exit), and the tab returns
+        // to its cwd-derived default, as it does in Block mode.
         terminal.connect_window_title_changed(move |_term| {
-            if let Some(title) = terminal_for_title.window_title() {
-                let title_str = jterm_core::review_input::safe_inline_display(&title, 512);
-                if !title_str.is_empty() {
-                    for callback in title_callbacks_clone.borrow().iter() {
-                        callback(&title_str);
-                    }
-                }
+            let title = terminal_for_title.window_title().unwrap_or_default();
+            let title_str = jterm_core::review_input::safe_inline_display(&title, 512);
+            for callback in title_callbacks_clone.borrow().iter() {
+                callback(&title_str);
             }
         });
 
@@ -901,18 +901,20 @@ pub(crate) fn default_tab_title(tab_index_1based: u32, working_directory: Option
 }
 
 /// Pick the link a Ctrl+click or "Open Link" acts on from what VTE reports at
-/// a cell: the URL regex match first, then an OSC 8 hyperlink target. Each is
-/// kept only when the system opener may have it (http/https,
-/// [`jterm_core::link::is_openable_url`]), so a refused regex hit still lets a
-/// real OSC 8 target through, and Unified's own zone-marker hyperlinks or a
-/// `file:`/`javascript:` target are never claimed.
+/// a cell: an OSC 8 hyperlink target first, then the URL regex match. The
+/// target is what the hover tooltip shows, and a label that is itself a URL
+/// (one an agent hard-wrapped, or one that differs from its target) must not
+/// open something else than the tooltip promised. Each is kept only when the
+/// system opener may have it (http/https, [`jterm_core::link::is_openable_url`]),
+/// so a refused target still lets a regex hit through, and Unified's own
+/// zone-marker hyperlinks or a `file:`/`javascript:` target are never claimed.
 pub(crate) fn openable_link(
-    regex_match: Option<String>,
-    hyperlink: impl FnOnce() -> Option<String>,
+    hyperlink: Option<String>,
+    regex_match: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
-    regex_match
+    hyperlink
         .filter(|uri| jterm_core::link::is_openable_url(uri))
-        .or_else(|| hyperlink().filter(|uri| jterm_core::link::is_openable_url(uri)))
+        .or_else(|| regex_match().filter(|uri| jterm_core::link::is_openable_url(uri)))
 }
 
 /// The openable link under (`x`, `y`) in `terminal`, if any.
@@ -923,8 +925,8 @@ pub(crate) fn openable_link(
 /// opened; `check_hyperlink_at` is the OSC 8 half.
 pub(crate) fn openable_link_at(terminal: &Terminal, x: f64, y: f64) -> Option<String> {
     openable_link(
-        terminal.check_match_at(x, y).0.map(|uri| uri.to_string()),
-        || terminal.check_hyperlink_at(x, y).map(|uri| uri.to_string()),
+        terminal.check_hyperlink_at(x, y).map(|uri| uri.to_string()),
+        || terminal.check_match_at(x, y).0.map(|uri| uri.to_string()),
     )
 }
 
@@ -1221,28 +1223,39 @@ mod tests {
     #[test]
     fn a_link_is_opened_only_when_the_opener_may_have_it() {
         let some = |uri: &str| Some(uri.to_string());
-        // The regex hit wins; the OSC 8 half is not even asked.
+        // The OSC 8 target wins — it is what the hover tooltip shows — and
+        // the regex half is not even asked. A hard-wrapped label URL matches
+        // the regex only up to the row end.
         assert_eq!(
-            super::openable_link(some("https://a.example/x"), || panic!("not needed")),
+            super::openable_link(
+                some("https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md"),
+                || panic!("not needed")
+            ),
+            some("https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md")
+        );
+        // Plain text URL, no OSC 8.
+        assert_eq!(
+            super::openable_link(None, || some("https://a.example/x")),
             some("https://a.example/x")
         );
-        // An OSC 8 label that is no URL at all ("Security guide").
+        // A refused OSC 8 target still lets a regex hit through.
         assert_eq!(
-            super::openable_link(None, || some("https://code.claude.com/docs/en/security")),
-            some("https://code.claude.com/docs/en/security")
-        );
-        // A refused regex hit still lets a real OSC 8 target through.
-        assert_eq!(
-            super::openable_link(some("https:///no-host"), || some("https://b.example/")),
+            super::openable_link(some("file:///etc/passwd"), || some("https://b.example/")),
             some("https://b.example/")
         );
         for refused in [
             "javascript:alert(1)",
             "file:///etc/passwd",
             "file://otherhost/etc/passwd",
+            "https:///no-host",
             // Unified's zone markers are hyperlinks too.
             "block://0123456789abcdef/prompt",
         ] {
+            assert_eq!(
+                super::openable_link(some(refused), || None),
+                None,
+                "{refused}"
+            );
             assert_eq!(
                 super::openable_link(None, || some(refused)),
                 None,
@@ -1278,7 +1291,8 @@ mod tests {
         settle();
         terminal.feed(
             b"\x1b]8;id=zaxmda;https://code.claude.com/docs/en/security\x07Security guide\x1b]8;;\x07\r\n\
-              \x1b]8;;file:///etc/passwd\x07local file\x1b]8;;\x07\r\n",
+              \x1b]8;;file:///etc/passwd\x07local file\x1b]8;;\x07\r\n\
+              \x1b]8;;https://target.example/full\x07https://label.example/x\x1b]8;;\x07\r\n",
         );
         settle();
 
@@ -1314,6 +1328,18 @@ mod tests {
                 .iter()
                 .all(|uri| uri.starts_with("https://")),
             "a file: target is never offered"
+        );
+        // A label that is itself a URL opens the target the tooltip shows.
+        let labelled = links_on_row(2.0);
+        assert!(
+            labelled
+                .iter()
+                .any(|uri| uri == "https://target.example/full"),
+            "{labelled:?}"
+        );
+        assert!(
+            labelled.iter().all(|uri| uri != "https://label.example/x"),
+            "{labelled:?}"
         );
         window.close();
     }

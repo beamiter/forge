@@ -106,6 +106,14 @@ fn pane_leaf_root_of(widget: &gtk4::Widget) -> Option<gtk4::Widget> {
 /// What an OSC 0/2 title does to a tab label: `None` leaves it alone (the
 /// user renamed the tab), an empty title restores `default` (the program is
 /// handing the title back), anything else becomes the label.
+/// A VTE pane's current directory for its default tab title: the OSC 7 value
+/// or the shell's `/proc` cwd, not the directory the tab was opened in.
+fn vte_live_cwd(terminal: &glib::WeakRef<vte4::Terminal>) -> Option<String> {
+    let terminal = terminal.upgrade()?;
+    crate::terminal::terminal_working_directory(&terminal)
+        .map(|cwd| jterm_core::review_input::safe_inline_display(&cwd, 4 * 1024))
+}
+
 fn tab_label_for_osc_title(title: &str, default: &str, custom: bool) -> Option<String> {
     if custom {
         None
@@ -852,16 +860,26 @@ impl UiState {
                 let header = label.clone();
                 let strip = strip_label.clone();
                 let custom = custom_title.clone();
+                let terminal = view.vte().downgrade();
                 view.connect_title_changed(move |title| {
                     let Some(identity) = identity.upgrade() else {
                         return;
                     };
-                    if identity.widget_name() != expected_name || custom.get() {
+                    if identity.widget_name() != expected_name {
                         return;
                     }
-                    header.set_text(title);
+                    // An empty title hands the label back to the cwd default.
+                    let default = if title.is_empty() {
+                        default_tab_title(tab_num + 1, vte_live_cwd(&terminal).as_deref())
+                    } else {
+                        String::new()
+                    };
+                    let Some(title) = tab_label_for_osc_title(title, &default, custom.get()) else {
+                        return;
+                    };
+                    header.set_text(&title);
                     if !tab_private_title_cell(&identity).is_some_and(|flag| flag.get()) {
-                        strip.set_text(title);
+                        strip.set_text(&title);
                     }
                 });
             }
@@ -1956,11 +1974,14 @@ impl UiState {
                 );
             }
             PaneLeaf::Vte(vte_view) => {
-                // The conventional VTE view never reports an empty title.
+                let terminal = vte_view.vte().downgrade();
                 let dir = working_directory.clone();
                 update_title(
                     &|callback| vte_view.connect_title_changed(callback),
-                    Box::new(move || default_tab_title(tab_index_for_pwd, dir.as_deref())),
+                    Box::new(move || {
+                        let cwd = vte_live_cwd(&terminal).or_else(|| dir.clone());
+                        default_tab_title(tab_index_for_pwd, cwd.as_deref())
+                    }),
                 );
             }
         }

@@ -71,6 +71,10 @@ tests=(
     block_view::tests::a_real_vte_focus_report_reaches_the_program_but_is_not_typing
     block_view::tests::a_finished_codex_session_keeps_its_history_in_the_card_and_block_data
     block_view::tests::header_button_presses_do_not_select_and_a_hidden_readout_measures
+    block_view::tests::a_real_cards_header_buttons_do_not_select_it
+    block_view::tests::a_dropped_path_reaches_the_program_as_a_bracketed_paste
+    block_view::tests::an_alt_screen_round_trip_keeps_a_real_running_cards_height
+    block_view::tests::a_truncated_output_shows_its_notice_on_a_real_card
     terminal::tests::an_osc8_label_opens_its_target_on_a_real_vte
     block_view::css::tests::the_generated_stylesheet_parses_without_error
     font::tests::a_real_vte_is_given_the_icon_family_behind_the_configured_one

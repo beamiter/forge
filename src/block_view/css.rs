@@ -1358,6 +1358,19 @@ mod tests {
         out
     }
 
+    /// Whether a CSS declaration can change a box's content size: margins,
+    /// paddings, minimum sizes and border widths (shorthands and longhands),
+    /// but not colours, radii or outlines.
+    fn declaration_moves_the_content_box(name: &str) -> bool {
+        name.starts_with("margin")
+            || name.starts_with("padding")
+            || name.starts_with("min-")
+            || (name.starts_with("border")
+                && !name.ends_with("-color")
+                && !name.ends_with("-radius")
+                && !name.starts_with("border-image"))
+    }
+
     /// A Block-mode alternate-screen app keeps the running card's exact
     /// content box. Any margin, padding or border width on the alt-screen
     /// rule would move the grid under the app at 1049h/l, and a moved grid is
@@ -1384,6 +1397,34 @@ mod tests {
                 "`{property}` must not be overridden for the alt screen: {declaring:?}"
             );
         }
+        // Longhands too (`margin-top`, `padding-left`, `border-top-width`),
+        // and every rule whose selector names the class, however combined.
+        let mut rest = css.as_str();
+        while let Some(open) = rest.find(" {\n") {
+            let selector = rest[..open].rsplit('\n').next().unwrap_or("").trim();
+            let body_start = open + " {\n".len();
+            let Some(close) = rest[body_start..].find("\n        }") else {
+                break;
+            };
+            if selector.contains("block-alt-screen") {
+                for line in rest[body_start..body_start + close].lines() {
+                    let name = line.trim_start().split(':').next().unwrap_or("").trim();
+                    assert!(
+                        !declaration_moves_the_content_box(name),
+                        "`{name}` in `{selector}` would move the grid at 1049h/l"
+                    );
+                }
+            }
+            rest = &rest[body_start + close + 1..];
+        }
+        assert!(declaration_moves_the_content_box("margin-top"));
+        assert!(declaration_moves_the_content_box("padding-left"));
+        assert!(declaration_moves_the_content_box("border-top-width"));
+        assert!(declaration_moves_the_content_box("border-bottom"));
+        assert!(declaration_moves_the_content_box("min-width"));
+        assert!(!declaration_moves_the_content_box("border-color"));
+        assert!(!declaration_moves_the_content_box("border-top-left-radius"));
+        assert!(!declaration_moves_the_content_box("outline-style"));
         let alt = rule_body(&css, ".block-active.block-alt-screen");
         assert!(alt.contains("border-color: transparent"), "{alt}");
         assert!(alt.contains("outline-style: none"), "{alt}");

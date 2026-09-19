@@ -402,6 +402,57 @@ fn decode_zstd_bounded(data: &[u8], max_decoded_bytes: u64) -> io::Result<Vec<u8
     Ok(decoded)
 }
 
+/// Exact schema immediately before the finished card's output notice was
+/// persisted. Its records carry `BLOCK_LIFECYCLE_SCHEMA_V3`, which the current
+/// shape's schema check refuses, so they are decoded through this layout.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct LegacyBlockDataV3 {
+    id: u64,
+    prompt: String,
+    cmd: String,
+    cmd_markup: Option<String>,
+    output: String,
+    exit_code: Option<i32>,
+    lifecycle_schema: u32,
+    completion_provenance: super::CompletionProvenanceWire,
+    start_mark_seen: bool,
+    estimated_height: i32,
+    line_count: usize,
+    start_time_ms: Option<u64>,
+    end_time_ms: Option<u64>,
+    duration_ms: Option<u64>,
+    cwd: Option<String>,
+    cols: u16,
+    command_exact: bool,
+    command_truncated: bool,
+}
+
+impl From<LegacyBlockDataV3> for BlockData {
+    fn from(legacy: LegacyBlockDataV3) -> Self {
+        Self {
+            id: legacy.id,
+            prompt: legacy.prompt,
+            cmd: legacy.cmd,
+            cmd_markup: legacy.cmd_markup,
+            output: legacy.output,
+            exit_code: legacy.exit_code,
+            lifecycle_schema: super::blocks::BLOCK_LIFECYCLE_SCHEMA,
+            completion_provenance: legacy.completion_provenance,
+            start_mark_seen: legacy.start_mark_seen,
+            estimated_height: legacy.estimated_height,
+            line_count: legacy.line_count,
+            start_time_ms: legacy.start_time_ms,
+            end_time_ms: legacy.end_time_ms,
+            duration_ms: legacy.duration_ms,
+            cwd: legacy.cwd,
+            cols: legacy.cols,
+            command_exact: legacy.command_exact,
+            command_truncated: legacy.command_truncated,
+            output_notice: None,
+        }
+    }
+}
+
 /// Exact schema immediately before lifecycle provenance was persisted.
 /// Keeping this separate from the older bare-i32 V1 prevents a normal recent
 /// history file from becoming undecodable when BlockData's archive grows.
@@ -451,6 +502,7 @@ impl From<LegacyBlockDataV2> for BlockData {
             // Legacy snapshots predate command-text provenance: fail closed.
             command_exact: false,
             command_truncated: false,
+            output_notice: None,
         }
     }
 }
@@ -507,6 +559,7 @@ impl From<LegacyBlockDataV1> for BlockData {
             // Legacy snapshots predate command-text provenance: fail closed.
             command_exact: false,
             command_truncated: false,
+            output_notice: None,
         }
     }
 }
@@ -517,6 +570,12 @@ fn decode_rkyv_block(data: &[u8]) -> Option<BlockData> {
     rkyv::from_bytes::<BlockData, rkyv::rancor::Error>(data)
         .ok()
         .filter(|block| block.lifecycle_schema == super::blocks::BLOCK_LIFECYCLE_SCHEMA)
+        .or_else(|| {
+            rkyv::from_bytes::<LegacyBlockDataV3, rkyv::rancor::Error>(data)
+                .ok()
+                .filter(|block| block.lifecycle_schema == super::blocks::BLOCK_LIFECYCLE_SCHEMA_V3)
+                .map(BlockData::from)
+        })
         .or_else(|| {
             rkyv::from_bytes::<LegacyBlockDataV2, rkyv::rancor::Error>(data)
                 .ok()
@@ -551,6 +610,10 @@ fn validate_block_fields(block: &BlockData) -> io::Result<()> {
             .cmd_markup
             .as_ref()
             .is_none_or(|markup| markup.len() <= MAX_HISTORY_COMMAND_MARKUP_BYTES)
+        && block
+            .output_notice
+            .as_ref()
+            .is_none_or(|notice| notice.len() <= 128)
         && block.output.len() <= MAX_HISTORY_OUTPUT_BYTES
         && block
             .cwd
@@ -2622,6 +2685,12 @@ impl TermView {
                     block.lifecycle_health(),
                     block.lifecycle_notice().as_deref(),
                 );
+                finished.set_output_notice(
+                    block
+                        .output_notice
+                        .as_deref()
+                        .and_then(crate::block_view::known_output_notice),
+                );
                 finished
                     .widget()
                     .insert_before(&self.block_list, Some(&sibling));
@@ -2733,6 +2802,7 @@ mod tests {
             cols: 80,
             command_exact: false,
             command_truncated: false,
+            output_notice: None,
         }
     }
 
@@ -2901,6 +2971,52 @@ mod tests {
                 "printf hello"
             );
         }
+    }
+
+    /// The card's output notice survives a save and reload; records saved
+    /// before it existed still decode, with no notice.
+    #[test]
+    fn history_keeps_the_output_notice_and_reads_the_schema_before_it() {
+        let mut block = sample_block(9, "cargo build");
+        block.output_notice = Some(super::super::FINISHED_OUTPUT_NOT_RETAINED.to_string());
+        let raw = rkyv::to_bytes::<rkyv::rancor::Error>(&block).unwrap();
+        let (decoded, _) = decode_block_record(raw.as_slice(), false).unwrap();
+        assert_eq!(
+            decoded.output_notice.as_deref(),
+            Some("Earlier output not retained")
+        );
+
+        let legacy = super::LegacyBlockDataV3 {
+            id: 10,
+            prompt: "$ ".into(),
+            cmd: "make".into(),
+            cmd_markup: None,
+            output: "built".into(),
+            exit_code: Some(2),
+            lifecycle_schema: super::super::blocks::BLOCK_LIFECYCLE_SCHEMA_V3,
+            completion_provenance: super::super::CompletionProvenanceWire::Unknown,
+            start_mark_seen: true,
+            estimated_height: 20,
+            line_count: 1,
+            start_time_ms: Some(1),
+            end_time_ms: Some(3),
+            duration_ms: Some(2),
+            cwd: Some("/tmp".into()),
+            cols: 80,
+            command_exact: true,
+            command_truncated: false,
+        };
+        let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&legacy).unwrap();
+        let (decoded, _) = decode_block_record(encoded.as_slice(), false).unwrap();
+        assert_eq!(decoded.cmd, "make");
+        assert_eq!(decoded.exit_code, Some(2));
+        assert!(decoded.command_exact);
+        assert_eq!(decoded.cols, 80);
+        assert_eq!(decoded.output_notice, None);
+        assert_eq!(
+            decoded.lifecycle_schema,
+            super::super::blocks::BLOCK_LIFECYCLE_SCHEMA
+        );
     }
 
     #[test]

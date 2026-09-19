@@ -1484,6 +1484,45 @@ impl OwnedPty {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(foreground);
     }
 
+    /// The winsize the child would read, and a way to change it from the
+    /// slave side as `stty cols 60 rows 20` would.
+    #[cfg(test)]
+    pub(crate) fn test_slave_winsize(&self) -> (u16, u16) {
+        let slave = self
+            .test_slave
+            .as_ref()
+            .expect("a test PTY holds its slave end");
+        let mut ws = libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `ws` is a live out-parameter and `slave` is owned by `self`.
+        unsafe {
+            libc::ioctl(slave.as_raw_fd(), libc::TIOCGWINSZ, &mut ws);
+        }
+        (ws.ws_col, ws.ws_row)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_slave_winsize(&self, cols: u16, rows: u16) {
+        let slave = self
+            .test_slave
+            .as_ref()
+            .expect("a test PTY holds its slave end");
+        let ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `ws` is a live in-parameter and `slave` is owned by `self`.
+        unsafe {
+            libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &ws);
+        }
+    }
+
     /// Write `bytes` from the slave end, as a program running on the PTY
     /// would: the pane's reader receives them as the child's output.
     pub(crate) fn write_test_slave(&self, bytes: &[u8]) {

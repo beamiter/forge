@@ -221,7 +221,9 @@ pub(crate) fn estimated_live_finished_block_retained_bytes(
 
 // ─── FinishedBlock ────────────────────────────────────────────────────────────
 
-pub(crate) const BLOCK_LIFECYCLE_SCHEMA: u32 = 0x4a54_4c31;
+pub(crate) const BLOCK_LIFECYCLE_SCHEMA: u32 = 0x4a54_4c32;
+/// The schema before `output_notice` was persisted; see `LegacyBlockDataV3`.
+pub(crate) const BLOCK_LIFECYCLE_SCHEMA_V3: u32 = 0x4a54_4c31;
 
 fn block_lifecycle_schema() -> u32 {
     BLOCK_LIFECYCLE_SCHEMA
@@ -272,6 +274,12 @@ pub(crate) struct BlockData {
     /// must not be treated as the command that actually ran.
     #[serde(default)]
     pub(crate) command_truncated: bool,
+    /// The card's notice that this is not the command's whole output
+    /// ("Earlier output not retained", …), so an undo, a restore or a
+    /// history reload rebuilds the card with it. Shown only through
+    /// [`known_output_notice`].
+    #[serde(default)]
+    pub(crate) output_notice: Option<String>,
 }
 
 pub(super) fn markdown_fence(text: &str) -> String {
@@ -1592,6 +1600,50 @@ type LateBoundAction = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 /// through it the card's state) alive.
 type LateBoundWeakAction = Rc<RefCell<Option<std::rc::Weak<dyn Fn()>>>>;
 
+/// The tooltip of a failure badge that names a signal. SIGSTOP, SIGTSTP,
+/// SIGTTIN and SIGTTOU (147-150) stop a job rather than end it — `fg`
+/// resumes it — so "terminated" would be wrong for them.
+pub(crate) fn failure_badge_tooltip(code: i32, signal: &str) -> String {
+    if jterm_core::exit_status::is_job_stop(code) {
+        format!("128 + signal number: suspended by {signal} — resume with fg")
+    } else {
+        format!("128 + signal number: terminated by {signal}")
+    }
+}
+
+/// The finished card's notices that its text is not the command's whole
+/// output; see `finished_output_notice`.
+pub(crate) const FINISHED_OUTPUT_NOT_RETAINED: &str = "Earlier output not retained";
+pub(crate) const FINISHED_OUTPUT_TEXT_TRUNCATED: &str = "Output text truncated";
+pub(crate) const FINISHED_OUTPUT_PARTLY_RETAINED: &str = "Output only partly retained";
+
+/// The notice `text` names, when it is one of the finished-card notices. A
+/// notice read back from saved history is shown only through this.
+pub(crate) fn known_output_notice(text: &str) -> Option<&'static str> {
+    [
+        FINISHED_OUTPUT_NOT_RETAINED,
+        FINISHED_OUTPUT_TEXT_TRUNCATED,
+        FINISHED_OUTPUT_PARTLY_RETAINED,
+    ]
+    .into_iter()
+    .find(|notice| *notice == text)
+}
+
+/// What each notice means, for its tooltip.
+pub(crate) fn output_notice_tooltip(notice: &str) -> Option<&'static str> {
+    match known_output_notice(notice)? {
+        FINISHED_OUTPUT_NOT_RETAINED => Some(
+            "The command wrote more than a finished block keeps; its oldest output was dropped",
+        ),
+        FINISHED_OUTPUT_TEXT_TRUNCATED => Some(
+            "The command wrote more than a finished block keeps; the text stops before the end of its output",
+        ),
+        _ => Some(
+            "The command wrote more than a finished block keeps; both its oldest and its latest output were dropped",
+        ),
+    }
+}
+
 /// Fade a card's quick-action strip in or out without changing its allocation.
 ///
 /// The strip must keep its width in both states: the header's hexpanding
@@ -2306,9 +2358,7 @@ impl FinishedBlock {
                 let badge = match signal_name_for_exit(code) {
                     Some(sig) => {
                         let badge = gtk4::Label::new(Some(&format!("exit:{code} {sig}")));
-                        badge.set_tooltip_text(Some(&format!(
-                            "128 + signal number: terminated by {sig}"
-                        )));
+                        badge.set_tooltip_text(Some(&failure_badge_tooltip(code, sig)));
                         badge
                     }
                     None => gtk4::Label::new(Some(&format!("exit:{code}"))),
@@ -2427,6 +2477,9 @@ impl FinishedBlock {
         collapse_btn.add_css_class("block-collapse-btn");
         collapse_btn.add_css_class("flat");
         collapse_btn.update_property(&[gtk4::accessible::Property::Label("Hide output")]);
+        // Like the action buttons: a click while an agent waits for Enter
+        // must not leave the chevron holding the next Enter/Space.
+        collapse_btn.set_focus_on_click(false);
         header_row.append(&collapse_btn);
 
         content.append(&header_row);
@@ -2876,6 +2929,7 @@ impl FinishedBlock {
         collapsed_summary.set_margin_end(8);
         collapsed_summary.set_margin_bottom(4);
         collapsed_summary.set_tooltip_text(Some("Show block output"));
+        collapsed_summary.set_focus_on_click(false);
         collapsed_summary.set_visible(false);
         content.append(&collapsed_summary);
 
@@ -3475,9 +3529,8 @@ impl FinishedBlock {
         match notice {
             Some(notice) => {
                 self.output_notice.set_text(notice);
-                self.output_notice.set_tooltip_text(Some(
-                    "The command wrote more than a finished block keeps; its oldest output was dropped",
-                ));
+                self.output_notice
+                    .set_tooltip_text(output_notice_tooltip(notice));
                 self.output_notice
                     .update_property(&[gtk4::accessible::Property::Label(notice)]);
                 self.output_notice.set_visible(true);
@@ -3696,8 +3749,15 @@ impl FinishedBlock {
             let going_up = dy < 0.0;
             let going_down = dy > 0.0;
             if (going_up && !at_top) || (going_down && !at_bottom) {
-                // VTE still has room to scroll itself; let it.
-                return glib::Propagation::Proceed;
+                // VTE still has room to scroll itself. A wheel notch is left
+                // to it; a surface-pixel delta (a Wayland touchpad) is not —
+                // VTE 0.76 counts each pixel as a notch and a gentle swipe
+                // jumped pages — so that one is normalised and applied here.
+                if !scroll_unit_is_surface(controller) {
+                    return glib::Propagation::Proceed;
+                }
+                scroll_adjustment_by_wheel(&inner_adj, wheel_steps(dy, true));
+                return glib::Propagation::Stop;
             }
             // Drive the outer ScrolledWindow by one step in the wheel direction.
             forward_outer_scroll(
@@ -3853,6 +3913,12 @@ pub(crate) struct ActiveBlock {
     /// so rows keep climbing for the life of the pane.
     live_cursor_origin: Rc<Cell<Option<i64>>>,
     live_cursor_high: Rc<Cell<i64>>,
+    /// Set when the app left the alternate screen, cleared by the live VTE's
+    /// next `contents-changed`. libvte processes the fed `CSI ? 1049 l` a
+    /// frame or more later, so until then its cursor is still the alternate
+    /// screen's; a layout that measured it latched that row as the card's
+    /// extent and pinned the running card to full height.
+    alt_leave_pending: Rc<Cell<bool>>,
     /// `preserve_live_scrollback` as it stands now (`reload_config` writes it).
     /// It decides where the prompt lives inside the live grid, which is what
     /// the compact-card layout has to know: with the default reset the prompt
@@ -4041,6 +4107,7 @@ impl ActiveBlock {
             live_extent_rows: Rc::new(Cell::new(0)),
             live_cursor_origin: Rc::new(Cell::new(None)),
             live_cursor_high: Rc::new(Cell::new(0)),
+            alt_leave_pending: Rc::new(Cell::new(false)),
             preserve_live_scrollback: Cell::new(config.preserve_live_scrollback),
             live_organism_surface,
             unified_image_surface,
@@ -4149,6 +4216,12 @@ impl ActiveBlock {
         self.live_cursor_high.clone()
     }
 
+    /// See the field; cloned into `block_layout_active_surface` and the live
+    /// VTE's `contents-changed` handler.
+    pub(crate) fn alt_leave_pending(&self) -> Rc<Cell<bool>> {
+        self.alt_leave_pending.clone()
+    }
+
     /// Height of the live card in pixels — the part of the grid the user can
     /// see. Live widgets positioned over the terminal (the organism) must stay
     /// inside it or they are clipped away.
@@ -4183,6 +4256,7 @@ impl ActiveBlock {
         // asynchronously.
         self.live_cursor_origin.set(None);
         self.live_cursor_high.set(0);
+        self.alt_leave_pending.set(false);
         if preserve_scrollback {
             self.active_vte.feed(b"\x1b[0m");
         } else {
@@ -4328,6 +4402,20 @@ mod tests {
     }
 
     #[test]
+    fn a_stopped_jobs_badge_says_suspended_not_terminated() {
+        for (code, signal) in [(147, "SIGSTOP"), (149, "SIGTTIN"), (150, "SIGTTOU")] {
+            assert_eq!(
+                super::failure_badge_tooltip(code, signal),
+                format!("128 + signal number: suspended by {signal} — resume with fg")
+            );
+        }
+        assert_eq!(
+            super::failure_badge_tooltip(137, "SIGKILL"),
+            "128 + signal number: terminated by SIGKILL"
+        );
+    }
+
+    #[test]
     #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
     fn lifecycle_chip_and_quick_actions_expose_truthful_status() {
         use gtk4::prelude::*;
@@ -4346,6 +4434,31 @@ mod tests {
             None,
             None,
             80,
+        );
+
+        // No button on a card takes focus on click — not the action row, not
+        // the collapse chevron, not the collapsed-output summary — so a click
+        // while an agent waits for Enter never leaves a button holding it.
+        let mut buttons = 0;
+        let mut pending: Vec<gtk4::Widget> = vec![block.widget().clone().upcast()];
+        while let Some(widget) = pending.pop() {
+            if let Some(button) = widget.downcast_ref::<gtk4::Button>() {
+                buttons += 1;
+                assert!(
+                    !button.gets_focus_on_click(),
+                    "{:?} takes focus on click",
+                    button.css_classes()
+                );
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                child = current.next_sibling();
+                pending.push(current);
+            }
+        }
+        assert!(
+            buttons >= 8,
+            "the card's buttons were all visited ({buttons})"
         );
 
         assert_eq!(
@@ -4906,6 +5019,7 @@ mod tests {
             cols: 80,
             command_exact: false,
             command_truncated: false,
+            output_notice: None,
         }
     }
 

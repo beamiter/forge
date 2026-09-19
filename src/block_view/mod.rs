@@ -469,6 +469,16 @@ fn running_header_mode(
     }
 }
 
+/// Whether the pill may give way to a live card under it at all: only for an
+/// interactive program — one that asked for bracketed paste or kitty keyboard
+/// flags while it runs, as codex, kimi and claude do and a build or `sleep`
+/// does not (the shell switches bracketed paste off before it runs a
+/// command). A plain command with a page of output keeps its elapsed time and
+/// Stop. Never in Unified, whose live surface always starts at the top.
+fn running_readout_yields_to_live(unified: bool, program_is_interactive: bool) -> bool {
+    !unified && program_is_interactive
+}
+
 /// Whether a readout pinned to the top of the scroller, ending at
 /// `readout_bottom_px`, would sit over the live card starting at
 /// `live_top_px` (both in the scroller's coordinates). The card only grows
@@ -2490,7 +2500,11 @@ fn lone_rerunnable_selection<'a>(
 /// non-zero exit with a real command qualifies — background output and an
 /// unknown status are never reclassified as failures.
 fn failed_block_section_visible(command: &str, exit_code: Option<i32>) -> bool {
-    jterm_core::block_contract::classify_completed(Some(command), exit_code).is_failed()
+    // The card's own classification: an interrupted or suspended command
+    // (130/141/143/148) reads neutral on the card, and must not be offered
+    // "Fix with Agent" or a Retry that starts a second copy of a job still
+    // stopped in the shell.
+    BlockOutcome::classify(Some(command), exit_code).is_failure()
 }
 
 /// frost's `verified_local_command_cwd` (ember's rule, verbatim). An
@@ -2929,15 +2943,91 @@ fn base_keyval_in_layout(
 /// instead of inserting a newline. There the PTY's foreground process group
 /// decides; `foreground` is only probed in that state. An unknown owner fails
 /// closed to legacy keys, as before.
-fn kitty_rewrite_applies(state: BlockState, foreground: impl FnOnce() -> PtyForeground) -> bool {
+///
+/// A pane whose PTY child is not a login shell (`forge -e codex`, a remote
+/// tab's `ssh`) has the program itself as the session leader, so the probe
+/// reports `Shell` while that program owns the keyboard: there a `Shell` owner
+/// is the program too, and its flags apply.
+fn kitty_rewrite_applies(
+    state: BlockState,
+    child_is_shell: bool,
+    foreground: impl FnOnce() -> PtyForeground,
+) -> bool {
+    kitty_gate(state, child_is_shell, foreground) == KittyGate::Rewrite
+}
+
+/// What a key commit does with pushed kitty flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KittyGate {
+    /// The program that pushed them owns the keyboard: encode.
+    Rewrite,
+    /// Send legacy keys, and keep the flags for when the program is back.
+    Legacy,
+    /// RawFallback with the pane's own shell in the foreground: whoever pushed
+    /// the flags is gone (or suspended, and re-pushes on `fg`). RawFallback
+    /// has no PromptStart/CommandEnd to forget them at, so this is its reset
+    /// boundary; left in place they would turn the next `python3`'s Ctrl+C
+    /// into `CSI 99;5u` and never raise SIGINT.
+    ForgetStale,
+}
+
+fn kitty_gate(
+    state: BlockState,
+    child_is_shell: bool,
+    foreground: impl FnOnce() -> PtyForeground,
+) -> KittyGate {
     match state {
-        BlockState::CollectingOutput | BlockState::AltScreen => true,
-        BlockState::RawFallback => foreground() == PtyForeground::Other,
+        BlockState::CollectingOutput | BlockState::AltScreen => KittyGate::Rewrite,
+        BlockState::RawFallback => match foreground() {
+            PtyForeground::Other => KittyGate::Rewrite,
+            PtyForeground::Shell if !child_is_shell => KittyGate::Rewrite,
+            PtyForeground::Shell => KittyGate::ForgetStale,
+            PtyForeground::Unknown => KittyGate::Legacy,
+        },
         BlockState::Idle
         | BlockState::CollectingPrompt
         | BlockState::AwaitingCommand
-        | BlockState::PostCommand => false,
+        | BlockState::PostCommand => KittyGate::Legacy,
     }
+}
+
+/// Whether the PTY's direct child is an interactive shell, so a foreground
+/// process group equal to its own means "at the prompt". An argv override
+/// (`forge -e codex`, `ssh host`, `bash -c cmd`) runs the program itself as
+/// the session leader.
+fn pty_child_is_shell(argv: &[String]) -> bool {
+    if shell_argv_runs_one_command(argv) {
+        return false;
+    }
+    if shell_argv_uses_jsh(argv) {
+        return true;
+    }
+    argv.first()
+        .and_then(|argument| std::path::Path::new(argument).file_name())
+        .and_then(|name| name.to_str())
+        .map(|name| name.trim_start_matches('-'))
+        .is_some_and(|name| {
+            matches!(
+                name,
+                "bash"
+                    | "zsh"
+                    | "fish"
+                    | "sh"
+                    | "dash"
+                    | "ksh"
+                    | "mksh"
+                    | "oksh"
+                    | "yash"
+                    | "tcsh"
+                    | "csh"
+                    | "nu"
+                    | "xonsh"
+                    | "elvish"
+                    | "ion"
+                    | "pwsh"
+                    | "powershell"
+            )
+        })
 }
 
 /// The process-control bytes for Ctrl+C / Ctrl+D under the kitty keyboard
@@ -4996,6 +5086,16 @@ fn emit_accepted_input(callbacks: &HumanInputCallbacks, origin: InputOrigin) {
     }
 }
 
+/// How long VTE gets to answer the cursor queries fed to it before a prompt
+/// or RIS boundary; see [`ReaderCtx::forget_unanswered_cpr_later`].
+const CPR_ANSWER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether a boundary's deferred forget still applies: no CPR was left to VTE
+/// since, so whatever is owed belongs to the program the boundary ended.
+fn cpr_forget_applies(asked_at_boundary: u64, asked_now: u64) -> bool {
+    asked_at_boundary == asked_now
+}
+
 const VERIFIED_SUBMISSION_POLL: std::time::Duration = std::time::Duration::from_millis(16);
 const VERIFIED_SUBMISSION_MAX_POLLS: u32 = 120;
 const REVIEWED_COMMAND_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -6101,19 +6201,25 @@ impl BlockRenderPayload {
     }
 }
 
-/// "Earlier output not retained" whenever any stage lost bytes: the bounded
-/// capture ring dropped its front, the line replay stopped short, or the
-/// screen replay's history budget evicted its oldest rows. Without it a long
-/// session's card silently starts partway through.
+/// The card's notice whenever any stage lost bytes, saying which end went.
+/// The bounded capture ring dropping its front and the screen replay's
+/// history budget evicting its oldest rows lose the START ("Earlier output
+/// not retained"); the line replay stopping at its cell or byte budget keeps
+/// the head and loses the END — usually where the final error or summary is
+/// — so it says the text is truncated instead. Without a notice a long
+/// session's card silently starts, or stops, partway through.
 fn finished_output_notice(
     dropped_front: bool,
     lost: bool,
     head_dropped: bool,
 ) -> Option<&'static str> {
-    (dropped_front || lost || head_dropped).then_some(FINISHED_OUTPUT_NOT_RETAINED)
+    match (dropped_front || head_dropped, lost) {
+        (false, false) => None,
+        (true, false) => Some(FINISHED_OUTPUT_NOT_RETAINED),
+        (false, true) => Some(FINISHED_OUTPUT_TEXT_TRUNCATED),
+        (true, true) => Some(FINISHED_OUTPUT_PARTLY_RETAINED),
+    }
 }
-
-const FINISHED_OUTPUT_NOT_RETAINED: &str = "Earlier output not retained";
 
 /// A finished command's captured bytes, decoded into the card's ANSI stream
 /// and its plain text.
@@ -6275,11 +6381,13 @@ impl BlockRenderPayloadAccessor for LazyBlockRenderPayload {
         }
         let mut output = self.output.borrow_mut();
         match output.as_mut()? {
-            CapturedFinalizeOutput::Foreground(ring) => {
-                zone_output_snapshot_from_ring(&mut ring.borrow_mut(), max_bytes)
-            }
+            CapturedFinalizeOutput::Foreground(ring) => zone_output_snapshot_from_capture(
+                &mut ring.borrow_mut(),
+                max_bytes,
+                self.child_winsize,
+            ),
             CapturedFinalizeOutput::Background(ring) => {
-                zone_output_snapshot_from_ring(ring, max_bytes)
+                zone_output_snapshot_from_capture(ring, max_bytes, self.child_winsize)
             }
         }
     }
@@ -6326,6 +6434,41 @@ fn unadjusted_output_tail(bytes: &[u8], max_bytes: usize) -> &[u8] {
         start += 1;
     }
     &bytes[start..]
+}
+
+/// Bounded snapshot of a capture ring that nothing materialized first. A
+/// stream that needs the screen replay (codex inserting its history above an
+/// inline viewport) goes through the same `render_captured_output` the card
+/// and `BlockData` use: the plain line strip has no scroll region or reverse
+/// index and kept only the first screenful, so Unified search and export
+/// lost the history whenever no journal observer had materialized the payload.
+/// Plain line output keeps the cheap raw-tail strip.
+fn zone_output_snapshot_from_capture(
+    ring: &mut BoundedByteRing,
+    max_bytes: usize,
+    child_winsize: (u16, u16),
+) -> Option<ZoneOutputSnapshot> {
+    use jterm_core::screen_replay::{resync_ring_head, stream_needs_screen_replay};
+
+    if ring.is_empty() {
+        return None;
+    }
+    let dropped_front = ring.dropped_front();
+    let bytes = ring.make_contiguous();
+    let head = if dropped_front {
+        resync_ring_head(bytes)
+    } else {
+        bytes
+    };
+    if !stream_needs_screen_replay(head) {
+        return zone_output_snapshot_from_ring(ring, max_bytes);
+    }
+    let rendered = render_captured_output(bytes, dropped_front, child_winsize);
+    zone_output_snapshot_from_plain(
+        &rendered.output_plain,
+        max_bytes,
+        dropped_front || rendered.lost || rendered.head_dropped,
+    )
 }
 
 /// Bounded snapshot from the raw ring — the metadata (Unified) finalize path.
@@ -6970,17 +7113,27 @@ struct ReaderCtx {
     activity_cbs: VoidCallbacks,
     alt_screen_cbs: AltScreenCallbacks,
     mouse_reporting_rc: Rc<Cell<MouseReporting>>,
+    /// See [`LiveInputModes`].
+    live_input_modes_rc: Rc<Cell<LiveInputModes>>,
     bracketed_paste_rc: Rc<Cell<bool>>,
     /// Kitty keyboard protocol flag stacks for the live surface, and a mirror
     /// of the flags in effect that the GTK-side key and commit handlers read.
     kitty_keyboard_rc: Rc<RefCell<KittyKeyboardStacks>>,
     kitty_flags_rc: Rc<Cell<u8>>,
+    /// See [`pty_child_is_shell`].
+    pty_child_is_shell: bool,
     /// Cursor position queries left to the live VTE whose answer has not come
     /// back through `commit` yet. The commit handler reads it to tell VTE's
     /// CPR from the modified F3 key that shares its shape, and decrements it
-    /// per answer. Zeroed at an accepted PromptStart and at RIS, so a query
-    /// VTE never answered cannot keep claiming Shift+F3 forever.
+    /// per answer. Forgotten a grace period after an accepted PromptStart or
+    /// RIS, so a query VTE never answered cannot keep claiming Shift+F3
+    /// forever — never at the boundary itself, because libvte processes fed
+    /// bytes a frame or more later and still answers the queries already fed
+    /// to it; zeroing then turned that answer into typing at the new prompt.
     cpr_outstanding_rc: Rc<Cell<u32>>,
+    /// How many CPR queries were ever left to the live VTE: a deferred forget
+    /// only applies while nothing new was asked since its boundary.
+    cpr_queries_rc: Rc<Cell<u64>>,
     /// When alternate-screen output last reported activity; see
     /// [`alt_screen_activity_due`].
     alt_screen_activity_at: Cell<Option<std::time::Instant>>,
@@ -7104,7 +7257,8 @@ impl ReaderCtx {
 
     fn on_hard_reset(&self) {
         self.reset_kitty_keyboard();
-        self.cpr_outstanding_rc.set(0);
+        self.live_input_modes_rc.set(LiveInputModes::default());
+        self.forget_unanswered_cpr_later();
         self.live_extent_force_full_rc.set(true);
         self.release_prompt_fence_before_reset();
 
@@ -7226,6 +7380,10 @@ impl ReaderCtx {
         // synthesises and for the gates that must know a program owns the
         // mouse. Tracking and encoding are separate modes: see
         // `MouseReporting`.
+        let mut modes = self.live_input_modes_rc.get();
+        if modes.apply_decset(mode, set) {
+            self.live_input_modes_rc.set(modes);
+        }
         let mut mouse = self.mouse_reporting_rc.get();
         if mouse.apply_decset(mode, set) {
             self.mouse_reporting_rc.set(mouse);
@@ -7450,8 +7608,9 @@ impl ReaderCtx {
         self.reset_mouse_reporting();
         // Same boundary for the CPR ledger: whatever the last program asked
         // the live VTE and never got answered no longer makes a modified F3
-        // typed at this prompt look like a report.
-        self.cpr_outstanding_rc.set(0);
+        // typed at this prompt look like a report — once VTE has had the
+        // time to answer the ones it is still processing.
+        self.forget_unanswered_cpr_later();
         // All rejection/recovery guards above have passed: this PromptStart
         // really ends the prior lifecycle. Clear an ED3/RIS full-card latch
         // before backend finalization resets VTE and can synchronously relayout.
@@ -8292,6 +8451,28 @@ impl ReaderCtx {
         self.dynamic_colors_rc.set(dynamic);
     }
 
+    /// A boundary ended whatever program asked the live VTE for its cursor.
+    /// The answers VTE still owes for queries fed before it arrive a frame or
+    /// more later and settle the ledger themselves; only what is still owed
+    /// after [`CPR_ANSWER_GRACE`], with nothing asked since, is forgotten.
+    fn forget_unanswered_cpr_later(&self) {
+        if self.cpr_outstanding_rc.get() == 0 {
+            return;
+        }
+        let ledger = self.cpr_outstanding_rc.clone();
+        let queries = self.cpr_queries_rc.clone();
+        let asked = queries.get();
+        // Only the thread that owns the main context can schedule; a test
+        // thread that cannot simply keeps the ledger, which is the safe side.
+        if glib::MainContext::default().acquire().is_ok() {
+            glib::timeout_add_local_once(CPR_ANSWER_GRACE, move || {
+                if cpr_forget_applies(asked, queries.get()) {
+                    ledger.set(0);
+                }
+            });
+        }
+    }
+
     fn on_keyboard_protocol_query(&self, query: KeyboardProtocolQuery) {
         // The parser reports the query *and* passes its bytes through to the
         // live surface. Where that surface answers for itself, a reply from
@@ -8301,14 +8482,45 @@ impl ReaderCtx {
         // a CPR there has the shape of a modified F3 (`CSI 1;2 R`), so count
         // the ones still owed: the commit handler knows a report by that.
         if self.backend.live_surface_answers_query(query) {
+            // VTE answers only once it is fed the query. At the idle prompt
+            // the post-B fence may be parking these very bytes until the
+            // anchor settles — up to its deadline, close to crossterm's 2 s
+            // timeout for a line editor's `cursor::position()`. The answer
+            // matters more than the anchor for this one prompt: release the
+            // fence, exactly as a ring overflow does.
+            if self.bstate_rc.get() == BlockState::AwaitingCommand
+                && !self.prompt_anchor_ready_rc.get()
+                && !self.post_prompt_fence_released_rc.get()
+            {
+                release_post_prompt_fence(
+                    &|deferred| self.backend.feed_live(deferred),
+                    &self.post_prompt_bytes_rc,
+                    &self.post_prompt_fence_released_rc,
+                );
+            }
             if query == KeyboardProtocolQuery::CursorPosition {
                 self.cpr_outstanding_rc
                     .set(self.cpr_outstanding_rc.get().saturating_add(1));
+                self.cpr_queries_rc
+                    .set(self.cpr_queries_rc.get().wrapping_add(1));
             }
             return;
         }
         let (col, row) = self.backend.cursor_position_report();
-        let reply = build_keyboard_query_reply(query, col, row, self.kitty_flags_rc.get());
+        // `CSI ? u` reports what the keys will really be. RawFallback encodes
+        // only while the program that pushed owns the keyboard; answering its
+        // flags anyway told a client the protocol was on and then sent it
+        // legacy keys.
+        let kitty_flags = if query == KeyboardProtocolQuery::KittyQuery
+            && self.bstate_rc.get() == BlockState::RawFallback
+            && !kitty_rewrite_applies(BlockState::RawFallback, self.pty_child_is_shell, || {
+                self.pty_for_init.foreground_owner()
+            }) {
+            0
+        } else {
+            self.kitty_flags_rc.get()
+        };
+        let reply = build_keyboard_query_reply(query, col, row, kitty_flags);
         if let Err(error) = self.pty_for_init.write_bytes(reply.as_bytes()) {
             self.pty_for_init
                 .report_write_error("could not queue keyboard-query reply", error);
@@ -9065,6 +9277,7 @@ impl RenderBackend for BlockBackend {
             cols: cols.clamp(1, u16::MAX as i64) as u16,
             command_exact: record.command_source == CommandTextSource::ShellReported,
             command_truncated: record.command_source == CommandTextSource::ScreenAfterTruncation,
+            output_notice: payload.output_notice().map(str::to_owned),
         };
         let max_blocks = self.config_for_cb.borrow().max_visible_blocks as usize;
         let newest_estimated_bytes = {
@@ -10409,7 +10622,7 @@ fn sync_active_to_pty(
     winsize: &PtyWinsize,
 ) {
     layout_active_surface();
-    winsize.publish(pty, pty_grid_size(vte, scroll));
+    winsize.reassert(pty, pty_grid_size(vte, scroll));
     winsize.arm_settle();
 }
 
@@ -10429,6 +10642,10 @@ struct PtyWinsize {
     generation: Rc<Cell<u64>>,
     /// Arms the settle tick; installed once the tick exists.
     arm: RefCell<Option<Rc<dyn Fn()>>>,
+    /// Test hook: a test that pins the child's winsize to a capture's grid
+    /// stops every publisher from correcting it to the test window's.
+    #[cfg(test)]
+    frozen: Cell<bool>,
 }
 
 impl PtyWinsize {
@@ -10437,12 +10654,18 @@ impl PtyWinsize {
             sent: Cell::new((0, 0)),
             generation,
             arm: RefCell::new(None),
+            #[cfg(test)]
+            frozen: Cell::new(false),
         }
     }
 
     /// Tell the child `sample` unless it already has it. Returns whether the
     /// PTY was resized.
     fn publish(&self, pty: &OwnedPty, sample: (u16, u16)) -> bool {
+        #[cfg(test)]
+        if self.frozen.get() {
+            return false;
+        }
         let Some((cols, rows)) = winsize_to_publish(self.sent.get(), sample) else {
             return false;
         };
@@ -10450,6 +10673,27 @@ impl PtyWinsize {
         self.generation.set(self.generation.get().wrapping_add(1));
         pty.resize(cols, rows);
         true
+    }
+
+    /// A state transition's push: issue `TIOCSWINSZ` even when forge's own
+    /// record already says `sample`. Something else may have changed the
+    /// tty's winsize through the slave (`stty cols 60`, `resize`, a program
+    /// that crashed mid-resize), and PromptStart/CommandStart are where the
+    /// real grid is reasserted. The kernel sends no SIGWINCH for an unchanged
+    /// size, so the repeat is free; only a real change bumps the generation.
+    fn reassert(&self, pty: &OwnedPty, sample: (u16, u16)) -> bool {
+        #[cfg(test)]
+        if self.frozen.get() {
+            return false;
+        }
+        if sample.0 == 0 || sample.1 == 0 {
+            return false;
+        }
+        if self.publish(pty, sample) {
+            return true;
+        }
+        pty.resize(sample.0, sample.1);
+        false
     }
 
     /// The `(cols, rows)` the child was last told — the geometry its absolute
@@ -10471,6 +10715,24 @@ impl PtyWinsize {
             arm();
         }
     }
+}
+
+/// Unchanged frames the resize tick still polls after an arm; see
+/// `install_resize_tick`.
+const RESIZE_TICK_GRACE_POLLS: u8 = 1;
+
+/// Whether the settle tick polls another frame: while something moved, and for
+/// the grace frames after an arm even when nothing did yet.
+fn resize_tick_continues(settling: bool, grace_polls: &Cell<u8>) -> bool {
+    if settling {
+        return true;
+    }
+    let grace = grace_polls.get();
+    if grace > 0 {
+        grace_polls.set(grace - 1);
+        return true;
+    }
+    false
 }
 
 /// What a winsize publisher sends for a grid sample: nothing for a degenerate
@@ -11416,6 +11678,9 @@ fn exit_alt_screen_chrome(
     unread: u32,
 ) {
     let active = active.borrow();
+    // Every caller has just fed VTE the return to the primary screen, which it
+    // has not processed yet: the next layout must not sample its cursor.
+    active.alt_leave_pending().set(true);
     active.widget().remove_css_class("block-alt-screen");
     active.set_live_organism_alt_screen(false);
     sticky.set_visible(false);
@@ -11425,6 +11690,67 @@ fn exit_alt_screen_chrome(
     } else {
         jump_fab.set_visible(false);
     }
+}
+
+/// Whether the idle scroll probe offers the jump-to-bottom FAB: whenever the
+/// live card is off screen, and whenever the view no longer follows the
+/// bottom. A lock kept while the card is still visible (a few pixels of
+/// scroll at the idle prompt) used to hide the FAB, and the next command's
+/// output then grew below the viewport with no way back offered until it
+/// finished.
+fn jump_fab_offered(live_card_visible: bool, scroll_locked: bool) -> bool {
+    !live_card_visible || scroll_locked
+}
+
+/// The DEC private modes the wheel path needs from the live surface, which
+/// libvte does not expose: DECCKM (1) picks `ESC O A` over `ESC [ A`, and
+/// alternate scroll (1007, on by default in libvte) turns the wheel into
+/// arrow keys on the alternate screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiveInputModes {
+    app_cursor_keys: bool,
+    alternate_scroll: bool,
+}
+
+impl Default for LiveInputModes {
+    fn default() -> Self {
+        Self {
+            app_cursor_keys: false,
+            alternate_scroll: true,
+        }
+    }
+}
+
+impl LiveInputModes {
+    fn apply_decset(&mut self, mode: u32, set: bool) -> bool {
+        match mode {
+            1 => self.app_cursor_keys = set,
+            1007 => self.alternate_scroll = set,
+            _ => return false,
+        }
+        true
+    }
+}
+
+/// The arrow keys libvte's alternate scroll sends for `notches` whole wheel
+/// notches: a tenth of the screen per notch (its page increment over 10, at
+/// least one), up for negative notches, in the DECCKM form in effect.
+fn alternate_scroll_arrows(notches: i32, rows: i64, app_cursor_keys: bool) -> Vec<u8> {
+    if notches == 0 {
+        return Vec::new();
+    }
+    let per_notch = ((rows.max(1) + 9) / 10).max(1) as usize;
+    let key: &[u8] = match (notches < 0, app_cursor_keys) {
+        (true, true) => b"\x1bOA",
+        (true, false) => b"\x1b[A",
+        (false, true) => b"\x1bOB",
+        (false, false) => b"\x1b[B",
+    };
+    // Bounded like the mouse path: a flick never floods the program.
+    let count = (notches.unsigned_abs() as usize)
+        .min(alt_screen::MAX_WHEEL_REPORTS_PER_EVENT as usize)
+        .saturating_mul(per_notch);
+    key.repeat(count)
 }
 
 /// Whether the running-command Ctrl+C/Ctrl+D fallback may act on this key
@@ -11768,6 +12094,10 @@ struct LiveCommitSink {
     selection_anchor_id: Rc<Cell<Option<u64>>>,
     human_input: HumanInputCallbacks,
     kitty_flags: Rc<Cell<u8>>,
+    /// The stacks behind `kitty_flags`, reset at RawFallback's boundary.
+    kitty_keyboard: Rc<RefCell<KittyKeyboardStacks>>,
+    /// See [`pty_child_is_shell`].
+    pty_child_is_shell: bool,
     /// The key press the recorder saw last, taken by the commit it produced.
     kitty_last_key: Rc<Cell<Option<(KittyKey, KittyModifiers)>>>,
     alt_escape: Rc<Cell<AltEscapeJoiner>>,
@@ -11809,10 +12139,23 @@ impl LiveCommitSink {
         // the IME swallowed — passes unchanged.
         if let Some((key, mods)) = key {
             let flags = self.kitty_flags.get();
-            if flags != 0 && kitty_rewrite_applies(block_state, || self.pty.foreground_owner()) {
-                if let Some(encoded) = kitty_keyboard::rewrite_commit(key, mods, &bytes, flags) {
-                    self.write_rewritten(&encoded);
-                    return LiveCommitRoute::KittyEncoded;
+            if flags != 0 {
+                match kitty_gate(block_state, self.pty_child_is_shell, || {
+                    self.pty.foreground_owner()
+                }) {
+                    KittyGate::Rewrite => {
+                        if let Some(encoded) =
+                            kitty_keyboard::rewrite_commit(key, mods, &bytes, flags)
+                        {
+                            self.write_rewritten(&encoded);
+                            return LiveCommitRoute::KittyEncoded;
+                        }
+                    }
+                    KittyGate::ForgetStale => {
+                        self.kitty_keyboard.borrow_mut().reset();
+                        self.kitty_flags.set(self.kitty_keyboard.borrow().flags());
+                    }
+                    KittyGate::Legacy => {}
                 }
             }
         }
@@ -12094,6 +12437,24 @@ impl KeyCtx {
             let Some(active_vte_for_key) = active_vte_for_key.upgrade() else {
                 return glib::Propagation::Proceed;
             };
+            // Focus stranded on a card while a program runs: an unbound Ctrl or
+            // Alt chord is the program's (claude's Ctrl+O, codex's Ctrl+T,
+            // Alt+B word motion) and would otherwise die on the card's
+            // input-disabled snapshot VTE. Every branch below that declines a
+            // key returns through here, so a chord a Block binding looked at
+            // and let go (Ctrl+Enter with no selection, Ctrl+Esc, Ctrl+, with
+            // no bookmarks) is rescued too; forwarded through the live VTE's
+            // own controllers, so it is encoded exactly as if typed there.
+            let decline = |controller: &gtk4::EventControllerKey| {
+                if scope == KeyScope::StrandedFocus
+                    && stranded_focus_rescues_chord(bstate_for_key.get(), keyval, modifiers)
+                {
+                    focus_terminal(&active_vte_for_key);
+                    controller.forward(&active_vte_for_key);
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            };
             let Some(block_list_for_key) = block_list_for_key.upgrade() else {
                 return glib::Propagation::Proceed;
             };
@@ -12244,7 +12605,7 @@ impl KeyCtx {
                 let selected_count = selected_block_ids_for_key.borrow().len();
                 if !block_selection_owns_ctrl_enter(selected_block_id_for_key.get(), selected_count)
                 {
-                    return glib::Propagation::Proceed;
+                    return decline(controller);
                 }
                 let finished = finished_blocks_for_key.borrow();
                 let target = {
@@ -12428,7 +12789,7 @@ impl KeyCtx {
                     );
                     return glib::Propagation::Stop;
                 }
-                return glib::Propagation::Proceed;
+                return decline(controller);
             }
 
             // Linux Warp toggles the selected/latest block's output filter with Alt+Shift+F.
@@ -12480,7 +12841,9 @@ impl KeyCtx {
                 let finished = finished_blocks_for_key.borrow();
                 let marks = bookmarks_for_key.borrow();
                 if marks.is_empty() {
-                    return glib::Propagation::Proceed;
+                    drop(marks);
+                    drop(finished);
+                    return decline(controller);
                 }
                 let marked_idx: Vec<usize> = finished
                     .iter()
@@ -12489,7 +12852,9 @@ impl KeyCtx {
                     .map(|(i, _)| i)
                     .collect();
                 if marked_idx.is_empty() {
-                    return glib::Propagation::Proceed;
+                    drop(marks);
+                    drop(finished);
+                    return decline(controller);
                 }
                 let cur = selected_block_id_for_key
                     .get()
@@ -12535,23 +12900,11 @@ impl KeyCtx {
             // Plain Ctrl+P belongs to readline and terminal applications. The
             // app-level Ctrl+Shift+H action owns command-history recall.
 
-            // Focus stranded on a card while a program runs: an unbound Ctrl or
-            // Alt chord is the program's (claude's Ctrl+O, codex's Ctrl+T,
-            // Alt+B word motion) and would otherwise die on the card's
-            // input-disabled snapshot VTE. Last, so every Block-owned chord
-            // above has already had its turn; forwarded through the live VTE's
-            // own controllers, so it is encoded exactly as if typed there.
-            if scope == KeyScope::StrandedFocus
-                && stranded_focus_rescues_chord(bstate_for_key.get(), keyval, modifiers)
-            {
-                focus_terminal(&active_vte_for_key);
-                controller.forward(&active_vte_for_key);
-                return glib::Propagation::Stop;
-            }
-
             // Everything else: let the VTE translate it (printable keys, editing,
-            // control sequences, IME) and emit `commit`.
-            glib::Propagation::Proceed
+            // control sequences, IME) and emit `commit` — or, stranded on a
+            // card, rescue an unbound chord (see `decline`). Last, so every
+            // Block-owned chord above has already had its turn.
+            decline(controller)
         });
     }
 }
@@ -12826,6 +13179,7 @@ impl TermView {
         // exhaustion retain their original io::Error for the transactional UI
         // caller to log and present instead of panicking the application.
         let request_shell_token = shell_argv_supports_agent_ids(shell_argv);
+        let pty_child_is_shell = pty_child_is_shell(shell_argv);
         let pty = Rc::new(spawn(&argv, cwd, &env_extra, request_shell_token)?);
         let shell_integration_token = pty
             .shell_integration_token()
@@ -13263,6 +13617,7 @@ impl TermView {
             // `reset_active` funnel that clears the high-water.
             let live_cursor_origin = active.borrow().live_cursor_origin();
             let live_cursor_high = active.borrow().live_cursor_high();
+            let alt_leave_pending = active.borrow().alt_leave_pending();
             // The engine clears this ring immediately before entering
             // CollectingOutput and appends every subsequent output chunk before
             // feeding the VTE. It gates coherent growth after CommandStart;
@@ -13340,6 +13695,16 @@ impl TermView {
                             preserved_scrollback_running_rows(viewport_rows);
                         live_rows_high_water.set(high_water);
                         visible_rows
+                    }
+                    // Back from the alternate screen, but VTE has not processed
+                    // the switch yet: its cursor is still the alternate
+                    // screen's, and measuring it would latch that row as the
+                    // card's extent for the rest of the command. Keep the card
+                    // as it was until `contents-changed` says VTE caught up.
+                    BlockState::CollectingOutput | BlockState::PostCommand
+                        if alt_leave_pending.get() =>
+                    {
+                        live_visible_rows(live_rows_high_water.get(), viewport_rows)
                     }
                     BlockState::CollectingOutput | BlockState::PostCommand => {
                         let output_started = !live_raw_output_for_layout.borrow().is_empty();
@@ -13486,8 +13851,12 @@ impl TermView {
             let scroll = block_scroll.downgrade();
             let debouncer = scroll_debouncer.clone();
             let contents_generation = contents_generation.clone();
+            let alt_leave_pending = active.borrow().alt_leave_pending();
             active_vte.connect_contents_changed(move |_| {
                 contents_generation.set(contents_generation.get().wrapping_add(1));
+                // VTE has processed what it was fed, including any return to
+                // the primary screen: its cursor may be measured again.
+                alt_leave_pending.set(false);
                 f();
                 let Some(scroll) = scroll.upgrade() else {
                     return;
@@ -13563,6 +13932,8 @@ impl TermView {
         };
         let mouse_reporting_mode: Rc<Cell<MouseReporting>> =
             Rc::new(Cell::new(MouseReporting::OFF));
+        let live_input_modes: Rc<Cell<LiveInputModes>> =
+            Rc::new(Cell::new(LiveInputModes::default()));
         // Unlike a regular VTE terminal, block mode owns the shell PTY. Keep
         // DECSET 2004 state here so clipboard pastes can be forwarded as one
         // ordered byte stream instead of relying on VTE's unrelated PTY.
@@ -14009,7 +14380,9 @@ impl TermView {
                 ftcs_seen_rc: ftcs_seen.clone(),
                 kitty_keyboard_rc: kitty_keyboard.clone(),
                 kitty_flags_rc: kitty_flags.clone(),
+                pty_child_is_shell,
                 cpr_outstanding_rc: cpr_outstanding.clone(),
+                cpr_queries_rc: Rc::new(Cell::new(0)),
                 alt_screen_activity_at: Cell::new(None),
                 live_reporting_modes_set: Cell::new(false),
                 engine: RefCell::new(EngineState {
@@ -14060,6 +14433,7 @@ impl TermView {
                 activity_cbs,
                 alt_screen_cbs,
                 mouse_reporting_rc,
+                live_input_modes_rc: live_input_modes.clone(),
                 bracketed_paste_rc,
                 config_for_cb,
                 dynamic_colors_rc: dynamic_colors.clone(),
@@ -14173,13 +14547,10 @@ impl TermView {
                         // still off the bottom; the FAB stays geometric.
                         let adj = scroll.vadjustment();
                         let bottom = (adj.upper() - adj.page_size()).max(adj.lower());
-                        user_scrolled.set(next_scroll_lock(
-                            user_scrolled.get(),
-                            at_bottom,
-                            adj.value(),
-                            bottom,
-                        ));
-                        if at_bottom {
+                        let locked =
+                            next_scroll_lock(user_scrolled.get(), at_bottom, adj.value(), bottom);
+                        user_scrolled.set(locked);
+                        if !jump_fab_offered(at_bottom, locked) {
                             unread.set(0);
                             fab.set_visible(false);
                         } else {
@@ -14382,6 +14753,8 @@ impl TermView {
             let finished = finished_blocks_rc.clone();
             let scroll = block_scroll.clone();
             let fullscreen = fullscreen.clone();
+            let bracketed_paste_for_sticky = bracketed_paste.clone();
+            let kitty_flags_for_sticky = kitty_flags.clone();
             // Last fingerprinted scan inputs plus the candidate they produced;
             // see `StickyScanInputs`. Lives only in this closure.
             type StickyScanState =
@@ -14411,6 +14784,10 @@ impl TermView {
                 // Only a pill that is due needs the geometry: where the live
                 // card starts against where the pill would end.
                 let covers_live = following
+                    && running_readout_yields_to_live(
+                        unified,
+                        bracketed_paste_for_sticky.get() || kitty_flags_for_sticky.get() != 0,
+                    )
                     && running_secs.is_some_and(|secs| secs >= RUNNING_HEADER_AT_BOTTOM_AFTER_SECS)
                     && {
                         present_sticky_bar(&sticky, &sticky_presentation, true, minimized);
@@ -14557,6 +14934,8 @@ impl TermView {
             selection_anchor_id: selection_anchor_id.clone(),
             human_input: human_input_callbacks.clone(),
             kitty_flags: kitty_flags.clone(),
+            kitty_keyboard: kitty_keyboard.clone(),
+            pty_child_is_shell,
             kitty_last_key: kitty_last_key.clone(),
             alt_escape: alt_escape.clone(),
             cpr_outstanding: cpr_outstanding.clone(),
@@ -14840,6 +15219,7 @@ impl TermView {
             let pty_for_scroll = pty.clone();
             let pointer_for_scroll = pointer_cell.clone();
             let bstate_for_scroll = bstate.clone();
+            let input_modes_for_scroll = live_input_modes.clone();
             let fidelity_for_scroll = typed_cmd_fidelity.clone();
             let dirty_for_scroll = idle_input_dirty.clone();
             let synced_for_scroll = pty_synced.clone();
@@ -14910,10 +15290,43 @@ impl TermView {
                     }
                     return glib::Propagation::Stop;
                 }
-                // Alt-screen without mouse reporting: VTE natively fakes
-                // arrow keys for the wheel (less/vim paging). Let it.
+                // Alt-screen without mouse reporting: VTE fakes arrow keys for
+                // the wheel (less, man, codex's Ctrl+T transcript). A wheel
+                // notch is left to it; a surface-pixel delta is not — VTE 0.76
+                // counts each pixel as a notch, so a gentle touchpad swipe sent
+                // dozens of arrows. Those are normalised into notches here and
+                // sent as VTE would send them.
                 if bstate_for_scroll.get() == BlockState::AltScreen {
-                    return glib::Propagation::Proceed;
+                    let modes = input_modes_for_scroll.get();
+                    if !surface_unit || !modes.alternate_scroll {
+                        return glib::Propagation::Proceed;
+                    }
+                    let mut accumulator = wheel_accumulator.get();
+                    let notches = accumulator.push(dy, true);
+                    wheel_accumulator.set(accumulator);
+                    let rows = vte_for_scroll
+                        .upgrade()
+                        .map(|vte| vte.row_count())
+                        .unwrap_or(0);
+                    let bytes = alternate_scroll_arrows(notches, rows, modes.app_cursor_keys);
+                    if !bytes.is_empty() {
+                        hold_for_scroll.flush_then(|| match pty_for_scroll.write_bytes(&bytes) {
+                            Ok(()) => record_protocol_reply_input(
+                                bstate_for_scroll.get(),
+                                &fidelity_for_scroll,
+                                &dirty_for_scroll,
+                                &synced_for_scroll,
+                                &submitted_for_scroll,
+                                &typeahead_for_scroll,
+                                &input_generation_for_scroll,
+                            ),
+                            Err(error) => pty_for_scroll.report_write_error(
+                                "could not queue alternate-scroll input",
+                                error,
+                            ),
+                        });
+                    }
+                    return glib::Propagation::Stop;
                 }
                 // While a command streams, its scrollback is a first-class
                 // reading surface: the wheel scrolls the live VTE itself and
@@ -15225,7 +15638,15 @@ impl TermView {
         let vte_for_resize = self.active_vte.downgrade();
         let last_pane: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((0, 0)));
         let tick_slot = self.resize_tick_id.clone();
+        // Frames the tick keeps polling after an unchanged one. GTK runs tick
+        // callbacks in the frame clock's UPDATE phase, before LAYOUT: a width
+        // that only moves with the next allocation (a density toggle swaps
+        // CSS classes and arms from its synchronous push) is still the old one
+        // at the first poll, and stopping there left the grid to change on a
+        // later contents-driven layout with no TIOCSWINSZ.
+        let grace_polls: Rc<Cell<u8>> = Rc::new(Cell::new(0));
         let arm: Rc<dyn Fn()> = Rc::new(move || {
+            grace_polls.set(RESIZE_TICK_GRACE_POLLS);
             // Already settling: the running tick reads absolute geometry on
             // every poll, so it observes this change without a second tick.
             if tick_slot.borrow().is_some() {
@@ -15242,6 +15663,7 @@ impl TermView {
             let backend_for_resize = backend_for_resize.clone();
             let clip_for_resize = clip_for_resize.clone();
             let last_pane = last_pane.clone();
+            let grace_polls = grace_polls.clone();
             let tick_id = vte_for_tick.add_tick_callback(move |vte, _clock| {
                 let Some(scroll_for_resize) = scroll_for_resize.upgrade() else {
                     tick_slot_for_tick.borrow_mut().take();
@@ -15272,11 +15694,11 @@ impl TermView {
                         settling = true;
                     }
                 }
-                if !settling {
-                    // A full frame with no pane- or grid-level movement: the
-                    // change that armed this tick has been applied end to end.
-                    // Hand the frame clock back; the next geometry signal
-                    // re-arms it.
+                if !resize_tick_continues(settling, &grace_polls) {
+                    // A full frame with no pane- or grid-level movement, after
+                    // the post-layout grace: the change that armed this tick
+                    // has been applied end to end. Hand the frame clock back;
+                    // the next geometry signal re-arms it.
                     tick_slot_for_tick.borrow_mut().take();
                     return glib::ControlFlow::Break;
                 }
@@ -16595,6 +17017,9 @@ impl TermView {
                     block.lifecycle_health(),
                     block.lifecycle_notice().as_deref(),
                 );
+                finished.set_output_notice(
+                    block.output_notice.as_deref().and_then(known_output_notice),
+                );
                 apply_dynamic_colors_to_finished(&finished, self.dynamic_colors.get());
                 // The card that will follow this one, or the live block when
                 // every mounted card is older.
@@ -16789,6 +17214,9 @@ impl TermView {
                 finished.set_lifecycle(
                     block.lifecycle_health(),
                     block.lifecycle_notice().as_deref(),
+                );
+                finished.set_output_notice(
+                    block.output_notice.as_deref().and_then(known_output_notice),
                 );
                 apply_dynamic_colors_to_finished(&finished, self.dynamic_colors.get());
                 finished
@@ -17606,6 +18034,97 @@ mod tests {
         assert_eq!(published, vec![(122, 40), (120, 40)]);
     }
 
+    /// The transition pushes reassert the real grid even when forge's record
+    /// already says so: a winsize changed through the slave (`stty cols 60
+    /// rows 20`, a crashed program) used to stay until the pane moved.
+    #[test]
+    fn a_transition_push_restores_a_winsize_changed_behind_forges_back() {
+        let pty = crate::pty::OwnedPty::for_tests(PtyForeground::Shell).expect("a test PTY");
+        let generation = Rc::new(Cell::new(0));
+        let winsize = super::PtyWinsize::new(generation.clone());
+        assert!(winsize.reassert(&pty, (120, 40)));
+        assert_eq!(pty.test_slave_winsize(), (120, 40));
+        assert_eq!(generation.get(), 1);
+
+        pty.set_test_slave_winsize(60, 20);
+        assert!(
+            !winsize.publish(&pty, (120, 40)),
+            "the settle tick still dedups"
+        );
+        assert_eq!(pty.test_slave_winsize(), (60, 20));
+        assert!(
+            !winsize.reassert(&pty, (120, 40)),
+            "not a change of forge's grid"
+        );
+        assert_eq!(pty.test_slave_winsize(), (120, 40));
+        assert_eq!(
+            generation.get(),
+            1,
+            "the prompt was not reflowed by a resize"
+        );
+        assert!(!winsize.reassert(&pty, (0, 40)));
+    }
+
+    /// The settle tick polls in UPDATE, before the frame's LAYOUT: an arm
+    /// keeps it alive for a post-layout frame, so a width that moves only
+    /// with the next allocation is still followed.
+    #[test]
+    fn the_resize_tick_polls_a_post_layout_frame_after_an_arm() {
+        use super::{resize_tick_continues, RESIZE_TICK_GRACE_POLLS};
+        let grace = Cell::new(RESIZE_TICK_GRACE_POLLS);
+        assert!(resize_tick_continues(true, &grace));
+        assert_eq!(
+            grace.get(),
+            RESIZE_TICK_GRACE_POLLS,
+            "movement spends no grace"
+        );
+        for _ in 0..RESIZE_TICK_GRACE_POLLS {
+            assert!(resize_tick_continues(false, &grace));
+        }
+        assert!(!resize_tick_continues(false, &grace));
+    }
+
+    /// Alternate scroll without mouse reporting: surface-pixel deltas are
+    /// normalised into notches and sent as libvte sends them — a tenth of the
+    /// screen of arrows per notch, in the DECCKM form the program chose.
+    #[test]
+    fn alternate_scroll_sends_vtes_arrows_for_whole_notches() {
+        use super::{alternate_scroll_arrows, LiveInputModes};
+        assert!(alternate_scroll_arrows(0, 40, false).is_empty());
+        assert_eq!(alternate_scroll_arrows(-1, 40, false), b"\x1b[A".repeat(4));
+        assert_eq!(alternate_scroll_arrows(2, 40, true), b"\x1bOB".repeat(8));
+        assert_eq!(alternate_scroll_arrows(1, 5, false), b"\x1b[B");
+        assert_eq!(
+            alternate_scroll_arrows(-500, 10, true),
+            b"\x1bOA".repeat(super::alt_screen::MAX_WHEEL_REPORTS_PER_EVENT as usize),
+            "a flick is bounded like the mouse path"
+        );
+
+        let mut modes = LiveInputModes::default();
+        assert!(modes.alternate_scroll && !modes.app_cursor_keys);
+        assert!(modes.apply_decset(1, true));
+        assert!(modes.apply_decset(1007, false));
+        assert!(!modes.apply_decset(2004, true));
+        assert_eq!(
+            modes,
+            LiveInputModes {
+                app_cursor_keys: true,
+                alternate_scroll: false
+            }
+        );
+        let mut surface = jterm_core::wheel::WheelAccumulator::new();
+        // A 20px swipe is two notches, not twenty.
+        assert_eq!(surface.push(-20.0, true), -2);
+    }
+
+    #[test]
+    fn a_kept_scroll_lock_offers_the_way_back_even_with_the_card_visible() {
+        assert!(super::jump_fab_offered(true, true));
+        assert!(super::jump_fab_offered(false, false));
+        assert!(super::jump_fab_offered(false, true));
+        assert!(!super::jump_fab_offered(true, false));
+    }
+
     #[test]
     fn alt_screen_activity_is_coalesced() {
         use super::{alt_screen_activity_due, ALT_SCREEN_ACTIVITY_INTERVAL};
@@ -17977,6 +18496,15 @@ mod tests {
 
         // A full card starts a few px under the scroller top; a ~30 px pill
         // (10 px margin included) would sit on its first row.
+        assert!(super::running_readout_yields_to_live(false, true));
+        assert!(
+            !super::running_readout_yields_to_live(false, false),
+            "cargo build"
+        );
+        assert!(
+            !super::running_readout_yields_to_live(true, true),
+            "Unified"
+        );
         assert!(running_readout_covers_live(0.0, 30.0));
         assert!(running_readout_covers_live(7.0, 30.0));
         assert!(!running_readout_covers_live(400.0, 30.0));
@@ -18185,6 +18713,14 @@ mod tests {
                 Key::Return,
                 ModifierType::ALT_MASK | ModifierType::SHIFT_MASK
             ));
+            // Chords a Block binding looks at and declines (Ctrl+Enter with
+            // no selection, Ctrl/Alt+Esc with none, Ctrl+, / Ctrl+. with no
+            // bookmarks) return through the same rescue.
+            assert!(rescues(state, Key::Return, ModifierType::CONTROL_MASK));
+            assert!(rescues(state, Key::Escape, ModifierType::CONTROL_MASK));
+            assert!(rescues(state, Key::Escape, ModifierType::ALT_MASK));
+            assert!(rescues(state, Key::comma, ModifierType::CONTROL_MASK));
+            assert!(rescues(state, Key::period, ModifierType::CONTROL_MASK));
             // Holding the modifier down is not the chord yet.
             for modifier in [Key::Control_L, Key::Alt_R, Key::ISO_Level3_Shift] {
                 assert!(!rescues(state, modifier, ModifierType::CONTROL_MASK));
@@ -18254,10 +18790,22 @@ mod tests {
     fn the_kitty_rewrite_follows_the_foreground_program_without_shell_integration() {
         use crate::pty::PtyForeground;
 
-        let applies = |state, foreground| super::kitty_rewrite_applies(state, || foreground);
+        let applies = |state, foreground| super::kitty_rewrite_applies(state, true, || foreground);
         assert!(applies(BlockState::RawFallback, PtyForeground::Other));
         assert!(!applies(BlockState::RawFallback, PtyForeground::Shell));
         assert!(!applies(BlockState::RawFallback, PtyForeground::Unknown));
+        // `forge -e codex` / a remote tab's ssh: the program is the session
+        // leader, so a "shell" owner is the program that pushed the flags.
+        let direct = |foreground| {
+            super::kitty_rewrite_applies(BlockState::RawFallback, false, || foreground)
+        };
+        assert!(direct(PtyForeground::Shell));
+        assert!(direct(PtyForeground::Other));
+        assert!(!direct(PtyForeground::Unknown));
+        assert_eq!(
+            super::kitty_gate(BlockState::RawFallback, true, || PtyForeground::Shell),
+            super::KittyGate::ForgetStale
+        );
         for state in [BlockState::CollectingOutput, BlockState::AltScreen] {
             assert!(applies(state, PtyForeground::Shell), "{state:?}");
         }
@@ -18272,6 +18820,7 @@ mod tests {
         // The Block states never pay for the foreground probe.
         assert!(super::kitty_rewrite_applies(
             BlockState::CollectingOutput,
+            true,
             || unreachable!("probed outside RawFallback")
         ));
     }
@@ -18286,6 +18835,14 @@ mod tests {
         assert!(!super::failed_block_section_visible("cargo test", None));
         assert!(!super::failed_block_section_visible("", Some(1)));
         assert!(!super::failed_block_section_visible("   ", Some(1)));
+        // Interrupted and suspended commands are not failures to fix.
+        for code in [130, 141, 143, 148] {
+            assert!(
+                !super::failed_block_section_visible("codex", Some(code)),
+                "{code}"
+            );
+        }
+        assert!(super::failed_block_section_visible("codex", Some(137)));
     }
 
     #[test]
@@ -18658,6 +19215,7 @@ mod tests {
             cols: 80,
             command_exact: false,
             command_truncated: false,
+            output_notice: None,
         };
 
         let expanded = super::collapsed_aware_block_height(&config, &data, false, 80);
@@ -18897,6 +19455,145 @@ mod tests {
         window.close();
     }
 
+    /// The same predicate on a real finished card: its collapse chevron and
+    /// the action it reveals are buttons the press belongs to, whatever
+    /// overlays and pick flags the card carries; its command text is not.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn a_real_cards_header_buttons_do_not_select_it() {
+        use gtk4::prelude::*;
+
+        gtk4::init().expect("gtk init");
+        let config = crate::config::Config::safe_defaults();
+        let card = super::FinishedBlock::new(
+            3,
+            "$ ",
+            "cargo build --release",
+            None,
+            "Compiling forge\r\nFinished\r\n",
+            Some(0),
+            &config,
+            Some(5),
+            None,
+            None,
+            80,
+        );
+        let window = gtk4::Window::builder()
+            .default_width(700)
+            .default_height(300)
+            .child(card.widget())
+            .build();
+        window.present();
+        let context = gtk4::glib::MainContext::default();
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_millis(250) {
+            while context.iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // As the pointer entering the card does.
+        super::blocks::reveal_block_actions(&card.action_box, true);
+        while context.iteration(false) {}
+        let card_widget: gtk4::Widget = card.widget().clone().upcast();
+        let mut buttons = Vec::new();
+        let mut pending: Vec<gtk4::Widget> = vec![card.header_row.clone().upcast()];
+        while let Some(widget) = pending.pop() {
+            if widget.is::<gtk4::Button>() && widget.is_drawable() {
+                buttons.push(widget.clone());
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                child = current.next_sibling();
+                pending.push(current);
+            }
+        }
+        assert!(
+            buttons
+                .iter()
+                .any(|button| button.has_css_class("block-collapse-btn")),
+            "the collapse chevron is on screen"
+        );
+        for button in &buttons {
+            let bounds = button.compute_bounds(&card_widget).expect("laid out");
+            let (x, y) = (
+                (bounds.x() + bounds.width() / 2.0) as f64,
+                (bounds.y() + bounds.height() / 2.0) as f64,
+            );
+            assert!(
+                super::press_lands_on_header_button(&card_widget, x, y, &card.header_row),
+                "{:?}",
+                button.css_classes()
+            );
+        }
+        let header = card
+            .header_row
+            .compute_bounds(&card_widget)
+            .expect("laid out");
+        assert!(!super::press_lands_on_header_button(
+            &card_widget,
+            (header.x() + 4.0) as f64,
+            (header.y() + header.height() / 2.0) as f64,
+            &card.header_row
+        ));
+        window.close();
+    }
+
+    /// End to end on a real pane: a dropped path is pasted, not typed —
+    /// framed when the program enabled bracketed paste — and ends block
+    /// selection like Ctrl+Shift+V does.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn a_dropped_path_reaches_the_program_as_a_bracketed_paste() {
+        use gtk4::prelude::*;
+
+        gtk4::init().expect("gtk init");
+        let config = crate::config::Config::safe_defaults();
+        let view = super::TermView::new_with_spawner(
+            &config,
+            &crate::config::TerminalMode::Block,
+            &["sh".to_string()],
+            None,
+            None,
+            &[],
+            |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+        )
+        .expect("a Block pane over a test PTY");
+        let window = gtk4::Window::builder()
+            .default_width(700)
+            .default_height(400)
+            .child(&view.widget())
+            .build();
+        window.present();
+        let settle = || {
+            let context = gtk4::glib::MainContext::default();
+            let started = std::time::Instant::now();
+            while started.elapsed() < std::time::Duration::from_millis(200) {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        settle();
+        view.pty.write_test_slave(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07codex\r\n\x1b]133;C\x07\x1b[?2004h> ",
+        );
+        settle();
+        view.pty
+            .drain_test_slave(std::time::Duration::from_millis(10));
+        view.selected_block_id.set(Some(7));
+        let dir = std::env::temp_dir().join(format!("forge-drop-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let dropped = dir.join("a b.png");
+        std::fs::write(&dropped, b"png").expect("a dropped file");
+        let payload = crate::image_drop::dropped_paths_payload(&[dropped]).expect("one local file");
+        let _ = std::fs::remove_dir_all(&dir);
+        view.paste_text(&payload).expect("the paste was queued");
+        let mut expected = b"\x1b[200~".to_vec();
+        expected.extend_from_slice(payload.as_bytes());
+        expected.extend_from_slice(b"\x1b[201~");
+        assert_eq!(view.pty.drain_test_slave(PTY_REPLY_WAIT), expected);
+        assert_eq!(view.selected_block_id.get(), None, "the selection ended");
+        window.close();
+    }
+
     /// A card left selected by a header click must not take the arrows,
     /// Delete or every Enter from a running agent.
     #[test]
@@ -19018,8 +19715,11 @@ mod tests {
             .write_test_slave(b"\x1b]133;A\x07$ \x1b]133;B\x07codex\r\n\x1b]133;C\x07");
         settle();
         // What the child was told at command start is the test window's grid;
-        // the capture was recorded at 16x120.
+        // the capture was recorded at 16x120. Pin it there: a settle tick or
+        // layout publish during the feed would otherwise correct it back to
+        // the window's grid.
         view.pty_winsize.sent.set((120, 16));
+        view.pty_winsize.frozen.set(true);
         view.pty.write_test_slave(CODEX_16ROWS);
         settle();
         assert_eq!(
@@ -19047,6 +19747,166 @@ mod tests {
         let shown = super::find::live_vte_search_text(&card.output_vte).expect("card text");
         assert_in_order(&shown, &history);
         assert!(!card.output_notice.is_visible(), "nothing was dropped");
+        drop(cards);
+        window.close();
+    }
+
+    /// End to end on a real pane: an inline program's alternate-screen round
+    /// trip (codex's Ctrl+T transcript, claude's Ctrl+G editor) leaves its card
+    /// the height it was. libvte processes the fed `CSI ? 1049 l` a frame or
+    /// more later, so the leave-time layout used to read the alternate
+    /// screen's cursor, latch it as the card's extent and pin the card to the
+    /// whole viewport for the rest of the command.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn an_alt_screen_round_trip_keeps_a_real_running_cards_height() {
+        use gtk4::prelude::*;
+        use vte4::prelude::*;
+
+        gtk4::init().expect("gtk init");
+        let config = crate::config::Config::safe_defaults();
+        let view = super::TermView::new_with_spawner(
+            &config,
+            &crate::config::TerminalMode::Block,
+            &["sh".to_string()],
+            None,
+            None,
+            &[],
+            |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+        )
+        .expect("a Block pane over a test PTY");
+        let window = gtk4::Window::builder()
+            .default_width(900)
+            .default_height(700)
+            .child(&view.widget())
+            .build();
+        window.present();
+        let settle = || {
+            let context = gtk4::glib::MainContext::default();
+            let started = std::time::Instant::now();
+            while started.elapsed() < std::time::Duration::from_millis(300) {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        settle();
+        view.pty
+            .write_test_slave(b"\x1b]133;A\x07$ \x1b]133;B\x07codex\r\n\x1b]133;C\x07");
+        settle();
+        view.pty
+            .write_test_slave(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n> ");
+        settle();
+        let extent = view.active.borrow().live_extent_rows();
+        let running = extent.get();
+        let viewport = view.active_vte.row_count();
+        assert!(
+            running > 0 && running < viewport / 2,
+            "a short running card ({running} of {viewport} rows)"
+        );
+
+        let winsize = view.pty.test_slave_winsize();
+        let columns = view.active_vte.column_count();
+
+        view.pty.write_test_slave(b"\x1b[?1049h");
+        settle();
+        // The alt-screen chrome keeps the running card's content box, so the
+        // app is not resized (a SIGWINCH makes codex replay its transcript).
+        assert_eq!(view.pty.test_slave_winsize(), winsize, "no resize at 1049h");
+        assert_eq!(view.active_vte.column_count(), columns);
+        view.pty.write_test_slave(b"\x1b[999;1Htranscript");
+        settle();
+        view.pty.write_test_slave(b"\x1b[?1049l");
+        settle();
+        assert_eq!(view.pty.test_slave_winsize(), winsize, "no resize at 1049l");
+        assert_eq!(view.active_vte.column_count(), columns);
+        assert_eq!(
+            extent.get(),
+            running,
+            "the card keeps its height across the alternate screen"
+        );
+        assert!(!view.active.borrow().alt_leave_pending().get());
+        view.pty
+            .drain_test_slave(std::time::Duration::from_millis(10));
+        window.close();
+    }
+
+    /// End to end on a real pane: output the line replay cuts short puts the
+    /// notice on the card — saying the END was lost, not the beginning — and
+    /// into the block's data, so an undo or a history reload keeps it.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn a_truncated_output_shows_its_notice_on_a_real_card() {
+        use gtk4::prelude::*;
+
+        gtk4::init().expect("gtk init");
+        let config = crate::config::Config::safe_defaults();
+        let view = super::TermView::new_with_spawner(
+            &config,
+            &crate::config::TerminalMode::Block,
+            &["sh".to_string()],
+            None,
+            None,
+            &[],
+            |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+        )
+        .expect("a Block pane over a test PTY");
+        let window = gtk4::Window::builder()
+            .default_width(800)
+            .default_height(500)
+            .child(&view.widget())
+            .build();
+        window.present();
+        let settle = |ms: u64| {
+            let context = gtk4::glib::MainContext::default();
+            let started = std::time::Instant::now();
+            while started.elapsed() < std::time::Duration::from_millis(ms) {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        settle(200);
+        view.pty.write_test_slave(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07rg --color=always x\r\n\x1b]133;C\x07",
+        );
+        settle(100);
+        // More cells than the line replay keeps: it stops, keeping the head.
+        let mut log = b"\x1b[31mstart\x1b[0m\r\n".to_vec();
+        for line in 0..20_000 {
+            log.extend_from_slice(
+                format!("{line:06} a coloured log line long enough to fill the replay budget\r\n")
+                    .as_bytes(),
+            );
+        }
+        log.extend_from_slice(b"FINAL ERROR\r\n");
+        // In slices, letting the main loop drain the reader between them: the
+        // reader hands chunks to this thread, which a single blocking write
+        // would never let run.
+        for chunk in log.chunks(2048) {
+            view.pty.write_test_slave(chunk);
+            let context = gtk4::glib::MainContext::default();
+            while context.iteration(false) {}
+        }
+        settle(1500);
+        view.pty.set_test_foreground(PtyForeground::Shell);
+        view.pty
+            .write_test_slave(b"\x1b]133;D;1\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        settle(500);
+        view.pty
+            .drain_test_slave(std::time::Duration::from_millis(10));
+
+        {
+            let data = view.block_data.borrow();
+            let block = data.back().expect("the command finished");
+            assert!(block.output.starts_with("start"));
+            assert_eq!(
+                block.output_notice.as_deref(),
+                Some("Output text truncated")
+            );
+        }
+        let cards = view.finished_blocks.borrow();
+        let card = cards.last().expect("a finished card");
+        assert!(card.output_notice.is_visible());
+        assert_eq!(card.output_notice.text(), "Output text truncated");
         drop(cards);
         window.close();
     }
@@ -19581,9 +20441,11 @@ mod tests {
         assert!(!rendered.lost && !rendered.head_dropped);
     }
 
-    /// The same through the lazy payload, at the winsize the engine hands it.
+    /// The same through the lazy payload, at a winsize handed to it directly
+    /// (the engine's own hand-off is exercised on a real pane by
+    /// `a_finished_codex_session_keeps_its_history_in_the_card_and_block_data`).
     #[test]
-    fn materialized_codex_payload_replays_at_the_child_winsize() {
+    fn materialized_codex_payload_replays_at_a_given_winsize() {
         let output = Rc::new(RefCell::new(BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES)));
         output.borrow_mut().append(CODEX_16ROWS);
         let payload = super::LazyBlockRenderPayload::new(
@@ -19597,6 +20459,43 @@ mod tests {
             &["Tip: Try the Desktop app on Linux", "usage limit"],
         );
         assert_eq!(value.output_notice(), None);
+    }
+
+    /// Unified's bounded snapshot, taken when nothing materialized the
+    /// payload first (no jsh journal observer), keeps codex's history too.
+    #[test]
+    fn an_unmaterialized_zone_snapshot_keeps_an_inline_tuis_history() {
+        use super::BlockRenderPayloadAccessor as _;
+        let output = Rc::new(RefCell::new(BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES)));
+        output.borrow_mut().append(CODEX_16ROWS);
+        let payload = super::LazyBlockRenderPayload::new(
+            "$ ".to_string(),
+            super::CapturedFinalizeOutput::Foreground(output),
+            (120, 16),
+        );
+        let snapshot = payload
+            .output_snapshot(super::MAX_ZONE_SNAPSHOT_BYTES)
+            .expect("codex printed something");
+        assert_in_order(
+            &snapshot.plain,
+            &["Tip: Try the Desktop app on Linux", "usage limit"],
+        );
+        assert!(!snapshot.truncated);
+        assert_eq!(
+            payload.materialization_count(),
+            0,
+            "still bounded, not memoized"
+        );
+
+        // Plain line output keeps the raw-tail strip.
+        let lines = Rc::new(RefCell::new(BoundedByteRing::new(64)));
+        lines.borrow_mut().append(b"one\ntwo\n");
+        let payload = super::LazyBlockRenderPayload::new(
+            String::new(),
+            super::CapturedFinalizeOutput::Foreground(lines),
+            (80, 24),
+        );
+        assert_eq!(payload.output_snapshot(1024).unwrap().plain, "one\ntwo");
     }
 
     /// Plain line output keeps its raw bytes for the card — colour, CR
@@ -19654,22 +20553,37 @@ mod tests {
     #[test]
     fn finished_output_notice_speaks_for_any_lost_output() {
         assert_eq!(super::finished_output_notice(false, false, false), None);
-        for flags in [
-            (true, false, false),
-            (false, true, false),
-            (false, false, true),
-        ] {
+        for flags in [(true, false, false), (false, false, true)] {
             assert_eq!(
                 super::finished_output_notice(flags.0, flags.1, flags.2),
                 Some("Earlier output not retained"),
                 "{flags:?}"
             );
         }
+        // The line replay keeps the head and loses the END.
+        assert_eq!(
+            super::finished_output_notice(false, true, false),
+            Some("Output text truncated")
+        );
+        assert_eq!(
+            super::finished_output_notice(true, true, false),
+            Some("Output only partly retained")
+        );
+        for notice in [
+            super::FINISHED_OUTPUT_NOT_RETAINED,
+            super::FINISHED_OUTPUT_TEXT_TRUNCATED,
+            super::FINISHED_OUTPUT_PARTLY_RETAINED,
+        ] {
+            assert_eq!(super::known_output_notice(notice), Some(notice));
+            assert!(super::output_notice_tooltip(notice).is_some());
+        }
+        assert_eq!(super::known_output_notice("<b>forged</b>"), None);
     }
 
-    /// A ring that wrapped carries its drop into the finished payload.
+    /// A ring that wrapped carries its drop into the finished payload (the
+    /// card side is `a_truncated_output_shows_its_notice_on_a_real_card`).
     #[test]
-    fn a_wrapped_ring_reports_its_dropped_front_on_the_card() {
+    fn a_wrapped_ring_reports_its_dropped_front_in_the_payload() {
         let output = Rc::new(RefCell::new(BoundedByteRing::new(16)));
         output
             .borrow_mut()
@@ -21863,6 +22777,25 @@ mod tests {
         assert_eq!(harness.ctx.kitty_flags_rc.get(), 0);
     }
 
+    /// Without shell integration `CSI ? u` answers what the keys will really
+    /// be: the pushed flags while the program owns the keyboard, 0 while the
+    /// shell does, so the answer never disagrees with the bytes sent.
+    #[test]
+    fn raw_fallback_reports_kitty_flags_only_while_they_are_applied() {
+        let harness = ReaderHarness::with_foreground(PtyForeground::Other);
+        harness.ctx.bstate_rc.set(BlockState::RawFallback);
+        harness.feed(ParserEvent::KittyKeyboard(super::KittyKeyboardOp::Push(1)));
+        let query = || {
+            harness.feed(ParserEvent::KeyboardProtocolQuery(
+                KeyboardProtocolQuery::KittyQuery,
+            ));
+            harness.pty.drain_test_slave(PTY_REPLY_WAIT)
+        };
+        assert_eq!(query(), b"\x1b[?1u");
+        harness.pty.set_test_foreground(PtyForeground::Shell);
+        assert_eq!(query(), b"\x1b[?0u");
+    }
+
     #[test]
     fn kitty_key_mapping_names_the_keys_the_protocol_treats_specially() {
         use super::{base_unicode_for, kitty_control_bytes, kitty_key_for, KittyKey};
@@ -21972,6 +22905,7 @@ mod tests {
             cols: 0,
             command_exact: false,
             command_truncated: false,
+            output_notice: None,
         }
     }
 
@@ -24478,6 +25412,7 @@ mod tests {
                 cols: cols.clamp(1, u16::MAX as i64) as u16,
                 command_exact: false,
                 command_truncated: false,
+                output_notice: None,
             };
             self.records.borrow_mut().push_back(block_data);
             self.record(Call::FinalizeBlock(FinalizeRecord {
@@ -25014,10 +25949,13 @@ mod tests {
                 activity_cbs: Rc::new(RefCell::new(Vec::new())),
                 alt_screen_cbs,
                 mouse_reporting_rc: Rc::new(Cell::new(MouseReporting::OFF)),
+                live_input_modes_rc: Rc::new(Cell::new(super::LiveInputModes::default())),
                 bracketed_paste_rc: Rc::new(Cell::new(false)),
                 kitty_keyboard_rc: Rc::new(RefCell::new(super::KittyKeyboardStacks::new())),
                 kitty_flags_rc: Rc::new(Cell::new(0)),
+                pty_child_is_shell: true,
                 cpr_outstanding_rc: Rc::new(Cell::new(0)),
+                cpr_queries_rc: Rc::new(Cell::new(0)),
                 alt_screen_activity_at: Cell::new(None),
                 live_reporting_modes_set: Cell::new(false),
                 config_for_cb: config.clone(),
@@ -27434,23 +28372,60 @@ mod tests {
         ));
         assert_eq!(harness.ctx.cpr_outstanding_rc.get(), 2);
 
+        // libvte still answers the queries fed before a boundary, a frame or
+        // more later: zeroing here turned that answer into typing at the new
+        // prompt. The forget is deferred and applies only if nothing was
+        // asked since.
         harness.feed(ParserEvent::PromptStart);
-        assert_eq!(
-            harness.ctx.cpr_outstanding_rc.get(),
-            0,
-            "an accepted prompt ends the program that asked"
-        );
-
-        cpr();
-        assert_eq!(harness.ctx.cpr_outstanding_rc.get(), 1);
+        assert_eq!(harness.ctx.cpr_outstanding_rc.get(), 2);
         harness.feed(ParserEvent::HardReset);
-        assert_eq!(harness.ctx.cpr_outstanding_rc.get(), 0);
+        assert_eq!(harness.ctx.cpr_outstanding_rc.get(), 2);
+        let asked = harness.ctx.cpr_queries_rc.get();
+        assert_eq!(asked, 2);
+        assert!(super::cpr_forget_applies(
+            asked,
+            harness.ctx.cpr_queries_rc.get()
+        ));
+        cpr();
+        assert_eq!(harness.ctx.cpr_outstanding_rc.get(), 3);
+        assert!(!super::cpr_forget_applies(
+            asked,
+            harness.ctx.cpr_queries_rc.get()
+        ));
 
         // A synthesizing backend answers itself and owes nothing.
+        harness.ctx.cpr_outstanding_rc.set(0);
         harness.backend.answers_queries_natively.set(false);
         cpr();
         assert_eq!(harness.ctx.cpr_outstanding_rc.get(), 0);
         assert!(!harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+    }
+
+    /// A line editor's query right after OSC 133 B used to wait for the
+    /// post-prompt fence: VTE answers only once it is fed the bytes, and the
+    /// fence parks them until the anchor settles.
+    #[test]
+    fn a_query_at_the_idle_prompt_releases_the_post_prompt_fence() {
+        let harness = ReaderHarness::new();
+        harness.backend.answers_queries_natively.set(true);
+        harness.ctx.bstate_rc.set(BlockState::AwaitingCommand);
+        harness.ctx.prompt_anchor_ready_rc.set(false);
+        harness.ctx.post_prompt_fence_released_rc.set(false);
+        harness
+            .ctx
+            .post_prompt_bytes_rc
+            .borrow_mut()
+            .append(b"parked\x1b[6n");
+        harness.backend.take_calls();
+        harness.feed(ParserEvent::KeyboardProtocolQuery(
+            KeyboardProtocolQuery::CursorPosition,
+        ));
+        assert!(harness.ctx.post_prompt_fence_released_rc.get());
+        assert!(harness
+            .backend
+            .take_calls()
+            .contains(&Call::FeedLive(b"parked\x1b[6n".to_vec())));
+        assert_eq!(harness.ctx.cpr_outstanding_rc.get(), 1);
     }
 
     /// A [`LiveCommitSink`](super::LiveCommitSink) over a test PTY, with a
@@ -27494,6 +28469,8 @@ mod tests {
                 selection_anchor_id: Rc::new(Cell::new(Some(7))),
                 human_input,
                 kitty_flags: Rc::new(Cell::new(0)),
+                kitty_keyboard: Rc::new(RefCell::new(super::KittyKeyboardStacks::new())),
+                pty_child_is_shell: true,
                 kitty_last_key: Rc::new(Cell::new(None)),
                 alt_escape: Rc::new(Cell::new(super::AltEscapeJoiner::new())),
                 cpr_outstanding: Rc::new(Cell::new(0)),
@@ -27728,6 +28705,99 @@ mod tests {
             harness.pty.set_test_foreground(foreground);
             assert_eq!(shift_enter(&harness), LiveCommitRoute::Typed);
             assert_eq!(harness.written(), b"\r");
+        }
+    }
+
+    /// RawFallback has no PromptStart or CommandEnd to forget pushed flags at.
+    /// A client that died without popping (a dropped ssh, a killed codex) used
+    /// to leave them for the next program: Ctrl+C in `python3` went out as
+    /// `CSI 99;5u` and never raised SIGINT. The shell owning the keyboard again
+    /// is the boundary.
+    #[test]
+    fn raw_fallback_forgets_a_dead_clients_kitty_flags_once_the_shell_is_back() {
+        use super::{KittyKey, LiveCommitRoute};
+
+        let harness = CommitHarness::new(BlockState::RawFallback, PtyForeground::Other);
+        harness.sink.kitty_keyboard.borrow_mut().apply(
+            jterm_core::kitty_keyboard::KittyKeyboardOp::Push(
+                jterm_core::kitty_keyboard::DISAMBIGUATE,
+            ),
+        );
+        harness
+            .sink
+            .kitty_flags
+            .set(harness.sink.kitty_keyboard.borrow().flags());
+        let ctrl_c = |harness: &CommitHarness| {
+            harness.press(KittyKey::Unicode('c'), false, true);
+            harness.sink.on_commit("\x03")
+        };
+        assert_eq!(ctrl_c(&harness), LiveCommitRoute::KittyEncoded);
+        assert_eq!(harness.written(), b"\x1b[99;5u");
+
+        // The client is gone and the user types at the shell.
+        harness.pty.set_test_foreground(PtyForeground::Shell);
+        harness.press(KittyKey::Unicode('p'), false, false);
+        assert_eq!(harness.sink.on_commit("p"), LiveCommitRoute::Typed);
+        assert_eq!(harness.written(), b"p");
+        assert_eq!(
+            harness.sink.kitty_flags.get(),
+            0,
+            "the stale flags are gone"
+        );
+
+        // The next program that pushed nothing gets its legacy Ctrl+C.
+        harness.pty.set_test_foreground(PtyForeground::Other);
+        assert_eq!(ctrl_c(&harness), LiveCommitRoute::Typed);
+        assert_eq!(harness.written(), b"\x03");
+    }
+
+    /// `forge -e codex` and remote tabs run the program as the PTY's session
+    /// leader, so the foreground probe says `Shell` while it owns the
+    /// keyboard. Its pushed flags must still encode its keys, and must not be
+    /// forgotten as stale.
+    #[test]
+    fn kitty_keys_are_encoded_when_the_program_is_the_ptys_own_child() {
+        use super::{KittyKey, LiveCommitRoute};
+
+        let mut harness = CommitHarness::new(BlockState::RawFallback, PtyForeground::Shell);
+        harness.sink.pty_child_is_shell = false;
+        harness
+            .sink
+            .kitty_flags
+            .set(jterm_core::kitty_keyboard::DISAMBIGUATE);
+        harness.sink.record_key_press((
+            KittyKey::Enter,
+            super::KittyModifiers {
+                shift: true,
+                ..super::KittyModifiers::default()
+            },
+        ));
+        assert_eq!(harness.sink.on_commit("\r"), LiveCommitRoute::KittyEncoded);
+        assert_eq!(harness.written(), b"\x1b[13;2u");
+        assert_eq!(
+            harness.sink.kitty_flags.get(),
+            jterm_core::kitty_keyboard::DISAMBIGUATE
+        );
+    }
+
+    #[test]
+    fn only_an_interactive_shell_argv_is_the_ptys_shell() {
+        let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        for shell in [
+            argv(&["/bin/bash", "-l"]),
+            argv(&["zsh"]),
+            argv(&["/usr/bin/fish"]),
+            argv(&["/home/u/.local/bin/jsh"]),
+        ] {
+            assert!(super::pty_child_is_shell(&shell), "{shell:?}");
+        }
+        for program in [
+            argv(&["ssh", "-t", "host"]),
+            argv(&["codex"]),
+            argv(&["bash", "-c", "kimi"]),
+            argv(&[]),
+        ] {
+            assert!(!super::pty_child_is_shell(&program), "{program:?}");
         }
     }
 

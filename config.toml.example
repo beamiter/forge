@@ -101,8 +101,8 @@ notify_long_block_threshold_ms = 10000
 # 响铃（BEL）：后台标签页显示响铃标记；窗口未激活时当前标签页也显示，并弹出
 # 一条桌面通知（每个面板 30 秒内最多一条），窗口重新激活时清除。
 # 让 agent CLI 在需要你时响铃或通知：
-#   - Claude Code：`claude config set --global preferredNotifChannel terminal_bell`
-#     （响铃），或设为 "ghostty"（OSC 777 桌面通知，forge 直接显示）。
+#   - Claude Code：在 claude 中用 `/config` 把 preferredNotifChannel 设为
+#     "terminal_bell"（响铃），或设为 "ghostty"（OSC 777 桌面通知，forge 直接显示）。
 #     默认的 "auto" 在 forge 中不发出任何信号。
 #   - Codex：默认即响铃（BEL）；也可在 ~/.codex/config.toml 的 [tui] 下设置
 #     notification_method = "osc9"，改用 OSC 9 桌面通知。
