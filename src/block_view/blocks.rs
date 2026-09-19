@@ -2345,6 +2345,9 @@ impl FinishedBlock {
         ] {
             btn.add_css_class("block-action-btn");
             btn.add_css_class("flat");
+            // A click on Copy output while an agent runs must leave focus on
+            // the live surface; the button stays Tab-reachable.
+            btn.set_focus_on_click(false);
             action_box.append(btn);
         }
         header_row.append(&action_box);
@@ -2835,7 +2838,8 @@ impl FinishedBlock {
 
         // Ctrl+click on a URL inside the output VTE → open in browser.
         // VTE's `match_add_regex` (registered in create_finished_terminal) makes
-        // `check_match_at` return the matching URL at the pointer position;
+        // `check_match_at` return the matching URL at the pointer position, and
+        // `check_hyperlink_at` an OSC 8 target (see `openable_link_at`);
         // VTE handles word/line double/triple-click selection natively.
         {
             let click = gtk4::GestureClick::new();
@@ -2852,16 +2856,13 @@ impl FinishedBlock {
                 if !state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
                     return;
                 }
-                let (uri, _tag) = vte_for_click.check_match_at(x, y);
-                if let Some(uri) = uri {
-                    let s = uri.to_string();
-                    if !s.is_empty() {
-                        open_uri(&s);
-                        controller.set_state(gtk4::EventSequenceState::Claimed);
-                    }
+                if let Some(uri) = crate::terminal::openable_link_at(&vte_for_click, x, y) {
+                    open_uri(&uri);
+                    controller.set_state(gtk4::EventSequenceState::Claimed);
                 }
             });
             output_vte.add_controller(click);
+            crate::terminal::install_hyperlink_hover_tooltip(&output_vte);
         }
 
         let has_images = images_box.is_some();

@@ -20,6 +20,29 @@ fn scroll_value_changed(current: f64, target: f64) -> bool {
     (current - target).abs() > SCROLL_EPSILON_PX
 }
 
+/// The scroll lock a user's own move of the history leaves behind, recorded
+/// the moment the adjustment moves.
+///
+/// Anything off the bottom is a request to stop following. The deferred
+/// geometric probe alone can't say so: it only reports "away" once the live
+/// card has left the viewport, and while an agent streams that card is a full
+/// page, so a scrollbar drag, a find match or a bookmark jump into the last
+/// few blocks never got that far and the next repaint snapped it back.
+pub(crate) fn user_scroll_intent(value: f64, bottom: f64) -> bool {
+    scroll_value_changed(value, bottom)
+}
+
+/// The scroll lock after the deferred geometric probe has looked.
+///
+/// A live card that has left the viewport always locks, as it always has. With
+/// the card still on screen the probe no longer clears an intent the user
+/// already recorded while the adjustment is still off the bottom, but it never
+/// creates one either: between the event and this idle `upper` may have grown
+/// under a view that was following, which is drift, not a request.
+pub(crate) fn next_scroll_lock(prev: bool, holder_visible: bool, value: f64, bottom: f64) -> bool {
+    !holder_visible || (prev && scroll_value_changed(value, bottom))
+}
+
 fn next_stable_frame_count(last_target: Option<f64>, target: f64, current: u8) -> u8 {
     match last_target {
         Some(last) if !scroll_value_changed(last, target) => current.saturating_add(1),
@@ -170,6 +193,11 @@ impl ScrollDebouncer {
     /// blocks kicked once per notch and went nowhere until the command ended.
     /// Reading the adjustment we just wrote settles it in one step, and a notch
     /// that lands back at the bottom clears the flag again.
+    ///
+    /// The outer adjustment's value-changed handler now records the same
+    /// [`user_scroll_intent`] for every non-programmatic move and the probe
+    /// keeps it ([`next_scroll_lock`]), so this is belt and braces for the
+    /// wheel paths that write the adjustment themselves.
     pub(crate) fn record_wheel_intent(&self, scroll: &ScrolledWindow) {
         let adjustment = scroll.vadjustment();
         let bottom = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
@@ -416,6 +444,31 @@ mod tests {
         ));
         assert_eq!(controller.bottom_pin_generation.get(), 2);
         assert_eq!(activation.bottom_pin_generation.get(), 2);
+    }
+
+    #[test]
+    fn a_user_scroll_short_of_a_card_height_keeps_the_scroll_lock() {
+        let bottom = 5_000.0;
+        // Scrollbar drag / find jump 200px up with the live card still visible.
+        assert!(user_scroll_intent(bottom - 200.0, bottom));
+        assert!(next_scroll_lock(true, true, bottom - 200.0, bottom));
+        // The same geometry without a recorded intent is drift, not a request.
+        assert!(!next_scroll_lock(false, true, bottom - 200.0, bottom));
+        // Back at the bottom the lock clears, whatever was recorded.
+        assert!(!user_scroll_intent(bottom, bottom));
+        assert!(!next_scroll_lock(true, true, bottom, bottom));
+        // A card that left the viewport locks, as it always has.
+        assert!(next_scroll_lock(false, false, bottom, bottom));
+
+        // And the follow-bottom pin stands down for the kept lock.
+        let controller =
+            ScrollDebouncer::with_scroll_lock(Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
+        let lock = next_scroll_lock(true, true, bottom - 200.0, bottom);
+        assert!(!request_bottom_pin(
+            lock,
+            &controller.bottom_pin_active,
+            &controller.bottom_pin_generation,
+        ));
     }
 
     #[test]

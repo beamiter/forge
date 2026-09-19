@@ -900,6 +900,54 @@ pub(crate) fn default_tab_title(tab_index_1based: u32, working_directory: Option
     jterm_core::review_input::safe_inline_display(&format!("{prefix}{}", out_parts.join("/")), 512)
 }
 
+/// Pick the link a Ctrl+click or "Open Link" acts on from what VTE reports at
+/// a cell: the URL regex match first, then an OSC 8 hyperlink target. Each is
+/// kept only when the system opener may have it (http/https,
+/// [`jterm_core::link::is_openable_url`]), so a refused regex hit still lets a
+/// real OSC 8 target through, and Unified's own zone-marker hyperlinks or a
+/// `file:`/`javascript:` target are never claimed.
+pub(crate) fn openable_link(
+    regex_match: Option<String>,
+    hyperlink: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    regex_match
+        .filter(|uri| jterm_core::link::is_openable_url(uri))
+        .or_else(|| hyperlink().filter(|uri| jterm_core::link::is_openable_url(uri)))
+}
+
+/// The openable link under (`x`, `y`) in `terminal`, if any.
+///
+/// claude renders markdown links as OSC 8 with a label that is not a URL
+/// ("Security guide"). VTE underlines it and shows the hand cursor, but
+/// `check_match_at` only knows the URL regex, so those links could never be
+/// opened; `check_hyperlink_at` is the OSC 8 half.
+pub(crate) fn openable_link_at(terminal: &Terminal, x: f64, y: f64) -> Option<String> {
+    openable_link(
+        terminal.check_match_at(x, y).0.map(|uri| uri.to_string()),
+        || terminal.check_hyperlink_at(x, y).map(|uri| uri.to_string()),
+    )
+}
+
+/// Show an OSC 8 hyperlink's real target as the terminal's tooltip while the
+/// pointer is over it: its label can say anything, including another URL.
+/// Only targets the opener would accept are shown, so Unified's zone markers
+/// and refused schemes stay silent.
+pub(crate) fn install_hyperlink_hover_tooltip(terminal: &Terminal) {
+    terminal.connect_hyperlink_hover_uri_notify(|terminal| {
+        let target = terminal
+            .hyperlink_hover_uri()
+            .map(|uri| uri.to_string())
+            .filter(|uri| jterm_core::link::is_openable_url(uri));
+        match target {
+            Some(uri) => {
+                let shown = jterm_core::review_input::safe_inline_display(&uri, 512);
+                terminal.set_tooltip_text(Some(&format!("{shown}\nCtrl+click to open")));
+            }
+            None => terminal.set_tooltip_text(None),
+        }
+    });
+}
+
 pub(crate) fn setup_terminal_click_handler(terminal: &Terminal) {
     // Use a click gesture in Capture phase to intercept Ctrl+Click before VTE sees it
     // For normal clicks, let them pass through to VTE for text selection
@@ -914,7 +962,10 @@ pub(crate) fn setup_terminal_click_handler(terminal: &Terminal) {
         if n_press == 1 {
             let state = controller.current_event_state();
             if state.contains(ModifierType::CONTROL_MASK) {
-                if let Some(uri) = terminal_clone.check_match_at(x, y).0 {
+                // Claim only a link that will actually open; anything else
+                // (a refused scheme, a Unified zone marker) falls through to
+                // VTE instead of being swallowed.
+                if let Some(uri) = openable_link_at(&terminal_clone, x, y) {
                     open_uri(&uri);
                     // Claim this event to prevent VTE from processing it
                     controller.set_state(gtk4::EventSequenceState::Claimed);
@@ -927,6 +978,7 @@ pub(crate) fn setup_terminal_click_handler(terminal: &Terminal) {
     });
 
     terminal.add_controller(click_controller);
+    install_hyperlink_hover_tooltip(terminal);
 }
 
 /// Find the first Terminal in a widget tree (depth-first). Traverses children
@@ -1164,5 +1216,105 @@ mod tests {
             commands.as_slice(),
             strings(&["& 'ssh' 'host' 'printf ''safe''; one argument'"]).as_slice()
         );
+    }
+
+    #[test]
+    fn a_link_is_opened_only_when_the_opener_may_have_it() {
+        let some = |uri: &str| Some(uri.to_string());
+        // The regex hit wins; the OSC 8 half is not even asked.
+        assert_eq!(
+            super::openable_link(some("https://a.example/x"), || panic!("not needed")),
+            some("https://a.example/x")
+        );
+        // An OSC 8 label that is no URL at all ("Security guide").
+        assert_eq!(
+            super::openable_link(None, || some("https://code.claude.com/docs/en/security")),
+            some("https://code.claude.com/docs/en/security")
+        );
+        // A refused regex hit still lets a real OSC 8 target through.
+        assert_eq!(
+            super::openable_link(some("https:///no-host"), || some("https://b.example/")),
+            some("https://b.example/")
+        );
+        for refused in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "file://otherhost/etc/passwd",
+            // Unified's zone markers are hyperlinks too.
+            "block://0123456789abcdef/prompt",
+        ] {
+            assert_eq!(
+                super::openable_link(None, || some(refused)),
+                None,
+                "{refused}"
+            );
+        }
+    }
+
+    /// Needs a display: runs from `make test-display`.
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn an_osc8_label_opens_its_target_on_a_real_vte() {
+        use gtk4::prelude::*;
+        use vte4::TerminalExt;
+
+        gtk4::init().expect("GTK display");
+        let config = crate::config::Config::safe_defaults();
+        let terminal = super::create_terminal(&config);
+        let window = gtk4::Window::builder()
+            .default_width(640)
+            .default_height(240)
+            .child(&terminal)
+            .build();
+        window.present();
+        let settle = || {
+            let context = gtk4::glib::MainContext::default();
+            let started = std::time::Instant::now();
+            while started.elapsed() < std::time::Duration::from_millis(250) {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        settle();
+        terminal.feed(
+            b"\x1b]8;id=zaxmda;https://code.claude.com/docs/en/security\x07Security guide\x1b]8;;\x07\r\n\
+              \x1b]8;;file:///etc/passwd\x07local file\x1b]8;;\x07\r\n",
+        );
+        settle();
+
+        let cell_w = terminal.char_width() as f64;
+        let cell_h = terminal.char_height() as f64;
+        assert!(cell_w > 0.0 && cell_h > 0.0, "the terminal is laid out");
+        // VTE's CSS padding offsets the grid, so probe every half cell of
+        // each row rather than guess it.
+        let links_on_row = |row: f64| {
+            let mut found = Vec::new();
+            let mut y = row * cell_h;
+            while y < (row + 1.0) * cell_h + 16.0 {
+                let mut x = 0.0;
+                while x < cell_w * 20.0 {
+                    if let Some(uri) = super::openable_link_at(&terminal, x, y) {
+                        found.push(uri);
+                    }
+                    x += cell_w / 2.0;
+                }
+                y += cell_h / 2.0;
+            }
+            found
+        };
+        let first = links_on_row(0.0);
+        assert!(
+            first
+                .iter()
+                .any(|uri| uri == "https://code.claude.com/docs/en/security"),
+            "the OSC 8 label is openable: {first:?}"
+        );
+        assert!(
+            links_on_row(1.0)
+                .iter()
+                .all(|uri| uri.starts_with("https://")),
+            "a file: target is never offered"
+        );
+        window.close();
     }
 }

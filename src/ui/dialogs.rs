@@ -3635,7 +3635,7 @@ impl UiState {
                 .filter(|host| crate::config::validate_remote_host(host).is_ok())
                 .cloned()
                 .collect();
-            let link_uri: Option<String> = term.check_match_at(x, y).0.map(|s| s.to_string());
+            let link_uri: Option<String> = crate::terminal::openable_link_at(&term, x, y);
 
             let popover = gtk4::Popover::new();
             popover.set_parent(&term);

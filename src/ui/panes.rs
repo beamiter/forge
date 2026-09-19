@@ -453,13 +453,13 @@ impl UiState {
         // so both drop targets can coexist on the leaf. Resolve the pane again
         // through a weak root at drop time to avoid a controller ownership
         // cycle that would keep its PTY alive after close.
-        let image_target = gtk4::DropTarget::new(
+        let path_target = gtk4::DropTarget::new(
             gtk4::gdk::FileList::static_type(),
             gtk4::gdk::DragAction::COPY,
         );
         let ui = self.clone();
         let target_root = leaf.root_widget().downgrade();
-        image_target.connect_drop(move |_, value, _x, _y| {
+        path_target.connect_drop(move |_, value, _x, _y| {
             let Ok(files) = value.get::<gtk4::gdk::FileList>() else {
                 return false;
             };
@@ -471,7 +471,7 @@ impl UiState {
             if paths.is_empty() {
                 return false;
             }
-            let result = crate::image_drop::prompt_payload(&paths)
+            let result = crate::image_drop::dropped_paths_payload(&paths)
                 .map_err(|error| error.to_string())
                 .and_then(|payload| {
                     target_root
@@ -482,15 +482,20 @@ impl UiState {
                 })
                 .and_then(|(leaf, payload)| {
                     leaf.grab_focus();
-                    leaf.write_review_input(&payload)
+                    // A Block pane pastes it (bracketed when the program asked
+                    // for 2004); a plain VTE pane keeps its review-input path.
+                    match leaf.block_view() {
+                        Some(view) => view.paste_text(&payload),
+                        None => leaf.write_review_input(&payload),
+                    }
                 });
             if let Err(error) = result {
                 ui.toast_overlay
-                    .add_toast(adw::Toast::new(&format!("Image drop rejected: {error}")));
+                    .add_toast(adw::Toast::new(&format!("Drop rejected: {error}")));
             }
             true
         });
-        leaf.root_widget().add_controller(image_target);
+        leaf.root_widget().add_controller(path_target);
 
         let ui = self.clone();
         let target_root = leaf.root_widget().downgrade();

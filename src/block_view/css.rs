@@ -1258,6 +1258,13 @@ pub(crate) fn block_css(config: &Config) -> String {
             color: {accent};
             background-color: rgba({acc_r},{acc_g},{acc_b},0.12);
         }}
+        .sticky-running-header.sticky-compact {{
+            background-color: rgba({bg_r},{bg_g},{bg_b},0.94);
+            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.45);
+            border-radius: 999px;
+            padding: 2px 4px 2px 12px;
+            margin: 10px 22px 0 0;
+        }}
         .sticky-running-header.sticky-minimized {{
             padding-left: 4px;
         }}
@@ -1379,6 +1386,23 @@ mod tests {
         let unified = rule_body(&css, ".block-active.block-fullscreen");
         assert!(unified.contains("margin: 0"), "{unified}");
         assert!(unified.contains("padding: 0"), "{unified}");
+    }
+
+    #[test]
+    fn the_running_pill_is_a_rounded_inset_readout_not_a_strip() {
+        let config = crate::config::Config::safe_defaults();
+        let css = block_css(&config);
+        let pill = rule_body(&css, ".sticky-running-header.sticky-compact");
+        assert!(pill.contains("border-radius: 999px"), "{pill}");
+        assert!(pill.contains("margin: 10px 22px 0 0"), "{pill}");
+        // The pill's own translucent background replaces the bar's opaque one.
+        assert!(pill.contains("background-color: rgba("), "{pill}");
+        // Declared after the base rule so it wins at equal specificity, and
+        // before the minimized rule so a minimized pill still tucks in.
+        let base = css.find(".sticky-running-header {\n").unwrap();
+        let compact = css.find(".sticky-running-header.sticky-compact").unwrap();
+        let minimized = css.find(".sticky-running-header.sticky-minimized").unwrap();
+        assert!(base < compact && compact < minimized);
     }
 
     /// A stylesheet GTK cannot parse fails silently: the provider keeps the
