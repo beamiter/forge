@@ -69,6 +69,7 @@ tests=(
     block_view::tests::entering_alt_screen_ends_the_block_selection_it_hides
     block_view::tests::alt_screen_chrome_keeps_the_running_cards_geometry
     block_view::tests::a_real_vte_focus_report_reaches_the_program_but_is_not_typing
+    block_view::tests::a_finished_codex_session_keeps_its_history_in_the_card_and_block_data
     block_view::tests::header_button_presses_do_not_select_and_a_hidden_readout_measures
     terminal::tests::an_osc8_label_opens_its_target_on_a_real_vte
     block_view::css::tests::the_generated_stylesheet_parses_without_error

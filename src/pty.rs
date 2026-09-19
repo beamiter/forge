@@ -295,6 +295,11 @@ fn request_reader_cancel(cancelled: &AtomicBool, cancel_eventfd: Option<&OwnedFd
 
 /// Bound queued output. Once this queue fills, the reader blocks and the kernel
 /// PTY buffer provides natural backpressure to a runaway producer.
+/// The `(cols, rows)` a PTY is opened with, before its owner publishes the
+/// real grid. Block mode's finish replay falls back to it when no resize was
+/// ever sent: it is what the child was told.
+pub(crate) const INITIAL_WINSIZE: (u16, u16) = (80, 24);
+
 const PTY_QUEUE_CAPACITY: usize = 8;
 /// Bound queued terminal input without ever blocking GTK. Each write is one
 /// semantic unit (a keystroke sequence, paste frame, or command submission),
@@ -697,8 +702,8 @@ impl OwnedPty {
             .unwrap_or(-1);
 
         let initial_size = nix::pty::Winsize {
-            ws_row: 24,
-            ws_col: 80,
+            ws_row: INITIAL_WINSIZE.1,
+            ws_col: INITIAL_WINSIZE.0,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
@@ -1477,6 +1482,41 @@ impl OwnedPty {
             .test_foreground
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(foreground);
+    }
+
+    /// Write `bytes` from the slave end, as a program running on the PTY
+    /// would: the pane's reader receives them as the child's output.
+    pub(crate) fn write_test_slave(&self, bytes: &[u8]) {
+        let slave = self
+            .test_slave
+            .as_ref()
+            .expect("a test PTY holds its slave end");
+        let mut written = 0;
+        while written < bytes.len() {
+            let rest = &bytes[written..];
+            // SAFETY: `rest` is a live slice and `slave` is owned by `self`
+            // for the duration of the call.
+            let n = unsafe {
+                libc::write(
+                    slave.as_raw_fd(),
+                    rest.as_ptr().cast::<libc::c_void>(),
+                    rest.len(),
+                )
+            };
+            if n > 0 {
+                written += n as usize;
+                continue;
+            }
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                io::ErrorKind::Interrupted => {}
+                // The slave is non-blocking; the reader drains the master.
+                io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(1))
+                }
+                _ => panic!("writing to the test slave failed: {error}"),
+            }
+        }
     }
 
     /// Read whatever the master side has already been written, waiting up to

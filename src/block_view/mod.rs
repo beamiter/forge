@@ -6083,6 +6083,89 @@ struct BlockRenderPayload {
     /// last captured byte. The text is a prefix then, and nothing in it says
     /// so, so a snapshot taken from it must report the loss.
     output_plain_lost_bytes: bool,
+    /// The capture ring dropped its front before the command finished.
+    output_dropped_front: bool,
+    /// The screen replay's history budget evicted its oldest rows.
+    output_head_dropped: bool,
+}
+
+impl BlockRenderPayload {
+    /// The dim notice a finished card shows when this text is not the
+    /// command's whole output.
+    fn output_notice(&self) -> Option<&'static str> {
+        finished_output_notice(
+            self.output_dropped_front,
+            self.output_plain_lost_bytes,
+            self.output_head_dropped,
+        )
+    }
+}
+
+/// "Earlier output not retained" whenever any stage lost bytes: the bounded
+/// capture ring dropped its front, the line replay stopped short, or the
+/// screen replay's history budget evicted its oldest rows. Without it a long
+/// session's card silently starts partway through.
+fn finished_output_notice(
+    dropped_front: bool,
+    lost: bool,
+    head_dropped: bool,
+) -> Option<&'static str> {
+    (dropped_front || lost || head_dropped).then_some(FINISHED_OUTPUT_NOT_RETAINED)
+}
+
+const FINISHED_OUTPUT_NOT_RETAINED: &str = "Earlier output not retained";
+
+/// A finished command's captured bytes, decoded into the card's ANSI stream
+/// and its plain text.
+struct RenderedCapture {
+    output_with_ansi: String,
+    output_plain: String,
+    lost: bool,
+    head_dropped: bool,
+}
+
+/// Decode a finished command's captured normal-screen bytes.
+///
+/// Plain line output (text, SGR, CR, EL, tabs) keeps the cheap path: its raw
+/// bytes feed the card and the horizontal strip is its text. A stream that
+/// moves the cursor vertically or scrolls — an inline TUI such as codex,
+/// which inserts its transcript above the viewport through a scroll region —
+/// is replayed on a screen of the geometry the CHILD last saw (`winsize`):
+/// its history survives into both the card and the text, and the card is fed
+/// the replay's frame (rows, SGR and links only), which the card constructor
+/// then leaves alone. A ring that dropped its front is resynchronised first,
+/// so a CSI or UTF-8 fragment at the cut is not printed as text.
+fn render_captured_output(
+    bytes: &[u8],
+    dropped_front: bool,
+    winsize: (u16, u16),
+) -> RenderedCapture {
+    use jterm_core::screen_replay::{resync_ring_head, stream_needs_screen_replay, ScreenReplay};
+
+    let bytes = if dropped_front {
+        resync_ring_head(bytes)
+    } else {
+        bytes
+    };
+    if !stream_needs_screen_replay(bytes) {
+        let output_with_ansi = String::from_utf8_lossy(bytes).into_owned();
+        let (output_plain, lost) = strip_ansi_reporting_loss(&output_with_ansi);
+        return RenderedCapture {
+            output_with_ansi,
+            output_plain,
+            lost,
+            head_dropped: false,
+        };
+    }
+    let mut replay = ScreenReplay::new(usize::from(winsize.0), usize::from(winsize.1));
+    replay.feed(bytes);
+    let replay = replay.finish();
+    RenderedCapture {
+        output_with_ansi: replay.to_ansi(),
+        output_plain: replay.to_plain(),
+        lost: false,
+        head_dropped: replay.head_dropped,
+    }
 }
 
 /// Object-safe, memoized accessor handed to every backend. A backend needs no
@@ -6113,11 +6196,13 @@ struct LazyBlockRenderPayload {
     /// Whoever materializes first consumes the ring, and the decoded text
     /// carries no trace of the bytes that fell out of its front.
     dropped_front: bool,
+    /// The `(cols, rows)` the child last saw, for the screen replay.
+    child_winsize: (u16, u16),
     materializations: Rc<Cell<usize>>,
 }
 
 impl LazyBlockRenderPayload {
-    fn new(prompt: String, output: CapturedFinalizeOutput) -> Self {
+    fn new(prompt: String, output: CapturedFinalizeOutput, child_winsize: (u16, u16)) -> Self {
         let dropped_front = match &output {
             CapturedFinalizeOutput::Foreground(ring) => ring.borrow().dropped_front(),
             CapturedFinalizeOutput::Background(ring) => ring.dropped_front(),
@@ -6127,6 +6212,7 @@ impl LazyBlockRenderPayload {
             prompt: RefCell::new(Some(prompt)),
             output: RefCell::new(Some(output)),
             dropped_front,
+            child_winsize,
             materializations: Rc::new(Cell::new(0)),
         }
     }
@@ -6147,24 +6233,29 @@ impl BlockRenderPayloadAccessor for LazyBlockRenderPayload {
                 .borrow_mut()
                 .take()
                 .expect("a finalize payload is materialized at most once");
-            let output_with_ansi = match self
+            let render = |ring: &mut BoundedByteRing| {
+                render_captured_output(
+                    ring.make_contiguous(),
+                    self.dropped_front,
+                    self.child_winsize,
+                )
+            };
+            let rendered = match self
                 .output
                 .borrow_mut()
                 .take()
                 .expect("a finalize payload is materialized at most once")
             {
-                CapturedFinalizeOutput::Foreground(output) => live_output_text(&output),
-                CapturedFinalizeOutput::Background(mut output) => {
-                    String::from_utf8_lossy(output.make_contiguous()).into_owned()
-                }
+                CapturedFinalizeOutput::Foreground(output) => render(&mut output.borrow_mut()),
+                CapturedFinalizeOutput::Background(mut output) => render(&mut output),
             };
-            let (output_plain, output_plain_lost_bytes) =
-                strip_ansi_reporting_loss(&output_with_ansi);
             BlockRenderPayload {
                 prompt,
-                output_with_ansi,
-                output_plain,
-                output_plain_lost_bytes,
+                output_with_ansi: rendered.output_with_ansi,
+                output_plain: rendered.output_plain,
+                output_plain_lost_bytes: rendered.lost,
+                output_dropped_front: self.dropped_front,
+                output_head_dropped: rendered.head_dropped,
             }
         })
     }
@@ -6179,7 +6270,7 @@ impl BlockRenderPayloadAccessor for LazyBlockRenderPayload {
             return zone_output_snapshot_from_plain(
                 &value.output_plain,
                 max_bytes,
-                self.dropped_front || value.output_plain_lost_bytes,
+                value.output_notice().is_some(),
             );
         }
         let mut output = self.output.borrow_mut();
@@ -6856,6 +6947,10 @@ struct ReaderCtx {
     prompt_anchor_rows_rc: Rc<Cell<i64>>,
     prompt_anchor_resize_generation_rc: Rc<Cell<u64>>,
     pty_resize_generation_rc: Rc<Cell<u64>>,
+    /// The winsize this pane last told its child. A finished command's
+    /// captured bytes are replayed at exactly this geometry: absolute cursor
+    /// addressing and scroll regions only mean what they meant to the child.
+    pty_winsize: Rc<PtyWinsize>,
     prompt_anchor_prefix_rc: Rc<RefCell<String>>,
     prompt_anchor_ready_rc: Rc<Cell<bool>>,
     prompt_identity_output_rc: Rc<Cell<bool>>,
@@ -7548,7 +7643,11 @@ impl ReaderCtx {
                 command_source,
                 start_mark_seen: !is_background,
             };
-            let payload = LazyBlockRenderPayload::new(prompt, captured_output);
+            let payload = LazyBlockRenderPayload::new(
+                prompt,
+                captured_output,
+                self.pty_winsize.child_winsize(),
+            );
 
             // jsh owns the command/cwd/status/duration events. The lifecycle
             // token names the exact Start generation the terminal observed,
@@ -8449,6 +8548,7 @@ fn take_background_output(pending: &mut BoundedByteRing) -> Option<BoundedByteRi
     }
 }
 
+#[cfg(test)]
 /// Lossy text of the running command's accumulated raw output. The ring is
 /// engine-owned shared state ([`ReaderCtx::live_raw_output_rc`]), so this read
 /// is engine-side, not a backend query.
@@ -9058,6 +9158,7 @@ impl RenderBackend for BlockBackend {
             record.lifecycle_health(),
             record.lifecycle_notice().as_deref(),
         );
+        finished.set_output_notice(payload.output_notice());
         // A block finishing after an app recolored the
         // terminal must not pop in with static theme
         // colors next to the recolored live VTE.
@@ -10351,6 +10452,13 @@ impl PtyWinsize {
         true
     }
 
+    /// The `(cols, rows)` the child was last told — the geometry its absolute
+    /// cursor addressing and scroll regions meant. Before the first publish
+    /// that is the size the PTY was opened with.
+    fn child_winsize(&self) -> (u16, u16) {
+        child_winsize_or_initial(self.sent.get())
+    }
+
     fn set_settle_arm(&self, arm: Option<Rc<dyn Fn()>>) {
         *self.arm.borrow_mut() = arm;
     }
@@ -10369,6 +10477,16 @@ impl PtyWinsize {
 /// sample or for the size the child already has, the sample otherwise.
 fn winsize_to_publish(sent: (u16, u16), sample: (u16, u16)) -> Option<(u16, u16)> {
     (sample.0 > 0 && sample.1 > 0 && sample != sent).then_some(sample)
+}
+
+/// A never-published winsize reads as the PTY's opening size, which is what
+/// the child really has until the first `TIOCSWINSZ`.
+fn child_winsize_or_initial(sent: (u16, u16)) -> (u16, u16) {
+    if sent.0 > 0 && sent.1 > 0 {
+        sent
+    } else {
+        crate::pty::INITIAL_WINSIZE
+    }
 }
 
 fn pty_grid_size(vte: &Terminal, scroll: &ScrolledWindow) -> (u16, u16) {
@@ -13928,6 +14046,7 @@ impl TermView {
                 prompt_anchor_rows_rc,
                 prompt_anchor_resize_generation_rc,
                 pty_resize_generation_rc,
+                pty_winsize: pty_winsize.clone(),
                 prompt_anchor_prefix_rc,
                 prompt_anchor_ready_rc,
                 prompt_identity_output_rc: prompt_identity_output.clone(),
@@ -18859,6 +18978,79 @@ mod tests {
         assert!(super::lone_rerunnable_selection(&[], &many, Some(8)).is_none());
     }
 
+    /// End to end on a real Block pane: a codex session that inserted
+    /// history above its viewport finishes into a card and a `BlockData`
+    /// that both still hold that history. The replay runs at the winsize the
+    /// child last saw, which the test pins to the capture's 16x120.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn a_finished_codex_session_keeps_its_history_in_the_card_and_block_data() {
+        use gtk4::prelude::*;
+
+        gtk4::init().expect("gtk init");
+        let config = crate::config::Config::safe_defaults();
+        let view = super::TermView::new_with_spawner(
+            &config,
+            &crate::config::TerminalMode::Block,
+            &["sh".to_string()],
+            None,
+            None,
+            &[],
+            |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+        )
+        .expect("a Block pane over a test PTY");
+        let window = gtk4::Window::builder()
+            .default_width(1000)
+            .default_height(600)
+            .child(&view.widget())
+            .build();
+        window.present();
+        let settle = || {
+            let context = gtk4::glib::MainContext::default();
+            let started = std::time::Instant::now();
+            while started.elapsed() < std::time::Duration::from_millis(300) {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        settle();
+        view.pty
+            .write_test_slave(b"\x1b]133;A\x07$ \x1b]133;B\x07codex\r\n\x1b]133;C\x07");
+        settle();
+        // What the child was told at command start is the test window's grid;
+        // the capture was recorded at 16x120.
+        view.pty_winsize.sent.set((120, 16));
+        view.pty.write_test_slave(CODEX_16ROWS);
+        settle();
+        assert_eq!(
+            view.pty_winsize.child_winsize(),
+            (120, 16),
+            "nothing republished the winsize while codex ran"
+        );
+        // codex exited; the shell owns the terminal again.
+        view.pty.set_test_foreground(PtyForeground::Shell);
+        view.pty
+            .write_test_slave(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        settle();
+        // Whatever the pane answered to codex's queries.
+        view.pty
+            .drain_test_slave(std::time::Duration::from_millis(10));
+
+        let history = ["Tip: Try the Desktop app on Linux", "usage limit"];
+        {
+            let data = view.block_data.borrow();
+            let block = data.back().expect("the codex command finished");
+            assert_in_order(&block.output, &history);
+        }
+        let cards = view.finished_blocks.borrow();
+        let card = cards.last().expect("a finished card");
+        let shown = super::find::live_vte_search_text(&card.output_vte).expect("card text");
+        assert_in_order(&shown, &history);
+        assert!(!card.output_notice.is_visible(), "nothing was dropped");
+        drop(cards);
+        window.close();
+    }
+
     /// End to end on a real pane: libvte 0.76 commits focus reports through
     /// `commit` although nothing but our handler is behind it — once DECSET
     /// 1004 is fed, at once for the current focus and then on every focus
@@ -19338,6 +19530,7 @@ mod tests {
         let payload = super::LazyBlockRenderPayload::new(
             String::new(),
             super::CapturedFinalizeOutput::Foreground(output),
+            crate::pty::INITIAL_WINSIZE,
         );
         payload.materialize();
         let snapshot = payload
@@ -19345,6 +19538,161 @@ mod tests {
             .expect("memoized output");
         assert!(!snapshot.plain.contains("ERROR: build failed"));
         assert!(snapshot.truncated);
+    }
+
+    /// Real codex 0.155.0 startup bytes under a 16x120 PTY (recorded
+    /// 2026-09-19 with a harness that answers the terminal's queries; no
+    /// prompt submitted). Once its viewport reaches the bottom, codex inserts
+    /// history above it through a scroll region (`ESC[1;16r` + `ESC M`, then
+    /// `ESC[1;7r` + `\r\n`), which the live VTE turns into scrollback.
+    const CODEX_16ROWS: &[u8] =
+        include_bytes!("../../tests/fixtures/screen_replay/codex-16rows.bin");
+
+    fn assert_in_order(text: &str, needles: &[&str]) {
+        let mut from = 0;
+        for needle in needles {
+            let Some(at) = text[from..].find(needle) else {
+                panic!("{needle:?} missing (or out of order) in:\n{text}");
+            };
+            from += at + needle.len();
+        }
+    }
+
+    /// The finish replay keeps what codex inserted above its viewport. The
+    /// old absolute-row replay rewrote each history batch at the same rows and
+    /// the next viewport redraw overwrote it: the tip and the usage-limit
+    /// line were gone from the card, Copy output, Find and history.
+    #[test]
+    fn finished_codex_capture_keeps_history_in_the_card_and_the_text() {
+        let rendered = super::render_captured_output(CODEX_16ROWS, false, (120, 16));
+        let history = [
+            "OpenAI Codex",
+            "Tip: Try the Desktop app on Linux",
+            "usage limit",
+        ];
+        // `BlockData.output` (and the journal, Find, persistence) is this text.
+        assert_in_order(&rendered.output_plain, &history);
+        // The card is fed this frame: rows, SGR and links only, so the card
+        // constructor feeds it verbatim instead of collapsing it again.
+        assert!(!super::output_has_vertical_repaint(
+            &rendered.output_with_ansi
+        ));
+        assert_in_order(&strip_ansi(&rendered.output_with_ansi), &history);
+        assert!(!rendered.lost && !rendered.head_dropped);
+    }
+
+    /// The same through the lazy payload, at the winsize the engine hands it.
+    #[test]
+    fn materialized_codex_payload_replays_at_the_child_winsize() {
+        let output = Rc::new(RefCell::new(BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES)));
+        output.borrow_mut().append(CODEX_16ROWS);
+        let payload = super::LazyBlockRenderPayload::new(
+            "$ ".to_string(),
+            super::CapturedFinalizeOutput::Foreground(output),
+            (120, 16),
+        );
+        let value = payload.materialize();
+        assert_in_order(
+            value.output_plain.trim(),
+            &["Tip: Try the Desktop app on Linux", "usage limit"],
+        );
+        assert_eq!(value.output_notice(), None);
+    }
+
+    /// Plain line output keeps its raw bytes for the card — colour, CR
+    /// spinners and all — and the cheap horizontal strip for its text.
+    #[test]
+    fn plain_line_output_keeps_the_raw_card_bytes() {
+        for stream in [
+            &b"hello\n"[..],
+            b"\x1b[32mgreen\x1b[0m\nplain\n",
+            b"working\rdone \x1b[K\nnext\n",
+            b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\\n",
+        ] {
+            let rendered = super::render_captured_output(stream, false, (80, 24));
+            assert_eq!(rendered.output_with_ansi.as_bytes(), stream);
+            assert_eq!(
+                rendered.output_plain,
+                strip_ansi(&String::from_utf8_lossy(stream))
+            );
+        }
+    }
+
+    /// `top`/`watch`-style loops still collapse to their final frame.
+    #[test]
+    fn a_cursor_home_loop_finishes_as_its_last_frame() {
+        let frame = |n: char| format!("\x1b[H\x1b[2Jheader {n}\r\nrow-a {n}\r\nrow-b {n}\r\n");
+        let stream = format!("{}{}{}", frame('1'), frame('2'), frame('3'));
+        let rendered = super::render_captured_output(stream.as_bytes(), false, (80, 24));
+        assert_eq!(rendered.output_plain, "header 3\nrow-a 3\nrow-b 3");
+        assert_eq!(
+            strip_ansi(&rendered.output_with_ansi),
+            "header 3\nrow-a 3\nrow-b 3"
+        );
+    }
+
+    /// A ring that dropped its front is cut at an arbitrary byte. The
+    /// fragment before the first sequence or line must not print as text.
+    #[test]
+    fn a_ring_cut_mid_sequence_resyncs_before_it_replays() {
+        let cut = b"8;29Hstale\x1b[2;1Hfresh\r\n";
+        let rendered = super::render_captured_output(cut, true, (80, 24));
+        assert!(
+            !rendered.output_plain.contains("8;29H"),
+            "{:?}",
+            rendered.output_plain
+        );
+        assert!(rendered.output_plain.contains("fresh"));
+        let plain_cut = b"9;1mtail of a line\nnext line\n";
+        let rendered = super::render_captured_output(plain_cut, true, (80, 24));
+        assert_eq!(rendered.output_plain, "next line\n");
+        // An intact capture is never trimmed.
+        let rendered = super::render_captured_output(plain_cut, false, (80, 24));
+        assert_eq!(rendered.output_plain, "9;1mtail of a line\nnext line\n");
+    }
+
+    #[test]
+    fn finished_output_notice_speaks_for_any_lost_output() {
+        assert_eq!(super::finished_output_notice(false, false, false), None);
+        for flags in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            assert_eq!(
+                super::finished_output_notice(flags.0, flags.1, flags.2),
+                Some("Earlier output not retained"),
+                "{flags:?}"
+            );
+        }
+    }
+
+    /// A ring that wrapped carries its drop into the finished payload.
+    #[test]
+    fn a_wrapped_ring_reports_its_dropped_front_on_the_card() {
+        let output = Rc::new(RefCell::new(BoundedByteRing::new(16)));
+        output
+            .borrow_mut()
+            .append(b"first line\nsecond line\nthird\n");
+        let payload = super::LazyBlockRenderPayload::new(
+            String::new(),
+            super::CapturedFinalizeOutput::Foreground(output),
+            (80, 24),
+        );
+        assert_eq!(
+            payload.materialize().output_notice(),
+            Some("Earlier output not retained")
+        );
+    }
+
+    /// Before the first resize the child has the PTY's opening size.
+    #[test]
+    fn an_unpublished_winsize_reads_as_the_opening_size() {
+        assert_eq!(
+            super::child_winsize_or_initial((0, 0)),
+            crate::pty::INITIAL_WINSIZE
+        );
+        assert_eq!(super::child_winsize_or_initial((120, 16)), (120, 16));
     }
 
     /// The per-zone cap and the retention budget must bound the same
@@ -19427,6 +19775,7 @@ mod tests {
         let payload = super::LazyBlockRenderPayload::new(
             String::new(),
             super::CapturedFinalizeOutput::Foreground(output),
+            crate::pty::INITIAL_WINSIZE,
         );
 
         // The journal observer runs first and consumes the ring.
@@ -19774,6 +20123,7 @@ mod tests {
         let payload = super::LazyBlockRenderPayload::new(
             "$ ".to_string(),
             super::CapturedFinalizeOutput::Foreground(output),
+            crate::pty::INITIAL_WINSIZE,
         );
 
         assert_eq!(payload.materialization_count(), 0);
@@ -19796,6 +20146,7 @@ mod tests {
         let payload = super::LazyBlockRenderPayload::new(
             "$ ".to_string(),
             super::CapturedFinalizeOutput::Foreground(output.clone()),
+            crate::pty::INITIAL_WINSIZE,
         );
 
         let snapshot = payload
@@ -19824,6 +20175,7 @@ mod tests {
         let empty = super::LazyBlockRenderPayload::new(
             String::new(),
             super::CapturedFinalizeOutput::Background(BoundedByteRing::new(MAX_RAW_OUTPUT_BYTES)),
+            crate::pty::INITIAL_WINSIZE,
         );
         assert_eq!(empty.output_snapshot(MAX_ZONE_SNAPSHOT_BYTES), None);
     }
@@ -19838,6 +20190,7 @@ mod tests {
             super::LazyBlockRenderPayload::new(
                 String::new(),
                 super::CapturedFinalizeOutput::Foreground(output),
+                crate::pty::INITIAL_WINSIZE,
             )
         };
 
@@ -24645,6 +24998,7 @@ mod tests {
                 prompt_anchor_rows_rc: prompt_anchor_rows,
                 prompt_anchor_resize_generation_rc: Rc::new(Cell::new(0)),
                 pty_resize_generation_rc: Rc::new(Cell::new(0)),
+                pty_winsize: Rc::new(super::PtyWinsize::new(Rc::new(Cell::new(0)))),
                 prompt_anchor_prefix_rc: Rc::new(RefCell::new(String::new())),
                 prompt_anchor_ready_rc: prompt_anchor_ready,
                 prompt_identity_output_rc: Rc::new(Cell::new(false)),

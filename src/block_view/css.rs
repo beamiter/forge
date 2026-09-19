@@ -1017,6 +1017,11 @@ pub(crate) fn block_css(config: &Config) -> String {
             font-size: 0.78em;
             padding: 1px 9px;
         }}
+        .block-output-notice {{
+            color: {dim_fg};
+            font-size: 0.78em;
+            font-style: italic;
+        }}
         .block-status-ok {{
             color: {ok_hex};
             background-color: rgba({ok_r},{ok_g},{ok_b},0.16);

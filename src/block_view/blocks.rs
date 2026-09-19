@@ -766,6 +766,9 @@ pub(crate) struct FinishedBlock {
     pub(crate) status_icon: gtk4::Label,
     /// Header chip naming an untrusted completion; hidden on healthy/background records.
     lifecycle_chip: gtk4::Label,
+    /// Dim header note shown when the card is not the command's whole output
+    /// (the capture ring or the replay's history budget dropped its head).
+    pub(super) output_notice: gtk4::Label,
     /// Column count the output VTE is sized to — needed for re-feed (filter).
     pub(crate) cols: i64,
     /// Visible rows allocated to this full-height finished block.
@@ -816,6 +819,7 @@ impl Clone for FinishedBlock {
             bookmark_star: self.bookmark_star.clone(),
             status_icon: self.status_icon.clone(),
             lifecycle_chip: self.lifecycle_chip.clone(),
+            output_notice: self.output_notice.clone(),
             cols: self.cols,
             viewport_cap: self.viewport_cap,
             long_output: self.long_output,
@@ -2025,6 +2029,12 @@ impl FinishedBlock {
         // final on-screen frame — a colour-preserving snapshot with CRLF breaks —
         // so the finished block mirrors what the live VTE showed. Ordinary output
         // has no vertical repaint and is fed unchanged.
+        //
+        // A live command's capture never reaches this branch any more: finalize
+        // replays such a stream on a screen of the child's winsize
+        // (`render_captured_output`, which keeps an inline TUI's scrollback
+        // too) and hands over a frame of plain rows. This remains for callers
+        // that pass raw repainting bytes without a geometry.
         let collapsed;
         let repaint_collapsed = output_has_vertical_repaint(output);
         let output = if repaint_collapsed {
@@ -2198,6 +2208,17 @@ impl FinishedBlock {
         lifecycle_chip.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         lifecycle_chip.set_visible(false);
         header_row.append(&lifecycle_chip);
+
+        // Lost output is stated, not hidden: a long session whose capture
+        // outgrew its bounds would otherwise start partway through with
+        // nothing saying so. A header note rather than a row above the output,
+        // so the card's measured and estimated heights stay the same.
+        let output_notice = gtk4::Label::new(None);
+        output_notice.add_css_class("block-output-notice");
+        output_notice.set_halign(gtk4::Align::Start);
+        output_notice.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        output_notice.set_visible(false);
+        header_row.append(&output_notice);
 
         // Context chips (Warp-style): cwd pill + git-branch pill.
         if let Some(cwd_path) = cwd {
@@ -3413,6 +3434,7 @@ impl FinishedBlock {
             bookmark_star,
             status_icon,
             lifecycle_chip,
+            output_notice,
             cols,
             viewport_cap,
             long_output,
@@ -3443,6 +3465,26 @@ impl FinishedBlock {
             None => {
                 self.lifecycle_chip.set_visible(false);
                 self.lifecycle_chip.set_tooltip_text(None);
+            }
+        }
+    }
+
+    /// Show (or hide, with `None`) the dim note that this card is not the
+    /// command's whole output.
+    pub(crate) fn set_output_notice(&self, notice: Option<&str>) {
+        match notice {
+            Some(notice) => {
+                self.output_notice.set_text(notice);
+                self.output_notice.set_tooltip_text(Some(
+                    "The command wrote more than a finished block keeps; its oldest output was dropped",
+                ));
+                self.output_notice
+                    .update_property(&[gtk4::accessible::Property::Label(notice)]);
+                self.output_notice.set_visible(true);
+            }
+            None => {
+                self.output_notice.set_visible(false);
+                self.output_notice.set_tooltip_text(None);
             }
         }
     }
