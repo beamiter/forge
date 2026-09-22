@@ -209,6 +209,7 @@ pub struct VteTerminalView {
     config: Rc<RefCell<Config>>,
     cwd_callbacks: StrCallbacks,
     exited_callbacks: IntCallbacks,
+    launch_failed_callbacks: StrCallbacks,
     bell_callbacks: VoidCallbacks,
     title_callbacks: StrCallbacks,
     activity_callbacks: VoidCallbacks,
@@ -242,6 +243,7 @@ impl VteTerminalView {
 
         let cwd_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn(&str)>>::new()));
         let exited_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn(i32)>>::new()));
+        let launch_failed_callbacks: StrCallbacks = Rc::new(RefCell::new(Vec::new()));
         let bell_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn()>>::new()));
         let title_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn(&str)>>::new()));
         let activity_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn()>>::new()));
@@ -315,7 +317,18 @@ impl VteTerminalView {
             }
         });
 
-        // Spawn shell
+        // Spawn errors have no child-exited signal; notify them separately.
+        let failed_callbacks = launch_failed_callbacks.clone();
+        let on_resolved = Box::new(move |result: Result<(), String>| {
+            if let Some(on_launched) = on_launched {
+                on_launched();
+            }
+            if let Err(message) = result {
+                for callback in failed_callbacks.borrow().iter() {
+                    callback(&message);
+                }
+            }
+        });
         spawn_shell(
             &terminal,
             shell_argv,
@@ -323,7 +336,7 @@ impl VteTerminalView {
             session_id,
             initial_commands,
             env_extra,
-            on_launched,
+            on_resolved,
         );
 
         VteTerminalView {
@@ -333,6 +346,7 @@ impl VteTerminalView {
             config,
             cwd_callbacks,
             exited_callbacks,
+            launch_failed_callbacks,
             bell_callbacks,
             title_callbacks,
             activity_callbacks,
@@ -363,6 +377,15 @@ impl VteTerminalView {
         F: Fn(i32) + 'static,
     {
         self.exited_callbacks.borrow_mut().push(Box::new(callback));
+    }
+
+    pub(crate) fn connect_launch_failed<F>(&self, callback: F)
+    where
+        F: Fn(&str) + 'static,
+    {
+        self.launch_failed_callbacks
+            .borrow_mut()
+            .push(Box::new(callback));
     }
 
     pub fn grab_focus(&self) {
@@ -562,7 +585,7 @@ pub(crate) fn spawn_shell(
     session_id: Option<&str>,
     initial_commands: &[String],
     env_extra: Vec<(String, String)>,
-    on_launched: Option<Box<dyn FnOnce()>>,
+    on_resolved: Box<dyn FnOnce(Result<(), String>)>,
 ) {
     // Append --session <id> to argv when restoring a session (only for jsh)
     let mut argv_vec: Vec<String> = argv_owned.to_vec();
@@ -678,24 +701,35 @@ pub(crate) fn spawn_shell(
             // has already entered its working directory through the path it
             // was handed, so launch-time pins may be released now. Runs on
             // failure too — the pin must not leak on a failed spawn.
-            if let Some(on_launched) = on_launched {
-                on_launched();
-            }
-            if let Ok(pid) = res {
-                let pid_i32: i32 = pid.into_glib();
-                // VTE spawned this child through glib, and glib's child watch
-                // is what calls `waitpid` for it — hence `Foreign`. The
-                // lifecycle only ever signals it (through a pidfd), and learns
-                // the status from `child-exited`; reaping here would consume
-                // the status VTE is waiting for and free the pid behind its
-                // back.
-                match ChildLifecycle::new(pid_i32, ReapOwner::Foreign) {
-                    Ok(lifecycle) => set_terminal_child_lifecycle(&terminal_for_pid, lifecycle),
-                    Err(error) => {
-                        log::warn!("Cannot manage the lifecycle of VTE child {pid_i32}: {error}")
-                    }
+            let pid = match res {
+                Ok(pid) => pid,
+                Err(error) => {
+                    let detail =
+                        jterm_core::review_input::safe_inline_display(&error.to_string(), 2048);
+                    let message = format!("Could not launch terminal: {detail}");
+                    log::error!("{message}");
+                    // Observers must retire the launch before the diagnostic
+                    // can emit contents-changed (remote first-output badges).
+                    let diagnostic = format!("\r\nforge: {message}\r\n");
+                    on_resolved(Err(message));
+                    terminal_for_pid.feed(diagnostic.as_bytes());
+                    return;
+                }
+            };
+            let pid_i32: i32 = pid.into_glib();
+            // VTE spawned this child through glib, and glib's child watch
+            // is what calls `waitpid` for it — hence `Foreign`. The
+            // lifecycle only ever signals it (through a pidfd), and learns
+            // the status from `child-exited`; reaping here would consume
+            // the status VTE is waiting for and free the pid behind its
+            // back.
+            match ChildLifecycle::new(pid_i32, ReapOwner::Foreign) {
+                Ok(lifecycle) => set_terminal_child_lifecycle(&terminal_for_pid, lifecycle),
+                Err(error) => {
+                    log::warn!("Cannot manage the lifecycle of VTE child {pid_i32}: {error}")
                 }
             }
+            on_resolved(Ok(()));
             // Feed initial commands after the shell has fully initialized.
             // We delay to ensure the shell has entered raw mode; sending \r
             // too early would hit the kernel's cooked-mode icrnl translation
@@ -1261,6 +1295,106 @@ mod tests {
                 None,
                 "{refused}"
             );
+        }
+    }
+
+    /// A rejected exec has no child-exited signal. Its separate failure
+    /// notification must end both kinds of task session and release the pin.
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn a_failed_vte_spawn_retires_task_sessions_without_an_exit_code() {
+        use crate::agent_task::{
+            AgentProvider, NewTask, TaskManager, TaskStatus, TaskValidationStatus,
+        };
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        gtk4::init().expect("GTK display");
+        let context = gtk4::glib::MainContext::default();
+        let _guard = context.acquire().expect("own GTK main context");
+        for validation in [false, true] {
+            let mut manager = TaskManager::new();
+            let task_id = manager
+                .create(NewTask {
+                    title: "failed exec".into(),
+                    provider: AgentProvider::Codex,
+                    repo_root: "/repo".into(),
+                    worktree_path: "/tasks/failed-exec".into(),
+                    branch: "app/failed-exec".into(),
+                    base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+                    source_context: None,
+                })
+                .unwrap();
+            if validation {
+                manager
+                    .update_status(task_id, TaskStatus::ReadyForReview, None)
+                    .unwrap();
+                manager
+                    .bind_validation_session(task_id, "failed-launch".into())
+                    .unwrap();
+            } else {
+                manager
+                    .bind_terminal_session(task_id, "failed-launch".into())
+                    .unwrap();
+            }
+            let manager = Rc::new(RefCell::new(manager));
+            let resolved = Rc::new(Cell::new(false));
+            let release_pin = resolved.clone();
+            let view = super::VteTerminalView::new(
+                Rc::new(RefCell::new(crate::config::Config::safe_defaults())),
+                &["/forge-test/nonexistent-executable".into()],
+                Some("/tmp"),
+                None,
+                &[],
+                Vec::new(),
+                Some(Box::new(move || release_pin.set(true))),
+            );
+            let failure = Rc::new(RefCell::new(None));
+            let failure_callback = failure.clone();
+            let manager_callback = manager.clone();
+            view.connect_launch_failed(move |message| {
+                *failure_callback.borrow_mut() = Some(message.to_string());
+                manager_callback
+                    .borrow_mut()
+                    .handle_terminal_session_exit("failed-launch", None);
+            });
+            let exits = Rc::new(Cell::new(0));
+            let exits_callback = exits.clone();
+            view.connect_exited(move |_| exits_callback.set(exits_callback.get() + 1));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while failure.borrow().is_none() && std::time::Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(
+                resolved.get(),
+                "spawn resolution must release the validation pin"
+            );
+            assert!(
+                failure
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|message| message.contains("nonexistent-executable")),
+                "a failed exec must report its cause instead of leaving a task running"
+            );
+            assert_eq!(
+                exits.get(),
+                0,
+                "failed exec has no authoritative child exit"
+            );
+            let mut manager = manager.borrow_mut();
+            // Closing the diagnostic pane cannot rewrite the recorded failure.
+            manager.handle_terminal_session_closed("failed-launch");
+            let task = manager.get(task_id).unwrap();
+            if validation {
+                assert_eq!(task.validation.status, TaskValidationStatus::Inconclusive);
+                assert_eq!(task.validation.exit_code, None);
+                assert_eq!(manager.next_validation_attempt(task_id).unwrap(), 2);
+            } else {
+                assert_eq!(task.status, TaskStatus::Failed);
+                assert_eq!(task.exit_code, None);
+                assert!(manager.terminal_retry_session_id(task_id).is_ok());
+            }
         }
     }
 

@@ -871,6 +871,26 @@ impl UiState {
         }
     }
 
+    /// No child-exited signal follows a rejected VTE spawn. Record the
+    /// missing result while retaining the pane's diagnostic and task binding
+    /// for retry; do not invent an exit code or call this user cancellation.
+    pub(crate) fn note_task_terminal_launch_failed(&self, leaf: &PaneLeaf) {
+        let Some(session_id) = leaf.task_session_id() else {
+            return;
+        };
+        let panel_visible = {
+            let mut domain = self.agent_tasks.borrow_mut();
+            domain.pending_validation_pins.remove(&session_id);
+            domain
+                .task_manager
+                .handle_terminal_session_exit(&session_id, None);
+            domain.panel_visible
+        };
+        if panel_visible {
+            self.sync_tasks_panel();
+        }
+    }
+
     /// A task-terminal pane is being removed without a process-exit signal
     /// (the user closed its tab). This is the close half of ember's
     /// exit/closed split: a validation still marked Running becomes Cancelled

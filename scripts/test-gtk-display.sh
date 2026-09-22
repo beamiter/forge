@@ -52,6 +52,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    ui::tabs::tests::failed_remote_launch_diagnostics_never_mark_the_attempt_connected
     ui::sidebar_tabs::tests::many_tab_switches_update_mirror_before_notebook_commits
     ui::dialogs::tests::cross_block_search_compact_rows_are_inside_horizontal_scroller
     ui::dialogs::tests::cross_block_search_close_borrows_the_gtk_dialog_without_releasing_its_slot
@@ -75,6 +76,7 @@ tests=(
     block_view::tests::a_dropped_path_reaches_the_program_as_a_bracketed_paste
     block_view::tests::an_alt_screen_round_trip_keeps_a_real_running_cards_height
     block_view::tests::a_truncated_output_shows_its_notice_on_a_real_card
+    terminal::tests::a_failed_vte_spawn_retires_task_sessions_without_an_exit_code
     terminal::tests::an_osc8_label_opens_its_target_on_a_real_vte
     block_view::css::tests::the_generated_stylesheet_parses_without_error
     font::tests::a_real_vte_is_given_the_icon_family_behind_the_configured_one

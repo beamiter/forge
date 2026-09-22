@@ -20,6 +20,26 @@ use crate::terminal::{
     show_rename_dialog, show_rename_dialog_with_strip, terminal_working_directory, VteTerminalView,
 };
 
+/// A launch diagnostic is rendered through VTE too. Only the first output of
+/// an attempt which has not failed may turn its remote badge green.
+fn connect_remote_launch_status(leaf: &PaneLeaf, on_status: impl Fn(ConnStatus) + 'static) {
+    let settled = Rc::new(Cell::new(false));
+    let on_status = Rc::new(on_status);
+    if let PaneLeaf::Vte(view) = leaf {
+        let settled = settled.clone();
+        let on_status = on_status.clone();
+        view.connect_launch_failed(move |_| {
+            settled.set(true);
+            on_status(ConnStatus::Disconnected);
+        });
+    }
+    leaf.terminal().connect_contents_changed(move |_| {
+        if !settled.replace(true) {
+            on_status(ConnStatus::Connected);
+        }
+    });
+}
+
 struct TabLaunch {
     working_directory: Option<String>,
     tab_name: Option<String>,
@@ -1366,16 +1386,6 @@ impl UiState {
         }))
     }
 
-    /// Mark a remote tab as connected (green badge). Called on first output.
-    /// Note: this is a visual signal only — backoff reset is decided at exit
-    /// time by `spawn_at` duration, so a fast ssh error banner can't reset it.
-    fn mark_tab_connected(&self, tab_num: u32) {
-        if let Some(conn) = self.tab_connections.borrow_mut().get_mut(&tab_num) {
-            conn.status = ConnStatus::Connected;
-        }
-        self.set_tab_conn_status(tab_num, ConnStatus::Connected);
-    }
-
     /// Close the tab with the given tab_num via the normal exit path.
     fn close_tab_by_num(&self, tab_num: u32) {
         for i in 0..self.notebook.n_pages() {
@@ -1765,6 +1775,20 @@ impl UiState {
                 self.attach_ascii_organism_to_view(term_view, is_remote);
             }
             PaneLeaf::Vte(vte_view) => {
+                let ui_for_failure = UiState::clone(self);
+                let root_for_failure = vte_view.widget().downgrade();
+                vte_view.connect_launch_failed(move |message| {
+                    let Some(root) = root_for_failure.upgrade() else {
+                        return;
+                    };
+                    let Some(leaf) = PaneLeaf::from_widget(&root) else {
+                        return;
+                    };
+                    ui_for_failure.note_task_terminal_launch_failed(&leaf);
+                    ui_for_failure
+                        .toast_overlay
+                        .add_toast(adw::Toast::new(message));
+                });
                 let ui_for_exit = UiState::clone(self);
                 let root_for_exit = vte_view.widget().downgrade();
                 let terminal_for_exit = vte_view.vte().downgrade();
@@ -1801,20 +1825,27 @@ impl UiState {
             }
         }
 
-        // For remote tabs, flip the status badge to green on first output.
+        // First child output is a visual connection signal only: backoff is
+        // still reset by connection duration at exit, never by an SSH banner.
         if remote.is_some() {
             let ui_for_conn = self.clone();
-            let fired = Rc::new(Cell::new(false));
             let root_for_conn = view_type.root_widget().downgrade();
-            terminal.connect_contents_changed(move |_| {
-                if fired.get() {
+            connect_remote_launch_status(&view_type, move |status| {
+                let Some(root) = root_for_conn.upgrade() else {
                     return;
+                };
+                let current_tab_num = tab_num_for_widget(&root).unwrap_or(tab_num);
+                {
+                    let mut connections = ui_for_conn.tab_connections.borrow_mut();
+                    let Some(connection) = connections
+                        .get_mut(&current_tab_num)
+                        .filter(|connection| connection.identity == tab_num)
+                    else {
+                        return;
+                    };
+                    connection.status = status;
                 }
-                fired.set(true);
-                if let Some(root) = root_for_conn.upgrade() {
-                    let current_tab_num = tab_num_for_widget(&root).unwrap_or(tab_num);
-                    ui_for_conn.mark_tab_connected(current_tab_num);
-                }
+                ui_for_conn.set_tab_conn_status(current_tab_num, status);
             });
         }
 
@@ -2635,6 +2666,62 @@ impl UiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn failed_remote_launch_diagnostics_never_mark_the_attempt_connected() {
+        gtk4::init().expect("GTK display");
+        let context = glib::MainContext::default();
+        let _guard = context.acquire().expect("own GTK main context");
+        for fail in [true, false] {
+            let argv = if fail {
+                vec!["/forge-test/nonexistent-ssh".to_string()]
+            } else {
+                vec!["/bin/sh".into(), "-c".into(), "printf remote-output".into()]
+            };
+            let view = Rc::new(VteTerminalView::new(
+                Rc::new(RefCell::new(crate::config::Config::safe_defaults())),
+                &argv,
+                Some("/tmp"),
+                None,
+                &[],
+                Vec::new(),
+                None,
+            ));
+            let leaf = PaneLeaf::Vte(view.clone());
+            let statuses = Rc::new(RefCell::new(Vec::new()));
+            let observed = statuses.clone();
+            connect_remote_launch_status(&leaf, move |status| observed.borrow_mut().push(status));
+            let output_seen = Rc::new(Cell::new(false));
+            let output_callback = output_seen.clone();
+            view.vte()
+                .connect_contents_changed(move |_| output_callback.set(true));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while (!output_seen.get() || statuses.borrow().is_empty())
+                && std::time::Instant::now() < deadline
+            {
+                context.iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(
+                output_seen.get(),
+                "exercise actual VTE output, including the launch diagnostic"
+            );
+            let statuses = statuses.borrow();
+            assert_eq!(statuses.len(), 1, "one outcome for this attempt");
+            if fail {
+                assert!(
+                    matches!(statuses[0], ConnStatus::Disconnected),
+                    "locally rendered launch failure is not remote connection evidence"
+                );
+            } else {
+                assert!(
+                    matches!(statuses[0], ConnStatus::Connected),
+                    "actual child output still marks the attempt connected"
+                );
+            }
+        }
+    }
 
     /// VTE's `commit` is the *input* signal: agents enable focus reporting,
     /// so a tab hooked to it went "active" the moment the user left it, while
