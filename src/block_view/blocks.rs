@@ -497,9 +497,6 @@ pub(crate) enum BlockOutcome {
     Unknown,
 }
 
-/// `128 + SIGTSTP`: the shell's status for a job stopped by Ctrl+Z.
-const SUSPENDED_EXIT_CODE: i32 = 148;
-
 impl BlockOutcome {
     /// Exit statuses that mean "this was stopped", not "this went wrong".
     ///
@@ -509,26 +506,25 @@ impl BlockOutcome {
     /// itself, too: the live card's Stop button writes `\x03`, so the block it
     /// produces was interrupted by Forge's own UI.
     ///
-    /// `128 + signal`, restricted to the three signals that carry no fault:
+    /// `128 + signal`, including the three terminating signals that carry no fault:
     /// SIGINT (Ctrl+C), SIGPIPE (the reader went away, as in `... | head`) and
     /// SIGTERM (an orderly stop request). Faults keep their failure styling:
     /// SIGSEGV, SIGABRT and SIGQUIT are real crashes, and SIGKILL is usually
     /// the OOM killer, all of which the user needs to see in red.
     ///
-    /// SIGTSTP (148, Ctrl+Z) joins them: codex and claude suspend on Ctrl+Z,
-    /// and the shell reports 128 + SIGTSTP when it takes the terminal back.
-    /// The job is suspended, not failed; `fg` resumes it.
+    /// The four job-control stops (147–150) join them. The job is suspended,
+    /// not failed; `fg` resumes it.
     ///
     /// A script that genuinely exits 130 for its own reasons is misread here.
     /// The raw code stays visible in the badge, in export and in history for
     /// exactly that reason.
-    const fn interrupt_signal(exit_code: i32) -> Option<&'static str> {
-        match exit_code {
-            130 => Some("SIGINT"),
-            141 => Some("SIGPIPE"),
-            143 => Some("SIGTERM"),
-            SUSPENDED_EXIT_CODE => Some("SIGTSTP"),
-            _ => None,
+    fn interrupt_signal(exit_code: i32) -> Option<&'static str> {
+        match jterm_core::exit_status::interrupt_signal(exit_code) {
+            Some(signal) => Some(signal),
+            None if jterm_core::exit_status::is_job_stop(exit_code) => {
+                jterm_core::exit_status::signal_name_for_exit(exit_code)
+            }
+            None => None,
         }
     }
 
@@ -537,10 +533,11 @@ impl BlockOutcome {
     /// classified as interrupted here, and the number is how the user tells
     /// the two apart.
     fn interrupted_badge(code: i32) -> (String, String) {
-        if code == SUSPENDED_EXIT_CODE {
+        if jterm_core::exit_status::is_job_stop(code) {
+            let signal = Self::interrupt_signal(code).unwrap_or("a stop signal");
             return (
                 format!("exit:{code} · suspended"),
-                "Stopped by SIGTSTP — resume with fg".to_string(),
+                format!("Stopped by {signal} — resume with fg"),
             );
         }
         let signal = Self::interrupt_signal(code).unwrap_or("signal");
@@ -630,7 +627,9 @@ impl BlockOutcome {
             Self::Background => "Background output",
             Self::Success => "Command succeeded",
             Self::Failure(_) => "Command failed",
-            Self::Interrupted(SUSPENDED_EXIT_CODE) => "Command suspended",
+            Self::Interrupted(code) if jterm_core::exit_status::is_job_stop(code) => {
+                "Command suspended"
+            }
             Self::Interrupted(_) => "Command interrupted",
             Self::Unknown => "Command exit status unavailable",
         }
@@ -5083,8 +5082,7 @@ mod tests {
             assert_ne!(outcome.status_css_class(), "block-status-bad");
         }
 
-        // Faults stay red: these are things the user needs to see. SIGSTOP,
-        // SIGTTIN and SIGTTOU are not Ctrl+Z and keep their plain status.
+        // Faults stay red: these are things the user needs to see.
         for code in [
             1, 2, 127, 131, /* SIGQUIT */
             134, /* SIGABRT */
@@ -5101,28 +5099,34 @@ mod tests {
         }
     }
 
-    /// Ctrl+Z on codex or claude suspends the job, and the shell reports 148
-    /// (128 + SIGTSTP). That card used to be a red `exit:148` failure that
-    /// the Failed filter and failure navigation then stopped on.
+    /// Job-control stops suspend the process. They must not produce a red
+    /// failure card or appear in the Failed filter and failure navigation.
     #[test]
-    fn a_ctrl_z_suspend_is_not_a_failure() {
-        let outcome = BlockOutcome::classify(Some("codex"), Some(148));
-        assert_eq!(outcome, BlockOutcome::Interrupted(148));
-        assert!(!outcome.is_failure());
-        assert_eq!(outcome.reported_exit_code(), Some(148));
-        assert_eq!(outcome.accessible_label(), "Command suspended");
-        assert_eq!(
-            BlockOutcome::interrupted_badge(148),
-            (
-                "exit:148 · suspended".to_string(),
-                "Stopped by SIGTSTP — resume with fg".to_string()
-            )
-        );
+    fn job_control_stops_are_not_failures() {
+        for (code, signal) in [
+            (147, "SIGSTOP"),
+            (148, "SIGTSTP"),
+            (149, "SIGTTIN"),
+            (150, "SIGTTOU"),
+        ] {
+            let outcome = BlockOutcome::classify(Some("codex"), Some(code));
+            assert_eq!(outcome, BlockOutcome::Interrupted(code));
+            assert!(!outcome.is_failure());
+            assert_eq!(outcome.reported_exit_code(), Some(code));
+            assert_eq!(outcome.accessible_label(), "Command suspended");
+            assert_eq!(
+                BlockOutcome::interrupted_badge(code),
+                (
+                    format!("exit:{code} · suspended"),
+                    format!("Stopped by {signal} — resume with fg")
+                )
+            );
+            assert!(!BlockOutcome::classify_foreground(Some(code)).is_failure());
+        }
         assert_eq!(
             BlockOutcome::interrupted_badge(130).0,
             "exit:130 · interrupted"
         );
-        assert!(!BlockOutcome::classify_foreground(Some(148)).is_failure());
     }
 
     /// The pool clears stripe classes by list; the list must cover every value
