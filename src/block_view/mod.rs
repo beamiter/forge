@@ -12111,7 +12111,9 @@ impl LiveCommitSink {
         if let Some(report) =
             classify_terminal_report(text.as_bytes(), self.cpr_outstanding.get() > 0)
         {
-            if report == TerminalReport::CursorPosition {
+            // DECXCPR answers CSI ?6n, which never entered the plain CPR ledger.
+            // Settling it here would make the next ordinary answer look typed.
+            if report == TerminalReport::CursorPosition && !text.starts_with("\x1b[?") {
                 self.cpr_outstanding
                     .set(self.cpr_outstanding.get().saturating_sub(1));
             }
@@ -28567,6 +28569,39 @@ mod tests {
         assert_eq!(harness.sink.on_commit("\x1b[1;2R"), LiveCommitRoute::Typed);
         assert_eq!(harness.written(), b"\x1b[1;2R");
         assert_eq!(harness.human_inputs.get(), 2);
+    }
+
+    #[test]
+    fn a_private_cursor_report_preserves_the_pending_plain_answer() {
+        use super::LiveCommitRoute;
+        use jterm_core::terminal_report::TerminalReport;
+
+        for private in ["\x1b[?1;2R", "\x1b[?1;2;1R"] {
+            let harness = CommitHarness::new(BlockState::CollectingOutput, PtyForeground::Other);
+            harness.press(super::KittyKey::Unicode('b'), true, false);
+            let recorded = harness.sink.kitty_last_key.get();
+            // Only the plain CSI 6n query is counted by the reader.
+            harness.sink.cpr_outstanding.set(1);
+            for reply in [private, "\x1b[1;2R"] {
+                assert_eq!(
+                    harness.sink.on_commit(reply),
+                    LiveCommitRoute::Report(TerminalReport::CursorPosition)
+                );
+                assert_eq!(harness.written(), reply.as_bytes());
+                assert_eq!(
+                    harness.sink.cpr_outstanding.get(),
+                    u32::from(reply == private)
+                );
+                assert_eq!(harness.human_inputs.get(), 0);
+                assert_eq!(harness.sink.selected_block_id.get(), Some(7));
+                assert_eq!(harness.sink.kitty_last_key.get(), recorded);
+            }
+            // With the plain query settled, Shift+F3 is input again.
+            assert_eq!(harness.sink.on_commit("\x1b[1;2R"), LiveCommitRoute::Typed);
+            assert_eq!(harness.written(), b"\x1b[1;2R");
+            assert_eq!(harness.human_inputs.get(), 1);
+            assert_eq!(harness.sink.selected_block_id.get(), None);
+        }
     }
 
     /// VTE 0.76 commits Alt+b as ESC and then `b`. Taken one at a time, the
