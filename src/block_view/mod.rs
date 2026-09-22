@@ -8464,7 +8464,7 @@ impl ReaderCtx {
         let asked = queries.get();
         // Only the thread that owns the main context can schedule; a test
         // thread that cannot simply keeps the ledger, which is the safe side.
-        if glib::MainContext::default().acquire().is_ok() {
+        if let Ok(_guard) = glib::MainContext::default().acquire() {
             glib::timeout_add_local_once(CPR_ANSWER_GRACE, move || {
                 if cpr_forget_applies(asked, queries.get()) {
                     ledger.set(0);
