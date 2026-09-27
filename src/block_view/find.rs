@@ -1715,6 +1715,10 @@ impl TermView {
                 }
             }
 
+            if hits.len() >= max_hits {
+                break;
+            }
+
             if scan_incomplete {
                 break;
             }
@@ -2014,7 +2018,8 @@ mod tests {
         native_cursor_action, outcome_matches_filters, plan_matching_windows,
         record_matches_filters, regex_consumption, snippet, step_compressed_cursor,
         unresolved_record_target_result, utf8_prefix, vte_cross_block_pattern,
-        BookmarkedSearchEmptyReason, CrossBlockSearchOptions, CrossBlockSearchScope, FindCursor,
+        BookmarkedSearchEmptyReason, CrossBlockHit, CrossBlockSearchOptions,
+        CrossBlockSearchScope, FindCursor,
         FindDirection, FindScanBudget, FindSurface, NativeCursorAction, RecordNavigationResult,
         RecordSnapshotView, RegexConsumption, VTE_SEARCH_FLAGS,
     };
@@ -4029,6 +4034,113 @@ tail ab";
             !scan_incomplete,
             "stopping at max_hits must not mark the palette scan incomplete"
         );
+    }
+
+    #[test]
+    fn cross_block_pattern_search_shares_hit_cap_across_command_and_output() {
+        let block = BlockData {
+            id: 1,
+            prompt: String::new(),
+            cmd: "needle-cmd".to_string(),
+            cmd_markup: None,
+            output: "needle-out".to_string(),
+            exit_code: Some(0),
+            lifecycle_schema: crate::block_view::blocks::BLOCK_LIFECYCLE_SCHEMA,
+            completion_provenance: super::super::CompletionProvenance::ShellReported.into(),
+            start_mark_seen: true,
+            estimated_height: 1,
+            line_count: 1,
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            cols: 80,
+            command_exact: false,
+            command_truncated: false,
+            output_notice: None,
+        };
+        let backend_record = BackendRecordRef::Block(&block);
+        let re = regex::Regex::new("needle").unwrap();
+        let options = CrossBlockSearchOptions::default();
+        let scope = CrossBlockSearchScope::All;
+        let max_hits = 1usize;
+        let mut hits: Vec<CrossBlockHit> = Vec::new();
+        let mut scan_budget = FindScanBudget::for_cross_block();
+        let mut scan_incomplete = false;
+        let records = [backend_record];
+        for record in records.iter().copied() {
+            if hits.len() >= max_hits {
+                break;
+            }
+            if scan_budget.exhausted() {
+                scan_incomplete = true;
+                break;
+            }
+            if !record_matches_filters(
+                record,
+                &BlockFilters::default(),
+                false,
+            ) {
+                continue;
+            }
+            let command = record.command();
+            let cmd_preview = command_preview(command);
+            if scope.includes_command() {
+                for (ln_idx, line) in command.lines().enumerate() {
+                    if hits.len() >= max_hits {
+                        break;
+                    }
+                    if scan_budget.exhausted() {
+                        scan_incomplete = true;
+                        break;
+                    }
+                    scan_budget.consume_bytes(line.len());
+                    let matches = cross_block_match_count(&re, line, options.whole_word);
+                    if matches > 0 {
+                        hits.push(CrossBlockHit {
+                            block_id: record.id(),
+                            is_output: false,
+                            line_no: ln_idx + 1,
+                            line_text: snippet(line),
+                            cmd_preview: cmd_preview.clone(),
+                            occurrence: 0,
+                        });
+                    }
+                }
+            }
+            if hits.len() >= max_hits {
+                break;
+            }
+            if scan_incomplete {
+                break;
+            }
+            if scope.includes_output() {
+                for (ln_idx, line) in record.output().unwrap_or("").lines().enumerate() {
+                    if hits.len() >= max_hits {
+                        break;
+                    }
+                    if scan_budget.exhausted() {
+                        scan_incomplete = true;
+                        break;
+                    }
+                    scan_budget.consume_bytes(line.len());
+                    let matches = cross_block_match_count(&re, line, options.whole_word);
+                    if matches > 0 {
+                        hits.push(CrossBlockHit {
+                            block_id: record.id(),
+                            is_output: true,
+                            line_no: ln_idx + 1,
+                            line_text: snippet(line),
+                            cmd_preview: cmd_preview.clone(),
+                            occurrence: 0,
+                        });
+                    }
+                }
+            }
+        }
+        assert_eq!(hits.len(), 1);
+        assert!(!hits[0].is_output);
+        assert!(!scan_incomplete);
     }
 
     #[test]

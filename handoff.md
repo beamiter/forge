@@ -21,6 +21,11 @@ saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
 
+- **Cross-block hit cap across surfaces (2026-09-28, wave 7, round 87)** —
+  pattern search now stops once `max_hits` is reached on the command surface
+  instead of spending the remainder of the cap on output from the same record.
+  A focused regression pins the shared cap across command and output.
+
 - **Metadata filter hit-cap contract (2026-09-28, wave 6, round 86)** — the
   metadata-only palette scan now mirrors cross-block search: reaching `max_hits`
   must not set `scan_incomplete`; only scan-budget exhaustion may disclose

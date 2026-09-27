@@ -424,3 +424,6 @@ quality gates listed in `README.md`.
 86. **Metadata filter hit-cap contract** — the metadata-only palette path now
     mirrors the pattern-search rule: stopping at `max_hits` must not set
     `scan_incomplete`; only scan-budget exhaustion may disclose truncation.
+87. **Cross-block hit cap across surfaces** — pattern search stops once
+    `max_hits` is reached on the command surface instead of spending the
+    remainder of the cap on output from the same record.
