@@ -421,3 +421,6 @@ quality gates listed in `README.md`.
     walk early but must not set `scan_incomplete`; only byte/time budget
     exhaustion may disclose an incomplete scan. A focused regression pins that
     distinction for pattern search.
+86. **Metadata filter hit-cap contract** — the metadata-only palette path now
+    mirrors the pattern-search rule: stopping at `max_hits` must not set
+    `scan_incomplete`; only scan-budget exhaustion may disclose truncation.

@@ -21,6 +21,11 @@ saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
 
+- **Metadata filter hit-cap contract (2026-09-28, wave 6, round 86)** — the
+  metadata-only palette scan now mirrors cross-block search: reaching `max_hits`
+  must not set `scan_incomplete`; only scan-budget exhaustion may disclose
+  truncation. A focused unit regression pins the distinction.
+
 - **Agent CLIs in Block mode (2026-09-20, core `33093da`)**: a seven-area audit
   of how claude (fullscreen/alt-screen on this machine), codex and kimi (inline)
   and opencode (alt-screen) behave in Block mode, with each finding checked by a

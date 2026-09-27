@@ -4030,4 +4030,43 @@ tail ab";
             "stopping at max_hits must not mark the palette scan incomplete"
         );
     }
+
+    #[test]
+    fn metadata_filter_hit_cap_does_not_imply_scan_incomplete() {
+        let records: Vec<CompletedCommandRecord> = (0..4)
+            .map(|id| CompletedCommandRecord {
+                id,
+                cmd: format!("needle-{id}"),
+                exit_code: Some(0),
+                start_time_ms: None,
+                end_time_ms: None,
+                duration_ms: None,
+                cwd: None,
+                is_background: false,
+                completion_provenance: super::super::CompletionProvenance::ShellReported,
+                command_source: super::super::CommandTextSource::Screen,
+                start_mark_seen: true,
+            })
+            .collect();
+        let backend_records: Vec<BackendRecordRef<'_>> = records
+            .iter()
+            .map(|record| BackendRecordRef::Metadata {
+                record,
+                snapshot: None,
+            })
+            .collect();
+        let (hits, scan_incomplete) = metadata_filter_hits_with_budget(
+            backend_records,
+            CrossBlockSearchScope::Command,
+            2,
+            &BlockFilters::default(),
+            &BookmarkState::default(),
+            &mut FindScanBudget::for_cross_block(),
+        );
+        assert_eq!(hits.len(), 2);
+        assert!(
+            !scan_incomplete,
+            "metadata filter hit cap must not set scan_incomplete"
+        );
+    }
 }
