@@ -60,6 +60,11 @@ fn record_outcome_matches_filters(record: BackendRecordRef<'_>, filters: &BlockF
 pub(crate) const FIND_MATCH_LIMIT: usize = 10_000;
 const FIND_SCAN_BYTE_LIMIT: usize = 4 * 1024 * 1024;
 const FIND_SCAN_TIME_LIMIT: Duration = Duration::from_millis(12);
+/// Cross-block palette search is user-initiated and may walk retained history;
+/// give it a wider budget than the live Find overlay, but still fail visibly
+/// when the walk stops early (never silent truncation).
+const CROSS_BLOCK_SCAN_BYTE_LIMIT: usize = 8 * 1024 * 1024;
+const CROSS_BLOCK_SCAN_TIME_LIMIT: Duration = Duration::from_millis(48);
 const CROSS_BLOCK_REGEX_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 /// VTE uses PCRE2 while match counting uses Rust's Unicode-aware regex engine.
 /// UTF validates/decodes the subject as Unicode and UCP makes shorthand classes
@@ -262,6 +267,7 @@ struct ScanPrefix<'a> {
 struct FindScanBudget {
     remaining_bytes: usize,
     started: Instant,
+    time_limit: Duration,
 }
 
 impl FindScanBudget {
@@ -269,7 +275,20 @@ impl FindScanBudget {
         Self {
             remaining_bytes: FIND_SCAN_BYTE_LIMIT,
             started: Instant::now(),
+            time_limit: FIND_SCAN_TIME_LIMIT,
         }
+    }
+
+    fn for_cross_block() -> Self {
+        Self {
+            remaining_bytes: CROSS_BLOCK_SCAN_BYTE_LIMIT,
+            started: Instant::now(),
+            time_limit: CROSS_BLOCK_SCAN_TIME_LIMIT,
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.time_exhausted() || self.remaining_bytes == 0
     }
 
     fn take_prefix<'a>(&mut self, text: &'a str) -> ScanPrefix<'a> {
@@ -288,7 +307,7 @@ impl FindScanBudget {
     }
 
     fn time_exhausted(&self) -> bool {
-        self.started.elapsed() >= FIND_SCAN_TIME_LIMIT
+        self.started.elapsed() >= self.time_limit
     }
 
     fn remaining_bytes(&self) -> usize {
@@ -742,6 +761,16 @@ pub struct CrossBlockHit {
     /// can be driven to. Counted in matches rather than lines because that is
     /// what VTE's cursor steps over: one line can hold several.
     pub occurrence: usize,
+}
+
+/// Outcome of a cross-block palette scan. `scan_incomplete` is true when the
+/// byte/time budget stopped the walk before every eligible record was
+/// examined — distinct from hitting `max_hits`, which is a result cap the
+/// status line already discloses as "(capped)".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrossBlockSearchReport {
+    pub hits: Vec<CrossBlockHit>,
+    pub scan_incomplete: bool,
 }
 
 /// How many times a jump may step VTE's search cursor to reach the occurrence
@@ -1529,15 +1558,17 @@ impl TermView {
     /// enough context (line number + the raw line + cmd preview) to drive a
     /// palette UI that lets the user pick one and jump to it.
     ///
-    /// Errors only on invalid regex; an empty pattern returns `Ok(vec![])`
-    /// so the caller can clear results without a special branch.
+    /// Errors only on invalid regex; an empty pattern returns an empty report
+    /// so the caller can clear results without a special branch. When the
+    /// scan budget stops the walk early, `scan_incomplete` is set so the UI
+    /// can disclose that later records were not examined.
     pub fn cross_block_search(
         &self,
         pattern: &str,
         options: CrossBlockSearchOptions,
         max_hits: usize,
         filters: &BlockFilters,
-    ) -> Result<Vec<CrossBlockHit>, String> {
+    ) -> Result<CrossBlockSearchReport, String> {
         self.cross_block_search_in_scope(
             pattern,
             options,
@@ -1555,20 +1586,26 @@ impl TermView {
         scope: CrossBlockSearchScope,
         max_hits: usize,
         filters: &BlockFilters,
-    ) -> Result<Vec<CrossBlockHit>, String> {
+    ) -> Result<CrossBlockSearchReport, String> {
         if pattern.is_empty() {
             if !has_metadata_filters(filters) {
-                return Ok(Vec::new());
+                return Ok(CrossBlockSearchReport {
+                    hits: Vec::new(),
+                    scan_incomplete: false,
+                });
             }
             let bookmarks = self.bookmarks.borrow();
             let records = self.render_backend.records();
-            return Ok(metadata_filter_hits(
-                records.iter(),
-                scope,
-                max_hits,
-                filters,
-                &bookmarks,
-            ));
+            return Ok(CrossBlockSearchReport {
+                hits: metadata_filter_hits(
+                    records.iter(),
+                    scope,
+                    max_hits,
+                    filters,
+                    &bookmarks,
+                ),
+                scan_incomplete: false,
+            });
         }
 
         let compiled_pattern = cross_block_pattern(pattern, options);
@@ -1582,9 +1619,15 @@ impl TermView {
         let bookmarks = self.bookmarks.borrow();
         let records = self.render_backend.records();
         let mut hits: Vec<CrossBlockHit> = Vec::new();
+        let mut scan_budget = FindScanBudget::for_cross_block();
+        let mut scan_incomplete = false;
 
         for record in records.iter() {
             if hits.len() >= max_hits {
+                break;
+            }
+            if scan_budget.exhausted() {
+                scan_incomplete = true;
                 break;
             }
             // Metadata predicates run before this record contributes any
@@ -1605,6 +1648,11 @@ impl TermView {
                     if hits.len() >= max_hits {
                         break;
                     }
+                    if scan_budget.exhausted() {
+                        scan_incomplete = true;
+                        break;
+                    }
+                    scan_budget.consume_bytes(line.len());
                     let matches = cross_block_match_count(&re, line, options.whole_word);
                     if matches > 0 {
                         hits.push(CrossBlockHit {
@@ -1620,12 +1668,21 @@ impl TermView {
                 }
             }
 
+            if scan_incomplete {
+                break;
+            }
+
             if scope.includes_output() {
                 let mut occurrence = 0usize;
                 for (ln_idx, line) in record.output().unwrap_or("").lines().enumerate() {
                     if hits.len() >= max_hits {
                         break;
                     }
+                    if scan_budget.exhausted() {
+                        scan_incomplete = true;
+                        break;
+                    }
+                    scan_budget.consume_bytes(line.len());
                     let matches = cross_block_match_count(&re, line, options.whole_word);
                     if matches > 0 {
                         hits.push(CrossBlockHit {
@@ -1641,7 +1698,10 @@ impl TermView {
                 }
             }
         }
-        Ok(hits)
+        Ok(CrossBlockSearchReport {
+            hits,
+            scan_incomplete,
+        })
     }
 
     /// Whether activating this hit would show the user anything: a per-record
@@ -1915,7 +1975,7 @@ mod tests {
         CompletedCommandRecord, ZoneOutputSnapshot,
     };
     use std::collections::HashSet;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn surface(count: usize, complete: bool) -> FindSurface {
         FindSurface {
@@ -2299,6 +2359,7 @@ tail ab";
         let mut budget = FindScanBudget {
             remaining_bytes: 5,
             started: Instant::now(),
+            time_limit: Duration::from_millis(12),
         };
         let first = budget.take_prefix("abc");
         assert_eq!(first.text, "abc");

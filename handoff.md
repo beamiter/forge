@@ -1564,19 +1564,12 @@ doctor and correction probes.
   something to decide in the margin of another change.
 
 - **Moving the cross-block search scan to a cancellable worker** (TODO P2).
-  `cross_block_search_in_scope` (`block_view/find.rs:1449`) regex-scans every
-  retained record's command and output on the GTK thread with no time or byte
-  budget; the `max_hits` cap bounds the *results*, not the scan, so a query
-  that matches nothing still walks the whole retained history. The records are
-  borrowed out of the pane's `RefCell`s, so a real thread would have to copy up
-  to the full retained history to use them — the tractable shape is a resumable
-  slice (`start_at` cursor plus a `FindScanBudget`-style deadline, which
-  `find_in_blocks` already has for its own scan) driven from
-  `glib::idle_add_local` and cancelled by the search generation the dialog
-  already keeps. That is dialog surgery in `ui/dialogs.rs`'s 200-line rebuild
-  closure, and a half-applied version that bounds the scan without driving the
-  continuation would silently truncate results, which is worse than being slow.
-  Left whole for the next round.
+  Partial progress (2026-09-27): `cross_block_search_in_scope` now shares a
+  `FindScanBudget` (8 MiB / 48 ms) and returns `CrossBlockSearchReport` with
+  `scan_incomplete`. The palette status line discloses budget stops instead of
+  silently truncating. The remaining work is a resumable `glib::idle_add_local`
+  continuation cancelled by the dialog's search generation so large histories
+  keep scanning without holding the GTK thread for the full walk.
 
 ### Follow-up migrations (next rounds)
 

@@ -471,9 +471,17 @@ fn cross_block_search_memory(
     }
 }
 
-fn cross_block_search_status(total: usize, selected: Option<usize>) -> String {
+fn cross_block_search_status(
+    total: usize,
+    selected: Option<usize>,
+    scan_incomplete: bool,
+) -> String {
     if total == 0 {
-        "No matches.".to_string()
+        if scan_incomplete {
+            "No matches in the scanned prefix — history scan budget reached; narrow the scope or refine the query.".to_string()
+        } else {
+            "No matches.".to_string()
+        }
     } else {
         let noun = if total == 1 { "match" } else { "matches" };
         let position = selected
@@ -482,6 +490,10 @@ fn cross_block_search_status(total: usize, selected: Option<usize>) -> String {
             .unwrap_or_default();
         if total == CROSS_BLOCK_SEARCH_LIMIT {
             format!("{position}{total} {noun} (capped) — refine your query.")
+        } else if scan_incomplete {
+            format!(
+                "{position}{total} {noun} (scan budget reached — later blocks not examined)"
+            )
         } else {
             format!("{position}{total} {noun}")
         }
@@ -1580,6 +1592,7 @@ impl UiState {
         // keystroke / regex-toggle change.
         let hits: Rc<RefCell<Vec<crate::block_view::CrossBlockHit>>> =
             Rc::new(RefCell::new(Vec::new()));
+        let scan_incomplete = Rc::new(Cell::new(false));
         let row_bookmark_buttons: Rc<RefCell<Vec<(u64, gtk4::ToggleButton)>>> =
             Rc::new(RefCell::new(Vec::new()));
         let retained_hit: Rc<RefCell<Option<CrossBlockSelectionAnchor>>> =
@@ -1593,12 +1606,14 @@ impl UiState {
 
         {
             let hits = hits.clone();
+            let scan_incomplete = scan_incomplete.clone();
             let status_label = status_label.clone();
             list_box.connect_row_selected(move |_, row| {
                 let total = hits.borrow().len();
                 status_label.set_text(&cross_block_search_status(
                     total,
                     row.map(|row| row.index() as usize),
+                    scan_incomplete.get(),
                 ));
             });
         }
@@ -1607,6 +1622,7 @@ impl UiState {
             let term_view = term_view.clone();
             let list_box = list_box.clone();
             let hits = hits.clone();
+            let scan_incomplete = scan_incomplete.clone();
             let row_bookmark_buttons = row_bookmark_buttons.clone();
             let status_label = status_label.clone();
             let filter_entry = filter_entry.clone();
@@ -1661,11 +1677,13 @@ impl UiState {
                     filters.bookmarked_only,
                 ) {
                     hits.borrow_mut().clear();
+                    scan_incomplete.set(false);
                     status_label.set_text(cross_block_search_idle_status());
                     return;
                 }
                 if let Some(message) = cross_block_search_query_error(&query) {
                     hits.borrow_mut().clear();
+                    scan_incomplete.set(false);
                     status_label.set_text(message);
                     return;
                 }
@@ -1679,16 +1697,20 @@ impl UiState {
                     CROSS_BLOCK_SEARCH_LIMIT,
                     &filters,
                 ) {
-                    Ok(results) => {
+                    Ok(report) => {
+                        let results = report.hits;
+                        scan_incomplete.set(report.scan_incomplete);
                         let total = results.len();
-                        let status = if total == 0 {
+                        let status = if total == 0 && !report.scan_incomplete {
                             term_view
                                 .bookmarked_search_empty_reason(&query, scope, &filters)
                                 .map(cross_block_bookmarked_empty_status)
                                 .map(str::to_string)
-                                .unwrap_or_else(|| cross_block_search_status(total, None))
+                                .unwrap_or_else(|| {
+                                    cross_block_search_status(total, None, false)
+                                })
                         } else {
-                            cross_block_search_status(total, None)
+                            cross_block_search_status(total, None, report.scan_incomplete)
                         };
                         status_label.set_text(&status);
                         let jumpable = term_view.jumpable_search_hits(&results);
@@ -1783,6 +1805,7 @@ impl UiState {
                     }
                     Err(e) => {
                         hits.borrow_mut().clear();
+                        scan_incomplete.set(false);
                         clear_list_box(&list_box);
                         status_label.set_text(&format!("Bad regex: {e}"));
                     }
@@ -4427,15 +4450,26 @@ mod tests {
         );
         assert_eq!(cross_block_search_pending_status(), "Searching blocks…");
         assert_eq!(cross_block_search_refresh_status(), "Refreshing blocks…");
-        assert_eq!(cross_block_search_status(0, None), "No matches.");
+        assert_eq!(cross_block_search_status(0, None, false), "No matches.");
         assert_eq!(
-            cross_block_search_status(CROSS_BLOCK_SEARCH_LIMIT, None),
+            cross_block_search_status(0, None, true),
+            "No matches in the scanned prefix — history scan budget reached; narrow the scope or refine the query."
+        );
+        assert_eq!(
+            cross_block_search_status(CROSS_BLOCK_SEARCH_LIMIT, None, false),
             "500 matches (capped) — refine your query."
         );
-        assert_eq!(cross_block_search_status(37, None), "37 matches");
-        assert_eq!(cross_block_search_status(1, Some(0)), "1 of 1 match");
+        assert_eq!(cross_block_search_status(37, None, false), "37 matches");
         assert_eq!(
-            cross_block_search_status(CROSS_BLOCK_SEARCH_LIMIT, Some(36)),
+            cross_block_search_status(37, None, true),
+            "37 matches (scan budget reached — later blocks not examined)"
+        );
+        assert_eq!(
+            cross_block_search_status(1, Some(0), false),
+            "1 of 1 match"
+        );
+        assert_eq!(
+            cross_block_search_status(CROSS_BLOCK_SEARCH_LIMIT, Some(36), false),
             "37 of 500 matches (capped) — refine your query."
         );
         assert_eq!(
