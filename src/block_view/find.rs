@@ -916,12 +916,56 @@ fn metadata_filter_hits<'a>(
     filters: &BlockFilters,
     bookmarks: &BookmarkState,
 ) -> Vec<CrossBlockHit> {
-    records
-        .into_iter()
-        .filter(|record| record_matches_filters(*record, filters, bookmarks.contains(record.id())))
-        .filter_map(|record| metadata_filter_hit(record, scope))
-        .take(max_hits)
-        .collect()
+    metadata_filter_hits_with_budget(
+        records,
+        scope,
+        max_hits,
+        filters,
+        bookmarks,
+        &mut FindScanBudget::for_cross_block(),
+    )
+    .0
+}
+
+fn metadata_filter_hits_with_budget<'a>(
+    records: impl IntoIterator<Item = BackendRecordRef<'a>>,
+    scope: CrossBlockSearchScope,
+    max_hits: usize,
+    filters: &BlockFilters,
+    bookmarks: &BookmarkState,
+    scan_budget: &mut FindScanBudget,
+) -> (Vec<CrossBlockHit>, bool) {
+    let mut hits = Vec::new();
+    let mut scan_incomplete = false;
+    for record in records {
+        if hits.len() >= max_hits {
+            break;
+        }
+        if scan_budget.exhausted() {
+            scan_incomplete = true;
+            break;
+        }
+        scan_budget.consume_bytes(record.command().len());
+        if scope.includes_output() {
+            scan_budget.consume_bytes(record.output().unwrap_or("").len());
+        }
+        let budget_stopped = scan_budget.exhausted();
+        if !record_matches_filters(record, filters, bookmarks.contains(record.id())) {
+            if budget_stopped {
+                scan_incomplete = true;
+                break;
+            }
+            continue;
+        }
+        if let Some(hit) = metadata_filter_hit(record, scope) {
+            hits.push(hit);
+        }
+        if budget_stopped {
+            scan_incomplete = true;
+            break;
+        }
+    }
+    (hits, scan_incomplete)
 }
 
 fn bookmarked_search_empty_reason<'a>(
@@ -1596,15 +1640,18 @@ impl TermView {
             }
             let bookmarks = self.bookmarks.borrow();
             let records = self.render_backend.records();
+            let mut scan_budget = FindScanBudget::for_cross_block();
+            let (hits, scan_incomplete) = metadata_filter_hits_with_budget(
+                records.iter(),
+                scope,
+                max_hits,
+                filters,
+                &bookmarks,
+                &mut scan_budget,
+            );
             return Ok(CrossBlockSearchReport {
-                hits: metadata_filter_hits(
-                    records.iter(),
-                    scope,
-                    max_hits,
-                    filters,
-                    &bookmarks,
-                ),
-                scan_incomplete: false,
+                hits,
+                scan_incomplete,
             });
         }
 
@@ -1962,7 +2009,8 @@ mod tests {
         add_snapshot_jump_fallbacks, bookmarked_search_empty_reason, bounded_match_count,
         command_preview, cross_block_match_count, cross_block_pattern, cross_block_search_version,
         duration_matches, focus_one_native_forward_match, has_metadata_filters,
-        matching_record_ids, metadata_filter_hits, metadata_record_snapshot_view,
+        matching_record_ids, metadata_filter_hits, metadata_filter_hits_with_budget,
+        metadata_record_snapshot_view,
         native_cursor_action, outcome_matches_filters, plan_matching_windows,
         record_matches_filters, regex_consumption, snippet, step_compressed_cursor,
         unresolved_record_target_result, utf8_prefix, vte_cross_block_pattern,
@@ -3850,5 +3898,40 @@ tail ab";
         assert_eq!(preview.chars().count(), 241);
         assert!(preview.ends_with('…'));
         assert!(!preview.contains("ignored second line"));
+    }
+
+    #[test]
+    fn metadata_filter_browse_reports_scan_incomplete_when_budget_stops() {
+        let record = CompletedCommandRecord {
+            id: 1,
+            cmd: "x".repeat(9 * 1024 * 1024),
+            exit_code: Some(7),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
+            start_mark_seen: true,
+        };
+        let filters = BlockFilters {
+            failed_only: true,
+            ..Default::default()
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &record,
+            snapshot: None,
+        }];
+        let mut budget = FindScanBudget::for_cross_block();
+        let (_, scan_incomplete) = metadata_filter_hits_with_budget(
+            records.iter().copied(),
+            CrossBlockSearchScope::All,
+            10,
+            &filters,
+            &BookmarkState::default(),
+            &mut budget,
+        );
+        assert!(scan_incomplete);
     }
 }

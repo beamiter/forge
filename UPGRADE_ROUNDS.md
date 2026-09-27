@@ -405,3 +405,8 @@ quality gates listed in `README.md`.
     and nothing is lost; core falls back to a writer thread of its own, outside
     forge's coalescing, admission bound and shutdown drain, and says so only in
     a log line.
+
+83. **Metadata-only palette scan budget** — empty-query cross-block browse with
+    active metadata filters now shares the 8 MiB / 48 ms scan budget and sets
+    `scan_incomplete` when the walk stops early instead of silently omitting
+    later records.
