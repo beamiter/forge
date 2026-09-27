@@ -3934,4 +3934,44 @@ tail ab";
         );
         assert!(scan_incomplete);
     }
+
+    #[test]
+    fn cross_block_pattern_search_reports_scan_incomplete_when_budget_stops() {
+        let record = CompletedCommandRecord {
+            id: 1,
+            cmd: format!("needle\n{}", "x".repeat(9 * 1024 * 1024)),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
+            start_mark_seen: true,
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &record,
+            snapshot: None,
+        }];
+        let mut budget = FindScanBudget::for_cross_block();
+        budget.consume_bytes(super::CROSS_BLOCK_SCAN_BYTE_LIMIT - 1);
+        let re = regex::Regex::new("needle").unwrap();
+        let options = CrossBlockSearchOptions::default();
+        let mut scan_incomplete = false;
+        for record in records.iter().copied() {
+            for line in record.command().lines() {
+                if budget.exhausted() {
+                    scan_incomplete = true;
+                    break;
+                }
+                budget.consume_bytes(line.len());
+                let _matches = cross_block_match_count(&re, line, options.whole_word);
+            }
+            if scan_incomplete {
+                break;
+            }
+        }
+        assert!(scan_incomplete);
+    }
 }

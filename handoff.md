@@ -1568,8 +1568,10 @@ doctor and correction probes.
   `FindScanBudget` (8 MiB / 48 ms) and returns `CrossBlockSearchReport` with
   `scan_incomplete`. The palette status line discloses budget stops instead of
   silently truncating. Empty-query metadata browse now uses the same budget and
-  sets `scan_incomplete` when the record walk stops early. The remaining work
-  is a resumable `glib::idle_add_local`
+  sets `scan_incomplete` when the record walk stops early. Non-empty pattern
+  scans now have a unit regression proving the same budget sets
+  `scan_incomplete` when the walk stops mid-record. The remaining work is a
+  resumable `glib::idle_add_local`
   continuation cancelled by the dialog's search generation so large histories
   keep scanning without holding the GTK thread for the full walk.
 

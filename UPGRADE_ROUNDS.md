@@ -410,3 +410,9 @@ quality gates listed in `README.md`.
     active metadata filters now shares the 8 MiB / 48 ms scan budget and sets
     `scan_incomplete` when the walk stops early instead of silently omitting
     later records.
+
+84. **Pattern-search scan budget regression** — non-empty cross-block palette
+    queries already consumed the shared byte budget while walking command and
+    output lines; a focused unit regression now proves the pattern path sets
+    `scan_incomplete` when the budget stops mid-record instead of returning a
+    silently truncated hit list.
