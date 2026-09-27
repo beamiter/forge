@@ -416,3 +416,8 @@ quality gates listed in `README.md`.
     output lines; a focused unit regression now proves the pattern path sets
     `scan_incomplete` when the budget stops mid-record instead of returning a
     silently truncated hit list.
+
+85. **Hit-cap versus scan-incomplete contract** — reaching `max_hits` stops the
+    walk early but must not set `scan_incomplete`; only byte/time budget
+    exhaustion may disclose an incomplete scan. A focused regression pins that
+    distinction for pattern search.

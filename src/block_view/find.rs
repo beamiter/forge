@@ -3974,4 +3974,60 @@ tail ab";
         }
         assert!(scan_incomplete);
     }
+
+    #[test]
+    fn cross_block_hit_cap_does_not_imply_scan_incomplete() {
+        let records: Vec<CompletedCommandRecord> = (0..3)
+            .map(|id| CompletedCommandRecord {
+                id,
+                cmd: format!("needle-{id}"),
+                exit_code: Some(0),
+                start_time_ms: None,
+                end_time_ms: None,
+                duration_ms: None,
+                cwd: None,
+                is_background: false,
+                completion_provenance: super::super::CompletionProvenance::ShellReported,
+                command_source: super::super::CommandTextSource::Screen,
+                start_mark_seen: true,
+            })
+            .collect();
+        let backend_records: Vec<BackendRecordRef<'_>> = records
+            .iter()
+            .map(|record| BackendRecordRef::Metadata {
+                record,
+                snapshot: None,
+            })
+            .collect();
+        let mut budget = FindScanBudget::for_cross_block();
+        let re = regex::Regex::new("needle").unwrap();
+        let options = CrossBlockSearchOptions::default();
+        let mut hits = 0usize;
+        let max_hits = 2usize;
+        let mut scan_incomplete = false;
+        for record in backend_records.iter().copied() {
+            if hits >= max_hits {
+                break;
+            }
+            for line in record.command().lines() {
+                if hits >= max_hits {
+                    break;
+                }
+                if budget.exhausted() {
+                    scan_incomplete = true;
+                    break;
+                }
+                budget.consume_bytes(line.len());
+                hits += cross_block_match_count(&re, line, options.whole_word);
+            }
+            if scan_incomplete {
+                break;
+            }
+        }
+        assert_eq!(hits, max_hits);
+        assert!(
+            !scan_incomplete,
+            "stopping at max_hits must not mark the palette scan incomplete"
+        );
+    }
 }
