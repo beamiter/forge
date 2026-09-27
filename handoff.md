@@ -21,6 +21,11 @@ saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
 
+- **Excluded records spend pattern-search budget (2026-09-28, wave 8, round 88)** —
+  filter-excluded records now consume the shared scan byte budget during pattern
+  search (matching metadata browse), so a long filtered walk discloses
+  `scan_incomplete` instead of examining unbounded history for free.
+
 - **Cross-block hit cap across surfaces (2026-09-28, wave 7, round 87)** —
   pattern search now stops once `max_hits` is reached on the command surface
   instead of spending the remainder of the cap on output from the same record.

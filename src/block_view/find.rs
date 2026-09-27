@@ -1678,9 +1678,20 @@ impl TermView {
                 break;
             }
             // Metadata predicates run before this record contributes any
-            // command/output hit, so an excluded record cannot spend the
+            // command/output *hit*, so an excluded record cannot spend the
             // bounded result budget and starve a later eligible record.
+            // Excluded records still spend the scan *byte* budget, matching
+            // metadata browse: a long filtered walk must disclose truncation
+            // instead of examining unbounded history for free.
             if !record_matches_filters(record, filters, bookmarks.contains(record.id())) {
+                scan_budget.consume_bytes(record.command().len());
+                if scope.includes_output() {
+                    scan_budget.consume_bytes(record.output().unwrap_or("").len());
+                }
+                if scan_budget.exhausted() {
+                    scan_incomplete = true;
+                    break;
+                }
                 continue;
             }
             let command = record.command();
@@ -4141,6 +4152,104 @@ tail ab";
         assert_eq!(hits.len(), 1);
         assert!(!hits[0].is_output);
         assert!(!scan_incomplete);
+    }
+
+    #[test]
+    fn cross_block_pattern_search_excluded_records_consume_scan_budget() {
+        let records: Vec<CompletedCommandRecord> = (0..3)
+            .map(|id| CompletedCommandRecord {
+                id,
+                cmd: format!("needle-{id}-{}", "x".repeat(64)),
+                exit_code: Some(0),
+                start_time_ms: None,
+                end_time_ms: None,
+                duration_ms: None,
+                cwd: None,
+                is_background: false,
+                completion_provenance: super::super::CompletionProvenance::ShellReported,
+                command_source: super::super::CommandTextSource::Screen,
+                start_mark_seen: true,
+            })
+            .collect();
+        let backend_records: Vec<BackendRecordRef<'_>> = records
+            .iter()
+            .map(|record| BackendRecordRef::Metadata {
+                record,
+                snapshot: None,
+            })
+            .collect();
+        // Only the last record is bookmarked; the first two are excluded but
+        // must still spend the scan budget.
+        let mut bookmarks = BookmarkState::default();
+        bookmarks.toggle(2);
+        let filters = BlockFilters {
+            bookmarked_only: true,
+            ..BlockFilters::default()
+        };
+        let re = regex::Regex::new("needle").unwrap();
+        let options = CrossBlockSearchOptions::default();
+        let scope = CrossBlockSearchScope::All;
+        let max_hits = 8usize;
+        let mut hits: Vec<CrossBlockHit> = Vec::new();
+        let mut scan_budget = FindScanBudget {
+            remaining_bytes: 100,
+            started: std::time::Instant::now(),
+            time_limit: std::time::Duration::from_secs(5),
+        };
+        let mut scan_incomplete = false;
+        for record in backend_records.iter().copied() {
+            if hits.len() >= max_hits {
+                break;
+            }
+            if scan_budget.exhausted() {
+                scan_incomplete = true;
+                break;
+            }
+            if !record_matches_filters(record, &filters, bookmarks.contains(record.id())) {
+                scan_budget.consume_bytes(record.command().len());
+                if scope.includes_output() {
+                    scan_budget.consume_bytes(record.output().unwrap_or("").len());
+                }
+                if scan_budget.exhausted() {
+                    scan_incomplete = true;
+                    break;
+                }
+                continue;
+            }
+            let command = record.command();
+            let cmd_preview = command_preview(command);
+            if scope.includes_command() {
+                for (ln_idx, line) in command.lines().enumerate() {
+                    if hits.len() >= max_hits {
+                        break;
+                    }
+                    if scan_budget.exhausted() {
+                        scan_incomplete = true;
+                        break;
+                    }
+                    scan_budget.consume_bytes(line.len());
+                    let matches = cross_block_match_count(&re, line, options.whole_word);
+                    if matches > 0 {
+                        hits.push(CrossBlockHit {
+                            block_id: record.id(),
+                            is_output: false,
+                            line_no: ln_idx + 1,
+                            line_text: snippet(line),
+                            cmd_preview: cmd_preview.clone(),
+                            occurrence: 0,
+                        });
+                    }
+                }
+            }
+        }
+        assert!(
+            hits.is_empty(),
+            "budget must stop on excluded records before the bookmarked match"
+        );
+        assert!(
+            scan_incomplete,
+            "excluded records must spend the scan budget so truncation is disclosed"
+        );
     }
 
     #[test]

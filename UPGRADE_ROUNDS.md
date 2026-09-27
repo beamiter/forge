@@ -427,3 +427,7 @@ quality gates listed in `README.md`.
 87. **Cross-block hit cap across surfaces** — pattern search stops once
     `max_hits` is reached on the command surface instead of spending the
     remainder of the cap on output from the same record.
+88. **Excluded records spend pattern-search budget** — filter-excluded records
+    consume the shared scan byte budget during pattern search, matching
+    metadata browse, so a long filtered walk discloses `scan_incomplete`
+    instead of examining unbounded history for free.
