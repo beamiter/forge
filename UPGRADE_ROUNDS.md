@@ -1035,3 +1035,22 @@ quality gates listed in `README.md`.
      RestAfterPush→UnknownOutcome; Calm/Static snap. Pairs anvil 178 / core
      `RestAfterPushToUnknownOutcome` beside Celebrate*→Unknown inside between()
      93.
+
+225. **Sticky deeper nesting mid-range VS / Mongolian Manchu full-stop labels** —
+     U+FE06 / U+FE08 / U+1809 variants of "Save Block history" stay toast-only
+     beside rounds 220/215. Pairs anvil 179.
+
+226. **output_notice deeper nesting VS / Mongolian Manchu full-stop gate** —
+     U+FE06 / U+FE08 / U+1809-padded Truncated/Partly/Earlier strings stay
+     outside the known-set remount gate beside rounds 221/216. Pairs anvil sticky tip.
+
+227. **CrossBlock cancel near-near-near-near-near-wrap bump** — palette idle
+     continuation drops MAX-5→MAX-4 generation bumps (with or without resume),
+     scheduled ahead MAX-4 vs MAX-5, and finished walks at MAX-5. Pairs anvil
+     180 / core cancel edge.
+
+228. **Celebrate/Rest→UnknownOutcome UI-bridge membership + Calm/Static snaps** —
+     semantic_bridges len 93 lists Celebrate{,Big}→UnknownOutcome and
+     RestAfterPush→UnknownOutcome beside core between() 93; Calm/Static snap in
+     the Full-motion bridge loop. Pairs anvil 181.
+
