@@ -1,5 +1,21 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (hold/ambient/Watch mode + CrossBlock wrap + Sticky Retry + notice)
+
+## 2026-09-29 (hold/ambient/Watch mode + CrossBlock wrap + Sticky Retry + notice)
+
+- **Round 180**: Hold/rest→Explore/Sleep/Approach Full-motion None (pairs core / anvil 141).
+- **Round 181**: Guard*→Explore/Sleep/Approach Full-motion None (pairs core / anvil 142).
+- **Round 182**: WatchCommand↔WatchAgent↔WatchSettled Full-motion None (pairs anvil 143).
+- **Round 183**: CrossBlock cancel finished walk at wrap gen (`MAX,MAX,false`) (pairs anvil 144).
+- **Round 184**: Sticky Retry continues leaf walk after sync refusal (pairs anvil 145).
+- **Round 185**: sticky Mongolian FVS / mid ZWNBSP / interlinear near-miss labels stay toast-only.
+- **Round 186**: Find Command/Output/All NBSP/ZWSP-only query stays QueryNoMatches with stale extras.
+- **Round 187**: output_notice Mongolian FVS / mid ZWNBSP / interlinear near-miss restore gate.
+  Rounds 175–179 (Ogham/whitespace/notice/Guard/Celebrate) sit beside. STAGE 71 / between() **93**
+  unchanged. Core/jagent tips still **pending push/repin**.
+
+
 Updated: 2026-09-29 (Ogham sticky + All whitespace find + Guard/Celebrate Full-motion + notice)
 
 ## 2026-09-29 (Ogham sticky + All whitespace find + Guard/Celebrate Full-motion + notice)
