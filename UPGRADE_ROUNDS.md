@@ -796,3 +796,26 @@ quality gates listed in `README.md`.
      outside the known-set remount gate beside rounds 166/159. Pairs anvil
      sticky/find tip.
 
+170. **Sticky near-miss Hangul-filler/Braille/format-control labels** — U+115F /
+     U+1160 / U+3164 / U+FFA0 / U+2800 / U+206A / U+206F variants of
+     `"Save Block history"` stay toast-only beside rounds 167/164. Pairs anvil
+     133.
+
+171. **Find Command/Output whitespace-query QueryNoMatches + stale** —
+     whitespace-only `" \t "` under Command and Output stays QueryNoMatches when
+     stale ids remain (empty-query browser already pinned). Pairs anvil 134.
+
+172. **output_notice Hangul-filler/Braille/format-control near-miss gate** —
+     Hangul fillers / Braille blank / U+206A–U+206F padded Truncated/Partly/
+     Earlier strings stay outside the known-set remount gate beside rounds
+     169/166. Pairs anvil sticky tip.
+
+173. **Watch*→Guard* Full-motion None** — Full motion pins WatchCommand/Agent/
+     Settled→Guard* intentional None beside WatchSettled finish Somes. Pairs
+     anvil 135 / core `watch_poses_never_bridge_to_repo_vigil_guards`.
+
+174. **Watch*→ambient Full-motion None + semantic_bridges WatchSettled note** —
+     Full motion pins Watch*→Explore/Sleep/Approach None; `semantic_bridges`
+     comment notes WatchSettled finish six sit inside between() **93**. Pairs
+     anvil 136 / core `watch_poses_never_bridge_to_ambient_utility`.
+
