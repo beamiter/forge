@@ -1128,3 +1128,7 @@ quality gates listed in `README.md`.
      membership sync. Pairs anvil 194 / core `UnknownOutcomeToGuardRecovery`
      reverse of GuardRecovery→Unknown inside between() 93.
 
+245. **Find 1801/ellipsis-query QueryNoMatches + stale** —
+     U+1801-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FE07/birga already pinned). Pairs anvil 195.
+
