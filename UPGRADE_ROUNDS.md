@@ -595,3 +595,7 @@ quality gates listed in `README.md`.
      current retained records list are `NoRetainedBookmarks`, not a metadata
      or query miss. Pairs anvil round 90 (empty-query browser `None`).
 
+125. **GuardFailure/Stuck/Cautious→error-hold None UI** — Full motion pins
+     Failure/Stuck/Cautious→Inspect/Sit/Unknown as None beside Recovery's
+     finish-overwrite bridges. Pairs anvil round 91.
+
