@@ -1,5 +1,23 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (Find empty-query browser + error→Watch None UI)
+
+## 2026-09-29 (Find empty-query browser + error/unknown→Watch* None)
+
+- **Round 127**: dedicated empty-query browser `None` pin beside round 124
+  stale ids (pairs anvil 93).
+- **Round 128**: Full motion pins Inspect/SitNear/Unknown→Watch* as None.
+  Tip 123 now notes STAGE round 122 membership-only vs `between()` 90 catch-up.
+  Pairs anvil 94.
+
+Updated: 2026-09-29 (between() 90 ledger note on tip 123)
+
+## 2026-09-29 (between() 90 ledger completeness)
+
+- Tip **123** now records that STAGE docs round 122 stayed membership-only
+  (len 67) while this round caught `between()` 76→90 — same catch-up shape as
+  tip 120 for 70→76.
+
 Updated: 2026-09-29 (core tip fail-closed deepen STAGE nest + transparency)
 
 ## 2026-09-29 (core tip fail-closed deepen STAGE nest + transparency)
