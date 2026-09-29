@@ -1187,6 +1187,19 @@ pub(crate) fn format_block_duration(dur_ms: u64) -> String {
 
 pub(crate) use jterm_core::exit_status::signal_name_for_exit;
 
+/// Badge text for a non-zero exit, shared by Block cards and cross-block search
+/// hit rows so one record cannot read `exit:137` beside `exit:137 SIGKILL`.
+pub(crate) fn record_exit_badge_text(code: i32) -> String {
+    if BlockOutcome::interrupt_signal(code).is_some() {
+        BlockOutcome::interrupted_badge(code).0
+    } else {
+        match signal_name_for_exit(code) {
+            Some(sig) => format!("exit:{code} {sig}"),
+            None => format!("exit:{code}"),
+        }
+    }
+}
+
 /// Gregorian date for a count of days since 1970-01-01 (may be negative).
 /// Howard Hinnant's civil-from-days; avoids pulling a chrono dependency for
 /// one label.

@@ -6155,6 +6155,15 @@ impl<'a> BackendRecordRef<'a> {
         }
     }
 
+    /// Working directory the record ran in. Both backing record types carry
+    /// it; the cross-block palette reads it for an optional outcome suffix.
+    fn cwd(self) -> Option<&'a str> {
+        match self {
+            Self::Block(record) => record.cwd.as_deref(),
+            Self::Metadata { record, .. } => record.cwd.as_deref(),
+        }
+    }
+
     fn is_background(self) -> bool {
         match self {
             Self::Block(record) => record.is_background(),

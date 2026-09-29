@@ -191,6 +191,41 @@ fn update_cross_block_bookmark_buttons(
     }
 }
 
+/// CSS class for [`hit_outcome_label`]: an interrupt or a stop is neutral, as
+/// on its card, and only a real failure is painted bad.
+fn hit_outcome_class(exit_code: Option<i32>) -> &'static str {
+    match exit_code {
+        Some(code)
+            if matches!(
+                crate::block_view::BlockOutcome::classify_foreground(Some(code)),
+                crate::block_view::BlockOutcome::Interrupted(_)
+            ) =>
+        {
+            "block-status-interrupted"
+        }
+        Some(code) if code != 0 => "block-status-bad",
+        _ => "block-status-ok",
+    }
+}
+
+/// `exit:1 · 2.4s · …/forge` for one hit, or `None` when the record carried
+/// none of the three. Uses the same badge text Block cards paint.
+fn hit_outcome_label(hit: &crate::block_view::CrossBlockHit) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    match hit.exit_code {
+        Some(0) => {}
+        Some(code) => parts.push(crate::block_view::record_exit_badge_text(code)),
+        None => {}
+    }
+    if let Some(duration) = hit.duration_ms {
+        parts.push(crate::block_view::format_block_duration(duration));
+    }
+    if let Some(cwd) = hit.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
+        parts.push(crate::block_view::shorten_path(cwd));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 /// Append one palette hit row, including the bookmark suffix. Shared by the
 /// initial rebuild and `pending_scan_continue` idle slices so continued hits
 /// stay bookmarkable (parity with anvil's append_hit_row).
@@ -282,6 +317,14 @@ fn append_cross_block_hit_row(
         });
     }
     row.add_suffix(&bookmark_button);
+    // Outcome at a glance: telling the failing `cargo build` from the passing
+    // ones should not require visiting each (parity with anvil).
+    if let Some(outcome) = hit_outcome_label(hit) {
+        let label = gtk4::Label::new(Some(&outcome));
+        label.add_css_class(hit_outcome_class(hit.exit_code));
+        label.set_valign(gtk4::Align::Center);
+        row.add_suffix(&label);
+    }
     list_box.append(&row);
 }
 
@@ -4475,8 +4518,71 @@ mod tests {
             line_no: 1,
             line_text: format!("hit {block_id}"),
             cmd_preview: "cargo test".to_string(),
+            exit_code: None,
+            duration_ms: None,
+            cwd: None,
             occurrence: 0,
         }
+    }
+
+    fn outcome_hit(
+        exit_code: Option<i32>,
+        duration_ms: Option<u64>,
+        cwd: Option<&str>,
+    ) -> CrossBlockHit {
+        CrossBlockHit {
+            block_id: 1,
+            is_output: true,
+            line_no: 1,
+            line_text: "error[E0308]".to_string(),
+            cmd_preview: "cargo build".to_string(),
+            exit_code,
+            duration_ms,
+            cwd: cwd.map(str::to_string),
+            occurrence: 0,
+        }
+    }
+
+    /// Optional palette chrome must answer "which of these `cargo build`s
+    /// failed" without visiting each one — success stays badge-free, and an
+    /// empty record wears no suffix.
+    #[test]
+    fn outcome_suffix_reports_only_what_the_record_carried() {
+        assert_eq!(
+            super::hit_outcome_label(&outcome_hit(
+                Some(1),
+                Some(2_400),
+                Some("/srv/ci/work/forge")
+            ))
+            .as_deref(),
+            Some("exit:1 · 2.4s · …/work/forge")
+        );
+        assert_eq!(
+            super::hit_outcome_label(&outcome_hit(Some(0), Some(2_400), None)).as_deref(),
+            Some("2.4s"),
+            "a success is the absence of an exit badge, not `exit:0`"
+        );
+        assert_eq!(
+            super::hit_outcome_label(&outcome_hit(None, None, None)),
+            None,
+            "a record with no outcome gets no suffix rather than an empty one"
+        );
+        assert_eq!(
+            super::hit_outcome_label(&outcome_hit(None, None, Some(""))),
+            None,
+            "an empty cwd is not a directory"
+        );
+        assert_eq!(
+            super::hit_outcome_label(&outcome_hit(Some(137), Some(2_400), None)).as_deref(),
+            Some("exit:137 SIGKILL · 2.4s")
+        );
+        assert_eq!(
+            super::hit_outcome_label(&outcome_hit(Some(130), None, None)).as_deref(),
+            Some("exit:130 · interrupted")
+        );
+        assert_eq!(super::hit_outcome_class(Some(130)), "block-status-interrupted");
+        assert_eq!(super::hit_outcome_class(Some(137)), "block-status-bad");
+        assert_eq!(super::hit_outcome_class(Some(0)), "block-status-ok");
     }
 
     #[test]
