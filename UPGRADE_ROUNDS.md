@@ -658,3 +658,13 @@ quality gates listed in `README.md`.
 138. **Ambient→Watch* None UI** — Idle/Explore/Sleep/Approach never bridge to
      WatchCommand/Agent/Settled under Full motion (Watch*→Idle animates).
      Pairs anvil 104.
+
+139. **Ambient→Guard*/Celebrate* None UI** — Explore/Sleep/Approach never
+     bridge to GuardFailure/Stuck/Recovery/Cautious or Celebrate/CelebrateBig
+     under Full motion (Idle/Rest→Guard* already pinned). Pairs anvil 105.
+140. **Find NoRetainedTextInScope with stale extras** — Output-scope live
+     bookmark without retained output stays NoRetainedTextInScope when stale
+     ids remain. Pairs anvil 106.
+141. **Sticky near-miss soft-hyphen/WJ/bidi labels** — soft hyphen / word
+     joiner / LRM / ZWNJ / figure-space variants of `"Save Block history"`
+     stay toast-only beside round 135. Pairs anvil 107.
