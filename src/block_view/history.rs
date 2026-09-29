@@ -2974,7 +2974,9 @@ mod tests {
     }
 
     /// The card's output notice survives a save and reload; records saved
-    /// before it existed still decode, with no notice.
+    /// before it existed still decode, with no notice. Truncated and
+    /// PartlyRetained round-trip the same way as EarlierNotRetained — the
+    /// known-set restore gate must not drop either richer variant.
     #[test]
     fn history_keeps_the_output_notice_and_reads_the_schema_before_it() {
         let mut block = sample_block(9, "cargo build");
@@ -2985,6 +2987,22 @@ mod tests {
             decoded.output_notice.as_deref(),
             Some(super::super::FINISHED_OUTPUT_NOT_RETAINED)
         );
+
+        for notice in [
+            super::super::FINISHED_OUTPUT_TEXT_TRUNCATED,
+            super::super::FINISHED_OUTPUT_PARTLY_RETAINED,
+        ] {
+            let mut richer = sample_block(11, "cargo test");
+            richer.output_notice = Some(notice.to_string());
+            let raw = rkyv::to_bytes::<rkyv::rancor::Error>(&richer).unwrap();
+            let (decoded, _) = decode_block_record(raw.as_slice(), false).unwrap();
+            assert_eq!(decoded.output_notice.as_deref(), Some(notice));
+            assert_eq!(
+                crate::block_view::known_output_notice(notice),
+                Some(notice),
+                "{notice} must stay in the shared known set"
+            );
+        }
 
         let legacy = super::LegacyBlockDataV3 {
             id: 10,
