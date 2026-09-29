@@ -4242,6 +4242,67 @@ tail ab";
         }
     }
 
+    /// Word-joiner / figure-space / soft-hyphen / bidi-embedding-only queries
+    /// stay `QueryNoMatches` under Command/Output with stale extras (NBSP/ZWSP
+    /// already pinned).
+    #[test]
+    fn bookmarked_empty_reason_keeps_wj_figure_bidi_query_no_matches_under_command_and_output_with_stale()
+    {
+        let retained = CompletedCommandRecord {
+            id: 1,
+            cmd: "echo retained".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(20),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
+            start_mark_seen: true,
+        };
+        let retained_output = ZoneOutputSnapshot {
+            plain: "noise line\n".to_string(),
+            truncated: false,
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &retained,
+            snapshot: Some(&retained_output),
+        }];
+        let mut bookmarks = BookmarkState::default();
+        bookmarks.toggle(1);
+        bookmarks.toggle(99);
+        bookmarks.toggle(100);
+        let filters = BlockFilters {
+            bookmarked_only: true,
+            ..Default::default()
+        };
+        for query in ["\u{2060}", "\u{2007}", "\u{00ad}", "\u{202a}", "\u{202e}"] {
+            assert_eq!(
+                bookmarked_search_empty_reason(
+                    records,
+                    query,
+                    CrossBlockSearchScope::Command,
+                    &filters,
+                    &bookmarks,
+                ),
+                Some(BookmarkedSearchEmptyReason::QueryNoMatches),
+                "{query:?} Command-scope must stay no-matches beside stale"
+            );
+            assert_eq!(
+                bookmarked_search_empty_reason(
+                    records,
+                    query,
+                    CrossBlockSearchScope::Output,
+                    &filters,
+                    &bookmarks,
+                ),
+                Some(BookmarkedSearchEmptyReason::QueryNoMatches),
+                "{query:?} Output-scope must stay no-matches beside stale"
+            );
+        }
+    }
+
     /// NBSP / ZWSP-only queries under All with stale extras beside a live
     /// scoped bookmark stay `QueryNoMatches` — same non-empty miss contract as
     /// Command/Output (ASCII whitespace All already pinned).
@@ -4277,6 +4338,54 @@ tail ab";
             ..Default::default()
         };
         for query in ["\u{00a0}", "\u{200b}"] {
+            assert_eq!(
+                bookmarked_search_empty_reason(
+                    records,
+                    query,
+                    CrossBlockSearchScope::All,
+                    &filters,
+                    &bookmarks,
+                ),
+                Some(BookmarkedSearchEmptyReason::QueryNoMatches),
+                "{query:?} All-scope must stay no-matches beside stale"
+            );
+        }
+    }
+
+    /// Word-joiner / figure-space / soft-hyphen / bidi-embedding-only queries
+    /// under All with stale extras stay `QueryNoMatches` beside NBSP/ZWSP.
+    #[test]
+    fn bookmarked_empty_reason_keeps_wj_figure_bidi_query_no_matches_under_all_with_stale() {
+        let retained = CompletedCommandRecord {
+            id: 1,
+            cmd: "echo retained".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(20),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
+            start_mark_seen: true,
+        };
+        let retained_output = ZoneOutputSnapshot {
+            plain: "noise line\n".to_string(),
+            truncated: false,
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &retained,
+            snapshot: Some(&retained_output),
+        }];
+        let mut bookmarks = BookmarkState::default();
+        bookmarks.toggle(1);
+        bookmarks.toggle(99);
+        bookmarks.toggle(100);
+        let filters = BlockFilters {
+            bookmarked_only: true,
+            ..Default::default()
+        };
+        for query in ["\u{2060}", "\u{2007}", "\u{00ad}", "\u{202a}", "\u{202e}"] {
             assert_eq!(
                 bookmarked_search_empty_reason(
                     records,
