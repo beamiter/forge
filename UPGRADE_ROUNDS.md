@@ -1054,3 +1054,13 @@ quality gates listed in `README.md`.
      RestAfterPush→UnknownOutcome beside core between() 93; Calm/Static snap in
      the Full-motion bridge loop. Pairs anvil 181.
 
+229. **Find FE05/Manchu-comma-query QueryNoMatches + stale** —
+     U+FE05 / U+FE09 / U+1808-only queries stay QueryNoMatches under
+     Command/Output/All when stale ids remain (FE04/syllable already pinned).
+     Pairs anvil 182.
+
+230. **SitNear/Inspect→UnknownOutcome Full-motion bridges** — Full motion
+     animates SitNearError/InspectError→UnknownOutcome; Calm/Static snap.
+     Pairs anvil 183 / core SitNear/Inspect→Unknown inside between() 93 beside
+     Celebrate*/Rest→Unknown.
+
