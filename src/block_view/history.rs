@@ -3173,6 +3173,10 @@ mod tests {
                 format!("{base}\u{fe06}"),
                 format!("{base}\u{fe08}"),
                 format!("{base}\u{1809}"),
+                // Center mid-range VS / Mongolian birga catch-up beside sticky
+                // FE07/1800 — still outside the gate.
+                format!("{base}\u{fe07}"),
+                format!("{base}\u{1800}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
