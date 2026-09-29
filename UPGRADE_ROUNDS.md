@@ -514,3 +514,7 @@ quality gates listed in `README.md`.
 109. **WatchAgent→UnknownOutcome None + agent Celebrate UI** — Full motion
      pins WatchAgent→UnknownOutcome as None; agent-driven recovery stays
      Celebrate (never CelebrateBig), matching core quiet-nod contract.
+
+110. **WatchCommand→UnknownOutcome None UI** — Full motion pins
+     WatchCommand→UnknownOutcome as None (missing exit status snaps), pairing
+     core intentional None beside WatchAgent→UnknownOutcome.

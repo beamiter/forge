@@ -1,5 +1,13 @@
 # Engineering handoff
 
+## 2026-09-29 (organism WatchCommand→UnknownOutcome None)
+
+- **WatchCommand→UnknownOutcome** pinned None in Full-motion UI (and core),
+  beside WatchAgent→UnknownOutcome — missing exit status snaps.
+
+Updated: 2026-09-29 (organism WatchCommand→UnknownOutcome None pin)
+
+
 ## 2026-09-29 (organism intentional None + agent Celebrate)
 
 - **WatchAgent→UnknownOutcome** pinned None in Full-motion UI (and core).
