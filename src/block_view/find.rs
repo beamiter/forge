@@ -4025,6 +4025,53 @@ tail ab";
         );
     }
 
+    /// Empty query under All with stale extras beside a live scoped bookmark
+    /// stays a browser (`None`) — never invent QueryNoMatches or collapse to
+    /// NoRetainedBookmarks (Command/Output empty+stale already pinned).
+    #[test]
+    fn bookmarked_empty_reason_stays_none_for_empty_query_under_all_with_stale() {
+        let retained = CompletedCommandRecord {
+            id: 1,
+            cmd: "echo retained".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(20),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
+            start_mark_seen: true,
+        };
+        let retained_output = ZoneOutputSnapshot {
+            plain: "noise line\n".to_string(),
+            truncated: false,
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &retained,
+            snapshot: Some(&retained_output),
+        }];
+        let mut bookmarks = BookmarkState::default();
+        bookmarks.toggle(1);
+        bookmarks.toggle(99);
+        bookmarks.toggle(100);
+        let filters = BlockFilters {
+            bookmarked_only: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            bookmarked_search_empty_reason(
+                records,
+                "",
+                CrossBlockSearchScope::All,
+                &filters,
+                &bookmarks,
+            ),
+            None,
+            "stale extras must not turn an empty All-scope query into a miss"
+        );
+    }
+
     #[test]
     fn background_filter_composes_before_cap_and_uses_only_real_scoped_text() {
         let record = |id, cmd: &str, duration_ms, is_background| CompletedCommandRecord {
