@@ -185,6 +185,14 @@ mod tests {
             "Save block history",
             "Save Block histor",
             "Save Block history\n",
+            // Whitespace / invisible catch-up beside anvil round 100–101.
+            "Save Block history\t",
+            "Save Block history\r",
+            "Save\tBlock history",
+            "Save Block\u{00a0}history",
+            "Save Block\u{200b}history",
+            "\u{feff}Save Block history",
+            "Save Block history\u{000b}",
             "Block history",
         ] {
             assert_eq!(
