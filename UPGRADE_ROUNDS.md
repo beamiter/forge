@@ -1012,3 +1012,26 @@ quality gates listed in `README.md`.
 219. **Celebrate*→UnknownOutcome Full-motion bridges** — Full motion animates
      Celebrate{,Big}→UnknownOutcome; Calm/Static snap. Pairs anvil 174 / core
      `CelebrateToUnknownOutcome` / `CelebrateBigToUnknownOutcome`.
+
+220. **Sticky nesting mid-range VS / Mongolian Manchu-comma labels** —
+     U+FE05 / U+FE09 / U+1808 variants of "Save Block history" stay toast-only
+     beside rounds 215/208. Pairs anvil 175.
+
+221. **output_notice nesting mid-range VS / Mongolian Manchu-comma gate** —
+     U+FE05 / U+FE09 / U+1808-padded Truncated/Partly/Earlier strings stay
+     outside the known-set remount gate beside rounds 216/209. Pairs anvil sticky tip.
+
+222. **Find FE04/syllable-boundary-query QueryNoMatches + stale** —
+     U+FE04 / U+FE0A / U+1807-only queries stay QueryNoMatches under
+     Command/Output/All when stale ids remain (FE03/Todo already pinned).
+     Pairs anvil 176.
+
+223. **CrossBlock cancel near-near-near-near-wrap bump** — palette idle
+     continuation drops MAX-4→MAX-3 generation bumps (with or without resume),
+     scheduled ahead MAX-3 vs MAX-4, and finished walks at MAX-4. Pairs anvil
+     177 / core cancel edge.
+
+224. **RestAfterPush→UnknownOutcome Full-motion bridge** — Full motion animates
+     RestAfterPush→UnknownOutcome; Calm/Static snap. Pairs anvil 178 / core
+     `RestAfterPushToUnknownOutcome` beside Celebrate*→Unknown inside between()
+     93.
