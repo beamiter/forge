@@ -752,3 +752,18 @@ quality gates listed in `README.md`.
      teaches kbd `openvt` VT launcher peels (`-c`/`--console` meta) plus
      timeout/nice nest classify; Inspect/Sit→Unknown `between()` **93** already
      ledgered. Manifests stay on published pins. Pairs anvil 125.
+
+161. **Sticky near-miss punct/thin/hair/ALM/bidi-isolate labels** — U+2008 /
+     U+2009 / U+200A / U+061C / U+2066–U+2069 variants of `"Save Block history"`
+     stay toast-only beside rounds 156/154. Pairs anvil 126.
+
+162. **Find Command/Output empty-query browser + stale** — empty query under
+     Command and Output scopes stays `None` (browser) when stale ids remain
+     beside a live scoped bookmark (All-scope empty-query already pinned).
+     Pairs anvil 127.
+
+163. **output_notice ZWJ/NNBSP/LS/NEL/ideo/FA near-miss gate** — ZWJ / NNBSP /
+     line-separator / NEL / ideographic-space / function-application padded
+     Truncated/Partly/Earlier strings stay outside the known-set remount gate
+     beside rounds 159/150. Pairs anvil STAGE tip.
+
