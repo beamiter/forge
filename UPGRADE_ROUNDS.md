@@ -618,3 +618,12 @@ quality gates listed in `README.md`.
 128. **Error/unknown→Watch* None UI** — Full motion pins Inspect/SitNear/
      Unknown→Watch* as None beside Celebrate*/Rest/Recovery→Watch*. Pairs anvil
      round 94; core `error_and_unknown_holds_never_bridge_to_watch_poses`.
+
+129. **Find mixed stale+live bookmark empty-reason** — stale ids beside a live
+     bookmark do not collapse to `NoRetainedBookmarks`; empty query stays a
+     browser and a live query miss stays `QueryNoMatches`. Pairs anvil round 96.
+
+130. **Core tip STAGE_PREFIXES uclampset/gamemoderun (len 70)** — path-patched
+     local core teaches util-linux util clamp + GameMode env launcher peels;
+     GuardFailure/Stuck/Cautious→Celebrate* None survey pin; `between()` stays
+     90. Manifests stay on published pins. Pairs anvil round 97.
