@@ -959,4 +959,4 @@ quality gates listed in `README.md`.
 
 207. **CrossBlock cancel finished at near-wrap gen** — palette idle continuation
      drops MAX-1,MAX-1 finished walks (no resume) beside the MAX-1→MAX bump.
-     Pairs anvil 164 / core `continue_idle_resume_edges_drop_stale_or_finished_walks`.
+     Pairs anvil 164 / core cancel edge `continue_idle_resume_edges_drop_stale_or_finished_walks`.
