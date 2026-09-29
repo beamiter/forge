@@ -564,7 +564,7 @@ quality gates listed in `README.md`.
      with `classify_command` see-through and membership pin; Cargo manifests
      stay on the published pin (pending push/repin). Pairs anvil round 84.
 
-117. **Clear-vigil Idle Full-motion UI contract** — Full motion mirrors
+119. **Clear-vigil Idle Full-motion UI contract** — Full motion mirrors
      core Inspect/SitNear→Idle and Guard*→Idle bridges (`between()` 64→70).
-     Pairs anvil round 83; core clear-vigil Idle survey wave.
+     Pairs anvil round 85; core clear-vigil Idle survey wave.
 

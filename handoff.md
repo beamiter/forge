@@ -4,9 +4,9 @@ Updated: 2026-09-29 (clear-vigil Idle bridges UI sync, 70)
 
 ## 2026-09-29 (clear-vigil Idle bridges UI sync)
 
-- **Round 117**: Full-motion `semantic_bridges` list mirrors core tip 64→**70**
+- **Round 119**: Full-motion `semantic_bridges` list mirrors core tip 64→**70**
   `VisualTransition::between` pairs — adds Inspect/SitNear→Idle and
-  Guard*→Idle clear-vigil settles (pairs anvil round 83; core Idle survey).
+  Guard*→Idle clear-vigil settles (pairs anvil round 85; core Idle survey).
 
 
 Updated: 2026-09-29 (core tip STAGE_PREFIXES systemd-socket-activate len 64)
