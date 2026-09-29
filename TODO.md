@@ -26,7 +26,9 @@ P1 四项已在 `jterm_core` `9f94f77` 这一轮全部完成；P2 中的 history
   仍开放：live-block VTE 对齐 vs PCRE2。）
 - [ ] 为 per-session history 设计可证明所有权的安全 GC：依据 state manifest 与 active/restorable session 集合清理；禁止恢复基于文件名或 mtime 的猜测式删除。
 - [x] 当 history 因预算、损坏或 revision 冲突进入 fail-closed 时提供明确的 Reload/Retry 入口和持久状态提示。
-- [ ] 文件树根目录或子目录扫描失败时显示可聚焦错误、Retry 与 toast，区分空目录和权限/I/O 错误。
+- [x] 文件树根目录或子目录扫描失败时显示可聚焦错误、Retry 与 toast，区分空目录和权限/I/O 错误。
+  （落地：Error 行 + 可聚焦 Retry + toast；`directory_scan_errors_distinguish_permission_from_missing`
+  钉住 PermissionDenied vs NotFound 文案，空目录走成功 listing。）
 
 ## 质量门禁
 

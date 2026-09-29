@@ -7261,6 +7261,43 @@ mod tests {
         );
     }
 
+    /// Handoff/TODO leftover: empty listings are success rows, while permission
+    /// and missing roots must surface distinct public copy (Retry + toast stay
+    /// on the Error status path — never reuse the empty-directory presentation).
+    #[test]
+    fn directory_scan_errors_distinguish_permission_from_missing() {
+        assert_eq!(
+            public_directory_error_message(&io::Error::from(io::ErrorKind::PermissionDenied)),
+            "Permission denied"
+        );
+        assert_eq!(
+            public_directory_error_message(&io::Error::from(io::ErrorKind::NotFound)),
+            "Directory not found or unavailable"
+        );
+        let denied = directory_error_status(
+            &io::Error::from(io::ErrorKind::PermissionDenied),
+            None,
+        );
+        let missing = directory_error_status(&io::Error::from(io::ErrorKind::NotFound), None);
+        match (&denied, &missing) {
+            (
+                DirectoryRowStatus::Error {
+                    message: denied_msg,
+                    ..
+                },
+                DirectoryRowStatus::Error {
+                    message: missing_msg,
+                    ..
+                },
+            ) => {
+                assert_eq!(denied_msg, "Permission denied");
+                assert_eq!(missing_msg, "Directory not found or unavailable");
+                assert_ne!(denied_msg, missing_msg);
+            }
+            _ => panic!("permission and missing scans must publish Error rows, not empty listings"),
+        }
+    }
+
     #[test]
     fn directory_failure_backoff_classifies_caps_and_retry_bypasses_once() {
         let now = Instant::now();
