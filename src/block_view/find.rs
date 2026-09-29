@@ -4443,6 +4443,14 @@ tail ab";
         assert!(cross_block_search_continue_is_current(7, 7, true));
         assert!(!cross_block_search_continue_is_current(7, 8, true));
         assert!(!cross_block_search_continue_is_current(7, 7, false));
+        // schedule_rebuild uses wrapping_add; the idle slice must still cancel.
+        let scheduled = 0_u64;
+        assert!(!cross_block_search_continue_is_current(
+            scheduled,
+            scheduled.wrapping_add(1),
+            true
+        ));
+        assert!(!cross_block_search_continue_is_current(u64::MAX, 0, true));
     }
 
     #[test]
