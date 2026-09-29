@@ -1064,3 +1064,21 @@ quality gates listed in `README.md`.
      Pairs anvil 183 / core SitNear/Inspect→Unknown inside between() 93 beside
      Celebrate*/Rest→Unknown.
 
+231. **Sticky center mid-range VS / Mongolian birga labels** —
+     U+FE07 / U+1800 variants of "Save Block history" stay toast-only
+     beside rounds 225/220. Pairs anvil 184.
+
+232. **output_notice center mid-range VS / Mongolian birga gate** —
+     U+FE07 / U+1800-padded Truncated/Partly/Earlier strings stay
+     outside the known-set remount gate beside rounds 226/221. Pairs anvil sticky tip.
+
+233. **CrossBlock cancel near-near-near-near-near-near-wrap bump** — palette idle
+     continuation drops MAX-6→MAX-5 generation bumps (with or without resume),
+     scheduled ahead MAX-5 vs MAX-6, and finished walks at MAX-6. Pairs anvil
+     185 / core cancel edge.
+
+234. **GuardRecovery→UnknownOutcome Full-motion bridge** — Full motion animates
+     GuardRecovery→UnknownOutcome; Calm/Static snap. Pairs anvil 186 / core
+     `GuardRecoveryToUnknownOutcome` beside Celebrate*/Rest/SitNear/Inspect→
+     Unknown inside between() 93.
+
