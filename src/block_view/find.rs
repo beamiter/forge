@@ -3613,6 +3613,60 @@ tail ab";
         );
     }
 
+    /// Stale ids beside a live bookmark must not collapse the empty-reason to
+    /// NoRetainedBookmarks — continue/rebuild status still keys off the live
+    /// retained identity (empty query stays a browser).
+    #[test]
+    fn bookmarked_empty_reason_ignores_stale_ids_when_a_live_bookmark_remains() {
+        let retained = CompletedCommandRecord {
+            id: 1,
+            cmd: "echo retained".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(20),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
+            start_mark_seen: true,
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &retained,
+            snapshot: None,
+        }];
+        let mut bookmarks = BookmarkState::default();
+        bookmarks.toggle(1);
+        bookmarks.toggle(99);
+        bookmarks.toggle(100);
+        let filters = BlockFilters {
+            bookmarked_only: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            bookmarked_search_empty_reason(
+                records,
+                "",
+                CrossBlockSearchScope::All,
+                &filters,
+                &bookmarks,
+            ),
+            None,
+            "live bookmark + scoped text with empty query stays a browser"
+        );
+        assert_eq!(
+            bookmarked_search_empty_reason(
+                records,
+                "nope",
+                CrossBlockSearchScope::All,
+                &filters,
+                &bookmarks,
+            ),
+            Some(BookmarkedSearchEmptyReason::QueryNoMatches),
+            "stale extras must not mask a live query miss"
+        );
+    }
+
     /// Empty Bookmarked query with an eligible scoped record is a browser, not
     /// a miss — keep this named beside the stale-id pin so the None branch
     /// cannot quietly turn into QueryNoMatches.
