@@ -960,3 +960,34 @@ quality gates listed in `README.md`.
 207. **CrossBlock cancel finished at near-wrap gen** — palette idle continuation
      drops MAX-1,MAX-1 finished walks (no resume) beside the MAX-1→MAX bump.
      Pairs anvil 164 / core cancel edge `continue_idle_resume_edges_drop_stale_or_finished_walks`.
+
+208. **Sticky closer mid-range VS / Mongolian Todo soft-hyphen labels** —
+     U+FE03 / U+FE0B / U+1806 variants of "Save Block history" stay toast-only
+     beside rounds 203/196. Pairs anvil 165.
+
+209. **output_notice closer mid-range VS / Mongolian Todo soft-hyphen gate** —
+     U+FE03 / U+FE0B / U+1806-padded Truncated/Partly/Earlier strings stay
+     outside the known-set remount gate beside rounds 204/197. Pairs anvil sticky tip.
+
+210. **Find FVS/MVS/VS/Khmer/CGJ-query QueryNoMatches + stale** —
+     U+180B / U+180E / U+FE00 / U+17B4 / U+034F-only queries stay
+     QueryNoMatches under Command/Output/All when stale ids remain (Hangul/
+     ideo/Ogham already pinned). Pairs anvil 166.
+
+211. **CrossBlock cancel near-near-wrap bump** — palette idle continuation
+     drops MAX-2→MAX-1 generation bumps (with or without resume), scheduled
+     ahead MAX-1 vs MAX-2, and finished walks at MAX-2. Pairs anvil 167 /
+     core cancel edge.
+
+212. **Sticky Retry skips missing Block view without aborting** — `continue`
+     past notebook pages/leaves without a Block view so non-Block chrome
+     cannot starve later leaves of `retry_history_persistence`. Pairs anvil 168.
+
+213. **Sticky Retry hides before walk / stays quiet on Ok** — optimistic
+     `set_visible(false)` precedes the notebook walk; only Err re-raises via
+     `show_block_history_failure`. Pairs anvil 169.
+
+214. **SitNear/Celebrate tier overwrite Full-motion None** — Full motion pins
+     SitNear→Inspect and Celebrate↔CelebrateBig intentional None. Pairs anvil
+     170 / core `sit_near_and_celebrate_tier_overwrites_stay_none`.
+
