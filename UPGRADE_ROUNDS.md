@@ -682,3 +682,31 @@ quality gates listed in `README.md`.
      cwd; palette rows show anvil-parity outcome suffixes without breaking
      ActionRow layout. Closes the Full Find Hit schema survey leftover. Pairs
      anvil round 110 / core Hit pin retarget.
+
+145. **Sticky ReloadFirst chains labeled save** — Retry on Failed-load latches
+     `retry_save_after_history_load`, reloads, then enqueues `"Save Block
+     history"` on Loaded (or early sync restore). Sync load-queue Failed
+     clears the latch and returns Err so the sticky bar re-shows. Pairs
+     anvil 111.
+
+146. **Find Hit chrome parity pins** — palette `hit_outcome_label` covers
+     exit:148 suspended and `hit_outcome_class(None)` beside 130/137. Pairs
+     anvil 112.
+
+147. **semantic_bridges list len == 91 + CelebrateBig fifteen lockstep** —
+     Full-motion contract list asserts length against core `between()` 91;
+     CelebrateBig Some arcs stay fifteen; Celebrate↔CelebrateBig Nones join
+     the finish-arc UI pin. Pairs anvil 113.
+
+148. **Ambient→Inspect/Sit/Unknown/Rest None UI** — Explore/Sleep/Approach
+     never bridge to error/unknown holds or RestAfterPush under Full motion.
+     Pairs anvil 114 / core ambient hold/rest pin.
+
+149. **Find Command-scope NoRetainedTextInScope + stale** — whitespace-only
+     command with retained output stays NoRetainedTextInScope under Command
+     scope when stale ids remain. Pairs anvil 115.
+
+150. **Sticky line/paragraph separators + notice near-miss restore gate** —
+     U+2028/U+2029 `"Save Block history"` stay toast-only; padded/cased
+     Truncated/Partly/Earlier strings stay outside the known-set remount gate.
+     Pairs anvil 116.
