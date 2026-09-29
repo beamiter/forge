@@ -3189,6 +3189,9 @@ mod tests {
                 // Mongolian colon catch-up beside sticky 1804 — still outside
                 // the gate (one edge).
                 format!("{base}\u{1804}"),
+                // Mongolian four dots catch-up beside sticky 1805 — still outside
+                // the gate (one edge).
+                format!("{base}\u{1805}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
