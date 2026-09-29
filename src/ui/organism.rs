@@ -4957,6 +4957,36 @@ mod tests {
         }
     }
 
+    /// SitNearError/InspectError→UnknownOutcome animates under Full motion
+    /// (unknown overwrite from a vigil/inspect hold) and snaps under Calm/Static.
+    /// Pairs core SitNear/Inspect→Unknown bridges inside between() 93 beside
+    /// Celebrate*/Rest→Unknown.
+    #[test]
+    fn sit_near_and_inspect_bridge_to_unknown_outcome_under_full_motion_only() {
+        for from in [Behavior::SitNearError, Behavior::InspectError] {
+            assert!(
+                visual_transition_for_motion(
+                    OrganismMotion::Full,
+                    from,
+                    Behavior::UnknownOutcome,
+                )
+                .is_some(),
+                "Full {from:?}→UnknownOutcome"
+            );
+            assert!(
+                VisualTransition::between(from, Behavior::UnknownOutcome).is_some(),
+                "core {from:?}→UnknownOutcome"
+            );
+            for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+                assert_eq!(
+                    visual_transition_for_motion(motion, from, Behavior::UnknownOutcome),
+                    None,
+                    "{motion:?} {from:?}→UnknownOutcome"
+                );
+            }
+        }
+    }
+
     #[test]
     fn ambient_and_typing_surfaces_skip_visual_transition_arcs() {
         // Ambient utility poses (Explore/Sleep/Approach/Idle) display through
