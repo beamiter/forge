@@ -4580,9 +4580,19 @@ mod tests {
             super::hit_outcome_label(&outcome_hit(Some(130), None, None)).as_deref(),
             Some("exit:130 · interrupted")
         );
+        assert_eq!(
+            super::hit_outcome_label(&outcome_hit(Some(148), None, None)).as_deref(),
+            Some("exit:148 · suspended")
+        );
+        assert_eq!(super::hit_outcome_class(Some(148)), "block-status-interrupted");
         assert_eq!(super::hit_outcome_class(Some(130)), "block-status-interrupted");
         assert_eq!(super::hit_outcome_class(Some(137)), "block-status-bad");
         assert_eq!(super::hit_outcome_class(Some(0)), "block-status-ok");
+        assert_eq!(
+            super::hit_outcome_class(None),
+            "block-status-ok",
+            "missing exit stays success-class, matching the Block card"
+        );
     }
 
     #[test]
