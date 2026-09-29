@@ -3125,6 +3125,14 @@ mod tests {
                 format!("{base}\u{fe00}"),
                 format!("\u{fe0f}{base}"),
                 format!("{base}\u{17b4}"),
+                // Mongolian FVS / mid ZWNBSP / interlinear catch-up beside the
+                // sticky FVS wave — still outside the known-set gate.
+                format!("{base}\u{180b}"),
+                format!("{base}\u{180c}"),
+                format!("{base}\u{180d}"),
+                format!("{base}\u{feff}"),
+                format!("\u{fff9}{base}\u{fffb}"),
+                format!("{base}\u{fffa}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
