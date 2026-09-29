@@ -753,6 +753,21 @@ quality gates listed in `README.md`.
      timeout/nice nest classify; Inspect/Sit→Unknown `between()` **93** already
      ledgered. Manifests stay on published pins. Pairs anvil 125.
 
+161. **WatchSettled finish arcs Full-motion (6 Some)** — Full motion pins all
+     six WatchSettled→Celebrate{,Big}/Inspect/Sit/Rest/Idle bridges and keeps
+     UnknownOutcome intentional None. Pairs anvil 126 / core
+     `watch_settled_finish_arcs_cover_pass_fail_rest_and_idle`.
+
+162. **CrossBlock cancel live wrapping ahead of scheduled** — live generation
+     wrapping ahead of scheduled (`0` vs `u64::MAX`) cancels with or without a
+     resume — reverse of the MAX→0 schedule bump. Pairs anvil 127 / core cancel
+     edge.
+
+163. **Core tip PATH wave-30 ctl/notify leftovers** — path-patched local core
+     keeps `systemctl` / `busctl` / `journalctl` / `timedatectl` / `resolvectl`
+     / `systemd-notify` / `systemd-mount` / `chvt` / `aa-status` out of STAGE
+     beside openvt 71. Manifests stay on published pins. Pairs anvil 128.
+
 164. **Sticky near-miss punct/thin/hair/ALM/bidi-isolate labels** — U+2008 /
      U+2009 / U+200A / U+061C / U+2066–U+2069 variants of `"Save Block history"`
      stay toast-only beside rounds 156/154. Pairs anvil 129. Leaves 161–163 for

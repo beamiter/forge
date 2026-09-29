@@ -1,5 +1,17 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (WatchSettled finish + CrossBlock wrap-ahead + PATH wave-30 tip)
+
+## 2026-09-29 (WatchSettled finish + CrossBlock wrap-ahead + PATH wave-30)
+
+- **Round 161**: Full-motion WatchSettled finish arcs (6 Some + Unknown None).
+- **Round 162**: CrossBlock continue cancel live wrapping ahead of scheduled
+  (`0` vs `MAX`, with or without resume).
+- **Round 163**: path-patched core tip PATH wave-30 ctl/notify leftovers stay
+  out of STAGE beside openvt 71; WatchSettled finish + CrossBlock wrap already
+  ledgered. Core/jagent tips still **pending push/repin**.
+
+
 Updated: 2026-09-29 (sticky punct/thin/hair + find empty-query + notice catch-up)
 
 ## 2026-09-29 (sticky punct/thin/hair + find empty-query + notice catch-up)
