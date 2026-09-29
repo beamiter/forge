@@ -1598,6 +1598,8 @@ impl UiState {
         let retained_hit: Rc<RefCell<Option<CrossBlockSelectionAnchor>>> =
             Rc::new(RefCell::new(None));
         let pending_rebuild: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        let pending_scan_continue: Rc<RefCell<Option<glib::SourceId>>> =
+            Rc::new(RefCell::new(None));
         let pending_manual_refresh: Rc<RefCell<Option<gtk4::TickCallbackId>>> =
             Rc::new(RefCell::new(None));
         let search_generation = Rc::new(Cell::new(0u64));
@@ -1637,7 +1639,13 @@ impl UiState {
             let retained_hit = retained_hit.clone();
             let observed_version = observed_version.clone();
             let schedule_rebuild_slot = schedule_rebuild_slot.clone();
+            let search_generation = search_generation.clone();
+            let pending_scan_continue = pending_scan_continue.clone();
             Rc::new(move || {
+                if let Some(source) = pending_scan_continue.borrow_mut().take() {
+                    source.remove();
+                }
+                let generation = search_generation.get();
                 let query = filter_entry.text().to_string();
                 // Navigation remains available while the short refresh
                 // debounce runs. Re-snapshot at execution time so a Down/Up
@@ -1698,6 +1706,7 @@ impl UiState {
                     &filters,
                 ) {
                     Ok(report) => {
+                        let resume = report.resume.clone();
                         let results = report.hits;
                         scan_incomplete.set(report.scan_incomplete);
                         let total = results.len();
@@ -1802,6 +1811,101 @@ impl UiState {
                         if let Some(row) = list_box.row_at_index(selected as i32) {
                             list_box.select_row(Some(&row));
                         }
+
+                        if let Some(initial_resume) = resume {
+                            let cursor = Rc::new(RefCell::new(Some(initial_resume)));
+                            let term_view = term_view.clone();
+                            let list_box = list_box.clone();
+                            let hits = hits.clone();
+                            let scan_incomplete = scan_incomplete.clone();
+                            let status_label = status_label.clone();
+                            let search_generation = search_generation.clone();
+                            let pending_scan_continue = pending_scan_continue.clone();
+                            let query = query.clone();
+                            let source = glib::idle_add_local(move || {
+                                if !crate::block_view::cross_block_search_continue_is_current(
+                                    generation,
+                                    search_generation.get(),
+                                    cursor.borrow().is_some(),
+                                ) {
+                                    pending_scan_continue.borrow_mut().take();
+                                    return glib::ControlFlow::Break;
+                                }
+                                let Some(resume) = cursor.borrow().clone() else {
+                                    pending_scan_continue.borrow_mut().take();
+                                    return glib::ControlFlow::Break;
+                                };
+                                let already = hits.borrow().len();
+                                if already >= CROSS_BLOCK_SEARCH_LIMIT {
+                                    scan_incomplete.set(false);
+                                    status_label.set_text(&cross_block_search_status(
+                                        already,
+                                        list_box.selected_row().map(|row| row.index() as usize),
+                                        false,
+                                    ));
+                                    pending_scan_continue.borrow_mut().take();
+                                    return glib::ControlFlow::Break;
+                                }
+                                let remaining = CROSS_BLOCK_SEARCH_LIMIT - already;
+                                match term_view.cross_block_search_in_scope_from(
+                                    &query,
+                                    options,
+                                    scope,
+                                    remaining,
+                                    &filters,
+                                    Some(&resume),
+                                ) {
+                                    Ok(more) => {
+                                        let jumpable = term_view.jumpable_search_hits(&more.hits);
+                                        for hit in more.hits.iter() {
+                                            let can_jump =
+                                                jumpable.contains(&(hit.block_id, hit.is_output));
+                                            let surface =
+                                                if hit.is_output { "out" } else { "cmd" };
+                                            let mut subtitle = format!(
+                                                "{surface} L{}: {}",
+                                                hit.line_no,
+                                                glib::markup_escape_text(&hit.line_text)
+                                            );
+                                            if !can_jump {
+                                                subtitle.push_str(" — location unavailable");
+                                            }
+                                            let row = adw::ActionRow::builder()
+                                                .title(
+                                                    glib::markup_escape_text(&hit.cmd_preview)
+                                                        .as_str(),
+                                                )
+                                                .subtitle(&subtitle)
+                                                .activatable(can_jump)
+                                                .build();
+                                            list_box.append(&row);
+                                        }
+                                        hits.borrow_mut().extend(more.hits.iter().cloned());
+                                        let total = hits.borrow().len();
+                                        scan_incomplete.set(more.scan_incomplete);
+                                        status_label.set_text(&cross_block_search_status(
+                                            total,
+                                            list_box
+                                                .selected_row()
+                                                .map(|row| row.index() as usize),
+                                            more.scan_incomplete,
+                                        ));
+                                        *cursor.borrow_mut() = more.resume;
+                                        if cursor.borrow().is_some() {
+                                            glib::ControlFlow::Continue
+                                        } else {
+                                            pending_scan_continue.borrow_mut().take();
+                                            glib::ControlFlow::Break
+                                        }
+                                    }
+                                    Err(_) => {
+                                        pending_scan_continue.borrow_mut().take();
+                                        glib::ControlFlow::Break
+                                    }
+                                }
+                            });
+                            *pending_scan_continue.borrow_mut() = Some(source);
+                        }
                     }
                     Err(e) => {
                         hits.borrow_mut().clear();
@@ -1815,6 +1919,7 @@ impl UiState {
 
         let schedule_rebuild: CrossBlockScheduleRebuild = {
             let pending_rebuild = pending_rebuild.clone();
+            let pending_scan_continue = pending_scan_continue.clone();
             let pending_manual_refresh = pending_manual_refresh.clone();
             let search_generation = search_generation.clone();
             let rebuild = rebuild.clone();
@@ -1831,6 +1936,9 @@ impl UiState {
                 let generation = search_generation.get().wrapping_add(1);
                 search_generation.set(generation);
                 if let Some(source) = pending_rebuild.borrow_mut().take() {
+                    source.remove();
+                }
+                if let Some(source) = pending_scan_continue.borrow_mut().take() {
                     source.remove();
                 }
                 if let Some(tick) = pending_manual_refresh.borrow_mut().take() {
@@ -1983,6 +2091,7 @@ impl UiState {
             let term_view = term_view.clone();
             let observed_version = observed_version.clone();
             let pending_rebuild = pending_rebuild.clone();
+            let pending_scan_continue = pending_scan_continue.clone();
             let pending_manual_refresh = pending_manual_refresh.clone();
             let search_generation = search_generation.clone();
             let retained_hit = retained_hit.clone();
@@ -1999,6 +2108,9 @@ impl UiState {
                 observed_version.set(term_view.cross_block_search_version());
                 search_generation.set(search_generation.get().wrapping_add(1));
                 if let Some(source) = pending_rebuild.borrow_mut().take() {
+                    source.remove();
+                }
+                if let Some(source) = pending_scan_continue.borrow_mut().take() {
                     source.remove();
                 }
                 if let Some(tick) = pending_manual_refresh.borrow_mut().take() {
@@ -2352,6 +2464,7 @@ impl UiState {
 
         let dialog_ref = self.cross_block_search_dialog.clone();
         let pending_rebuild_for_close = pending_rebuild.clone();
+        let pending_scan_continue_for_close = pending_scan_continue.clone();
         let pending_manual_refresh_for_close = pending_manual_refresh.clone();
         let refresh_source_for_close = refresh_source.clone();
         let memory_for_close = self.cross_block_search_memory.clone();
@@ -2369,6 +2482,9 @@ impl UiState {
                 source.remove();
             }
             if let Some(source) = pending_rebuild_for_close.borrow_mut().take() {
+                source.remove();
+            }
+            if let Some(source) = pending_scan_continue_for_close.borrow_mut().take() {
                 source.remove();
             }
             if let Some(tick) = pending_manual_refresh_for_close.borrow_mut().take() {

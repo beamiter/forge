@@ -1,8 +1,18 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (upgrade round 90: persisted earlier-output notice parity)
+Updated: 2026-09-29 (rounds 90–92: earlier-output notice, search idle continue, organism heal settle)
 
 ## Completed since the previous handoff
+
+- **Organism error-hold heal settle UI contract (upgrade round 92, pending core
+  push/repin)** — Full-motion tests also mirror SitNearError/InspectError →
+  Recovery/Cautious/Stuck and Cautious→Recovery once core recognizes those
+  bridges.
+
+- **Resumable cross-block search idle continuation (upgrade round 91)** —
+  budget-stopped scans return a `CrossBlockSearchCursor`; the dialog schedules
+  `glib::idle_add_local` slices cancelled by search generation so large
+  histories keep walking without holding the GTK thread for the full walk.
 
 - **Persisted "Earlier output not retained" (upgrade round 90)** —
   `BlockData.output_notice` already survives Block-history save/restore and
@@ -1581,17 +1591,11 @@ doctor and correction probes.
   history save) or an explicitly-documented grace floor, and neither is
   something to decide in the margin of another change.
 
-- **Moving the cross-block search scan to a cancellable worker** (TODO P2).
-  Partial progress (2026-09-27): `cross_block_search_in_scope` now shares a
-  `FindScanBudget` (8 MiB / 48 ms) and returns `CrossBlockSearchReport` with
-  `scan_incomplete`. The palette status line discloses budget stops instead of
-  silently truncating. Empty-query metadata browse now uses the same budget and
-  sets `scan_incomplete` when the record walk stops early. Non-empty pattern
-  scans now have a unit regression proving the same budget sets
-  `scan_incomplete` when the walk stops mid-record. The remaining work is a
-  resumable `glib::idle_add_local`
-  continuation cancelled by the dialog's search generation so large histories
-  keep scanning without holding the GTK thread for the full walk.
+- **Moving the cross-block search scan to a cancellable worker** (TODO P2):
+  **done in upgrade round 91**. Budget-stopped walks return
+  `CrossBlockSearchCursor`; the dialog schedules `glib::idle_add_local`
+  continuations cancelled by search generation. Remaining related polish
+  (live-block VTE alignment vs PCRE2) is still open under TODO.md P2.
 
 ### Follow-up migrations (next rounds)
 

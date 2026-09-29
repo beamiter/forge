@@ -442,3 +442,10 @@ quality gates listed in `README.md`.
     `output_head_dropped` contract. Pre-notice frames still decode with the
     notice off; `history_keeps_the_output_notice_and_reads_the_schema_before_it`
     pins both directions.
+91. **Resumable cross-block search idle continuation** — budget stops return a
+    `CrossBlockSearchCursor`; the dialog runs `glib::idle_add_local` slices
+    cancelled by search generation. Unit regressions pin resume cursors and the
+    generation cancel helper.
+92. **Organism error-hold heal settle UI contract** — Full motion mirrors
+    SitNearError/InspectError→Recovery/Cautious/Stuck and Cautious→Recovery
+    once core recognizes those bridges (pending push/repin). Calm/Static snap.
