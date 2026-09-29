@@ -341,4 +341,55 @@ mod tests {
         );
     }
 
+
+    /// Sticky Retry must `continue` past notebook pages / leaves without a
+    /// Block view instead of aborting — non-Block chrome must not starve later
+    /// Block leaves of `retry_history_persistence` (pairs anvil TermView skip).
+    #[test]
+    fn retry_block_history_skips_missing_block_views_without_aborting() {
+        let source = include_str!("history_notice.rs");
+        let retry = source
+            .split("pub(crate) fn retry_block_history(&self) {")
+            .nth(1)
+            .expect("retry_block_history")
+            .split("\n}\n\n#[cfg(test)]")
+            .next()
+            .expect("retry closes before tests");
+        assert!(
+            retry.contains("block_view()") && retry.contains("continue;"),
+            "missing Block view must continue the leaf walk"
+        );
+        assert!(
+            !retry.contains("break;") && !retry.contains("return;"),
+            "missing Block view must not abort Retry"
+        );
+    }
+
+    /// Optimistic hide must precede the notebook walk so a prior failure bar
+    /// never stays visible while Retry is in flight; Ok results must not call
+    /// `show_block_history_failure` (only Err re-raises).
+    #[test]
+    fn retry_block_history_hides_before_walk_and_stays_quiet_on_ok() {
+        let source = include_str!("history_notice.rs");
+        let retry = source
+            .split("pub(crate) fn retry_block_history(&self) {")
+            .nth(1)
+            .expect("retry_block_history")
+            .split("\n}\n\n#[cfg(test)]")
+            .next()
+            .expect("retry closes before tests");
+        let hide = retry
+            .find("set_visible(false)")
+            .expect("optimistic hide");
+        let walk = retry.find("n_pages()").expect("notebook walk");
+        assert!(hide < walk, "hide must run before the notebook walk");
+        assert!(
+            retry.contains("if let Err(error) = view.retry_history_persistence()"),
+            "only Err must re-raise the sticky bar"
+        );
+        assert!(
+            !retry.contains("if let Ok"),
+            "Ok path must stay quiet (no show on success)"
+        );
+    }
 }
