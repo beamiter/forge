@@ -731,3 +731,24 @@ quality gates listed in `README.md`.
 155. **Find All-scope NoRetainedTextInScope + stale** — whitespace-only command
      and output stay NoRetainedTextInScope under All scope when stale ids remain.
      Pairs anvil 121.
+
+156. **Sticky near-miss ZWJ/RLM/FA/ideo/NEL labels** — U+200D / U+200F /
+     U+2061 / U+3000 / U+0085 variants of  stay toast-only
+     beside round 154. Pairs anvil 122.
+
+157. **Find Command/Output-scope QueryNoMatches + stale** — live bookmark whose
+     scoped text misses the query stays QueryNoMatches under Command and Output
+     when stale ids remain (All-scope query miss already pinned). Pairs anvil 123.
+
+158. **CrossBlock cancel ahead-without-resume + wrapping finished** — scheduled
+     generation ahead of live cancels even with an empty resume; wrapping
+     MAX→0 bump with a finished cursor cancels the same way. Pairs anvil 124.
+
+159. **output_notice CR/NBSP/ZWSP/BOM/soft-hyphen near-miss gate** — CR / NBSP /
+     ZWSP / BOM / soft-hyphen padded Truncated/Partly/Earlier strings stay
+     outside the known-set remount gate beside round 150. Pairs anvil STAGE tip.
+
+160. **Core tip STAGE_PREFIXES openvt (len 71)** — path-patched local core
+     teaches kbd  VT launcher peels (/ meta) plus
+     timeout/nice nest classify; Inspect/Sit→Unknown  **93** already
+     ledgered. Manifests stay on published pins. Pairs anvil 125.
