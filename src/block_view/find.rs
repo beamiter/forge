@@ -4788,7 +4788,6 @@ tail ab";
         }
     }
 
-
     #[test]
     fn background_filter_composes_before_cap_and_uses_only_real_scoped_text() {
         let record = |id, cmd: &str, duration_ms, is_background| CompletedCommandRecord {
@@ -5834,6 +5833,31 @@ tail ab";
         // Finished walk at the near-near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
             near_near_near_near_near_near_wrap, near_near_near_near_near_near_wrap, false
+        ));
+
+        // Near-near-near-near-near-near-near-wrap bump (MAX-7→MAX-6) cancels with a
+        // resume — one step earlier than the MAX-6→MAX-5 sibling.
+        let near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_wrap.wrapping_sub(1);
+        assert!(cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_wrap, false
+        ));
+        // Scheduled ahead at the near-near-near-near-near-near-near-wrap boundary
+        // (MAX-6 vs MAX-7).
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_wrap, false
+        ));
+        // Finished walk at the near-near-near-near-near-near-near-wrap generation itself.
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_wrap, false
         ));
     }
 
