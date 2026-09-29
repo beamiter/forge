@@ -1197,3 +1197,21 @@ quality gates listed in `README.md`.
      U+1804-only queries stay QueryNoMatches under Command/Output/All when stale
      ids remain (1803/full-stop already pinned). Pairs anvil 207.
 
+261. **Sticky fullwidth colon label** —
+     U+FF1A variant of "Save Block history" stays toast-only beside Mongolian
+     four dots (round 256). Pairs anvil 208.
+
+262. **output_notice fullwidth colon gate** —
+     U+FF1A-padded Truncated/Partly/Earlier strings stay outside the known-set
+     remount gate beside sticky FF1A. Pairs anvil sticky tip.
+
+263. **CrossBlock cancel near-near-near-near-near-near-near-near-near-near-near-near-wrap bump** — palette idle
+     continuation drops MAX-12→MAX-11 generation bumps (with or without resume),
+     scheduled ahead MAX-11 vs MAX-12, and finished walks at MAX-12. Pairs anvil
+     209 / core cancel edge.
+
+264. **UnknownOutcome→Idle Full-motion bridge** — Full motion animates
+     UnknownOutcome→Idle; Calm/Static snap + semantic_bridges membership sync.
+     Unknown→GuardFailure already synced in round 259. Pairs anvil 210 / core
+     `UnknownOutcomeToIdle` inside between() 93.
+
