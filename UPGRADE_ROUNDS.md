@@ -436,3 +436,9 @@ quality gates listed in `README.md`.
     and idle Failure→Stuck / Recovery→Cautious); Calm/Static still snap.
     Behavior itself lands with core `fbfcafa` (pending push/repin from
     `33093da`).
+90. **Persisted earlier-output notice** — `BlockData.output_notice` carries the
+    finished-card loss notice (including "Earlier output not retained") across
+    history save/restore and clear undo, matching anvil's round-50
+    `output_head_dropped` contract. Pre-notice frames still decode with the
+    notice off; `history_keeps_the_output_notice_and_reads_the_schema_before_it`
+    pins both directions.

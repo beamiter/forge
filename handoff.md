@@ -1,8 +1,15 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (family pin align: jagent `628811b`; organism core still pending push)
+Updated: 2026-09-29 (upgrade round 90: persisted earlier-output notice parity)
 
 ## Completed since the previous handoff
+
+- **Persisted "Earlier output not retained" (upgrade round 90)** —
+  `BlockData.output_notice` already survives Block-history save/restore and
+  clear undo (known notices, including "Earlier output not retained"), matching
+  anvil round 50's `output_head_dropped` contract with forge's richer notice
+  string; pre-notice history frames still decode with the notice off. The stale
+  agent-CLI handoff note that claimed this was left open is closed.
 
 - **Family pin align (2026-09-29)** — direct `jagent` pin `6ed0b9f` → `628811b`
   (deny + lock), matching path-patched local `jterm_core`. Manifest `jterm_core`
@@ -51,8 +58,8 @@ Updated: 2026-09-29 (family pin align: jagent `628811b`; organism core still pen
   verified differentially against real libvte 0.76, which finished blocks now
   use so a codex session keeps its whole transcript. Display tests run headless
   with `gtk4-broadwayd` when xvfb is missing (GDK_BACKEND=broadway; the broadway
-  socket lives in XDG_RUNTIME_DIR). Left open: the "Earlier output not retained"
-  notice is not persisted in BlockData (needs a history-format field); the flaky
+  socket lives in XDG_RUNTIME_DIR). The finished-card output notice is persisted
+  in `BlockData.output_notice` (see upgrade round 90). Left open: the flaky
   parallel test-binary crash in GTK IM-module teardown predates this work.
 
 - **The ASCII organism moves into core (`jterm_core` `9f94f77` → `fa256d6`)**:
