@@ -891,3 +891,21 @@ quality gates listed in `README.md`.
      animates). Pairs anvil 151 / core
      `failure_stuck_cautious_never_bridge_to_error_or_unknown_holds`.
 
+
+192. **Sticky near-miss bidi embeddings / deprecated format labels** —
+     U+202A–U+202E / U+206B–U+206E variants of "Save Block history" stay
+     toast-only beside rounds 185/175. Pairs anvil 152.
+
+193. **output_notice bidi embedding / deprecated-format near-miss gate** —
+     U+202A–U+202E / U+206B–U+206E-padded Truncated/Partly/Earlier strings stay
+     outside the known-set remount gate beside rounds 187/177. Pairs anvil sticky tip.
+
+194. **Find WJ/figure/soft-hyphen/bidi-query QueryNoMatches + stale** —
+     U+2060 / U+2007 / U+00AD / U+202A / U+202E-only queries stay
+     QueryNoMatches under Command/Output/All when stale ids remain (NBSP/ZWSP
+     already pinned). Pairs anvil 153.
+
+195. **Ambient disposition exchange Full-motion None completeness** — Full
+     motion pins Idle↔Sleep/Approach, Explore↔Approach, Approach↔Sleep
+     intentional None beside the partial ambient table. Pairs anvil 154 /
+     core `ambient_disposition_exchanges_have_no_visual_transition`.
