@@ -510,3 +510,7 @@ quality gates listed in `README.md`.
 108. **Full-motion semantic_bridges catch-up** — Full-motion UI contract list
      mirrors every core `VisualTransition::between` pair (64 bridges), closing
      gaps left by the staged UnknownOutcome / Watch* / vigil rounds.
+
+109. **WatchAgent→UnknownOutcome None + agent Celebrate UI** — Full motion
+     pins WatchAgent→UnknownOutcome as None; agent-driven recovery stays
+     Celebrate (never CelebrateBig), matching core quiet-nod contract.

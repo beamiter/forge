@@ -1,6 +1,12 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (round 108: Full-motion semantic_bridges covers all core between pairs)
+## 2026-09-29 (organism intentional None + agent Celebrate)
+
+- **WatchAgent→UnknownOutcome** pinned None in Full-motion UI (and core).
+- **Agent CelebrateBig** — UI test that agent recovery stays Celebrate,
+  never CelebrateBig (pairs core quiet-nod contract).
+
+Updated: 2026-09-29 (organism WatchAgent→UnknownOutcome None + agent Celebrate pin)
 
 ## Completed since the previous handoff
 
