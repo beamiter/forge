@@ -1,5 +1,14 @@
 # Engineering handoff
 
+## 2026-09-29 (core tip STAGE_PREFIXES systemd-cat/aa-exec)
+
+- **STAGE_PREFIXES len 60→62** on path-patched local core tip () —
+   /  peel +  see-through (jagent
+  ). Cargo manifests stay on published  (pending
+  push/repin). Upgrade round 114.
+
+Updated: 2026-09-29 (core tip STAGE_PREFIXES systemd-cat/aa-exec len 62)
+
 ## 2026-09-29 (organism Guard*/Watch*/Celebrate*/Glance None pins)
 
 - Full-motion UI pins the core intentional-None arcs from the audit wave:

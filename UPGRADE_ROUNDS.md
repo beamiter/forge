@@ -534,3 +534,8 @@ quality gates listed in `README.md`.
      pins WatchSettled→UnknownOutcome, Watch*→Guard*, Guard*→Celebrate*,
      Celebrate*→Watch*, Idle/Rest→Guard*, and GlanceAside as source/target
      (pairs anvil round 77; core audit wave).
+
+114. **Core tip STAGE_PREFIXES systemd-cat/aa-exec (len 62)** — path-patched
+     local `jterm_core` peels `systemd-cat` / `aa-exec` (STAGE_PREFIXES 60→62)
+     with `classify_command` see-through (and full STAGE membership pin);
+     Cargo manifests stay on the published pin (pending push/repin).
