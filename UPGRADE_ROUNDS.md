@@ -1132,3 +1132,20 @@ quality gates listed in `README.md`.
      U+1801-only queries stay QueryNoMatches under Command/Output/All when stale
      ids remain (FE07/birga already pinned). Pairs anvil 195.
 
+246. **Sticky Mongolian full stop label** —
+     U+1803 variant of "Save Block history" stays toast-only beside comma
+     (round 241). Pairs anvil 196.
+
+247. **output_notice Mongolian full stop gate** —
+     U+1803-padded Truncated/Partly/Earlier strings stay outside the known-set
+     remount gate beside sticky 1803. Pairs anvil sticky tip.
+
+248. **CrossBlock cancel near-near-near-near-near-near-near-near-near-wrap bump** — palette idle
+     continuation drops MAX-9→MAX-8 generation bumps (with or without resume),
+     scheduled ahead MAX-8 vs MAX-9, and finished walks at MAX-9. Pairs anvil
+     197 / core cancel edge.
+
+249. **UnknownOutcome→GuardCautious Full-motion bridge** — Full motion animates
+     UnknownOutcome→GuardCautious; Calm/Static snap + semantic_bridges
+     membership sync. Unknown↔GuardRecovery already synced in rounds 239/244.
+     Pairs anvil 198 / core `UnknownOutcomeToGuardCautious` inside between() 93.
