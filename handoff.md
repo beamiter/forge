@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (file-tree permission vs missing + STAGE 70 docs present)
+
+## 2026-09-29 (file-tree permission vs missing)
+
+- **Round 134**: Error-row copy distinguishes PermissionDenied from NotFound;
+  empty directories stay success listings (TODO.md P2 closed). STAGE 70 tip
+  already ledgered at round 130 (pairs anvil 97); no extra STAGE docs needed.
+  Pairs anvil 100 sticky whitespace. Core/jagent tips still **pending
+  push/repin**.
+
 Updated: 2026-09-29 (Inspect→SitNear 91 + vigil→Watch None)
 
 ## 2026-09-29 (Inspect→SitNear 91 + vigil→Watch None)
