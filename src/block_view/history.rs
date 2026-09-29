@@ -3133,6 +3133,16 @@ mod tests {
                 format!("{base}\u{feff}"),
                 format!("\u{fff9}{base}\u{fffb}"),
                 format!("{base}\u{fffa}"),
+                // Bidi embeddings/overrides + remaining deprecated format
+                // controls beside the sticky bidi wave — still outside the gate.
+                format!("\u{202a}{base}\u{202c}"),
+                format!("\u{202b}{base}\u{202c}"),
+                format!("\u{202d}{base}\u{202c}"),
+                format!("\u{202e}{base}\u{202c}"),
+                format!("{base}\u{206b}"),
+                format!("{base}\u{206c}"),
+                format!("{base}\u{206d}"),
+                format!("{base}\u{206e}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
