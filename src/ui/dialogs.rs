@@ -594,6 +594,23 @@ fn cross_block_search_status(
     }
 }
 
+/// Continue slices share the first rebuild's bookmarked-empty copy so a
+/// Bookmarked scan that finishes empty after idle resume does not drop to
+/// generic "No matches."
+fn overlay_scan_status(
+    total: usize,
+    selected: Option<usize>,
+    scan_incomplete: bool,
+    bookmarked_empty: Option<&'static str>,
+) -> String {
+    if total == 0 && !scan_incomplete {
+        if let Some(message) = bookmarked_empty {
+            return message.to_string();
+        }
+    }
+    cross_block_search_status(total, selected, scan_incomplete)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CrossBlockSelectionMove {
     First,
@@ -1804,17 +1821,14 @@ impl UiState {
                         let results = report.hits;
                         scan_incomplete.set(report.scan_incomplete);
                         let total = results.len();
-                        let status = if total == 0 && !report.scan_incomplete {
+                        let status = overlay_scan_status(
+                            total,
+                            None,
+                            report.scan_incomplete,
                             term_view
                                 .bookmarked_search_empty_reason(&query, scope, &filters)
-                                .map(cross_block_bookmarked_empty_status)
-                                .map(str::to_string)
-                                .unwrap_or_else(|| {
-                                    cross_block_search_status(total, None, false)
-                                })
-                        } else {
-                            cross_block_search_status(total, None, report.scan_incomplete)
-                        };
+                                .map(cross_block_bookmarked_empty_status),
+                        );
                         status_label.set_text(&status);
                         let jumpable = term_view.jumpable_search_hits(&results);
                         for hit in results.iter() {
@@ -1906,12 +1920,17 @@ impl UiState {
                                         hits.borrow_mut().extend(more.hits.iter().cloned());
                                         let total = hits.borrow().len();
                                         scan_incomplete.set(more.scan_incomplete);
-                                        status_label.set_text(&cross_block_search_status(
+                                        status_label.set_text(&overlay_scan_status(
                                             total,
                                             list_box
                                                 .selected_row()
                                                 .map(|row| row.index() as usize),
                                             more.scan_incomplete,
+                                            term_view
+                                                .bookmarked_search_empty_reason(
+                                                    &query, scope, &filters,
+                                                )
+                                                .map(cross_block_bookmarked_empty_status),
                                         ));
                                         *cursor.borrow_mut() = more.resume;
                                         if cursor.borrow().is_some() {
@@ -2490,6 +2509,7 @@ impl UiState {
         let pending_scan_continue_for_close = pending_scan_continue.clone();
         let pending_manual_refresh_for_close = pending_manual_refresh.clone();
         let refresh_source_for_close = refresh_source.clone();
+        let search_generation_for_close = search_generation.clone();
         let memory_for_close = self.cross_block_search_memory.clone();
         let filter_entry_for_close = filter_entry.clone();
         let case_toggle_for_close = case_toggle.clone();
@@ -2501,6 +2521,9 @@ impl UiState {
         let background_toggle_for_close = background_toggle.clone();
         let bookmarked_toggle_for_close = bookmarked_toggle.clone();
         dialog.connect_closed(move |closed_dialog| {
+            search_generation_for_close.set(
+                search_generation_for_close.get().wrapping_add(1),
+            );
             if let Some(source) = refresh_source_for_close.borrow_mut().take() {
                 source.remove();
             }
@@ -4429,7 +4452,8 @@ mod tests {
         cross_block_search_is_bookmark_shortcut, cross_block_search_is_plain_refresh_key,
         cross_block_search_jump_unavailable_status, cross_block_search_memory,
         cross_block_search_pending_status, cross_block_search_query_error,
-        cross_block_search_refresh_status, cross_block_search_status, cross_block_selection_index,
+        cross_block_search_refresh_status, cross_block_search_status, overlay_scan_status,
+        cross_block_selection_index,
         cross_block_should_step, preferences_group_title, record_snapshot_dialog_title,
         record_snapshot_status_line, record_snapshot_unavailable_message,
         record_workflow_arg_entry_change, remote_picker_guard, CrossBlockBookmarkKeyDecision,
@@ -4590,6 +4614,14 @@ mod tests {
         assert_eq!(cross_block_search_pending_status(), "Searching blocks…");
         assert_eq!(cross_block_search_refresh_status(), "Refreshing blocks…");
         assert_eq!(cross_block_search_status(0, None, false), "No matches.");
+        assert_eq!(
+            overlay_scan_status(0, None, false, Some("No bookmarked blocks in retained history.")),
+            "No bookmarked blocks in retained history."
+        );
+        assert_eq!(
+            overlay_scan_status(0, None, true, Some("No bookmarked blocks in retained history.")),
+            cross_block_search_status(0, None, true)
+        );
         assert_eq!(
             cross_block_search_status(0, None, true),
             "No matches in the scanned prefix — history scan budget reached; narrow the scope or refine the query."
