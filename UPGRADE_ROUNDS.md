@@ -588,8 +588,9 @@ quality gates listed in `README.md`.
 
 123. **Celebrate*/Rest/GuardRecovery hold-overwrite UI contract** — Full motion
      mirrors core Celebrate*/RestAfterPush/GuardRecovery finish overwrites
-     (`between()` 76→90). Rest/GuardRecovery→Watch* stay None. Pairs anvil
-     round 89; core hold-overwrite survey wave.
+     (`between()` 76→90). STAGE docs round 122 stays membership-only (len 67);
+     the 76 count was round 120, this round catches 90. Rest/GuardRecovery→Watch*
+     stay None. Pairs anvil round 89; core hold-overwrite survey wave.
 
 124. **Find stale-bookmark empty-reason pin** — bookmark ids absent from the
      current retained records list are `NoRetainedBookmarks`, not a metadata
@@ -608,3 +609,12 @@ quality gates listed in `README.md`.
      PIPE-only `unshare`/`nsenter`. Cargo manifests stay on the published pin
      (pending push/repin). Pairs anvil round 92.
 
+
+127. **Find empty-query browser pin** — Bookmarked empty-reason stays `None`
+     when an empty query still has eligible scoped text (browser, not
+     QueryNoMatches). Dedicated pin beside round 124 stale ids. Pairs anvil
+     round 93 (stale ids) / 90 (empty-query).
+
+128. **Error/unknown→Watch* None UI** — Full motion pins Inspect/SitNear/
+     Unknown→Watch* as None beside Celebrate*/Rest/Recovery→Watch*. Pairs anvil
+     round 94; core `error_and_unknown_holds_never_bridge_to_watch_poses`.
