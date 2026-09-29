@@ -1193,3 +1193,7 @@ quality gates listed in `README.md`.
      membership sync. Unknown→GuardStuck already synced in round 254.
      Pairs anvil 206 / core `UnknownOutcomeToGuardFailure` inside between() 93.
 
+260. **Find 1804/colon-query QueryNoMatches + stale** —
+     U+1804-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (1803/full-stop already pinned). Pairs anvil 207.
+
