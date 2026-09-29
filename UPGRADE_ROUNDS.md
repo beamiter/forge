@@ -507,5 +507,6 @@ quality gates listed in `README.md`.
      (8 MiB / 48 ms); live overlay `FindScanBudget::new` uses
      `FIND_OVERLAY_SCAN_*` (4 MiB / 12 ms). Unit test pins both constructors.
 
+108. **Full-motion semantic_bridges catch-up** — Full-motion UI contract list
      mirrors every core `VisualTransition::between` pair (64 bridges), closing
      gaps left by the staged UnknownOutcome / Watch* / vigil rounds.

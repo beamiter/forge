@@ -1,8 +1,15 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (round 107: FindScanBudget constructor semantic pin)
+Updated: 2026-09-29 (round 108: Full-motion semantic_bridges covers all core between pairs)
 
 ## Completed since the previous handoff
+
+- **Full-motion semantic_bridges catch-up (upgrade round 108)** — the Full-motion
+  UI contract list now includes every `VisualTransition::between` pair from the
+  local core tip (64 bridges), including InspectError→GuardFailure/Cautious,
+  SitNearError→GuardStuck, Celebrate{,Big}→GuardRecovery/Cautious/Stuck,
+  WatchSettled→Celebrate{,Big}, vigil-tier RestAfterPush pushes, and the
+  remaining Guard*↔Guard* arcs previously only covered piecemeal.
 
 - **FindScanBudget constructor semantic pin (upgrade round 107)** —
   `FindScanBudget::for_cross_block` stays on shared `CROSS_BLOCK_SCAN_*`
