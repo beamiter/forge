@@ -668,3 +668,17 @@ quality gates listed in `README.md`.
 141. **Sticky near-miss soft-hyphen/WJ/bidi labels** — soft hyphen / word
      joiner / LRM / ZWNJ / figure-space variants of `"Save Block history"`
      stay toast-only beside round 135. Pairs anvil 107.
+
+142. **CelebrateBig finish arcs Full-motion UI** — Full motion pins all fifteen
+     CelebrateBig inbound/outbound Some bridges and WatchAgent→CelebrateBig
+     None (pairs core tip and anvil round 108).
+
+143. **output_notice Truncated/Partly history round-trip** — Block-history
+     restore keeps TextTruncated and PartlyRetained through the known-set gate
+     beside EarlierNotRetained. Pairs anvil round 109 Earlier-only disk pin.
+
+144. **Find Hit optional exit_code/duration/cwd + outcome suffix** — forge
+     `CrossBlockHit` carries optional palette chrome; BackendRecordRef exposes
+     cwd; palette rows show anvil-parity outcome suffixes without breaking
+     ActionRow layout. Closes the Full Find Hit schema survey leftover. Pairs
+     anvil round 110 / core Hit pin retarget.
