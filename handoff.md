@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (find mixed stale + STAGE 70 tip)
+
+## 2026-09-29 (find mixed stale + STAGE 70)
+
+- **Round 129**: mixed stale+live bookmark empty-reason (pairs anvil 96).
+- **Round 130**: path-patched core tip STAGE 70 (`uclampset`/`gamemoderun`) +
+  Guard*→Celebrate* None survey; `between()` stays 90. Pairs anvil 97.
+  Core/jagent tips still **pending push/repin**.
+
 Updated: 2026-09-29 (Find empty-query browser + error→Watch None UI)
 
 ## 2026-09-29 (Find empty-query browser + error/unknown→Watch* None)
