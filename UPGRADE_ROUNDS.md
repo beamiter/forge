@@ -1174,3 +1174,22 @@ quality gates listed in `README.md`.
 255. **Find 1803/full-stop-query QueryNoMatches + stale** —
      U+1803-only queries stay QueryNoMatches under Command/Output/All when stale
      ids remain (1802/comma already pinned). Pairs anvil 203.
+
+256. **Sticky Mongolian four dots label** —
+     U+1805 variant of "Save Block history" stays toast-only beside colon
+     (round 251). Pairs anvil 204.
+
+257. **output_notice Mongolian four dots gate** —
+     U+1805-padded Truncated/Partly/Earlier strings stay outside the known-set
+     remount gate beside sticky 1805. Pairs anvil sticky tip.
+
+258. **CrossBlock cancel near-near-near-near-near-near-near-near-near-near-near-wrap bump** — palette idle
+     continuation drops MAX-11→MAX-10 generation bumps (with or without resume),
+     scheduled ahead MAX-10 vs MAX-11, and finished walks at MAX-11. Pairs anvil
+     205 / core cancel edge.
+
+259. **UnknownOutcome→GuardFailure Full-motion bridge** — Full motion animates
+     UnknownOutcome→GuardFailure; Calm/Static snap + semantic_bridges
+     membership sync. Unknown→GuardStuck already synced in round 254.
+     Pairs anvil 206 / core `UnknownOutcomeToGuardFailure` inside between() 93.
+
