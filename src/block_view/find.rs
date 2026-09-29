@@ -619,6 +619,12 @@ pub struct CrossBlockHit {
     pub line_no: usize,
     pub line_text: String,
     pub cmd_preview: String,
+    /// Outcome of the record the hit came from. Optional palette chrome —
+    /// carried so the row can show which `cargo build` failed without making
+    /// the user jump to each one (parity with anvil).
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<u64>,
+    pub cwd: Option<String>,
     /// Zero-based index of this hit's FIRST match among all matches on this
     /// record's surface, counted in reading order.
     ///
@@ -633,8 +639,8 @@ pub struct CrossBlockHit {
 }
 
 /// Outcome of a cross-block palette scan. Hit rows stay app-owned
-/// ([`CrossBlockHit`] differs across frontends — forge omits anvil's
-/// exit_code / duration_ms / cwd palette-chrome fields); the shared report
+/// ([`CrossBlockHit`] may carry optional exit_code / duration_ms / cwd
+/// palette-chrome fields; GTK badge wiring stays local); the shared report
 /// shell lives in [`jterm_core::cross_block_search`].
 pub type CrossBlockSearchReport =
     jterm_core::cross_block_search::CrossBlockSearchReport<CrossBlockHit>;
@@ -771,6 +777,9 @@ fn metadata_filter_hit(
         line_no,
         line_text: snippet(line),
         cmd_preview: command_preview(command),
+        exit_code: record.exit_code(),
+        duration_ms: record.duration_ms(),
+        cwd: record.cwd().map(str::to_string),
         occurrence: 0,
     })
 }
@@ -956,6 +965,9 @@ fn pattern_search_hits_with_budget<'a>(
                         line_no: ln_idx + 1,
                         line_text: snippet(line),
                         cmd_preview: cmd_preview.clone(),
+                        exit_code: record.exit_code(),
+                        duration_ms: record.duration_ms(),
+                        cwd: record.cwd().map(str::to_string),
                         occurrence,
                     });
                 }
@@ -1002,6 +1014,9 @@ fn pattern_search_hits_with_budget<'a>(
                         line_no: ln_idx + 1,
                         line_text: snippet(line),
                         cmd_preview: cmd_preview.clone(),
+                        exit_code: record.exit_code(),
+                        duration_ms: record.duration_ms(),
+                        cwd: record.cwd().map(str::to_string),
                         occurrence,
                     });
                 }
@@ -3710,6 +3725,49 @@ tail ab";
         );
     }
 
+    /// Stale ids beside a live bookmark that has command text but no output
+    /// must still surface NoRetainedTextInScope under Output scope — never
+    /// collapse to NoRetainedBookmarks or invent QueryNoMatches.
+    #[test]
+    fn bookmarked_empty_reason_keeps_no_retained_text_when_stale_ids_remain() {
+        let retained = CompletedCommandRecord {
+            id: 1,
+            cmd: "echo retained".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(20),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
+            start_mark_seen: true,
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &retained,
+            snapshot: None,
+        }];
+        let mut bookmarks = BookmarkState::default();
+        bookmarks.toggle(1);
+        bookmarks.toggle(99);
+        bookmarks.toggle(100);
+        let filters = BlockFilters {
+            bookmarked_only: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            bookmarked_search_empty_reason(
+                records,
+                "retained",
+                CrossBlockSearchScope::Output,
+                &filters,
+                &bookmarks,
+            ),
+            Some(BookmarkedSearchEmptyReason::NoRetainedTextInScope),
+            "stale extras must not mask a live Output-scope text miss"
+        );
+    }
+
     /// Empty Bookmarked query with an eligible scoped record is a browser, not
     /// a miss — keep this named beside the stale-id pin so the None branch
     /// cannot quietly turn into QueryNoMatches.
@@ -4301,6 +4359,9 @@ tail ab";
                             line_no: ln_idx + 1,
                             line_text: snippet(line),
                             cmd_preview: cmd_preview.clone(),
+                            exit_code: record.exit_code(),
+                            duration_ms: record.duration_ms(),
+                            cwd: record.cwd().map(str::to_string),
                             occurrence: 0,
                         });
                     }
@@ -4330,6 +4391,9 @@ tail ab";
                             line_no: ln_idx + 1,
                             line_text: snippet(line),
                             cmd_preview: cmd_preview.clone(),
+                            exit_code: record.exit_code(),
+                            duration_ms: record.duration_ms(),
+                            cwd: record.cwd().map(str::to_string),
                             occurrence: 0,
                         });
                     }
@@ -4423,6 +4487,9 @@ tail ab";
                             line_no: ln_idx + 1,
                             line_text: snippet(line),
                             cmd_preview: cmd_preview.clone(),
+                            exit_code: record.exit_code(),
+                            duration_ms: record.duration_ms(),
+                            cwd: record.cwd().map(str::to_string),
                             occurrence: 0,
                         });
                     }
@@ -4783,7 +4850,7 @@ tail ab";
     }
 
     /// After the core lift, the local alias must stay generic over forge's
-    /// six-field navigation hit (no anvil palette-chrome columns).
+    /// navigation hit plus optional palette-chrome columns.
     #[test]
     fn cross_block_search_report_alias_stays_hit_generic_after_lift() {
         use super::CrossBlockSearchReport;
@@ -4795,6 +4862,9 @@ tail ab";
             line_no: 1,
             line_text: "cargo test".into(),
             cmd_preview: "cargo test".into(),
+            exit_code: None,
+            duration_ms: None,
+            cwd: None,
             occurrence: 0,
         };
         let finished = CrossBlockSearchReport::finished(vec![hit.clone()]);
