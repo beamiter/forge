@@ -455,3 +455,7 @@ quality gates listed in `README.md`.
 94. **Organism celebrate-hold relapse UI contract** — Full motion mirrors
     Celebrate/CelebrateBig→Failure/Stuck once core recognizes those bridges
     (pending push/repin). Calm/Static snap.
+95. **Organism failure-push + error-hold success UI contract** — Full motion
+    mirrors GuardFailure/Stuck→RestAfterPush and
+    Inspect/SitNear→Celebrate{,Big} once core recognizes those bridges
+    (pending push/repin). Calm/Static snap.

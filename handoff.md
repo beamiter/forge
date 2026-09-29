@@ -1,8 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (round 94: organism celebrate-hold relapse UI contract)
+Updated: 2026-09-29 (round 95: failure-push + error-hold success UI contract)
 
 ## Completed since the previous handoff
+
+- **Organism failure-push + error-hold success UI contract (upgrade round 95,
+  pending core push/repin)** — Full motion mirrors
+  GuardFailure/Stuck→RestAfterPush and Inspect/SitNear→Celebrate{,Big} once
+  core recognizes those bridges.
 
 - **Organism celebrate-hold relapse UI contract (upgrade round 94, pending core
   push/repin)** — Full motion mirrors Celebrate/CelebrateBig → Failure/Stuck
