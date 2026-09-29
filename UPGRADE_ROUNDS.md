@@ -631,3 +631,11 @@ quality gates listed in `README.md`.
 131. **Sticky near-miss Block-history labels** — padded / cased / truncated
      `"Save Block history"` strings stay on the toast surface (exact worker
      label only). Pairs anvil round 95.
+
+132. **InspectError→SitNearError Full-motion (90→91)** — Full-motion
+     `semantic_bridges` mirrors core Inspect hold second-failure overwrite.
+     Pairs anvil round 98.
+
+133. **Failure/Stuck/Cautious→Watch* + tier overwrite None UI** — Full motion
+     pins Failure/Stuck/Cautious→Watch* beside Rest/Recovery→Watch*, and
+     SitNear→Inspect / Celebrate↔CelebrateBig as None. Pairs anvil round 99.
