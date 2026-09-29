@@ -3143,6 +3143,11 @@ mod tests {
                 format!("{base}\u{206c}"),
                 format!("{base}\u{206d}"),
                 format!("{base}\u{206e}"),
+                // Mid-range VS / Mongolian FVS4 catch-up beside the sticky
+                // VS/FVS4 wave — still outside the known-set gate.
+                format!("{base}\u{fe01}"),
+                format!("{base}\u{fe0d}"),
+                format!("{base}\u{180f}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
