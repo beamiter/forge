@@ -1,5 +1,18 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (ambient→vigil/celebrate + find text-scope + sticky format)
+
+## 2026-09-29 (ambient→vigil/celebrate + find Output stale + sticky format)
+
+- **Round 139**: Explore/Sleep/Approach→Guard*/Celebrate* Full-motion None
+  (pairs anvil 105).
+- **Round 140**: Find NoRetainedTextInScope with stale bookmark extras under
+  Output scope (pairs anvil 106).
+- **Round 141**: soft-hyphen / WJ / LRM / ZWNJ / figure-space near-miss
+  `"Save Block history"` stay toast-only (pairs anvil 107).
+  STAGE 70 tip already ledgered at round 130 (pairs anvil 97). Core/jagent tips
+  still **pending push/repin**.
+
 Updated: 2026-09-29 (sticky whitespace catch-up + find/file-op/ambient pins)
 
 ## 2026-09-29 (sticky whitespace + find/file-op/ambient→Watch*)
