@@ -568,3 +568,14 @@ quality gates listed in `README.md`.
      core Inspect/SitNear→Idle and Guard*→Idle bridges (`between()` 64→70).
      Pairs anvil round 85; core clear-vigil Idle survey wave.
 
+120. **Error-hold/Unknown→Rest + Watch*→Idle UI contract** — Full motion
+     mirrors core Inspect/SitNear/Unknown→RestAfterPush and Watch*→Idle
+     (`between()` 70→76). STAGE docs rounds 117–118 stay membership-only
+     (len 63/64); the 70 count was round 119, this round catches 76.
+     Pairs anvil round 86.
+
+121. **Find overlay continue bookmark-empty status** — `pending_scan_continue`
+     idle slices reuse `overlay_scan_status` (and close bumps
+     `search_generation`) so a finished Bookmarked scan that added no hits
+     keeps the bookmark-empty copy. Pairs anvil round 87.
+
