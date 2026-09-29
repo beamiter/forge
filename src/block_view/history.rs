@@ -3117,6 +3117,14 @@ mod tests {
                 format!("\u{2800}{base}"),
                 format!("{base}\u{206a}"),
                 format!("{base}\u{206f}"),
+                // Ogham / MVS / CGJ / VS / Khmer inherent catch-up beside the
+                // sticky ogham wave — still outside the known-set gate.
+                format!("{base}\u{1680}"),
+                format!("{base}\u{180e}"),
+                format!("{base}\u{034f}"),
+                format!("{base}\u{fe00}"),
+                format!("\u{fe0f}{base}"),
+                format!("{base}\u{17b4}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
