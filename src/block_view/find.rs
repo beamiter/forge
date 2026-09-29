@@ -4180,6 +4180,117 @@ tail ab";
         );
     }
 
+    /// NBSP / ZWSP-only queries are non-empty (`is_empty` is false) but match
+    /// no retained scoped text — still `QueryNoMatches` under Command/Output
+    /// with stale extras, never the empty-query browser or NoRetainedBookmarks
+    /// (ASCII whitespace `" \t "` already pinned).
+    #[test]
+    fn bookmarked_empty_reason_keeps_nbsp_zwsp_query_no_matches_under_command_and_output_with_stale()
+    {
+        let retained = CompletedCommandRecord {
+            id: 1,
+            cmd: "echo retained".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(20),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
+            start_mark_seen: true,
+        };
+        let retained_output = ZoneOutputSnapshot {
+            plain: "noise line\n".to_string(),
+            truncated: false,
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &retained,
+            snapshot: Some(&retained_output),
+        }];
+        let mut bookmarks = BookmarkState::default();
+        bookmarks.toggle(1);
+        bookmarks.toggle(99);
+        bookmarks.toggle(100);
+        let filters = BlockFilters {
+            bookmarked_only: true,
+            ..Default::default()
+        };
+        for query in ["\u{00a0}", "\u{200b}"] {
+            assert_eq!(
+                bookmarked_search_empty_reason(
+                    records,
+                    query,
+                    CrossBlockSearchScope::Command,
+                    &filters,
+                    &bookmarks,
+                ),
+                Some(BookmarkedSearchEmptyReason::QueryNoMatches),
+                "{query:?} Command-scope must stay no-matches beside stale"
+            );
+            assert_eq!(
+                bookmarked_search_empty_reason(
+                    records,
+                    query,
+                    CrossBlockSearchScope::Output,
+                    &filters,
+                    &bookmarks,
+                ),
+                Some(BookmarkedSearchEmptyReason::QueryNoMatches),
+                "{query:?} Output-scope must stay no-matches beside stale"
+            );
+        }
+    }
+
+    /// NBSP / ZWSP-only queries under All with stale extras beside a live
+    /// scoped bookmark stay `QueryNoMatches` — same non-empty miss contract as
+    /// Command/Output (ASCII whitespace All already pinned).
+    #[test]
+    fn bookmarked_empty_reason_keeps_nbsp_zwsp_query_no_matches_under_all_with_stale() {
+        let retained = CompletedCommandRecord {
+            id: 1,
+            cmd: "echo retained".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(20),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
+            start_mark_seen: true,
+        };
+        let retained_output = ZoneOutputSnapshot {
+            plain: "noise line\n".to_string(),
+            truncated: false,
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &retained,
+            snapshot: Some(&retained_output),
+        }];
+        let mut bookmarks = BookmarkState::default();
+        bookmarks.toggle(1);
+        bookmarks.toggle(99);
+        bookmarks.toggle(100);
+        let filters = BlockFilters {
+            bookmarked_only: true,
+            ..Default::default()
+        };
+        for query in ["\u{00a0}", "\u{200b}"] {
+            assert_eq!(
+                bookmarked_search_empty_reason(
+                    records,
+                    query,
+                    CrossBlockSearchScope::All,
+                    &filters,
+                    &bookmarks,
+                ),
+                Some(BookmarkedSearchEmptyReason::QueryNoMatches),
+                "{query:?} All-scope must stay no-matches beside stale"
+            );
+        }
+    }
+
     #[test]
     fn background_filter_composes_before_cap_and_uses_only_real_scoped_text() {
         let record = |id, cmd: &str, duration_ms, is_background| CompletedCommandRecord {
@@ -5080,6 +5191,9 @@ tail ab";
         assert!(!cross_block_search_continue_is_current(0, u64::MAX, true));
         // Same reverse-wrap cancel without a resume still drops the idle slice.
         assert!(!cross_block_search_continue_is_current(0, u64::MAX, false));
+        // Finished walk at the wrap generation itself (MAX,MAX,no resume) —
+        // pairs core cancel edge catch-up beside MAX→0 schedule bump.
+        assert!(!cross_block_search_continue_is_current(u64::MAX, u64::MAX, false));
     }
 
     #[test]
