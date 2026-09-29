@@ -1,5 +1,22 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (error/unknown Rest + Watch Idle UI, between 76)
+
+## 2026-09-29 (error/unknown→Rest + Watch*→Idle UI contract)
+
+- **Round 120**: Full-motion `semantic_bridges` mirrors core tip 70→**76** —
+  Inspect/SitNear/Unknown→RestAfterPush and Watch*→Idle. STAGE rounds 117–118
+  stay `STAGE_PREFIXES` len 63/64; `between()` 70 was round 119. Pairs anvil
+  86.
+
+Updated: 2026-09-29 (Find overlay continue bookmark-empty status)
+
+## 2026-09-29 (Find overlay continue bookmark-empty status)
+
+- **Round 121**: `pending_scan_continue` uses `overlay_scan_status`; dialog
+  close bumps `search_generation` before removing idle sources. Pairs anvil
+  87.
+
 Updated: 2026-09-29 (clear-vigil Idle bridges UI sync, 70)
 
 ## 2026-09-29 (clear-vigil Idle bridges UI sync)
@@ -16,7 +33,8 @@ Updated: 2026-09-29 (core tip STAGE_PREFIXES systemd-socket-activate len 64)
 - **STAGE_PREFIXES len 63→64** on path-patched local core tip (`1391c88`) —
   `systemd-socket-activate` peel + `classify_command` see-through (jagent
   `af4f101`). Cargo manifests stay on published `33093da` (pending
-  push/repin). Upgrade round 118 (pairs anvil 84).
+  push/repin). Upgrade round 118 (pairs anvil 84). `between()` 70/76 is the
+  later UI contract rounds 119–120, not this STAGE membership round.
 
 Updated: 2026-09-29 (core tip STAGE_PREFIXES systemd-inhibit len 63)
 
