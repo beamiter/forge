@@ -529,3 +529,7 @@ quality gates listed in `README.md`.
      hit-generic `CrossBlockSearchReport<CrossBlockHit>` from path-patched
      core; `CrossBlockHit` stays local (no anvil palette-chrome fields). GTK
      idle stays here. Pairs anvil round 76.
+113. **Guard*/Watch*/Celebrate*/Glance intentional None UI** — Full motion
+     pins WatchSettled→UnknownOutcome, Watch*→Guard*, Guard*→Celebrate*,
+     Celebrate*→Watch*, Idle/Rest→Guard*, and GlanceAside as source/target
+     (pairs anvil round 77; core audit wave).

@@ -1,5 +1,14 @@
 # Engineering handoff
 
+## 2026-09-29 (organism Guard*/Watch*/Celebrate*/Glance None pins)
+
+- Full-motion UI pins the core intentional-None arcs from the audit wave:
+  WatchSettled→UnknownOutcome, Watch*→Guard*, Guard*→Celebrate*,
+  Celebrate*→Watch*, Idle/Rest→Guard*, GlanceAside as source **and** target.
+- Upgrade round 113 (pairs anvil 77).
+
+Updated: 2026-09-29 (organism Guard*/Watch*/Celebrate*/Glance None pins)
+
 ## 2026-09-29 (FindScanBudget + Options/Scope + generic Report)
 
 - Re-exports `FindScanBudget`, `CrossBlockSearchOptions` /
