@@ -3163,6 +3163,11 @@ mod tests {
                 format!("{base}\u{fe04}"),
                 format!("{base}\u{fe0a}"),
                 format!("{base}\u{1807}"),
+                // Nesting mid-range VS / Mongolian Manchu comma catch-up beside
+                // the sticky FE05/FE09/1808 wave — still outside the gate.
+                format!("{base}\u{fe05}"),
+                format!("{base}\u{fe09}"),
+                format!("{base}\u{1808}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
