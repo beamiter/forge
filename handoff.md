@@ -1,5 +1,19 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (CelebrateBig finish arcs + output_notice + Find Hit chrome)
+
+## 2026-09-29 (CelebrateBig finish arcs + output_notice + Find Hit)
+
+- **Round 142**: Full-motion CelebrateBig finish arcs (15 Some + WatchAgent
+  None). Pairs anvil 108 / core tip.
+- **Round 143**: Truncated/PartlyRetained survive Block-history round-trip
+  through the known-set gate (pairs anvil 109).
+- **Round 144**: CrossBlockHit optional exit_code/duration/cwd + palette
+  outcome suffix (cwd on BackendRecordRef). Closes Full Find Hit schema
+  leftover — forge can gain the fields without breaking UI. Core/jagent tips
+  still **pending push/repin**.
+
+
 Updated: 2026-09-29 (ambient→vigil/celebrate + find text-scope + sticky format)
 
 ## 2026-09-29 (ambient→vigil/celebrate + find Output stale + sticky format)
