@@ -3137,7 +3137,7 @@ tail ab";
             start_time_ms: None,
             end_time_ms: None,
             duration_ms: Some(2_000),
-            cwd: None,
+            cwd: Some("/srv/legacy".to_string()),
             is_background: false,
             completion_provenance: super::super::CompletionProvenance::Unknown,
             command_source: super::super::CommandTextSource::Screen,
@@ -3192,6 +3192,9 @@ tail ab";
             assert!(hits[0].is_output);
             assert_eq!(hits[0].line_text, "retained foreground output");
             assert_eq!(hits[0].cmd_preview, "");
+            assert_eq!(hits[0].exit_code, Some(7));
+            assert_eq!(hits[0].duration_ms, Some(2_000));
+            assert_eq!(hits[0].cwd.as_deref(), Some("/srv/legacy"));
         }
         assert!(metadata_filter_hits(
             [BackendRecordRef::Metadata {
@@ -3306,7 +3309,7 @@ tail ab";
             start_time_ms: None,
             end_time_ms: None,
             duration_ms,
-            cwd: None,
+            cwd: Some("/tmp/forge-hit".to_string()),
             is_background: false,
             completion_provenance: super::super::CompletionProvenance::ShellReported,
             command_source: super::super::CommandTextSource::Screen,
@@ -3345,6 +3348,9 @@ tail ab";
         let hit = &hits[0];
         assert_eq!(hit.block_id, 3);
         assert_eq!(hit.line_text, "needle");
+        assert_eq!(hit.exit_code, Some(9));
+        assert_eq!(hit.duration_ms, Some(2_000));
+        assert_eq!(hit.cwd.as_deref(), Some("/tmp/forge-hit"));
         assert!(metadata_filter_hits(
             records(),
             CrossBlockSearchScope::Output,
@@ -3765,6 +3771,53 @@ tail ab";
             ),
             Some(BookmarkedSearchEmptyReason::NoRetainedTextInScope),
             "stale extras must not mask a live Output-scope text miss"
+        );
+    }
+
+    /// Stale ids beside a live bookmark that has output but no meaningful
+    /// command text must still surface NoRetainedTextInScope under Command
+    /// scope — never collapse to NoRetainedBookmarks or invent QueryNoMatches.
+    #[test]
+    fn bookmarked_empty_reason_keeps_command_scope_no_text_when_stale_ids_remain() {
+        let retained = CompletedCommandRecord {
+            id: 1,
+            cmd: "   \n\t  ".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(20),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
+            start_mark_seen: true,
+        };
+        let retained_output = ZoneOutputSnapshot {
+            plain: "noise line\n".to_string(),
+            truncated: false,
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &retained,
+            snapshot: Some(&retained_output),
+        }];
+        let mut bookmarks = BookmarkState::default();
+        bookmarks.toggle(1);
+        bookmarks.toggle(99);
+        bookmarks.toggle(100);
+        let filters = BlockFilters {
+            bookmarked_only: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            bookmarked_search_empty_reason(
+                records,
+                "noise",
+                CrossBlockSearchScope::Command,
+                &filters,
+                &bookmarks,
+            ),
+            Some(BookmarkedSearchEmptyReason::NoRetainedTextInScope),
+            "stale extras must not mask a live Command-scope text miss"
         );
     }
 
