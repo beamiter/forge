@@ -3876,6 +3876,10 @@ mod tests {
             (Behavior::UnknownOutcome, Behavior::Celebrate),
             (Behavior::UnknownOutcome, Behavior::CelebrateBig),
             (Behavior::UnknownOutcome, Behavior::SitNearError),
+            (Behavior::UnknownOutcome, Behavior::GuardFailure),
+            (Behavior::UnknownOutcome, Behavior::GuardStuck),
+            (Behavior::UnknownOutcome, Behavior::GuardRecovery),
+            (Behavior::UnknownOutcome, Behavior::GuardCautious),
             (Behavior::GuardFailure, Behavior::GuardStuck),
             (Behavior::GuardFailure, Behavior::RestAfterPush),
             (Behavior::GuardStuck, Behavior::RestAfterPush),
@@ -3924,6 +3928,14 @@ mod tests {
                     motion,
                     Behavior::WatchSettled,
                     Behavior::RestAfterPush,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::GuardFailure,
                 ),
                 None
             );

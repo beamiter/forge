@@ -484,3 +484,7 @@ quality gates listed in `README.md`.
 102. **Organism WatchAgent/WatchSettled→RestAfterPush UI contract** — Full motion
     mirrors WatchAgent→RestAfterPush and WatchSettled→RestAfterPush once core
     recognizes those bridges (pending push/repin). Calm/Static snap.
+103. **UnknownOutcome→Guard* Full-motion UI** — Full motion mirrors
+     UnknownOutcome→GuardFailure/Stuck/Recovery/Cautious vigil settles once core
+     recognizes those bridges; Find overlay scan caps come from core
+     `FIND_OVERLAY_SCAN_*`.

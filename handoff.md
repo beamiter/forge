@@ -1,8 +1,17 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (round 102: WatchAgent/WatchSettled→RestAfterPush UI contract)
+Updated: 2026-09-29 (round 103: UnknownOutcome→Guard* vigil settles)
 
 ## Completed since the previous handoff
+
+- **Organism UnknownOutcome→Guard* vigil settle UI contract (upgrade round 103,
+  pending core push/repin)** — Full motion mirrors UnknownOutcome→GuardFailure/
+  Stuck/Recovery/Cautious once core recognizes those bridges (pairs with
+  clear-vigil Idle and overwrite arcs from rounds 100–101).
+
+- **Find overlay scan budgets from core (upgrade round 103 companion)** —
+  `FindScanBudget::new` uses `FIND_OVERLAY_SCAN_{BYTE,TIME}_LIMIT` from
+  `jterm_core::cross_block_search` instead of local 4 MiB / 12 ms duplicates.
 
 - **Organism WatchAgent/WatchSettled→RestAfterPush UI contract (upgrade round 102,
   pending core push/repin)** — Full motion mirrors WatchAgent→RestAfterPush and
