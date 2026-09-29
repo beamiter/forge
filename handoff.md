@@ -1,8 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (round 105: ambient VisualTransition N/A probe)
+Updated: 2026-09-29 (round 106: close idle cross-block continue TODO + UPGRADE 104–105)
 
 ## Completed since the previous handoff
+
+- **Cross-block cancellable continue closed in TODO (upgrade round 106)** —
+  `TODO.md` P2 now marks the cancellable cross-block scan done in the landed
+  form from round 91 (`CrossBlockSearchCursor` + `glib::idle_add_local`), and
+  `UPGRADE_ROUNDS.md` backfills rounds 104–105 (Find/finished-output pins;
+  ambient VisualTransition N/A). Live VTE↔PCRE2 alignment stays open.
 
 - **AmbientBehavior Full-motion bridges (upgrade round 105 probe, N/A)** —
   UI ambient pose (Explore/Sleep/Approach/Idle) does not route through
@@ -1670,10 +1676,11 @@ doctor and correction probes.
   something to decide in the margin of another change.
 
 - **Moving the cross-block search scan to a cancellable worker** (TODO P2):
-  **done in upgrade round 91**. Budget-stopped walks return
-  `CrossBlockSearchCursor`; the dialog schedules `glib::idle_add_local`
-  continuations cancelled by search generation. Remaining related polish
-  (live-block VTE alignment vs PCRE2) is still open under TODO.md P2.
+  **done in upgrade round 91**; TODO checkbox closed in round 106. Budget-stopped
+  walks return `CrossBlockSearchCursor`; the dialog schedules
+  `glib::idle_add_local` continuations cancelled by search generation.
+  Remaining related polish (live-block VTE alignment vs PCRE2) is still open
+  under TODO.md P2.
 
 ### Follow-up migrations (next rounds)
 

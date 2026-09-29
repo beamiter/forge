@@ -488,3 +488,16 @@ quality gates listed in `README.md`.
      UnknownOutcome→GuardFailure/Stuck/Recovery/Cautious vigil settles once core
      recognizes those bridges; Find overlay scan caps come from core
      `FIND_OVERLAY_SCAN_*`.
+
+104. **Find-overlay / finished-output test pins** — live-dump and aggregate
+     FindScanBudget regressions use `FIND_OVERLAY_SCAN_{BYTE,TIME}_LIMIT`;
+     finished-output notice tests pin `FINISHED_OUTPUT_*`. TODO clarifies
+     CROSS_BLOCK_* vs FIND_OVERLAY_* budgets.
+
+105. **Ambient VisualTransition N/A probe** — UI ambient pose
+     (Explore/Sleep/Approach/Idle) does not route through
+     `VisualTransition::between`; no ambient snap bridges to add.
+
+106. **Close idle cross-block continue TODO** — mark the cancellable
+     cross-block scan P2 done in the round-91 idle-continuation form;
+     backfill ledger rounds 104–105. Live VTE↔PCRE2 alignment stays open.
