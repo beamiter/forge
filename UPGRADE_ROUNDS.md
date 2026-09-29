@@ -470,3 +470,7 @@ quality gates listed in `README.md`.
     mirrors WatchCommand→Celebrate{,Big}/Inspect/SitNear/RestAfterPush and
     WatchAgent→Celebrate/Inspect/SitNear once core recognizes those bridges
     (pending push/repin). Calm/Static snap.
+99. **Shared CrossBlockSearchCursor** — resume cursor / mid-record /
+    generation-current predicate / cross-block budget constants come from
+    `jterm_core::cross_block_search` (pending core push/repin). GTK idle and
+    `CrossBlockSearchReport`/`FindScanBudget` stay local.

@@ -1,8 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (round 98: WatchCommand/WatchAgent finish UI contract)
+Updated: 2026-09-29 (round 99: shared CrossBlockSearchCursor)
 
 ## Completed since the previous handoff
+
+- **Shared CrossBlockSearchCursor (upgrade round 99, pending core push/repin)** —
+  resume cursor, mid-record point, generation-current predicate, and
+  cross-block scan budget constants re-export `jterm_core::cross_block_search`.
+  GTK idle scheduling and `CrossBlockSearchReport`/`FindScanBudget` stay local
+  (hit rows differ; Find overlay shares the budget type).
 
 - **Organism WatchCommand/WatchAgent finish UI contract (upgrade round 98,
   pending core push/repin)** — Full motion mirrors
