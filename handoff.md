@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (1804 find beside rounds 256–259)
+
+## 2026-09-30 (sticky/find/organism edges — round 260)
+
+- 1804/colon find QueryNoMatches + stale beside rounds 256–259 sticky 1805 /
+  output_notice / MAX-11 / Unknown→GuardFailure. Unique round **260**. Pairs
+  anvil 207 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-09-30 (sticky 1805 + output_notice + MAX-11 cancel + Unknown→GuardFailure)
 
 ## 2026-09-30 (sticky/find/organism edges — rounds 256–259)
