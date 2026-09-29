@@ -19,7 +19,9 @@ P1 四项已在 `jterm_core` `9f94f77` 这一轮全部完成；P2 中的 history
 - [ ] 对齐 live block 的搜索数据源与 VTE 实际缓冲区，避免 prompt、command 和保留 scrollback 导致 Rust 计数与 PCRE2 选中项错位。
 - [x] 跨块搜索记录 surface 内 occurrence/line，选择结果会从 surface 顶部精确步进到对应命中；超过 4096 步或中途耗尽时 fail closed，不再高亮较早的错误命中。
 - [ ] 将跨块搜索扫描移到可取消 worker，避免大历史扫描阻塞 GTK 主线程。
-  （部分落地：主线程扫描现有 8 MiB / 48 ms 预算，`scan_incomplete` 会在状态栏明示截断；续扫 worker 仍待做。）
+  （部分落地：主线程跨块 palette 扫描用 `CROSS_BLOCK_SCAN_*`（8 MiB / 48 ms），
+  live Find overlay 用更紧的 `FIND_OVERLAY_SCAN_*`（4 MiB / 12 ms）；
+  `scan_incomplete` 会在状态栏明示截断；续扫 worker 仍待做。）
 - [ ] 为 per-session history 设计可证明所有权的安全 GC：依据 state manifest 与 active/restorable session 集合清理；禁止恢复基于文件名或 mtime 的猜测式删除。
 - [x] 当 history 因预算、损坏或 revision 冲突进入 fail-closed 时提供明确的 Reload/Retry 入口和持久状态提示。
 - [ ] 文件树根目录或子目录扫描失败时显示可聚焦错误、Retry 与 toast，区分空目录和权限/I/O 错误。
