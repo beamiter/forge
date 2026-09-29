@@ -5435,6 +5435,11 @@ tail ab";
         assert!(!cross_block_search_continue_is_current(
             u64::MAX, near_wrap, false
         ));
+        // Finished walk at the near-wrap generation itself (MAX-1,MAX-1,no
+        // resume) cancels like MAX,MAX finished — beside the MAX-1→MAX bump.
+        assert!(!cross_block_search_continue_is_current(
+            near_wrap, near_wrap, false
+        ));
     }
 
     #[test]
