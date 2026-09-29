@@ -926,3 +926,11 @@ quality gates listed in `README.md`.
 199. **GlanceAside↔ambient Full-motion None completeness** — Full motion pins
      GlanceAside↔Explore/Sleep/Approach intentional None beside the prior
      GlanceAside overwrite table. Pairs anvil 157 / between() 93.
+
+200. **CrossBlock cancel near-wrap bump** — palette idle continuation drops
+     MAX-1→MAX generation bumps (with or without resume) and keeps a live
+     resume at matching MAX. Pairs anvil 158 / core cancel edge.
+
+201. **CrossBlock cancel scheduled-ahead near-wrap** — scheduled MAX vs live
+     MAX-1 cancels with or without resume (speculative gen / rewound live
+     beside the MAX-1→MAX bump). Pairs anvil 159 / core cancel edge.
