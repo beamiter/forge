@@ -579,3 +579,19 @@ quality gates listed in `README.md`.
      `search_generation`) so a finished Bookmarked scan that added no hits
      keeps the bookmark-empty copy. Pairs anvil round 87.
 
+122. **Core tip STAGE_PREFIXES daemonize/setlock/s6-setuidgid (len 67)** —
+     path-patched local `jterm_core` peels `daemonize` / `setlock` /
+     `s6-setuidgid` (STAGE_PREFIXES 64→67) with `classify_command` see-through
+     (including `--` before the s6 account) and leftover pin for `s6-envdir` /
+     `s6-log` / runit helpers; Cargo manifests stay on the published pin
+     (pending push/repin). Pairs anvil round 88.
+
+123. **Celebrate*/Rest/GuardRecovery hold-overwrite UI contract** — Full motion
+     mirrors core Celebrate*/RestAfterPush/GuardRecovery finish overwrites
+     (`between()` 76→90). Rest/GuardRecovery→Watch* stay None. Pairs anvil
+     round 89; core hold-overwrite survey wave.
+
+124. **Find stale-bookmark empty-reason pin** — bookmark ids absent from the
+     current retained records list are `NoRetainedBookmarks`, not a metadata
+     or query miss. Pairs anvil round 90 (empty-query browser `None`).
+
