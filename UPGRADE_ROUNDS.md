@@ -939,3 +939,24 @@ quality gates listed in `README.md`.
      pins those vigil poses→Celebrate{,Big} intentional None (success finishes
      via Watch*; Recovery→Celebrate already covered in round 178). Pairs anvil
      160 / core `failure_stuck_cautious_never_bridge_to_celebrate_holds`.
+
+203. **Sticky interior mid-range VS / Mongolian nirugu labels** —
+     U+FE02 / U+FE0C / U+180A variants of "Save Block history" stay toast-only
+     beside rounds 196/192. Pairs anvil 161.
+
+204. **output_notice interior mid-range VS / Mongolian nirugu near-miss gate** —
+     U+FE02 / U+FE0C / U+180A-padded Truncated/Partly/Earlier strings stay
+     outside the known-set remount gate beside rounds 197/193. Pairs anvil sticky tip.
+
+205. **Find Hangul/Braille/ideo/Ogham-query QueryNoMatches + stale** —
+     U+115F / U+3164 / U+2800 / U+3000 / U+1680-only queries stay
+     QueryNoMatches under Command/Output/All when stale ids remain (marks/WJ
+     already pinned). Pairs anvil 162.
+
+206. **WatchAgent→CelebrateBig + Watch*→Unknown Full-motion None** — Full
+     motion pins WatchAgent→CelebrateBig and WatchCommand/Agent/Settled→
+     UnknownOutcome intentional None. Pairs anvil 163 / core watch_* None pins.
+
+207. **CrossBlock cancel finished at near-wrap gen** — palette idle continuation
+     drops MAX-1,MAX-1 finished walks (no resume) beside the MAX-1→MAX bump.
+     Pairs anvil 164 / core `continue_idle_resume_edges_drop_stale_or_finished_walks`.
