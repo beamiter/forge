@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (sticky 1802 + MAX-8 cancel + Unknown→GuardRecovery)
+
+## 2026-09-29 (sticky/find/organism edges — rounds 241–244)
+
+- Sticky Mongolian comma (U+1802) + output_notice gate, CrossBlock
+  near-near-near-near-near-near-near-near-wrap (MAX-8→MAX-7) cancel, and
+  UnknownOutcome→GuardRecovery Full-motion bridge + UI membership sync
+  beside rounds 236–240. Unique rounds **241–244**. Pairs anvil 192–194 /
+  core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-09-29 (FE07 find beside rounds 236–239)
 
 ## 2026-09-29 (sticky/find/organism edges — round 240)
