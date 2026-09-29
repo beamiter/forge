@@ -306,6 +306,8 @@ mod tests {
             // beside FE06/FE08/Manchu full stop.
             "Save Block\u{fe07}history",
             "Save Block\u{1800}history",
+            // Mongolian ellipsis stays toast-only beside FE07/birga (one edge).
+            "Save Block\u{1801}history",
             "Block history",
         ] {
             assert_eq!(
