@@ -7261,6 +7261,25 @@ mod tests {
         );
     }
 
+    /// File-op toasts must keep permission distinct from missing — same split
+    /// as directory_scan_errors_distinguish_permission_from_missing, but for
+    /// rename/delete/copy public copy (never collapse into the generic Other).
+    #[test]
+    fn file_operation_errors_distinguish_permission_from_missing() {
+        assert_eq!(
+            public_file_operation_error_message(&io::Error::from(io::ErrorKind::PermissionDenied)),
+            "Permission denied"
+        );
+        assert_eq!(
+            public_file_operation_error_message(&io::Error::from(io::ErrorKind::NotFound)),
+            "The item no longer exists"
+        );
+        assert_ne!(
+            public_file_operation_error_message(&io::Error::from(io::ErrorKind::PermissionDenied)),
+            public_file_operation_error_message(&io::Error::from(io::ErrorKind::NotFound))
+        );
+    }
+
     /// Handoff/TODO leftover: empty listings are success rows, while permission
     /// and missing roots must surface distinct public copy (Retry + toast stay
     /// on the Error status path — never reuse the empty-directory presentation).
