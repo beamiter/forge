@@ -1105,3 +1105,8 @@ quality gates listed in `README.md`.
      Celebrate*/Rest pins (dedicated Full-motion hold already at round 234).
      Pairs anvil 190 / core `GuardRecoveryToUnknownOutcome` inside between() 93.
 
+240. **Find FE07/birga-query QueryNoMatches + stale** —
+     U+FE07 / U+1800-only queries stay QueryNoMatches under
+     Command/Output/All when stale ids remain (FE06/Manchu-full-stop already pinned).
+     Pairs anvil 191.
+
