@@ -3148,6 +3148,11 @@ mod tests {
                 format!("{base}\u{fe01}"),
                 format!("{base}\u{fe0d}"),
                 format!("{base}\u{180f}"),
+                // Interior mid-range VS / Mongolian nirugu catch-up beside the
+                // sticky FE02/FE0C/nirugu wave — still outside the known-set.
+                format!("{base}\u{fe02}"),
+                format!("{base}\u{fe0c}"),
+                format!("{base}\u{180a}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
