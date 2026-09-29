@@ -1,5 +1,18 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (sticky quad-space/RLI/FSI + find All empty+stale + notice catch-up)
+
+## 2026-09-29 (sticky quad-space/RLI/FSI + find All empty+stale + notice catch-up)
+
+- **Round 167**: sticky U+2000–U+2006 / U+2067–U+2068 near-miss labels stay toast-only.
+- **Round 168**: Find All-scope empty query stays None with stale extras.
+- **Round 169**: output_notice punct/quad-space/RLI near-miss restore gate catch-up.
+  Rounds 164–166 (punct/thin/hair + Command/Output empty+stale + ZWJ notice)
+  and 161–163 (WatchSettled/CrossBlock/PATH wave-30) sit beside. STAGE 71 /
+  between() 93 unchanged. Core/jagent tips still **pending push/repin**.
+
+
+
 Updated: 2026-09-29 (WatchSettled finish + CrossBlock wrap-ahead + PATH wave-30 tip)
 
 ## 2026-09-29 (WatchSettled finish + CrossBlock wrap-ahead + PATH wave-30)
