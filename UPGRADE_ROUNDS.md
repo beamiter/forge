@@ -840,3 +840,35 @@ quality gates listed in `README.md`.
 179. **Celebrate*→Watch* Full-motion None** — Full motion pins
      Celebrate{,Big}→WatchCommand/Agent/Settled intentional None. Pairs anvil
      140 / core `celebrate_holds_never_bridge_to_watch_poses`.
+
+180. **Hold/rest→ambient Full-motion None** — Full motion pins Celebrate{,Big}/
+     Inspect/Sit/Unknown/Rest→Explore/Sleep/Approach intentional None. Pairs
+     anvil 141 / core `hold_and_rest_poses_never_bridge_to_ambient_utility`.
+
+181. **Guard*→ambient Full-motion None** — Full motion pins
+     GuardFailure/Stuck/Recovery/Cautious→Explore/Sleep/Approach intentional
+     None. Pairs anvil 142 / core `repo_vigil_guards_never_bridge_to_ambient_utility`.
+
+182. **Watch* mode-switch Full-motion None** — Full motion pins
+     WatchCommand↔WatchAgent↔WatchSettled intentional None (live SurfaceMode
+     remaps). Pairs anvil 143 / core `watch_pose_mode_switches_have_no_visual_transition`.
+
+183. **CrossBlock cancel finished at wrap gen** — palette idle continuation
+     drops `MAX,MAX` finished walks (no resume) beside MAX→0 schedule bump.
+     Pairs anvil 144 / core cancel edge.
+
+184. **Sticky Retry continues after sync refusal** — `retry_block_history`
+     re-shows on Err but does not break/return before later leaves retry.
+     Pairs anvil 145.
+
+185. **Sticky near-miss Mongolian FVS / mid ZWNBSP / interlinear labels** —
+     U+180B–U+180D / mid U+FEFF / U+FFF9–U+FFFB variants of "Save Block history"
+     stay toast-only beside rounds 175/170. Pairs anvil 146.
+
+186. **Find Command/Output/All NBSP/ZWSP-query QueryNoMatches + stale** —
+     NBSP / ZWSP-only queries stay QueryNoMatches when stale ids remain (ASCII
+     whitespace already pinned). Pairs anvil 147.
+
+187. **output_notice Mongolian FVS / mid ZWNBSP / interlinear near-miss gate** —
+     FVS / mid ZWNBSP / interlinear-padded Truncated/Partly/Earlier strings stay
+     outside the known-set remount gate beside rounds 177/172. Pairs anvil sticky tip.
