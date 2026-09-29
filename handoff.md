@@ -1,5 +1,28 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (sticky NNBSP + Find All-scope stale)
+
+## 2026-09-29 (sticky NNBSP + Find All-scope stale)
+
+- **Round 154**: sticky U+202F/U+205F/U+2062–2064 near-miss labels stay toast-only.
+- **Round 155**: Find All-scope NoRetainedTextInScope with stale extras.
+  Rounds 151–153 (Inspect/Sit→Unknown 91→93, Idle→hold None, CrossBlock cancel)
+  sit beside if present. STAGE tip already ledgered. Core/jagent tips still
+  **pending push/repin**.
+
+
+Updated: 2026-09-29 (Inspect/Sit→Unknown 93 + Idle pin + CrossBlock cancel)
+
+## 2026-09-29 (Inspect/Sit→Unknown 93 + Idle pin + CrossBlock cancel)
+
+- **Round 151**: Full-motion Inspect/SitNear→UnknownOutcome (pairs core 91→93).
+- **Round 152**: Idle→Inspect/Sit/Unknown/Celebrate{,Big}/Rest Full-motion None
+  beside ambient→hold/rest (pairs core Idle pin / anvil 118).
+- **Round 153**: CrossBlock continue cancel pins scheduled-ahead + gen-0
+  finished (pairs core cancel/resume edge / anvil 119).
+  STAGE 70 tip already ledgered at round 130. Core/jagent tips still
+  **pending push/repin**.
+
 Updated: 2026-09-29 (ReloadFirst save + CelebrateBig 91 lockstep + find/history edges)
 
 ## 2026-09-29 (ReloadFirst save + CelebrateBig 91 lockstep + find/history edges)

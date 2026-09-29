@@ -710,3 +710,24 @@ quality gates listed in `README.md`.
      U+2028/U+2029 `"Save Block history"` stay toast-only; padded/cased
      Truncated/Partly/Earlier strings stay outside the known-set remount gate.
      Pairs anvil 116.
+
+151. **Inspect/SitNear→UnknownOutcome Full-motion (91→93)** — Full-motion
+     `semantic_bridges` mirrors core error-hold missing-exit overwrites.
+     CelebrateBig fifteen lockstep recounts against `between()` **93**.
+     Pairs anvil 117.
+
+152. **Idle→hold/cele/rest None UI** — Idle never bridges to Inspect/Sit/
+     Unknown/Celebrate{,Big}/RestAfterPush under Full motion (live finishes
+     via Watch*). Pairs anvil 118 / core Idle pin.
+
+153. **CrossBlock continue cancel scheduled-ahead + gen-0** — palette idle
+     continue pins scheduled generation ahead of live and gen-0 finished
+     (no resume) as cancel. Pairs anvil 119 / core cancel edge.
+
+154. **Sticky near-miss NNBSP/MMSP/invisible-math labels** — U+202F / U+205F /
+     U+2062 / U+2063 / U+2064 variants of `"Save Block history"` stay toast-only
+     beside round 150. Pairs anvil 120.
+
+155. **Find All-scope NoRetainedTextInScope + stale** — whitespace-only command
+     and output stay NoRetainedTextInScope under All scope when stale ids remain.
+     Pairs anvil 121.
