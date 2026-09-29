@@ -3101,6 +3101,15 @@ mod tests {
                 format!("{base}\u{0085}"),
                 format!("\u{3000}{base}"),
                 format!("{base}\u{2061}"),
+                // Punct/thin/hair + en/em/three-per-em + RLI catch-up beside
+                // the sticky quad-space wave — still outside the known-set gate.
+                format!("{base}\u{2008}"),
+                format!("{base}\u{2009}"),
+                format!("{base}\u{200a}"),
+                format!("\u{2000}{base}"),
+                format!("\u{2003}{base}"),
+                format!("{base}\u{2004}"),
+                format!("\u{2067}{base}\u{2069}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
