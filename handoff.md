@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (GuardFailure/Stuck/Cautious error-hold None UI)
+
+## 2026-09-29 (GuardFailure/Stuck/Cautious→error-hold None UI)
+
+- **Round 125**: Full motion pins Failure/Stuck/Cautious→Inspect/Sit/Unknown
+  as None beside Recovery's finish-overwrite bridges. Pairs anvil 91.
+
 Updated: 2026-09-29 (Celebrate/Rest/Recovery hold overwrites UI, between 90)
 
 ## 2026-09-29 (Celebrate*/Rest/GuardRecovery hold-overwrite UI contract)
