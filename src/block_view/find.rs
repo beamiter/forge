@@ -4943,6 +4943,58 @@ tail ab";
             }
         }
     }
+    #[test]
+    fn bookmarked_empty_reason_keeps_1803_full_stop_query_no_matches_with_stale() {
+        let retained = CompletedCommandRecord {
+            id: 1,
+            cmd: "echo retained".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(20),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
+            start_mark_seen: true,
+        };
+        let retained_output = ZoneOutputSnapshot {
+            plain: "noise line\n".to_string(),
+            truncated: false,
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &retained,
+            snapshot: Some(&retained_output),
+        }];
+        let mut bookmarks = BookmarkState::default();
+        bookmarks.toggle(1);
+        bookmarks.toggle(99);
+        bookmarks.toggle(100);
+        let filters = BlockFilters {
+            bookmarked_only: true,
+            ..Default::default()
+        };
+        for query in ["\u{1803}"] {
+            for scope in [
+                CrossBlockSearchScope::Command,
+                CrossBlockSearchScope::Output,
+                CrossBlockSearchScope::All,
+            ] {
+                assert_eq!(
+                    bookmarked_search_empty_reason(
+                        records,
+                        query,
+                        scope,
+                        &filters,
+                        &bookmarks,
+                    ),
+                    Some(BookmarkedSearchEmptyReason::QueryNoMatches),
+                    "{query:?} {scope:?} must stay no-matches beside stale"
+                );
+            }
+        }
+    }
+
 
 
 
