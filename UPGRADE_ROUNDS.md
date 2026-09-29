@@ -627,3 +627,7 @@ quality gates listed in `README.md`.
      local core teaches util-linux util clamp + GameMode env launcher peels;
      GuardFailure/Stuck/Cautious→Celebrate* None survey pin; `between()` stays
      90. Manifests stay on published pins. Pairs anvil round 97.
+
+131. **Sticky near-miss Block-history labels** — padded / cased / truncated
+     `"Save Block history"` strings stay on the toast surface (exact worker
+     label only). Pairs anvil round 95.
