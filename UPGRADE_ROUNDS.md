@@ -518,3 +518,8 @@ quality gates listed in `README.md`.
 110. **WatchCommand→UnknownOutcome None UI** — Full motion pins
      WatchCommand→UnknownOutcome as None (missing exit status snaps), pairing
      core intentional None beside WatchAgent→UnknownOutcome.
+
+111. **Core tip STAGE_PREFIXES strace/scriptlive (len 60)** — path-patched
+     local `jterm_core` peels `strace` / `scriptlive` (STAGE_PREFIXES 58→60)
+     with `classify_command` see-through; Cargo manifests stay on the
+     published pin (pending push/repin).
