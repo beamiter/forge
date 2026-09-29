@@ -1110,3 +1110,21 @@ quality gates listed in `README.md`.
      Command/Output/All when stale ids remain (FE06/Manchu-full-stop already pinned).
      Pairs anvil 191.
 
+241. **Sticky Mongolian comma label** —
+     U+1802 variant of "Save Block history" stays toast-only beside ellipsis
+     (round 236). Pairs anvil 192.
+
+242. **output_notice Mongolian comma gate** —
+     U+1802-padded Truncated/Partly/Earlier strings stay outside the known-set
+     remount gate beside sticky 1802. Pairs anvil sticky tip.
+
+243. **CrossBlock cancel near-near-near-near-near-near-near-near-wrap bump** — palette idle
+     continuation drops MAX-8→MAX-7 generation bumps (with or without resume),
+     scheduled ahead MAX-7 vs MAX-8, and finished walks at MAX-8. Pairs anvil
+     193 / core cancel edge.
+
+244. **UnknownOutcome→GuardRecovery Full-motion bridge** — Full motion animates
+     UnknownOutcome→GuardRecovery; Calm/Static snap + semantic_bridges
+     membership sync. Pairs anvil 194 / core `UnknownOutcomeToGuardRecovery`
+     reverse of GuardRecovery→Unknown inside between() 93.
+
