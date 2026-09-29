@@ -645,3 +645,16 @@ quality gates listed in `README.md`.
      success listings. Closes TODO.md P2 file-tree Retry/toast leftover.
      Pin `directory_scan_errors_distinguish_permission_from_missing`. Pairs
      anvil round 100. STAGE 70 tip already ledgered at round 130.
+
+135. **Sticky near-miss whitespace/invisible labels** — tab / CR / NBSP / ZWSP /
+     BOM / VT variants of `"Save Block history"` stay toast-only. Catch-up
+     beside anvil rounds 100–101.
+136. **File-op permission vs missing** — `public_file_operation_error_message`
+     keeps PermissionDenied distinct from NotFound beside round 134 directory
+     scan. Pairs anvil 102 FS copy pin.
+137. **Find MetadataMismatch with stale extras** — live bookmark failing
+     metadata filters stays MetadataMismatch when stale ids remain. Pairs
+     anvil 103.
+138. **Ambient→Watch* None UI** — Idle/Explore/Sleep/Approach never bridge to
+     WatchCommand/Agent/Settled under Full motion (Watch*→Idle animates).
+     Pairs anvil 104.
