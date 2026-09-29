@@ -1,5 +1,17 @@
 # Engineering handoff
 
+## 2026-09-29 (FindScanBudget + Options/Scope + generic Report)
+
+- Re-exports `FindScanBudget`, `CrossBlockSearchOptions` /
+  `CrossBlockSearchScope`, and hit-generic `CrossBlockSearchReport<CrossBlockHit>`
+  from `jterm_core::cross_block_search` (path-patched tip; pending push/repin).
+- `CrossBlockHit` stays local — forge omits anvil's exit_code / duration_ms /
+  cwd palette-chrome fields; core pin documents the divergence.
+- GTK idle scheduling stays here. Pairs anvil companion commit.
+
+Updated: 2026-09-29 (FindScanBudget / Options / Report from core)
+
+
 ## 2026-09-29 (core tip STAGE_PREFIXES strace/scriptlive)
 
 - **STAGE_PREFIXES len 58→60** on path-patched local core tip (`2e867b8`) —
