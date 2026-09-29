@@ -478,3 +478,6 @@ quality gates listed in `README.md`.
     mirrors UnknownOutcome→Idle and UnknownOutcome→InspectError once core
     recognizes those bridges (pending push/repin). GlanceAside stays live-only.
     Calm/Static snap.
+101. **Organism UnknownOutcome success/sit overwrite UI contract** — Full motion
+    mirrors UnknownOutcome→Celebrate{,Big} and UnknownOutcome→SitNearError once
+    core recognizes those bridges (pending push/repin). Calm/Static snap.
