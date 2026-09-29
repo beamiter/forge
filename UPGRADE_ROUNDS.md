@@ -783,3 +783,16 @@ quality gates listed in `README.md`.
      Truncated/Partly/Earlier strings stay outside the known-set remount gate
      beside rounds 159/150. Pairs anvil STAGE tip.
 
+167. **Sticky near-miss en/em/quad-space + RLI/FSI labels** — U+2000–U+2006 /
+     U+2067 / U+2068 variants of `"Save Block history"` stay toast-only beside
+     rounds 164/156. Pairs anvil 131.
+
+168. **Find All-scope empty-query browser + stale** — empty query under All
+     scope stays `None` (browser) when stale ids remain beside a live scoped
+     bookmark (Command/Output empty+stale already pinned). Pairs anvil 132.
+
+169. **output_notice punct/quad-space/RLI near-miss gate** — punct/thin/hair /
+     en/em/three-per-em / RLI-padded Truncated/Partly/Earlier strings stay
+     outside the known-set remount gate beside rounds 166/159. Pairs anvil
+     sticky/find tip.
+
