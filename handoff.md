@@ -1,13 +1,19 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (core tip pending-push clarification)
+Updated: 2026-09-29 (round 100: UnknownOutcome settle/overwrite UI contract)
 
 ## Completed since the previous handoff
 
-- **Local core tip `dd16df9` still pending push/repin** (clarification) — path
+- **Organism UnknownOutcome settle/overwrite UI contract (upgrade round 100,
+  pending core push/repin)** — Full motion mirrors UnknownOutcome→Idle and
+  UnknownOutcome→InspectError once core recognizes those bridges. GlanceAside
+  stays live-only.
+
+- **Local core tip `7199b4c` still pending push/repin** (clarification) — path
   patches already see shared `cross_block_search` (`36675b0`) and
-  `output_notice` plus later organism/STAGE_PREFIXES waves; Cargo manifests
-  stay on published `33093da` until a pusher publishes the tip cohort.
+  `output_notice` plus later organism/STAGE_PREFIXES/UnknownOutcome waves;
+  Cargo manifests stay on published `33093da` until a pusher publishes the tip
+  cohort.
 
 - **Shared CrossBlockSearchCursor (upgrade round 99, pending core push/repin)** —
   resume cursor, mid-record point, generation-current predicate, and
