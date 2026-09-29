@@ -909,3 +909,20 @@ quality gates listed in `README.md`.
      motion pins Idle↔Sleep/Approach, Explore↔Approach, Approach↔Sleep
      intentional None beside the partial ambient table. Pairs anvil 154 /
      core `ambient_disposition_exchanges_have_no_visual_transition`.
+
+196. **Sticky near-miss mid-range VS / Mongolian FVS4 labels** —
+     U+FE01 / U+FE0D / U+180F variants of "Save Block history" stay toast-only
+     beside rounds 192/185. Pairs anvil 155.
+
+197. **output_notice mid-range VS / Mongolian FVS4 near-miss gate** —
+     U+FE01 / U+FE0D / U+180F-padded Truncated/Partly/Earlier strings stay
+     outside the known-set remount gate beside rounds 193/187. Pairs anvil sticky tip.
+
+198. **Find ZWNJ/ZWJ/LRM/RLM/ALM-query QueryNoMatches + stale** —
+     U+200C / U+200D / U+200E / U+200F / U+061C-only queries stay
+     QueryNoMatches under Command/Output/All when stale ids remain (WJ/figure/
+     bidi already pinned). Pairs anvil 156.
+
+199. **GlanceAside↔ambient Full-motion None completeness** — Full motion pins
+     GlanceAside↔Explore/Sleep/Approach intentional None beside the prior
+     GlanceAside overwrite table. Pairs anvil 157 / between() 93.
