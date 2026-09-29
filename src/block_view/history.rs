@@ -3153,6 +3153,11 @@ mod tests {
                 format!("{base}\u{fe02}"),
                 format!("{base}\u{fe0c}"),
                 format!("{base}\u{180a}"),
+                // Closer mid-range VS / Mongolian Todo soft hyphen catch-up
+                // beside the sticky FE03/FE0B/1806 wave — still outside the gate.
+                format!("{base}\u{fe03}"),
+                format!("{base}\u{fe0b}"),
+                format!("{base}\u{1806}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
