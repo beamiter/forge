@@ -1149,3 +1149,7 @@ quality gates listed in `README.md`.
      UnknownOutcome→GuardCautious; Calm/Static snap + semantic_bridges
      membership sync. Unknown↔GuardRecovery already synced in rounds 239/244.
      Pairs anvil 198 / core `UnknownOutcomeToGuardCautious` inside between() 93.
+250. **Find 1802/comma-query QueryNoMatches + stale** —
+     U+1802-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (1801/ellipsis already pinned). Pairs anvil 199.
+
