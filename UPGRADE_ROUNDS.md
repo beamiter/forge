@@ -819,3 +819,24 @@ quality gates listed in `README.md`.
      comment notes WatchSettled finish six sit inside between() **93**. Pairs
      anvil 136 / core `watch_poses_never_bridge_to_ambient_utility`.
 
+175. **Sticky near-miss Ogham/MVS/CGJ/VS/Khmer labels** — U+1680 / U+180E /
+     U+034F / U+FE00 / U+FE0E / U+FE0F / U+17B4 / U+17B5 variants of
+     "Save Block history" stay toast-only beside rounds 170/167. Pairs anvil
+     137.
+
+176. **Find All-scope whitespace-query QueryNoMatches + stale** —
+     whitespace-only `" \t "` under All stays QueryNoMatches when stale ids
+     remain (Command/Output whitespace already pinned). Pairs anvil 138.
+
+177. **output_notice Ogham/MVS/CGJ/VS/Khmer near-miss gate** — Ogham space /
+     MVS / CGJ / VS / Khmer-inherent padded Truncated/Partly/Earlier strings
+     stay outside the known-set remount gate beside rounds 172/169. Pairs
+     anvil sticky tip.
+
+178. **Guard*→Celebrate* Full-motion None** — Full motion pins
+     GuardFailure/Stuck/Recovery/Cautious→Celebrate{,Big} intentional None.
+     Pairs anvil 139 / core `repo_vigil_guards_never_bridge_to_celebrate`.
+
+179. **Celebrate*→Watch* Full-motion None** — Full motion pins
+     Celebrate{,Big}→WatchCommand/Agent/Settled intentional None. Pairs anvil
+     140 / core `celebrate_holds_never_bridge_to_watch_poses`.
