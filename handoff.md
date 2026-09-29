@@ -8,8 +8,8 @@ Updated: 2026-09-29 (sticky ZWJ + find query scopes + cancel/notice + STAGE 71 t
 - **Round 157**: Find Command/Output-scope QueryNoMatches with stale extras.
 - **Round 158**: CrossBlock continue cancel ahead-without-resume + wrapping finished.
 - **Round 159**: output_notice CR/NBSP/ZWSP/BOM/soft-hyphen near-miss restore gate.
-- **Round 160**: path-patched core tip STAGE 71 () + timeout/nice nest;
-  Inspect/Sit→Unknown  93 already ledgered at rounds 151–153.
+- **Round 160**: path-patched core tip STAGE 71 (`openvt`) + timeout/nice nest;
+  Inspect/Sit→Unknown `between()` 93 already ledgered at rounds 151–153.
   Core/jagent tips still **pending push/repin**.
 
 

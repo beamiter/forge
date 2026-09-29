@@ -733,7 +733,7 @@ quality gates listed in `README.md`.
      Pairs anvil 121.
 
 156. **Sticky near-miss ZWJ/RLM/FA/ideo/NEL labels** — U+200D / U+200F /
-     U+2061 / U+3000 / U+0085 variants of  stay toast-only
+     U+2061 / U+3000 / U+0085 variants of `"Save Block history"` stay toast-only
      beside round 154. Pairs anvil 122.
 
 157. **Find Command/Output-scope QueryNoMatches + stale** — live bookmark whose
@@ -749,6 +749,6 @@ quality gates listed in `README.md`.
      outside the known-set remount gate beside round 150. Pairs anvil STAGE tip.
 
 160. **Core tip STAGE_PREFIXES openvt (len 71)** — path-patched local core
-     teaches kbd  VT launcher peels (/ meta) plus
-     timeout/nice nest classify; Inspect/Sit→Unknown  **93** already
+     teaches kbd `openvt` VT launcher peels (`-c`/`--console` meta) plus
+     timeout/nice nest classify; Inspect/Sit→Unknown `between()` **93** already
      ledgered. Manifests stay on published pins. Pairs anvil 125.
