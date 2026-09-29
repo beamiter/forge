@@ -191,6 +191,100 @@ fn update_cross_block_bookmark_buttons(
     }
 }
 
+/// Append one palette hit row, including the bookmark suffix. Shared by the
+/// initial rebuild and `pending_scan_continue` idle slices so continued hits
+/// stay bookmarkable (parity with anvil's append_hit_row).
+fn append_cross_block_hit_row(
+    list_box: &gtk4::ListBox,
+    term_view: &Rc<crate::block_view::TermView>,
+    hit: &crate::block_view::CrossBlockHit,
+    jumpable: &std::collections::HashSet<(u64, bool)>,
+    row_bookmark_buttons: &Rc<RefCell<Vec<(u64, gtk4::ToggleButton)>>>,
+    status_label: &gtk4::Label,
+    filter_entry: &SearchEntry,
+    observed_version: &Rc<Cell<crate::block_view::CrossBlockSearchVersion>>,
+    schedule_rebuild_slot: &CrossBlockScheduleRebuildSlot,
+    bookmarked_toggle: &gtk4::ToggleButton,
+) {
+    let can_jump = jumpable.contains(&(hit.block_id, hit.is_output));
+    let surface = if hit.is_output { "out" } else { "cmd" };
+    let mut subtitle = format!(
+        "{surface} L{}: {}",
+        hit.line_no,
+        glib::markup_escape_text(&hit.line_text)
+    );
+    if !can_jump {
+        subtitle.push_str(" — location unavailable");
+    }
+    let row = adw::ActionRow::builder()
+        .title(glib::markup_escape_text(&hit.cmd_preview).as_str())
+        .subtitle(&subtitle)
+        .activatable(can_jump)
+        .build();
+    let bookmark_button = gtk4::ToggleButton::new();
+    bookmark_button.add_css_class("flat");
+    bookmark_button.set_valign(gtk4::Align::Center);
+    update_cross_block_bookmark_button(
+        &bookmark_button,
+        term_view.is_record_bookmarked(hit.block_id),
+    );
+    row_bookmark_buttons
+        .borrow_mut()
+        .push((hit.block_id, bookmark_button.clone()));
+    {
+        let term_view = term_view.clone();
+        let filter_entry = filter_entry.clone();
+        let status_label = status_label.clone();
+        let observed_version = observed_version.clone();
+        let schedule_rebuild_slot = schedule_rebuild_slot.clone();
+        let row_bookmark_buttons = row_bookmark_buttons.clone();
+        let bookmarked_toggle = bookmarked_toggle.clone();
+        let record_id = hit.block_id;
+        bookmark_button.connect_clicked(move |button| {
+            if let Some(active) = term_view.toggle_record_bookmark(record_id) {
+                update_cross_block_bookmark_buttons(
+                    &row_bookmark_buttons.borrow(),
+                    record_id,
+                    active,
+                );
+                observed_version.set(term_view.cross_block_search_version());
+                if bookmarked_toggle.is_active() {
+                    if let Some(schedule) = schedule_rebuild_slot
+                        .borrow()
+                        .as_ref()
+                        .and_then(std::rc::Weak::upgrade)
+                    {
+                        schedule(true);
+                    }
+                }
+                status_label.announce(
+                    cross_block_bookmark_confirmation(active),
+                    gtk4::AccessibleAnnouncementPriority::Medium,
+                );
+            } else {
+                let active = term_view.is_record_bookmarked(record_id);
+                update_cross_block_bookmark_buttons(
+                    &row_bookmark_buttons.borrow(),
+                    record_id,
+                    active,
+                );
+                // Keep the clicked widget authoritative even if a
+                // defensive stale row was not present in the index.
+                update_cross_block_bookmark_button(button, active);
+                let message = cross_block_bookmark_unavailable_status();
+                status_label.set_text(message);
+                status_label.announce(
+                    message,
+                    gtk4::AccessibleAnnouncementPriority::Medium,
+                );
+            }
+            filter_entry.grab_focus();
+        });
+    }
+    row.add_suffix(&bookmark_button);
+    list_box.append(&row);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CrossBlockRefreshKeyDecision {
     Refresh,
@@ -1724,86 +1818,18 @@ impl UiState {
                         status_label.set_text(&status);
                         let jumpable = term_view.jumpable_search_hits(&results);
                         for hit in results.iter() {
-                            let can_jump = jumpable.contains(&(hit.block_id, hit.is_output));
-                            let surface = if hit.is_output { "out" } else { "cmd" };
-                            let mut subtitle = format!(
-                                "{surface} L{}: {}",
-                                hit.line_no,
-                                glib::markup_escape_text(&hit.line_text)
+                            append_cross_block_hit_row(
+                                &list_box,
+                                &term_view,
+                                hit,
+                                &jumpable,
+                                &row_bookmark_buttons,
+                                &status_label,
+                                &filter_entry,
+                                &observed_version,
+                                &schedule_rebuild_slot,
+                                &bookmarked_toggle,
                             );
-                            if !can_jump {
-                                subtitle.push_str(" — location unavailable");
-                            }
-                            let row = adw::ActionRow::builder()
-                                .title(glib::markup_escape_text(&hit.cmd_preview).as_str())
-                                .subtitle(&subtitle)
-                                .activatable(can_jump)
-                                .build();
-                            let bookmark_button = gtk4::ToggleButton::new();
-                            bookmark_button.add_css_class("flat");
-                            bookmark_button.set_valign(gtk4::Align::Center);
-                            update_cross_block_bookmark_button(
-                                &bookmark_button,
-                                term_view.is_record_bookmarked(hit.block_id),
-                            );
-                            row_bookmark_buttons
-                                .borrow_mut()
-                                .push((hit.block_id, bookmark_button.clone()));
-                            {
-                                let term_view = term_view.clone();
-                                let filter_entry = filter_entry.clone();
-                                let status_label = status_label.clone();
-                                let observed_version = observed_version.clone();
-                                let schedule_rebuild_slot = schedule_rebuild_slot.clone();
-                                let row_bookmark_buttons = row_bookmark_buttons.clone();
-                                let bookmarked_toggle = bookmarked_toggle.clone();
-                                let record_id = hit.block_id;
-                                bookmark_button.connect_clicked(move |button| {
-                                    if let Some(active) =
-                                        term_view.toggle_record_bookmark(record_id)
-                                    {
-                                        update_cross_block_bookmark_buttons(
-                                            &row_bookmark_buttons.borrow(),
-                                            record_id,
-                                            active,
-                                        );
-                                        observed_version
-                                            .set(term_view.cross_block_search_version());
-                                        if bookmarked_toggle.is_active() {
-                                            if let Some(schedule) = schedule_rebuild_slot
-                                                .borrow()
-                                                .as_ref()
-                                                .and_then(std::rc::Weak::upgrade)
-                                            {
-                                                schedule(true);
-                                            }
-                                        }
-                                        status_label.announce(
-                                            cross_block_bookmark_confirmation(active),
-                                            gtk4::AccessibleAnnouncementPriority::Medium,
-                                        );
-                                    } else {
-                                        let active = term_view.is_record_bookmarked(record_id);
-                                        update_cross_block_bookmark_buttons(
-                                            &row_bookmark_buttons.borrow(),
-                                            record_id,
-                                            active,
-                                        );
-                                        // Keep the clicked widget authoritative even if a
-                                        // defensive stale row was not present in the index.
-                                        update_cross_block_bookmark_button(button, active);
-                                        let message = cross_block_bookmark_unavailable_status();
-                                        status_label.set_text(message);
-                                        status_label.announce(
-                                            message,
-                                            gtk4::AccessibleAnnouncementPriority::Medium,
-                                        );
-                                    }
-                                    filter_entry.grab_focus();
-                                });
-                            }
-                            row.add_suffix(&bookmark_button);
-                            list_box.append(&row);
                         }
                         let selected =
                             cross_block_refresh_selection_index(&results, retained_hit.as_ref());
@@ -1822,6 +1848,11 @@ impl UiState {
                             let search_generation = search_generation.clone();
                             let pending_scan_continue = pending_scan_continue.clone();
                             let pending_scan_continue_idle = pending_scan_continue.clone();
+                            let row_bookmark_buttons = row_bookmark_buttons.clone();
+                            let filter_entry = filter_entry.clone();
+                            let observed_version = observed_version.clone();
+                            let schedule_rebuild_slot = schedule_rebuild_slot.clone();
+                            let bookmarked_toggle = bookmarked_toggle.clone();
                             let query = query.clone();
                             let source = glib::idle_add_local(move || {
                                 if !crate::block_view::cross_block_search_continue_is_current(
@@ -1859,27 +1890,18 @@ impl UiState {
                                     Ok(more) => {
                                         let jumpable = term_view.jumpable_search_hits(&more.hits);
                                         for hit in more.hits.iter() {
-                                            let can_jump =
-                                                jumpable.contains(&(hit.block_id, hit.is_output));
-                                            let surface =
-                                                if hit.is_output { "out" } else { "cmd" };
-                                            let mut subtitle = format!(
-                                                "{surface} L{}: {}",
-                                                hit.line_no,
-                                                glib::markup_escape_text(&hit.line_text)
+                                            append_cross_block_hit_row(
+                                                &list_box,
+                                                &term_view,
+                                                hit,
+                                                &jumpable,
+                                                &row_bookmark_buttons,
+                                                &status_label,
+                                                &filter_entry,
+                                                &observed_version,
+                                                &schedule_rebuild_slot,
+                                                &bookmarked_toggle,
                                             );
-                                            if !can_jump {
-                                                subtitle.push_str(" — location unavailable");
-                                            }
-                                            let row = adw::ActionRow::builder()
-                                                .title(
-                                                    glib::markup_escape_text(&hit.cmd_preview)
-                                                        .as_str(),
-                                                )
-                                                .subtitle(&subtitle)
-                                                .activatable(can_jump)
-                                                .build();
-                                            list_box.append(&row);
                                         }
                                         hits.borrow_mut().extend(more.hits.iter().cloned());
                                         let total = hits.borrow().len();
