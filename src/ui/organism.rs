@@ -3944,6 +3944,22 @@ mod tests {
             93,
             "semantic_bridges list must match core visual_transition_between_recognizes_ninety_three_intentional_arcs"
         );
+        // Celebrate{,Big}→UnknownOutcome and RestAfterPush→UnknownOutcome stay
+        // inside between() 93 and this UI bridge list (no len bump).
+        for pair in [
+            (Behavior::Celebrate, Behavior::UnknownOutcome),
+            (Behavior::CelebrateBig, Behavior::UnknownOutcome),
+            (Behavior::RestAfterPush, Behavior::UnknownOutcome),
+        ] {
+            assert!(
+                semantic_bridges.contains(&pair),
+                "UI bridges must list {pair:?} beside core between() 93"
+            );
+            assert!(
+                VisualTransition::between(pair.0, pair.1).is_some(),
+                "core between() must keep {pair:?}"
+            );
+        }
         for &(from, to) in semantic_bridges {
             assert_eq!(
                 visual_transition_for_motion(OrganismMotion::Full, from, to),
@@ -3992,6 +4008,32 @@ mod tests {
                     motion,
                     Behavior::UnknownOutcome,
                     Behavior::GuardFailure,
+                ),
+                None
+            );
+            // Celebrate*/Rest→UnknownOutcome snaps under Calm/Static (Full
+            // animates; dedicated hold pins cover the same arcs).
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::Celebrate,
+                    Behavior::UnknownOutcome,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::CelebrateBig,
+                    Behavior::UnknownOutcome,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::RestAfterPush,
+                    Behavior::UnknownOutcome,
                 ),
                 None
             );
