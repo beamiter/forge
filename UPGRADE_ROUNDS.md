@@ -553,3 +553,13 @@ quality gates listed in `README.md`.
      onto WatchCommand stay `VisualTransition::between` None (pairs core ambient
      N/A pin and anvil round 82). Round 105 documented Ambient N/A; this lands
      the regression.
+
+117. **Core tip STAGE_PREFIXES systemd-inhibit (len 63)** — path-patched local
+     `jterm_core` peels `systemd-inhibit` (STAGE_PREFIXES 62→63) with
+     `classify_command` see-through; Cargo manifests stay on the published pin
+     (pending push/repin). Catch-up after ambient round 116. Pairs anvil round 83.
+
+118. **Core tip STAGE_PREFIXES systemd-socket-activate (len 64)** — path-patched
+     local `jterm_core` peels `systemd-socket-activate` (STAGE_PREFIXES 63→64)
+     with `classify_command` see-through and membership pin; Cargo manifests
+     stay on the published pin (pending push/repin). Pairs anvil round 84.
