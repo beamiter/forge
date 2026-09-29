@@ -4400,6 +4400,60 @@ tail ab";
         }
     }
 
+    /// ZWNJ / ZWJ / LRM / RLM / ALM-only queries stay `QueryNoMatches` under
+    /// Command/Output/All with stale extras (WJ/figure/bidi already pinned).
+    #[test]
+    fn bookmarked_empty_reason_keeps_zwnj_zwj_marks_query_no_matches_with_stale() {
+        let retained = CompletedCommandRecord {
+            id: 1,
+            cmd: "echo retained".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(20),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
+            start_mark_seen: true,
+        };
+        let retained_output = ZoneOutputSnapshot {
+            plain: "noise line\n".to_string(),
+            truncated: false,
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &retained,
+            snapshot: Some(&retained_output),
+        }];
+        let mut bookmarks = BookmarkState::default();
+        bookmarks.toggle(1);
+        bookmarks.toggle(99);
+        bookmarks.toggle(100);
+        let filters = BlockFilters {
+            bookmarked_only: true,
+            ..Default::default()
+        };
+        for query in ["\u{200c}", "\u{200d}", "\u{200e}", "\u{200f}", "\u{061c}"] {
+            for scope in [
+                CrossBlockSearchScope::Command,
+                CrossBlockSearchScope::Output,
+                CrossBlockSearchScope::All,
+            ] {
+                assert_eq!(
+                    bookmarked_search_empty_reason(
+                        records,
+                        query,
+                        scope,
+                        &filters,
+                        &bookmarks,
+                    ),
+                    Some(BookmarkedSearchEmptyReason::QueryNoMatches),
+                    "{query:?} {scope:?} must stay no-matches beside stale"
+                );
+            }
+        }
+    }
+
     #[test]
     fn background_filter_composes_before_cap_and_uses_only_real_scoped_text() {
         let record = |id, cmd: &str, duration_ms, is_background| CompletedCommandRecord {
@@ -5303,6 +5357,21 @@ tail ab";
         // Finished walk at the wrap generation itself (MAX,MAX,no resume) —
         // pairs core cancel edge catch-up beside MAX→0 schedule bump.
         assert!(!cross_block_search_continue_is_current(u64::MAX, u64::MAX, false));
+        // Near-wrap bump (MAX-1→MAX) cancels with a resume — non-wrapping
+        // sibling of the MAX→0 schedule bump (pairs core cancel edge).
+        let near_wrap = u64::MAX.wrapping_sub(1);
+        assert!(cross_block_search_continue_is_current(
+            near_wrap, near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            near_wrap, u64::MAX, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            near_wrap, u64::MAX, false
+        ));
+        assert!(cross_block_search_continue_is_current(
+            u64::MAX, u64::MAX, true
+        ));
     }
 
     #[test]
