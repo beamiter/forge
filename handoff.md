@@ -1,5 +1,18 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (sticky ZWJ + find query scopes + cancel/notice + STAGE 71 tip)
+
+## 2026-09-29 (sticky ZWJ + find query scopes + cancel/notice + STAGE 71)
+
+- **Round 156**: sticky U+200D/U+200F/U+2061/U+3000/U+0085 near-miss labels stay toast-only.
+- **Round 157**: Find Command/Output-scope QueryNoMatches with stale extras.
+- **Round 158**: CrossBlock continue cancel ahead-without-resume + wrapping finished.
+- **Round 159**: output_notice CR/NBSP/ZWSP/BOM/soft-hyphen near-miss restore gate.
+- **Round 160**: path-patched core tip STAGE 71 () + timeout/nice nest;
+  Inspect/Sit→Unknown  93 already ledgered at rounds 151–153.
+  Core/jagent tips still **pending push/repin**.
+
+
 Updated: 2026-09-29 (sticky NNBSP + Find All-scope stale)
 
 ## 2026-09-29 (sticky NNBSP + Find All-scope stale)
