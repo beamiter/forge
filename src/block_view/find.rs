@@ -4603,4 +4603,33 @@ tail ab";
         assert_eq!(rest_hits[0].line_no, 2);
         assert_eq!(rest_hits[0].occurrence, 0);
     }
+
+    /// After the core lift, the local alias must stay generic over forge's
+    /// six-field navigation hit (no anvil palette-chrome columns).
+    #[test]
+    fn cross_block_search_report_alias_stays_hit_generic_after_lift() {
+        use super::CrossBlockSearchReport;
+        use jterm_core::cross_block_search::CrossBlockSearchCursor;
+
+        let hit = CrossBlockHit {
+            block_id: 1,
+            is_output: false,
+            line_no: 1,
+            line_text: "cargo test".into(),
+            cmd_preview: "cargo test".into(),
+            occurrence: 0,
+        };
+        let finished = CrossBlockSearchReport::finished(vec![hit.clone()]);
+        assert!(!finished.scan_incomplete);
+        assert!(finished.resume.is_none());
+        assert_eq!(finished.hits, [hit.clone()]);
+
+        let resume = CrossBlockSearchCursor {
+            record_index: 4,
+            mid: None,
+        };
+        let stopped = CrossBlockSearchReport::budget_stopped(vec![hit], resume.clone());
+        assert!(stopped.scan_incomplete);
+        assert_eq!(stopped.resume, Some(resume));
+    }
 }
