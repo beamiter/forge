@@ -282,6 +282,11 @@ mod tests {
             "Save Block\u{fe02}history",
             "Save Block\u{fe0c}history",
             "Save Block\u{180a}history",
+            // Closer mid-range VS (FE03/FE0B) + Mongolian Todo soft hyphen stay
+            // toast-only beside FE02/FE0C/nirugu.
+            "Save Block\u{fe03}history",
+            "Save Block\u{fe0b}history",
+            "Save Block\u{1806}history",
             "Block history",
         ] {
             assert_eq!(
@@ -335,4 +340,5 @@ mod tests {
             "Retry must walk every notebook page leaf"
         );
     }
+
 }
