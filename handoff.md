@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (sticky near-miss Block-history labels)
+
+## 2026-09-29 (sticky near-miss Block-history labels)
+
+- **Round 131**: near-miss `"Save Block history"` labels stay toast-only
+  (pairs anvil 95). Tip 129–130 find mixed-stale + STAGE 70 stay below.
+
 Updated: 2026-09-29 (find mixed stale + STAGE 70 tip)
 
 ## 2026-09-29 (find mixed stale + STAGE 70)
