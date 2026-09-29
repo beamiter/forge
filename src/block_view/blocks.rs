@@ -1611,37 +1611,12 @@ pub(crate) fn failure_badge_tooltip(code: i32, signal: &str) -> String {
 }
 
 /// The finished card's notices that its text is not the command's whole
-/// output; see `finished_output_notice`.
-pub(crate) const FINISHED_OUTPUT_NOT_RETAINED: &str = "Earlier output not retained";
-pub(crate) const FINISHED_OUTPUT_TEXT_TRUNCATED: &str = "Output text truncated";
-pub(crate) const FINISHED_OUTPUT_PARTLY_RETAINED: &str = "Output only partly retained";
-
-/// The notice `text` names, when it is one of the finished-card notices. A
-/// notice read back from saved history is shown only through this.
-pub(crate) fn known_output_notice(text: &str) -> Option<&'static str> {
-    [
-        FINISHED_OUTPUT_NOT_RETAINED,
-        FINISHED_OUTPUT_TEXT_TRUNCATED,
-        FINISHED_OUTPUT_PARTLY_RETAINED,
-    ]
-    .into_iter()
-    .find(|notice| *notice == text)
-}
-
-/// What each notice means, for its tooltip.
-pub(crate) fn output_notice_tooltip(notice: &str) -> Option<&'static str> {
-    match known_output_notice(notice)? {
-        FINISHED_OUTPUT_NOT_RETAINED => Some(
-            "The command wrote more than a finished block keeps; its oldest output was dropped",
-        ),
-        FINISHED_OUTPUT_TEXT_TRUNCATED => Some(
-            "The command wrote more than a finished block keeps; the text stops before the end of its output",
-        ),
-        _ => Some(
-            "The command wrote more than a finished block keeps; both its oldest and its latest output were dropped",
-        ),
-    }
-}
+/// output; see `finished_output_notice`. Shared with anvil via jterm_core.
+pub(crate) use jterm_core::output_notice::{
+    known_output_notice, output_notice_tooltip, EARLIER_OUTPUT_NOT_RETAINED as FINISHED_OUTPUT_NOT_RETAINED,
+    OUTPUT_PARTLY_RETAINED as FINISHED_OUTPUT_PARTLY_RETAINED,
+    OUTPUT_TEXT_TRUNCATED as FINISHED_OUTPUT_TEXT_TRUNCATED,
+};
 
 /// Fade a card's quick-action strip in or out without changing its allocation.
 ///

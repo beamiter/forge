@@ -1,8 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (rounds 90–92: earlier-output notice, search idle continue, organism heal settle)
+Updated: 2026-09-29 (round 93: shared output_notice from jterm_core)
 
 ## Completed since the previous handoff
+
+- **Shared finished-block output notice (upgrade round 93, pending core
+  push/repin)** — `FINISHED_OUTPUT_*` consts, `known_output_notice`, and
+  `output_notice_tooltip` re-export `jterm_core::output_notice`. Persistence
+  stays `Option<String>` with the known-set restore gate.
 
 - **Organism error-hold heal settle UI contract (upgrade round 92, pending core
   push/repin)** — Full-motion tests also mirror SitNearError/InspectError →

@@ -449,3 +449,6 @@ quality gates listed in `README.md`.
 92. **Organism error-hold heal settle UI contract** — Full motion mirrors
     SitNearError/InspectError→Recovery/Cautious/Stuck and Cautious→Recovery
     once core recognizes those bridges (pending push/repin). Calm/Static snap.
+93. **Shared finished-block output notice** — notice strings and known-set parse
+    come from `jterm_core::output_notice` (pending core push/repin). History
+    still stores `Option<String>` behind the known-set gate.
