@@ -3093,6 +3093,14 @@ mod tests {
                 format!("{base}\u{200b}"),
                 format!("\u{feff}{base}"),
                 format!("{base}\u{00ad}"),
+                // ZWJ / NNBSP / LS / NEL / ideographic / FA catch-up beside
+                // the sticky unicode wave — still outside the known-set gate.
+                format!("{base}\u{200d}"),
+                format!("\u{202f}{base}"),
+                format!("{base}\u{2028}"),
+                format!("{base}\u{0085}"),
+                format!("\u{3000}{base}"),
+                format!("{base}\u{2061}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
