@@ -1087,3 +1087,21 @@ quality gates listed in `README.md`.
      Command/Output/All when stale ids remain (FE05/Manchu-comma already pinned).
      Pairs anvil 187.
 
+236. **Sticky Mongolian ellipsis label** —
+     U+1801 variant of "Save Block history" stays toast-only beside FE07/birga
+     (round 231). Pairs anvil 188.
+
+237. **output_notice Mongolian ellipsis gate** —
+     U+1801-padded Truncated/Partly/Earlier strings stay outside the known-set
+     remount gate beside sticky 1801. Pairs anvil sticky tip.
+
+238. **CrossBlock cancel near-near-near-near-near-near-near-wrap bump** — palette idle
+     continuation drops MAX-7→MAX-6 generation bumps (with or without resume),
+     scheduled ahead MAX-6 vs MAX-7, and finished walks at MAX-7. Pairs anvil
+     189 / core cancel edge.
+
+239. **GuardRecovery→UnknownOutcome Full-motion UI bridge sync** — semantic_bridges
+     membership + Calm/Static snaps list GuardRecovery→Unknown beside
+     Celebrate*/Rest pins (dedicated Full-motion hold already at round 234).
+     Pairs anvil 190 / core `GuardRecoveryToUnknownOutcome` inside between() 93.
+
