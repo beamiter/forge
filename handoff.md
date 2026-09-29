@@ -1,25 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-08-29 (workflow subsystem upstreamed to jterm_core::workflows;
-the family-wide unfilled-argument guard closed, forge's silent TOML coercion
-removed, the bundled library reconciled with its three siblings)
-
-This working tree contains the nine-round "Evolve ASCII organism" series
-(`d6fb8b4..00a099e`), the continued pass (`fa5c947`), the recovery-vigil
-layer, and the current five-round debugging-vigil evolution: the experimental
-Block-pane organism grew from an event reflex into a continuous life
-simulation with utility-selected behavior, agent attribution, interpolated
-spatial motion, motion restraint, a persistent per-repo build-duration
-baseline, and a five-part embodiment pass covering visible growth, output
-rhythm, semantic transitions, repo territory, and attention arbitration.
-Every historical round followed the
-same loop — implement, unit-test, sync `docs/USER_GUIDE.md`, run a
-three-agent adversarial verification workflow, fix confirmed findings,
-commit, push. The verification pass caught one to two real defects almost
-every round (attribution races, a Drop panic on a fired glib source, a
-saturation hole in a validate invariant); do not skip it.
+Updated: 2026-09-29 (family pin align: jagent `628811b`; organism core still pending push)
 
 ## Completed since the previous handoff
+
+- **Family pin align (2026-09-29)** — direct `jagent` pin `6ed0b9f` → `628811b`
+  (deny + lock), matching path-patched local `jterm_core`. Manifest `jterm_core`
+  stays at published `33093da`; organism vigil `fbfcafa`/`99e24c0` still
+  **pending push/repin**. Local `.cargo/config.toml` path patch unchanged.
 
 - **Organism vigil-tier transition continuity (2026-09-29, core `fbfcafa`,
   pending push/repin)** — `jterm_core` closes the embodiment-pass asymmetry:
