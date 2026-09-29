@@ -3168,6 +3168,11 @@ mod tests {
                 format!("{base}\u{fe05}"),
                 format!("{base}\u{fe09}"),
                 format!("{base}\u{1808}"),
+                // Deeper nesting mid-range VS / Mongolian Manchu full stop
+                // catch-up beside sticky FE06/FE08/1809 — still outside the gate.
+                format!("{base}\u{fe06}"),
+                format!("{base}\u{fe08}"),
+                format!("{base}\u{1809}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
