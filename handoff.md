@@ -1,8 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (round 99: shared CrossBlockSearchCursor)
+Updated: 2026-09-29 (core tip pending-push clarification)
 
 ## Completed since the previous handoff
+
+- **Local core tip `dd16df9` still pending push/repin** (clarification) — path
+  patches already see shared `cross_block_search` (`36675b0`) and
+  `output_notice` plus later organism/STAGE_PREFIXES waves; Cargo manifests
+  stay on published `33093da` until a pusher publishes the tip cohort.
 
 - **Shared CrossBlockSearchCursor (upgrade round 99, pending core push/repin)** —
   resume cursor, mid-record point, generation-current predicate, and
