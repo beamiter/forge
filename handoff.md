@@ -1,5 +1,17 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (sticky whitespace catch-up + find/file-op/ambient pins)
+
+## 2026-09-29 (sticky whitespace + find/file-op/ambient→Watch*)
+
+- **Round 135**: tab/CR/NBSP/ZWSP/BOM/VT near-miss `"Save Block history"` stay
+  toast-only (anvil 100–101 catch-up).
+- **Round 136**: file-op PermissionDenied ≠ NotFound public copy (beside 134).
+- **Round 137**: Find MetadataMismatch with stale bookmark extras.
+- **Round 138**: Ambient→Watch* Full-motion None (Idle/Explore/Sleep/Approach).
+  STAGE 70 tip already ledgered at round 130 (pairs anvil 97). Core/jagent tips
+  still **pending push/repin**.
+
 Updated: 2026-09-29 (file-tree permission vs missing + STAGE 70 docs present)
 
 ## 2026-09-29 (file-tree permission vs missing)
