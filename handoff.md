@@ -1,8 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (round 101: UnknownOutcome success/sit overwrite UI contract)
+Updated: 2026-09-29 (round 102: WatchAgent/WatchSettled→RestAfterPush UI contract)
 
 ## Completed since the previous handoff
+
+- **Organism WatchAgent/WatchSettled→RestAfterPush UI contract (upgrade round 102,
+  pending core push/repin)** — Full motion mirrors WatchAgent→RestAfterPush and
+  WatchSettled→RestAfterPush once core recognizes those bridges (pairs with
+  WatchCommand→RestAfterPush from round 98).
 
 - **Organism UnknownOutcome success/sit overwrite UI contract (upgrade round 101,
   pending core push/repin)** — Full motion mirrors UnknownOutcome→Celebrate{,Big}
