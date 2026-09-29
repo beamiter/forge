@@ -2,9 +2,9 @@
 
 ## 2026-09-29 (core tip STAGE_PREFIXES systemd-cat/aa-exec)
 
-- **STAGE_PREFIXES len 60→62** on path-patched local core tip () —
-   /  peel +  see-through (jagent
-  ). Cargo manifests stay on published  (pending
+- **STAGE_PREFIXES len 60→62** on path-patched local core tip (`60c7378`) —
+  `systemd-cat` / `aa-exec` peel + `classify_command` see-through (jagent
+  `5e09180`). Cargo manifests stay on published `33093da` (pending
   push/repin). Upgrade round 114.
 
 Updated: 2026-09-29 (core tip STAGE_PREFIXES systemd-cat/aa-exec len 62)
