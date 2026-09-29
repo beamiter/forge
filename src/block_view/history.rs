@@ -3088,6 +3088,11 @@ mod tests {
                 format!("{base} "),
                 format!("\t{base}"),
                 format!("{base}\n"),
+                format!("{base}\r"),
+                format!("\u{00a0}{base}"),
+                format!("{base}\u{200b}"),
+                format!("\u{feff}{base}"),
+                format!("{base}\u{00ad}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
