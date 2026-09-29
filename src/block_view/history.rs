@@ -3180,6 +3180,9 @@ mod tests {
                 // Mongolian ellipsis catch-up beside sticky 1801 — still outside
                 // the gate (one edge).
                 format!("{base}\u{1801}"),
+                // Mongolian comma catch-up beside sticky 1802 — still outside
+                // the gate (one edge).
+                format!("{base}\u{1802}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
