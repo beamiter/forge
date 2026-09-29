@@ -872,3 +872,22 @@ quality gates listed in `README.md`.
 187. **output_notice Mongolian FVS / mid ZWNBSP / interlinear near-miss gate** —
      FVS / mid ZWNBSP / interlinear-padded Truncated/Partly/Earlier strings stay
      outside the known-set remount gate beside rounds 177/172. Pairs anvil sticky tip.
+
+188. **Idle/Rest→Guard* Full-motion None** — Full motion pins Idle/RestAfterPush→
+     GuardFailure/Stuck/Recovery/Cautious intentional None (shipped beside
+     hold/ambient pins). Pairs anvil 148 / core
+     `idle_and_rest_never_bridge_to_repo_vigil_guards`.
+
+189. **Rest/Guard*→Watch* Full-motion None** — Full motion pins RestAfterPush/
+     Guard*→WatchCommand/Agent/Settled intentional None. Pairs anvil 149 / core
+     `rest_and_repo_vigil_never_bridge_to_watch_poses`.
+
+190. **Inspect/Sit/Unknown→Watch* Full-motion None** — Full motion pins
+     InspectError/SitNearError/UnknownOutcome→Watch* intentional None. Pairs
+     anvil 150 / core `error_and_unknown_holds_never_bridge_to_watch_poses`.
+
+191. **GuardFailure/Stuck/Cautious→holds Full-motion None** — Full motion pins
+     those vigil poses→Inspect/Sit/Unknown intentional None (Recovery alone
+     animates). Pairs anvil 151 / core
+     `failure_stuck_cautious_never_bridge_to_error_or_unknown_holds`.
+
