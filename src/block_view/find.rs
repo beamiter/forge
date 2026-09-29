@@ -3967,6 +3967,64 @@ tail ab";
         );
     }
 
+    /// Empty query under Command/Output with stale extras beside a live
+    /// scoped bookmark stays a browser (`None`) — never invent QueryNoMatches
+    /// or collapse to NoRetainedBookmarks (All-scope empty-query already pinned).
+    #[test]
+    fn bookmarked_empty_reason_stays_none_for_empty_query_under_command_and_output_with_stale() {
+        let retained = CompletedCommandRecord {
+            id: 1,
+            cmd: "echo retained".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(20),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
+            start_mark_seen: true,
+        };
+        let retained_output = ZoneOutputSnapshot {
+            plain: "noise line\n".to_string(),
+            truncated: false,
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &retained,
+            snapshot: Some(&retained_output),
+        }];
+        let mut bookmarks = BookmarkState::default();
+        bookmarks.toggle(1);
+        bookmarks.toggle(99);
+        bookmarks.toggle(100);
+        let filters = BlockFilters {
+            bookmarked_only: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            bookmarked_search_empty_reason(
+                records,
+                "",
+                CrossBlockSearchScope::Command,
+                &filters,
+                &bookmarks,
+            ),
+            None,
+            "stale extras must not turn an empty Command-scope query into a miss"
+        );
+        assert_eq!(
+            bookmarked_search_empty_reason(
+                records,
+                "",
+                CrossBlockSearchScope::Output,
+                &filters,
+                &bookmarks,
+            ),
+            None,
+            "stale extras must not turn an empty Output-scope query into a miss"
+        );
+    }
+
     #[test]
     fn background_filter_composes_before_cap_and_uses_only_real_scoped_text() {
         let record = |id, cmd: &str, duration_ms, is_background| CompletedCommandRecord {
@@ -4862,6 +4920,11 @@ tail ab";
         assert!(!cross_block_search_continue_is_current(u64::MAX, 0, false));
         // Gen-0 finished walk (no resume) cancels like any empty cursor.
         assert!(!cross_block_search_continue_is_current(0, 0, false));
+        // Live wrapping ahead of scheduled (0 vs MAX) cancels with a resume —
+        // reverse of the MAX→0 schedule bump (pairs core cancel edge).
+        assert!(!cross_block_search_continue_is_current(0, u64::MAX, true));
+        // Same reverse-wrap cancel without a resume still drops the idle slice.
+        assert!(!cross_block_search_continue_is_current(0, u64::MAX, false));
     }
 
     #[test]
