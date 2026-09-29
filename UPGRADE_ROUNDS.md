@@ -523,3 +523,9 @@ quality gates listed in `README.md`.
      local `jterm_core` peels `strace` / `scriptlive` (STAGE_PREFIXES 58→60)
      with `classify_command` see-through; Cargo manifests stay on the
      published pin (pending push/repin).
+
+112. **FindScanBudget / Options / Report from core** — re-export
+     `FindScanBudget`, `CrossBlockSearchOptions` / `CrossBlockSearchScope`, and
+     hit-generic `CrossBlockSearchReport<CrossBlockHit>` from path-patched
+     core; `CrossBlockHit` stays local (no anvil palette-chrome fields). GTK
+     idle stays here. Pairs anvil round 76.

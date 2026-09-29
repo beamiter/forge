@@ -8,6 +8,7 @@
 - `CrossBlockHit` stays local — forge omits anvil's exit_code / duration_ms /
   cwd palette-chrome fields; core pin documents the divergence.
 - GTK idle scheduling stays here. Pairs anvil companion commit.
+- Upgrade round 112 (pairs anvil 76).
 
 Updated: 2026-09-29 (FindScanBudget / Options / Report from core)
 
