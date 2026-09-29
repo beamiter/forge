@@ -3848,6 +3848,7 @@ mod tests {
             (Behavior::SitNearError, Behavior::GuardCautious),
             (Behavior::SitNearError, Behavior::Celebrate),
             (Behavior::SitNearError, Behavior::CelebrateBig),
+            (Behavior::SitNearError, Behavior::UnknownOutcome),
             (Behavior::SitNearError, Behavior::Idle),
             (Behavior::SitNearError, Behavior::RestAfterPush),
             (Behavior::InspectError, Behavior::GuardFailure),
@@ -3857,6 +3858,7 @@ mod tests {
             (Behavior::InspectError, Behavior::Celebrate),
             (Behavior::InspectError, Behavior::CelebrateBig),
             (Behavior::InspectError, Behavior::SitNearError),
+            (Behavior::InspectError, Behavior::UnknownOutcome),
             (Behavior::InspectError, Behavior::Idle),
             (Behavior::InspectError, Behavior::RestAfterPush),
             (Behavior::Celebrate, Behavior::GuardRecovery),
@@ -3936,8 +3938,8 @@ mod tests {
         ];
         assert_eq!(
             semantic_bridges.len(),
-            91,
-            "semantic_bridges list must match core visual_transition_between_recognizes_ninety_one_intentional_arcs"
+            93,
+            "semantic_bridges list must match core visual_transition_between_recognizes_ninety_three_intentional_arcs"
         );
         for &(from, to) in semantic_bridges {
             assert_eq!(
@@ -4340,10 +4342,10 @@ mod tests {
     }
 
     /// Tip lockstep: CelebrateBig still owns exactly fifteen Some arcs inside
-    /// the core `between()` recount of 91. If a new CelebrateBig bridge lands,
-    /// bump both this pin and `visual_transition_between_recognizes_ninety_one_*`.
+    /// the core `between()` recount of 93. If a new CelebrateBig bridge lands,
+    /// bump both this pin and `visual_transition_between_recognizes_ninety_three_*`.
     #[test]
-    fn celebrate_big_some_arcs_stay_fifteen_beside_between_ninety_one() {
+    fn celebrate_big_some_arcs_stay_fifteen_beside_between_ninety_three() {
         let behaviors = [
             Behavior::Idle,
             Behavior::WatchCommand,
@@ -4380,7 +4382,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(total, 91, "between() Some count drifted; sync UI contracts");
+        assert_eq!(total, 93, "between() Some count drifted; sync UI contracts");
         assert_eq!(
             celebrate_big, 15,
             "CelebrateBig Some arcs drifted; sync finish-arc UI table"
@@ -4457,7 +4459,7 @@ mod tests {
             }
         }
         // Ambient→Inspect/Sit/Unknown/Rest stays None under Full motion too
-        // (holds/rest arrive from finish/push reducers). between() stays 91.
+        // (holds/rest arrive from finish/push reducers). between() stays 93.
         for from in [
             Behavior::Explore,
             Behavior::Sleep,
@@ -4476,6 +4478,24 @@ mod tests {
                 );
                 assert_eq!(VisualTransition::between(from, to), None);
             }
+        }
+        // Idle→hold/cele/rest stays None: live finishes arrive through Watch*
+        // (which already animate). A finish applied from Idle without Watch
+        // snaps; pin beside ambient utility hold/rest Nones (pairs core).
+        for to in [
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::UnknownOutcome,
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::RestAfterPush,
+        ] {
+            assert_eq!(
+                visual_transition_for_motion(OrganismMotion::Full, Behavior::Idle, to),
+                None,
+                "Full Idle→{to:?} (finish without Watch snaps)"
+            );
+            assert_eq!(VisualTransition::between(Behavior::Idle, to), None);
         }
     }
 
