@@ -172,4 +172,26 @@ mod tests {
             );
         }
     }
+
+    /// Near-miss labels must not raise the sticky bar — the surface is keyed
+    /// on the exact `"Save Block history"` operation string workers enqueue.
+    #[test]
+    fn near_miss_block_history_labels_stay_on_the_toast_surface() {
+        for near_miss in [
+            "Save Block history ",
+            " Save Block history",
+            "save Block history",
+            "Save Block History",
+            "Save block history",
+            "Save Block histor",
+            "Save Block history\n",
+            "Block history",
+        ] {
+            assert_eq!(
+                persistence_failure_surface(near_miss),
+                PersistenceFailureSurface::Toast,
+                "{near_miss:?}"
+            );
+        }
+    }
 }
