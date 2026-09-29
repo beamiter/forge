@@ -1,8 +1,23 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (round 103: UnknownOutcome→Guard* vigil settles)
+Updated: 2026-09-29 (round 105: ambient VisualTransition N/A probe)
 
 ## Completed since the previous handoff
+
+- **AmbientBehavior Full-motion bridges (upgrade round 105 probe, N/A)** —
+  UI ambient pose (Explore/Sleep/Approach/Idle) does not route through
+  `VisualTransition::between` — Behavior-only under Full motion. No ambient
+  snap bridges to add (pairs with anvil round 66 probe).
+
+- **Find-overlay test budgets use shared consts (upgrade round 104)** —
+  live-dump / aggregate FindScanBudget regressions pin
+  `FIND_OVERLAY_SCAN_{BYTE,TIME}_LIMIT` instead of `4 * 1024 * 1024` /
+  `12ms` literals. TODO clarifies CROSS_BLOCK_* (8 MiB / 48 ms) vs
+  FIND_OVERLAY_* (4 MiB / 12 ms).
+
+- **Finished-output notice tests pin shared strings (upgrade round 104)** —
+  history / finished-card regressions assert via `FINISHED_OUTPUT_*`
+  re-exports of `jterm_core::output_notice` (no drifted string literals).
 
 - **Organism UnknownOutcome→Guard* vigil settle UI contract (upgrade round 103,
   pending core push/repin)** — Full motion mirrors UnknownOutcome→GuardFailure/
