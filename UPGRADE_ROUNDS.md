@@ -462,3 +462,7 @@ quality gates listed in `README.md`.
 96. **Organism celebrate-hold push UI contract** — Full motion mirrors
     Celebrate/CelebrateBig→RestAfterPush once core recognizes those bridges
     (pending push/repin). Calm/Static snap.
+97. **Organism WatchSettled fail + idle settles UI contract** — Full motion
+    mirrors WatchSettled→Inspect/SitNear and
+    Celebrate{,Big}/RestAfterPush→Idle once core recognizes those bridges
+    (pending push/repin). Calm/Static snap.

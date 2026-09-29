@@ -1,8 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (round 96: celebrate-hold push UI contract)
+Updated: 2026-09-29 (round 97: WatchSettled fail + idle settles UI contract)
 
 ## Completed since the previous handoff
+
+- **Organism WatchSettled fail + idle settles UI contract (upgrade round 97,
+  pending core push/repin)** — Full motion mirrors
+  WatchSettled→Inspect/SitNear and Celebrate{,Big}/RestAfterPush→Idle once
+  core recognizes those bridges.
 
 - **Organism celebrate-hold push UI contract (upgrade round 96, pending core
   push/repin)** — Full motion mirrors Celebrate/CelebrateBig→RestAfterPush once
