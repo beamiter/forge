@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (sticky 1804 + output_notice + MAX-10 + Unknown→GuardStuck)
+
+## 2026-09-30 (sticky/find/organism edges — rounds 251–254)
+
+- Sticky Mongolian colon (U+1804) beside full stop/comma, output_notice colon
+  gate catch-up, CrossBlock near-near-near-near-near-near-near-near-near-near-wrap
+  (MAX-10→MAX-9) cancel, and UnknownOutcome→GuardStuck Full-motion bridge + UI
+  membership sync. Unique rounds **251–254**. Pairs anvil 200–202 / core cancel.
+  STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-09-30 (1802 find beside rounds 246–249)
 
 ## 2026-09-30 (sticky/find/organism edges — round 250)
