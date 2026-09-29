@@ -547,3 +547,9 @@ quality gates listed in `README.md`.
      ExplicitReplace past Failed-load in the worker; history_notice docs now
      name that Clear contract so the two trees stay aligned. No forge
      behavior change.
+
+116. **Ambient / Typing VisualTransition N/A pin** — Full-motion UI pins that
+     Idle/Explore/Sleep/Approach disposition exchanges and Typing-surface entry
+     onto WatchCommand stay `VisualTransition::between` None (pairs core ambient
+     N/A pin and anvil round 82). Round 105 documented Ambient N/A; this lands
+     the regression.

@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (Ambient / Typing VisualTransition N/A pin)
+
+## 2026-09-29 (Ambient / Typing VisualTransition N/A pin)
+
+- **Round 116**: Full-motion UI pins ambient disposition exchanges and
+  Typing→WatchCommand entry as VisualTransition None (pairs core ambient N/A
+  pin; anvil round 82). Closes the untested half of the round-105 Ambient N/A
+  probe.
+
 Updated: 2026-09-29 (anvil Block-history sticky catch-up note)
 
 ## 2026-09-29 (anvil Block-history sticky catch-up note)
