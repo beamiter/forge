@@ -2170,7 +2170,8 @@ mod tests {
         CrossBlockSearchOptions, CrossBlockSearchScope, FindCursor, FindDirection,
         FindScanBudget, FindSurface, NativeCursorAction, RecordNavigationResult,
         RecordSnapshotView, RegexConsumption, VTE_SEARCH_FLAGS,
-        cross_block_search_continue_is_current,
+        cross_block_search_continue_is_current, FIND_OVERLAY_SCAN_BYTE_LIMIT,
+        FIND_OVERLAY_SCAN_TIME_LIMIT,
     };
     use crate::block_view::{
         BackendRecordRef, BackendSearchWindow, BlockData, BlockFilters, BookmarkState,
@@ -2200,9 +2201,21 @@ mod tests {
     #[test]
     fn a_huge_live_buffer_is_not_dumped_for_an_incremental_search() {
         use super::{live_dump_exceeds_budget, utf8_cut_past};
-        assert!(!live_dump_exceeds_budget(5_000.0, 120, 4 * 1024 * 1024));
-        assert!(live_dump_exceeds_budget(1_000_000.0, 120, 4 * 1024 * 1024));
-        assert!(live_dump_exceeds_budget(f64::INFINITY, 80, 4 * 1024 * 1024));
+        assert!(!live_dump_exceeds_budget(
+            5_000.0,
+            120,
+            FIND_OVERLAY_SCAN_BYTE_LIMIT
+        ));
+        assert!(live_dump_exceeds_budget(
+            1_000_000.0,
+            120,
+            FIND_OVERLAY_SCAN_BYTE_LIMIT
+        ));
+        assert!(live_dump_exceeds_budget(
+            f64::INFINITY,
+            80,
+            FIND_OVERLAY_SCAN_BYTE_LIMIT
+        ));
         assert!(live_dump_exceeds_budget(10.0, 80, 0));
 
         let text = "ab\u{e9}cd".as_bytes(); // a b [c3 a9] c d
@@ -2561,7 +2574,7 @@ tail ab";
         let mut budget = FindScanBudget {
             remaining_bytes: 5,
             started: Instant::now(),
-            time_limit: Duration::from_millis(12),
+            time_limit: FIND_OVERLAY_SCAN_TIME_LIMIT,
         };
         let first = budget.take_prefix("abc");
         assert_eq!(first.text, "abc");
