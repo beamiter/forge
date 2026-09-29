@@ -1082,3 +1082,8 @@ quality gates listed in `README.md`.
      `GuardRecoveryToUnknownOutcome` beside Celebrate*/Rest/SitNear/Inspect→
      Unknown inside between() 93.
 
+235. **Find FE06/Manchu-full-stop-query QueryNoMatches + stale** —
+     U+FE06 / U+FE08 / U+1809-only queries stay QueryNoMatches under
+     Command/Output/All when stale ids remain (FE05/Manchu-comma already pinned).
+     Pairs anvil 187.
+
