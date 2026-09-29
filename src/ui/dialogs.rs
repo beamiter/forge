@@ -1821,6 +1821,7 @@ impl UiState {
                             let status_label = status_label.clone();
                             let search_generation = search_generation.clone();
                             let pending_scan_continue = pending_scan_continue.clone();
+                            let pending_scan_continue_idle = pending_scan_continue.clone();
                             let query = query.clone();
                             let source = glib::idle_add_local(move || {
                                 if !crate::block_view::cross_block_search_continue_is_current(
@@ -1828,11 +1829,11 @@ impl UiState {
                                     search_generation.get(),
                                     cursor.borrow().is_some(),
                                 ) {
-                                    pending_scan_continue.borrow_mut().take();
+                                    pending_scan_continue_idle.borrow_mut().take();
                                     return glib::ControlFlow::Break;
                                 }
                                 let Some(resume) = cursor.borrow().clone() else {
-                                    pending_scan_continue.borrow_mut().take();
+                                    pending_scan_continue_idle.borrow_mut().take();
                                     return glib::ControlFlow::Break;
                                 };
                                 let already = hits.borrow().len();
@@ -1843,7 +1844,7 @@ impl UiState {
                                         list_box.selected_row().map(|row| row.index() as usize),
                                         false,
                                     ));
-                                    pending_scan_continue.borrow_mut().take();
+                                    pending_scan_continue_idle.borrow_mut().take();
                                     return glib::ControlFlow::Break;
                                 }
                                 let remaining = CROSS_BLOCK_SEARCH_LIMIT - already;
@@ -1894,12 +1895,12 @@ impl UiState {
                                         if cursor.borrow().is_some() {
                                             glib::ControlFlow::Continue
                                         } else {
-                                            pending_scan_continue.borrow_mut().take();
+                                            pending_scan_continue_idle.borrow_mut().take();
                                             glib::ControlFlow::Break
                                         }
                                     }
                                     Err(_) => {
-                                        pending_scan_continue.borrow_mut().take();
+                                        pending_scan_continue_idle.borrow_mut().take();
                                         glib::ControlFlow::Break
                                     }
                                 }
