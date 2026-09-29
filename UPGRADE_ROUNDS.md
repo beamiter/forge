@@ -431,3 +431,8 @@ quality gates listed in `README.md`.
     consume the shared scan byte budget during pattern search, matching
     metadata browse, so a long filtered walk discloses `scan_incomplete`
     instead of examining unbounded history for free.
+89. **Organism vigil-tier UI contract** — Full-motion bridge selection mirrors
+    `VisualTransition::between` for the vigil-tier arcs (second-failure settle
+    and idle Failure→Stuck / Recovery→Cautious); Calm/Static still snap.
+    Behavior itself lands with core `fbfcafa` (pending push/repin from
+    `33093da`).

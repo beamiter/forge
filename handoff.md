@@ -21,6 +21,14 @@ saturation hole in a validate invariant); do not skip it.
 
 ## Completed since the previous handoff
 
+- **Organism vigil-tier transition continuity (2026-09-29, core `fbfcafa`,
+  pending push/repin)** — `jterm_core` closes the embodiment-pass asymmetry:
+  Full motion now bridges `SitNearError→GuardFailure` (the common second open
+  failure settle) plus idle escalations `GuardFailure→GuardStuck` and
+  `GuardRecovery→GuardCautious`. Forge UI tests assert Full motion mirrors
+  `VisualTransition::between` for those arcs (None on the current `33093da`
+  pin; Some after repin). No schema or content-perception change.
+
 - **Excluded records spend pattern-search budget (2026-09-28, wave 8, round 88)** —
   filter-excluded records now consume the shared scan byte budget during pattern
   search (matching metadata browse), so a long filtered walk discloses

@@ -3837,9 +3837,31 @@ mod tests {
             ),
             VisualTransition::between(Behavior::Celebrate, Behavior::GuardRecovery)
         );
+        // Full motion must mirror every bridge core recognizes — including the
+        // vigil-tier arcs (SitNearError→GuardFailure, Failure→Stuck,
+        // Recovery→Cautious). On an older pin `between` is None and Full stays
+        // None; after core fbfcafa both sides become Some together.
+        for (from, to) in [
+            (Behavior::SitNearError, Behavior::GuardFailure),
+            (Behavior::GuardFailure, Behavior::GuardStuck),
+            (Behavior::GuardRecovery, Behavior::GuardCautious),
+        ] {
+            assert_eq!(
+                visual_transition_for_motion(OrganismMotion::Full, from, to),
+                VisualTransition::between(from, to)
+            );
+        }
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
                 visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::GuardRecovery,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::SitNearError,
+                    Behavior::GuardFailure,
+                ),
                 None
             );
         }
