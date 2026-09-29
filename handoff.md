@@ -1,8 +1,12 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (round 93: shared output_notice from jterm_core)
+Updated: 2026-09-29 (round 94: organism celebrate-hold relapse UI contract)
 
 ## Completed since the previous handoff
+
+- **Organism celebrate-hold relapse UI contract (upgrade round 94, pending core
+  push/repin)** — Full motion mirrors Celebrate/CelebrateBig → Failure/Stuck
+  once core recognizes those bridges.
 
 - **Shared finished-block output notice (upgrade round 93, pending core
   push/repin)** — `FINISHED_OUTPUT_*` consts, `known_output_notice`, and

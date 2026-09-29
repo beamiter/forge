@@ -452,3 +452,6 @@ quality gates listed in `README.md`.
 93. **Shared finished-block output notice** — notice strings and known-set parse
     come from `jterm_core::output_notice` (pending core push/repin). History
     still stores `Option<String>` behind the known-set gate.
+94. **Organism celebrate-hold relapse UI contract** — Full motion mirrors
+    Celebrate/CelebrateBig→Failure/Stuck once core recognizes those bridges
+    (pending push/repin). Calm/Static snap.
