@@ -1,5 +1,18 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (ReloadFirst save + CelebrateBig 91 lockstep + find/history edges)
+
+## 2026-09-29 (ReloadFirst save + CelebrateBig 91 lockstep + find/history edges)
+
+- **Round 145**: sticky ReloadFirst latches labeled save after reload.
+- **Round 146**: Find Hit chrome parity (exit:148 / class(None)).
+- **Round 147**: `semantic_bridges` len == 91 + CelebrateBig fifteen lockstep.
+- **Round 148**: Ambient→Inspect/Sit/Unknown/Rest Full-motion None.
+- **Round 149**: Find Command-scope NoRetainedTextInScope with stale extras.
+- **Round 150**: sticky U+2028/U+2029 + output_notice near-miss restore gate.
+  STAGE 70 tip already ledgered at round 130. Core/jagent tips still
+  **pending push/repin**.
+
 Updated: 2026-09-29 (CelebrateBig finish arcs + output_notice + Find Hit chrome)
 
 ## 2026-09-29 (CelebrateBig finish arcs + output_notice + Find Hit)
