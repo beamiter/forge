@@ -14,3 +14,4 @@ flatpak-build/
 flatpak-repo/
 *.flatpak
 flatpak-smoke-logs/
+.cargo/config.toml
