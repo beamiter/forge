@@ -639,3 +639,9 @@ quality gates listed in `README.md`.
 133. **Failure/Stuck/Cautious→Watch* + tier overwrite None UI** — Full motion
      pins Failure/Stuck/Cautious→Watch* beside Rest/Recovery→Watch*, and
      SitNear→Inspect / Celebrate↔CelebrateBig as None. Pairs anvil round 99.
+
+134. **File-tree permission vs missing scan errors** — public Error-row copy
+     distinguishes PermissionDenied from NotFound; empty directories stay
+     success listings. Closes TODO.md P2 file-tree Retry/toast leftover.
+     Pin `directory_scan_errors_distinguish_permission_from_missing`. Pairs
+     anvil round 100. STAGE 70 tip already ledgered at round 130.
