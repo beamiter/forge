@@ -1215,3 +1215,7 @@ quality gates listed in `README.md`.
      Unknown→GuardFailure already synced in round 259. Pairs anvil 210 / core
      `UnknownOutcomeToIdle` inside between() 93.
 
+265. **Find 1805/four-dots-query QueryNoMatches + stale** —
+     U+1805-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (1804/colon already pinned). Pairs anvil 211.
+
