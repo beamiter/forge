@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (Inspect→SitNear 91 + vigil→Watch None)
+
+## 2026-09-29 (Inspect→SitNear 91 + vigil→Watch None)
+
+- **Round 132**: Full-motion `semantic_bridges` mirrors core tip 90→**91**
+  (`InspectError→SitNearError`). Pairs anvil 98.
+- **Round 133**: Full motion pins Failure/Stuck/Cautious→Watch* beside
+  Rest/Recovery→Watch*, plus SitNear→Inspect and Celebrate↔CelebrateBig None.
+  Pairs anvil 99. Core/jagent tips still **pending push/repin**.
+
 Updated: 2026-09-29 (sticky near-miss Block-history labels)
 
 ## 2026-09-29 (sticky near-miss Block-history labels)
