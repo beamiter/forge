@@ -991,3 +991,24 @@ quality gates listed in `README.md`.
      SitNear→Inspect and Celebrate↔CelebrateBig intentional None. Pairs anvil
      170 / core `sit_near_and_celebrate_tier_overwrites_stay_none`.
 
+215. **Sticky inner mid-range VS / Mongolian syllable-boundary labels** —
+     U+FE04 / U+FE0A / U+1807 variants of "Save Block history" stay toast-only
+     beside rounds 208/203. Pairs anvil 171.
+
+216. **output_notice inner mid-range VS / Mongolian syllable-boundary gate** —
+     U+FE04 / U+FE0A / U+1807-padded Truncated/Partly/Earlier strings stay
+     outside the known-set remount gate beside rounds 209/204. Pairs anvil sticky tip.
+
+217. **Find FE03/Todo soft-hyphen-query QueryNoMatches + stale** —
+     U+FE03 / U+FE0B / U+1806-only queries stay QueryNoMatches under
+     Command/Output/All when stale ids remain (FVS/Khmer already pinned).
+     Pairs anvil 172.
+
+218. **CrossBlock cancel near-near-near-wrap bump** — palette idle continuation
+     drops MAX-3→MAX-2 generation bumps (with or without resume), scheduled
+     ahead MAX-2 vs MAX-3, and finished walks at MAX-3. Pairs anvil 173 /
+     core cancel edge.
+
+219. **Celebrate*→UnknownOutcome Full-motion bridges** — Full motion animates
+     Celebrate{,Big}→UnknownOutcome; Calm/Static snap. Pairs anvil 174 / core
+     `CelebrateToUnknownOutcome` / `CelebrateBigToUnknownOutcome`.
