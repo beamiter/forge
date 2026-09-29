@@ -200,6 +200,10 @@ mod tests {
             "Save\u{200e} Block history",
             "Save Block\u{200c}history",
             "Save Block\u{2007}history",
+            // Line / paragraph separators stay toast-only beside soft-hyphen/WJ.
+            "Save Block history\u{2028}",
+            "Save Block history\u{2029}",
+            "Save Block\u{2028}history",
             "Block history",
         ] {
             assert_eq!(
@@ -208,5 +212,26 @@ mod tests {
                 "{near_miss:?}"
             );
         }
+    }
+
+    /// Sticky Retry hides the bar optimistically; a synchronous
+    /// `retry_history_persistence` Err must raise it again immediately so an
+    /// empty bar never implies the retry was accepted (pairs anvil).
+    #[test]
+    fn retry_block_history_reopens_bar_on_sync_refusal() {
+        let source = include_str!("history_notice.rs");
+        let retry = source
+            .split("pub(crate) fn retry_block_history(&self) {")
+            .nth(1)
+            .expect("retry_block_history")
+            .split("\n}\n\n#[cfg(test)]")
+            .next()
+            .expect("retry closes before tests");
+        assert!(
+            retry.contains("set_visible(false)")
+                && retry.contains("retry_history_persistence()")
+                && retry.contains("show_block_history_failure"),
+            "optimistic hide must re-show on sync refusal"
+        );
     }
 }
