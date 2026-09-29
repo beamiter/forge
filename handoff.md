@@ -1,8 +1,12 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (round 95: failure-push + error-hold success UI contract)
+Updated: 2026-09-29 (round 96: celebrate-hold push UI contract)
 
 ## Completed since the previous handoff
+
+- **Organism celebrate-hold push UI contract (upgrade round 96, pending core
+  push/repin)** — Full motion mirrors Celebrate/CelebrateBig→RestAfterPush once
+  core recognizes those bridges.
 
 - **Organism failure-push + error-hold success UI contract (upgrade round 95,
   pending core push/repin)** — Full motion mirrors

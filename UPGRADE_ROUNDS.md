@@ -459,3 +459,6 @@ quality gates listed in `README.md`.
     mirrors GuardFailure/Stuck→RestAfterPush and
     Inspect/SitNear→Celebrate{,Big} once core recognizes those bridges
     (pending push/repin). Calm/Static snap.
+96. **Organism celebrate-hold push UI contract** — Full motion mirrors
+    Celebrate/CelebrateBig→RestAfterPush once core recognizes those bridges
+    (pending push/repin). Calm/Static snap.
