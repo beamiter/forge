@@ -3186,6 +3186,9 @@ mod tests {
                 // Mongolian full stop catch-up beside sticky 1803 — still outside
                 // the gate (one edge).
                 format!("{base}\u{1803}"),
+                // Mongolian colon catch-up beside sticky 1804 — still outside
+                // the gate (one edge).
+                format!("{base}\u{1804}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
