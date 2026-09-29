@@ -2313,14 +2313,25 @@ impl TermView {
     /// A save that refused because the *load* failed cannot be fixed by saving
     /// again — that refusal is the whole point, so an unreadable file never
     /// becomes an excuse to overwrite whatever is actually on disk. Those panes
-    /// restart the load instead, and the ordinary save path picks up from its
-    /// result. Every other failure (a full disk, a permission change, a lock
-    /// timeout) is a save that can simply be tried again.
+    /// restart the load, then — once Loaded (or an early sync restore finishes)
+    /// — enqueue a labeled `"Save Block history"` so Retry matches the tooltip
+    /// ("Reload and save…") and anvil's ReloadFirst→revalidate→save chain.
+    /// Synchronous load-queue refusals clear the pending-save latch and return
+    /// `Err` so the sticky bar can re-show immediately. Every other failure (a
+    /// full disk, a permission change, a lock timeout) is a save that can
+    /// simply be tried again.
     pub(crate) fn retry_history_persistence(self: &Rc<Self>) -> std::io::Result<()> {
         match history_retry_action(&self.history_load.outcome()) {
             HistoryRetryAction::ReloadFirst => {
+                self.retry_save_after_history_load.set(true);
                 self.start_history_load();
-                Ok(())
+                match self.history_load.outcome() {
+                    HistoryLoadOutcome::Failed { kind, message } => {
+                        self.retry_save_after_history_load.set(false);
+                        Err(io::Error::new(kind, message.to_string()))
+                    }
+                    _ => Ok(()),
+                }
             }
             HistoryRetryAction::SaveAgain => self.save_history(),
         }
@@ -2459,6 +2470,10 @@ impl TermView {
     /// Load and decode Block history on the shared disk worker, then construct
     /// GTK widgets in a short main-thread callback. Commands that finish while
     /// the read is pending remain newer than every restored block.
+    ///
+    /// When [`Self::retry_save_after_history_load`] is latched (sticky Retry
+    /// ReloadFirst), a successful restore enqueues a labeled save; Failed /
+    /// discarded paths clear the latch without saving.
     pub(crate) fn start_history_load(self: &Rc<Self>) {
         // A backend without the Block card document restores its own bounded
         // zone document instead. That replay is synchronous on purpose: it
@@ -2467,6 +2482,7 @@ impl TermView {
         if !self.render_backend.persists_block_history() {
             self.restore_zone_history();
             self.resolve_block_onboarding_after_history();
+            self.finish_reload_first_labeled_save();
             return;
         }
         let (path_opt, compress, load_limit) = {
@@ -2482,6 +2498,7 @@ impl TermView {
         };
         let Some(path) = path_opt else {
             self.resolve_block_onboarding_after_history();
+            self.finish_reload_first_labeled_save();
             return;
         };
         let base = match absolute_history_path(&path) {
@@ -2489,6 +2506,7 @@ impl TermView {
             Err(error) => {
                 log::warn!("refusing invalid Block history path: {error}");
                 self.resolve_block_onboarding_after_history();
+                self.retry_save_after_history_load.set(false);
                 return;
             }
         };
@@ -2513,6 +2531,9 @@ impl TermView {
             let result = Err(io::Error::new(error.kind(), error.to_string()));
             self.history_load.complete(&result);
             log::warn!("could not queue Block history load: {error}");
+            // Leave retry_save_after_history_load set so
+            // retry_history_persistence can observe Failed and return Err;
+            // it clears the latch before surfacing to the sticky bar.
         }
 
         let weak_view = Rc::downgrade(self);
@@ -2522,6 +2543,7 @@ impl TermView {
                 return glib::ControlFlow::Break;
             };
             if load_for_poll.discarded.load(Ordering::Acquire) {
+                view.retry_save_after_history_load.set(false);
                 view.resolve_block_onboarding_after_history();
                 view.history_load_poll_id.borrow_mut().take();
                 return glib::ControlFlow::Break;
@@ -2531,6 +2553,7 @@ impl TermView {
                     if load_for_poll.applied.load(Ordering::Acquire)
                         || load_for_poll.discarded.load(Ordering::Acquire) =>
                 {
+                    view.retry_save_after_history_load.set(false);
                     view.resolve_block_onboarding_after_history();
                     view.history_load_poll_id.borrow_mut().take();
                     glib::ControlFlow::Break
@@ -2545,6 +2568,7 @@ impl TermView {
                     view.resolve_block_onboarding_after_history();
                     load_for_poll.mark_applied_and_consume();
                     view.history_load_poll_id.borrow_mut().take();
+                    view.finish_reload_first_labeled_save();
                     glib::ControlFlow::Break
                 }
                 HistoryLoadOutcome::Failed { message, .. } => {
@@ -2552,6 +2576,7 @@ impl TermView {
                     // A later save may still succeed (for example, a removable
                     // drive was remounted). Pre-load shutdown saves preserve the
                     // unreadable file; subsequent user mutations may retry it.
+                    view.retry_save_after_history_load.set(false);
                     view.resolve_block_onboarding_after_history();
                     load_for_poll.mark_applied_and_consume();
                     view.history_load_poll_id.borrow_mut().take();
@@ -2560,6 +2585,17 @@ impl TermView {
             }
         });
         *self.history_load_poll_id.borrow_mut() = Some(source);
+    }
+
+    /// Complete a sticky ReloadFirst by enqueueing labeled save once the load
+    /// path has made the on-disk revision honest again.
+    fn finish_reload_first_labeled_save(self: &Rc<Self>) {
+        if !self.retry_save_after_history_load.take() {
+            return;
+        }
+        if let Err(error) = self.save_history() {
+            log::warn!("save Block history after ReloadFirst: {error}");
+        }
     }
 
     /// Close the construction-time empty-state gate from every history-load
@@ -3035,6 +3071,46 @@ mod tests {
             decoded.lifecycle_schema,
             super::super::blocks::BLOCK_LIFECYCLE_SCHEMA
         );
+    }
+
+    /// Near-miss / padded / cased Truncated and PartlyRetained strings must
+    /// stay outside the known-set restore gate used when remounting finished
+    /// cards from Block history — exact family strings round-trip above.
+    #[test]
+    fn history_restore_gate_rejects_near_miss_output_notice_strings() {
+        for base in [
+            super::super::FINISHED_OUTPUT_NOT_RETAINED,
+            super::super::FINISHED_OUTPUT_TEXT_TRUNCATED,
+            super::super::FINISHED_OUTPUT_PARTLY_RETAINED,
+        ] {
+            for candidate in [
+                format!(" {base}"),
+                format!("{base} "),
+                format!("\t{base}"),
+                format!("{base}\n"),
+                base.to_ascii_uppercase(),
+                format!("{base}!"),
+            ] {
+                assert_eq!(
+                    crate::block_view::known_output_notice(&candidate),
+                    None,
+                    "near-miss {candidate:?} must not remount as a finished-card notice"
+                );
+                let mut block = sample_block(12, "cargo check");
+                block.output_notice = Some(candidate.clone());
+                let raw = rkyv::to_bytes::<rkyv::rancor::Error>(&block).unwrap();
+                let (decoded, _) = decode_block_record(raw.as_slice(), false).unwrap();
+                // Raw bytes may survive decode, but the remount gate drops them.
+                assert_eq!(
+                    decoded
+                        .output_notice
+                        .as_deref()
+                        .and_then(crate::block_view::known_output_notice),
+                    None,
+                    "restore gate must drop near-miss {candidate:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3649,6 +3725,47 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// ReloadFirst must latch a post-load labeled save (anvil revalidate→save
+    /// parity). The sticky tooltip says "Reload and save…"; stopping after
+    /// `start_history_load` alone would hide the bar while live blocks stay
+    /// unsaved. Sync load-queue Failed clears the latch and returns Err.
+    #[test]
+    fn reload_first_chains_labeled_save_after_reload() {
+        let source = include_str!("history.rs");
+        let retry = source
+            .split("pub(crate) fn retry_history_persistence(self: &Rc<Self>) -> std::io::Result<()> {")
+            .nth(1)
+            .expect("retry_history_persistence")
+            .split("\n    /// Snapshot block history on the GTK thread")
+            .next()
+            .expect("retry closes before save_history docs");
+        assert!(
+            retry.contains("HistoryRetryAction::ReloadFirst")
+                && retry.contains("retry_save_after_history_load.set(true)")
+                && retry.contains("start_history_load()")
+                && retry.contains("HistoryLoadOutcome::Failed")
+                && retry.contains("retry_save_after_history_load.set(false)"),
+            "ReloadFirst must latch a post-load save and surface sync Failed"
+        );
+        assert!(
+            source.contains("fn finish_reload_first_labeled_save")
+                && source.contains("finish_reload_first_labeled_save()")
+                && source.contains("retry_save_after_history_load.take()"),
+            "Loaded / early sync restore must enqueue labeled save via the latch"
+        );
+        let loaded_arm = source
+            .split("HistoryLoadOutcome::Loaded(loaded) => {")
+            .nth(1)
+            .expect("Loaded poll arm")
+            .split("HistoryLoadOutcome::Failed")
+            .next()
+            .expect("Loaded arm ends before Failed");
+        assert!(
+            loaded_arm.contains("finish_reload_first_labeled_save()"),
+            "async Loaded must chain the labeled save"
+        );
     }
 
     #[test]

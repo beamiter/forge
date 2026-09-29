@@ -5768,6 +5768,11 @@ pub struct TermView {
     persist_history_on_drop: Cell<bool>,
     /// Main-thread poll applying a completed history load to GTK widgets.
     history_load_poll_id: RefCell<Option<glib::SourceId>>,
+    /// Sticky Retry ReloadFirst: after the async reload reaches Loaded (or an
+    /// early sync restore path finishes), enqueue a labeled save so live blocks
+    /// are not left unsaved while the bar hides optimistically. Cleared on
+    /// Failed / discarded / sync enqueue refusal.
+    retry_save_after_history_load: Cell<bool>,
     /// Slot of the settling resize tick installed on `active_vte`, shared with
     /// the arming closure so a geometry signal installs at most one tick and
     /// the tick clears the slot when it stands down. Removed on Drop —
@@ -15478,6 +15483,7 @@ impl TermView {
             history_load: Arc::new(history::HistoryLoadShared::default()),
             persist_history_on_drop: Cell::new(true),
             history_load_poll_id: RefCell::new(None),
+            retry_save_after_history_load: Cell::new(false),
             resize_tick_id: Rc::new(RefCell::new(None)),
             sticky_timer_id: RefCell::new(Some(sticky_timer_id)),
             sticky_organism_slot,
