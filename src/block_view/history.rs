@@ -2983,7 +2983,7 @@ mod tests {
         let (decoded, _) = decode_block_record(raw.as_slice(), false).unwrap();
         assert_eq!(
             decoded.output_notice.as_deref(),
-            Some("Earlier output not retained")
+            Some(super::super::FINISHED_OUTPUT_NOT_RETAINED)
         );
 
         let legacy = super::LegacyBlockDataV3 {

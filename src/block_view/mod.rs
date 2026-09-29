@@ -19902,13 +19902,16 @@ mod tests {
             assert!(block.output.starts_with("start"));
             assert_eq!(
                 block.output_notice.as_deref(),
-                Some("Output text truncated")
+                Some(super::FINISHED_OUTPUT_TEXT_TRUNCATED)
             );
         }
         let cards = view.finished_blocks.borrow();
         let card = cards.last().expect("a finished card");
         assert!(card.output_notice.is_visible());
-        assert_eq!(card.output_notice.text(), "Output text truncated");
+        assert_eq!(
+            card.output_notice.text(),
+            super::FINISHED_OUTPUT_TEXT_TRUNCATED
+        );
         drop(cards);
         window.close();
     }
@@ -20558,18 +20561,18 @@ mod tests {
         for flags in [(true, false, false), (false, false, true)] {
             assert_eq!(
                 super::finished_output_notice(flags.0, flags.1, flags.2),
-                Some("Earlier output not retained"),
+                Some(super::FINISHED_OUTPUT_NOT_RETAINED),
                 "{flags:?}"
             );
         }
         // The line replay keeps the head and loses the END.
         assert_eq!(
             super::finished_output_notice(false, true, false),
-            Some("Output text truncated")
+            Some(super::FINISHED_OUTPUT_TEXT_TRUNCATED)
         );
         assert_eq!(
             super::finished_output_notice(true, true, false),
-            Some("Output only partly retained")
+            Some(super::FINISHED_OUTPUT_PARTLY_RETAINED)
         );
         for notice in [
             super::FINISHED_OUTPUT_NOT_RETAINED,
@@ -20597,7 +20600,7 @@ mod tests {
         );
         assert_eq!(
             payload.materialize().output_notice(),
-            Some("Earlier output not retained")
+            Some(super::FINISHED_OUTPUT_NOT_RETAINED)
         );
     }
 
