@@ -3110,6 +3110,13 @@ mod tests {
                 format!("\u{2003}{base}"),
                 format!("{base}\u{2004}"),
                 format!("\u{2067}{base}\u{2069}"),
+                // Hangul fillers / Braille blank / format-control catch-up
+                // beside the sticky hangul wave — still outside the known-set.
+                format!("{base}\u{115f}"),
+                format!("{base}\u{3164}"),
+                format!("\u{2800}{base}"),
+                format!("{base}\u{206a}"),
+                format!("{base}\u{206f}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
