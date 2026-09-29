@@ -1,8 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (round 106: close idle cross-block continue TODO + UPGRADE 104–105)
+Updated: 2026-09-29 (round 107: FindScanBudget constructor semantic pin)
 
 ## Completed since the previous handoff
+
+- **FindScanBudget constructor semantic pin (upgrade round 107)** —
+  `FindScanBudget::for_cross_block` stays on shared `CROSS_BLOCK_SCAN_*`
+  (8 MiB / 48 ms); `FindScanBudget::new` stays on `FIND_OVERLAY_SCAN_*`
+  (4 MiB / 12 ms). Regression
+  `find_scan_budget_constructors_split_overlay_and_cross_block_caps` pins both.
 
 - **Cross-block cancellable continue closed in TODO (upgrade round 106)** —
   `TODO.md` P2 now marks the cancellable cross-block scan done in the landed

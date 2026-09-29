@@ -501,3 +501,11 @@ quality gates listed in `README.md`.
 106. **Close idle cross-block continue TODO** — mark the cancellable
      cross-block scan P2 done in the round-91 idle-continuation form;
      backfill ledger rounds 104–105. Live VTE↔PCRE2 alignment stays open.
+
+107. **FindScanBudget constructor semantic pin** — palette
+     `FindScanBudget::for_cross_block` uses shared `CROSS_BLOCK_SCAN_*`
+     (8 MiB / 48 ms); live overlay `FindScanBudget::new` uses
+     `FIND_OVERLAY_SCAN_*` (4 MiB / 12 ms). Unit test pins both constructors.
+
+     mirrors every core `VisualTransition::between` pair (64 bridges), closing
+     gaps left by the staged UnknownOutcome / Watch* / vigil rounds.
