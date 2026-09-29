@@ -753,16 +753,17 @@ quality gates listed in `README.md`.
      timeout/nice nest classify; Inspect/Sit→Unknown `between()` **93** already
      ledgered. Manifests stay on published pins. Pairs anvil 125.
 
-161. **Sticky near-miss punct/thin/hair/ALM/bidi-isolate labels** — U+2008 /
+164. **Sticky near-miss punct/thin/hair/ALM/bidi-isolate labels** — U+2008 /
      U+2009 / U+200A / U+061C / U+2066–U+2069 variants of `"Save Block history"`
-     stay toast-only beside rounds 156/154. Pairs anvil 126.
+     stay toast-only beside rounds 156/154. Pairs anvil 129. Leaves 161–163 for
+     WatchSettled/CrossBlock/PATH wave-30 cohort.
 
-162. **Find Command/Output empty-query browser + stale** — empty query under
+165. **Find Command/Output empty-query browser + stale** — empty query under
      Command and Output scopes stays `None` (browser) when stale ids remain
      beside a live scoped bookmark (All-scope empty-query already pinned).
-     Pairs anvil 127.
+     Pairs anvil 130.
 
-163. **output_notice ZWJ/NNBSP/LS/NEL/ideo/FA near-miss gate** — ZWJ / NNBSP /
+166. **output_notice ZWJ/NNBSP/LS/NEL/ideo/FA near-miss gate** — ZWJ / NNBSP /
      line-separator / NEL / ideographic-space / function-application padded
      Truncated/Partly/Earlier strings stay outside the known-set remount gate
      beside rounds 159/150. Pairs anvil STAGE tip.

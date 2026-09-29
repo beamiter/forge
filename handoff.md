@@ -4,9 +4,10 @@ Updated: 2026-09-29 (sticky punct/thin/hair + find empty-query + notice catch-up
 
 ## 2026-09-29 (sticky punct/thin/hair + find empty-query + notice catch-up)
 
-- **Round 161**: sticky U+2008/U+2009/U+200A/U+061C/U+2066–U+2069 near-miss labels stay toast-only.
-- **Round 162**: Find Command/Output-scope empty query stays None with stale extras.
-- **Round 163**: output_notice ZWJ/NNBSP/LS/NEL/ideo/FA near-miss restore gate catch-up.
+- **Round 164**: sticky U+2008/U+2009/U+200A/U+061C/U+2066–U+2069 near-miss labels stay toast-only.
+- **Round 165**: Find Command/Output-scope empty query stays None with stale extras.
+- **Round 166**: output_notice ZWJ/NNBSP/LS/NEL/ideo/FA near-miss restore gate catch-up.
+  Leaves 161–163 for WatchSettled/CrossBlock/PATH wave-30 cohort if present.
   Rounds 156–160 (ZWJ sticky, QueryNoMatches scopes, cancel/notice, STAGE 71 tip) sit beside.
   Core/jagent tips still **pending push/repin**.
 
