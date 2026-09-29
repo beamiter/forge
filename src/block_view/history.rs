@@ -3158,6 +3158,11 @@ mod tests {
                 format!("{base}\u{fe03}"),
                 format!("{base}\u{fe0b}"),
                 format!("{base}\u{1806}"),
+                // Inner mid-range VS / Mongolian syllable boundary catch-up
+                // beside the sticky FE04/FE0A/1807 wave — still outside the gate.
+                format!("{base}\u{fe04}"),
+                format!("{base}\u{fe0a}"),
+                format!("{base}\u{1807}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
