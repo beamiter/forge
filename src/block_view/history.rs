@@ -3177,6 +3177,9 @@ mod tests {
                 // FE07/1800 — still outside the gate.
                 format!("{base}\u{fe07}"),
                 format!("{base}\u{1800}"),
+                // Mongolian ellipsis catch-up beside sticky 1801 — still outside
+                // the gate (one edge).
+                format!("{base}\u{1801}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
