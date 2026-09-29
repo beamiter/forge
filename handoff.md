@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (anvil Block-history sticky catch-up note)
+
+## 2026-09-29 (anvil Block-history sticky catch-up note)
+
+- **Round 115**: anvil rounds 75/78/80/81 close sticky parity with forge round
+  78 (Retry foundation, chrome, labeled enqueue, toast partition + ReloadFirst
+  pins + Explicit Clear Failed-load bypass). `history_notice` docs name the
+  Clear/ExplicitReplace contract. No forge behavior change.
+
 ## 2026-09-29 (core tip STAGE_PREFIXES systemd-cat/aa-exec)
 
 - **STAGE_PREFIXES len 60→62** on path-patched local core tip (`60c7378`) —

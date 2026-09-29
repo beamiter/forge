@@ -539,3 +539,11 @@ quality gates listed in `README.md`.
      local `jterm_core` peels `systemd-cat` / `aa-exec` (STAGE_PREFIXES 60→62)
      with `classify_command` see-through (and full STAGE membership pin);
      Cargo manifests stay on the published pin (pending push/repin).
+
+115. **Anvil Block-history sticky catch-up note** — anvil rounds 75 (Retry
+     foundation), 78 (sticky chrome), 80 (labeled enqueue), and 81 (toast
+     partition + ReloadFirst pins + Explicit Clear bypass of Failed-load)
+     close sticky parity with forge round 78. Forge already routes
+     ExplicitReplace past Failed-load in the worker; history_notice docs now
+     name that Clear contract so the two trees stay aligned. No forge
+     behavior change.

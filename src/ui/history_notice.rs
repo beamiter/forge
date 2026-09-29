@@ -7,6 +7,13 @@
 //! failure gets, so the one class of failure that *needs* a decision was the
 //! class most likely to be missed — a toast that has already faded is not a
 //! decision. This bar stays until it is answered, and it carries the answer.
+//!
+//! Retry is ReloadFirst when this pane's load Failed (saving again would only
+//! refuse again), else SaveAgain. An Explicit Clear answers a Failed load on
+//! its own: the worker writes HistoryWriteIntent::ExplicitReplace and does not
+//! consult the Failed outcome — Clear parking must not revive the overwrite
+//! refusal. Anvil mirrors that bypass on its sync arm path (upgrade rounds
+//! 75/78/80 → forge 78 sticky story).
 
 use adw::prelude::*;
 use gtk4::{Align, Box as GBox, Button};
