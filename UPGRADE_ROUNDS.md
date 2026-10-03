@@ -3048,3 +3048,7 @@ quality gates listed in `README.md`.
      sync. RestAfterPush→SitNearError already synced in round 674. Pairs anvil
      609 / core `RestAfterPushToCelebrate` inside between() 93.
 
+680. **Find FF6C/halfwidth-katakana-letter-small-tu-query QueryNoMatches + stale** —
+     U+FF6C-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF6B/halfwidth-katakana-letter-small-o already pinned). Pairs anvil 610.
+
