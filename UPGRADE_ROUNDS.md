@@ -3353,3 +3353,8 @@ quality gates listed in `README.md`.
      live==scheduled with resume; bump/scheduled-ahead/finished walks at
      MAX-109 vs MAX-108. Pairs anvil 678.
 
+749. **WatchCommand→SitNearError Full-motion membership** —
+     dedicated Some-bridge already pinned; membership catch-up + Calm/Static
+     snap None. Pairs anvil 679 / core `WatchCommandToSitNearError` inside
+     between() 93.
+

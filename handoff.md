@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (WatchCommand→SitNearError membership beside round 748)
+
+## 2026-10-04 (sticky/find/organism edges — round 749)
+
+- WatchCommand→SitNearError Full-motion membership (Calm/Static snap). Unique
+  round **749**. Pairs anvil 679 / core `WatchCommandToSitNearError` inside
+  between() 93. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (MAX-109 cancel beside round 747)
 
 ## 2026-10-04 (sticky/find/organism edges — round 748)
