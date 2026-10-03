@@ -1342,3 +1342,8 @@ quality gates listed in `README.md`.
      ahead MAX-17 vs MAX-18, and finished walks at MAX-18. Pairs anvil 233 /
      core cancel edge.
 
+294. **GuardCautious→Idle Full-motion bridge** — Full motion animates
+     GuardCautious→Idle; Calm/Static snap + semantic_bridges membership
+     sync. Unknown→RestAfterPush already synced in round 289. Pairs anvil
+     234 / core `GuardCautiousToIdle` inside between() 93.
+

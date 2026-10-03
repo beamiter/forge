@@ -3948,8 +3948,8 @@ mod tests {
         // Unknown→GuardCautious / Unknown→GuardStuck / Unknown→GuardFailure /
         // Unknown→Idle / Unknown→Celebrate / Unknown→CelebrateBig /
         // Unknown→SitNearError / Unknown→InspectError /
-        // Unknown→RestAfterPush stay inside between() 93 and this UI bridge
-        // list (no len bump; already counted in the 93).
+        // Unknown→RestAfterPush / GuardCautious→Idle stay inside between()
+        // 93 and this UI bridge list (no len bump; already counted in the 93).
         for pair in [
             (Behavior::Celebrate, Behavior::UnknownOutcome),
             (Behavior::CelebrateBig, Behavior::UnknownOutcome),
@@ -3965,6 +3965,7 @@ mod tests {
             (Behavior::UnknownOutcome, Behavior::SitNearError),
             (Behavior::UnknownOutcome, Behavior::InspectError),
             (Behavior::UnknownOutcome, Behavior::RestAfterPush),
+            (Behavior::GuardCautious, Behavior::Idle),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4139,6 +4140,14 @@ mod tests {
                     motion,
                     Behavior::UnknownOutcome,
                     Behavior::RestAfterPush,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::GuardCautious,
+                    Behavior::Idle,
                 ),
                 None
             );
@@ -5401,6 +5410,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} UnknownOutcome→RestAfterPush"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_cautious_bridges_to_idle_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardCautious,
+                Behavior::Idle,
+            )
+            .is_some(),
+            "Full GuardCautious→Idle"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardCautious, Behavior::Idle).is_some(),
+            "core GuardCautious→Idle"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::GuardCautious,
+                    Behavior::Idle,
+                ),
+                None,
+                "{motion:?} GuardCautious→Idle"
             );
         }
     }
