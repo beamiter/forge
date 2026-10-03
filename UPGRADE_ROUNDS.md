@@ -1435,3 +1435,7 @@ quality gates listed in `README.md`.
      GuardRecovery→Idle already synced in round 309. Pairs anvil 250 /
      core `CelebrateToIdle` inside between() 93.
 
+315. **Find FF23/fullwidth-latin-C-query QueryNoMatches + stale** —
+     U+FF23-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF22/fullwidth-latin-B already pinned). Pairs anvil 251.
+
