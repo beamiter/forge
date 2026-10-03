@@ -4315,3 +4315,7 @@ quality gates listed in `README.md`.
      guard_failure_bridges_to_guard_cautious_under_full_motion_only). Pairs
      anvil 909.
 
+980. **Find QueryNoMatches+stale U+FFA8/halfwidth-hangul-letter-ssangtikeut** —
+     bookmarked_search_empty_reason QueryNoMatches for Unicode-only query
+     with stale bookmark ids (FFA7 already pinned). Pairs anvil 910.
+
