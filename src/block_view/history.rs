@@ -3420,6 +3420,9 @@ mod tests {
                 // Halfwidth katakana middle dot catch-up beside sticky FF65 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff65}"),
+                // Halfwidth katakana letter wo catch-up beside sticky FF66 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff66}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
