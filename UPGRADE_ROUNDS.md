@@ -3670,3 +3670,7 @@ quality gates listed in `README.md`.
      snap None. Pairs anvil 754 / core `UnknownOutcomeToGuardCautious` inside
      between() 93.
 
+825. **Find FF89/halfwidth-katakana-letter-no-query QueryNoMatches + stale** —
+     U+FF89-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF88/halfwidth-katakana-letter-ne already pinned). Pairs anvil 755.
+

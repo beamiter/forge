@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FF89 find beside rounds 821–824)
+
+## 2026-10-04 (sticky/find/organism edges — round 825)
+
+- FF89/halfwidth-katakana-letter-no find QueryNoMatches + stale beside rounds
+  821–824 sticky FF8A / output_notice / MAX-124 / UnknownOutcome→GuardCautious.
+  Unique round **825**. Pairs anvil 755 / core cancel. STAGE **71** / between()
+  **93** unchanged.
+
 Updated: 2026-10-04 (UnknownOutcome→GuardCautious membership beside round 823)
 
 ## 2026-10-04 (sticky/find/organism edges — round 824)
