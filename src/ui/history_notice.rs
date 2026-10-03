@@ -458,6 +458,8 @@ mod tests {
             "Save Block\u{ff5f}history",
             // Fullwidth right white parenthesis stays toast-only beside fullwidth left white parenthesis (one edge).
             "Save Block\u{ff60}history",
+            // Halfwidth ideographic full stop stays toast-only beside fullwidth right white parenthesis (one edge).
+            "Save Block\u{ff61}history",
             "Block history",
         ] {
             assert_eq!(
