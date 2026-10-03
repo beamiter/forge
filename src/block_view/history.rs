@@ -3558,6 +3558,9 @@ mod tests {
                 // Halfwidth katakana letter mo catch-up beside sticky FF93 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff93}"),
+                // Halfwidth katakana letter ya catch-up beside sticky FF94 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff94}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
