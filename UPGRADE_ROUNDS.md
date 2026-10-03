@@ -3522,3 +3522,7 @@ quality gates listed in `README.md`.
      dedicated Some-bridge already pinned; membership catch-up + Calm/Static
      snap None. Pairs anvil 719 / core `UnknownOutcomeToIdle` inside between() 93.
 
+790. **Find FF82/halfwidth-katakana-letter-tu-query QueryNoMatches + stale** —
+     U+FF82-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF81/halfwidth-katakana-letter-ti already pinned). Pairs anvil 720.
+
