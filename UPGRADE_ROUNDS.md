@@ -3358,3 +3358,7 @@ quality gates listed in `README.md`.
      snap None. Pairs anvil 679 / core `WatchCommandToSitNearError` inside
      between() 93.
 
+750. **Find FF7A/halfwidth-katakana-letter-ko-query QueryNoMatches + stale** —
+     U+FF7A-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF79/halfwidth-katakana-letter-ke already pinned). Pairs anvil 680.
+
