@@ -3809,3 +3809,7 @@ quality gates listed in `README.md`.
      live==scheduled with resume; bump/scheduled-ahead/finished walks at
      MAX-131 vs MAX-130. Pairs anvil 788.
 
+859. **Celebrate→Idle Full-motion membership** —
+     dedicated Some-bridge already pinned; membership catch-up + Calm/Static
+     snap None. Pairs anvil 789 / core `CelebrateToIdle` inside between() 93.
+
