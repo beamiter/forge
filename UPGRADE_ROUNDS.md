@@ -3183,3 +3183,7 @@ quality gates listed in `README.md`.
      already exists). WatchSettled→Celebrate already synced in round 704. Pairs
      anvil 639 / core `WatchSettledToCelebrateBig` inside between() 93.
 
+710. **Find FF72/halfwidth-katakana-letter-i-query QueryNoMatches + stale** —
+     U+FF72-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF71/halfwidth-katakana-letter-a already pinned). Pairs anvil 640.
+
