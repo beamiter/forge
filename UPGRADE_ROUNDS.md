@@ -4167,3 +4167,7 @@ quality gates listed in `README.md`.
      sit_near_error_bridges_to_guard_recovery_under_full_motion_only). Pairs
      anvil 874.
 
+945. **Find QueryNoMatches+stale U+FFA1/halfwidth-hangul-letter-kiyeok** —
+     bookmarked_search_empty_reason QueryNoMatches for Unicode-only query
+     with stale bookmark ids (FFA0 already pinned). Pairs anvil 875.
+
