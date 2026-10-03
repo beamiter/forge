@@ -2151,3 +2151,7 @@ quality gates listed in `README.md`.
      persistence_failure_surface keeps "Save Block\u{ff45}history" on Toast
      (FF44/fullwidth-latin-small-d already pinned). Pairs anvil 406.
 
+477. **output_notice remount gate U+FF45/fullwidth-latin-small-e** —
+     known_output_notice rejects Truncated/Partly/Earlier strings padded with
+     U+FF45 (FF44 already pinned). Pairs anvil 407.
+
