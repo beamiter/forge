@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFAC find beside rounds 996–999 — milestone 1000)
+
+## 2026-10-04 (sticky/find/organism edges — round 1000)
+
+- Find QueryNoMatches+stale U+FFAC/halfwidth-hangul-letter-rieul-mieum. Unique
+  round **1000**. Pairs anvil 930 / core cancel. STAGE **71** / between() **93**
+  unchanged. Milestone **1000**. Unique ledger complete.
+
 Updated: 2026-10-04 (GuardStuck GuardCautious membership beside round 998)
 
 ## 2026-10-04 (sticky/find/organism edges — round 999)

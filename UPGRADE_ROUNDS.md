@@ -4399,3 +4399,8 @@ quality gates listed in `README.md`.
      guard_stuck_bridges_to_guard_cautious_under_full_motion_only). Pairs
      anvil 929.
 
+1000. **Find QueryNoMatches+stale U+FFAC/halfwidth-hangul-letter-rieul-mieum** —
+     bookmarked_search_empty_reason QueryNoMatches for Unicode-only query
+     with stale bookmark ids (FFAB already pinned). Pairs anvil 930.
+     Milestone **1000**. Unique ledger complete.
+
