@@ -2055,3 +2055,7 @@ quality gates listed in `README.md`.
      sync. InspectError→GuardStuck already synced in round 449. Pairs anvil
      384 / core `InspectErrorToGuardCautious` inside between() 93.
 
+455. **Find FF3F/fullwidth-low-line-query QueryNoMatches + stale** —
+     U+FF3F-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF3E/fullwidth-circumflex already pinned). Pairs anvil 385.
+

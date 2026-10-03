@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF3F find beside rounds 451–454)
+
+## 2026-10-03 (sticky/find/organism edges — round 455)
+
+- FF3F/fullwidth-low-line find QueryNoMatches + stale beside rounds 451–454
+  sticky FF40 / output_notice / MAX-50 / InspectError→GuardCautious. Unique
+  round **455**. Pairs anvil 385 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (InspectError→GuardCautious beside round 453)
 
 ## 2026-10-03 (sticky/find/organism edges — round 454)
