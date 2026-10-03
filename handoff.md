@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FF61 find beside rounds 621–624)
+
+## 2026-10-04 (sticky/find/organism edges — round 625)
+
+- FF61/halfwidth-ideographic-full-stop find QueryNoMatches + stale beside rounds
+  621–624 sticky FF62 / output_notice / MAX-84 / Celebrate→InspectError.
+  Unique round **625**. Pairs anvil 555 / core cancel. STAGE **71** / between()
+  **93** unchanged.
+
 Updated: 2026-10-04 (Celebrate→InspectError beside round 623)
 
 ## 2026-10-04 (sticky/find/organism edges — round 624)

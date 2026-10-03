@@ -2805,3 +2805,7 @@ quality gates listed in `README.md`.
      sync. Celebrate→RestAfterPush already synced in round 619. Pairs anvil
      554 / core `CelebrateToInspectError` inside between() 93.
 
+625. **Find FF61/halfwidth-ideographic-full-stop-query QueryNoMatches + stale** —
+     U+FF61-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF60/fullwidth-right-white-parenthesis already pinned). Pairs anvil 555.
+
