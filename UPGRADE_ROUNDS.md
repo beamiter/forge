@@ -1964,3 +1964,7 @@ quality gates listed in `README.md`.
      sync. SitNearError→GuardStuck already synced in round 429. Pairs anvil
      364 / core `SitNearErrorToGuardFailure` inside between() 93.
 
+435. **Find FF3B/fullwidth-left-square-bracket-query QueryNoMatches + stale** —
+     U+FF3B-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF3A/fullwidth-latin-Z already pinned). Pairs anvil 365.
+

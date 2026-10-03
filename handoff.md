@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF3B find beside rounds 431–434)
+
+## 2026-10-03 (sticky/find/organism edges — round 435)
+
+- FF3B/fullwidth-left-square-bracket find QueryNoMatches + stale beside
+  rounds 431–434 sticky FF3C / output_notice / MAX-46 /
+  SitNearError→GuardFailure. Unique round **435**. Pairs anvil 365 / core
+  cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-03 (SitNearError→GuardFailure beside round 433)
 
 ## 2026-10-03 (sticky/find/organism edges — round 434)
