@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (MAX-50 cancel beside round 452)
+
+## 2026-10-03 (sticky/find/organism edges — round 453)
+
+- CrossBlock MAX-50→MAX-49 cancel. Unique round **453**. Pairs anvil 383 /
+  core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-03 (output_notice FF40 beside round 451)
 
 ## 2026-10-03 (sticky/find/organism edges — round 452)
