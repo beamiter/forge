@@ -1633,3 +1633,7 @@ quality gates listed in `README.md`.
      sync. WatchAgent→Celebrate already synced in round 354. Pairs anvil 289 /
      core `WatchCommandToCelebrate` inside between() 93.
 
+360. **Find FF2C/fullwidth-latin-L-query QueryNoMatches + stale** —
+     U+FF2C-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF2B/fullwidth-latin-K already pinned). Pairs anvil 290.
+
