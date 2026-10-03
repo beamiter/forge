@@ -2315,3 +2315,8 @@ quality gates listed in `README.md`.
      ahead MAX-61 vs MAX-62, and finished walks at MAX-62. Pairs anvil 443 /
      core cancel edge.
 
+514. **GuardFailure→GuardRecovery Full-motion bridge** — Full motion animates
+     GuardFailure→GuardRecovery; Calm/Static snap + semantic_bridges membership
+     sync. GuardFailure→GuardStuck already synced in round 509. Pairs anvil
+     444 / core `GuardFailureToGuardRecovery` inside between() 93.
+
