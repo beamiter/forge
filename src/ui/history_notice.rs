@@ -466,6 +466,8 @@ mod tests {
             "Save Block\u{ff63}history",
             // Halfwidth ideographic comma stays toast-only beside halfwidth right corner bracket (one edge).
             "Save Block\u{ff64}history",
+            // Halfwidth katakana middle dot stays toast-only beside halfwidth ideographic comma (one edge).
+            "Save Block\u{ff65}history",
             "Block history",
         ] {
             assert_eq!(
