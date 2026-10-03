@@ -438,6 +438,8 @@ mod tests {
             "Save Block\u{ff55}history",
             // Fullwidth latin small v stays toast-only beside fullwidth latin small u (one edge).
             "Save Block\u{ff56}history",
+            // Fullwidth latin small w stays toast-only beside fullwidth latin small v (one edge).
+            "Save Block\u{ff57}history",
             "Block history",
         ] {
             assert_eq!(
