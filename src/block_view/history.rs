@@ -3417,6 +3417,9 @@ mod tests {
                 // Halfwidth ideographic comma catch-up beside sticky FF64 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff64}"),
+                // Halfwidth katakana middle dot catch-up beside sticky FF65 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff65}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
