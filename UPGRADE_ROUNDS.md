@@ -3707,3 +3707,8 @@ quality gates listed in `README.md`.
      live==scheduled with resume; bump/scheduled-ahead/finished walks at
      MAX-126 vs MAX-125. Pairs anvil 763.
 
+834. **UnknownOutcome→RestAfterPush Full-motion membership** —
+     dedicated Some-bridge already pinned; membership catch-up + Calm/Static
+     snap None. Pairs anvil 764 / core `UnknownOutcomeToRestAfterPush` inside
+     between() 93.
+
