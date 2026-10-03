@@ -4373,3 +4373,8 @@ quality gates listed in `README.md`.
      live==scheduled with resume; bump/scheduled-ahead/finished walks at
      MAX-158 vs MAX-157. Pairs anvil 923.
 
+994. **GuardStuck→GuardRecovery Full-motion membership** — Calm/Static snap
+     None; semantic_bridges membership for-loop (dedicated
+     guard_stuck_bridges_to_guard_recovery_under_full_motion_only). Pairs
+     anvil 924.
+
