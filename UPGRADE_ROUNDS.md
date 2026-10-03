@@ -1611,3 +1611,7 @@ quality gates listed in `README.md`.
      sync. WatchSettled→Idle already synced in round 349. Pairs anvil 284 /
      core `WatchAgentToCelebrate` inside between() 93.
 
+355. **Find FF2B/fullwidth-latin-K-query QueryNoMatches + stale** —
+     U+FF2B-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF2A/fullwidth-latin-J already pinned). Pairs anvil 285.
+

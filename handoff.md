@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF2B find beside rounds 351–354)
+
+## 2026-10-03 (sticky/find/organism edges — round 355)
+
+- FF2B/fullwidth-latin-K find QueryNoMatches + stale beside rounds 351–354
+  sticky FF2C / output_notice / MAX-30 / WatchAgent→Celebrate. Unique round
+  **355**. Pairs anvil 285 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (WatchAgent→Celebrate beside round 353)
 
 ## 2026-10-03 (sticky/find/organism edges — round 354)
