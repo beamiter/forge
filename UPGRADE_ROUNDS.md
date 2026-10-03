@@ -1465,3 +1465,7 @@ quality gates listed in `README.md`.
      U+FF26 variant of "Save Block history" stays toast-only beside fullwidth
      latin E (round 316). Pairs anvil 256.
 
+322. **output_notice fullwidth latin-F gate** —
+     U+FF26-padded Truncated/Partly/Earlier strings stay outside the known-set
+     remount gate beside sticky FF26. Pairs anvil sticky tip.
+
