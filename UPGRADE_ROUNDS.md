@@ -1527,3 +1527,7 @@ quality gates listed in `README.md`.
      U+FF27-only queries stay QueryNoMatches under Command/Output/All when stale
      ids remain (FF26/fullwidth-latin-F already pinned). Pairs anvil 267.
 
+336. **Sticky fullwidth latin-I label** —
+     U+FF29 variant of "Save Block history" stays toast-only beside fullwidth
+     latin H (round 331). Pairs anvil 268.
+
