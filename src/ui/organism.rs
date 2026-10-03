@@ -3992,6 +3992,7 @@ mod tests {
             (Behavior::WatchSettled, Behavior::InspectError),
             (Behavior::WatchSettled, Behavior::SitNearError),
             (Behavior::WatchSettled, Behavior::RestAfterPush),
+            (Behavior::InspectError, Behavior::GuardFailure),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4374,6 +4375,14 @@ mod tests {
                     motion,
                     Behavior::WatchSettled,
                     Behavior::RestAfterPush,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::InspectError,
+                    Behavior::GuardFailure,
                 ),
                 None
             );
@@ -6364,6 +6373,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} WatchSettled→RestAfterPush"
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_error_bridges_to_guard_failure_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::InspectError,
+                Behavior::GuardFailure,
+            )
+            .is_some(),
+            "Full InspectError→GuardFailure"
+        );
+        assert!(
+            VisualTransition::between(Behavior::InspectError, Behavior::GuardFailure).is_some(),
+            "core InspectError→GuardFailure"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::InspectError,
+                    Behavior::GuardFailure,
+                ),
+                None,
+                "{motion:?} InspectError→GuardFailure"
             );
         }
     }
