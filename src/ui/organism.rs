@@ -4045,6 +4045,7 @@ mod tests {
             (Behavior::RestAfterPush, Behavior::SitNearError),
             (Behavior::RestAfterPush, Behavior::Celebrate),
             (Behavior::RestAfterPush, Behavior::CelebrateBig),
+            (Behavior::RestAfterPush, Behavior::UnknownOutcome),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -7965,6 +7966,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} RestAfterPush→CelebrateBig"
+            );
+        }
+    }
+
+    #[test]
+    fn rest_after_push_bridges_to_unknown_outcome_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::RestAfterPush,
+                Behavior::UnknownOutcome,
+            )
+            .is_some(),
+            "Full RestAfterPush→UnknownOutcome"
+        );
+        assert!(
+            VisualTransition::between(Behavior::RestAfterPush, Behavior::UnknownOutcome).is_some(),
+            "core RestAfterPush→UnknownOutcome"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::RestAfterPush,
+                    Behavior::UnknownOutcome,
+                ),
+                None,
+                "{motion:?} RestAfterPush→UnknownOutcome"
             );
         }
     }

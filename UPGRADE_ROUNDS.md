@@ -3087,3 +3087,9 @@ quality gates listed in `README.md`.
      ahead MAX-96 vs MAX-97, and finished walks at MAX-97. Pairs anvil 618 /
      core cancel edge.
 
+689. **RestAfterPush→UnknownOutcome Full-motion bridge** — Full motion animates
+     RestAfterPush→UnknownOutcome; Calm/Static snap + semantic_bridges membership
+     sync. RestAfterPush→CelebrateBig already synced in round 684. Combined
+     RestAfterPush UnknownOutcome pin remains. Pairs anvil 619 / core
+     `RestAfterPushToUnknownOutcome` inside between() 93.
+
