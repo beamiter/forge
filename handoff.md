@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (output_notice FF1F beside round 286)
+
+## 2026-10-03 (sticky/find/organism edges — round 287)
+
+- output_notice fullwidth question mark (U+FF1F) gate beside sticky FF1F.
+  Unique round **287**. Pairs anvil sticky tip. STAGE **71** / between()
+  **93** unchanged.
+
 Updated: 2026-10-03 (sticky FF1F beside round 285)
 
 ## 2026-10-03 (sticky/find/organism edges — round 286)

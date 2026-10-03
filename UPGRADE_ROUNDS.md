@@ -1311,3 +1311,7 @@ quality gates listed in `README.md`.
      U+FF1F variant of "Save Block history" stays toast-only beside fullwidth
      greater-than (round 281). Pairs anvil 228.
 
+287. **output_notice fullwidth question-mark gate** —
+     U+FF1F-padded Truncated/Partly/Earlier strings stay outside the known-set
+     remount gate beside sticky FF1F. Pairs anvil sticky tip.
+
