@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (InspectError→Idle membership beside round 873)
+
+## 2026-10-04 (sticky/find/organism edges — round 874)
+
+- InspectError→Idle Full-motion membership (Calm/Static snap). Unique round
+  **874**. Pairs anvil 804 / core `InspectErrorToIdle` inside between() 93.
+  STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (MAX-134 cancel beside round 872)
 
 ## 2026-10-04 (sticky/find/organism edges — round 873)

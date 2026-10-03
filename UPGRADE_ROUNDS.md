@@ -3869,3 +3869,7 @@ quality gates listed in `README.md`.
      live==scheduled with resume; bump/scheduled-ahead/finished walks at
      MAX-134 vs MAX-133. Pairs anvil 803.
 
+874. **InspectError→Idle Full-motion membership** —
+     dedicated Some-bridge already pinned; membership catch-up + Calm/Static
+     snap None. Pairs anvil 804 / core `InspectErrorToIdle` inside between() 93.
+
