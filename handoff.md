@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (output_notice FF60 beside round 611)
+
+## 2026-10-03 (sticky/find/organism edges — round 612)
+
+- output_notice remount gate U+FF60/fullwidth-right-white-parenthesis. Unique
+  round **612**. Pairs anvil 542 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (sticky FF60 beside round 610)
 
 ## 2026-10-03 (sticky/find/organism edges — round 611)
