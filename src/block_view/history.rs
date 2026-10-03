@@ -3396,6 +3396,9 @@ mod tests {
                 // Fullwidth right curly bracket catch-up beside sticky FF5D — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff5d}"),
+                // Fullwidth tilde catch-up beside sticky FF5E — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff5e}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {

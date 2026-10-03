@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (output_notice FF5E beside round 601)
+
+## 2026-10-03 (sticky/find/organism edges — round 602)
+
+- output_notice remount gate U+FF5E/fullwidth-tilde. Unique round **602**. Pairs
+  anvil 532 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-03 (sticky FF5E beside round 600)
 
 ## 2026-10-03 (sticky/find/organism edges — round 601)
