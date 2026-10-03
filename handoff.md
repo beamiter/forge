@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF1B find beside rounds 271–274)
+
+## 2026-10-03 (sticky/find/organism edges — round 275)
+
+- FF1B/fullwidth-semicolon find QueryNoMatches + stale beside rounds 271–274
+  sticky FF1C / output_notice / MAX-14 / Unknown→CelebrateBig. Unique round
+  **275**. Pairs anvil 219 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (Unknown→CelebrateBig beside round 273)
 
 ## 2026-10-03 (sticky/find/organism edges — round 274)
