@@ -318,6 +318,8 @@ mod tests {
             "Save Block\u{1805}history",
             // Fullwidth colon stays toast-only beside Mongolian four dots (one edge).
             "Save Block\u{ff1a}history",
+            // Fullwidth semicolon stays toast-only beside fullwidth colon (one edge).
+            "Save Block\u{ff1b}history",
             "Block history",
         ] {
             assert_eq!(

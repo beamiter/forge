@@ -1219,3 +1219,7 @@ quality gates listed in `README.md`.
      U+1805-only queries stay QueryNoMatches under Command/Output/All when stale
      ids remain (1804/colon already pinned). Pairs anvil 211.
 
+266. **Sticky fullwidth semicolon label** —
+     U+FF1B variant of "Save Block history" stays toast-only beside fullwidth
+     colon (round 261). Pairs anvil 212.
+
