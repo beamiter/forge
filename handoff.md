@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (sticky FF1F beside round 285)
+
+## 2026-10-03 (sticky/find/organism edges — round 286)
+
+- Sticky fullwidth question mark (U+FF1F) beside fullwidth greater-than.
+  Unique round **286**. Pairs anvil 228 / core cancel. STAGE **71** /
+  between() **93** unchanged.
+
 Updated: 2026-10-03 (FF1D find beside rounds 281–284)
 
 ## 2026-10-03 (sticky/find/organism edges — round 285)

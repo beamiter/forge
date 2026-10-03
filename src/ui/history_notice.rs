@@ -326,6 +326,8 @@ mod tests {
             "Save Block\u{ff1d}history",
             // Fullwidth greater-than stays toast-only beside fullwidth equals (one edge).
             "Save Block\u{ff1e}history",
+            // Fullwidth question mark stays toast-only beside fullwidth greater-than (one edge).
+            "Save Block\u{ff1f}history",
             "Block history",
         ] {
             assert_eq!(
