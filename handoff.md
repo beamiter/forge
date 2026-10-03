@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (SitNearError Idle membership beside round 878)
+
+## 2026-10-04 (sticky/find/organism edges — round 879)
+
+- SitNearError→Idle Full-motion membership (Calm/Static snap). Unique round
+  **879**. Pairs anvil 809 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-135 cancel beside round 877)
 
 ## 2026-10-04 (sticky/find/organism edges — round 878)
