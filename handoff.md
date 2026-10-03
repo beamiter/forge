@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFA7 find beside rounds 971–974)
+
+## 2026-10-04 (sticky/find/organism edges — round 975)
+
+- Find QueryNoMatches+stale U+FFA7/halfwidth-hangul-letter-tikeut. Unique round
+  **975**. Pairs anvil 905 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (GuardFailure GuardRecovery membership beside round 973)
 
 ## 2026-10-04 (sticky/find/organism edges — round 974)
