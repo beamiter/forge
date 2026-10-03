@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (MAX-15 cancel beside round 277)
+
+## 2026-10-03 (sticky/find/organism edges — round 278)
+
+- CrossBlock near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-wrap
+  (MAX-15→MAX-14) cancel. Unique round **278**. Pairs anvil 221 / core cancel.
+  STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-03 (output_notice FF1D beside round 276)
 
 ## 2026-10-03 (sticky/find/organism edges — round 277)
