@@ -4205,3 +4205,8 @@ quality gates listed in `README.md`.
      live==scheduled with resume; bump/scheduled-ahead/finished walks at
      MAX-150 vs MAX-149. Pairs anvil 883.
 
+954. **SitNearError→CelebrateBig Full-motion membership** — Calm/Static snap
+     None; semantic_bridges membership for-loop (dedicated
+     sit_near_error_bridges_to_celebrate_big_under_full_motion_only). Pairs
+     anvil 884.
+
