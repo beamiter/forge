@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFA2 find beside rounds 946–949 — milestone 950)
+
+## 2026-10-04 (sticky/find/organism edges — round 950)
+
+- Find QueryNoMatches+stale U+FFA2/halfwidth-hangul-letter-ssangkiyeok. Unique
+  round **950**. Pairs anvil 880 / core cancel. STAGE **71** / between() **93**
+  unchanged. Milestone **950**.
+
 Updated: 2026-10-04 (SitNearError Celebrate membership beside round 948)
 
 ## 2026-10-04 (sticky/find/organism edges — round 949)

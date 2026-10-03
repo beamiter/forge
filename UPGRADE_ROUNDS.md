@@ -4188,3 +4188,8 @@ quality gates listed in `README.md`.
      sit_near_error_bridges_to_celebrate_under_full_motion_only). Pairs anvil
      879.
 
+950. **Find QueryNoMatches+stale U+FFA2/halfwidth-hangul-letter-ssangkiyeok** —
+     bookmarked_search_empty_reason QueryNoMatches for Unicode-only query
+     with stale bookmark ids (FFA1 already pinned). Pairs anvil 880.
+     Milestone **950**.
+
