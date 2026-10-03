@@ -2089,3 +2089,8 @@ quality gates listed in `README.md`.
      known_output_notice rejects Truncated/Partly/Earlier strings padded with
      U+FF42 (FF41 already pinned). Pairs anvil 392.
 
+463. **CrossBlock cancel MAX-52→MAX-51 wrap bump** — palette idle continuation
+     drops MAX-52→MAX-51 generation bumps (with or without resume), scheduled
+     ahead MAX-51 vs MAX-52, and finished walks at MAX-52. Pairs anvil 393 /
+     core cancel edge.
+
