@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (output_notice FF5D beside round 596)
+
+## 2026-10-03 (sticky/find/organism edges — round 597)
+
+- output_notice remount gate U+FF5D/fullwidth-right-curly-bracket. Unique round
+  **597**. Pairs anvil 527 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (sticky FF5D beside round 595)
 
 ## 2026-10-03 (sticky/find/organism edges — round 596)
