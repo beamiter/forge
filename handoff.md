@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (sticky FF5B beside round 585)
+
+## 2026-10-03 (sticky/find/organism edges — round 586)
+
+- sticky U+FF5B/fullwidth-left-curly-bracket near-miss stays Toast. Unique round
+  **586**. Pairs anvil 516 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (FF59 find beside rounds 581–584)
 
 ## 2026-10-03 (sticky/find/organism edges — round 585)
