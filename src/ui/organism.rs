@@ -4046,6 +4046,7 @@ mod tests {
             (Behavior::RestAfterPush, Behavior::Celebrate),
             (Behavior::RestAfterPush, Behavior::CelebrateBig),
             (Behavior::RestAfterPush, Behavior::UnknownOutcome),
+            (Behavior::Celebrate, Behavior::UnknownOutcome),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -7994,6 +7995,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} RestAfterPush→UnknownOutcome"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_bridges_to_unknown_outcome_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::Celebrate,
+                Behavior::UnknownOutcome,
+            )
+            .is_some(),
+            "Full Celebrate→UnknownOutcome"
+        );
+        assert!(
+            VisualTransition::between(Behavior::Celebrate, Behavior::UnknownOutcome).is_some(),
+            "core Celebrate→UnknownOutcome"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::Celebrate,
+                    Behavior::UnknownOutcome,
+                ),
+                None,
+                "{motion:?} Celebrate→UnknownOutcome"
             );
         }
     }
