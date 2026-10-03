@@ -2607,3 +2607,7 @@ quality gates listed in `README.md`.
      sync. GuardRecovery→SitNearError already synced in round 574. Pairs anvil
      509 / core `GuardCautiousToGuardFailure` inside between() 93.
 
+580. **Find FF58/fullwidth-latin-small-x-query QueryNoMatches + stale** —
+     U+FF58-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF57/fullwidth-latin-small-w already pinned). Pairs anvil 510.
+
