@@ -4179,3 +4179,7 @@ quality gates listed in `README.md`.
      known_output_notice rejects Unicode-padded Truncated/Partly/Earlier
      strings with U+FFA3 (FFA2 already pinned). Pairs anvil 877.
 
+948. **CrossBlock MAX-149 wrapping-generation cancel** —
+     live==scheduled with resume; bump/scheduled-ahead/finished walks at
+     MAX-149 vs MAX-148. Pairs anvil 878.
+
