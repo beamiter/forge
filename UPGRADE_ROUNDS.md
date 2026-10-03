@@ -1391,3 +1391,7 @@ quality gates listed in `README.md`.
      sync. GuardFailure→Idle already synced in round 299. Pairs anvil 242 /
      core `GuardStuckToIdle` inside between() 93.
 
+305. **Find FF21/fullwidth-latin-A-query QueryNoMatches + stale** —
+     U+FF21-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF20/fullwidth-commercial-at already pinned). Pairs anvil 243.
+
