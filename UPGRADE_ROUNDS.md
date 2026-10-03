@@ -3133,3 +3133,9 @@ quality gates listed in `README.md`.
      ahead MAX-98 vs MAX-99, and finished walks at MAX-99. Pairs anvil 628 /
      core cancel edge.
 
+699. **CelebrateBig→UnknownOutcome Full-motion bridge** — Full motion animates
+     CelebrateBig→UnknownOutcome; Calm/Static snap + semantic_bridges membership
+     sync. Celebrate→UnknownOutcome already synced in round 694. Combined
+     Celebrate* UnknownOutcome pin remains. Pairs anvil 629 / core
+     `CelebrateBigToUnknownOutcome` inside between() 93.
+
