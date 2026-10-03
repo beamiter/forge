@@ -2231,3 +2231,7 @@ quality gates listed in `README.md`.
      sync. SitNearError→Celebrate already synced in round 489. Pairs anvil
      424 / core `SitNearErrorToCelebrateBig` inside between() 93.
 
+495. **Find FF47/fullwidth-latin-small-g-query QueryNoMatches + stale** —
+     U+FF47-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF46/fullwidth-latin-small-f already pinned). Pairs anvil 425.
+
