@@ -3999,3 +3999,7 @@ quality gates listed in `README.md`.
      inspect_error_bridges_to_celebrate_under_full_motion_only). Pairs anvil
      834.
 
+905. **Find QueryNoMatches+stale U+FF99/halfwidth-katakana-letter-chi** —
+     bookmarked_search_empty_reason QueryNoMatches for Unicode-only query
+     with stale bookmark ids (FF98 already pinned). Pairs anvil 835.
+

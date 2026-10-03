@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FF99 find beside rounds 901–904)
+
+## 2026-10-04 (sticky/find/organism edges — round 905)
+
+- Find QueryNoMatches+stale U+FF99/halfwidth-katakana-letter-chi. Unique round
+  **905**. Pairs anvil 835 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (InspectError Celebrate membership beside round 903)
 
 ## 2026-10-04 (sticky/find/organism edges — round 904)
