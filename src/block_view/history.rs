@@ -3210,6 +3210,9 @@ mod tests {
                 // Fullwidth question mark catch-up beside sticky FF1F — still outside
                 // the gate (one edge).
                 format!("{base}\u{ff1f}"),
+                // Fullwidth commercial at catch-up beside sticky FF20 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff20}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {

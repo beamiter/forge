@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (output_notice FF20 beside round 291)
+
+## 2026-10-03 (sticky/find/organism edges — round 292)
+
+- output_notice fullwidth commercial at (U+FF20) gate beside sticky FF20.
+  Unique round **292**. Pairs anvil sticky tip. STAGE **71** / between()
+  **93** unchanged.
+
 Updated: 2026-10-03 (sticky FF20 beside round 290)
 
 ## 2026-10-03 (sticky/find/organism edges — round 291)

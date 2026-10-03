@@ -1333,3 +1333,7 @@ quality gates listed in `README.md`.
      U+FF20 variant of "Save Block history" stays toast-only beside fullwidth
      question mark (round 286). Pairs anvil 232.
 
+292. **output_notice fullwidth commercial-at gate** —
+     U+FF20-padded Truncated/Partly/Earlier strings stay outside the known-set
+     remount gate beside sticky FF20. Pairs anvil sticky tip.
+
