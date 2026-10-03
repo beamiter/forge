@@ -3303,6 +3303,9 @@ mod tests {
                 // Fullwidth circumflex catch-up beside sticky FF3E — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff3e}"),
+                // Fullwidth low line catch-up beside sticky FF3F — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff3f}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
