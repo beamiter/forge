@@ -2187,3 +2187,7 @@ quality gates listed in `README.md`.
      sync. InspectError→UnknownOutcome already synced in round 479. Pairs anvil
      414 / core `InspectErrorToRestAfterPush` inside between() 93.
 
+485. **Find FF45/fullwidth-latin-small-e-query QueryNoMatches + stale** —
+     U+FF45-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF44/fullwidth-latin-small-d already pinned). Pairs anvil 415.
+
