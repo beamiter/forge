@@ -3435,3 +3435,8 @@ quality gates listed in `README.md`.
      live==scheduled with resume; bump/scheduled-ahead/finished walks at
      MAX-113 vs MAX-112. Pairs anvil 698.
 
+769. **WatchAgent→InspectError Full-motion membership** —
+     dedicated Some-bridge already pinned; membership catch-up + Calm/Static
+     snap None. Pairs anvil 699 / core `WatchAgentToInspectError` inside
+     between() 93.
+
