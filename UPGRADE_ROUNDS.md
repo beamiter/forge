@@ -1743,3 +1743,7 @@ quality gates listed in `README.md`.
      sync. WatchCommand→RestAfterPush already synced in round 379. Pairs anvil
      314 / core `WatchAgentToInspectError` inside between() 93.
 
+385. **Find FF31/fullwidth-latin-Q-query QueryNoMatches + stale** —
+     U+FF31-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF30/fullwidth-latin-P already pinned). Pairs anvil 315.
+
