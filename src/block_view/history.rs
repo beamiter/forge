@@ -3399,6 +3399,9 @@ mod tests {
                 // Fullwidth tilde catch-up beside sticky FF5E — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff5e}"),
+                // Fullwidth left white parenthesis catch-up beside sticky FF5F — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff5f}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
