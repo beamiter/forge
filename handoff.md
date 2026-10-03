@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF3C find beside rounds 436–439)
+
+## 2026-10-03 (sticky/find/organism edges — round 440)
+
+- FF3C/fullwidth-reverse-solidus find QueryNoMatches + stale beside rounds
+  436–439 sticky FF3D / output_notice / MAX-47 / SitNearError→GuardCautious.
+  Unique round **440**. Pairs anvil 370 / core cancel. STAGE **71** /
+  between() **93** unchanged.
+
 Updated: 2026-10-03 (SitNearError→GuardCautious beside round 438)
 
 ## 2026-10-03 (sticky/find/organism edges — round 439)

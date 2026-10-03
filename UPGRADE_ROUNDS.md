@@ -1986,3 +1986,8 @@ quality gates listed in `README.md`.
      sync. SitNearError→GuardFailure already synced in round 434. Pairs anvil
      369 / core `SitNearErrorToGuardCautious` inside between() 93.
 
+440. **Find FF3C/fullwidth-reverse-solidus-query QueryNoMatches + stale** —
+     U+FF3C-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF3B/fullwidth-left-square-bracket already pinned). Pairs anvil
+     370.
+
