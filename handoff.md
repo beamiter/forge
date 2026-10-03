@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF36 find beside rounds 406–409)
+
+## 2026-10-03 (sticky/find/organism edges — round 410)
+
+- FF36/fullwidth-latin-V find QueryNoMatches + stale beside rounds 406–409
+  sticky FF37 / output_notice / MAX-41 / WatchSettled→InspectError. Unique
+  round **410**. Pairs anvil 340 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (WatchSettled→InspectError beside round 408)
 
 ## 2026-10-03 (sticky/find/organism edges — round 409)

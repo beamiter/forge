@@ -1853,3 +1853,7 @@ quality gates listed in `README.md`.
      sync. WatchSettled→CelebrateBig already synced in round 404. Pairs anvil
      339 / core `WatchSettledToInspectError` inside between() 93.
 
+410. **Find FF36/fullwidth-latin-V-query QueryNoMatches + stale** —
+     U+FF36-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF35/fullwidth-latin-U already pinned). Pairs anvil 340.
+
