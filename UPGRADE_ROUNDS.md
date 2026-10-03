@@ -2050,3 +2050,8 @@ quality gates listed in `README.md`.
      ahead MAX-49 vs MAX-50, and finished walks at MAX-50. Pairs anvil 383 /
      core cancel edge.
 
+454. **InspectError→GuardCautious Full-motion bridge** — Full motion animates
+     InspectError→GuardCautious; Calm/Static snap + semantic_bridges membership
+     sync. InspectError→GuardStuck already synced in round 449. Pairs anvil
+     384 / core `InspectErrorToGuardCautious` inside between() 93.
+
