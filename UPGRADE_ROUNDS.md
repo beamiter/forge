@@ -1452,3 +1452,8 @@ quality gates listed in `README.md`.
      ahead MAX-22 vs MAX-23, and finished walks at MAX-23. Pairs anvil 253 /
      core cancel edge.
 
+319. **CelebrateBig→Idle Full-motion bridge** — Full motion animates
+     CelebrateBig→Idle; Calm/Static snap + semantic_bridges membership
+     sync. Celebrate→Idle already synced in round 314. Pairs anvil 254 /
+     core `CelebrateBigToIdle` inside between() 93.
+

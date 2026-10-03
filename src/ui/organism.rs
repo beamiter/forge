@@ -3971,6 +3971,7 @@ mod tests {
             (Behavior::GuardStuck, Behavior::Idle),
             (Behavior::GuardRecovery, Behavior::Idle),
             (Behavior::Celebrate, Behavior::Idle),
+            (Behavior::CelebrateBig, Behavior::Idle),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4184,6 +4185,14 @@ mod tests {
                 visual_transition_for_motion(
                     motion,
                     Behavior::Celebrate,
+                    Behavior::Idle,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::CelebrateBig,
                     Behavior::Idle,
                 ),
                 None
@@ -5587,6 +5596,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} Celebrate→Idle"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_big_bridges_to_idle_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::CelebrateBig,
+                Behavior::Idle,
+            )
+            .is_some(),
+            "Full CelebrateBig→Idle"
+        );
+        assert!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::Idle).is_some(),
+            "core CelebrateBig→Idle"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::CelebrateBig,
+                    Behavior::Idle,
+                ),
+                None,
+                "{motion:?} CelebrateBig→Idle"
             );
         }
     }

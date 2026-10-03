@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (CelebrateBig→Idle beside round 318)
+
+## 2026-10-03 (sticky/find/organism edges — round 319)
+
+- CelebrateBig→Idle Full-motion bridge + UI membership sync. Unique round
+  **319**. Pairs anvil 254 / core. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-03 (MAX-23 cancel beside round 317)
 
 ## 2026-10-03 (sticky/find/organism edges — round 318)
