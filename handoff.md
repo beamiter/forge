@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FF71 beside round 696)
+
+## 2026-10-04 (sticky/find/organism edges — round 697)
+
+- output_notice remount gate U+FF71/halfwidth-katakana-letter-a. Unique
+  round **697**. Pairs anvil 627 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (sticky FF71 beside round 695)
 
 ## 2026-10-04 (sticky/find/organism edges — round 696)

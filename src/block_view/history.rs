@@ -3453,6 +3453,9 @@ mod tests {
                 // Halfwidth katakana-hiragana prolonged sound mark catch-up beside sticky FF70 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff70}"),
+                // Halfwidth katakana letter a catch-up beside sticky FF71 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff71}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {

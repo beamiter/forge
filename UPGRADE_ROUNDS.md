@@ -3124,3 +3124,7 @@ quality gates listed in `README.md`.
      persistence_failure_surface keeps "Save Block\u{ff71}history" on Toast
      (FF70/halfwidth-katakana-hiragana-prolonged-sound-mark already pinned). Pairs anvil 626.
 
+697. **output_notice remount gate U+FF71/halfwidth-katakana-letter-a** —
+     known_output_notice rejects Truncated/Partly/Earlier strings padded with
+     U+FF71 (FF70 already pinned). Pairs anvil 627.
+
