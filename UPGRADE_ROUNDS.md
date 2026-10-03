@@ -3374,3 +3374,8 @@ quality gates listed in `README.md`.
      live==scheduled with resume; bump/scheduled-ahead/finished walks at
      MAX-110 vs MAX-109. Pairs anvil 683.
 
+754. **WatchCommand→RestAfterPush Full-motion membership** —
+     dedicated Some-bridge already pinned; membership catch-up + Calm/Static
+     snap None. Pairs anvil 684 / core `WatchCommandToRestAfterPush` inside
+     between() 93.
+

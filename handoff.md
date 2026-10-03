@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (WatchCommand→RestAfterPush membership beside round 753)
+
+## 2026-10-04 (sticky/find/organism edges — round 754)
+
+- WatchCommand→RestAfterPush Full-motion membership (Calm/Static snap). Unique
+  round **754**. Pairs anvil 684 / core `WatchCommandToRestAfterPush` inside
+  between() 93. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (MAX-110 cancel beside round 752)
 
 ## 2026-10-04 (sticky/find/organism edges — round 753)
