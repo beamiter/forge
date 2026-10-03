@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (sticky FFA2 beside round 940)
+
+## 2026-10-04 (sticky/find/organism edges — round 941)
+
+- sticky U+FFA2/halfwidth-hangul-letter-ssangkiyeok near-miss stays Toast.
+  Unique round **941**. Pairs anvil 871 / core cancel. STAGE **71** / between()
+  **93** unchanged.
+
 Updated: 2026-10-04 (FFA0 find beside rounds 936–939)
 
 ## 2026-10-04 (sticky/find/organism edges — round 940)

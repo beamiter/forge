@@ -588,6 +588,8 @@ mod tests {
             "Save Block\u{ffa0}history",
             // Halfwidth hangul letter kiyeok stays toast-only beside halfwidth hangul filler (one edge).
             "Save Block\u{ffa1}history",
+            // Halfwidth hangul letter ssangkiyeok stays toast-only beside halfwidth hangul letter kiyeok (one edge).
+            "Save Block\u{ffa2}history",
             "Block history",
         ] {
             assert_eq!(
