@@ -9421,6 +9421,30 @@ tail ab";
         assert!(!cross_block_search_continue_is_current(
             near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
         ));
+        // near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-wrap bump (MAX-54→MAX-53) cancels with a
+        // resume — one step earlier than the MAX-53→MAX-52 sibling.
+        let near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
+        assert!(cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+        ));
+        // Scheduled ahead at the near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-wrap boundary
+        // (MAX-53 vs MAX-54).
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+        ));
+        // Finished walk at the near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-wrap generation itself.
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+        ));
     }
 
     #[test]
