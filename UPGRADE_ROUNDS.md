@@ -3004,3 +3004,7 @@ quality gates listed in `README.md`.
      sync. CelebrateBig→SitNearError already synced in round 664. Pairs anvil
      599 / core `RestAfterPushToInspectError` inside between() 93.
 
+670. **Find FF6A/halfwidth-katakana-letter-small-e-query QueryNoMatches + stale** —
+     U+FF6A-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF69/halfwidth-katakana-letter-small-u already pinned). Pairs anvil 600.
+
