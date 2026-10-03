@@ -4357,3 +4357,7 @@ quality gates listed in `README.md`.
      guard_stuck_bridges_to_guard_failure_under_full_motion_only). Pairs
      anvil 919.
 
+990. **Find QueryNoMatches+stale U+FFAA/halfwidth-hangul-letter-rieul** —
+     bookmarked_search_empty_reason QueryNoMatches for Unicode-only query
+     with stale bookmark ids (FFA9 already pinned). Pairs anvil 920.
+

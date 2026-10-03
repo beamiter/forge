@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFAA find beside rounds 986–989)
+
+## 2026-10-04 (sticky/find/organism edges — round 990)
+
+- Find QueryNoMatches+stale U+FFAA/halfwidth-hangul-letter-rieul. Unique round
+  **990**. Pairs anvil 920 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (GuardStuck GuardFailure membership beside round 988)
 
 ## 2026-10-04 (sticky/find/organism edges — round 989)
