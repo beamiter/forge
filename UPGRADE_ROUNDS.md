@@ -1369,3 +1369,7 @@ quality gates listed in `README.md`.
      sync. GuardCautious→Idle already synced in round 294. Pairs anvil 238 /
      core `GuardFailureToIdle` inside between() 93.
 
+300. **Find FF20/fullwidth-commercial-at-query QueryNoMatches + stale** —
+     U+FF20-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF1F/fullwidth-question-mark already pinned). Pairs anvil 239.
+

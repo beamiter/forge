@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF20 find beside rounds 296–299)
+
+## 2026-10-03 (sticky/find/organism edges — round 300)
+
+- FF20/fullwidth-commercial-at find QueryNoMatches + stale beside rounds
+  296–299 sticky FF21 / output_notice / MAX-19 / GuardFailure→Idle.
+  Unique round **300**. Pairs anvil 239 / core cancel. STAGE **71** /
+  between() **93** unchanged.
+
 Updated: 2026-10-03 (GuardFailure→Idle beside round 298)
 
 ## 2026-10-03 (sticky/find/organism edges — round 299)
