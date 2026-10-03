@@ -4067,6 +4067,7 @@ mod tests {
             (Behavior::WatchAgent, Behavior::Idle),
             (Behavior::UnknownOutcome, Behavior::Idle),
             (Behavior::UnknownOutcome, Behavior::InspectError),
+            (Behavior::UnknownOutcome, Behavior::Celebrate),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),

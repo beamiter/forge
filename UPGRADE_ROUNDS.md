@@ -3559,3 +3559,8 @@ quality gates listed in `README.md`.
      live==scheduled with resume; bump/scheduled-ahead/finished walks at
      MAX-119 vs MAX-118. Pairs anvil 728.
 
+799. **UnknownOutcome→Celebrate Full-motion membership** —
+     dedicated Some-bridge already pinned; membership catch-up + Calm/Static
+     snap None. Pairs anvil 729 / core `UnknownOutcomeToCelebrate` inside
+     between() 93.
+
