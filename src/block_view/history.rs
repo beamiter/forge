@@ -3513,6 +3513,9 @@ mod tests {
                 // Halfwidth katakana letter to catch-up beside sticky FF84 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff84}"),
+                // Halfwidth katakana letter na catch-up beside sticky FF85 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff85}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
