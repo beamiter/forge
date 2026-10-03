@@ -2990,3 +2990,7 @@ quality gates listed in `README.md`.
      persistence_failure_surface keeps "Save Block\u{ff6b}history" on Toast
      (FF6A/halfwidth-katakana-letter-small-e already pinned). Pairs anvil 596.
 
+667. **output_notice remount gate U+FF6B/halfwidth-katakana-letter-small-o** —
+     known_output_notice rejects Truncated/Partly/Earlier strings padded with
+     U+FF6B (FF6A already pinned). Pairs anvil 597.
+

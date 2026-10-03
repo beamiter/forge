@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FF6B beside round 666)
+
+## 2026-10-04 (sticky/find/organism edges — round 667)
+
+- output_notice remount gate U+FF6B/halfwidth-katakana-letter-small-o. Unique
+  round **667**. Pairs anvil 597 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (sticky FF6B beside round 665)
 
 ## 2026-10-04 (sticky/find/organism edges — round 666)
