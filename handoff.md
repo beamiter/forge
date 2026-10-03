@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFAB find beside rounds 991–994)
+
+## 2026-10-04 (sticky/find/organism edges — round 995)
+
+- Find QueryNoMatches+stale U+FFAB/halfwidth-hangul-letter-rieul-kiyeok. Unique
+  round **995**. Pairs anvil 925 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (GuardStuck GuardRecovery membership beside round 993)
 
 ## 2026-10-04 (sticky/find/organism edges — round 994)

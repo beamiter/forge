@@ -4378,3 +4378,7 @@ quality gates listed in `README.md`.
      guard_stuck_bridges_to_guard_recovery_under_full_motion_only). Pairs
      anvil 924.
 
+995. **Find QueryNoMatches+stale U+FFAB/halfwidth-hangul-letter-rieul-kiyeok** —
+     bookmarked_search_empty_reason QueryNoMatches for Unicode-only query
+     with stale bookmark ids (FFAA already pinned). Pairs anvil 925.
+
