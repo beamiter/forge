@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF57 find beside rounds 571–574)
+
+## 2026-10-03 (sticky/find/organism edges — round 575)
+
+- FF57/fullwidth-latin-small-w find QueryNoMatches + stale beside rounds
+  571–574 sticky FF58 / output_notice / MAX-74 / GuardRecovery→SitNearError.
+  Unique round **575**. Pairs anvil 505 / core cancel. STAGE **71** /
+  between() **93** unchanged.
+
 Updated: 2026-10-03 (GuardRecovery→SitNearError beside round 573)
 
 ## 2026-10-03 (sticky/find/organism edges — round 574)
