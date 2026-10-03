@@ -2982,3 +2982,7 @@ quality gates listed in `README.md`.
      sync. CelebrateBig→InspectError already synced in round 659. Pairs anvil
      594 / core `CelebrateBigToSitNearError` inside between() 93.
 
+665. **Find FF69/halfwidth-katakana-letter-small-u-query QueryNoMatches + stale** —
+     U+FF69-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF68/halfwidth-katakana-letter-small-i already pinned). Pairs anvil 595.
+
