@@ -3379,3 +3379,7 @@ quality gates listed in `README.md`.
      snap None. Pairs anvil 684 / core `WatchCommandToRestAfterPush` inside
      between() 93.
 
+755. **Find FF7B/halfwidth-katakana-letter-sa-query QueryNoMatches + stale** —
+     U+FF7B-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF7A/halfwidth-katakana-letter-ko already pinned). Pairs anvil 685.
+
