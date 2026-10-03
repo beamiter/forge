@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (sticky FF39 beside round 415)
+
+## 2026-10-03 (sticky/find/organism edges — round 416)
+
+- Sticky U+FF39/fullwidth-latin-Y near-miss stays Toast. Unique round **416**.
+  Pairs anvil 346 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-03 (FF37 find beside rounds 411–414)
 
 ## 2026-10-03 (sticky/find/organism edges — round 415)
