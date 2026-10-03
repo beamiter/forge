@@ -4000,6 +4000,7 @@ mod tests {
             (Behavior::InspectError, Behavior::GuardStuck),
             (Behavior::InspectError, Behavior::GuardCautious),
             (Behavior::InspectError, Behavior::GuardRecovery),
+            (Behavior::InspectError, Behavior::Celebrate),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -6660,6 +6661,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} InspectError→GuardRecovery"
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_error_bridges_to_celebrate_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::InspectError,
+                Behavior::Celebrate,
+            )
+            .is_some(),
+            "Full InspectError→Celebrate"
+        );
+        assert!(
+            VisualTransition::between(Behavior::InspectError, Behavior::Celebrate).is_some(),
+            "core InspectError→Celebrate"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::InspectError,
+                    Behavior::Celebrate,
+                ),
+                None,
+                "{motion:?} InspectError→Celebrate"
             );
         }
     }
