@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (sticky FF63 beside round 625)
+
+## 2026-10-04 (sticky/find/organism edges — round 626)
+
+- sticky U+FF63/halfwidth-right-corner-bracket near-miss stays Toast. Unique
+  round **626**. Pairs anvil 556 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (FF61 find beside rounds 621–624)
 
 ## 2026-10-04 (sticky/find/organism edges — round 625)

@@ -2809,3 +2809,7 @@ quality gates listed in `README.md`.
      U+FF61-only queries stay QueryNoMatches under Command/Output/All when stale
      ids remain (FF60/fullwidth-right-white-parenthesis already pinned). Pairs anvil 555.
 
+626. **sticky U+FF63/halfwidth-right-corner-bracket near-miss stays Toast** —
+     persistence_failure_surface keeps "Save Block\u{ff63}history" on Toast
+     (FF62/halfwidth-left-corner-bracket already pinned). Pairs anvil 556.
+
