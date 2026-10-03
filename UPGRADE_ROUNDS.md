@@ -2004,3 +2004,8 @@ quality gates listed in `README.md`.
      ahead MAX-47 vs MAX-48, and finished walks at MAX-48. Pairs anvil 373 /
      core cancel edge.
 
+444. **SitNearError→GuardRecovery Full-motion bridge** — Full motion animates
+     SitNearError→GuardRecovery; Calm/Static snap + semantic_bridges membership
+     sync. SitNearError→GuardCautious already synced in round 439. Pairs anvil
+     374 / core `SitNearErrorToGuardRecovery` inside between() 93.
+
