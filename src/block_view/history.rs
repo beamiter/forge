@@ -3348,6 +3348,9 @@ mod tests {
                 // Fullwidth latin small m catch-up beside sticky FF4D — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff4d}"),
+                // Fullwidth latin small n catch-up beside sticky FF4E — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff4e}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
