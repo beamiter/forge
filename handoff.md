@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FF64 beside round 631)
+
+## 2026-10-04 (sticky/find/organism edges — round 632)
+
+- output_notice remount gate U+FF64/halfwidth-ideographic-comma. Unique
+  round **632**. Pairs anvil 562 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (sticky FF64 beside round 630)
 
 ## 2026-10-04 (sticky/find/organism edges — round 631)

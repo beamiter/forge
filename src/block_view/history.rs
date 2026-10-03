@@ -3414,6 +3414,9 @@ mod tests {
                 // Halfwidth right corner bracket catch-up beside sticky FF63 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff63}"),
+                // Halfwidth ideographic comma catch-up beside sticky FF64 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff64}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
