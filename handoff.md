@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FF9A find beside rounds 906–909)
+
+## 2026-10-04 (sticky/find/organism edges — round 910)
+
+- Find QueryNoMatches+stale U+FF9A/halfwidth-katakana-letter-tsu. Unique round
+  **910**. Pairs anvil 840 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (InspectError CelebrateBig membership beside round 908)
 
 ## 2026-10-04 (sticky/find/organism edges — round 909)

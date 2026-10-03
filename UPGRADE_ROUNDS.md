@@ -4020,3 +4020,7 @@ quality gates listed in `README.md`.
      inspect_error_bridges_to_celebrate_big_under_full_motion_only). Pairs
      anvil 839.
 
+910. **Find QueryNoMatches+stale U+FF9A/halfwidth-katakana-letter-tsu** —
+     bookmarked_search_empty_reason QueryNoMatches for Unicode-only query
+     with stale bookmark ids (FF99 already pinned). Pairs anvil 840.
+
