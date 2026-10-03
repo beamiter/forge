@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (WatchCommand→CelebrateBig beside round 363)
+
+## 2026-10-03 (sticky/find/organism edges — round 364)
+
+- WatchCommand→CelebrateBig Full-motion bridge + UI membership sync. Unique
+  round **364**. Pairs anvil 294 / core. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (MAX-32 cancel beside round 362)
 
 ## 2026-10-03 (sticky/find/organism edges — round 363)
