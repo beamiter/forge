@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FF9B find beside rounds 911–914)
+
+## 2026-10-04 (sticky/find/organism edges — round 915)
+
+- Find QueryNoMatches+stale U+FF9B/halfwidth-katakana-letter-te. Unique round
+  **915**. Pairs anvil 845 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (InspectError SitNearError membership beside round 913)
 
 ## 2026-10-04 (sticky/find/organism edges — round 914)
