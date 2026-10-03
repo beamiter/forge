@@ -3519,6 +3519,9 @@ mod tests {
                 // Halfwidth katakana letter ni catch-up beside sticky FF86 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff86}"),
+                // Halfwidth katakana letter nu catch-up beside sticky FF87 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff87}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
