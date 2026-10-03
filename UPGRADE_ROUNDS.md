@@ -3266,3 +3266,8 @@ quality gates listed in `README.md`.
      ahead MAX-104 vs MAX-105, and finished walks at MAX-105. Pairs anvil 658 /
      core cancel edge.
 
+729. **WatchSettled→Idle Full-motion membership** — semantic_bridges
+     membership catch-up for WatchSettled→Idle (dedicated Full-motion pin
+     already exists). WatchSettled→RestAfterPush already synced in round 724.
+     Pairs anvil 659 / core `WatchSettledToIdle` inside between() 93.
+
