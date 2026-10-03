@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (sticky FF1C beside round 270)
+
+## 2026-10-03 (sticky/find/organism edges — round 271)
+
+- Sticky fullwidth less-than (U+FF1C) beside fullwidth semicolon. Unique round
+  **271**. Pairs anvil 216 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (FF1A find beside rounds 266–269)
 
 ## 2026-10-03 (sticky/find/organism edges — round 270)
