@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FF8C find beside rounds 836–839)
+
+## 2026-10-04 (sticky/find/organism edges — round 840)
+
+- FF8C/halfwidth-katakana-letter-hu find QueryNoMatches + stale beside rounds
+  836–839 sticky FF8D / output_notice / MAX-127 / GuardFailure→Idle. Unique
+  round **840**. Pairs anvil 770 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (GuardFailure→Idle membership beside round 838)
 
 ## 2026-10-04 (sticky/find/organism edges — round 839)
