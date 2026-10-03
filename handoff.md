@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (output_notice FF5A beside round 581)
+
+## 2026-10-03 (sticky/find/organism edges — round 582)
+
+- output_notice remount gate U+FF5A/fullwidth-latin-small-z. Unique round
+  **582**. Pairs anvil 512 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (sticky FF5A beside round 580)
 
 ## 2026-10-03 (sticky/find/organism edges — round 581)
