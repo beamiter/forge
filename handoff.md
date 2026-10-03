@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (InspectError Celebrate membership beside round 903)
+
+## 2026-10-04 (sticky/find/organism edges — round 904)
+
+- InspectError→Celebrate Full-motion membership (Calm/Static snap). Unique
+  round **904**. Pairs anvil 834 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-140 cancel beside round 902)
 
 ## 2026-10-04 (sticky/find/organism edges — round 903)
