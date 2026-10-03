@@ -3405,6 +3405,9 @@ mod tests {
                 // Fullwidth right white parenthesis catch-up beside sticky FF60 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff60}"),
+                // Halfwidth ideographic full stop catch-up beside sticky FF61 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff61}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
