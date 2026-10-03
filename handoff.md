@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF4C find beside rounds 516–519)
+
+## 2026-10-03 (sticky/find/organism edges — round 520)
+
+- FF4C/fullwidth-latin-small-l find QueryNoMatches + stale beside rounds
+  516–519 sticky FF4D / output_notice / MAX-63 / GuardFailure→GuardCautious.
+  Unique round **520**. Pairs anvil 450 / core cancel. STAGE **71** /
+  between() **93** unchanged.
+
 Updated: 2026-10-03 (GuardFailure→GuardCautious beside round 518)
 
 ## 2026-10-03 (sticky/find/organism edges — round 519)
