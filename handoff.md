@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF37 find beside rounds 411–414)
+
+## 2026-10-03 (sticky/find/organism edges — round 415)
+
+- FF37/fullwidth-latin-W find QueryNoMatches + stale beside rounds 411–414
+  sticky FF38 / output_notice / MAX-42 / WatchSettled→SitNearError. Unique
+  round **415**. Pairs anvil 345 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (WatchSettled→SitNearError beside round 413)
 
 ## 2026-10-03 (sticky/find/organism edges — round 414)
