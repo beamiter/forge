@@ -2032,3 +2032,8 @@ quality gates listed in `README.md`.
      sync. SitNearError→GuardRecovery already synced in round 444. Pairs anvil
      379 / core `InspectErrorToGuardStuck` inside between() 93.
 
+450. **Find FF3E/fullwidth-circumflex-query QueryNoMatches + stale** —
+     U+FF3E-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF3D/fullwidth-right-square-bracket already pinned). Pairs anvil
+     380.
+
