@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (UnknownOutcome→GuardCautious membership beside round 823)
+
+## 2026-10-04 (sticky/find/organism edges — round 824)
+
+- UnknownOutcome→GuardCautious Full-motion membership (Calm/Static snap). Unique
+  round **824**. Pairs anvil 754 / core `UnknownOutcomeToGuardCautious` inside
+  between() 93. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (MAX-124 cancel beside round 822)
 
 ## 2026-10-04 (sticky/find/organism edges — round 823)
