@@ -3853,3 +3853,7 @@ quality gates listed in `README.md`.
      dedicated Some-bridge already pinned; membership catch-up + Calm/Static
      snap None. Pairs anvil 799 / core `RestAfterPushToIdle` inside between() 93.
 
+870. **Find FF92/halfwidth-katakana-letter-me-query QueryNoMatches + stale** —
+     U+FF92-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF91/halfwidth-katakana-letter-mu already pinned). Pairs anvil 800.
+
