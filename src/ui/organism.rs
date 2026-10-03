@@ -3988,6 +3988,7 @@ mod tests {
             (Behavior::WatchAgent, Behavior::SitNearError),
             (Behavior::WatchAgent, Behavior::RestAfterPush),
             (Behavior::WatchSettled, Behavior::Celebrate),
+            (Behavior::WatchSettled, Behavior::CelebrateBig),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4338,6 +4339,14 @@ mod tests {
                     motion,
                     Behavior::WatchSettled,
                     Behavior::Celebrate,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchSettled,
+                    Behavior::CelebrateBig,
                 ),
                 None
             );
@@ -6216,6 +6225,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} WatchSettled→Celebrate"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_settled_bridges_to_celebrate_big_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchSettled,
+                Behavior::CelebrateBig,
+            )
+            .is_some(),
+            "Full WatchSettled→CelebrateBig"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchSettled, Behavior::CelebrateBig).is_some(),
+            "core WatchSettled→CelebrateBig"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchSettled,
+                    Behavior::CelebrateBig,
+                ),
+                None,
+                "{motion:?} WatchSettled→CelebrateBig"
             );
         }
     }
