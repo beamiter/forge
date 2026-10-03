@@ -2182,3 +2182,8 @@ quality gates listed in `README.md`.
      ahead MAX-55 vs MAX-56, and finished walks at MAX-56. Pairs anvil 413 /
      core cancel edge.
 
+484. **InspectError→RestAfterPush Full-motion bridge** — Full motion animates
+     InspectError→RestAfterPush; Calm/Static snap + semantic_bridges membership
+     sync. InspectError→UnknownOutcome already synced in round 479. Pairs anvil
+     414 / core `InspectErrorToRestAfterPush` inside between() 93.
+

@@ -4004,6 +4004,7 @@ mod tests {
             (Behavior::InspectError, Behavior::CelebrateBig),
             (Behavior::InspectError, Behavior::SitNearError),
             (Behavior::InspectError, Behavior::UnknownOutcome),
+            (Behavior::InspectError, Behavior::RestAfterPush),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -6776,6 +6777,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} InspectError→UnknownOutcome"
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_error_bridges_to_rest_after_push_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::InspectError,
+                Behavior::RestAfterPush,
+            )
+            .is_some(),
+            "Full InspectError→RestAfterPush"
+        );
+        assert!(
+            VisualTransition::between(Behavior::InspectError, Behavior::RestAfterPush).is_some(),
+            "core InspectError→RestAfterPush"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::InspectError,
+                    Behavior::RestAfterPush,
+                ),
+                None,
+                "{motion:?} InspectError→RestAfterPush"
             );
         }
     }
