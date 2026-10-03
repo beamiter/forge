@@ -3249,3 +3249,7 @@ quality gates listed in `README.md`.
      already exists). WatchSettled→SitNearError already synced in round 719.
      Pairs anvil 654 / core `WatchSettledToRestAfterPush` inside between() 93.
 
+725. **Find FF75/halfwidth-katakana-letter-o-query QueryNoMatches + stale** —
+     U+FF75-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF74/halfwidth-katakana-letter-e already pinned). Pairs anvil 655.
+
