@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (GuardFailure→GuardStuck beside round 508)
+
+## 2026-10-03 (sticky/find/organism edges — round 509)
+
+- GuardFailure→GuardStuck Full-motion bridge + UI membership sync. Unique
+  round **509**. Pairs anvil 439 / core. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (MAX-61 cancel beside round 507)
 
 ## 2026-10-03 (sticky/find/organism edges — round 508)
