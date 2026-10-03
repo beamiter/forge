@@ -3981,6 +3981,7 @@ mod tests {
             (Behavior::WatchAgent, Behavior::Celebrate),
             (Behavior::WatchCommand, Behavior::Celebrate),
             (Behavior::WatchCommand, Behavior::CelebrateBig),
+            (Behavior::WatchCommand, Behavior::InspectError),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4275,6 +4276,14 @@ mod tests {
                     motion,
                     Behavior::WatchCommand,
                     Behavior::CelebrateBig,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchCommand,
+                    Behavior::InspectError,
                 ),
                 None
             );
@@ -5957,6 +5966,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} WatchCommand→CelebrateBig"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_command_bridges_to_inspect_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchCommand,
+                Behavior::InspectError,
+            )
+            .is_some(),
+            "Full WatchCommand→InspectError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchCommand, Behavior::InspectError).is_some(),
+            "core WatchCommand→InspectError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchCommand,
+                    Behavior::InspectError,
+                ),
+                None,
+                "{motion:?} WatchCommand→InspectError"
             );
         }
     }
