@@ -460,6 +460,8 @@ mod tests {
             "Save Block\u{ff60}history",
             // Halfwidth ideographic full stop stays toast-only beside fullwidth right white parenthesis (one edge).
             "Save Block\u{ff61}history",
+            // Halfwidth left corner bracket stays toast-only beside halfwidth ideographic full stop (one edge).
+            "Save Block\u{ff62}history",
             "Block history",
         ] {
             assert_eq!(
