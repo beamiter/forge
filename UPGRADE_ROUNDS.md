@@ -3736,3 +3736,7 @@ quality gates listed in `README.md`.
      U+FF8C-only queries stay QueryNoMatches under Command/Output/All when stale
      ids remain (FF8B/halfwidth-katakana-letter-hi already pinned). Pairs anvil 770.
 
+841. **sticky U+FF8E/halfwidth-katakana-letter-ho near-miss stays Toast** —
+     persistence_failure_surface keeps "Save Block\u{ff8e}history" on Toast
+     (FF8D/halfwidth-katakana-letter-he already pinned). Pairs anvil 771.
+
