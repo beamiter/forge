@@ -586,6 +586,8 @@ mod tests {
             "Save Block\u{ff9f}history",
             // Halfwidth hangul filler stays toast-only beside halfwidth katakana letter nu (one edge).
             "Save Block\u{ffa0}history",
+            // Halfwidth hangul letter kiyeok stays toast-only beside halfwidth hangul filler (one edge).
+            "Save Block\u{ffa1}history",
             "Block history",
         ] {
             assert_eq!(
