@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF48 find beside rounds 496–499; unique 500/1000)
+
+## 2026-10-03 (sticky/find/organism edges — round 500)
+
+- FF48/fullwidth-latin-small-h find QueryNoMatches + stale beside rounds
+  496–499 sticky FF49 / output_notice / MAX-59 / SitNearError→UnknownOutcome.
+  Unique round **500**. Pairs anvil 430 / core cancel. STAGE **71** /
+  between() **93** unchanged. Milestone **500/1000**.
+
 Updated: 2026-10-03 (SitNearError→UnknownOutcome beside round 498)
 
 ## 2026-10-03 (sticky/find/organism edges — round 499)

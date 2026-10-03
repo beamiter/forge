@@ -2253,3 +2253,8 @@ quality gates listed in `README.md`.
      sync. SitNearError→CelebrateBig already synced in round 494. Pairs anvil
      429 / core `SitNearErrorToUnknownOutcome` inside between() 93.
 
+500. **Find FF48/fullwidth-latin-small-h-query QueryNoMatches + stale** —
+     U+FF48-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF47/fullwidth-latin-small-g already pinned). Pairs anvil 430.
+     Milestone **500/1000**.
+
