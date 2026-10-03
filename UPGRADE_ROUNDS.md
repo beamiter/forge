@@ -4386,3 +4386,7 @@ quality gates listed in `README.md`.
      persistence_failure_surface keeps "Save Block\u{ffad}history" on Toast
      (FFAC/halfwidth-hangul-letter-rieul-mieum already pinned). Pairs anvil 926.
 
+997. **output_notice remount gate U+FFAD/halfwidth-hangul-letter-rieul-pieup** —
+     known_output_notice rejects Unicode-padded Truncated/Partly/Earlier
+     strings with U+FFAD (FFAC already pinned). Pairs anvil 927.
+
