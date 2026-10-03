@@ -4025,6 +4025,7 @@ mod tests {
             (Behavior::GuardRecovery, Behavior::SitNearError),
             (Behavior::GuardCautious, Behavior::GuardFailure),
             (Behavior::GuardCautious, Behavior::GuardStuck),
+            (Behavior::GuardCautious, Behavior::GuardRecovery),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -7385,6 +7386,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} GuardCautious→GuardStuck"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_cautious_bridges_to_guard_recovery_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardCautious,
+                Behavior::GuardRecovery,
+            )
+            .is_some(),
+            "Full GuardCautious→GuardRecovery"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardCautious, Behavior::GuardRecovery).is_some(),
+            "core GuardCautious→GuardRecovery"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::GuardCautious,
+                    Behavior::GuardRecovery,
+                ),
+                None,
+                "{motion:?} GuardCautious→GuardRecovery"
             );
         }
     }
