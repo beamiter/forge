@@ -3947,8 +3947,9 @@ mod tests {
         // Celebrate{,Big}/RestAfterPush/GuardRecovery↔UnknownOutcome /
         // Unknown→GuardCautious / Unknown→GuardStuck / Unknown→GuardFailure /
         // Unknown→Idle / Unknown→Celebrate / Unknown→CelebrateBig /
-        // Unknown→SitNearError / Unknown→InspectError stay inside between()
-        // 93 and this UI bridge list (no len bump; already counted in the 93).
+        // Unknown→SitNearError / Unknown→InspectError /
+        // Unknown→RestAfterPush stay inside between() 93 and this UI bridge
+        // list (no len bump; already counted in the 93).
         for pair in [
             (Behavior::Celebrate, Behavior::UnknownOutcome),
             (Behavior::CelebrateBig, Behavior::UnknownOutcome),
@@ -3963,6 +3964,7 @@ mod tests {
             (Behavior::UnknownOutcome, Behavior::CelebrateBig),
             (Behavior::UnknownOutcome, Behavior::SitNearError),
             (Behavior::UnknownOutcome, Behavior::InspectError),
+            (Behavior::UnknownOutcome, Behavior::RestAfterPush),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4129,6 +4131,14 @@ mod tests {
                     motion,
                     Behavior::UnknownOutcome,
                     Behavior::InspectError,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::RestAfterPush,
                 ),
                 None
             );
@@ -5363,6 +5373,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} UnknownOutcome→InspectError"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_outcome_bridges_to_rest_after_push_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::UnknownOutcome,
+                Behavior::RestAfterPush,
+            )
+            .is_some(),
+            "Full UnknownOutcome→RestAfterPush"
+        );
+        assert!(
+            VisualTransition::between(Behavior::UnknownOutcome, Behavior::RestAfterPush).is_some(),
+            "core UnknownOutcome→RestAfterPush"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::RestAfterPush,
+                ),
+                None,
+                "{motion:?} UnknownOutcome→RestAfterPush"
             );
         }
     }

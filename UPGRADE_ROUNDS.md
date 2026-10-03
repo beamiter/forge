@@ -1320,3 +1320,8 @@ quality gates listed in `README.md`.
      ahead MAX-16 vs MAX-17, and finished walks at MAX-17. Pairs anvil 229 /
      core cancel edge.
 
+289. **UnknownOutcome→RestAfterPush Full-motion bridge** — Full motion animates
+     UnknownOutcome→RestAfterPush; Calm/Static snap + semantic_bridges
+     membership sync. Unknown→InspectError already synced in round 284.
+     Pairs anvil 230 / core `UnknownOutcomeToRestAfterPush` inside between() 93.
+

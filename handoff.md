@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (Unknown→RestAfterPush beside round 288)
+
+## 2026-10-03 (sticky/find/organism edges — round 289)
+
+- UnknownOutcome→RestAfterPush Full-motion bridge + UI membership sync.
+  Unique round **289**. Pairs anvil 230 / core. STAGE **71** / between()
+  **93** unchanged.
+
 Updated: 2026-10-03 (MAX-17 cancel beside round 287)
 
 ## 2026-10-03 (sticky/find/organism edges — round 288)
