@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (SitNearError→Idle beside round 333)
+
+## 2026-10-03 (sticky/find/organism edges — round 334)
+
+- SitNearError→Idle Full-motion bridge + UI membership sync. Unique round
+  **334**. Pairs anvil 266 / core. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-03 (MAX-26 cancel beside round 332)
 
 ## 2026-10-03 (sticky/find/organism edges — round 333)
