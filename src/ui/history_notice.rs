@@ -456,6 +456,8 @@ mod tests {
             "Save Block\u{ff5e}history",
             // Fullwidth left white parenthesis stays toast-only beside fullwidth tilde (one edge).
             "Save Block\u{ff5f}history",
+            // Fullwidth right white parenthesis stays toast-only beside fullwidth left white parenthesis (one edge).
+            "Save Block\u{ff60}history",
             "Block history",
         ] {
             assert_eq!(
