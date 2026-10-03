@@ -3306,6 +3306,9 @@ mod tests {
                 // Fullwidth low line catch-up beside sticky FF3F — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff3f}"),
+                // Fullwidth grave catch-up beside sticky FF40 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff40}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
