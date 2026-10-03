@@ -3772,3 +3772,8 @@ quality gates listed in `README.md`.
      dedicated Some-bridge already pinned; membership catch-up + Calm/Static
      snap None. Pairs anvil 779 / core `GuardRecoveryToIdle` inside between() 93.
 
+850. **Find FF8E/halfwidth-katakana-letter-ho-query QueryNoMatches + stale** —
+     U+FF8E-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF8D/halfwidth-katakana-letter-he already pinned). Milestone
+     850/1000. Pairs anvil 780.
+
