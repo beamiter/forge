@@ -1347,3 +1347,7 @@ quality gates listed in `README.md`.
      sync. Unknown→RestAfterPush already synced in round 289. Pairs anvil
      234 / core `GuardCautiousToIdle` inside between() 93.
 
+295. **Find FF1F/fullwidth-question-mark-query QueryNoMatches + stale** —
+     U+FF1F-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF1E/fullwidth-greater-than already pinned). Pairs anvil 235.
+

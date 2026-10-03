@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF1F find beside rounds 291–294)
+
+## 2026-10-03 (sticky/find/organism edges — round 295)
+
+- FF1F/fullwidth-question-mark find QueryNoMatches + stale beside rounds
+  291–294 sticky FF20 / output_notice / MAX-18 / GuardCautious→Idle.
+  Unique round **295**. Pairs anvil 235 / core cancel. STAGE **71** /
+  between() **93** unchanged.
+
 Updated: 2026-10-03 (GuardCautious→Idle beside round 293)
 
 ## 2026-10-03 (sticky/find/organism edges — round 294)
