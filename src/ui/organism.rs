@@ -4073,6 +4073,7 @@ mod tests {
             (Behavior::UnknownOutcome, Behavior::GuardFailure),
             (Behavior::UnknownOutcome, Behavior::GuardStuck),
             (Behavior::UnknownOutcome, Behavior::GuardCautious),
+            (Behavior::UnknownOutcome, Behavior::GuardRecovery),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
