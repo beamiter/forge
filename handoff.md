@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (UnknownOutcome→SitNearError membership beside round 808)
+
+## 2026-10-04 (sticky/find/organism edges — round 809)
+
+- UnknownOutcome→SitNearError Full-motion membership (Calm/Static snap). Unique
+  round **809**. Pairs anvil 739 / core `UnknownOutcomeToSitNearError` inside
+  between() 93. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (MAX-121 cancel beside round 807)
 
 ## 2026-10-04 (sticky/find/organism edges — round 808)

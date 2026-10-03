@@ -3602,3 +3602,8 @@ quality gates listed in `README.md`.
      live==scheduled with resume; bump/scheduled-ahead/finished walks at
      MAX-121 vs MAX-120. Pairs anvil 738.
 
+809. **UnknownOutcome→SitNearError Full-motion membership** —
+     dedicated Some-bridge already pinned; membership catch-up + Calm/Static
+     snap None. Pairs anvil 739 / core `UnknownOutcomeToSitNearError` inside
+     between() 93.
+
