@@ -4044,6 +4044,7 @@ mod tests {
             (Behavior::RestAfterPush, Behavior::InspectError),
             (Behavior::RestAfterPush, Behavior::SitNearError),
             (Behavior::RestAfterPush, Behavior::Celebrate),
+            (Behavior::RestAfterPush, Behavior::CelebrateBig),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -7936,6 +7937,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} RestAfterPush→Celebrate"
+            );
+        }
+    }
+
+    #[test]
+    fn rest_after_push_bridges_to_celebrate_big_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::RestAfterPush,
+                Behavior::CelebrateBig,
+            )
+            .is_some(),
+            "Full RestAfterPush→CelebrateBig"
+        );
+        assert!(
+            VisualTransition::between(Behavior::RestAfterPush, Behavior::CelebrateBig).is_some(),
+            "core RestAfterPush→CelebrateBig"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::RestAfterPush,
+                    Behavior::CelebrateBig,
+                ),
+                None,
+                "{motion:?} RestAfterPush→CelebrateBig"
             );
         }
     }
