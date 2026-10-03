@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (output_notice FF1C beside round 271)
+
+## 2026-10-03 (sticky/find/organism edges — round 272)
+
+- output_notice fullwidth less-than (U+FF1C) gate beside sticky FF1C. Unique
+  round **272**. Pairs anvil sticky tip. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (sticky FF1C beside round 270)
 
 ## 2026-10-03 (sticky/find/organism edges — round 271)

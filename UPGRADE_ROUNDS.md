@@ -1245,3 +1245,7 @@ quality gates listed in `README.md`.
      U+FF1C variant of "Save Block history" stays toast-only beside fullwidth
      semicolon (round 266). Pairs anvil 216.
 
+272. **output_notice fullwidth less-than gate** —
+     U+FF1C-padded Truncated/Partly/Earlier strings stay outside the known-set
+     remount gate beside sticky FF1C. Pairs anvil sticky tip.
+

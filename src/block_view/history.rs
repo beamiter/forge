@@ -3198,6 +3198,9 @@ mod tests {
                 // Fullwidth semicolon catch-up beside sticky FF1B — still outside
                 // the gate (one edge).
                 format!("{base}\u{ff1b}"),
+                // Fullwidth less-than catch-up beside sticky FF1C — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff1c}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
