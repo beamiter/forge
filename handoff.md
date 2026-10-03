@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF1D find beside rounds 281–284)
+
+## 2026-10-03 (sticky/find/organism edges — round 285)
+
+- FF1D/fullwidth-equals find QueryNoMatches + stale beside rounds 281–284
+  sticky FF1E / output_notice / MAX-16 / Unknown→InspectError. Unique round
+  **285**. Pairs anvil 227 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (Unknown→InspectError beside round 283)
 
 ## 2026-10-03 (sticky/find/organism edges — round 284)
