@@ -3502,3 +3502,7 @@ quality gates listed in `README.md`.
      dedicated Some-bridge already pinned; membership catch-up + Calm/Static
      snap None. Pairs anvil 714 / core `WatchAgentToIdle` inside between() 93.
 
+785. **Find FF81/halfwidth-katakana-letter-ti-query QueryNoMatches + stale** —
+     U+FF81-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF80/halfwidth-katakana-letter-ta already pinned). Pairs anvil 715.
+

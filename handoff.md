@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FF81 find beside rounds 781–784)
+
+## 2026-10-04 (sticky/find/organism edges — round 785)
+
+- FF81/halfwidth-katakana-letter-ti find QueryNoMatches + stale beside rounds
+  781–784 sticky FF82 / output_notice / MAX-116 / WatchAgent→Idle. Unique
+  round **785**. Pairs anvil 715 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (WatchAgent→Idle membership beside round 783)
 
 ## 2026-10-04 (sticky/find/organism edges — round 784)
