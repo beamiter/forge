@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (output_notice FF25 beside round 316)
+
+## 2026-10-03 (sticky/find/organism edges — round 317)
+
+- output_notice fullwidth latin E (U+FF25) gate beside sticky FF25. Unique
+  round **317**. Pairs anvil sticky tip. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (sticky FF25 beside round 315)
 
 ## 2026-10-03 (sticky/find/organism edges — round 316)
