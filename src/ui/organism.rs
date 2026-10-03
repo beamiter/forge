@@ -4032,6 +4032,7 @@ mod tests {
             (Behavior::Celebrate, Behavior::GuardFailure),
             (Behavior::Celebrate, Behavior::GuardStuck),
             (Behavior::Celebrate, Behavior::RestAfterPush),
+            (Behavior::Celebrate, Behavior::InspectError),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -7588,6 +7589,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} Celebrate→RestAfterPush"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_bridges_to_inspect_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::Celebrate,
+                Behavior::InspectError,
+            )
+            .is_some(),
+            "Full Celebrate→InspectError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::Celebrate, Behavior::InspectError).is_some(),
+            "core Celebrate→InspectError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::Celebrate,
+                    Behavior::InspectError,
+                ),
+                None,
+                "{motion:?} Celebrate→InspectError"
             );
         }
     }
