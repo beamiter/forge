@@ -4031,6 +4031,7 @@ mod tests {
             (Behavior::Celebrate, Behavior::GuardCautious),
             (Behavior::Celebrate, Behavior::GuardFailure),
             (Behavior::Celebrate, Behavior::GuardStuck),
+            (Behavior::Celebrate, Behavior::RestAfterPush),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -7559,6 +7560,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} Celebrate→GuardStuck"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_bridges_to_rest_after_push_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::Celebrate,
+                Behavior::RestAfterPush,
+            )
+            .is_some(),
+            "Full Celebrate→RestAfterPush"
+        );
+        assert!(
+            VisualTransition::between(Behavior::Celebrate, Behavior::RestAfterPush).is_some(),
+            "core Celebrate→RestAfterPush"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::Celebrate,
+                    Behavior::RestAfterPush,
+                ),
+                None,
+                "{motion:?} Celebrate→RestAfterPush"
             );
         }
     }
