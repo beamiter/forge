@@ -3538,3 +3538,8 @@ quality gates listed in `README.md`.
      live==scheduled with resume; bump/scheduled-ahead/finished walks at
      MAX-118 vs MAX-117. Pairs anvil 723.
 
+794. **UnknownOutcome→InspectError Full-motion membership** —
+     dedicated Some-bridge already pinned; membership catch-up + Calm/Static
+     snap None. Pairs anvil 724 / core `UnknownOutcomeToInspectError` inside
+     between() 93.
+

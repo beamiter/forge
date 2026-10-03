@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (UnknownOutcome→InspectError membership beside round 793)
+
+## 2026-10-04 (sticky/find/organism edges — round 794)
+
+- UnknownOutcome→InspectError Full-motion membership (Calm/Static snap). Unique
+  round **794**. Pairs anvil 724 / core `UnknownOutcomeToInspectError` inside
+  between() 93. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (MAX-118 cancel beside round 792)
 
 ## 2026-10-04 (sticky/find/organism edges — round 793)
