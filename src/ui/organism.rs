@@ -3989,6 +3989,7 @@ mod tests {
             (Behavior::WatchAgent, Behavior::RestAfterPush),
             (Behavior::WatchSettled, Behavior::Celebrate),
             (Behavior::WatchSettled, Behavior::CelebrateBig),
+            (Behavior::WatchSettled, Behavior::InspectError),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4347,6 +4348,14 @@ mod tests {
                     motion,
                     Behavior::WatchSettled,
                     Behavior::CelebrateBig,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchSettled,
+                    Behavior::InspectError,
                 ),
                 None
             );
@@ -6253,6 +6262,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} WatchSettled→CelebrateBig"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_settled_bridges_to_inspect_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchSettled,
+                Behavior::InspectError,
+            )
+            .is_some(),
+            "Full WatchSettled→InspectError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchSettled, Behavior::InspectError).is_some(),
+            "core WatchSettled→InspectError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchSettled,
+                    Behavior::InspectError,
+                ),
+                None,
+                "{motion:?} WatchSettled→InspectError"
             );
         }
     }

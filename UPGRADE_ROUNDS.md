@@ -1848,3 +1848,8 @@ quality gates listed in `README.md`.
      ahead MAX-40 vs MAX-41, and finished walks at MAX-41. Pairs anvil 338 /
      core cancel edge.
 
+409. **WatchSettled→InspectError Full-motion bridge** — Full motion animates
+     WatchSettled→InspectError; Calm/Static snap + semantic_bridges membership
+     sync. WatchSettled→CelebrateBig already synced in round 404. Pairs anvil
+     339 / core `WatchSettledToInspectError` inside between() 93.
+
