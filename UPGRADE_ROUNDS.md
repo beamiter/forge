@@ -1232,3 +1232,8 @@ quality gates listed in `README.md`.
      scheduled ahead MAX-12 vs MAX-13, and finished walks at MAX-13. Pairs anvil
      213 / core cancel edge.
 
+269. **UnknownOutcome→Celebrate Full-motion bridge** — Full motion animates
+     UnknownOutcome→Celebrate; Calm/Static snap + semantic_bridges
+     membership sync. Unknown→Idle already synced in round 264.
+     Pairs anvil 214 / core `UnknownOutcomeToCelebrate` inside between() 93.
+
