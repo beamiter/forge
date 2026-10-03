@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFA0 find beside rounds 936–939)
+
+## 2026-10-04 (sticky/find/organism edges — round 940)
+
+- Find QueryNoMatches+stale U+FFA0/halfwidth-hangul-filler. Unique round
+  **940**. Pairs anvil 870 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (SitNearError GuardCautious membership beside round 938)
 
 ## 2026-10-04 (sticky/find/organism edges — round 939)

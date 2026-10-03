@@ -4146,3 +4146,7 @@ quality gates listed in `README.md`.
      sit_near_error_bridges_to_guard_cautious_under_full_motion_only). Pairs
      anvil 869.
 
+940. **Find QueryNoMatches+stale U+FFA0/halfwidth-hangul-filler** —
+     bookmarked_search_empty_reason QueryNoMatches for Unicode-only query
+     with stale bookmark ids (FF9F already pinned). Pairs anvil 870.
+
