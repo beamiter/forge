@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFA5 find beside rounds 961–964)
+
+## 2026-10-04 (sticky/find/organism edges — round 965)
+
+- Find QueryNoMatches+stale U+FFA5/halfwidth-hangul-letter-nieun-cieuc. Unique
+  round **965**. Pairs anvil 895 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (SitNearError RestAfterPush membership beside round 963)
 
 ## 2026-10-04 (sticky/find/organism edges — round 964)

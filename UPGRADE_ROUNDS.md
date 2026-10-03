@@ -4252,3 +4252,7 @@ quality gates listed in `README.md`.
      sit_near_error_bridges_to_rest_after_push_under_full_motion_only). Pairs
      anvil 894.
 
+965. **Find QueryNoMatches+stale U+FFA5/halfwidth-hangul-letter-nieun-cieuc** —
+     bookmarked_search_empty_reason QueryNoMatches for Unicode-only query
+     with stale bookmark ids (FFA4 already pinned). Pairs anvil 895.
+
