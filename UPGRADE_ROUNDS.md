@@ -4273,3 +4273,7 @@ quality gates listed in `README.md`.
      guard_failure_bridges_to_guard_stuck_under_full_motion_only). Pairs
      anvil 899.
 
+970. **Find QueryNoMatches+stale U+FFA6/halfwidth-hangul-letter-nieun-hieuh** —
+     bookmarked_search_empty_reason QueryNoMatches for Unicode-only query
+     with stale bookmark ids (FFA5 already pinned). Pairs anvil 900.
+
