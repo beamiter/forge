@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (GuardStuck GuardCautious membership beside round 998)
+
+## 2026-10-04 (sticky/find/organism edges — round 999)
+
+- GuardStuck→GuardCautious Full-motion membership (Calm/Static snap). Unique
+  round **999**. Pairs anvil 929 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-159 cancel beside round 997)
 
 ## 2026-10-04 (sticky/find/organism edges — round 998)
