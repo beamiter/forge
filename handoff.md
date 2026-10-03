@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF2D find beside rounds 361–364)
+
+## 2026-10-03 (sticky/find/organism edges — round 365)
+
+- FF2D/fullwidth-latin-M find QueryNoMatches + stale beside rounds 361–364
+  sticky FF2E / output_notice / MAX-32 / WatchCommand→CelebrateBig. Unique
+  round **365**. Pairs anvil 295 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (WatchCommand→CelebrateBig beside round 363)
 
 ## 2026-10-03 (sticky/find/organism edges — round 364)
