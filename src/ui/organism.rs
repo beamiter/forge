@@ -3982,6 +3982,7 @@ mod tests {
             (Behavior::WatchCommand, Behavior::Celebrate),
             (Behavior::WatchCommand, Behavior::CelebrateBig),
             (Behavior::WatchCommand, Behavior::InspectError),
+            (Behavior::WatchCommand, Behavior::SitNearError),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4284,6 +4285,14 @@ mod tests {
                     motion,
                     Behavior::WatchCommand,
                     Behavior::InspectError,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchCommand,
+                    Behavior::SitNearError,
                 ),
                 None
             );
@@ -5994,6 +6003,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} WatchCommand→InspectError"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_command_bridges_to_sit_near_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchCommand,
+                Behavior::SitNearError,
+            )
+            .is_some(),
+            "Full WatchCommand→SitNearError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchCommand, Behavior::SitNearError).is_some(),
+            "core WatchCommand→SitNearError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchCommand,
+                    Behavior::SitNearError,
+                ),
+                None,
+                "{motion:?} WatchCommand→SitNearError"
             );
         }
     }

@@ -1694,3 +1694,8 @@ quality gates listed in `README.md`.
      ahead MAX-33 vs MAX-34, and finished walks at MAX-34. Pairs anvil 303 /
      core cancel edge.
 
+374. **WatchCommand→SitNearError Full-motion bridge** — Full motion animates
+     WatchCommand→SitNearError; Calm/Static snap + semantic_bridges membership
+     sync. WatchCommand→InspectError already synced in round 369. Pairs anvil
+     304 / core `WatchCommandToSitNearError` inside between() 93.
+
