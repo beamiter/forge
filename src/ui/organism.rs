@@ -3984,6 +3984,7 @@ mod tests {
             (Behavior::WatchCommand, Behavior::InspectError),
             (Behavior::WatchCommand, Behavior::SitNearError),
             (Behavior::WatchCommand, Behavior::RestAfterPush),
+            (Behavior::WatchAgent, Behavior::InspectError),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4302,6 +4303,14 @@ mod tests {
                     motion,
                     Behavior::WatchCommand,
                     Behavior::RestAfterPush,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchAgent,
+                    Behavior::InspectError,
                 ),
                 None
             );
@@ -6068,6 +6077,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} WatchCommand→RestAfterPush"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_agent_bridges_to_inspect_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchAgent,
+                Behavior::InspectError,
+            )
+            .is_some(),
+            "Full WatchAgent→InspectError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchAgent, Behavior::InspectError).is_some(),
+            "core WatchAgent→InspectError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchAgent,
+                    Behavior::InspectError,
+                ),
+                None,
+                "{motion:?} WatchAgent→InspectError"
             );
         }
     }

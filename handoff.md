@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (WatchAgent→InspectError beside round 383)
+
+## 2026-10-03 (sticky/find/organism edges — round 384)
+
+- WatchAgent→InspectError Full-motion bridge + UI membership sync. Unique
+  round **384**. Pairs anvil 314 / core. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (MAX-36 cancel beside round 382)
 
 ## 2026-10-03 (sticky/find/organism edges — round 383)
