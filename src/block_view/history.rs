@@ -3612,6 +3612,9 @@ mod tests {
                 // Halfwidth hangul letter nieun-cieuc catch-up beside sticky FFA5 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ffa5}"),
+                // Halfwidth hangul letter nieun-hieuh catch-up beside sticky FFA6 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffa6}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
