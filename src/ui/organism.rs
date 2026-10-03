@@ -4005,6 +4005,7 @@ mod tests {
             (Behavior::InspectError, Behavior::SitNearError),
             (Behavior::InspectError, Behavior::UnknownOutcome),
             (Behavior::InspectError, Behavior::RestAfterPush),
+            (Behavior::SitNearError, Behavior::Celebrate),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -6805,6 +6806,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} InspectError→RestAfterPush"
+            );
+        }
+    }
+
+    #[test]
+    fn sit_near_error_bridges_to_celebrate_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::SitNearError,
+                Behavior::Celebrate,
+            )
+            .is_some(),
+            "Full SitNearError→Celebrate"
+        );
+        assert!(
+            VisualTransition::between(Behavior::SitNearError, Behavior::Celebrate).is_some(),
+            "core SitNearError→Celebrate"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::SitNearError,
+                    Behavior::Celebrate,
+                ),
+                None,
+                "{motion:?} SitNearError→Celebrate"
             );
         }
     }
