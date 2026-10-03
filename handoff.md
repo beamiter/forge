@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FFA2 beside round 941)
+
+## 2026-10-04 (sticky/find/organism edges — round 942)
+
+- output_notice remount gate U+FFA2/halfwidth-hangul-letter-ssangkiyeok. Unique
+  round **942**. Pairs anvil 872 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (sticky FFA2 beside round 940)
 
 ## 2026-10-04 (sticky/find/organism edges — round 941)
