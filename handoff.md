@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (GuardFailure→Idle beside round 298)
+
+## 2026-10-03 (sticky/find/organism edges — round 299)
+
+- GuardFailure→Idle Full-motion bridge + UI membership sync. Unique round
+  **299**. Pairs anvil 238 / core. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-03 (MAX-19 cancel beside round 297)
 
 ## 2026-10-03 (sticky/find/organism edges — round 298)
