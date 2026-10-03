@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (sticky FF28 beside round 330)
+
+## 2026-10-03 (sticky/find/organism edges — round 331)
+
+- Sticky fullwidth latin H (U+FF28) beside fullwidth latin G. Unique round
+  **331**. Pairs anvil 264 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (FF26 find beside rounds 326–329)
 
 ## 2026-10-03 (sticky/find/organism edges — round 330)
