@@ -3213,6 +3213,9 @@ mod tests {
                 // Fullwidth commercial at catch-up beside sticky FF20 — still outside
                 // the gate (one edge).
                 format!("{base}\u{ff20}"),
+                // Fullwidth latin A catch-up beside sticky FF21 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff21}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
