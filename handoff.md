@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (GuardFailure→Idle membership beside round 838)
+
+## 2026-10-04 (sticky/find/organism edges — round 839)
+
+- GuardFailure→Idle Full-motion membership (Calm/Static snap). Unique round
+  **839**. Pairs anvil 769 / core `GuardFailureToIdle` inside between() 93.
+  STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (MAX-127 cancel beside round 837)
 
 ## 2026-10-04 (sticky/find/organism edges — round 838)
