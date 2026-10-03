@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (sticky FF70 beside round 690)
+
+## 2026-10-04 (sticky/find/organism edges — round 691)
+
+- sticky U+FF70/halfwidth-katakana-hiragana-prolonged-sound-mark near-miss stays
+  Toast. Unique round **691**. Pairs anvil 621 / core cancel. STAGE **71** /
+  between() **93** unchanged.
+
 Updated: 2026-10-04 (FF6E find beside rounds 686–689)
 
 ## 2026-10-04 (sticky/find/organism edges — round 690)

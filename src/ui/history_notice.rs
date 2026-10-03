@@ -488,6 +488,8 @@ mod tests {
             "Save Block\u{ff6e}history",
             // Halfwidth katakana letter small yo stays toast-only beside halfwidth katakana letter small yu (one edge).
             "Save Block\u{ff6f}history",
+            // Halfwidth katakana-hiragana prolonged sound mark stays toast-only beside halfwidth katakana letter small yo (one edge).
+            "Save Block\u{ff70}history",
             "Block history",
         ] {
             assert_eq!(
