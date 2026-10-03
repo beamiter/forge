@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (sticky FF6B beside round 665)
+
+## 2026-10-04 (sticky/find/organism edges — round 666)
+
+- sticky U+FF6B/halfwidth-katakana-letter-small-o near-miss stays Toast. Unique
+  round **666**. Pairs anvil 596 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (FF69 find beside rounds 661–664)
 
 ## 2026-10-04 (sticky/find/organism edges — round 665)
