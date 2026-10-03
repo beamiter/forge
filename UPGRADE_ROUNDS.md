@@ -1787,3 +1787,7 @@ quality gates listed in `README.md`.
      sync. WatchAgent→SitNearError already synced in round 389. Pairs anvil
      324 / core `WatchAgentToRestAfterPush` inside between() 93.
 
+395. **Find FF33/fullwidth-latin-S-query QueryNoMatches + stale** —
+     U+FF33-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF32/fullwidth-latin-R already pinned). Pairs anvil 325.
+
