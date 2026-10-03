@@ -3161,3 +3161,7 @@ quality gates listed in `README.md`.
      already exists). CelebrateBig→UnknownOutcome already synced in round 699.
      Pairs anvil 634 / core `WatchSettledToCelebrate` inside between() 93.
 
+705. **Find FF71/halfwidth-katakana-letter-a-query QueryNoMatches + stale** —
+     U+FF71-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF70/halfwidth-katakana-hiragana-prolonged-sound-mark already pinned). Pairs anvil 635.
+
