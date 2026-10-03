@@ -384,6 +384,8 @@ mod tests {
             "Save Block\u{ff3a}history",
             // Fullwidth left square bracket stays toast-only beside fullwidth latin Z (one edge).
             "Save Block\u{ff3b}history",
+            // Fullwidth reverse solidus stays toast-only beside fullwidth left square bracket (one edge).
+            "Save Block\u{ff3c}history",
             "Block history",
         ] {
             assert_eq!(
