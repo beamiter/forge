@@ -3165,3 +3165,7 @@ quality gates listed in `README.md`.
      U+FF71-only queries stay QueryNoMatches under Command/Output/All when stale
      ids remain (FF70/halfwidth-katakana-hiragana-prolonged-sound-mark already pinned). Pairs anvil 635.
 
+706. **sticky U+FF73/halfwidth-katakana-letter-u near-miss stays Toast** —
+     persistence_failure_surface keeps "Save Block\u{ff73}history" on Toast
+     (FF72/halfwidth-katakana-letter-i already pinned). Pairs anvil 636.
+
