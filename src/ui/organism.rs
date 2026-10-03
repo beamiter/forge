@@ -3975,6 +3975,7 @@ mod tests {
             (Behavior::RestAfterPush, Behavior::Idle),
             (Behavior::InspectError, Behavior::Idle),
             (Behavior::SitNearError, Behavior::Idle),
+            (Behavior::WatchCommand, Behavior::Idle),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4220,6 +4221,14 @@ mod tests {
                 visual_transition_for_motion(
                     motion,
                     Behavior::SitNearError,
+                    Behavior::Idle,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchCommand,
                     Behavior::Idle,
                 ),
                 None
@@ -5735,6 +5744,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} SitNearError→Idle"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_command_bridges_to_idle_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchCommand,
+                Behavior::Idle,
+            )
+            .is_some(),
+            "Full WatchCommand→Idle"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchCommand, Behavior::Idle).is_some(),
+            "core WatchCommand→Idle"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchCommand,
+                    Behavior::Idle,
+                ),
+                None,
+                "{motion:?} WatchCommand→Idle"
             );
         }
     }
