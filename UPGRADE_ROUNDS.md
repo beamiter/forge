@@ -3026,3 +3026,7 @@ quality gates listed in `README.md`.
      sync. RestAfterPush→InspectError already synced in round 669. Pairs anvil
      604 / core `RestAfterPushToSitNearError` inside between() 93.
 
+675. **Find FF6B/halfwidth-katakana-letter-small-o-query QueryNoMatches + stale** —
+     U+FF6B-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF6A/halfwidth-katakana-letter-small-e already pinned). Pairs anvil 605.
+
