@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (InspectError→GuardRecovery beside round 458)
+
+## 2026-10-03 (sticky/find/organism edges — round 459)
+
+- InspectError→GuardRecovery Full-motion bridge + UI membership sync. Unique
+  round **459**. Pairs anvil 389 / core. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (MAX-51 cancel beside round 457)
 
 ## 2026-10-03 (sticky/find/organism edges — round 458)

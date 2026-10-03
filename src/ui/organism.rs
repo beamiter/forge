@@ -3999,6 +3999,7 @@ mod tests {
             (Behavior::SitNearError, Behavior::GuardRecovery),
             (Behavior::InspectError, Behavior::GuardStuck),
             (Behavior::InspectError, Behavior::GuardCautious),
+            (Behavior::InspectError, Behavior::GuardRecovery),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4437,6 +4438,14 @@ mod tests {
                     motion,
                     Behavior::InspectError,
                     Behavior::GuardCautious,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::InspectError,
+                    Behavior::GuardRecovery,
                 ),
                 None
             );
@@ -6623,6 +6632,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} InspectError→GuardCautious"
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_error_bridges_to_guard_recovery_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::InspectError,
+                Behavior::GuardRecovery,
+            )
+            .is_some(),
+            "Full InspectError→GuardRecovery"
+        );
+        assert!(
+            VisualTransition::between(Behavior::InspectError, Behavior::GuardRecovery).is_some(),
+            "core InspectError→GuardRecovery"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::InspectError,
+                    Behavior::GuardRecovery,
+                ),
+                None,
+                "{motion:?} InspectError→GuardRecovery"
             );
         }
     }
