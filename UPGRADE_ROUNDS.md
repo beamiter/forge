@@ -2717,3 +2717,7 @@ quality gates listed in `README.md`.
      sync. Celebrate→GuardRecovery already synced in round 599. Pairs anvil
      534 / core `CelebrateToGuardCautious` inside between() 93.
 
+605. **Find FF5D/fullwidth-right-curly-bracket-query QueryNoMatches + stale** —
+     U+FF5D-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF5C/fullwidth-vertical-line already pinned). Pairs anvil 535.
+
