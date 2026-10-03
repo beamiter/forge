@@ -3969,6 +3969,7 @@ mod tests {
             (Behavior::GuardCautious, Behavior::Idle),
             (Behavior::GuardFailure, Behavior::Idle),
             (Behavior::GuardStuck, Behavior::Idle),
+            (Behavior::GuardRecovery, Behavior::Idle),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4166,6 +4167,14 @@ mod tests {
                 visual_transition_for_motion(
                     motion,
                     Behavior::GuardStuck,
+                    Behavior::Idle,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::GuardRecovery,
                     Behavior::Idle,
                 ),
                 None
@@ -5513,6 +5522,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} GuardStuck→Idle"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_recovery_bridges_to_idle_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardRecovery,
+                Behavior::Idle,
+            )
+            .is_some(),
+            "Full GuardRecovery→Idle"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardRecovery, Behavior::Idle).is_some(),
+            "core GuardRecovery→Idle"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::GuardRecovery,
+                    Behavior::Idle,
+                ),
+                None,
+                "{motion:?} GuardRecovery→Idle"
             );
         }
     }

@@ -1408,3 +1408,8 @@ quality gates listed in `README.md`.
      ahead MAX-20 vs MAX-21, and finished walks at MAX-21. Pairs anvil 245 /
      core cancel edge.
 
+309. **GuardRecovery→Idle Full-motion bridge** — Full motion animates
+     GuardRecovery→Idle; Calm/Static snap + semantic_bridges membership
+     sync. GuardStuck→Idle already synced in round 304. Pairs anvil 246 /
+     core `GuardRecoveryToIdle` inside between() 93.
+
