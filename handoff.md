@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (output_notice FF2B beside round 346)
+
+## 2026-10-03 (sticky/find/organism edges — round 347)
+
+- output_notice remount gate U+FF2B/fullwidth-latin-K. Unique round **347**.
+  Pairs anvil 277 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-03 (sticky FF2B beside round 345)
 
 ## 2026-10-03 (sticky/find/organism edges — round 346)
