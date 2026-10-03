@@ -2408,3 +2408,7 @@ quality gates listed in `README.md`.
      sync. GuardStuck→GuardFailure already synced in round 529. Pairs anvil
      464 / core `GuardStuckToGuardRecovery` inside between() 93.
 
+535. **Find FF4F/fullwidth-latin-small-o-query QueryNoMatches + stale** —
+     U+FF4F-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF4E/fullwidth-latin-small-n already pinned). Pairs anvil 465.
+

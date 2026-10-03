@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF4F find beside rounds 531–534)
+
+## 2026-10-03 (sticky/find/organism edges — round 535)
+
+- FF4F/fullwidth-latin-small-o find QueryNoMatches + stale beside rounds
+  531–534 sticky FF50 / output_notice / MAX-66 / GuardStuck→GuardRecovery.
+  Unique round **535**. Pairs anvil 465 / core cancel. STAGE **71** /
+  between() **93** unchanged.
+
 Updated: 2026-10-03 (GuardStuck→GuardRecovery beside round 533)
 
 ## 2026-10-03 (sticky/find/organism edges — round 534)
