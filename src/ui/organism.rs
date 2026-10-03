@@ -3946,8 +3946,9 @@ mod tests {
         );
         // Celebrate{,Big}/RestAfterPush/GuardRecovery↔UnknownOutcome /
         // Unknown→GuardCautious / Unknown→GuardStuck / Unknown→GuardFailure /
-        // Unknown→Idle / Unknown→Celebrate stay inside between() 93 and this
-        // UI bridge list (no len bump; already counted in the 93).
+        // Unknown→Idle / Unknown→Celebrate / Unknown→CelebrateBig stay inside
+        // between() 93 and this UI bridge list (no len bump; already counted
+        // in the 93).
         for pair in [
             (Behavior::Celebrate, Behavior::UnknownOutcome),
             (Behavior::CelebrateBig, Behavior::UnknownOutcome),
@@ -3959,6 +3960,7 @@ mod tests {
             (Behavior::UnknownOutcome, Behavior::GuardFailure),
             (Behavior::UnknownOutcome, Behavior::Idle),
             (Behavior::UnknownOutcome, Behavior::Celebrate),
+            (Behavior::UnknownOutcome, Behavior::CelebrateBig),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4101,6 +4103,14 @@ mod tests {
                     motion,
                     Behavior::UnknownOutcome,
                     Behavior::Celebrate,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::CelebrateBig,
                 ),
                 None
             );
@@ -5251,6 +5261,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} UnknownOutcome→Celebrate"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_outcome_bridges_to_celebrate_big_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::UnknownOutcome,
+                Behavior::CelebrateBig,
+            )
+            .is_some(),
+            "Full UnknownOutcome→CelebrateBig"
+        );
+        assert!(
+            VisualTransition::between(Behavior::UnknownOutcome, Behavior::CelebrateBig).is_some(),
+            "core UnknownOutcome→CelebrateBig"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::CelebrateBig,
+                ),
+                None,
+                "{motion:?} UnknownOutcome→CelebrateBig"
             );
         }
     }
