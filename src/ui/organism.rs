@@ -4036,6 +4036,7 @@ mod tests {
             (Behavior::Celebrate, Behavior::SitNearError),
             (Behavior::CelebrateBig, Behavior::GuardRecovery),
             (Behavior::CelebrateBig, Behavior::GuardCautious),
+            (Behavior::CelebrateBig, Behavior::GuardFailure),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -7704,6 +7705,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} CelebrateBig→GuardCautious"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_big_bridges_to_guard_failure_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::CelebrateBig,
+                Behavior::GuardFailure,
+            )
+            .is_some(),
+            "Full CelebrateBig→GuardFailure"
+        );
+        assert!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::GuardFailure).is_some(),
+            "core CelebrateBig→GuardFailure"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::CelebrateBig,
+                    Behavior::GuardFailure,
+                ),
+                None,
+                "{motion:?} CelebrateBig→GuardFailure"
             );
         }
     }
