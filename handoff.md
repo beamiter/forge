@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (Celebrate→SitNearError beside round 628)
+
+## 2026-10-04 (sticky/find/organism edges — round 629)
+
+- Celebrate→SitNearError Full-motion bridge. Unique round **629**. Pairs anvil
+  559 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (MAX-85 cancel beside round 627)
 
 ## 2026-10-04 (sticky/find/organism edges — round 628)
