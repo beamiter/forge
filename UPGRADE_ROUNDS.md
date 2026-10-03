@@ -3222,3 +3222,8 @@ quality gates listed in `README.md`.
      ahead MAX-102 vs MAX-103, and finished walks at MAX-103. Pairs anvil 648 /
      core cancel edge.
 
+719. **WatchSettled→SitNearError Full-motion membership** — semantic_bridges
+     membership catch-up for WatchSettled→SitNearError (dedicated Full-motion pin
+     already exists). WatchSettled→InspectError already synced in round 714.
+     Pairs anvil 649 / core `WatchSettledToSitNearError` inside between() 93.
+
