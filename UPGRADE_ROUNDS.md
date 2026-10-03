@@ -1699,3 +1699,7 @@ quality gates listed in `README.md`.
      sync. WatchCommand→InspectError already synced in round 369. Pairs anvil
      304 / core `WatchCommandToSitNearError` inside between() 93.
 
+375. **Find FF2F/fullwidth-latin-O-query QueryNoMatches + stale** —
+     U+FF2F-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF2E/fullwidth-latin-N already pinned). Pairs anvil 305.
+

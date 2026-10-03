@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF2F find beside rounds 371–374)
+
+## 2026-10-03 (sticky/find/organism edges — round 375)
+
+- FF2F/fullwidth-latin-O find QueryNoMatches + stale beside rounds 371–374
+  sticky FF30 / output_notice / MAX-34 / WatchCommand→SitNearError. Unique
+  round **375**. Pairs anvil 305 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (WatchCommand→SitNearError beside round 373)
 
 ## 2026-10-03 (sticky/find/organism edges — round 374)
