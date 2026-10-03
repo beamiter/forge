@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FF70 find beside rounds 696–699)
+
+## 2026-10-04 (sticky/find/organism edges — round 700)
+
+- FF70/halfwidth-katakana-hiragana-prolonged-sound-mark find QueryNoMatches + stale
+  beside rounds 696–699 sticky FF71 / output_notice / MAX-99 /
+  CelebrateBig→UnknownOutcome. Unique round **700**. Pairs anvil 630 / core
+  cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (CelebrateBig→UnknownOutcome beside round 698)
 
 ## 2026-10-04 (sticky/find/organism edges — round 699)

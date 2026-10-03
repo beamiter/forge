@@ -3139,3 +3139,7 @@ quality gates listed in `README.md`.
      Celebrate* UnknownOutcome pin remains. Pairs anvil 629 / core
      `CelebrateBigToUnknownOutcome` inside between() 93.
 
+700. **Find FF70/halfwidth-katakana-hiragana-prolonged-sound-mark-query QueryNoMatches + stale** —
+     U+FF70-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF6F/halfwidth-katakana-letter-small-yo already pinned). Pairs anvil 630.
+
