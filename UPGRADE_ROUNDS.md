@@ -1804,3 +1804,8 @@ quality gates listed in `README.md`.
      ahead MAX-38 vs MAX-39, and finished walks at MAX-39. Pairs anvil 328 /
      core cancel edge.
 
+399. **WatchSettled→Celebrate Full-motion bridge** — Full motion animates
+     WatchSettled→Celebrate; Calm/Static snap + semantic_bridges membership
+     sync. WatchAgent→RestAfterPush already synced in round 394. Pairs anvil
+     329 / core `WatchSettledToCelebrate` inside between() 93.
+
