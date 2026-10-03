@@ -4066,3 +4066,7 @@ quality gates listed in `README.md`.
      bookmarked_search_empty_reason QueryNoMatches for Unicode-only query
      with stale bookmark ids (FF9B already pinned). Pairs anvil 850.
 
+921. **sticky U+FF9E/halfwidth-katakana-letter-ni near-miss stays Toast** —
+     persistence_failure_surface keeps "Save Block\u{ff9e}history" on Toast
+     (FF9D/halfwidth-katakana-letter-na already pinned). Pairs anvil 851.
+
