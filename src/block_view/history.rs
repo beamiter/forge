@@ -3297,6 +3297,9 @@ mod tests {
                 // Fullwidth reverse solidus catch-up beside sticky FF3C — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff3c}"),
+                // Fullwidth right square bracket catch-up beside sticky FF3D — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff3d}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
