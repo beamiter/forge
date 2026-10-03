@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (output_notice FF34 beside round 391)
+
+## 2026-10-03 (sticky/find/organism edges — round 392)
+
+- output_notice remount gate U+FF34/fullwidth-latin-T. Unique round **392**.
+  Pairs anvil 322 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-03 (sticky FF34 beside round 390)
 
 ## 2026-10-03 (sticky/find/organism edges — round 391)
