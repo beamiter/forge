@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF35 find beside rounds 401–404)
+
+## 2026-10-03 (sticky/find/organism edges — round 405)
+
+- FF35/fullwidth-latin-U find QueryNoMatches + stale beside rounds 401–404
+  sticky FF36 / output_notice / MAX-40 / WatchSettled→CelebrateBig. Unique
+  round **405**. Pairs anvil 335 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (WatchSettled→CelebrateBig beside round 403)
 
 ## 2026-10-03 (sticky/find/organism edges — round 404)
