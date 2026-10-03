@@ -1281,3 +1281,7 @@ quality gates listed in `README.md`.
      membership sync. Unknown→CelebrateBig already synced in round 274.
      Pairs anvil 222 / core `UnknownOutcomeToSitNearError` inside between() 93.
 
+280. **Find FF1C/fullwidth-less-than-query QueryNoMatches + stale** —
+     U+FF1C-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF1B/fullwidth-semicolon already pinned). Pairs anvil 223.
+
