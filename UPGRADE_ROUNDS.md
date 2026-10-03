@@ -2276,3 +2276,7 @@ quality gates listed in `README.md`.
      sync. SitNearError→UnknownOutcome already synced in round 499. Pairs anvil
      434 / core `SitNearErrorToRestAfterPush` inside between() 93.
 
+505. **Find FF49/fullwidth-latin-small-i-query QueryNoMatches + stale** —
+     U+FF49-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF48/fullwidth-latin-small-h already pinned). Pairs anvil 435.
+
