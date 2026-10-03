@@ -3387,6 +3387,9 @@ mod tests {
                 // Fullwidth latin small z catch-up beside sticky FF5A — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff5a}"),
+                // Fullwidth left curly bracket catch-up beside sticky FF5B — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff5b}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
