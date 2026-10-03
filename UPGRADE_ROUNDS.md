@@ -1942,3 +1942,7 @@ quality gates listed in `README.md`.
      sync. InspectError→GuardFailure already synced in round 424. Pairs anvil
      359 / core `SitNearErrorToGuardStuck` inside between() 93.
 
+430. **Find FF3A/fullwidth-latin-Z-query QueryNoMatches + stale** —
+     U+FF3A-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF39/fullwidth-latin-Y already pinned). Pairs anvil 360.
+
