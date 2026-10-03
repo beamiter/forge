@@ -2213,3 +2213,7 @@ quality gates listed in `README.md`.
      U+FF46-only queries stay QueryNoMatches under Command/Output/All when stale
      ids remain (FF45/fullwidth-latin-small-e already pinned). Pairs anvil 420.
 
+491. **sticky U+FF48/fullwidth-latin-small-h near-miss stays Toast** —
+     persistence_failure_surface keeps "Save Block\u{ff48}history" on Toast
+     (FF47/fullwidth-latin-small-g already pinned). Pairs anvil 421.
+
