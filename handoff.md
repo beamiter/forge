@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (InspectError CelebrateBig membership beside round 908)
+
+## 2026-10-04 (sticky/find/organism edges — round 909)
+
+- InspectError→CelebrateBig Full-motion membership (Calm/Static snap). Unique
+  round **909**. Pairs anvil 839 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-141 cancel beside round 907)
 
 ## 2026-10-04 (sticky/find/organism edges — round 908)
