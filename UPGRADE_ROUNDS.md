@@ -3271,3 +3271,7 @@ quality gates listed in `README.md`.
      already exists). WatchSettled→RestAfterPush already synced in round 724.
      Pairs anvil 659 / core `WatchSettledToIdle` inside between() 93.
 
+730. **Find FF76/halfwidth-katakana-letter-ka-query QueryNoMatches + stale** —
+     U+FF76-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF75/halfwidth-katakana-letter-o already pinned). Pairs anvil 660.
+
