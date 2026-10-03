@@ -3977,3 +3977,8 @@ quality gates listed in `README.md`.
      inspect_error_bridges_to_guard_recovery_under_full_motion_only). Pairs
      anvil 829.
 
+900. **Find QueryNoMatches+stale U+FF98/halfwidth-katakana-letter-ta** —
+     bookmarked_search_empty_reason QueryNoMatches for Unicode-only query
+     with stale bookmark ids (FF97 already pinned). Pairs anvil 830.
+     Milestone **900**.
+

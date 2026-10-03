@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FF98 find beside rounds 896–899 — milestone 900)
+
+## 2026-10-04 (sticky/find/organism edges — round 900)
+
+- Find QueryNoMatches+stale U+FF98/halfwidth-katakana-letter-ta. Unique round
+  **900**. Pairs anvil 830 / core cancel. STAGE **71** / between() **93**
+  unchanged. Milestone **900**.
+
 Updated: 2026-10-04 (InspectError GuardRecovery membership beside round 898)
 
 ## 2026-10-04 (sticky/find/organism edges — round 899)
