@@ -2121,3 +2121,7 @@ quality gates listed in `README.md`.
      sync. InspectError→Celebrate already synced in round 464. Pairs anvil
      399 / core `InspectErrorToCelebrateBig` inside between() 93.
 
+470. **Find FF42/fullwidth-latin-small-b-query QueryNoMatches + stale** —
+     U+FF42-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF41/fullwidth-latin-small-a already pinned). Pairs anvil 400.
+
