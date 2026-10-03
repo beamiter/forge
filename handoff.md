@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (output_notice FF3B beside round 426)
+
+## 2026-10-03 (sticky/find/organism edges — round 427)
+
+- output_notice remount gate U+FF3B/fullwidth-left-square-bracket. Unique
+  round **427**. Pairs anvil 357 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (sticky FF3B beside round 425)
 
 ## 2026-10-03 (sticky/find/organism edges — round 426)

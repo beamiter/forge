@@ -3291,6 +3291,9 @@ mod tests {
                 // Fullwidth latin Z catch-up beside sticky FF3A — still outside
                 // the gate (one edge).
                 format!("{base}\u{ff3a}"),
+                // Fullwidth left square bracket catch-up beside sticky FF3B — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff3b}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
