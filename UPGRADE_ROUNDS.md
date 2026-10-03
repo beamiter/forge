@@ -2425,3 +2425,8 @@ quality gates listed in `README.md`.
      ahead MAX-66 vs MAX-67, and finished walks at MAX-67. Pairs anvil 468 /
      core cancel edge.
 
+539. **GuardStuck→GuardCautious Full-motion bridge** — Full motion animates
+     GuardStuck→GuardCautious; Calm/Static snap + semantic_bridges membership
+     sync. GuardStuck→GuardRecovery already synced in round 534. Pairs anvil
+     469 / core `GuardStuckToGuardCautious` inside between() 93.
+
