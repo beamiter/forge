@@ -500,6 +500,8 @@ mod tests {
             "Save Block\u{ff74}history",
             // Halfwidth katakana letter o stays toast-only beside halfwidth katakana letter e (one edge).
             "Save Block\u{ff75}history",
+            // Halfwidth katakana letter ka stays toast-only beside halfwidth katakana letter o (one edge).
+            "Save Block\u{ff76}history",
             "Block history",
         ] {
             assert_eq!(
