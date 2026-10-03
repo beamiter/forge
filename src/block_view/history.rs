@@ -3603,6 +3603,9 @@ mod tests {
                 // Halfwidth hangul letter ssangkiyeok catch-up beside sticky FFA2 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ffa2}"),
+                // Halfwidth hangul letter kiyeok-sios catch-up beside sticky FFA3 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffa3}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {

@@ -4175,3 +4175,7 @@ quality gates listed in `README.md`.
      persistence_failure_surface keeps "Save Block\u{ffa3}history" on Toast
      (FFA2/halfwidth-hangul-letter-ssangkiyeok already pinned). Pairs anvil 876.
 
+947. **output_notice remount gate U+FFA3/halfwidth-hangul-letter-kiyeok-sios** —
+     known_output_notice rejects Unicode-padded Truncated/Partly/Earlier
+     strings with U+FFA3 (FFA2 already pinned). Pairs anvil 877.
+
