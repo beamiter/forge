@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (GuardRecovery→SitNearError beside round 573)
+
+## 2026-10-03 (sticky/find/organism edges — round 574)
+
+- GuardRecovery→SitNearError Full-motion bridge + UI membership sync. Unique
+  round **574**. Pairs anvil 504 / core. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (MAX-74 cancel beside round 572)
 
 ## 2026-10-03 (sticky/find/organism edges — round 573)
