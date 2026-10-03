@@ -1479,3 +1479,7 @@ quality gates listed in `README.md`.
      sync. CelebrateBig→Idle already synced in round 319. Pairs anvil 258 /
      core `RestAfterPushToIdle` inside between() 93.
 
+325. **Find FF25/fullwidth-latin-E-query QueryNoMatches + stale** —
+     U+FF25-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF24/fullwidth-latin-D already pinned). Pairs anvil 259.
+
