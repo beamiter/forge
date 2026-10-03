@@ -2827,3 +2827,7 @@ quality gates listed in `README.md`.
      sync. Celebrate→InspectError already synced in round 624. Pairs anvil
      559 / core `CelebrateToSitNearError` inside between() 93.
 
+630. **Find FF62/halfwidth-left-corner-bracket-query QueryNoMatches + stale** —
+     U+FF62-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF61/halfwidth-ideographic-full-stop already pinned). Pairs anvil 560.
+

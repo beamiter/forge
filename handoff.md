@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FF62 find beside rounds 626–629)
+
+## 2026-10-04 (sticky/find/organism edges — round 630)
+
+- FF62/halfwidth-left-corner-bracket find QueryNoMatches + stale beside rounds
+  626–629 sticky FF63 / output_notice / MAX-85 / Celebrate→SitNearError.
+  Unique round **630**. Pairs anvil 560 / core cancel. STAGE **71** / between()
+  **93** unchanged.
+
 Updated: 2026-10-04 (Celebrate→SitNearError beside round 628)
 
 ## 2026-10-04 (sticky/find/organism edges — round 629)
