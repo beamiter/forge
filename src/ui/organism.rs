@@ -3991,6 +3991,7 @@ mod tests {
             (Behavior::WatchSettled, Behavior::CelebrateBig),
             (Behavior::WatchSettled, Behavior::InspectError),
             (Behavior::WatchSettled, Behavior::SitNearError),
+            (Behavior::WatchSettled, Behavior::RestAfterPush),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4365,6 +4366,14 @@ mod tests {
                     motion,
                     Behavior::WatchSettled,
                     Behavior::SitNearError,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchSettled,
+                    Behavior::RestAfterPush,
                 ),
                 None
             );
@@ -6327,6 +6336,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} WatchSettled→SitNearError"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_settled_bridges_to_rest_after_push_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchSettled,
+                Behavior::RestAfterPush,
+            )
+            .is_some(),
+            "Full WatchSettled→RestAfterPush"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchSettled, Behavior::RestAfterPush).is_some(),
+            "core WatchSettled→RestAfterPush"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchSettled,
+                    Behavior::RestAfterPush,
+                ),
+                None,
+                "{motion:?} WatchSettled→RestAfterPush"
             );
         }
     }

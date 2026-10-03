@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (WatchSettled→RestAfterPush beside round 418)
+
+## 2026-10-03 (sticky/find/organism edges — round 419)
+
+- WatchSettled→RestAfterPush Full-motion bridge + UI membership sync. Unique
+  round **419**. Pairs anvil 349 / core. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (MAX-43 cancel beside round 417)
 
 ## 2026-10-03 (sticky/find/organism edges — round 418)

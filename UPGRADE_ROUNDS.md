@@ -1892,3 +1892,8 @@ quality gates listed in `README.md`.
      ahead MAX-42 vs MAX-43, and finished walks at MAX-43. Pairs anvil 348 /
      core cancel edge.
 
+419. **WatchSettled→RestAfterPush Full-motion bridge** — Full motion animates
+     WatchSettled→RestAfterPush; Calm/Static snap + semantic_bridges membership
+     sync. WatchSettled→SitNearError already synced in round 414. Pairs anvil
+     349 / core `WatchSettledToRestAfterPush` inside between() 93.
+
