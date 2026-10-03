@@ -1839,3 +1839,7 @@ quality gates listed in `README.md`.
      keeps "Save Block\u{ff37}history" on Toast (FF36/fullwidth-latin-V already
      pinned). Pairs anvil 336.
 
+407. **output_notice remount gate U+FF37/fullwidth-latin-W** — known_output_notice
+     rejects Truncated/Partly/Earlier strings padded with U+FF37 (FF36 already
+     pinned). Pairs anvil 337.
+
