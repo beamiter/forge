@@ -3399,3 +3399,7 @@ quality gates listed in `README.md`.
      dedicated Some-bridge already pinned; membership catch-up + Calm/Static
      snap None. Pairs anvil 689 / core `WatchCommandToIdle` inside between() 93.
 
+760. **Find FF7C/halfwidth-katakana-letter-si-query QueryNoMatches + stale** —
+     U+FF7C-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF7B/halfwidth-katakana-letter-sa already pinned). Pairs anvil 690.
+
