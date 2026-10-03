@@ -3300,6 +3300,9 @@ mod tests {
                 // Fullwidth right square bracket catch-up beside sticky FF3D — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff3d}"),
+                // Fullwidth circumflex catch-up beside sticky FF3E — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff3e}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {

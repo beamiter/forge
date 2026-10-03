@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (output_notice FF3E beside round 441)
+
+## 2026-10-03 (sticky/find/organism edges — round 442)
+
+- output_notice remount gate U+FF3E/fullwidth-circumflex. Unique round
+  **442**. Pairs anvil 372 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (sticky FF3E beside round 440)
 
 ## 2026-10-03 (sticky/find/organism edges — round 441)
