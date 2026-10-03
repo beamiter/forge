@@ -3624,6 +3624,9 @@ mod tests {
                 // Halfwidth hangul letter tikeut-sios catch-up beside sticky FFA9 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ffa9}"),
+                // Halfwidth hangul letter rieul catch-up beside sticky FFAA — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffaa}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {

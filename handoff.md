@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FFAA beside round 981)
+
+## 2026-10-04 (sticky/find/organism edges — round 982)
+
+- output_notice remount gate U+FFAA/halfwidth-hangul-letter-rieul. Unique round
+  **982**. Pairs anvil 912 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (sticky FFAA beside round 980)
 
 ## 2026-10-04 (sticky/find/organism edges — round 981)
