@@ -2258,3 +2258,7 @@ quality gates listed in `README.md`.
      ids remain (FF47/fullwidth-latin-small-g already pinned). Pairs anvil 430.
      Milestone **500/1000**.
 
+501. **sticky U+FF4A/fullwidth-latin-small-j near-miss stays Toast** —
+     persistence_failure_surface keeps "Save Block\u{ff4a}history" on Toast
+     (FF49/fullwidth-latin-small-i already pinned). Pairs anvil 431.
+
