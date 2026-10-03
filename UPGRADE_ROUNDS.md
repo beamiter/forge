@@ -2014,3 +2014,7 @@ quality gates listed in `README.md`.
      ids remain (FF3C/fullwidth-reverse-solidus already pinned). Pairs anvil
      375.
 
+446. **Sticky near-miss U+FF3F/fullwidth-low-line** —
+     persistence_failure_surface keeps "Save Block\u{ff3f}history" on Toast
+     (FF3E/fullwidth-circumflex already pinned). Pairs anvil 376.
+
