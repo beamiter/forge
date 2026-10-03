@@ -3607,3 +3607,7 @@ quality gates listed in `README.md`.
      snap None. Pairs anvil 739 / core `UnknownOutcomeToSitNearError` inside
      between() 93.
 
+810. **Find FF86/halfwidth-katakana-letter-ni-query QueryNoMatches + stale** —
+     U+FF86-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF85/halfwidth-katakana-letter-na already pinned). Pairs anvil 740.
+

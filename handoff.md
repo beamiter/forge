@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FF86 find beside rounds 806–809)
+
+## 2026-10-04 (sticky/find/organism edges — round 810)
+
+- FF86/halfwidth-katakana-letter-ni find QueryNoMatches + stale beside rounds
+  806–809 sticky FF87 / output_notice / MAX-121 / UnknownOutcome→SitNearError.
+  Unique round **810**. Pairs anvil 740 / core cancel. STAGE **71** / between()
+  **93** unchanged.
+
 Updated: 2026-10-04 (UnknownOutcome→SitNearError membership beside round 808)
 
 ## 2026-10-04 (sticky/find/organism edges — round 809)
