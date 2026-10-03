@@ -2099,3 +2099,7 @@ quality gates listed in `README.md`.
      sync. InspectError→GuardRecovery already synced in round 459. Pairs anvil
      394 / core `InspectErrorToCelebrate` inside between() 93.
 
+465. **Find FF41/fullwidth-latin-small-a-query QueryNoMatches + stale** —
+     U+FF41-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF40/fullwidth-grave already pinned). Pairs anvil 395.
+
