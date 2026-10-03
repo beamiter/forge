@@ -2739,3 +2739,7 @@ quality gates listed in `README.md`.
      sync. Celebrate→GuardCautious already synced in round 604. Pairs anvil
      539 / core `CelebrateToGuardFailure` inside between() 93.
 
+610. **Find FF5E/fullwidth-tilde-query QueryNoMatches + stale** —
+     U+FF5E-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF5D/fullwidth-right-curly-bracket already pinned). Pairs anvil 540.
+
