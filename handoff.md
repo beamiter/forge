@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (InspectError GuardFailure membership beside round 883)
+
+## 2026-10-04 (sticky/find/organism edges — round 884)
+
+- InspectError→GuardFailure Full-motion membership (Calm/Static snap). Unique
+  round **884**. Pairs anvil 814 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-136 cancel beside round 882)
 
 ## 2026-10-04 (sticky/find/organism edges — round 883)

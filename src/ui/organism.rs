@@ -4084,6 +4084,7 @@ mod tests {
             (Behavior::RestAfterPush, Behavior::Idle),
             (Behavior::InspectError, Behavior::Idle),
             (Behavior::SitNearError, Behavior::Idle),
+            (Behavior::InspectError, Behavior::GuardFailure),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
