@@ -2867,3 +2867,8 @@ quality gates listed in `README.md`.
      ahead MAX-86 vs MAX-87, and finished walks at MAX-87. Pairs anvil 568 /
      core cancel edge.
 
+639. **CelebrateBig→GuardCautious Full-motion bridge** — Full motion animates
+     CelebrateBig→GuardCautious; Calm/Static snap + semantic_bridges membership
+     sync. CelebrateBig→GuardRecovery already synced in round 634. Pairs anvil
+     569 / core `CelebrateBigToGuardCautious` inside between() 93.
+
