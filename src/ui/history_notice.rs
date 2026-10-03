@@ -322,6 +322,8 @@ mod tests {
             "Save Block\u{ff1b}history",
             // Fullwidth less-than stays toast-only beside fullwidth semicolon (one edge).
             "Save Block\u{ff1c}history",
+            // Fullwidth equals stays toast-only beside fullwidth less-than (one edge).
+            "Save Block\u{ff1d}history",
             "Block history",
         ] {
             assert_eq!(

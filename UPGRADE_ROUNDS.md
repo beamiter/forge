@@ -1263,3 +1263,7 @@ quality gates listed in `README.md`.
      U+FF1B-only queries stay QueryNoMatches under Command/Output/All when stale
      ids remain (FF1A/fullwidth-colon already pinned). Pairs anvil 219.
 
+276. **Sticky fullwidth equals label** —
+     U+FF1D variant of "Save Block history" stays toast-only beside fullwidth
+     less-than (round 271). Pairs anvil 220.
+
