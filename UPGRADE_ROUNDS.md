@@ -3116,3 +3116,7 @@ quality gates listed in `README.md`.
      Celebrate* UnknownOutcome pin remains. Pairs anvil 624 / core
      `CelebrateToUnknownOutcome` inside between() 93.
 
+695. **Find FF6F/halfwidth-katakana-letter-small-yo-query QueryNoMatches + stale** —
+     U+FF6F-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF6E/halfwidth-katakana-letter-small-yu already pinned). Pairs anvil 625.
+

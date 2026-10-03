@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FF6F find beside rounds 691–694)
+
+## 2026-10-04 (sticky/find/organism edges — round 695)
+
+- FF6F/halfwidth-katakana-letter-small-yo find QueryNoMatches + stale beside rounds
+  691–694 sticky FF70 / output_notice / MAX-98 / Celebrate→UnknownOutcome.
+  Unique round **695**. Pairs anvil 625 / core cancel. STAGE **71** / between()
+  **93** unchanged.
+
 Updated: 2026-10-04 (Celebrate→UnknownOutcome beside round 693)
 
 ## 2026-10-04 (sticky/find/organism edges — round 694)
