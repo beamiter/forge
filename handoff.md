@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (SitNearError GuardFailure membership beside round 928)
+
+## 2026-10-04 (sticky/find/organism edges — round 929)
+
+- SitNearError→GuardFailure Full-motion membership (Calm/Static snap). Unique
+  round **929**. Pairs anvil 859 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-145 cancel beside round 927)
 
 ## 2026-10-04 (sticky/find/organism edges — round 928)

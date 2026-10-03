@@ -4099,3 +4099,8 @@ quality gates listed in `README.md`.
      live==scheduled with resume; bump/scheduled-ahead/finished walks at
      MAX-145 vs MAX-144. Pairs anvil 858.
 
+929. **SitNearError→GuardFailure Full-motion membership** — Calm/Static snap
+     None; semantic_bridges membership for-loop (dedicated
+     sit_near_error_bridges_to_guard_failure_under_full_motion_only). Pairs
+     anvil 859.
+
