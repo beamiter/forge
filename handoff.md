@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FFAB beside round 986)
+
+## 2026-10-04 (sticky/find/organism edges — round 987)
+
+- output_notice remount gate U+FFAB/halfwidth-hangul-letter-rieul-kiyeok. Unique
+  round **987**. Pairs anvil 917 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (sticky FFAB beside round 985)
 
 ## 2026-10-04 (sticky/find/organism edges — round 986)
