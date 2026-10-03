@@ -4090,6 +4090,7 @@ mod tests {
             (Behavior::InspectError, Behavior::GuardRecovery),
             (Behavior::InspectError, Behavior::Celebrate),
             (Behavior::InspectError, Behavior::CelebrateBig),
+            (Behavior::InspectError, Behavior::SitNearError),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),

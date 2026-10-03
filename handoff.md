@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (InspectError SitNearError membership beside round 913)
+
+## 2026-10-04 (sticky/find/organism edges — round 914)
+
+- InspectError→SitNearError Full-motion membership (Calm/Static snap). Unique
+  round **914**. Pairs anvil 844 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-142 cancel beside round 912)
 
 ## 2026-10-04 (sticky/find/organism edges — round 913)
