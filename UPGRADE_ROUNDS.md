@@ -2651,3 +2651,7 @@ quality gates listed in `README.md`.
      sync. GuardCautious→GuardStuck already synced in round 584. Pairs anvil
      519 / core `GuardCautiousToGuardRecovery` inside between() 93.
 
+590. **Find FF5A/fullwidth-latin-small-z-query QueryNoMatches + stale** —
+     U+FF5A-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF59/fullwidth-latin-small-y already pinned). Pairs anvil 520.
+
