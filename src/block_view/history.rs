@@ -3204,6 +3204,9 @@ mod tests {
                 // Fullwidth equals catch-up beside sticky FF1D — still outside
                 // the gate (one edge).
                 format!("{base}\u{ff1d}"),
+                // Fullwidth greater-than catch-up beside sticky FF1E — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff1e}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {

@@ -1289,3 +1289,7 @@ quality gates listed in `README.md`.
      U+FF1E variant of "Save Block history" stays toast-only beside fullwidth
      equals (round 276). Pairs anvil 224.
 
+282. **output_notice fullwidth greater-than gate** —
+     U+FF1E-padded Truncated/Partly/Earlier strings stay outside the known-set
+     remount gate beside sticky FF1E. Pairs anvil sticky tip.
+
