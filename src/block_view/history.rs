@@ -3240,6 +3240,9 @@ mod tests {
                 // Fullwidth latin I catch-up beside sticky FF29 — still outside
                 // the gate (one edge).
                 format!("{base}\u{ff29}"),
+                // Fullwidth latin J catch-up beside sticky FF2A — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff2a}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {

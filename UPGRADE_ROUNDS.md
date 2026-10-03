@@ -1553,3 +1553,7 @@ quality gates listed in `README.md`.
      U+FF2A variant of "Save Block history" stays toast-only beside fullwidth
      latin I (round 336). Pairs anvil 272.
 
+342. **output_notice fullwidth latin-J gate** —
+     U+FF2A-padded Truncated/Partly/Earlier strings stay outside the known-set
+     remount gate beside sticky FF2A. Pairs anvil sticky tip.
+
