@@ -1325,3 +1325,7 @@ quality gates listed in `README.md`.
      membership sync. Unknown→InspectError already synced in round 284.
      Pairs anvil 230 / core `UnknownOutcomeToRestAfterPush` inside between() 93.
 
+290. **Find FF1E/fullwidth-greater-than-query QueryNoMatches + stale** —
+     U+FF1E-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF1D/fullwidth-equals already pinned). Pairs anvil 231.
+
