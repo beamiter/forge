@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (output_notice FF1B beside round 266)
+
+## 2026-10-03 (sticky/find/organism edges — round 267)
+
+- output_notice fullwidth semicolon (U+FF1B) gate beside sticky FF1B. Unique
+  round **267**. Pairs anvil sticky tip. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (sticky FF1B beside round 265)
 
 ## 2026-10-03 (sticky/find/organism edges — round 266)

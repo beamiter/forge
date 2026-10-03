@@ -1223,3 +1223,7 @@ quality gates listed in `README.md`.
      U+FF1B variant of "Save Block history" stays toast-only beside fullwidth
      colon (round 261). Pairs anvil 212.
 
+267. **output_notice fullwidth semicolon gate** —
+     U+FF1B-padded Truncated/Partly/Earlier strings stay outside the known-set
+     remount gate beside sticky FF1B. Pairs anvil sticky tip.
+
