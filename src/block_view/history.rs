@@ -3390,6 +3390,9 @@ mod tests {
                 // Fullwidth left curly bracket catch-up beside sticky FF5B — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff5b}"),
+                // Fullwidth vertical line catch-up beside sticky FF5C — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff5c}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
