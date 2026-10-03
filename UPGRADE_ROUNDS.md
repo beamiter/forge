@@ -3586,3 +3586,7 @@ quality gates listed in `README.md`.
      snap None. Pairs anvil 734 / core `UnknownOutcomeToCelebrateBig` inside
      between() 93.
 
+805. **Find FF85/halfwidth-katakana-letter-na-query QueryNoMatches + stale** —
+     U+FF85-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF84/halfwidth-katakana-letter-to already pinned). Pairs anvil 735.
+
