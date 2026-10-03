@@ -1782,3 +1782,8 @@ quality gates listed in `README.md`.
      ahead MAX-37 vs MAX-38, and finished walks at MAX-38. Pairs anvil 323 /
      core cancel edge.
 
+394. **WatchAgent→RestAfterPush Full-motion bridge** — Full motion animates
+     WatchAgent→RestAfterPush; Calm/Static snap + semantic_bridges membership
+     sync. WatchAgent→SitNearError already synced in round 389. Pairs anvil
+     324 / core `WatchAgentToRestAfterPush` inside between() 93.
+

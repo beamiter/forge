@@ -3986,6 +3986,7 @@ mod tests {
             (Behavior::WatchCommand, Behavior::RestAfterPush),
             (Behavior::WatchAgent, Behavior::InspectError),
             (Behavior::WatchAgent, Behavior::SitNearError),
+            (Behavior::WatchAgent, Behavior::RestAfterPush),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4320,6 +4321,14 @@ mod tests {
                     motion,
                     Behavior::WatchAgent,
                     Behavior::SitNearError,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchAgent,
+                    Behavior::RestAfterPush,
                 ),
                 None
             );
@@ -6142,6 +6151,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} WatchAgent→SitNearError"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_agent_bridges_to_rest_after_push_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchAgent,
+                Behavior::RestAfterPush,
+            )
+            .is_some(),
+            "Full WatchAgent→RestAfterPush"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchAgent, Behavior::RestAfterPush).is_some(),
+            "core WatchAgent→RestAfterPush"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchAgent,
+                    Behavior::RestAfterPush,
+                ),
+                None,
+                "{motion:?} WatchAgent→RestAfterPush"
             );
         }
     }
