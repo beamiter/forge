@@ -2037,3 +2037,7 @@ quality gates listed in `README.md`.
      ids remain (FF3D/fullwidth-right-square-bracket already pinned). Pairs anvil
      380.
 
+451. **Sticky near-miss U+FF40/fullwidth-grave** —
+     persistence_failure_surface keeps "Save Block\u{ff40}history" on Toast
+     (FF3F/fullwidth-low-line already pinned). Pairs anvil 381.
+
