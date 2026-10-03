@@ -464,6 +464,8 @@ mod tests {
             "Save Block\u{ff62}history",
             // Halfwidth right corner bracket stays toast-only beside halfwidth left corner bracket (one edge).
             "Save Block\u{ff63}history",
+            // Halfwidth ideographic comma stays toast-only beside halfwidth right corner bracket (one edge).
+            "Save Block\u{ff64}history",
             "Block history",
         ] {
             assert_eq!(

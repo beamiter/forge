@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (sticky FF64 beside round 630)
+
+## 2026-10-04 (sticky/find/organism edges — round 631)
+
+- sticky U+FF64/halfwidth-ideographic-comma near-miss stays Toast. Unique
+  round **631**. Pairs anvil 561 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (FF62 find beside rounds 626–629)
 
 ## 2026-10-04 (sticky/find/organism edges — round 630)

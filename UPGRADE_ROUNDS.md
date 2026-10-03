@@ -2831,3 +2831,7 @@ quality gates listed in `README.md`.
      U+FF62-only queries stay QueryNoMatches under Command/Output/All when stale
      ids remain (FF61/halfwidth-ideographic-full-stop already pinned). Pairs anvil 560.
 
+631. **sticky U+FF64/halfwidth-ideographic-comma near-miss stays Toast** —
+     persistence_failure_surface keeps "Save Block\u{ff64}history" on Toast
+     (FF63/halfwidth-right-corner-bracket already pinned). Pairs anvil 561.
+
