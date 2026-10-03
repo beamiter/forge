@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FF60 find beside rounds 616–619)
+
+## 2026-10-04 (sticky/find/organism edges — round 620)
+
+- FF60/fullwidth-right-white-parenthesis find QueryNoMatches + stale beside rounds
+  616–619 sticky FF61 / output_notice / MAX-83 / Celebrate→RestAfterPush.
+  Unique round **620**. Pairs anvil 550 / core cancel. STAGE **71** / between()
+  **93** unchanged.
+
 Updated: 2026-10-04 (Celebrate→RestAfterPush beside round 618)
 
 ## 2026-10-04 (sticky/find/organism edges — round 619)

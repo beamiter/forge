@@ -2783,3 +2783,7 @@ quality gates listed in `README.md`.
      sync. Celebrate→GuardStuck already synced in round 614. Pairs anvil
      549 / core `CelebrateToRestAfterPush` inside between() 93.
 
+620. **Find FF60/fullwidth-right-white-parenthesis-query QueryNoMatches + stale** —
+     U+FF60-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF5F/fullwidth-left-white-parenthesis already pinned). Pairs anvil 550.
+
