@@ -2850,3 +2850,7 @@ quality gates listed in `README.md`.
      Full-motion pin. Pairs anvil 564 / core `CelebrateBigToGuardRecovery`
      inside between() 93.
 
+635. **Find FF63/halfwidth-right-corner-bracket-query QueryNoMatches + stale** —
+     U+FF63-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF62/halfwidth-left-corner-bracket already pinned). Pairs anvil 565.
+

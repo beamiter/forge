@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FF63 find beside rounds 631–634)
+
+## 2026-10-04 (sticky/find/organism edges — round 635)
+
+- FF63/halfwidth-right-corner-bracket find QueryNoMatches + stale beside rounds
+  631–634 sticky FF64 / output_notice / MAX-86 / CelebrateBig→GuardRecovery.
+  Unique round **635**. Pairs anvil 565 / core cancel. STAGE **71** / between()
+  **93** unchanged.
+
 Updated: 2026-10-04 (CelebrateBig→GuardRecovery beside round 633)
 
 ## 2026-10-04 (sticky/find/organism edges — round 634)
