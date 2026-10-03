@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FF97 find beside rounds 891–894)
+
+## 2026-10-04 (sticky/find/organism edges — round 895)
+
+- Find QueryNoMatches+stale U+FF97/halfwidth-katakana-letter-small-tsu. Unique
+  round **895**. Pairs anvil 825 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (InspectError GuardCautious membership beside round 893)
 
 ## 2026-10-04 (sticky/find/organism edges — round 894)
