@@ -3893,3 +3893,7 @@ quality gates listed in `README.md`.
      semantic_bridges membership for-loop (dedicated
      sit_near_error_bridges_to_idle_under_full_motion_only). Pairs anvil 809.
 
+880. **Find QueryNoMatches+stale U+FF94/halfwidth-katakana-letter-ya** —
+     bookmarked_search_empty_reason QueryNoMatches for Unicode-only query
+     with stale bookmark ids (FF93 already pinned). Pairs anvil 810.
+
