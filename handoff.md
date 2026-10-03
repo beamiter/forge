@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (UnknownOutcome→Idle membership beside round 788)
+
+## 2026-10-04 (sticky/find/organism edges — round 789)
+
+- UnknownOutcome→Idle Full-motion membership (Calm/Static snap). Unique round
+  **789**. Pairs anvil 719 / core `UnknownOutcomeToIdle` inside between() 93.
+  STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (MAX-117 cancel beside round 787)
 
 ## 2026-10-04 (sticky/find/organism edges — round 788)
