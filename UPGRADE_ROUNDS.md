@@ -3093,3 +3093,7 @@ quality gates listed in `README.md`.
      RestAfterPush UnknownOutcome pin remains. Pairs anvil 619 / core
      `RestAfterPushToUnknownOutcome` inside between() 93.
 
+690. **Find FF6E/halfwidth-katakana-letter-small-yu-query QueryNoMatches + stale** —
+     U+FF6E-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF6D/halfwidth-katakana-letter-small-ya already pinned). Pairs anvil 620.
+
