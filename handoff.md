@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (InspectError→UnknownOutcome beside round 478)
+
+## 2026-10-03 (sticky/find/organism edges — round 479)
+
+- InspectError→UnknownOutcome Full-motion bridge + UI membership sync. Unique
+  round **479**. Pairs anvil 409 / core. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (MAX-55 cancel beside round 477)
 
 ## 2026-10-03 (sticky/find/organism edges — round 478)

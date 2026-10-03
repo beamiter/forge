@@ -2160,3 +2160,8 @@ quality gates listed in `README.md`.
      ahead MAX-54 vs MAX-55, and finished walks at MAX-55. Pairs anvil 408 /
      core cancel edge.
 
+479. **InspectError→UnknownOutcome Full-motion bridge** — Full motion animates
+     InspectError→UnknownOutcome; Calm/Static snap + semantic_bridges membership
+     sync. InspectError→SitNearError already synced in round 474. Pairs anvil
+     409 / core `InspectErrorToUnknownOutcome` inside between() 93.
+
