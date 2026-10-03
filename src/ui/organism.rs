@@ -3993,6 +3993,7 @@ mod tests {
             (Behavior::WatchSettled, Behavior::SitNearError),
             (Behavior::WatchSettled, Behavior::RestAfterPush),
             (Behavior::InspectError, Behavior::GuardFailure),
+            (Behavior::SitNearError, Behavior::GuardStuck),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4383,6 +4384,14 @@ mod tests {
                     motion,
                     Behavior::InspectError,
                     Behavior::GuardFailure,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::SitNearError,
+                    Behavior::GuardStuck,
                 ),
                 None
             );
@@ -6401,6 +6410,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} InspectError→GuardFailure"
+            );
+        }
+    }
+
+    #[test]
+    fn sit_near_error_bridges_to_guard_stuck_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::SitNearError,
+                Behavior::GuardStuck,
+            )
+            .is_some(),
+            "Full SitNearError→GuardStuck"
+        );
+        assert!(
+            VisualTransition::between(Behavior::SitNearError, Behavior::GuardStuck).is_some(),
+            "core SitNearError→GuardStuck"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::SitNearError,
+                    Behavior::GuardStuck,
+                ),
+                None,
+                "{motion:?} SitNearError→GuardStuck"
             );
         }
     }
