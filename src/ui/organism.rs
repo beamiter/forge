@@ -4034,6 +4034,7 @@ mod tests {
             (Behavior::Celebrate, Behavior::RestAfterPush),
             (Behavior::Celebrate, Behavior::InspectError),
             (Behavior::Celebrate, Behavior::SitNearError),
+            (Behavior::CelebrateBig, Behavior::GuardRecovery),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -7646,6 +7647,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} Celebrate→SitNearError"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_big_bridges_to_guard_recovery_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::CelebrateBig,
+                Behavior::GuardRecovery,
+            )
+            .is_some(),
+            "Full CelebrateBig→GuardRecovery"
+        );
+        assert!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::GuardRecovery).is_some(),
+            "core CelebrateBig→GuardRecovery"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::CelebrateBig,
+                    Behavior::GuardRecovery,
+                ),
+                None,
+                "{motion:?} CelebrateBig→GuardRecovery"
             );
         }
     }

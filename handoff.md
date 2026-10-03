@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (CelebrateBig→GuardRecovery beside round 633)
+
+## 2026-10-04 (sticky/find/organism edges — round 634)
+
+- CelebrateBig→GuardRecovery Full-motion bridge. Unique round **634**. Pairs
+  anvil 564 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (MAX-86 cancel beside round 632)
 
 ## 2026-10-04 (sticky/find/organism edges — round 633)
