@@ -3591,6 +3591,9 @@ mod tests {
                 // Halfwidth katakana letter ni catch-up beside sticky FF9E — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff9e}"),
+                // Halfwidth katakana letter nu catch-up beside sticky FF9F — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff9f}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
