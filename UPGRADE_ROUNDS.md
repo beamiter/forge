@@ -2298,3 +2298,7 @@ quality gates listed in `README.md`.
      sync. SitNearError→RestAfterPush already synced in round 504. Pairs anvil
      439 / core `GuardFailureToGuardStuck` inside between() 93.
 
+510. **Find FF4A/fullwidth-latin-small-j-query QueryNoMatches + stale** —
+     U+FF4A-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF49/fullwidth-latin-small-i already pinned). Pairs anvil 440.
+
