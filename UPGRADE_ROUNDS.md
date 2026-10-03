@@ -3440,3 +3440,7 @@ quality gates listed in `README.md`.
      snap None. Pairs anvil 699 / core `WatchAgentToInspectError` inside
      between() 93.
 
+770. **Find FF7E/halfwidth-katakana-letter-se-query QueryNoMatches + stale** —
+     U+FF7E-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF7D/halfwidth-katakana-letter-su already pinned). Pairs anvil 700.
+
