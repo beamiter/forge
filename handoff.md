@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (InspectError GuardStuck membership beside round 888)
+
+## 2026-10-04 (sticky/find/organism edges — round 889)
+
+- InspectError→GuardStuck Full-motion membership (Calm/Static snap). Unique
+  round **889**. Pairs anvil 819 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-137 cancel beside round 887)
 
 ## 2026-10-04 (sticky/find/organism edges — round 888)
