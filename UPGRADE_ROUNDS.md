@@ -1545,3 +1545,7 @@ quality gates listed in `README.md`.
      sync. SitNearError→Idle already synced in round 334. Pairs anvil 270 /
      core `WatchCommandToIdle` inside between() 93.
 
+340. **Find FF28/fullwidth-latin-H-query QueryNoMatches + stale** —
+     U+FF28-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF27/fullwidth-latin-G already pinned). Pairs anvil 271.
+

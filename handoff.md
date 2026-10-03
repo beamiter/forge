@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF28 find beside rounds 336–339)
+
+## 2026-10-03 (sticky/find/organism edges — round 340)
+
+- FF28/fullwidth-latin-H find QueryNoMatches + stale beside rounds 336–339
+  sticky FF29 / output_notice / MAX-27 / WatchCommand→Idle. Unique round
+  **340**. Pairs anvil 271 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (WatchCommand→Idle beside round 338)
 
 ## 2026-10-03 (sticky/find/organism edges — round 339)
