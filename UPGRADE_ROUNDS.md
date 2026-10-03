@@ -3315,3 +3315,7 @@ quality gates listed in `README.md`.
      already exists). WatchCommand→Celebrate already synced in round 734. Pairs
      anvil 669 / core `WatchCommandToCelebrateBig` inside between() 93.
 
+740. **Find FF78/halfwidth-katakana-letter-ku-query QueryNoMatches + stale** —
+     U+FF78-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF77/halfwidth-katakana-letter-ki already pinned). Pairs anvil 670.
+
