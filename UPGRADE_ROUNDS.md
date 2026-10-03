@@ -1897,3 +1897,7 @@ quality gates listed in `README.md`.
      sync. WatchSettled→SitNearError already synced in round 414. Pairs anvil
      349 / core `WatchSettledToRestAfterPush` inside between() 93.
 
+420. **Find FF38/fullwidth-latin-X-query QueryNoMatches + stale** —
+     U+FF38-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF37/fullwidth-latin-W already pinned). Pairs anvil 350.
+
