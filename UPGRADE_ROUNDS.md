@@ -1920,3 +1920,7 @@ quality gates listed in `README.md`.
      UnknownOutcome→InspectError already had a dedicated pin. Pairs anvil 354 /
      core inside between() 93.
 
+425. **Find FF39/fullwidth-latin-Y-query QueryNoMatches + stale** —
+     U+FF39-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF38/fullwidth-latin-X already pinned). Pairs anvil 355.
+

@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF39 find beside rounds 421–424)
+
+## 2026-10-03 (sticky/find/organism edges — round 425)
+
+- FF39/fullwidth-latin-Y find QueryNoMatches + stale beside rounds 421–424
+  sticky FF3A / output_notice / MAX-44 / InspectError→GuardFailure. Unique
+  round **425**. Pairs anvil 355 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (InspectError→GuardFailure beside round 423)
 
 ## 2026-10-03 (sticky/find/organism edges — round 424)
