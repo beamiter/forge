@@ -3597,6 +3597,9 @@ mod tests {
                 // Halfwidth hangul filler catch-up beside sticky FFA0 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ffa0}"),
+                // Halfwidth hangul letter kiyeok catch-up beside sticky FFA1 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffa1}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
