@@ -3156,3 +3156,8 @@ quality gates listed in `README.md`.
      ahead MAX-99 vs MAX-100, and finished walks at MAX-100. Pairs anvil 633 /
      core cancel edge.
 
+704. **WatchSettled→Celebrate Full-motion membership** — semantic_bridges
+     membership catch-up for WatchSettled→Celebrate (dedicated Full-motion pin
+     already exists). CelebrateBig→UnknownOutcome already synced in round 699.
+     Pairs anvil 634 / core `WatchSettledToCelebrate` inside between() 93.
+
