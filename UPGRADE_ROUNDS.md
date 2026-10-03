@@ -4125,3 +4125,7 @@ quality gates listed in `README.md`.
      sit_near_error_bridges_to_guard_stuck_under_full_motion_only). Pairs
      anvil 864.
 
+935. **Find QueryNoMatches+stale U+FF9F/halfwidth-katakana-letter-nu** —
+     bookmarked_search_empty_reason QueryNoMatches for Unicode-only query
+     with stale bookmark ids (FF9E already pinned). Pairs anvil 865.
+
