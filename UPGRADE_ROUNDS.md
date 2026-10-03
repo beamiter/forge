@@ -2165,3 +2165,7 @@ quality gates listed in `README.md`.
      sync. InspectError→SitNearError already synced in round 474. Pairs anvil
      409 / core `InspectErrorToUnknownOutcome` inside between() 93.
 
+480. **Find FF44/fullwidth-latin-small-d-query QueryNoMatches + stale** —
+     U+FF44-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF43/fullwidth-latin-small-c already pinned). Pairs anvil 410.
+

@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF44 find beside rounds 476–479)
+
+## 2026-10-03 (sticky/find/organism edges — round 480)
+
+- FF44/fullwidth-latin-small-d find QueryNoMatches + stale beside rounds
+  476–479 sticky FF45 / output_notice / MAX-55 / InspectError→UnknownOutcome.
+  Unique round **480**. Pairs anvil 410 / core cancel. STAGE **71** /
+  between() **93** unchanged.
+
 Updated: 2026-10-03 (InspectError→UnknownOutcome beside round 478)
 
 ## 2026-10-03 (sticky/find/organism edges — round 479)
