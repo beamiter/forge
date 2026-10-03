@@ -3294,6 +3294,9 @@ mod tests {
                 // Fullwidth left square bracket catch-up beside sticky FF3B — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff3b}"),
+                // Fullwidth reverse solidus catch-up beside sticky FF3C — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff3c}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {

@@ -1950,3 +1950,7 @@ quality gates listed in `README.md`.
      persistence_failure_surface keeps "Save Block\u{ff3c}history" on Toast
      (FF3B/fullwidth-left-square-bracket already pinned). Pairs anvil 361.
 
+432. **output_notice remount gate U+FF3C/fullwidth-reverse-solidus** —
+     known_output_notice rejects Truncated/Partly/Earlier strings padded with
+     U+FF3C (FF3B already pinned). Pairs anvil 362.
+
