@@ -2911,3 +2911,8 @@ quality gates listed in `README.md`.
      ahead MAX-88 vs MAX-89, and finished walks at MAX-89. Pairs anvil 578 /
      core cancel edge.
 
+649. **CelebrateBig→GuardStuck Full-motion bridge** — Full motion animates
+     CelebrateBig→GuardStuck; Calm/Static snap + semantic_bridges membership
+     sync. CelebrateBig→GuardFailure already synced in round 644. Pairs anvil
+     579 / core `CelebrateBigToGuardStuck` inside between() 93.
+
