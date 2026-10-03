@@ -3021,3 +3021,8 @@ quality gates listed in `README.md`.
      ahead MAX-93 vs MAX-94, and finished walks at MAX-94. Pairs anvil 603 /
      core cancel edge.
 
+674. **RestAfterPush→SitNearError Full-motion bridge** — Full motion animates
+     RestAfterPush→SitNearError; Calm/Static snap + semantic_bridges membership
+     sync. RestAfterPush→InspectError already synced in round 669. Pairs anvil
+     604 / core `RestAfterPushToSitNearError` inside between() 93.
+

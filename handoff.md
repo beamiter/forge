@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (RestAfterPush→SitNearError beside round 673)
+
+## 2026-10-04 (sticky/find/organism edges — round 674)
+
+- RestAfterPush→SitNearError Full-motion bridge. Unique round **674**. Pairs
+  anvil 604 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (MAX-94 cancel beside round 672)
 
 ## 2026-10-04 (sticky/find/organism edges — round 673)
