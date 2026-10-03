@@ -3543,3 +3543,7 @@ quality gates listed in `README.md`.
      snap None. Pairs anvil 724 / core `UnknownOutcomeToInspectError` inside
      between() 93.
 
+795. **Find FF83/halfwidth-katakana-letter-te-query QueryNoMatches + stale** —
+     U+FF83-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF82/halfwidth-katakana-letter-tu already pinned). Pairs anvil 725.
+
