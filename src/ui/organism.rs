@@ -3973,6 +3973,7 @@ mod tests {
             (Behavior::Celebrate, Behavior::Idle),
             (Behavior::CelebrateBig, Behavior::Idle),
             (Behavior::RestAfterPush, Behavior::Idle),
+            (Behavior::InspectError, Behavior::Idle),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4202,6 +4203,14 @@ mod tests {
                 visual_transition_for_motion(
                     motion,
                     Behavior::RestAfterPush,
+                    Behavior::Idle,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::InspectError,
                     Behavior::Idle,
                 ),
                 None
@@ -5661,6 +5670,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} RestAfterPush→Idle"
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_error_bridges_to_idle_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::InspectError,
+                Behavior::Idle,
+            )
+            .is_some(),
+            "Full InspectError→Idle"
+        );
+        assert!(
+            VisualTransition::between(Behavior::InspectError, Behavior::Idle).is_some(),
+            "core InspectError→Idle"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::InspectError,
+                    Behavior::Idle,
+                ),
+                None,
+                "{motion:?} InspectError→Idle"
             );
         }
     }
