@@ -2209,3 +2209,7 @@ quality gates listed in `README.md`.
      sync. InspectError→RestAfterPush already synced in round 484. Pairs anvil
      419 / core `SitNearErrorToCelebrate` inside between() 93.
 
+490. **Find FF46/fullwidth-latin-small-f-query QueryNoMatches + stale** —
+     U+FF46-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF45/fullwidth-latin-small-e already pinned). Pairs anvil 420.
+
