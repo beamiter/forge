@@ -1447,3 +1447,8 @@ quality gates listed in `README.md`.
      U+FF25-padded Truncated/Partly/Earlier strings stay outside the known-set
      remount gate beside sticky FF25. Pairs anvil sticky tip.
 
+318. **CrossBlock cancel MAX-23→MAX-22 wrap bump** — palette idle continuation
+     drops MAX-23→MAX-22 generation bumps (with or without resume), scheduled
+     ahead MAX-22 vs MAX-23, and finished walks at MAX-23. Pairs anvil 253 /
+     core cancel edge.
+
