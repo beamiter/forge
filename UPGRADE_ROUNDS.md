@@ -3777,3 +3777,7 @@ quality gates listed in `README.md`.
      ids remain (FF8D/halfwidth-katakana-letter-he already pinned). Milestone
      850/1000. Pairs anvil 780.
 
+851. **sticky U+FF90/halfwidth-katakana-letter-mi near-miss stays Toast** —
+     persistence_failure_surface keeps "Save Block\u{ff90}history" on Toast
+     (FF8F/halfwidth-katakana-letter-ma already pinned). Pairs anvil 781.
+
