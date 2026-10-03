@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FF64 find beside rounds 636–639)
+
+## 2026-10-04 (sticky/find/organism edges — round 640)
+
+- FF64/halfwidth-ideographic-comma find QueryNoMatches + stale beside rounds
+  636–639 sticky FF65 / output_notice / MAX-87 / CelebrateBig→GuardCautious.
+  Unique round **640**. Pairs anvil 570 / core cancel. STAGE **71** / between()
+  **93** unchanged.
+
 Updated: 2026-10-04 (CelebrateBig→GuardCautious beside round 638)
 
 ## 2026-10-04 (sticky/find/organism edges — round 639)

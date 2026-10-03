@@ -2872,3 +2872,7 @@ quality gates listed in `README.md`.
      sync. CelebrateBig→GuardRecovery already synced in round 634. Pairs anvil
      569 / core `CelebrateBigToGuardCautious` inside between() 93.
 
+640. **Find FF64/halfwidth-ideographic-comma-query QueryNoMatches + stale** —
+     U+FF64-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF63/halfwidth-right-corner-bracket already pinned). Pairs anvil 570.
+
