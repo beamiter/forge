@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (RestAfterPush→Idle membership beside round 868)
+
+## 2026-10-04 (sticky/find/organism edges — round 869)
+
+- RestAfterPush→Idle Full-motion membership (Calm/Static snap). Unique round
+  **869**. Pairs anvil 799 / core `RestAfterPushToIdle` inside between() 93.
+  STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (MAX-133 cancel beside round 867)
 
 ## 2026-10-04 (sticky/find/organism edges — round 868)
