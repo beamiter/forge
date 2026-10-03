@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (WatchSettled→RestAfterPush membership beside round 723)
+
+## 2026-10-04 (sticky/find/organism edges — round 724)
+
+- WatchSettled→RestAfterPush Full-motion membership. Unique round **724**. Pairs
+  anvil 654 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (MAX-104 cancel beside round 722)
 
 ## 2026-10-04 (sticky/find/organism edges — round 723)
