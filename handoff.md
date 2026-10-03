@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFA4 find beside rounds 956–959)
+
+## 2026-10-04 (sticky/find/organism edges — round 960)
+
+- Find QueryNoMatches+stale U+FFA4/halfwidth-hangul-letter-nieun. Unique round
+  **960**. Pairs anvil 890 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (SitNearError UnknownOutcome membership beside round 958)
 
 ## 2026-10-04 (sticky/find/organism edges — round 959)
