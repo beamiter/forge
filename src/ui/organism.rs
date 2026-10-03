@@ -4103,6 +4103,7 @@ mod tests {
             (Behavior::SitNearError, Behavior::RestAfterPush),
             (Behavior::GuardFailure, Behavior::GuardStuck),
             (Behavior::GuardFailure, Behavior::GuardRecovery),
+            (Behavior::GuardFailure, Behavior::GuardCautious),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
