@@ -2916,3 +2916,7 @@ quality gates listed in `README.md`.
      sync. CelebrateBig→GuardFailure already synced in round 644. Pairs anvil
      579 / core `CelebrateBigToGuardStuck` inside between() 93.
 
+650. **Find FF66/halfwidth-katakana-letter-wo-query QueryNoMatches + stale** —
+     U+FF66-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF65/halfwidth-katakana-middle-dot already pinned). Pairs anvil 580.
+
