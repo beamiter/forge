@@ -1237,3 +1237,7 @@ quality gates listed in `README.md`.
      membership sync. Unknown→Idle already synced in round 264.
      Pairs anvil 214 / core `UnknownOutcomeToCelebrate` inside between() 93.
 
+270. **Find FF1A/fullwidth-colon-query QueryNoMatches + stale** —
+     U+FF1A-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (1805/four-dots already pinned). Pairs anvil 215.
+
