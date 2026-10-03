@@ -8433,6 +8433,30 @@ tail ab";
         assert!(!cross_block_search_continue_is_current(
             near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
         ));
+        // Near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-wrap bump (MAX-41→MAX-40) cancels with a
+        // resume — one step earlier than the MAX-40→MAX-39 sibling.
+        let near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
+        assert!(cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+        ));
+        // Scheduled ahead at the near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-wrap boundary
+        // (MAX-40 vs MAX-41).
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+        ));
+        // Finished walk at the near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-wrap generation itself.
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+        ));
     }
 
     #[test]
