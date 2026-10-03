@@ -3070,3 +3070,7 @@ quality gates listed in `README.md`.
      sync. RestAfterPush→Celebrate already synced in round 679. Pairs anvil
      614 / core `RestAfterPushToCelebrateBig` inside between() 93.
 
+685. **Find FF6D/halfwidth-katakana-letter-small-ya-query QueryNoMatches + stale** —
+     U+FF6D-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF6C/halfwidth-katakana-letter-small-tu already pinned). Pairs anvil 615.
+
