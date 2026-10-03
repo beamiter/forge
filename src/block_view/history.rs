@@ -3531,6 +3531,9 @@ mod tests {
                 // Halfwidth katakana letter ha catch-up beside sticky FF8A — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff8a}"),
+                // Halfwidth katakana letter hi catch-up beside sticky FF8B — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff8b}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
