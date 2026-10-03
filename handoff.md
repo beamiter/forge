@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF5F find beside rounds 611–614)
+
+## 2026-10-03 (sticky/find/organism edges — round 615)
+
+- FF5F/fullwidth-left-white-parenthesis find QueryNoMatches + stale beside rounds
+  611–614 sticky FF60 / output_notice / MAX-82 / Celebrate→GuardStuck.
+  Unique round **615**. Pairs anvil 545 / core cancel. STAGE **71** / between()
+  **93** unchanged.
+
 Updated: 2026-10-03 (Celebrate→GuardStuck beside round 613)
 
 ## 2026-10-03 (sticky/find/organism edges — round 614)
