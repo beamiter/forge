@@ -2563,3 +2563,7 @@ quality gates listed in `README.md`.
      sync. GuardRecovery→RestAfterPush already synced in round 564. Pairs anvil
      499 / core `GuardRecoveryToInspectError` inside between() 93.
 
+570. **Find FF56/fullwidth-latin-small-v-query QueryNoMatches + stale** —
+     U+FF56-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF55/fullwidth-latin-small-u already pinned). Pairs anvil 500.
+
