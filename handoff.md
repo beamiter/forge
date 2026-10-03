@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FF96 find beside rounds 886–889)
+
+## 2026-10-04 (sticky/find/organism edges — round 890)
+
+- Find QueryNoMatches+stale U+FF96/halfwidth-katakana-letter-yo. Unique round
+  **890**. Pairs anvil 820 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (InspectError GuardStuck membership beside round 888)
 
 ## 2026-10-04 (sticky/find/organism edges — round 889)
