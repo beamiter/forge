@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FF79 find beside rounds 741–744)
+
+## 2026-10-04 (sticky/find/organism edges — round 745)
+
+- FF79/halfwidth-katakana-letter-ke find QueryNoMatches + stale beside rounds
+  741–744 sticky FF7A / output_notice / MAX-108 / WatchCommand→InspectError.
+  Unique round **745**. Pairs anvil 675 / core cancel. STAGE **71** / between()
+  **93** unchanged.
+
 Updated: 2026-10-04 (WatchCommand→InspectError membership beside round 743)
 
 ## 2026-10-04 (sticky/find/organism edges — round 744)
