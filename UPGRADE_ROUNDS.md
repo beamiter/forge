@@ -1809,3 +1809,7 @@ quality gates listed in `README.md`.
      sync. WatchAgent→RestAfterPush already synced in round 394. Pairs anvil
      329 / core `WatchSettledToCelebrate` inside between() 93.
 
+400. **Find FF34/fullwidth-latin-T-query QueryNoMatches + stale** —
+     U+FF34-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF33/fullwidth-latin-S already pinned). Pairs anvil 330.
+
