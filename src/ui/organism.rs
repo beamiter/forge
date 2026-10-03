@@ -4029,6 +4029,7 @@ mod tests {
             (Behavior::GuardCautious, Behavior::RestAfterPush),
             (Behavior::Celebrate, Behavior::GuardRecovery),
             (Behavior::Celebrate, Behavior::GuardCautious),
+            (Behavior::Celebrate, Behavior::GuardFailure),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -7501,6 +7502,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} Celebrate→GuardCautious"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_bridges_to_guard_failure_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::Celebrate,
+                Behavior::GuardFailure,
+            )
+            .is_some(),
+            "Full Celebrate→GuardFailure"
+        );
+        assert!(
+            VisualTransition::between(Behavior::Celebrate, Behavior::GuardFailure).is_some(),
+            "core Celebrate→GuardFailure"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::Celebrate,
+                    Behavior::GuardFailure,
+                ),
+                None,
+                "{motion:?} Celebrate→GuardFailure"
             );
         }
     }
