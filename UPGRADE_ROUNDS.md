@@ -4083,3 +4083,7 @@ quality gates listed in `README.md`.
      inspect_error_bridges_to_rest_after_push_under_full_motion_only). Pairs
      anvil 854.
 
+925. **Find QueryNoMatches+stale U+FF9D/halfwidth-katakana-letter-na** —
+     bookmarked_search_empty_reason QueryNoMatches for Unicode-only query
+     with stale bookmark ids (FF9C already pinned). Pairs anvil 855.
+
