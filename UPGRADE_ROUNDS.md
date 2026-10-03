@@ -2813,3 +2813,7 @@ quality gates listed in `README.md`.
      persistence_failure_surface keeps "Save Block\u{ff63}history" on Toast
      (FF62/halfwidth-left-corner-bracket already pinned). Pairs anvil 556.
 
+627. **output_notice remount gate U+FF63/halfwidth-right-corner-bracket** —
+     known_output_notice rejects Truncated/Partly/Earlier strings padded with
+     U+FF63 (FF62 already pinned). Pairs anvil 557.
+

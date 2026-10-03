@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FF63 beside round 626)
+
+## 2026-10-04 (sticky/find/organism edges — round 627)
+
+- output_notice remount gate U+FF63/halfwidth-right-corner-bracket. Unique
+  round **627**. Pairs anvil 557 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (sticky FF63 beside round 625)
 
 ## 2026-10-04 (sticky/find/organism edges — round 626)

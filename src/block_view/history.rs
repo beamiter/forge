@@ -3411,6 +3411,9 @@ mod tests {
                 // Halfwidth left corner bracket catch-up beside sticky FF62 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff62}"),
+                // Halfwidth right corner bracket catch-up beside sticky FF63 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff63}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
