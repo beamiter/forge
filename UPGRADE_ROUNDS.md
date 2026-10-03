@@ -3332,3 +3332,8 @@ quality gates listed in `README.md`.
      ahead MAX-107 vs MAX-108, and finished walks at MAX-108. Pairs anvil 673 /
      core cancel edge.
 
+744. **WatchCommand→InspectError Full-motion membership** — semantic_bridges
+     membership catch-up for WatchCommand→InspectError (dedicated Full-motion pin
+     already exists). WatchCommand→CelebrateBig already synced in round 739.
+     Pairs anvil 674 / core `WatchCommandToInspectError` inside between() 93.
+

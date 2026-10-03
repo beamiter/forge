@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (WatchCommand→InspectError membership beside round 743)
+
+## 2026-10-04 (sticky/find/organism edges — round 744)
+
+- WatchCommand→InspectError Full-motion membership. Unique round **744**. Pairs
+  anvil 674 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (MAX-108 cancel beside round 742)
 
 ## 2026-10-04 (sticky/find/organism edges — round 743)
