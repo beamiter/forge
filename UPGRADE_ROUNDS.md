@@ -1584,3 +1584,8 @@ quality gates listed in `README.md`.
      ahead MAX-28 vs MAX-29, and finished walks at MAX-29. Pairs anvil 278 /
      core cancel edge.
 
+349. **WatchSettled→Idle Full-motion bridge** — Full motion animates
+     WatchSettled→Idle; Calm/Static snap + semantic_bridges membership
+     sync. WatchAgent→Idle already synced in round 344. Pairs anvil 279 /
+     core `WatchSettledToIdle` inside between() 93.
+
