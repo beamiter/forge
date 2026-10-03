@@ -3873,3 +3873,7 @@ quality gates listed in `README.md`.
      dedicated Some-bridge already pinned; membership catch-up + Calm/Static
      snap None. Pairs anvil 804 / core `InspectErrorToIdle` inside between() 93.
 
+875. **Find FF93/halfwidth-katakana-letter-mo-query QueryNoMatches + stale** —
+     U+FF93-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF92/halfwidth-katakana-letter-me already pinned). Pairs anvil 805.
+
