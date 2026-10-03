@@ -3408,6 +3408,9 @@ mod tests {
                 // Halfwidth ideographic full stop catch-up beside sticky FF61 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff61}"),
+                // Halfwidth left corner bracket catch-up beside sticky FF62 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff62}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
