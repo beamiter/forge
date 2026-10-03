@@ -1373,3 +1373,7 @@ quality gates listed in `README.md`.
      U+FF20-only queries stay QueryNoMatches under Command/Output/All when stale
      ids remain (FF1F/fullwidth-question-mark already pinned). Pairs anvil 239.
 
+301. **Sticky fullwidth latin-B label** —
+     U+FF22 variant of "Save Block history" stays toast-only beside fullwidth
+     latin A (round 296). Pairs anvil 240.
+
