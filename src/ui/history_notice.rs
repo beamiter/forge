@@ -448,6 +448,8 @@ mod tests {
             "Save Block\u{ff5a}history",
             // Fullwidth left curly bracket stays toast-only beside fullwidth latin small z (one edge).
             "Save Block\u{ff5b}history",
+            // Fullwidth vertical line stays toast-only beside fullwidth left curly bracket (one edge).
+            "Save Block\u{ff5c}history",
             "Block history",
         ] {
             assert_eq!(
