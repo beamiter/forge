@@ -3318,6 +3318,9 @@ mod tests {
                 // Fullwidth latin small c catch-up beside sticky FF43 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ff43}"),
+                // Fullwidth latin small d catch-up beside sticky FF44 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff44}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
