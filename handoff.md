@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF3D find beside rounds 441–444)
+
+## 2026-10-03 (sticky/find/organism edges — round 445)
+
+- FF3D/fullwidth-right-square-bracket find QueryNoMatches + stale beside
+  rounds 441–444 sticky FF3E / output_notice / MAX-48 /
+  SitNearError→GuardRecovery. Unique round **445**. Pairs anvil 375 / core
+  cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-03 (SitNearError→GuardRecovery beside round 443)
 
 ## 2026-10-03 (sticky/find/organism edges — round 444)
