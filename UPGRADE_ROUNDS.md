@@ -3748,3 +3748,7 @@ quality gates listed in `README.md`.
      live==scheduled with resume; bump/scheduled-ahead/finished walks at
      MAX-128 vs MAX-127. Pairs anvil 773.
 
+844. **GuardStuck→Idle Full-motion membership** —
+     dedicated Some-bridge already pinned; membership catch-up + Calm/Static
+     snap None. Pairs anvil 774 / core `GuardStuckToIdle` inside between() 93.
+
