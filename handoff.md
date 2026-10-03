@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF40 find beside rounds 456–459)
+
+## 2026-10-03 (sticky/find/organism edges — round 460)
+
+- FF40/fullwidth-grave find QueryNoMatches + stale beside rounds 456–459
+  sticky FF41 / output_notice / MAX-51 / InspectError→GuardRecovery. Unique
+  round **460**. Pairs anvil 390 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-03 (InspectError→GuardRecovery beside round 458)
 
 ## 2026-10-03 (sticky/find/organism edges — round 459)

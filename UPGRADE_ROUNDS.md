@@ -2077,3 +2077,7 @@ quality gates listed in `README.md`.
      sync. InspectError→GuardCautious already synced in round 454. Pairs anvil
      389 / core `InspectErrorToGuardRecovery` inside between() 93.
 
+460. **Find FF40/fullwidth-grave-query QueryNoMatches + stale** —
+     U+FF40-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF3F/fullwidth-low-line already pinned). Pairs anvil 390.
+
