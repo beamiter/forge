@@ -2695,3 +2695,7 @@ quality gates listed in `README.md`.
      sync. GuardCautious→RestAfterPush already synced in round 594. Pairs anvil
      529 / core `CelebrateToGuardRecovery` inside between() 93.
 
+600. **Find FF5C/fullwidth-vertical-line-query QueryNoMatches + stale** —
+     U+FF5C-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF5B/fullwidth-left-curly-bracket already pinned). Pairs anvil 530.
+
