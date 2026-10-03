@@ -3979,6 +3979,7 @@ mod tests {
             (Behavior::WatchAgent, Behavior::Idle),
             (Behavior::WatchSettled, Behavior::Idle),
             (Behavior::WatchAgent, Behavior::Celebrate),
+            (Behavior::WatchCommand, Behavior::Celebrate),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4256,6 +4257,14 @@ mod tests {
                 visual_transition_for_motion(
                     motion,
                     Behavior::WatchAgent,
+                    Behavior::Celebrate,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchCommand,
                     Behavior::Celebrate,
                 ),
                 None
@@ -5883,6 +5892,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} WatchAgent→Celebrate"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_command_bridges_to_celebrate_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchCommand,
+                Behavior::Celebrate,
+            )
+            .is_some(),
+            "Full WatchCommand→Celebrate"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchCommand, Behavior::Celebrate).is_some(),
+            "core WatchCommand→Celebrate"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchCommand,
+                    Behavior::Celebrate,
+                ),
+                None,
+                "{motion:?} WatchCommand→Celebrate"
             );
         }
     }
