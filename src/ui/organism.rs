@@ -3990,6 +3990,7 @@ mod tests {
             (Behavior::WatchSettled, Behavior::Celebrate),
             (Behavior::WatchSettled, Behavior::CelebrateBig),
             (Behavior::WatchSettled, Behavior::InspectError),
+            (Behavior::WatchSettled, Behavior::SitNearError),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4356,6 +4357,14 @@ mod tests {
                     motion,
                     Behavior::WatchSettled,
                     Behavior::InspectError,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchSettled,
+                    Behavior::SitNearError,
                 ),
                 None
             );
@@ -6290,6 +6299,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} WatchSettled→InspectError"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_settled_bridges_to_sit_near_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchSettled,
+                Behavior::SitNearError,
+            )
+            .is_some(),
+            "Full WatchSettled→SitNearError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchSettled, Behavior::SitNearError).is_some(),
+            "core WatchSettled→SitNearError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchSettled,
+                    Behavior::SitNearError,
+                ),
+                None,
+                "{motion:?} WatchSettled→SitNearError"
             );
         }
     }
