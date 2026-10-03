@@ -3976,6 +3976,7 @@ mod tests {
             (Behavior::InspectError, Behavior::Idle),
             (Behavior::SitNearError, Behavior::Idle),
             (Behavior::WatchCommand, Behavior::Idle),
+            (Behavior::WatchAgent, Behavior::Idle),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4229,6 +4230,14 @@ mod tests {
                 visual_transition_for_motion(
                     motion,
                     Behavior::WatchCommand,
+                    Behavior::Idle,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchAgent,
                     Behavior::Idle,
                 ),
                 None
@@ -5772,6 +5781,34 @@ mod tests {
                 ),
                 None,
                 "{motion:?} WatchCommand→Idle"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_agent_bridges_to_idle_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchAgent,
+                Behavior::Idle,
+            )
+            .is_some(),
+            "Full WatchAgent→Idle"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchAgent, Behavior::Idle).is_some(),
+            "core WatchAgent→Idle"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchAgent,
+                    Behavior::Idle,
+                ),
+                None,
+                "{motion:?} WatchAgent→Idle"
             );
         }
     }
