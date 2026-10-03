@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FF68 find beside rounds 656–659)
+
+## 2026-10-04 (sticky/find/organism edges — round 660)
+
+- FF68/halfwidth-katakana-letter-small-i find QueryNoMatches + stale beside rounds
+  656–659 sticky FF69 / output_notice / MAX-91 / CelebrateBig→InspectError.
+  Unique round **660**. Pairs anvil 590 / core cancel. STAGE **71** / between()
+  **93** unchanged.
+
 Updated: 2026-10-04 (CelebrateBig→InspectError beside round 658)
 
 ## 2026-10-04 (sticky/find/organism edges — round 659)
