@@ -1991,3 +1991,7 @@ quality gates listed in `README.md`.
      ids remain (FF3B/fullwidth-left-square-bracket already pinned). Pairs anvil
      370.
 
+441. **Sticky near-miss U+FF3E/fullwidth-circumflex** —
+     persistence_failure_surface keeps "Save Block\u{ff3e}history" on Toast
+     (FF3D/fullwidth-right-square-bracket already pinned). Pairs anvil 371.
+

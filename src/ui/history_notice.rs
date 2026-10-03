@@ -388,6 +388,8 @@ mod tests {
             "Save Block\u{ff3c}history",
             // Fullwidth right square bracket stays toast-only beside fullwidth reverse solidus (one edge).
             "Save Block\u{ff3d}history",
+            // Fullwidth circumflex accent stays toast-only beside fullwidth right square bracket (one edge).
+            "Save Block\u{ff3e}history",
             "Block history",
         ] {
             assert_eq!(
