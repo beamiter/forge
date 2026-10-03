@@ -3043,3 +3043,8 @@ quality gates listed in `README.md`.
      ahead MAX-94 vs MAX-95, and finished walks at MAX-95. Pairs anvil 608 /
      core cancel edge.
 
+679. **RestAfterPush→Celebrate Full-motion bridge** — Full motion animates
+     RestAfterPush→Celebrate; Calm/Static snap + semantic_bridges membership
+     sync. RestAfterPush→SitNearError already synced in round 674. Pairs anvil
+     609 / core `RestAfterPushToCelebrate` inside between() 93.
+
