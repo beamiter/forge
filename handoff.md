@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (Celebrate→GuardCautious beside round 603)
+
+## 2026-10-03 (sticky/find/organism edges — round 604)
+
+- Celebrate→GuardCautious Full-motion bridge. Unique round **604**. Pairs anvil
+  534 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-03 (MAX-80 cancel beside round 602)
 
 ## 2026-10-03 (sticky/find/organism edges — round 603)

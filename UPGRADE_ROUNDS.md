@@ -2712,3 +2712,8 @@ quality gates listed in `README.md`.
      ahead MAX-79 vs MAX-80, and finished walks at MAX-80. Pairs anvil 533 /
      core cancel edge.
 
+604. **Celebrate→GuardCautious Full-motion bridge** — Full motion animates
+     Celebrate→GuardCautious; Calm/Static snap + semantic_bridges membership
+     sync. Celebrate→GuardRecovery already synced in round 599. Pairs anvil
+     534 / core `CelebrateToGuardCautious` inside between() 93.
+
