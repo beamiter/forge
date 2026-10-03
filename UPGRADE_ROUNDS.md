@@ -2226,3 +2226,8 @@ quality gates listed in `README.md`.
      ahead MAX-57 vs MAX-58, and finished walks at MAX-58. Pairs anvil 423 /
      core cancel edge.
 
+494. **SitNearError→CelebrateBig Full-motion bridge** — Full motion animates
+     SitNearError→CelebrateBig; Calm/Static snap + semantic_bridges membership
+     sync. SitNearError→Celebrate already synced in round 489. Pairs anvil
+     424 / core `SitNearErrorToCelebrateBig` inside between() 93.
+
