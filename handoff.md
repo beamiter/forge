@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FFA5 beside round 956)
+
+## 2026-10-04 (sticky/find/organism edges — round 957)
+
+- output_notice remount gate U+FFA5/halfwidth-hangul-letter-nieun-cieuc. Unique
+  round **957**. Pairs anvil 887 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (sticky FFA5 beside round 955)
 
 ## 2026-10-04 (sticky/find/organism edges — round 956)
