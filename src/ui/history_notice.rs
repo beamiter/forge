@@ -394,6 +394,8 @@ mod tests {
             "Save Block\u{ff3f}history",
             // Fullwidth grave accent stays toast-only beside fullwidth low line (one edge).
             "Save Block\u{ff40}history",
+            // Fullwidth latin small a stays toast-only beside fullwidth grave (one edge).
+            "Save Block\u{ff41}history",
             "Block history",
         ] {
             assert_eq!(
