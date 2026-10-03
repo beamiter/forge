@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (WatchAgent→Celebrate membership beside round 763)
+
+## 2026-10-04 (sticky/find/organism edges — round 764)
+
+- WatchAgent→Celebrate Full-motion membership (Calm/Static snap). Unique round
+  **764**. Pairs anvil 694 / core `WatchAgentToCelebrate` inside between() 93.
+  STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (MAX-112 cancel beside round 762)
 
 ## 2026-10-04 (sticky/find/organism edges — round 763)

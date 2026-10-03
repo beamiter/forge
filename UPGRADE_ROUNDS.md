@@ -3415,3 +3415,7 @@ quality gates listed in `README.md`.
      live==scheduled with resume; bump/scheduled-ahead/finished walks at
      MAX-112 vs MAX-111. Pairs anvil 693.
 
+764. **WatchAgent→Celebrate Full-motion membership** —
+     dedicated Some-bridge already pinned; membership catch-up + Calm/Static
+     snap None. Pairs anvil 694 / core `WatchAgentToCelebrate` inside between() 93.
+
