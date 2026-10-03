@@ -1501,3 +1501,7 @@ quality gates listed in `README.md`.
      sync. RestAfterPush→Idle already synced in round 324. Pairs anvil 262 /
      core `InspectErrorToIdle` inside between() 93.
 
+330. **Find FF26/fullwidth-latin-F-query QueryNoMatches + stale** —
+     U+FF26-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF25/fullwidth-latin-E already pinned). Pairs anvil 263.
+
