@@ -1593,3 +1593,7 @@ quality gates listed in `README.md`.
      U+FF2A-only queries stay QueryNoMatches under Command/Output/All when stale
      ids remain (FF29/fullwidth-latin-I already pinned). Pairs anvil 280.
 
+351. **Sticky near-miss U+FF2C/fullwidth-latin-L** — persistence_failure_surface
+     keeps "Save Block\u{ff2c}history" on Toast (FF2B/fullwidth-latin-K already
+     pinned). Pairs anvil 281.
+
