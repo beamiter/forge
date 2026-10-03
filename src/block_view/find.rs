@@ -7901,6 +7901,30 @@ tail ab";
         assert!(!cross_block_search_continue_is_current(
             near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
         ));
+        // Near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-wrap bump (MAX-34→MAX-33) cancels with a
+        // resume — one step earlier than the MAX-33→MAX-32 sibling.
+        let near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
+        assert!(cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+        ));
+        // Scheduled ahead at the near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-wrap boundary
+        // (MAX-33 vs MAX-34).
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+        ));
+        // Finished walk at the near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-wrap generation itself.
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+        ));
     }
 
     #[test]
