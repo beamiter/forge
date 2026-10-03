@@ -3712,3 +3712,7 @@ quality gates listed in `README.md`.
      snap None. Pairs anvil 764 / core `UnknownOutcomeToRestAfterPush` inside
      between() 93.
 
+835. **Find FF8B/halfwidth-katakana-letter-hi-query QueryNoMatches + stale** —
+     U+FF8B-only queries stay QueryNoMatches under Command/Output/All when stale
+     ids remain (FF8A/halfwidth-katakana-letter-ha already pinned). Pairs anvil 765.
+
