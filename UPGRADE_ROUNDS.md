@@ -1579,3 +1579,8 @@ quality gates listed in `README.md`.
      rejects Truncated/Partly/Earlier strings padded with U+FF2B (FF2A already
      pinned). Pairs anvil 277.
 
+348. **CrossBlock cancel MAX-29→MAX-28 wrap bump** — palette idle continuation
+     drops MAX-29→MAX-28 generation bumps (with or without resume), scheduled
+     ahead MAX-28 vs MAX-29, and finished walks at MAX-29. Pairs anvil 278 /
+     core cancel edge.
+
