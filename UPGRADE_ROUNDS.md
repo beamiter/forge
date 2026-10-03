@@ -4193,3 +4193,7 @@ quality gates listed in `README.md`.
      with stale bookmark ids (FFA1 already pinned). Pairs anvil 880.
      Milestone **950**.
 
+951. **sticky U+FFA4/halfwidth-hangul-letter-nieun near-miss stays Toast** —
+     persistence_failure_surface keeps "Save Block\u{ffa4}history" on Toast
+     (FFA3/halfwidth-hangul-letter-kiyeok-sios already pinned). Pairs anvil 881.
+
