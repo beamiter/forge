@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFA3 find beside rounds 951–954)
+
+## 2026-10-04 (sticky/find/organism edges — round 955)
+
+- Find QueryNoMatches+stale U+FFA3/halfwidth-hangul-letter-kiyeok-sios. Unique
+  round **955**. Pairs anvil 885 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (SitNearError CelebrateBig membership beside round 953)
 
 ## 2026-10-04 (sticky/find/organism edges — round 954)

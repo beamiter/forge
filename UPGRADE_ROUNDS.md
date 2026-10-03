@@ -4210,3 +4210,7 @@ quality gates listed in `README.md`.
      sit_near_error_bridges_to_celebrate_big_under_full_motion_only). Pairs
      anvil 884.
 
+955. **Find QueryNoMatches+stale U+FFA3/halfwidth-hangul-letter-kiyeok-sios** —
+     bookmarked_search_empty_reason QueryNoMatches for Unicode-only query
+     with stale bookmark ids (FFA2 already pinned). Pairs anvil 885.
+
