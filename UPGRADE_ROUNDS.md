@@ -3657,3 +3657,7 @@ quality gates listed in `README.md`.
      persistence_failure_surface keeps "Save Block\u{ff8a}history" on Toast
      (FF89/halfwidth-katakana-letter-no already pinned). Pairs anvil 751.
 
+822. **output_notice remount gate U+FF8A/halfwidth-katakana-letter-ha** —
+     known_output_notice rejects Unicode-padded Truncated/Partly/Earlier
+     strings with U+FF8A (FF89 already pinned). Pairs anvil 752.
+
