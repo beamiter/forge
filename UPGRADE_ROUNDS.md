@@ -1249,3 +1249,8 @@ quality gates listed in `README.md`.
      U+FF1C-padded Truncated/Partly/Earlier strings stay outside the known-set
      remount gate beside sticky FF1C. Pairs anvil sticky tip.
 
+273. **CrossBlock cancel near-near-near-near-near-near-near-near-near-near-near-near-near-near-wrap bump** — palette idle
+     continuation drops MAX-14→MAX-13 generation bumps (with or without resume),
+     scheduled ahead MAX-13 vs MAX-14, and finished walks at MAX-14. Pairs anvil
+     217 / core cancel edge.
+
