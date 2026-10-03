@@ -3982,3 +3982,7 @@ quality gates listed in `README.md`.
      with stale bookmark ids (FF97 already pinned). Pairs anvil 830.
      Milestone **900**.
 
+901. **sticky U+FF9A/halfwidth-katakana-letter-tsu near-miss stays Toast** —
+     persistence_failure_surface keeps "Save Block\u{ff9a}history" on Toast
+     (FF99/halfwidth-katakana-letter-chi already pinned). Pairs anvil 831.
+
