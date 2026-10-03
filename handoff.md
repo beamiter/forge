@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (FF54 find beside rounds 556–559)
+
+## 2026-10-03 (sticky/find/organism edges — round 560)
+
+- FF54/fullwidth-latin-small-t find QueryNoMatches + stale beside rounds
+  556–559 sticky FF55 / output_notice / MAX-71 / GuardRecovery→GuardCautious.
+  Unique round **560**. Pairs anvil 490 / core cancel. STAGE **71** /
+  between() **93** unchanged.
+
 Updated: 2026-10-03 (GuardRecovery→GuardCautious beside round 558)
 
 ## 2026-10-03 (sticky/find/organism edges — round 559)
