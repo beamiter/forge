@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FFB6 beside round 1041)
+
+## 2026-10-04 (sticky/find/organism edges — round 1042)
+
+- output_notice remount gate U+FFB6/halfwidth-hangul-letter-sios. Unique
+  round **1042**. Pairs anvil 972 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (sticky FFB6 beside round 1040)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1041)
