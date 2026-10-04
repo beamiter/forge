@@ -3732,6 +3732,9 @@ mod tests {
                 // Halfwidth white circle catch-up beside sticky FFEE — still
                 // outside the gate (one edge).
                 format!("{base}\u{ffee}"),
+                // Interlinear annotation anchor catch-up beside sticky FFF9 — still
+                // outside the gate (one edge).
+                format!("{base}\u{fff9}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
