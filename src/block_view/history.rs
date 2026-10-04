@@ -3738,6 +3738,9 @@ mod tests {
                 // Interlinear annotation separator catch-up beside sticky FFFA — still
                 // outside the gate (one edge).
                 format!("{base}\u{fffa}"),
+                // Interlinear annotation terminator catch-up beside sticky FFFB — still
+                // outside the gate (one edge).
+                format!("{base}\u{fffb}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {

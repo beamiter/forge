@@ -5122,3 +5122,7 @@ quality gates listed in `README.md`.
      persistence_failure_surface keeps "Save Block\u{fffb}history" on Toast
      (FFFA/interlinear-annotation-separator already pinned). Pairs anvil 1101.
 
+1172. **output_notice remount gate U+FFFB/interlinear-annotation-terminator** —
+     known_output_notice rejects Unicode-padded Truncated/Partly/Earlier
+     strings with U+FFFB (FFFA already pinned). Pairs anvil 1102.
+
