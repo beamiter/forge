@@ -5017,3 +5017,7 @@ quality gates listed in `README.md`.
      persistence_failure_surface keeps "Save Block\u{ffec}history" on Toast
      (FFEB/halfwidth-forms-light-left already pinned). Pairs anvil 1076.
 
+1147. **output_notice remount gate U+FFEC/halfwidth-forms-light-right** —
+     known_output_notice rejects Unicode-padded Truncated/Partly/Earlier
+     strings with U+FFEC (FFEB already pinned). Pairs anvil 1077.
+
