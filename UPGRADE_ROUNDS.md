@@ -4425,3 +4425,7 @@ quality gates listed in `README.md`.
      bookmarked_search_empty_reason QueryNoMatches for Unicode-only query
      with stale bookmark ids (FFAC already pinned). Pairs anvil 935.
 
+1006. **sticky U+FFAF/halfwidth-hangul-letter-rieul-thieuth near-miss stays Toast** —
+     persistence_failure_surface keeps "Save Block\u{ffaf}history" on Toast
+     (FFAE/halfwidth-hangul-letter-rieul-sios already pinned). Pairs anvil 936.
+
