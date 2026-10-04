@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFE0 find beside rounds 1096–1099 — unique 1100)
+
+## 2026-10-04 (sticky/find/organism edges — round 1100)
+
+- Find QueryNoMatches+stale U+FFE0/halfwidth-cent-sign. Unique round **1100**.
+  Pairs anvil 1030 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (Celebrate UnknownOutcome membership beside round 1098)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1099)
