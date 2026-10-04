@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFB5 find beside rounds 1041–1044)
+
+## 2026-10-04 (sticky/find/organism edges — round 1045)
+
+- Find QueryNoMatches+stale U+FFB5/halfwidth-hangul-letter-pieup-sios. Unique
+  round **1045**. Pairs anvil 975 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (GuardRecovery RestAfterPush membership beside round 1043)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1044)

@@ -4589,3 +4589,7 @@ quality gates listed in `README.md`.
      guard_recovery_bridges_to_rest_after_push_under_full_motion_only). Pairs
      anvil 974.
 
+1045. **Find QueryNoMatches+stale U+FFB5/halfwidth-hangul-letter-pieup-sios** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (FFB4 already pinned). Pairs anvil 975.
+
