@@ -3693,6 +3693,9 @@ mod tests {
                 // Halfwidth cent sign catch-up beside sticky FFE0 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ffe0}"),
+                // Halfwidth pound sign catch-up beside sticky FFE1 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffe1}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
