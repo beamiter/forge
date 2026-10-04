@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFEC find beside rounds 1151–1154)
+
+## 2026-10-04 (sticky/find/organism edges — round 1155)
+
+- Find QueryNoMatches+stale U+FFEC/halfwidth-forms-light-right. Unique
+  round **1155**. Pairs anvil 1085 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (RestAfterPush Celebrate membership beside round 1153)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1154)

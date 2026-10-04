@@ -5051,3 +5051,7 @@ quality gates listed in `README.md`.
      rest_after_push_bridges_to_celebrate_under_full_motion_only). Pairs
      anvil 1084.
 
+1155. **Find QueryNoMatches+stale U+FFEC/halfwidth-forms-light-right** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (FFEB already pinned). Pairs anvil 1085.
+
