@@ -4925,3 +4925,7 @@ quality gates listed in `README.md`.
      celebrate_big_bridges_to_rest_after_push_under_full_motion_only). Pairs
      anvil 1054.
 
+1125. **Find QueryNoMatches+stale U+FFE5/halfwidth-won-sign** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (FFE4 already pinned). Pairs anvil 1055.
+

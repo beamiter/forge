@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFE5 find beside rounds 1121–1124)
+
+## 2026-10-04 (sticky/find/organism edges — round 1125)
+
+- Find QueryNoMatches+stale U+FFE5/halfwidth-won-sign. Unique round **1125**.
+  Pairs anvil 1055 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (CelebrateBig RestAfterPush membership beside round 1123)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1124)
