@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (MAX-171 cancel beside round 1057)
+
+## 2026-10-04 (sticky/find/organism edges — round 1058)
+
+- CrossBlock MAX-171 wrapping-generation cancel. Unique round **1058**. Pairs
+  anvil 988 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (output_notice FFB9 beside round 1056)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1057)
