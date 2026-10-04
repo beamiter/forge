@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (sticky FFB5 beside round 1035)
+
+## 2026-10-04 (sticky/find/organism edges — round 1036)
+
+- sticky U+FFB5/halfwidth-hangul-letter-pieup-sios near-miss stays Toast. Unique
+  round **1036**. Pairs anvil 966 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (FFB3 find beside rounds 1031–1034)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1035)
