@@ -3711,6 +3711,9 @@ mod tests {
                 // Halfwidth double vertical line catch-up beside sticky FFE6 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ffe6}"),
+                // Halfwidth forms light vertical catch-up beside sticky FFE8 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffe8}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
