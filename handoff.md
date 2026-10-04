@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FFE3 beside round 1106)
+
+## 2026-10-04 (sticky/find/organism edges — round 1107)
+
+- output_notice remount gate U+FFE3/halfwidth-macron. Unique round **1107**.
+  Pairs anvil 1037 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (sticky FFE3 beside round 1105)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1106)

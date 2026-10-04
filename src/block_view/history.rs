@@ -3699,6 +3699,9 @@ mod tests {
                 // Halfwidth yen sign catch-up beside sticky FFE2 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ffe2}"),
+                // Halfwidth macron catch-up beside sticky FFE3 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffe3}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
