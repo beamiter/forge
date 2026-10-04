@@ -5283,3 +5283,7 @@ quality gates listed in `README.md`.
      watch_settled_bridges_to_idle_under_full_motion_only already exists.
      Pairs anvil 1139.
 
+1210. **Find QueryNoMatches U+10003/linear-b-syllable-b053-o + stale** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (10002 already pinned). Pairs anvil 1140.
+
