@@ -5072,3 +5072,7 @@ quality gates listed in `README.md`.
      rest_after_push_bridges_to_celebrate_big_under_full_motion_only already
      exists. Pairs anvil 1089.
 
+1160. **Find QueryNoMatches U+FFED/halfwidth-black-square + stale** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (FFEC already pinned). Pairs anvil 1090.
+
