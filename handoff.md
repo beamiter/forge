@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (sticky FFFA beside round 1165)
+
+## 2026-10-04 (sticky/find/organism edges — round 1166)
+
+- sticky U+FFFA/interlinear-annotation-separator near-miss stays Toast. Unique
+  round **1166**. Pairs anvil 1096 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (FFEE find beside rounds 1161–1164)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1165)
