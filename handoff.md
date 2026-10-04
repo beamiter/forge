@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice 10004 beside round 1206)
+
+## 2026-10-04 (sticky/find/organism edges — round 1207)
+
+- output_notice remount gate U+10004/linear-b-syllable-b061-u. Unique round
+  **1207**. Pairs anvil 1137 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (sticky 10004 beside round 1205)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1206)
