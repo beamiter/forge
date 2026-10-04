@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (GuardRecovery UnknownOutcome membership beside round 1058)
+
+## 2026-10-04 (sticky/find/organism edges — round 1059)
+
+- GuardRecovery→UnknownOutcome Full-motion membership (Calm/Static snap). Unique
+  round **1059**. Pairs anvil 989 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-171 cancel beside round 1057)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1058)
