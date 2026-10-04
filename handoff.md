@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFBE find beside rounds 1086–1089)
+
+## 2026-10-04 (sticky/find/organism edges — round 1090)
+
+- Find QueryNoMatches+stale U+FFBE/halfwidth-hangul-letter-phieuph. Unique
+  round **1090**. Pairs anvil 1020 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (Celebrate InspectError membership beside round 1088)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1089)

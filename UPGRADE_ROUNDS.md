@@ -4778,3 +4778,7 @@ quality gates listed in `README.md`.
      celebrate_bridges_to_inspect_error_under_full_motion_only). Pairs
      anvil 1019.
 
+1090. **Find QueryNoMatches+stale U+FFBE/halfwidth-hangul-letter-phieuph** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (FFBD already pinned). Pairs anvil 1020.
+
