@@ -4757,3 +4757,7 @@ quality gates listed in `README.md`.
      celebrate_bridges_to_rest_after_push_under_full_motion_only). Pairs
      anvil 1014.
 
+1085. **Find QueryNoMatches+stale U+FFBD/halfwidth-hangul-letter-thieuth** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (FFBC already pinned). Pairs anvil 1015.
+
