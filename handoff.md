@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FFE6 beside round 1121)
+
+## 2026-10-04 (sticky/find/organism edges — round 1122)
+
+- output_notice remount gate U+FFE6/halfwidth-double-vertical-line. Unique
+  round **1122**. Pairs anvil 1052 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (sticky FFE6 beside round 1120)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1121)
