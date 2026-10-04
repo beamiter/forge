@@ -5151,3 +5151,8 @@ quality gates listed in `README.md`.
      live==scheduled with resume; bump/scheduled-ahead/finished walks at
      MAX-195 vs MAX-194. Pairs anvil 1108.
 
+1179. **GuardCautious→Idle Full-motion membership** —
+     semantic_bridges catch-up; Calm/Static snap None. Dedicated
+     guard_cautious_bridges_to_idle_under_full_motion_only already exists.
+     Pairs anvil 1109.
+
