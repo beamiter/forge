@@ -5304,3 +5304,7 @@ quality gates listed in `README.md`.
      watch_command_bridges_to_idle_under_full_motion_only already exists.
      Pairs anvil 1144.
 
+1215. **Find QueryNoMatches U+10004/linear-b-syllable-b061-u + stale** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (10003 already pinned). Pairs anvil 1145.
+
