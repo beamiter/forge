@@ -704,6 +704,8 @@ mod tests {
             "Save Block\u{10007}history",
             // Linear B syllable B012 DO stays toast-only beside Linear B syllable B011 DI (one edge).
             "Save Block\u{10008}history",
+            // Linear B syllable B013 DU stays toast-only beside Linear B syllable B012 DO (one edge).
+            "Save Block\u{10009}history",
             "Block history",
         ] {
             assert_eq!(
