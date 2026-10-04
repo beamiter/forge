@@ -3729,6 +3729,9 @@ mod tests {
                 // Halfwidth black square catch-up beside sticky FFED — still
                 // outside the gate (one edge).
                 format!("{base}\u{ffed}"),
+                // Halfwidth white circle catch-up beside sticky FFEE — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffee}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {

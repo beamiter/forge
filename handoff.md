@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FFEE beside round 1156)
+
+## 2026-10-04 (sticky/find/organism edges — round 1157)
+
+- output_notice remount gate U+FFEE/halfwidth-white-circle. Unique
+  round **1157**. Pairs anvil 1087 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (sticky FFEE beside round 1155)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1156)
