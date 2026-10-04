@@ -4946,3 +4946,7 @@ quality gates listed in `README.md`.
      celebrate_big_bridges_to_inspect_error_under_full_motion_only). Pairs
      anvil 1059.
 
+1130. **Find QueryNoMatches+stale U+FFE6/halfwidth-double-vertical-line** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (FFE5 already pinned). Pairs anvil 1060.
+

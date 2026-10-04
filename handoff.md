@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFE6 find beside rounds 1126–1129)
+
+## 2026-10-04 (sticky/find/organism edges — round 1130)
+
+- Find QueryNoMatches+stale U+FFE6/halfwidth-double-vertical-line. Unique
+  round **1130**. Pairs anvil 1060 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (CelebrateBig InspectError membership beside round 1128)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1129)
