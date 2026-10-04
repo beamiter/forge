@@ -5240,3 +5240,8 @@ quality gates listed in `README.md`.
      celebrate_big_bridges_to_idle_under_full_motion_only already exists.
      Pairs anvil 1129.
 
+1200. **Find QueryNoMatches U+10001/linear-b-syllable-b038-e + stale** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (10000 already pinned). Milestone 1200;
+     mill continues. Pairs anvil 1130.
+
