@@ -4135,6 +4135,7 @@ mod tests {
             (Behavior::CelebrateBig, Behavior::RestAfterPush),
             (Behavior::CelebrateBig, Behavior::InspectError),
             (Behavior::CelebrateBig, Behavior::SitNearError),
+            (Behavior::CelebrateBig, Behavior::UnknownOutcome),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),

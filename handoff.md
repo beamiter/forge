@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (CelebrateBig UnknownOutcome membership beside round 1138)
+
+## 2026-10-04 (sticky/find/organism edges — round 1139)
+
+- CelebrateBig→UnknownOutcome Full-motion membership (Calm/Static snap). Unique
+  round **1139**. Pairs anvil 1069 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-187 cancel beside round 1137)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1138)
