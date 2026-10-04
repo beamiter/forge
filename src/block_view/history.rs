@@ -3672,6 +3672,9 @@ mod tests {
                 // Halfwidth hangul letter cieuc catch-up beside sticky FFB9 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ffb9}"),
+                // Halfwidth hangul letter ssangcieuc catch-up beside sticky FFBA — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffba}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {

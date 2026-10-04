@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FFBA beside round 1061)
+
+## 2026-10-04 (sticky/find/organism edges — round 1062)
+
+- output_notice remount gate U+FFBA/halfwidth-hangul-letter-ssangcieuc. Unique
+  round **1062**. Pairs anvil 992 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (sticky FFBA beside round 1060)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1061)
