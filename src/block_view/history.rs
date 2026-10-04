@@ -3696,6 +3696,9 @@ mod tests {
                 // Halfwidth pound sign catch-up beside sticky FFE1 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ffe1}"),
+                // Halfwidth yen sign catch-up beside sticky FFE2 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffe2}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
