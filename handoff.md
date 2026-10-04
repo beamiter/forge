@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (CelebrateBig GuardStuck membership beside round 1118)
+
+## 2026-10-04 (sticky/find/organism edges — round 1119)
+
+- CelebrateBig→GuardStuck Full-motion membership (Calm/Static snap). Unique
+  round **1119**. Pairs anvil 1049 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-183 cancel beside round 1117)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1118)
