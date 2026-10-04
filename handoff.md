@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (GuardRecovery InspectError membership beside round 1048)
+
+## 2026-10-04 (sticky/find/organism edges — round 1049)
+
+- GuardRecovery→InspectError Full-motion membership (Calm/Static snap). Unique
+  round **1049**. Pairs anvil 979 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-169 cancel beside round 1047)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1048)
