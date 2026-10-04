@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (CelebrateBig Idle beside round 1198)
+
+## 2026-10-04 (sticky/find/organism edges — round 1199)
+
+- CelebrateBig→Idle Full-motion membership (Calm/Static snap). Unique round
+  **1199**. Pairs anvil 1129 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-199 cancel beside round 1197)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1198)
