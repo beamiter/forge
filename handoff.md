@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFAF find beside rounds 1011–1014)
+
+## 2026-10-04 (sticky/find/organism edges — round 1015)
+
+- Find QueryNoMatches+stale U+FFAF/halfwidth-hangul-letter-rieul-thieuth. Unique
+  round **1015**. Pairs anvil 945 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (GuardCautious GuardStuck membership beside round 1013)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1014)
