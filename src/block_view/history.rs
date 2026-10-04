@@ -3720,6 +3720,9 @@ mod tests {
                 // Halfwidth forms light up catch-up beside sticky FFEA — still
                 // outside the gate (one edge).
                 format!("{base}\u{ffea}"),
+                // Halfwidth forms light left catch-up beside sticky FFEB — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffeb}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {

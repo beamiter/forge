@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FFEB beside round 1141)
+
+## 2026-10-04 (sticky/find/organism edges — round 1142)
+
+- output_notice remount gate U+FFEB/halfwidth-forms-light-left. Unique
+  round **1142**. Pairs anvil 1072 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (sticky FFEB beside round 1140)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1141)
