@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FFB7 beside round 1046)
+
+## 2026-10-04 (sticky/find/organism edges — round 1047)
+
+- output_notice remount gate U+FFB7/halfwidth-hangul-letter-ssangsios. Unique
+  round **1047**. Pairs anvil 977 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (sticky FFB7 beside round 1045)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1046)
