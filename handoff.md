@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FFE5 beside round 1116)
+
+## 2026-10-04 (sticky/find/organism edges — round 1117)
+
+- output_notice remount gate U+FFE5/halfwidth-won-sign. Unique round **1117**.
+  Pairs anvil 1047 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (sticky FFE5 beside round 1115)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1116)

@@ -3705,6 +3705,9 @@ mod tests {
                 // Halfwidth broken bar catch-up beside sticky FFE4 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ffe4}"),
+                // Halfwidth won sign catch-up beside sticky FFE5 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffe5}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {

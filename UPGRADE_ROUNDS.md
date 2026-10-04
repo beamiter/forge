@@ -4891,3 +4891,7 @@ quality gates listed in `README.md`.
      persistence_failure_surface keeps "Save Block\u{ffe5}history" on Toast
      (FFE4/halfwidth-broken-bar already pinned). Pairs anvil 1046.
 
+1117. **output_notice remount gate U+FFE5/halfwidth-won-sign** —
+     known_output_notice rejects Unicode-padded Truncated/Partly/Earlier
+     strings with U+FFE5 (FFE4 already pinned). Pairs anvil 1047.
+
