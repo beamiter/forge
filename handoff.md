@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FFB3 beside round 1026)
+
+## 2026-10-04 (sticky/find/organism edges — round 1027)
+
+- output_notice remount gate U+FFB3/halfwidth-hangul-letter-pieup. Unique round
+  **1027**. Pairs anvil 957 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (sticky FFB3 beside round 1025)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1026)
