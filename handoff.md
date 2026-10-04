@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FFAF beside round 1006)
+
+## 2026-10-04 (sticky/find/organism edges — round 1007)
+
+- output_notice remount gate U+FFAF/halfwidth-hangul-letter-rieul-thieuth. Unique
+  round **1007**. Pairs anvil 937 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (sticky FFAF beside round 1005)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1006)
