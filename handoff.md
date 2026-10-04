@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (WatchSettled InspectError beside round 1233)
+
+## 2026-10-04 (sticky/find/organism edges — round 1234)
+
+- WatchSettled→InspectError Full-motion membership (Calm/Static snap). Unique
+  round **1234**. Pairs anvil 1164 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-206 cancel beside round 1232)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1233)

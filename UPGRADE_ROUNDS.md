@@ -5383,3 +5383,8 @@ quality gates listed in `README.md`.
      live==scheduled with resume; bump/scheduled-ahead/finished walks at
      MAX-206 vs MAX-205. Pairs anvil 1163.
 
+1234. **WatchSettled→InspectError Full-motion membership** —
+     semantic_bridges catch-up; Calm/Static snap None. Dedicated
+     watch_settled_bridges_to_inspect_error_under_full_motion_only already
+     exists. Pairs anvil 1164.
+
