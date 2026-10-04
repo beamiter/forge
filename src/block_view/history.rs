@@ -3690,6 +3690,9 @@ mod tests {
                 // Halfwidth hangul letter hieuh catch-up beside sticky FFBF — still
                 // outside the gate (one edge).
                 format!("{base}\u{ffbf}"),
+                // Halfwidth cent sign catch-up beside sticky FFE0 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffe0}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
