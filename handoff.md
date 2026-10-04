@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (WatchSettled Idle beside round 1208)
+
+## 2026-10-04 (sticky/find/organism edges — round 1209)
+
+- WatchSettled→Idle Full-motion membership (Calm/Static snap). Unique round
+  **1209**. Pairs anvil 1139 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-201 cancel beside round 1207)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1208)
