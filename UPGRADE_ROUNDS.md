@@ -5388,3 +5388,7 @@ quality gates listed in `README.md`.
      watch_settled_bridges_to_inspect_error_under_full_motion_only already
      exists. Pairs anvil 1164.
 
+1235. **Find QueryNoMatches U+10008/linear-b-syllable-b012-do + stale** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (10007 already pinned). Pairs anvil 1165.
+
