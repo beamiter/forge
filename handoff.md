@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (10002 find beside rounds 1201–1204)
+
+## 2026-10-04 (sticky/find/organism edges — round 1205)
+
+- Find QueryNoMatches U+10002/linear-b-syllable-b028-i + stale. Unique round
+  **1205**. Pairs anvil 1135 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (UnknownOutcome Idle beside round 1203)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1204)

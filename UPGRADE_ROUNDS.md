@@ -5262,3 +5262,7 @@ quality gates listed in `README.md`.
      unknown_outcome_bridges_to_idle_under_full_motion_only already exists.
      Pairs anvil 1134.
 
+1205. **Find QueryNoMatches U+10002/linear-b-syllable-b028-i + stale** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (10001 already pinned). Pairs anvil 1135.
+
