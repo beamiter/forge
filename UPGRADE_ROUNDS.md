@@ -4694,3 +4694,7 @@ quality gates listed in `README.md`.
      celebrate_bridges_to_guard_cautious_under_full_motion_only). Pairs
      anvil 999.
 
+1070. **Find QueryNoMatches+stale U+FFBA/halfwidth-hangul-letter-ssangcieuc** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (FFB9 already pinned). Pairs anvil 1000.
+

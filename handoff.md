@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFBA find beside rounds 1066–1069)
+
+## 2026-10-04 (sticky/find/organism edges — round 1070)
+
+- Find QueryNoMatches+stale U+FFBA/halfwidth-hangul-letter-ssangcieuc. Unique
+  round **1070**. Pairs anvil 1000 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (Celebrate GuardCautious membership beside round 1068)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1069)
