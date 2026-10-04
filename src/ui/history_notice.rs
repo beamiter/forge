@@ -676,6 +676,8 @@ mod tests {
             "Save Block\u{ffed}history",
             // Halfwidth white circle stays toast-only beside halfwidth black square (one edge).
             "Save Block\u{ffee}history",
+            // Interlinear annotation anchor stays toast-only beside halfwidth white circle (one edge).
+            "Save Block\u{fff9}history",
             "Block history",
         ] {
             assert_eq!(
