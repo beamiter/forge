@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFB7 find beside rounds 1051–1054)
+
+## 2026-10-04 (sticky/find/organism edges — round 1055)
+
+- Find QueryNoMatches+stale U+FFB7/halfwidth-hangul-letter-ssangsios. Unique
+  round **1055**. Pairs anvil 985 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (GuardRecovery SitNearError membership beside round 1053)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1054)
