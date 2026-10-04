@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFB6 find beside rounds 1046–1049)
+
+## 2026-10-04 (sticky/find/organism edges — round 1050)
+
+- Find QueryNoMatches+stale U+FFB6/halfwidth-hangul-letter-sios. Unique
+  round **1050**. Pairs anvil 980 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (GuardRecovery InspectError membership beside round 1048)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1049)

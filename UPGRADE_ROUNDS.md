@@ -4610,3 +4610,7 @@ quality gates listed in `README.md`.
      guard_recovery_bridges_to_inspect_error_under_full_motion_only). Pairs
      anvil 979.
 
+1050. **Find QueryNoMatches+stale U+FFB6/halfwidth-hangul-letter-sios** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (FFB5 already pinned). Pairs anvil 980.
+
