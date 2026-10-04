@@ -4988,3 +4988,7 @@ quality gates listed in `README.md`.
      celebrate_big_bridges_to_unknown_outcome_under_full_motion_only). Pairs
      anvil 1069.
 
+1140. **Find QueryNoMatches+stale U+FFE9/halfwidth-forms-light-down** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (FFE8 already pinned). Pairs anvil 1070.
+
