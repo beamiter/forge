@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFE2 find beside rounds 1106–1109)
+
+## 2026-10-04 (sticky/find/organism edges — round 1110)
+
+- Find QueryNoMatches+stale U+FFE2/halfwidth-yen-sign. Unique round **1110**.
+  Pairs anvil 1040 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (CelebrateBig GuardCautious membership beside round 1108)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1109)
