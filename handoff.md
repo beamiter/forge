@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (RestAfterPush InspectError membership beside round 1143)
+
+## 2026-10-04 (sticky/find/organism edges — round 1144)
+
+- RestAfterPush→InspectError Full-motion membership (Calm/Static snap). Unique
+  round **1144**. Pairs anvil 1074 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-188 cancel beside round 1142)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1143)
