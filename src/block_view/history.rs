@@ -3762,6 +3762,9 @@ mod tests {
                 // Linear B syllable B061 U catch-up beside sticky 10004 — still
                 // outside the gate (one edge).
                 format!("{base}\u{10004}"),
+                // Linear B syllable B010 DA catch-up beside sticky 10005 — still
+                // outside the gate (one edge).
+                format!("{base}\u{10005}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
