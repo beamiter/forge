@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (sticky FFBA beside round 1060)
+
+## 2026-10-04 (sticky/find/organism edges — round 1061)
+
+- sticky U+FFBA/halfwidth-hangul-letter-ssangcieuc near-miss stays Toast. Unique
+  round **1061**. Pairs anvil 991 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (FFB8 find beside rounds 1056–1059)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1060)
