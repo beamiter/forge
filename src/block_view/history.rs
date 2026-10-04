@@ -3747,6 +3747,9 @@ mod tests {
                 // Replacement character catch-up beside sticky FFFD — still
                 // outside the gate (one edge).
                 format!("{base}\u{fffd}"),
+                // Linear B syllable B008 A catch-up beside sticky 10000 — still
+                // outside the gate (one edge).
+                format!("{base}\u{10000}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
