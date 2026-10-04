@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (sticky FFFD beside round 1180)
+
+## 2026-10-04 (sticky/find/organism edges — round 1181)
+
+- sticky U+FFFD/replacement-character near-miss stays Toast. Unique round
+  **1181**. Pairs anvil 1111 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (FFFB find beside rounds 1176–1179)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1180)

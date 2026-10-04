@@ -684,6 +684,8 @@ mod tests {
             "Save Block\u{fffb}history",
             // Object replacement character stays toast-only beside interlinear annotation terminator (one edge).
             "Save Block\u{fffc}history",
+            // Replacement character stays toast-only beside object replacement character (one edge).
+            "Save Block\u{fffd}history",
             "Block history",
         ] {
             assert_eq!(
