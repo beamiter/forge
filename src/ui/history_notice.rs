@@ -668,6 +668,8 @@ mod tests {
             "Save Block\u{ffe9}history",
             // Halfwidth forms light up stays toast-only beside halfwidth forms light down (one edge).
             "Save Block\u{ffea}history",
+            // Halfwidth forms light left stays toast-only beside halfwidth forms light up (one edge).
+            "Save Block\u{ffeb}history",
             "Block history",
         ] {
             assert_eq!(
