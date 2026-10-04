@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (sticky FFE3 beside round 1105)
+
+## 2026-10-04 (sticky/find/organism edges — round 1106)
+
+- sticky U+FFE3/halfwidth-macron near-miss stays Toast. Unique round **1106**.
+  Pairs anvil 1036 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (FFE1 find beside rounds 1101–1104)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1105)
