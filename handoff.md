@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (GuardStuck RestAfterPush membership beside round 1003)
+
+## 2026-10-04 (sticky/find/organism edges — round 1004)
+
+- GuardStuck→RestAfterPush Full-motion membership (Calm/Static snap). Unique
+  round **1004**. Pairs anvil 934 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-160 cancel beside round 1002)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1003)
