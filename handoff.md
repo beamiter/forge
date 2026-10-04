@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (RestAfterPush UnknownOutcome beside round 1163)
+
+## 2026-10-04 (sticky/find/organism edges — round 1164)
+
+- RestAfterPush→UnknownOutcome Full-motion membership (Calm/Static snap). Unique
+  round **1164**. Pairs anvil 1094 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-192 cancel beside round 1162)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1163)
