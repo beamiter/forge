@@ -3654,6 +3654,9 @@ mod tests {
                 // Halfwidth hangul letter pieup catch-up beside sticky FFB3 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ffb3}"),
+                // Halfwidth hangul letter ssangpieup catch-up beside sticky FFB4 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffb4}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
