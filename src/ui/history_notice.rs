@@ -672,6 +672,8 @@ mod tests {
             "Save Block\u{ffeb}history",
             // Halfwidth forms light right stays toast-only beside halfwidth forms light left (one edge).
             "Save Block\u{ffec}history",
+            // Halfwidth black square stays toast-only beside halfwidth forms light right (one edge).
+            "Save Block\u{ffed}history",
             "Block history",
         ] {
             assert_eq!(
