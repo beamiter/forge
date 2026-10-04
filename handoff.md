@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (WatchAgent Idle beside round 1218)
+
+## 2026-10-04 (sticky/find/organism edges — round 1219)
+
+- WatchAgent→Idle Full-motion membership (Calm/Static snap). Unique round
+  **1219**. Pairs anvil 1149 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-203 cancel beside round 1217)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1218)

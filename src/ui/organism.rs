@@ -4151,6 +4151,7 @@ mod tests {
             (Behavior::UnknownOutcome, Behavior::Idle),
             (Behavior::WatchSettled, Behavior::Idle),
             (Behavior::WatchCommand, Behavior::Idle),
+            (Behavior::WatchAgent, Behavior::Idle),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
