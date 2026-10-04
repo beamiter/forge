@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFBB find beside rounds 1071–1074)
+
+## 2026-10-04 (sticky/find/organism edges — round 1075)
+
+- Find QueryNoMatches+stale U+FFBB/halfwidth-hangul-letter-chieuch. Unique
+  round **1075**. Pairs anvil 1005 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (Celebrate GuardFailure membership beside round 1073)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1074)
