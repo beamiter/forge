@@ -3702,6 +3702,9 @@ mod tests {
                 // Halfwidth macron catch-up beside sticky FFE3 — still
                 // outside the gate (one edge).
                 format!("{base}\u{ffe3}"),
+                // Halfwidth broken bar catch-up beside sticky FFE4 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffe4}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {

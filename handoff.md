@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FFE4 beside round 1111)
+
+## 2026-10-04 (sticky/find/organism edges — round 1112)
+
+- output_notice remount gate U+FFE4/halfwidth-broken-bar. Unique round **1112**.
+  Pairs anvil 1042 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (sticky FFE4 beside round 1110)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1111)
