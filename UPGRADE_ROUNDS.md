@@ -4652,3 +4652,7 @@ quality gates listed in `README.md`.
      guard_recovery_bridges_to_unknown_outcome_under_full_motion_only). Pairs
      anvil 989.
 
+1060. **Find QueryNoMatches+stale U+FFB8/halfwidth-hangul-letter-ieung** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (FFB7 already pinned). Pairs anvil 990.
+
