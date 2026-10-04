@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFE4 find beside rounds 1116–1119)
+
+## 2026-10-04 (sticky/find/organism edges — round 1120)
+
+- Find QueryNoMatches+stale U+FFE4/halfwidth-broken-bar. Unique round **1120**.
+  Pairs anvil 1050 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (CelebrateBig GuardStuck membership beside round 1118)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1119)
