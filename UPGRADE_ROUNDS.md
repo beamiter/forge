@@ -4421,3 +4421,7 @@ quality gates listed in `README.md`.
      guard_stuck_bridges_to_rest_after_push_under_full_motion_only). Pairs
      anvil 934.
 
+1005. **Find QueryNoMatches+stale U+FFAD/halfwidth-hangul-letter-rieul-pieup** —
+     bookmarked_search_empty_reason QueryNoMatches for Unicode-only query
+     with stale bookmark ids (FFAC already pinned). Pairs anvil 935.
+
