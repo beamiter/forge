@@ -3741,6 +3741,9 @@ mod tests {
                 // Interlinear annotation terminator catch-up beside sticky FFFB — still
                 // outside the gate (one edge).
                 format!("{base}\u{fffb}"),
+                // Object replacement character catch-up beside sticky FFFC — still
+                // outside the gate (one edge).
+                format!("{base}\u{fffc}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {

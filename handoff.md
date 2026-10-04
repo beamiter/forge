@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FFFC beside round 1176)
+
+## 2026-10-04 (sticky/find/organism edges — round 1177)
+
+- output_notice remount gate U+FFFC/object-replacement-character. Unique
+  round **1177**. Pairs anvil 1107 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (sticky FFFC beside round 1175)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1176)
