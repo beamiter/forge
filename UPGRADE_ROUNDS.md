@@ -5362,3 +5362,8 @@ quality gates listed in `README.md`.
      live==scheduled with resume; bump/scheduled-ahead/finished walks at
      MAX-205 vs MAX-204. Pairs anvil 1158.
 
+1229. **WatchSettled→CelebrateBig Full-motion membership** —
+     semantic_bridges catch-up; Calm/Static snap None. Dedicated
+     watch_settled_bridges_to_celebrate_big_under_full_motion_only already
+     exists. Pairs anvil 1159.
+

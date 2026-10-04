@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (WatchSettled CelebrateBig beside round 1228)
+
+## 2026-10-04 (sticky/find/organism edges — round 1229)
+
+- WatchSettled→CelebrateBig Full-motion membership (Calm/Static snap). Unique
+  round **1229**. Pairs anvil 1159 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-205 cancel beside round 1227)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1228)

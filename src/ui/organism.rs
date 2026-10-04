@@ -4153,6 +4153,7 @@ mod tests {
             (Behavior::WatchCommand, Behavior::Idle),
             (Behavior::WatchAgent, Behavior::Idle),
             (Behavior::WatchSettled, Behavior::Celebrate),
+            (Behavior::WatchSettled, Behavior::CelebrateBig),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
