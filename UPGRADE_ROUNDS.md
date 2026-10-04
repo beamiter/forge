@@ -5177,3 +5177,7 @@ quality gates listed in `README.md`.
      guard_recovery_bridges_to_idle_under_full_motion_only already exists.
      Pairs anvil 1114.
 
+1185. **Find QueryNoMatches U+FFFC/object-replacement-character + stale** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (FFFB already pinned). Pairs anvil 1115.
+
