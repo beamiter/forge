@@ -5156,3 +5156,7 @@ quality gates listed in `README.md`.
      guard_cautious_bridges_to_idle_under_full_motion_only already exists.
      Pairs anvil 1109.
 
+1180. **Find QueryNoMatches U+FFFB/interlinear-annotation-terminator + stale** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (FFFA already pinned). Pairs anvil 1110.
+
