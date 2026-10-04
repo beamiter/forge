@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (GuardRecovery Idle beside round 1183)
+
+## 2026-10-04 (sticky/find/organism edges — round 1184)
+
+- GuardRecovery→Idle Full-motion membership (Calm/Static snap). Unique round
+  **1184**. Pairs anvil 1114 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-196 cancel beside round 1182)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1183)
