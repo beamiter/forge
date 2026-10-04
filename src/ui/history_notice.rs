@@ -628,6 +628,8 @@ mod tests {
             "Save Block\u{ffb4}history",
             // Halfwidth hangul letter pieup-sios stays toast-only beside halfwidth hangul letter ssangpieup (one edge).
             "Save Block\u{ffb5}history",
+            // Halfwidth hangul letter sios stays toast-only beside halfwidth hangul letter pieup-sios (one edge).
+            "Save Block\u{ffb6}history",
             "Block history",
         ] {
             assert_eq!(
