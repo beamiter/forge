@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (sticky FFE0 beside round 1090)
+
+## 2026-10-04 (sticky/find/organism edges — round 1091)
+
+- sticky U+FFE0/halfwidth-cent-sign near-miss stays Toast. Unique
+  round **1091**. Pairs anvil 1021 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (FFBE find beside rounds 1086–1089)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1090)

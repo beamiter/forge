@@ -648,6 +648,8 @@ mod tests {
             "Save Block\u{ffbe}history",
             // Halfwidth hangul letter hieuh stays toast-only beside halfwidth hangul letter phieuph (one edge).
             "Save Block\u{ffbf}history",
+            // Halfwidth cent sign stays toast-only beside halfwidth hangul letter hieuh (one edge).
+            "Save Block\u{ffe0}history",
             "Block history",
         ] {
             assert_eq!(
