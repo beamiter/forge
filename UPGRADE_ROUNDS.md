@@ -5093,3 +5093,7 @@ quality gates listed in `README.md`.
      rest_after_push_bridges_to_unknown_outcome_under_full_motion_only already
      exists. Pairs anvil 1094.
 
+1165. **Find QueryNoMatches U+FFEE/halfwidth-white-circle + stale** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (FFED already pinned). Pairs anvil 1095.
+
