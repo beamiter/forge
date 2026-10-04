@@ -680,6 +680,8 @@ mod tests {
             "Save Block\u{fff9}history",
             // Interlinear annotation separator stays toast-only beside interlinear annotation anchor (one edge).
             "Save Block\u{fffa}history",
+            // Interlinear annotation terminator stays toast-only beside interlinear annotation separator (one edge).
+            "Save Block\u{fffb}history",
             "Block history",
         ] {
             assert_eq!(

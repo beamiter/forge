@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (sticky FFFB beside round 1170)
+
+## 2026-10-04 (sticky/find/organism edges — round 1171)
+
+- sticky U+FFFB/interlinear-annotation-terminator near-miss stays Toast. Unique
+  round **1171**. Pairs anvil 1101 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (FFF9 find beside rounds 1166–1169)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1170)
