@@ -5257,3 +5257,8 @@ quality gates listed in `README.md`.
      live==scheduled with resume; bump/scheduled-ahead/finished walks at
      MAX-200 vs MAX-199. Pairs anvil 1133.
 
+1204. **UnknownOutcome→Idle Full-motion membership** —
+     semantic_bridges catch-up; Calm/Static snap None. Dedicated
+     unknown_outcome_bridges_to_idle_under_full_motion_only already exists.
+     Pairs anvil 1134.
+
