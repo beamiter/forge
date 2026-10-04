@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFE8 find beside rounds 1131–1134)
+
+## 2026-10-04 (sticky/find/organism edges — round 1135)
+
+- Find QueryNoMatches+stale U+FFE8/halfwidth-forms-light-vertical. Unique
+  round **1135**. Pairs anvil 1065 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (CelebrateBig SitNearError membership beside round 1133)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1134)
