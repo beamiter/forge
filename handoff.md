@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFBC find beside rounds 1076–1079)
+
+## 2026-10-04 (sticky/find/organism edges — round 1080)
+
+- Find QueryNoMatches+stale U+FFBC/halfwidth-hangul-letter-khieukh. Unique
+  round **1080**. Pairs anvil 1010 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (Celebrate GuardStuck membership beside round 1078)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1079)

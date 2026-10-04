@@ -4736,3 +4736,7 @@ quality gates listed in `README.md`.
      celebrate_bridges_to_guard_stuck_under_full_motion_only). Pairs
      anvil 1009.
 
+1080. **Find QueryNoMatches+stale U+FFBC/halfwidth-hangul-letter-khieukh** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (FFBB already pinned). Pairs anvil 1010.
+
