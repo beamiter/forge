@@ -5245,3 +5245,7 @@ quality gates listed in `README.md`.
      queries with stale bookmark ids (10000 already pinned). Milestone 1200;
      mill continues. Pairs anvil 1130.
 
+1201. **sticky U+10003/linear-b-syllable-b053-o near-miss stays Toast** —
+     persistence_failure_surface keeps "Save Block\u{10003}history" on Toast
+     (10002/linear-b-syllable-b028-i already pinned). Pairs anvil 1131.
+

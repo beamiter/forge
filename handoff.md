@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (sticky 10003 beside round 1200)
+
+## 2026-10-04 (sticky/find/organism edges — round 1201)
+
+- sticky U+10003/linear-b-syllable-b053-o near-miss stays Toast. Unique round
+  **1201**. Pairs anvil 1131 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (10001 find beside rounds 1196–1199; unique 1200)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1200)
