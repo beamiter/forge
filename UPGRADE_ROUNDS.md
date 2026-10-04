@@ -5135,3 +5135,7 @@ quality gates listed in `README.md`.
      guard_stuck_bridges_to_idle_under_full_motion_only already exists.
      Pairs anvil 1104.
 
+1175. **Find QueryNoMatches U+FFFA/interlinear-annotation-separator + stale** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (FFF9 already pinned). Pairs anvil 1105.
+
