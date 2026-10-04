@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFB9 find beside rounds 1061–1064)
+
+## 2026-10-04 (sticky/find/organism edges — round 1065)
+
+- Find QueryNoMatches+stale U+FFB9/halfwidth-hangul-letter-cieuc. Unique
+  round **1065**. Pairs anvil 995 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (Celebrate GuardRecovery membership beside round 1063)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1064)

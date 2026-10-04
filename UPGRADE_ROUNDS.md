@@ -4673,3 +4673,7 @@ quality gates listed in `README.md`.
      celebrate_bridges_to_guard_recovery_under_full_motion_only). Pairs
      anvil 994.
 
+1065. **Find QueryNoMatches+stale U+FFB9/halfwidth-hangul-letter-cieuc** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (FFB8 already pinned). Pairs anvil 995.
+
