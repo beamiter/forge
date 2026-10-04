@@ -4723,3 +4723,7 @@ quality gates listed in `README.md`.
      persistence_failure_surface keeps "Save Block\u{ffbd}history" on Toast
      (FFBC/halfwidth-hangul-letter-khieukh already pinned). Pairs anvil 1006.
 
+1077. **output_notice remount gate U+FFBD/halfwidth-hangul-letter-thieuth** —
+     known_output_notice rejects Unicode-padded Truncated/Partly/Earlier
+     strings with U+FFBD (FFBC already pinned). Pairs anvil 1007.
+
