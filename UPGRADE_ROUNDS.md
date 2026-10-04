@@ -4954,3 +4954,7 @@ quality gates listed in `README.md`.
      persistence_failure_surface keeps "Save Block\u{ffe9}history" on Toast
      (FFE8/halfwidth-forms-light-vertical already pinned). Pairs anvil 1061.
 
+1132. **output_notice remount gate U+FFE9/halfwidth-forms-light-down** —
+     known_output_notice rejects Unicode-padded Truncated/Partly/Earlier
+     strings with U+FFE9 (FFE8 already pinned). Pairs anvil 1062.
+
