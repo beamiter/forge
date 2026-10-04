@@ -3744,6 +3744,9 @@ mod tests {
                 // Object replacement character catch-up beside sticky FFFC — still
                 // outside the gate (one edge).
                 format!("{base}\u{fffc}"),
+                // Replacement character catch-up beside sticky FFFD — still
+                // outside the gate (one edge).
+                format!("{base}\u{fffd}"),
                 base.to_ascii_uppercase(),
                 format!("{base}!"),
             ] {
