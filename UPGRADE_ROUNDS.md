@@ -5249,3 +5249,7 @@ quality gates listed in `README.md`.
      persistence_failure_surface keeps "Save Block\u{10003}history" on Toast
      (10002/linear-b-syllable-b028-i already pinned). Pairs anvil 1131.
 
+1202. **output_notice remount gate U+10003/linear-b-syllable-b053-o** —
+     known_output_notice rejects Unicode-padded Truncated/Partly/Earlier
+     strings with U+10003 (10002 already pinned). Pairs anvil 1132.
+
