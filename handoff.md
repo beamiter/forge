@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (sticky FFE4 beside round 1110)
+
+## 2026-10-04 (sticky/find/organism edges — round 1111)
+
+- sticky U+FFE4/halfwidth-broken-bar near-miss stays Toast. Unique round **1111**.
+  Pairs anvil 1041 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (FFE2 find beside rounds 1106–1109)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1110)

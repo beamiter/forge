@@ -656,6 +656,8 @@ mod tests {
             "Save Block\u{ffe2}history",
             // Halfwidth macron stays toast-only beside halfwidth yen sign (one edge).
             "Save Block\u{ffe3}history",
+            // Halfwidth broken bar stays toast-only beside halfwidth macron (one edge).
+            "Save Block\u{ffe4}history",
             "Block history",
         ] {
             assert_eq!(
