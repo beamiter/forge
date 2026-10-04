@@ -5219,3 +5219,7 @@ quality gates listed in `README.md`.
      celebrate_bridges_to_idle_under_full_motion_only already exists.
      Pairs anvil 1124.
 
+1195. **Find QueryNoMatches U+10000/linear-b-syllable-b008-a + stale** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (FFFD already pinned). Pairs anvil 1125.
+
