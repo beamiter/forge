@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (RestAfterPush SitNearError membership beside round 1148)
+
+## 2026-10-04 (sticky/find/organism edges — round 1149)
+
+- RestAfterPush→SitNearError Full-motion membership (Calm/Static snap). Unique
+  round **1149**. Pairs anvil 1079 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-189 cancel beside round 1147)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1148)
