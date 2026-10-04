@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (GuardRecovery GuardFailure membership beside round 1028)
+
+## 2026-10-04 (sticky/find/organism edges — round 1029)
+
+- GuardRecovery→GuardFailure Full-motion membership (Calm/Static snap). Unique
+  round **1029**. Pairs anvil 959 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (MAX-165 cancel beside round 1027)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1028)
