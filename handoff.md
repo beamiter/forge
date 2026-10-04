@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFFD find beside rounds 1186–1189)
+
+## 2026-10-04 (sticky/find/organism edges — round 1190)
+
+- Find QueryNoMatches U+FFFD/replacement-character + stale. Unique round
+  **1190**. Pairs anvil 1120 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (GuardFailure Idle beside round 1188)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1189)
