@@ -4547,3 +4547,7 @@ quality gates listed in `README.md`.
      guard_recovery_bridges_to_guard_stuck_under_full_motion_only). Pairs
      anvil 964.
 
+1035. **Find QueryNoMatches+stale U+FFB3/halfwidth-hangul-letter-pieup** —
+     bookmarked_search_empty_reason QueryNoMatches for Unicode-only query
+     with stale bookmark ids (FFB2 already pinned). Pairs anvil 965.
+

@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFB3 find beside rounds 1031–1034)
+
+## 2026-10-04 (sticky/find/organism edges — round 1035)
+
+- Find QueryNoMatches+stale U+FFB3/halfwidth-hangul-letter-pieup. Unique round
+  **1035**. Pairs anvil 965 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (GuardRecovery GuardStuck membership beside round 1033)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1034)
