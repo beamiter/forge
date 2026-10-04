@@ -686,6 +686,8 @@ mod tests {
             "Save Block\u{fffc}history",
             // Replacement character stays toast-only beside object replacement character (one edge).
             "Save Block\u{fffd}history",
+            // Linear B syllable B008 A stays toast-only beside replacement character (one edge).
+            "Save Block\u{10000}history",
             "Block history",
         ] {
             assert_eq!(
