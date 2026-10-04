@@ -4404,3 +4404,7 @@ quality gates listed in `README.md`.
      with stale bookmark ids (FFAB already pinned). Pairs anvil 930.
      Milestone **1000**. Unique ledger complete.
 
+1001. **sticky U+FFAE/halfwidth-hangul-letter-rieul-sios near-miss stays Toast** —
+     persistence_failure_surface keeps "Save Block\u{ffae}history" on Toast
+     (FFAD/halfwidth-hangul-letter-rieul-pieup already pinned). Pairs anvil 931.
+
