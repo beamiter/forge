@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FFFA beside round 1166)
+
+## 2026-10-04 (sticky/find/organism edges — round 1167)
+
+- output_notice remount gate U+FFFA/interlinear-annotation-separator. Unique
+  round **1167**. Pairs anvil 1097 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (sticky FFFA beside round 1165)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1166)
