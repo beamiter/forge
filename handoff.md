@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFF9 find beside rounds 1166–1169)
+
+## 2026-10-04 (sticky/find/organism edges — round 1170)
+
+- Find QueryNoMatches U+FFF9/interlinear-annotation-anchor + stale. Unique
+  round **1170**. Pairs anvil 1100 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (RestAfterPush Idle beside round 1168)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1169)

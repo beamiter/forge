@@ -5114,3 +5114,7 @@ quality gates listed in `README.md`.
      rest_after_push_bridges_to_idle_under_full_motion_only already exists.
      Pairs anvil 1099.
 
+1170. **Find QueryNoMatches U+FFF9/interlinear-annotation-anchor + stale** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (FFEE already pinned). Pairs anvil 1100.
+
