@@ -4442,3 +4442,7 @@ quality gates listed in `README.md`.
      guard_cautious_bridges_to_guard_failure_under_full_motion_only). Pairs
      anvil 939.
 
+1010. **Find QueryNoMatches+stale U+FFAE/halfwidth-hangul-letter-rieul-sios** —
+     bookmarked_search_empty_reason QueryNoMatches for Unicode-only query
+     with stale bookmark ids (FFAD already pinned). Pairs anvil 940.
+

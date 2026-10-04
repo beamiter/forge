@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFAE find beside rounds 1006–1009)
+
+## 2026-10-04 (sticky/find/organism edges — round 1010)
+
+- Find QueryNoMatches+stale U+FFAE/halfwidth-hangul-letter-rieul-sios. Unique
+  round **1010**. Pairs anvil 940 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (GuardCautious GuardFailure membership beside round 1008)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1009)
