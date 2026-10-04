@@ -660,6 +660,8 @@ mod tests {
             "Save Block\u{ffe4}history",
             // Halfwidth won sign stays toast-only beside halfwidth broken bar (one edge).
             "Save Block\u{ffe5}history",
+            // Halfwidth double vertical line stays toast-only beside halfwidth won sign (one edge).
+            "Save Block\u{ffe6}history",
             "Block history",
         ] {
             assert_eq!(

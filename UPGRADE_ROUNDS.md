@@ -4908,3 +4908,7 @@ quality gates listed in `README.md`.
      bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
      queries with stale bookmark ids (FFE3 already pinned). Pairs anvil 1050.
 
+1121. **sticky U+FFE6/halfwidth-double-vertical-line near-miss stays Toast** —
+     persistence_failure_surface keeps "Save Block\u{ffe6}history" on Toast
+     (FFE5/halfwidth-won-sign already pinned). Pairs anvil 1051.
+

@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (sticky FFE6 beside round 1120)
+
+## 2026-10-04 (sticky/find/organism edges — round 1121)
+
+- sticky U+FFE6/halfwidth-double-vertical-line near-miss stays Toast. Unique
+  round **1121**. Pairs anvil 1051 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (FFE4 find beside rounds 1116–1119)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1120)
