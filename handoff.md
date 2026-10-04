@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (output_notice FFED beside round 1151)
+
+## 2026-10-04 (sticky/find/organism edges — round 1152)
+
+- output_notice remount gate U+FFED/halfwidth-black-square. Unique
+  round **1152**. Pairs anvil 1082 / core cancel. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-10-04 (sticky FFED beside round 1150)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1151)
