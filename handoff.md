@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (FFE1 find beside rounds 1101–1104)
+
+## 2026-10-04 (sticky/find/organism edges — round 1105)
+
+- Find QueryNoMatches+stale U+FFE1/halfwidth-pound-sign. Unique round **1105**.
+  Pairs anvil 1035 / core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-10-04 (CelebrateBig GuardRecovery membership beside round 1103)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1104)

@@ -4841,3 +4841,7 @@ quality gates listed in `README.md`.
      celebrate_big_bridges_to_guard_recovery_under_full_motion_only). Pairs
      anvil 1034.
 
+1105. **Find QueryNoMatches+stale U+FFE1/halfwidth-pound-sign** —
+     bookmarked_search_empty_reason stays QueryNoMatches for Unicode-only
+     queries with stale bookmark ids (FFE0 already pinned). Pairs anvil 1035.
+
