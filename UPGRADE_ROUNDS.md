@@ -4773,3 +4773,8 @@ quality gates listed in `README.md`.
      live==scheduled with resume; bump/scheduled-ahead/finished walks at
      MAX-177 vs MAX-176. Pairs anvil 1018.
 
+1089. **Celebrate→InspectError Full-motion membership** — Calm/Static snap
+     None; semantic_bridges membership for-loop (dedicated
+     celebrate_bridges_to_inspect_error_under_full_motion_only). Pairs
+     anvil 1019.
+
