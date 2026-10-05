@@ -7293,10 +7293,8 @@ mod tests {
             public_directory_error_message(&io::Error::from(io::ErrorKind::NotFound)),
             "Directory not found or unavailable"
         );
-        let denied = directory_error_status(
-            &io::Error::from(io::ErrorKind::PermissionDenied),
-            None,
-        );
+        let denied =
+            directory_error_status(&io::Error::from(io::ErrorKind::PermissionDenied), None);
         let missing = directory_error_status(&io::Error::from(io::ErrorKind::NotFound), None);
         match (&denied, &missing) {
             (

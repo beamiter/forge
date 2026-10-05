@@ -1626,7 +1626,8 @@ pub(crate) fn failure_badge_tooltip(code: i32, signal: &str) -> String {
 /// The finished card's notices that its text is not the command's whole
 /// output; see `finished_output_notice`. Shared with anvil via jterm_core.
 pub(crate) use jterm_core::output_notice::{
-    known_output_notice, output_notice_tooltip, EARLIER_OUTPUT_NOT_RETAINED as FINISHED_OUTPUT_NOT_RETAINED,
+    known_output_notice, output_notice_tooltip,
+    EARLIER_OUTPUT_NOT_RETAINED as FINISHED_OUTPUT_NOT_RETAINED,
     OUTPUT_PARTLY_RETAINED as FINISHED_OUTPUT_PARTLY_RETAINED,
     OUTPUT_TEXT_TRUNCATED as FINISHED_OUTPUT_TEXT_TRUNCATED,
 };

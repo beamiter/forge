@@ -226,21 +226,34 @@ fn hit_outcome_label(hit: &crate::block_view::CrossBlockHit) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
+/// Palette widgets and bookmark state shared by the initial and continued rows.
+struct CrossBlockHitRowContext<'a> {
+    list_box: &'a gtk4::ListBox,
+    term_view: &'a Rc<crate::block_view::TermView>,
+    row_bookmark_buttons: &'a Rc<RefCell<Vec<(u64, gtk4::ToggleButton)>>>,
+    status_label: &'a gtk4::Label,
+    filter_entry: &'a SearchEntry,
+    observed_version: &'a Rc<Cell<crate::block_view::CrossBlockSearchVersion>>,
+    schedule_rebuild_slot: &'a CrossBlockScheduleRebuildSlot,
+    bookmarked_toggle: &'a gtk4::ToggleButton,
+}
+
 /// Append one palette hit row, including the bookmark suffix. Shared by the
 /// initial rebuild and `pending_scan_continue` idle slices so continued hits
 /// stay bookmarkable (parity with anvil's append_hit_row).
 fn append_cross_block_hit_row(
-    list_box: &gtk4::ListBox,
-    term_view: &Rc<crate::block_view::TermView>,
+    context: &CrossBlockHitRowContext<'_>,
     hit: &crate::block_view::CrossBlockHit,
     jumpable: &std::collections::HashSet<(u64, bool)>,
-    row_bookmark_buttons: &Rc<RefCell<Vec<(u64, gtk4::ToggleButton)>>>,
-    status_label: &gtk4::Label,
-    filter_entry: &SearchEntry,
-    observed_version: &Rc<Cell<crate::block_view::CrossBlockSearchVersion>>,
-    schedule_rebuild_slot: &CrossBlockScheduleRebuildSlot,
-    bookmarked_toggle: &gtk4::ToggleButton,
 ) {
+    let list_box = context.list_box;
+    let term_view = context.term_view;
+    let row_bookmark_buttons = context.row_bookmark_buttons;
+    let status_label = context.status_label;
+    let filter_entry = context.filter_entry;
+    let observed_version = context.observed_version;
+    let schedule_rebuild_slot = context.schedule_rebuild_slot;
+    let bookmarked_toggle = context.bookmarked_toggle;
     let can_jump = jumpable.contains(&(hit.block_id, hit.is_output));
     let surface = if hit.is_output { "out" } else { "cmd" };
     let mut subtitle = format!(
@@ -308,10 +321,7 @@ fn append_cross_block_hit_row(
                 update_cross_block_bookmark_button(button, active);
                 let message = cross_block_bookmark_unavailable_status();
                 status_label.set_text(message);
-                status_label.announce(
-                    message,
-                    gtk4::AccessibleAnnouncementPriority::Medium,
-                );
+                status_label.announce(message, gtk4::AccessibleAnnouncementPriority::Medium);
             }
             filter_entry.grab_focus();
         });
@@ -628,9 +638,7 @@ fn cross_block_search_status(
         if total == CROSS_BLOCK_SEARCH_LIMIT {
             format!("{position}{total} {noun} (capped) — refine your query.")
         } else if scan_incomplete {
-            format!(
-                "{position}{total} {noun} (scan budget reached — later blocks not examined)"
-            )
+            format!("{position}{total} {noun} (scan budget reached — later blocks not examined)")
         } else {
             format!("{position}{total} {noun}")
         }
@@ -1876,16 +1884,18 @@ impl UiState {
                         let jumpable = term_view.jumpable_search_hits(&results);
                         for hit in results.iter() {
                             append_cross_block_hit_row(
-                                &list_box,
-                                &term_view,
+                                &CrossBlockHitRowContext {
+                                    list_box: &list_box,
+                                    term_view: &term_view,
+                                    row_bookmark_buttons: &row_bookmark_buttons,
+                                    status_label: &status_label,
+                                    filter_entry: &filter_entry,
+                                    observed_version: &observed_version,
+                                    schedule_rebuild_slot: &schedule_rebuild_slot,
+                                    bookmarked_toggle: &bookmarked_toggle,
+                                },
                                 hit,
                                 &jumpable,
-                                &row_bookmark_buttons,
-                                &status_label,
-                                &filter_entry,
-                                &observed_version,
-                                &schedule_rebuild_slot,
-                                &bookmarked_toggle,
                             );
                         }
                         let selected =
@@ -1948,16 +1958,18 @@ impl UiState {
                                         let jumpable = term_view.jumpable_search_hits(&more.hits);
                                         for hit in more.hits.iter() {
                                             append_cross_block_hit_row(
-                                                &list_box,
-                                                &term_view,
+                                                &CrossBlockHitRowContext {
+                                                    list_box: &list_box,
+                                                    term_view: &term_view,
+                                                    row_bookmark_buttons: &row_bookmark_buttons,
+                                                    status_label: &status_label,
+                                                    filter_entry: &filter_entry,
+                                                    observed_version: &observed_version,
+                                                    schedule_rebuild_slot: &schedule_rebuild_slot,
+                                                    bookmarked_toggle: &bookmarked_toggle,
+                                                },
                                                 hit,
                                                 &jumpable,
-                                                &row_bookmark_buttons,
-                                                &status_label,
-                                                &filter_entry,
-                                                &observed_version,
-                                                &schedule_rebuild_slot,
-                                                &bookmarked_toggle,
                                             );
                                         }
                                         hits.borrow_mut().extend(more.hits.iter().cloned());
@@ -1965,9 +1977,7 @@ impl UiState {
                                         scan_incomplete.set(more.scan_incomplete);
                                         status_label.set_text(&overlay_scan_status(
                                             total,
-                                            list_box
-                                                .selected_row()
-                                                .map(|row| row.index() as usize),
+                                            list_box.selected_row().map(|row| row.index() as usize),
                                             more.scan_incomplete,
                                             term_view
                                                 .bookmarked_search_empty_reason(
@@ -2564,9 +2574,7 @@ impl UiState {
         let background_toggle_for_close = background_toggle.clone();
         let bookmarked_toggle_for_close = bookmarked_toggle.clone();
         dialog.connect_closed(move |closed_dialog| {
-            search_generation_for_close.set(
-                search_generation_for_close.get().wrapping_add(1),
-            );
+            search_generation_for_close.set(search_generation_for_close.get().wrapping_add(1));
             if let Some(source) = refresh_source_for_close.borrow_mut().take() {
                 source.remove();
             }
@@ -4495,15 +4503,15 @@ mod tests {
         cross_block_search_is_bookmark_shortcut, cross_block_search_is_plain_refresh_key,
         cross_block_search_jump_unavailable_status, cross_block_search_memory,
         cross_block_search_pending_status, cross_block_search_query_error,
-        cross_block_search_refresh_status, cross_block_search_status, overlay_scan_status,
-        cross_block_selection_index,
-        cross_block_should_step, preferences_group_title, record_snapshot_dialog_title,
-        record_snapshot_status_line, record_snapshot_unavailable_message,
-        record_workflow_arg_entry_change, remote_picker_guard, CrossBlockBookmarkKeyDecision,
-        CrossBlockBookmarkKeyLatch, CrossBlockEnterKeyRoute, CrossBlockJumpOutcome,
-        CrossBlockRefreshFrameDecision, CrossBlockRefreshFrameGate, CrossBlockRefreshKeyDecision,
-        CrossBlockRefreshKeyLatch, CrossBlockSelectionAnchor, CrossBlockSelectionMove,
-        CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES, WORKFLOW_PALETTE_POLICY,
+        cross_block_search_refresh_status, cross_block_search_status, cross_block_selection_index,
+        cross_block_should_step, overlay_scan_status, preferences_group_title,
+        record_snapshot_dialog_title, record_snapshot_status_line,
+        record_snapshot_unavailable_message, record_workflow_arg_entry_change, remote_picker_guard,
+        CrossBlockBookmarkKeyDecision, CrossBlockBookmarkKeyLatch, CrossBlockEnterKeyRoute,
+        CrossBlockJumpOutcome, CrossBlockRefreshFrameDecision, CrossBlockRefreshFrameGate,
+        CrossBlockRefreshKeyDecision, CrossBlockRefreshKeyLatch, CrossBlockSelectionAnchor,
+        CrossBlockSelectionMove, CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
+        WORKFLOW_PALETTE_POLICY,
     };
     use crate::block_view::{
         BookmarkedSearchEmptyReason, CrossBlockHit, CrossBlockSearchOptions, CrossBlockSearchScope,
@@ -4584,8 +4592,14 @@ mod tests {
             super::hit_outcome_label(&outcome_hit(Some(148), None, None)).as_deref(),
             Some("exit:148 · suspended")
         );
-        assert_eq!(super::hit_outcome_class(Some(148)), "block-status-interrupted");
-        assert_eq!(super::hit_outcome_class(Some(130)), "block-status-interrupted");
+        assert_eq!(
+            super::hit_outcome_class(Some(148)),
+            "block-status-interrupted"
+        );
+        assert_eq!(
+            super::hit_outcome_class(Some(130)),
+            "block-status-interrupted"
+        );
         assert_eq!(super::hit_outcome_class(Some(137)), "block-status-bad");
         assert_eq!(super::hit_outcome_class(Some(0)), "block-status-ok");
         assert_eq!(
@@ -4731,11 +4745,21 @@ mod tests {
         assert_eq!(cross_block_search_refresh_status(), "Refreshing blocks…");
         assert_eq!(cross_block_search_status(0, None, false), "No matches.");
         assert_eq!(
-            overlay_scan_status(0, None, false, Some("No bookmarked blocks in retained history.")),
+            overlay_scan_status(
+                0,
+                None,
+                false,
+                Some("No bookmarked blocks in retained history.")
+            ),
             "No bookmarked blocks in retained history."
         );
         assert_eq!(
-            overlay_scan_status(0, None, true, Some("No bookmarked blocks in retained history.")),
+            overlay_scan_status(
+                0,
+                None,
+                true,
+                Some("No bookmarked blocks in retained history.")
+            ),
             cross_block_search_status(0, None, true)
         );
         assert_eq!(
@@ -4751,10 +4775,7 @@ mod tests {
             cross_block_search_status(37, None, true),
             "37 matches (scan budget reached — later blocks not examined)"
         );
-        assert_eq!(
-            cross_block_search_status(1, Some(0), false),
-            "1 of 1 match"
-        );
+        assert_eq!(cross_block_search_status(1, Some(0), false), "1 of 1 match");
         assert_eq!(
             cross_block_search_status(CROSS_BLOCK_SEARCH_LIMIT, Some(36), false),
             "37 of 500 matches (capped) — refine your query."

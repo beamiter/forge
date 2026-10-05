@@ -762,7 +762,6 @@ mod tests {
         );
     }
 
-
     /// Sticky Retry must `continue` past notebook pages / leaves without a
     /// Block view instead of aborting — non-Block chrome must not starve later
     /// Block leaves of `retry_history_persistence` (pairs anvil TermView skip).
@@ -799,9 +798,7 @@ mod tests {
             .split("\n}\n\n#[cfg(test)]")
             .next()
             .expect("retry closes before tests");
-        let hide = retry
-            .find("set_visible(false)")
-            .expect("optimistic hide");
+        let hide = retry.find("set_visible(false)").expect("optimistic hide");
         let walk = retry.find("n_pages()").expect("notebook walk");
         assert!(hide < walk, "hide must run before the notebook walk");
         assert!(

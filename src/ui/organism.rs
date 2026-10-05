@@ -4186,19 +4186,11 @@ mod tests {
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchCommand,
-                    Behavior::Celebrate,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchCommand, Behavior::Celebrate,),
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchAgent,
-                    Behavior::RestAfterPush,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::RestAfterPush,),
                 None
             );
             assert_eq!(
@@ -4222,11 +4214,7 @@ mod tests {
             // under Calm/Static (Full animates; dedicated hold pins cover the
             // same arcs).
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::Celebrate,
-                    Behavior::UnknownOutcome,
-                ),
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::UnknownOutcome,),
                 None
             );
             assert_eq!(
@@ -4286,19 +4274,11 @@ mod tests {
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::UnknownOutcome,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::UnknownOutcome, Behavior::Idle,),
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::UnknownOutcome,
-                    Behavior::Celebrate,
-                ),
+                visual_transition_for_motion(motion, Behavior::UnknownOutcome, Behavior::Celebrate,),
                 None
             );
             assert_eq!(
@@ -4334,115 +4314,59 @@ mod tests {
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::GuardCautious,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::GuardCautious, Behavior::Idle,),
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::GuardFailure,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::GuardFailure, Behavior::Idle,),
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::GuardStuck,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::GuardStuck, Behavior::Idle,),
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::GuardRecovery,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::GuardRecovery, Behavior::Idle,),
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::Celebrate,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::Idle,),
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::CelebrateBig,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::CelebrateBig, Behavior::Idle,),
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::RestAfterPush,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::RestAfterPush, Behavior::Idle,),
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::InspectError,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::InspectError, Behavior::Idle,),
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::SitNearError,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::SitNearError, Behavior::Idle,),
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchCommand,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchCommand, Behavior::Idle,),
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchAgent,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::Idle,),
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchSettled,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchSettled, Behavior::Idle,),
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchAgent,
-                    Behavior::Celebrate,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::Celebrate,),
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchCommand,
-                    Behavior::Celebrate,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchCommand, Behavior::Celebrate,),
                 None
             );
             assert_eq!(
@@ -4478,35 +4402,19 @@ mod tests {
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchAgent,
-                    Behavior::InspectError,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::InspectError,),
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchAgent,
-                    Behavior::SitNearError,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::SitNearError,),
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchAgent,
-                    Behavior::RestAfterPush,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::RestAfterPush,),
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchSettled,
-                    Behavior::Celebrate,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchSettled, Behavior::Celebrate,),
                 None
             );
             assert_eq!(
@@ -4550,11 +4458,7 @@ mod tests {
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::SitNearError,
-                    Behavior::GuardStuck,
-                ),
+                visual_transition_for_motion(motion, Behavior::SitNearError, Behavior::GuardStuck,),
                 None
             );
             assert_eq!(
@@ -4582,11 +4486,7 @@ mod tests {
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::InspectError,
-                    Behavior::GuardStuck,
-                ),
+                visual_transition_for_motion(motion, Behavior::InspectError, Behavior::GuardStuck,),
                 None
             );
             assert_eq!(
@@ -4837,20 +4737,12 @@ mod tests {
             Behavior::Approach,
         ] {
             assert_eq!(
-                visual_transition_for_motion(
-                    OrganismMotion::Full,
-                    Behavior::GlanceAside,
-                    other,
-                ),
+                visual_transition_for_motion(OrganismMotion::Full, Behavior::GlanceAside, other,),
                 None,
                 "Full GlanceAside→{other:?}"
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    OrganismMotion::Full,
-                    other,
-                    Behavior::GlanceAside,
-                ),
+                visual_transition_for_motion(OrganismMotion::Full, other, Behavior::GlanceAside,),
                 None,
                 "Full {other:?}→GlanceAside"
             );
@@ -4880,12 +4772,8 @@ mod tests {
         ];
         for from in inbound {
             assert!(
-                visual_transition_for_motion(
-                    OrganismMotion::Full,
-                    from,
-                    Behavior::CelebrateBig,
-                )
-                .is_some(),
+                visual_transition_for_motion(OrganismMotion::Full, from, Behavior::CelebrateBig,)
+                    .is_some(),
                 "Full {from:?}→CelebrateBig"
             );
             assert!(
@@ -4906,12 +4794,8 @@ mod tests {
         ];
         for to in outbound {
             assert!(
-                visual_transition_for_motion(
-                    OrganismMotion::Full,
-                    Behavior::CelebrateBig,
-                    to,
-                )
-                .is_some(),
+                visual_transition_for_motion(OrganismMotion::Full, Behavior::CelebrateBig, to,)
+                    .is_some(),
                 "Full CelebrateBig→{to:?}"
             );
             assert!(
@@ -5022,12 +4906,8 @@ mod tests {
         ];
         for to in arcs {
             assert!(
-                visual_transition_for_motion(
-                    OrganismMotion::Full,
-                    Behavior::WatchSettled,
-                    to,
-                )
-                .is_some(),
+                visual_transition_for_motion(OrganismMotion::Full, Behavior::WatchSettled, to,)
+                    .is_some(),
                 "Full WatchSettled→{to:?}"
             );
             assert!(
@@ -5090,11 +4970,7 @@ mod tests {
             Behavior::WatchAgent,
             Behavior::WatchSettled,
         ] {
-            for to in [
-                Behavior::Explore,
-                Behavior::Sleep,
-                Behavior::Approach,
-            ] {
+            for to in [Behavior::Explore, Behavior::Sleep, Behavior::Approach] {
                 assert_eq!(
                     visual_transition_for_motion(OrganismMotion::Full, from, to),
                     None,
@@ -5175,11 +5051,7 @@ mod tests {
             Behavior::UnknownOutcome,
             Behavior::RestAfterPush,
         ] {
-            for to in [
-                Behavior::Explore,
-                Behavior::Sleep,
-                Behavior::Approach,
-            ] {
+            for to in [Behavior::Explore, Behavior::Sleep, Behavior::Approach] {
                 assert_eq!(
                     visual_transition_for_motion(OrganismMotion::Full, from, to),
                     None,
@@ -5205,11 +5077,7 @@ mod tests {
             Behavior::GuardRecovery,
             Behavior::GuardCautious,
         ] {
-            for to in [
-                Behavior::Explore,
-                Behavior::Sleep,
-                Behavior::Approach,
-            ] {
+            for to in [Behavior::Explore, Behavior::Sleep, Behavior::Approach] {
                 assert_eq!(
                     visual_transition_for_motion(OrganismMotion::Full, from, to),
                     None,
@@ -5425,11 +5293,7 @@ mod tests {
             Behavior::WatchSettled,
         ] {
             assert_eq!(
-                visual_transition_for_motion(
-                    OrganismMotion::Full,
-                    from,
-                    Behavior::UnknownOutcome,
-                ),
+                visual_transition_for_motion(OrganismMotion::Full, from, Behavior::UnknownOutcome,),
                 None,
                 "Full {from:?}→UnknownOutcome"
             );
@@ -5464,7 +5328,6 @@ mod tests {
         }
     }
 
-
     /// Celebrate{,Big}→UnknownOutcome animates under Full motion (unknown
     /// overwrite from a celebrate hold) and snaps under Calm/Static. Pairs core
     /// celebrate→unknown bridges inside between() 93.
@@ -5472,12 +5335,8 @@ mod tests {
     fn celebrate_holds_bridge_to_unknown_outcome_under_full_motion_only() {
         for from in [Behavior::Celebrate, Behavior::CelebrateBig] {
             assert!(
-                visual_transition_for_motion(
-                    OrganismMotion::Full,
-                    from,
-                    Behavior::UnknownOutcome,
-                )
-                .is_some(),
+                visual_transition_for_motion(OrganismMotion::Full, from, Behavior::UnknownOutcome,)
+                    .is_some(),
                 "Full {from:?}→UnknownOutcome"
             );
             assert!(
@@ -5533,12 +5392,8 @@ mod tests {
     fn sit_near_and_inspect_bridge_to_unknown_outcome_under_full_motion_only() {
         for from in [Behavior::SitNearError, Behavior::InspectError] {
             assert!(
-                visual_transition_for_motion(
-                    OrganismMotion::Full,
-                    from,
-                    Behavior::UnknownOutcome,
-                )
-                .is_some(),
+                visual_transition_for_motion(OrganismMotion::Full, from, Behavior::UnknownOutcome,)
+                    .is_some(),
                 "Full {from:?}→UnknownOutcome"
             );
             assert!(
@@ -5554,7 +5409,6 @@ mod tests {
             }
         }
     }
-
 
     /// GuardRecovery→UnknownOutcome animates under Full motion (unknown
     /// overwrite from a recovery vigil) and snaps under Calm/Static. Pairs core
@@ -5717,11 +5571,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::UnknownOutcome,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::UnknownOutcome, Behavior::Idle,),
                 None,
                 "{motion:?} UnknownOutcome→Idle"
             );
@@ -5745,11 +5595,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::UnknownOutcome,
-                    Behavior::Celebrate,
-                ),
+                visual_transition_for_motion(motion, Behavior::UnknownOutcome, Behavior::Celebrate,),
                 None,
                 "{motion:?} UnknownOutcome→Celebrate"
             );
@@ -5885,11 +5731,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::GuardCautious,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::GuardCautious, Behavior::Idle,),
                 None,
                 "{motion:?} GuardCautious→Idle"
             );
@@ -5913,11 +5755,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::GuardFailure,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::GuardFailure, Behavior::Idle,),
                 None,
                 "{motion:?} GuardFailure→Idle"
             );
@@ -5941,11 +5779,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::GuardStuck,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::GuardStuck, Behavior::Idle,),
                 None,
                 "{motion:?} GuardStuck→Idle"
             );
@@ -5969,11 +5803,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::GuardRecovery,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::GuardRecovery, Behavior::Idle,),
                 None,
                 "{motion:?} GuardRecovery→Idle"
             );
@@ -5997,11 +5827,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::Celebrate,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::Idle,),
                 None,
                 "{motion:?} Celebrate→Idle"
             );
@@ -6025,11 +5851,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::CelebrateBig,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::CelebrateBig, Behavior::Idle,),
                 None,
                 "{motion:?} CelebrateBig→Idle"
             );
@@ -6053,11 +5875,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::RestAfterPush,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::RestAfterPush, Behavior::Idle,),
                 None,
                 "{motion:?} RestAfterPush→Idle"
             );
@@ -6081,11 +5899,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::InspectError,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::InspectError, Behavior::Idle,),
                 None,
                 "{motion:?} InspectError→Idle"
             );
@@ -6109,11 +5923,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::SitNearError,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::SitNearError, Behavior::Idle,),
                 None,
                 "{motion:?} SitNearError→Idle"
             );
@@ -6137,11 +5947,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchCommand,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchCommand, Behavior::Idle,),
                 None,
                 "{motion:?} WatchCommand→Idle"
             );
@@ -6165,11 +5971,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchAgent,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::Idle,),
                 None,
                 "{motion:?} WatchAgent→Idle"
             );
@@ -6193,11 +5995,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchSettled,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchSettled, Behavior::Idle,),
                 None,
                 "{motion:?} WatchSettled→Idle"
             );
@@ -6221,11 +6019,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchAgent,
-                    Behavior::Celebrate,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::Celebrate,),
                 None,
                 "{motion:?} WatchAgent→Celebrate"
             );
@@ -6249,11 +6043,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchCommand,
-                    Behavior::Celebrate,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchCommand, Behavior::Celebrate,),
                 None,
                 "{motion:?} WatchCommand→Celebrate"
             );
@@ -6389,11 +6179,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchAgent,
-                    Behavior::InspectError,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::InspectError,),
                 None,
                 "{motion:?} WatchAgent→InspectError"
             );
@@ -6417,11 +6203,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchAgent,
-                    Behavior::SitNearError,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::SitNearError,),
                 None,
                 "{motion:?} WatchAgent→SitNearError"
             );
@@ -6445,11 +6227,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchAgent,
-                    Behavior::RestAfterPush,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::RestAfterPush,),
                 None,
                 "{motion:?} WatchAgent→RestAfterPush"
             );
@@ -6473,11 +6251,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchSettled,
-                    Behavior::Celebrate,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchSettled, Behavior::Celebrate,),
                 None,
                 "{motion:?} WatchSettled→Celebrate"
             );
@@ -6641,11 +6415,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::SitNearError,
-                    Behavior::GuardStuck,
-                ),
+                visual_transition_for_motion(motion, Behavior::SitNearError, Behavior::GuardStuck,),
                 None,
                 "{motion:?} SitNearError→GuardStuck"
             );
@@ -6753,11 +6523,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::InspectError,
-                    Behavior::GuardStuck,
-                ),
+                visual_transition_for_motion(motion, Behavior::InspectError, Behavior::GuardStuck,),
                 None,
                 "{motion:?} InspectError→GuardStuck"
             );
@@ -6837,11 +6603,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::InspectError,
-                    Behavior::Celebrate,
-                ),
+                visual_transition_for_motion(motion, Behavior::InspectError, Behavior::Celebrate,),
                 None,
                 "{motion:?} InspectError→Celebrate"
             );
@@ -6977,11 +6739,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::SitNearError,
-                    Behavior::Celebrate,
-                ),
+                visual_transition_for_motion(motion, Behavior::SitNearError, Behavior::Celebrate,),
                 None,
                 "{motion:?} SitNearError→Celebrate"
             );
@@ -7089,11 +6847,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::GuardFailure,
-                    Behavior::GuardStuck,
-                ),
+                visual_transition_for_motion(motion, Behavior::GuardFailure, Behavior::GuardStuck,),
                 None,
                 "{motion:?} GuardFailure→GuardStuck"
             );
@@ -7201,11 +6955,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::GuardStuck,
-                    Behavior::GuardFailure,
-                ),
+                visual_transition_for_motion(motion, Behavior::GuardStuck, Behavior::GuardFailure,),
                 None,
                 "{motion:?} GuardStuck→GuardFailure"
             );
@@ -7229,11 +6979,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::GuardStuck,
-                    Behavior::GuardRecovery,
-                ),
+                visual_transition_for_motion(motion, Behavior::GuardStuck, Behavior::GuardRecovery,),
                 None,
                 "{motion:?} GuardStuck→GuardRecovery"
             );
@@ -7257,11 +7003,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::GuardStuck,
-                    Behavior::GuardCautious,
-                ),
+                visual_transition_for_motion(motion, Behavior::GuardStuck, Behavior::GuardCautious,),
                 None,
                 "{motion:?} GuardStuck→GuardCautious"
             );
@@ -7285,11 +7027,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::GuardStuck,
-                    Behavior::RestAfterPush,
-                ),
+                visual_transition_for_motion(motion, Behavior::GuardStuck, Behavior::RestAfterPush,),
                 None,
                 "{motion:?} GuardStuck→RestAfterPush"
             );
@@ -7341,11 +7079,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::GuardRecovery,
-                    Behavior::GuardStuck,
-                ),
+                visual_transition_for_motion(motion, Behavior::GuardRecovery, Behavior::GuardStuck,),
                 None,
                 "{motion:?} GuardRecovery→GuardStuck"
             );
@@ -7509,11 +7243,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::GuardCautious,
-                    Behavior::GuardStuck,
-                ),
+                visual_transition_for_motion(motion, Behavior::GuardCautious, Behavior::GuardStuck,),
                 None,
                 "{motion:?} GuardCautious→GuardStuck"
             );
@@ -7593,11 +7323,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::Celebrate,
-                    Behavior::GuardRecovery,
-                ),
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::GuardRecovery,),
                 None,
                 "{motion:?} Celebrate→GuardRecovery"
             );
@@ -7621,11 +7347,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::Celebrate,
-                    Behavior::GuardCautious,
-                ),
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::GuardCautious,),
                 None,
                 "{motion:?} Celebrate→GuardCautious"
             );
@@ -7649,11 +7371,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::Celebrate,
-                    Behavior::GuardFailure,
-                ),
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::GuardFailure,),
                 None,
                 "{motion:?} Celebrate→GuardFailure"
             );
@@ -7677,11 +7395,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::Celebrate,
-                    Behavior::GuardStuck,
-                ),
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::GuardStuck,),
                 None,
                 "{motion:?} Celebrate→GuardStuck"
             );
@@ -7705,11 +7419,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::Celebrate,
-                    Behavior::RestAfterPush,
-                ),
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::RestAfterPush,),
                 None,
                 "{motion:?} Celebrate→RestAfterPush"
             );
@@ -7733,11 +7443,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::Celebrate,
-                    Behavior::InspectError,
-                ),
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::InspectError,),
                 None,
                 "{motion:?} Celebrate→InspectError"
             );
@@ -7761,11 +7467,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::Celebrate,
-                    Behavior::SitNearError,
-                ),
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::SitNearError,),
                 None,
                 "{motion:?} Celebrate→SitNearError"
             );
@@ -7873,11 +7575,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::CelebrateBig,
-                    Behavior::GuardStuck,
-                ),
+                visual_transition_for_motion(motion, Behavior::CelebrateBig, Behavior::GuardStuck,),
                 None,
                 "{motion:?} CelebrateBig→GuardStuck"
             );
@@ -8041,11 +7739,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::RestAfterPush,
-                    Behavior::Celebrate,
-                ),
+                visual_transition_for_motion(motion, Behavior::RestAfterPush, Behavior::Celebrate,),
                 None,
                 "{motion:?} RestAfterPush→Celebrate"
             );
@@ -8125,11 +7819,7 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::Celebrate,
-                    Behavior::UnknownOutcome,
-                ),
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::UnknownOutcome,),
                 None,
                 "{motion:?} Celebrate→UnknownOutcome"
             );
@@ -8163,15 +7853,6 @@ mod tests {
             );
         }
     }
-
-
-
-
-
-
-
-
-
 
     #[test]
     fn ambient_and_typing_surfaces_skip_visual_transition_arcs() {
@@ -8229,11 +7910,7 @@ mod tests {
         // holds under Full motion (open vigil / success finish land via Watch*
         // or Idle snap). Idle/Rest→Guard* is pinned in semantic_bridges; pin
         // Explore/Sleep/Approach the same way.
-        for from in [
-            Behavior::Explore,
-            Behavior::Sleep,
-            Behavior::Approach,
-        ] {
+        for from in [Behavior::Explore, Behavior::Sleep, Behavior::Approach] {
             for to in [
                 Behavior::GuardFailure,
                 Behavior::GuardStuck,
@@ -8252,11 +7929,7 @@ mod tests {
         }
         // Ambient→Inspect/Sit/Unknown/Rest stays None under Full motion too
         // (holds/rest arrive from finish/push reducers). between() stays 93.
-        for from in [
-            Behavior::Explore,
-            Behavior::Sleep,
-            Behavior::Approach,
-        ] {
+        for from in [Behavior::Explore, Behavior::Sleep, Behavior::Approach] {
             for to in [
                 Behavior::InspectError,
                 Behavior::SitNearError,

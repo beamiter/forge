@@ -4427,7 +4427,9 @@ mod tests {
     fn reload_first_chains_labeled_save_after_reload() {
         let source = include_str!("history.rs");
         let retry = source
-            .split("pub(crate) fn retry_history_persistence(self: &Rc<Self>) -> std::io::Result<()> {")
+            .split(
+                "pub(crate) fn retry_history_persistence(self: &Rc<Self>) -> std::io::Result<()> {",
+            )
             .nth(1)
             .expect("retry_history_persistence")
             .split("\n    /// Snapshot block history on the GTK thread")

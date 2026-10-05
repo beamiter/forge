@@ -859,20 +859,33 @@ fn metadata_filter_hits_with_budget<'a>(
     (hits, None)
 }
 
+/// Immutable query inputs shared by each budget slice of a pattern search.
+struct PatternSearchQuery<'a> {
+    re: &'a regex::Regex,
+    options: CrossBlockSearchOptions,
+    scope: CrossBlockSearchScope,
+    max_hits: usize,
+    filters: &'a BlockFilters,
+    bookmarks: &'a BookmarkState,
+}
+
 /// Pattern-search one budget slice starting at `resume` (or the first record).
 /// Returns new hits for this slice plus an optional cursor when the shared
 /// byte/time budget stopped the walk early.
 fn pattern_search_hits_with_budget<'a>(
     records: impl IntoIterator<Item = BackendRecordRef<'a>>,
-    re: &regex::Regex,
-    options: CrossBlockSearchOptions,
-    scope: CrossBlockSearchScope,
-    max_hits: usize,
-    filters: &BlockFilters,
-    bookmarks: &BookmarkState,
+    query: PatternSearchQuery<'_>,
     scan_budget: &mut FindScanBudget,
     resume: Option<&CrossBlockSearchCursor>,
 ) -> (Vec<CrossBlockHit>, Option<CrossBlockSearchCursor>) {
+    let PatternSearchQuery {
+        re,
+        options,
+        scope,
+        max_hits,
+        filters,
+        bookmarks,
+    } = query;
     let start_index = resume.map(|cursor| cursor.record_index).unwrap_or(0);
     let mut mid = resume.and_then(|cursor| cursor.mid.clone());
     let mut hits: Vec<CrossBlockHit> = Vec::new();
@@ -1743,12 +1756,14 @@ impl TermView {
         let mut scan_budget = FindScanBudget::for_cross_block();
         let (hits, resume) = pattern_search_hits_with_budget(
             records.iter(),
-            &re,
-            options,
-            scope,
-            max_hits,
-            filters,
-            &bookmarks,
+            PatternSearchQuery {
+                re: &re,
+                options,
+                scope,
+                max_hits,
+                filters,
+                bookmarks: &bookmarks,
+            },
             &mut scan_budget,
             resume,
         );
@@ -2014,26 +2029,25 @@ pub(super) fn clear_find_state(
 mod tests {
     use super::{
         add_snapshot_jump_fallbacks, bookmarked_search_empty_reason, bounded_match_count,
-        command_preview, cross_block_match_count, cross_block_pattern, cross_block_search_version,
-        duration_matches, focus_one_native_forward_match, has_metadata_filters,
-        matching_record_ids, metadata_filter_hits, metadata_filter_hits_with_budget,
-        metadata_record_snapshot_view,
+        command_preview, cross_block_match_count, cross_block_pattern,
+        cross_block_search_continue_is_current, cross_block_search_version, duration_matches,
+        focus_one_native_forward_match, has_metadata_filters, matching_record_ids,
+        metadata_filter_hits, metadata_filter_hits_with_budget, metadata_record_snapshot_view,
         native_cursor_action, outcome_matches_filters, pattern_search_hits_with_budget,
         plan_matching_windows, record_matches_filters, regex_consumption, snippet,
-        step_compressed_cursor, unresolved_record_target_result,
-        vte_cross_block_pattern, BookmarkedSearchEmptyReason, CrossBlockHit,
-        CrossBlockSearchOptions, CrossBlockSearchScope, FindCursor, FindDirection,
-        FindScanBudget, FindSurface, NativeCursorAction, RecordNavigationResult,
-        RecordSnapshotView, RegexConsumption, VTE_SEARCH_FLAGS,
-        cross_block_search_continue_is_current,
-    };
-    use jterm_core::cross_block_search::{
-        utf8_prefix, CROSS_BLOCK_SCAN_BYTE_LIMIT, CROSS_BLOCK_SCAN_TIME_LIMIT,
-        FIND_OVERLAY_SCAN_BYTE_LIMIT, FIND_OVERLAY_SCAN_TIME_LIMIT,
+        step_compressed_cursor, unresolved_record_target_result, vte_cross_block_pattern,
+        BookmarkedSearchEmptyReason, CrossBlockHit, CrossBlockSearchOptions, CrossBlockSearchScope,
+        FindCursor, FindDirection, FindScanBudget, FindSurface, NativeCursorAction,
+        PatternSearchQuery, RecordNavigationResult, RecordSnapshotView, RegexConsumption,
+        VTE_SEARCH_FLAGS,
     };
     use crate::block_view::{
         BackendRecordRef, BackendSearchWindow, BlockData, BlockFilters, BookmarkState,
         CompletedCommandRecord, ZoneOutputSnapshot,
+    };
+    use jterm_core::cross_block_search::{
+        utf8_prefix, CROSS_BLOCK_SCAN_BYTE_LIMIT, CROSS_BLOCK_SCAN_TIME_LIMIT,
+        FIND_OVERLAY_SCAN_BYTE_LIMIT, FIND_OVERLAY_SCAN_TIME_LIMIT,
     };
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
@@ -2437,7 +2451,7 @@ tail ab";
         assert_eq!(cross_block.remaining_bytes(), CROSS_BLOCK_SCAN_BYTE_LIMIT);
         assert_eq!(cross_block.time_limit, CROSS_BLOCK_SCAN_TIME_LIMIT);
 
-        assert!(CROSS_BLOCK_SCAN_BYTE_LIMIT > FIND_OVERLAY_SCAN_BYTE_LIMIT);
+        const { assert!(CROSS_BLOCK_SCAN_BYTE_LIMIT > FIND_OVERLAY_SCAN_BYTE_LIMIT) };
         assert!(CROSS_BLOCK_SCAN_TIME_LIMIT > FIND_OVERLAY_SCAN_TIME_LIMIT);
     }
 
@@ -4077,8 +4091,8 @@ tail ab";
     /// false for `" \t "`, so this must not collapse to the empty-query browser
     /// (`None`) or to NoRetainedBookmarks.
     #[test]
-    fn bookmarked_empty_reason_keeps_whitespace_query_no_matches_under_command_and_output_with_stale()
-    {
+    fn bookmarked_empty_reason_keeps_whitespace_query_no_matches_under_command_and_output_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -4185,8 +4199,8 @@ tail ab";
     /// with stale extras, never the empty-query browser or NoRetainedBookmarks
     /// (ASCII whitespace `" \t "` already pinned).
     #[test]
-    fn bookmarked_empty_reason_keeps_nbsp_zwsp_query_no_matches_under_command_and_output_with_stale()
-    {
+    fn bookmarked_empty_reason_keeps_nbsp_zwsp_query_no_matches_under_command_and_output_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -4246,8 +4260,8 @@ tail ab";
     /// stay `QueryNoMatches` under Command/Output with stale extras (NBSP/ZWSP
     /// already pinned).
     #[test]
-    fn bookmarked_empty_reason_keeps_wj_figure_bidi_query_no_matches_under_command_and_output_with_stale()
-    {
+    fn bookmarked_empty_reason_keeps_wj_figure_bidi_query_no_matches_under_command_and_output_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -4440,13 +4454,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -4495,13 +4503,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -4543,26 +4545,14 @@ tail ab";
             bookmarked_only: true,
             ..Default::default()
         };
-        for query in [
-            "\u{180b}",
-            "\u{180e}",
-            "\u{fe00}",
-            "\u{17b4}",
-            "\u{034f}",
-        ] {
+        for query in ["\u{180b}", "\u{180e}", "\u{fe00}", "\u{17b4}", "\u{034f}"] {
             for scope in [
                 CrossBlockSearchScope::Command,
                 CrossBlockSearchScope::Output,
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -4611,13 +4601,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -4666,20 +4650,13 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
             }
         }
     }
-
 
     /// Nesting mid-range VS / Mongolian Manchu-comma-only queries stay
     /// `QueryNoMatches` under Command/Output/All with stale extras
@@ -4722,13 +4699,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -4774,13 +4745,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -4826,13 +4791,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -4878,13 +4837,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -4930,13 +4883,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -4981,13 +4928,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -5033,13 +4974,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -5085,31 +5020,13 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
             }
         }
     }
-
-
-
-
-
-
-
-
-
-
-
-
 
     #[test]
     fn bookmarked_empty_reason_keeps_ff1a_fullwidth_colon_query_no_matches_with_stale() {
@@ -5149,13 +5066,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -5201,13 +5112,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -5253,13 +5158,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -5305,13 +5204,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -5357,13 +5250,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -5409,13 +5296,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -5461,13 +5342,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -5513,13 +5388,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -5565,13 +5434,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -5617,13 +5480,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -5669,13 +5526,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -5721,13 +5572,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -5773,13 +5618,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -5825,13 +5664,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -5877,13 +5710,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -5929,13 +5756,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -5981,13 +5802,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -6033,13 +5848,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -6085,13 +5894,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -6137,13 +5940,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -6189,13 +5986,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -6241,13 +6032,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -6293,13 +6078,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -6345,13 +6124,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -6397,13 +6170,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -6449,13 +6216,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -6501,13 +6262,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -6553,13 +6308,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -6605,13 +6354,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -6657,13 +6400,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -6709,13 +6446,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -6761,13 +6492,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -6813,13 +6538,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -6828,7 +6547,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff3b_fullwidth_left_square_bracket_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff3b_fullwidth_left_square_bracket_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -6865,13 +6585,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -6917,13 +6631,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -6932,7 +6640,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff3d_fullwidth_right_square_bracket_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff3d_fullwidth_right_square_bracket_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -6969,13 +6678,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -7021,13 +6724,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -7073,13 +6770,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -7125,13 +6816,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -7177,13 +6862,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -7229,13 +6908,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -7281,13 +6954,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -7333,13 +7000,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -7385,13 +7046,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -7437,13 +7092,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -7489,13 +7138,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -7541,13 +7184,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -7593,13 +7230,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -7645,13 +7276,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -7697,13 +7322,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -7749,13 +7368,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -7801,13 +7414,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -7853,13 +7460,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -7905,13 +7506,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -7957,13 +7552,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -8009,13 +7598,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -8061,13 +7644,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -8113,13 +7690,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -8165,13 +7736,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -8217,13 +7782,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -8269,13 +7828,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -8321,13 +7874,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -8373,13 +7920,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -8425,13 +7966,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -8477,13 +8012,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -8492,7 +8021,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff5b_fullwidth_left_curly_bracket_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff5b_fullwidth_left_curly_bracket_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -8529,13 +8059,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -8581,13 +8105,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -8596,7 +8114,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff5d_fullwidth_right_curly_bracket_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff5d_fullwidth_right_curly_bracket_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -8633,13 +8152,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -8685,13 +8198,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -8700,7 +8207,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff5f_fullwidth_left_white_parenthesis_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff5f_fullwidth_left_white_parenthesis_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -8737,13 +8245,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -8752,7 +8254,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff60_fullwidth_right_white_parenthesis_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff60_fullwidth_right_white_parenthesis_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -8789,13 +8292,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -8804,7 +8301,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff61_halfwidth_ideographic_full_stop_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff61_halfwidth_ideographic_full_stop_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -8841,13 +8339,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -8856,7 +8348,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff62_halfwidth_left_corner_bracket_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff62_halfwidth_left_corner_bracket_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -8893,13 +8386,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -8908,7 +8395,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff63_halfwidth_right_corner_bracket_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff63_halfwidth_right_corner_bracket_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -8945,13 +8433,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -8960,7 +8442,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff64_halfwidth_ideographic_comma_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff64_halfwidth_ideographic_comma_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -8997,13 +8480,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -9012,7 +8489,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff65_halfwidth_katakana_middle_dot_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff65_halfwidth_katakana_middle_dot_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -9049,13 +8527,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -9064,7 +8536,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff66_halfwidth_katakana_letter_wo_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff66_halfwidth_katakana_letter_wo_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -9101,13 +8574,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -9116,7 +8583,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff67_halfwidth_katakana_letter_small_a_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff67_halfwidth_katakana_letter_small_a_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -9153,13 +8621,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -9168,7 +8630,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff68_halfwidth_katakana_letter_small_i_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff68_halfwidth_katakana_letter_small_i_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -9205,13 +8668,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -9220,7 +8677,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff69_halfwidth_katakana_letter_small_u_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff69_halfwidth_katakana_letter_small_u_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -9257,13 +8715,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -9272,7 +8724,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff6a_halfwidth_katakana_letter_small_e_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff6a_halfwidth_katakana_letter_small_e_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -9309,13 +8762,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -9324,7 +8771,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff6b_halfwidth_katakana_letter_small_o_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff6b_halfwidth_katakana_letter_small_o_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -9361,13 +8809,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -9376,7 +8818,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff6c_halfwidth_katakana_letter_small_tu_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff6c_halfwidth_katakana_letter_small_tu_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -9413,13 +8856,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -9428,7 +8865,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff6d_halfwidth_katakana_letter_small_ya_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff6d_halfwidth_katakana_letter_small_ya_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -9465,13 +8903,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -9480,7 +8912,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff6e_halfwidth_katakana_letter_small_yu_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff6e_halfwidth_katakana_letter_small_yu_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -9517,13 +8950,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -9532,7 +8959,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff6f_halfwidth_katakana_letter_small_yo_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff6f_halfwidth_katakana_letter_small_yo_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -9569,13 +8997,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -9584,7 +9006,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff70_halfwidth_katakana_hiragana_prolonged_sound_mark_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff70_halfwidth_katakana_hiragana_prolonged_sound_mark_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -9621,13 +9044,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -9636,7 +9053,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff71_halfwidth_katakana_letter_a_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff71_halfwidth_katakana_letter_a_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -9673,13 +9091,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -9688,7 +9100,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff72_halfwidth_katakana_letter_i_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff72_halfwidth_katakana_letter_i_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -9725,13 +9138,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -9740,7 +9147,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff73_halfwidth_katakana_letter_u_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff73_halfwidth_katakana_letter_u_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -9777,13 +9185,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -9792,7 +9194,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff74_halfwidth_katakana_letter_e_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff74_halfwidth_katakana_letter_e_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -9829,13 +9232,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -9844,7 +9241,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff75_halfwidth_katakana_letter_o_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff75_halfwidth_katakana_letter_o_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -9881,13 +9279,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -9896,7 +9288,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff76_halfwidth_katakana_letter_ka_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff76_halfwidth_katakana_letter_ka_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -9933,13 +9326,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -9948,7 +9335,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff77_halfwidth_katakana_letter_ki_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff77_halfwidth_katakana_letter_ki_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -9985,13 +9373,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -10000,7 +9382,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff78_halfwidth_katakana_letter_ku_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff78_halfwidth_katakana_letter_ku_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -10037,13 +9420,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -10052,7 +9429,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff79_halfwidth_katakana_letter_ke_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff79_halfwidth_katakana_letter_ke_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -10089,13 +9467,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -10104,7 +9476,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff7a_halfwidth_katakana_letter_ko_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff7a_halfwidth_katakana_letter_ko_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -10141,13 +9514,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -10156,7 +9523,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff7b_halfwidth_katakana_letter_sa_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff7b_halfwidth_katakana_letter_sa_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -10193,13 +9561,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -10208,7 +9570,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff7c_halfwidth_katakana_letter_si_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff7c_halfwidth_katakana_letter_si_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -10245,13 +9608,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -10260,7 +9617,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff7d_halfwidth_katakana_letter_su_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff7d_halfwidth_katakana_letter_su_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -10297,13 +9655,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -10312,7 +9664,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff7e_halfwidth_katakana_letter_se_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff7e_halfwidth_katakana_letter_se_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -10349,13 +9702,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -10364,7 +9711,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff7f_halfwidth_katakana_letter_so_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff7f_halfwidth_katakana_letter_so_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -10401,13 +9749,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -10416,7 +9758,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff80_halfwidth_katakana_letter_ta_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff80_halfwidth_katakana_letter_ta_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -10453,13 +9796,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -10468,7 +9805,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff81_halfwidth_katakana_letter_ti_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff81_halfwidth_katakana_letter_ti_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -10505,13 +9843,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -10520,7 +9852,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff82_halfwidth_katakana_letter_tu_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff82_halfwidth_katakana_letter_tu_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -10557,13 +9890,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -10572,7 +9899,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff83_halfwidth_katakana_letter_te_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff83_halfwidth_katakana_letter_te_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -10609,13 +9937,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -10624,7 +9946,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff84_halfwidth_katakana_letter_to_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff84_halfwidth_katakana_letter_to_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -10661,13 +9984,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -10676,7 +9993,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff85_halfwidth_katakana_letter_na_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff85_halfwidth_katakana_letter_na_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -10713,13 +10031,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -10728,7 +10040,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff86_halfwidth_katakana_letter_ni_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff86_halfwidth_katakana_letter_ni_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -10765,13 +10078,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -10780,7 +10087,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff87_halfwidth_katakana_letter_nu_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff87_halfwidth_katakana_letter_nu_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -10817,13 +10125,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -10832,7 +10134,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff88_halfwidth_katakana_letter_ne_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff88_halfwidth_katakana_letter_ne_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -10869,13 +10172,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -10884,7 +10181,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff89_halfwidth_katakana_letter_no_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff89_halfwidth_katakana_letter_no_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -10921,13 +10219,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -10936,7 +10228,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff8a_halfwidth_katakana_letter_ha_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff8a_halfwidth_katakana_letter_ha_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -10973,13 +10266,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -10988,7 +10275,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff8b_halfwidth_katakana_letter_hi_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff8b_halfwidth_katakana_letter_hi_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -11025,13 +10313,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -11040,7 +10322,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff8c_halfwidth_katakana_letter_hu_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff8c_halfwidth_katakana_letter_hu_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -11077,13 +10360,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -11092,7 +10369,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff8d_halfwidth_katakana_letter_he_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff8d_halfwidth_katakana_letter_he_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -11129,13 +10407,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -11144,7 +10416,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff8e_halfwidth_katakana_letter_ho_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff8e_halfwidth_katakana_letter_ho_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -11181,13 +10454,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -11196,7 +10463,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff8f_halfwidth_katakana_letter_ma_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff8f_halfwidth_katakana_letter_ma_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -11233,13 +10501,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -11248,7 +10510,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff90_halfwidth_katakana_letter_mi_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff90_halfwidth_katakana_letter_mi_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -11285,13 +10548,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -11300,7 +10557,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff91_halfwidth_katakana_letter_mu_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff91_halfwidth_katakana_letter_mu_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -11337,13 +10595,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -11352,7 +10604,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff92_halfwidth_katakana_letter_me_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff92_halfwidth_katakana_letter_me_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -11389,13 +10642,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -11404,7 +10651,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff93_halfwidth_katakana_letter_mo_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff93_halfwidth_katakana_letter_mo_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -11441,13 +10689,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -11456,7 +10698,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff94_halfwidth_katakana_letter_ya_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff94_halfwidth_katakana_letter_ya_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -11493,13 +10736,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -11508,7 +10745,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff95_halfwidth_katakana_letter_yu_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff95_halfwidth_katakana_letter_yu_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -11545,13 +10783,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -11560,7 +10792,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff96_halfwidth_katakana_letter_yo_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff96_halfwidth_katakana_letter_yo_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -11597,13 +10830,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -11612,7 +10839,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff97_halfwidth_katakana_letter_small_tsu_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff97_halfwidth_katakana_letter_small_tsu_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -11649,13 +10877,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -11664,7 +10886,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff98_halfwidth_katakana_letter_ta_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff98_halfwidth_katakana_letter_ta_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -11701,13 +10924,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -11716,7 +10933,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff99_halfwidth_katakana_letter_chi_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff99_halfwidth_katakana_letter_chi_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -11753,13 +10971,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -11768,7 +10980,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff9a_halfwidth_katakana_letter_tsu_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff9a_halfwidth_katakana_letter_tsu_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -11805,13 +11018,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -11820,7 +11027,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff9b_halfwidth_katakana_letter_te_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff9b_halfwidth_katakana_letter_te_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -11857,13 +11065,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -11872,7 +11074,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff9c_halfwidth_katakana_letter_to_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff9c_halfwidth_katakana_letter_to_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -11909,13 +11112,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -11924,7 +11121,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff9d_halfwidth_katakana_letter_na_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff9d_halfwidth_katakana_letter_na_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -11961,13 +11159,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -11976,7 +11168,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff9e_halfwidth_katakana_letter_ni_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff9e_halfwidth_katakana_letter_ni_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -12013,13 +11206,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -12028,7 +11215,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ff9f_halfwidth_katakana_letter_nu_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ff9f_halfwidth_katakana_letter_nu_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -12065,13 +11253,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -12117,13 +11299,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -12132,7 +11308,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ffa1_halfwidth_hangul_letter_kiyeok_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffa1_halfwidth_hangul_letter_kiyeok_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -12169,13 +11346,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -12184,7 +11355,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ffa2_halfwidth_hangul_letter_ssangkiyeok_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffa2_halfwidth_hangul_letter_ssangkiyeok_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -12221,13 +11393,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -12236,7 +11402,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ffa3_halfwidth_hangul_letter_kiyeok_sios_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffa3_halfwidth_hangul_letter_kiyeok_sios_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -12273,13 +11440,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -12288,7 +11449,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ffa4_halfwidth_hangul_letter_nieun_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffa4_halfwidth_hangul_letter_nieun_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -12325,13 +11487,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -12340,7 +11496,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ffa5_halfwidth_hangul_letter_nieun_cieuc_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffa5_halfwidth_hangul_letter_nieun_cieuc_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -12377,13 +11534,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -12392,7 +11543,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ffa6_halfwidth_hangul_letter_nieun_hieuh_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffa6_halfwidth_hangul_letter_nieun_hieuh_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -12429,13 +11581,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -12444,7 +11590,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ffa7_halfwidth_hangul_letter_tikeut_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffa7_halfwidth_hangul_letter_tikeut_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -12481,13 +11628,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -12496,7 +11637,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ffa8_halfwidth_hangul_letter_ssangtikeut_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffa8_halfwidth_hangul_letter_ssangtikeut_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -12533,13 +11675,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -12548,7 +11684,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ffa9_halfwidth_hangul_letter_tikeut_sios_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffa9_halfwidth_hangul_letter_tikeut_sios_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -12585,13 +11722,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -12600,7 +11731,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ffaa_halfwidth_hangul_letter_rieul_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffaa_halfwidth_hangul_letter_rieul_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -12637,13 +11769,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -12652,7 +11778,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ffab_halfwidth_hangul_letter_rieul_kiyeok_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffab_halfwidth_hangul_letter_rieul_kiyeok_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -12689,13 +11816,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -12704,7 +11825,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ffac_halfwidth_hangul_letter_rieul_mieum_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffac_halfwidth_hangul_letter_rieul_mieum_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -12741,13 +11863,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -12756,7 +11872,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ffad_halfwidth_hangul_letter_rieul_pieup_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffad_halfwidth_hangul_letter_rieul_pieup_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -12793,13 +11910,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -12808,7 +11919,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ffae_halfwidth_hangul_letter_rieul_sios_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffae_halfwidth_hangul_letter_rieul_sios_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -12845,13 +11957,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -12860,7 +11966,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ffaf_halfwidth_hangul_letter_rieul_thieuth_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffaf_halfwidth_hangul_letter_rieul_thieuth_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -12897,13 +12004,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -12912,7 +12013,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ffb0_halfwidth_hangul_letter_rieul_phieuph_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffb0_halfwidth_hangul_letter_rieul_phieuph_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -12949,13 +12051,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -12964,7 +12060,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ffb1_halfwidth_hangul_letter_rieul_hieuh_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffb1_halfwidth_hangul_letter_rieul_hieuh_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -13001,13 +12098,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -13016,7 +12107,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ffb2_halfwidth_hangul_letter_mieum_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffb2_halfwidth_hangul_letter_mieum_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -13053,13 +12145,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -13068,7 +12154,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ffb3_halfwidth_hangul_letter_pieup_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffb3_halfwidth_hangul_letter_pieup_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -13105,13 +12192,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -13120,7 +12201,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_ffb4_halfwidth_hangul_letter_ssangpieup_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffb4_halfwidth_hangul_letter_ssangpieup_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -13157,13 +12239,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -13172,8 +12248,8 @@ tail ab";
     }
 
     #[test]
-    #[test]
-    fn bookmarked_empty_reason_keeps_ffb5_halfwidth_hangul_letter_pieup_sios_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffb5_halfwidth_hangul_letter_pieup_sios_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -13210,13 +12286,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -13225,8 +12295,8 @@ tail ab";
     }
 
     #[test]
-    #[test]
-    fn bookmarked_empty_reason_keeps_ffb6_halfwidth_hangul_letter_sios_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffb6_halfwidth_hangul_letter_sios_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -13263,13 +12333,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -13278,8 +12342,8 @@ tail ab";
     }
 
     #[test]
-    #[test]
-    fn bookmarked_empty_reason_keeps_ffb7_halfwidth_hangul_letter_ssangsios_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffb7_halfwidth_hangul_letter_ssangsios_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -13316,13 +12380,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -13331,8 +12389,8 @@ tail ab";
     }
 
     #[test]
-    #[test]
-    fn bookmarked_empty_reason_keeps_ffb8_halfwidth_hangul_letter_ieung_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffb8_halfwidth_hangul_letter_ieung_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -13369,13 +12427,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -13384,8 +12436,8 @@ tail ab";
     }
 
     #[test]
-    #[test]
-    fn bookmarked_empty_reason_keeps_ffb9_halfwidth_hangul_letter_cieuc_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffb9_halfwidth_hangul_letter_cieuc_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -13422,13 +12474,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -13437,8 +12483,8 @@ tail ab";
     }
 
     #[test]
-    #[test]
-    fn bookmarked_empty_reason_keeps_ffba_halfwidth_hangul_letter_ssangcieuc_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffba_halfwidth_hangul_letter_ssangcieuc_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -13475,13 +12521,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -13490,8 +12530,8 @@ tail ab";
     }
 
     #[test]
-    #[test]
-    fn bookmarked_empty_reason_keeps_ffbb_halfwidth_hangul_letter_chieuch_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffbb_halfwidth_hangul_letter_chieuch_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -13528,13 +12568,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -13543,8 +12577,8 @@ tail ab";
     }
 
     #[test]
-    #[test]
-    fn bookmarked_empty_reason_keeps_ffbc_halfwidth_hangul_letter_khieukh_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffbc_halfwidth_hangul_letter_khieukh_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -13581,13 +12615,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -13596,8 +12624,8 @@ tail ab";
     }
 
     #[test]
-    #[test]
-    fn bookmarked_empty_reason_keeps_ffbd_halfwidth_hangul_letter_thieuth_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffbd_halfwidth_hangul_letter_thieuth_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -13634,13 +12662,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -13649,8 +12671,8 @@ tail ab";
     }
 
     #[test]
-    #[test]
-    fn bookmarked_empty_reason_keeps_ffbe_halfwidth_hangul_letter_phieuph_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffbe_halfwidth_hangul_letter_phieuph_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -13687,13 +12709,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -13702,8 +12718,8 @@ tail ab";
     }
 
     #[test]
-    #[test]
-    fn bookmarked_empty_reason_keeps_ffbf_halfwidth_hangul_letter_hieuh_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffbf_halfwidth_hangul_letter_hieuh_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -13740,13 +12756,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -13754,7 +12764,6 @@ tail ab";
         }
     }
 
-    #[test]
     #[test]
     fn bookmarked_empty_reason_keeps_ffe0_halfwidth_cent_sign_query_no_matches_with_stale() {
         let retained = CompletedCommandRecord {
@@ -13793,13 +12802,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -13807,7 +12810,6 @@ tail ab";
         }
     }
 
-    #[test]
     #[test]
     fn bookmarked_empty_reason_keeps_ffe1_halfwidth_pound_sign_query_no_matches_with_stale() {
         let retained = CompletedCommandRecord {
@@ -13846,13 +12848,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -13860,7 +12856,6 @@ tail ab";
         }
     }
 
-    #[test]
     #[test]
     fn bookmarked_empty_reason_keeps_ffe2_halfwidth_yen_sign_query_no_matches_with_stale() {
         let retained = CompletedCommandRecord {
@@ -13899,13 +12894,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -13913,7 +12902,6 @@ tail ab";
         }
     }
 
-    #[test]
     #[test]
     fn bookmarked_empty_reason_keeps_ffe3_halfwidth_macron_query_no_matches_with_stale() {
         let retained = CompletedCommandRecord {
@@ -13952,13 +12940,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -13966,7 +12948,6 @@ tail ab";
         }
     }
 
-    #[test]
     #[test]
     fn bookmarked_empty_reason_keeps_ffe4_halfwidth_broken_bar_query_no_matches_with_stale() {
         let retained = CompletedCommandRecord {
@@ -14005,13 +12986,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -14019,7 +12994,6 @@ tail ab";
         }
     }
 
-    #[test]
     #[test]
     fn bookmarked_empty_reason_keeps_ffe5_halfwidth_won_sign_query_no_matches_with_stale() {
         let retained = CompletedCommandRecord {
@@ -14058,13 +13032,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -14073,8 +13041,8 @@ tail ab";
     }
 
     #[test]
-    #[test]
-    fn bookmarked_empty_reason_keeps_ffe6_halfwidth_double_vertical_line_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffe6_halfwidth_double_vertical_line_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -14111,13 +13079,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -14126,8 +13088,8 @@ tail ab";
     }
 
     #[test]
-    #[test]
-    fn bookmarked_empty_reason_keeps_ffe8_halfwidth_forms_light_vertical_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffe8_halfwidth_forms_light_vertical_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -14164,13 +13126,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -14178,7 +13134,6 @@ tail ab";
         }
     }
 
-    #[test]
     #[test]
     fn bookmarked_empty_reason_keeps_ffe9_halfwidth_forms_light_down_query_no_matches_with_stale() {
         let retained = CompletedCommandRecord {
@@ -14217,13 +13172,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -14231,7 +13180,6 @@ tail ab";
         }
     }
 
-    #[test]
     #[test]
     fn bookmarked_empty_reason_keeps_ffea_halfwidth_forms_light_up_query_no_matches_with_stale() {
         let retained = CompletedCommandRecord {
@@ -14270,13 +13218,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -14284,7 +13226,6 @@ tail ab";
         }
     }
 
-    #[test]
     #[test]
     fn bookmarked_empty_reason_keeps_ffeb_halfwidth_forms_light_left_query_no_matches_with_stale() {
         let retained = CompletedCommandRecord {
@@ -14323,13 +13264,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -14338,8 +13273,8 @@ tail ab";
     }
 
     #[test]
-    #[test]
-    fn bookmarked_empty_reason_keeps_ffec_halfwidth_forms_light_right_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_ffec_halfwidth_forms_light_right_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -14376,13 +13311,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -14428,13 +13357,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -14480,13 +13403,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -14495,7 +13412,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_fff9_interlinear_annotation_anchor_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_fff9_interlinear_annotation_anchor_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -14532,13 +13450,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -14547,7 +13459,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_fffa_interlinear_annotation_separator_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_fffa_interlinear_annotation_separator_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -14584,13 +13497,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -14599,7 +13506,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_fffb_interlinear_annotation_terminator_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_fffb_interlinear_annotation_terminator_query_no_matches_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -14636,13 +13544,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -14651,7 +13553,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_fffc_object_replacement_character_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_fffc_object_replacement_character_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -14688,13 +13591,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -14740,13 +13637,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -14792,13 +13683,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -14844,13 +13729,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -14896,13 +13775,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -14948,13 +13821,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -15000,13 +13867,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -15015,7 +13876,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_u10005_linear_b_syllable_b010_da_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_u10005_linear_b_syllable_b010_da_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -15052,13 +13914,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -15067,7 +13923,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_u10006_linear_b_syllable_b007_de_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_u10006_linear_b_syllable_b007_de_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -15104,13 +13961,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -15119,7 +13970,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_u10007_linear_b_syllable_b011_di_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_u10007_linear_b_syllable_b011_di_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -15156,13 +14008,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -15171,7 +14017,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_u10008_linear_b_syllable_b012_do_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_u10008_linear_b_syllable_b012_do_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -15208,13 +14055,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -15223,7 +14064,8 @@ tail ab";
     }
 
     #[test]
-    fn bookmarked_empty_reason_keeps_u10009_linear_b_syllable_b013_du_query_no_matches_with_stale() {
+    fn bookmarked_empty_reason_keeps_u10009_linear_b_syllable_b013_du_query_no_matches_with_stale()
+    {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -15260,13 +14102,7 @@ tail ab";
                 CrossBlockSearchScope::All,
             ] {
                 assert_eq!(
-                    bookmarked_search_empty_reason(
-                        records,
-                        query,
-                        scope,
-                        &filters,
-                        &bookmarks,
-                    ),
+                    bookmarked_search_empty_reason(records, query, scope, &filters, &bookmarks,),
                     Some(BookmarkedSearchEmptyReason::QueryNoMatches),
                     "{query:?} {scope:?} must stay no-matches beside stale"
                 );
@@ -15797,11 +14633,7 @@ tail ab";
                 scan_incomplete = true;
                 break;
             }
-            if !record_matches_filters(
-                record,
-                &BlockFilters::default(),
-                false,
-            ) {
+            if !record_matches_filters(record, &BlockFilters::default(), false) {
                 continue;
             }
             let command = record.command();
@@ -16046,12 +14878,14 @@ tail ab";
         };
         let (first_hits, first_resume) = pattern_search_hits_with_budget(
             backend_records.iter().copied(),
-            &re,
-            options,
-            CrossBlockSearchScope::Command,
-            8,
-            &BlockFilters::default(),
-            &BookmarkState::default(),
+            PatternSearchQuery {
+                re: &re,
+                options,
+                scope: CrossBlockSearchScope::Command,
+                max_hits: 8,
+                filters: &BlockFilters::default(),
+                bookmarks: &BookmarkState::default(),
+            },
             &mut first_budget,
             None,
         );
@@ -16067,12 +14901,14 @@ tail ab";
         };
         let (rest_hits, rest_resume) = pattern_search_hits_with_budget(
             backend_records.iter().copied(),
-            &re,
-            options,
-            CrossBlockSearchScope::Command,
-            8,
-            &BlockFilters::default(),
-            &BookmarkState::default(),
+            PatternSearchQuery {
+                re: &re,
+                options,
+                scope: CrossBlockSearchScope::Command,
+                max_hits: 8,
+                filters: &BlockFilters::default(),
+                bookmarks: &BookmarkState::default(),
+            },
             &mut second_budget,
             Some(&resume),
         );
@@ -16176,7 +15012,11 @@ tail ab";
         assert!(!cross_block_search_continue_is_current(0, u64::MAX, false));
         // Finished walk at the wrap generation itself (MAX,MAX,no resume) —
         // pairs core cancel edge catch-up beside MAX→0 schedule bump.
-        assert!(!cross_block_search_continue_is_current(u64::MAX, u64::MAX, false));
+        assert!(!cross_block_search_continue_is_current(
+            u64::MAX,
+            u64::MAX,
+            false
+        ));
         // Near-wrap bump (MAX-1→MAX) cancels with a resume — non-wrapping
         // sibling of the MAX→0 schedule bump (pairs core cancel edge).
         let near_wrap = u64::MAX.wrapping_sub(1);
@@ -16184,21 +15024,31 @@ tail ab";
             near_wrap, near_wrap, true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_wrap, u64::MAX, true
+            near_wrap,
+            u64::MAX,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_wrap, u64::MAX, false
+            near_wrap,
+            u64::MAX,
+            false
         ));
         assert!(cross_block_search_continue_is_current(
-            u64::MAX, u64::MAX, true
+            u64::MAX,
+            u64::MAX,
+            true
         ));
         // Scheduled ahead at the near-wrap boundary (MAX vs MAX-1) cancels —
         // pairs core cancel edge beside the MAX-1→MAX bump.
         assert!(!cross_block_search_continue_is_current(
-            u64::MAX, near_wrap, true
+            u64::MAX,
+            near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            u64::MAX, near_wrap, false
+            u64::MAX,
+            near_wrap,
+            false
         ));
         // Finished walk at the near-wrap generation itself (MAX-1,MAX-1,no
         // resume) cancels like MAX,MAX finished — beside the MAX-1→MAX bump.
@@ -16209,364 +15059,558 @@ tail ab";
         // earlier than the MAX-1→MAX sibling (pairs core cancel edge).
         let near_near_wrap = near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_wrap, near_near_wrap, true
+            near_near_wrap,
+            near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_wrap, near_wrap, true
+            near_near_wrap,
+            near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_wrap, near_wrap, false
+            near_near_wrap,
+            near_wrap,
+            false
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_wrap, near_near_wrap, true
+            near_wrap,
+            near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_wrap, near_near_wrap, false
+            near_wrap,
+            near_near_wrap,
+            false
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_wrap, near_near_wrap, false
+            near_near_wrap,
+            near_near_wrap,
+            false
         ));
         // Near-near-near-wrap bump (MAX-3→MAX-2) cancels with a resume — one
         // step earlier than the MAX-2→MAX-1 sibling.
         let near_near_near_wrap = near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_wrap, near_near_near_wrap, true
+            near_near_near_wrap,
+            near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_wrap, near_near_wrap, true
+            near_near_near_wrap,
+            near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_wrap, near_near_wrap, false
+            near_near_near_wrap,
+            near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-wrap boundary (MAX-2 vs MAX-3).
         assert!(!cross_block_search_continue_is_current(
-            near_near_wrap, near_near_near_wrap, true
+            near_near_wrap,
+            near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_wrap, near_near_near_wrap, false
+            near_near_wrap,
+            near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_wrap, near_near_near_wrap, false
+            near_near_near_wrap,
+            near_near_near_wrap,
+            false
         ));
         // Near-near-near-near-wrap bump (MAX-4→MAX-3) cancels with a resume —
         // one step earlier than the MAX-3→MAX-2 sibling.
         let near_near_near_near_wrap = near_near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_wrap, near_near_near_near_wrap, true
+            near_near_near_near_wrap,
+            near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_wrap, near_near_near_wrap, true
+            near_near_near_near_wrap,
+            near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_wrap, near_near_near_wrap, false
+            near_near_near_near_wrap,
+            near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-wrap boundary (MAX-3 vs MAX-4).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_wrap, near_near_near_near_wrap, true
+            near_near_near_wrap,
+            near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_wrap, near_near_near_near_wrap, false
+            near_near_near_wrap,
+            near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_wrap, near_near_near_near_wrap, false
+            near_near_near_near_wrap,
+            near_near_near_near_wrap,
+            false
         ));
         // Near-near-near-near-near-wrap bump (MAX-5→MAX-4) cancels with a
         // resume — one step earlier than the MAX-4→MAX-3 sibling.
         let near_near_near_near_near_wrap = near_near_near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_near_wrap, near_near_near_near_near_wrap, true
+            near_near_near_near_near_wrap,
+            near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_wrap, near_near_near_near_wrap, true
+            near_near_near_near_near_wrap,
+            near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_wrap, near_near_near_near_wrap, false
+            near_near_near_near_near_wrap,
+            near_near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-near-wrap boundary
         // (MAX-4 vs MAX-5).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_wrap, near_near_near_near_near_wrap, true
+            near_near_near_near_wrap,
+            near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_wrap, near_near_near_near_near_wrap, false
+            near_near_near_near_wrap,
+            near_near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_wrap, near_near_near_near_near_wrap, false
+            near_near_near_near_near_wrap,
+            near_near_near_near_near_wrap,
+            false
         ));
         // Near-near-near-near-near-near-wrap bump (MAX-6→MAX-5) cancels with a
         // resume — one step earlier than the MAX-5→MAX-4 sibling.
         let near_near_near_near_near_near_wrap = near_near_near_near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_near_near_wrap, near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_wrap, near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_wrap,
+            near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_wrap, near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_wrap,
+            near_near_near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-near-near-wrap boundary
         // (MAX-5 vs MAX-6).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_wrap, near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_wrap,
+            near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_wrap, near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_wrap,
+            near_near_near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_wrap, near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_wrap,
+            false
         ));
 
         // Near-near-near-near-near-near-near-wrap bump (MAX-7→MAX-6) cancels with a
         // resume — one step earlier than the MAX-6→MAX-5 sibling.
-        let near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_wrap.wrapping_sub(1);
+        let near_near_near_near_near_near_near_wrap =
+            near_near_near_near_near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-near-near-near-wrap boundary
         // (MAX-6 vs MAX-7).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_wrap,
+            false
         ));
 
         // Near-near-near-near-near-near-near-near-wrap bump (MAX-8→MAX-7) cancels with a
         // resume — one step earlier than the MAX-7→MAX-6 sibling.
-        let near_near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_near_wrap.wrapping_sub(1);
+        let near_near_near_near_near_near_near_near_wrap =
+            near_near_near_near_near_near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-near-near-near-near-wrap boundary
         // (MAX-7 vs MAX-8).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_wrap,
+            false
         ));
 
         // Near-near-near-near-near-near-near-near-near-wrap bump (MAX-9→MAX-8) cancels with a
         // resume — one step earlier than the MAX-8→MAX-7 sibling.
-        let near_near_near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
+        let near_near_near_near_near_near_near_near_near_wrap =
+            near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-near-near-near-near-near-wrap boundary
         // (MAX-8 vs MAX-9).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
 
         // Near-near-near-near-near-near-near-near-near-near-wrap bump (MAX-10→MAX-9) cancels with a
         // resume — one step earlier than the MAX-9→MAX-8 sibling.
-        let near_near_near_near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
+        let near_near_near_near_near_near_near_near_near_near_wrap =
+            near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-near-near-near-near-near-near-wrap boundary
         // (MAX-9 vs MAX-10).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-near-near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Near-near-near-near-near-near-near-near-near-near-near-wrap bump (MAX-11→MAX-10) cancels with a
         // resume — one step earlier than the MAX-10→MAX-9 sibling.
-        let near_near_near_near_near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
+        let near_near_near_near_near_near_near_near_near_near_near_wrap =
+            near_near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-near-near-near-near-near-near-near-wrap boundary
         // (MAX-10 vs MAX-11).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-near-near-near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Near-near-near-near-near-near-near-near-near-near-near-near-wrap bump (MAX-12→MAX-11) cancels with a
         // resume — one step earlier than the MAX-11→MAX-10 sibling.
-        let near_near_near_near_near_near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
+        let near_near_near_near_near_near_near_near_near_near_near_near_wrap =
+            near_near_near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-near-near-near-near-near-near-near-near-wrap boundary
         // (MAX-11 vs MAX-12).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-near-near-near-near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Near-near-near-near-near-near-near-near-near-near-near-near-near-wrap bump (MAX-13→MAX-12) cancels with a
         // resume — one step earlier than the MAX-12→MAX-11 sibling.
-        let near_near_near_near_near_near_near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
+        let near_near_near_near_near_near_near_near_near_near_near_near_near_wrap =
+            near_near_near_near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-near-near-near-near-near-near-near-near-near-wrap boundary
         // (MAX-12 vs MAX-13).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-near-near-near-near-near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Near-near-near-near-near-near-near-near-near-near-near-near-near-near-wrap bump (MAX-14→MAX-13) cancels with a
         // resume — one step earlier than the MAX-13→MAX-12 sibling.
-        let near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
+        let near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap =
+            near_near_near_near_near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-near-near-near-near-near-near-near-near-near-near-wrap boundary
         // (MAX-13 vs MAX-14).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-near-near-near-near-near-near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-wrap bump (MAX-15→MAX-14) cancels with a
         // resume — one step earlier than the MAX-14→MAX-13 sibling.
-        let near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
+        let near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap =
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap
+                .wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-wrap boundary
         // (MAX-14 vs MAX-15).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-wrap bump (MAX-16→MAX-15) cancels with a
         // resume — one step earlier than the MAX-15→MAX-14 sibling.
-        let near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
+        let near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap =
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap
+                .wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-wrap boundary
         // (MAX-15 vs MAX-16).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-near-wrap bump (MAX-17→MAX-16) cancels with a
         // resume — one step earlier than the MAX-16→MAX-15 sibling.
-        let near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
+        let near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap =
+            near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap
+                .wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
             near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
         ));
@@ -21183,12 +20227,14 @@ tail ab";
         };
         let (first_hits, first_resume) = pattern_search_hits_with_budget(
             backend.iter().copied(),
-            &re,
-            options,
-            CrossBlockSearchScope::Command,
-            8,
-            &BlockFilters::default(),
-            &BookmarkState::default(),
+            PatternSearchQuery {
+                re: &re,
+                options,
+                scope: CrossBlockSearchScope::Command,
+                max_hits: 8,
+                filters: &BlockFilters::default(),
+                bookmarks: &BookmarkState::default(),
+            },
             &mut first_budget,
             None,
         );
@@ -21213,12 +20259,14 @@ tail ab";
         };
         let (rest_hits, rest_resume) = pattern_search_hits_with_budget(
             backend.iter().copied(),
-            &re,
-            options,
-            CrossBlockSearchScope::Command,
-            8,
-            &filters,
-            &BookmarkState::default(),
+            PatternSearchQuery {
+                re: &re,
+                options,
+                scope: CrossBlockSearchScope::Command,
+                max_hits: 8,
+                filters: &filters,
+                bookmarks: &BookmarkState::default(),
+            },
             &mut second_budget,
             Some(&resume),
         );
@@ -21261,12 +20309,14 @@ tail ab";
         };
         let (first_hits, first_resume) = pattern_search_hits_with_budget(
             backend.iter().copied(),
-            &re,
-            options,
-            CrossBlockSearchScope::All,
-            8,
-            &BlockFilters::default(),
-            &BookmarkState::default(),
+            PatternSearchQuery {
+                re: &re,
+                options,
+                scope: CrossBlockSearchScope::All,
+                max_hits: 8,
+                filters: &BlockFilters::default(),
+                bookmarks: &BookmarkState::default(),
+            },
             &mut first_budget,
             None,
         );
@@ -21285,12 +20335,14 @@ tail ab";
         };
         let (rest_hits, rest_resume) = pattern_search_hits_with_budget(
             backend.iter().copied(),
-            &re,
-            options,
-            CrossBlockSearchScope::All,
-            8,
-            &BlockFilters::default(),
-            &BookmarkState::default(),
+            PatternSearchQuery {
+                re: &re,
+                options,
+                scope: CrossBlockSearchScope::All,
+                max_hits: 8,
+                filters: &BlockFilters::default(),
+                bookmarks: &BookmarkState::default(),
+            },
             &mut second_budget,
             Some(&resume),
         );
@@ -21322,7 +20374,7 @@ tail ab";
         let finished = CrossBlockSearchReport::finished(vec![hit.clone()]);
         assert!(!finished.scan_incomplete);
         assert!(finished.resume.is_none());
-        assert_eq!(finished.hits, [hit.clone()]);
+        assert_eq!(finished.hits.as_slice(), std::slice::from_ref(&hit));
 
         let resume = CrossBlockSearchCursor {
             record_index: 4,
