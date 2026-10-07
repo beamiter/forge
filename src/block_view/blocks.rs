@@ -4817,6 +4817,19 @@ mod tests {
     fn block_actions_remain_discoverable_without_hover() {
         use gtk4::prelude::*;
         gtk4::init().expect("gtk init");
+        let config = crate::config::Config::safe_defaults();
+        let view = super::super::TermView::new_with_spawner(
+            &config,
+            &crate::config::TerminalMode::Block,
+            &["sh".to_string()],
+            None,
+            None,
+            &[],
+            |_argv, _cwd, _env, _token| {
+                crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Other)
+            },
+        )
+        .expect("a Block pane over a test PTY");
         let card = super::FinishedBlock::new(
             1,
             "$ ",
@@ -4824,12 +4837,15 @@ mod tests {
             None,
             "ok\r\n",
             Some(0),
-            &crate::config::Config::safe_defaults(),
+            &config,
             Some(5),
             None,
             None,
             80,
         );
+        // Mount real pane actions rather than leaving block.show-menu
+        // unresolved, which makes GTK disable the permanent More button.
+        view.mount_rebuilt_block(&card);
         let mut child = card.header_row.first_child();
         let mut more = None;
         while let Some(widget) = child {
