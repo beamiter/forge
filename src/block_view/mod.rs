@@ -4049,7 +4049,12 @@ impl BlockBackend {
         let long_output_for_menu = long_output;
         let block_data_for_export = self.block_data_for_cb.clone();
         let block_scroll_for_menu = self.block_scroll_rc.downgrade();
-        right_click.connect_pressed(move |gesture, _n_press, x, y| {
+        let open_popover = Rc::new(RefCell::new(glib::WeakRef::<gtk4::Popover>::new()));
+        let open_menu: Rc<dyn Fn(f64, f64)> = Rc::new(move |x, y| {
+            if let Some(popover) = open_popover.borrow().upgrade() {
+                popover.popup();
+                return;
+            }
             let Some(finished_blocks) = finished_blocks_for_menu.upgrade() else {
                 return;
             };
@@ -4059,7 +4064,6 @@ impl BlockBackend {
             let Some(finished_widget) = finished_widget_for_menu.upgrade() else {
                 return;
             };
-            gesture.set_state(gtk4::EventSequenceState::Claimed);
             {
                 let finished = finished_blocks.borrow();
                 clear_vte_text_selections(&finished, &vte_for_copy);
@@ -4073,6 +4077,7 @@ impl BlockBackend {
             }
 
             let popover = gtk4::Popover::new();
+            *open_popover.borrow_mut() = popover.downgrade();
             popover.set_parent(&finished_widget);
             popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             popover.set_has_arrow(false);
@@ -4560,6 +4565,53 @@ impl BlockBackend {
                 });
                 vbox.append(&item);
             }
+            if finished_blocks
+                .borrow()
+                .iter()
+                .any(|block| block.id == block_id && block.can_collapse)
+            {
+                let collapsed = finished_blocks
+                    .borrow()
+                    .iter()
+                    .find(|block| block.id == block_id)
+                    .is_some_and(FinishedBlock::is_collapsed);
+                let item = make_item(if collapsed {
+                    "Show Output"
+                } else {
+                    "Hide Output"
+                });
+                let popover_c = popover.downgrade();
+                let finished = finished_blocks_for_menu.clone();
+                item.connect_clicked(move |_| {
+                    popdown_if_alive(&popover_c);
+                    if let Some(finished) = finished.upgrade() {
+                        if let Some(block) = finished.borrow().iter().find(|b| b.id == block_id) {
+                            block.set_collapsed(!block.is_collapsed());
+                        }
+                    }
+                });
+                vbox.append(&item);
+            }
+            if let Some(block) = finished_blocks.borrow().iter().find(|b| b.id == block_id) {
+                if block.expand_btn.is_visible() {
+                    let item = make_item(
+                        block
+                            .expand_btn
+                            .tooltip_text()
+                            .as_deref()
+                            .unwrap_or("Expand block"),
+                    );
+                    let expand = block.expand_btn.downgrade();
+                    let popover_c = popover.downgrade();
+                    item.connect_clicked(move |_| {
+                        popdown_if_alive(&popover_c);
+                        if let Some(expand) = expand.upgrade() {
+                            expand.emit_clicked();
+                        }
+                    });
+                    vbox.append(&item);
+                }
+            }
             {
                 let item = make_item("Toggle Output Filter");
                 let popover_c = popover.downgrade();
@@ -4681,13 +4733,42 @@ impl BlockBackend {
                 vbox.append(&item);
             }
 
-            popover.set_child(Some(&vbox));
+            // Long action lists must remain usable on short windows and
+            // enlarged fonts; scrolling never changes the terminal geometry.
+            let menu_scroll = gtk4::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk4::PolicyType::Never)
+                .vscrollbar_policy(gtk4::PolicyType::Automatic)
+                .propagate_natural_height(true)
+                .max_content_height(420)
+                .child(&vbox)
+                .build();
+            popover.set_child(Some(&menu_scroll));
+            let slot = open_popover.clone();
             popover.connect_closed(move |p| {
+                slot.borrow_mut().set(None);
                 p.unparent();
             });
             popover.popup();
         });
+        let open_from_pointer = open_menu.clone();
+        right_click.connect_pressed(move |gesture, _, x, y| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            open_from_pointer(x, y);
+        });
         finished_widget.add_controller(right_click);
+
+        // This action group belongs to the card, so restored and undo-created
+        // cards get exactly the same menu and execution gates as new ones.
+        let actions = gtk4::gio::SimpleActionGroup::new();
+        let show_menu = gtk4::gio::SimpleAction::new("show-menu", None);
+        let card = finished_widget.downgrade();
+        show_menu.connect_activate(move |_, _| {
+            if let Some(card) = card.upgrade() {
+                open_menu(f64::from(card.width().saturating_sub(24)), 24.0);
+            }
+        });
+        actions.add_action(&show_menu);
+        finished_widget.insert_action_group("block", Some(&actions));
     }
 }
 
@@ -11287,7 +11368,11 @@ impl BlockDocumentIndex {
 
 /// The lowest set bit of a Fenwick node index, which is the span it covers.
 const fn lowest_set_bit(node: usize) -> usize {
-    node & node.wrapping_neg()
+    if node == 0 {
+        0
+    } else {
+        1usize << node.trailing_zeros()
+    }
 }
 
 /// Reference implementation of [`BlockDocumentIndex::viewport_state`]: the
@@ -19844,6 +19929,104 @@ mod tests {
         assert!(!view.active.borrow().alt_leave_pending().get());
         view.pty
             .drain_test_slave(std::time::Duration::from_millis(10));
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn persistent_block_actions_reopen_without_duplicates_or_pty_input() {
+        use gtk4::prelude::*;
+        gtk4::init().expect("gtk init");
+        let config = crate::config::Config::safe_defaults();
+        let view = super::TermView::new_with_spawner(
+            &config,
+            &crate::config::TerminalMode::Block,
+            &["sh".to_string()],
+            None,
+            None,
+            &[],
+            |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+        )
+        .expect("a Block pane over a test PTY");
+        let window = gtk4::Window::builder()
+            .default_width(700)
+            .default_height(400)
+            .child(&view.widget())
+            .build();
+        window.present();
+        let settle = || {
+            let context = gtk4::glib::MainContext::default();
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_millis(200) {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        settle();
+        view.pty
+            .write_test_slave(b"\x1b]133;A\x07$ \x1b]133;B\x07printf ok\r\n\x1b]133;C\x07ok\r\n");
+        settle();
+        view.pty.set_test_foreground(PtyForeground::Shell);
+        view.pty
+            .write_test_slave(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        settle();
+        view.pty
+            .drain_test_slave(std::time::Duration::from_millis(10));
+        let popovers = |card: &gtk4::Box| {
+            let mut result = Vec::new();
+            let mut child = card.first_child();
+            while let Some(widget) = child {
+                if let Ok(popover) = widget.clone().downcast::<gtk4::Popover>() {
+                    result.push(popover);
+                }
+                child = widget.next_sibling();
+            }
+            result
+        };
+        for restored in [false, true] {
+            if restored {
+                assert_eq!(view.clear_blocks(), 1);
+                assert_eq!(view.undo_clear_blocks(), 1);
+                settle();
+                view.pty
+                    .drain_test_slave(std::time::Duration::from_millis(10));
+            }
+            let card = view
+                .finished_blocks
+                .borrow()
+                .last()
+                .unwrap()
+                .widget()
+                .clone();
+            card.activate_action("block.show-menu", None)
+                .expect("installed action");
+            settle();
+            assert_eq!(popovers(&card).len(), 1);
+            let first = popovers(&card).pop().unwrap();
+            let scroll = first
+                .child()
+                .unwrap()
+                .downcast::<gtk4::ScrolledWindow>()
+                .unwrap();
+            assert_eq!(scroll.max_content_height(), 420);
+            card.activate_action("block.show-menu", None).unwrap();
+            settle();
+            assert_eq!(popovers(&card), vec![first.clone()]);
+            first.popdown();
+            settle();
+            assert!(popovers(&card).is_empty());
+            card.activate_action("block.show-menu", None).unwrap();
+            settle();
+            assert_eq!(popovers(&card).len(), 1);
+            popovers(&card)[0].popdown();
+            settle();
+            assert!(
+                view.pty
+                    .drain_test_slave(std::time::Duration::from_millis(10))
+                    .is_empty(),
+                "opening and closing a block menu must never send terminal input"
+            );
+        }
         window.close();
     }
 

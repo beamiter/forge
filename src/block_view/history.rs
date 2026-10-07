@@ -203,15 +203,23 @@ impl HistoryLoadShared {
     /// resource pressure may make ordinary saves require a complete reload,
     /// but must not make a successful Clear reappear on the next launch.
     pub(super) fn discard_for_explicit_clear(&self) {
-        self.explicit_replace_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
-                Some(
-                    epoch
-                        .checked_add(1)
-                        .expect("explicit Block-history replacement epoch exhausted"),
-                )
-            })
-            .expect("explicit Block-history replacement epoch update is infallible");
+        // compare_exchange_weak keeps this available on older Rust toolchains
+        // without the now-deprecated fetch_update spelling.
+        let mut epoch = self.explicit_replace_epoch.load(Ordering::Acquire);
+        loop {
+            let next = epoch
+                .checked_add(1)
+                .expect("explicit Block-history replacement epoch exhausted");
+            match self.explicit_replace_epoch.compare_exchange_weak(
+                epoch,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => epoch = observed,
+            }
+        }
         self.discarded.store(true, Ordering::Release);
         self.applied.store(true, Ordering::Release);
         let prior = {

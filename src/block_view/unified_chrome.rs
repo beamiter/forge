@@ -477,7 +477,7 @@ fn parse_canonical_zone_uri(uri: &str) -> Option<([u8; 16], u64)> {
         return None;
     }
     let mut nonce = [0_u8; 16];
-    for (index, pair) in nonce_hex.chunks_exact(2).enumerate() {
+    for (index, pair) in nonce_hex.as_chunks::<2>().0.iter().enumerate() {
         let high = lowercase_hex_value(pair[0])?;
         let low = lowercase_hex_value(pair[1])?;
         nonce[index] = (high << 4) | low;

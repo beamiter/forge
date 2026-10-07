@@ -2274,8 +2274,13 @@ fn parse_list(bytes: &[u8], dir: &Path) -> FsListing {
     let mut seen_names = std::collections::HashSet::new();
     let mut seen_paths = std::collections::HashSet::new();
     let mut complete_pairs = 0usize;
-    // chunks_exact ignores a dangling half-pair on its own.
-    for pair in tokens.chunks_exact(2).take(REMOTE_LIST_PAIR_LIMIT) {
+    // The array chunks exclude a dangling half-pair.
+    for pair in tokens
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .take(REMOTE_LIST_PAIR_LIMIT)
+    {
         complete_pairs += 1;
         if entries.len() >= MAX_DIRECTORY_ENTRIES {
             continue;
