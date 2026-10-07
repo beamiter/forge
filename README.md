@@ -478,6 +478,13 @@ AI / Agent / 命令面板的建议仍然只 **Insert for review**，永不自行
 用于快速收拢一长串输出；这三个和 Undo 一样默认不占快捷键，可在 `[keybindings]` 里自行绑定
 （`collapse_all_blocks`、`expand_all_blocks`、`toggle_block_collapsed`、`undo_clear_blocks`）。
 折叠状态目前不跨重启保存。
+卡片 header 的 **Block actions**（⋮）始终可见，鼠标、触摸和 Tab 键都能找到完整操作，
+与右键菜单共用同一动作和安全门禁；不必先知道右键或快捷键。菜单高度有界，长菜单可滚动，
+反复点击不会叠出多个实例。header 快捷区只保留复制输出与 **Insert for review**，后者只回填
+可编辑命令而不执行；过滤、顶部/底部跳转、展开、折叠等统一从菜单可达，窄分屏不再为六个
+隐藏图标预留宽度。快捷按钮持有键盘焦点时，鼠标移出不会让它消失；cwd/git/时间/耗时汇成一条可收缩的上下文
+摘要，省略后的完整可见文本可通过 tooltip 查看，状态与动作保持独立。
+
 右键多选区域可批量复制命令、输出或完整块；长 Block 提供顶部/底部跳转与 sticky header，
 后台异步输出使用独立 Block 样式。历史恢复和撤销清空重建的块与新块拥有完全相同的右键菜单。
 

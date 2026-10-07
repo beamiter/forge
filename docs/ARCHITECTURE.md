@@ -74,3 +74,23 @@ CI runs the tracked-text privacy guard, rustfmt, shell syntax/ShellCheck, the fu
 9. An AI response may update only its originating extant chat; switching or deleting that chat cannot redirect or resurrect the response.
 10. Terminal/Block bytes are bounded and carried as untrusted user-role data, never interpolated into AI system instructions.
 11. Stopping AI work terminates its transport child; stopping an Agent model turn never terminates an already approved shell command.
+
+
+## Finished-card action surface
+
+Each finished card installs a pane-bound `block.show-menu` action group. Its permanent
+Block actions button and pointer context gesture share one weakly guarded menu factory,
+including selection, prompt-ownership checks and verified submission. A per-card weak
+popover slot prevents duplicate menus; menus use a bounded scrolling viewport. Restore
+and undo mount the same action group. Widget pooling removes the group alongside old
+controllers and child widgets so retired block identities cannot survive reuse.
+
+The compact quick-action strip owns its secondary controls even when their child visibility
+is disabled; the menu invokes the existing filter/expand/navigation paths rather than
+forking their state machines. Focus ownership is independent of hover and selection:
+a focused quick-action strip stays sensitive and visible until focus leaves it.
+
+Directory, branch, timestamp and duration share one expanding context label with a
+one-character width floor and middle ellipsis. Its tooltip and accessible label retain
+bounded safe details. This keeps the finished-card header at one row, so the existing
+height estimator, collapse geometry and virtual-scroll anchoring contract remain unchanged.

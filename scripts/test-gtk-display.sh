@@ -82,6 +82,12 @@ tests=(
     font::tests::a_real_vte_is_given_the_icon_family_behind_the_configured_one
     block_view::onboarding::tests::block_onboarding_overlay_is_non_measuring_and_non_targetable
     block_view::tests::a_stranded_focus_mount_declines_only_what_the_focused_widget_owns
+    block_view::blocks::tests::repeated_action_feedback_restores_the_original_affordance
+    block_view::tests::persistent_block_actions_reopen_without_duplicates_or_pty_input
+    block_view::blocks::tests::outputless_cards_cannot_create_a_phantom_collapsed_summary
+    block_view::blocks::tests::long_context_uses_one_flexible_accessible_summary
+    block_view::blocks::tests::block_actions_remain_discoverable_without_hover
+    block_view::blocks::tests::pointer_leave_never_disables_keyboard_focused_actions
     block_view::blocks::tests::revealing_a_cards_actions_does_not_move_its_metadata
     block_view::blocks::tests::the_selection_hint_sits_on_the_spacers_left
     block_view::tests::a_refusal_flash_is_visible_exposed_and_restores_only_the_latest_status

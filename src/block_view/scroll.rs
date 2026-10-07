@@ -244,6 +244,9 @@ impl WidgetPool {
         // leaves the previous card's string stored on a shell that can later be
         // enabled again.
         widget.set_tooltip_text(None);
+        // Card-local action groups capture the old pane and block identity.
+        // Pooled shells must never retain or activate a retired card's menu.
+        widget.insert_action_group("block", None::<&gtk4::gio::SimpleActionGroup>);
         while let Some(child) = widget.first_child() {
             widget.remove(&child);
         }
@@ -290,6 +293,15 @@ mod tests {
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         widget.append(&gtk::Label::new(Some("heavy child stand-in")));
         widget.set_tooltip_text(Some("stale lifecycle warning"));
+        let actions = gtk4::gio::SimpleActionGroup::new();
+        let action = gtk4::gio::SimpleAction::new("show-menu", None);
+        let activated = Rc::new(Cell::new(0));
+        let observed = activated.clone();
+        action.connect_activate(move |_, _| observed.set(observed.get() + 1));
+        actions.add_action(&action);
+        widget.insert_action_group("block", Some(&actions));
+        widget.activate_action("block.show-menu", None).unwrap();
+        assert_eq!(activated.get(), 1);
         let right_click = gtk::GestureClick::new();
         right_click.set_button(3);
         widget.add_controller(right_click);
@@ -301,6 +313,12 @@ mod tests {
         let reused = pool.acquire().expect("the released box is available again");
 
         assert!(reused.first_child().is_none());
+        assert!(reused.activate_action("block.show-menu", None).is_err());
+        assert_eq!(
+            activated.get(),
+            1,
+            "pool reuse cannot activate a retired menu"
+        );
         assert!(
             !reused.has_tooltip(),
             "a recycled card must not inherit the previous card's lifecycle warning"

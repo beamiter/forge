@@ -6,6 +6,12 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Block 卡片加入常驻、可键盘访问的 Block actions 菜单，与右键共用安全动作；缩减 header
+  的隐藏工具栏占宽，保留复制输出与只回填的快捷入口。长菜单可滚动且重复激活只保留一个实例。
+  快捷按钮的键盘焦点不会因鼠标移出而被隐藏/禁用，cwd/git 省略文本增加完整 tooltip。
+  连续复制/插入的反馈现在合并为一个计时器，始终恢复原始图标和提示，不会把上一轮反馈永久留下。
+  同步修正 Block 验收清单中的多行回填、分阶段重跑和默认快捷键说明。
+
 - `jterm_core` 升级到 `fa256d6`（`Cargo.toml`、`Cargo.lock`、`deny.toml`、`flake.nix` 四处
   一起移动）。ASCII organism 的三个模块——状态归约器、持久化记忆、注意力仲裁——共约 9,000 行
   从 forge 删除，改为消费 `jterm_core::organism`、`organism_memory`、`organism_attention`；
