@@ -4855,6 +4855,23 @@ mod tests {
             child = widget.next_sibling();
         }
         let more = more.expect("every card has a permanent More action");
+        // Root the card so GTK resolves the late-installed action through its
+        // widget ancestry, then wait for the actual mapped/enabled state.
+        let window = gtk4::Window::builder()
+            .default_width(700)
+            .default_height(300)
+            .child(card.widget())
+            .build();
+        window.present();
+        let context = gtk4::glib::MainContext::default();
+        let started = std::time::Instant::now();
+        while !(more.is_mapped() && more.is_sensitive())
+            && started.elapsed() < std::time::Duration::from_secs(2)
+        {
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(more.is_mapped(), "More is mapped in the presented card");
         assert!(more.is_visible());
         assert!(more.is_sensitive());
         assert_eq!(more.action_name().as_deref(), Some("block.show-menu"));
@@ -4868,6 +4885,7 @@ mod tests {
             .tooltip_text()
             .unwrap()
             .contains("does not run"));
+        window.close();
     }
 
     #[test]
