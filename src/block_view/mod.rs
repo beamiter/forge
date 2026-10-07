@@ -19567,6 +19567,16 @@ mod tests {
 
         gtk4::init().expect("gtk init");
         let config = crate::config::Config::safe_defaults();
+        let view = super::TermView::new_with_spawner(
+            &config,
+            &crate::config::TerminalMode::Block,
+            &["sh".to_string()],
+            None,
+            None,
+            &[],
+            |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+        )
+        .expect("a Block pane over a test PTY");
         let card = super::FinishedBlock::new(
             3,
             "$ ",
@@ -19580,6 +19590,9 @@ mod tests {
             None,
             80,
         );
+        // A constructed card has no pane-bound actions yet. Use the same
+        // wiring as restored cards so More is sensitive to normal GTK picks.
+        view.mount_rebuilt_block(&card);
         let window = gtk4::Window::builder()
             .default_width(700)
             .default_height(300)
@@ -19614,7 +19627,14 @@ mod tests {
                 .any(|button| button.has_css_class("block-collapse-btn")),
             "the collapse chevron is on screen"
         );
+        assert!(
+            buttons
+                .iter()
+                .any(|button| button.has_css_class("block-more-btn")),
+            "the permanent More action is on screen"
+        );
         for button in &buttons {
+            assert!(button.is_sensitive(), "{:?}", button.css_classes());
             let bounds = button.compute_bounds(&card_widget).expect("laid out");
             let (x, y) = (
                 (bounds.x() + bounds.width() / 2.0) as f64,
