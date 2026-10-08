@@ -531,6 +531,8 @@ name = "env"
 
 侧栏 Files 页以当前标签 cwd 为根：双击目录展开/折叠；双击普通文件把 shell 引号保护后的路径插入编辑行，不自动执行；双击 `.jtnb.md` 打开 Notebook。向上按钮进入父目录，主页按钮回到当前终端 cwd。Block 走自管 PTY 输入，VTE 走 VTE child input。
 
+点击 Files 路径标题可打开绝对路径输入和祖先目录按钮。长目录名会在中间省略，避免挤出 Open/Cancel；悬停查看完整显示名称，点击仍跳转到原始完整路径。
+
 ## 9. Flatpak 与桌面安装
 
 Flatpak 应用 ID 是 `io.github.beamiter.forge`。打包版本通过 `flatpak-spawn --host` 启动宿主 Shell、SSH、Git、curl 和通知工具，避免命令误跑在一次性应用沙箱；因此 forge Flatpak 本身不是命令隔离边界。

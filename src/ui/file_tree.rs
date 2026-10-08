@@ -502,6 +502,24 @@ fn validate_absolute_navigation_path(value: &str) -> Result<PathBuf, &'static st
     Ok(normalized)
 }
 
+fn navigation_breadcrumb_button(ancestor: &Path) -> gtk4::Button {
+    let label = if ancestor == Path::new("/") {
+        "/".to_string()
+    } else {
+        ancestor
+            .file_name()
+            .map(|name| safe_file_label(&name.to_string_lossy()))
+            .unwrap_or_else(|| "/".to_string())
+    };
+    let button = gtk4::Button::with_label(&label);
+    button.add_css_class("flat");
+    if let Some(text) = button.child().and_downcast::<gtk4::Label>() {
+        text.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+    }
+    button.set_tooltip_text(Some(&label));
+    button
+}
+
 fn navigation_breadcrumbs(path: &Path) -> Vec<PathBuf> {
     let mut ancestors: Vec<_> = path.ancestors().map(Path::to_path_buf).collect();
     ancestors.reverse();
@@ -4328,16 +4346,7 @@ impl UiState {
         breadcrumbs.set_column_spacing(4);
         breadcrumbs.set_row_spacing(4);
         for ancestor in navigation_breadcrumbs(&self.file_tree_root.borrow()) {
-            let label = if ancestor == Path::new("/") {
-                "/".to_string()
-            } else {
-                ancestor
-                    .file_name()
-                    .map(|name| safe_file_label(&name.to_string_lossy()))
-                    .unwrap_or_else(|| "/".to_string())
-            };
-            let button = gtk4::Button::with_label(&label);
-            button.add_css_class("flat");
+            let button = navigation_breadcrumb_button(&ancestor);
             let ui = self.clone();
             let dialog_for_ancestor = dialog.clone();
             button.connect_clicked(move |_| {
@@ -6307,6 +6316,108 @@ mod tests {
         assert_eq!(state.back.len(), 2);
         assert_eq!(state.back[0].location, FsLocation::Remote(7));
         assert_eq!(state.back[1], local);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn path_dialog_long_components_keep_open_visible_and_full_targets() {
+        adw::init().unwrap();
+        for component in ["short".to_string(), "x".repeat(200), "界".repeat(80)] {
+            let path = PathBuf::from("/tmp").join(&component);
+            let parent = adw::Window::builder()
+                .default_width(500)
+                .default_height(320)
+                .content(&gtk4::Label::new(Some("inert Files dialog fixture")))
+                .build();
+            parent.present();
+            let dialog = adw::Dialog::builder()
+                .title("Open Filesystem Path")
+                .content_width(440)
+                .build();
+            let entry = adw::EntryRow::new();
+            entry.set_title("Absolute path");
+            entry.set_text(&path.to_string_lossy());
+            let content = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+            content.set_margin_start(12);
+            content.set_margin_end(12);
+            content.set_margin_top(12);
+            content.set_margin_bottom(12);
+            content.append(&entry);
+            let breadcrumbs = gtk4::FlowBox::new();
+            breadcrumbs.set_selection_mode(gtk4::SelectionMode::None);
+            breadcrumbs.set_column_spacing(4);
+            breadcrumbs.set_row_spacing(4);
+            let selected = Rc::new(RefCell::new(None));
+            let mut last = None;
+            for ancestor in navigation_breadcrumbs(&path) {
+                let button = navigation_breadcrumb_button(&ancestor);
+                let selected = Rc::clone(&selected);
+                button.connect_clicked(move |_| {
+                    *selected.borrow_mut() = Some(ancestor.clone());
+                });
+                breadcrumbs.insert(&button, -1);
+                last = Some(button);
+            }
+            content.append(&breadcrumbs);
+            let header = adw::HeaderBar::new();
+            header.set_show_start_title_buttons(false);
+            header.set_show_end_title_buttons(false);
+            header.pack_start(&gtk4::Button::with_label("Cancel"));
+            let open = gtk4::Button::with_label("Open");
+            header.pack_end(&open);
+            let toolbar = adw::ToolbarView::new();
+            toolbar.add_top_bar(&header);
+            toolbar.set_content(Some(&content));
+            dialog.set_child(Some(&toolbar));
+            dialog.present(Some(&parent));
+            let context = glib::MainContext::default();
+            for _ in 0..60 {
+                while context.pending() {
+                    context.iteration(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let minimum = breadcrumbs.measure(gtk4::Orientation::Horizontal, -1).0;
+            let open_bounds = open.compute_bounds(&parent).unwrap();
+            eprintln!(
+                "component_bytes={} window_width={} breadcrumb_minimum={} open_right={}",
+                component.len(),
+                parent.width(),
+                minimum,
+                open_bounds.x() + open_bounds.width()
+            );
+            if component.len() == 200 {
+                if let Some(path) = std::env::var_os("FORGE_PATH_DIALOG_SCREENSHOT") {
+                    let paintable = gtk4::WidgetPaintable::new(Some(&parent));
+                    let snapshot = gtk4::Snapshot::new();
+                    paintable.snapshot(&snapshot, parent.width() as f64, parent.height() as f64);
+                    let renderer =
+                        gtk4::gsk::Renderer::for_surface(&parent.surface().unwrap()).unwrap();
+                    renderer
+                        .render_texture(snapshot.to_node().unwrap(), None)
+                        .save_to_png(path)
+                        .unwrap();
+                    renderer.unrealize();
+                }
+            }
+            assert!(
+                minimum <= parent.width(),
+                "long components must fit the dialog"
+            );
+            assert!(
+                open_bounds.x() >= 0.0
+                    && open_bounds.x() + open_bounds.width() <= parent.width() as f32,
+                "Open must remain inside the window"
+            );
+            let button = last.unwrap();
+            assert_eq!(button.label().as_deref(), Some(component.as_str()));
+            assert_eq!(button.tooltip_text().as_deref(), Some(component.as_str()));
+            button.grab_focus();
+            button.emit_clicked();
+            assert_eq!(*selected.borrow(), Some(path));
+            dialog.close();
+            parent.close();
+        }
     }
 
     #[test]

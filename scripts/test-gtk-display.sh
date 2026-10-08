@@ -52,6 +52,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    ui::file_tree::tests::path_dialog_long_components_keep_open_visible_and_full_targets
     state::tests::failed_quarantine_blocks_the_real_window_autosave
     state::tests::rejected_window_layouts_survive_the_first_real_autosave
     font::tests::an_explicit_appended_fallback_resolves_on_a_real_vte

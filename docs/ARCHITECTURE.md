@@ -91,6 +91,10 @@ CI runs the tracked-text privacy guard, rustfmt, shell syntax/ShellCheck, the fu
 11. Stopping AI work terminates its transport child; stopping an Agent model turn never terminates an already approved shell command.
 
 
+The Files path dialog gives breadcrumb labels middle ellipsization so a long
+component cannot enlarge the dialog beyond its parent. The full safe display
+label remains in the tooltip; navigation callbacks retain the original PathBuf.
+
 ## Finished-card action surface
 
 Each finished card installs a pane-bound `block.show-menu` action group. Its permanent

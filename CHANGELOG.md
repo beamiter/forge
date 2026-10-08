@@ -6,6 +6,10 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Files path-dialog breadcrumbs ellipsize long components so Open and Cancel
+  stay visible; tooltips retain the full display name and navigation uses the
+  original complete path.
+
 - Window restore preserves the original snapshot when layout bounds omit tabs
   or splits, before saving the surviving workspace. If the recovery move fails,
   session writes and publication pause instead of replacing the original; the
