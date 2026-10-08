@@ -15,6 +15,7 @@
 //! issued a fresh id from this process's counter, which keeps the marker
 //! injector's monotonic replay defence intact across restarts.
 
+use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -84,10 +85,54 @@ pub(super) struct PersistedZone {
     pub(super) output_truncated: bool,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize)]
 pub(super) struct PersistedZoneSession {
     pub(super) version: u32,
     pub(super) zones: Vec<PersistedZone>,
+}
+
+/// Validate every record, but retain only the newest bounded suffix. Do not
+/// trust a sequence size hint: even tiny JSON records have substantial inline
+/// metadata, and truncating a fully decoded Vec would keep its huge capacity.
+struct RestoreZones {
+    zones: Vec<PersistedZone>,
+    evicted: bool,
+}
+
+impl<'de> serde::Deserialize<'de> for RestoreZones {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = RestoreZones;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a sequence of persisted zones")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut zones = VecDeque::with_capacity(MAX_RESTORED_ZONES);
+                let mut evicted = false;
+                while let Some(zone) = sequence.next_element::<PersistedZone>()? {
+                    if zones.len() == MAX_RESTORED_ZONES {
+                        zones.pop_front();
+                        evicted = true;
+                    }
+                    zones.push_back(zone);
+                }
+                Ok(RestoreZones {
+                    zones: zones.into(),
+                    evicted,
+                })
+            }
+        }
+        deserializer.deserialize_seq(Visitor)
+    }
 }
 
 impl PersistedZone {
@@ -303,18 +348,23 @@ fn decode_session_for_restore(bytes: &[u8]) -> io::Result<DecodedSession> {
             ),
         ));
     }
-    let session: PersistedZoneSession = serde_json::from_slice(bytes)
+    #[derive(serde::Deserialize)]
+    struct RestoreSession {
+        #[serde(rename = "version")]
+        _version: u32,
+        zones: RestoreZones,
+    }
+    let session: RestoreSession = serde_json::from_slice(bytes)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    let limited = session.zones.len() > MAX_RESTORED_ZONES
-        || session.zones.iter().fold(0usize, |total, zone| {
+    let RestoreZones { zones, evicted } = session.zones;
+    // Compact snapshots only after count eviction. Early byte shedding could
+    // lose output that fits once a large old record leaves the retained suffix.
+    let limited = evicted
+        || zones.iter().fold(0usize, |total, zone| {
             total.saturating_add(zone.retained_bytes())
         }) > MAX_RESTORED_SNAPSHOT_BYTES;
     Ok(DecodedSession {
-        zones: bound_persisted_zones(
-            session.zones,
-            MAX_RESTORED_ZONES,
-            MAX_RESTORED_SNAPSHOT_BYTES,
-        ),
+        zones: bound_persisted_zones(zones, MAX_RESTORED_ZONES, MAX_RESTORED_SNAPSHOT_BYTES),
         limited,
     })
 }
@@ -517,6 +567,135 @@ mod tests {
             start_mark_seen: true,
             output: output.map(str::to_string),
             output_truncated: false,
+        }
+    }
+
+    #[test]
+    fn decoding_preserves_required_fields_and_version_precedence() {
+        for document in [
+            r#"{"zones":[]}"#,
+            r#"{"version":1}"#,
+            r#"{"version":1,"version":1,"zones":[]}"#,
+            r#"{"version":1,"zones":[],"zones":[]}"#,
+            r#"{"version":1,"zones":[{}]}"#,
+            r#"{"version":1,"zones":[{"cmd":"a","cmd":"b"}]}"#,
+        ] {
+            assert_eq!(
+                decode_session_for_restore(document.as_bytes())
+                    .err()
+                    .unwrap()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        for document in [
+            r#"{"version":2,"zones":false}"#,
+            r#"{"version":2,"future_payload":{}}"#,
+        ] {
+            assert_eq!(
+                decode_session_for_restore(document.as_bytes())
+                    .err()
+                    .unwrap()
+                    .kind(),
+                io::ErrorKind::Unsupported
+            );
+        }
+        let empty =
+            decode_session_for_restore(br#"{"extra":true,"zones":[],"version":1}"#).unwrap();
+        assert!(empty.zones.is_empty());
+        assert!(!empty.limited);
+    }
+
+    #[test]
+    fn decoding_ignores_untrusted_sequence_size_hints() {
+        struct HintedSequence(usize);
+        impl<'de> serde::de::SeqAccess<'de> for HintedSequence {
+            type Error = serde_json::Error;
+
+            fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
+            where
+                T: serde::de::DeserializeSeed<'de>,
+            {
+                if self.0 == 0 {
+                    return Ok(None);
+                }
+                self.0 -= 1;
+                seed.deserialize(serde_json::json!({ "cmd": "small" }))
+                    .map(Some)
+            }
+
+            fn size_hint(&self) -> Option<usize> {
+                Some(usize::MAX)
+            }
+        }
+        let decoded: RestoreZones = serde::Deserialize::deserialize(
+            serde::de::value::SeqAccessDeserializer::new(HintedSequence(2)),
+        )
+        .unwrap();
+        assert!(!decoded.evicted);
+        assert_eq!(decoded.zones.len(), 2);
+        assert!(decoded.zones.capacity() <= MAX_RESTORED_ZONES);
+    }
+
+    #[test]
+    fn decoding_many_small_zones_retains_only_bounded_record_capacity() {
+        let count = 500_000;
+        let mut document = String::from(r#"{"version":1,"zones":["#);
+        for index in 0..count {
+            if index != 0 {
+                document.push(',');
+            }
+            document.push_str(r#"{"cmd":""}"#);
+        }
+        document.push_str("]}");
+        assert!(document.len() < MAX_ZONE_HISTORY_FILE_BYTES as usize);
+        let decoded = decode_session_for_restore(document.as_bytes()).unwrap();
+        assert!(decoded.limited);
+        assert_eq!(decoded.zones.len(), MAX_RESTORED_ZONES);
+        eprintln!(
+            "input_bytes={} records={} retained_capacity={} inline_allocation_bytes={}",
+            document.len(),
+            count,
+            decoded.zones.capacity(),
+            decoded.zones.capacity() * std::mem::size_of::<PersistedZone>()
+        );
+        assert!(decoded.zones.capacity() <= MAX_RESTORED_ZONES);
+    }
+
+    #[test]
+    fn decoding_count_eviction_precedes_snapshot_byte_compaction() {
+        let mut zones = vec![zone(&"x".repeat(3 * 1024 * 1024), None)];
+        let output = "y".repeat(32 * 1024);
+        for index in 0..MAX_RESTORED_ZONES {
+            zones.push(zone(&format!("newest-{index}"), Some(&output)));
+        }
+        let document = serde_json::to_vec(&PersistedZoneSession {
+            version: FORMAT_VERSION,
+            zones: zones.clone(),
+        })
+        .unwrap();
+        assert!(document.len() < MAX_ZONE_HISTORY_FILE_BYTES as usize);
+        let decoded = decode_session_for_restore(&document).unwrap();
+        assert!(decoded.limited);
+        assert_eq!(decoded.zones, zones[1..]);
+        assert!(decoded.zones.iter().all(|zone| !zone.output_truncated));
+    }
+
+    #[test]
+    fn decoding_validates_evicted_records_and_the_document_tail() {
+        let good = r#"{"cmd":"valid"},"#.repeat(MAX_RESTORED_ZONES + 1);
+        for document in [
+            format!(r#"{{"version":1,"zones":[{{"cmd":false}},{good}{{"cmd":"last"}}]}}"#),
+            format!(r#"{{"version":1,"zones":[{good}{{"cmd":false}}]}}"#),
+            format!(r#"{{"version":1,"zones":[{good}{{"cmd":"last"}}]}} trailing"#),
+        ] {
+            assert_eq!(
+                decode_session_for_restore(document.as_bytes())
+                    .err()
+                    .unwrap()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
         }
     }
 

@@ -6,6 +6,10 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Unified history decoding validates every saved zone while retaining only the
+  newest 64 records, avoiding large temporary record arrays from files with
+  many tiny entries. Partial restores still preserve the original file.
+
 - Appended Pango font fallbacks no longer acquire an extra leading space in
   their family name, so an explicit installed fallback resolves correctly when
   the primary font is unavailable. Font styles, saved settings and CSS stacks
