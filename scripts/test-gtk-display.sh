@@ -52,6 +52,8 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    state::tests::failed_quarantine_blocks_the_real_window_autosave
+    state::tests::rejected_window_layouts_survive_the_first_real_autosave
     font::tests::an_explicit_appended_fallback_resolves_on_a_real_vte
     block_view::history::tests::unified_pane_lifecycle_preserves_failed_and_incomplete_restore_bytes
     block_view::history::tests::unified_pane_fresh_drop_reopen_and_runtime_retention_remain_writable

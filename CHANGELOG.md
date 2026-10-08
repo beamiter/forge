@@ -6,6 +6,11 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Window restore preserves the original snapshot when layout bounds omit tabs
+  or splits, before saving the surviving workspace. If the recovery move fails,
+  session writes and publication pause instead of replacing the original; the
+  existing bounded recovery-copy retention policy still applies.
+
 - Block history Retry keeps failed-load state until it can reload, and repeated
   retry failures reappear in the persistent notice. A successful repaired-file
   reload still replays and saves; ordinary autosave errors remain deduplicated.

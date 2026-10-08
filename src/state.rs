@@ -65,6 +65,20 @@ struct WindowStatePaths {
 
 static WINDOW_STATE_PATHS: OnceLock<WindowStatePaths> = OnceLock::new();
 static WINDOW_STATE_FINALIZED: AtomicBool = AtomicBool::new(false);
+// WINDOW_STATE_PATHS is immutable for this process. A failed recovery move
+// must not let any later save (including one already queued) replace that path.
+static WINDOW_STATE_WRITABLE: AtomicBool = AtomicBool::new(true);
+
+fn ensure_window_state_writable() -> io::Result<()> {
+    if WINDOW_STATE_WRITABLE.load(Ordering::Acquire) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("Window session is not being saved because {} could not be preserved for recovery. Keep this file, resolve the storage problem, and reopen the window.", window_state_paths().active.display()),
+        ))
+    }
+}
 static WINDOW_STATE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 struct AiConversationState {
     generation: u64,
@@ -686,17 +700,23 @@ fn prune_quarantined_snapshots_in(directory: &Path, keep: usize) {
 /// the unconditional save right after restore in `main.rs`) would destroy the
 /// only copy. Quarantining before returning from the failed load is what keeps
 /// the bytes recoverable.
-fn quarantine_corrupt_snapshot(path: &Path) {
+fn quarantine_corrupt_snapshot(path: &Path) -> bool {
     match snapshot_file::quarantine_corrupt(path) {
-        Ok(backup) => log::warn!(
-            "Quarantined corrupt window snapshot {} as {}",
-            path.display(),
-            backup.display()
-        ),
-        Err(error) => log::warn!(
-            "Failed to quarantine corrupt window snapshot {}: {error}",
-            path.display()
-        ),
+        Ok(backup) => {
+            log::warn!(
+                "Preserved window snapshot {} for recovery as {}",
+                path.display(),
+                backup.display()
+            );
+            true
+        }
+        Err(error) => {
+            log::warn!(
+                "Failed to quarantine corrupt window snapshot {}: {error}",
+                path.display()
+            );
+            false
+        }
     }
 }
 
@@ -1200,8 +1220,13 @@ fn parse_ai_conversation(contents: &str) -> AiConversationLine {
     parsed
 }
 
+struct RestoredConversation {
+    snapshot: Option<crate::ai::ConversationSnapshot>,
+    source_writable: bool,
+}
+
 /// Decide what a readable snapshot's AI line means for this session, moving the
-/// file aside when the line is present but unusable.
+/// file aside when the line is unusable or tab recovery omitted layouts.
 ///
 /// The quarantine is the whole point. `parse_tabs_state` cannot fail, so a
 /// damaged tab line still restores as *something*; the AI line has its own
@@ -1212,14 +1237,24 @@ fn parse_ai_conversation(contents: &str) -> AiConversationLine {
 /// a library written by a newer forge pinning a newer snapshot schema, was
 /// silently and permanently deleted. Move the bytes aside first and the chats
 /// stay recoverable, exactly as for an unreadable snapshot.
-fn restore_ai_conversation(path: &Path, contents: &str) -> Option<crate::ai::ConversationSnapshot> {
-    match parse_ai_conversation(contents) {
+fn restore_ai_conversation(
+    path: &Path,
+    contents: &str,
+    preserve_unrestored_tabs: bool,
+) -> RestoredConversation {
+    let conversation = parse_ai_conversation(contents);
+    // The same original can contain both rejected layouts and an unusable AI
+    // line. Preserve it once before the first autosave replaces the active file.
+    let source_writable = !(preserve_unrestored_tabs
+        || matches!(conversation, AiConversationLine::Rejected))
+        || quarantine_corrupt_snapshot(path);
+    let snapshot = match conversation {
         AiConversationLine::Parsed(snapshot) => Some(*snapshot),
-        AiConversationLine::Absent => None,
-        AiConversationLine::Rejected => {
-            quarantine_corrupt_snapshot(path);
-            None
-        }
+        AiConversationLine::Absent | AiConversationLine::Rejected => None,
+    };
+    RestoredConversation {
+        snapshot,
+        source_writable,
     }
 }
 
@@ -1342,7 +1377,18 @@ fn push_restored_tab_bounded(
     tabs.push((name, layout));
 }
 
+struct ParsedTabsState {
+    current_page: Option<u32>,
+    tabs: Vec<(Option<String>, PaneLayout)>,
+    omitted_layouts: bool,
+}
+
 pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, PaneLayout)>) {
+    let parsed = parse_tabs_state_for_restore(contents);
+    (parsed.current_page, parsed.tabs)
+}
+
+fn parse_tabs_state_for_restore(contents: &str) -> ParsedTabsState {
     let mut current_page: Option<u32> = None;
     let mut tabs: Vec<(Option<String>, PaneLayout)> = Vec::new();
     let mut total_panes = 0usize;
@@ -1350,6 +1396,7 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
     // not shift the saved selection onto an unrelated surviving tab.
     let mut source_tab_indices = Vec::new();
     let mut source_tab_index = 0usize;
+    let mut omitted_layouts = false;
 
     for raw_line in contents.lines() {
         let line = raw_line.trim();
@@ -1363,6 +1410,9 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
         // Metadata can appear after tabs in legacy snapshots. Still read the
         // selected page after reaching the cap, without decoding more layouts.
         if tabs.len() == MAX_RESTORED_TABS {
+            // AI metadata is handled separately; every other nonempty,
+            // non-selection line would have represented another legacy/new tab.
+            omitted_layouts |= !line.starts_with(AI_CONVERSATION_PREFIX);
             continue;
         }
         if let Some(rest) = line.strip_prefix("tab=") {
@@ -1502,7 +1552,12 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
                 .unwrap_or(0) as u32
         });
     }
-    (current_page, tabs)
+    omitted_layouts |= source_tab_index > tabs.len();
+    ParsedTabsState {
+        current_page,
+        tabs,
+        omitted_layouts,
+    }
 }
 
 /// Read a window snapshot through the family's bounded loader: an oversized
@@ -1548,6 +1603,7 @@ pub(crate) fn load_tabs_state() -> (Option<u32>, Vec<(Option<String>, PaneLayout
     let contents = match read_window_state_bounded(&path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            WINDOW_STATE_WRITABLE.store(true, Ordering::Release);
             set_ai_conversation_snapshot(None);
             log::info!("No window snapshot found (first run or a new window)");
             return (None, Vec::new());
@@ -1562,25 +1618,29 @@ pub(crate) fn load_tabs_state() -> (Option<u32>, Vec<(Option<String>, PaneLayout
             // .active name, and main.rs saves over that path unconditionally
             // right after restore — move the bytes aside first or they are
             // unrecoverable.
-            quarantine_corrupt_snapshot(&path);
+            WINDOW_STATE_WRITABLE.store(quarantine_corrupt_snapshot(&path), Ordering::Release);
             return (None, Vec::new());
         }
     };
 
-    // Tabs need no quarantine: `parse_tabs_state` cannot fail — its last arm
-    // takes any non-blank line it does not recognise as a legacy bare-path tab,
-    // so damaged-but-readable contents restore as a tab rather than as an empty
-    // window. The AI line is the exception, and `restore_ai_conversation`
-    // quarantines the bytes itself when it has to throw a chat library away.
-    set_ai_conversation_snapshot(restore_ai_conversation(&path, &contents));
-    let (current_page, tabs) = parse_tabs_state(&contents);
-    log::info!("Loaded {} tabs from window snapshot", tabs.len());
-    (current_page, tabs)
+    let parsed = parse_tabs_state_for_restore(&contents);
+    // Parsing retains legacy compatibility, but restore bounds can omit whole
+    // layouts. Keep the exact source alongside rejected AI snapshots before
+    // startup's unconditional autosave writes the surviving workspace.
+    let conversation = restore_ai_conversation(&path, &contents, parsed.omitted_layouts);
+    WINDOW_STATE_WRITABLE.store(conversation.source_writable, Ordering::Release);
+    set_ai_conversation_snapshot(conversation.snapshot);
+    log::info!("Loaded {} tabs from window snapshot", parsed.tabs.len());
+    (parsed.current_page, parsed.tabs)
 }
 
 /// Publish this process's active snapshot for a future forge window. Active
 /// snapshots are deliberately invisible to other running instances.
 pub(crate) fn finalize_tabs_state() {
+    if let Err(error) = ensure_window_state_writable() {
+        log::warn!("Window snapshot publication paused: {error}");
+        return;
+    }
     if WINDOW_STATE_FINALIZED.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -1591,6 +1651,7 @@ pub(crate) fn finalize_tabs_state() {
     let directory = paths.directory.clone();
     let key = PersistenceKey::for_path("window-finalize", &active);
     if let Err(error) = persistence::enqueue(key, "Publish window session", move || {
+        ensure_window_state_writable()?;
         match open_private_regular_file(&active) {
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -1750,6 +1811,7 @@ fn preserve_existing_workspace_with_ai(
         "Save window session",
         estimated_bytes,
         move || {
+            ensure_window_state_writable()?;
             match rewrite_existing_ai_conversation(&path_for_job, ai_snapshot.as_ref()) {
                 Ok((compacted, durable_snapshot)) => {
                     commit_ai_conversation_snapshot(ai_generation, durable_snapshot);
@@ -1780,6 +1842,15 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
         return;
     }
     let path = tabs_state_file_path();
+    if ensure_window_state_writable().is_err() {
+        let key = PersistenceKey::for_path("window-state", &path);
+        if let Err(error) =
+            persistence::enqueue(key, "Save window session", ensure_window_state_writable)
+        {
+            log::error!("Could not report paused window session save: {error}");
+        }
+        return;
+    }
     log::info!("Saving tabs state to: {}", path.display());
 
     let _home = std::env::var("HOME").ok();
@@ -1947,6 +2018,7 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
     let path_for_job = path.clone();
     if let Err(error) =
         persistence::enqueue_weighted(key, "Save window session", estimated_bytes, move || {
+            ensure_window_state_writable()?;
             if let Some(parent) = path_for_job.parent() {
                 ensure_private_directory(parent)?;
             }
@@ -2434,6 +2506,272 @@ mod tests {
         assert_eq!(parse_ai_conversation(future), AiConversationLine::Rejected);
     }
 
+    #[test]
+    fn omitted_layout_tracking_preserves_legacy_paths_and_late_metadata() {
+        let legacy = parse_tabs_state_for_restore("tab=literal\t{legacy-path}\n");
+        assert_eq!(legacy.tabs.len(), 1);
+        assert!(!legacy.omitted_layouts);
+        let mut document = (0..MAX_RESTORED_TABS)
+            .map(|index| layout_tab_line(&format!("tab-{index}"), &test_leaf(index)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        document.push_str("\n\ncurrent_page=31\nai_conversation=handled-separately\n");
+        let parsed = parse_tabs_state_for_restore(&document);
+        assert_eq!(parsed.current_page, Some(31));
+        assert_eq!(parsed.tabs.len(), MAX_RESTORED_TABS);
+        assert!(!parsed.omitted_layouts);
+        document.push_str("/another-legacy-tab\n");
+        assert!(parse_tabs_state_for_restore(&document).omitted_layouts);
+    }
+
+    fn flush_window_fixture_worker(active: &Path) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        persistence::enqueue(
+            PersistenceKey::unique_for_path("fixture-barrier", active),
+            "fixture barrier",
+            move || {
+                tx.send(()).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    }
+
+    fn hold_window_fixture_worker(active: &Path) -> std::sync::mpsc::Sender<()> {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        persistence::enqueue(
+            PersistenceKey::unique_for_path("fixture-blocker", active),
+            "fixture blocker",
+            move || {
+                started_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        release_tx
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display and process-local window state"]
+    fn failed_quarantine_blocks_the_real_window_autosave() {
+        gtk4::init().expect("GTK display");
+        let directory = temporary_state_dir("failed-quarantine-autosave");
+        // Normal atomic-write temporary names fit NAME_MAX, but the longer
+        // recovery suffix cannot. This is a real private-fixture I/O failure;
+        // no permission changes, full disk, or external file are needed.
+        let target_len = 255 - (format!(".tmp.{}.0", std::process::id()).len() + 1);
+        let prefix = format!("window-{}-", generate_window_state_id());
+        let name = format!(
+            "{prefix}{}.active",
+            "x".repeat(target_len - prefix.len() - 7)
+        );
+        let active = directory.join(name);
+        WINDOW_STATE_PATHS
+            .set(WindowStatePaths {
+                directory: directory.clone(),
+                active: active.clone(),
+                ready: active.with_extension(READY_STATE_EXTENSION),
+            })
+            .expect("isolated process owns its window state");
+        let original = b"ai_conversation={\"version\":9999}\ntab=/tmp\n";
+        atomic_write_private_file(&active, original).unwrap();
+        let failure = snapshot_file::quarantine_corrupt(&active).unwrap_err();
+        assert_eq!(failure.raw_os_error(), Some(nix::libc::ENAMETOOLONG));
+        assert_eq!(fs::read(&active).unwrap(), original);
+        let (_, tabs) = load_tabs_state();
+        assert_eq!(tabs.len(), 1);
+        let notebook = Notebook::new();
+        notebook.append_page(&Terminal::new(), Some(&Label::new(Some("live"))));
+        save_tabs_state(&notebook, &HashMap::new());
+        let (tx, rx) = std::sync::mpsc::channel();
+        persistence::enqueue(
+            PersistenceKey::unique_for_path("fixture-barrier", &active),
+            "fixture barrier",
+            move || {
+                tx.send(()).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let preserved = fs::read(&active).unwrap() == original;
+        let failures = persistence::drain_failures();
+        eprintln!(
+            "quarantine_errno={} preserved_original={preserved} write_failures={}",
+            nix::libc::ENAMETOOLONG,
+            failures.len()
+        );
+        assert!(
+            preserved,
+            "failed quarantine must not authorize replacement"
+        );
+        assert!(failures
+            .iter()
+            .any(|failure| failure.operation == "Save window session"));
+        finalize_tabs_state();
+        flush_window_fixture_worker(&active);
+        assert_eq!(fs::read(&active).unwrap(), original);
+        assert!(!active.with_extension(READY_STATE_EXTENSION).exists());
+
+        for preserve_existing in [false, true] {
+            // Only an actual successful load can re-enable the path. A save
+            // already queued when another restore fails must recheck authority.
+            atomic_write_private_file(&active, b"tab=/tmp\n").unwrap();
+            assert_eq!(load_tabs_state().1.len(), 1);
+            save_tabs_state(&notebook, &HashMap::new());
+            flush_window_fixture_worker(&active);
+            assert!(persistence::drain_failures().is_empty());
+            let release = hold_window_fixture_worker(&active);
+            if preserve_existing {
+                let too_many = Notebook::new();
+                for _ in 0..MAX_RESTORED_TABS + 1 {
+                    too_many.append_page(&Terminal::new(), None::<&Label>);
+                }
+                save_tabs_state(&too_many, &HashMap::new());
+            } else {
+                save_tabs_state(&notebook, &HashMap::new());
+            }
+            atomic_write_private_file(&active, original).unwrap();
+            assert_eq!(load_tabs_state().1.len(), 1);
+            release.send(()).unwrap();
+            flush_window_fixture_worker(&active);
+            assert_eq!(fs::read(&active).unwrap(), original);
+            assert!(persistence::drain_failures()
+                .iter()
+                .any(|failure| failure.operation == "Save window session"));
+        }
+        let unreadable = [0xff, 0xfe];
+        atomic_write_private_file(&active, &unreadable).unwrap();
+        assert!(load_tabs_state().1.is_empty());
+        save_tabs_state(&notebook, &HashMap::new());
+        flush_window_fixture_worker(&active);
+        assert_eq!(fs::read(&active).unwrap(), unreadable);
+        // Return to the original fixture before exercising actual missing-file
+        // recovery, keeping the final backup assertion byte-exact.
+        atomic_write_private_file(&active, original).unwrap();
+        load_tabs_state();
+        let backup = directory.join("preserved-original");
+        fs::rename(&active, &backup).unwrap();
+        assert!(load_tabs_state().1.is_empty());
+        save_tabs_state(&notebook, &HashMap::new());
+        flush_window_fixture_worker(&active);
+        assert!(persistence::drain_failures().is_empty());
+        assert_ne!(fs::read(&active).unwrap(), original);
+        finalize_tabs_state();
+        flush_window_fixture_worker(&active);
+        assert!(!active.exists());
+        assert!(active.with_extension(READY_STATE_EXTENSION).is_file());
+        assert_eq!(fs::read(backup).unwrap(), original);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display and process-local window state"]
+    fn rejected_window_layouts_survive_the_first_real_autosave() {
+        gtk4::init().expect("GTK display");
+        let directory = temporary_state_dir("rejected-layout-autosave");
+        let active = directory.join(format!("window-{}.active", generate_window_state_id()));
+        WINDOW_STATE_PATHS
+            .set(WindowStatePaths {
+                directory: directory.clone(),
+                active: active.clone(),
+                ready: active.with_extension(READY_STATE_EXTENSION),
+            })
+            .expect("isolated process owns its window state");
+        let too_wide = layout_tab_line(
+            "recoverable wide layout",
+            &wide_test_layout(0, MAX_RESTORED_PANES_PER_TAB + 1),
+        );
+        let too_many = (0..MAX_RESTORED_TABS + 1)
+            .map(|index| layout_tab_line(&format!("tab-{index}"), &test_leaf(index)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mixed = format!("ai_conversation={{\"version\":9999}}\n{too_wide}");
+        let cases = [
+            ("empty", "current_page=0\n".to_string(), 0, false),
+            ("legacy", "/tmp\n".to_string(), 1, false),
+            ("all-rejected", too_wide, 0, true),
+            ("tabs-and-ai-rejected", mixed, 0, true),
+            ("partial", too_many, MAX_RESTORED_TABS, true),
+        ];
+        let mut results = Vec::new();
+        for (name, original, expected_tabs, preserve) in cases {
+            let recovery_count_before = fs::read_dir(&directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| is_quarantined_snapshot(&entry.path()))
+                .count();
+            atomic_write_private_file(&active, original.as_bytes()).unwrap();
+            let (_, tabs) = load_tabs_state();
+            assert_eq!(tabs.len(), expected_tabs, "{name}");
+            // Model the survivor count or the fresh fallback tab using native
+            // VTE widgets without a PTY or child process. Exercise the actual
+            // autosave entry point that follows startup restoration.
+            let notebook = Notebook::new();
+            for index in 0..expected_tabs.max(1) {
+                notebook.append_page(
+                    &Terminal::new(),
+                    Some(&Label::new(Some(&format!("restored-{index}")))),
+                );
+            }
+            save_tabs_state(&notebook, &HashMap::new());
+            let (tx, rx) = std::sync::mpsc::channel();
+            persistence::enqueue(
+                PersistenceKey::unique_for_path("fixture-barrier", &active),
+                "fixture barrier",
+                move || {
+                    tx.send(()).unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            assert!(
+                persistence::drain_failures().is_empty(),
+                "{name}: autosave failed"
+            );
+            assert_ne!(
+                fs::read(&active).unwrap(),
+                original.as_bytes(),
+                "{name}: actual autosave must replace the active payload"
+            );
+            let preserved = fs::read_dir(&directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| is_quarantined_snapshot(path))
+                .any(|path| fs::read(path).unwrap() == original.as_bytes());
+            let recovery_count_after = fs::read_dir(&directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| is_quarantined_snapshot(&entry.path()))
+                .count();
+            assert_eq!(
+                recovery_count_after - recovery_count_before,
+                usize::from(preserve),
+                "{name}: quarantine once"
+            );
+            eprintln!(
+                "{name}: restored_tabs={} preserved_original={preserved}",
+                tabs.len()
+            );
+            results.push((name, preserved == preserve));
+        }
+        fs::remove_dir_all(directory).unwrap();
+        assert!(
+            results.iter().all(|(_, matched)| *matched),
+            "recovery preservation outcomes: {results:?}"
+        );
+    }
+
     /// A chat library this build cannot read is still the user's only copy, and
     /// the very next autosave replaces the claimed `.active` file with a payload
     /// carrying no `ai_conversation=` line at all. Move the bytes aside first —
@@ -2451,7 +2789,9 @@ mod tests {
         );
         fs::write(&path, contents).unwrap();
 
-        assert!(restore_ai_conversation(&path, contents).is_none());
+        assert!(restore_ai_conversation(&path, contents, false)
+            .snapshot
+            .is_none());
         assert!(
             !path.exists(),
             "the claimed snapshot must not stay where the next save overwrites it"
@@ -2496,7 +2836,7 @@ mod tests {
             let path = directory.join(name);
             fs::write(&path, &contents).unwrap();
             assert_eq!(
-                restore_ai_conversation(&path, &contents),
+                restore_ai_conversation(&path, &contents, false).snapshot,
                 expected,
                 "{name}"
             );
