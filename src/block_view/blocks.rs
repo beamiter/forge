@@ -2371,7 +2371,18 @@ impl FinishedBlock {
         context_label.update_property(&[gtk4::accessible::Property::Label(
             &context_details.join("; "),
         )]);
-        header_row.append(&context_label);
+        let review_button = gtk4::Button::new();
+        review_button.set_child(Some(&context_label));
+        review_button.set_hexpand(true);
+        review_button.add_css_class("flat");
+        review_button.add_css_class("block-review-button");
+        review_button.set_focus_on_click(false);
+        review_button.set_action_name(Some("block.review"));
+        review_button.set_tooltip_text(Some(
+            "Review full command, working directory and capture details",
+        ));
+        review_button.update_property(&[gtk4::accessible::Property::Label("Review block details")]);
+        header_row.append(&review_button);
 
         // Exit code badge. A successful command shows none; an unknown status
         // gets its own badge rather than silently looking like a success.
@@ -4952,8 +4963,10 @@ mod tests {
         let mut summaries = Vec::new();
         let mut child = card.header_row.first_child();
         while let Some(widget) = child {
-            if widget.has_css_class("block-context-summary") {
-                summaries.push(widget.clone().downcast::<gtk4::Label>().unwrap());
+            if widget.has_css_class("block-review-button") {
+                let button = widget.clone().downcast::<gtk4::Button>().unwrap();
+                assert_eq!(button.action_name().as_deref(), Some("block.review"));
+                summaries.push(button.child().unwrap().downcast::<gtk4::Label>().unwrap());
             }
             child = widget.next_sibling();
         }

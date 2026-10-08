@@ -44,6 +44,7 @@ mod kitty_graphics;
 mod onboarding;
 #[allow(dead_code)]
 mod palette;
+mod review;
 mod scroll;
 mod selection_hold;
 mod unified_chrome;
@@ -4042,6 +4043,56 @@ impl BlockBackend {
         let fix_block_cbs_for_menu = self.fix_block_with_agent_cbs.clone();
         let current_cwd_for_menu = self.current_cwd_for_menu.clone();
 
+        // Read-only inspection is shared by the persistent header and menu.
+        // Keep only weak native window/card references; no history/VTE copies.
+        let review_slot = Rc::new(RefCell::new(glib::WeakRef::<gtk4::Window>::new()));
+        let open_review: Rc<dyn Fn()> = {
+            let slot = review_slot.clone();
+            let card = finished_widget.downgrade();
+            let finished = finished_blocks_for_menu.clone();
+            let records = self.block_data_for_cb.clone();
+            let selected = selected_ids_for_menu.clone();
+            let active = selected_for_menu.clone();
+            let anchor = anchor_for_menu.clone();
+            let live = vte_for_copy.clone();
+            Rc::new(move || {
+                if let Some(window) = slot.borrow().upgrade() {
+                    window.present();
+                    return;
+                }
+                let (Some(card), Some(finished), Some(live)) =
+                    (card.upgrade(), finished.upgrade(), live.upgrade())
+                else {
+                    return;
+                };
+                if !records.borrow().iter().any(|record| record.id == block_id) {
+                    return;
+                }
+                activate_finished_block_selection(
+                    &finished.borrow(),
+                    &selected,
+                    &active,
+                    &anchor,
+                    block_id,
+                );
+                if let Some(window) = review::open(
+                    card.upcast_ref(),
+                    records.clone(),
+                    &selected.borrow(),
+                    block_id,
+                    &live,
+                ) {
+                    *slot.borrow_mut() = window.downgrade();
+                    let slot = slot.clone();
+                    window.connect_close_request(move |_| {
+                        slot.borrow_mut().set(None);
+                        glib::Propagation::Proceed
+                    });
+                }
+            })
+        };
+        let review_from_menu = open_review.clone();
+
         let right_click = gtk4::GestureClick::new();
         right_click.set_button(3);
 
@@ -4095,6 +4146,17 @@ impl BlockBackend {
                 btn.add_css_class("flat");
                 btn
             };
+
+            {
+                let item = make_item("Review Block / Selection");
+                let popover = popover.downgrade();
+                let review = review_from_menu.clone();
+                item.connect_clicked(move |_| {
+                    popdown_if_alive(&popover);
+                    review();
+                });
+                vbox.append(&item);
+            }
 
             let selected_count = selected_ids_for_menu.borrow().len();
             let has_selected_commands = {
@@ -4767,6 +4829,9 @@ impl BlockBackend {
                 open_menu(f64::from(card.width().saturating_sub(24)), 24.0);
             }
         });
+        let inspect = gtk4::gio::SimpleAction::new("review", None);
+        inspect.connect_activate(move |_, _| open_review());
+        actions.add_action(&inspect);
         actions.add_action(&show_menu);
         finished_widget.insert_action_group("block", Some(&actions));
     }
@@ -20048,6 +20113,269 @@ mod tests {
             );
         }
         window.close();
+    }
+
+    /// Exercise the actual action group installed by BlockBackend, over a real
+    /// VTE/test PTY. Pure inspector fixtures cannot catch missing production
+    /// action wiring or accidental input/focus/geometry regressions.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn block_review_production_actions_are_read_only_responsive_and_revalidated() {
+        use gtk4::prelude::*;
+        gtk4::init().expect("gtk init");
+        let config = crate::config::Config::safe_defaults();
+        let view = super::TermView::new_with_spawner(
+            &config,
+            &crate::config::TerminalMode::Block,
+            &["sh".into()],
+            None,
+            None,
+            &[],
+            |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+        )
+        .unwrap();
+        let owner = gtk4::Window::builder()
+            .default_width(900)
+            .default_height(720)
+            .child(&view.widget())
+            .build();
+        owner.present();
+        let settle = || {
+            let context = gtk4::glib::MainContext::default();
+            let started = std::time::Instant::now();
+            while started.elapsed() < std::time::Duration::from_millis(180) {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        fn descendants(widget: &gtk4::Widget) -> Vec<gtk4::Widget> {
+            let mut all = vec![widget.clone()];
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                child = current.next_sibling();
+                all.extend(descendants(&current));
+            }
+            all
+        }
+        let inspectors = || {
+            gtk4::Window::list_toplevels()
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk4::Window>().ok())
+                .filter(|window| window.has_css_class("block-review-window") && window.is_visible())
+                .collect::<Vec<_>>()
+        };
+        settle();
+        for command in ["printf '你好🌿'", "cargo test --all-features", "true"] {
+            let encoded: String = command.bytes().map(|byte| format!("%{byte:02X}")).collect();
+            view.pty.write_test_slave(
+                format!("\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C;cmdline_url={encoded}\x07").as_bytes(),
+            );
+            settle();
+            if command == "true" {
+                view.pty
+                    .write_test_slave(b"\x1b_Ga=T,f=32,s=1,v=1,i=42,c=2,r=1,q=2;AP8A/w==\x1b\\");
+                settle();
+            }
+            view.pty.set_test_foreground(PtyForeground::Shell);
+            view.pty
+                .write_test_slave(b"\x1b]133;D\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+            settle();
+        }
+        assert_eq!(view.block_data.borrow().len(), 3);
+        {
+            let mut blocks = view.block_data.borrow_mut();
+            blocks[0].cwd = Some("/workspace/研究/long project directory".into());
+            blocks[1].exit_code = Some(7);
+            blocks[1].command_truncated = true;
+            blocks[1].output_notice = Some("Earlier output not retained".into());
+        }
+        let ids: HashSet<_> = view
+            .block_data
+            .borrow()
+            .iter()
+            .map(|record| record.id)
+            .collect();
+        *view.selected_block_ids.borrow_mut() = ids;
+        let card = view
+            .finished_blocks
+            .borrow()
+            .last()
+            .unwrap()
+            .widget()
+            .clone();
+        // Busy and dirty input does not prevent observation. No insertion or
+        // execution capability is available to this inspector at all.
+        view.pty.set_test_foreground(PtyForeground::Other);
+        view.pty
+            .drain_test_slave(std::time::Duration::from_millis(10));
+        view.pending_typeahead.set(true);
+        assert!(
+            descendants(
+                view.finished_blocks
+                    .borrow()
+                    .last()
+                    .unwrap()
+                    .widget()
+                    .upcast_ref()
+            )
+            .iter()
+            .any(|widget| widget.is::<gtk4::Picture>()),
+            "the fixture includes an image-only card"
+        );
+        let winsize = view.pty.test_slave_winsize();
+        let scroll = view.block_scroll.vadjustment().value();
+        card.activate_action("block.review", None).unwrap();
+        settle();
+        assert_eq!(inspectors().len(), 1);
+        let review = inspectors().pop().unwrap();
+        card.activate_action("block.review", None).unwrap();
+        settle();
+        assert_eq!(inspectors().as_slice(), std::slice::from_ref(&review));
+        assert!(review.is_modal());
+        let widgets = descendants(review.upcast_ref());
+        let texts: Vec<_> = widgets
+            .iter()
+            .filter_map(|widget| widget.clone().downcast::<gtk4::TextView>().ok())
+            .collect();
+        assert_eq!(texts.len(), 2);
+        assert!(texts.iter().all(|text| !text.is_editable()));
+        let picker = widgets
+            .iter()
+            .find_map(|widget| widget.clone().downcast::<gtk4::DropDown>().ok())
+            .unwrap();
+        assert_eq!(picker.model().unwrap().n_items(), 3);
+        picker.set_selected(1);
+        settle();
+        assert!(texts.iter().any(|text| {
+            let buffer = text.buffer();
+            buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                .contains("Truncated command report")
+        }));
+        let screenshot = |name: &str| {
+            if let Ok(directory) = std::env::var("FORGE_REVIEW_SCREENSHOT_DIR") {
+                let paintable = gtk4::WidgetPaintable::new(Some(&review));
+                let snapshot = gtk4::Snapshot::new();
+                paintable.snapshot(&snapshot, review.width() as f64, review.height() as f64);
+                let node = snapshot.to_node().expect("rendered review");
+                let renderer = review.renderer().expect("native renderer");
+                renderer
+                    .render_texture(&node, None)
+                    .save_to_png(std::path::Path::new(&directory).join(name))
+                    .unwrap();
+            }
+        };
+        screenshot("forge-block-review-wide.png");
+        picker.set_selected(0);
+        settle();
+        screenshot("forge-block-review-unicode.png");
+        picker.set_selected(1);
+        review.set_default_size(360, 520);
+        settle();
+        assert!(
+            review.width() <= 400,
+            "narrow inspector: {}",
+            review.width()
+        );
+        screenshot("forge-block-review-narrow.png");
+        let stack = widgets
+            .iter()
+            .find_map(|widget| widget.clone().downcast::<gtk4::Stack>().ok())
+            .unwrap();
+        stack.set_visible_child_name("commands");
+        settle();
+        screenshot("forge-command-order-narrow.png");
+        let copy = widgets
+            .iter()
+            .find_map(|widget| {
+                widget
+                    .clone()
+                    .downcast::<gtk4::Button>()
+                    .ok()
+                    .filter(|button| button.label().as_deref() == Some("Copy commands"))
+            })
+            .unwrap();
+        assert!(copy.is_sensitive());
+        copy.emit_clicked();
+        settle();
+        let clipboard = gtk4::glib::MainContext::default()
+            .block_on(copy.clipboard().read_text_future())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            clipboard,
+            "printf '你好🌿'\ncargo test --all-features\ntrue"
+        );
+        // An evicted identity never silently becomes a copy of a smaller range.
+        let evicted = view.block_data.borrow_mut().pop_front().unwrap();
+        copy.emit_clicked();
+        assert!(!copy.is_sensitive());
+        assert!(descendants(review.upcast_ref()).iter().any(|widget| widget
+            .clone()
+            .downcast::<gtk4::Label>()
+            .ok()
+            .is_some_and(|label| label.text().contains("no longer retained"))));
+        assert_eq!(view.pty.test_slave_winsize(), winsize);
+        assert_eq!(view.block_scroll.vadjustment().value(), scroll);
+        assert!(view
+            .pty
+            .drain_test_slave(std::time::Duration::from_millis(10))
+            .is_empty());
+        assert!(
+            view.pending_typeahead.get(),
+            "review leaves a dirty/busy prompt unchanged"
+        );
+        view.block_data.borrow_mut().push_front(evicted);
+        // Emit through the production key controller, including Escape focus return.
+        let controllers = review.observe_controllers();
+        for index in 0..controllers.n_items() {
+            if let Some(keys) = controllers
+                .item(index)
+                .and_downcast::<gtk4::EventControllerKey>()
+            {
+                keys.emit_by_name::<bool>(
+                    "key-pressed",
+                    &[
+                        &gtk4::gdk::Key::Escape,
+                        &0u32,
+                        &gtk4::gdk::ModifierType::empty(),
+                    ],
+                );
+            }
+        }
+        settle();
+        assert!(inspectors().is_empty());
+        assert!(view.active_vte.has_focus());
+        card.activate_action("block.review", None).unwrap();
+        settle();
+        assert_eq!(inspectors().len(), 1);
+        inspectors()[0].close();
+        settle();
+        assert!(view
+            .pty
+            .drain_test_slave(std::time::Duration::from_millis(10))
+            .is_empty());
+        view.pending_typeahead.set(false);
+        assert_eq!(view.clear_blocks(), 3);
+        assert_eq!(view.undo_clear_blocks(), 3);
+        settle();
+        let restored = view
+            .finished_blocks
+            .borrow()
+            .last()
+            .unwrap()
+            .widget()
+            .clone();
+        restored.activate_action("block.review", None).unwrap();
+        settle();
+        assert_eq!(
+            inspectors().len(),
+            1,
+            "restored cards get the production review action"
+        );
+        inspectors()[0].close();
+        settle();
+        owner.close();
     }
 
     /// End to end on a real pane: output the line replay cuts short puts the

@@ -1044,6 +1044,18 @@ pub(crate) fn block_css(config: &Config) -> String {
             font-size: 0.82em;
             font-weight: bold;
         }}
+        .block-review-button {{
+            min-width: 0;
+            min-height: 24px;
+            padding: 0 4px;
+            border-radius: 6px;
+        }}
+        .block-review-button:hover {{
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
+        }}
+        .block-review-window textview {{
+            border-radius: 8px;
+        }}
         .block-action-btn {{
             color: {dim_fg};
             min-width: 24px;

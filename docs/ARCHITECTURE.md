@@ -94,3 +94,21 @@ Directory, branch, timestamp and duration share one expanding context label with
 one-character width floor and middle ellipsis. Its tooltip and accessible label retain
 bounded safe details. This keeps the finished-card header at one row, so the existing
 height estimator, collapse geometry and virtual-scroll anchoring contract remain unchanged.
+
+
+### Bounded Block record review
+
+`block_view/review.rs` is a read-only native transient inspector, mounted through the same
+`BlockBackend::install_finished_block_context_menu` action group as production, restored,
+and undo-restored cards. `block.review` and the menu share one weak window slot per card.
+The modal window does not participate in terminal layout or scroll virtualization.
+
+Snapshots retain only bounded command/metadata strings, never clone output, textures, or
+finished widgets. Admission is capped at 64 records and 256 KiB of command bytes; individual
+metadata fields use a 16 KiB safe-display budget. Any omitted/missing selected record disables
+atomic clipboard copy. Copy re-resolves every captured ID and compares its command against
+the current model, refusing the entire selection if stale or display-sanitized. The module
+has no PTY, command-submission context, or execute/insert callback. Output bytes and line counts
+are metadata only, and unknown completion/timing remain explicit. GTK tests exercise the actual
+production action group, response to eviction, repeated open/close, narrow/wide rendering,
+clipboard order, Escape focus return, and unchanged PTY size/input/scroll anchor.

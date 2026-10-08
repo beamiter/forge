@@ -83,6 +83,7 @@ tests=(
     block_view::onboarding::tests::block_onboarding_overlay_is_non_measuring_and_non_targetable
     block_view::tests::a_stranded_focus_mount_declines_only_what_the_focused_widget_owns
     block_view::blocks::tests::repeated_action_feedback_restores_the_original_affordance
+    block_view::tests::block_review_production_actions_are_read_only_responsive_and_revalidated
     block_view::tests::persistent_block_actions_reopen_without_duplicates_or_pty_input
     block_view::blocks::tests::outputless_cards_cannot_create_a_phantom_collapsed_summary
     block_view::blocks::tests::long_context_uses_one_flexible_accessible_summary

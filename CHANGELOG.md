@@ -6,6 +6,12 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Block 新增只读原生审阅窗口：点击卡片元数据或选择菜单中的 Review Block / Selection，
+  查看完整保留命令、cwd、退出状态、可信时长、生命周期与截断来源。多选可逐块查看，并按
+  历史顺序预览/复制命令。窗口不回填、不执行，不改变终端大小或历史滚动锚点。
+  最多审阅 64 块、256 KiB 命令；超限明确提示且禁用整组复制，绝不静默复制部分选择。
+  复制时重新核对块 ID 与命令，拒绝已淘汰/变化的记录和隐藏控制字符，Escape 关闭后归还焦点。
+
 - Block 卡片加入常驻、可键盘访问的 Block actions 菜单，与右键共用安全动作；缩减 header
   的隐藏工具栏占宽，保留复制输出与只回填的快捷入口。长菜单可滚动且重复激活只保留一个实例。
   快捷按钮的键盘焦点不会因鼠标移出而被隐藏/禁用，cwd/git 省略文本增加完整 tooltip。
