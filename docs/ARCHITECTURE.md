@@ -8,7 +8,7 @@
 
 `src/font.rs` checks the display's Pango family catalog after GTK initialization.
 Only an unavailable, standalone default `JetBrainsMono Nerd Font Mono` family is
-replaced with `Monospace` at rendering time, before icon fallback is appended.
+replaced with `Monospace` at rendering time, before icon fallback is appended. Generated Pango family-list separators contain no added whitespace: `set_family` treats that whitespace as part of the fallback name. CSS quoting/separators remain a separate path.
 The availability result is cached for the process lifetime; restart after installing
 a new font. The Pango description retains its size, weight and style, and config
 is never rewritten. Custom family names and lists keep their existing behavior.

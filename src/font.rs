@@ -139,7 +139,10 @@ fn family_list_with_icon(families: &str, icon_family: &str) -> Option<String> {
         let family = family.trim();
         family.contains(NERD_FONT_MARKER) || family.eq_ignore_ascii_case(icon_family)
     });
-    (!already_covered).then(|| format!("{families}, {icon_family}"))
+    // set_family receives a literal Pango list, not a parsed font description:
+    // whitespace here becomes part of the appended family name and can make
+    // an installed fallback unresolvable. CSS formatting is separate below.
+    (!already_covered).then(|| format!("{families},{icon_family}"))
 }
 
 /// Parse `desc`, resolve a missing default, and append the icon fallback.
@@ -337,7 +340,7 @@ mod tests {
     fn the_icon_family_lands_behind_the_configured_one() {
         assert_eq!(
             family_list_with_icon("Monospace", "Symbols Nerd Font Mono"),
-            Some("Monospace, Symbols Nerd Font Mono".to_string())
+            Some("Monospace,Symbols Nerd Font Mono".to_string())
         );
     }
 
@@ -346,7 +349,7 @@ mod tests {
         let font = font_description("Monospace Bold Italic 14", Some("Symbols Nerd Font Mono"));
         assert_eq!(
             font.family().map(|f| f.to_string()).unwrap_or_default(),
-            "Monospace, Symbols Nerd Font Mono"
+            "Monospace,Symbols Nerd Font Mono"
         );
         assert_eq!(font.size() / gtk4::pango::SCALE, 14);
         assert_eq!(font.weight(), gtk4::pango::Weight::Bold);
@@ -385,11 +388,88 @@ mod tests {
             .expect("the terminal carries a font");
 
         match icon_family(&config) {
-            Some(icon) => assert_eq!(families, format!("{configured}, {icon}")),
+            Some(icon) => assert_eq!(families, format!("{configured},{icon}")),
             // A box with no Nerd Font installed has nothing to fall back to,
             // and the description must then be exactly what the user asked for.
             None => assert_eq!(families, configured),
         }
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn an_explicit_appended_fallback_resolves_on_a_real_vte() {
+        use vte4::TerminalExt;
+        gtk4::init().expect("GTK display");
+        let mut config = Config::safe_defaults();
+        config.font_desc = "Forge QA Unavailable Family 14".to_string();
+        config.icon_font = Some("Monospace".to_string());
+        let before = config.font_desc.clone();
+        let terminal = crate::terminal::create_terminal(&config);
+        let context = terminal.pango_context();
+        assert!(!context
+            .list_families()
+            .iter()
+            .any(|family| family.name() == "Forge QA Unavailable Family"));
+        let reference_description = FontDescription::from_string("Monospace 14");
+        let actual_description = terminal.font().expect("configured font");
+        let actual_family = context
+            .load_font(&actual_description)
+            .unwrap()
+            .describe()
+            .family()
+            .unwrap();
+        let expected_family = context
+            .load_font(&reference_description)
+            .unwrap()
+            .describe()
+            .family()
+            .unwrap();
+        assert_eq!(
+            actual_family, expected_family,
+            "the appended family must actually resolve"
+        );
+
+        let reference = vte4::Terminal::new();
+        reference.set_font(Some(&reference_description));
+        let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        for surface in [&terminal, &reference] {
+            surface.set_size(32, 6);
+            surface.set_hexpand(true);
+            surface.set_vexpand(true);
+            row.append(surface);
+        }
+        let window = gtk4::Window::builder()
+            .default_width(1000)
+            .default_height(240)
+            .child(&row)
+            .build();
+        window.present();
+        let pump = || {
+            for _ in 0..20 {
+                for _ in 0..64 {
+                    if !gtk4::glib::MainContext::default().iteration(false) {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        pump();
+        for surface in [&terminal, &reference] {
+            surface.feed("iiii WWWW\r\n你好 😀 e\u{301}\r\nA中😀e\u{301}".as_bytes());
+        }
+        pump();
+        assert_eq!(terminal.char_width(), reference.char_width());
+        assert_eq!(terminal.char_height(), reference.char_height());
+        assert_eq!(terminal.cursor_position(), (6, 2));
+        assert_eq!(terminal.cursor_position(), reference.cursor_position());
+        assert_eq!(
+            terminal.text_format(vte4::Format::Text),
+            reference.text_format(vte4::Format::Text)
+        );
+        window.close();
+        assert_eq!(config.font_desc, before);
+        assert_eq!(config.icon_font.as_deref(), Some("Monospace"));
     }
 
     #[test]

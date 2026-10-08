@@ -665,6 +665,8 @@ dashboard 和 Settings 中的 **AI command correction** 开关控制 `command_co
 
 ## 12. 配置保存与快捷键
 
+显式图标/备用字体会以正确的 Pango 列表格式附加，不会因字体名前多出的空格而被忽略；字号、粗体、斜体和保存的设置不变。
+
 默认字体为 `JetBrainsMono Nerd Font Mono 14`。若系统未安装此字体，显示时会使用系统的
 `Monospace` 等宽字体，避免默认替代字体使字符间距失真；不会改写保存的配置。自定义字体
 和字体列表保持原样，已安装的默认字体仍优先使用。安装字体后请重启 Forge。

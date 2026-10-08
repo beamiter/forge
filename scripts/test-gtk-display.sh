@@ -52,6 +52,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    font::tests::an_explicit_appended_fallback_resolves_on_a_real_vte
     block_view::history::tests::unified_pane_lifecycle_preserves_failed_and_incomplete_restore_bytes
     block_view::history::tests::unified_pane_fresh_drop_reopen_and_runtime_retention_remain_writable
     block_view::history::tests::failed_zone_history_notice_wraps_and_explains_recovery

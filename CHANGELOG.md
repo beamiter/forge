@@ -6,6 +6,11 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Appended Pango font fallbacks no longer acquire an extra leading space in
+  their family name, so an explicit installed fallback resolves correctly when
+  the primary font is unavailable. Font styles, saved settings and CSS stacks
+  keep their existing behavior.
+
 - Unified keeps unsupported, damaged, or unreadable history files intact after
   restore fails or only a bounded subset fits, including empty-pane close and later saves. A persistent pane
   notice explains that saving is paused until the file is repaired or moved and
