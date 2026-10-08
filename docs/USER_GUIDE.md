@@ -81,6 +81,8 @@ terminal_mode = "block"
   `boundary_inferred` / `degraded`，不伪造退出码、结束时刻或耗时。
 - `vte` 是传统终端，适合要求完整滚屏语义的 TUI 或兼容性排查。
 
+Unified 运行中的分区元数据同时受 `max_visible_blocks` 与每 pane 128 MiB 估算内存上限约束（包含命令和 cwd 字符串容量），从最旧记录开始淘汰，最新记录始终保留；输出快照另受 4 MiB 总量限制。淘汰元数据会清理其书签和 badge，但不擦除 VTE 自身的滚屏文本。
+
 Unified 的重启历史保留最近至多 64 个分区，命令、cwd 与输出合计最多 4 MiB，实际 JSON 文件最多 8 MiB（包括转义与元数据）。达到上限时先舍弃较旧输出，再舍弃较旧分区；保留下来的截断提示不会伪装成完整输出。
 
 Kitty 支持刻意限定为 direct `a=T` 静态显示（`i`、`c/r/C`，PNG/RGB/RGBA）与 `a=q`

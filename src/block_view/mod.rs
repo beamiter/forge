@@ -5023,6 +5023,12 @@ struct CompletedCommandRecord {
 }
 
 impl CompletedCommandRecord {
+    fn estimated_retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.cmd.capacity())
+            .saturating_add(self.cwd.as_ref().map_or(0, String::capacity))
+    }
+
     fn lifecycle_health(&self) -> BlockLifecycleHealth {
         assess_lifecycle(self.start_mark_seen, self.completion_provenance)
     }
@@ -9907,6 +9913,9 @@ struct ZoneOutputSnapshot {
 /// snapshot bytes without touching the record they belonged to.
 struct UnifiedZoneStore {
     records: VecDeque<CompletedCommandRecord>,
+    /// Metadata has its own byte bound; a large configured count must not
+    /// allow long commands/directories to grow memory without a byte ceiling.
+    record_bytes: usize,
     snapshots: std::collections::HashMap<u64, ZoneOutputSnapshot>,
     /// Running total of the retained snapshots' `plain` byte lengths, the
     /// quantity [`MAX_TOTAL_SNAPSHOT_BYTES`] bounds.
@@ -9917,6 +9926,7 @@ impl UnifiedZoneStore {
     fn new() -> Self {
         Self {
             records: VecDeque::new(),
+            record_bytes: 0,
             snapshots: std::collections::HashMap::new(),
             snapshot_bytes: 0,
         }
@@ -10011,35 +10021,44 @@ fn prepare_inline_notice_for_mount(
     true
 }
 
-/// Append a completed record to the Unified zone table, dropping the oldest
-/// entries past
-/// `max_zones`.
-///
-/// The bound is deliberately the same `max_visible_blocks` knob Block-mode
-/// retention uses: a zone is much smaller than a finished block, so this is
-/// conservative, but until 1b decides what a zone must outlive (the VTE's own
-/// scrollback trim, most likely) an unbounded table would be the only
-/// unbounded allocation this mode adds. A drained record takes its snapshot
-/// with it. Pure so the retention rule is testable without a surface.
+/// Retain Unified metadata under both the configured count and the same
+/// estimated byte ceiling as completed Block history. Unified still owns no
+/// card widgets: only its command/directory metadata is charged here; output
+/// snapshots retain their independent 4 MiB cap. Retiring a record removes its
+/// matching snapshot, and callers retire bookmarks/chrome by the returned IDs.
 fn record_unified_zone(
     zones: &mut UnifiedZoneStore,
     record: CompletedCommandRecord,
     max_zones: usize,
 ) -> Vec<u64> {
+    record_unified_zone_with_budget(zones, record, max_zones, MAX_COMPLETED_BLOCK_RETAINED_BYTES)
+}
+
+fn record_unified_zone_with_budget(
+    zones: &mut UnifiedZoneStore,
+    record: CompletedCommandRecord,
+    max_zones: usize,
+    max_bytes: usize,
+) -> Vec<u64> {
+    zones.record_bytes = zones
+        .record_bytes
+        .saturating_add(record.estimated_retained_bytes());
     zones.records.push_back(record);
     let max = max_zones.max(1);
-    if zones.records.len() > max {
-        let drained: Vec<u64> = zones
-            .records
-            .drain(..zones.records.len() - max)
-            .map(|record| record.id)
-            .collect();
-        for id in &drained {
-            zones.remove_snapshot(*id);
-        }
-        return drained;
+    let mut retired = Vec::new();
+    // As in Block retention, preserve the newest record even when a
+    // degenerate budget cannot fit it. Valid production records are much
+    // smaller than the byte cap; a tiny test/configuration must not erase the
+    // command that just finished.
+    while zones.records.len() > 1 && (zones.records.len() > max || zones.record_bytes > max_bytes) {
+        let record = zones.records.pop_front().expect("nonempty record history");
+        zones.record_bytes = zones
+            .record_bytes
+            .saturating_sub(record.estimated_retained_bytes());
+        zones.remove_snapshot(record.id);
+        retired.push(record.id);
     }
-    Vec::new()
+    retired
 }
 
 /// The sole Unified live-feed wrapper, also captured by the prompt-settling
@@ -20900,6 +20919,96 @@ mod tests {
         assert!(zones.replay_snapshot(2, 0).is_empty());
         assert_eq!(zones.records.len(), 5, "saving never mutates live history");
         assert_eq!(zones.snapshots.len(), 5);
+    }
+
+    #[test]
+    fn unified_metadata_byte_budget_retires_identity_and_snapshot_together() {
+        let record = |id| CompletedCommandRecord {
+            id,
+            cmd: format!("command-{id}"),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: Some("/tmp/example".into()),
+            is_background: false,
+            completion_provenance: super::CompletionProvenance::ShellReported,
+            command_source: super::CommandTextSource::ShellReported,
+            start_mark_seen: true,
+        };
+        let mut zones = UnifiedZoneStore::new();
+        let budget = record(1).estimated_retained_bytes() * 2;
+        for id in 1..=2 {
+            assert!(
+                super::record_unified_zone_with_budget(&mut zones, record(id), 1000, budget)
+                    .is_empty()
+            );
+            zones.insert_snapshot(
+                id,
+                ZoneOutputSnapshot {
+                    plain: format!("output-{id}"),
+                    truncated: false,
+                },
+            );
+        }
+        let retired = super::record_unified_zone_with_budget(&mut zones, record(3), 1000, budget);
+        assert_eq!(retired, [1]);
+        assert_eq!(
+            zones
+                .records
+                .iter()
+                .map(|record| record.id)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+        assert!(zones.snapshot(1).is_none());
+        assert_eq!(zones.snapshot(2).unwrap().plain, "output-2");
+        assert_eq!(zones.snapshot_bytes, "output-2".len());
+        assert_eq!(
+            zones.record_bytes,
+            zones
+                .records
+                .iter()
+                .map(CompletedCommandRecord::estimated_retained_bytes)
+                .sum::<usize>()
+        );
+        assert!(zones.record_bytes <= budget);
+        let retired = super::record_unified_zone_with_budget(&mut zones, record(4), 0, 0);
+        assert_eq!(retired, [2, 3]);
+        assert_eq!(
+            zones.records[0].id, 4,
+            "the newest command survives a degenerate budget"
+        );
+        assert_eq!(
+            zones.record_bytes,
+            zones.records[0].estimated_retained_bytes()
+        );
+        assert_eq!(zones.snapshot_bytes, 0);
+    }
+
+    #[test]
+    fn unified_metadata_budget_accounts_for_reserved_string_capacity() {
+        let mut record = CompletedCommandRecord {
+            id: 1,
+            cmd: String::with_capacity(4096),
+            exit_code: None,
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: Some(String::with_capacity(2048)),
+            is_background: false,
+            completion_provenance: super::CompletionProvenance::Unknown,
+            command_source: super::CommandTextSource::Screen,
+            start_mark_seen: false,
+        };
+        record.cmd.push('x');
+        record.cwd.as_mut().unwrap().push('/');
+        assert_eq!(
+            record.estimated_retained_bytes(),
+            std::mem::size_of::<CompletedCommandRecord>()
+                + record.cmd.capacity()
+                + record.cwd.as_ref().unwrap().capacity()
+        );
     }
 
     #[test]

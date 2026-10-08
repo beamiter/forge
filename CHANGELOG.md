@@ -6,6 +6,9 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Unified 完成分区的命令/cwd 元数据新增每 pane 128 MiB 估算内存上限，与数量限制共同生效；
+  从最旧记录开始淘汰，并同步清理对应输出快照、书签和 badge，不擦除 VTE 自己的滚屏文本。
+
 - Unified 历史保存现在同时计算 cwd、JSON 转义与文件 framing；超限时优先丢弃最旧输出，
   再淘汰最旧记录，避免写出重启后被自身大小限制拒绝的会话文件。
 
