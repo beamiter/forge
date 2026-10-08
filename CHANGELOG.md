@@ -6,6 +6,10 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- 修复跨块文本拖选只复制最后一个 VTE 的问题：跨终端区域时由单一选区 owner 标记整区并按
+  显示顺序读取其完整保留文本，不再反复抢占 PRIMARY。单个 VTE 内仍保留原生按字选择；
+  选区以弱引用固定身份，区域卸载/内容变化后撤销，超限或失效时整次拒绝复制。
+
 - Unified 完成分区的命令/cwd 元数据新增每 pane 128 MiB 估算内存上限，与数量限制共同生效；
   从最旧记录开始淘汰，并同步清理对应输出快照、书签和 badge，不擦除 VTE 自己的滚屏文本。
 

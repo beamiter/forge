@@ -82,6 +82,7 @@ pub(crate) struct SelectionFeedHold {
     /// every drag — a plain click must not flash the indicator) and `false`
     /// when the hold releases.
     state_cb: RefCell<Option<StateFn>>,
+    release_cb: RefCell<Option<Box<dyn Fn()>>>,
 }
 
 impl SelectionFeedHold {
@@ -92,6 +93,7 @@ impl SelectionFeedHold {
             parked: RefCell::new(Vec::new()),
             flush_cb: RefCell::new(None),
             state_cb: RefCell::new(None),
+            release_cb: RefCell::new(None),
         })
     }
 
@@ -104,6 +106,10 @@ impl SelectionFeedHold {
     /// Wire the paused-output indicator. Called once by the view.
     pub(crate) fn set_state_listener(&self, listener: impl Fn(bool) + 'static) {
         *self.state_cb.borrow_mut() = Some(Box::new(listener));
+    }
+
+    pub(crate) fn set_release_listener(&self, listener: impl Fn() + 'static) {
+        *self.release_cb.borrow_mut() = Some(Box::new(listener));
     }
 
     fn notify_state(&self, parked: bool) {
@@ -201,6 +207,9 @@ impl SelectionFeedHold {
             return;
         }
         let parked = std::mem::take(&mut *self.parked.borrow_mut());
+        if let Some(released) = self.release_cb.borrow().as_ref() {
+            released();
+        }
         if parked.is_empty() {
             return;
         }
@@ -227,6 +236,18 @@ mod tests {
 
     use super::{commit_releases_hold, feed_hold_eligible, SelectionFeedHold, MAX_PARKED_BYTES};
     use crate::block_view::{BlockState, MouseReporting};
+
+    #[test]
+    fn releasing_an_empty_hold_notifies_the_external_selection_owner_once() {
+        let hold = SelectionFeedHold::new();
+        let count = Rc::new(std::cell::Cell::new(0));
+        let observed = count.clone();
+        hold.set_release_listener(move || observed.set(observed.get() + 1));
+        hold.begin_drag();
+        hold.flush_now();
+        hold.flush_now();
+        assert_eq!(count.get(), 1);
+    }
 
     fn sgr_any_event() -> MouseReporting {
         let mut mouse = MouseReporting::OFF;

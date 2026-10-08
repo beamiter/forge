@@ -16944,9 +16944,9 @@ impl TermView {
             return;
         }
         // Ctrl+Up enters anvil/Warp-style block selection at the newest block.
-        {
+        let moved_selection = {
             let finished = self.finished_blocks.borrow();
-            if (lines < 0 || self.selected_block_id.get().is_some())
+            (lines < 0 || self.selected_block_id.get().is_some())
                 && move_finished_block_selection(
                     &finished,
                     &self.selected_block_ids,
@@ -16955,10 +16955,12 @@ impl TermView {
                     &self.block_scroll,
                     lines.signum(),
                 )
-            {
-                self.cross_selection.clear_all();
-                return;
-            }
+        };
+        if moved_selection {
+            // Resuming a text-selection hold can finalize/evict commands.
+            // No history borrow may survive across that replay boundary.
+            self.cross_selection.clear_all();
+            return;
         }
 
         let adj = self.block_scroll.vadjustment();
@@ -17064,6 +17066,10 @@ impl TermView {
             return;
         }
         self.cross_selection.clear_all();
+        // Parked output may have entered an alt-screen program during replay.
+        if self.fullscreen.get() {
+            return;
+        }
         let finished = self.finished_blocks.borrow();
         // Only what the pane is showing: "select all" of a narrowed stream means
         // the cards on screen, not the ones the filter hid — and the range's two
@@ -17887,9 +17893,25 @@ impl TermView {
     }
 
     pub fn scroll_to_block(&self, block_index: usize) {
+        if self.fullscreen.get() {
+            return;
+        }
+        let Some(target_id) = self
+            .finished_blocks
+            .borrow()
+            .get(block_index)
+            .map(|block| block.id)
+        else {
+            return;
+        };
+        self.cross_selection.clear_all();
+        if self.fullscreen.get() {
+            return;
+        }
         let finished = self.finished_blocks.borrow();
-        if let Some(block) = finished.get(block_index) {
-            self.cross_selection.clear_all();
+        // Replay may evict an earlier block and shift every index. Keep the
+        // requested identity, or decline when it is no longer retained.
+        if let Some(block) = finished.iter().find(|block| block.id == target_id) {
             replace_finished_block_selection(
                 &finished,
                 &self.selected_block_ids,
@@ -20055,6 +20077,121 @@ mod tests {
         view.pty
             .drain_test_slave(std::time::Duration::from_millis(10));
         window.close();
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn block_navigation_releases_feed_without_a_history_borrow() {
+        use gtk4::prelude::*;
+        gtk4::init().unwrap();
+        let config = crate::config::Config::safe_defaults();
+        let view = Rc::new(
+            super::TermView::new_with_spawner(
+                &config,
+                &crate::config::TerminalMode::Block,
+                &["sh".into()],
+                None,
+                None,
+                &[],
+                |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+            )
+            .unwrap(),
+        );
+        let window = gtk4::Window::builder()
+            .default_width(700)
+            .default_height(400)
+            .child(&view.widget())
+            .build();
+        window.present();
+        let settle = || {
+            for _ in 0..20 {
+                for _ in 0..64 {
+                    if !gtk4::glib::MainContext::default().iteration(false) {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        settle();
+        view.pty
+            .write_test_slave(b"\x1b]133;A\x07$ \x1b]133;B\x07printf ok\r\n\x1b]133;C\x07ok\r\n");
+        settle();
+        view.pty.set_test_foreground(PtyForeground::Shell);
+        view.pty
+            .write_test_slave(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        settle();
+        assert_eq!(view.finished_blocks.borrow().len(), 1);
+        let history = view.finished_blocks.clone();
+        let writable = Rc::new(RefCell::new(Vec::new()));
+        let observed = writable.clone();
+        view.selection_feed_hold.set_flush(move |_| {
+            // The real replay path can finalize a command and mutate this
+            // history; check availability without panicking across GTK.
+            observed.borrow_mut().push(history.try_borrow_mut().is_ok());
+        });
+        for by_index in [false, true] {
+            view.selection_feed_hold.begin_drag();
+            assert!(view.selection_feed_hold.try_buffer(b"parked completion"));
+            view.selection_feed_hold.end_drag(true);
+            if by_index {
+                view.scroll_to_block(0);
+            } else {
+                view.scroll_lines(-1);
+            }
+            settle();
+        }
+        assert_eq!(&*writable.borrow(), &[true, true], "production navigation must release history borrows before replay can finalize or evict a block");
+        for _ in 0..2 {
+            view.pty.write_test_slave(b"printf next\r\n\x1b]133;C;cmdline_url=printf%20next\x07next\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+            settle();
+        }
+        assert_eq!(view.finished_blocks.borrow().len(), 3);
+        let oldest_id = view.finished_blocks.borrow()[0].id;
+        let target_id = view.finished_blocks.borrow()[1].id;
+        let weak_view = Rc::downgrade(&view);
+        view.selection_feed_hold.set_flush(move |_| {
+            weak_view.upgrade().unwrap().delete_block_by_id(oldest_id);
+        });
+        view.selection_feed_hold.begin_drag();
+        assert!(view.selection_feed_hold.try_buffer(b"retire older command"));
+        view.selection_feed_hold.end_drag(true);
+        view.scroll_to_block(1);
+        assert_eq!(
+            view.selected_block_id.get(),
+            Some(target_id),
+            "replay must not shift the requested navigation identity"
+        );
+        let survivor_id = view.finished_blocks.borrow()[1].id;
+        let weak_view = Rc::downgrade(&view);
+        view.selection_feed_hold.set_flush(move |_| {
+            weak_view.upgrade().unwrap().delete_block_by_id(target_id);
+        });
+        view.selection_feed_hold.begin_drag();
+        assert!(view
+            .selection_feed_hold
+            .try_buffer(b"retire target command"));
+        view.selection_feed_hold.end_drag(true);
+        view.scroll_to_block(0);
+        assert_ne!(
+            view.selected_block_id.get(),
+            Some(survivor_id),
+            "a retired target must not redirect navigation to its replacement index"
+        );
+        let fullscreen = view.fullscreen.clone();
+        view.selection_feed_hold
+            .set_flush(move |_| fullscreen.set(true));
+        view.selection_feed_hold.begin_drag();
+        assert!(view.selection_feed_hold.try_buffer(b"enter full screen"));
+        view.selection_feed_hold.end_drag(true);
+        view.select_all_blocks();
+        assert!(
+            view.selected_block_ids.borrow().is_empty(),
+            "replayed alt-screen ownership must block hidden history selection"
+        );
+        view.fullscreen.set(false);
+        window.close();
+        settle();
     }
 
     #[test]

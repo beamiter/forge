@@ -52,6 +52,8 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::tests::block_navigation_releases_feed_without_a_history_borrow
+    block_view::cross_selection::tests::a_single_native_text_selection_survives_whole_card_selection_precedence
     ui::tabs::tests::failed_remote_launch_diagnostics_never_mark_the_attempt_connected
     ui::sidebar_tabs::tests::many_tab_switches_update_mirror_before_notebook_commits
     ui::dialogs::tests::cross_block_search_compact_rows_are_inside_horizontal_scroller

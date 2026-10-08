@@ -136,6 +136,8 @@ jobs:
             libpcre2-dev \
             xvfb \
             xauth \
+            libxtst6 \
+            python3 \
             dbus-x11
 
       - name: Install Rust toolchain
@@ -147,7 +149,7 @@ jobs:
           shared-key: gtk-display
 
       - name: Run display-backed GTK/VTE regressions
-        run: bash scripts/test-gtk-display.sh
+        run: FORGE_XTEST_DRIVER="$PWD/scripts/qa-cross-selection-pointer.py" bash scripts/test-gtk-display.sh
 
   clippy:
     name: Clippy
