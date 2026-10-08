@@ -6,6 +6,10 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Files path dialogs scroll deep ancestor lists within compact windows while
+  keeping Open and Cancel visible. Keyboard focus reveals the chosen ancestor,
+  and manual scrolling stays where the user leaves it.
+
 - Files path-dialog breadcrumbs ellipsize long components so Open and Cancel
   stay visible; tooltips retain the full display name and navigation uses the
   original complete path.

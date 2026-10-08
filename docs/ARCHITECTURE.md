@@ -94,6 +94,9 @@ CI runs the tracked-text privacy guard, rustfmt, shell syntax/ShellCheck, the fu
 The Files path dialog gives breadcrumb labels middle ellipsization so a long
 component cannot enlarge the dialog beyond its parent. The full safe display
 label remains in the tooltip; navigation callbacks retain the original PathBuf.
+A native vertical ScrolledWindow contains the ancestors while the entry, error
+and ToolbarView header stay outside it. GTK handles ancestor focus reveal; no idle
+callback resets the user's scroll position.
 
 ## Finished-card action surface
 

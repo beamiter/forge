@@ -520,6 +520,29 @@ fn navigation_breadcrumb_button(ancestor: &Path) -> gtk4::Button {
     button
 }
 
+fn navigation_path_content(
+    entry: &adw::EntryRow,
+    error: &gtk4::Label,
+    breadcrumbs: &gtk4::FlowBox,
+) -> gtk4::Widget {
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.append(entry);
+    content.append(error);
+    let scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vscrollbar_policy(gtk4::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .vexpand(true)
+        .child(breadcrumbs)
+        .build();
+    content.append(&scroll);
+    content.upcast()
+}
+
 fn navigation_breadcrumbs(path: &Path) -> Vec<PathBuf> {
     let mut ancestors: Vec<_> = path.ancestors().map(Path::to_path_buf).collect();
     ancestors.reverse();
@@ -4333,14 +4356,6 @@ impl UiState {
         error.set_wrap(true);
         error.set_visible(false);
 
-        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-        content.set_margin_start(12);
-        content.set_margin_end(12);
-        content.set_margin_top(12);
-        content.set_margin_bottom(12);
-        content.append(&entry);
-        content.append(&error);
-
         let breadcrumbs = gtk4::FlowBox::new();
         breadcrumbs.set_selection_mode(gtk4::SelectionMode::None);
         breadcrumbs.set_column_spacing(4);
@@ -4355,7 +4370,7 @@ impl UiState {
             });
             breadcrumbs.insert(&button, -1);
         }
-        content.append(&breadcrumbs);
+        let content = navigation_path_content(&entry, &error, &breadcrumbs);
 
         let header = adw::HeaderBar::new();
         header.set_show_start_title_buttons(false);
@@ -6337,12 +6352,6 @@ mod tests {
             let entry = adw::EntryRow::new();
             entry.set_title("Absolute path");
             entry.set_text(&path.to_string_lossy());
-            let content = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-            content.set_margin_start(12);
-            content.set_margin_end(12);
-            content.set_margin_top(12);
-            content.set_margin_bottom(12);
-            content.append(&entry);
             let breadcrumbs = gtk4::FlowBox::new();
             breadcrumbs.set_selection_mode(gtk4::SelectionMode::None);
             breadcrumbs.set_column_spacing(4);
@@ -6358,7 +6367,9 @@ mod tests {
                 breadcrumbs.insert(&button, -1);
                 last = Some(button);
             }
-            content.append(&breadcrumbs);
+            let error = gtk4::Label::new(None);
+            error.set_visible(false);
+            let content = navigation_path_content(&entry, &error, &breadcrumbs);
             let header = adw::HeaderBar::new();
             header.set_show_start_title_buttons(false);
             header.set_show_end_title_buttons(false);
@@ -6418,6 +6429,155 @@ mod tests {
             dialog.close();
             parent.close();
         }
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn path_dialog_deep_ancestors_keep_actions_and_focus_reachable() {
+        adw::init().unwrap();
+        // This isolated fixture checks settled allocation, not a spring-animation frame.
+        gtk4::Settings::default()
+            .unwrap()
+            .set_gtk_enable_animations(false);
+        let path = PathBuf::from((0..40).map(|i| format!("/dir{i}")).collect::<String>());
+        let parent = adw::Window::builder()
+            .default_width(500)
+            .default_height(320)
+            .content(&gtk4::Label::new(Some("inert deep-path fixture")))
+            .build();
+        parent.present();
+        let dialog = adw::Dialog::builder()
+            .title("Open Filesystem Path")
+            .content_width(440)
+            .build();
+        let entry = adw::EntryRow::new();
+        entry.set_title("Absolute path");
+        entry.set_text(&path.to_string_lossy());
+        let error = gtk4::Label::new(None);
+        error.set_wrap(true);
+        error.set_visible(false);
+        let breadcrumbs = gtk4::FlowBox::new();
+        breadcrumbs.set_selection_mode(gtk4::SelectionMode::None);
+        breadcrumbs.set_column_spacing(4);
+        breadcrumbs.set_row_spacing(4);
+        let selected = Rc::new(RefCell::new(None));
+        let mut last = None;
+        for ancestor in navigation_breadcrumbs(&path) {
+            let button = navigation_breadcrumb_button(&ancestor);
+            let selected = Rc::clone(&selected);
+            button.connect_clicked(move |_| *selected.borrow_mut() = Some(ancestor.clone()));
+            breadcrumbs.insert(&button, -1);
+            last = Some(button);
+        }
+        let content = navigation_path_content(&entry, &error, &breadcrumbs);
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+        let cancel = gtk4::Button::with_label("Cancel");
+        let open = gtk4::Button::with_label("Open");
+        header.pack_start(&cancel);
+        header.pack_end(&open);
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&content));
+        dialog.set_child(Some(&toolbar));
+        dialog.present(Some(&parent));
+        let pump = || {
+            let context = glib::MainContext::default();
+            for _ in 0..60 {
+                while context.pending() {
+                    context.iteration(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        pump();
+        let last = last.unwrap();
+        let open_bounds = open.compute_bounds(&parent).unwrap();
+        let last_bounds = last.compute_bounds(&parent).unwrap();
+        eprintln!(
+            "parent_height={} open_top={} last_bottom={}",
+            parent.height(),
+            open_bounds.y(),
+            last_bounds.y() + last_bounds.height()
+        );
+        let capture = |key: &str| {
+            if let Some(path) = std::env::var_os(key) {
+                let paintable = gtk4::WidgetPaintable::new(Some(&parent));
+                let snapshot = gtk4::Snapshot::new();
+                paintable.snapshot(&snapshot, parent.width() as f64, parent.height() as f64);
+                let renderer =
+                    gtk4::gsk::Renderer::for_surface(&parent.surface().unwrap()).unwrap();
+                renderer
+                    .render_texture(snapshot.to_node().unwrap(), None)
+                    .save_to_png(path)
+                    .unwrap();
+                renderer.unrealize();
+            }
+        };
+        capture("FORGE_PATH_SCROLL_SCREENSHOT");
+        for action in [&open, &cancel] {
+            let bounds = action.compute_bounds(&parent).unwrap();
+            assert!(
+                bounds.y() >= 0.0 && bounds.y() + bounds.height() <= parent.height() as f32,
+                "dialog actions must remain inside the compact window"
+            );
+        }
+        assert!(last.grab_focus());
+        pump();
+        let bounds = last.compute_bounds(&parent).unwrap();
+        assert!(
+            bounds.y() >= 0.0 && bounds.y() + bounds.height() <= parent.height() as f32,
+            "focusing the final ancestor must reveal it"
+        );
+        let viewport = content
+            .last_child()
+            .unwrap()
+            .downcast::<gtk4::ScrolledWindow>()
+            .unwrap();
+        let viewport_bounds = viewport.compute_bounds(&parent).unwrap();
+        assert!(
+            bounds.y() >= viewport_bounds.y()
+                && bounds.y() + bounds.height() <= viewport_bounds.y() + viewport_bounds.height(),
+            "focused ancestor must be fully inside the scrolling viewport"
+        );
+        let adjustment = viewport.vadjustment();
+        assert!(adjustment.value() > 0.0);
+        capture("FORGE_PATH_SCROLL_FOCUS_SCREENSHOT");
+        adjustment.set_value(0.0);
+        pump();
+        assert!(
+            adjustment.value().abs() < 0.5,
+            "idle layout must not undo a manual scroll away from the focused ancestor"
+        );
+        capture("FORGE_PATH_SCROLL_IDLE_SCREENSHOT");
+        entry.set_text("relative");
+        error.set_text(validate_absolute_navigation_path(&entry.text()).unwrap_err());
+        error.set_visible(true);
+        adjustment.set_value(adjustment.upper() - adjustment.page_size());
+        assert!(entry.grab_focus());
+        pump();
+        let content_bounds = content.compute_bounds(&parent).unwrap();
+        for widget in [entry.upcast_ref::<gtk4::Widget>(), error.upcast_ref()] {
+            let bounds = widget.compute_bounds(&parent).unwrap();
+            assert!(
+                bounds.y() >= content_bounds.y()
+                    && bounds.y() + bounds.height() <= content_bounds.y() + content_bounds.height(),
+                "path entry and validation error must remain visible"
+            );
+        }
+        capture("FORGE_PATH_SCROLL_ERROR_SCREENSHOT");
+        open.grab_focus();
+        assert!(last.grab_focus());
+        pump();
+        assert!(
+            adjustment.value() > 0.0,
+            "explicit focus reveals the ancestor again"
+        );
+        last.emit_clicked();
+        assert_eq!(*selected.borrow(), Some(path));
+        dialog.close();
+        parent.close();
     }
 
     #[test]
