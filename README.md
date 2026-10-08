@@ -21,6 +21,9 @@ forge 是一个面向开发工作流的原生 GTK4 终端。它默认使用 Bloc
 
 分屏会继承当前 pane 的后端：Block 创建 Block sibling，VTE 创建 VTE sibling，并可继续嵌套。每个可见 pane 都独立拥有并清理其进程，关闭 pane、标签或窗口前会统一检查前台任务。
 
+默认字体 `JetBrainsMono Nerd Font Mono` 未安装时，运行时自动使用系统 `Monospace` 等宽字体；
+不会改写配置或覆盖自定义字体/字体列表。安装字体后重启即可使用。
+
 ## 构建与运行
 
 推荐使用仓库提供的 Nix 开发环境：

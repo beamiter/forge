@@ -4,6 +4,15 @@
 
 `src/bin/forge.rs` is intentionally tiny and delegates to the library application. `src/cli.rs` handles help, version, human/JSON config validation and diagnostics, config initialization/backup recovery, shell-integration output, and launch overrides before GTK initialization. Headless operations therefore remain usable over SSH and in CI. A normal launch enters `src/main.rs`, which builds the libadwaita application and the shared `UiState`.
 
+## Font resolution
+
+`src/font.rs` checks the display's Pango family catalog after GTK initialization.
+Only an unavailable, standalone default `JetBrainsMono Nerd Font Mono` family is
+replaced with `Monospace` at rendering time, before icon fallback is appended.
+The availability result is cached for the process lifetime; restart after installing
+a new font. The Pango description retains its size, weight and style, and config
+is never rewritten. Custom family names and lists keep their existing behavior.
+
 ## Terminal models
 
 forge has two explicit terminal models:

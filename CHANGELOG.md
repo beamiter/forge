@@ -6,6 +6,11 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- When the default JetBrainsMono Nerd Font Mono family is unavailable, terminal
+  text and Block chrome use the system Monospace family instead of a proportional
+  substitute. Installed preferred fonts, custom families/lists, and saved settings
+  are unchanged; Nerd Font icon fallback remains available.
+
 - 修复跨块文本拖选只复制最后一个 VTE 的问题：跨终端区域时由单一选区 owner 标记整区并按
   显示顺序读取其完整保留文本，不再反复抢占 PRIMARY。单个 VTE 内仍保留原生按字选择；
   选区以弱引用固定身份，区域卸载/内容变化后撤销，超限或失效时整次拒绝复制。

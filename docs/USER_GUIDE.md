@@ -661,6 +661,10 @@ dashboard 和 Settings 中的 **AI command correction** 开关控制 `command_co
 
 ## 12. 配置保存与快捷键
 
+默认字体为 `JetBrainsMono Nerd Font Mono 14`。若系统未安装此字体，显示时会使用系统的
+`Monospace` 等宽字体，避免默认替代字体使字符间距失真；不会改写保存的配置。自定义字体
+和字体列表保持原样，已安装的默认字体仍优先使用。安装字体后请重启 Forge。
+
 完整字段见 `config.toml.example`。保存后自动热重载，`Ctrl+Shift+R` 手动重载。语法或语义错误不会替换当前有效配置。
 
 应用内设置保存还会：获取进程级 advisory lock、检查加载时 revision、拒绝并发编辑冲突、用 owner-only 临时文件 `fsync` 后原子替换，并轮换 `.bak` / `.bak.1` 两份经过验证的备份。恢复前的当前文件另存为 `.before-restore`。冲突、验证拒绝、锁超时和 I/O 错误会在窗口中明确提示；内存中的临时改动仍有效，但磁盘不会被覆盖。发生冲突时先重载配置再重新应用改动；必要时运行 `forge --restore-config-backup`。safe mode 中的设置只影响当前窗口，也会明确提示不会保存。

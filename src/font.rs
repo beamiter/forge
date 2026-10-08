@@ -22,6 +22,37 @@ use std::sync::OnceLock;
 /// Substring every Nerd Font family name carries.
 const NERD_FONT_MARKER: &str = "Nerd Font";
 
+/// The preferred family in `DEFAULT_FONT_DESC`; keep saved settings unchanged.
+const DEFAULT_FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
+
+/// Resolve only our single default family. Custom names and ordered lists belong
+/// to the user, including lists that happen to contain the default family.
+fn default_family_fallback(family: &str, default_available: bool) -> &str {
+    if !default_available && family.eq_ignore_ascii_case(DEFAULT_FONT_FAMILY) {
+        "Monospace"
+    } else {
+        family
+    }
+}
+
+fn runtime_family(family: &str) -> &str {
+    if !family.eq_ignore_ascii_case(DEFAULT_FONT_FAMILY) || !gtk4::is_initialized_main_thread() {
+        return family;
+    }
+    // Font enumeration is expensive: like icon detection, do it once after GTK
+    // starts, never caching a headless/unit-test answer. Use the display's Pango
+    // family catalog rather than load_font(), which silently substitutes a face.
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    let available = *AVAILABLE.get_or_init(|| {
+        gtk4::Label::new(None)
+            .pango_context()
+            .list_families()
+            .iter()
+            .any(|candidate| candidate.name().eq_ignore_ascii_case(DEFAULT_FONT_FAMILY))
+    });
+    default_family_fallback(family, available)
+}
+
 /// Rank `name` as an icon fallback; lower is better, `None` rejects it.
 ///
 /// The `Mono` cuts hold every icon to a single cell, which is the only shape
@@ -111,12 +142,18 @@ fn family_list_with_icon(families: &str, icon_family: &str) -> Option<String> {
     (!already_covered).then(|| format!("{families}, {icon_family}"))
 }
 
-/// Parse `desc` and append `icon_family` behind the families it names.
+/// Parse `desc`, resolve a missing default, and append the icon fallback.
 ///
 /// Everything else in the description — size, weight, style — survives, so the
 /// user's font string stays the one thing that decides how text looks.
 pub(crate) fn font_description(desc: &str, icon_family: Option<&str>) -> FontDescription {
     let mut font = FontDescription::from_string(desc);
+    if let Some(family) = font.family() {
+        let resolved = runtime_family(&family);
+        if resolved != family.as_str() {
+            font.set_family(resolved);
+        }
+    }
     let Some(icon_family) = icon_family else {
         return font;
     };
@@ -137,6 +174,7 @@ pub(crate) fn terminal_font_description(desc: &str, config: &Config) -> FontDesc
 /// Block chrome draws command text through GTK labels rather than the VTE, so
 /// it needs the same fallback list spelled the way CSS wants it.
 pub(crate) fn css_font_stack(family: &str, icon_family: Option<&str>) -> String {
+    let family = runtime_family(family);
     let escape = |value: &str| value.replace('\\', "\\\\").replace('"', "\\\"");
     let primary = format!("\"{}\"", escape(family));
     match icon_family {
@@ -150,6 +188,104 @@ pub(crate) fn css_font_stack(family: &str, icon_family: Option<&str>) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_fallback_is_narrow_and_keeps_the_saved_default() {
+        let configured = FontDescription::from_string(crate::config::DEFAULT_FONT_DESC);
+        assert_eq!(configured.family().as_deref(), Some(DEFAULT_FONT_FAMILY));
+        assert_eq!(
+            default_family_fallback(DEFAULT_FONT_FAMILY, false),
+            "Monospace"
+        );
+        assert_eq!(
+            default_family_fallback(DEFAULT_FONT_FAMILY, true),
+            DEFAULT_FONT_FAMILY
+        );
+        assert_eq!(
+            default_family_fallback("jetbrainsmono nerd font mono", false),
+            "Monospace"
+        );
+        for custom in [
+            "",
+            "Monospace",
+            "User Font",
+            "JetBrainsMono Nerd Font",
+            "JetBrainsMono Nerd Font Mono, Monospace",
+        ] {
+            assert_eq!(default_family_fallback(custom, false), custom);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn default_font_resolution_preserves_grid_and_configuration() {
+        use vte4::TerminalExt;
+        // A pre-GTK lookup must not poison the runtime availability cache.
+        let _ = font_description(crate::config::DEFAULT_FONT_DESC, None);
+        gtk4::init().expect("GTK display");
+        let config = Config::safe_defaults();
+        let before = config.font_desc.clone();
+        let context = gtk4::Label::new(None).pango_context();
+        let installed = context
+            .list_families()
+            .iter()
+            .any(|family| family.name().eq_ignore_ascii_case(DEFAULT_FONT_FAMILY));
+        let expected = default_family_fallback(DEFAULT_FONT_FAMILY, installed);
+        let actual = font_description("JetBrainsMono Nerd Font Mono Bold Italic 13.5", None);
+        assert_eq!(actual.family().as_deref(), Some(expected));
+        assert_eq!(actual.size(), (13.5 * gtk4::pango::SCALE as f64) as i32);
+        assert_eq!(actual.weight(), gtk4::pango::Weight::Bold);
+        assert_eq!(actual.style(), gtk4::pango::Style::Italic);
+        assert_eq!(
+            css_font_stack(DEFAULT_FONT_FAMILY, None),
+            format!("\"{expected}\"")
+        );
+        let terminal = crate::terminal::create_terminal(&config);
+        let reference = vte4::Terminal::new();
+        reference.set_font(Some(&font_description(
+            &format!("{expected} 14"),
+            icon_family(&config),
+        )));
+        let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        for surface in [&terminal, &reference] {
+            surface.set_size(32, 6);
+            surface.set_hexpand(true);
+            surface.set_vexpand(true);
+            row.append(surface);
+        }
+        let window = gtk4::Window::builder()
+            .default_width(1000)
+            .default_height(240)
+            .child(&row)
+            .build();
+        window.present();
+        let pump = || {
+            for _ in 0..20 {
+                for _ in 0..64 {
+                    if !gtk4::glib::MainContext::default().iteration(false) {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        pump();
+        for surface in [&terminal, &reference] {
+            surface.feed("iiii WWWW\r\n你好 😀 e\u{301}\r\nA中😀e\u{301}".as_bytes());
+        }
+        pump();
+        assert_eq!(terminal.char_width(), reference.char_width());
+        assert_eq!(terminal.char_height(), reference.char_height());
+        assert_eq!(terminal.cursor_position(), (6, 2));
+        assert_eq!(terminal.cursor_position(), reference.cursor_position());
+        assert_eq!(
+            terminal.text_format(vte4::Format::Text),
+            reference.text_format(vte4::Format::Text)
+        );
+        window.close();
+        assert_eq!(config.font_desc, before);
+        assert_eq!(before, crate::config::DEFAULT_FONT_DESC);
+    }
 
     #[test]
     fn mono_cuts_outrank_proportional_and_symbols_outrank_text_fonts() {
@@ -235,7 +371,8 @@ mod tests {
         use vte4::TerminalExt;
 
         gtk4::init().expect("GTK display");
-        let config = Config::safe_defaults();
+        let mut config = Config::safe_defaults();
+        config.font_desc = "Monospace 14".to_string();
         let configured = FontDescription::from_string(&config.font_desc)
             .family()
             .map(|family| family.to_string())

@@ -81,6 +81,7 @@ tests=(
     terminal::tests::a_failed_vte_spawn_retires_task_sessions_without_an_exit_code
     terminal::tests::an_osc8_label_opens_its_target_on_a_real_vte
     block_view::css::tests::the_generated_stylesheet_parses_without_error
+    font::tests::default_font_resolution_preserves_grid_and_configuration
     font::tests::a_real_vte_is_given_the_icon_family_behind_the_configured_one
     block_view::onboarding::tests::block_onboarding_overlay_is_non_measuring_and_non_targetable
     block_view::tests::a_stranded_focus_mount_declines_only_what_the_focused_widget_owns
