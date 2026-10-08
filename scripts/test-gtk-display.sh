@@ -52,6 +52,9 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::history::tests::unified_pane_lifecycle_preserves_failed_and_incomplete_restore_bytes
+    block_view::history::tests::unified_pane_fresh_drop_reopen_and_runtime_retention_remain_writable
+    block_view::history::tests::failed_zone_history_notice_wraps_and_explains_recovery
     block_view::tests::block_navigation_releases_feed_without_a_history_borrow
     block_view::cross_selection::tests::a_single_native_text_selection_survives_whole_card_selection_precedence
     ui::tabs::tests::failed_remote_launch_diagnostics_never_mark_the_attempt_connected

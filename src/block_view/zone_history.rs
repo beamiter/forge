@@ -16,7 +16,7 @@
 //! injector's monotonic replay defence intact across restarts.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::{
     CompletedCommandRecord, CompletionProvenance, CompletionProvenanceWire, ZoneOutputSnapshot,
@@ -275,23 +275,48 @@ pub(super) fn encode_session(zones: Vec<PersistedZone>) -> io::Result<Vec<u8>> {
 
 /// Decode a session document, rejecting an unknown version outright rather
 /// than replaying fields this build cannot interpret.
-pub(super) fn decode_session(bytes: &[u8]) -> io::Result<Vec<PersistedZone>> {
-    let session: PersistedZoneSession =
-        serde_json::from_slice(bytes).map_err(|error| io::Error::other(error.to_string()))?;
-    if session.version != FORMAT_VERSION {
+#[cfg(test)]
+fn decode_session(bytes: &[u8]) -> io::Result<Vec<PersistedZone>> {
+    decode_session_for_restore(bytes).map(|session| session.zones)
+}
+
+struct DecodedSession {
+    zones: Vec<PersistedZone>,
+    limited: bool,
+}
+
+fn decode_session_for_restore(bytes: &[u8]) -> io::Result<DecodedSession> {
+    #[derive(serde::Deserialize)]
+    struct Version {
+        version: u32,
+    }
+    // Read the version before interpreting records. A future document need
+    // not use today's zone shape in order to be identified as unsupported.
+    let header: Version = serde_json::from_slice(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    if header.version != FORMAT_VERSION {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+            io::ErrorKind::Unsupported,
             format!(
                 "unsupported zone history version {} (expected {FORMAT_VERSION})",
-                session.version
+                header.version
             ),
         ));
     }
-    Ok(bound_persisted_zones(
-        session.zones,
-        MAX_RESTORED_ZONES,
-        MAX_RESTORED_SNAPSHOT_BYTES,
-    ))
+    let session: PersistedZoneSession = serde_json::from_slice(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let limited = session.zones.len() > MAX_RESTORED_ZONES
+        || session.zones.iter().fold(0usize, |total, zone| {
+            total.saturating_add(zone.retained_bytes())
+        }) > MAX_RESTORED_SNAPSHOT_BYTES;
+    Ok(DecodedSession {
+        zones: bound_persisted_zones(
+            session.zones,
+            MAX_RESTORED_ZONES,
+            MAX_RESTORED_SNAPSHOT_BYTES,
+        ),
+        limited,
+    })
 }
 
 /// Read a bounded zone-history file. A file over the ceiling is refused
@@ -305,12 +330,121 @@ pub(super) fn decode_session(bytes: &[u8]) -> io::Result<Vec<PersistedZone>> {
 /// open descriptor, caps the read itself, and refuses a fifo — which this path
 /// would otherwise have blocked the restoring thread on — a device, a hard-
 /// linked file, and one another user can write.
-pub(super) fn read_session(path: &Path) -> io::Result<Vec<PersistedZone>> {
+#[cfg(test)]
+fn read_session(path: &Path) -> io::Result<Vec<PersistedZone>> {
+    read_session_for_restore(path).map(|session| session.map_or_else(Vec::new, |s| s.zones))
+}
+
+fn read_session_for_restore(path: &Path) -> io::Result<Option<DecodedSession>> {
     match jterm_core::snapshot_file::read_bounded(path, MAX_ZONE_HISTORY_FILE_BYTES) {
-        Ok(text) => decode_session(text.as_bytes()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Ok(text) => decode_session_for_restore(text.as_bytes()).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum RestoreStatus {
+    #[default]
+    Unobserved,
+    Missing,
+    ValidEmpty,
+    Restored,
+    RestoredLimited,
+    Unsupported,
+    Corrupt,
+    ReadFailed,
+}
+
+/// Restore authority belongs to one path and one pane. A missing file is a
+/// fresh writable session; a failed read is not an empty session.
+#[derive(Debug, Default)]
+pub(super) struct SessionPersistence {
+    path: Option<PathBuf>,
+    status: RestoreStatus,
+}
+
+impl SessionPersistence {
+    pub(super) fn restore(&mut self, path: &Path) -> io::Result<Vec<PersistedZone>> {
+        self.path = Some(path.to_path_buf());
+        match read_session_for_restore(path) {
+            Ok(session) => {
+                self.status = match session.as_ref() {
+                    None => RestoreStatus::Missing,
+                    Some(session) if session.limited => RestoreStatus::RestoredLimited,
+                    Some(session) if session.zones.is_empty() => RestoreStatus::ValidEmpty,
+                    Some(_) => RestoreStatus::Restored,
+                };
+                Ok(session.map_or_else(Vec::new, |session| session.zones))
+            }
+            Err(error) => {
+                self.status = match error.kind() {
+                    io::ErrorKind::Unsupported => RestoreStatus::Unsupported,
+                    io::ErrorKind::InvalidData => RestoreStatus::Corrupt,
+                    _ => RestoreStatus::ReadFailed,
+                };
+                Err(error)
+            }
+        }
+    }
+
+    /// No retry may turn a failed restore into authority to replace bytes that
+    /// were never replayed. Only a real restore on this exact path grants it.
+    pub(super) fn save_refusal(&self, path: &Path) -> Option<String> {
+        if self.path.as_deref() != Some(path) {
+            return Some(
+                "Unified history is not being saved because this path has not been restored. \
+                 Existing files are kept. Reopen this pane to load its history first."
+                    .to_string(),
+            );
+        }
+        if self.status == RestoreStatus::RestoredLimited {
+            return Some(
+                "Unified history was only partly restored because it exceeds restore limits. \
+                 Existing files are kept and new history is not being saved. Keep a backup, \
+                 then reduce or move the history file and reopen this pane."
+                    .to_string(),
+            );
+        }
+        let reason = match self.status {
+            RestoreStatus::Missing | RestoreStatus::ValidEmpty | RestoreStatus::Restored => {
+                return None;
+            }
+            RestoreStatus::Unobserved => "history has not been restored",
+            RestoreStatus::RestoredLimited => unreachable!("handled above"),
+            RestoreStatus::Unsupported => "its format is not supported by this version",
+            RestoreStatus::Corrupt => "the history file is damaged",
+            RestoreStatus::ReadFailed => "the history file could not be read",
+        };
+        Some(format!(
+            "Unified history is not being saved because {reason}. Existing files are kept. \
+             Repair or move the history file, then reopen this pane."
+        ))
+    }
+
+    pub(super) fn save(&self, path: &Path, zones: Vec<PersistedZone>) -> io::Result<()> {
+        if let Some(message) = self.save_refusal(path) {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, message));
+        }
+        write_session(path, zones)
+    }
+}
+
+fn write_session(path: &Path, zones: Vec<PersistedZone>) -> io::Result<()> {
+    if zones.is_empty() {
+        // An empty successfully restored session removes its old document.
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        return Ok(());
+    }
+    let encoded = encode_session(zones)?;
+    super::history::atomic_write(path, |file| {
+        use std::io::Write;
+        file.write_all(&encoded)
+    })
 }
 
 /// Terminal bytes that reconstruct one restored zone above the next prompt.
@@ -598,7 +732,7 @@ mod tests {
     fn an_unknown_version_is_refused_rather_than_partially_replayed() {
         let document = br#"{"version":9999,"zones":[{"cmd":"x"}]}"#;
         let error = decode_session(document).expect_err("refuses");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     }
 
     #[test]
@@ -713,6 +847,168 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct SessionFixture {
+        directory: PathBuf,
+        path: PathBuf,
+    }
+
+    impl SessionFixture {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let directory =
+                std::env::temp_dir().join(format!("forge-zone-recovery-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let path = directory.join("zones.json");
+            Self { directory, path }
+        }
+
+        fn write(&self, bytes: &[u8]) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&self.path, bytes).unwrap();
+            std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    impl Drop for SessionFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[test]
+    fn failed_restore_preserves_exact_bytes_on_empty_close_and_later_save() {
+        for original in [
+            &b"{\"version\":2,\"future_document\":{\"kept\":true}}"[..],
+            &b"{\"version\":1,\"zones\":["[..],
+            &b""[..],
+            &[0xff, 0xfe][..],
+        ] {
+            for later_zones in [Vec::new(), vec![zone("new command", Some("new output"))]] {
+                let fixture = SessionFixture::new();
+                fixture.write(original);
+                let mut state = SessionPersistence::default();
+                assert!(state.restore(&fixture.path).is_err());
+                assert!(state.save(&fixture.path, later_zones).is_err());
+                assert_eq!(std::fs::read(&fixture.path).unwrap(), original);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_restore_does_not_gain_save_authority_when_disk_is_repaired() {
+        let fixture = SessionFixture::new();
+        fixture.write(b"not json");
+        let mut state = SessionPersistence::default();
+        assert!(state.restore(&fixture.path).is_err());
+        let repaired = encode_session(vec![zone("recovered", Some("preserved output"))]).unwrap();
+        fixture.write(&repaired);
+        for _ in 0..2 {
+            assert!(state.save(&fixture.path, vec![zone("live", None)]).is_err());
+            assert_eq!(std::fs::read(&fixture.path).unwrap(), repaired);
+        }
+        let mut reopened = SessionPersistence::default();
+        let restored = reopened.restore(&fixture.path).unwrap();
+        assert_eq!(restored[0].cmd, "recovered");
+        reopened.save(&fixture.path, restored).unwrap();
+        assert_eq!(read_session(&fixture.path).unwrap()[0].cmd, "recovered");
+    }
+
+    #[test]
+    fn restore_outcomes_distinguish_fresh_empty_unsupported_corrupt_and_read_failure() {
+        let fixture = SessionFixture::new();
+        let mut state = SessionPersistence::default();
+        assert_eq!(state.status, RestoreStatus::Unobserved);
+        assert!(state.save(&fixture.path, Vec::new()).is_err());
+        assert!(!fixture.path.exists());
+
+        assert!(state.restore(&fixture.path).unwrap().is_empty());
+        assert_eq!(state.status, RestoreStatus::Missing);
+        state
+            .save(&fixture.path, vec![zone("fresh", None)])
+            .unwrap();
+        assert_eq!(read_session(&fixture.path).unwrap()[0].cmd, "fresh");
+
+        let restored = state.restore(&fixture.path).unwrap();
+        assert_eq!(state.status, RestoreStatus::Restored);
+        state.save(&fixture.path, restored).unwrap();
+
+        fixture.write(br#"{"version":1,"zones":[]}"#);
+        assert!(state.restore(&fixture.path).unwrap().is_empty());
+        assert_eq!(state.status, RestoreStatus::ValidEmpty);
+        state.save(&fixture.path, Vec::new()).unwrap();
+        assert!(!fixture.path.exists());
+
+        fixture.write(br#"{"version":2,"future_payload":{}}"#);
+        assert!(state.restore(&fixture.path).is_err());
+        assert_eq!(state.status, RestoreStatus::Unsupported);
+
+        fixture.write(br#"{"version":1,"zones":false}"#);
+        assert!(state.restore(&fixture.path).is_err());
+        assert_eq!(state.status, RestoreStatus::Corrupt);
+
+        assert!(state.restore(&fixture.directory).is_err());
+        assert_eq!(state.status, RestoreStatus::ReadFailed);
+        assert!(state.save(&fixture.directory, Vec::new()).is_err());
+        assert!(fixture.path.is_file());
+    }
+
+    #[test]
+    fn write_authority_cannot_follow_a_changed_history_path() {
+        let original = SessionFixture::new();
+        let changed = SessionFixture::new();
+        let preserved = br#"{"version":9,"future_payload":true}"#;
+        changed.write(preserved);
+        let mut state = SessionPersistence::default();
+        state.restore(&original.path).unwrap();
+        for zones in [Vec::new(), vec![zone("new", None)]] {
+            assert!(state.save(&changed.path, zones).is_err());
+            assert_eq!(std::fs::read(&changed.path).unwrap(), preserved);
+        }
+        assert!(!original.path.exists());
+    }
+
+    #[test]
+    fn recovery_refusals_explain_preservation_without_disclosing_file_contents() {
+        let fixture = SessionFixture::new();
+        fixture.write(b"private broken content");
+        let mut state = SessionPersistence::default();
+        assert!(state.restore(&fixture.path).is_err());
+        let message = state.save_refusal(&fixture.path).unwrap();
+        assert!(message.contains("not being saved"));
+        assert!(message.contains("Existing files are kept"));
+        assert!(message.contains("reopen this pane"));
+        assert!(!message.contains("private broken content"));
+    }
+
+    #[test]
+    fn limited_restore_never_becomes_authority_to_delete_unreplayed_data() {
+        let oversized = zone(&"c".repeat(MAX_RESTORED_SNAPSHOT_BYTES + 1), None);
+        let output_heavy = zone("output", Some(&"o".repeat(MAX_RESTORED_SNAPSHOT_BYTES + 1)));
+        let many = (0..=MAX_RESTORED_ZONES)
+            .map(|_| zone("small", None))
+            .collect();
+        for zones in [vec![oversized], vec![output_heavy], many] {
+            let fixture = SessionFixture::new();
+            // Model an older producer: serialize directly so today's writer
+            // does not repair this fixture before the restore boundary sees it.
+            let original = serde_json::to_vec(&PersistedZoneSession {
+                version: FORMAT_VERSION,
+                zones,
+            })
+            .unwrap();
+            assert!(original.len() < MAX_ZONE_HISTORY_FILE_BYTES as usize);
+            fixture.write(&original);
+            let mut state = SessionPersistence::default();
+            let restored = state.restore(&fixture.path).unwrap();
+            assert_eq!(state.status, RestoreStatus::RestoredLimited);
+            assert!(state.save(&fixture.path, restored).is_err());
+            assert_eq!(std::fs::read(&fixture.path).unwrap(), original);
+            assert!(state.save(&fixture.path, Vec::new()).is_err());
+            assert_eq!(std::fs::read(&fixture.path).unwrap(), original);
+        }
     }
 
     #[test]

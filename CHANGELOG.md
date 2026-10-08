@@ -6,6 +6,11 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Unified keeps unsupported, damaged, or unreadable history files intact after
+  restore fails or only a bounded subset fits, including empty-pane close and later saves. A persistent pane
+  notice explains that saving is paused until the file is repaired or moved and
+  the pane is reopened; changed history paths require their own restore.
+
 - Session recovery keeps the selected surviving tab when earlier saved layouts
   are rejected by restore limits. If the selected layout cannot be restored,
   the nearest preceding survivor (or the first tab) is selected instead.

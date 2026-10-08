@@ -161,6 +161,7 @@ struct HistoryLoadState {
 
 pub(super) struct HistoryLoadShared {
     state: Mutex<HistoryLoadState>,
+    zone_persistence: Mutex<zone_history::SessionPersistence>,
     revision: Mutex<Option<HistoryRevision>>,
     legacy_authority: Mutex<LegacyHistoryAuthority>,
     applied: AtomicBool,
@@ -177,6 +178,7 @@ impl Default for HistoryLoadShared {
                 pre_apply_save_leases: 0,
                 consume_requested: false,
             }),
+            zone_persistence: Mutex::new(zone_history::SessionPersistence::default()),
             revision: Mutex::new(None),
             legacy_authority: Mutex::new(LegacyHistoryAuthority::MergeOnly),
             applied: AtomicBool::new(true),
@@ -1109,7 +1111,7 @@ impl Drop for HistoryFileLock {
 /// the old file. Keeping the temporary file in the same directory guarantees
 /// that the rename cannot cross filesystems. A failed encoder leaves the old
 /// history intact and removes its incomplete temporary file.
-fn atomic_write(
+pub(super) fn atomic_write(
     target: &Path,
     write_contents: impl FnOnce(&mut File) -> io::Result<()>,
 ) -> io::Result<()> {
@@ -2237,6 +2239,28 @@ fn write_history_snapshot_with_intent_parts(
     })
 }
 
+const ZONE_HISTORY_NOTICE_NAME: &str = "zone-history-recovery-notice";
+
+fn zone_history_notice(message: &str, details: &str) -> gtk4::Box {
+    let notice = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    notice.set_widget_name(ZONE_HISTORY_NOTICE_NAME);
+    notice.add_css_class("block-finished");
+    notice.add_css_class("block-assistant");
+    notice.set_hexpand(true);
+    notice.set_tooltip_text(Some(details));
+    let label = gtk4::Label::new(Some(message));
+    label.set_wrap(true);
+    label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+    label.set_max_width_chars(72);
+    label.set_xalign(0.0);
+    label.set_margin_start(12);
+    label.set_margin_end(12);
+    label.set_margin_top(8);
+    label.set_margin_bottom(8);
+    notice.append(&label);
+    notice
+}
+
 #[allow(dead_code)]
 impl TermView {
     /// Mark a fallibly prepared pane as rolled back. Exit callbacks and Drop
@@ -2280,40 +2304,78 @@ impl TermView {
         let Some(path) = self.zone_history_path() else {
             return Ok(());
         };
-        if zones.is_empty() {
-            // An empty session must not leave a stale document behind for the
-            // next run to replay.
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-            return Ok(());
-        }
-        let encoded = zone_history::encode_session(zones)?;
-        atomic_write(&path, |file| file.write_all(&encoded))
+        // This path also runs from Drop. Keep shutdown file I/O separate from
+        // notice rendering; a failed restore already left a persistent notice.
+        self.history_load
+            .zone_persistence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .save(&path, zones)
     }
 
     /// Replay this pane's persisted zones onto the surface before any PTY
-    /// byte reaches it. A failed or unreadable document is logged and skipped:
-    /// a restart with no history is a working pane, and refusing to start is
-    /// not.
+    /// byte reaches it. A failed read keeps the pane usable, but revokes this
+    /// path's save authority and leaves a persistent recovery notice so an
+    /// empty close or later live output cannot erase the unread document.
     fn restore_zone_history(&self) {
         let Some(path) = self.zone_history_path() else {
             return;
         };
-        let zones = match zone_history::read_session(&path) {
+        let (result, refusal) = {
+            let mut state = self
+                .history_load
+                .zone_persistence
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let result = state.restore(&path);
+            (result, state.save_refusal(&path))
+        };
+        let zones = match result {
             Ok(zones) => zones,
             Err(error) => {
                 log::warn!("zone history not restored from {}: {error}", path.display());
+                let message = refusal.expect("a failed restore never grants save authority");
+                self.show_zone_history_notice(&path, &message, &error);
                 return;
             }
         };
+        if let Some(message) = refusal {
+            self.show_zone_history_notice(
+                &path,
+                &message,
+                &io::Error::new(
+                    io::ErrorKind::FileTooLarge,
+                    "history exceeded restore limits",
+                ),
+            );
+        } else {
+            self.clear_zone_history_notice();
+        }
         if zones.is_empty() {
             return;
         }
         let restored = self.render_backend.replay_zone_snapshot(zones);
         log::debug!("restored {restored} zones from {}", path.display());
+    }
+
+    fn clear_zone_history_notice(&self) {
+        let mut child = self.notice_dock.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if widget.widget_name() == ZONE_HISTORY_NOTICE_NAME {
+                self.remove_inline_notice(&widget);
+            }
+        }
+    }
+
+    fn show_zone_history_notice(&self, path: &Path, message: &str, error: &io::Error) {
+        self.clear_zone_history_notice();
+        let details = jterm_core::review_input::safe_inline_display(
+            &format!("{}: {error}", path.display()),
+            2 * 1024,
+        );
+        let notice = zone_history_notice(message, &details);
+        self.insert_inline_notice(notice.upcast_ref());
     }
 
     /// Re-attempt whatever this pane's Block history is stuck on.
@@ -2795,6 +2857,7 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::{Path, PathBuf};
+    use std::rc::Rc;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -2848,6 +2911,252 @@ mod tests {
             command_truncated: false,
             output_notice: None,
         }
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn failed_zone_history_notice_wraps_and_explains_recovery() {
+        use gtk4::prelude::*;
+        gtk4::init().expect("GTK display");
+        let message = "Unified history is not being saved because its format is not supported \
+                       by this version. Existing files are kept. Repair or move the history \
+                       file, then reopen this pane.";
+        let notice =
+            super::zone_history_notice(message, "/tmp/session-zones.json: unsupported version");
+        let window = gtk4::Window::builder()
+            .default_width(360)
+            .default_height(180)
+            .child(&notice)
+            .build();
+        window.present();
+        let context = gtk4::glib::MainContext::default();
+        for _ in 0..40 {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let label = notice
+            .first_child()
+            .unwrap()
+            .downcast::<gtk4::Label>()
+            .unwrap();
+        assert_eq!(label.text(), message);
+        assert!(label.wraps());
+        assert!(
+            !label.is_focusable(),
+            "a recovery notice must not become a new focus target"
+        );
+        assert!(label.layout().line_count() > 1);
+        assert!(notice.width() > 0 && notice.width() <= window.width());
+        assert_eq!(notice.widget_name(), super::ZONE_HISTORY_NOTICE_NAME);
+        assert!(notice
+            .tooltip_text()
+            .unwrap()
+            .contains("session-zones.json"));
+        if let Some(path) = std::env::var_os("FORGE_HISTORY_NOTICE_SCREENSHOT") {
+            let paintable = gtk4::WidgetPaintable::new(Some(&window));
+            let snapshot = gtk4::Snapshot::new();
+            paintable.snapshot(&snapshot, window.width() as f64, window.height() as f64);
+            let node = snapshot.to_node().expect("notice render node");
+            let renderer = gtk4::gsk::Renderer::for_surface(&window.surface().unwrap())
+                .expect("notice renderer");
+            renderer
+                .render_texture(&node, None)
+                .save_to_png(path)
+                .unwrap();
+            renderer.unrealize();
+        }
+        window.close();
+    }
+
+    fn inert_unified_history_view(directory: &Path, max_blocks: u32) -> Rc<super::TermView> {
+        let mut config = crate::config::Config::safe_defaults();
+        config.block_history_path =
+            Some(directory.join("history.bin").to_string_lossy().into_owned());
+        config.max_visible_blocks = max_blocks;
+        Rc::new(
+            super::TermView::new_with_spawner(
+                &config,
+                &crate::config::TerminalMode::Unified,
+                &["inert-fixture-never-executed".to_string()],
+                None,
+                Some("history-fixture"),
+                &[],
+                |_argv, _cwd, _env, _token| {
+                    crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Other)
+                },
+            )
+            .expect("real Unified pane over an inert PTY"),
+        )
+    }
+
+    fn write_native_zone_fixture(path: &Path, bytes: &[u8]) {
+        fs::write(path, bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn mount_native_history_view(view: &Rc<super::TermView>) -> gtk4::Window {
+        use gtk4::prelude::*;
+        let window = gtk4::Window::builder()
+            .default_width(480)
+            .default_height(240)
+            .child(&view.widget())
+            .build();
+        window.present();
+        let context = gtk4::glib::MainContext::default();
+        for _ in 0..10 {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        window
+    }
+
+    fn close_native_history_view(window: gtk4::Window, view: Rc<super::TermView>) {
+        use gtk4::prelude::*;
+        window.set_child(None::<&gtk4::Widget>);
+        window.close();
+        let weak = Rc::downgrade(&view);
+        drop(view);
+        assert!(weak.upgrade().is_none(), "TermView::drop must actually run");
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn unified_pane_lifecycle_preserves_failed_and_incomplete_restore_bytes() {
+        use gtk4::prelude::*;
+        gtk4::init().expect("GTK display");
+        let limited = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "zones": [{"cmd": "x".repeat(super::zone_history::MAX_RESTORED_SNAPSHOT_BYTES + 1)}]
+        }))
+        .unwrap();
+        for original in [
+            br#"{"version":2,"future_payload":true}"#.to_vec(),
+            br#"{"version":1,"zones":["#.to_vec(),
+            limited,
+        ] {
+            for later_save in [false, true] {
+                let directory = TestDir::new("native-unified-preserve");
+                let view = inert_unified_history_view(directory.path(), 200);
+                let path = view.zone_history_path().unwrap();
+                write_native_zone_fixture(&path, &original);
+                let window = mount_native_history_view(&view);
+                view.start_history_load();
+                assert!(view.notice_dock.is_visible());
+                assert_eq!(
+                    view.notice_dock.first_child().unwrap().widget_name(),
+                    super::ZONE_HISTORY_NOTICE_NAME
+                );
+                assert!(view.save_history().is_err());
+                assert_eq!(fs::read(&path).unwrap(), original);
+                let expected = if later_save {
+                    // Insert inert record data through the real Unified backend;
+                    // no command or shell is executed by this persistence test.
+                    let zone = serde_json::from_str(
+                        r#"{"cmd":"later live record","output":"kept in memory"}"#,
+                    )
+                    .unwrap();
+                    assert_eq!(view.render_backend.replay_zone_snapshot(vec![zone]), 1);
+                    assert!(view.save_history().is_err());
+                    assert_eq!(fs::read(&path).unwrap(), original);
+                    let repaired =
+                        br#"{"version":1,"zones":[{"cmd":"repaired on disk"}]}"#.to_vec();
+                    write_native_zone_fixture(&path, &repaired);
+                    assert!(view.retry_history_persistence().is_err());
+                    assert_eq!(fs::read(&path).unwrap(), repaired);
+                    repaired
+                } else {
+                    original.clone()
+                };
+                close_native_history_view(window, view);
+                assert_eq!(
+                    fs::read(&path).unwrap(),
+                    expected,
+                    "Drop must preserve the source bytes"
+                );
+                if later_save {
+                    let recovered = inert_unified_history_view(directory.path(), 200);
+                    let window = mount_native_history_view(&recovered);
+                    recovered.start_history_load();
+                    let zones = recovered
+                        .render_backend
+                        .zone_replay_snapshot(64, 4 * 1024 * 1024)
+                        .unwrap();
+                    assert_eq!(zones[0].cmd, "repaired on disk");
+                    assert!(recovered.notice_dock.first_child().is_none());
+                    recovered.save_history().unwrap();
+                    close_native_history_view(window, recovered);
+                    let saved: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                    assert_eq!(saved["zones"][0]["cmd"], "repaired on disk");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn unified_pane_fresh_drop_reopen_and_runtime_retention_remain_writable() {
+        use gtk4::prelude::*;
+        gtk4::init().expect("GTK display");
+        let directory = TestDir::new("native-unified-fresh");
+        let fresh = inert_unified_history_view(directory.path(), 200);
+        let path = fresh.zone_history_path().unwrap();
+        let window = mount_native_history_view(&fresh);
+        fresh.start_history_load();
+        assert!(fresh.notice_dock.first_child().is_none());
+        let zone =
+            serde_json::from_str(r#"{"cmd":"fresh persisted record","output":"retained output"}"#)
+                .unwrap();
+        assert_eq!(fresh.render_backend.replay_zone_snapshot(vec![zone]), 1);
+        // Deliberately rely on Drop, not an explicit save, for this first write.
+        close_native_history_view(window, fresh);
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["zones"][0]["cmd"], "fresh persisted record");
+
+        let reopened = inert_unified_history_view(directory.path(), 200);
+        let window = mount_native_history_view(&reopened);
+        reopened.start_history_load();
+        let restored = reopened
+            .render_backend
+            .zone_replay_snapshot(64, 4 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].cmd, "fresh persisted record");
+        assert!(reopened.notice_dock.first_child().is_none());
+        reopened.save_history().unwrap();
+        close_native_history_view(window, reopened);
+
+        // The decoder restored both records completely. Applying the user's
+        // smaller live max_visible_blocks afterward is intentional runtime
+        // retention, not the incomplete-decode state which blocks saves.
+        write_native_zone_fixture(
+            &path,
+            br#"{"version":1,"zones":[{"cmd":"older"},{"cmd":"newer"}]}"#,
+        );
+        let limited_runtime = inert_unified_history_view(directory.path(), 1);
+        let window = mount_native_history_view(&limited_runtime);
+        limited_runtime.start_history_load();
+        assert!(limited_runtime.notice_dock.first_child().is_none());
+        limited_runtime.save_history().unwrap();
+        close_native_history_view(window, limited_runtime);
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["zones"].as_array().unwrap().len(), 1);
+        assert_eq!(saved["zones"][0]["cmd"], "newer");
+
+        write_native_zone_fixture(&path, br#"{"version":1,"zones":[]}"#);
+        let empty = inert_unified_history_view(directory.path(), 200);
+        let window = mount_native_history_view(&empty);
+        empty.start_history_load();
+        assert!(empty.notice_dock.first_child().is_none());
+        close_native_history_view(window, empty);
+        assert!(
+            !path.exists(),
+            "a genuinely empty restored session may remove its file"
+        );
     }
 
     #[test]
