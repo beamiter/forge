@@ -716,6 +716,7 @@ pub(crate) struct FinishedBlock {
     pub(crate) action_box: gtk4::Box,
     /// Keyboard affordances shown only while this block is selected.
     pub(crate) selection_hint: gtk4::Label,
+    pub(crate) review_selection: gtk4::Button,
     /// Persistent selection legend kept separate from transient refusal text.
     /// A second refusal may arrive before the first timeout; restoring from
     /// the label itself would then preserve the first refusal indefinitely.
@@ -812,6 +813,7 @@ impl Clone for FinishedBlock {
             header_row: self.header_row.clone(),
             action_box: self.action_box.clone(),
             selection_hint: self.selection_hint.clone(),
+            review_selection: self.review_selection.clone(),
             selection_hint_steady: self.selection_hint_steady.clone(),
             selection_feedback_generation: self.selection_feedback_generation.clone(),
             toggle_filter: self.toggle_filter.clone(),
@@ -2376,8 +2378,15 @@ impl FinishedBlock {
         review_button.set_hexpand(true);
         review_button.add_css_class("flat");
         review_button.add_css_class("block-review-button");
-        review_button.set_focus_on_click(false);
-        review_button.set_action_name(Some("block.review"));
+        review_button.set_focus_on_click(true);
+        // The production group belongs to the outer card and is mounted after
+        // construction, including on restored/pooled cards. Resolve it there.
+        let review_card = outer.downgrade();
+        review_button.connect_clicked(move |_| {
+            if let Some(card) = review_card.upgrade() {
+                let _ = card.activate_action("block.review", None);
+            }
+        });
         review_button.set_tooltip_text(Some(
             "Review full command, working directory and capture details",
         ));
@@ -2553,6 +2562,25 @@ impl FinishedBlock {
         header_row.append(&collapse_btn);
 
         content.append(&header_row);
+
+        // A separate, compact shelf keeps range review discoverable without
+        // competing with metadata or making a narrow header wider.
+        let review_selection = gtk4::Button::with_label("Review selection");
+        review_selection.add_css_class("flat");
+        review_selection.add_css_class("block-review-selection");
+        review_selection.set_halign(gtk4::Align::Start);
+        review_selection.set_margin_start(8);
+        let review_card = outer.downgrade();
+        review_selection.connect_clicked(move |_| {
+            if let Some(card) = review_card.upgrade() {
+                let _ = card.activate_action("block.review", None);
+            }
+        });
+        review_selection.set_tooltip_text(Some(
+            "Review selected blocks in terminal order; copy only, nothing runs",
+        ));
+        review_selection.set_visible(false);
+        content.append(&review_selection);
 
         // ── VTE-rendered command + output ─────────────────────────────────
         // Command VTE: full-height read-only renderer for the executed command.
@@ -3548,6 +3576,7 @@ impl FinishedBlock {
             header_row,
             action_box,
             selection_hint,
+            review_selection,
             selection_hint_steady: Rc::new(RefCell::new(String::new())),
             selection_feedback_generation: Rc::new(Cell::new(0)),
             toggle_filter,
@@ -4537,17 +4566,18 @@ mod tests {
             80,
         );
 
-        // No button on a card takes focus on click — not the action row, not
-        // the collapse chevron, not the collapsed-output summary — so a click
-        // while an agent waits for Enter never leaves a button holding it.
+        // Inline quick actions leave a running prompt focused. Read-only
+        // review is the deliberate exception: its modal returns to history.
         let mut buttons = 0;
         let mut pending: Vec<gtk4::Widget> = vec![block.widget().clone().upcast()];
         while let Some(widget) = pending.pop() {
             if let Some(button) = widget.downcast_ref::<gtk4::Button>() {
                 buttons += 1;
                 assert!(
-                    !button.gets_focus_on_click(),
-                    "{:?} takes focus on click",
+                    button.gets_focus_on_click()
+                        == (button.has_css_class("block-review-button")
+                            || button.has_css_class("block-review-selection")),
+                    "{:?} has incorrect click focus policy",
                     button.css_classes()
                 );
             }
@@ -4960,16 +4990,39 @@ mod tests {
             Some(&cwd),
             80,
         );
+        let activations = Rc::new(Cell::new(0));
+        let count = activations.clone();
+        let group = gtk4::gio::SimpleActionGroup::new();
+        let action = gtk4::gio::SimpleAction::new("review", None);
+        action.connect_activate(move |_, _| count.set(count.get() + 1));
+        group.add_action(&action);
+        card.widget().insert_action_group("block", Some(&group));
         let mut summaries = Vec::new();
         let mut child = card.header_row.first_child();
         while let Some(widget) = child {
             if widget.has_css_class("block-review-button") {
                 let button = widget.clone().downcast::<gtk4::Button>().unwrap();
-                assert_eq!(button.action_name().as_deref(), Some("block.review"));
+                assert!(button.is_sensitive());
+                button.emit_clicked();
+                assert_eq!(
+                    activations.get(),
+                    1,
+                    "metadata invokes the owning card action"
+                );
                 summaries.push(button.child().unwrap().downcast::<gtk4::Label>().unwrap());
             }
             child = widget.next_sibling();
         }
+        assert!(
+            !card.review_selection.is_visible(),
+            "no selection has no shelf"
+        );
+        card.review_selection.emit_clicked();
+        assert_eq!(
+            activations.get(),
+            2,
+            "selection shelf shares the same action"
+        );
         assert_eq!(summaries.len(), 1);
         let summary = &summaries[0];
         assert!(summary.hexpands());

@@ -1053,6 +1053,23 @@ pub(crate) fn block_css(config: &Config) -> String {
         .block-review-button:hover {{
             background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
         }}
+        .block-review-selection {{
+            color: {fg_hex};
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.16);
+            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.42);
+            border-radius: 6px;
+            min-height: 24px;
+            padding: 2px 10px;
+            margin-bottom: 4px;
+            font-family: {font_stack};
+            font-size: 0.85em;
+        }}
+        .block-review-selection:hover,
+        .block-review-selection:focus-visible {{
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.28);
+            outline: 2px solid {accent};
+            outline-offset: 1px;
+        }}
         .block-review-window textview {{
             border-radius: 8px;
         }}

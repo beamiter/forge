@@ -6,6 +6,9 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Block 的活动选择边缘新增常驻 Review selection 操作与数量；Close/Escape 恢复原历史操作焦点，
+  保留选择、滚动和未读状态。仅当原历史卡片已卸载时回到 live 终端；继续只复制，不回填或执行。
+
 - Block 新增只读原生审阅窗口：点击卡片元数据或选择菜单中的 Review Block / Selection，
   查看完整保留命令、cwd、退出状态、可信时长、生命周期与截断来源。多选可逐块查看，并按
   历史顺序预览/复制命令。窗口不回填、不执行，不改变终端大小或历史滚动锚点。

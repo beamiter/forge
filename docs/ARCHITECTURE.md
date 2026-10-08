@@ -112,3 +112,13 @@ has no PTY, command-submission context, or execute/insert callback. Output bytes
 are metadata only, and unknown completion/timing remain explicit. GTK tests exercise the actual
 production action group, response to eviction, repeated open/close, narrow/wide rendering,
 clipboard order, Escape focus return, and unchanged PTY size/input/scroll anchor.
+
+### Block review navigation
+
+The active selection edge owns a compact, text-labelled Review selection shelf,
+using the same `block.review` production action as metadata and the menu. It is
+hidden for unselected cards. The inspector captures only weak references to its
+invoking history control/card and owner; Close/Escape restores a mapped history
+target before considering the live VTE. This path does not clear selection, unread
+state or move the history scroll anchor. Review remains clipboard-only and bounded;
+output and images remain in the original retained blocks.

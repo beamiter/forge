@@ -3228,6 +3228,16 @@ fn sync_finished_block_selection(
             block.selection_hint_steady.borrow_mut().clear();
         }
         block.selection_hint.set_visible(is_active);
+        block.review_selection.set_visible(is_active && is_selected);
+        block
+            .review_selection
+            .set_label(&format!("Review selection ({})", selected.len()));
+        block
+            .review_selection
+            .update_property(&[gtk4::accessible::Property::Label(&format!(
+                "Review {} selected blocks",
+                selected.len()
+            ))]);
         if is_active {
             block.widget().add_css_class("block-selection-active");
             blocks::reveal_block_actions(&block.action_box, true);
@@ -4045,6 +4055,7 @@ impl BlockBackend {
 
         // Read-only inspection is shared by the persistent header and menu.
         // Keep only weak native window/card references; no history/VTE copies.
+        finished_widget.set_focusable(true);
         let review_slot = Rc::new(RefCell::new(glib::WeakRef::<gtk4::Window>::new()));
         let open_review: Rc<dyn Fn()> = {
             let slot = review_slot.clone();
@@ -20222,9 +20233,57 @@ mod tests {
             .any(|widget| widget.is::<gtk4::Picture>()),
             "the fixture includes an image-only card"
         );
+        let selected_id = view.finished_blocks.borrow().last().unwrap().id;
+        view.selected_block_id.set(Some(selected_id));
+        super::sync_finished_block_selection(
+            &view.finished_blocks.borrow(),
+            &view.selected_block_ids,
+            &view.selected_block_id,
+        );
+        let shelf = view
+            .finished_blocks
+            .borrow()
+            .last()
+            .unwrap()
+            .review_selection
+            .clone();
+        assert!(shelf.is_visible());
+        assert_eq!(shelf.label().as_deref(), Some("Review selection (3)"));
+        assert_eq!(
+            view.finished_blocks
+                .borrow()
+                .iter()
+                .filter(|block| block.review_selection.is_visible())
+                .count(),
+            1
+        );
+        assert!(shelf.is_sensitive(), "selection review action is enabled");
+        assert!(shelf.grab_focus(), "selection review is keyboard reachable");
+        settle();
+        let capture_owner = |name: &str| {
+            if let Ok(directory) = std::env::var("FORGE_REVIEW_SCREENSHOT_DIR") {
+                let paintable = gtk4::WidgetPaintable::new(Some(&owner));
+                let snapshot = gtk4::Snapshot::new();
+                paintable.snapshot(&snapshot, owner.width() as f64, owner.height() as f64);
+                owner
+                    .renderer()
+                    .unwrap()
+                    .render_texture(snapshot.to_node().unwrap(), None)
+                    .save_to_png(std::path::Path::new(&directory).join(name))
+                    .unwrap();
+            }
+        };
+        capture_owner("forge-selection-shelf-wide.png");
+        owner.set_default_size(360, 720);
+        settle();
+        assert!(shelf.width() <= owner.width());
+        capture_owner("forge-selection-shelf-narrow.png");
+        owner.set_default_size(900, 720);
+        settle();
+        view.unread_count.set(7);
         let winsize = view.pty.test_slave_winsize();
         let scroll = view.block_scroll.vadjustment().value();
-        card.activate_action("block.review", None).unwrap();
+        shelf.emit_clicked();
         settle();
         assert_eq!(inspectors().len(), 1);
         let review = inspectors().pop().unwrap();
@@ -20345,12 +20404,29 @@ mod tests {
         }
         settle();
         assert!(inspectors().is_empty());
-        assert!(view.active_vte.has_focus());
+        assert!(
+            shelf.has_focus(),
+            "Escape restores the invoking selection action"
+        );
+        assert_eq!(view.block_scroll.vadjustment().value(), scroll);
+        assert_eq!(view.unread_count.get(), 7);
+        assert_eq!(view.selected_block_ids.borrow().len(), 3);
         card.activate_action("block.review", None).unwrap();
         settle();
         assert_eq!(inspectors().len(), 1);
-        inspectors()[0].close();
+        let close = descendants(inspectors()[0].upcast_ref())
+            .into_iter()
+            .find_map(|widget| {
+                widget
+                    .downcast::<gtk4::Button>()
+                    .ok()
+                    .filter(|button| button.label().as_deref() == Some("Close"))
+            })
+            .unwrap();
+        close.emit_clicked();
         settle();
+        assert!(shelf.has_focus(), "Close also restores the invoking action");
+        assert_eq!(view.unread_count.get(), 7);
         assert!(view
             .pty
             .drain_test_slave(std::time::Duration::from_millis(10))
@@ -20373,8 +20449,41 @@ mod tests {
             1,
             "restored cards get the production review action"
         );
+        // New completions are not inserted into the review snapshot and do
+        // not steal the reading position or reset unread state.
+        let review = inspectors()[0].clone();
+        let picker = descendants(review.upcast_ref())
+            .into_iter()
+            .find_map(|widget| widget.downcast::<gtk4::DropDown>().ok())
+            .unwrap();
+        let reviewed_count = picker.model().unwrap().n_items();
+        view.user_scrolled_up.set(true);
+        view.unread_count.set(9);
+        let reading_position = view.block_scroll.vadjustment().value();
+        view.pty.set_test_foreground(PtyForeground::Shell);
+        view.pty.write_test_slave(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07true\r\n\x1b]133;C;cmdline_url=true\x07",
+        );
+        settle();
+        view.pty
+            .write_test_slave(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        settle();
+        assert_eq!(view.block_data.borrow().len(), 4);
+        assert_eq!(picker.model().unwrap().n_items(), reviewed_count);
+        assert_eq!(view.unread_count.get(), 10);
+        assert_eq!(view.block_scroll.vadjustment().value(), reading_position);
+        // Eviction/unmount while reading must not hold or focus old history.
+        assert_eq!(view.clear_blocks(), 4);
         inspectors()[0].close();
         settle();
+        assert!(
+            view.active_vte.has_focus(),
+            "unmounted history uses live fallback"
+        );
+        assert!(view
+            .pty
+            .drain_test_slave(std::time::Duration::from_millis(10))
+            .is_empty());
         owner.close();
     }
 

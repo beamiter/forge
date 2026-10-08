@@ -204,6 +204,18 @@ pub(super) fn open(
     focus: &vte4::Terminal,
 ) -> Option<gtk4::Window> {
     let owner = parent.root()?.downcast::<gtk4::Window>().ok()?;
+    // Only remember an invoking action inside this card, never a live prompt
+    // that happened to retain focus during pointer/menu activation. Weak refs
+    // must not keep virtualized history alive.
+    let invoker = gtk4::prelude::GtkWindowExt::focus(&owner)
+        .filter(|widget| widget == parent || widget.is_ancestor(parent))
+        .unwrap_or_else(|| parent.clone())
+        .downgrade();
+    let card = parent.downgrade();
+    let history_scroll = parent
+        .ancestor(gtk4::ScrolledWindow::static_type())
+        .and_downcast::<gtk4::ScrolledWindow>()
+        .map(|scroll| scroll.downgrade());
     let snapshot = Rc::new(ReviewSnapshot::capture(&blocks.borrow(), selected));
     let window = gtk4::Window::builder()
         .title("Block review")
@@ -433,12 +445,43 @@ pub(super) fn open(
     window.connect_close_request(move |_| {
         let focus = focus.clone();
         let owner = owner.clone();
+        let invoker = invoker.clone();
+        let card = card.clone();
+        // GTK may scroll a focused descendant into view when the owner becomes
+        // active again. Capture before closing restores native owner focus.
+        let scroll_position = history_scroll
+            .as_ref()
+            .and_then(|scroll| scroll.upgrade())
+            .map(|scroll| {
+                let horizontal = scroll.hadjustment();
+                let vertical = scroll.vadjustment();
+                (
+                    horizontal.downgrade(),
+                    horizontal.value(),
+                    vertical.downgrade(),
+                    vertical.value(),
+                )
+            });
         glib::idle_add_local_once(move || {
-            if let (Some(focus), Some(owner)) = (focus.upgrade(), owner.upgrade()) {
-                if owner.is_visible() && focus.is_mapped() {
-                    // A separate native toplevel owns focus while inspecting.
-                    // Restore its transient owner before focusing its terminal.
-                    owner.present();
+            if let Some(owner) = owner.upgrade().filter(|owner| owner.is_visible()) {
+                owner.present();
+                // Menu items disappear on activation, so prefer their retained
+                // history card before falling back to the live terminal.
+                let target = invoker
+                    .upgrade()
+                    .filter(|widget| widget.is_mapped())
+                    .or_else(|| card.upgrade().filter(|widget| widget.is_mapped()));
+                if let Some(target) = target {
+                    target.grab_focus();
+                    if let Some((horizontal, x, vertical, y)) = scroll_position {
+                        if let Some(horizontal) = horizontal.upgrade() {
+                            horizontal.set_value(x);
+                        }
+                        if let Some(vertical) = vertical.upgrade() {
+                            vertical.set_value(y);
+                        }
+                    }
+                } else if let Some(focus) = focus.upgrade().filter(|focus| focus.is_mapped()) {
                     crate::terminal::focus_terminal(&focus);
                 }
             }
@@ -475,6 +518,71 @@ mod tests {
             command_truncated: false,
             output_notice: None,
         }
+    }
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn closing_review_preserves_scrolled_history_and_invoking_control() {
+        gtk4::init().unwrap();
+        let card = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let invoke = gtk4::Button::with_label("Review selection");
+        card.append(&invoke);
+        let spacer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        spacer.set_height_request(1600);
+        card.append(&spacer);
+        let live = vte4::Terminal::new();
+        card.append(&live);
+        let scroll = gtk4::ScrolledWindow::builder().child(&card).build();
+        let owner = gtk4::Window::builder()
+            .default_width(360)
+            .default_height(400)
+            .child(&scroll)
+            .build();
+        owner.present();
+        let settle = || {
+            let context = glib::MainContext::default();
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_millis(160) {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        settle();
+        invoke.grab_focus();
+        let records = Rc::new(RefCell::new(VecDeque::from([record(1, "true")])));
+        for _ in 0..2 {
+            scroll.vadjustment().set_value(500.0);
+            settle();
+            let position = scroll.vadjustment().value();
+            assert!(position > 0.0);
+            let review = open(
+                card.upcast_ref(),
+                records.clone(),
+                &HashSet::from([1]),
+                1,
+                &live,
+            )
+            .unwrap();
+            settle();
+            review.close();
+            settle();
+            assert!(invoke.has_focus());
+            assert_eq!(scroll.vadjustment().value(), position);
+        }
+        owner.close();
+    }
+    #[test]
+    fn empty_and_evicted_selection_cannot_copy_or_expand_with_new_history() {
+        let mut records = VecDeque::from([record(1, "echo one")]);
+        let empty = ReviewSnapshot::capture(&records, &HashSet::new());
+        assert!(empty.records.is_empty());
+        assert!(empty.copy_commands(&records).is_err());
+        let stale = ReviewSnapshot::capture(&records, &HashSet::from([99]));
+        assert!(stale.incomplete);
+        assert!(stale.copy_commands(&records).is_err());
+        let snapshot = ReviewSnapshot::capture(&records, &HashSet::from([1]));
+        records.push_back(record(2, "echo new"));
+        assert_eq!(snapshot.records.len(), 1);
+        assert_eq!(snapshot.copy_commands(&records).unwrap(), "echo one");
     }
     #[test]
     fn review_preserves_terminal_order_and_unicode_without_background_commands() {
