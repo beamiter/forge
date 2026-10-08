@@ -9922,6 +9922,24 @@ impl UnifiedZoneStore {
         }
     }
 
+    /// Bound candidate count before cloning. A pane can retain substantially
+    /// more live metadata than the restart document needs.
+    fn replay_snapshot(
+        &self,
+        max_zones: usize,
+        max_bytes: usize,
+    ) -> Vec<zone_history::PersistedZone> {
+        let persisted = self
+            .records
+            .iter()
+            .rev()
+            .take(max_zones)
+            .rev()
+            .map(|record| zone_history::PersistedZone::from_live(record, self.snapshot(record.id)))
+            .collect();
+        zone_history::bound_persisted_zones(persisted, max_zones, max_bytes)
+    }
+
     fn snapshot(&self, id: u64) -> Option<&ZoneOutputSnapshot> {
         self.snapshots.get(&id)
     }
@@ -10368,15 +10386,7 @@ impl RenderBackend for UnifiedBackend {
         max_zones: usize,
         max_bytes: usize,
     ) -> Option<Vec<zone_history::PersistedZone>> {
-        let zones = self.zones.borrow();
-        let persisted = zones
-            .records
-            .iter()
-            .map(|record| zone_history::PersistedZone::from_live(record, zones.snapshot(record.id)))
-            .collect();
-        Some(zone_history::bound_persisted_zones(
-            persisted, max_zones, max_bytes,
-        ))
+        Some(self.zones.borrow().replay_snapshot(max_zones, max_bytes))
     }
 
     fn replay_zone_snapshot(&self, zones: Vec<zone_history::PersistedZone>) -> usize {
@@ -20844,6 +20854,52 @@ mod tests {
         record_unified_zone(&mut zones, record(4, "fourth"), 0);
         assert_eq!(zones.records.len(), 1);
         assert_eq!(zones.records[0].id, 4);
+    }
+
+    #[test]
+    fn unified_restart_snapshot_keeps_newest_record_and_output_identity() {
+        let mut zones = UnifiedZoneStore::new();
+        for id in 1..=5 {
+            record_unified_zone(
+                &mut zones,
+                CompletedCommandRecord {
+                    id,
+                    cmd: format!("command-{id}"),
+                    exit_code: Some(id as i32),
+                    start_time_ms: None,
+                    end_time_ms: None,
+                    duration_ms: None,
+                    cwd: None,
+                    is_background: false,
+                    completion_provenance: super::CompletionProvenance::ShellReported,
+                    command_source: super::CommandTextSource::ShellReported,
+                    start_mark_seen: true,
+                },
+                5,
+            );
+            zones.insert_snapshot(
+                id,
+                ZoneOutputSnapshot {
+                    plain: format!("output-{id}"),
+                    truncated: false,
+                },
+            );
+        }
+        let snapshot = zones.replay_snapshot(2, 4096);
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|zone| zone.cmd.as_str())
+                .collect::<Vec<_>>(),
+            ["command-4", "command-5"]
+        );
+        assert_eq!(snapshot[0].output.as_deref(), Some("output-4"));
+        assert_eq!(snapshot[1].output.as_deref(), Some("output-5"));
+        assert_eq!(snapshot[1].exit_code, Some(5));
+        assert!(zones.replay_snapshot(0, 4096).is_empty());
+        assert!(zones.replay_snapshot(2, 0).is_empty());
+        assert_eq!(zones.records.len(), 5, "saving never mutates live history");
+        assert_eq!(zones.snapshots.len(), 5);
     }
 
     #[test]

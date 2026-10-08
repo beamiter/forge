@@ -158,6 +158,7 @@ impl PersistedZone {
     fn retained_bytes(&self) -> usize {
         self.cmd
             .len()
+            .saturating_add(self.cwd.as_ref().map_or(0, String::len))
             .saturating_add(self.output.as_ref().map_or(0, String::len))
     }
 }
@@ -197,13 +198,79 @@ pub(super) fn bound_persisted_zones(
     zones
 }
 
-/// Serialize a bounded session document.
+/// Measure the actual JSON representation without allocating a second copy of
+/// snapshots. Escaping can grow plain text by up to six times its byte length.
+fn encoded_size(value: &impl serde::Serialize) -> io::Result<usize> {
+    #[derive(Default)]
+    struct Counter(usize);
+    impl io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 = self.0.checked_add(bytes.len()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "zone history size overflow")
+            })?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter::default();
+    serde_json::to_writer(&mut counter, value).map_err(io::Error::other)?;
+    Ok(counter.0)
+}
+
+/// Serialize a bounded session document that its own reader can reopen.
+/// Preserve the newest records, shedding oldest output before command metadata
+/// just as the decoded-text budget does. JSON framing and escaping count too.
 pub(super) fn encode_session(zones: Vec<PersistedZone>) -> io::Result<Vec<u8>> {
-    let session = PersistedZoneSession {
+    let mut session = PersistedZoneSession {
         version: FORMAT_VERSION,
-        zones,
+        zones: Vec::new(),
     };
-    serde_json::to_vec(&session).map_err(|error| io::Error::other(error.to_string()))
+    let framing = encoded_size(&session)?;
+    session.zones = bound_persisted_zones(zones, MAX_RESTORED_ZONES, MAX_RESTORED_SNAPSHOT_BYTES);
+    let mut sizes = session
+        .zones
+        .iter()
+        .map(encoded_size)
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut total = framing + sizes.iter().sum::<usize>() + sizes.len().saturating_sub(1);
+    let limit = MAX_ZONE_HISTORY_FILE_BYTES as usize;
+    for (zone, size) in session.zones.iter_mut().zip(&mut sizes) {
+        if total <= limit {
+            break;
+        }
+        if let Some(output) = zone.output.take() {
+            let was_truncated = zone.output_truncated;
+            zone.output_truncated = true;
+            let next_size = encoded_size(zone)?;
+            if next_size < *size {
+                total = total - *size + next_size;
+                *size = next_size;
+            } else {
+                // An empty/short snapshot can cost less than the truncation
+                // notice replacing it. Preserve it instead of growing the
+                // document while losing its explicit captured-empty meaning.
+                zone.output = Some(output);
+                zone.output_truncated = was_truncated;
+            }
+        }
+    }
+    let mut drop_count = 0;
+    while total > limit && drop_count < sizes.len() {
+        total -= sizes[drop_count];
+        if sizes.len() - drop_count > 1 {
+            total -= 1; // the comma separating this record from the next
+        }
+        drop_count += 1;
+    }
+    session.zones.drain(..drop_count);
+    debug_assert!(total <= limit);
+    let mut encoded = Vec::with_capacity(total);
+    serde_json::to_writer(&mut encoded, &session).map_err(io::Error::other)?;
+    debug_assert_eq!(encoded.len(), total);
+    Ok(encoded)
 }
 
 /// Decode a session document, rejecting an unknown version outright rather
@@ -335,7 +402,7 @@ mod tests {
 
         // A budget that fits the three commands plus exactly one output: the
         // two older zones survive without theirs rather than being dropped.
-        let budget = "first".len() + "second".len() + "third".len() + 64;
+        let budget = "first".len() + "second".len() + "third".len() + 3 * "/tmp".len() + 64;
         let bounded = bound_persisted_zones(zones, 3, budget);
         assert_eq!(bounded.len(), 3, "records outlive their output");
         assert_eq!(bounded[0].output, None);
@@ -351,11 +418,84 @@ mod tests {
     #[test]
     fn an_unfittable_zone_set_drops_records_oldest_first() {
         let zones = vec![zone("aaaa", None), zone("bbbb", None)];
-        let bounded = bound_persisted_zones(zones, 8, 5);
+        let bounded = bound_persisted_zones(zones, 8, 8);
         assert_eq!(
             bounded.iter().map(|z| z.cmd.as_str()).collect::<Vec<_>>(),
             vec!["bbbb"]
         );
+    }
+
+    #[test]
+    fn replay_budget_counts_working_directory_metadata() {
+        let mut older = zone("first", None);
+        older.cwd = Some("x".repeat(256));
+        let mut newer = zone("last", None);
+        newer.cwd = None;
+        let bounded = bound_persisted_zones(vec![older, newer], 64, 128);
+        assert_eq!(
+            bounded.len(),
+            1,
+            "cwd metadata must share the retained byte budget"
+        );
+        assert_eq!(bounded[0].cmd, "last");
+    }
+
+    #[test]
+    fn an_encoded_session_always_fits_its_own_reader_limit() {
+        // A real plain-text snapshot can consist of quotes/backslashes. JSON
+        // doubles those bytes even though the retained text fits its budget.
+        let zones = (0..MAX_RESTORED_ZONES)
+            .map(|_| {
+                let mut record = zone(&"\\".repeat(32 * 1024), Some(&"\\".repeat(64 * 1024)));
+                record.cwd = None;
+                record
+            })
+            .collect();
+        let bounded = bound_persisted_zones(zones, MAX_RESTORED_ZONES, MAX_RESTORED_SNAPSHOT_BYTES);
+        let encoded = encode_session(bounded).expect("bounded session encodes");
+        assert!(
+            encoded.len() as u64 <= MAX_ZONE_HISTORY_FILE_BYTES,
+            "writer emitted {} bytes, but its reader accepts only {}",
+            encoded.len(),
+            MAX_ZONE_HISTORY_FILE_BYTES
+        );
+        let decoded = decode_session(&encoded).expect("our own document must restore");
+        assert_eq!(decoded.len(), MAX_RESTORED_ZONES);
+        assert_eq!(decoded.last().unwrap().cmd.len(), 32 * 1024);
+    }
+
+    #[test]
+    fn json_budget_sheds_records_after_empty_output_and_sixfold_escaping() {
+        let zones = (0..MAX_RESTORED_ZONES)
+            .map(|index| {
+                let mut record = zone(
+                    &format!("{}record-{index}", "\0".repeat(64 * 1024 - 10)),
+                    Some(""),
+                );
+                record.cwd = None;
+                record
+            })
+            .collect();
+        let encoded = encode_session(zones).expect("control-heavy metadata encodes");
+        assert!(encoded.len() as u64 <= MAX_ZONE_HISTORY_FILE_BYTES);
+        let decoded = decode_session(&encoded).expect("bounded escaped metadata restores");
+        assert!(!decoded.is_empty());
+        assert!(decoded.len() < MAX_RESTORED_ZONES);
+        assert!(decoded.last().unwrap().cmd.ends_with("record-63"));
+        assert!(decoded
+            .iter()
+            .all(|zone| zone.output.as_deref() == Some("") && !zone.output_truncated));
+    }
+
+    #[test]
+    fn encoded_size_counts_unicode_controls_and_json_framing_exactly() {
+        for output in [None, Some(""), Some("漢字🦀\n\t\r\0\u{001f}\\\"")] {
+            let record = zone("command 漢字🦀\0", output);
+            assert_eq!(
+                encoded_size(&record).unwrap(),
+                serde_json::to_vec(&record).unwrap().len()
+            );
+        }
     }
 
     #[test]

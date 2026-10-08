@@ -6,6 +6,9 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Unified 历史保存现在同时计算 cwd、JSON 转义与文件 framing；超限时优先丢弃最旧输出，
+  再淘汰最旧记录，避免写出重启后被自身大小限制拒绝的会话文件。
+
 - Block 的活动选择边缘新增常驻 Review selection 操作与数量；Close/Escape 恢复原历史操作焦点，
   保留选择、滚动和未读状态。仅当原历史卡片已卸载时回到 live 终端；继续只复制，不回填或执行。
 
