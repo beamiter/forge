@@ -1346,11 +1346,12 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
     let mut current_page: Option<u32> = None;
     let mut tabs: Vec<(Option<String>, PaneLayout)> = Vec::new();
     let mut total_panes = 0usize;
+    // Keep at most one original index per retained tab. Rejected layouts must
+    // not shift the saved selection onto an unrelated surviving tab.
+    let mut source_tab_indices = Vec::new();
+    let mut source_tab_index = 0usize;
 
     for raw_line in contents.lines() {
-        if tabs.len() == MAX_RESTORED_TABS {
-            break;
-        }
         let line = raw_line.trim();
         if line.is_empty() {
             continue;
@@ -1359,7 +1360,13 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
             current_page = rest.trim().parse::<u32>().ok();
             continue;
         }
+        // Metadata can appear after tabs in legacy snapshots. Still read the
+        // selected page after reaching the cap, without decoding more layouts.
+        if tabs.len() == MAX_RESTORED_TABS {
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("tab=") {
+            let previous_len = tabs.len();
             // Split into fields
             let fields: Vec<&str> = rest.splitn(4, '\t').collect();
             match fields.len() {
@@ -1455,6 +1462,10 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
                 }
                 _ => {}
             }
+            if tabs.len() > previous_len {
+                source_tab_indices.push(source_tab_index);
+            }
+            source_tab_index = source_tab_index.saturating_add(1);
             continue;
         }
         // Parsed separately so a damaged or future AI payload cannot create a
@@ -1473,9 +1484,24 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
             cmds: None,
             pinned: None,
         };
+        let previous_len = tabs.len();
         push_restored_tab_bounded(&mut tabs, &mut total_panes, None, layout);
+        if tabs.len() > previous_len {
+            source_tab_indices.push(source_tab_index);
+        }
+        source_tab_index = source_tab_index.saturating_add(1);
     }
 
+    if !source_tab_indices.is_empty() {
+        current_page = current_page.map(|selected| {
+            // Prefer the same tab; if it was rejected, select its nearest
+            // surviving predecessor, or the first survivor when none precedes it.
+            source_tab_indices
+                .iter()
+                .rposition(|&index| index <= selected as usize)
+                .unwrap_or(0) as u32
+        });
+    }
     (current_page, tabs)
 }
 

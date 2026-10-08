@@ -6,6 +6,10 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Session recovery keeps the selected surviving tab when earlier saved layouts
+  are rejected by restore limits. If the selected layout cannot be restored,
+  the nearest preceding survivor (or the first tab) is selected instead.
+
 - When the default JetBrainsMono Nerd Font Mono family is unavailable, terminal
   text and Block chrome use the system Monospace family instead of a proportional
   substitute. Installed preferred fonts, custom families/lists, and saved settings

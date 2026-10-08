@@ -14,6 +14,8 @@ forge --execute bash -lc 'cargo test'
 
 `--execute` 后的参数原样作为 argv，不经过额外 shell 拆词。显式 cwd、`--execute`、`--no-restore` 和 `--safe-mode` 都不会意外领取普通恢复快照；execute/safe-mode 窗口也不发布会话快照。单独使用 `--mode` 只覆盖本窗口后端，仍可恢复窗口布局。
 
+恢复会话时，先前的活动标签只要保留下来就仍会被选中。若它因无效或超限布局被跳过，则选择其前方最近的保留标签；没有前方标签时选择第一个。
+
 以下命令在 GTK 初始化前完成，可用于 SSH、TTY 和 CI：
 
 ```bash
