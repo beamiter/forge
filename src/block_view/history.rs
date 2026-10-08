@@ -368,8 +368,11 @@ impl HistoryLoadShared {
                 .pre_apply_save_leases
                 .checked_sub(1)
                 .expect("pre-apply history save lease accounting underflow");
-            (state.pre_apply_save_leases == 0 && state.consume_requested)
-                .then(|| std::mem::replace(&mut state.outcome, HistoryLoadOutcome::Idle))
+            (state.pre_apply_save_leases == 0
+                && state.consume_requested
+                && (self.discarded.load(Ordering::Acquire)
+                    || !matches!(state.outcome, HistoryLoadOutcome::Failed { .. })))
+            .then(|| std::mem::replace(&mut state.outcome, HistoryLoadOutcome::Idle))
         };
         drop(prior);
     }
@@ -385,8 +388,12 @@ impl HistoryLoadShared {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             self.applied.store(true, Ordering::Release);
             state.consume_requested = true;
-            (state.pre_apply_save_leases == 0)
-                .then(|| std::mem::replace(&mut state.outcome, HistoryLoadOutcome::Idle))
+            // Failed carries no retained document. Keep its diagnostic so
+            // a later explicit Retry reloads, even after GTK applied the error.
+            (state.pre_apply_save_leases == 0
+                && (self.discarded.load(Ordering::Acquire)
+                    || !matches!(state.outcome, HistoryLoadOutcome::Failed { .. })))
+            .then(|| std::mem::replace(&mut state.outcome, HistoryLoadOutcome::Idle))
         };
         drop(prior);
     }
@@ -2403,13 +2410,17 @@ impl TermView {
                     _ => Ok(()),
                 }
             }
-            HistoryRetryAction::SaveAgain => self.save_history(),
+            HistoryRetryAction::SaveAgain => self.save_history_with_failure_report(true),
         }
     }
 
     /// Snapshot block history on the GTK thread and queue all encoding and
     /// durable file I/O on the shared persistence worker.
     pub fn save_history(&self) -> std::io::Result<()> {
+        self.save_history_with_failure_report(false)
+    }
+
+    fn save_history_with_failure_report(&self, report_failure: bool) -> std::io::Result<()> {
         if !self.persist_history_on_drop.get() {
             return Ok(());
         }
@@ -2455,10 +2466,11 @@ impl TermView {
         let estimated_bytes = estimated_snapshot_retained_bytes(&blocks, blocks.capacity());
         let history_load = Arc::clone(&self.history_load);
         let key = PersistenceKey::for_path("block-history", &path);
-        persistence::enqueue_weighted(
+        persistence::enqueue_weighted_with_reporting(
             key,
             BLOCK_HISTORY_PERSIST_OPERATION,
             estimated_bytes,
+            report_failure,
             move || {
                 let _pre_apply_save_lease = pre_apply_save_lease;
                 let loaded_for_save = if _pre_apply_save_lease.is_some() {
@@ -2596,7 +2608,11 @@ impl TermView {
             let result =
                 read_history_snapshot_reserved(&base, session_id.as_deref(), compress, load_limit);
             load_for_job.complete(&result);
-            result.map(|_| ())
+            if load_for_job.discarded.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                result.map(|_| ())
+            }
         }) {
             let result = Err(io::Error::new(error.kind(), error.to_string()));
             self.history_load.complete(&result);
@@ -2643,10 +2659,15 @@ impl TermView {
                 }
                 HistoryLoadOutcome::Failed { message, .. } => {
                     log::warn!("load Block history: {message}");
-                    // A later save may still succeed (for example, a removable
-                    // drive was remounted). Pre-load shutdown saves preserve the
-                    // unreadable file; subsequent user mutations may retry it.
-                    view.retry_save_after_history_load.set(false);
+                    // Report an explicit retry through the ordinary save key.
+                    // Its pre-apply lease refuses the failed load; a later Clear
+                    // can cancel/replace it and successful saves clear its event.
+                    // A discarded load never reaches this branch.
+                    if view.retry_save_after_history_load.take() {
+                        if let Err(error) = view.save_history_with_failure_report(true) {
+                            log::warn!("report Block history retry failure: {error}");
+                        }
+                    }
                     view.resolve_block_onboarding_after_history();
                     load_for_poll.mark_applied_and_consume();
                     view.history_load_poll_id.borrow_mut().take();
@@ -2663,7 +2684,7 @@ impl TermView {
         if !self.retry_save_after_history_load.take() {
             return;
         }
-        if let Err(error) = self.save_history() {
+        if let Err(error) = self.save_history_with_failure_report(true) {
             log::warn!("save Block history after ReloadFirst: {error}");
         }
     }
@@ -2911,6 +2932,198 @@ mod tests {
             command_truncated: false,
             output_notice: None,
         }
+    }
+
+    fn wait_for_history_worker(view: &Rc<super::TermView>) {
+        let (sent, received) = std::sync::mpsc::channel();
+        crate::persistence::enqueue(
+            crate::persistence::PersistenceKey::unique_for_path(
+                "fixture-barrier",
+                Path::new("inert"),
+            ),
+            "fixture barrier",
+            move || {
+                sent.send(()).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        received.recv_timeout(Duration::from_secs(5)).unwrap();
+        let context = gtk4::glib::MainContext::default();
+        for _ in 0..20 {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!matches!(
+            view.history_load.outcome(),
+            HistoryLoadOutcome::Pending
+        ));
+    }
+
+    fn hold_history_worker(path: &Path) -> std::sync::mpsc::Sender<()> {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        crate::persistence::enqueue(
+            crate::persistence::PersistenceKey::unique_for_path("retry-fixture-blocker", path),
+            "fixture blocker",
+            move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        release_tx
+    }
+
+    fn retry_failure_from_inert_block_pane(reload_first: bool, clear_retry: bool) {
+        use crate::ui::history_notice::{persistence_failure_surface, PersistenceFailureSurface};
+        gtk4::init().expect("GTK display");
+        let directory = TestDir::new("retry-failure");
+        let path = directory.0.join("history.bin");
+        let original = b"inert damaged saved history";
+        let preserved_path = if reload_first {
+            fs::create_dir(&path).unwrap();
+            path.join("preserved-fixture")
+        } else {
+            path.clone()
+        };
+        if reload_first {
+            write_native_zone_fixture(&preserved_path, original);
+        }
+        let mut config = crate::config::Config::safe_defaults();
+        config.block_history_path = Some(path.to_string_lossy().into_owned());
+        let view = Rc::new(
+            super::TermView::new_with_spawner(
+                &config,
+                &crate::config::TerminalMode::Block,
+                &["inert-fixture-never-executed".to_string()],
+                None,
+                None,
+                &[],
+                |_argv, _cwd, _env, _token| {
+                    crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Other)
+                },
+            )
+            .unwrap(),
+        );
+        let window = mount_native_history_view(&view);
+        view.start_history_load();
+        wait_for_history_worker(&view);
+        assert_eq!(
+            matches!(
+                view.history_load.outcome(),
+                HistoryLoadOutcome::Failed { .. }
+            ),
+            reload_first
+        );
+        crate::persistence::drain_failures();
+        if !reload_first {
+            write_native_zone_fixture(&path, original);
+        }
+        view.save_history().unwrap();
+        wait_for_history_worker(&view);
+        let first = crate::persistence::drain_failures();
+        assert!(first
+            .iter()
+            .any(|failure| persistence_failure_surface(&failure.operation)
+                == PersistenceFailureSurface::BlockHistoryBar));
+        // Keep the disk worker occupied so this exercises the asynchronous
+        // retry failure, rather than a synchronous already-finished refusal.
+        let release_tx = hold_history_worker(&path);
+        view.retry_history_persistence().unwrap();
+        release_tx.send(()).unwrap();
+        wait_for_history_worker(&view);
+        wait_for_history_worker(&view);
+        let repeated = crate::persistence::drain_failures();
+        assert!(
+            repeated
+                .iter()
+                .any(|failure| persistence_failure_surface(&failure.operation)
+                    == PersistenceFailureSurface::BlockHistoryBar),
+            "explicit retry must deliver a sticky failure again: {repeated:?}"
+        );
+        assert_eq!(fs::read(&preserved_path).unwrap(), original);
+        if reload_first {
+            let original_directory = directory.0.join("saved-original");
+            fs::rename(&path, &original_directory).unwrap();
+            write_history_snapshot(
+                &path,
+                &path,
+                None,
+                &[sample_block(1, "recovered after repair")],
+                config.block_history_compress,
+                Some(HistoryRevision::Missing),
+            )
+            .unwrap();
+            let release_tx = hold_history_worker(&path);
+            view.retry_history_persistence().unwrap();
+            if clear_retry {
+                view.clear_blocks();
+            }
+            release_tx.send(()).unwrap();
+            wait_for_history_worker(&view);
+            // Successful GTK replay queues the promised save after the first
+            // worker barrier, so also wait for that actual disk write.
+            wait_for_history_worker(&view);
+            assert!(crate::persistence::drain_failures().is_empty());
+            assert!(matches!(
+                view.history_load.outcome(),
+                HistoryLoadOutcome::Idle
+            ));
+            let restored =
+                read_history_snapshot(&path, None, config.block_history_compress, 100).unwrap();
+            if clear_retry {
+                assert!(view.finished_blocks.borrow().is_empty());
+                assert!(restored.blocks.is_empty());
+            } else {
+                assert!(view
+                    .finished_blocks
+                    .borrow()
+                    .iter()
+                    .any(|block| block.cmd_text == "recovered after repair"));
+                assert!(restored
+                    .blocks
+                    .iter()
+                    .any(|block| block.cmd == "recovered after repair"));
+            }
+            assert_eq!(
+                fs::read(original_directory.join("preserved-fixture")).unwrap(),
+                original
+            );
+        }
+        close_native_history_view(window, view);
+        // The barrier starts only after Drop's queued save has finished.
+        let release_tx = hold_history_worker(&path);
+        release_tx.send(()).unwrap();
+        assert!(crate::persistence::drain_failures().is_empty());
+        let preserved_after_drop = if reload_first {
+            directory.0.join("saved-original/preserved-fixture")
+        } else {
+            preserved_path
+        };
+        assert_eq!(fs::read(preserved_after_drop).unwrap(), original);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn retry_save_again_reports_repeated_failure_from_real_pane() {
+        retry_failure_from_inert_block_pane(false, false);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn retry_reload_first_reports_repeated_failure_from_real_pane() {
+        retry_failure_from_inert_block_pane(true, false);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn explicit_clear_cancels_a_pending_history_retry_without_stale_failure() {
+        retry_failure_from_inert_block_pane(true, true);
     }
 
     #[test]
@@ -3248,6 +3461,40 @@ mod tests {
             super::legacy_removal_state(true, HistoryRevision::Missing, false),
             (true, None)
         );
+    }
+
+    #[test]
+    fn failed_load_keeps_reload_intent_after_apply_and_last_save_lease() {
+        for leased in [false, true] {
+            let shared = Arc::new(HistoryLoadShared::default());
+            shared.begin();
+            let lease = leased.then(|| shared.acquire_pre_apply_save_lease().unwrap());
+            shared.complete(&Err(io::Error::other("inert load failure")));
+            shared.mark_applied_and_consume();
+            assert_eq!(
+                history_retry_action(&shared.outcome()),
+                HistoryRetryAction::ReloadFirst
+            );
+            drop(lease);
+            assert_eq!(
+                history_retry_action(&shared.outcome()),
+                HistoryRetryAction::ReloadFirst
+            );
+            shared.discard_for_explicit_clear();
+            assert!(matches!(shared.outcome(), HistoryLoadOutcome::Idle));
+        }
+    }
+
+    #[test]
+    fn explicit_clear_releases_failed_state_after_an_outstanding_save_lease() {
+        let shared = Arc::new(HistoryLoadShared::default());
+        shared.begin();
+        let lease = shared.acquire_pre_apply_save_lease().unwrap();
+        shared.complete(&Err(io::Error::other("inert load failure")));
+        shared.mark_applied_and_consume();
+        shared.discard_for_explicit_clear();
+        drop(lease);
+        assert!(matches!(shared.outcome(), HistoryLoadOutcome::Idle));
     }
 
     #[test]

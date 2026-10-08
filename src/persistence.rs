@@ -77,6 +77,7 @@ struct PendingJob {
     generation: u64,
     operation: String,
     estimated_bytes: usize,
+    report_failure: bool,
     task: PersistenceTask,
 }
 
@@ -121,6 +122,7 @@ impl WorkerState {
         key: PersistenceKey,
         generation: u64,
         failure: PersistenceFailure,
+        report_failure: bool,
     ) {
         // A failing mount can reject every autosave in a burst. Report one
         // event per target until that target saves successfully again.
@@ -148,8 +150,11 @@ impl WorkerState {
             {
                 existing.1 = generation;
                 existing.2 = failure;
+                return;
             }
-            return;
+            if !report_failure {
+                return;
+            }
         }
         if self.failures.len() == MAX_REPORTED_FAILURES {
             if let Some((stale_key, _, _)) = self.failures.pop_front() {
@@ -274,12 +279,30 @@ impl PersistenceWorker {
         estimated_bytes: usize,
         task: PersistenceTask,
     ) -> io::Result<()> {
+        self.enqueue_weighted_with_reporting(key, operation, estimated_bytes, false, task)
+    }
+
+    fn enqueue_weighted_with_reporting(
+        &self,
+        key: PersistenceKey,
+        operation: String,
+        estimated_bytes: usize,
+        report_failure: bool,
+        task: PersistenceTask,
+    ) -> io::Result<()> {
         let mut state = self
             .shared
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let generation = state.issue_generation();
+        // An autosave can replace a queued explicit retry. Keep the request
+        // for a fresh diagnostic attached to the newest snapshot for that key.
+        let report_failure = report_failure
+            || state
+                .pending
+                .get(&key)
+                .is_some_and(|job| job.report_failure);
         if !state.accepting {
             let error = io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -292,6 +315,7 @@ impl PersistenceWorker {
                     operation,
                     error: error.to_string(),
                 },
+                report_failure,
             );
             // A rejected task may own a retained-result permit whose Drop
             // re-enters this ledger. Release the mutex before dropping it.
@@ -319,6 +343,7 @@ impl PersistenceWorker {
                     operation,
                     error: error.to_string(),
                 },
+                report_failure,
             );
             drop(state);
             return Err(error);
@@ -348,6 +373,7 @@ impl PersistenceWorker {
                     operation,
                     error: error.to_string(),
                 },
+                report_failure,
             );
             drop(state);
             return Err(error);
@@ -360,6 +386,7 @@ impl PersistenceWorker {
             generation,
             operation,
             estimated_bytes,
+            report_failure,
             task,
         };
         if replacing_pending {
@@ -539,6 +566,7 @@ fn run_worker(shared: Arc<WorkerShared>) {
             generation,
             operation,
             estimated_bytes,
+            report_failure,
             task,
         } = job;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task))
@@ -556,6 +584,7 @@ fn run_worker(shared: Arc<WorkerShared>) {
                     operation,
                     error: error.to_string(),
                 },
+                report_failure,
             );
             state.release_estimated_bytes(estimated_bytes);
             state.running = false;
@@ -608,6 +637,25 @@ pub(crate) fn enqueue_weighted(
     global_worker()?.enqueue_weighted(key, operation.into(), estimated_bytes, Box::new(task))
 }
 
+/// Explicit user retries need a new failure event even after a prior event
+/// was drained. Ordinary autosaves keep their per-target failure deduplication.
+/// A coalescing replacement inherits this intent until that queued attempt runs.
+pub(crate) fn enqueue_weighted_with_reporting(
+    key: PersistenceKey,
+    operation: impl Into<String>,
+    estimated_bytes: usize,
+    report_failure: bool,
+    task: impl FnOnce() -> io::Result<()> + Send + 'static,
+) -> io::Result<()> {
+    global_worker()?.enqueue_weighted_with_reporting(
+        key,
+        operation.into(),
+        estimated_bytes,
+        report_failure,
+        Box::new(task),
+    )
+}
+
 /// Try to charge a retained result which escapes its worker closure. This never
 /// waits for capacity: callers on the persistence thread must shrink or drop
 /// the result on `WouldBlock`, otherwise they could deadlock behind queued work
@@ -658,6 +706,169 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retained_estimated_bytes
+    }
+
+    fn wait_for_worker(worker: &PersistenceWorker) {
+        let (tx, rx) = mpsc::channel();
+        worker
+            .enqueue(
+                PersistenceKey::named("barrier"),
+                "barrier".into(),
+                Box::new(move || {
+                    tx.send(()).unwrap();
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn explicit_retry_reports_again_while_autosaves_stay_deduplicated() {
+        let worker = PersistenceWorker::new(4).unwrap();
+        let key = PersistenceKey::named("history");
+        for (report_failure, expected) in [(false, 1), (false, 0), (true, 1), (false, 0)] {
+            worker
+                .enqueue_weighted_with_reporting(
+                    key.clone(),
+                    "Save Block history".into(),
+                    0,
+                    report_failure,
+                    Box::new(|| Err(io::Error::other("inert write failure"))),
+                )
+                .unwrap();
+            wait_for_worker(&worker);
+            assert_eq!(worker.drain_failures().len(), expected);
+        }
+        worker
+            .enqueue_weighted_with_reporting(
+                key.clone(),
+                "Save Block history".into(),
+                0,
+                true,
+                Box::new(|| Ok(())),
+            )
+            .unwrap();
+        wait_for_worker(&worker);
+        assert!(worker.drain_failures().is_empty());
+        worker
+            .enqueue(
+                key,
+                "Save Block history".into(),
+                Box::new(|| Err(io::Error::other("new failure after success"))),
+            )
+            .unwrap();
+        worker.shutdown(Duration::from_secs(2)).unwrap();
+        assert_eq!(worker.drain_failures().len(), 1);
+    }
+
+    #[test]
+    fn autosave_replacement_keeps_the_explicit_retry_diagnostic_request() {
+        let worker = PersistenceWorker::new(4).unwrap();
+        let key = PersistenceKey::named("history");
+        worker
+            .enqueue(
+                key.clone(),
+                "Save Block history".into(),
+                Box::new(|| Err(io::Error::other("first"))),
+            )
+            .unwrap();
+        wait_for_worker(&worker);
+        assert_eq!(worker.drain_failures().len(), 1);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        worker
+            .enqueue(
+                PersistenceKey::named("blocker"),
+                "blocker".into(),
+                Box::new(move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker
+            .enqueue_weighted_with_reporting(
+                key.clone(),
+                "Save Block history".into(),
+                4,
+                true,
+                Box::new(|| panic!("replaced retry must not run")),
+            )
+            .unwrap();
+        worker
+            .enqueue_weighted(
+                key,
+                "Save Block history".into(),
+                2,
+                Box::new(|| Err(io::Error::other("newest snapshot failed"))),
+            )
+            .unwrap();
+        release_tx.send(()).unwrap();
+        worker.shutdown(Duration::from_secs(2)).unwrap();
+        let failures = worker.drain_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].error, "newest snapshot failed");
+        assert_eq!(retained_estimated_bytes(&worker), 0);
+    }
+
+    #[test]
+    fn older_retry_completion_cannot_replace_a_newer_admission_failure() {
+        let worker = PersistenceWorker::new_with_limits(4, 0).unwrap();
+        let key = PersistenceKey::named("history");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        worker
+            .enqueue_weighted_with_reporting(
+                key.clone(),
+                "Save Block history".into(),
+                0,
+                true,
+                Box::new(move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    Err(io::Error::other("older retry failed"))
+                }),
+            )
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(worker
+            .enqueue_weighted(key, "Save Block history".into(), 1, Box::new(|| Ok(())))
+            .is_err());
+        release_tx.send(()).unwrap();
+        worker.shutdown(Duration::from_secs(2)).unwrap();
+        let failures = worker.drain_failures();
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].error.contains("estimated-byte budget exceeded"));
+    }
+
+    #[test]
+    fn retry_reporting_preserves_generation_order_and_failure_bounds() {
+        let mut state = WorkerState::new();
+        let key = PersistenceKey::named("history");
+        let failure = || PersistenceFailure {
+            operation: "Save Block history".into(),
+            error: "failure".into(),
+        };
+        state.record_failure(key.clone(), 10, failure(), false);
+        state.failures.clear();
+        state.record_failure(key.clone(), 9, failure(), true);
+        state.record_success(&key, 9);
+        assert!(state.failures.is_empty());
+        assert_eq!(state.failed_targets.get(&key), Some(&10));
+        state.record_failure(key.clone(), 11, failure(), true);
+        assert_eq!(state.failures.len(), 1);
+        state.record_success(&key, 11);
+        assert!(state.failures.is_empty());
+        for index in 0..MAX_REPORTED_FAILURES * 2 {
+            let key = PersistenceKey::named(&format!("target-{index}"));
+            state.record_failure(key.clone(), index as u64, failure(), true);
+            state.record_failure(key, index as u64 + 1, failure(), true);
+            assert!(state.failures.len() <= MAX_REPORTED_FAILURES);
+            assert!(state.failed_targets.len() <= MAX_REPORTED_FAILURES);
+        }
     }
 
     #[test]

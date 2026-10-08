@@ -6,6 +6,10 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Block history Retry keeps failed-load state until it can reload, and repeated
+  retry failures reappear in the persistent notice. A successful repaired-file
+  reload still replays and saves; ordinary autosave errors remain deduplicated.
+
 - Unified history decoding validates every saved zone while retaining only the
   newest 64 records, avoiding large temporary record arrays from files with
   many tiny entries. Partial restores still preserve the original file.
