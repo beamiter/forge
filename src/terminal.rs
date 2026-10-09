@@ -497,19 +497,36 @@ pub(crate) fn scrollbar_wrapper_of(term_widget: &gtk4::Widget) -> Option<gtk4::B
 }
 
 pub(crate) fn terminal_working_directory(terminal: &Terminal) -> Option<String> {
-    // Prefer OSC 7 reported directory
+    // This value starts local shells and navigates the local Files tree.
+    // GFile::path() discards a file URI's remote authority, so it cannot be
+    // the decoder here. Remote cwd metadata remains available on the view.
     if let Some(uri) = terminal.current_directory_uri() {
-        let file = gio::File::for_uri(uri.as_str());
-        if let Some(path) = file
-            .path()
-            .map(|p| p.to_string_lossy().to_string())
-            .filter(|s| !s.is_empty())
-        {
+        if let Some(path) = local_osc7_working_directory(uri.as_str()) {
             return Some(path);
         }
     }
     // Fallback: read /proc/<pid>/cwd
     crate::process::process_cwd(terminal_child_pid(terminal)?)
+}
+
+/// Decode an OSC 7 path only in this machine's filesystem namespace.
+fn local_osc7_working_directory(uri: &str) -> Option<String> {
+    // Bound allocation before percent-decoding an untrusted terminal report.
+    if uri.len() > 16 * 1024 {
+        return None;
+    }
+    let (path, host) = glib::filename_from_uri(uri).ok()?;
+    if host.as_deref().is_some_and(|host| {
+        !host.is_empty()
+            && !host.eq_ignore_ascii_case("localhost")
+            && !host.eq_ignore_ascii_case(glib::host_name().as_str())
+    }) {
+        return None;
+    }
+    let path = path.to_str()?;
+    (std::path::Path::new(path).is_absolute()
+        && jterm_core::execution_journal::is_valid_jsh_cwd(path))
+    .then(|| path.to_string())
 }
 
 /// Commands typed into a new shell on its behalf, one PTY line each.
@@ -1476,5 +1493,50 @@ mod tests {
             "{labelled:?}"
         );
         window.close();
+    }
+}
+
+#[cfg(test)]
+mod local_cwd_authority_tests {
+    use super::local_osc7_working_directory;
+
+    #[test]
+    fn remote_osc7_paths_never_become_local_working_directories() {
+        for uri in [
+            "file://remote.invalid/tmp",
+            "file://remote.invalid/",
+            "sftp://remote.invalid/tmp",
+        ] {
+            assert_eq!(local_osc7_working_directory(uri), None, "{uri}");
+        }
+    }
+
+    #[test]
+    fn local_osc7_authorities_preserve_exact_valid_paths() {
+        for uri in [
+            "file:///tmp/My%20Files".to_string(),
+            "file://LOCALHOST/tmp/My%20Files".to_string(),
+            format!("file://{}/tmp/My%20Files", gtk4::glib::host_name()),
+        ] {
+            assert_eq!(
+                local_osc7_working_directory(&uri).as_deref(),
+                Some("/tmp/My Files")
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_osc7_paths_cannot_start_a_local_shell() {
+        for uri in [
+            "file:///tmp/a%0Ab".to_string(),
+            "file:///tmp/a%E2%80%AEb".to_string(),
+            "file:///tmp/%FF".to_string(),
+            "file:///tmp/%00".to_string(),
+            "file:///tmp/%2".to_string(),
+            format!("file:///{}", "a".repeat(4097)),
+            format!("file:///{}", "%61".repeat(16384)),
+        ] {
+            assert_eq!(local_osc7_working_directory(&uri), None);
+        }
     }
 }

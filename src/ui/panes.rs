@@ -873,13 +873,11 @@ impl UiState {
             return;
         };
         let current_term = current_leaf.terminal().clone();
-        // Block views track cwd themselves (their PTY is not owned by the live
-        // VTE), so prefer that over VTE's OSC 7 / child-pid inspection.
-        let working_directory = current_leaf
-            .block_view()
-            .map(|view| view.cwd())
-            .filter(|cwd| !cwd.is_empty())
-            .or_else(|| terminal_working_directory(&current_term));
+        // A split starts a local shell even beside a remote pane. Raw Block
+        // cwd metadata may name a different machine, so use only a local OSC 7
+        // authority or the original local PTY child's /proc directory.
+        let working_directory = terminal_working_directory(&current_term)
+            .or_else(|| crate::process::process_cwd(current_leaf.process_probe().1));
         let tab_widget_name = Some(page_widget.widget_name().to_string());
         let pinned = self.tab_page_is_pinned(&page_widget);
         let custom_title = tab_custom_title_cell(&page_widget);

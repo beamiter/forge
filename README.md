@@ -551,3 +551,9 @@ forge 以 **MIT OR Apache-2.0** 双许可证发布，使用者可任选其一；
 - 项目采用 `MIT OR Apache-2.0` 双许可证；Cargo 包仍有意保留 `publish = false`，不将仓库许可自动等同于 crates.io 发布。依赖继续由每周 RustSec 审计与 Dependabot 检查。
 
 进一步说明见 [用户指南](docs/USER_GUIDE.md)、[架构说明](docs/ARCHITECTURE.md)、[Block 模式验收清单](docs/BLOCK_MODE_ACCEPTANCE.md)、[AI / Agent / Chat 验收矩阵](docs/AI_AGENT_CHAT_ACCEPTANCE.md)、[性能指南](docs/PERFORMANCE.md)、[发布流程](docs/RELEASING.md) 和 [Tailscale/SSH 配置](docs/tailscale-setup.md)。参与开发前请阅读 [贡献指南](CONTRIBUTING.md)、[安全策略](SECURITY.md) 与 [变更日志](CHANGELOG.md)。
+
+### Files 远端文件安全约束
+
+远端重命名/移动、复制和目录上传的发布阶段需要 Linux、Python 3，以及 libc 和目标文件系统支持 `renameat2(RENAME_NOREPLACE)`。探针先在目标文件系统检查该能力；不支持时明确失败，不回退到普通 `mv`，也不安装远端软件。浏览、新建空文件和单文件硬链接上传不依赖 Python。
+
+上传目录先在本地生成有界、私有的完整归档，确认 tar 成功后才连接远端发布；远端在私有同父目录 staging 内解包并原子拒绝同名目标。失败不会删除其他进程创建的目标。子进程组在主进程被回收前终止；非阻塞管道和期限确保继承管道的逃逸子进程无法让取消或超时永久等待。
