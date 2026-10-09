@@ -320,6 +320,8 @@ forge --generate-completion pwsh | Out-String | Invoke-Expression
 
 Block 模式可通过 `finished_block_viewport_rows` 调整长块出现顶部/底部导航控件的行数阈值；`block_compact = true` 可启用更接近 anvil/Warp 的紧凑块间距。两项配置均保持 GTK4 原生实现，不增加运行时依赖。
 
+底部状态栏的长路径和 Git 信息会按可用宽度在中间省略，避免把窗口撑得过宽；悬停可查看完整状态文本，网格、退出状态和标签计数保持正常显示。
+
 ### 安装与更新 jsh
 
 forge 优先使用配套 shell [`jsh`](https://github.com/beamiter/jsh)，找不到时才退回 bash。
