@@ -704,10 +704,14 @@ impl TasksPanel {
                 self.approvals_box.append(&card);
             }
         }
-        self.rendered_approvals
-            .borrow_mut()
-            .clone_from_slice(incoming);
+        replace_approval_cache(&mut self.rendered_approvals.borrow_mut(), incoming);
     }
+}
+
+/// Approval arrivals and decisions change the cache's length. Slice copying
+/// requires equal lengths, so replace the vector at this shared boundary.
+fn replace_approval_cache<T: Clone>(cache: &mut Vec<T>, incoming: &[T]) {
+    *cache = incoming.to_vec();
 }
 
 /// Set a read-only text view's buffer only when the content actually
@@ -720,5 +724,28 @@ fn set_view_text(view: &TextView, text: &str) {
         != text
     {
         buffer.set_text(text);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replace_approval_cache;
+
+    #[test]
+    fn approval_cache_accepts_arrivals_and_removals() {
+        let mut cache = Vec::<u64>::new();
+        for incoming in [vec![], vec![1], vec![1, 2], vec![], vec![3], vec![]] {
+            replace_approval_cache(&mut cache, &incoming);
+            assert_eq!(cache, incoming);
+        }
+    }
+
+    #[test]
+    fn approval_cache_replaces_equal_length_and_unchanged_sets() {
+        let mut cache = vec![1, 2];
+        let incoming = vec![3, 4];
+        replace_approval_cache(&mut cache, &incoming);
+        replace_approval_cache(&mut cache, &incoming);
+        assert_eq!(cache, incoming);
     }
 }
