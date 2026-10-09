@@ -52,6 +52,8 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    ui::dialogs::organism_preview::tests::preview_lifecycle_keeps_motion_local_and_stops_hidden_sources
+    ui::organism::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers
     ui::bottom_bar::tests::long_status_segments_keep_compact_geometry_and_full_text
     ui::file_tree::tests::path_dialog_deep_ancestors_keep_actions_and_focus_reachable
     ui::file_tree::tests::path_dialog_long_components_keep_open_visible_and_full_targets
@@ -95,6 +97,7 @@ tests=(
     block_view::css::tests::the_generated_stylesheet_parses_without_error
     font::tests::default_font_resolution_preserves_grid_and_configuration
     font::tests::a_real_vte_is_given_the_icon_family_behind_the_configured_one
+    block_view::onboarding::tests::inline_notice_priority_handles_multiple_cards_reparenting_and_narrow_panes
     block_view::onboarding::tests::block_onboarding_overlay_is_non_measuring_and_non_targetable
     block_view::tests::a_stranded_focus_mount_declines_only_what_the_focused_widget_owns
     block_view::blocks::tests::repeated_action_feedback_restores_the_original_affordance

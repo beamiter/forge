@@ -921,6 +921,8 @@ impl UiState {
         // as well so behavior changes do not require reopening block tabs.
         self.sync_block_configs();
 
+        self.sync_ascii_organism_settings();
+
         // Apply all visual changes
         self.window_opacity.set(opacity);
         self.window.set_opacity(opacity);

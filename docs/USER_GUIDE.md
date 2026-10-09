@@ -108,8 +108,9 @@ Block pane 可以显式启用一个完全本地、无 LLM 的 ASCII organism：
 ascii_organism_enabled = true
 ```
 
-临时试用可设置 `FORGE_ASCII_ORGANISM_ENABLED=1`；修改该键后需新建 Block
-pane 或重启 Forge。它监听 Forge 从 OSC 133
+临时试用可设置 `FORGE_ASCII_ORGANISM_ENABLED=1`。Settings 的启停和动作等级会立即
+作用于已打开的本地 Block / Unified pane；修改配置文件后使用 Reload Config，无需重建
+pane。关闭会立即收起身体、卡片和该 pane 的动画定时器；重复启停不会重复挂接。它监听 Forge 从 OSC 133
 边界捕获的真实 command start/finished 事件。生命体平时沿 live terminal surface
 缓慢移动，命令运行时靠近输出区观察；用户上滚查看历史时，它缩成 sticky header
 里的单行形态。PTY 真正接收键入、粘贴或进程控制键后，live body 会立即收起；
@@ -118,6 +119,14 @@ pane 或重启 Forge。它监听 Forge 从 OSC 133
 和放不下完整 sprite 的窄小 surface 会直接隐藏空间身体，结果仍保留在 prompt
 上方的 inline widget。图层不参与 GTK 测量、不改变 PTY 行列、不可点击，也不向
 PTY 注入 ANSI；VTE pane 不显示。
+
+在可见的静息身体旁停留指针约 600ms，它会轻轻抬头回应约 2 秒；同一窗口的分屏共享
+8 秒冷却。点击与拖选仍交给终端，身体不接管键盘或焦点。真实输入、命令开始、切 pane、
+窗口失焦、全屏应用或几何变化会取消驻留；忙碌和错误守望不会被问候打断。Calm 只切换
+静态姿态，Static 不显示空间身体。此互动不修改真实生命状态或记忆。
+
+Settings 的 Organism Preview 可查看八种姿态、解释和本地 Say hello 示例，即使生命体
+关闭也可预览。预览不运行命令、不写养成记忆；隐藏或关闭设置后不保留动画定时器。
 
 感知只在内存中保留“不含内容”的 accepted-input/output-activity 脉冲，不记录
 按键、剪贴板或输出文本。它会观察 build/test、检查非零退出，并在失败后成功或
