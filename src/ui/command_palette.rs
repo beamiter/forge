@@ -314,6 +314,7 @@ fn render_rows(list: &ListBox, entries: &[Entry]) {
         let title = jterm_core::review_input::safe_inline_display(&entry.label, 16 * 1024);
         let row = adw::ActionRow::builder()
             .title(&title)
+            .use_markup(false)
             .activatable(true)
             .build();
         if let Some(subtitle) = entry.sublabel.as_deref() {
@@ -843,16 +844,25 @@ impl UiState {
         toolbar.set_content(Some(&body));
         dialog.set_child(Some(&toolbar));
 
-        {
+        let refresh_query = {
             let ui = self.clone();
             let list = list.clone();
             let entries = entries.clone();
             let snapshot = snapshot.clone();
-            filter.connect_search_changed(move |entry| {
-                let next = ui.gather_palette_entries(&entry.text(), initial_mode, &snapshot);
+            let rendered_query = RefCell::new(String::new());
+            Rc::new(move |query: &str| {
+                if *rendered_query.borrow() == query {
+                    return;
+                }
+                let next = ui.gather_palette_entries(query, initial_mode, &snapshot);
                 render_rows(&list, &next);
                 *entries.borrow_mut() = next;
-            });
+                *rendered_query.borrow_mut() = query.to_string();
+            })
+        };
+        {
+            let refresh_query = refresh_query.clone();
+            filter.connect_search_changed(move |entry| refresh_query(&entry.text()));
         }
 
         let activate = {
@@ -880,6 +890,8 @@ impl UiState {
             let dialog = dialog.clone();
             let dialog_slot = self.command_palette_dialog.clone();
             let activate = activate.clone();
+            let filter = filter.clone();
+            let refresh_query = refresh_query.clone();
             keys.connect_key_pressed(move |_, key, _, state| {
                 if key == Key::Escape || palette_toggle_key(initial_mode, key, state) {
                     dialog_slot.borrow_mut().take();
@@ -887,6 +899,9 @@ impl UiState {
                     return true.into();
                 }
                 if matches!(key, Key::Return | Key::KP_Enter) {
+                    // search-changed is delayed; accept against the text that is
+                    // visible now, while retaining selection if it has not changed.
+                    refresh_query(&filter.text());
                     if let Some(row) = list.selected_row() {
                         activate(row.index() as usize);
                     }
@@ -932,6 +947,56 @@ mod tests {
         assert!(!preview.contains('\u{202e}'));
         assert!(!preview.contains('\u{fff0}'));
         assert!(!preview.contains('\u{e0080}'));
+    }
+
+    #[test]
+    fn palette_rows_disable_markup_for_literal_shell_text() {
+        // A source-wiring check keeps this regression independent of a display
+        // server. ActionRow interprets titles and subtitles as markup by
+        // default, while safe_inline_display deliberately preserves shell
+        // punctuation. The row must explicitly opt out of that interpretation.
+        let source = include_str!("command_palette.rs");
+        let render_rows = source
+            .split_once("fn render_rows(")
+            .unwrap()
+            .1
+            .split_once("\nstruct PaletteSnapshot")
+            .unwrap()
+            .0;
+        assert!(render_rows.contains(".use_markup(false)"));
+
+        for command in [
+            "printf '<b>hello</b>'",
+            "echo a && echo b",
+            "cat < input.txt",
+        ] {
+            assert_eq!(
+                jterm_core::review_input::safe_inline_display(command, 16 * 1024),
+                command
+            );
+        }
+        let (_, parsed, _) = gtk4::pango::parse_markup("printf '<b>hello</b>'", '\0').unwrap();
+        assert_eq!(parsed.as_str(), "printf 'hello'");
+        assert!(gtk4::pango::parse_markup("echo a && echo b", '\0').is_err());
+        assert!(gtk4::pango::parse_markup("cat < input.txt", '\0').is_err());
+    }
+
+    #[test]
+    fn enter_refreshes_the_current_query_before_resolving_selection() {
+        // Source-wiring regression, independent of a display server. Native
+        // GTK signal ordering still requires an integration test.
+        let source = include_str!("command_palette.rs");
+        let enter = source
+            .split_once("if matches!(key, Key::Return | Key::KP_Enter) {")
+            .unwrap()
+            .1
+            .split_once("return true.into();")
+            .unwrap()
+            .0;
+        let refresh = enter.find("refresh_query(&filter.text());").unwrap();
+        let selection = enter.find("list.selected_row()").unwrap();
+        let activation = enter.find("activate(row.index() as usize)").unwrap();
+        assert!(refresh < selection && selection < activation);
     }
 
     #[test]

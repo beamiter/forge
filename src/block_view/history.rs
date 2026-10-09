@@ -2268,6 +2268,29 @@ fn zone_history_notice(message: &str, details: &str) -> gtk4::Box {
     notice
 }
 
+/// Keep synchronous Unified failures observable after the pane is destroyed.
+/// The window drains this process-global queue into its sticky history bar.
+/// Queue only the diagnostic, never the stale snapshot or another save attempt.
+fn report_zone_history_save_result(path: &Path, result: io::Result<()>) -> io::Result<()> {
+    if let Err(error) = &result {
+        let kind = error.kind();
+        let message = error.to_string();
+        let estimated_bytes = message.capacity();
+        if let Err(report_error) = persistence::enqueue_weighted_with_reporting(
+            PersistenceKey::for_path("unified-history-diagnostic", path),
+            BLOCK_HISTORY_PERSIST_OPERATION,
+            estimated_bytes,
+            true, // A later pane's close must not inherit an old failure's deduplication.
+            move || Err(io::Error::new(kind, message)),
+        ) {
+            // Admission failures are themselves parked by the worker; retain
+            // the original save error for callers and shutdown logging too.
+            log::warn!("could not report Unified history save failure: {report_error}");
+        }
+    }
+    result
+}
+
 #[allow(dead_code)]
 impl TermView {
     /// Mark a fallibly prepared pane as rolled back. Exit callbacks and Drop
@@ -2313,11 +2336,13 @@ impl TermView {
         };
         // This path also runs from Drop. Keep shutdown file I/O separate from
         // notice rendering; a failed restore already left a persistent notice.
-        self.history_load
+        let result = self
+            .history_load
             .zone_persistence
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .save(&path, zones)
+            .save(&path, zones);
+        report_zone_history_save_result(&path, result)
     }
 
     /// Replay this pane's persisted zones onto the surface before any PTY
@@ -5778,5 +5803,119 @@ mod tests {
         let error = atomic_write(&history, |file| file.write_all(b"payload")).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(!history.exists());
+    }
+    #[test]
+    fn synchronous_zone_failure_outlives_the_saving_pane() {
+        // Isolate the process-global queue from other parallel tests. The
+        // child runs only this test, without GTK or a terminal process.
+        const ENV: &str = "FORGE_TEST_ZONE_DIAGNOSTIC_CHILD";
+        if std::env::var_os(ENV).is_none() {
+            let name = concat!(
+                module_path!(),
+                "::synchronous_zone_failure_outlives_the_saving_pane"
+            );
+            let test_name = name.split_once("::").unwrap().1;
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(ENV, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let directory = TestDir::new("zone-diagnostic");
+        let path = directory.path().join("zones.json");
+        super::atomic_write(&path, |file| {
+            file.write_all(br#"{"version":1,"zones":[{"cmd":"saved command"}]}"#)
+        })
+        .unwrap();
+        let mut first = super::zone_history::SessionPersistence::default();
+        let mut stale = super::zone_history::SessionPersistence::default();
+        let zones = first.restore(&path).unwrap();
+        stale.restore(&path).unwrap();
+        first.save(&path, zones).unwrap();
+        let saved = fs::read(&path).unwrap();
+        let wait = || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            crate::persistence::enqueue(
+                crate::persistence::PersistenceKey::unique_for_path(
+                    "zone-diagnostic-barrier",
+                    &path,
+                ),
+                "zone diagnostic barrier",
+                move || {
+                    tx.send(()).unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+            rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        };
+        super::report_zone_history_save_result(&path, Ok(())).unwrap();
+        wait();
+        assert!(crate::persistence::drain_failures().is_empty());
+        let result = super::report_zone_history_save_result(&path, stale.save(&path, Vec::new()));
+        assert_eq!(
+            result.as_ref().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(result);
+        drop(stale);
+        drop(first); // The diagnostic must outlive the pane's persistence state.
+        wait();
+        let failures = crate::persistence::drain_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].operation,
+            super::BLOCK_HISTORY_PERSIST_OPERATION
+        );
+        assert!(failures[0].error.contains("new history is not being saved"));
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            saved,
+            "reporting never rewrites the snapshot"
+        );
+        // A successful new pane never queued a diagnostic to reset the
+        // worker's failed-target cache. Its later conflict must still report.
+        let _ = super::report_zone_history_save_result(
+            &path,
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "a later pane also could not save",
+            )),
+        );
+        wait();
+        let later = crate::persistence::drain_failures();
+        assert_eq!(later.len(), 1);
+        assert!(later[0].error.contains("later pane"));
+    }
+
+    #[test]
+    fn synchronous_zone_save_routes_even_when_close_discards_the_result() {
+        let source = include_str!("history.rs");
+        let save = source
+            .split("fn save_zone_history(&self)")
+            .nth(1)
+            .unwrap()
+            .split("/// Replay this pane")
+            .next()
+            .unwrap();
+        assert!(save.contains("report_zone_history_save_result(&path, result)"));
+        let view = include_str!("mod.rs");
+        let drop = view
+            .split("impl Drop for TermView")
+            .nth(1)
+            .unwrap()
+            .split("/// Reader-pipeline")
+            .next()
+            .unwrap();
+        assert!(drop.contains("self.save_history()"));
+        let panes = include_str!("../ui/panes.rs");
+        let tabs = include_str!("../ui/tabs.rs");
+        assert!(panes.contains("let _ = view.save_history();"));
+        assert!(tabs.contains("let _ = term_view.save_history();"));
+        let main = include_str!("../main.rs");
+        assert!(main.contains("crate::persistence::drain_failures()"));
+        assert!(main.contains("ui.show_block_history_failure(&failure.error)"));
     }
 }
