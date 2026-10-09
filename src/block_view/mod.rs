@@ -2347,6 +2347,33 @@ fn prepend_in_order<T>(current: &mut VecDeque<T>, older: Vec<T>) {
     }
 }
 
+/// Positions of bookmarked cards that exist in the current filtered document.
+fn visible_marked_positions(cards: impl IntoIterator<Item = (bool, bool)>) -> Vec<usize> {
+    cards
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, (marked, filtered))| (marked && !filtered).then_some(index))
+        .collect()
+}
+
+/// Preserve Delete's next-then-previous choice while skipping filtered cards.
+fn visible_neighbor_after_removal(
+    cards: impl IntoIterator<Item = (u64, bool)>,
+    removed_position: usize,
+) -> Option<u64> {
+    let mut previous = None;
+    for (position, (id, filtered)) in cards.into_iter().enumerate() {
+        if filtered {
+            continue;
+        }
+        if position >= removed_position {
+            return Some(id);
+        }
+        previous = Some(id);
+    }
+    previous
+}
+
 /// Step through sorted marked block indices, wrapping at both ends.
 fn step_marked_indices(marked: &[usize], current: Option<usize>, direction: i32) -> Option<usize> {
     if direction < 0 {
@@ -3907,14 +3934,12 @@ fn remove_finished_block(
         refs.selection.anchor,
         block_id,
     );
-    finished
-        .get(removed_pos)
-        .or_else(|| {
-            removed_pos
-                .checked_sub(1)
-                .and_then(|previous| finished.get(previous))
-        })
-        .map(|block| block.id)
+    visible_neighbor_after_removal(
+        finished
+            .iter()
+            .map(|block| (block.id, block.is_filtered_out())),
+        removed_pos,
+    )
 }
 
 /// Whether a press at (`x`, `y`) in `card`'s coordinates lands on a button
@@ -5203,6 +5228,19 @@ type HumanInputCallbacks = Rc<RefCell<Vec<Box<dyn Fn(HumanInputKind)>>>>;
 type AltScreenCallbacks = Rc<RefCell<Vec<Box<dyn Fn(AltScreenTransition)>>>>;
 type AskAiCallbacks =
     Rc<RefCell<Vec<Box<dyn Fn(crate::ai::BlockContext, crate::ai::BlockAiIntent)>>>>;
+
+/// Preserve structured capture loss, independently of words in the output.
+/// These three card notices specifically mean bytes or rows were not retained;
+/// unrelated diagnostics must not turn complete output into a truncated sample.
+fn output_evidence_is_truncated(source: &str, sample: &str, notice: Option<&str>) -> bool {
+    source != sample
+        || matches!(
+            notice,
+            Some(FINISHED_OUTPUT_NOT_RETAINED)
+                | Some(FINISHED_OUTPUT_TEXT_TRUNCATED)
+                | Some(FINISHED_OUTPUT_PARTLY_RETAINED)
+        )
+}
 
 fn block_context_for_id(
     finished: &[FinishedBlock],
@@ -13082,12 +13120,11 @@ impl KeyCtx {
                     drop(finished);
                     return decline(controller);
                 }
-                let marked_idx: Vec<usize> = finished
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, b)| marks.contains(b.id))
-                    .map(|(i, _)| i)
-                    .collect();
+                let marked_idx: Vec<usize> = visible_marked_positions(
+                    finished
+                        .iter()
+                        .map(|block| (marks.contains(block.id), block.is_filtered_out())),
+                );
                 if marked_idx.is_empty() {
                     drop(marks);
                     drop(finished);
@@ -17656,7 +17693,7 @@ impl TermView {
         if let Some((idx, _)) = finished
             .iter()
             .enumerate()
-            .find(|(_, block)| bookmarks.contains(block.id))
+            .find(|(_, block)| !block.is_filtered_out() && bookmarks.contains(block.id))
         {
             drop(bookmarks);
             drop(finished);
@@ -17670,12 +17707,11 @@ impl TermView {
         if bookmarks.is_empty() {
             return;
         }
-        let marked: Vec<usize> = finished
-            .iter()
-            .enumerate()
-            .filter(|(_, block)| bookmarks.contains(block.id))
-            .map(|(idx, _)| idx)
-            .collect();
+        let marked: Vec<usize> = visible_marked_positions(
+            finished
+                .iter()
+                .map(|block| (bookmarks.contains(block.id), block.is_filtered_out())),
+        );
         if marked.is_empty() {
             return;
         }
@@ -18043,10 +18079,15 @@ impl TermView {
         let data = self.block_data.borrow();
         let bd = data.iter().find(|b| b.id == id);
 
-        let output_total_bytes = block.with_stripped_output(|s| s.len());
-        let output =
-            block.with_stripped_output(|s| crate::ai::truncate_for_context(s, lines_per_side));
-        let output_truncated = output.contains("lines elided") || output.contains("bytes elided");
+        let (output, output_truncated, output_total_bytes) = block.with_stripped_output(|source| {
+            let output = crate::ai::truncate_for_context(source, lines_per_side);
+            let truncated = output_evidence_is_truncated(
+                source,
+                &output,
+                bd.and_then(|block| block.output_notice.as_deref()),
+            );
+            (output, truncated, source.len())
+        });
         let to_time = |ms: Option<u64>| {
             ms.map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms))
         };
@@ -30438,5 +30479,78 @@ mod controller_selection_regressions {
             selected_visible_id_range(cards, 30, 20),
             Some((30, vec![30, 10, 20]))
         );
+    }
+}
+
+#[cfg(test)]
+mod controller_evidence_regressions {
+    use super::*;
+
+    #[test]
+    fn short_agent_evidence_preserves_each_known_capture_loss() {
+        for notice in [
+            FINISHED_OUTPUT_NOT_RETAINED,
+            FINISHED_OUTPUT_TEXT_TRUNCATED,
+            FINISHED_OUTPUT_PARTLY_RETAINED,
+        ] {
+            assert!(output_evidence_is_truncated("tail", "tail", Some(notice)));
+        }
+    }
+
+    #[test]
+    fn literal_elision_words_and_unrelated_notices_are_not_capture_loss() {
+        for text in ["0 lines elided", "0 bytes elided", "complete output", ""] {
+            assert!(!output_evidence_is_truncated(text, text, None));
+            assert!(!output_evidence_is_truncated(
+                text,
+                text,
+                Some("unrelated diagnostic")
+            ));
+        }
+    }
+
+    #[test]
+    fn actual_context_sampling_marks_agent_evidence_truncated() {
+        assert!(output_evidence_is_truncated(
+            "head\nmiddle\ntail",
+            "head\ntail",
+            None
+        ));
+        assert!(output_evidence_is_truncated("éé", "é", None));
+    }
+}
+
+#[cfg(test)]
+mod controller_navigation_regressions {
+    use super::{step_marked_indices, visible_marked_positions, visible_neighbor_after_removal};
+
+    #[test]
+    fn bookmark_steps_use_visible_marks_and_wrap_both_directions() {
+        let positions =
+            visible_marked_positions([(true, false), (true, true), (false, false), (true, false)]);
+        assert_eq!(positions, vec![0, 3]);
+        assert_eq!(step_marked_indices(&positions, Some(0), 1), Some(3));
+        assert_eq!(step_marked_indices(&positions, Some(3), -1), Some(0));
+        assert_eq!(step_marked_indices(&positions, Some(3), 1), Some(0));
+        assert_eq!(step_marked_indices(&positions, Some(0), -1), Some(3));
+        assert!(visible_marked_positions([(true, true), (false, false)]).is_empty());
+    }
+
+    #[test]
+    fn delete_neighbor_skips_hidden_cards_and_prefers_next() {
+        let cards = [(10, false), (20, true), (30, false), (40, true)];
+        assert_eq!(visible_neighbor_after_removal(cards, 1), Some(30));
+        assert_eq!(visible_neighbor_after_removal(cards, 3), Some(30));
+        assert_eq!(visible_neighbor_after_removal(cards, 4), Some(30));
+        assert_eq!(visible_neighbor_after_removal([(10, true)], 0), None);
+        assert_eq!(visible_neighbor_after_removal([], 0), None);
+    }
+
+    #[test]
+    fn unfiltered_delete_neighbor_preserves_existing_order() {
+        let cards = [(30, false), (10, false), (20, false)];
+        assert_eq!(visible_neighbor_after_removal(cards, 0), Some(30));
+        assert_eq!(visible_neighbor_after_removal(cards, 1), Some(10));
+        assert_eq!(visible_neighbor_after_removal(cards, 3), Some(20));
     }
 }
