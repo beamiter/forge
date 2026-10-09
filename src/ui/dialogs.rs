@@ -659,6 +659,28 @@ type CrossBlockScheduleRebuildSlot = Rc<RefCell<Option<std::rc::Weak<dyn Fn(bool
 /// a stale index would silently edit a different host.
 type RemoteHostEditTarget = (usize, String);
 
+const REMOTE_HOSTS_CHANGED: &str = "Remote hosts changed; close and reopen this dialog.";
+
+/// Commit only against the host list the dialog displayed. A stale edit must
+/// neither overwrite a replacement profile nor resurrect a removed profile.
+fn apply_remote_host_edit<T: PartialEq>(
+    hosts: &mut Vec<T>,
+    expected: &[T],
+    target: Option<usize>,
+    new_host: T,
+) -> Result<(), &'static str> {
+    if hosts.as_slice() != expected {
+        return Err(REMOTE_HOSTS_CHANGED);
+    }
+    match target {
+        Some(index) => {
+            *hosts.get_mut(index).ok_or(REMOTE_HOSTS_CHANGED)? = new_host;
+        }
+        None => hosts.push(new_host),
+    }
+    Ok(())
+}
+
 const CROSS_BLOCK_SEARCH_LIMIT: usize = 500;
 const CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES: usize = 8 * 1024;
 const CROSS_BLOCK_SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
@@ -698,6 +720,7 @@ fn render_workflow_palette_rows(list: &ListBox, workflows: &[crate::workflows::W
         let row = adw::ActionRow::builder()
             .title(&title)
             .subtitle(&subtitle)
+            .use_markup(false)
             .activatable(true)
             .build();
         list.append(&row);
@@ -1764,6 +1787,7 @@ impl UiState {
             let row = adw::ActionRow::builder()
                 .title(name.as_str())
                 .subtitle(target.as_str())
+                .use_markup(false)
                 .activatable(true)
                 .build();
             list_box.append(&row);
@@ -2034,6 +2058,7 @@ impl UiState {
             let first_line = cmd.lines().next().unwrap_or(cmd);
             let row = adw::ActionRow::builder()
                 .title(first_line)
+                .use_markup(false)
                 .activatable(true)
                 .build();
             list_box.append(&row);
@@ -4240,15 +4265,15 @@ impl UiState {
         // back untouched. Rebuilding an entry from the visible rows alone would
         // drop a `-p 2222` or a pinned session the moment someone corrected a
         // typo in the name, and nothing on screen would show it happened.
+        let expected_hosts = self.config.borrow().remote_hosts.clone();
         let existing = editing.as_ref().and_then(|(index, name)| {
-            let config = self.config.borrow();
-            let resolved = match config.remote_hosts.get(*index) {
+            let resolved = match expected_hosts.get(*index) {
                 Some(host) if &host.name == name => Some(*index),
                 // The file can be reloaded behind an open panel; fall back to
                 // matching the name, exactly as the delete path does.
-                _ => config.remote_hosts.iter().position(|h| &h.name == name),
+                _ => expected_hosts.iter().position(|h| &h.name == name),
             };
-            resolved.map(|index| (index, config.remote_hosts[index].clone()))
+            resolved.map(|index| (index, expected_hosts[index].clone()))
         });
 
         let dialog = adw::Dialog::builder()
@@ -4375,6 +4400,9 @@ impl UiState {
             // Mirrors parse_remote_hosts so a host accepted here always
             // survives a reload of the saved file.
             let result: Result<(Option<usize>, crate::config::RemoteHost), &'static str> = (|| {
+                if ui.config.borrow().remote_hosts != expected_hosts {
+                    return Err(REMOTE_HOSTS_CHANGED);
+                }
                 if was_editing && existing.is_none() {
                     return Err("This host is no longer in the configuration.");
                 }
@@ -4456,19 +4484,24 @@ impl UiState {
                     error_label.set_visible(true);
                 }
                 Ok((target, new_host)) => {
-                    let previous_hosts = {
+                    let committed = {
                         let mut config = ui.config.borrow_mut();
                         let previous_hosts = config.remote_hosts.clone();
-                        match target {
-                            // Replaced in place so the host keeps its position
-                            // in the picker; remove-then-push would move it to
-                            // the end on every edit.
-                            Some(index) if index < config.remote_hosts.len() => {
-                                config.remote_hosts[index] = new_host;
-                            }
-                            _ => config.remote_hosts.push(new_host),
+                        apply_remote_host_edit(
+                            &mut config.remote_hosts,
+                            &expected_hosts,
+                            target,
+                            new_host,
+                        )
+                        .map(|()| previous_hosts)
+                    };
+                    let previous_hosts = match committed {
+                        Ok(previous) => previous,
+                        Err(message) => {
+                            error_label.set_text(message);
+                            error_label.set_visible(true);
+                            return;
                         }
-                        previous_hosts
                     };
                     ui.reconcile_file_tree_remote_hosts(&previous_hosts);
                     ui.persist_config();
@@ -5126,6 +5159,70 @@ impl UiState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plain_text_picker_rows_disable_implicit_pango_markup() {
+        let source = include_str!("dialogs.rs");
+        for (start, end) in [
+            (
+                "fn render_workflow_palette_rows(",
+                "fn preferences_group_title(",
+            ),
+            (
+                "pub(crate) fn show_remote_picker(",
+                "pub(crate) fn show_history_palette(",
+            ),
+            (
+                "pub(crate) fn show_history_palette(",
+                "pub(crate) fn close_cross_block_search(",
+            ),
+        ] {
+            let section = source
+                .split(start)
+                .nth(1)
+                .unwrap()
+                .split(end)
+                .next()
+                .unwrap();
+            let builder = section
+                .split("let row = adw::ActionRow::builder()")
+                .nth(1)
+                .unwrap()
+                .split(".build()")
+                .next()
+                .unwrap();
+            assert!(
+                builder.contains(".use_markup(false)"),
+                "plain text row: {start}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_host_edit_refuses_every_stale_list_without_mutation() {
+        let expected = vec![1, 2];
+        for mut current in [vec![3, 2], vec![2], vec![], vec![2, 1], vec![1, 2, 3]] {
+            let unchanged = current.clone();
+            for target in [Some(0), None] {
+                assert_eq!(
+                    super::apply_remote_host_edit(&mut current, &expected, target, 4),
+                    Err(super::REMOTE_HOSTS_CHANGED)
+                );
+                assert_eq!(current, unchanged);
+            }
+        }
+    }
+
+    #[test]
+    fn remote_host_edit_never_appends_for_a_missing_edit_target() {
+        let mut current = vec![1];
+        assert!(super::apply_remote_host_edit(&mut current, &[1], Some(1), 2).is_err());
+        assert_eq!(current, [1]);
+        super::apply_remote_host_edit(&mut current, &[1], Some(0), 2).unwrap();
+        assert_eq!(current, [2]);
+        super::apply_remote_host_edit(&mut current, &[2], None, 3).unwrap();
+        assert_eq!(current, [2, 3]);
+    }
+
     use super::{
         clear_cross_block_search_dialog_claim, cross_block_bookmark_confirmation,
         cross_block_bookmark_copy, cross_block_bookmark_unavailable_status,

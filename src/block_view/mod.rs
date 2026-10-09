@@ -2663,9 +2663,10 @@ fn ansi256_to_rgb(idx: u8, palette: &[RGBA; 16]) -> (u8, u8, u8) {
         }
         16..=231 => {
             let idx = idx - 16;
-            let r = (idx / 36) * 51;
-            let g = ((idx % 36) / 6) * 51;
-            let b = (idx % 6) * 51;
+            let levels = [0, 95, 135, 175, 215, 255];
+            let r = levels[usize::from(idx / 36)];
+            let g = levels[usize::from((idx % 36) / 6)];
+            let b = levels[usize::from(idx % 6)];
             (r, g, b)
         }
         232..=255 => {
@@ -3373,6 +3374,29 @@ fn selected_id_range(ids: &[u64], anchor: u64, target: u64) -> Vec<u64> {
     ids[start..=end].to_vec()
 }
 
+/// Plan a range only through cards present in the filtered document. A stale
+/// target refuses the transition without clearing the prior selection; a stale
+/// anchor starts a fresh range at the visible target.
+fn selected_visible_id_range(
+    cards: impl IntoIterator<Item = (u64, bool)>,
+    anchor: u64,
+    target: u64,
+) -> Option<(u64, Vec<u64>)> {
+    let visible: Vec<u64> = cards
+        .into_iter()
+        .filter_map(|(id, filtered)| (!filtered).then_some(id))
+        .collect();
+    if !visible.contains(&target) {
+        return None;
+    }
+    let anchor = if visible.contains(&anchor) {
+        anchor
+    } else {
+        target
+    };
+    Some((anchor, selected_id_range(&visible, anchor, target)))
+}
+
 fn select_finished_block_range(
     finished: &[FinishedBlock],
     selected_block_ids: &SelectedBlockIds,
@@ -3384,8 +3408,15 @@ fn select_finished_block_range(
         .get()
         .or_else(|| selected_block_id.get())
         .unwrap_or(target);
-    let ordered_ids: Vec<u64> = finished.iter().map(|block| block.id).collect();
-    let range = selected_id_range(&ordered_ids, anchor, target);
+    let Some((anchor, range)) = selected_visible_id_range(
+        finished
+            .iter()
+            .map(|block| (block.id, block.is_filtered_out())),
+        anchor,
+        target,
+    ) else {
+        return;
+    };
     {
         let mut selected = selected_block_ids.borrow_mut();
         selected.clear();
@@ -30311,5 +30342,101 @@ mod tests {
                 "{refusal:?} must write no PTY bytes"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod controller_palette_regressions {
+    use super::*;
+
+    #[test]
+    fn ansi256_cube_matches_all_xterm_levels() {
+        let palette = [RGBA::new(0.0, 0.0, 0.0, 1.0); 16];
+        let levels = [0, 95, 135, 175, 215, 255];
+        for idx in 16_u8..=231 {
+            let cube = usize::from(idx - 16);
+            assert_eq!(
+                ansi256_to_rgb(idx, &palette),
+                (levels[cube / 36], levels[(cube % 36) / 6], levels[cube % 6]),
+                "palette index {idx}",
+            );
+        }
+    }
+
+    #[test]
+    fn ansi256_keeps_all_configured_base_colors() {
+        let palette = std::array::from_fn(|index| {
+            RGBA::new(index as f32 / 16.0, (15 - index) as f32 / 16.0, 0.5, 1.0)
+        });
+        for idx in 0_u8..16 {
+            let color = palette[usize::from(idx)];
+            assert_eq!(
+                ansi256_to_rgb(idx, &palette),
+                (
+                    (color.red() * 255.0) as u8,
+                    (color.green() * 255.0) as u8,
+                    (color.blue() * 255.0) as u8,
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn ansi256_keeps_all_grayscale_levels() {
+        let palette = [RGBA::new(0.0, 0.0, 0.0, 1.0); 16];
+        for idx in 232_u8..=255 {
+            let gray = 8 + (idx - 232) * 10;
+            assert_eq!(ansi256_to_rgb(idx, &palette), (gray, gray, gray));
+        }
+    }
+}
+
+#[cfg(test)]
+mod controller_selection_regressions {
+    use super::selected_visible_id_range;
+
+    #[test]
+    fn range_selection_excludes_filtered_cards_in_both_directions() {
+        let cards = [(10, false), (20, true), (30, false)];
+        assert_eq!(
+            selected_visible_id_range(cards, 10, 30),
+            Some((10, vec![10, 30]))
+        );
+        assert_eq!(
+            selected_visible_id_range(cards, 30, 10),
+            Some((30, vec![10, 30]))
+        );
+    }
+
+    #[test]
+    fn range_selection_rebases_a_filtered_or_missing_anchor() {
+        let cards = [(10, true), (20, false), (30, false)];
+        for anchor in [10, 99] {
+            assert_eq!(
+                selected_visible_id_range(cards, anchor, 30),
+                Some((30, vec![30]))
+            );
+        }
+    }
+
+    #[test]
+    fn range_selection_refuses_hidden_missing_and_empty_targets() {
+        let cards = [(10, false), (20, true)];
+        assert_eq!(selected_visible_id_range(cards, 10, 20), None);
+        assert_eq!(selected_visible_id_range(cards, 10, 99), None);
+        assert_eq!(
+            selected_visible_id_range([(10, true), (20, true)], 10, 20),
+            None
+        );
+        assert_eq!(selected_visible_id_range([], 10, 20), None);
+    }
+
+    #[test]
+    fn range_selection_preserves_all_visible_document_order() {
+        let cards = [(30, false), (10, false), (20, false)];
+        assert_eq!(
+            selected_visible_id_range(cards, 30, 20),
+            Some((30, vec![30, 10, 20]))
+        );
     }
 }

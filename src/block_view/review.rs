@@ -1,6 +1,6 @@
 //! Read-only, bounded inspection of retained Block records. This module has no
 //! PTY or submission capability: neither opening, navigation nor copying can run.
-use super::{BlockData, CompletionProvenance};
+use super::{BlockData, BlockOutcome, CompletionProvenance};
 use gtk4::{glib, prelude::*};
 use std::{
     cell::RefCell,
@@ -44,15 +44,15 @@ impl ReviewSnapshot {
             }
             bytes += block.cmd.len();
             let background = block.is_background();
-            let result = if background {
-                "Background output (no command result)".to_string()
-            } else {
-                match block.exit_code {
-                    Some(0) => "Success · exit 0".to_string(),
-                    Some(code @ (130 | 141 | 143)) => format!("Interrupted · exit {code}"),
-                    Some(code) => format!("Failed · exit {code}"),
-                    None => "Unknown · no exit status retained".to_string(),
+            let result = match BlockOutcome::classify(Some(&block.cmd), block.exit_code) {
+                BlockOutcome::Background => "Background output (no command result)".to_string(),
+                BlockOutcome::Success => "Success · exit 0".to_string(),
+                BlockOutcome::Interrupted(code) if jterm_core::exit_status::is_job_stop(code) => {
+                    format!("Suspended · exit {code}")
                 }
+                BlockOutcome::Interrupted(code) => format!("Interrupted · exit {code}"),
+                BlockOutcome::Failure(code) => format!("Failed · exit {code}"),
+                BlockOutcome::Unknown => "Unknown · no exit status retained".to_string(),
             };
             let duration = if background {
                 "Not applicable".to_string()
@@ -615,6 +615,17 @@ mod tests {
         assert!(details.contains("completion timing is not authoritative"));
         assert!(!details.contains("42 ms"));
         assert!(details.contains("completeness is not independently verified"));
+    }
+    #[test]
+    fn review_job_control_stops_match_the_suspended_card_status() {
+        for code in 147..=150 {
+            let mut data = record(1, "sleep 10");
+            data.exit_code = Some(code);
+            let review = ReviewSnapshot::capture(&VecDeque::from([data]), &HashSet::from([1]));
+            let details = &review.records[0].description;
+            assert!(details.contains(&format!("Suspended · exit {code}")));
+            assert!(!details.contains("Failed"));
+        }
     }
     #[test]
     fn review_exposes_exactness_truncation_and_retained_output_without_copying_it() {

@@ -985,14 +985,16 @@ fn filter_output_lines(
         }
     }
     let mut out = String::new();
+    let mut wrote_line = false;
     for (line, keep) in lines.iter().zip(keep.iter()) {
         if !*keep {
             continue;
         }
-        if !out.is_empty() {
+        if wrote_line {
             out.push('\n');
         }
         out.push_str(line);
+        wrote_line = true;
     }
     Ok(out)
 }
@@ -6048,6 +6050,22 @@ mod tests {
         assert_eq!(
             filter_output_lines("one\ntwo\nthree\nfour", "three", false, true, false, 1).unwrap(),
             "two\nthree\nfour"
+        );
+    }
+
+    #[test]
+    fn filter_output_lines_preserves_selected_leading_blank_lines() {
+        assert_eq!(
+            filter_output_lines("skip\n\n\nmatch\nafter", "match", false, true, false, 2).unwrap(),
+            "\n\nmatch\nafter"
+        );
+        assert_eq!(
+            filter_output_lines("\n\nnonempty", "^$", true, true, false, 0).unwrap(),
+            "\n"
+        );
+        assert_eq!(
+            filter_output_lines("\n\nx", "absent", false, true, true, 0).unwrap(),
+            "\n\nx"
         );
     }
 
