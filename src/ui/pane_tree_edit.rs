@@ -256,7 +256,9 @@ pub(crate) fn restore_zoomed_leaf(notebook: &Notebook, swap: &ZoomPageSwap) -> O
     let inserted = notebook.insert_page(
         &swap.original_page,
         swap.tab_label.as_ref(),
-        Some(swap.page_index),
+        // Tabs can be reordered while zoomed. Replace the live placeholder
+        // in its current slot instead of restoring its historical index.
+        Some(current_page),
     );
     notebook.set_tab_reorderable(&swap.original_page, true);
     notebook.set_current_page(Some(inserted));

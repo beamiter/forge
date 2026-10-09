@@ -2467,6 +2467,34 @@ pub(crate) fn start_dir(loc: &FsLocation, hosts: &[RemoteHost]) -> io::Result<Pa
     start_dir_with_overlay(loc, hosts, &FsExecutionOverlay::default())
 }
 
+/// Automatic follow home lookup shares the same token as the first listing.
+pub(crate) fn start_dir_with_overlay_cancel(
+    loc: &FsLocation,
+    hosts: &[RemoteHost],
+    overlay: &FsExecutionOverlay,
+    cancellation: &CancelToken,
+) -> io::Result<PathBuf> {
+    if cancellation.is_cancelled() {
+        return Err(cancelled_error());
+    }
+    match remote_host_with_overlay(loc, hosts, overlay)? {
+        None => Ok(std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"))),
+        Some(host) => {
+            let capture = run_probe_or_cancel(
+                &host,
+                "home",
+                &[],
+                PROBE_LIST_TIMEOUT,
+                PROBE_HOME_MAX_OUTPUT,
+                Some(cancellation),
+            )?;
+            parse_home(&capture.stdout)
+        }
+    }
+}
+
 pub(crate) fn start_dir_with_overlay(
     loc: &FsLocation,
     hosts: &[RemoteHost],
@@ -3103,6 +3131,79 @@ mod tests {
         assert!(!path.exists(), "a partial extraction is never left behind");
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Use a child test process so the fake SSH PATH never affects parallel
+    /// tests. This exercises the real home wrapper and capture watchdog, with
+    /// no network service or installed SSH client required.
+    #[cfg(unix)]
+    #[test]
+    fn running_home_probe_honors_cancellation() {
+        const CHILD_MARKER: &str = "FILES_HOME_CANCELLATION_TEST_CHILD";
+        if let Some(marker) = std::env::var_os(CHILD_MARKER) {
+            let marker = PathBuf::from(marker);
+            let host = host_fixture();
+            let cancellation = CancelToken::default();
+            let trigger = cancellation.clone();
+            let setter = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !marker.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let spawned = marker.exists();
+                trigger.cancel();
+                assert!(spawned, "the isolated home probe never started");
+            });
+            let started = std::time::Instant::now();
+            let error = start_dir_with_overlay_cancel(
+                &FsLocation::Remote(0),
+                &[host],
+                &FsExecutionOverlay::default(),
+                &cancellation,
+            )
+            .unwrap_err();
+            setter.join().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "home waited for its ordinary deadline instead of cancellation"
+            );
+            return;
+        }
+
+        use std::os::unix::fs::PermissionsExt;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("forge-home-cancel-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let ssh = root.join("ssh");
+        std::fs::write(&ssh, "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$FILES_HOME_CANCELLATION_TEST_CHILD\"\nsleep 30 &\nwait\n").unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut paths = vec![root.clone()];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let path = std::env::join_paths(paths).unwrap();
+        let test_name = format!(
+            "{}::running_home_probe_honors_cancellation",
+            module_path!().split_once("::").unwrap().1
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture"])
+            .env("PATH", path)
+            .env(CHILD_MARKER, root.join("spawned"))
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            output.status.success(),
+            "isolated cancellation test failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn host_fixture() -> RemoteHost {
@@ -5064,5 +5165,18 @@ mod transport_regressions {
         assert_eq!(code(&result), 0);
         assert!(result.stdout.len() > 512);
         assert_eq!(&result.stdout[257..262], b"ustar");
+    }
+    #[test]
+    fn cancelled_home_lookup_rejects_before_endpoint_resolution_or_spawn() {
+        let cancellation = CancelToken::default();
+        cancellation.cancel();
+        let error = start_dir_with_overlay_cancel(
+            &FsLocation::Remote(usize::MAX),
+            &[],
+            &FsExecutionOverlay::default(),
+            &cancellation,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     }
 }

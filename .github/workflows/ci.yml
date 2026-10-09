@@ -72,6 +72,18 @@ jobs:
         with:
           components: rustfmt
 
+      - name: Check Files follow callback races
+        run: python3 scripts/test-files-follow.py
+
+      - name: Check search callback lifecycle
+        run: python3 scripts/test-search-lifecycle.py
+
+      - name: Check pane focus and zoom lifecycle
+        run: python3 scripts/test-pane-lifecycle.py
+
+      - name: Check bidirectional tab selection
+        run: python3 scripts/test-tab-selection.py
+
       - name: Check formatting
         id: fmt
         run: cargo fmt --all -- --check

@@ -1775,7 +1775,7 @@ pub fn run() -> glib::ExitCode {
             ui_for_switch.refresh_pane_headers_for(widget);
             if ui_for_switch.search_bar.is_search_mode() {
                 ui_for_switch.invalidate_tab_focus_requests();
-                ui_for_switch.search_apply();
+                ui_for_switch.search_apply_in_page(widget);
                 ui_for_switch.search_entry.grab_focus();
             } else if let Some(target_terminal) = ui_for_switch.terminal_in_page(widget) {
                 if let Some(term_view) = ui_for_switch.term_view_in_page(widget) {

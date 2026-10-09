@@ -1016,10 +1016,19 @@ impl UiState {
             return;
         }
 
-        let focused = leaves
+        // Finished Block cards and pane controls can hold focus instead of
+        // the live VTE. Resolve the same owning/last-active leaf used by
+        // directional focus rather than silently cycling from pane zero.
+        let Some(active) = node.active_leaf() else {
+            return;
+        };
+        let active_root = active.root_widget();
+        let Some(focused) = leaves
             .iter()
-            .position(|leaf| leaf.terminal().has_focus())
-            .unwrap_or(0);
+            .position(|leaf| leaf.root_widget() == active_root)
+        else {
+            return;
+        };
         let next = if direction > 0 {
             (focused + 1) % leaves.len()
         } else if focused == 0 {

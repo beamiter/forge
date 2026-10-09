@@ -329,6 +329,7 @@ struct FileTreeNavigationRequest {
 
 #[derive(Default)]
 pub(crate) struct FileTreeNavigationState {
+    automatic_probe: Option<(u64, remote_fs::CancelToken)>,
     revision: u64,
     pending: Option<FileTreeNavigationRequest>,
     current: Option<FileTreeNavigationPoint>,
@@ -337,6 +338,29 @@ pub(crate) struct FileTreeNavigationState {
 }
 
 impl FileTreeNavigationState {
+    fn cancel_automatic_probe(&mut self) {
+        if let Some((_, cancellation)) = self.automatic_probe.take() {
+            cancellation.cancel();
+        }
+    }
+
+    fn begin_automatic_probe(&mut self, intent: u64) -> remote_fs::CancelToken {
+        self.cancel_automatic_probe();
+        let cancellation = remote_fs::CancelToken::default();
+        self.automatic_probe = Some((intent, cancellation.clone()));
+        cancellation
+    }
+
+    fn retire_automatic_probe(&mut self, intent: u64) {
+        if self
+            .automatic_probe
+            .as_ref()
+            .is_some_and(|(current, _)| *current == intent)
+        {
+            self.automatic_probe = None;
+        }
+    }
+
     fn push_bounded(
         history: &mut VecDeque<FileTreeNavigationPoint>,
         point: FileTreeNavigationPoint,
@@ -3088,6 +3112,9 @@ impl UiState {
     }
 
     pub(crate) fn invalidate_file_tree_remote_follow(&self) {
+        self.file_tree_navigation
+            .borrow_mut()
+            .cancel_automatic_probe();
         let _ = self.next_file_tree_remote_follow_intent();
     }
 
@@ -3255,6 +3282,11 @@ impl UiState {
             location: self.file_tree_location.borrow().clone(),
             root: self.file_tree_root.borrow().clone(),
         };
+        let cancellation = self
+            .file_tree_navigation
+            .borrow_mut()
+            .begin_automatic_probe(intent);
+        let cancellation_for_apply = cancellation.clone();
         let location_for_work = location.clone();
         let hosts_for_work = hosts.clone();
         let ui = self.clone();
@@ -3262,8 +3294,13 @@ impl UiState {
         let argv_for_apply = source_argv.clone();
         let target_for_apply = target.clone();
         let overlay_for_apply = overlay.clone();
-        let apply = move |result: io::Result<PathBuf>| {
-            if std::env::var_os("FORGE_SAFE_MODE").is_some() {
+        let apply = move |result: io::Result<(PathBuf, Option<DirectoryScan>)>| {
+            ui.file_tree_navigation
+                .borrow_mut()
+                .retire_automatic_probe(intent);
+            if cancellation_for_apply.is_cancelled()
+                || std::env::var_os("FORGE_SAFE_MODE").is_some()
+            {
                 return;
             }
             let Some(source_root) = source_root.upgrade() else {
@@ -3305,7 +3342,7 @@ impl UiState {
             }
 
             match result {
-                Ok(root) => {
+                Ok((root, listing)) => {
                     let current_hosts = ui.config.borrow().remote_hosts.clone();
                     let Some(current_location) =
                         remap_remote_location(&location, &hosts, &current_hosts)
@@ -3337,23 +3374,44 @@ impl UiState {
                         );
                         return;
                     }
-                    let root = if same_target {
-                        ui.file_tree_root.borrow().clone()
-                    } else {
-                        root
-                    };
-                    ui.navigate_file_tree_point(
-                        FileTreeNavigationPoint {
-                            location: current_location,
-                            overlay: overlay_for_apply,
-                            root,
+                    let authority =
+                        match remote_fs::filesystem_identity(&current_location, &current_hosts) {
+                            Ok(authority) => authority,
+                            Err(_) => return,
+                        };
+                    let point = FileTreeNavigationPoint {
+                        location: current_location.clone(),
+                        overlay: overlay_for_apply.clone(),
+                        root: if same_target {
+                            ui.file_tree_root.borrow().clone()
+                        } else {
+                            root
                         },
+                    };
+                    let request = ui.file_tree_navigation.borrow_mut().begin(
+                        point,
                         if same_target {
                             FileTreeNavigationAction::Replace
                         } else {
                             FileTreeNavigationAction::Push
                         },
                     );
+                    if same_target {
+                        // This is an execution-route rebind within the exact
+                        // proven namespace, so retain rows and expansion.
+                        ui.file_tree_model.cancel_pending_scans_preserve_tree();
+                        if ui.file_tree_navigation.borrow_mut().commit(&request) {
+                            *ui.file_tree_location.borrow_mut() = current_location;
+                            *ui.file_tree_execution_overlay.borrow_mut() = overlay_for_apply;
+                            ui.file_tree_model.set_committed_authority(authority);
+                            ui.refresh_file_tree_location_selector();
+                            ui.refresh_file_tree_root_header();
+                        }
+                    } else if let Some(listing) = listing {
+                        // Source authority was checked after the first listing,
+                        // so publication has no second asynchronous boundary.
+                        ui.commit_file_tree_point_listing(&request, authority, listing);
+                    }
                 }
                 Err(error) => ui.show_remote_follow_failure(
                     source_for_apply,
@@ -3365,10 +3423,39 @@ impl UiState {
         };
         if let Err(error) = request_fs_op(
             move || {
-                remote_fs::start_dir_with_overlay(&location_for_work, &hosts_for_work, &overlay)
+                if cancellation.is_cancelled() {
+                    return Err(remote_fs::cancelled_error());
+                }
+                let root = remote_fs::start_dir_with_overlay_cancel(
+                    &location_for_work,
+                    &hosts_for_work,
+                    &overlay,
+                    &cancellation,
+                )?;
+                if cancellation.is_cancelled() {
+                    return Err(remote_fs::cancelled_error());
+                }
+                let listing = if same_target {
+                    None
+                } else {
+                    Some(scan_entries(
+                        &location_for_work,
+                        &hosts_for_work,
+                        &overlay,
+                        &root,
+                        &cancellation,
+                    )?)
+                };
+                if cancellation.is_cancelled() {
+                    return Err(remote_fs::cancelled_error());
+                }
+                Ok((root, listing))
             },
             apply,
         ) {
+            self.file_tree_navigation
+                .borrow_mut()
+                .cancel_automatic_probe();
             self.show_remote_follow_failure(source_session, source_argv, target, error);
         }
     }
@@ -3629,6 +3716,51 @@ impl UiState {
         }
     }
 
+    fn commit_file_tree_point_listing(
+        &self,
+        request: &FileTreeNavigationRequest,
+        expected_authority: remote_fs::FilesystemIdentity,
+        listing: DirectoryScan,
+    ) {
+        if !self.file_tree_navigation.borrow_mut().commit(request) {
+            return;
+        }
+        let reconcile_started = Instant::now();
+        let generation = self.file_tree_model.reset();
+        self.file_tree_model
+            .set_committed_authority(expected_authority.clone());
+        *self.file_tree_location.borrow_mut() = request.target.location.clone();
+        *self.file_tree_execution_overlay.borrow_mut() = request.target.overlay.clone();
+        *self.file_tree_root.borrow_mut() = request.target.root.clone();
+        self.file_tree_model.set_root_path(&request.target.root);
+        self.file_tree_model
+            .mark_snapshot_completed(&request.target.root);
+        let timing = listing.timing;
+        let entry_count = listing.entries.len();
+        self.file_tree_model
+            .replace_root(generation, listing.entries);
+        self.refresh_file_tree_location_selector();
+        self.refresh_file_tree_root_header();
+        let delta = StoreReconcileDelta {
+            inserted_rows: entry_count,
+            ..StoreReconcileDelta::default()
+        };
+        log_scan_timing(
+            &request.target.root,
+            timing,
+            reconcile_started.elapsed(),
+            &delta,
+        );
+        if listing.truncated {
+            self.toast_overlay.add_toast(adw::Toast::new(&format!(
+                "{} has more than {} entries; showing the first {}",
+                root_display_label(&request.target.location, &request.target.root),
+                remote_fs::MAX_DIRECTORY_ENTRIES,
+                remote_fs::MAX_DIRECTORY_ENTRIES
+            )));
+        }
+    }
+
     fn navigate_file_tree_point(
         &self,
         target: FileTreeNavigationPoint,
@@ -3701,52 +3833,11 @@ impl UiState {
                 }
                 match result {
                     Ok(listing) => {
-                        if !ui
-                            .file_tree_navigation
-                            .borrow_mut()
-                            .commit(&request_for_result)
-                        {
-                            return;
-                        }
-                        let reconcile_started = Instant::now();
-                        let generation = ui.file_tree_model.reset();
-                        ui.file_tree_model
-                            .set_committed_authority(expected_authority.clone());
-                        *ui.file_tree_location.borrow_mut() =
-                            request_for_result.target.location.clone();
-                        *ui.file_tree_execution_overlay.borrow_mut() =
-                            request_for_result.target.overlay.clone();
-                        *ui.file_tree_root.borrow_mut() = request_for_result.target.root.clone();
-                        ui.file_tree_model
-                            .set_root_path(&request_for_result.target.root);
-                        ui.file_tree_model
-                            .mark_snapshot_completed(&request_for_result.target.root);
-                        let timing = listing.timing;
-                        let entry_count = listing.entries.len();
-                        ui.file_tree_model.replace_root(generation, listing.entries);
-                        ui.refresh_file_tree_location_selector();
-                        ui.refresh_file_tree_root_header();
-                        let delta = StoreReconcileDelta {
-                            inserted_rows: entry_count,
-                            ..StoreReconcileDelta::default()
-                        };
-                        log_scan_timing(
-                            &request_for_result.target.root,
-                            timing,
-                            reconcile_started.elapsed(),
-                            &delta,
+                        ui.commit_file_tree_point_listing(
+                            &request_for_result,
+                            expected_authority.clone(),
+                            listing,
                         );
-                        if listing.truncated {
-                            ui.toast_overlay.add_toast(adw::Toast::new(&format!(
-                                "{} has more than {} entries; showing the first {}",
-                                root_display_label(
-                                    &request_for_result.target.location,
-                                    &request_for_result.target.root
-                                ),
-                                remote_fs::MAX_DIRECTORY_ENTRIES,
-                                remote_fs::MAX_DIRECTORY_ENTRIES
-                            )));
-                        }
                     }
                     Err(error) => {
                         ui.file_tree_navigation
@@ -4341,6 +4432,8 @@ impl UiState {
     }
 
     pub(crate) fn present_file_tree_path_dialog(&self) {
+        let expected_generation = self.file_tree_model.generation.get();
+        let expected_location = self.file_tree_location.borrow().clone();
         let dialog = adw::Dialog::builder()
             .title("Open Filesystem Path")
             .content_width(440)
@@ -4364,7 +4457,11 @@ impl UiState {
             let button = navigation_breadcrumb_button(&ancestor);
             let ui = self.clone();
             let dialog_for_ancestor = dialog.clone();
+            let expected_location = expected_location.clone();
             button.connect_clicked(move |_| {
+                if !ui.require_current_file_tree_context(expected_generation, &expected_location) {
+                    return;
+                }
                 dialog_for_ancestor.close();
                 ui.set_file_tree_root(ancestor.clone());
             });
@@ -4391,8 +4488,11 @@ impl UiState {
         });
         let ui = self.clone();
         let dialog_for_navigate = dialog.clone();
-        navigate.connect_clicked(
-            move |_| match validate_absolute_navigation_path(&entry.text()) {
+        navigate.connect_clicked(move |_| {
+            if !ui.require_current_file_tree_context(expected_generation, &expected_location) {
+                return;
+            }
+            match validate_absolute_navigation_path(&entry.text()) {
                 Ok(path) => {
                     dialog_for_navigate.close();
                     ui.set_file_tree_root(path);
@@ -4401,8 +4501,8 @@ impl UiState {
                     error.set_text(message);
                     error.set_visible(true);
                 }
-            },
-        );
+            }
+        });
         dialog.present(Some(&self.window));
     }
 
@@ -6263,6 +6363,53 @@ mod tests {
         assert!(state.back.is_empty());
         assert!(state.forward.is_empty());
         assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn automatic_probe_replacement_and_late_retirement_keep_latest_cancellable() {
+        let mut state = FileTreeNavigationState::default();
+        let old = state.begin_automatic_probe(41);
+        let latest = state.begin_automatic_probe(42);
+        assert!(old.is_cancelled());
+        assert!(!latest.is_cancelled());
+
+        // The old UI callback can arrive after a replacement was admitted.
+        state.retire_automatic_probe(41);
+        state.cancel_automatic_probe();
+        assert!(latest.is_cancelled());
+        assert!(state.automatic_probe.is_none());
+    }
+
+    #[test]
+    fn completed_automatic_probe_is_retired_without_cancelling_its_result() {
+        let mut state = FileTreeNavigationState::default();
+        let completed = state.begin_automatic_probe(41);
+        state.retire_automatic_probe(41);
+        assert!(state.automatic_probe.is_none());
+        assert!(!completed.is_cancelled());
+
+        // Retiring before the final live-context gate must not reject a
+        // successful result by cancelling the callback's cloned token.
+        state.cancel_automatic_probe();
+        assert!(!completed.is_cancelled());
+    }
+
+    #[test]
+    fn automatic_probe_cancellation_preserves_user_navigation_authority() {
+        let mut state = FileTreeNavigationState::default();
+        let original = navigation_point("/original");
+        state.install_initial(original.clone());
+        let automatic = state.begin_automatic_probe(41);
+        let manual = state.begin(navigation_point("/chosen"), FileTreeNavigationAction::Push);
+
+        // A terminal-focus change invalidates automatic follow only. The
+        // user's explicit Files navigation retains its independent request.
+        state.cancel_automatic_probe();
+        assert!(automatic.is_cancelled());
+        assert!(!manual.cancel.is_cancelled());
+        assert!(state.commit(&manual));
+        assert_eq!(state.current, Some(navigation_point("/chosen")));
+        assert_eq!(state.back_target(), Some(original));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use libadwaita as adw;
 use std::time::Duration;
 use vte4::TerminalExt;
 
-use crate::block_view::{FindNavigationResult, FindProgress, FindSearchResult};
+use crate::block_view::{FindNavigationResult, FindProgress, FindSearchResult, TermView};
 
 use super::*;
 
@@ -102,26 +102,51 @@ impl UiState {
         self.apply_search_now();
     }
 
+    /// `switch-page` runs before GtkNotebook commits `current_page`. Bind the
+    /// query to its explicit destination instead of resolving the old page.
+    pub(crate) fn search_apply_in_page(&self, page: &gtk4::Widget) {
+        self.cancel_pending_search();
+        // Retire the outgoing pane's search so closing the bar in another tab
+        // cannot leave an invisible native query or finished-block highlights.
+        if let Some(term) = self.current_terminal() {
+            term.search_set_regex(None::<&vte4::Regex>, 0);
+        }
+        if let Some(term_view) = self.current_term_view() {
+            term_view.clear_find();
+        }
+        self.apply_search_to(
+            self.terminal_in_page(page).as_ref(),
+            self.term_view_in_page(page).as_deref(),
+        );
+    }
+
     fn apply_search_now(&self) {
+        self.apply_search_to(
+            self.current_terminal().as_ref(),
+            self.current_term_view().as_deref(),
+        );
+    }
+
+    fn apply_search_to(&self, terminal: Option<&vte4::Terminal>, term_view: Option<&TermView>) {
         let text = self.search_entry.text();
         if text.is_empty() {
             // `search_changed` also fires when the user deletes the query.  Clear
             // both search backends here; otherwise the previous highlights stay
             // painted until the search bar itself is closed.
-            if let Some(term_view) = self.current_term_view() {
+            if let Some(term_view) = term_view {
                 term_view.clear_find();
             }
-            if let Some(term) = self.current_terminal() {
+            if let Some(term) = terminal {
                 term.search_set_regex(None::<&vte4::Regex>, 0);
             }
             self.search_status.set_text("");
             return;
         }
         if query_exceeds_byte_limit(&text) {
-            if let Some(term_view) = self.current_term_view() {
+            if let Some(term_view) = term_view {
                 term_view.clear_find();
             }
-            if let Some(term) = self.current_terminal() {
+            if let Some(term) = terminal {
                 term.search_set_regex(None::<&vte4::Regex>, 0);
             }
             self.search_status.set_text(&format!(
@@ -142,7 +167,7 @@ impl UiState {
 
         // Block mode: highlight every in-text match and focus the first one
         // (Warp's FindWithinBlock). Next/Prev step through them.
-        if let Some(term_view) = self.current_term_view() {
+        if let Some(term_view) = term_view {
             let result = term_view.find_in_blocks(&query, use_regex);
             match result {
                 FindSearchResult::Matches(_)
@@ -157,7 +182,7 @@ impl UiState {
 
         // Fall back to the live VTE for prompts/classic terminal panes. VTE can
         // report whether navigation found a hit, but it does not expose a count.
-        if let Some(term) = self.current_terminal() {
+        if let Some(term) = terminal {
             let pattern = if use_regex {
                 query
             } else {
@@ -173,9 +198,13 @@ impl UiState {
                     let found = term.search_find_next();
                     self.search_status.set_text(terminal_status_text(found));
                 }
-                Err(_) => self
-                    .search_status
-                    .set_text(&find_status_text(FindSearchResult::InvalidRegex)),
+                Err(_) => {
+                    // A compilation error must retire the previous query;
+                    // otherwise Enter still navigates those obsolete matches.
+                    term.search_set_regex(None::<&vte4::Regex>, 0);
+                    self.search_status
+                        .set_text(&find_status_text(FindSearchResult::InvalidRegex));
+                }
             }
         } else {
             self.search_status

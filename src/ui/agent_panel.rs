@@ -345,8 +345,16 @@ fn load_agent_snapshot(path: &std::path::Path) -> Option<AgentSession> {
     }
 }
 
+fn restored_history_notice(session: &jterm_core::agent::AgentSession) -> Option<&'static str> {
+    session
+        .snapshot()
+        .is_some_and(|snapshot| snapshot.transcript_truncated())
+        .then_some("Earlier activity was omitted to keep the saved session within its size limit")
+}
+
 struct AgentRuntime {
     session: RefCell<AgentSession>,
+    history_notice: Label,
     target: Rc<TermView>,
     ui_lifetime: Rc<AgentUiLifetime>,
     config: Rc<RefCell<crate::config::Config>>,
@@ -523,6 +531,7 @@ impl AgentRuntime {
         match result {
             Ok(started_new) => {
                 if started_new {
+                    runtime.history_notice.set_visible(false);
                     runtime.task_epoch.set(runtime.task_epoch.get() + 1);
                     runtime.clear_proposal();
                     runtime.pending_command.borrow_mut().take();
@@ -1872,7 +1881,15 @@ impl UiState {
         // Pending approval state must never be restorable by two processes.
         let restored_session = load_agent_snapshot(&agent_snapshot_path());
         let was_restored = restored_session.is_some();
+        let notice = restored_session.as_ref().and_then(restored_history_notice);
+        let history_notice = Label::new(notice);
+        history_notice.set_xalign(0.0);
+        history_notice.set_wrap(true);
+        history_notice.add_css_class("dim-label");
+        history_notice.set_visible(notice.is_some());
+        body.prepend(&history_notice);
         let runtime = Rc::new(AgentRuntime {
+            history_notice,
             session: RefCell::new(restored_session.unwrap_or_else(|| AgentSession::new(max_turns))),
             target: target.clone(),
             ui_lifetime: self.agent_ui_lifetime.clone(),
@@ -2078,6 +2095,39 @@ impl UiState {
 
 #[cfg(test)]
 mod tests {
+    fn legacy_omitted_history_session() -> jterm_core::agent::AgentSession {
+        use jterm_core::agent::{AgentSession, AgentSessionSnapshot};
+        let mut session = AgentSession::new(10);
+        session.submit_user("retained task").unwrap();
+        let mut snapshot: serde_json::Value =
+            serde_json::from_str(&session.snapshot().unwrap().to_json().unwrap()).unwrap();
+        snapshot["transcript_truncated"] = serde_json::json!(true);
+        AgentSession::restore(AgentSessionSnapshot::from_json(&snapshot.to_string()).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn restored_history_notice_accepts_legacy_omission_and_rejects_complete_history() {
+        let omitted = legacy_omitted_history_session();
+        assert!(super::restored_history_notice(&omitted)
+            .unwrap()
+            .contains("Earlier activity was omitted"));
+        let mut complete = jterm_core::agent::AgentSession::new(10);
+        complete.submit_user("complete task").unwrap();
+        assert!(super::restored_history_notice(&complete).is_none());
+    }
+
+    #[test]
+    fn restored_history_notice_has_a_fixed_card_outside_the_activity_budget() {
+        let source = include_str!("agent_panel.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(source.contains("body.prepend(&history_notice)"));
+        assert!(source.contains("history_notice.set_visible(notice.is_some())"));
+        assert!(source.contains("runtime.history_notice.set_visible(false)"));
+    }
+
     use super::{
         agent_message_display_bytes, agent_message_display_text, bounded_agent_input,
         claim_weak_target, load_agent_snapshot, proposal_callback_is_current,

@@ -733,30 +733,37 @@ impl UiState {
     }
 
     pub(crate) fn select_tab_range(&self, from_name: &str, to_name: &str) {
-        self.clear_tab_selection();
-        let mut selected = self.selected_tabs.borrow_mut();
-        let mut in_range = false;
-
-        if let Some(mut child) = self.tab_strip.first_child() {
-            loop {
-                let child_name = child.widget_name();
-                if child_name.as_str() == from_name {
-                    in_range = true;
-                }
-                if in_range {
-                    selected.push(child_name.to_string());
-                    if let Ok(btn) = child.clone().downcast::<ToggleButton>() {
-                        btn.add_css_class("tab-selected");
-                    }
-                }
-                if child_name.as_str() == to_name {
-                    in_range = false;
-                }
-                match child.next_sibling() {
-                    Some(next) => child = next,
-                    None => break,
-                }
+        let mut buttons = Vec::new();
+        let mut child = self.tab_strip.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if let Ok(button) = widget.downcast::<ToggleButton>() {
+                buttons.push(button);
             }
+        }
+        // Resolve both stable identities before changing selection. A tab may
+        // have disappeared since the anchor was captured, and ambiguous names
+        // must never select an unrelated tail of the strip.
+        let unique_index = |name: &str| {
+            let mut matching = buttons
+                .iter()
+                .enumerate()
+                .filter(|(_, button)| button.widget_name() == name);
+            let first = matching.next()?.0;
+            matching.next().is_none().then_some(first)
+        };
+        let (Some(from), Some(to)) = (unique_index(from_name), unique_index(to_name)) else {
+            return;
+        };
+
+        self.clear_tab_selection();
+        let range = &buttons[from.min(to)..=from.max(to)];
+        *self.selected_tabs.borrow_mut() = range
+            .iter()
+            .map(|button| button.widget_name().to_string())
+            .collect();
+        for button in range {
+            button.add_css_class("tab-selected");
         }
     }
 
