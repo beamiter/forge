@@ -2100,9 +2100,8 @@ mod tests {
     #[test]
     fn unavailable_window_root_remains_unavailable_without_filesystem_work() {
         let slot = OnceLock::new();
-        let first = resolve_window_state_paths(&slot, || {
-            Err(crate::config::config_root_unavailable())
-        });
+        let first =
+            resolve_window_state_paths(&slot, || Err(crate::config::config_root_unavailable()));
         assert_eq!(first.unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert!(slot.get().is_some_and(Option::is_none));
         let later = resolve_window_state_paths(&slot, || {
@@ -2626,8 +2625,7 @@ mod tests {
             assert!(parsed.omitted_layouts);
             assert_eq!(parsed.current_page, Some(expected_page));
         }
-        let all_invalid =
-            parse_tabs_state_for_restore("current_page=1\ntab=one\t{}\ntab=two\t{\n");
+        let all_invalid = parse_tabs_state_for_restore("current_page=1\ntab=one\t{}\ntab=two\t{\n");
         assert!(all_invalid.omitted_layouts);
         assert!(all_invalid.tabs.is_empty());
     }

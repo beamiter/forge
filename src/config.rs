@@ -3290,19 +3290,29 @@ mod tests {
     #[test]
     fn credential_file_selection_is_exact_and_never_retargets_invalid_paths() {
         for raw in [
-            "relative.key", "   ", " /absolute/key ", "/absolute/\nkey",
-            "/absolute/\u{202e}key", "/absolute/key", "~/key",
+            "relative.key",
+            "   ",
+            " /absolute/key ",
+            "/absolute/\nkey",
+            "/absolute/\u{202e}key",
+            "/absolute/key",
+            "~/key",
         ] {
             let selected = selected_ai_api_key_file(Some(raw.to_string()));
             assert_eq!(selected.as_deref(), Some(raw));
-            let effective = selected.clone().or_else(|| Some("/configured/key".to_string()));
+            let effective = selected
+                .clone()
+                .or_else(|| Some("/configured/key".to_string()));
             assert_eq!(effective.as_deref(), Some(raw));
             let write_target = selected.or_else(|| Some("/default/key".to_string()));
             assert_eq!(write_target.as_deref(), Some(raw));
         }
         let oversized = format!("/{}", "x".repeat(MAX_CONFIG_PATH_BYTES));
         assert!(!configured_path_is_safe(&oversized, true));
-        assert_eq!(selected_ai_api_key_file(Some(oversized.clone())), Some(oversized));
+        assert_eq!(
+            selected_ai_api_key_file(Some(oversized.clone())),
+            Some(oversized)
+        );
         assert_eq!(selected_ai_api_key_file(None), None);
         assert_eq!(selected_ai_api_key_file(Some(String::new())), None);
         assert_eq!(
@@ -3329,11 +3339,39 @@ mod tests {
     fn automatic_config_root_requires_an_absolute_directory() {
         use std::ffi::OsStr;
         let absolute_home = Some(OsStr::new("/home/tester"));
-        assert_eq!(config_home_from(Some(OsStr::new("/xdg")), absolute_home, Path::new("/fallback")), Some(PathBuf::from("/xdg")));
+        assert_eq!(
+            config_home_from(
+                Some(OsStr::new("/xdg")),
+                absolute_home,
+                Path::new("/fallback")
+            ),
+            Some(PathBuf::from("/xdg"))
+        );
         for invalid in ["", ".", "relative", "../relative"] {
-            assert_eq!(config_home_from(Some(OsStr::new(invalid)), absolute_home, Path::new("/fallback")), Some(PathBuf::from("/home/tester/.config")));
-            assert_eq!(config_home_from(Some(OsStr::new(invalid)), Some(OsStr::new(invalid)), Path::new("/fallback")), Some(PathBuf::from("/fallback")));
-            assert_eq!(config_home_from(Some(OsStr::new(invalid)), Some(OsStr::new(invalid)), Path::new(invalid)), None);
+            assert_eq!(
+                config_home_from(
+                    Some(OsStr::new(invalid)),
+                    absolute_home,
+                    Path::new("/fallback")
+                ),
+                Some(PathBuf::from("/home/tester/.config"))
+            );
+            assert_eq!(
+                config_home_from(
+                    Some(OsStr::new(invalid)),
+                    Some(OsStr::new(invalid)),
+                    Path::new("/fallback")
+                ),
+                Some(PathBuf::from("/fallback"))
+            );
+            assert_eq!(
+                config_home_from(
+                    Some(OsStr::new(invalid)),
+                    Some(OsStr::new(invalid)),
+                    Path::new(invalid)
+                ),
+                None
+            );
         }
         assert_eq!(config_home_from(None, None, Path::new("relative")), None);
     }
@@ -3344,11 +3382,13 @@ mod tests {
         for explicit in ["relative.toml", "/absolute/config.toml"] {
             let path = config_file_path_from(Some(OsStr::new(explicit)), || {
                 panic!("an explicit override must not resolve or access automatic storage")
-            }).unwrap();
+            })
+            .unwrap();
             assert_eq!(path, PathBuf::from(explicit));
         }
         for explicit in [None, Some(OsStr::new(""))] {
-            let error = config_file_path_from(explicit, || Err(config_root_unavailable())).unwrap_err();
+            let error =
+                config_file_path_from(explicit, || Err(config_root_unavailable())).unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         }
     }
@@ -4389,11 +4429,7 @@ session = "bad/session"
                 );
             }
             assert_eq!(
-                xdg_state_home_from(
-                    None,
-                    home.map(std::ffi::OsStr::new),
-                    Path::new("/fallback")
-                ),
+                xdg_state_home_from(None, home.map(std::ffi::OsStr::new), Path::new("/fallback")),
                 Some(PathBuf::from("/fallback/.local/state"))
             );
         }

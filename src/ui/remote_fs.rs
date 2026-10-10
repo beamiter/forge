@@ -836,7 +836,10 @@ fn run_capture_or_cancel(
                 .spawn(move || stdin.write_all(&bytes))
         })
         .transpose()?
-        .map(|handle| PipeWorker { handle: Some(handle), pipes: child.pipes.clone() });
+        .map(|handle| PipeWorker {
+            handle: Some(handle),
+            pipes: child.pipes.clone(),
+        });
 
     let stdout_reader = spawn_bounded_reader(child.stdout.take(), max_out, &child.pipes)?;
     let stderr_reader = spawn_bounded_reader(child.stderr.take(), max_out, &child.pipes)?;
@@ -882,7 +885,10 @@ struct PipeWorker<T> {
 
 impl<T> PipeWorker<T> {
     fn join(mut self) -> std::thread::Result<T> {
-        self.handle.take().expect("pipe worker owns its join handle").join()
+        self.handle
+            .take()
+            .expect("pipe worker owns its join handle")
+            .join()
     }
 }
 
@@ -940,12 +946,13 @@ where
         io::copy(&mut limited.into_inner(), &mut io::sink())?;
         Ok((buffer, true))
     }))?;
-    Ok(BoundedReader { handle: Some(handle), pipes: pipes.clone() })
+    Ok(BoundedReader {
+        handle: Some(handle),
+        pipes: pipes.clone(),
+    })
 }
 
-fn join_bounded_reader(
-    reader: BoundedReader,
-) -> io::Result<(Vec<u8>, bool)> {
+fn join_bounded_reader(reader: BoundedReader) -> io::Result<(Vec<u8>, bool)> {
     reader
         .join()
         .map_err(|_| io::Error::other("probe output reader panicked"))?
@@ -1267,7 +1274,8 @@ fn stream_download_to_file(
 
     let mut child = spawn_argv(argv, Stdio::null(), Stdio::piped(), Stdio::piped())?;
     child.pipes.set_timeout(timeout);
-    let stderr_reader = spawn_bounded_reader(child.stderr.take(), PROBE_OP_MAX_OUTPUT, &child.pipes)?;
+    let stderr_reader =
+        spawn_bounded_reader(child.stderr.take(), PROBE_OP_MAX_OUTPUT, &child.pipes)?;
     let Some(mut stdout) = child.stdout.take() else {
         return Err(io::Error::other("could not open probe stdout"));
     };
@@ -1372,7 +1380,8 @@ fn stream_upload_to_probe(
 
     let mut child = spawn_argv(argv, Stdio::piped(), Stdio::null(), Stdio::piped())?;
     child.pipes.set_timeout(timeout);
-    let stderr_reader = spawn_bounded_reader(child.stderr.take(), PROBE_OP_MAX_OUTPUT, &child.pipes)?;
+    let stderr_reader =
+        spawn_bounded_reader(child.stderr.take(), PROBE_OP_MAX_OUTPUT, &child.pipes)?;
     let Some(mut stdin) = child.stdin.take() else {
         return Err(io::Error::other("could not open probe stdin"));
     };
@@ -1717,10 +1726,12 @@ fn stream_download_dir(
     }
     let mut remote = spawn_argv(argv, Stdio::null(), Stdio::piped(), Stdio::piped())?;
     remote.pipes.set_timeout(timeout);
-    let remote_stderr = spawn_bounded_reader(remote.stderr.take(), PROBE_OP_MAX_OUTPUT, &remote.pipes)?;
+    let remote_stderr =
+        spawn_bounded_reader(remote.stderr.take(), PROBE_OP_MAX_OUTPUT, &remote.pipes)?;
     let mut local = spawn_argv(local_argv, Stdio::piped(), Stdio::null(), Stdio::piped())?;
     local.pipes.set_timeout(timeout);
-    let local_stderr = spawn_bounded_reader(local.stderr.take(), PROBE_OP_MAX_OUTPUT, &local.pipes)?;
+    let local_stderr =
+        spawn_bounded_reader(local.stderr.take(), PROBE_OP_MAX_OUTPUT, &local.pipes)?;
     let Some(remote_stdout) = remote.stdout.take() else {
         return Err(io::Error::other("could not open probe stdout"));
     };
@@ -3069,7 +3080,8 @@ mod tests {
 
     impl Drop for TrackedReader {
         fn drop(&mut self) {
-            self.dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -3078,11 +3090,18 @@ mod tests {
         let pipes = super::PipeDeadline::new(std::time::Duration::from_secs(60));
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pipe = TrackedReader {
-            pipes: pipes.clone(), dropped: dropped.clone(), wait_for_retirement: false,
+            pipes: pipes.clone(),
+            dropped: dropped.clone(),
+            wait_for_retirement: false,
         };
         let error = super::spawn_bounded_reader_with(Some(pipe), 16, &pipes, |_task| {
-            Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "thread limit"))
-        }).err().expect("injected reader startup failure");
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "thread limit",
+            ))
+        })
+        .err()
+        .expect("injected reader startup failure");
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
@@ -3094,14 +3113,28 @@ mod tests {
         let second_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let first = super::spawn_bounded_reader_with(
             Some(TrackedReader {
-                pipes: pipes.clone(), dropped: first_dropped.clone(), wait_for_retirement: true,
-            }), 16, &pipes, |task| std::thread::Builder::new().spawn(task),
-        ).expect("local test reader starts");
+                pipes: pipes.clone(),
+                dropped: first_dropped.clone(),
+                wait_for_retirement: true,
+            }),
+            16,
+            &pipes,
+            |task| std::thread::Builder::new().spawn(task),
+        )
+        .expect("local test reader starts");
         let second = super::spawn_bounded_reader_with(
             Some(TrackedReader {
-                pipes: pipes.clone(), dropped: second_dropped.clone(), wait_for_retirement: false,
-            }), 16, &pipes, |_task| {
-                Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "thread limit"))
+                pipes: pipes.clone(),
+                dropped: second_dropped.clone(),
+                wait_for_retirement: false,
+            }),
+            16,
+            &pipes,
+            |_task| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "thread limit",
+                ))
             },
         );
         assert!(second.is_err());
@@ -3261,7 +3294,10 @@ mod tests {
             );
             relay.path.clone()
         };
-        assert!(!path.exists(), "relay payload must be removed on scope exit");
+        assert!(
+            !path.exists(),
+            "relay payload must be removed on scope exit"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

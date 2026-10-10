@@ -1449,13 +1449,9 @@ mod tests {
         // A non-cooperating editor can change the target to an unreadable
         // object after staging. No replacement may survive the read error.
         fs::create_dir(&path).unwrap();
-        let error = verify_staged_revision(
-            &directory_fd,
-            &path,
-            &ConfigRevision::missing(),
-            &staged,
-        )
-        .unwrap_err();
+        let error =
+            verify_staged_revision(&directory_fd, &path, &ConfigRevision::missing(), &staged)
+                .unwrap_err();
         assert!(matches!(error, ConfigWriteError::Io(_)));
         assert!(!directory.join(&staged).exists());
         assert!(path.is_dir());

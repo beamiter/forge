@@ -1006,7 +1006,10 @@ fn start_file_workers(
     mut spawn: impl FnMut(usize) -> io::Result<()>,
 ) -> io::Result<usize> {
     if requested == 0 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "file worker pool cannot be empty"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file worker pool cannot be empty",
+        ));
     }
     let mut started = 0;
     for index in 0..requested {
@@ -1064,12 +1067,17 @@ impl ScanScheduler {
                 .spawn(move || scan_worker(shared))
                 .map(|_handle| ())
         })?;
-        Ok(Self { shared, worker_count })
+        Ok(Self {
+            shared,
+            worker_count,
+        })
     }
 
     fn global() -> io::Result<&'static Self> {
         static SCHEDULER: OnceLock<io::Result<ScanScheduler>> = OnceLock::new();
-        cached_file_scheduler(&SCHEDULER, || Self::new(MAX_CONCURRENT_SCANS, MAX_PENDING_SCANS))
+        cached_file_scheduler(&SCHEDULER, || {
+            Self::new(MAX_CONCURRENT_SCANS, MAX_PENDING_SCANS)
+        })
     }
 
     fn enqueue(&self, priority: ScanPriority, job: ScanJob) -> io::Result<()> {
@@ -1166,12 +1174,18 @@ impl FsOpScheduler {
                 .spawn(move || fs_op_worker(shared))
                 .map(|_handle| ())
         })?;
-        Ok(Self { shared, capacity, worker_count })
+        Ok(Self {
+            shared,
+            capacity,
+            worker_count,
+        })
     }
 
     fn global() -> io::Result<&'static Self> {
         static SCHEDULER: OnceLock<io::Result<FsOpScheduler>> = OnceLock::new();
-        cached_file_scheduler(&SCHEDULER, || Self::new(MAX_CONCURRENT_FS_OPS, MAX_PENDING_FS_OPS))
+        cached_file_scheduler(&SCHEDULER, || {
+            Self::new(MAX_CONCURRENT_FS_OPS, MAX_PENDING_FS_OPS)
+        })
     }
 
     fn enqueue(&self, job: FsOpJob) -> io::Result<()> {
@@ -2295,7 +2309,10 @@ impl FileTreeModel {
 }
 
 fn public_directory_error_message(error: &io::Error) -> &'static str {
-    if error.get_ref().is_some_and(|source| source.is::<FileWorkerStartupFailure>()) {
+    if error
+        .get_ref()
+        .is_some_and(|source| source.is::<FileWorkerStartupFailure>())
+    {
         return "File workers could not start; restart Forge after freeing system resources";
     }
     match error.kind() {
@@ -2317,7 +2334,10 @@ fn public_directory_error_message(error: &io::Error) -> &'static str {
 }
 
 fn public_file_operation_error_message(error: &io::Error) -> &'static str {
-    if error.get_ref().is_some_and(|source| source.is::<FileWorkerStartupFailure>()) {
+    if error
+        .get_ref()
+        .is_some_and(|source| source.is::<FileWorkerStartupFailure>())
+    {
         return "File workers could not start; restart Forge after freeing system resources";
     }
     match error.kind() {
@@ -6195,7 +6215,8 @@ mod tests {
             } else {
                 Ok(())
             }
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(started, 2);
         assert_eq!(attempts, [0, 1, 2]);
         assert_eq!(start_file_workers(3, |_| Ok(())).unwrap(), 3);
@@ -6205,11 +6226,14 @@ mod tests {
     fn file_worker_startup_rejects_zero_workers_without_admission() {
         let error = start_file_workers(8, |_| {
             Err(io::Error::new(io::ErrorKind::WouldBlock, "thread limit"))
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         assert_eq!(error.to_string(), "thread limit");
         assert_eq!(
-            start_file_workers(0, |_| panic!("empty pool must not spawn")).unwrap_err().kind(),
+            start_file_workers(0, |_| panic!("empty pool must not spawn"))
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidInput,
         );
         assert!(ScanScheduler::new(0, 1).is_err());
@@ -6221,10 +6245,12 @@ mod tests {
         let slot: OnceLock<io::Result<usize>> = OnceLock::new();
         let first = cached_file_scheduler(&slot, || {
             Err(io::Error::new(io::ErrorKind::WouldBlock, "thread limit"))
-        }).unwrap_err();
+        })
+        .unwrap_err();
         let repeated = cached_file_scheduler(&slot, || {
             panic!("failed pool initialization is stable for this process")
-        }).unwrap_err();
+        })
+        .unwrap_err();
         for error in [first, repeated] {
             assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
             assert_eq!(error.to_string(), "thread limit");

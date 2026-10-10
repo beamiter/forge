@@ -730,8 +730,7 @@ impl OwnedPty {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        let OpenptyResult { master, slave } =
-            openpty_cloexec(Some(&initial_size))?;
+        let OpenptyResult { master, slave } = openpty_cloexec(Some(&initial_size))?;
         let master_fd = master.as_raw_fd();
         let slave_fd = slave.as_raw_fd();
 
@@ -763,9 +762,7 @@ impl OwnedPty {
                 // survive exec, even in that case.
                 for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
                     let flags = libc::fcntl(fd, libc::F_GETFD);
-                    if flags < 0
-                        || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
-                    {
+                    if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
                         libc::_exit(126);
                     }
                 }
@@ -1716,7 +1713,10 @@ mod tests {
             .arg(pair.slave.as_raw_fd().to_string())
             .status()
             .unwrap();
-        assert!(status.success(), "an unrelated exec inherited a PTY descriptor");
+        assert!(
+            status.success(),
+            "an unrelated exec inherited a PTY descriptor"
+        );
     }
 
     #[cfg(target_os = "linux")]

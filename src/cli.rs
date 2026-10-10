@@ -746,7 +746,6 @@ fn doctor(format: ReportFormat) -> bool {
                     },
                 });
             }
-
         }
     }
 
@@ -1232,7 +1231,7 @@ pub(crate) fn handle_early_args() -> Option<glib::ExitCode> {
                 eprintln!("forge: {error}");
                 false
             }
-        }
+        },
         EarlyCommand::PrintDefaultConfig => {
             print!("{}", include_str!("../config.toml.example"));
             true
@@ -1274,11 +1273,7 @@ pub(crate) fn handle_early_args() -> Option<glib::ExitCode> {
                     .map_err(|error| error.to_string())
             }) {
             Ok((target, source)) => {
-                println!(
-                    "Restored {} from {}",
-                    target.display(),
-                    source.display()
-                );
+                println!("Restored {} from {}", target.display(), source.display());
                 true
             }
             Err(err) => {

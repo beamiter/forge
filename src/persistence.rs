@@ -709,21 +709,37 @@ mod tests {
     fn operation_only_failure_keys_never_alias_file_targets() {
         let operation = PersistenceKey::for_operation("window-state-unavailable");
         assert!(operation.path.is_none());
-        assert_eq!(operation, PersistenceKey::for_operation("window-state-unavailable"));
+        assert_eq!(
+            operation,
+            PersistenceKey::for_operation("window-state-unavailable")
+        );
         assert_ne!(operation, PersistenceKey::for_operation("other-operation"));
-        assert_ne!(operation, PersistenceKey::for_path("window-state-unavailable", Path::new("")));
+        assert_ne!(
+            operation,
+            PersistenceKey::for_path("window-state-unavailable", Path::new(""))
+        );
         let file = PersistenceKey::for_path("config", Path::new("/home/test/config.toml"));
-        assert_eq!(file, PersistenceKey::for_path("config", Path::new("/home/test/config.toml")));
+        assert_eq!(
+            file,
+            PersistenceKey::for_path("config", Path::new("/home/test/config.toml"))
+        );
     }
 
     #[test]
     fn operation_only_error_uses_the_existing_failure_channel() {
         let worker = PersistenceWorker::new(2).unwrap();
-        worker.enqueue(
-            PersistenceKey::for_operation("window-state-unavailable"),
-            "Save window session".to_string(),
-            Box::new(|| Err(io::Error::new(io::ErrorKind::InvalidInput, "root unavailable"))),
-        ).unwrap();
+        worker
+            .enqueue(
+                PersistenceKey::for_operation("window-state-unavailable"),
+                "Save window session".to_string(),
+                Box::new(|| {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "root unavailable",
+                    ))
+                }),
+            )
+            .unwrap();
         worker.shutdown(Duration::from_secs(2)).unwrap();
         let failures = worker.drain_failures();
         assert_eq!(failures.len(), 1);
