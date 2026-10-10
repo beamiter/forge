@@ -1905,6 +1905,30 @@ fn clear_cross_block_search_dialog_claim<T: PartialEq>(
     }
 }
 
+/// History filtering is case-insensitive; delayed notifications for the same
+/// effective text must not reset the user's selected visible row.
+fn changed_history_query(previous: &str, text: &str) -> Option<String> {
+    let query = text.to_lowercase();
+    (query != previous).then_some(query)
+}
+
+/// Synchronize the effective query without resetting a still-valid selection
+/// when SearchEntry later emits its delayed notification for the same text.
+fn refresh_workflow_picker_query(
+    picker: &mut crate::workflows::WorkflowPicker,
+    query: &str,
+) -> bool {
+    let previous_query = picker.query().to_string();
+    let previous_selection = picker.selected();
+    picker.set_query(query);
+    if picker.query() == previous_query {
+        picker.select(previous_selection);
+        false
+    } else {
+        true
+    }
+}
+
 /// Retire the argument form only after the original target accepts the text.
 /// Acceptance may only enqueue PTY input; it does not acknowledge later I/O.
 fn finish_workflow_insertion(insert: impl FnOnce() -> bool, finish: impl FnOnce()) {
@@ -2786,8 +2810,12 @@ impl UiState {
         let list_box_for_filter = list_box.clone();
         let haystacks_for_filter = haystacks.clone();
         let status_for_filter = status_label.clone();
-        filter_entry.connect_search_changed(move |entry| {
-            let query = entry.text().to_string().to_lowercase();
+        let rendered_query = RefCell::new(String::new());
+        let refresh_query = Rc::new(move |text: &str| {
+            let Some(query) = changed_history_query(&rendered_query.borrow(), text) else {
+                return;
+            };
+            *rendered_query.borrow_mut() = query.clone();
             let mut first_visible: Option<gtk4::ListBoxRow> = None;
             let mut visible_count = 0usize;
             for (idx, hay) in haystacks_for_filter.iter().enumerate() {
@@ -2836,6 +2864,11 @@ impl UiState {
             }
         });
 
+        {
+            let refresh_query = refresh_query.clone();
+            filter_entry.connect_search_changed(move |entry| refresh_query(entry.text().as_str()));
+        }
+
         // Paste the selected command into the live VTE. Does NOT append a
         // trailing newline — user reviews/edits, then presses Enter — which
         // matches how bash's reverse-i-search behaves.
@@ -2864,6 +2897,8 @@ impl UiState {
         let list_box_for_key = list_box.clone();
         let dialog_for_key = dialog.clone();
         let paste_for_key = paste.clone();
+        let filter_for_key = filter_entry.clone();
+        let refresh_query_for_key = refresh_query.clone();
         key_controller.connect_key_pressed(move |_, keyval, _, state| {
             // Escape, or the same chord that opened the palette, closes it.
             if keyval == Key::Escape
@@ -2877,6 +2912,7 @@ impl UiState {
                 return true.into();
             }
             if matches!(keyval, Key::Return | Key::KP_Enter) {
+                refresh_query_for_key(filter_for_key.text().as_str());
                 if let Some(row) = list_box_for_key
                     .selected_row()
                     .filter(|row| row.is_visible())
@@ -5497,28 +5533,35 @@ impl UiState {
         toolbar_view.set_content(Some(&search_box));
         dialog.set_child(Some(&toolbar_view));
 
-        let list_box_for_filter = list_box.clone();
-        let picker_for_filter = picker.clone();
-        filter_entry.connect_search_changed(move |entry| {
-            let normalized = {
-                let mut picker = picker_for_filter.borrow_mut();
-                picker.set_query(entry.text().to_string());
-                picker.query().to_string()
-            };
-            if entry.text().as_str() != normalized {
-                // `set_text` emits this signal again; the normalized second
-                // pass reaches the rendering branch and terminates.
-                entry.set_text(&normalized);
-                return;
-            }
-            let visible: Vec<_> = picker_for_filter
-                .borrow()
-                .filtered()
-                .into_iter()
-                .cloned()
-                .collect();
-            render_workflow_palette_rows(&list_box_for_filter, &visible);
-        });
+        let refresh_query = {
+            let list_box = list_box.clone();
+            let picker = picker.clone();
+            let entry = filter_entry.downgrade();
+            Rc::new(move || {
+                let Some(entry) = entry.upgrade() else {
+                    return;
+                };
+                let (normalized, visible) = {
+                    let mut picker = picker.borrow_mut();
+                    let changed = refresh_workflow_picker_query(&mut picker, entry.text().as_str());
+                    let visible =
+                        changed.then(|| picker.filtered().into_iter().cloned().collect::<Vec<_>>());
+                    (picker.query().to_string(), visible)
+                };
+                // Complete the refresh in this call: normalization must not
+                // depend on a second delayed search-changed signal.
+                if entry.text().as_str() != normalized {
+                    entry.set_text(&normalized);
+                }
+                if let Some(visible) = visible {
+                    render_workflow_palette_rows(&list_box, &visible);
+                }
+            })
+        };
+        {
+            let refresh_query = refresh_query.clone();
+            filter_entry.connect_search_changed(move |_| refresh_query());
+        }
 
         // Pick is the only verb here: either write the command directly
         // (no args) or hand off to the args dialog. The row index resolves
@@ -5556,6 +5599,7 @@ impl UiState {
         let dialog_for_key = dialog.clone();
         let pick_for_key = pick.clone();
         let picker_for_key = picker.clone();
+        let refresh_query_for_key = refresh_query.clone();
         key_controller.connect_key_pressed(move |_, keyval, _, state| {
             if keyval == Key::Escape
                 || (matches!(keyval, Key::M | Key::m)
@@ -5568,6 +5612,8 @@ impl UiState {
                 return true.into();
             }
             if matches!(keyval, Key::Return | Key::KP_Enter) {
+                // Accept the query visible now, before the debounced signal.
+                refresh_query_for_key();
                 if let Some(row) = list_box_for_key.selected_row() {
                     let idx = row.index() as usize;
                     dialog_for_key.force_close();
@@ -6242,6 +6288,171 @@ mod tests {
             form.is_set(0),
             "a real user edit is still recorded as supplied"
         );
+    }
+
+    #[test]
+    fn history_query_refresh_changes_only_effective_filter_text() {
+        assert_eq!(
+            super::changed_history_query("", "ALPHA"),
+            Some("alpha".to_string())
+        );
+        assert_eq!(super::changed_history_query("alpha", "AlPhA"), None);
+        assert_eq!(
+            super::changed_history_query("alpha", "zzzz-unmatched"),
+            Some("zzzz-unmatched".to_string())
+        );
+        assert_eq!(
+            super::changed_history_query("zzzz-unmatched", ""),
+            Some(String::new())
+        );
+        assert_eq!(super::changed_history_query("", ""), None);
+    }
+
+    #[test]
+    fn history_enter_refreshes_before_accepting_visible_row() {
+        let source = include_str!("dialogs.rs");
+        let palette = source
+            .split("pub(crate) fn show_history_palette(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn close_cross_block_search(")
+            .next()
+            .unwrap();
+        let refresh = palette
+            .split("let refresh_query = Rc::new(move |text: &str|")
+            .nth(1)
+            .unwrap()
+            .split("// Paste the selected command")
+            .next()
+            .unwrap();
+        assert!(refresh.contains("changed_history_query(&rendered_query.borrow(), text)"));
+        assert!(refresh.contains("query.is_empty() || hay.contains(&query)"));
+        assert!(refresh.contains("list_box_for_filter.unselect_all()"));
+        assert!(!refresh.contains("filter_entry.clone()"));
+        let enter = palette
+            .split("if matches!(keyval, Key::Return | Key::KP_Enter) {")
+            .nth(1)
+            .unwrap()
+            .split("if keyval == Key::Down")
+            .next()
+            .unwrap();
+        assert!(
+            enter
+                .find("refresh_query_for_key(filter_for_key.text().as_str())")
+                .unwrap()
+                < enter.find("selected_row()").unwrap()
+        );
+        assert!(enter.contains(".filter(|row| row.is_visible())"));
+        assert!(enter.find("if let Some(row)").unwrap() < enter.find("force_close()").unwrap());
+        let paste = palette
+            .split("let paste = {")
+            .nth(1)
+            .unwrap()
+            .split("let paste_for_activate")
+            .next()
+            .unwrap();
+        assert!(paste.contains("let pane = pane.clone();"));
+        assert!(paste.contains("ui.insert_review_text(&pane, cmd)"));
+        let mouse = palette
+            .split("list_box.connect_row_activated")
+            .nth(1)
+            .unwrap()
+            .split("let key_controller")
+            .next()
+            .unwrap();
+        assert!(!mouse.contains("refresh_query"));
+    }
+
+    #[test]
+    fn workflow_query_refresh_handles_fast_enter_and_preserves_unchanged_selection() {
+        let entries = ["alpha", "beta"]
+            .into_iter()
+            .map(|name| Workflow {
+                name: name.to_string(),
+                description: String::new(),
+                command: format!("echo {name}"),
+                tags: Vec::new(),
+                shell: None,
+                args: Vec::new(),
+                source_path: None,
+            })
+            .collect();
+        let mut picker = crate::workflows::WorkflowPicker::new(entries, WORKFLOW_PALETTE_POLICY);
+        picker.select(1);
+        assert!(!super::refresh_workflow_picker_query(&mut picker, ""));
+        assert_eq!(picker.selected(), 1);
+        assert!(super::refresh_workflow_picker_query(&mut picker, "alpha\n"));
+        assert_eq!(picker.query(), "alpha");
+        assert_eq!(picker.workflow_at_filtered(0).unwrap().name, "alpha");
+        assert!(!super::refresh_workflow_picker_query(&mut picker, "alpha"));
+        assert!(super::refresh_workflow_picker_query(
+            &mut picker,
+            "zzzz-unmatched"
+        ));
+        assert!(picker.workflow_at_filtered(0).is_none());
+        assert!(super::refresh_workflow_picker_query(&mut picker, ""));
+        picker.select(1);
+        assert!(!super::refresh_workflow_picker_query(&mut picker, "\n"));
+        assert_eq!(picker.query(), "");
+        assert_eq!(
+            picker.selected(),
+            1,
+            "normalization-only notification preserves selection"
+        );
+    }
+
+    #[test]
+    fn workflow_enter_refreshes_visible_query_before_selection_and_close() {
+        let source = include_str!("dialogs.rs");
+        let palette = source
+            .split("pub(crate) fn show_workflows_palette(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn show_workflow_args_dialog(")
+            .next()
+            .unwrap();
+        let refresh = palette
+            .split("let refresh_query = {")
+            .nth(1)
+            .unwrap()
+            .split("// Pick is the only verb here:")
+            .next()
+            .unwrap();
+        assert!(
+            refresh.contains("refresh_workflow_picker_query(&mut picker, entry.text().as_str())")
+        );
+        assert!(refresh.contains("if let Some(visible) = visible"));
+        assert!(refresh.contains("let entry = filter_entry.downgrade();"));
+        let normalization = refresh
+            .split("if entry.text().as_str() != normalized")
+            .nth(1)
+            .unwrap()
+            .split("if let Some(visible)")
+            .next()
+            .unwrap();
+        assert!(
+            !normalization.contains("return;"),
+            "normalization must finish in the same refresh"
+        );
+        let enter = palette
+            .split("if matches!(keyval, Key::Return | Key::KP_Enter) {")
+            .nth(1)
+            .unwrap()
+            .split("if matches!(keyval, Key::Down | Key::Up)")
+            .next()
+            .unwrap();
+        assert!(
+            enter.find("refresh_query_for_key()").unwrap() < enter.find("selected_row()").unwrap()
+        );
+        assert!(enter.find("if let Some(row)").unwrap() < enter.find("force_close()").unwrap());
+        let mouse = palette
+            .split("list_box.connect_row_activated")
+            .nth(1)
+            .unwrap()
+            .split("let key_controller")
+            .next()
+            .unwrap();
+        assert!(!mouse.contains("refresh_query"));
     }
 
     #[test]
