@@ -170,6 +170,22 @@ impl ConfigDirtyEpoch {
         }
     }
 
+    /// Only the edit generation named by an explicit discard may bypass
+    /// watcher de-duplication. A newer edit retires that permission, even if
+    /// its writer has already made it clean while a reload retry was pending.
+    fn reload_decision(
+        &self,
+        live_revision: Option<&crate::config_store::ConfigRevision>,
+        disk_revision: &crate::config_store::ConfigRevision,
+        discard_epoch: Option<u64>,
+    ) -> ConfigReloadDecision {
+        if discard_epoch == Some(self.edits.get()) {
+            ConfigReloadDecision::Apply
+        } else {
+            decide_config_reload(live_revision, disk_revision, self.has_unsaved_edits())
+        }
+    }
+
     /// Abandon every unsaved edit, because the user chose the file's version.
     fn abandon_unsaved_edits(&self) {
         self.persisted
@@ -768,7 +784,7 @@ impl UiState {
 
     /// Reload configuration from disk and apply changes.
     pub(crate) fn reload_config(&self) {
-        self.reload_config_attempt(CONFIG_REVISION_READ_ATTEMPTS);
+        self.reload_config_attempt(CONFIG_REVISION_READ_ATTEMPTS, None);
     }
 
     /// Tell the user their in-window settings and the file have diverged, and
@@ -817,15 +833,17 @@ impl UiState {
             .set(self.config_persist_generation.get().wrapping_add(1));
         self.font_persist_generation
             .set(self.font_persist_generation.get().wrapping_add(1));
-        // Likewise the queued font-zoom widget sweep: the reload sets every
-        // pane's scale from the file, and a pending sweep would re-apply the
-        // discarded one to the widgets while the config said otherwise.
-        self.pending_font_scale.set(None);
-        self.config_dirty.abandon_unsaved_edits();
-        self.reload_config();
+        // Keep the live edits dirty (and their pending widget sweep intact)
+        // until a validated replacement is ready. Read/parse failures do not
+        // mean the requested discard actually completed.
+        let discard_epoch = self.config_dirty.edits.get();
+        self.reload_config_attempt(CONFIG_REVISION_READ_ATTEMPTS, Some(discard_epoch));
     }
 
-    fn reload_config_attempt(&self, attempts_left: u8) {
+    fn reload_config_attempt(&self, attempts_left: u8, discard_epoch: Option<u64>) {
+        // This request cannot discard any edit made after its confirmation.
+        // Carry only a still-current permission through the bounded retry.
+        let discard_epoch = discard_epoch.filter(|epoch| *epoch == self.config_dirty.edits.get());
         if std::env::var_os("FORGE_SAFE_MODE").is_some() {
             let dialog = adw::AlertDialog::new(
                 Some("Configuration reload disabled"),
@@ -878,7 +896,7 @@ impl UiState {
             if attempts_left > 0 {
                 let ui = self.clone();
                 glib::timeout_add_local_once(CONFIG_REVISION_RETRY_DELAY, move || {
-                    ui.reload_config_attempt(attempts_left - 1);
+                    ui.reload_config_attempt(attempts_left - 1, discard_epoch);
                 });
             } else {
                 self.show_config_error(
@@ -888,10 +906,10 @@ impl UiState {
             }
             return;
         };
-        match decide_config_reload(
+        match self.config_dirty.reload_decision(
             live_revision.as_ref(),
             &disk_revision,
-            self.config_dirty.has_unsaved_edits(),
+            discard_epoch,
         ) {
             ConfigReloadDecision::Skip => {
                 log::debug!("Config reload skipped: file matches the current in-memory revision");
@@ -973,6 +991,17 @@ impl UiState {
         let ai_visible = new_config.ai_enabled && new_config.ai_panel_visible;
         let previous_remote_hosts = self.config.borrow().remote_hosts.clone();
 
+        if let Some(epoch) = discard_epoch {
+            if epoch != self.config_dirty.edits.get() {
+                return;
+            }
+            // The replacement passed both reads and validation. Retire the
+            // old sweep before installing it so an idle callback cannot put
+            // the discarded scale back over the newly loaded configuration.
+            self.pending_font_scale.set(None);
+            self.config_dirty.abandon_unsaved_edits();
+        }
+
         // New panes/tabs immediately use a changed shell; all other config is
         // replaced as one coherent snapshot instead of retaining stale fields.
         *self.shell_argv.borrow_mut() = choose_shell_argv(new_config.shell.as_deref());
@@ -1039,6 +1068,91 @@ mod tests {
     };
     use crate::config_store::ConfigRevision;
     use std::cell::Cell;
+
+    #[test]
+    fn explicit_discard_applies_even_when_disk_returns_to_original_revision() {
+        let dirty = ConfigDirtyEpoch::default();
+        let original = ConfigRevision::from_bytes(b"opacity = 0.9\n");
+        let external = ConfigRevision::from_bytes(b"opacity = 0.5\n");
+        dirty.record_edit();
+        assert_eq!(
+            dirty.reload_decision(Some(&original), &external, None),
+            ConfigReloadDecision::Conflict
+        );
+        let intent = Some(dirty.edits.get());
+        // The file returned to A while the A-versus-B prompt was open.
+        assert_eq!(
+            dirty.reload_decision(Some(&original), &original, None),
+            ConfigReloadDecision::Skip
+        );
+        assert_eq!(
+            dirty.reload_decision(Some(&original), &original, intent),
+            ConfigReloadDecision::Apply
+        );
+        // Merely deciding to load is not proof that a replacement was read.
+        assert!(dirty.has_unsaved_edits());
+        dirty.abandon_unsaved_edits();
+        assert!(!dirty.has_unsaved_edits());
+    }
+
+    #[test]
+    fn newer_edits_retire_discard_permission_even_after_their_save_finishes() {
+        let dirty = ConfigDirtyEpoch::default();
+        let original = ConfigRevision::from_bytes(b"opacity = 0.9\n");
+        let external = ConfigRevision::from_bytes(b"opacity = 0.5\n");
+        dirty.record_edit();
+        let intent = Some(dirty.edits.get());
+        dirty.record_edit();
+        assert_eq!(
+            dirty.reload_decision(Some(&original), &external, intent),
+            ConfigReloadDecision::Conflict
+        );
+        assert_eq!(
+            dirty.reload_decision(Some(&original), &original, intent),
+            ConfigReloadDecision::Skip
+        );
+        dirty.commit_handle().commit();
+        assert_eq!(
+            dirty.reload_decision(Some(&original), &original, intent),
+            ConfigReloadDecision::Skip
+        );
+    }
+
+    #[test]
+    fn discard_retires_dirty_state_and_old_sweep_only_after_validated_reload() {
+        // Wiring coverage, not an injected filesystem or GTK execution.
+        let source = include_str!("config_apply.rs");
+        let production = source.split_once("\n#[cfg(test)]").unwrap().0;
+        let discard = production
+            .split_once("fn discard_unsaved_config_edits_and_reload(&self)")
+            .unwrap()
+            .1
+            .split_once("fn reload_config_attempt(")
+            .unwrap()
+            .0;
+        assert!(!discard.contains("abandon_unsaved_edits()"));
+        assert!(!discard.contains("pending_font_scale.set(None)"));
+        assert!(discard.contains("Some(discard_epoch)"));
+        let reload = production
+            .split_once("fn reload_config_attempt(")
+            .unwrap()
+            .1;
+        assert!(reload
+            .contains("discard_epoch.filter(|epoch| *epoch == self.config_dirty.edits.get())"));
+        assert!(reload.contains("ui.reload_config_attempt(attempts_left - 1, discard_epoch)"));
+        let checked = reload
+            .find("if let Some(reason) = reload_read_failure(")
+            .unwrap();
+        let retire = reload.find("self.pending_font_scale.set(None)").unwrap();
+        let clean = reload
+            .find("self.config_dirty.abandon_unsaved_edits()")
+            .unwrap();
+        let install = reload
+            .find("*self.config.borrow_mut() = new_config")
+            .unwrap();
+        assert!(checked < retire && retire < clean && clean < install);
+        assert!(reload[..retire].contains("if epoch != self.config_dirty.edits.get()"));
+    }
 
     #[test]
     fn theme_updates_pane_snapshots_before_repainting() {
