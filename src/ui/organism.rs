@@ -3334,6 +3334,9 @@ impl UiState {
                 runtime.cancel_territory_intro();
                 runtime.set_sleeping(false);
                 if entering_retreat {
+                    // The sticky form follows the same input retreat immediately,
+                    // including when Calm mode has a dormant frame pending.
+                    runtime.sticky_avatar.set_visible(false);
                     // Keep the accepted-input hot path O(1): hide once, then
                     // keep the single frame callback suppressed for the whole
                     // retreat window. Repeated keys only extend time. Forgetting
@@ -3368,6 +3371,7 @@ impl UiState {
                 runtime.set_sleeping(false);
                 runtime.body_position.set(None);
                 runtime.body_in_transit.set(false);
+                runtime.sticky_avatar.set_visible(false);
                 if let Some(view) = view_weak.upgrade() {
                     view.set_live_organism_visible(false);
                 }
@@ -10057,6 +10061,61 @@ mod tests {
         assert!(reaction_hold(&first_error) < reaction_hold(&big_recovery));
         assert!(reaction_hold(&big_recovery) < reaction_hold(&repeated_error));
         assert_eq!(reaction_hold(&repeated_error), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn accepted_input_hides_sticky_form_before_waiting_for_a_frame() {
+        let source = include_str!("organism.rs");
+        let callback = source
+            .split_once("view.connect_human_input(move |_kind| {")
+            .unwrap()
+            .1
+            .split_once("view.connect_alt_screen_transition")
+            .unwrap()
+            .0;
+        let retreat = callback.split_once("if entering_retreat {").unwrap().1;
+        let sticky_hide = retreat
+            .find("runtime.sticky_avatar.set_visible(false);")
+            .unwrap();
+        let view_upgrade = retreat.find("view_weak.upgrade()").unwrap();
+        assert!(sticky_hide < view_upgrade);
+        assert!(retreat.contains("view.set_live_organism_visible(false);"));
+        assert!(!callback.contains("timeout_add"));
+    }
+
+    #[test]
+    fn alternate_screen_changes_hide_sticky_form_until_surface_refresh() {
+        let source = include_str!("organism.rs");
+        let callback = source
+            .split_once("view.connect_alt_screen_transition(move |transition| {")
+            .unwrap()
+            .1
+            .split_once("view.connect_activity(move || {")
+            .unwrap()
+            .0;
+        let sticky_hide = callback
+            .find("runtime.sticky_avatar.set_visible(false);")
+            .unwrap();
+        assert!(sticky_hide < callback.find("view_weak.upgrade()").unwrap());
+        assert!(callback.contains("view.set_live_organism_visible(false);"));
+        assert!(!callback.contains("timeout_add"));
+
+        let refresh = source
+            .split_once("fn refresh_surface(&self, view: &TermView, now: Instant) {")
+            .unwrap()
+            .1
+            .split_once("fn apply_settings(")
+            .unwrap()
+            .0;
+        let alt_gate = refresh.split_once("if metrics.alt_screen {").unwrap().1;
+        let hidden = alt_gate
+            .find("self.sticky_avatar.set_visible(false);")
+            .unwrap();
+        let early_return = alt_gate.find("return;").unwrap();
+        let restore = alt_gate
+            .find("self.sticky_avatar.set_visible(mode != SurfaceMode::Typing);")
+            .unwrap();
+        assert!(hidden < early_return && early_return < restore);
     }
 
     #[test]
