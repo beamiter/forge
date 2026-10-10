@@ -380,6 +380,8 @@ pub(crate) struct UiState {
     pub(crate) cross_block_search_memory: Rc<RefCell<dialogs::CrossBlockSearchMemory>>,
     pub(crate) workflows_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) settings_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
+    pub(crate) organism_settings_controls:
+        Rc<RefCell<Option<Rc<dialogs::OrganismSettingsControls>>>>,
     pub(crate) debug_dashboard_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     /// The single active Shell Agent session, rendered as an inline card in
     /// its bound Block pane's conversation (not a dialog).

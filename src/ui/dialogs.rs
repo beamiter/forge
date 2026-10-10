@@ -19,6 +19,68 @@ use crate::block_view::RecordNavigationResult;
 use crate::keybindings::Action;
 use crate::terminal::open_uri;
 
+/// Weak controls for the currently open settings dialog. External reloads
+/// update presentation without turning GTK notifications into new user edits.
+pub(crate) struct OrganismSettingsControls {
+    enabled: glib::WeakRef<adw::SwitchRow>,
+    motion: glib::WeakRef<adw::ComboRow>,
+    syncing: Cell<bool>,
+    retired: Cell<bool>,
+    safe_mode: bool,
+}
+
+struct OrganismSettingsSyncGuard<'a>(&'a Cell<bool>);
+
+impl Drop for OrganismSettingsSyncGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
+impl OrganismSettingsControls {
+    fn new(enabled: &adw::SwitchRow, motion: &adw::ComboRow, safe_mode: bool) -> Rc<Self> {
+        Rc::new(Self {
+            enabled: enabled.downgrade(),
+            motion: motion.downgrade(),
+            syncing: Cell::new(false),
+            retired: Cell::new(false),
+            safe_mode,
+        })
+    }
+
+    fn accepts_user_change(&self) -> bool {
+        !self.retired.get() && !self.syncing.get()
+    }
+
+    fn retire(&self) {
+        self.retired.set(true);
+    }
+
+    fn sync(&self, enabled: bool, motion: Option<crate::config::OrganismMotion>) {
+        if self.retired.get() || self.syncing.get() {
+            return;
+        }
+        let (Some(enabled_row), Some(motion_row)) = (self.enabled.upgrade(), self.motion.upgrade())
+        else {
+            return;
+        };
+        self.syncing.set(true);
+        let _guard = OrganismSettingsSyncGuard(&self.syncing);
+        enabled_row.set_active(enabled);
+        motion_row.set_selected(organism_motion_selection(motion));
+        motion_row.set_sensitive(!self.safe_mode && enabled);
+    }
+}
+
+fn organism_motion_selection(motion: Option<crate::config::OrganismMotion>) -> u32 {
+    match motion {
+        None => 0,
+        Some(crate::config::OrganismMotion::Full) => 1,
+        Some(crate::config::OrganismMotion::Calm) => 2,
+        Some(crate::config::OrganismMotion::Static) => 3,
+    }
+}
+
 /// A settings-only gallery: no terminal, reducer, repository memory, or config
 /// writes. All sources use weak references and are removed on hide or close.
 mod organism_preview {
@@ -663,6 +725,55 @@ mod organism_preview {
             assert!(!sprite.can_target());
             assert!(!sprite.is_focusable());
 
+            // External reload notifications refresh both real controls and
+            // the existing preview, without becoming persistence requests.
+            let enabled = adw::SwitchRow::new();
+            let controls = super::super::OrganismSettingsControls::new(&enabled, &motion, false);
+            let user_edits = Rc::new(Cell::new(0));
+            let controls_for_enabled = controls.clone();
+            let enabled_edits = user_edits.clone();
+            enabled.connect_active_notify(move |_| {
+                if controls_for_enabled.accepts_user_change() {
+                    enabled_edits.set(enabled_edits.get() + 1);
+                }
+            });
+            let controls_for_motion = controls.clone();
+            let motion_edits = user_edits.clone();
+            motion.connect_selected_notify(move |_| {
+                if controls_for_motion.accepts_user_change() {
+                    motion_edits.set(motion_edits.get() + 1);
+                }
+            });
+            controls.sync(true, Some(OrganismMotion::Calm));
+            assert!(enabled.is_active());
+            assert_eq!(motion.selected(), 2);
+            assert!(motion.is_sensitive());
+            assert_eq!(
+                motion.subtitle().as_deref(),
+                Some(motion_description(2, Some(false)))
+            );
+            assert_eq!(user_edits.get(), 0);
+            controls.sync(false, None);
+            assert!(!enabled.is_active());
+            assert_eq!(motion.selected(), 0);
+            assert!(!motion.is_sensitive());
+            assert_eq!(
+                motion.subtitle().as_deref(),
+                Some(motion_description(0, Some(false)))
+            );
+            assert_eq!(user_edits.get(), 0);
+            enabled.set_active(true);
+            motion.set_selected(1);
+            assert_eq!(user_edits.get(), 2, "later user changes are not suppressed");
+            controls.retire();
+            controls.sync(false, Some(OrganismMotion::Static));
+            assert!(
+                enabled.is_active(),
+                "retired dialog controls cannot be changed"
+            );
+            assert_eq!(motion.selected(), 1);
+            motion.set_sensitive(false);
+
             motion.set_selected(3);
             assert!(preview.source.borrow().is_none());
             for (index, example) in PreviewPose::ALL.into_iter().enumerate() {
@@ -807,6 +918,68 @@ mod organism_preview {
                 "hidden settings callbacks cannot restart a timer"
             );
             window.close();
+        }
+
+        #[test]
+        fn reload_controls_use_exact_motion_selection_and_scoped_suppression() {
+            use super::super::{organism_motion_selection, OrganismSettingsSyncGuard};
+            for (motion, selected) in [
+                (None, 0),
+                (Some(OrganismMotion::Full), 1),
+                (Some(OrganismMotion::Calm), 2),
+                (Some(OrganismMotion::Static), 3),
+            ] {
+                assert_eq!(organism_motion_selection(motion), selected);
+            }
+            let syncing = Cell::new(true);
+            {
+                let _guard = OrganismSettingsSyncGuard(&syncing);
+                assert!(syncing.get());
+            }
+            assert!(!syncing.get());
+        }
+
+        #[test]
+        fn reload_controls_are_weak_guarded_and_updated_only_after_config_acceptance() {
+            let source = include_str!("dialogs.rs");
+            let binding = source.split_once("/// A settings-only gallery:").unwrap().0;
+            assert!(binding.contains("glib::WeakRef<adw::SwitchRow>"));
+            assert!(binding.contains("glib::WeakRef<adw::ComboRow>"));
+            assert!(binding.contains("let _guard = OrganismSettingsSyncGuard(&self.syncing);"));
+            let settings = source
+                .rsplit_once("pub(crate) fn toggle_settings_panel(&self)")
+                .unwrap()
+                .1;
+            for callback in [
+                "ascii_organism_row.connect_active_notify",
+                "ascii_organism_motion_row.connect_selected_notify",
+            ] {
+                let callback = settings
+                    .split_once(callback)
+                    .unwrap()
+                    .1
+                    .split_once("});")
+                    .unwrap()
+                    .0;
+                assert!(
+                    callback.find("accepts_user_change()").unwrap()
+                        < callback.find("ui.config.borrow_mut()").unwrap()
+                );
+                assert!(callback.contains("ui.persist_config();"));
+            }
+            assert!(settings.contains("Rc::ptr_eq(controls, &controls_for_close)"));
+            assert!(settings.contains("dialog_ref.borrow().as_ref() == Some(closed)"));
+            let reload = include_str!("config_apply.rs");
+            let accepted = reload
+                .split_once("*self.config.borrow_mut() = new_config;")
+                .unwrap()
+                .1;
+            assert!(accepted.contains("self.sync_organism_settings_controls();"));
+            assert!(!reload
+                .split_once("*self.config.borrow_mut() = new_config;")
+                .unwrap()
+                .0
+                .contains("self.sync_organism_settings_controls();"));
         }
 
         #[test]
@@ -3966,6 +4139,17 @@ impl UiState {
         dialog.present(Some(&self.window));
     }
 
+    pub(crate) fn sync_organism_settings_controls(&self) {
+        let controls = self.organism_settings_controls.borrow().clone();
+        let values = {
+            let config = self.config.borrow();
+            (config.ascii_organism_enabled, config.ascii_organism_motion)
+        };
+        if let Some(controls) = controls {
+            controls.sync(values.0, values.1);
+        }
+    }
+
     pub(crate) fn toggle_settings_panel(&self) {
         let dialog_to_close = self.settings_dialog.borrow_mut().take();
         if let Some(dialog) = dialog_to_close {
@@ -4117,15 +4301,15 @@ impl UiState {
             .title("Organism Motion")
             .subtitle("Automatic follows the desktop animation preference")
             .model(&ascii_organism_motion_model)
-            .selected(match config.ascii_organism_motion {
-                None => 0,
-                Some(crate::config::OrganismMotion::Full) => 1,
-                Some(crate::config::OrganismMotion::Calm) => 2,
-                Some(crate::config::OrganismMotion::Static) => 3,
-            })
+            .selected(organism_motion_selection(config.ascii_organism_motion))
             .build();
         ascii_organism_motion_row.set_sensitive(!safe_mode && config.ascii_organism_enabled);
         terminal_group.add(&ascii_organism_motion_row);
+        let organism_controls = OrganismSettingsControls::new(
+            &ascii_organism_row,
+            &ascii_organism_motion_row,
+            safe_mode,
+        );
 
         let organism_preview_group = adw::PreferencesGroup::new();
         organism_preview::install(&organism_preview_group, &ascii_organism_motion_row, &dialog);
@@ -4393,7 +4577,11 @@ impl UiState {
 
         let motion_for_enabled = ascii_organism_motion_row.clone();
         let ui = self.clone();
+        let controls_for_enabled = organism_controls.clone();
         ascii_organism_row.connect_active_notify(move |row| {
+            if !controls_for_enabled.accepts_user_change() {
+                return;
+            }
             let enabled = row.is_active();
             ui.config.borrow_mut().ascii_organism_enabled = enabled;
             motion_for_enabled.set_sensitive(enabled);
@@ -4402,7 +4590,11 @@ impl UiState {
         });
 
         let ui = self.clone();
+        let controls_for_motion = organism_controls.clone();
         ascii_organism_motion_row.connect_selected_notify(move |row| {
+            if !controls_for_motion.accepts_user_change() {
+                return;
+            }
             ui.config.borrow_mut().ascii_organism_motion = match row.selected() {
                 1 => Some(crate::config::OrganismMotion::Full),
                 2 => Some(crate::config::OrganismMotion::Calm),
@@ -4747,10 +4939,24 @@ impl UiState {
         dialog.add_controller(key_controller);
 
         let dialog_ref = self.settings_dialog.clone();
-        dialog.connect_closed(move |_| {
-            *dialog_ref.borrow_mut() = None;
+        let controls_slot = self.organism_settings_controls.clone();
+        let controls_for_close = organism_controls.clone();
+        dialog.connect_closed(move |closed| {
+            controls_for_close.retire();
+            let is_current = controls_slot
+                .borrow()
+                .as_ref()
+                .is_some_and(|controls| Rc::ptr_eq(controls, &controls_for_close));
+            if is_current {
+                controls_slot.borrow_mut().take();
+            }
+            let is_current = dialog_ref.borrow().as_ref() == Some(closed);
+            if is_current {
+                dialog_ref.borrow_mut().take();
+            }
         });
 
+        *self.organism_settings_controls.borrow_mut() = Some(organism_controls);
         *self.settings_dialog.borrow_mut() = Some(dialog.clone());
         dialog.present(Some(&self.window));
     }

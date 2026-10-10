@@ -988,6 +988,7 @@ impl UiState {
         self.sync_block_configs();
 
         self.sync_ascii_organism_settings();
+        self.sync_organism_settings_controls();
 
         // Apply all visual changes
         self.window_opacity.set(opacity);
