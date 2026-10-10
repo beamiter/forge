@@ -10116,7 +10116,10 @@ mod tests {
             behavior_explanation(inline)
         );
         interaction.cancel();
-        assert_eq!(interaction.apply(Duration::from_millis(2), context), context);
+        assert_eq!(
+            interaction.apply(Duration::from_millis(2), context),
+            context
+        );
         assert_eq!(
             state_explanation(inline, None, true),
             behavior_explanation(inline)
@@ -10147,7 +10150,9 @@ mod tests {
         let interaction = surface
             .find(".apply(self.interaction_epoch.elapsed(), context);")
             .unwrap();
-        let shown = surface.find("view.set_live_organism_visible(true);").unwrap();
+        let shown = surface
+            .find("view.set_live_organism_visible(true);")
+            .unwrap();
         let explanation = surface
             .find("self.set_presented_behavior(Some(context.behavior));")
             .unwrap();
