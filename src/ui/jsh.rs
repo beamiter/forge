@@ -201,7 +201,7 @@ mod tests {
             // Deliberately drop the task without running it: no installer or
             // network access is needed to exercise thread-start failure.
             Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "thread limit"))
-        }).err().expect("injected startup failure");
+        }).expect_err("injected startup failure");
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         assert_eq!(error.to_string(), "thread limit");
     }

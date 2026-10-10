@@ -1082,7 +1082,7 @@ pub fn run() -> glib::ExitCode {
                     "no absolute state or home directory",
                 )
             })
-            .and_then(|path| jterm_core::organism_memory::OrganismMemory::load(path))
+            .and_then(jterm_core::organism_memory::OrganismMemory::load)
         {
             Ok(memory) => Some(memory),
             Err(error) => {

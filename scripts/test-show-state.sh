@@ -27,7 +27,10 @@ printf 'current_page=0\ntab=private-test-command\n' >"${WORK_DIR}/home/.config/f
 HOME="${WORK_DIR}/home" bash "${SCRIPT_DIR}/show-state.sh" >"${WORK_DIR}/metadata"
 grep -q '^Current page entries: 1$' "${WORK_DIR}/metadata"
 grep -q '^Tab entries: 1$' "${WORK_DIR}/metadata"
-! grep -q 'private-test-command' "${WORK_DIR}/metadata"
+if grep -q 'private-test-command' "${WORK_DIR}/metadata"; then
+    printf 'metadata unexpectedly contains private command content\n' >&2
+    exit 1
+fi
 
 status=0
 HOME="${WORK_DIR}/home" FORGE_DEBUG_ALLOW_STATE_CONTENT=0 \

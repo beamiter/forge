@@ -273,8 +273,8 @@ struct StoreReconcileDelta {
 }
 struct ScanScheduler;
 impl ScanScheduler {
-    fn global() -> Self {
-        Self
+    fn global() -> std::io::Result<Self> {
+        Ok(Self)
     }
     fn retire_cancelled(&self) {}
 }

@@ -1,4 +1,3 @@
-use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{Label, Notebook, Paned};
 use serde::{Deserialize, Serialize};

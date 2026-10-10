@@ -3057,9 +3057,11 @@ mod tests {
 
     impl std::io::Read for TrackedReader {
         fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-            while self.wait_for_retirement {
-                self.pipes.check()?;
-                std::thread::sleep(std::time::Duration::from_millis(5));
+            if self.wait_for_retirement {
+                loop {
+                    self.pipes.check()?;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
             }
             Ok(0)
         }
