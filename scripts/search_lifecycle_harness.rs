@@ -236,6 +236,39 @@ mod ui {
         );
     }
     #[test]
+    fn block_early_returns_retire_previous_live_query() {
+        for result in [
+            block_view::FindSearchResult::InvalidRegex,
+            block_view::FindSearchResult::ScanLimit,
+            block_view::FindSearchResult::Matches(block_view::FindProgress {
+                current: 1,
+                total: 2,
+                capped: false,
+                scan_limited: false,
+            }),
+        ] {
+            let mut ui = setup();
+            ui.search_entry.set_text("old-live-query");
+            ui.search_apply();
+            assert!(ui.terminals[0].installed.borrow().is_some());
+            ui.views[0] = Some(Rc::new(TermView {
+                result,
+                queries: Rc::new(RefCell::new(Vec::new())),
+                cleared: Rc::new(Cell::new(0)),
+            }));
+            ui.search_entry.set_text("new-block-query");
+            ui.search_apply();
+            assert!(ui.terminals[0].installed.borrow().is_none(), "{result:?}");
+            let steps = ui.terminals[0].steps.get();
+            // The test boundary deliberately makes Block navigation inactive;
+            // even then neither direction may fall back to the obsolete regex.
+            ui.search_next();
+            ui.search_prev();
+            assert_eq!(ui.terminals[0].steps.get(), steps, "{result:?}");
+        }
+    }
+
+    #[test]
     fn switch_page_applies_to_explicit_destination_before_notebook_commits() {
         let ui = setup();
         ui.search_entry.set_text("needle");

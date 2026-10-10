@@ -128,6 +128,12 @@ impl UiState {
     }
 
     fn apply_search_to(&self, terminal: Option<&vte4::Terminal>, term_view: Option<&TermView>) {
+        // A new query retires the live fallback before either backend can
+        // return early. Block errors/limits must never leave Enter navigating
+        // a native regex installed by an older query.
+        if let Some(term) = terminal {
+            term.search_set_regex(None::<&vte4::Regex>, 0);
+        }
         let text = self.search_entry.text();
         if text.is_empty() {
             // `search_changed` also fires when the user deletes the query.  Clear
@@ -136,18 +142,12 @@ impl UiState {
             if let Some(term_view) = term_view {
                 term_view.clear_find();
             }
-            if let Some(term) = terminal {
-                term.search_set_regex(None::<&vte4::Regex>, 0);
-            }
             self.search_status.set_text("");
             return;
         }
         if query_exceeds_byte_limit(&text) {
             if let Some(term_view) = term_view {
                 term_view.clear_find();
-            }
-            if let Some(term) = terminal {
-                term.search_set_regex(None::<&vte4::Regex>, 0);
             }
             self.search_status.set_text(&format!(
                 "Query too long ({} KiB limit)",
@@ -199,9 +199,6 @@ impl UiState {
                     self.search_status.set_text(terminal_status_text(found));
                 }
                 Err(_) => {
-                    // A compilation error must retire the previous query;
-                    // otherwise Enter still navigates those obsolete matches.
-                    term.search_set_regex(None::<&vte4::Regex>, 0);
                     self.search_status
                         .set_text(&find_status_text(FindSearchResult::InvalidRegex));
                 }
