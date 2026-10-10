@@ -1477,8 +1477,15 @@ pub fn run() -> glib::ExitCode {
                 );
             }
         } else {
+            let mut incomplete_restore = false;
             for (name, layout) in saved_tabs {
-                ui.restore_pane_layout(layout, name);
+                incomplete_restore |= ui.restore_pane_layout(layout, name).is_incomplete();
+            }
+            // UI construction can omit siblings even when parsing succeeded.
+            // Preserve the claimed source before installing any autosave hooks
+            // or writing the initial (possibly partial) live workspace.
+            if incomplete_restore {
+                crate::state::preserve_incomplete_tabs_restore();
             }
 
             if let Some(page) = saved_current {

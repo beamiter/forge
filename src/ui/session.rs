@@ -5,6 +5,18 @@ use std::io;
 
 use super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestoreOutcome {
+    Complete,
+    Incomplete,
+}
+
+impl RestoreOutcome {
+    pub(crate) fn is_incomplete(self) -> bool {
+        self == Self::Incomplete
+    }
+}
+
 #[derive(Clone)]
 struct RestoredLeafSeed {
     dir: String,
@@ -94,7 +106,7 @@ impl UiState {
         &self,
         layout: crate::state::PaneLayout,
         tab_name: Option<String>,
-    ) -> gtk4::Widget {
+    ) -> RestoreOutcome {
         use crate::state::PaneLayout;
 
         match layout {
@@ -163,7 +175,7 @@ impl UiState {
                     }
                 }
                 self.apply_restored_pin(&page, seed.pinned == Some(true));
-                page
+                RestoreOutcome::Complete
             }
             PaneLayout::Split {
                 orientation,
@@ -190,7 +202,7 @@ impl UiState {
         &self,
         layout: crate::state::PaneLayout,
         tab_name: Option<String>,
-    ) -> gtk4::Widget {
+    ) -> RestoreOutcome {
         let first = RestoredLeafSeed::from_layout(&layout).expect("split must contain a leaf");
         let managed = RestoredLeafSeed::first_managed(&layout);
         let resolved_remote = managed.as_ref().and_then(|leaf| {
@@ -279,7 +291,7 @@ impl UiState {
                     "Restored this tab as a single pane instead.",
                 );
                 self.apply_restored_pin(&first_page, first.pinned == Some(true));
-                return first_page;
+                return RestoreOutcome::Incomplete;
             }
         };
         debug_assert!(first_leaf.is_none());
@@ -291,7 +303,7 @@ impl UiState {
             log::error!("restored split tree lost its prepared first-pane slot");
             Self::discard_prepared_leaves(prepared_leaves);
             self.apply_restored_pin(&first_page, first.pinned == Some(true));
-            return first_page;
+            return RestoreOutcome::Incomplete;
         };
         let replace_start = parent.start_child().as_ref() == Some(&placeholder);
         let replace_end = parent.end_child().as_ref() == Some(&placeholder);
@@ -299,7 +311,7 @@ impl UiState {
             log::error!("restored split tree first-pane slot has an invalid parent");
             Self::discard_prepared_leaves(prepared_leaves);
             self.apply_restored_pin(&first_page, first.pinned == Some(true));
-            return first_page;
+            return RestoreOutcome::Incomplete;
         }
 
         // Commit: detach the live first page only after all fallible Block PTY
@@ -328,7 +340,7 @@ impl UiState {
         self.apply_restored_pin(&restored, first.pinned == Some(true));
         self.sync_tab_strip_active(Some(inserted));
         self.sync_tab_bar_visibility();
-        restored
+        RestoreOutcome::Complete
     }
 
     /// A rejected connection is visibly local and has no saved remote launch
@@ -549,6 +561,12 @@ mod tests {
             multiplex: true,
             deploy: jterm_core::jsh_remote::Deploy::Off,
         }
+    }
+
+    #[test]
+    fn restore_outcome_marks_only_missing_runtime_panes_incomplete() {
+        assert!(!super::RestoreOutcome::Complete.is_incomplete());
+        assert!(super::RestoreOutcome::Incomplete.is_incomplete());
     }
 
     #[test]

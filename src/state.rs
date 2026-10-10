@@ -734,6 +734,56 @@ fn quarantine_corrupt_snapshot(path: &Path) -> bool {
     }
 }
 
+/// Preserve a valid source whose UI restoration could not create every pane.
+/// Use the same bounded recovery namespace as parse-time omissions. A prior
+/// write prohibition must never be cleared by this later preservation attempt.
+fn preserve_incomplete_snapshot(path: &Path, writable: &AtomicBool) -> bool {
+    if !writable.swap(false, Ordering::AcqRel) {
+        return false;
+    }
+    let preserved = match snapshot_file::quarantine_corrupt(path) {
+        Ok(backup) => {
+            log::warn!(
+                "Partial window restore: preserved original snapshot {} as {}",
+                path.display(),
+                backup.display()
+            );
+            true
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // Parse-time preservation may already have moved it. This proves
+            // only that no source remains to overwrite, not that a backup exists.
+            log::debug!(
+                "Partial window restore has no remaining source at {}",
+                path.display()
+            );
+            true
+        }
+        Err(error) => {
+            log::warn!(
+                "Partial window restore: cannot preserve {}; session saving remains paused: {error}",
+                path.display()
+            );
+            false
+        }
+    };
+    writable.store(preserved, Ordering::Release);
+    preserved
+}
+
+pub(crate) fn preserve_incomplete_tabs_restore() {
+    match tabs_state_file_path() {
+        Ok(path) => {
+            preserve_incomplete_snapshot(&path, &WINDOW_STATE_WRITABLE);
+        }
+        Err(error) => {
+            WINDOW_STATE_WRITABLE.store(false, Ordering::Release);
+            log::warn!("Partial window restore cannot preserve its source: {error}");
+            report_unavailable_window_storage();
+        }
+    }
+}
+
 fn prepare_active_tabs_state_path() -> io::Result<PathBuf> {
     let paths = window_state_paths()?;
     let directory_file = match ensure_private_directory(&paths.directory) {
@@ -3106,6 +3156,110 @@ mod tests {
             0o644
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_restore_preserves_original_before_fresh_autosave() {
+        let directory = temporary_state_dir("partial-restore-preserve");
+        let active = directory.join("window-1-1.active");
+        let original = b"tab=/synthetic/one\ntab=/synthetic/two\n";
+        fs::write(&active, original).unwrap();
+        let writable = AtomicBool::new(true);
+        assert!(preserve_incomplete_snapshot(&active, &writable));
+        assert!(writable.load(Ordering::Acquire));
+        let backups: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| is_quarantined_snapshot(path))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(&backups[0]).unwrap(), original);
+        atomic_write_private_file(&active, b"tab=/synthetic/survivor\n").unwrap();
+        assert_eq!(fs::read(&backups[0]).unwrap(), original);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn partial_restore_preservation_failure_keeps_source_and_write_prohibition() {
+        let directory = temporary_state_dir("partial-restore-preserve-failure");
+        // Original NAME_MAX-sized file exists, but recovery's appended suffix
+        // cannot fit. No permission changes or user files are involved.
+        let active = directory.join(format!("{}.active", "x".repeat(248)));
+        let original = b"tab=/synthetic/original\n";
+        fs::write(&active, original).unwrap();
+        let writable = AtomicBool::new(true);
+        assert!(!preserve_incomplete_snapshot(&active, &writable));
+        assert!(!writable.load(Ordering::Acquire));
+        assert_eq!(fs::read(&active).unwrap(), original);
+        let ordinary = directory.join("window-1-1.active");
+        fs::write(&ordinary, original).unwrap();
+        assert!(!preserve_incomplete_snapshot(&ordinary, &writable));
+        assert_eq!(
+            fs::read(&ordinary).unwrap(),
+            original,
+            "an existing prohibition is not reopened"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn partial_restore_missing_source_does_not_claim_a_backup() {
+        let directory = temporary_state_dir("partial-restore-no-source");
+        let active = directory.join("window-1-1.active");
+        let writable = AtomicBool::new(true);
+        assert!(preserve_incomplete_snapshot(&active, &writable));
+        assert!(writable.load(Ordering::Acquire));
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn partial_ui_restore_is_reported_before_every_startup_autosave_hook() {
+        let main = include_str!("main.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        let preserve = main
+            .find("crate::state::preserve_incomplete_tabs_restore()")
+            .unwrap();
+        let aggregate = main
+            .find("incomplete_restore |= ui.restore_pane_layout(layout, name).is_incomplete()")
+            .unwrap();
+        assert!(aggregate < preserve);
+        for marker in [
+            "ai_panel.set_persistence_callback(",
+            "notebook.connect_page_added(",
+            "notebook.connect_page_removed(",
+            "notebook.connect_page_reordered(",
+            "save_tabs_state(&notebook, &ui.session_ids.borrow())",
+        ] {
+            assert!(preserve < main.find(marker).unwrap(), "{marker}");
+        }
+        let session = include_str!("ui/session.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        assert_eq!(
+            session
+                .matches("return RestoreOutcome::Incomplete;")
+                .count(),
+            3
+        );
+        assert!(session.contains("Self::discard_prepared_leaves(prepared_leaves)"));
+        let state = include_str!("state.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        let gate = state
+            .find("if !writable.swap(false, Ordering::AcqRel)")
+            .unwrap();
+        let preservation = state[gate..]
+            .find("snapshot_file::quarantine_corrupt(path)")
+            .unwrap();
+        assert!(preservation > 0);
+        assert!(state.contains("ensure_window_state_writable()?;"));
+        assert!(state.contains("pub(crate) fn finalize_tabs_state() {\n    if let Err(error) = ensure_window_state_writable()"));
     }
 
     /// The data-loss fix this round exists for: a snapshot this window has
