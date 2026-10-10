@@ -317,7 +317,7 @@ impl UiState {
         }
     }
 
-    fn restore_zoom_before_close(&self, target: &gtk4::Widget) {
+    pub(super) fn restore_zoom_before_close(&self, target: &gtk4::Widget) {
         let state = {
             let mut slot = self.zoom_state.borrow_mut();
             let belongs_to_zoom = slot.as_ref().is_some_and(|state| {

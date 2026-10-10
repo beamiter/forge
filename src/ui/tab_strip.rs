@@ -773,6 +773,16 @@ impl UiState {
             return;
         }
 
+        // A selected zoomed page exposes only one leaf in the Notebook.
+        // Restore that target before gathering the confirmation details, so
+        // retained running siblings receive the same warning as visible panes.
+        // Unselected zooms and the captured selected-name set are untouched.
+        for tab_name in &selected {
+            if let Some(widget) = notebook_page_named(&self.notebook, tab_name) {
+                self.restore_zoom_before_close(&widget);
+            }
+        }
+
         let mut running = Vec::new();
         for tab_name in &selected {
             for page in 0..self.notebook.n_pages() {
@@ -1354,5 +1364,35 @@ mod tests {
         assert!(resolved_tab_pinned(false, true, &[true, false]));
         assert!(resolved_tab_pinned(false, false, &[true, false]));
         assert!(!resolved_tab_pinned(false, false, &[false, false]));
+    }
+    #[test]
+    fn selected_close_restores_only_captured_targets_before_process_preflight() {
+        let source = include_str!("tab_strip.rs");
+        let close = source
+            .split_once("pub(crate) fn close_selected_tabs(&self)")
+            .unwrap()
+            .1
+            .split_once("pub(crate) fn move_tab_left")
+            .unwrap()
+            .0;
+        let capture = close
+            .find("let selected = self.selected_tabs.borrow().clone();")
+            .unwrap();
+        let restore = close
+            .find("self.restore_zoom_before_close(&widget);")
+            .unwrap();
+        let scan = close
+            .find("Self::running_processes_in_widget(&page_widget)")
+            .unwrap();
+        let prompt = close.find("Self::confirm_close_with_processes(").unwrap();
+        assert!(capture < restore && restore < scan && scan < prompt);
+        let preflight = &close[capture..scan];
+        assert!(preflight.contains("for tab_name in &selected"));
+        assert!(preflight.contains("notebook_page_named(&self.notebook, tab_name)"));
+        assert_eq!(close.matches("self.selected_tabs.borrow()").count(), 1);
+        let commit = close.split_once("let close_selected =").unwrap().1;
+        assert!(commit.contains("for tab_name in &selected"));
+        assert!(commit.contains("widget.widget_name().as_str() == tab_name"));
+        assert!(commit.contains("ui.remove_tab_by_widget_internal(&widget)"));
     }
 }
