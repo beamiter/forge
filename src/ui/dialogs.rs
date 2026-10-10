@@ -73,6 +73,55 @@ mod organism_preview {
         visible && mapped && host_active == Some(true)
     }
 
+    const DEMO_POSES: [PreviewPose; 5] = [
+        PreviewPose::Calm,
+        PreviewPose::Working,
+        PreviewPose::Concerned,
+        PreviewPose::Success,
+        PreviewPose::Sleeping,
+    ];
+    const DEMO_STEP: Duration = Duration::from_secs(2);
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct DemoFrame {
+        pose: PreviewPose,
+        index: usize,
+        next_wake: Duration,
+    }
+
+    #[derive(Default)]
+    struct PreviewSequence {
+        started: Option<Duration>,
+    }
+
+    impl PreviewSequence {
+        fn start(&mut self, now: Duration) {
+            self.started = Some(now);
+        }
+
+        fn stop(&mut self) {
+            self.started = None;
+        }
+
+        fn is_running(&self) -> bool {
+            self.started.is_some()
+        }
+
+        fn sample(&mut self, now: Duration) -> Option<DemoFrame> {
+            let elapsed = now.saturating_sub(self.started?);
+            if elapsed >= DEMO_STEP * DEMO_POSES.len() as u32 {
+                self.stop();
+                return None;
+            }
+            let index = (elapsed.as_secs() / DEMO_STEP.as_secs()) as usize;
+            Some(DemoFrame {
+                pose: DEMO_POSES[index],
+                index,
+                next_wake: DEMO_STEP * (index as u32 + 1) - elapsed,
+            })
+        }
+    }
+
     fn selected_pose(index: u32) -> PreviewPose {
         PreviewPose::ALL
             .get(index as usize)
@@ -98,7 +147,8 @@ mod organism_preview {
         }
     }
 
-    /// Still modes only wake for a requested greeting's expiry and cooldown.
+    /// Base preview wakes cover animation and requested greeting deadlines.
+    /// Explicit demo boundaries are merged by refresh into the same source.
     /// Visibility is a hard gate, including during the dialog close animation.
     fn next_wake(
         visible: bool,
@@ -137,6 +187,8 @@ mod organism_preview {
         sample: glib::WeakRef<adw::ActionRow>,
         sprite: glib::WeakRef<gtk::Label>,
         hello: glib::WeakRef<gtk::Button>,
+        demo: glib::WeakRef<gtk::Button>,
+        sequence: RefCell<PreviewSequence>,
         desktop: Option<gtk::Settings>,
         desktop_handler: RefCell<Option<glib::SignalHandlerId>>,
         host_handler: RefCell<Option<(glib::WeakRef<gtk::Window>, glib::SignalHandlerId)>>,
@@ -158,6 +210,11 @@ mod organism_preview {
         fn cancel_greeting(&self) {
             self.interaction.borrow_mut().cancel();
             self.greeting.set(None);
+        }
+
+        fn cancel_transients(&self) {
+            self.cancel_greeting();
+            self.sequence.borrow_mut().stop();
         }
 
         fn disconnect_host(&self) {
@@ -182,7 +239,7 @@ mod organism_preview {
                 return;
             }
             self.disconnect_host();
-            self.cancel_greeting();
+            self.cancel_transients();
             if let Some(host) = host {
                 let weak = Rc::downgrade(self);
                 let handler = host.connect_is_active_notify(move |_| {
@@ -210,7 +267,7 @@ mod organism_preview {
         fn hide(&self) {
             self.visible.set(false);
             self.stop_source();
-            self.cancel_greeting();
+            self.cancel_transients();
             self.disconnect_host();
         }
 
@@ -227,6 +284,7 @@ mod organism_preview {
                 Some(sample),
                 Some(sprite),
                 Some(hello),
+                Some(demo_button),
             ) = (
                 self.group.upgrade(),
                 self.pose.upgrade(),
@@ -234,6 +292,7 @@ mod organism_preview {
                 self.sample.upgrade(),
                 self.sprite.upgrade(),
                 self.hello.upgrade(),
+                self.demo.upgrade(),
             )
             else {
                 return;
@@ -243,10 +302,12 @@ mod organism_preview {
             if !active {
                 // Keep the absolute cooldown, but never replay a greeting when
                 // the actual settings host returns to the foreground.
-                self.cancel_greeting();
+                self.cancel_transients();
             }
             let now = self.epoch.elapsed();
-            let pose = self.pose();
+            let manual_pose = self.pose();
+            let demo = self.sequence.borrow_mut().sample(now);
+            let pose = demo.map_or(manual_pose, |frame| frame.pose);
             let animations = self
                 .desktop
                 .as_ref()
@@ -261,8 +322,8 @@ mod organism_preview {
             if sprite.text().as_str() != frame.as_ref() {
                 sprite.set_text(frame.as_ref());
             }
-            if pose_row.subtitle().as_deref() != Some(pose.explanation()) {
-                pose_row.set_subtitle(pose.explanation());
+            if pose_row.subtitle().as_deref() != Some(manual_pose.explanation()) {
+                pose_row.set_subtitle(manual_pose.explanation());
             }
             let greeting = self
                 .greeting
@@ -273,7 +334,16 @@ mod organism_preview {
                 .last_hello
                 .get()
                 .is_some_and(|start| now.saturating_sub(start) < GentleInteraction::COOLDOWN);
-            hello.set_sensitive(active && can_greet(pose) && !cooling_down);
+            hello.set_sensitive(active && can_greet(pose) && !cooling_down && demo.is_none());
+            let demo_label = if demo.is_some() {
+                "Stop demo"
+            } else {
+                "Play demo"
+            };
+            if demo_button.label().as_deref() != Some(demo_label) {
+                demo_button.set_label(demo_label);
+            }
+            demo_button.set_sensitive(active);
             let motion_note = match motion {
                 OrganismMotion::Full => "Full motion: animated example.",
                 OrganismMotion::Calm => "Calm: still poses, with no frame animation.",
@@ -281,7 +351,9 @@ mod organism_preview {
                     "Static: still example; the live companion uses inline cards only."
                 }
             };
-            let interaction_note = if greeting.is_some() {
+            let interaction_note = if demo.is_some() {
+                "Offline demo examples only. No commands run and no live state changes."
+            } else if greeting.is_some() {
                 "Hello! Returning to your chosen pose in a moment."
             } else if !can_greet(pose) {
                 "Choose a quiet pose to try a greeting."
@@ -295,29 +367,37 @@ mod organism_preview {
                 OrganismMotion::Calm => "Calm motion",
                 OrganismMotion::Static => "Static motion",
             };
-            let short_status = if greeting.is_some() {
-                "Hello!"
+            let short_status = if let Some(frame) = demo {
+                format!("Demo {}/5: {} · example", frame.index + 1, pose.label())
+            } else if greeting.is_some() {
+                "Hello!".to_owned()
             } else if !can_greet(pose) {
-                "Let it settle"
+                "Let it settle".to_owned()
             } else if cooling_down {
-                "Resting…"
+                "Resting…".to_owned()
             } else {
-                "Local preview"
+                "Local preview".to_owned()
             };
             if sample.title().as_str() != motion_title
-                || sample.subtitle().as_deref() != Some(short_status)
+                || sample.subtitle().as_deref() != Some(short_status.as_str())
             {
                 sample.set_title(motion_title);
-                sample.set_subtitle(short_status);
+                sample.set_subtitle(&short_status);
                 sample.set_tooltip_text(Some(&format!("{motion_note}\n{interaction_note}")));
             }
-            if let Some(delay) = next_wake(
+            let delay = next_wake(
                 active,
                 motion,
                 now,
                 greeting,
-                can_greet(pose).then(|| self.last_hello.get()).flatten(),
-            ) {
+                (demo.is_none() && can_greet(pose))
+                    .then(|| self.last_hello.get())
+                    .flatten(),
+            )
+            .into_iter()
+            .chain(demo.map(|frame| frame.next_wake))
+            .min();
+            if let Some(delay) = delay {
                 let weak = Rc::downgrade(self);
                 let source = glib::timeout_add_local_once(delay, move || {
                     if let Some(preview) = weak.upgrade() {
@@ -386,6 +466,14 @@ mod organism_preview {
             "A brief preview-only greeting. Does not send terminal input.",
         ));
         sample.add_suffix(&hello);
+        let demo = gtk::Button::builder()
+            .label("Play demo")
+            .valign(gtk::Align::Center)
+            .build();
+        demo.set_tooltip_text(Some(
+            "Ten seconds of offline examples. Stops when you leave or choose a pose; never runs commands.",
+        ));
+        sample.add_suffix(&demo);
         group.add(&pose);
         group.add(&sample);
         let preview = Rc::new(Preview {
@@ -395,6 +483,8 @@ mod organism_preview {
             sample: sample.downgrade(),
             sprite: sprite.downgrade(),
             hello: hello.downgrade(),
+            demo: demo.downgrade(),
+            sequence: RefCell::new(PreviewSequence::default()),
             desktop: gtk::Settings::default(),
             desktop_handler: RefCell::new(None),
             host_handler: RefCell::new(None),
@@ -408,14 +498,14 @@ mod organism_preview {
         pose.connect_selected_notify({
             let preview = preview.clone();
             move |_| {
-                preview.cancel_greeting();
+                preview.cancel_transients();
                 preview.refresh();
             }
         });
         hello.connect_clicked({
             let preview = preview.clone();
             move |_| {
-                if !preview.is_active() {
+                if !preview.is_active() || preview.sequence.borrow().is_running() {
                     return;
                 }
                 let now = preview.epoch.elapsed();
@@ -426,6 +516,22 @@ mod organism_preview {
                 {
                     preview.greeting.set(Some(now));
                     preview.last_hello.set(Some(now));
+                }
+                preview.refresh();
+            }
+        });
+        demo.connect_clicked({
+            let preview = preview.clone();
+            move |_| {
+                if !preview.is_active() {
+                    return;
+                }
+                let running = preview.sequence.borrow().is_running();
+                if running {
+                    preview.sequence.borrow_mut().stop();
+                } else {
+                    preview.cancel_greeting();
+                    preview.sequence.borrow_mut().start(preview.epoch.elapsed());
                 }
                 preview.refresh();
             }
@@ -649,6 +755,117 @@ mod organism_preview {
                 "hidden settings callbacks cannot restart a timer"
             );
             window.close();
+        }
+
+        #[test]
+        fn demo_sequence_has_five_bounded_phases_and_never_catches_up() {
+            let start = Duration::from_secs(7);
+            let mut sequence = PreviewSequence::default();
+            assert_eq!(sequence.sample(start), None);
+            sequence.start(start);
+            for (millis, pose, index, remaining) in [
+                (0, PreviewPose::Calm, 0, 2000),
+                (1999, PreviewPose::Calm, 0, 1),
+                (2000, PreviewPose::Working, 1, 2000),
+                (4000, PreviewPose::Concerned, 2, 2000),
+                (6000, PreviewPose::Success, 3, 2000),
+                (8000, PreviewPose::Sleeping, 4, 2000),
+                (9999, PreviewPose::Sleeping, 4, 1),
+            ] {
+                assert_eq!(
+                    sequence.sample(start + Duration::from_millis(millis)),
+                    Some(DemoFrame {
+                        pose,
+                        index,
+                        next_wake: Duration::from_millis(remaining),
+                    })
+                );
+            }
+            assert_eq!(sequence.sample(start + Duration::from_secs(10)), None);
+            assert!(!sequence.is_running());
+            assert_eq!(sequence.sample(start), None, "no implicit replay");
+            sequence.start(start);
+            assert_eq!(sequence.sample(start + Duration::from_secs(60)), None);
+            assert!(
+                !sequence.is_running(),
+                "a delayed frame skips the expired demo"
+            );
+        }
+
+        #[test]
+        fn cancelling_demo_restores_manual_pose_without_spending_hello_cooldown() {
+            let manual = PreviewPose::Curious;
+            let mut sequence = PreviewSequence::default();
+            let mut interaction = GentleInteraction::default();
+            assert!(interaction.request(Duration::ZERO, manual.context()));
+            interaction.cancel();
+            sequence.start(Duration::from_secs(1));
+            assert_eq!(
+                sequence.sample(Duration::from_secs(3)).unwrap().pose,
+                PreviewPose::Working
+            );
+            sequence.stop();
+            let restored = sequence
+                .sample(Duration::from_secs(3))
+                .map_or(manual, |frame| frame.pose);
+            assert_eq!(restored, manual);
+            assert_eq!(sequence.sample(Duration::from_secs(4)), None);
+            assert!(!interaction.request(Duration::from_secs(7), manual.context()));
+            assert!(interaction.request(Duration::from_secs(8), manual.context()));
+        }
+
+        #[test]
+        fn demo_deadlines_share_the_existing_wake_and_end_in_still_modes() {
+            for motion in [
+                OrganismMotion::Full,
+                OrganismMotion::Calm,
+                OrganismMotion::Static,
+            ] {
+                let mut sequence = PreviewSequence::default();
+                sequence.start(Duration::ZERO);
+                let demo = sequence.sample(Duration::ZERO);
+                let wake = next_wake(true, motion, Duration::ZERO, None, None)
+                    .into_iter()
+                    .chain(demo.map(|frame| frame.next_wake))
+                    .min();
+                assert_eq!(
+                    wake,
+                    Some(if motion == OrganismMotion::Full {
+                        FRAME_INTERVAL
+                    } else {
+                        DEMO_STEP
+                    })
+                );
+                assert_eq!(sequence.sample(Duration::from_secs(10)), None);
+                if motion != OrganismMotion::Full {
+                    assert_eq!(
+                        next_wake(true, motion, Duration::from_secs(10), None, None),
+                        None
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn demo_controls_are_preview_only_and_cancel_at_presentation_boundaries() {
+            let source = include_str!("dialogs.rs");
+            let production = source.split_once("#[cfg(test)]").unwrap().0;
+            let click = production
+                .split_once("demo.connect_clicked({")
+                .unwrap()
+                .1
+                .split_once("group.connect_map({")
+                .unwrap()
+                .0;
+            assert!(click.contains("if !preview.is_active()"));
+            assert!(!click.contains(".request("));
+            assert!(!click.contains("last_hello.set"));
+            assert!(production.contains("preview.sequence.borrow().is_running()"));
+            assert!(production.contains("let manual_pose = self.pose();"));
+            assert!(production.contains("Demo {}/5: {} · example"));
+            assert!(production.contains(".chain(demo.map(|frame| frame.next_wake))"));
+            assert!(production.contains("self.sequence.borrow_mut().stop();"));
+            assert!(!production.contains("pose_row.set_selected"));
         }
 
         #[test]
