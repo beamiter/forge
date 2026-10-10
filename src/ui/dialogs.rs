@@ -46,6 +46,19 @@ mod organism_preview {
         }
     }
 
+    fn motion_description(selected: u32, animations: Option<bool>) -> &'static str {
+        match selected {
+            1 => "Full: animated movement and quiet hover greetings.",
+            2 => "Calm: still poses and quiet hover greetings.",
+            3 => "Static: inline cards only; no live hover greetings.",
+            _ => match animations {
+                Some(true) => "Automatic (Full): follows desktop animations.",
+                Some(false) => "Automatic (Calm): desktop animations are disabled.",
+                None => "Automatic (Full): desktop preference unavailable.",
+            },
+        }
+    }
+
     fn selected_pose(index: u32) -> PreviewPose {
         PreviewPose::ALL
             .get(index as usize)
@@ -164,12 +177,15 @@ mod organism_preview {
             };
             let now = self.epoch.elapsed();
             let pose = self.pose();
-            let motion = motion_for_selection(
-                motion_row.selected(),
-                self.desktop
-                    .as_ref()
-                    .is_none_or(|settings| settings.is_gtk_enable_animations()),
-            );
+            let animations = self
+                .desktop
+                .as_ref()
+                .map(|settings| settings.is_gtk_enable_animations());
+            let motion = motion_for_selection(motion_row.selected(), animations.unwrap_or(true));
+            let description = motion_description(motion_row.selected(), animations);
+            if motion_row.subtitle().as_deref() != Some(description) {
+                motion_row.set_subtitle(description);
+            }
             let context = self.interaction.borrow_mut().apply(now, pose.context());
             let frame = sprite_frame_with_context(context, frame_index(motion, now));
             if sprite.text().as_str() != frame.as_ref() {
@@ -558,6 +574,57 @@ mod organism_preview {
                 "hidden settings callbacks cannot restart a timer"
             );
             window.close();
+        }
+
+        #[test]
+        fn motion_description_matches_automatic_and_explicit_resolution() {
+            assert_eq!(
+                motion_description(0, Some(true)),
+                "Automatic (Full): follows desktop animations."
+            );
+            assert_eq!(
+                motion_description(0, Some(false)),
+                "Automatic (Calm): desktop animations are disabled."
+            );
+            assert_eq!(
+                motion_description(0, None),
+                "Automatic (Full): desktop preference unavailable."
+            );
+            for selected in 1..=3 {
+                assert_eq!(
+                    motion_description(selected, Some(true)),
+                    motion_description(selected, Some(false))
+                );
+                assert_eq!(
+                    motion_description(selected, None),
+                    motion_description(selected, Some(true))
+                );
+            }
+            assert_eq!(
+                motion_description(3, Some(true)),
+                "Static: inline cards only; no live hover greetings."
+            );
+            assert_eq!(
+                motion_description(u32::MAX, Some(false)),
+                motion_description(0, Some(false))
+            );
+        }
+
+        #[test]
+        fn existing_preview_refresh_updates_the_motion_description() {
+            let source = include_str!("dialogs.rs");
+            let refresh = source
+                .split_once("fn refresh(self: &Rc<Self>) {")
+                .unwrap()
+                .1
+                .split_once("impl Drop for Preview")
+                .unwrap()
+                .0;
+            assert!(refresh.contains(
+                "motion_for_selection(motion_row.selected(), animations.unwrap_or(true))"
+            ));
+            assert!(refresh.contains("motion_description(motion_row.selected(), animations)"));
+            assert!(refresh.contains("motion_row.set_subtitle(description)"));
         }
 
         #[test]
