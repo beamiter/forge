@@ -2214,7 +2214,7 @@ mod tests {
                 .find("identity::init(")
                 .expect("run() initialises the shared identity");
             let load_at = run_body
-                .find("OrganismMemory::load(")
+                .find(".and_then(jterm_core::organism_memory::OrganismMemory::load)")
                 .expect("run() opens the organism memory file");
 
             assert!(
