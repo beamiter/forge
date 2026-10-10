@@ -235,7 +235,16 @@ impl UiState {
             return;
         }
         let snapshot = self.config.borrow().clone();
-        let path = config_file_path();
+        let path = match config_file_path() {
+            Ok(path) => path,
+            Err(error) => {
+                self.show_config_error(
+                    "Settings were not saved",
+                    &format!("{error}. The in-memory setting is still active."),
+                );
+                return;
+            }
+        };
         let key = crate::persistence::PersistenceKey::for_path("config", &path);
         // The witness names the edit this exact snapshot carries. Redeeming it
         // on the worker thread, immediately after the store published the new
@@ -779,7 +788,16 @@ impl UiState {
             dialog.present(Some(&self.window));
             return;
         }
-        let path = config_file_path();
+        let path = match config_file_path() {
+            Ok(path) => path,
+            Err(error) => {
+                self.show_config_error(
+                    "Configuration reload rejected",
+                    &format!("The current settings remain active. {error}"),
+                );
+                return;
+            }
+        };
         let contents = match crate::config_store::read_config_text(&path) {
             Ok(contents) => contents,
             Err(error) => {

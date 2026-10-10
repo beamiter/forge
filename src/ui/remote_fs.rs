@@ -835,10 +835,11 @@ fn run_capture_or_cancel(
                 .name("forge-remote-fs-stdin".into())
                 .spawn(move || stdin.write_all(&bytes))
         })
-        .transpose()?;
+        .transpose()?
+        .map(|handle| PipeWorker { handle: Some(handle), pipes: child.pipes.clone() });
 
-    let stdout_reader = spawn_bounded_reader(child.stdout.take(), max_out);
-    let stderr_reader = spawn_bounded_reader(child.stderr.take(), max_out);
+    let stdout_reader = spawn_bounded_reader(child.stdout.take(), max_out, &child.pipes)?;
+    let stderr_reader = spawn_bounded_reader(child.stderr.take(), max_out, &child.pipes)?;
 
     let status = wait_with_timeout_or_cancel(&mut child, timeout, cancel);
     child.pipes.retire();
@@ -871,14 +872,61 @@ fn run_capture_or_cancel(
 /// keeps draining into the void so the child is never wedged on a full pipe;
 /// the caller treats the returned `truncated` flag as an error (or ignores it
 /// for purely diagnostic stderr on streaming transfers).
+type BoundedReaderResult = io::Result<(Vec<u8>, bool)>;
+type BoundedReaderTask = Box<dyn FnOnce() -> BoundedReaderResult + Send + 'static>;
+
+struct PipeWorker<T> {
+    handle: Option<std::thread::JoinHandle<T>>,
+    pipes: PipeDeadline,
+}
+
+impl<T> PipeWorker<T> {
+    fn join(mut self) -> std::thread::Result<T> {
+        self.handle.take().expect("pipe worker owns its join handle").join()
+    }
+}
+
+impl<T> Drop for PipeWorker<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            // All production inputs are DeadlinePipe values sharing this
+            // control. Retire before joining, including partial setup errors;
+            // an escaped descendant cannot keep this reader alive forever.
+            self.pipes.retire();
+            let _ = handle.join();
+        }
+    }
+}
+
+type BoundedReader = PipeWorker<BoundedReaderResult>;
+
 fn spawn_bounded_reader<R>(
     pipe: Option<R>,
     max_out: u64,
-) -> std::thread::JoinHandle<io::Result<(Vec<u8>, bool)>>
+    pipes: &PipeDeadline,
+) -> io::Result<BoundedReader>
 where
     R: Read + Send + 'static,
 {
-    std::thread::spawn(move || {
+    spawn_bounded_reader_with(pipe, max_out, pipes, |task| {
+        std::thread::Builder::new()
+            .name("forge-remote-fs-reader".into())
+            .spawn(task)
+    })
+}
+
+fn spawn_bounded_reader_with<R>(
+    pipe: Option<R>,
+    max_out: u64,
+    pipes: &PipeDeadline,
+    spawn: impl FnOnce(BoundedReaderTask) -> io::Result<std::thread::JoinHandle<BoundedReaderResult>>,
+) -> io::Result<BoundedReader>
+where
+    R: Read + Send + 'static,
+{
+    // On startup failure the task (and its pipe) drops. Callers propagate the
+    // error, so HelperChild retires I/O and reaps its owned process group.
+    let handle = spawn(Box::new(move || {
         let Some(pipe) = pipe else {
             return Ok((Vec::new(), false));
         };
@@ -891,11 +939,12 @@ where
         buffer.truncate(max_out as usize);
         io::copy(&mut limited.into_inner(), &mut io::sink())?;
         Ok((buffer, true))
-    })
+    }))?;
+    Ok(BoundedReader { handle: Some(handle), pipes: pipes.clone() })
 }
 
 fn join_bounded_reader(
-    reader: std::thread::JoinHandle<io::Result<(Vec<u8>, bool)>>,
+    reader: BoundedReader,
 ) -> io::Result<(Vec<u8>, bool)> {
     reader
         .join()
@@ -1218,7 +1267,7 @@ fn stream_download_to_file(
 
     let mut child = spawn_argv(argv, Stdio::null(), Stdio::piped(), Stdio::piped())?;
     child.pipes.set_timeout(timeout);
-    let stderr_reader = spawn_bounded_reader(child.stderr.take(), PROBE_OP_MAX_OUTPUT);
+    let stderr_reader = spawn_bounded_reader(child.stderr.take(), PROBE_OP_MAX_OUTPUT, &child.pipes)?;
     let Some(mut stdout) = child.stdout.take() else {
         return Err(io::Error::other("could not open probe stdout"));
     };
@@ -1323,7 +1372,7 @@ fn stream_upload_to_probe(
 
     let mut child = spawn_argv(argv, Stdio::piped(), Stdio::null(), Stdio::piped())?;
     child.pipes.set_timeout(timeout);
-    let stderr_reader = spawn_bounded_reader(child.stderr.take(), PROBE_OP_MAX_OUTPUT);
+    let stderr_reader = spawn_bounded_reader(child.stderr.take(), PROBE_OP_MAX_OUTPUT, &child.pipes)?;
     let Some(mut stdin) = child.stdin.take() else {
         return Err(io::Error::other("could not open probe stdin"));
     };
@@ -1668,10 +1717,10 @@ fn stream_download_dir(
     }
     let mut remote = spawn_argv(argv, Stdio::null(), Stdio::piped(), Stdio::piped())?;
     remote.pipes.set_timeout(timeout);
-    let remote_stderr = spawn_bounded_reader(remote.stderr.take(), PROBE_OP_MAX_OUTPUT);
+    let remote_stderr = spawn_bounded_reader(remote.stderr.take(), PROBE_OP_MAX_OUTPUT, &remote.pipes)?;
     let mut local = spawn_argv(local_argv, Stdio::piped(), Stdio::null(), Stdio::piped())?;
     local.pipes.set_timeout(timeout);
-    let local_stderr = spawn_bounded_reader(local.stderr.take(), PROBE_OP_MAX_OUTPUT);
+    let local_stderr = spawn_bounded_reader(local.stderr.take(), PROBE_OP_MAX_OUTPUT, &local.pipes)?;
     let Some(remote_stdout) = remote.stdout.take() else {
         return Err(io::Error::other("could not open probe stdout"));
     };
@@ -1993,8 +2042,10 @@ pub(crate) fn transfer_with_overlays(
     }
 }
 
-/// Remote-to-remote hops relay through a unique local temp path: download,
-/// upload, clean up. The temp side never survives the call.
+/// Remote-to-remote hops relay inside an exclusively created 0700 directory.
+/// Source-readable payloads stay private locally. The cleanup guard is armed
+/// only after successful creation, so a collision never removes an existing
+/// entry; ordinary error returns get the same best-effort cleanup as success.
 fn transfer_relay(
     src_host: &RemoteHost,
     src: &Path,
@@ -2003,11 +2054,7 @@ fn transfer_relay(
     is_dir: bool,
     control: &TransferControl,
 ) -> io::Result<()> {
-    let relay = std::env::temp_dir().join(format!(
-        "forge-fs-relay-{}-{}",
-        std::process::id(),
-        unique_suffix()
-    ));
+    let relay = DownloadStaging::create(&std::env::temp_dir())?;
     if is_dir {
         let Some(name) = src.file_name() else {
             return Err(io::Error::new(
@@ -2015,17 +2062,13 @@ fn transfer_relay(
                 "transfer source has no file name",
             ));
         };
-        std::fs::create_dir(&relay)?;
-        let staged = relay.join(name);
-        let result = download_dir(src_host, src, &staged, control)
-            .and_then(|_| upload_dir(dst_host, &staged, dst, control));
-        let _ = std::fs::remove_dir_all(&relay);
-        result
+        let staged = relay.path.join(name);
+        download_dir(src_host, src, &staged, control)
+            .and_then(|_| upload_dir(dst_host, &staged, dst, control))
     } else {
-        let result = download_file(src_host, src, &relay, control)
-            .and_then(|_| upload_file(dst_host, &relay, dst, control));
-        let _ = std::fs::remove_file(&relay);
-        result
+        let staged = relay.path.join("payload");
+        download_file(src_host, src, &staged, control)
+            .and_then(|_| upload_file(dst_host, &staged, dst, control))
     }
 }
 
@@ -3006,6 +3049,68 @@ pub(crate) fn paste_destination(target_dir: &Path, source: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
 
+    struct TrackedReader {
+        pipes: super::PipeDeadline,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        wait_for_retirement: bool,
+    }
+
+    impl std::io::Read for TrackedReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            while self.wait_for_retirement {
+                self.pipes.check()?;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(0)
+        }
+    }
+
+    impl Drop for TrackedReader {
+        fn drop(&mut self) {
+            self.dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn first_reader_spawn_failure_returns_error_and_drops_its_pipe() {
+        let pipes = super::PipeDeadline::new(std::time::Duration::from_secs(60));
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pipe = TrackedReader {
+            pipes: pipes.clone(), dropped: dropped.clone(), wait_for_retirement: false,
+        };
+        let error = super::spawn_bounded_reader_with(Some(pipe), 16, &pipes, |_task| {
+            Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "thread limit"))
+        }).err().expect("injected reader startup failure");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn second_reader_failure_retires_and_joins_the_started_reader() {
+        let pipes = super::PipeDeadline::new(std::time::Duration::from_secs(60));
+        let first_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first = super::spawn_bounded_reader_with(
+            Some(TrackedReader {
+                pipes: pipes.clone(), dropped: first_dropped.clone(), wait_for_retirement: true,
+            }), 16, &pipes, |task| std::thread::Builder::new().spawn(task),
+        ).expect("local test reader starts");
+        let second = super::spawn_bounded_reader_with(
+            Some(TrackedReader {
+                pipes: pipes.clone(), dropped: second_dropped.clone(), wait_for_retirement: false,
+            }), 16, &pipes, |_task| {
+                Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "thread limit"))
+            },
+        );
+        assert!(second.is_err());
+        assert!(second_dropped.load(std::sync::atomic::Ordering::SeqCst));
+        drop(first);
+        // Drop has joined, not merely detached: the first owned pipe is gone
+        // before the setup error can return to the scheduler.
+        assert!(first_dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(pipes.retired.lock().unwrap().is_some());
+    }
+
     /// The pre-check is a diagnostic, not a guarantee: whatever appears between
     /// it and the rename must not be destroyed. Only the commit can enforce
     /// that, so assert on the commit directly.
@@ -3131,6 +3236,31 @@ mod tests {
         assert!(!path.exists(), "a partial extraction is never left behind");
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn private_relay_parent_contains_source_readable_payloads() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_temp_dir("relay-privacy");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = {
+            let relay = DownloadStaging::create(&root).unwrap();
+            let payload = relay.path.join("project");
+            std::fs::create_dir(&payload).unwrap();
+            std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let file = payload.join("source-readable.txt");
+            std::fs::write(&file, b"synthetic transfer data").unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(
+                std::fs::metadata(&relay.path).unwrap().permissions().mode() & 0o077,
+                0,
+                "downloaded source modes must not expose the private relay"
+            );
+            relay.path.clone()
+        };
+        assert!(!path.exists(), "relay payload must be removed on scope exit");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Use a child test process so the fake SSH PATH never affects parallel

@@ -20,6 +20,17 @@ use crate::jsh_install::{self, Status};
 /// How often the pending check result is polled from the worker thread.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+fn start_update_check_with(
+    max_age: u64,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()>,
+) -> std::io::Result<std::sync::mpsc::Receiver<Status>> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    spawn(Box::new(move || {
+        let _ = sender.send(jsh_install::check_blocking(max_age));
+    }))?;
+    Ok(receiver)
+}
+
 fn jsh_install_guard(safe_mode: bool) -> Result<(), &'static str> {
     if safe_mode {
         Err("jsh installation is unavailable in safe mode.")
@@ -117,10 +128,18 @@ impl UiState {
             return;
         };
 
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let _ = sender.send(jsh_install::check_blocking(max_age));
-        });
+        let receiver = match start_update_check_with(max_age, |task| {
+            std::thread::Builder::new()
+                .name("forge-jsh-update-check".into())
+                .spawn(task)
+                .map(|_handle| ())
+        }) {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                log::warn!("jsh update check could not start: {error}");
+                return;
+            }
+        };
 
         let receiver = RefCell::new(receiver);
         let bar = bar.clone();
@@ -175,6 +194,17 @@ fn apply_jsh_status(bar: &GBox, label: &Label, action: &Button, status: &Status)
 #[cfg(test)]
 mod tests {
     use super::jsh_install_guard;
+
+    #[test]
+    fn update_worker_failure_does_not_run_the_optional_check() {
+        let error = super::start_update_check_with(0, |_task| {
+            // Deliberately drop the task without running it: no installer or
+            // network access is needed to exercise thread-start failure.
+            Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "thread limit"))
+        }).err().expect("injected startup failure");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(error.to_string(), "thread limit");
+    }
 
     #[test]
     fn safe_mode_rejects_explicit_jsh_installation() {

@@ -411,8 +411,12 @@ fn revision_at_in_directory(
     ))
 }
 
+fn effective_config_path() -> Result<PathBuf, ConfigWriteError> {
+    config::config_file_path().map_err(|error| ConfigWriteError::Io(error.to_string()))
+}
+
 pub fn current_revision() -> Result<ConfigRevision, ConfigWriteError> {
-    revision_at(&config::config_file_path())
+    revision_at(&effective_config_path()?)
 }
 
 fn backup_path_for(path: &Path) -> PathBuf {
@@ -431,9 +435,9 @@ fn lock_path_for(path: &Path) -> PathBuf {
     path.with_extension("toml.lock")
 }
 
-pub fn backup_paths() -> [PathBuf; 2] {
-    let path = config::config_file_path();
-    [backup_path_for(&path), secondary_backup_path_for(&path)]
+pub fn backup_paths() -> Result<[PathBuf; 2], ConfigWriteError> {
+    let path = effective_config_path()?;
+    Ok([backup_path_for(&path), secondary_backup_path_for(&path)])
 }
 
 #[cfg(unix)]
@@ -645,7 +649,9 @@ fn lock_status_for(config_path: &Path) -> ConfigLockStatus {
 }
 
 pub fn lock_status() -> ConfigLockStatus {
-    lock_status_for(&config::config_file_path())
+    effective_config_path()
+        .map(|path| lock_status_for(&path))
+        .unwrap_or(ConfigLockStatus::Unavailable)
 }
 
 /// Advisory exclusive lock on a private file's parent directory.
@@ -1214,6 +1220,29 @@ fn save_config_bound(
     Ok(revision)
 }
 
+/// Every failed post-staging check must discard the private temporary file,
+/// including I/O errors (not just a successfully read, changed revision).
+fn verify_staged_revision(
+    directory: &fs::File,
+    path: &Path,
+    expected: &ConfigRevision,
+    staged: &OsStr,
+) -> Result<(), ConfigWriteError> {
+    let result = revision_at_in_directory(directory, path).and_then(|actual| {
+        if &actual == expected {
+            Ok(())
+        } else {
+            Err(ConfigWriteError::Conflict {
+                path: path.to_path_buf(),
+            })
+        }
+    });
+    if result.is_err() {
+        unlink_relative(directory, staged);
+    }
+    result
+}
+
 fn write_config_under_lock(
     path: &Path,
     config: &Config,
@@ -1270,12 +1299,7 @@ fn write_config_under_lock(
     }
 
     let staged = stage_private_file_in_directory(&lock.directory, path, "next", &rendered)?;
-    if revision_at_in_directory(&lock.directory, path)? != actual_revision {
-        unlink_relative(&lock.directory, &staged);
-        return Err(ConfigWriteError::Conflict {
-            path: path.to_path_buf(),
-        });
-    }
+    verify_staged_revision(&lock.directory, path, &actual_revision, &staged)?;
     if let Some(current) = current.as_deref() {
         if let Err(error) = rotate_backups_in_directory(&lock.directory, path, current) {
             unlink_relative(&lock.directory, &staged);
@@ -1285,12 +1309,7 @@ fn write_config_under_lock(
     // Non-cooperating editors do not take our advisory lock. Re-check after
     // the potentially slow backup fsyncs so their latest bytes are not silently
     // replaced by a revision validated several I/O operations ago.
-    if revision_at_in_directory(&lock.directory, path)? != actual_revision {
-        unlink_relative(&lock.directory, &staged);
-        return Err(ConfigWriteError::Conflict {
-            path: path.to_path_buf(),
-        });
-    }
+    verify_staged_revision(&lock.directory, path, &actual_revision, &staged)?;
     if let Err(error) = replace_with_staged_in_directory(&lock.directory, &staged, path) {
         unlink_relative(&lock.directory, &staged);
         return Err(error);
@@ -1309,7 +1328,7 @@ fn save_config_with_path(path: &Path, config: &Config) -> Result<ConfigRevision,
 }
 
 pub(crate) fn save_config(config: &Config) -> Result<ConfigRevision, ConfigWriteError> {
-    save_config_with_path(&config::config_file_path(), config)
+    save_config_with_path(&effective_config_path()?, config)
 }
 
 fn valid_config_bytes_in_directory(
@@ -1354,12 +1373,7 @@ fn restore_backup_to_path(path: &Path) -> Result<(PathBuf, ConfigRevision), Conf
     let current = read_optional_in_directory(&lock.directory, path)?;
     let expected_revision = revision_from_content(current.as_deref());
     let staged = stage_private_file_in_directory(&lock.directory, path, "restore", &bytes)?;
-    if revision_at_in_directory(&lock.directory, path)? != expected_revision {
-        unlink_relative(&lock.directory, &staged);
-        return Err(ConfigWriteError::Conflict {
-            path: path.to_path_buf(),
-        });
-    }
+    verify_staged_revision(&lock.directory, path, &expected_revision, &staged)?;
     if let Some(current) = current {
         if let Err(error) =
             atomic_replace_in_directory(&lock.directory, &before_restore_path_for(path), &current)
@@ -1368,12 +1382,7 @@ fn restore_backup_to_path(path: &Path) -> Result<(PathBuf, ConfigRevision), Conf
             return Err(error);
         }
     }
-    if revision_at_in_directory(&lock.directory, path)? != expected_revision {
-        unlink_relative(&lock.directory, &staged);
-        return Err(ConfigWriteError::Conflict {
-            path: path.to_path_buf(),
-        });
-    }
+    verify_staged_revision(&lock.directory, path, &expected_revision, &staged)?;
     if let Err(error) = replace_with_staged_in_directory(&lock.directory, &staged, path) {
         unlink_relative(&lock.directory, &staged);
         return Err(error);
@@ -1384,7 +1393,7 @@ fn restore_backup_to_path(path: &Path) -> Result<(PathBuf, ConfigRevision), Conf
 /// Restore the newest semantically valid rotating backup.  The replaced file,
 /// even when corrupt, is retained as `config.toml.before-restore`.
 pub fn restore_backup() -> Result<(PathBuf, ConfigRevision), ConfigWriteError> {
-    restore_backup_to_path(&config::config_file_path())
+    restore_backup_to_path(&effective_config_path()?)
 }
 
 #[cfg(test)]
@@ -1422,6 +1431,53 @@ mod tests {
         let second = revision_at(&path).unwrap();
         assert_ne!(first, second);
         assert!(!format!("{first:?}").contains("secret-model-name"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_revision_read_discards_staged_private_config() {
+        let directory = temporary_directory("staged-read-error");
+        let path = directory.join("config.toml");
+        let directory_fd = validate_existing_parent(&directory).unwrap();
+        let staged = stage_private_file_in_directory(
+            &directory_fd,
+            &path,
+            "next",
+            b"ai_model = 'private-draft'\n",
+        )
+        .unwrap();
+        // A non-cooperating editor can change the target to an unreadable
+        // object after staging. No replacement may survive the read error.
+        fs::create_dir(&path).unwrap();
+        let error = verify_staged_revision(
+            &directory_fd,
+            &path,
+            &ConfigRevision::missing(),
+            &staged,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConfigWriteError::Io(_)));
+        assert!(!directory.join(&staged).exists());
+        assert!(path.is_dir());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn revision_conflict_discards_staged_config_but_match_retains_it() {
+        let directory = temporary_directory("staged-conflict");
+        let path = directory.join("config.toml");
+        let directory_fd = validate_existing_parent(&directory).unwrap();
+        let expected = ConfigRevision::missing();
+        let staged =
+            stage_private_file_in_directory(&directory_fd, &path, "restore", b"opacity = 0.5\n")
+                .unwrap();
+        verify_staged_revision(&directory_fd, &path, &expected, &staged).unwrap();
+        assert!(directory.join(&staged).is_file());
+        fs::write(&path, b"opacity = 0.6\n").unwrap();
+        let error = verify_staged_revision(&directory_fd, &path, &expected, &staged).unwrap_err();
+        assert!(error.is_conflict());
+        assert!(!directory.join(&staged).exists());
+        assert_eq!(fs::read(&path).unwrap(), b"opacity = 0.6\n");
         fs::remove_dir_all(directory).unwrap();
     }
 

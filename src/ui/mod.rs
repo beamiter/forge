@@ -403,7 +403,7 @@ pub(crate) struct UiState {
     /// life simulation: one mind, one clock, however many pane bodies.
     pub(crate) organism_activity: Rc<OrganismActivity>,
     /// Focus-backed visibility arbiter: pane-local inline/sticky forms remain,
-    /// but at most one local Block pane owns the spatial live body.
+    /// but at most one local Block/Unified pane owns the spatial live body.
     pub(crate) organism_presence: Rc<OrganismPresence>,
     /// Content-free Shell Agent lifecycle phases feeding the shared mind.
     pub(crate) organism_agent: Rc<OrganismAgentSignal>,

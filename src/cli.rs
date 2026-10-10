@@ -392,6 +392,20 @@ struct ConfigReport<'a> {
     issues: Vec<JsonIssue<'a>>,
 }
 
+fn unavailable_config_report(error: &std::io::Error) -> serde_json::Value {
+    serde_json::json!({
+        "path": null,
+        "exists": null,
+        "valid": false,
+        "errors": 1,
+        "warnings": 0,
+        "issues": [{
+            "level": "error", "severity": "error",
+            "path": "$", "key": "$", "message": error.to_string()
+        }]
+    })
+}
+
 fn check_config(path: &Path, format: ReportFormat) -> bool {
     let contents = match crate::config_store::read_config_text(path) {
         Ok(Some(contents)) => contents,
@@ -619,11 +633,11 @@ fn workflow_discovery() -> (usize, usize, usize, usize) {
     )
 }
 
-fn config_backup_health() -> (usize, usize, usize) {
+fn config_backup_health() -> Result<(usize, usize, usize), crate::config_store::ConfigWriteError> {
     let mut present = 0;
     let mut valid = 0;
     let mut invalid_or_unreadable = 0;
-    for path in crate::config_store::backup_paths() {
+    for path in crate::config_store::backup_paths()? {
         match crate::config_store::read_config_text(&path) {
             Ok(Some(contents)) => {
                 present += 1;
@@ -639,7 +653,7 @@ fn config_backup_health() -> (usize, usize, usize) {
             }
         }
     }
-    (present, valid, invalid_or_unreadable)
+    Ok((present, valid, invalid_or_unreadable))
 }
 
 #[derive(Serialize)]
@@ -650,97 +664,112 @@ struct DoctorCheck {
 }
 
 fn doctor(format: ReportFormat) -> bool {
-    let path = config_file_path();
     let mut checks = Vec::new();
-    match crate::config_store::read_config_text(&path) {
-        Ok(Some(contents)) => match validate_config_contents(&contents) {
-            Ok(issues) => {
-                let errors = issues.iter().filter(|issue| issue.is_error()).count();
-                let warnings = issues.len() - errors;
-                checks.push(DoctorCheck {
-                    name: "config",
-                    status: if errors > 0 {
-                        "error"
-                    } else if warnings > 0 {
-                        "warning"
-                    } else {
-                        "ok"
-                    },
-                    detail: format!(
-                        "{} ({} errors, {} warnings)",
-                        diagnostic_path(&path),
-                        errors,
-                        warnings
-                    ),
-                });
-            }
-            Err(_err) => {
-                checks.push(DoctorCheck {
-                    name: "config",
-                    status: "error",
-                    // `toml::de::Error` can embed the offending source
-                    // line. Doctor reports must never echo configuration
-                    // contents; the explicit check command is the local,
-                    // user-requested detailed view.
-                    detail: format!(
-                        "{}: invalid TOML; run --check-config locally",
-                        diagnostic_path(&path)
-                    ),
-                });
-            }
-        },
-        Ok(None) => {
-            checks.push(DoctorCheck {
-                name: "config",
-                status: "warning",
-                detail: format!(
-                    "{} does not exist (built-in defaults)",
-                    diagnostic_path(&path)
-                ),
-            });
-        }
-        Err(err) => {
-            checks.push(DoctorCheck {
-                name: "config",
-                status: "error",
-                detail: if diagnostics_redacted() {
-                    "<config-file>: unreadable".to_string()
-                } else {
-                    format!("{}: {err}", path.display())
+    match config_file_path() {
+        Err(error) => checks.push(DoctorCheck {
+            name: "config",
+            status: "error",
+            detail: error.to_string(),
+        }),
+        Ok(path) => {
+            match crate::config_store::read_config_text(&path) {
+                Ok(Some(contents)) => match validate_config_contents(&contents) {
+                    Ok(issues) => {
+                        let errors = issues.iter().filter(|issue| issue.is_error()).count();
+                        let warnings = issues.len() - errors;
+                        checks.push(DoctorCheck {
+                            name: "config",
+                            status: if errors > 0 {
+                                "error"
+                            } else if warnings > 0 {
+                                "warning"
+                            } else {
+                                "ok"
+                            },
+                            detail: format!(
+                                "{} ({} errors, {} warnings)",
+                                diagnostic_path(&path),
+                                errors,
+                                warnings
+                            ),
+                        });
+                    }
+                    Err(_err) => {
+                        checks.push(DoctorCheck {
+                            name: "config",
+                            status: "error",
+                            // `toml::de::Error` can embed the offending source
+                            // line. Doctor reports must never echo configuration
+                            // contents; the explicit check command is the local,
+                            // user-requested detailed view.
+                            detail: format!(
+                                "{}: invalid TOML; run --check-config locally",
+                                diagnostic_path(&path)
+                            ),
+                        });
+                    }
                 },
-            });
+                Ok(None) => {
+                    checks.push(DoctorCheck {
+                        name: "config",
+                        status: "warning",
+                        detail: format!(
+                            "{} does not exist (built-in defaults)",
+                            diagnostic_path(&path)
+                        ),
+                    });
+                }
+                Err(err) => {
+                    checks.push(DoctorCheck {
+                        name: "config",
+                        status: "error",
+                        detail: if diagnostics_redacted() {
+                            "<config-file>: unreadable".to_string()
+                        } else {
+                            format!("{}: {err}", path.display())
+                        },
+                    });
+                }
+            }
+
+            #[cfg(unix)]
+            if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = metadata.permissions().mode() & 0o777;
+                checks.push(DoctorCheck {
+                    name: "config permissions",
+                    status: if mode & 0o077 == 0 { "ok" } else { "warning" },
+                    detail: if mode & 0o077 == 0 {
+                        format!("{mode:04o} (owner-only)")
+                    } else {
+                        format!("{mode:04o} (recommended: 0600)")
+                    },
+                });
+            }
+
         }
     }
 
-    #[cfg(unix)]
-    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = metadata.permissions().mode() & 0o777;
-        checks.push(DoctorCheck {
-            name: "config permissions",
-            status: if mode & 0o077 == 0 { "ok" } else { "warning" },
-            detail: if mode & 0o077 == 0 {
-                format!("{mode:04o} (owner-only)")
+    match config_backup_health() {
+        Err(error) => checks.push(DoctorCheck {
+            name: "config backups",
+            status: "error",
+            detail: format!("unknown: {error}"),
+        }),
+        Ok((present_backups, valid_backups, bad_backups)) => checks.push(DoctorCheck {
+            name: "config backups",
+            status: if bad_backups > 0 || valid_backups == 0 {
+                "warning"
             } else {
-                format!("{mode:04o} (recommended: 0600)")
+                "ok"
             },
-        });
+            detail: if present_backups == 0 {
+                "none yet; rotating backups are created after in-app saves".to_string()
+            } else {
+                format!("{valid_backups} valid, {bad_backups} invalid or unreadable")
+            },
+        }),
     }
-
-    let (present_backups, valid_backups, bad_backups) = config_backup_health();
-    checks.push(DoctorCheck {
-        name: "config backups",
-        status: if bad_backups > 0 || valid_backups == 0 {
-            "warning"
-        } else {
-            "ok"
-        },
-        detail: if present_backups == 0 {
-            "none yet; rotating backups are created after in-app saves".to_string()
-        } else {
-            format!("{valid_backups} valid, {bad_backups} invalid or unreadable")
-        },
-    });
 
     let (lock_status, lock_detail) = match crate::config_store::lock_status() {
         crate::config_store::ConfigLockStatus::Clear => ("ok", "clear"),
@@ -772,11 +801,17 @@ fn doctor(format: ReportFormat) -> bool {
         },
     });
 
-    let (ready, active) = crate::state::session_snapshot_counts();
-    checks.push(DoctorCheck {
-        name: "session snapshots",
-        status: "ok",
-        detail: format!("{ready} ready, {active} active"),
+    checks.push(match crate::state::session_snapshot_counts() {
+        Ok((ready, active)) => DoctorCheck {
+            name: "session snapshots",
+            status: "ok",
+            detail: format!("{ready} ready, {active} active"),
+        },
+        Err(error) => DoctorCheck {
+            name: "session snapshots",
+            status: "error",
+            detail: format!("unknown: {error}"),
+        },
     });
     let (config, _, _) = load_config();
     let shell_argv = choose_shell_argv(config.shell.as_deref());
@@ -1017,7 +1052,7 @@ fn doctor(format: ReportFormat) -> bool {
 }
 
 fn init_config_file() -> Result<(), String> {
-    let path = config_file_path();
+    let path = config_file_path().map_err(|error| error.to_string())?;
     crate::config_store::ensure_config_parent(&path).map_err(|error| error.to_string())?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -1188,16 +1223,32 @@ pub(crate) fn handle_early_args() -> Option<glib::ExitCode> {
             println!("forge {}", env!("CARGO_PKG_VERSION"));
             true
         }
-        EarlyCommand::ConfigPath => {
-            println!("{}", config_file_path().display());
-            true
+        EarlyCommand::ConfigPath => match config_file_path() {
+            Ok(path) => {
+                println!("{}", path.display());
+                true
+            }
+            Err(error) => {
+                eprintln!("forge: {error}");
+                false
+            }
         }
         EarlyCommand::PrintDefaultConfig => {
             print!("{}", include_str!("../config.toml.example"));
             true
         }
         EarlyCommand::CheckConfig(path, format) => {
-            check_config(&path.unwrap_or_else(config_file_path), format)
+            match path.map(Ok).unwrap_or_else(config_file_path) {
+                Ok(path) => check_config(&path, format),
+                Err(error) => {
+                    if format == ReportFormat::Json {
+                        println!("{}", unavailable_config_report(&error));
+                    } else {
+                        eprintln!("forge: {error}");
+                    }
+                    false
+                }
+            }
         }
         EarlyCommand::Doctor(format) => doctor(format),
         EarlyCommand::InitConfig => match init_config_file() {
@@ -1215,11 +1266,17 @@ pub(crate) fn handle_early_args() -> Option<glib::ExitCode> {
             print_completion(shell);
             true
         }
-        EarlyCommand::RestoreConfigBackup => match crate::config_store::restore_backup() {
-            Ok((source, _revision)) => {
+        EarlyCommand::RestoreConfigBackup => match config_file_path()
+            .map_err(|error| error.to_string())
+            .and_then(|target| {
+                crate::config_store::restore_backup()
+                    .map(|(source, _revision)| (target, source))
+                    .map_err(|error| error.to_string())
+            }) {
+            Ok((target, source)) => {
                 println!(
                     "Restored {} from {}",
-                    config_file_path().display(),
+                    target.display(),
                     source.display()
                 );
                 true
@@ -1240,6 +1297,18 @@ pub(crate) fn handle_early_args() -> Option<glib::ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_config_is_not_reported_as_a_missing_file() {
+        let report = unavailable_config_report(&crate::config::config_root_unavailable());
+        assert!(report["path"].is_null());
+        assert!(report["exists"].is_null());
+        assert_eq!(report["valid"], false);
+        assert_eq!(report["errors"], 1);
+        assert_eq!(report["warnings"], 0);
+        assert_eq!(report["issues"][0]["severity"], "error");
+        assert_eq!(report["issues"][0]["path"], "$");
+    }
 
     fn parse(args: &[&str]) -> Result<ParsedArgs, String> {
         parse_args(args.iter().map(OsString::from))

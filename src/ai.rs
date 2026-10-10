@@ -84,9 +84,46 @@ pub fn client_from_config(config: &crate::config::Config) -> Result<AiClient, Ai
     })
 }
 
+/// Fallible startup for UI request workers. A failed spawn drops the closure
+/// and its result sender, allowing the existing disconnected-channel recovery
+/// to clear request state without executing the request on the GUI thread.
+pub(crate) fn spawn_request_worker(
+    name: &str,
+    task: impl FnOnce() + Send + 'static,
+) -> std::io::Result<()> {
+    spawn_request_worker_with(task, |task| {
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(task)
+            .map(|_handle| ())
+    })
+}
+
+fn spawn_request_worker_with<T>(
+    task: T,
+    spawn: impl FnOnce(T) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    spawn(task)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_start_failure_disconnects_receiver_without_running_request() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<()>(1);
+        let task = move || {
+            let _ = sender.send(());
+            panic!("request must not run when thread startup fails");
+        };
+        let error = spawn_request_worker_with(task, |_task| {
+            Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "thread limit"))
+        }).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(error.to_string(), "thread limit");
+        assert_eq!(receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected));
+    }
 
     #[test]
     fn default_api_key_path_is_per_app_identity() {

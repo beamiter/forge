@@ -1075,9 +1075,15 @@ pub fn run() -> glib::ExitCode {
         // config reload followed by a new Block pane can then opt in without
         // silently falling back to volatile state. This is a bounded read and
         // never creates the file.
-        let organism_memory = match jterm_core::organism_memory::OrganismMemory::load(
-            crate::config::default_ascii_organism_memory_path(),
-        ) {
+        let organism_memory = match crate::config::default_ascii_organism_memory_path()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "no absolute state or home directory",
+                )
+            })
+            .and_then(|path| jterm_core::organism_memory::OrganismMemory::load(path))
+        {
             Ok(memory) => Some(memory),
             Err(error) => {
                 // Fail closed: a corrupt/future/unsafe memory file must not be
@@ -1198,6 +1204,8 @@ pub fn run() -> glib::ExitCode {
             ai_panel_visible: Rc::new(Cell::new(ai_initially_visible)),
             ai_panel_width_restoring: Rc::new(Cell::new(false)),
         });
+
+        ui.observe_ascii_organism_motion();
 
         // A configuration that could not be read leaves every setting at its
         // default, which looks exactly like a config file that does nothing.
@@ -2021,7 +2029,13 @@ pub fn run() -> glib::ExitCode {
 
         // Safe mode deliberately ignores later config-file changes.
         if !launch.safe_mode {
-            let config_path = config_file_path();
+            let config_path = match config_file_path() {
+                Ok(path) => path,
+                Err(error) => {
+                    log::warn!("Configuration watcher unavailable: {error}");
+                    return;
+                }
+            };
             if let Some(parent_dir) = config_path.parent() {
                 let _ = fs::create_dir_all(parent_dir);
             }

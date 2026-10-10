@@ -5,6 +5,7 @@
 
 use log::{LevelFilter, Log, Metadata, Record};
 use std::cmp::Reverse;
+use std::io::{self, Write};
 use std::time::Instant;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +42,21 @@ struct SimpleStderrLogger {
     started_at: Instant,
 }
 
+impl SimpleStderrLogger {
+    fn write_record(&self, writer: &mut impl Write, record: &Record<'_>) {
+        // Logging must not turn a recoverable application error into a panic
+        // when a redirected stderr closes or becomes temporarily unwritable.
+        let _ = writeln!(
+            writer,
+            "[+{:>9.3}s][{:>5}][{}] {}",
+            self.started_at.elapsed().as_secs_f64(),
+            record.level(),
+            record.target(),
+            record.args()
+        );
+    }
+}
+
 impl Log for SimpleStderrLogger {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
         metadata.level() <= self.filter.level_for(metadata.target())
@@ -48,13 +64,7 @@ impl Log for SimpleStderrLogger {
 
     fn log(&self, record: &Record<'_>) {
         if self.enabled(record.metadata()) {
-            eprintln!(
-                "[+{:>9.3}s][{:>5}][{}] {}",
-                self.started_at.elapsed().as_secs_f64(),
-                record.level(),
-                record.target(),
-                record.args()
-            );
+            self.write_record(&mut io::stderr().lock(), record);
         }
     }
 
@@ -132,6 +142,36 @@ pub(crate) fn init_logging() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logging_tolerates_unwritable_output() {
+        struct FailingWriter(io::ErrorKind);
+        impl Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(self.0))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let logger = SimpleStderrLogger {
+            filter: parse_log_filter("warn"),
+            started_at: Instant::now(),
+        };
+        let record = Record::builder()
+            .args(format_args!("recoverable storage error"))
+            .level(log::Level::Warn)
+            .target("forge::state")
+            .build();
+        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::WouldBlock] {
+            logger.write_record(&mut FailingWriter(kind), &record);
+        }
+        let mut output = Vec::new();
+        logger.write_record(&mut output, &record);
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .ends_with("s][ WARN][forge::state] recoverable storage error\n"));
+    }
 
     #[test]
     fn parses_plain_log_level() {

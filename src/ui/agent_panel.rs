@@ -236,7 +236,13 @@ impl AgentHandle {
     /// when there is nothing to save). Called on window close, before
     /// shutdown cancels the session.
     pub(crate) fn persist(&self) {
-        let path = agent_snapshot_path();
+        let path = match agent_snapshot_path() {
+            Ok(path) => path,
+            Err(error) => {
+                log::warn!("agent: session storage unavailable: {error}");
+                return;
+            }
+        };
         if let Some(snapshot) = self.runtime.session.borrow().snapshot() {
             if let Err(error) = write_agent_snapshot_file(&path, &snapshot) {
                 log::warn!("agent: could not persist session: {error}");
@@ -248,10 +254,10 @@ impl AgentHandle {
     }
 }
 
-fn agent_snapshot_path() -> std::path::PathBuf {
-    let mut path = crate::config::config_file_path();
+fn agent_snapshot_path() -> std::io::Result<std::path::PathBuf> {
+    let mut path = crate::config::config_file_path()?;
     path.set_file_name("agent_session.json");
-    path
+    Ok(path)
 }
 
 fn write_agent_snapshot_file(
@@ -746,7 +752,7 @@ impl AgentRuntime {
         );
 
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
+        if let Err(error) = crate::ai::spawn_request_worker("forge-agent-request", move || {
             if session_cancellation.is_cancelled() {
                 return;
             }
@@ -779,7 +785,9 @@ impl AgentRuntime {
             if !session_cancellation.is_cancelled() {
                 let _ = tx.send(result);
             }
-        });
+        }) {
+            log::warn!("forge-agent-request could not start: {error}");
+        }
 
         let rx = RefCell::new(rx);
         gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
@@ -1879,7 +1887,13 @@ impl UiState {
         // A snapshot persisted by the previous run is atomically claimed,
         // consumed once, and rebound to the pane the user opened the Agent on.
         // Pending approval state must never be restorable by two processes.
-        let restored_session = load_agent_snapshot(&agent_snapshot_path());
+        let restored_session = match agent_snapshot_path() {
+            Ok(path) => load_agent_snapshot(&path),
+            Err(error) => {
+                log::warn!("agent: session restore unavailable: {error}");
+                None
+            }
+        };
         let was_restored = restored_session.is_some();
         let notice = restored_session.as_ref().and_then(restored_history_notice);
         let history_notice = Label::new(notice);

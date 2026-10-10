@@ -999,12 +999,56 @@ impl ScanSchedulerState {
     }
 }
 
+/// Start a bounded pool without making temporary resource exhaustion fatal
+/// to the GUI. Keep workers already started; never admit work with zero.
+fn start_file_workers(
+    requested: usize,
+    mut spawn: impl FnMut(usize) -> io::Result<()>,
+) -> io::Result<usize> {
+    if requested == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "file worker pool cannot be empty"));
+    }
+    let mut started = 0;
+    for index in 0..requested {
+        match spawn(index) {
+            Ok(()) => started += 1,
+            Err(error) if started == 0 => return Err(error),
+            Err(error) => {
+                log::warn!("File worker pool started {started} of {requested} workers: {error}");
+                break;
+            }
+        }
+    }
+    Ok(started)
+}
+
+#[derive(Debug)]
+struct FileWorkerStartupFailure(String);
+
+impl std::fmt::Display for FileWorkerStartupFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FileWorkerStartupFailure {}
+
+fn cached_file_scheduler<T>(
+    slot: &OnceLock<io::Result<T>>,
+    initialize: impl FnOnce() -> io::Result<T>,
+) -> io::Result<&T> {
+    slot.get_or_init(initialize)
+        .as_ref()
+        .map_err(|error| io::Error::new(error.kind(), FileWorkerStartupFailure(error.to_string())))
+}
+
 struct ScanScheduler {
     shared: Arc<(Mutex<ScanSchedulerState>, Condvar)>,
+    worker_count: usize,
 }
 
 impl ScanScheduler {
-    fn new(worker_count: usize, capacity: usize) -> Self {
+    fn new(worker_count: usize, capacity: usize) -> io::Result<Self> {
         let shared = Arc::new((
             Mutex::new(ScanSchedulerState {
                 queue: ScanQueue::new(capacity),
@@ -1013,22 +1057,23 @@ impl ScanScheduler {
             }),
             Condvar::new(),
         ));
-        for index in 0..worker_count {
+        let worker_count = start_file_workers(worker_count, |index| {
             let shared = shared.clone();
             std::thread::Builder::new()
                 .name(format!("forge-file-tree-scan-{index}"))
                 .spawn(move || scan_worker(shared))
-                .expect("file-tree scan worker must start");
-        }
-        Self { shared }
+                .map(|_handle| ())
+        })?;
+        Ok(Self { shared, worker_count })
     }
 
-    fn global() -> &'static Self {
-        static SCHEDULER: OnceLock<ScanScheduler> = OnceLock::new();
-        SCHEDULER.get_or_init(|| Self::new(MAX_CONCURRENT_SCANS, MAX_PENDING_SCANS))
+    fn global() -> io::Result<&'static Self> {
+        static SCHEDULER: OnceLock<io::Result<ScanScheduler>> = OnceLock::new();
+        cached_file_scheduler(&SCHEDULER, || Self::new(MAX_CONCURRENT_SCANS, MAX_PENDING_SCANS))
     }
 
     fn enqueue(&self, priority: ScanPriority, job: ScanJob) -> io::Result<()> {
+        debug_assert!(self.worker_count > 0);
         let (lock, wake) = &*self.shared;
         let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let cancelled = state
@@ -1108,27 +1153,29 @@ type FsOpJob = Box<dyn FnOnce() + Send + 'static>;
 struct FsOpScheduler {
     shared: Arc<(Mutex<VecDeque<FsOpJob>>, Condvar)>,
     capacity: usize,
+    worker_count: usize,
 }
 
 impl FsOpScheduler {
-    fn new(worker_count: usize, capacity: usize) -> Self {
+    fn new(worker_count: usize, capacity: usize) -> io::Result<Self> {
         let shared = Arc::new((Mutex::new(VecDeque::<FsOpJob>::new()), Condvar::new()));
-        for index in 0..worker_count {
+        let worker_count = start_file_workers(worker_count, |index| {
             let shared = shared.clone();
             std::thread::Builder::new()
                 .name(format!("forge-file-tree-op-{index}"))
                 .spawn(move || fs_op_worker(shared))
-                .expect("file-tree operation worker must start");
-        }
-        Self { shared, capacity }
+                .map(|_handle| ())
+        })?;
+        Ok(Self { shared, capacity, worker_count })
     }
 
-    fn global() -> &'static Self {
-        static SCHEDULER: OnceLock<FsOpScheduler> = OnceLock::new();
-        SCHEDULER.get_or_init(|| Self::new(MAX_CONCURRENT_FS_OPS, MAX_PENDING_FS_OPS))
+    fn global() -> io::Result<&'static Self> {
+        static SCHEDULER: OnceLock<io::Result<FsOpScheduler>> = OnceLock::new();
+        cached_file_scheduler(&SCHEDULER, || Self::new(MAX_CONCURRENT_FS_OPS, MAX_PENDING_FS_OPS))
     }
 
     fn enqueue(&self, job: FsOpJob) -> io::Result<()> {
+        debug_assert!(self.worker_count > 0);
         let (lock, wake) = &*self.shared;
         let mut queue = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if queue.len() >= self.capacity {
@@ -1200,7 +1247,7 @@ where
 {
     let (tx, rx) = mpsc::sync_channel(1);
     let authority = remote_fs::filesystem_identity(&loc, &hosts)?;
-    ScanScheduler::global().enqueue(
+    ScanScheduler::global()?.enqueue(
         priority,
         ScanJob {
             authority,
@@ -1227,7 +1274,7 @@ where
     W: FnOnce() -> io::Result<T> + Send + 'static,
 {
     let (tx, rx) = mpsc::sync_channel(1);
-    FsOpScheduler::global().enqueue(Box::new(move || {
+    FsOpScheduler::global()?.enqueue(Box::new(move || {
         let _ = tx.send(work());
     }))?;
     poll_worker(rx, apply, "file operation worker disconnected");
@@ -1696,7 +1743,9 @@ impl FileTreeModel {
         self.selection_after_refresh.borrow_mut().clear();
         self.root_path.borrow_mut().clear();
         cancel_directory_scans(&self.directory_scan_revisions.borrow());
-        ScanScheduler::global().retire_cancelled();
+        if let Ok(scheduler) = ScanScheduler::global() {
+            scheduler.retire_cancelled();
+        }
         self.directory_scan_revisions.borrow_mut().clear();
         set_drop_hover(&self.drop_hover, None);
         generation
@@ -1716,7 +1765,9 @@ impl FileTreeModel {
 
     fn cancel_pending_scans_preserve_tree(&self) {
         cancel_directory_scans(&self.directory_scan_revisions.borrow());
-        ScanScheduler::global().retire_cancelled();
+        if let Ok(scheduler) = ScanScheduler::global() {
+            scheduler.retire_cancelled();
+        }
         self.directory_scan_revisions.borrow_mut().clear();
     }
 
@@ -2244,6 +2295,9 @@ impl FileTreeModel {
 }
 
 fn public_directory_error_message(error: &io::Error) -> &'static str {
+    if error.get_ref().is_some_and(|source| source.is::<FileWorkerStartupFailure>()) {
+        return "File workers could not start; restart Forge after freeing system resources";
+    }
     match error.kind() {
         io::ErrorKind::NotFound => "Directory not found or unavailable",
         io::ErrorKind::PermissionDenied => "Permission denied",
@@ -2263,6 +2317,9 @@ fn public_directory_error_message(error: &io::Error) -> &'static str {
 }
 
 fn public_file_operation_error_message(error: &io::Error) -> &'static str {
+    if error.get_ref().is_some_and(|source| source.is::<FileWorkerStartupFailure>()) {
+        return "File workers could not start; restart Forge after freeing system resources";
+    }
     match error.kind() {
         io::ErrorKind::AlreadyExists => "An item with this name already exists",
         io::ErrorKind::NotFound => "The item no longer exists",
@@ -2408,7 +2465,9 @@ fn invalidate_removed_subtrees_parts(
     }
     // Cancelled queued work is removed immediately instead of consuming one
     // of the bounded queue's physical slots until a worker happens to pop it.
-    ScanScheduler::global().retire_cancelled();
+    if let Ok(scheduler) = ScanScheduler::global() {
+        scheduler.retire_cancelled();
+    }
     child_stores
         .borrow_mut()
         .retain(|path, _| !path_is_in_removed_subtree(path, removed));
@@ -3781,7 +3840,9 @@ impl UiState {
             Ok(authority) => authority,
             Err(error) => {
                 self.file_tree_navigation.borrow_mut().fail(&request);
-                ScanScheduler::global().retire_cancelled();
+                if let Ok(scheduler) = ScanScheduler::global() {
+                    scheduler.retire_cancelled();
+                }
                 self.refresh_file_tree_root_header();
                 self.refresh_file_tree_location_selector();
                 let detail = public_directory_error_message(&error);
@@ -3881,7 +3942,9 @@ impl UiState {
             // selector/header immediately and retire its queued scan.
             self.invalidate_file_tree_remote_follow();
             if self.file_tree_navigation.borrow_mut().cancel_pending() {
-                ScanScheduler::global().retire_cancelled();
+                if let Ok(scheduler) = ScanScheduler::global() {
+                    scheduler.retire_cancelled();
+                }
             }
             self.refresh_file_tree_root_header();
             self.refresh_file_tree_location_selector();
@@ -6122,6 +6185,54 @@ fn copy_path_payload(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn file_worker_startup_keeps_only_the_actual_started_pool() {
+        let mut attempts = Vec::new();
+        let started = start_file_workers(8, |index| {
+            attempts.push(index);
+            if index == 2 {
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "thread limit"))
+            } else {
+                Ok(())
+            }
+        }).unwrap();
+        assert_eq!(started, 2);
+        assert_eq!(attempts, [0, 1, 2]);
+        assert_eq!(start_file_workers(3, |_| Ok(())).unwrap(), 3);
+    }
+
+    #[test]
+    fn file_worker_startup_rejects_zero_workers_without_admission() {
+        let error = start_file_workers(8, |_| {
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "thread limit"))
+        }).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(error.to_string(), "thread limit");
+        assert_eq!(
+            start_file_workers(0, |_| panic!("empty pool must not spawn")).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput,
+        );
+        assert!(ScanScheduler::new(0, 1).is_err());
+        assert!(FsOpScheduler::new(0, 1).is_err());
+    }
+
+    #[test]
+    fn unavailable_file_scheduler_preserves_error_without_retry_or_queue() {
+        let slot: OnceLock<io::Result<usize>> = OnceLock::new();
+        let first = cached_file_scheduler(&slot, || {
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "thread limit"))
+        }).unwrap_err();
+        let repeated = cached_file_scheduler(&slot, || {
+            panic!("failed pool initialization is stable for this process")
+        }).unwrap_err();
+        for error in [first, repeated] {
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(error.to_string(), "thread limit");
+            assert!(public_directory_error_message(&error).contains("restart Forge"));
+            assert!(public_file_operation_error_message(&error).contains("restart Forge"));
+        }
+    }
+
     fn navigation_point(path: &str) -> FileTreeNavigationPoint {
         FileTreeNavigationPoint {
             location: FsLocation::Local,
@@ -6787,7 +6898,7 @@ mod tests {
 
     #[test]
     fn fs_op_scheduler_uses_fixed_workers_and_hard_queue_backpressure() {
-        let scheduler = FsOpScheduler::new(1, 1);
+        let scheduler = FsOpScheduler::new(1, 1).expect("test worker starts");
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
         scheduler

@@ -1,4 +1,4 @@
-//! Native Block-pane body for the experimental ASCII organism.
+//! Native local Block/Unified body for the experimental ASCII organism.
 
 use gtk4::prelude::*;
 use gtk4::{Box as GBox, Label, Orientation};
@@ -3194,6 +3194,33 @@ impl UiState {
         });
         self.organism_presence
             .focus_view(focused.flatten().as_ref());
+    }
+
+    /// Install once per window. Automatic motion follows later desktop
+    /// preference changes without retaining the window through global Settings.
+    pub(crate) fn observe_ascii_organism_motion(self: &Rc<Self>) {
+        let Some(desktop) = gtk4::Settings::default() else {
+            return;
+        };
+        let ui = Rc::downgrade(self);
+        let handler = desktop.connect_gtk_enable_animations_notify(move |_| {
+            let Some(ui) = ui.upgrade() else {
+                return;
+            };
+            let follows_desktop = {
+                let config = ui.config.borrow();
+                config.ascii_organism_enabled && config.ascii_organism_motion.is_none()
+            };
+            if follows_desktop {
+                ui.sync_ascii_organism_settings();
+            }
+        });
+        let handler = RefCell::new(Some(handler));
+        self.window.connect_destroy(move |_| {
+            if let Some(handler) = handler.borrow_mut().take() {
+                desktop.disconnect(handler);
+            }
+        });
     }
 
     pub(crate) fn sync_ascii_organism_settings(&self) {

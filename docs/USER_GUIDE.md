@@ -46,6 +46,10 @@ forge --config ~/configs/work.toml
 forge --check-config ~/configs/work.toml
 ```
 
+自动配置目录必须是绝对路径：优先使用有效的 `XDG_CONFIG_HOME`，否则使用绝对 `HOME` 下的 `.config`，最后尝试 GLib 提供的绝对配置目录。无法确定时不会转向当前工作目录；配置、窗口及 Agent 会话的自动持久化暂停，已有文件保持不变。显式 `--config` / `FORGE_CONFIG` 仍可选择相对路径；显式 `--check-config PATH` 不依赖自动目录。
+
+`--check-config --json` 的正常路径报告保留原有字段类型。仅在未指定路径、且自动目录无法确定时，错误报告的 `path` 与 `exists` 为 `null`（未知），`valid` 为 `false`、`errors` 为 `1`，并以失败状态退出。脚本应先检查退出状态及 `valid`，再读取路径字段；未知目录不能当作首次运行或文件不存在。`--doctor` 同样将无法检查的备份及会话数量报告为错误，而不是零。
+
 安装版还提供隐私保护的支持归档工具：
 
 ```bash

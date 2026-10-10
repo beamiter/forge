@@ -3606,8 +3606,8 @@ impl UiState {
 
         let ascii_organism_row = adw::SwitchRow::builder()
             .title("ASCII Organism")
-            .subtitle("Local, no-LLM companion; changes apply to open panes")
-            .tooltip_text("Pause near a resting companion for a hello; clicks and selection stay with your terminal.")
+            .subtitle("Local, no-LLM companion for Block/Unified panes")
+            .tooltip_text("Changes apply to open panes. Pause near a resting companion for a hello; clicks and selection stay with your terminal.")
             .active(config.ascii_organism_enabled)
             .build();
         ascii_organism_row.set_sensitive(!safe_mode);
@@ -3886,7 +3886,7 @@ impl UiState {
             let mut config = ui.config.borrow_mut();
             config.command_history_enabled = enabled;
             if enabled && config.command_history_path.is_none() {
-                config.command_history_path = Some(crate::config::default_command_history_path());
+                config.command_history_path = crate::config::default_command_history_path();
             }
             drop(config);
             ui.sync_block_configs();
@@ -4052,7 +4052,14 @@ impl UiState {
                 .borrow()
                 .ai_api_key_file_configured
                 .clone()
-                .unwrap_or_else(crate::config::default_ai_api_key_path);
+                .or_else(crate::config::default_ai_api_key_path);
+            let Some(path) = path else {
+                ui.show_config_error(
+                    "API Key was not saved",
+                    "No usable default API key path; configure an absolute UTF-8 key file path.",
+                );
+                return;
+            };
             if let Err(error) = crate::ai::write_api_key_file(&path, row.text().as_str()) {
                 ui.show_config_error("API Key was not saved", &error.to_string());
                 return;

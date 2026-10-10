@@ -120,7 +120,7 @@ impl CommandSuggestionRuntime {
         let shell = runtime.shell.clone();
         let block_context = runtime.block_context.clone();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
+        if let Err(error) = crate::ai::spawn_request_worker("forge-command-suggestion", move || {
             let result = crate::ai::nl_to_command_with_context_blocking_cancellable(
                 &client,
                 &request,
@@ -131,7 +131,9 @@ impl CommandSuggestionRuntime {
                 &cancellation,
             );
             let _ = tx.send(result);
-        });
+        }) {
+            log::warn!("forge-command-suggestion could not start: {error}");
+        }
 
         let rx = RefCell::new(rx);
         gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {

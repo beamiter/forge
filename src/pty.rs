@@ -424,6 +424,29 @@ fn write_all_fd(fd: RawFd, mut data: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+fn set_close_on_exec(fd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: the owned descriptor stays live through both fcntl calls.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+    if flags < 0
+        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn openpty_cloexec(winsize: Option<&nix::pty::Winsize>) -> io::Result<OpenptyResult> {
+    let pair = openpty(winsize, None).map_err(io::Error::other)?;
+    // A retained master must not leak into a later pane or helper's exec.
+    // Both descriptors remain owned here and close if either update fails.
+    // openpty has no atomic CLOEXEC option: another thread can still fork in
+    // the allocation-to-fcntl window. This fixes steady-state inheritance,
+    // without imposing a newer Linux-only allocator on supported Unix hosts.
+    set_close_on_exec(&pair.master)?;
+    set_close_on_exec(&pair.slave)?;
+    Ok(pair)
+}
+
 fn spawn_fd_writer(fd: OwnedFd) -> io::Result<mpsc::SyncSender<Vec<u8>>> {
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(PTY_INPUT_QUEUE_CAPACITY);
     std::thread::Builder::new()
@@ -708,7 +731,7 @@ impl OwnedPty {
             ws_ypixel: 0,
         };
         let OpenptyResult { master, slave } =
-            openpty(Some(&initial_size), None).map_err(io::Error::other)?;
+            openpty_cloexec(Some(&initial_size))?;
         let master_fd = master.as_raw_fd();
         let slave_fd = slave.as_raw_fd();
 
@@ -734,6 +757,17 @@ impl OwnedPty {
                     || libc::dup2(slave_fd, libc::STDERR_FILENO) < 0
                 {
                     libc::_exit(126);
+                }
+                // dup2(fd, fd) preserves CLOEXEC when openpty reused a closed
+                // standard descriptor. All three final stdio descriptors must
+                // survive exec, even in that case.
+                for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags < 0
+                        || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                    {
+                        libc::_exit(126);
+                    }
                 }
                 if slave_fd > libc::STDERR_FILENO {
                     libc::close(slave_fd);
@@ -1432,7 +1466,7 @@ impl OwnedPty {
     /// return [`PtyForeground::Unknown`], which would silence every
     /// foreground-gated decision under test.
     pub(crate) fn for_tests(foreground: PtyForeground) -> io::Result<Self> {
-        let OpenptyResult { master, slave } = openpty(None, None).map_err(io::Error::other)?;
+        let OpenptyResult { master, slave } = openpty_cloexec(None)?;
         prepare_test_slave(&slave);
         // SAFETY: the child performs only async-signal-safe syscalls before
         // `_exit`, which is the rule for forking from this multi-threaded
@@ -1654,6 +1688,36 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::Path;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn allocated_pty_pair_is_close_on_exec() {
+        let pair = openpty_cloexec(None).unwrap();
+        for fd in [&pair.master, &pair.slave] {
+            // SAFETY: both owned descriptors stay live until the test returns.
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0);
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+            set_close_on_exec(fd).unwrap();
+            assert_eq!(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) }, flags);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_pty_descriptors_do_not_survive_helper_exec() {
+        let pair = openpty_cloexec(None).unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "for fd in \"$@\"; do test ! -e \"/proc/self/fd/$fd\" || exit 1; done",
+                "pty-fd-check",
+            ])
+            .arg(pair.master.as_raw_fd().to_string())
+            .arg(pair.slave.as_raw_fd().to_string())
+            .status()
+            .unwrap();
+        assert!(status.success(), "an unrelated exec inherited a PTY descriptor");
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

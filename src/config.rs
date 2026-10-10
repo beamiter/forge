@@ -876,8 +876,8 @@ pub struct Config {
     /// Disabled by default because finished blocks already own that history;
     /// enabling it deliberately presents both the VTE and structured views.
     pub(crate) preserve_live_scrollback: bool,
-    /// Show the experimental no-LLM ASCII organism in Block panes. The widget
-    /// reacts only to Forge's local command lifecycle events and never runs a
+    /// Show the experimental no-LLM ASCII organism in local Block/Unified panes.
+    /// The widget reacts only to local command lifecycle events and never runs a
     /// command or sends terminal contents elsewhere.
     pub(crate) ascii_organism_enabled: bool,
     /// Explicit motion level for the organism body; `None` follows the
@@ -1345,31 +1345,94 @@ fn env_rgba(name: &str) -> Option<RGBA> {
 // File config
 // ---------------------------------------------------------------------------
 
-pub(crate) fn config_file_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("FORGE_CONFIG").filter(|p| !p.is_empty()) {
-        return PathBuf::from(path);
-    }
-    glib::user_config_dir().join("forge").join("config.toml")
+pub(crate) fn config_root_unavailable() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "configuration storage is unavailable: no absolute config or home directory",
+    )
 }
 
-pub(crate) fn default_ai_api_key_path() -> String {
-    glib::user_config_dir()
-        .join("forge")
+fn config_home_from(
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    fallback: &Path,
+) -> Option<PathBuf> {
+    xdg_config_home
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            home.map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|home| home.join(".config"))
+        })
+        .or_else(|| fallback.is_absolute().then(|| fallback.to_path_buf()))
+}
+
+pub(crate) fn config_home() -> std::io::Result<PathBuf> {
+    config_home_from(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+        &glib::user_config_dir(),
+    )
+    .ok_or_else(config_root_unavailable)
+}
+
+fn config_file_path_from(
+    explicit: Option<&std::ffi::OsStr>,
+    default_root: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> std::io::Result<PathBuf> {
+    if let Some(path) = explicit.filter(|p| !p.is_empty()) {
+        // An explicitly selected relative path is intentional, unlike an
+        // automatic config root inherited from malformed XDG variables.
+        return Ok(PathBuf::from(path));
+    }
+    default_root().map(|root| root.join("forge").join("config.toml"))
+}
+
+pub(crate) fn config_file_path() -> std::io::Result<PathBuf> {
+    config_file_path_from(std::env::var_os("FORGE_CONFIG").as_deref(), config_home)
+}
+
+pub(crate) fn default_ai_api_key_path() -> Option<String> {
+    config_home()
+        .ok()
+        .and_then(|root| default_ai_api_key_path_in(&root))
+}
+
+fn default_ai_api_key_path_in(root: &Path) -> Option<String> {
+    // The key writer accepts UTF-8 paths only. A lossy conversion could name
+    // a different directory instead of rejecting this destination.
+    root.join("forge")
         .join("ai.key")
-        .to_string_lossy()
-        .into_owned()
+        .into_os_string()
+        .into_string()
+        .ok()
 }
 
 pub(crate) fn ai_api_key_file_env_override() -> Option<String> {
-    env_string("FORGE_AI_API_KEY_FILE").filter(|path| configured_path_is_safe(path, true))
+    selected_ai_api_key_file(std::env::var("FORGE_AI_API_KEY_FILE").ok())
 }
 
-pub(crate) fn default_command_history_path() -> String {
-    xdg_state_home()
+fn selected_ai_api_key_file(value: Option<String>) -> Option<String> {
+    // Keep a nonempty selection exact, even when invalid. The strict key
+    // reader/writer must reject that destination rather than fall back to
+    // another credential file. Only an exactly empty value means unset.
+    value.filter(|path| !path.is_empty())
+}
+
+pub(crate) fn default_command_history_path() -> Option<String> {
+    xdg_state_home().and_then(|state| default_command_history_path_in(&state))
+}
+
+fn default_command_history_path_in(state: &Path) -> Option<String> {
+    // History accepts String paths. Do not turn an unrepresentable state
+    // directory into a different destination by replacing its raw bytes.
+    state
         .join("forge")
         .join("history.jsonl")
-        .to_string_lossy()
-        .into_owned()
+        .into_os_string()
+        .into_string()
+        .ok()
 }
 
 /// Private, local state used by the experimental native ASCII organism.
@@ -1377,41 +1440,50 @@ pub(crate) fn default_command_history_path() -> String {
 /// This is intentionally not configurable: command metadata must never make
 /// an arbitrary user-selected path writable. Tests and isolated launches can
 /// still redirect it through the standard `XDG_STATE_HOME` environment.
-pub(crate) fn default_ascii_organism_memory_path() -> PathBuf {
+pub(crate) fn default_ascii_organism_memory_path() -> Option<PathBuf> {
     // Keep the native schema isolated from the standalone prototype, whose
     // historical `ascii-organism.json` uses an incompatible version-1 shape.
-    xdg_state_home()
-        .join("forge")
-        .join("ascii-organism-native.json")
+    xdg_state_home().map(|state| state.join("forge").join("ascii-organism-native.json"))
 }
 
 /// GLib only exposes `g_get_user_state_dir()` behind a newer API feature than
 /// forge currently requires, so implement the XDG Base Directory rule
-/// directly: an absolute `$XDG_STATE_HOME`, otherwise `$HOME/.local/state`.
-fn xdg_state_home() -> PathBuf {
-    xdg_state_home_from(
+/// directly: an absolute `$XDG_STATE_HOME`, otherwise an absolute home directory
+/// plus `.local/state`. GLib can return relative HOME verbatim, so validate its
+/// fallback too and disable persistence when neither source is safe.
+fn xdg_state_home() -> Option<PathBuf> {
+    let path = xdg_state_home_from(
         std::env::var_os("XDG_STATE_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
         &glib::home_dir(),
-    )
+    );
+    if path.is_none() {
+        log::warn!("local state persistence is unavailable: no absolute state or home directory");
+    }
+    path
 }
 
 fn xdg_state_home_from(
     xdg_state_home: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
     fallback_home: &Path,
-) -> PathBuf {
+) -> Option<PathBuf> {
     if let Some(path) = xdg_state_home
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
     {
-        return path;
+        return Some(path);
     }
     home.filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| fallback_home.to_path_buf())
-        .join(".local/state")
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            fallback_home
+                .is_absolute()
+                .then(|| fallback_home.to_path_buf())
+        })
+        .map(|home| home.join(".local/state"))
 }
 
 /// Severity reported by the headless config checker and startup diagnostics.
@@ -2343,7 +2415,14 @@ pub(crate) fn load_error() -> Option<String> {
 
 fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision>) {
     clear_load_error();
-    let path = config_file_path();
+    let path = match config_file_path() {
+        Ok(path) => path,
+        Err(error) => {
+            record_load_error(error.to_string());
+            log::warn!("Failed to resolve config file: {error}");
+            return (FileConfig::default(), None);
+        }
+    };
     let display_path =
         || jterm_core::review_input::safe_inline_display(&path.to_string_lossy(), 2 * 1024);
     let bytes = match crate::config_store::read_config_bytes(&path) {
@@ -2832,8 +2911,8 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let command_history_path = if command_history_enabled {
         let requested = env_string("FORGE_COMMAND_HISTORY_PATH")
             .or(fc.command_history_path)
-            .unwrap_or_else(default_command_history_path);
-        normalize_history_path(Some(requested), "command_history_path")
+            .or_else(default_command_history_path);
+        normalize_history_path(requested, "command_history_path")
     } else {
         None
     };
@@ -2943,9 +3022,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         env_string("FORGE_AI_BASE_URL").or(fc.ai_base_url),
         default_ai_base_url,
     );
-    let ai_api_key_file_configured = fc
-        .ai_api_key_file
-        .filter(|path| configured_path_is_safe(path, true));
+    let ai_api_key_file_configured = selected_ai_api_key_file(fc.ai_api_key_file);
     let ai_api_key_file =
         ai_api_key_file_env_override().or_else(|| ai_api_key_file_configured.clone());
 
@@ -3196,6 +3273,85 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn default_history_path_never_rewrites_non_utf8_root_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let state = PathBuf::from(std::ffi::OsString::from_vec(b"/state/test-\xff".to_vec()));
+        assert!(state.is_absolute());
+        assert_eq!(default_command_history_path_in(&state), None);
+        assert_eq!(
+            default_command_history_path_in(Path::new("/state/test")),
+            Some("/state/test/forge/history.jsonl".to_string()),
+        );
+    }
+
+    #[test]
+    fn credential_file_selection_is_exact_and_never_retargets_invalid_paths() {
+        for raw in [
+            "relative.key", "   ", " /absolute/key ", "/absolute/\nkey",
+            "/absolute/\u{202e}key", "/absolute/key", "~/key",
+        ] {
+            let selected = selected_ai_api_key_file(Some(raw.to_string()));
+            assert_eq!(selected.as_deref(), Some(raw));
+            let effective = selected.clone().or_else(|| Some("/configured/key".to_string()));
+            assert_eq!(effective.as_deref(), Some(raw));
+            let write_target = selected.or_else(|| Some("/default/key".to_string()));
+            assert_eq!(write_target.as_deref(), Some(raw));
+        }
+        let oversized = format!("/{}", "x".repeat(MAX_CONFIG_PATH_BYTES));
+        assert!(!configured_path_is_safe(&oversized, true));
+        assert_eq!(selected_ai_api_key_file(Some(oversized.clone())), Some(oversized));
+        assert_eq!(selected_ai_api_key_file(None), None);
+        assert_eq!(selected_ai_api_key_file(Some(String::new())), None);
+        assert_eq!(
+            selected_ai_api_key_file(Some(String::new()))
+                .or_else(|| Some("/configured/key".to_string())),
+            Some("/configured/key".to_string()),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_key_path_never_rewrites_non_utf8_root_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = PathBuf::from(std::ffi::OsString::from_vec(b"/home/test-\xff".to_vec()));
+        assert!(root.is_absolute());
+        assert_eq!(default_ai_api_key_path_in(&root), None);
+        assert_eq!(
+            default_ai_api_key_path_in(Path::new("/home/test/.config")),
+            Some("/home/test/.config/forge/ai.key".to_string()),
+        );
+    }
+
+    #[test]
+    fn automatic_config_root_requires_an_absolute_directory() {
+        use std::ffi::OsStr;
+        let absolute_home = Some(OsStr::new("/home/tester"));
+        assert_eq!(config_home_from(Some(OsStr::new("/xdg")), absolute_home, Path::new("/fallback")), Some(PathBuf::from("/xdg")));
+        for invalid in ["", ".", "relative", "../relative"] {
+            assert_eq!(config_home_from(Some(OsStr::new(invalid)), absolute_home, Path::new("/fallback")), Some(PathBuf::from("/home/tester/.config")));
+            assert_eq!(config_home_from(Some(OsStr::new(invalid)), Some(OsStr::new(invalid)), Path::new("/fallback")), Some(PathBuf::from("/fallback")));
+            assert_eq!(config_home_from(Some(OsStr::new(invalid)), Some(OsStr::new(invalid)), Path::new(invalid)), None);
+        }
+        assert_eq!(config_home_from(None, None, Path::new("relative")), None);
+    }
+
+    #[test]
+    fn explicit_config_path_does_not_require_automatic_storage() {
+        use std::ffi::OsStr;
+        for explicit in ["relative.toml", "/absolute/config.toml"] {
+            let path = config_file_path_from(Some(OsStr::new(explicit)), || {
+                panic!("an explicit override must not resolve or access automatic storage")
+            }).unwrap();
+            assert_eq!(path, PathBuf::from(explicit));
+        }
+        for explicit in [None, Some(OsStr::new(""))] {
+            let error = config_file_path_from(explicit, || Err(config_root_unavailable())).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
 
     fn host() -> RemoteHost {
         RemoteHost {
@@ -4191,7 +4347,7 @@ session = "bad/session"
                 Some(std::ffi::OsStr::new("/home/test")),
                 Path::new("/fallback")
             ),
-            PathBuf::from("/var/state")
+            Some(PathBuf::from("/var/state"))
         );
         assert_eq!(
             xdg_state_home_from(
@@ -4199,7 +4355,55 @@ session = "bad/session"
                 Some(std::ffi::OsStr::new("/home/test")),
                 Path::new("/fallback")
             ),
-            PathBuf::from("/home/test/.local/state")
+            Some(PathBuf::from("/home/test/.local/state"))
+        );
+    }
+
+    #[test]
+    fn state_directory_never_falls_back_to_the_working_directory() {
+        for home in [
+            None,
+            Some(""),
+            Some("."),
+            Some("relative-home"),
+            Some("../home"),
+        ] {
+            for fallback in ["", ".", "relative-home", "../home"] {
+                for state in [None, Some(""), Some("relative-state")] {
+                    assert_eq!(
+                        xdg_state_home_from(
+                            state.map(std::ffi::OsStr::new),
+                            home.map(std::ffi::OsStr::new),
+                            Path::new(fallback)
+                        ),
+                        None
+                    );
+                }
+                assert_eq!(
+                    xdg_state_home_from(
+                        Some(std::ffi::OsStr::new("/var/state")),
+                        home.map(std::ffi::OsStr::new),
+                        Path::new(fallback)
+                    ),
+                    Some(PathBuf::from("/var/state"))
+                );
+            }
+            assert_eq!(
+                xdg_state_home_from(
+                    None,
+                    home.map(std::ffi::OsStr::new),
+                    Path::new("/fallback")
+                ),
+                Some(PathBuf::from("/fallback/.local/state"))
+            );
+        }
+        assert_eq!(
+            xdg_state_home_from(
+                None,
+                Some(std::ffi::OsStr::new("/home/test")),
+                Path::new("relative-fallback")
+            ),
+            Some(PathBuf::from("/home/test/.local/state"))
         );
     }
 

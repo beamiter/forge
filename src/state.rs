@@ -63,19 +63,20 @@ struct WindowStatePaths {
     ready: PathBuf,
 }
 
-static WINDOW_STATE_PATHS: OnceLock<WindowStatePaths> = OnceLock::new();
+static WINDOW_STATE_PATHS: OnceLock<Option<WindowStatePaths>> = OnceLock::new();
 static WINDOW_STATE_FINALIZED: AtomicBool = AtomicBool::new(false);
 // WINDOW_STATE_PATHS is immutable for this process. A failed recovery move
 // must not let any later save (including one already queued) replace that path.
 static WINDOW_STATE_WRITABLE: AtomicBool = AtomicBool::new(true);
 
 fn ensure_window_state_writable() -> io::Result<()> {
+    let paths = window_state_paths()?;
     if WINDOW_STATE_WRITABLE.load(Ordering::Acquire) {
         Ok(())
     } else {
         Err(io::Error::new(
             io::ErrorKind::WouldBlock,
-            format!("Window session is not being saved because {} could not be preserved for recovery. Keep this file, resolve the storage problem, and reopen the window.", window_state_paths().active.display()),
+            format!("Window session is not being saved because {} could not be preserved for recovery. Keep this file, resolve the storage problem, and reopen the window.", paths.active.display()),
         ))
     }
 }
@@ -408,28 +409,42 @@ fn rename_noreplace_in_directory(directory: &File, source: &Path, target: &Path)
     rename_noreplace_between_directories(directory, source, directory, target)
 }
 
-fn window_state_directory() -> PathBuf {
-    glib::user_config_dir().join("forge").join("windows")
+fn window_state_directory() -> io::Result<PathBuf> {
+    crate::config::config_home().map(|root| root.join("forge").join("windows"))
 }
 
-fn legacy_tabs_state_file_path() -> PathBuf {
-    glib::user_config_dir().join("forge").join("tabs.state")
+fn window_state_paths() -> io::Result<&'static WindowStatePaths> {
+    resolve_window_state_paths(&WINDOW_STATE_PATHS, window_state_directory)
 }
 
-fn window_state_paths() -> &'static WindowStatePaths {
-    WINDOW_STATE_PATHS.get_or_init(|| {
-        let directory = window_state_directory();
+fn resolve_window_state_paths(
+    slot: &OnceLock<Option<WindowStatePaths>>,
+    resolve_directory: impl FnOnce() -> io::Result<PathBuf>,
+) -> io::Result<&WindowStatePaths> {
+    slot.get_or_init(|| {
+        let directory = resolve_directory().ok()?;
         let id = generate_window_state_id();
-        WindowStatePaths {
+        Some(WindowStatePaths {
             active: directory.join(format!("window-{id}.{ACTIVE_STATE_EXTENSION}")),
             ready: directory.join(format!("window-{id}.{READY_STATE_EXTENSION}")),
             directory,
-        }
+        })
     })
+    .as_ref()
+    .ok_or_else(crate::config::config_root_unavailable)
 }
 
-pub(crate) fn tabs_state_file_path() -> PathBuf {
-    window_state_paths().active.clone()
+pub(crate) fn tabs_state_file_path() -> io::Result<PathBuf> {
+    window_state_paths().map(|paths| paths.active.clone())
+}
+
+fn report_unavailable_window_storage() {
+    let key = PersistenceKey::for_operation("window-state-unavailable");
+    if let Err(error) = persistence::enqueue(key, "Save window session", || {
+        Err(crate::config::config_root_unavailable())
+    }) {
+        log::error!("Could not report unavailable window session storage: {error}");
+    }
 }
 
 /// Generate a unique session ID for jsh session persistence.
@@ -720,8 +735,8 @@ fn quarantine_corrupt_snapshot(path: &Path) -> bool {
     }
 }
 
-fn prepare_active_tabs_state_path() -> PathBuf {
-    let paths = window_state_paths();
+fn prepare_active_tabs_state_path() -> io::Result<PathBuf> {
+    let paths = window_state_paths()?;
     let directory_file = match ensure_private_directory(&paths.directory) {
         Ok(directory) => directory,
         Err(error) => {
@@ -729,18 +744,24 @@ fn prepare_active_tabs_state_path() -> PathBuf {
                 "Failed to create window-state directory {}: {error}",
                 paths.directory.display()
             );
-            return paths.active.clone();
+            return Ok(paths.active.clone());
         }
     };
 
     recover_stale_active_snapshots(&paths.directory);
     if paths.active.exists() {
-        return paths.active.clone();
+        return Ok(paths.active.clone());
     }
 
     // Upgrade the old single-file format first. Atomic rename means concurrent
     // launches cannot restore the same legacy snapshot.
-    let legacy = legacy_tabs_state_file_path();
+    // Derive legacy storage from this process's already-resolved root, so
+    // a later environment change cannot select a different claim directory.
+    let legacy = paths
+        .directory
+        .parent()
+        .ok_or_else(crate::config::config_root_unavailable)?
+        .join("tabs.state");
     if let Ok(legacy_file) = open_private_regular_file(&legacy) {
         let legacy_parent = legacy.parent().unwrap_or_else(|| Path::new("."));
         match ensure_private_directory(legacy_parent).and_then(|legacy_directory| {
@@ -770,7 +791,7 @@ fn prepare_active_tabs_state_path() -> PathBuf {
                     );
                 }
                 log::info!("Claimed legacy tabs snapshot {}", legacy.display());
-                return paths.active.clone();
+                return Ok(paths.active.clone());
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => log::warn!(
@@ -793,16 +814,16 @@ fn prepare_active_tabs_state_path() -> PathBuf {
     }
     prune_ready_snapshots_in(&paths.directory, MAX_READY_WINDOW_STATES);
     prune_quarantined_snapshots_in(&paths.directory, MAX_QUARANTINED_SNAPSHOTS);
-    paths.active.clone()
+    Ok(paths.active.clone())
 }
 
 /// Report saved and currently active window snapshots without exposing paths.
-pub(crate) fn session_snapshot_counts() -> (usize, usize) {
-    let directory = window_state_directory();
-    (
-        ready_snapshots_in(&directory).len(),
-        snapshots_with_extension(&directory, ACTIVE_STATE_EXTENSION).len(),
-    )
+pub(crate) fn session_snapshot_counts() -> io::Result<(usize, usize)> {
+    let directory = &window_state_paths()?.directory;
+    Ok((
+        ready_snapshots_in(directory).len(),
+        snapshots_with_extension(directory, ACTIVE_STATE_EXTENSION).len(),
+    ))
 }
 
 /// Whether any pane in this tab's split tree hosts a native agent task
@@ -1388,6 +1409,16 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
     (parsed.current_page, parsed.tabs)
 }
 
+fn looks_like_structured_layout(data: &str) -> bool {
+    data.trim_start().strip_prefix('{').is_some_and(|rest| {
+        // Preserve historical literal cwd names such as `{legacy-path}`;
+        // actual JSON object keys are quoted (or the object is empty/truncated).
+        // A cwd literally shaped like a JSON object is inherently ambiguous;
+        // preserve that snapshot for recovery instead of silently overwriting it.
+        matches!(rest.trim_start().chars().next(), Some('"' | '}') | None)
+    })
+}
+
 fn parse_tabs_state_for_restore(contents: &str) -> ParsedTabsState {
     let mut current_page: Option<u32> = None;
     let mut tabs: Vec<(Option<String>, PaneLayout)> = Vec::new();
@@ -1443,7 +1474,7 @@ fn parse_tabs_state_for_restore(contents: &str) -> ParsedTabsState {
                     // Try parsing as JSON first (new format)
                     if let Ok(layout) = serde_json::from_str::<PaneLayout>(&data) {
                         push_restored_tab_bounded(&mut tabs, &mut total_panes, Some(name), layout);
-                    } else {
+                    } else if !looks_like_structured_layout(&data) {
                         // Legacy: treat as directory
                         let layout = PaneLayout::Leaf {
                             dir: data,
@@ -1456,6 +1487,13 @@ fn parse_tabs_state_for_restore(contents: &str) -> ParsedTabsState {
                             pinned: None,
                         };
                         push_restored_tab_bounded(&mut tabs, &mut total_panes, Some(name), layout);
+                    } else {
+                        // JSON-shaped objects are structured layouts, not cwds.
+                        // Treating malformed/future JSON as a directory would
+                        // count it as restored and let autosave replace the
+                        // only recoverable copy. The omitted-index accounting
+                        // below routes the original snapshot to preservation.
+                        log::warn!("Ignoring invalid structured pane layout; preserving snapshot");
                     }
                 }
                 3 => {
@@ -1597,7 +1635,16 @@ fn window_state_oversize_error(path: &Path, actual: u64) -> io::Error {
 }
 
 pub(crate) fn load_tabs_state() -> (Option<u32>, Vec<(Option<String>, PaneLayout)>) {
-    let path = prepare_active_tabs_state_path();
+    let path = match prepare_active_tabs_state_path() {
+        Ok(path) => path,
+        Err(error) => {
+            WINDOW_STATE_WRITABLE.store(false, Ordering::Release);
+            set_ai_conversation_snapshot(None);
+            log::warn!("Window session restore unavailable: {error}");
+            report_unavailable_window_storage();
+            return (None, Vec::new());
+        }
+    };
     log::info!("Loading tabs state from: {}", path.display());
 
     let contents = match read_window_state_bounded(&path) {
@@ -1645,7 +1692,13 @@ pub(crate) fn finalize_tabs_state() {
         return;
     }
 
-    let paths = window_state_paths();
+    let paths = match window_state_paths() {
+        Ok(paths) => paths,
+        Err(error) => {
+            log::warn!("Window snapshot publication unavailable: {error}");
+            return;
+        }
+    };
     let active = paths.active.clone();
     let ready = paths.ready.clone();
     let directory = paths.directory.clone();
@@ -1841,7 +1894,13 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
     if WINDOW_STATE_FINALIZED.load(Ordering::Acquire) {
         return;
     }
-    let path = tabs_state_file_path();
+    let path = match tabs_state_file_path() {
+        Ok(path) => path,
+        Err(_) => {
+            report_unavailable_window_storage();
+            return;
+        }
+    };
     if ensure_window_state_writable().is_err() {
         let key = PersistenceKey::for_path("window-state", &path);
         if let Err(error) =
@@ -2038,6 +2097,20 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_window_root_remains_unavailable_without_filesystem_work() {
+        let slot = OnceLock::new();
+        let first = resolve_window_state_paths(&slot, || {
+            Err(crate::config::config_root_unavailable())
+        });
+        assert_eq!(first.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert!(slot.get().is_some_and(Option::is_none));
+        let later = resolve_window_state_paths(&slot, || {
+            panic!("unavailable storage must not be retried against a new directory")
+        });
+        assert_eq!(later.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
 
     #[test]
     fn pruned_snapshot_tabs_keep_interactive_order_and_remap_active() {
@@ -2507,6 +2580,60 @@ mod tests {
     }
 
     #[test]
+    fn invalid_structured_layouts_are_preserved_instead_of_becoming_cwds() {
+        for data in [
+            r#"{"type":"leaf","dir":"/work","sid":"1-2""#,
+            r#"{"type":"future-layout","dir":"/work","sid":"1-2"}"#,
+            r#"{"type":"leaf","dir":"/work","sid":7}"#,
+            r#"  {"type":"leaf","dir":"/work"}"#,
+            "{}",
+            "{",
+        ] {
+            let contents = format!("tab=broken\t{}\n", escape_tab_state(data));
+            let parsed = parse_tabs_state_for_restore(&contents);
+            assert!(
+                parsed.tabs.is_empty(),
+                "restored invalid layout as cwd: {data}"
+            );
+            assert!(parsed.omitted_layouts, "source must remain recoverable");
+        }
+    }
+
+    #[test]
+    fn malformed_layouts_do_not_shift_selection_or_break_legacy_paths() {
+        let contents = concat!(
+            "current_page=2\n",
+            "tab=before\t/tmp/before\n",
+            "tab=broken\t{\"type\":\"future-layout\"}\n",
+            "tab=after\t/tmp/{project}\n",
+        );
+        let parsed = parse_tabs_state_for_restore(contents);
+        assert!(parsed.omitted_layouts);
+        assert_eq!(parsed.current_page, Some(1));
+        assert_eq!(parsed.tabs.len(), 2);
+        let PaneLayout::Leaf { dir, .. } = &parsed.tabs[1].1 else {
+            panic!("expected a legacy leaf");
+        };
+        assert_eq!(dir, "/tmp/{project}");
+
+        for (contents, expected_page) in [
+            ("current_page=0\ntab=broken\t{}\ntab=ok\t/tmp/ok\n", 0),
+            (
+                "current_page=2\ntab=one\t/tmp/one\ntab=two\t/tmp/two\ntab=broken\t{}\n",
+                1,
+            ),
+        ] {
+            let parsed = parse_tabs_state_for_restore(contents);
+            assert!(parsed.omitted_layouts);
+            assert_eq!(parsed.current_page, Some(expected_page));
+        }
+        let all_invalid =
+            parse_tabs_state_for_restore("current_page=1\ntab=one\t{}\ntab=two\t{\n");
+        assert!(all_invalid.omitted_layouts);
+        assert!(all_invalid.tabs.is_empty());
+    }
+
+    #[test]
     fn omitted_layout_tracking_preserves_legacy_paths_and_late_metadata() {
         let legacy = parse_tabs_state_for_restore("tab=literal\t{legacy-path}\n");
         assert_eq!(legacy.tabs.len(), 1);
@@ -2575,11 +2702,11 @@ mod tests {
         );
         let active = directory.join(name);
         WINDOW_STATE_PATHS
-            .set(WindowStatePaths {
+            .set(Some(WindowStatePaths {
                 directory: directory.clone(),
                 active: active.clone(),
                 ready: active.with_extension(READY_STATE_EXTENSION),
-            })
+            }))
             .expect("isolated process owns its window state");
         let original = b"ai_conversation={\"version\":9999}\ntab=/tmp\n";
         atomic_write_private_file(&active, original).unwrap();
@@ -2680,11 +2807,11 @@ mod tests {
         let directory = temporary_state_dir("rejected-layout-autosave");
         let active = directory.join(format!("window-{}.active", generate_window_state_id()));
         WINDOW_STATE_PATHS
-            .set(WindowStatePaths {
+            .set(Some(WindowStatePaths {
                 directory: directory.clone(),
                 active: active.clone(),
                 ready: active.with_extension(READY_STATE_EXTENSION),
-            })
+            }))
             .expect("isolated process owns its window state");
         let too_wide = layout_tab_line(
             "recoverable wide layout",

@@ -3,8 +3,6 @@
 
 set -Eeuo pipefail
 
-readonly STATE_FILE="${HOME}/.config/forge/tabs.state"
-
 show_usage() {
     printf '%s\n' "Usage: $0 [--raw]"
     printf '%s\n' '  default  Show metadata only.'
@@ -39,6 +37,12 @@ case "${1:-}" in
         exit 0
         ;;
 esac
+
+if [[ "${HOME:-}" != /* ]]; then
+    printf '%s\n' 'Error: an absolute HOME is required to locate legacy session state.' >&2
+    exit 1
+fi
+readonly STATE_FILE="${HOME}/.config/forge/tabs.state"
 
 if [[ ! -f "${STATE_FILE}" ]]; then
     printf 'No legacy state file found at %s\n' "${STATE_FILE}" >&2

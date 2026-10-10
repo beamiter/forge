@@ -29,15 +29,25 @@ type PersistenceTask = Box<dyn FnOnce() -> io::Result<()> + Send + 'static>;
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct PersistenceKey {
     kind: String,
-    path: PathBuf,
+    path: Option<PathBuf>,
     nonce: Option<u64>,
 }
 
 impl PersistenceKey {
+    /// Identity for an error-only operation which has no resolved file path.
+    /// This is never a filesystem fallback: no path is synthesized.
+    pub(crate) fn for_operation(kind: &str) -> Self {
+        Self {
+            kind: kind.to_string(),
+            path: None,
+            nonce: None,
+        }
+    }
+
     pub(crate) fn for_path(kind: &str, path: &Path) -> Self {
         Self {
             kind: kind.to_string(),
-            path: path.to_path_buf(),
+            path: Some(path.to_path_buf()),
             nonce: None,
         }
     }
@@ -49,7 +59,7 @@ impl PersistenceKey {
         let sequence = NEXT_UNIQUE_KEY.fetch_add(1, Ordering::Relaxed);
         Self {
             kind: kind.to_string(),
-            path: path.to_path_buf(),
+            path: Some(path.to_path_buf()),
             nonce: Some(sequence),
         }
     }
@@ -694,6 +704,32 @@ pub(crate) fn shutdown(timeout: Duration) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operation_only_failure_keys_never_alias_file_targets() {
+        let operation = PersistenceKey::for_operation("window-state-unavailable");
+        assert!(operation.path.is_none());
+        assert_eq!(operation, PersistenceKey::for_operation("window-state-unavailable"));
+        assert_ne!(operation, PersistenceKey::for_operation("other-operation"));
+        assert_ne!(operation, PersistenceKey::for_path("window-state-unavailable", Path::new("")));
+        let file = PersistenceKey::for_path("config", Path::new("/home/test/config.toml"));
+        assert_eq!(file, PersistenceKey::for_path("config", Path::new("/home/test/config.toml")));
+    }
+
+    #[test]
+    fn operation_only_error_uses_the_existing_failure_channel() {
+        let worker = PersistenceWorker::new(2).unwrap();
+        worker.enqueue(
+            PersistenceKey::for_operation("window-state-unavailable"),
+            "Save window session".to_string(),
+            Box::new(|| Err(io::Error::new(io::ErrorKind::InvalidInput, "root unavailable"))),
+        ).unwrap();
+        worker.shutdown(Duration::from_secs(2)).unwrap();
+        let failures = worker.drain_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].operation, "Save window session");
+        assert_eq!(failures[0].error, "root unavailable");
+    }
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
