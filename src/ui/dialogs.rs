@@ -3666,11 +3666,12 @@ impl UiState {
         let apply_jump_outcome = {
             let ui = self.clone();
             let dialog = dialog.clone();
+            let term_view = term_view.clone();
             Rc::new(move |outcome: CrossBlockJumpOutcome| match outcome {
                 CrossBlockJumpOutcome::Close => dialog.force_close(),
                 CrossBlockJumpOutcome::ShowSnapshot(record_id) => {
                     dialog.force_close();
-                    ui.show_record_snapshot_dialog(record_id);
+                    ui.show_record_snapshot_dialog_for(&term_view, record_id);
                 }
                 CrossBlockJumpOutcome::KeepOpen => {}
             })
@@ -5818,6 +5819,16 @@ impl UiState {
         let Some(term_view) = self.current_term_view() else {
             return;
         };
+        self.show_record_snapshot_dialog_for(&term_view, record_id);
+    }
+
+    /// A search result belongs to its captured pane even if that pane exits
+    /// while the dialog is open. Never look up its record in the current pane.
+    fn show_record_snapshot_dialog_for(
+        &self,
+        term_view: &crate::block_view::TermView,
+        record_id: u64,
+    ) {
         let Some(view) = term_view.record_snapshot_view(record_id) else {
             // The budget can evict a snapshot between navigation and
             // presentation; answer with the honest message, not an empty pane.
@@ -6779,6 +6790,64 @@ mod tests {
             "a new intent deliberately starts at the top"
         );
         assert_eq!(cross_block_refresh_selection_index(&[], Some(&anchor)), 0);
+    }
+
+    #[test]
+    fn search_snapshot_keeps_the_captured_owner_and_never_falls_back() {
+        let source = include_str!("dialogs.rs");
+        let search = source
+            .split("pub(crate) fn show_cross_block_search(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn toggle_debug_dashboard(")
+            .next()
+            .unwrap();
+        let jump = search
+            .split("let jump = {")
+            .nth(1)
+            .unwrap()
+            .split("let apply_jump_outcome = {")
+            .next()
+            .unwrap();
+        assert!(jump.contains("let term_view = term_view.clone();"));
+        assert!(jump.contains("term_view.navigate_to_record_id(hit.block_id, hit.is_output)"));
+        let outcome = search
+            .split("let apply_jump_outcome = {")
+            .nth(1)
+            .unwrap()
+            .split("let jump_for_activate")
+            .next()
+            .unwrap();
+        assert!(outcome.contains("let term_view = term_view.clone();"));
+        assert!(outcome.contains("ui.show_record_snapshot_dialog_for(&term_view, record_id)"));
+        assert!(!outcome.contains("current_term_view"));
+        let explicit = source
+            .split("    fn show_record_snapshot_dialog_for(")
+            .nth(1)
+            .unwrap()
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap();
+        assert!(explicit.contains("term_view.record_snapshot_view(record_id)"));
+        assert!(!explicit.contains("current_term_view"));
+        let absent = explicit
+            .split("let Some(view) =")
+            .nth(1)
+            .unwrap()
+            .split("let dialog =")
+            .next()
+            .unwrap();
+        assert!(absent.contains("record_snapshot_unavailable_message()"));
+        assert!(absent.contains("return;"));
+        let wrapper = source
+            .split("pub(crate) fn show_record_snapshot_dialog(")
+            .nth(1)
+            .unwrap()
+            .split("    fn show_record_snapshot_dialog_for(")
+            .next()
+            .unwrap();
+        assert!(wrapper.contains("self.current_term_view()"));
+        assert!(wrapper.contains("self.show_record_snapshot_dialog_for(&term_view, record_id)"));
     }
 
     /// The snapshot dialog's header values come from the completed record;
