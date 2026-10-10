@@ -752,7 +752,18 @@ impl UiState {
             config.cursor_foreground = theme.cursor_foreground;
             config.palette = theme.palette;
         }
+        // Each Block pane owns a Config snapshot used by future cards and
+        // CSS refreshes. Update it before repainting existing renderers, or
+        // a later command/font change can bring the old palette back.
+        self.sync_block_configs();
         self.apply_colors_all();
+        // Finish with Block-specific treatment, including transparent
+        // snapshot cursors that the generic VTE pass would otherwise reset.
+        for leaf in self.configuration_leaves() {
+            if let Some(view) = leaf.block_view() {
+                view.apply_theme();
+            }
+        }
     }
 
     /// Reload configuration from disk and apply changes.
@@ -1027,6 +1038,67 @@ mod tests {
     };
     use crate::config_store::ConfigRevision;
     use std::cell::Cell;
+
+    #[test]
+    fn theme_updates_pane_snapshots_before_repainting() {
+        // Structural coverage only: this pins the actual snapshot/paint
+        // wiring without claiming to validate GTK pixels or starting a PTY.
+        let source = include_str!("config_apply.rs");
+        let production = source.split_once("\n#[cfg(test)]").unwrap().0;
+        let theme = production
+            .split_once("pub(crate) fn apply_theme(&self, theme: &Theme) {")
+            .unwrap()
+            .1
+            .split_once("\n    }")
+            .unwrap()
+            .0;
+        for field in [
+            "theme_name = theme.name.clone()",
+            "foreground = theme.foreground",
+            "background = theme.background",
+            "cursor = theme.cursor",
+            "cursor_foreground = theme.cursor_foreground",
+            "palette = theme.palette",
+        ] {
+            assert!(theme.contains(field), "theme snapshot must update {field}");
+        }
+        let sync = theme.find("self.sync_block_configs();").unwrap();
+        let repaint = theme.find("view.apply_theme();").unwrap();
+        let colors = theme.find("self.apply_colors_all();").unwrap();
+        assert!(sync < colors && colors < repaint);
+        assert!(theme.contains("self.configuration_leaves()"));
+
+        let block_source = include_str!("../block_view/mod.rs");
+        let reload = block_source
+            .split_once("pub(crate) fn reload_config(&self, config: &Config) {")
+            .unwrap()
+            .1
+            .split_once("\n    }")
+            .unwrap()
+            .0;
+        assert!(reload.contains("*self.config.borrow_mut() = config.clone();"));
+        let paint = block_source
+            .split_once("pub fn apply_theme(&self) {")
+            .unwrap()
+            .1
+            .split_once("\n    }")
+            .unwrap()
+            .0;
+        assert!(paint.contains("let config = self.config.borrow();"));
+        assert!(paint.contains("apply_terminal_theme(&self.active_vte, &config)"));
+        assert!(paint.contains("install_block_css(&config)"));
+        assert!(paint.contains("apply_snapshot_theme_to_vte(&block.output_vte, &config)"));
+        let snapshots = include_str!("../block_view/alt_screen.rs");
+        let snapshot_theme = snapshots
+            .split_once("fn apply_snapshot_theme_to_vte(terminal: &Terminal, config: &Config) {")
+            .unwrap()
+            .1
+            .split_once("\n}")
+            .unwrap()
+            .0;
+        assert!(snapshot_theme.contains("transparent.set_alpha(0.0);"));
+        assert!(snapshot_theme.contains("terminal.set_color_cursor(Some(&transparent));"));
+    }
 
     #[test]
     fn settings_reach_zoomed_and_detached_siblings_exactly_once() {
