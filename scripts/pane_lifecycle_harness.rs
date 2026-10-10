@@ -116,6 +116,10 @@ impl UiState {
 fn reattach_terminal_to_tree(_: &Widget, _: &Widget) {}
 // @pane-lifecycle:swap
 // @pane-lifecycle:restore
+// @pane-lifecycle:restore_preserving
+// @pane-lifecycle:restore_with_selection
+// @pane-lifecycle:selection
+// @pane-lifecycle:apply_selection
 fn focus_fixture(
     active: Option<usize>,
     live: Option<usize>,
@@ -238,4 +242,57 @@ fn stale_zoom_target_does_not_mutate_notebook() {
     };
     assert_eq!(restore_zoomed_leaf(&notebook, &swap), None);
     assert_eq!(notebook.pages.borrow()[0].id, 30);
+}
+
+#[test]
+fn background_zoom_restore_keeps_foreground_widget_identity() {
+    let original = Widget::new(10);
+    let zoomed = Widget::new(11);
+    let foreground = Widget::new(20);
+    let swap = ZoomPageSwap {
+        original_page: original.clone(),
+        zoomed_page: zoomed.clone(),
+        page_index: 99,
+        tab_label: None,
+    };
+    let notebook = Notebook {
+        pages: RefCell::new(vec![zoomed, foreground.clone()]),
+        current: Cell::new(Some(1)),
+    };
+    assert_eq!(
+        restore_zoomed_leaf_preserving_selection(&notebook, &swap),
+        Some(0)
+    );
+    assert_eq!(
+        notebook.nth_page(notebook.current_page()),
+        Some(foreground.clone())
+    );
+    assert_eq!(notebook.nth_page(Some(0)), Some(original));
+    // A late duplicate close completion cannot resurrect or select the old swap.
+    assert_eq!(
+        restore_zoomed_leaf_preserving_selection(&notebook, &swap),
+        None
+    );
+    assert_eq!(notebook.nth_page(notebook.current_page()), Some(foreground));
+}
+
+#[test]
+fn active_zoom_restore_selects_its_reinstated_tree() {
+    let original = Widget::new(10);
+    let zoomed = Widget::new(11);
+    let swap = ZoomPageSwap {
+        original_page: original.clone(),
+        zoomed_page: zoomed.clone(),
+        page_index: 99,
+        tab_label: None,
+    };
+    let notebook = Notebook {
+        pages: RefCell::new(vec![Widget::new(20), zoomed]),
+        current: Cell::new(Some(1)),
+    };
+    assert_eq!(
+        restore_zoomed_leaf_preserving_selection(&notebook, &swap),
+        Some(1)
+    );
+    assert_eq!(notebook.nth_page(notebook.current_page()), Some(original));
 }

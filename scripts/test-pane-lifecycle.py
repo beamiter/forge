@@ -30,10 +30,14 @@ def build_harness():
         ("cycle", item(panes, "pub(crate) fn cycle_pane_focus(")),
         ("swap", item(tree, "pub(crate) struct ZoomPageSwap")),
         ("restore", item(tree, "pub(crate) fn restore_zoomed_leaf(")),
+        ("restore_preserving", item(tree, "pub(crate) fn restore_zoomed_leaf_preserving_selection(")),
+        ("restore_with_selection", item(tree, "fn restore_zoomed_leaf_with_selection(")),
+        ("selection", item(tree, "fn selection_after_replacement<")),
+        ("apply_selection", item(tree, "fn restore_selection_after_replacement(")),
     ]:
-        placeholder = f"// @pane-lifecycle:{marker}"
+        placeholder = f"// @pane-lifecycle:{marker}\n"
         assert fixture.count(placeholder) == 1
-        fixture = fixture.replace(placeholder, value)
+        fixture = fixture.replace(placeholder, value + "\n")
     return fixture
 
 

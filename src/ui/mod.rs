@@ -60,8 +60,9 @@ pub(crate) use pane_header::{PaneHeader, PANE_HEADER_CSS};
 pub(crate) use pane_leaf::PaneLeaf;
 pub(crate) use pane_node::PaneNode;
 pub(crate) use pane_tree_edit::{
-    detach_leaf_and_promote, detach_leaf_for_zoom, plan_existing_leaf_split, restore_zoomed_leaf,
-    ZoomPageSwap,
+    detach_leaf_and_promote, detach_leaf_for_zoom, plan_existing_leaf_split,
+    restore_surviving_focus, restore_zoomed_leaf, restore_zoomed_leaf_preserving_selection,
+    widget_is_within, ZoomPageSwap,
 };
 pub(crate) use remote_fs::{FsClipboard, FsExecutionOverlay, FsLocation};
 pub(crate) use task_ops::AgentTaskDomain;

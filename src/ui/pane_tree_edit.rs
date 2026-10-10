@@ -59,10 +59,20 @@ pub(crate) fn detach_leaf_and_promote(notebook: &Notebook, leaf_root: &Widget) -
         }
     };
 
+    let selected = notebook
+        .current_page()
+        .and_then(|page| notebook.nth_page(Some(page)));
+    let root = parent.root();
+    let focus = root.as_ref().and_then(|root| root.focus());
+
     // Clear root focus while both children still belong to GtkPaned. If a
     // focused child is unparented first, GtkPaned can retain a stale private
     // last-focus pointer and warn while the sibling is detached for promotion.
-    if let Some(root) = parent.root() {
+    if let Some(root) = root.as_ref().filter(|_| {
+        focus
+            .as_ref()
+            .is_some_and(|focus| widget_is_within(focus, &parent_widget))
+    }) {
         root.set_focus(None::<&Widget>);
     }
 
@@ -79,10 +89,13 @@ pub(crate) fn detach_leaf_and_promote(notebook: &Notebook, leaf_root: &Widget) -
         Destination::Page { index, name, label } => {
             notebook.remove_page(Some(index));
             sibling.set_widget_name(&name);
-            let inserted = notebook.insert_page(&sibling, label.as_ref(), Some(index));
+            notebook.insert_page(&sibling, label.as_ref(), Some(index));
             notebook.set_tab_reorderable(&sibling, true);
-            notebook.set_current_page(Some(inserted));
+            restore_selection_after_replacement(notebook, selected, &parent_widget, &sibling);
         }
+    }
+    if let Some(root) = root.as_ref() {
+        restore_surviving_focus(root, focus.as_ref());
     }
     Some(sibling)
 }
@@ -247,6 +260,24 @@ pub(crate) fn detach_leaf_for_zoom(
 
 /// Restore a zoomed leaf to its empty split slot and reinstate the original page.
 pub(crate) fn restore_zoomed_leaf(notebook: &Notebook, swap: &ZoomPageSwap) -> Option<u32> {
+    restore_zoomed_leaf_with_selection(notebook, swap, true)
+}
+
+pub(crate) fn restore_zoomed_leaf_preserving_selection(
+    notebook: &Notebook,
+    swap: &ZoomPageSwap,
+) -> Option<u32> {
+    restore_zoomed_leaf_with_selection(notebook, swap, false)
+}
+
+fn restore_zoomed_leaf_with_selection(
+    notebook: &Notebook,
+    swap: &ZoomPageSwap,
+    activate_restored: bool,
+) -> Option<u32> {
+    let selected = notebook
+        .current_page()
+        .and_then(|page| notebook.nth_page(Some(page)));
     let current_page = notebook.page_num(&swap.zoomed_page)?;
     let page_name = swap.zoomed_page.widget_name().to_string();
     notebook.remove_page(Some(current_page));
@@ -261,6 +292,165 @@ pub(crate) fn restore_zoomed_leaf(notebook: &Notebook, swap: &ZoomPageSwap) -> O
         Some(current_page),
     );
     notebook.set_tab_reorderable(&swap.original_page, true);
-    notebook.set_current_page(Some(inserted));
+    if activate_restored {
+        notebook.set_current_page(Some(inserted));
+    } else {
+        restore_selection_after_replacement(
+            notebook,
+            selected,
+            &swap.zoomed_page,
+            &swap.original_page,
+        );
+    }
     Some(inserted)
+}
+
+pub(crate) fn widget_is_within(widget: &Widget, subtree: &Widget) -> bool {
+    widget == subtree || widget.is_ancestor(subtree)
+}
+
+/// Return focus only to an object that survived in the same native root.
+/// Background close must not replace a live search/settings focus with a VTE.
+pub(crate) fn restore_surviving_focus(root: &gtk4::Root, focus: Option<&Widget>) -> bool {
+    let Some(focus) = focus.filter(|focus| {
+        focus.root().as_ref() == Some(root) && focus.is_mapped() && focus.is_sensitive()
+    }) else {
+        return false;
+    };
+    root.focus().as_ref() == Some(focus) || focus.grab_focus()
+}
+
+fn selection_after_replacement<T: Clone + PartialEq>(
+    selected: Option<T>,
+    removed: &T,
+    replacement: &T,
+) -> Option<T> {
+    selected.map(|selected| {
+        if &selected == removed {
+            replacement.clone()
+        } else {
+            selected
+        }
+    })
+}
+
+fn restore_selection_after_replacement(
+    notebook: &Notebook,
+    selected: Option<Widget>,
+    removed: &Widget,
+    replacement: &Widget,
+) {
+    if let Some(selected) = selection_after_replacement(selected, removed, replacement) {
+        if let Some(index) = notebook.page_num(&selected) {
+            notebook.set_current_page(Some(index));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selection_after_replacement;
+
+    #[test]
+    fn background_replacements_preserve_selected_identity_across_index_changes() {
+        let selected = selection_after_replacement(Some("B"), &"zoom A", &"split A");
+        assert_eq!(selected, Some("B"));
+        // Removing/replacing A may change indices; resolve B in the final tree.
+        let reordered = ["C", "split A", "B"];
+        assert_eq!(
+            reordered.iter().position(|id| Some(*id) == selected),
+            Some(2)
+        );
+        assert_eq!(
+            selection_after_replacement(Some("B"), &"split A", &"surviving A pane"),
+            Some("B")
+        );
+    }
+
+    #[test]
+    fn active_zoom_and_split_replacements_follow_only_the_replaced_page() {
+        assert_eq!(
+            selection_after_replacement(Some("zoom A"), &"zoom A", &"split A"),
+            Some("split A")
+        );
+        assert_eq!(
+            selection_after_replacement(Some("split A"), &"split A", &"survivor A"),
+            Some("survivor A")
+        );
+        assert_eq!(selection_after_replacement::<&str>(None, &"A", &"B"), None);
+    }
+
+    #[test]
+    fn close_entrypoints_capture_target_before_scoped_zoom_restore() {
+        let tabs = include_str!("tabs.rs");
+        let close = tabs
+            .split_once("pub(crate) fn close_focused_pane_or_tab(&self)")
+            .unwrap()
+            .1
+            .split_once("pub(crate) fn duplicate_current_tab")
+            .unwrap()
+            .0;
+        let restore = close
+            .find("self.restore_zoom_before_close(&target);")
+            .unwrap();
+        assert!(close.find("let leaf =").unwrap() < restore);
+        assert!(close.find("let target =").unwrap() < restore);
+        assert!(!close[restore..].contains("current_page()"));
+        assert!(!close.contains("self.remove_current_tab()"));
+        assert!(close.contains("self.remove_tab_by_widget(&target)"));
+        let restore = tabs
+            .split_once("fn restore_zoom_before_close(")
+            .unwrap()
+            .1
+            .split_once("/// Resolve a descendant")
+            .unwrap()
+            .0;
+        assert!(restore.contains("widget_is_within(target, &state.swap.zoomed_page)"));
+        assert!(restore.contains("widget_is_within(target, &state.swap.original_page)"));
+        assert!(restore.contains("restore_zoomed_leaf_preserving_selection"));
+        assert!(!restore.contains("self.unzoom_pane"));
+        assert!(tabs.contains("self.restore_zoom_before_close(widget);"));
+        assert!(tabs.contains("self.restore_zoom_before_close(&leaf_root);"));
+    }
+
+    #[test]
+    fn background_close_never_falls_back_to_terminal_focus() {
+        let tabs = include_str!("tabs.rs");
+        let exit = tabs
+            .split_once("pub(crate) fn handle_terminal_exited_with_code(")
+            .unwrap()
+            .1
+            .split_once("pub(crate) fn remove_current_tab")
+            .unwrap()
+            .0;
+        let close = tabs
+            .split_once("pub(crate) fn remove_tab_by_widget_internal(")
+            .unwrap()
+            .1
+            .split_once("pub(crate) fn close_focused_pane_or_tab")
+            .unwrap()
+            .0;
+        assert!(
+            close
+                .find("self.restore_zoom_before_close(widget);")
+                .unwrap()
+                < close.find(".notebook_page_for_widget(widget)").unwrap()
+        );
+        for source in [exit, close] {
+            assert!(source
+                .contains("!restore_surviving_focus(root, focus.as_ref()) && target_was_active"));
+        }
+        let tree = include_str!("pane_tree_edit.rs")
+            .split_once("#[cfg(test)]")
+            .unwrap()
+            .0;
+        assert!(tree.contains("widget_is_within(focus, &parent_widget)"));
+        assert!(tree.contains("focus.root().as_ref() == Some(root)"));
+        assert!(tree.contains(
+            "restore_selection_after_replacement(notebook, selected, &parent_widget, &sibling)"
+        ));
+        let zoom = include_str!("zoom.rs");
+        assert!(zoom.contains("restore_zoomed_leaf(&self.notebook, &state.swap)"));
+        assert!(zoom.contains("state.zoomed_terminal.grab_focus();"));
+    }
 }

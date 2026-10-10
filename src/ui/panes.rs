@@ -1265,6 +1265,66 @@ mod tests {
         assert_eq!(root.end_child().as_ref(), Some(&nested_widget));
         assert_eq!(nested.start_child().as_ref(), Some(&leaf_b_widget));
         assert_eq!(nested.end_child().as_ref(), Some(&leaf_c_widget));
+
+        // Reuse these ordinary button leaves to exercise native Notebook
+        // reparenting. No terminal, child process or destructive close exists.
+        let notebook = gtk4::Notebook::new();
+        notebook.append_page(&root, None::<&gtk4::Widget>);
+        let foreground = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let entry = gtk4::Entry::new();
+        foreground.append(&entry);
+        notebook.append_page(&foreground, None::<&gtk4::Widget>);
+        let window = gtk4::Window::builder().child(&notebook).build();
+        window.present();
+        let main = gtk4::glib::MainContext::default();
+        let spin_until = |condition: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+            while !condition() && std::time::Instant::now() < deadline {
+                while main.pending() {
+                    main.iteration(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(condition(), "GTK pane fixture did not settle");
+        };
+        spin_until(&|| root.is_mapped());
+        let swap = super::detach_leaf_for_zoom(&notebook, &root_widget, &leaf_a_widget).unwrap();
+        notebook.set_current_page(Some(1));
+        spin_until(&|| entry.is_mapped());
+        assert!(entry.grab_focus());
+        let native_root = window.upcast_ref::<gtk4::Root>();
+        let focus = native_root.focus().expect("entry owns focus");
+        assert!(super::widget_is_within(&focus, entry.upcast_ref()));
+        assert_eq!(
+            super::restore_zoomed_leaf_preserving_selection(&notebook, &swap),
+            Some(0)
+        );
+        assert_eq!(
+            notebook.nth_page(notebook.current_page()),
+            Some(foreground.clone().upcast())
+        );
+        assert_eq!(native_root.focus().as_ref(), Some(&focus));
+
+        let promoted = super::detach_leaf_and_promote(&notebook, &leaf_a_widget).unwrap();
+        assert_eq!(promoted, nested_widget);
+        assert_eq!(
+            notebook.nth_page(notebook.current_page()),
+            Some(foreground.clone().upcast())
+        );
+        assert_eq!(native_root.focus().as_ref(), Some(&focus));
+
+        // The same preserving operation still selects the replacement when
+        // the replaced zoom itself was the active page.
+        notebook.set_current_page(Some(0));
+        spin_until(&|| leaf_b.is_mapped());
+        assert!(leaf_b.grab_focus());
+        let swap = super::detach_leaf_for_zoom(&notebook, &nested_widget, &leaf_b_widget).unwrap();
+        let _ = super::restore_zoomed_leaf_preserving_selection(&notebook, &swap).unwrap();
+        assert_eq!(
+            notebook.nth_page(notebook.current_page()),
+            Some(nested_widget)
+        );
+        window.close();
     }
 
     #[test]

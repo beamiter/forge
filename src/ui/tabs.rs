@@ -317,9 +317,26 @@ impl UiState {
         }
     }
 
-    fn restore_zoom_before_close(&self) {
-        if let Some(state) = self.zoom_state.borrow_mut().take() {
-            self.unzoom_pane(state);
+    fn restore_zoom_before_close(&self, target: &gtk4::Widget) {
+        let state = {
+            let mut slot = self.zoom_state.borrow_mut();
+            let belongs_to_zoom = slot.as_ref().is_some_and(|state| {
+                widget_is_within(target, &state.swap.zoomed_page)
+                    || widget_is_within(target, &state.swap.original_page)
+            });
+            if belongs_to_zoom {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(state) = state {
+            let root = self.window.upcast_ref::<gtk4::Root>();
+            let focus = root.focus();
+            let _ = restore_zoomed_leaf_preserving_selection(&self.notebook, &state.swap);
+            restore_surviving_focus(root, focus.as_ref());
+            self.sync_tab_strip_active(None);
+            self.refresh_pane_headers();
         }
     }
 
@@ -408,7 +425,7 @@ impl UiState {
     }
 
     pub(crate) fn remove_tab_by_widget(&self, widget: &gtk4::Widget) {
-        self.restore_zoom_before_close();
+        self.restore_zoom_before_close(widget);
         let page_widget = self
             .notebook_page_for_widget(widget)
             .unwrap_or_else(|| widget.clone());
@@ -457,12 +474,24 @@ impl UiState {
         // A zoom swap temporarily removes the sibling tree from the Notebook.
         // Restore it before collapsing the exited leaf; merely dropping the
         // swap would lose the still-running sibling and its PTY.
-        self.restore_zoom_before_close();
+        self.restore_zoom_before_close(&leaf_root);
+        let root = self.window.upcast_ref::<gtk4::Root>();
+        let focus = root.focus();
+        let target_was_active = self
+            .notebook_page_for_widget(&leaf_root)
+            .is_some_and(|page| {
+                self.notebook
+                    .current_page()
+                    .and_then(|index| self.notebook.nth_page(Some(index)))
+                    == Some(page)
+            });
 
         if let Some(sibling) = detach_leaf_and_promote(&self.notebook, &leaf_root) {
             let _detached = PaneLeaf::detach_from(&leaf_root);
-            if let Some(node) = PaneNode::from_widget(&sibling) {
-                node.grab_focus();
+            if !restore_surviving_focus(root, focus.as_ref()) && target_was_active {
+                if let Some(node) = PaneNode::from_widget(&sibling) {
+                    node.grab_focus();
+                }
             }
         } else {
             self.remove_tab_by_widget(&leaf_root);
@@ -478,9 +507,20 @@ impl UiState {
     }
 
     pub(crate) fn remove_tab_by_widget_internal(&self, widget: &gtk4::Widget) {
+        let root = self.window.upcast_ref::<gtk4::Root>();
+        let focus = root.focus();
+        // A close confirmation yields to the UI. The same target may have
+        // been zoomed again while it was open; include its retained siblings
+        // at commit time, before resolving the current Notebook page.
+        self.restore_zoom_before_close(widget);
         let widget = self
             .notebook_page_for_widget(widget)
             .unwrap_or_else(|| widget.clone());
+        let target_was_active = self
+            .notebook
+            .current_page()
+            .and_then(|index| self.notebook.nth_page(Some(index)))
+            == Some(widget.clone());
         let pane_leaves = PaneNode::from_widget(&widget)
             .map(|node| node.leaves())
             .unwrap_or_default();
@@ -529,69 +569,76 @@ impl UiState {
         } else {
             self.sync_tab_strip_active(None);
             self.sync_tab_bar_visibility();
-            self.focus_current_terminal();
+            if !restore_surviving_focus(root, focus.as_ref()) && target_was_active {
+                self.focus_current_terminal();
+            }
         }
     }
 
     pub(crate) fn close_focused_pane_or_tab(&self) {
-        self.restore_zoom_before_close();
         let Some(page_num) = self.notebook.current_page() else {
             return;
         };
         let Some(page_widget) = self.notebook.nth_page(Some(page_num)) else {
             return;
         };
-        if let Some(node) = PaneNode::from_widget(&page_widget) {
-            if node.is_split() {
-                if let Some(leaf) = node.active_leaf() {
-                    let leaf_root = leaf.root_widget();
-                    let pending_remote =
-                        leaf.is_remote()
-                            && tab_num_for_widget(&leaf_root).is_some_and(|tab_num| {
-                                self.tab_connections.borrow().get(&tab_num).is_some_and(
-                                    |connection| connection.status == ConnStatus::Disconnected,
-                                )
-                            });
-                    if pending_remote {
-                        if let Some(tab_num) = tab_num_for_widget(&leaf_root) {
-                            self.tab_connections.borrow_mut().remove(&tab_num);
-                            self.clear_tab_conn_status(tab_num);
-                        }
-                        // This child already emitted `exited`; killing it again
-                        // cannot drive the structural collapse callback.
-                        self.handle_terminal_exited(&leaf_root);
-                        if let Some(tab_num) = tab_num_for_widget(&leaf_root) {
-                            self.retitle_tab_from_active_leaf(tab_num);
-                        }
-                        return;
+        // Capture the intended controller before any zoom restoration can
+        // replace a Notebook page or emit focus/switch notifications.
+        let leaf = PaneNode::from_widget(&page_widget).and_then(|node| node.active_leaf());
+        let target = leaf.as_ref().map_or(page_widget, PaneLeaf::root_widget);
+        self.restore_zoom_before_close(&target);
+        if let Some(leaf) = leaf {
+            let leaf_root = leaf.root_widget();
+            if leaf_root
+                .parent()
+                .is_some_and(|parent| parent.is::<gtk4::Paned>())
+            {
+                let pending_remote = leaf.is_remote()
+                    && tab_num_for_widget(&leaf_root).is_some_and(|tab_num| {
+                        self.tab_connections
+                            .borrow()
+                            .get(&tab_num)
+                            .is_some_and(|connection| connection.status == ConnStatus::Disconnected)
+                    });
+                if pending_remote {
+                    if let Some(tab_num) = tab_num_for_widget(&leaf_root) {
+                        self.tab_connections.borrow_mut().remove(&tab_num);
+                        self.clear_tab_conn_status(tab_num);
                     }
-                    if let Some(process) = leaf.foreground_process_name() {
-                        let ui_state = self.clone();
-                        glib::MainContext::default().spawn_local(async move {
-                            if Self::confirm_close_with_processes(
-                                &ui_state.window,
-                                "Close pane with running process?",
-                                "Close Pane",
-                                &process,
-                            )
-                            .await
-                            {
-                                // The process may have exited and collapsed this
-                                // leaf while the confirmation was open. Never use
-                                // its now-stale PID after it left the pane tree.
-                                if leaf.root_widget().parent().is_some() {
-                                    leaf.kill();
-                                }
-                            }
-                        });
-                    } else {
-                        leaf.kill();
+                    // This child already emitted `exited`; killing it again
+                    // cannot drive the structural collapse callback.
+                    self.handle_terminal_exited(&leaf_root);
+                    if let Some(tab_num) = tab_num_for_widget(&leaf_root) {
+                        self.retitle_tab_from_active_leaf(tab_num);
                     }
                     return;
                 }
+                if let Some(process) = leaf.foreground_process_name() {
+                    let ui_state = self.clone();
+                    glib::MainContext::default().spawn_local(async move {
+                        if Self::confirm_close_with_processes(
+                            &ui_state.window,
+                            "Close pane with running process?",
+                            "Close Pane",
+                            &process,
+                        )
+                        .await
+                        {
+                            // The process may have exited and collapsed this
+                            // leaf while the confirmation was open. Never use
+                            // its now-stale PID after it left the pane tree.
+                            if leaf.root_widget().parent().is_some() {
+                                leaf.kill();
+                            }
+                        }
+                    });
+                } else {
+                    leaf.kill();
+                }
+                return;
             }
         }
-        self.remove_current_tab();
+        self.remove_tab_by_widget(&target);
     }
 
     pub(crate) fn duplicate_current_tab(&self) {
