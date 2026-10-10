@@ -1352,6 +1352,23 @@ fn apply_remote_host_edit<T: PartialEq>(
     Ok(())
 }
 
+/// A destructive confirmation belongs to one complete profile snapshot, not
+/// its old index or display name. Reordering is safe; ambiguity is not.
+fn remove_remote_host_snapshot<T: PartialEq>(hosts: &mut Vec<T>, expected: &T) -> bool {
+    let mut matches = hosts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, host)| (host == expected).then_some(index));
+    let Some(index) = matches.next() else {
+        return false;
+    };
+    if matches.next().is_some() {
+        return false;
+    }
+    hosts.remove(index);
+    true
+}
+
 const CROSS_BLOCK_SEARCH_LIMIT: usize = 500;
 const CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES: usize = 8 * 1024;
 const CROSS_BLOCK_SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
@@ -4865,9 +4882,9 @@ impl UiState {
 
                 let ui = ui_for_hosts.clone();
                 let populate_ref = populate_for_delete.clone();
-                let name = host.name.clone();
+                let expected_host = host.clone();
                 delete_btn.connect_clicked(move |_| {
-                    let display = jterm_core::review_input::safe_inline_display(&name, 1024);
+                    let display = jterm_core::review_input::safe_inline_display(&expected_host.name, 1024);
                     let dialog = adw::AlertDialog::new(
                         Some("Remove this host?"),
                         Some(&format!(
@@ -4880,7 +4897,7 @@ impl UiState {
                     dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
                     let ui_for_response = ui.clone();
                     let populate_ref = populate_ref.clone();
-                    let name = name.clone();
+                    let expected_host = expected_host.clone();
                     dialog.connect_response(None, move |_, response| {
                         if response != "remove" {
                             return;
@@ -4888,18 +4905,17 @@ impl UiState {
                         let previous_hosts = {
                             let mut config = ui_for_response.config.borrow_mut();
                             let previous_hosts = config.remote_hosts.clone();
-                            // The index can go stale if the file was reloaded
-                            // behind the panel; fall back to matching the name.
-                            match config.remote_hosts.get(index) {
-                                Some(host) if host.name == name => {
-                                    config.remote_hosts.remove(index);
-                                }
-                                _ => config.remote_hosts.retain(|h| h.name != name),
-                            }
-                            previous_hosts
+                            remove_remote_host_snapshot(&mut config.remote_hosts, &expected_host)
+                                .then_some(previous_hosts)
                         };
-                        ui_for_response.reconcile_file_tree_remote_hosts(&previous_hosts);
-                        ui_for_response.persist_config();
+                        if let Some(previous_hosts) = previous_hosts {
+                            ui_for_response.reconcile_file_tree_remote_hosts(&previous_hosts);
+                            ui_for_response.persist_config();
+                        } else {
+                            ui_for_response.toast_overlay.add_toast(adw::Toast::new(
+                                "Remote host changed, disappeared or is duplicated. Nothing was removed; review the refreshed list.",
+                            ));
+                        }
                         let populate = populate_ref.borrow().clone();
                         if let Some(populate) = populate {
                             populate();
@@ -4981,7 +4997,7 @@ impl UiState {
             let resolved = match expected_hosts.get(*index) {
                 Some(host) if &host.name == name => Some(*index),
                 // The file can be reloaded behind an open panel; fall back to
-                // matching the name, exactly as the delete path does.
+                // matching the name before displaying the current edit form.
                 _ => expected_hosts.iter().position(|h| &h.name == name),
             };
             resolved.map(|index| (index, expected_hosts[index].clone()))
@@ -5906,6 +5922,52 @@ mod tests {
                 "plain text row: {start}"
             );
         }
+    }
+
+    #[test]
+    fn remote_host_delete_uses_one_complete_snapshot_after_reorder() {
+        let expected = ("same name", "host-a", "port22");
+        let unrelated = ("other", "host-b", "port22");
+        let same_name_other = ("same name", "host-c", "port2222");
+        let mut hosts = vec![unrelated, same_name_other, expected];
+        assert!(super::remove_remote_host_snapshot(&mut hosts, &expected));
+        assert_eq!(hosts, [unrelated, same_name_other]);
+    }
+
+    #[test]
+    fn remote_host_delete_refuses_removed_edited_and_ambiguous_profiles() {
+        let expected = ("same name", "host-a", "port22");
+        for mut hosts in [
+            vec![],
+            vec![("same name", "replacement", "port22")],
+            vec![("same name", "host-a", "port2222")],
+            vec![expected, expected],
+        ] {
+            let unchanged = hosts.clone();
+            assert!(!super::remove_remote_host_snapshot(&mut hosts, &expected));
+            assert_eq!(hosts, unchanged);
+        }
+    }
+
+    #[test]
+    fn remote_host_delete_confirmation_captures_profile_and_has_no_name_fallback() {
+        let source = include_str!("dialogs.rs");
+        let delete = source
+            .split_once("let expected_host = host.clone();")
+            .unwrap()
+            .1
+            .split_once("group_for_hosts.add(&row);")
+            .unwrap()
+            .0;
+        assert!(delete.contains("let expected_host = expected_host.clone();"));
+        assert!(delete
+            .contains("remove_remote_host_snapshot(&mut config.remote_hosts, &expected_host)"));
+        assert!(!delete.contains("get(index)"));
+        assert!(!delete.contains("retain("));
+        assert!(
+            delete.find("if let Some(previous_hosts)").unwrap()
+                < delete.find("ui_for_response.persist_config()").unwrap()
+        );
     }
 
     #[test]
