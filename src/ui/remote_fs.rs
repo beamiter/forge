@@ -3005,29 +3005,45 @@ fn copy_recursive(src: &Path, dst: &Path, depth: usize) -> io::Result<()> {
         let target = std::fs::read_link(src)?;
         std::os::unix::fs::symlink(target, dst)
     } else if metadata.is_file() {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut source = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-            .open(src)?;
-        if !source.metadata()?.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "copy source is not a regular file",
-            ));
-        }
-        let mut destination = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(dst)?;
-        io::copy(&mut source, &mut destination)?;
-        destination.set_permissions(metadata.permissions())
+        copy_regular_file_with(src, dst, io::copy)
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "cannot copy a special filesystem entry",
         ))
     }
+}
+
+/// Keep a new copy private until all bytes arrive. In particular, copying a
+/// 0600 source must not expose its contents through default 0666 creation.
+/// Failed partial copies remain private; successful copies retain the existing
+/// final-permission contract, taken from the opened source rather than a stale
+/// pathname metadata lookup.
+fn copy_regular_file_with(
+    src: &Path,
+    dst: &Path,
+    transfer: impl FnOnce(&mut std::fs::File, &mut std::fs::File) -> io::Result<u64>,
+) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut source = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(src)?;
+    let metadata = source.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "copy source is not a regular file",
+        ));
+    }
+    let mut destination = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dst)?;
+    transfer(&mut source, &mut destination)?;
+    destination.set_permissions(metadata.permissions())
 }
 
 /// Validation shared by the create/rename dialogs and the operations they
@@ -4990,6 +5006,51 @@ mod transport_regressions {
             &PROBE_SCRIPT[offset..]
         )
     }
+    #[test]
+    fn local_regular_copy_is_private_until_complete_then_restores_source_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = Temp::new();
+        for mode in [0o600, 0o640, 0o755, 0o1755] {
+            let src = tmp.0.join(format!("source-{mode:o}"));
+            let dst = tmp.0.join(format!("copy-{mode:o}"));
+            std::fs::write(&src, b"private fixture").unwrap();
+            let permissions = std::fs::Permissions::from_mode(mode);
+            std::fs::set_permissions(&src, permissions).unwrap();
+            copy_regular_file_with(&src, &dst, |source, destination| {
+                let during = destination.metadata()?.permissions().mode();
+                assert_eq!(during & 0o077, 0);
+                assert_eq!(during & 0o7000, 0);
+                io::copy(source, destination)
+            })
+            .unwrap();
+            assert_eq!(std::fs::read(&dst).unwrap(), b"private fixture");
+            let copied_mode = dst.metadata().unwrap().permissions().mode();
+            assert_eq!(copied_mode & 0o7777, mode);
+        }
+    }
+
+    #[test]
+    fn failed_local_regular_copy_leaves_partial_bytes_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = Temp::new();
+        let src = tmp.0.join("source");
+        let dst = tmp.0.join("copy");
+        std::fs::write(&src, b"fixture").unwrap();
+        let permissions = std::fs::Permissions::from_mode(0o644);
+        std::fs::set_permissions(&src, permissions).unwrap();
+        let error = copy_regular_file_with(&src, &dst, |_, destination| {
+            destination.write_all(b"partial")?;
+            Err(io::Error::from_raw_os_error(nix::libc::EIO))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(nix::libc::EIO));
+        assert_eq!(std::fs::read(&dst).unwrap(), b"partial");
+        let partial_mode = dst.metadata().unwrap().permissions().mode();
+        assert_eq!(partial_mode & 0o077, 0);
+    }
+
     #[test]
     fn local_copy_refuses_existing_regular_file_and_dangling_link() {
         let root = Temp::new();
