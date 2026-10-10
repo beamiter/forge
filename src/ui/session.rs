@@ -79,6 +79,15 @@ fn restored_remote_host(
     Some(host)
 }
 
+/// A failed remote gate did not insert a page. Require a newly created local
+/// result rather than letting the caller reuse whatever tab was selected.
+fn restored_launch_or_local<T>(remote: Option<T>, local: impl FnOnce() -> T) -> (T, bool) {
+    match remote {
+        Some(terminal) => (terminal, false),
+        None => (local(), true),
+    }
+}
+
 impl UiState {
     /// Recursively restore a pane layout from saved state
     pub(crate) fn restore_pane_layout(
@@ -109,44 +118,49 @@ impl UiState {
                     cmds,
                     pinned,
                 };
-                if let Some(name) = seed.remote_name.as_deref() {
+                let (terminal, remote_rejected) = if let Some(name) = seed.remote_name.as_deref() {
                     if let Some(host) = self.resolve_restored_remote(name, &seed.sid) {
-                        self.add_restored_remote_tab(&host, seed.sid.clone(), tab_name);
+                        restored_launch_or_local(
+                            self.add_restored_remote_tab(&host, seed.sid.clone(), tab_name),
+                            || self.add_failed_remote_restore_tab(),
+                        )
                     } else {
                         self.show_missing_remote_profile(name);
-                        self.add_new_tab(
-                            None,
-                            tab_name,
-                            Some(seed.sid.clone()),
-                            crate::terminal::InitialCommands::default(),
-                        );
+                        (
+                            self.add_new_tab(
+                                None,
+                                tab_name,
+                                Some(seed.sid.clone()),
+                                crate::terminal::InitialCommands::default(),
+                            ),
+                            false,
+                        )
                     }
                 } else {
                     // Structured unmanaged argv is still replayed through the
                     // configured shell, but an external cwd is never reused on
                     // the local host.
                     let initial_commands = self.restored_initial_commands(seed.cmds.as_deref());
-                    self.add_new_tab(
-                        seed.local_working_directory(),
-                        tab_name,
-                        Some(seed.sid.clone()),
-                        initial_commands,
-                    );
-                }
-                // Return the page widget (last added page)
-                let page_num = self
-                    .notebook
-                    .current_page()
-                    .unwrap_or_else(|| self.notebook.n_pages().saturating_sub(1));
-                let page = self
-                    .notebook
-                    .nth_page(Some(page_num))
-                    .expect("Just added a page");
-                if let Some(custom_title) = seed.custom_title {
-                    set_tab_custom_title(&page, custom_title);
-                }
-                if seed.private_title == Some(true) {
-                    self.set_tab_title_privacy(&page, true);
+                    (
+                        self.add_new_tab(
+                            seed.local_working_directory(),
+                            tab_name,
+                            Some(seed.sid.clone()),
+                            initial_commands,
+                        ),
+                        false,
+                    )
+                };
+                let page = self.restored_page_for_terminal(&terminal);
+                if remote_rejected {
+                    set_tab_custom_title(&page, true);
+                } else {
+                    if let Some(custom_title) = seed.custom_title {
+                        set_tab_custom_title(&page, custom_title);
+                    }
+                    if seed.private_title == Some(true) {
+                        self.set_tab_title_privacy(&page, true);
+                    }
                 }
                 self.apply_restored_pin(&page, seed.pinned == Some(true));
                 page
@@ -196,38 +210,45 @@ impl UiState {
         // The one fully wired page can represent a managed remote wherever it
         // sits in the saved split tree. The placeholder is consumed at that
         // exact leaf; local siblings are prepared around it transactionally.
-        let existing_remote_name = resolved_remote
-            .as_ref()
-            .and_then(|(leaf, _)| leaf.remote_name.clone());
-        if let Some((leaf, host)) = resolved_remote.as_ref() {
-            self.add_restored_remote_tab(host, leaf.sid.clone(), tab_name);
+        let (terminal, remote_rejected) = if let Some((leaf, host)) = resolved_remote.as_ref() {
+            restored_launch_or_local(
+                self.add_restored_remote_tab(host, leaf.sid.clone(), tab_name),
+                || self.add_failed_remote_restore_tab(),
+            )
         } else {
             let initial_commands = if first.remote_name.is_some() {
                 crate::terminal::InitialCommands::default()
             } else {
                 self.restored_initial_commands(first.cmds.as_deref())
             };
-            self.add_new_tab(
-                first.local_working_directory(),
-                tab_name,
-                Some(first.sid.clone()),
-                initial_commands,
-            );
-        }
+            (
+                self.add_new_tab(
+                    first.local_working_directory(),
+                    tab_name,
+                    Some(first.sid.clone()),
+                    initial_commands,
+                ),
+                false,
+            )
+        };
+        let placeholder_remote_target = resolved_remote
+            .as_ref()
+            .and_then(|(leaf, _)| leaf.remote_name.clone());
 
+        let first_page = self.restored_page_for_terminal(&terminal);
         let page_num = self
             .notebook
-            .current_page()
-            .expect("normal tab creation selects the restored page");
-        let first_page = self
-            .notebook
-            .nth_page(Some(page_num))
-            .expect("normal tab creation inserted a page");
-        if let Some(custom_title) = first.custom_title {
-            set_tab_custom_title(&first_page, custom_title);
-        }
-        if first.private_title == Some(true) {
-            self.set_tab_title_privacy(&first_page, true);
+            .page_num(&first_page)
+            .expect("the returned restore terminal belongs to its new page");
+        if remote_rejected {
+            set_tab_custom_title(&first_page, true);
+        } else {
+            if let Some(custom_title) = first.custom_title {
+                set_tab_custom_title(&first_page, custom_title);
+            }
+            if first.private_title == Some(true) {
+                self.set_tab_title_privacy(&first_page, true);
+            }
         }
         let custom_title_cell = tab_custom_title_cell(&first_page);
         let private_title_cell = tab_private_title_cell(&first_page);
@@ -238,7 +259,10 @@ impl UiState {
         // real first page remains attached to the Notebook. Only a completely
         // prepared tree is allowed to replace it.
         let placeholder = gtk4::Box::new(gtk4::Orientation::Vertical, 0).upcast::<gtk4::Widget>();
-        let mut first_leaf = Some((existing_remote_name, placeholder.clone()));
+        // This is only a structural position selector, never transport metadata.
+        // Even a rejected remote gets its fresh local fallback at that exact
+        // saved leaf, preserving all independently restorable local siblings.
+        let mut first_leaf = Some((placeholder_remote_target, placeholder.clone()));
         let mut prepared_leaves = Vec::new();
         let restored = match self.restore_pane_layout_internal(
             layout,
@@ -305,6 +329,29 @@ impl UiState {
         self.sync_tab_strip_active(Some(inserted));
         self.sync_tab_bar_visibility();
         restored
+    }
+
+    /// A rejected connection is visibly local and has no saved remote launch
+    /// data: neither cwd/commands nor the remote session/history identity.
+    fn add_failed_remote_restore_tab(&self) -> vte4::Terminal {
+        self.add_new_tab(
+            None,
+            Some("Local (remote restore failed)".to_string()),
+            None,
+            crate::terminal::InitialCommands::default(),
+        )
+    }
+
+    /// Bind the page to the actual constructor result. Unified's compatibility
+    /// VTE need not be a visible descendant, so use its attached PaneLeaf's
+    /// terminal identity rather than ancestry or current-page selection.
+    fn restored_page_for_terminal(&self, terminal: &vte4::Terminal) -> gtk4::Widget {
+        (0..self.notebook.n_pages())
+            .filter_map(|index| self.notebook.nth_page(Some(index)))
+            .find(|page| {
+                PaneLeaf::from_widget(page).is_some_and(|leaf| leaf.terminal() == terminal)
+            })
+            .expect("normal tab creation attached the returned terminal to a new page")
     }
 
     fn resolve_restored_remote(
@@ -502,6 +549,114 @@ mod tests {
             multiplex: true,
             deploy: jterm_core::jsh_remote::Deploy::Off,
         }
+    }
+
+    #[test]
+    fn rejected_remote_launch_creates_a_fresh_local_result() {
+        let calls = std::cell::Cell::new(0);
+        let old_selected_page = 7;
+        let (created, rejected) = super::restored_launch_or_local(None, || {
+            calls.set(calls.get() + 1);
+            8
+        });
+        assert!(rejected);
+        assert_ne!(created, old_selected_page);
+        assert_eq!(calls.get(), 1);
+        let (created, rejected) = super::restored_launch_or_local(Some(9), || {
+            panic!("successful remote launch must not create a local shell")
+        });
+        assert_eq!(created, 9);
+        assert!(!rejected);
+    }
+
+    #[test]
+    fn saved_session_override_can_reject_an_otherwise_valid_remote_profile() {
+        let mut current = profile();
+        current.session = Some("s".into());
+        current.ssh_args = vec![format!("-o{}", "x".repeat(4094)); 64];
+        let fixed = current.name.len()
+            + current.host.len()
+            + current.user.as_deref().map_or(0, str::len)
+            + current.remote_shell.len()
+            + 1;
+        let last = current.ssh_args.last_mut().unwrap();
+        last.truncate(last.len() - fixed);
+        assert!(crate::config::validate_remote_host(&current).is_ok());
+        let restored = restored_remote_host(&[current], "production", "saved-session-7").unwrap();
+        assert_eq!(
+            crate::config::validate_remote_host(&restored),
+            Err("Remote profile exceeds the execution byte budget.")
+        );
+    }
+
+    #[test]
+    fn repeated_profile_names_choose_the_first_managed_leaf_position() {
+        use crate::state::PaneLayout;
+        fn leaf(remote: Option<&str>, sid: &str) -> PaneLayout {
+            PaneLayout::Leaf {
+                dir: "/synthetic".into(),
+                sid: sid.into(),
+                cwd_external: remote.is_some(),
+                remote_name: remote.map(str::to_owned),
+                custom_title: None,
+                private_title: None,
+                cmds: None,
+                pinned: None,
+            }
+        }
+        let layout = PaneLayout::Split {
+            orientation: 'h',
+            position: 30,
+            start: Box::new(leaf(None, "local")),
+            end: Box::new(PaneLayout::Split {
+                orientation: 'v',
+                position: 40,
+                start: Box::new(leaf(Some("production"), "first-remote")),
+                end: Box::new(leaf(Some("production"), "second-remote")),
+            }),
+        };
+        let selected = super::RestoredLeafSeed::first_managed(&layout).unwrap();
+        assert_eq!(selected.sid, "first-remote");
+        assert_eq!(selected.remote_name.as_deref(), Some("production"));
+    }
+
+    #[test]
+    fn restore_binds_created_terminal_and_keeps_rejected_placeholder_position() {
+        let source = include_str!("session.rs");
+        let production = source.split_once("\n#[cfg(test)]").unwrap().0;
+        assert_eq!(production.matches("restored_launch_or_local(").count(), 2);
+        assert!(!production.contains(".current_page()"));
+        assert!(production.contains("leaf.terminal() == terminal"));
+        let fallback = production
+            .split_once("fn add_failed_remote_restore_tab(")
+            .unwrap()
+            .1
+            .split_once("fn restored_page_for_terminal(")
+            .unwrap()
+            .0;
+        assert!(fallback.contains("Local (remote restore failed)"));
+        assert!(fallback.contains("InitialCommands::default()"));
+        assert_eq!(
+            fallback.matches("None,").count(),
+            2,
+            "no remote cwd or saved session"
+        );
+        let split = production
+            .split_once("fn restore_split_tab(")
+            .unwrap()
+            .1
+            .split_once("fn add_failed_remote_restore_tab(")
+            .unwrap()
+            .0;
+        assert!(split.contains("Some((placeholder_remote_target, placeholder.clone()))"));
+        assert!(!split.contains("filter(|_| !remote_rejected)"));
+        assert!(split.contains("if remote_rejected {\n            set_tab_custom_title(&first_page, true);\n        } else {"));
+        let build = production
+            .split_once("fn restore_pane_layout_internal(")
+            .unwrap()
+            .1;
+        assert!(build.contains("first_leaf.take()"));
+        assert!(!build.contains("set_managed_remote_name"));
     }
 
     #[test]
