@@ -722,12 +722,38 @@ mod organism_preview {
             );
             desktop.set_gtk_enable_animations(false);
             assert!(preview.source.borrow().is_none());
-            motion.set_selected(1);
+            motion.set_selected(3);
+            let demo = preview.demo.upgrade().unwrap();
+            let cooldown_before_interruptions = preview.last_hello.get();
+            demo.emit_clicked();
+            assert!(preview.sequence.borrow().is_running());
+            pose.set_selected(1);
+            assert!(!preview.sequence.borrow().is_running());
+            assert_eq!(demo.label().as_deref(), Some("Play demo"));
+            assert_eq!(
+                sprite.text().as_str(),
+                sprite_frame_with_context(PreviewPose::Curious.context(), 0).as_ref()
+            );
+            demo.emit_clicked();
+            assert!(preview.sequence.borrow().is_running());
             assert!(preview.source.borrow().is_some());
             group.set_visible(false);
             assert!(preview.source.borrow().is_none());
+            assert!(!preview.sequence.borrow().is_running());
             group.set_visible(true);
             spin_until(&|| group.is_mapped() && preview.is_active());
+            assert!(
+                !preview.sequence.borrow().is_running(),
+                "show must not replay demo"
+            );
+            assert_eq!(demo.label().as_deref(), Some("Play demo"));
+            assert_eq!(pose.selected(), 1);
+            assert_eq!(
+                sprite.text().as_str(),
+                sprite_frame_with_context(PreviewPose::Curious.context(), 0).as_ref()
+            );
+            assert_eq!(preview.last_hello.get(), cooldown_before_interruptions);
+            motion.set_selected(1);
             assert!(preview.source.borrow().is_some());
             dialog.force_close();
             spin_until(&|| !group.is_mapped());
@@ -736,6 +762,32 @@ mod organism_preview {
             dialog.present(Some(&window));
             spin_until(&|| group.is_mapped() && preview.is_active());
             assert!(preview.source.borrow().is_some());
+            // Drive the real preview controls once in a still mode. This is
+            // the existing offline settings fixture, never a terminal event.
+            motion.set_selected(3);
+            pose.set_selected(1);
+            let demo = preview.demo.upgrade().unwrap();
+            let sample = preview.sample.upgrade().unwrap();
+            let cooldown_before_demo = preview.last_hello.get();
+            demo.emit_clicked();
+            assert!(preview.sequence.borrow().is_running());
+            assert_eq!(demo.label().as_deref(), Some("Stop demo"));
+            assert!(!hello.is_sensitive());
+            spin_until(&|| sample.subtitle().as_deref() == Some("Demo 2/5: Working · example"));
+            assert_eq!(pose.selected(), 1, "demo preserves the manual pose");
+            assert_eq!(
+                sprite.text().as_str(),
+                sprite_frame_with_context(PreviewPose::Working.context(), 0).as_ref()
+            );
+            demo.emit_clicked();
+            assert!(!preview.sequence.borrow().is_running());
+            assert_eq!(demo.label().as_deref(), Some("Play demo"));
+            assert_eq!(preview.last_hello.get(), cooldown_before_demo);
+            assert_eq!(
+                sprite.text().as_str(),
+                sprite_frame_with_context(PreviewPose::Curious.context(), 0).as_ref()
+            );
+            motion.set_selected(1);
             dialog.force_close();
             spin_until(&|| !group.is_mapped());
             assert!(preview.source.borrow().is_none());
