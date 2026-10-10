@@ -1905,6 +1905,14 @@ fn clear_cross_block_search_dialog_claim<T: PartialEq>(
     }
 }
 
+/// Retire the argument form only after the original target accepts the text.
+/// Acceptance may only enqueue PTY input; it does not acknowledge later I/O.
+fn finish_workflow_insertion(insert: impl FnOnce() -> bool, finish: impl FnOnce()) {
+    if insert() {
+        finish();
+    }
+}
+
 /// Mirror a user edit into the shared workflow form, but ignore the synchronous
 /// `changed` signal emitted while Reset is only bringing the widget back in
 /// sync with a state already committed through `ArgsForm::clear`.
@@ -5759,8 +5767,13 @@ impl UiState {
             let rendered = form_for_run.borrow().render();
             match rendered {
                 Ok(resolved) => {
-                    dialog_for_run.force_close();
-                    ui_for_run.insert_review_text(&pane_for_run, &resolved);
+                    finish_workflow_insertion(
+                        || ui_for_run.insert_review_text(&pane_for_run, &resolved),
+                        || {
+                            dialog_for_run.force_close();
+                            pane_for_run.grab_focus();
+                        },
+                    );
                 }
                 Err(error) => {
                     log::warn!("refusing unsafe or incomplete workflow render: {error}");
@@ -6008,8 +6021,8 @@ mod tests {
         cross_block_search_jump_unavailable_status, cross_block_search_memory,
         cross_block_search_pending_status, cross_block_search_query_error,
         cross_block_search_refresh_status, cross_block_search_status, cross_block_selection_index,
-        cross_block_should_step, overlay_scan_status, preferences_group_title,
-        record_snapshot_dialog_title, record_snapshot_status_line,
+        cross_block_should_step, finish_workflow_insertion, overlay_scan_status,
+        preferences_group_title, record_snapshot_dialog_title, record_snapshot_status_line,
         record_snapshot_unavailable_message, record_workflow_arg_entry_change, remote_picker_guard,
         CrossBlockBookmarkKeyDecision, CrossBlockBookmarkKeyLatch, CrossBlockEnterKeyRoute,
         CrossBlockJumpOutcome, CrossBlockRefreshFrameDecision, CrossBlockRefreshFrameGate,
@@ -6124,6 +6137,68 @@ mod tests {
             Err("No remote hosts are configured. Add one in Settings → Remote Hosts.")
         );
         assert!(remote_picker_guard(false, 1).is_ok());
+    }
+
+    #[test]
+    fn workflow_insertion_rejection_preserves_the_form() {
+        let open = std::cell::Cell::new(true);
+        let draft = std::cell::RefCell::new(String::from("keep these arguments"));
+        let calls = std::cell::RefCell::new(Vec::new());
+        finish_workflow_insertion(
+            || {
+                calls.borrow_mut().push("rejected");
+                false
+            },
+            || {
+                calls.borrow_mut().push("closed");
+                open.set(false);
+                draft.borrow_mut().clear();
+            },
+        );
+        assert!(open.get());
+        assert_eq!(*draft.borrow(), "keep these arguments");
+        assert_eq!(*calls.borrow(), ["rejected"]);
+    }
+
+    #[test]
+    fn workflow_insertion_acceptance_precedes_form_close() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        finish_workflow_insertion(
+            || {
+                calls.borrow_mut().push("accepted");
+                true
+            },
+            || calls.borrow_mut().push("closed"),
+        );
+        assert_eq!(*calls.borrow(), ["accepted", "closed"]);
+    }
+
+    #[test]
+    fn workflow_form_completion_uses_the_captured_target_after_acceptance() {
+        let source = include_str!("dialogs.rs");
+        let form = source
+            .split("pub(crate) fn show_workflow_args_dialog")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn show_record_snapshot_dialog")
+            .next()
+            .unwrap();
+        let success = form
+            .split("Ok(resolved) => {")
+            .nth(1)
+            .unwrap()
+            .split("Err(error) => {")
+            .next()
+            .unwrap();
+        let gate = success.find("finish_workflow_insertion(").unwrap();
+        let insert = success
+            .find("insert_review_text(&pane_for_run, &resolved)")
+            .unwrap();
+        let close = success.find("dialog_for_run.force_close()").unwrap();
+        let focus = success.find("pane_for_run.grab_focus()").unwrap();
+        assert!(gate < insert && insert < close && close < focus);
+        assert!(!success.contains("current_pane"));
+        assert!(!success.contains("write_input"));
     }
 
     #[test]
