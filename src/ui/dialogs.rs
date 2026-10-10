@@ -34,6 +34,16 @@ mod organism_preview {
 
     use crate::config::OrganismMotion;
 
+    pub(super) const INTERACTION_HINT: &str = concat!(
+        "Changes apply to open panes.\n",
+        "In Full or Calm, keep the pointer near an idle companion for 600 ms ",
+        "for a brief hello (about 2 seconds). Greetings are at least 8 seconds apart; ",
+        "move away and return to try again.\n",
+        "Typing, running commands and alternate-screen apps take priority. ",
+        "Static uses inline cards only, without live hover greetings. ",
+        "Clicks and selection stay with your terminal."
+    );
+
     const FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
     fn motion_for_selection(selected: u32, animations: bool) -> OrganismMotion {
@@ -639,6 +649,35 @@ mod organism_preview {
                 "hidden settings callbacks cannot restart a timer"
             );
             window.close();
+        }
+
+        #[test]
+        fn interaction_help_matches_live_timing_and_settings_binding() {
+            assert_eq!(GentleInteraction::HOLD, Duration::from_secs(2));
+            assert_eq!(GentleInteraction::COOLDOWN, Duration::from_secs(8));
+            let runtime = include_str!("organism.rs");
+            let dwell = runtime
+                .split_once("const POINTER_GREETING_DWELL:")
+                .unwrap()
+                .1
+                .split_once(';')
+                .unwrap()
+                .0;
+            assert!(dwell.contains("Duration::from_millis(600)"));
+            assert!(runtime.contains("timeout_add_local_once(POINTER_GREETING_DWELL"));
+            assert!(INTERACTION_HINT.contains("600 ms"));
+            assert!(INTERACTION_HINT.contains("about 2 seconds"));
+            assert!(INTERACTION_HINT.contains("at least 8 seconds"));
+            assert!(INTERACTION_HINT.contains("without live hover greetings"));
+            let source = include_str!("dialogs.rs");
+            let row = source
+                .rsplit_once("let ascii_organism_row =")
+                .unwrap()
+                .1
+                .split_once(".build();")
+                .unwrap()
+                .0;
+            assert!(row.contains(".tooltip_text(organism_preview::INTERACTION_HINT)"));
         }
 
         #[test]
@@ -3797,7 +3836,7 @@ impl UiState {
         let ascii_organism_row = adw::SwitchRow::builder()
             .title("ASCII Organism")
             .subtitle("Local, no-LLM companion for Block/Unified panes")
-            .tooltip_text("Changes apply to open panes. Pause near a resting companion for a hello; clicks and selection stay with your terminal.")
+            .tooltip_text(organism_preview::INTERACTION_HINT)
             .active(config.ascii_organism_enabled)
             .build();
         ascii_organism_row.set_sensitive(!safe_mode);
