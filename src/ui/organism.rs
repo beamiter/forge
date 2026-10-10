@@ -18,7 +18,7 @@ use jterm_core::organism::{
     VisualGrowthStage, VisualTransition, WatchRhythm,
 };
 use jterm_core::organism_attention::{AttentionArbiter, AttentionCue};
-use jterm_core::organism_daily::GentleInteraction;
+use jterm_core::organism_daily::{behavior_explanation, GentleInteraction};
 use jterm_core::organism_memory::{
     local_circadian_time_at_ms, unix_ms, CircadianProfile, GrowthProgress, GrowthStage,
     LocalCircadianTime, MemoryEvent, MemoryInsight, RepoContext,
@@ -1695,6 +1695,8 @@ struct OrganismRuntime {
     interaction: RefCell<GentleInteraction>,
     interaction_epoch: Instant,
     live_context: Cell<RenderContext>,
+    /// Final post-interaction pose, only while the spatial body is presented.
+    presented_behavior: Cell<Option<Behavior>>,
     pointer_position: Cell<Option<(f64, f64)>>,
     pointer_near: Cell<bool>,
     pointer_timer: RefCell<Option<gtk4::glib::SourceId>>,
@@ -1887,6 +1889,7 @@ impl OrganismRuntime {
                 BodyLanguage::default(),
                 false,
             )),
+            presented_behavior: Cell::new(None),
             pointer_position: Cell::new(None),
             pointer_near: Cell::new(false),
             pointer_timer: RefCell::new(None),
@@ -2295,6 +2298,14 @@ impl OrganismRuntime {
         motion
     }
 
+    fn set_presented_behavior(&self, behavior: Option<Behavior>) {
+        if self.presented_behavior.replace(behavior) != behavior || behavior.is_some() {
+            // Existing visible frames also reconcile the first GTK mapping;
+            // the text/tooltip setters still run only when their value changes.
+            self.refresh_state(self.shared_life.get());
+        }
+    }
+
     fn hide_live_body(&self, view: &TermView) {
         self.cancel_pointer_greeting();
         self.reset_watch_rhythm_at_boundary(Instant::now());
@@ -2305,6 +2316,7 @@ impl OrganismRuntime {
         self.body_position.set(None);
         self.body_in_transit.set(false);
         view.set_live_organism_visible(false);
+        self.set_presented_behavior(None);
     }
 
     fn bump_generation(&self) -> u64 {
@@ -2348,6 +2360,7 @@ impl OrganismRuntime {
         self.surface_behavior_frame_origin
             .set(self.surface_frame.get());
         self.surface_behavior.set(reaction.behavior);
+        self.presented_behavior.set(None);
         self.refresh_inline_sprite();
         self.refresh_growth_badge();
         let status = match reaction.speech {
@@ -2410,11 +2423,16 @@ impl OrganismRuntime {
     }
 
     fn refresh_state(&self, state: LifeState) {
-        let words = state_words(state);
+        let explanation = state_explanation(
+            self.surface_behavior.get(),
+            self.presented_behavior.get(),
+            self.live_body.is_mapped(),
+        );
+        let words = format!("{explanation} · {}", state_words(state));
         if self.state.text().as_str() != words {
             self.state.set_text(&words);
         }
-        let detail = state_summary(state);
+        let detail = format!("{explanation}\n{}", state_summary(state));
         if self.state.tooltip_text().as_deref() != Some(detail.as_str()) {
             self.state.set_tooltip_text(Some(&detail));
         }
@@ -2754,6 +2772,7 @@ impl OrganismRuntime {
                 self.body_in_transit.set(moved);
                 self.body_position.set(Some((x, y)));
                 view.set_live_organism_visible(true);
+                self.set_presented_behavior(Some(context.behavior));
             } else {
                 // A detached/reparenting surface is not a place the body can
                 // visibly sleep. Fail closed until the next measured frame.
@@ -3118,6 +3137,21 @@ impl Drop for OrganismRuntime {
     }
 }
 
+/// Describe the actual visible surface. Hidden/static bodies fall back to
+/// the inline card's own pose rather than an internal typing/watch placeholder.
+fn state_explanation(
+    inline: Behavior,
+    presented: Option<Behavior>,
+    live_mapped: bool,
+) -> &'static str {
+    let behavior = if live_mapped {
+        presented.unwrap_or(inline)
+    } else {
+        inline
+    };
+    behavior_explanation(behavior)
+}
+
 fn state_summary(state: LifeState) -> String {
     format!(
         "E{:02} M{:02} C{:02} B{:02} S{:02} N{:02} A{:02} F{:02}",
@@ -3290,11 +3324,10 @@ impl UiState {
             .set(!view.organism_activity_settled());
         self.organism_presence.bind(presence_token, view, &runtime);
         OrganismRuntime::install_pointer_observer(&runtime, view);
-        // Two surfaces, deliberately: the card is the organism's home in the
-        // block conversation, the live body below is its home on the terminal
-        // surface itself. A pane that cannot host inline cards (Unified) keeps
-        // only the overlay — which is also why that overlay must be suppressed
-        // for alt-screen apps there, see `UnifiedBackend::enter_alt_screen_chrome`.
+        // The transient card lives in Block's conversation or Unified's dock;
+        // it is never a persisted FinishedBlock. The separate spatial body
+        // remains pass-through and is suppressed while an alt-screen app owns
+        // the terminal surface.
         if !view.insert_inline_notice(&runtime.card) {
             log::debug!(
                 "organism card not mounted in this pane; the live-surface body is its only home"
@@ -3344,6 +3377,7 @@ impl UiState {
                     // no typing-triggered run competes with the prompt.
                     runtime.body_position.set(None);
                     runtime.body_in_transit.set(false);
+                    runtime.set_presented_behavior(None);
                     if let Some(view) = view_weak.upgrade() {
                         // Clear desired visibility even behind the alternate-
                         // screen override, so rmcup cannot briefly restore a
@@ -3371,6 +3405,7 @@ impl UiState {
                 runtime.set_sleeping(false);
                 runtime.body_position.set(None);
                 runtime.body_in_transit.set(false);
+                runtime.set_presented_behavior(None);
                 runtime.sticky_avatar.set_visible(false);
                 if let Some(view) = view_weak.upgrade() {
                     view.set_live_organism_visible(false);
@@ -3419,6 +3454,7 @@ impl UiState {
                 // and restores the body below the new cursor edge.
                 runtime.body_position.set(None);
                 runtime.body_in_transit.set(false);
+                runtime.set_presented_behavior(None);
                 if let Some(view) = view {
                     view.set_live_organism_visible(false);
                 }
@@ -10061,6 +10097,77 @@ mod tests {
         assert!(reaction_hold(&first_error) < reaction_hold(&big_recovery));
         assert!(reaction_hold(&big_recovery) < reaction_hold(&repeated_error));
         assert_eq!(reaction_hold(&repeated_error), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn state_explanation_follows_the_presented_greeting_and_restores_inline_pose() {
+        let inline = Behavior::Idle;
+        let context = RenderContext::new(inline, BodyLanguage::default(), false);
+        let mut interaction = GentleInteraction::default();
+        assert!(interaction.request(Duration::ZERO, context));
+        let displayed = interaction.apply(Duration::from_millis(1), context);
+        assert_eq!(displayed.behavior, Behavior::Approach);
+        assert_eq!(
+            state_explanation(inline, Some(displayed.behavior), true),
+            behavior_explanation(Behavior::Approach)
+        );
+        assert_eq!(
+            state_explanation(inline, Some(displayed.behavior), false),
+            behavior_explanation(inline)
+        );
+        interaction.cancel();
+        assert_eq!(interaction.apply(Duration::from_millis(2), context), context);
+        assert_eq!(
+            state_explanation(inline, None, true),
+            behavior_explanation(inline)
+        );
+    }
+
+    #[test]
+    fn description_tracks_final_context_and_retires_previous_reaction() {
+        let source = include_str!("organism.rs");
+        let render = source
+            .split_once("fn render(&self, reaction: &Reaction) {")
+            .unwrap()
+            .1
+            .split_once("fn refresh_growth_badge")
+            .unwrap()
+            .0;
+        assert!(
+            render.find("self.presented_behavior.set(None);").unwrap()
+                < render.find("self.refresh_state(").unwrap()
+        );
+        let surface = source
+            .split_once("fn refresh_surface(&self, view: &TermView, now: Instant) {")
+            .unwrap()
+            .1
+            .split_once("fn apply_settings(")
+            .unwrap()
+            .0;
+        let interaction = surface
+            .find(".apply(self.interaction_epoch.elapsed(), context);")
+            .unwrap();
+        let shown = surface.find("view.set_live_organism_visible(true);").unwrap();
+        let explanation = surface
+            .find("self.set_presented_behavior(Some(context.behavior));")
+            .unwrap();
+        assert!(interaction < shown && shown < explanation);
+    }
+
+    #[test]
+    fn hidden_typing_placeholders_do_not_describe_unstarted_work() {
+        assert_eq!(
+            state_explanation(Behavior::Idle, Some(Behavior::WatchCommand), false),
+            behavior_explanation(Behavior::Idle)
+        );
+        assert_ne!(
+            state_explanation(Behavior::UnknownOutcome, None, false),
+            state_explanation(Behavior::GlanceAside, None, false)
+        );
+        assert_eq!(
+            state_explanation(Behavior::CelebrateBig, None, false),
+            behavior_explanation(Behavior::CelebrateBig)
+        );
     }
 
     #[test]
