@@ -14,6 +14,12 @@ mod gtk4 {
 }
 pub mod glib {
     use super::*;
+    pub struct WeakRef<T>(pub Rc<dyn Fn() -> Option<T>>);
+    impl<T> WeakRef<T> {
+        pub fn upgrade(&self) -> Option<T> {
+            (self.0)()
+        }
+    }
     type Callback = Box<dyn FnOnce()>;
     thread_local! { static SOURCES: RefCell<Vec<Option<Callback>>> = const { RefCell::new(Vec::new()) }; }
     pub struct SourceId(usize);
@@ -66,12 +72,29 @@ mod vte4 {
             }
         }
     }
-    #[derive(Clone, Default)]
-    pub struct Terminal {
+    #[derive(Default)]
+    pub struct TerminalState {
         pub installed: Rc<RefCell<Option<String>>>,
         pub steps: Rc<Cell<usize>>,
     }
+    #[derive(Clone, Default)]
+    pub struct Terminal(Rc<TerminalState>);
+    impl std::ops::Deref for Terminal {
+        type Target = TerminalState;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+    impl PartialEq for Terminal {
+        fn eq(&self, other: &Self) -> bool {
+            Rc::ptr_eq(&self.0, &other.0)
+        }
+    }
     impl Terminal {
+        pub fn downgrade(&self) -> glib::WeakRef<Self> {
+            let weak = Rc::downgrade(&self.0);
+            glib::WeakRef(Rc::new(move || weak.upgrade().map(Self)))
+        }
         pub fn search_set_regex(&self, re: Option<&Regex>, _: u32) {
             *self.installed.borrow_mut() = re.map(|r| r.0.clone());
         }
@@ -170,6 +193,7 @@ mod ui {
         search_entry: Entry,
         search_status: Label,
         search_generation: Rc<Cell<u64>>,
+        search_owner: Rc<RefCell<Option<search::SearchOwner>>>,
         search_debounce_source: Rc<RefCell<Option<glib::SourceId>>>,
         current: Rc<Cell<usize>>,
         terminals: Vec<vte4::Terminal>,
@@ -200,6 +224,7 @@ mod ui {
             search_entry: Entry::default(),
             search_status: Label::default(),
             search_generation: Rc::new(Cell::new(0)),
+            search_owner: Rc::new(RefCell::new(None)),
             search_debounce_source: Rc::new(RefCell::new(None)),
             current: Rc::new(Cell::new(0)),
             terminals: vec![vte4::Terminal::default(), vte4::Terminal::default()],
@@ -323,6 +348,76 @@ mod ui {
         assert_eq!(*ui.search_status.0.borrow(), "1 of 2");
         assert!(ui.terminals[0].installed.borrow().is_none());
     }
+    #[test]
+    fn same_query_moves_between_split_owners_before_navigation() {
+        let ui = setup();
+        ui.search_entry.set_text("same-query");
+        ui.search_apply();
+        ui.current.set(1);
+        ui.search_next();
+        assert!(ui.terminals[0].installed.borrow().is_none());
+        assert_eq!(*ui.terminals[1].installed.borrow(), Some("same-query".into()));
+        assert_eq!(ui.terminals[1].steps.get(), 1);
+        ui.search_next();
+        assert_eq!(ui.terminals[1].steps.get(), 2);
+        ui.current.set(0);
+        ui.search_prev();
+        assert!(ui.terminals[1].installed.borrow().is_none());
+        assert_eq!(*ui.terminals[0].installed.borrow(), Some("same-query".into()));
+        assert_eq!(ui.terminals[0].steps.get(), 2);
+    }
+
+    #[test]
+    fn close_clears_the_installed_owner_after_split_focus_changes() {
+        let mut ui = setup();
+        let view = Rc::new(TermView {
+            result: block_view::FindSearchResult::NoMatches,
+            queries: Rc::new(RefCell::new(Vec::new())),
+            cleared: Rc::new(Cell::new(0)),
+        });
+        ui.views[0] = Some(view.clone());
+        ui.search_entry.set_text("owner-query");
+        ui.search_apply();
+        let cleared = view.cleared.get();
+        ui.current.set(1);
+        *ui.terminals[1].installed.borrow_mut() = Some("unrelated-query".into());
+        ui.toggle_search();
+        assert!(ui.terminals[0].installed.borrow().is_none());
+        assert_eq!(view.cleared.get(), cleared + 1);
+        assert_eq!(
+            *ui.terminals[1].installed.borrow(),
+            Some("unrelated-query".into())
+        );
+        assert!(ui.search_owner.borrow().is_none());
+    }
+
+    #[test]
+    fn destroyed_search_owner_is_not_retained_or_confused_with_replacement() {
+        let mut ui = setup();
+        let view = Rc::new(TermView {
+            result: block_view::FindSearchResult::NoMatches,
+            queries: Rc::new(RefCell::new(Vec::new())),
+            cleared: Rc::new(Cell::new(0)),
+        });
+        let weak_view = Rc::downgrade(&view);
+        let weak_terminal = ui.terminals[0].downgrade();
+        ui.views[0] = Some(view);
+        ui.search_entry.set_text("retired-query");
+        ui.search_apply();
+        ui.views[0] = None;
+        ui.terminals[0] = vte4::Terminal::default();
+        assert!(weak_view.upgrade().is_none());
+        assert!(weak_terminal.upgrade().is_none());
+        ui.search_next();
+        assert_eq!(
+            *ui.terminals[0].installed.borrow(),
+            Some("retired-query".into())
+        );
+        assert_eq!(ui.terminals[0].steps.get(), 1);
+        ui.toggle_search();
+        assert!(ui.terminals[0].installed.borrow().is_none());
+    }
+
     #[test]
     fn newest_debounce_wins() {
         let ui = setup();

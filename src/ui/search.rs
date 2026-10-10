@@ -2,6 +2,7 @@
 use adw::prelude::*;
 use gtk4::glib;
 use libadwaita as adw;
+use std::rc::{Rc, Weak};
 use std::time::Duration;
 use vte4::TerminalExt;
 
@@ -11,6 +12,47 @@ use super::*;
 
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
 const SEARCH_QUERY_BYTE_LIMIT: usize = 8 * 1024;
+
+/// The pane that owns the installed query, independently of later focus.
+/// Neither backend may be kept alive solely by an open search bar.
+pub(crate) struct SearchOwner {
+    terminal: Option<glib::WeakRef<vte4::Terminal>>,
+    view: Option<Weak<TermView>>,
+}
+
+impl SearchOwner {
+    fn new(terminal: Option<&vte4::Terminal>, view: Option<&Rc<TermView>>) -> Self {
+        Self {
+            terminal: terminal.map(|terminal| terminal.downgrade()),
+            view: view.map(Rc::downgrade),
+        }
+    }
+
+    fn matches(&self, terminal: Option<&vte4::Terminal>, view: Option<&Rc<TermView>>) -> bool {
+        let same_terminal = match (&self.terminal, terminal) {
+            (Some(previous), Some(current)) => previous.upgrade().as_ref() == Some(current),
+            (None, None) => true,
+            _ => false,
+        };
+        let same_view = match (&self.view, view) {
+            (Some(previous), Some(current)) => previous
+                .upgrade()
+                .is_some_and(|previous| Rc::ptr_eq(&previous, current)),
+            (None, None) => true,
+            _ => false,
+        };
+        same_terminal && same_view
+    }
+
+    fn clear(&self) {
+        if let Some(terminal) = self.terminal.as_ref().and_then(glib::WeakRef::upgrade) {
+            terminal.search_set_regex(None::<&vte4::Regex>, 0);
+        }
+        if let Some(view) = self.view.as_ref().and_then(Weak::upgrade) {
+            view.clear_find();
+        }
+    }
+}
 
 fn query_exceeds_byte_limit(query: &str) -> bool {
     query.len() > SEARCH_QUERY_BYTE_LIMIT
@@ -56,16 +98,27 @@ impl UiState {
             }
         } else {
             self.cancel_pending_search();
-            // Clear search highlight when closing
-            if let Some(term) = self.current_terminal() {
-                term.search_set_regex(None::<&vte4::Regex>, 0);
-            }
-            if let Some(term_view) = self.current_term_view() {
-                term_view.clear_find();
-            }
+            // Focus may have moved to another split since this query ran.
+            self.clear_search_owner();
             self.search_status.set_text("");
             self.focus_current_terminal();
         }
+    }
+
+    fn clear_search_owner(&self) {
+        let previous = self.search_owner.borrow_mut().take();
+        if let Some(previous) = previous {
+            previous.clear();
+        }
+    }
+
+    fn search_owner_is_current(&self) -> bool {
+        let terminal = self.current_terminal();
+        let view = self.current_term_view();
+        self.search_owner
+            .borrow()
+            .as_ref()
+            .is_some_and(|owner| owner.matches(terminal.as_ref(), view.as_ref()))
     }
 
     fn cancel_pending_search(&self) {
@@ -106,28 +159,26 @@ impl UiState {
     /// query to its explicit destination instead of resolving the old page.
     pub(crate) fn search_apply_in_page(&self, page: &gtk4::Widget) {
         self.cancel_pending_search();
-        // Retire the outgoing pane's search so closing the bar in another tab
-        // cannot leave an invisible native query or finished-block highlights.
-        if let Some(term) = self.current_terminal() {
-            term.search_set_regex(None::<&vte4::Regex>, 0);
-        }
-        if let Some(term_view) = self.current_term_view() {
-            term_view.clear_find();
-        }
         self.apply_search_to(
             self.terminal_in_page(page).as_ref(),
-            self.term_view_in_page(page).as_deref(),
+            self.term_view_in_page(page).as_ref(),
         );
     }
 
     fn apply_search_now(&self) {
         self.apply_search_to(
             self.current_terminal().as_ref(),
-            self.current_term_view().as_deref(),
+            self.current_term_view().as_ref(),
         );
     }
 
-    fn apply_search_to(&self, terminal: Option<&vte4::Terminal>, term_view: Option<&TermView>) {
+    fn apply_search_to(
+        &self,
+        terminal: Option<&vte4::Terminal>,
+        term_view: Option<&Rc<TermView>>,
+    ) {
+        self.clear_search_owner();
+        *self.search_owner.borrow_mut() = Some(SearchOwner::new(terminal, term_view));
         // A new query retires the live fallback before either backend can
         // return early. Block errors/limits must never leave Enter navigating
         // a native regex installed by an older query.
@@ -210,7 +261,7 @@ impl UiState {
     }
 
     pub(crate) fn search_next(&self) {
-        if self.search_debounce_source.borrow().is_some() {
+        if self.search_debounce_source.borrow().is_some() || !self.search_owner_is_current() {
             self.search_apply();
             return;
         }
@@ -238,7 +289,7 @@ impl UiState {
     }
 
     pub(crate) fn search_prev(&self) {
-        if self.search_debounce_source.borrow().is_some() {
+        if self.search_debounce_source.borrow().is_some() || !self.search_owner_is_current() {
             self.search_apply();
             return;
         }

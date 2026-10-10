@@ -288,6 +288,7 @@ pub(crate) struct UiState {
     pub(crate) search_status: gtk4::Label,
     pub(crate) search_debounce_source: Rc<RefCell<Option<gtk4::glib::SourceId>>>,
     pub(crate) search_generation: Rc<Cell<u64>>,
+    pub(crate) search_owner: Rc<RefCell<Option<search::SearchOwner>>>,
     pub(crate) tab_strip: gtk4::Box,
     pub(crate) sidebar: gtk4::Box,
     /// Sidebar scroll holder for the (vertical) tab strip.

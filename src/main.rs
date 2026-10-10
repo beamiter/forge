@@ -1130,6 +1130,7 @@ pub fn run() -> glib::ExitCode {
             search_status: search_status.clone(),
             search_debounce_source: Rc::new(RefCell::new(None)),
             search_generation: Rc::new(Cell::new(0)),
+            search_owner: Rc::new(RefCell::new(None)),
             tab_strip: tab_strip.clone(),
             sidebar: sidebar.clone(),
             tab_strip_scroll: tab_strip_scroll.clone(),
