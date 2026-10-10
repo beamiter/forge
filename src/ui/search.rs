@@ -172,11 +172,7 @@ impl UiState {
         );
     }
 
-    fn apply_search_to(
-        &self,
-        terminal: Option<&vte4::Terminal>,
-        term_view: Option<&Rc<TermView>>,
-    ) {
+    fn apply_search_to(&self, terminal: Option<&vte4::Terminal>, term_view: Option<&Rc<TermView>>) {
         self.clear_search_owner();
         *self.search_owner.borrow_mut() = Some(SearchOwner::new(terminal, term_view));
         // A new query retires the live fallback before either backend can
