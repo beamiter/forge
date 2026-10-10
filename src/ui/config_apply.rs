@@ -12,6 +12,34 @@ use crate::config::{
 };
 use crate::terminal::collect_terminals;
 
+/// Configuration broadcasts include temporarily detached pane trees, unlike
+/// focus and input traversal. Walk incomplete splits and visit each identity
+/// once so a reparenting overlap cannot apply a setting twice.
+fn configuration_leaf_targets<T: Clone + PartialEq>(
+    roots: impl IntoIterator<Item = T>,
+    mut children: impl FnMut(&T) -> Vec<T>,
+    mut is_leaf: impl FnMut(&T) -> bool,
+) -> Vec<T> {
+    let mut pending: Vec<_> = roots.into_iter().collect();
+    pending.reverse();
+    let mut visited = Vec::new();
+    let mut leaves = Vec::new();
+    while let Some(node) = pending.pop() {
+        if visited.contains(&node) {
+            continue;
+        }
+        visited.push(node.clone());
+        if is_leaf(&node) {
+            leaves.push(node);
+        } else {
+            let mut descendants = children(&node);
+            descendants.reverse();
+            pending.extend(descendants);
+        }
+    }
+    leaves
+}
+
 /// Attempts a reload spends waiting for the persistence worker's short
 /// critical section on the revision slot before it gives up and says so.
 const CONFIG_REVISION_READ_ATTEMPTS: u8 = 4;
@@ -165,6 +193,37 @@ impl ConfigPersistCommit {
 }
 
 impl UiState {
+    /// Snapshot every retained pane for settings only. During zoom the
+    /// original split has an empty child slot and is outside the Notebook;
+    /// PaneNode's complete-tree invariant intentionally does not apply here.
+    fn configuration_leaves(&self) -> Vec<PaneLeaf> {
+        let mut roots: Vec<_> = (0..self.notebook.n_pages())
+            .filter_map(|page| self.notebook.nth_page(Some(page)))
+            .collect();
+        if let Some(state) = self.zoom_state.borrow().as_ref() {
+            roots.push(state.swap.original_page.clone());
+        }
+        configuration_leaf_targets(
+            roots,
+            |widget| {
+                widget
+                    .clone()
+                    .downcast::<gtk4::Paned>()
+                    .map(|paned| {
+                        [paned.start_child(), paned.end_child()]
+                            .into_iter()
+                            .flatten()
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            },
+            |widget| PaneLeaf::from_widget(widget).is_some(),
+        )
+        .iter()
+        .filter_map(PaneLeaf::from_widget)
+        .collect()
+    }
+
     fn show_safe_mode_config_notice(&self) {
         // Safe mode deliberately refuses persistence; that is informational,
         // not an error that should block the settings surface. Its guard is
@@ -286,17 +345,9 @@ impl UiState {
         // across `reload_config` would become re-entrant if their ownership is
         // ever unified.
         let config = self.config.borrow().clone();
-        for page in 0..self.notebook.n_pages() {
-            let Some(widget) = self.notebook.nth_page(Some(page)) else {
-                continue;
-            };
-            let Some(node) = PaneNode::from_widget(&widget) else {
-                continue;
-            };
-            for leaf in node.leaves() {
-                if let Some(view) = leaf.block_view() {
-                    view.reload_config(&config);
-                }
+        for leaf in self.configuration_leaves() {
+            if let Some(view) = leaf.block_view() {
+                view.reload_config(&config);
             }
         }
     }
@@ -342,33 +393,26 @@ impl UiState {
 
     pub(crate) fn set_font_scale_all(&self, new_scale: f64) {
         self.font_scale.set(new_scale);
-        for i in 0..self.notebook.n_pages() {
-            if let Some(widget) = self.notebook.nth_page(Some(i)) {
-                let Some(node) = PaneNode::from_widget(&widget) else {
-                    continue;
-                };
-                for leaf in node.leaves() {
-                    if let Some(view) = leaf.block_view() {
-                        // Updates the live surface, every finished renderer,
-                        // and the TermView config used by future blocks.
-                        view.set_font_scale(new_scale);
-                    } else {
-                        leaf.terminal().set_font_scale(new_scale);
-                    }
-                }
+        for leaf in self.configuration_leaves() {
+            if let Some(view) = leaf.block_view() {
+                // Updates the live surface, every finished renderer,
+                // and the TermView config used by future blocks.
+                view.set_font_scale(new_scale);
+            } else {
+                leaf.terminal().set_font_scale(new_scale);
             }
         }
     }
 
     pub(crate) fn for_each_terminal(&self, f: impl Fn(&Terminal)) {
-        for i in 0..self.notebook.n_pages() {
-            if let Some(widget) = self.notebook.nth_page(Some(i)) {
-                let mut terms = Vec::new();
-                collect_terminals(&widget, &mut terms);
-                for term in terms {
-                    f(&term);
-                }
-            }
+        let mut terminals = Vec::new();
+        for leaf in self.configuration_leaves() {
+            // Keep the existing broadcast to finished Block renderers as
+            // well as the live terminal; a pane owns more than one VTE.
+            collect_terminals(&leaf.root_widget(), &mut terminals);
+        }
+        for term in terminals {
+            f(&term);
         }
     }
 
@@ -682,18 +726,11 @@ impl UiState {
         let desc = config.font_desc.clone();
         let font_desc = crate::font::terminal_font_description(&desc, &config);
         drop(config);
-        for i in 0..self.notebook.n_pages() {
-            if let Some(widget) = self.notebook.nth_page(Some(i)) {
-                let Some(node) = PaneNode::from_widget(&widget) else {
-                    continue;
-                };
-                for leaf in node.leaves() {
-                    if let Some(view) = leaf.block_view() {
-                        view.set_font(&desc);
-                    } else {
-                        leaf.terminal().set_font(Some(&font_desc));
-                    }
-                }
+        for leaf in self.configuration_leaves() {
+            if let Some(view) = leaf.block_view() {
+                view.set_font(&desc);
+            } else {
+                leaf.terminal().set_font(Some(&font_desc));
             }
         }
     }
@@ -985,11 +1022,60 @@ fn claim_font_scale_sweep(pending: &Cell<Option<f64>>, scale: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        claim_font_scale_sweep, decide_config_reload, reload_matches_live_revision,
-        reload_read_failure, ConfigDirtyEpoch, ConfigReloadDecision,
+        claim_font_scale_sweep, configuration_leaf_targets, decide_config_reload,
+        reload_matches_live_revision, reload_read_failure, ConfigDirtyEpoch, ConfigReloadDecision,
     };
     use crate::config_store::ConfigRevision;
     use std::cell::Cell;
+
+    #[test]
+    fn settings_reach_zoomed_and_detached_siblings_exactly_once() {
+        // Leaf 10 is promoted into the Notebook. Its old parent (2) has
+        // only leaf 11 left; the outer retained root also holds leaf 12.
+        let leaves = configuration_leaf_targets(
+            [10, 1],
+            |node| match node {
+                1 => vec![2, 12],
+                2 => vec![11],
+                _ => Vec::new(),
+            },
+            |node| *node >= 10,
+        );
+        assert_eq!(leaves, [10, 11, 12]);
+
+        // Reparenting may momentarily expose the same root or leaf through
+        // both inputs. Configuration setters still receive one call each.
+        let overlap = configuration_leaf_targets(
+            [10, 1, 1],
+            |node| match node {
+                1 => vec![2, 12],
+                2 => vec![10, 11],
+                _ => Vec::new(),
+            },
+            |node| *node >= 10,
+        );
+        assert_eq!(overlap, leaves);
+    }
+
+    #[test]
+    fn settings_broadcast_covers_the_same_leaves_before_zoom_and_after_unzoom() {
+        let restored = configuration_leaf_targets(
+            [1],
+            |node| match node {
+                1 => vec![2, 12],
+                2 => vec![10, 11],
+                _ => Vec::new(),
+            },
+            |node| *node >= 10,
+        );
+        assert_eq!(restored, [10, 11, 12]);
+        let empty: Vec<u8> = configuration_leaf_targets([], |_| Vec::new(), |_| false);
+        assert!(empty.is_empty());
+        assert_eq!(
+            configuration_leaf_targets([10], |_| Vec::<u8>::new(), |_| true),
+            [10]
+        );
+    }
 
     /// A wheel gesture arrives as a train of 0.025 notches. Exactly one of them
     /// may schedule the widget sweep, and the sweep must run at the scale the
