@@ -59,6 +59,10 @@ mod organism_preview {
         }
     }
 
+    fn presentation_active(visible: bool, mapped: bool, host_active: Option<bool>) -> bool {
+        visible && mapped && host_active == Some(true)
+    }
+
     fn selected_pose(index: u32) -> PreviewPose {
         PreviewPose::ALL
             .get(index as usize)
@@ -125,6 +129,7 @@ mod organism_preview {
         hello: glib::WeakRef<gtk::Button>,
         desktop: Option<gtk::Settings>,
         desktop_handler: RefCell<Option<glib::SignalHandlerId>>,
+        host_handler: RefCell<Option<(glib::WeakRef<gtk::Window>, glib::SignalHandlerId)>>,
         source: RefCell<Option<glib::SourceId>>,
         visible: Cell<bool>,
         epoch: Instant,
@@ -145,10 +150,58 @@ mod organism_preview {
             self.greeting.set(None);
         }
 
+        fn disconnect_host(&self) {
+            let observer = self.host_handler.borrow_mut().take();
+            if let Some((host, handler)) = observer {
+                if let Some(host) = host.upgrade() {
+                    host.disconnect(handler);
+                }
+            }
+        }
+
+        fn bind_host(self: &Rc<Self>, group: &adw::PreferencesGroup) {
+            let host = (self.visible.get() && group.is_mapped())
+                .then(|| group.root().and_downcast::<gtk::Window>())
+                .flatten();
+            let previous = self
+                .host_handler
+                .borrow()
+                .as_ref()
+                .and_then(|(host, _)| host.upgrade());
+            if host.is_some() && previous == host {
+                return;
+            }
+            self.disconnect_host();
+            self.cancel_greeting();
+            if let Some(host) = host {
+                let weak = Rc::downgrade(self);
+                let handler = host.connect_is_active_notify(move |_| {
+                    if let Some(preview) = weak.upgrade() {
+                        preview.refresh();
+                    }
+                });
+                *self.host_handler.borrow_mut() = Some((host.downgrade(), handler));
+            }
+        }
+
+        fn is_active(&self) -> bool {
+            self.group.upgrade().is_some_and(|group| {
+                presentation_active(
+                    self.visible.get(),
+                    group.is_mapped(),
+                    group
+                        .root()
+                        .and_downcast::<gtk::Window>()
+                        .map(|host| host.is_active()),
+                )
+            })
+        }
+
         fn hide(&self) {
             self.visible.set(false);
             self.stop_source();
             self.cancel_greeting();
+            self.disconnect_host();
         }
 
         fn pose(&self) -> PreviewPose {
@@ -175,6 +228,13 @@ mod organism_preview {
             else {
                 return;
             };
+            self.bind_host(&group);
+            let active = self.is_active();
+            if !active {
+                // Keep the absolute cooldown, but never replay a greeting when
+                // the actual settings host returns to the foreground.
+                self.cancel_greeting();
+            }
             let now = self.epoch.elapsed();
             let pose = self.pose();
             let animations = self
@@ -203,7 +263,7 @@ mod organism_preview {
                 .last_hello
                 .get()
                 .is_some_and(|start| now.saturating_sub(start) < GentleInteraction::COOLDOWN);
-            hello.set_sensitive(can_greet(pose) && !cooling_down);
+            hello.set_sensitive(active && can_greet(pose) && !cooling_down);
             let motion_note = match motion {
                 OrganismMotion::Full => "Full motion: animated example.",
                 OrganismMotion::Calm => "Calm: still poses, with no frame animation.",
@@ -242,7 +302,7 @@ mod organism_preview {
                 sample.set_tooltip_text(Some(&format!("{motion_note}\n{interaction_note}")));
             }
             if let Some(delay) = next_wake(
-                self.visible.get() && group.is_mapped(),
+                active,
                 motion,
                 now,
                 greeting,
@@ -264,6 +324,7 @@ mod organism_preview {
     impl Drop for Preview {
         fn drop(&mut self) {
             self.stop_source();
+            self.disconnect_host();
             if let (Some(desktop), Some(handler)) =
                 (&self.desktop, self.desktop_handler.borrow_mut().take())
             {
@@ -326,6 +387,7 @@ mod organism_preview {
             hello: hello.downgrade(),
             desktop: gtk::Settings::default(),
             desktop_handler: RefCell::new(None),
+            host_handler: RefCell::new(None),
             source: RefCell::new(None),
             visible: Cell::new(false),
             epoch: Instant::now(),
@@ -343,12 +405,7 @@ mod organism_preview {
         hello.connect_clicked({
             let preview = preview.clone();
             move |_| {
-                if !preview.visible.get()
-                    || !preview
-                        .group
-                        .upgrade()
-                        .is_some_and(|group| group.is_mapped())
-                {
+                if !preview.is_active() {
                     return;
                 }
                 let now = preview.epoch.elapsed();
@@ -368,6 +425,14 @@ mod organism_preview {
             move |_| {
                 preview.visible.set(true);
                 preview.refresh();
+            }
+        });
+        group.connect_root_notify({
+            let weak = Rc::downgrade(&preview);
+            move |_| {
+                if let Some(preview) = weak.upgrade() {
+                    preview.refresh();
+                }
             }
         });
         group.connect_unmap({
@@ -456,7 +521,7 @@ mod organism_preview {
                 }
                 assert!(condition(), "GTK condition did not settle");
             };
-            spin_until(&|| group.is_mapped());
+            spin_until(&|| group.is_mapped() && preview.is_active());
             // Discard fixture initialization bytes; the following interactions
             // must never write into this nonexecuting terminal's PTY.
             crate::block_view::organism_settings_test_pty_bytes(&view);
@@ -546,14 +611,14 @@ mod organism_preview {
             group.set_visible(false);
             assert!(preview.source.borrow().is_none());
             group.set_visible(true);
-            spin_until(&|| group.is_mapped());
+            spin_until(&|| group.is_mapped() && preview.is_active());
             assert!(preview.source.borrow().is_some());
             dialog.force_close();
             spin_until(&|| !group.is_mapped());
             assert!(preview.source.borrow().is_none());
             // Reopening the same dialog starts exactly one mapped source.
             dialog.present(Some(&window));
-            spin_until(&|| group.is_mapped());
+            spin_until(&|| group.is_mapped() && preview.is_active());
             assert!(preview.source.borrow().is_some());
             dialog.force_close();
             spin_until(&|| !group.is_mapped());
@@ -574,6 +639,64 @@ mod organism_preview {
                 "hidden settings callbacks cannot restart a timer"
             );
             window.close();
+        }
+
+        #[test]
+        fn inactive_preview_has_no_wakes_and_cannot_replay_a_greeting() {
+            for visible in [false, true] {
+                for mapped in [false, true] {
+                    for host in [None, Some(false), Some(true)] {
+                        let active = presentation_active(visible, mapped, host);
+                        assert_eq!(active, visible && mapped && host == Some(true));
+                        if !active {
+                            for motion in [
+                                OrganismMotion::Full,
+                                OrganismMotion::Calm,
+                                OrganismMotion::Static,
+                            ] {
+                                assert_eq!(
+                                    next_wake(
+                                        active,
+                                        motion,
+                                        Duration::ZERO,
+                                        Some(Duration::ZERO),
+                                        Some(Duration::ZERO),
+                                    ),
+                                    None
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            let mut interaction = GentleInteraction::default();
+            let context = PreviewPose::Calm.context();
+            assert!(interaction.request(Duration::ZERO, context));
+            interaction.cancel();
+            assert_eq!(interaction.apply(Duration::from_secs(1), context), context);
+            assert!(!interaction.request(Duration::from_secs(1), context));
+            assert!(interaction.request(GentleInteraction::COOLDOWN, context));
+        }
+
+        #[test]
+        fn preview_focus_gates_existing_wakes_and_retires_host_handlers() {
+            let source = include_str!("dialogs.rs");
+            let runtime = source
+                .split_once("impl Preview {")
+                .unwrap()
+                .1
+                .split_once("#[cfg(test)]")
+                .unwrap()
+                .0;
+            assert!(runtime.contains("group.root().and_downcast::<gtk::Window>()"));
+            assert!(runtime.contains("host.connect_is_active_notify"));
+            assert!(runtime.contains("group.connect_root_notify"));
+            assert!(runtime.contains("if !preview.is_active()"));
+            assert!(runtime.contains("hello.set_sensitive(active && can_greet(pose)"));
+            assert!(runtime.contains("let active = self.is_active();"));
+            let drop = runtime.split_once("impl Drop for Preview").unwrap().1;
+            assert!(drop.contains("self.disconnect_host();"));
+            assert!(runtime.contains("host.disconnect(handler);"));
         }
 
         #[test]
