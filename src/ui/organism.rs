@@ -1,3 +1,6 @@
+Warning: truncated output (original token count: 101755)
+Total output lines: 10611
+
 //! Native local Block/Unified body for the experimental ASCII organism.
 
 use gtk4::prelude::*;
@@ -1815,6 +1818,9 @@ impl OrganismRuntime {
         sprite.set_xalign(0.0);
         sprite.set_yalign(0.5);
         sprite.set_selectable(false);
+        // The adjacent status/state labels carry the meaning. Do not make
+        // assistive technology read the decorative ASCII punctuation too.
+        sprite.set_accessible_role(gtk4::AccessibleRole::Presentation);
         content.append(&sprite);
 
         let detail = GBox::new(Orientation::Vertical, 3);
@@ -4141,6 +4147,25 @@ mod tests {
         assert!(!runtime.live_body.can_target());
         assert!(!runtime.live_body.is_focusable());
         assert!(!runtime.card.can_target());
+        assert_eq!(
+            runtime.sprite.accessible_role(),
+            gtk4::AccessibleRole::Presentation
+        );
+        assert_eq!(
+            runtime.live_body.accessible_role(),
+            gtk4::AccessibleRole::Presentation
+        );
+        assert_eq!(
+            runtime.sticky_avatar.accessible_role(),
+            gtk4::AccessibleRole::Presentation
+        );
+        assert_eq!(
+            runtime.status.accessible_role(),
+            gtk4::AccessibleRole::Status
+        );
+        assert_eq!(runtime.state.accessible_role(), gtk4::AccessibleRole::Label);
+        assert!(!runtime.status.text().is_empty());
+        assert!(!runtime.state.text().is_empty());
         view.insert_inline_notice(&runtime.card);
         view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0);
         view.put_sticky_organism_avatar(runtime.sticky_avatar.upcast_ref());
@@ -4800,122 +4825,7 @@ mod tests {
             (Behavior::UnknownOutcome, Behavior::GuardRecovery),
             (Behavior::UnknownOutcome, Behavior::GuardCautious),
             (Behavior::UnknownOutcome, Behavior::GuardStuck),
-            (Behavior::UnknownOutcome, Behavior::GuardFailure),
-            (Behavior::UnknownOutcome, Behavior::Idle),
-            (Behavior::UnknownOutcome, Behavior::Celebrate),
-            (Behavior::UnknownOutcome, Behavior::CelebrateBig),
-            (Behavior::UnknownOutcome, Behavior::SitNearError),
-            (Behavior::UnknownOutcome, Behavior::InspectError),
-            (Behavior::UnknownOutcome, Behavior::RestAfterPush),
-            (Behavior::GuardCautious, Behavior::Idle),
-            (Behavior::GuardFailure, Behavior::Idle),
-            (Behavior::GuardStuck, Behavior::Idle),
-            (Behavior::GuardRecovery, Behavior::Idle),
-            (Behavior::Celebrate, Behavior::Idle),
-            (Behavior::CelebrateBig, Behavior::Idle),
-            (Behavior::RestAfterPush, Behavior::Idle),
-            (Behavior::InspectError, Behavior::Idle),
-            (Behavior::SitNearError, Behavior::Idle),
-            (Behavior::WatchCommand, Behavior::Idle),
-            (Behavior::WatchAgent, Behavior::Idle),
-            (Behavior::WatchSettled, Behavior::Idle),
-            (Behavior::WatchAgent, Behavior::Celebrate),
-            (Behavior::WatchCommand, Behavior::Celebrate),
-            (Behavior::WatchCommand, Behavior::CelebrateBig),
-            (Behavior::WatchCommand, Behavior::InspectError),
-            (Behavior::WatchCommand, Behavior::SitNearError),
-            (Behavior::WatchCommand, Behavior::RestAfterPush),
-            (Behavior::WatchAgent, Behavior::InspectError),
-            (Behavior::WatchAgent, Behavior::SitNearError),
-            (Behavior::WatchAgent, Behavior::RestAfterPush),
-            (Behavior::WatchSettled, Behavior::Celebrate),
-            (Behavior::WatchSettled, Behavior::CelebrateBig),
-            (Behavior::WatchSettled, Behavior::InspectError),
-            (Behavior::WatchSettled, Behavior::SitNearError),
-            (Behavior::WatchSettled, Behavior::RestAfterPush),
-            (Behavior::InspectError, Behavior::GuardFailure),
-            (Behavior::SitNearError, Behavior::GuardStuck),
-            (Behavior::SitNearError, Behavior::GuardFailure),
-            (Behavior::SitNearError, Behavior::GuardCautious),
-            (Behavior::SitNearError, Behavior::GuardRecovery),
-            (Behavior::InspectError, Behavior::GuardStuck),
-            (Behavior::InspectError, Behavior::GuardCautious),
-            (Behavior::InspectError, Behavior::GuardRecovery),
-            (Behavior::InspectError, Behavior::Celebrate),
-            (Behavior::InspectError, Behavior::CelebrateBig),
-            (Behavior::InspectError, Behavior::SitNearError),
-            (Behavior::InspectError, Behavior::UnknownOutcome),
-            (Behavior::InspectError, Behavior::RestAfterPush),
-            (Behavior::SitNearError, Behavior::Celebrate),
-            (Behavior::SitNearError, Behavior::CelebrateBig),
-            (Behavior::SitNearError, Behavior::UnknownOutcome),
-            (Behavior::SitNearError, Behavior::RestAfterPush),
-            (Behavior::GuardFailure, Behavior::GuardStuck),
-            (Behavior::GuardFailure, Behavior::GuardRecovery),
-            (Behavior::GuardFailure, Behavior::GuardCautious),
-            (Behavior::GuardFailure, Behavior::RestAfterPush),
-            (Behavior::GuardStuck, Behavior::GuardFailure),
-            (Behavior::GuardStuck, Behavior::GuardRecovery),
-            (Behavior::GuardStuck, Behavior::GuardCautious),
-            (Behavior::GuardStuck, Behavior::RestAfterPush),
-            (Behavior::GuardRecovery, Behavior::GuardFailure),
-            (Behavior::GuardRecovery, Behavior::GuardStuck),
-            (Behavior::GuardRecovery, Behavior::GuardCautious),
-            (Behavior::GuardRecovery, Behavior::RestAfterPush),
-            (Behavior::GuardRecovery, Behavior::InspectError),
-            (Behavior::GuardRecovery, Behavior::SitNearError),
-            (Behavior::GuardCautious, Behavior::GuardFailure),
-            (Behavior::GuardCautious, Behavior::GuardStuck),
-            (Behavior::GuardCautious, Behavior::GuardRecovery),
-            (Behavior::GuardCautious, Behavior::RestAfterPush),
-            (Behavior::Celebrate, Behavior::GuardRecovery),
-            (Behavior::Celebrate, Behavior::GuardCautious),
-            (Behavior::Celebrate, Behavior::GuardFailure),
-            (Behavior::Celebrate, Behavior::GuardStuck),
-            (Behavior::Celebrate, Behavior::RestAfterPush),
-            (Behavior::Celebrate, Behavior::InspectError),
-            (Behavior::Celebrate, Behavior::SitNearError),
-            (Behavior::CelebrateBig, Behavior::GuardRecovery),
-            (Behavior::CelebrateBig, Behavior::GuardCautious),
-            (Behavior::CelebrateBig, Behavior::GuardFailure),
-            (Behavior::CelebrateBig, Behavior::GuardStuck),
-            (Behavior::CelebrateBig, Behavior::RestAfterPush),
-            (Behavior::CelebrateBig, Behavior::InspectError),
-            (Behavior::CelebrateBig, Behavior::SitNearError),
-            (Behavior::RestAfterPush, Behavior::InspectError),
-            (Behavior::RestAfterPush, Behavior::SitNearError),
-            (Behavior::RestAfterPush, Behavior::Celebrate),
-            (Behavior::RestAfterPush, Behavior::CelebrateBig),
-            (Behavior::RestAfterPush, Behavior::UnknownOutcome),
-            (Behavior::Celebrate, Behavior::UnknownOutcome),
-            (Behavior::CelebrateBig, Behavior::UnknownOutcome),
-            (Behavior::WatchSettled, Behavior::Celebrate),
-            (Behavior::WatchSettled, Behavior::CelebrateBig),
-            (Behavior::WatchSettled, Behavior::InspectError),
-            (Behavior::WatchSettled, Behavior::SitNearError),
-            (Behavior::WatchSettled, Behavior::RestAfterPush),
-            (Behavior::WatchSettled, Behavior::Idle),
-            (Behavior::WatchCommand, Behavior::Celebrate),
-            (Behavior::WatchCommand, Behavior::CelebrateBig),
-            (Behavior::WatchCommand, Behavior::InspectError),
-            (Behavior::WatchCommand, Behavior::SitNearError),
-            (Behavior::WatchCommand, Behavior::RestAfterPush),
-            (Behavior::WatchCommand, Behavior::Idle),
-            (Behavior::WatchAgent, Behavior::Celebrate),
-            (Behavior::WatchAgent, Behavior::InspectError),
-            (Behavior::WatchAgent, Behavior::SitNearError),
-            (Behavior::WatchAgent, Behavior::RestAfterPush),
-            (Behavior::WatchAgent, Behavior::Idle),
-            (Behavior::UnknownOutcome, Behavior::Idle),
-            (Behavior::UnknownOutcome, Behavior::InspectError),
-            (Behavior::UnknownOutcome, Behavior::Celebrate),
-            (Behavior::UnknownOutcome, Behavior::CelebrateBig),
-            (Behavior::UnknownOutcome, Behavior::SitNearError),
-            (Behavior::UnknownOutcome, Behavior::GuardFailure),
-            (Behavior::UnknownOutcome, Behavior::GuardStuck),
-            (Behavior::UnknownOutcome, Behavior::GuardCautious),
-            (Behavior::UnknownOutcome, Behavior::GuardRecovery),
-            (Behavior::UnknownOutcome, Behavior::RestAfterPush),
+…1755 tokens truncated…Behavior::RestAfterPush),
             (Behavior::GuardFailure, Behavior::Idle),
             (Behavior::GuardStuck, Behavior::Idle),
             (Behavior::GuardRecovery, Behavior::Idle),
