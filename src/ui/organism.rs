@@ -82,6 +82,24 @@ fn surface_frame_delay(
     }
 }
 
+/// Keep the existing maintenance heartbeat when a measured body cannot fit,
+/// unless the sticky surface still needs animated frames. Inline cards use
+/// frame zero. A resize is discovered by the next maintenance tick.
+fn surface_frame_delay_after_placement(
+    motion: OrganismMotion,
+    owner: bool,
+    alt_screen: bool,
+    resting: bool,
+    no_safe_placement: bool,
+    sticky_mapped: bool,
+) -> Duration {
+    if no_safe_placement && !sticky_mapped {
+        DORMANT_FRAME_INTERVAL
+    } else {
+        surface_frame_delay(motion, owner, alt_screen, resting)
+    }
+}
+
 /// A focus transfer may replace an already-pending source, but must not start
 /// a second source after the fired callback has taken its id from the slot.
 /// That callback observes the new owner at its tail and schedules the right
@@ -160,6 +178,16 @@ struct SurfaceBox {
     /// On-screen grid row of the cursor: the output growth edge after which a
     /// watching/reaction pose may use only fully clear rows.
     cursor_row: i32,
+}
+
+fn measured_placement_blocked(surface: SurfaceBox, placement_found: bool) -> bool {
+    !placement_found
+        && surface.width > 0
+        && surface.height > 0
+        && surface.body_width > 0
+        && surface.body_height > 0
+        && surface.cell_width > 0
+        && surface.cell_height > 0
 }
 
 type SurfaceSignature = (i32, i32, i32, i32, i32, i32, i32);
@@ -1747,6 +1775,7 @@ struct OrganismRuntime {
     /// hidden, so every reappearance snaps into place and the cat only ever
     /// walks where it can be seen.
     body_position: Cell<Option<(f64, f64)>>,
+    measured_no_safe_placement: Cell<bool>,
     /// The body moved last frame — drives gait frames during transit.
     body_in_transit: Cell<bool>,
     /// Surface/body geometry the standing spot was computed against. A resize,
@@ -1932,6 +1961,7 @@ impl OrganismRuntime {
             transition_source_override: Cell::new(None),
             command_origin_behavior: Cell::new(None),
             body_position: Cell::new(None),
+            measured_no_safe_placement: Cell::new(false),
             body_in_transit: Cell::new(false),
             surface_signature: Cell::new((0, 0, 0, 0, 0, 0, 0)),
             surface_behavior: Cell::new(Behavior::Idle),
@@ -2514,6 +2544,8 @@ impl OrganismRuntime {
     }
 
     fn refresh_surface(&self, view: &TermView, now: Instant) {
+        // An early return or new owner must not inherit an old geometry verdict.
+        self.measured_no_safe_placement.set(false);
         if !self.enabled.get() {
             self.hide_live_body(view);
             self.sticky_avatar.set_visible(false);
@@ -2749,6 +2781,8 @@ impl OrganismRuntime {
             self.territory.get(),
         );
 
+        self.measured_no_safe_placement
+            .set(view.widget().is_mapped() && measured_placement_blocked(surface, point.is_some()));
         if let Some(target) = point {
             let previous = self.body_position.get();
             let (x, y, moved) = match previous {
@@ -3043,11 +3077,13 @@ impl OrganismRuntime {
                     }
                 }
             }
-            let next = surface_frame_delay(
+            let next = surface_frame_delay_after_placement(
                 runtime.motion.get(),
                 runtime.presence.is_owner(runtime.presence_token),
                 alt_screen,
                 runtime.activity.resting(now),
+                runtime.measured_no_safe_placement.get(),
+                runtime.sticky_avatar.is_mapped(),
             );
             // A synchronous settings callback may already have replaced the
             // source while this frame was rendering. Never create a second.
@@ -10278,6 +10314,171 @@ mod tests {
         assert_eq!(
             surface_frame_delay(OrganismMotion::Static, true, false, false),
             DORMANT_FRAME_INTERVAL
+        );
+    }
+
+    #[test]
+    fn measured_no_room_slows_only_without_an_animated_sticky_surface() {
+        for sticky in [false, true] {
+            assert_eq!(
+                super::surface_frame_delay_after_placement(
+                    OrganismMotion::Full,
+                    true,
+                    false,
+                    false,
+                    false,
+                    sticky
+                ),
+                SURFACE_FRAME_INTERVAL,
+                "unknown or recovered placement retains Full cadence"
+            );
+            assert_eq!(
+                super::surface_frame_delay_after_placement(
+                    OrganismMotion::Full,
+                    true,
+                    false,
+                    false,
+                    true,
+                    sticky
+                ),
+                if sticky {
+                    SURFACE_FRAME_INTERVAL
+                } else {
+                    DORMANT_FRAME_INTERVAL
+                }
+            );
+        }
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            for blocked in [false, true] {
+                assert_eq!(
+                    super::surface_frame_delay_after_placement(
+                        motion, true, false, false, blocked, true
+                    ),
+                    DORMANT_FRAME_INTERVAL
+                );
+            }
+        }
+        assert_eq!(
+            super::surface_frame_delay_after_placement(
+                OrganismMotion::Full,
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            DORMANT_FRAME_INTERVAL
+        );
+        assert_eq!(
+            super::surface_frame_delay_after_placement(
+                OrganismMotion::Full,
+                true,
+                true,
+                false,
+                false,
+                true
+            ),
+            DORMANT_FRAME_INTERVAL
+        );
+        assert_eq!(
+            super::surface_frame_delay_after_placement(
+                OrganismMotion::Full,
+                true,
+                false,
+                true,
+                false,
+                true
+            ),
+            DORMANT_FRAME_INTERVAL
+        );
+    }
+
+    #[test]
+    fn zero_or_unknown_measurements_do_not_claim_no_room() {
+        let surface = SurfaceBox {
+            width: 20,
+            height: 20,
+            right_gutter: 0,
+            cell_width: 8,
+            cell_height: 16,
+            body_width: 88,
+            body_height: 48,
+            cursor_row: 0,
+        };
+        assert!(super::measured_placement_blocked(surface, false));
+        assert!(!super::measured_placement_blocked(surface, true));
+        for unknown in [
+            SurfaceBox {
+                width: 0,
+                ..surface
+            },
+            SurfaceBox {
+                height: 0,
+                ..surface
+            },
+            SurfaceBox {
+                body_width: 0,
+                ..surface
+            },
+            SurfaceBox {
+                body_height: 0,
+                ..surface
+            },
+            SurfaceBox {
+                cell_width: 0,
+                ..surface
+            },
+            SurfaceBox {
+                cell_height: 0,
+                ..surface
+            },
+        ] {
+            assert!(!super::measured_placement_blocked(unknown, false));
+        }
+    }
+
+    #[test]
+    fn no_room_cadence_uses_fresh_geometry_and_actual_sticky_mapping() {
+        let source = include_str!("organism.rs");
+        let refresh = source
+            .split("    fn refresh_surface(")
+            .nth(1)
+            .unwrap()
+            .split("    fn apply_settings(")
+            .next()
+            .unwrap();
+        assert!(
+            refresh
+                .find("self.measured_no_safe_placement.set(false)")
+                .unwrap()
+                < refresh.find("if !self.enabled.get()").unwrap()
+        );
+        assert!(
+            refresh.find("surface_point_for_territory(").unwrap()
+                < refresh
+                    .find("measured_placement_blocked(surface, point.is_some())")
+                    .unwrap()
+        );
+        assert!(refresh.contains("view.widget().is_mapped() && measured_placement_blocked"));
+        let scheduler = source
+            .split("let next = surface_frame_delay_after_placement(")
+            .nth(1)
+            .unwrap()
+            .split("// A synchronous settings callback")
+            .next()
+            .unwrap();
+        assert!(scheduler.contains("runtime.measured_no_safe_placement.get()"));
+        assert!(scheduler.contains("runtime.sticky_avatar.is_mapped()"));
+        let inline = source
+            .split("    fn refresh_inline_sprite(")
+            .nth(1)
+            .unwrap()
+            .split("    fn refresh_state(")
+            .next()
+            .unwrap();
+        assert!(
+            inline.contains("            0,"),
+            "inline card poses do not require animated frames"
         );
     }
 

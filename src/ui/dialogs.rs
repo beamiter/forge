@@ -67,8 +67,19 @@ impl OrganismSettingsControls {
         self.syncing.set(true);
         let _guard = OrganismSettingsSyncGuard(&self.syncing);
         enabled_row.set_active(enabled);
+        enabled_row.set_subtitle(organism_enabled_description(self.safe_mode, enabled));
         motion_row.set_selected(organism_motion_selection(motion));
         motion_row.set_sensitive(!self.safe_mode && enabled);
+    }
+}
+
+fn organism_enabled_description(safe_mode: bool, enabled: bool) -> &'static str {
+    if safe_mode {
+        "Unavailable in safe mode; offline preview is still available."
+    } else if enabled {
+        "Local, no-LLM companion for Block/Unified panes"
+    } else {
+        "Off. Offline preview is still available below."
     }
 }
 
@@ -745,6 +756,10 @@ mod organism_preview {
                 }
             });
             controls.sync(true, Some(OrganismMotion::Calm));
+            assert_eq!(
+                enabled.subtitle().as_deref(),
+                Some(super::super::organism_enabled_description(false, true))
+            );
             assert!(enabled.is_active());
             assert_eq!(motion.selected(), 2);
             assert!(motion.is_sensitive());
@@ -754,6 +769,10 @@ mod organism_preview {
             );
             assert_eq!(user_edits.get(), 0);
             controls.sync(false, None);
+            assert_eq!(
+                enabled.subtitle().as_deref(),
+                Some(super::super::organism_enabled_description(false, false))
+            );
             assert!(!enabled.is_active());
             assert_eq!(motion.selected(), 0);
             assert!(!motion.is_sensitive());
@@ -772,8 +791,18 @@ mod organism_preview {
                 "retired dialog controls cannot be changed"
             );
             assert_eq!(motion.selected(), 1);
-            motion.set_sensitive(false);
+            let safe_controls =
+                super::super::OrganismSettingsControls::new(&enabled, &motion, true);
+            safe_controls.sync(false, Some(OrganismMotion::Static));
+            assert_eq!(
+                enabled.subtitle().as_deref(),
+                Some(super::super::organism_enabled_description(true, false))
+            );
+            assert!(!motion.is_sensitive());
+            safe_controls.retire();
 
+            // The following real pose/Hello/Demo controls remain usable even
+            // when accepted live-companion controls reflect safe mode/off.
             motion.set_selected(3);
             assert!(preview.source.borrow().is_none());
             for (index, example) in PreviewPose::ALL.into_iter().enumerate() {
@@ -4350,7 +4379,10 @@ impl UiState {
 
         let ascii_organism_row = adw::SwitchRow::builder()
             .title("ASCII Organism")
-            .subtitle("Local, no-LLM companion for Block/Unified panes")
+            .subtitle(organism_enabled_description(
+                safe_mode,
+                config.ascii_organism_enabled,
+            ))
             .tooltip_text(organism_preview::INTERACTION_HINT)
             .active(config.ascii_organism_enabled)
             .build();
@@ -4645,6 +4677,10 @@ impl UiState {
                 return;
             }
             let enabled = row.is_active();
+            row.set_subtitle(organism_enabled_description(
+                controls_for_enabled.safe_mode,
+                enabled,
+            ));
             ui.config.borrow_mut().ascii_organism_enabled = enabled;
             motion_for_enabled.set_sensitive(enabled);
             ui.sync_ascii_organism_settings();
@@ -6488,6 +6524,68 @@ mod tests {
         assert_eq!(picker.selected(), 0, "query changes reset selection");
         assert_eq!(picker.filtered().len(), 1);
         assert_eq!(picker.filtered()[0].name, "workflow-19");
+    }
+
+    #[test]
+    fn organism_availability_description_distinguishes_safe_off_and_on() {
+        assert_eq!(
+            super::organism_enabled_description(false, true),
+            "Local, no-LLM companion for Block/Unified panes"
+        );
+        assert_eq!(
+            super::organism_enabled_description(false, false),
+            "Off. Offline preview is still available below."
+        );
+        for enabled in [false, true] {
+            assert_eq!(
+                super::organism_enabled_description(true, enabled),
+                "Unavailable in safe mode; offline preview is still available."
+            );
+        }
+    }
+
+    #[test]
+    fn organism_availability_description_follows_accepted_controls_and_user_toggle() {
+        let source = include_str!("dialogs.rs");
+        let sync = source
+            .split("    fn sync(&self, enabled: bool,")
+            .nth(1)
+            .unwrap()
+            .split("fn organism_enabled_description(")
+            .next()
+            .unwrap();
+        assert!(sync.contains("organism_enabled_description(self.safe_mode, enabled)"));
+        let settings = source
+            .split(concat!(
+                "    pub(crate) fn ",
+                "toggle_settings_panel(&self) {"
+            ))
+            .nth(1)
+            .unwrap();
+        let row = settings
+            .split(concat!(
+                "let ascii_organism_row",
+                " = adw::SwitchRow::builder()"
+            ))
+            .nth(1)
+            .unwrap()
+            .split("let ascii_organism_motion_model")
+            .next()
+            .unwrap();
+        assert!(row.contains("organism_enabled_description("));
+        assert!(row.contains("config.ascii_organism_enabled"));
+        let toggle = settings
+            .split("ascii_organism_row.connect_active_notify")
+            .nth(1)
+            .unwrap()
+            .split("let controls_for_motion")
+            .next()
+            .unwrap();
+        assert!(
+            toggle.find("accepts_user_change()").unwrap()
+                < toggle.find("organism_enabled_description(").unwrap()
+        );
+        assert!(toggle.contains("controls_for_enabled.safe_mode"));
     }
 
     #[test]
