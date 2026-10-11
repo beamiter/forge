@@ -2452,6 +2452,98 @@ impl OrganismRuntime {
         motion
     }
 
+    /// Read-only tooltip picking includes pass-through decoration without
+    /// changing the widget selected for terminal input or selection.
+    fn card_tooltip_at(
+        &self,
+        view: &TermView,
+        root: &gtk4::Widget,
+        x: i32,
+        y: i32,
+        keyboard: bool,
+    ) -> Option<(gtk4::glib::GString, gtk4::gdk::Rectangle)> {
+        let buttons = gtk4::gdk::ModifierType::BUTTON1_MASK
+            | gtk4::gdk::ModifierType::BUTTON2_MASK
+            | gtk4::gdk::ModifierType::BUTTON3_MASK
+            | gtk4::gdk::ModifierType::BUTTON4_MASK
+            | gtk4::gdk::ModifierType::BUTTON5_MASK;
+        if keyboard
+            || !self.enabled.get()
+            || view.widget() != *root
+            || !root.is_mapped()
+            || !self.card.is_mapped()
+            || !self.card.is_ancestor(root)
+            || root
+                .display()
+                .default_seat()
+                .and_then(|seat| seat.pointer())
+                .is_some_and(|pointer| pointer.modifier_state().intersects(buttons))
+        {
+            return None;
+        }
+        // Pick from the actual top-level so ancestor clipping and overlapping
+        // non-targetable overlays outside this pane also suppress the tip.
+        let top = root.root()?.upcast::<gtk4::Widget>();
+        let point = root.compute_point(&top, &gtk4::graphene::Point::new(x as f32, y as f32))?;
+        let picked = top.pick(
+            f64::from(point.x()),
+            f64::from(point.y()),
+            gtk4::PickFlags::NON_TARGETABLE,
+        )?;
+        for label in [&self.state, &self.status] {
+            let widget: &gtk4::Widget = label.upcast_ref();
+            if !widget.is_mapped()
+                || !widget.is_ancestor(&self.card)
+                || (picked != *widget && !picked.is_ancestor(widget))
+            {
+                continue;
+            }
+            let text = label.tooltip_text().filter(|text| !text.is_empty())?;
+            let bounds = widget.compute_bounds(root)?;
+            let left = bounds.x().floor() as i32;
+            let top = bounds.y().floor() as i32;
+            let right = (bounds.x() + bounds.width()).ceil() as i32;
+            let bottom = (bounds.y() + bounds.height()).ceil() as i32;
+            return Some((
+                text,
+                gtk4::gdk::Rectangle::new(left, top, right - left, bottom - top),
+            ));
+        }
+        None
+    }
+
+    fn install_card_tooltip(runtime: &Rc<Self>, view: &Rc<TermView>) {
+        let root = view.widget();
+        root.set_has_tooltip(true);
+        root.connect_query_tooltip({
+            let runtime = Rc::downgrade(runtime);
+            let view = Rc::downgrade(view);
+            move |root, x, y, keyboard, tooltip| {
+                let (Some(runtime), Some(view)) = (runtime.upgrade(), view.upgrade()) else {
+                    return false;
+                };
+                let Some((text, area)) = runtime.card_tooltip_at(&view, root, x, y, keyboard)
+                else {
+                    return false;
+                };
+                tooltip.set_text(Some(&text));
+                tooltip.set_tip_area(&area);
+                true
+            }
+        });
+        // GTK attributes the forwarded tip to root. Unmapping only the card
+        // therefore needs one native requery; text changes already trigger
+        // their own requery through GtkWidget::set_tooltip_text.
+        runtime.card.connect_unmap({
+            let root = root.downgrade();
+            move |_| {
+                if let Some(root) = root.upgrade() {
+                    root.trigger_tooltip_query();
+                }
+            }
+        });
+    }
+
     fn set_presented_surface(&self, behavior: Option<(Behavior, WatchRhythm)>) {
         if self.presented_surface.replace(behavior) != behavior || behavior.is_some() {
             // Existing visible frames also reconcile the first GTK mapping;
@@ -3590,6 +3682,7 @@ impl UiState {
             .set(!view.organism_activity_settled());
         self.organism_presence.bind(presence_token, view, &runtime);
         OrganismRuntime::install_pointer_observer(&runtime, view);
+        OrganismRuntime::install_card_tooltip(&runtime, view);
         // The transient card lives in Block's conversation or Unified's dock;
         // it is never a persisted FinishedBlock. The separate spatial body
         // remains pass-through and is suppressed while an alt-screen app owns
@@ -4403,6 +4496,11 @@ mod tests {
             false,
         );
         presence.bind(token, &view, &runtime);
+        let runtime_owners = Rc::strong_count(&runtime);
+        let view_owners = Rc::strong_count(&view);
+        OrganismRuntime::install_card_tooltip(&runtime, &view);
+        assert_eq!(Rc::strong_count(&runtime), runtime_owners);
+        assert_eq!(Rc::strong_count(&view), view_owners);
         assert!(Rc::ptr_eq(&presence.runtime_for(&view).unwrap(), &runtime));
         assert!(!runtime.live_body.can_target());
         assert!(!runtime.live_body.is_focusable());
@@ -4438,10 +4536,12 @@ mod tests {
             .and_then(|value| value.parse::<i32>().ok())
             .unwrap_or(700)
             .clamp(280, 900);
+        let tooltip_overlay = gtk4::Overlay::new();
+        tooltip_overlay.set_child(Some(&content));
         let window = gtk4::Window::builder()
             .default_width(screenshot_width)
             .default_height(500)
-            .child(&content)
+            .child(&tooltip_overlay)
             .build();
         window.present();
         entry.grab_focus();
@@ -4452,6 +4552,81 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert!(view.widget().is_mapped());
+        let wait_for_tooltip_layout = |ready: &dyn Fn() -> bool| {
+            let started = Instant::now();
+            while !ready() && started.elapsed() < Duration::from_secs(2) {
+                while main.iteration(false) {}
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(ready(), "tooltip fixture layout did not settle");
+        };
+        let tooltip: gtk4::Tooltip = gtk4::glib::Object::new();
+        let pane_root = view.widget();
+        let bounds = runtime.state.compute_bounds(&pane_root).unwrap();
+        let tip_x = (bounds.x() + bounds.width() / 2.0) as i32;
+        let tip_y = (bounds.y() + bounds.height() / 2.0) as i32;
+        let query = |keyboard: bool| {
+            pane_root.emit_by_name::<bool>("query-tooltip", &[&tip_x, &tip_y, &keyboard, &tooltip])
+        };
+        assert!(
+            query(false),
+            "native query reaches the pass-through state label"
+        );
+        assert!(!query(true), "keyboard tooltip coordinates are not defined");
+        assert_eq!(
+            runtime
+                .card_tooltip_at(&view, &pane_root, tip_x, tip_y, false)
+                .unwrap()
+                .0,
+            runtime.state.tooltip_text().unwrap()
+        );
+        assert!(runtime
+            .card_tooltip_at(&view, &entry.clone().upcast(), tip_x, tip_y, false)
+            .is_none());
+        assert!(runtime
+            .card_tooltip_at(&view, &pane_root, -100, -100, false)
+            .is_none());
+        let focus_before_tooltip = gtk4::prelude::RootExt::focus(&window);
+        // A pass-through overlay must block only the explanation, while the
+        // actual input pick remains unchanged beneath that decoration.
+        let cover = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        cover.set_hexpand(true);
+        cover.set_vexpand(true);
+        cover.set_can_target(false);
+        let input_pick =
+            pane_root.pick(f64::from(tip_x), f64::from(tip_y), gtk4::PickFlags::DEFAULT);
+        tooltip_overlay.add_overlay(&cover);
+        wait_for_tooltip_layout(&|| cover.width() > 0 && cover.height() > 0);
+        assert!(!query(false), "top-level overlay hides the card tooltip");
+        assert_eq!(
+            pane_root.pick(f64::from(tip_x), f64::from(tip_y), gtk4::PickFlags::DEFAULT),
+            input_pick
+        );
+        tooltip_overlay.remove_overlay(&cover);
+        while main.iteration(false) {}
+        assert!(query(false));
+        runtime.card.set_visible(false);
+        assert!(
+            !query(false),
+            "unmapped cards cannot keep a forwarded tooltip"
+        );
+        runtime.card.set_visible(true);
+        wait_for_tooltip_layout(&|| query(false));
+        assert_eq!(gtk4::prelude::RootExt::focus(&window), focus_before_tooltip);
+        assert!(!runtime.card.can_target());
+        #[cfg(target_os = "linux")]
+        {
+            native_pointer_button(true);
+            while main.iteration(false) {}
+            let while_pressed = query(false);
+            native_pointer_button(false);
+            while main.iteration(false) {}
+            assert!(!while_pressed, "held selection cannot show a card tooltip");
+            // The synthetic native press may move focus through the card;
+            // restore the entry required by the existing settings assertions.
+            entry.grab_focus();
+        }
+
         presence.focus_view(Some(&view));
         let before = life.get();
         for _ in 0..4 {
@@ -10513,6 +10688,64 @@ mod tests {
         assert_eq!(
             state_explanation(inline, None, true),
             behavior_explanation(inline)
+        );
+    }
+
+    #[test]
+    fn card_tooltip_proxy_is_weak_pane_local_and_read_only() {
+        let source = include_str!("organism.rs");
+        let install = source
+            .split_once("    fn install_card_tooltip(")
+            .unwrap()
+            .1
+            .split_once("    fn set_presented_surface(")
+            .unwrap()
+            .0;
+        assert!(install.contains("Rc::downgrade(runtime)"));
+        assert!(install.contains("Rc::downgrade(view)"));
+        assert!(install.contains("root.downgrade()"));
+        assert_eq!(install.matches("connect_query_tooltip").count(), 1);
+        assert_eq!(install.matches("connect_unmap").count(), 1);
+        assert!(install.contains("root.trigger_tooltip_query()"));
+        assert!(!install.contains("timeout_add"));
+        assert!(!install.contains("add_controller"));
+        assert!(!install.contains("grab_focus"));
+        let query = source
+            .split_once("    fn card_tooltip_at(")
+            .unwrap()
+            .1
+            .split_once("    fn install_card_tooltip(")
+            .unwrap()
+            .0;
+        for guard in [
+            "!self.enabled.get()",
+            "view.widget() != *root",
+            "!self.card.is_mapped()",
+            "!self.card.is_ancestor(root)",
+            "BUTTON5_MASK",
+            "root.compute_point",
+            "top.pick",
+            "PickFlags::NON_TARGETABLE",
+            "label.tooltip_text()",
+        ] {
+            assert!(query.contains(guard), "missing query guard: {guard}");
+        }
+        assert!(
+            !query.contains("presence.is_owner"),
+            "card semantics remain pane-local"
+        );
+        let attach = source
+            .split_once("    pub(crate) fn attach_ascii_organism_to_view(")
+            .unwrap()
+            .1
+            .split_once("        // The transient card")
+            .unwrap()
+            .0;
+        assert_eq!(
+            attach
+                .matches("OrganismRuntime::install_card_tooltip(&runtime, view)")
+                .count(),
+            1
         );
     }
 
