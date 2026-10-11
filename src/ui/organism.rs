@@ -72,15 +72,22 @@ const TONE_CLASSES: [&str; 5] = [
     "organism-warning",
 ];
 
+/// Pointer state is available only while the device is on this native
+/// surface. In particular, Device::modifier_state is keyboard-only.
+fn pointer_button_state(root: &gtk4::Widget, buttons: gtk4::gdk::ModifierType) -> Option<bool> {
+    let pointer = root.display().default_seat()?.pointer()?;
+    let surface = root.native()?.surface()?;
+    let (_, _, modifiers) = surface.device_position(&pointer)?;
+    Some(modifiers.intersects(buttons))
+}
+
 fn pointer_buttons_down(view: &TermView) -> bool {
+    // Explicit keyboard hello does not require the pointer in this window.
+    // This checks a known local drag, not global pointer state elsewhere.
     let buttons = gtk4::gdk::ModifierType::BUTTON1_MASK
         | gtk4::gdk::ModifierType::BUTTON2_MASK
         | gtk4::gdk::ModifierType::BUTTON3_MASK;
-    view.widget()
-        .display()
-        .default_seat()
-        .and_then(|seat| seat.pointer())
-        .is_some_and(|pointer| pointer.modifier_state().intersects(buttons))
+    pointer_button_state(&view.widget(), buttons) == Some(true)
 }
 
 fn surface_frame_delay(
@@ -2462,23 +2469,22 @@ impl OrganismRuntime {
         y: i32,
         keyboard: bool,
     ) -> Option<(gtk4::glib::GString, gtk4::gdk::Rectangle)> {
-        let buttons = gtk4::gdk::ModifierType::BUTTON1_MASK
-            | gtk4::gdk::ModifierType::BUTTON2_MASK
-            | gtk4::gdk::ModifierType::BUTTON3_MASK
-            | gtk4::gdk::ModifierType::BUTTON4_MASK
-            | gtk4::gdk::ModifierType::BUTTON5_MASK;
         if keyboard
             || !self.enabled.get()
             || view.widget() != *root
             || !root.is_mapped()
             || !self.card.is_mapped()
             || !self.card.is_ancestor(root)
-            || root
-                .display()
-                .default_seat()
-                .and_then(|seat| seat.pointer())
-                .is_some_and(|pointer| pointer.modifier_state().intersects(buttons))
         {
+            return None;
+        }
+        // Tooltips fail closed if the pointer state cannot be established.
+        let buttons = gtk4::gdk::ModifierType::BUTTON1_MASK
+            | gtk4::gdk::ModifierType::BUTTON2_MASK
+            | gtk4::gdk::ModifierType::BUTTON3_MASK
+            | gtk4::gdk::ModifierType::BUTTON4_MASK
+            | gtk4::gdk::ModifierType::BUTTON5_MASK;
+        if pointer_button_state(root, buttons) != Some(false) {
             return None;
         }
         // Pick from the actual top-level so ancestor clipping and overlapping
@@ -4565,6 +4571,36 @@ mod tests {
         let bounds = runtime.state.compute_bounds(&pane_root).unwrap();
         let tip_x = (bounds.x() + bounds.width() / 2.0) as i32;
         let tip_y = (bounds.y() + bounds.height() / 2.0) as i32;
+        #[cfg(target_os = "linux")]
+        {
+            let point = pane_root
+                .compute_point(
+                    &window,
+                    &gtk4::graphene::Point::new(tip_x as f32, tip_y as f32),
+                )
+                .unwrap();
+            move_native_pointer(&window, point.x() as i32, point.y() as i32);
+        }
+        let pointer = window.display().default_seat().unwrap().pointer().unwrap();
+        let surface = window.surface().unwrap();
+        wait_for_tooltip_layout(&|| surface.device_position(&pointer).is_some());
+        #[cfg(target_os = "linux")]
+        let wait_for_button = |pressed: bool| {
+            let started = Instant::now();
+            loop {
+                while main.iteration(false) {}
+                let observed = surface
+                    .device_position(&pointer)
+                    .map(|(_, _, mask)| mask.contains(gtk4::gdk::ModifierType::BUTTON1_MASK));
+                if observed == Some(pressed) {
+                    break true;
+                }
+                if started.elapsed() >= Duration::from_secs(2) {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
         let query = |keyboard: bool| {
             pane_root.emit_by_name::<bool>("query-tooltip", &[&tip_x, &tip_y, &keyboard, &tooltip])
         };
@@ -4617,10 +4653,13 @@ mod tests {
         #[cfg(target_os = "linux")]
         {
             native_pointer_button(true);
-            while main.iteration(false) {}
+            let pressed_seen = wait_for_button(true);
             let while_pressed = query(false);
+            // Release before any assertion, including an observation timeout.
             native_pointer_button(false);
-            while main.iteration(false) {}
+            let released_seen = wait_for_button(false);
+            assert!(pressed_seen, "native pointer press was not observed");
+            assert!(released_seen, "native pointer release was not observed");
             assert!(!while_pressed, "held selection cannot show a card tooltip");
             // The synthetic native press may move focus through the card;
             // restore the entry required by the existing settings assertions.
@@ -4879,6 +4918,21 @@ mod tests {
             move_native_pointer(&window, 1, 1);
             settle(GentleInteraction::COOLDOWN);
             OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Full);
+            let greeting_before_drag = presence.state.borrow().last_greeting;
+            native_pointer_button(true);
+            let pressed_seen = wait_for_button(true);
+            let local_drag = pointer_buttons_down(&view);
+            let explicit_during_drag = runtime.request_greeting(&view, GreetingSource::Explicit);
+            let pointer_during_drag = runtime.request_greeting(&view, GreetingSource::Pointer);
+            native_pointer_button(false);
+            let released_seen = wait_for_button(false);
+            assert!(
+                pressed_seen && released_seen,
+                "native drag lifecycle was not observed"
+            );
+            assert!(local_drag && !pointer_buttons_down(&view));
+            assert!(!explicit_during_drag && !pointer_during_drag);
+            assert_eq!(presence.state.borrow().last_greeting, greeting_before_drag);
             runtime
                 .activity
                 .active_at
@@ -10717,12 +10771,24 @@ mod tests {
             .split_once("    fn install_card_tooltip(")
             .unwrap()
             .0;
+        assert!(query.contains("pointer_button_state(root, buttons) != Some(false)"));
+        let pointer = source
+            .split_once("fn pointer_button_state(")
+            .unwrap()
+            .1
+            .split_once("fn surface_frame_delay(")
+            .unwrap()
+            .0;
+        assert!(pointer.contains("surface.device_position(&pointer)?"));
+        assert!(pointer.contains("pointer_button_state(&view.widget(), buttons) == Some(true)"));
+        assert!(!pointer.contains("BUTTON4_MASK"));
+        assert!(query.contains("BUTTON5_MASK"));
+        assert!(!pointer.contains("pointer.modifier_state()"));
         for guard in [
             "!self.enabled.get()",
             "view.widget() != *root",
             "!self.card.is_mapped()",
             "!self.card.is_ancestor(root)",
-            "BUTTON5_MASK",
             "root.compute_point",
             "top.pick",
             "PickFlags::NON_TARGETABLE",
