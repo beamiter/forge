@@ -4581,7 +4581,12 @@ mod tests {
                 .unwrap();
             move_native_pointer(&window, point.x() as i32, point.y() as i32);
         }
-        let pointer = window.display().default_seat().unwrap().pointer().unwrap();
+        let pointer = pane_root
+            .display()
+            .default_seat()
+            .unwrap()
+            .pointer()
+            .unwrap();
         let surface = window.surface().unwrap();
         wait_for_tooltip_layout(&|| surface.device_position(&pointer).is_some());
         #[cfg(target_os = "linux")]
