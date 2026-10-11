@@ -1782,7 +1782,7 @@ struct OrganismRuntime {
     interaction_epoch: Instant,
     live_context: Cell<RenderContext>,
     /// Final post-interaction pose, only while the spatial body is presented.
-    presented_behavior: Cell<Option<Behavior>>,
+    presented_surface: Cell<Option<(Behavior, WatchRhythm)>>,
     pointer_position: Cell<Option<(f64, f64)>>,
     pointer_near: Cell<bool>,
     greeting_source: Cell<Option<(GreetingSource, Instant)>>,
@@ -1982,7 +1982,7 @@ impl OrganismRuntime {
                 BodyLanguage::default(),
                 false,
             )),
-            presented_behavior: Cell::new(None),
+            presented_surface: Cell::new(None),
             pointer_position: Cell::new(None),
             pointer_near: Cell::new(false),
             greeting_source: Cell::new(None),
@@ -2452,8 +2452,8 @@ impl OrganismRuntime {
         motion
     }
 
-    fn set_presented_behavior(&self, behavior: Option<Behavior>) {
-        if self.presented_behavior.replace(behavior) != behavior || behavior.is_some() {
+    fn set_presented_surface(&self, behavior: Option<(Behavior, WatchRhythm)>) {
+        if self.presented_surface.replace(behavior) != behavior || behavior.is_some() {
             // Existing visible frames also reconcile the first GTK mapping;
             // the text/tooltip setters still run only when their value changes.
             self.refresh_state(self.shared_life.get());
@@ -2470,7 +2470,7 @@ impl OrganismRuntime {
         self.body_position.set(None);
         self.body_in_transit.set(false);
         view.set_live_organism_visible(false);
-        self.set_presented_behavior(None);
+        self.set_presented_surface(None);
     }
 
     fn bump_generation(&self) -> u64 {
@@ -2514,7 +2514,7 @@ impl OrganismRuntime {
         self.surface_behavior_frame_origin
             .set(self.surface_frame.get());
         self.surface_behavior.set(reaction.behavior);
-        self.presented_behavior.set(None);
+        self.presented_surface.set(None);
         self.refresh_inline_sprite();
         self.refresh_growth_badge();
         let status = match reaction.speech {
@@ -2577,9 +2577,9 @@ impl OrganismRuntime {
     }
 
     fn refresh_state(&self, state: LifeState) {
-        let explanation = state_explanation(
+        let explanation = state_explanation_with_rhythm(
             self.surface_behavior.get(),
-            self.presented_behavior.get(),
+            self.presented_surface.get(),
             self.live_body.is_mapped(),
         );
         let words = format!("{explanation} · {}", state_words(state));
@@ -2937,7 +2937,7 @@ impl OrganismRuntime {
                 self.body_in_transit.set(moved);
                 self.body_position.set(Some((x, y)));
                 view.set_live_organism_visible(true);
-                self.set_presented_behavior(Some(context.behavior));
+                self.set_presented_surface(Some((context.behavior, context.watch_rhythm)));
             } else {
                 // A detached/reparenting surface is not a place the body can
                 // visibly sleep. Fail closed until the next measured frame.
@@ -3370,6 +3370,36 @@ fn state_explanation(
     behavior_explanation(behavior)
 }
 
+/// Rhythm is an admitted observation attached to the final placed watch
+/// context, never a prediction of command progress or a raw tracker edge.
+fn state_explanation_with_rhythm(
+    inline: Behavior,
+    presented: Option<(Behavior, WatchRhythm)>,
+    live_mapped: bool,
+) -> String {
+    let explanation =
+        state_explanation(inline, presented.map(|(behavior, _)| behavior), live_mapped);
+    let observation = if live_mapped {
+        presented.and_then(|(behavior, rhythm)| {
+            if !matches!(behavior, Behavior::WatchCommand | Behavior::WatchSettled) {
+                return None;
+            }
+            match rhythm {
+                WatchRhythm::Steady => None,
+                WatchRhythm::Busy => Some("Recent output activity."),
+                WatchRhythm::Waiting => Some("No new output observed recently."),
+                WatchRhythm::Resumed => Some("Output activity resumed."),
+            }
+        })
+    } else {
+        None
+    };
+    match observation {
+        Some(observation) => format!("{explanation} {observation}"),
+        None => explanation.to_owned(),
+    }
+}
+
 fn state_summary(state: LifeState) -> String {
     format!(
         "E{:02} M{:02} C{:02} B{:02} S{:02} N{:02} A{:02} F{:02}",
@@ -3613,7 +3643,7 @@ impl UiState {
                     // no typing-triggered run competes with the prompt.
                     runtime.body_position.set(None);
                     runtime.body_in_transit.set(false);
-                    runtime.set_presented_behavior(None);
+                    runtime.set_presented_surface(None);
                     if let Some(view) = view_weak.upgrade() {
                         // Clear desired visibility even behind the alternate-
                         // screen override, so rmcup cannot briefly restore a
@@ -3641,7 +3671,7 @@ impl UiState {
                 runtime.set_sleeping(false);
                 runtime.body_position.set(None);
                 runtime.body_in_transit.set(false);
-                runtime.set_presented_behavior(None);
+                runtime.set_presented_surface(None);
                 runtime.sticky_avatar.set_visible(false);
                 if let Some(view) = view_weak.upgrade() {
                     view.set_live_organism_visible(false);
@@ -3690,7 +3720,7 @@ impl UiState {
                 // and restores the body below the new cursor edge.
                 runtime.body_position.set(None);
                 runtime.body_in_transit.set(false);
-                runtime.set_presented_behavior(None);
+                runtime.set_presented_surface(None);
                 if let Some(view) = view {
                     view.set_live_organism_visible(false);
                 }
@@ -4491,6 +4521,31 @@ mod tests {
         crate::block_view::organism_settings_test_running(&view, false);
         runtime.refresh_surface(&view, Instant::now());
         assert!(!runtime.awaiting_unobserved_work.get());
+        runtime.last_human_input.set(None);
+        runtime.command_running.set(true);
+        runtime.visible_watch_rhythm.set(WatchRhythm::Waiting);
+        runtime.refresh_surface(&view, Instant::now());
+        while main.iteration(false) {}
+        runtime.visible_watch_rhythm.set(WatchRhythm::Waiting);
+        runtime.refresh_surface(&view, Instant::now());
+        assert!(runtime.live_body.is_mapped());
+        assert!(runtime
+            .state
+            .text()
+            .contains("No new output observed recently."));
+        assert!(runtime
+            .state
+            .tooltip_text()
+            .unwrap()
+            .contains("No new output observed recently."));
+        let authoritative_status = runtime.status.text();
+        runtime.visible_watch_rhythm.set(WatchRhythm::Resumed);
+        runtime.refresh_surface(&view, Instant::now());
+        assert!(runtime.state.text().contains("Output activity resumed."));
+        assert_eq!(runtime.status.text(), authoritative_status);
+        runtime.hide_live_body(&view);
+        assert!(!runtime.state.text().contains("Output activity resumed."));
+        runtime.command_running.set(false);
         OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Full);
 
         // Exercise the real motion controller on a stationary calm body.
@@ -4679,7 +4734,13 @@ mod tests {
             let explicit_started = presence.state.borrow().last_greeting.unwrap();
             runtime.pointer_left();
             runtime.refresh_surface(&view, Instant::now());
-            assert_eq!(runtime.presented_behavior.get(), Some(Behavior::Approach));
+            assert_eq!(
+                runtime
+                    .presented_surface
+                    .get()
+                    .map(|(behavior, _)| behavior),
+                Some(Behavior::Approach)
+            );
             assert!(runtime.pointer_timer.borrow().is_none());
             assert!(runtime
                 .greeting_source
@@ -10456,6 +10517,89 @@ mod tests {
     }
 
     #[test]
+    fn watch_explanation_uses_only_the_visible_final_observation() {
+        for behavior in [Behavior::WatchCommand, Behavior::WatchSettled] {
+            for (rhythm, observation) in [
+                (WatchRhythm::Busy, "Recent output activity."),
+                (WatchRhythm::Waiting, "No new output observed recently."),
+                (WatchRhythm::Resumed, "Output activity resumed."),
+            ] {
+                assert_eq!(
+                    state_explanation_with_rhythm(Behavior::Idle, Some((behavior, rhythm)), true),
+                    format!("{} {observation}", behavior_explanation(behavior))
+                );
+                assert_eq!(
+                    state_explanation_with_rhythm(Behavior::Idle, Some((behavior, rhythm)), false),
+                    behavior_explanation(Behavior::Idle)
+                );
+            }
+        }
+        for behavior in [
+            Behavior::Idle,
+            Behavior::Approach,
+            Behavior::Celebrate,
+            Behavior::InspectError,
+            Behavior::WatchAgent,
+        ] {
+            assert_eq!(
+                state_explanation_with_rhythm(
+                    Behavior::Idle,
+                    Some((behavior, WatchRhythm::Busy)),
+                    true
+                ),
+                behavior_explanation(behavior)
+            );
+        }
+        assert_eq!(
+            state_explanation_with_rhythm(Behavior::Idle, None, true),
+            behavior_explanation(Behavior::Idle)
+        );
+        assert_eq!(
+            state_explanation_with_rhythm(
+                Behavior::Idle,
+                Some((Behavior::WatchCommand, WatchRhythm::Steady)),
+                true
+            ),
+            behavior_explanation(Behavior::WatchCommand)
+        );
+    }
+
+    #[test]
+    fn rhythm_description_uses_placed_context_and_preserves_authoritative_status() {
+        let source = include_str!("organism.rs");
+        let setter = source
+            .split_once("    fn set_presented_surface(")
+            .unwrap()
+            .1
+            .split_once("    fn hide_live_body(")
+            .unwrap()
+            .0;
+        assert!(setter.contains("self.refresh_state(self.shared_life.get())"));
+        let refresh = source
+            .split_once("    fn refresh_state(")
+            .unwrap()
+            .1
+            .split_once("    fn human_input_age(")
+            .unwrap()
+            .0;
+        assert!(refresh.contains("state_explanation_with_rhythm("));
+        assert!(refresh.contains("self.presented_surface.get()"));
+        assert!(refresh.contains("self.live_body.is_mapped()"));
+        assert!(!refresh.contains("self.status."));
+        assert!(!refresh.contains("output_rhythm"));
+        assert!(!refresh.contains("offered_watch_rhythm"));
+        assert!(!refresh.contains("timeout"));
+        let hide = source
+            .split_once("    fn hide_live_body(")
+            .unwrap()
+            .1
+            .split_once("    fn bump_generation(")
+            .unwrap()
+            .0;
+        assert!(hide.contains("self.set_presented_surface(None)"));
+    }
+
+    #[test]
     fn description_tracks_final_context_and_retires_previous_reaction() {
         let source = include_str!("organism.rs");
         let render = source
@@ -10466,7 +10610,7 @@ mod tests {
             .unwrap()
             .0;
         assert!(
-            render.find("self.presented_behavior.set(None);").unwrap()
+            render.find("self.presented_surface.set(None);").unwrap()
                 < render.find("self.refresh_state(").unwrap()
         );
         let surface = source
@@ -10483,7 +10627,7 @@ mod tests {
             .find("view.set_live_organism_visible(true);")
             .unwrap();
         let explanation = surface
-            .find("self.set_presented_behavior(Some(context.behavior));")
+            .find("self.set_presented_surface(Some((context.behavior, context.watch_rhythm)));")
             .unwrap();
         assert!(interaction < shown && shown < explanation);
     }
