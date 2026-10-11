@@ -427,9 +427,7 @@ mod organism_preview {
         }
 
         fn sync_demo_controls(self: &Rc<Self>, active: bool) -> Option<gtk::Button> {
-            let Some(controls) = self.controls.upgrade() else {
-                return None;
-            };
+            let controls = self.controls.upgrade()?;
             let (revision, running, paused) = {
                 let sequence = self.sequence.borrow();
                 (
