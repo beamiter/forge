@@ -133,7 +133,9 @@ fn greeting_frame_delay(
     if motion != OrganismMotion::Full || !owner || alt_screen || !body_mapped {
         return None;
     }
-    remaining.filter(|left| !left.is_zero()).map(|left| {
+    // Some(0) still describes a greeting retained by the last rendered frame.
+    // Schedule its cleanup once; a subsequent refresh clears that source.
+    remaining.map(|left| {
         left.min(SURFACE_FRAME_INTERVAL)
             .max(Duration::from_millis(1))
     })
@@ -3111,10 +3113,12 @@ impl OrganismRuntime {
     }
 
     fn greeting_frame_delay(&self, view: &TermView, now: Instant) -> Option<Duration> {
-        let remaining =
-            active_greeting_source(self.greeting_source.get(), now).map(|(_, started)| {
-                GentleInteraction::HOLD.saturating_sub(now.saturating_duration_since(started))
-            });
+        // Refresh owns source retirement. If this tail crosses the hold
+        // deadline after that refresh drew the greeting, retain Some(0) so
+        // the stale last frame is cleared promptly instead of resting 900ms.
+        let remaining = self.greeting_source.get().map(|(_, started)| {
+            GentleInteraction::HOLD.saturating_sub(now.saturating_duration_since(started))
+        });
         greeting_frame_delay(
             self.motion.get(),
             self.presence.is_owner(self.presence_token),
@@ -11045,7 +11049,7 @@ mod tests {
                 true,
                 Some(Duration::ZERO)
             ),
-            None
+            Some(Duration::from_millis(1))
         );
         assert_eq!(
             greeting_frame_delay(
@@ -11129,6 +11133,98 @@ mod tests {
             None,
         );
         assert_eq!(first_wake + next, newer_input + HUMAN_INPUT_RETREAT);
+    }
+
+    #[test]
+    fn retained_greeting_cleans_up_once_when_the_frame_tail_crosses_expiry() {
+        let started = Instant::now();
+        let before = GentleInteraction::HOLD - Duration::from_nanos(1);
+        let baseline = RenderContext::new(Behavior::Idle, BodyLanguage::default(), false);
+        for source in [GreetingSource::Pointer, GreetingSource::Explicit] {
+            let retained = active_greeting_source(Some((source, started)), started + before);
+            let mut interaction = GentleInteraction::default();
+            assert!(interaction.request(Duration::ZERO, baseline));
+            assert_eq!(
+                interaction.apply(before, baseline).behavior,
+                Behavior::Approach
+            );
+            for after in [
+                Duration::ZERO,
+                Duration::from_nanos(1),
+                Duration::from_millis(5),
+            ] {
+                let tail = started + GentleInteraction::HOLD + after;
+                let remaining = retained.map(|(_, at)| {
+                    GentleInteraction::HOLD.saturating_sub(tail.saturating_duration_since(at))
+                });
+                let cleanup =
+                    greeting_frame_delay(OrganismMotion::Full, true, false, true, remaining);
+                assert_eq!(cleanup, Some(Duration::from_millis(1)));
+                assert_eq!(
+                    greeting_frame_delay(OrganismMotion::Calm, true, false, true, remaining),
+                    None
+                );
+                assert_eq!(
+                    greeting_frame_delay(OrganismMotion::Full, false, false, true, remaining),
+                    None
+                );
+                assert_eq!(
+                    greeting_frame_delay(OrganismMotion::Full, true, true, true, remaining),
+                    None
+                );
+                assert_eq!(
+                    greeting_frame_delay(OrganismMotion::Full, true, false, false, remaining),
+                    None
+                );
+                let next_frame = tail + cleanup.unwrap();
+                assert_eq!(active_greeting_source(retained, next_frame), None);
+                assert_eq!(
+                    interaction.apply(next_frame.duration_since(started), baseline),
+                    baseline
+                );
+                assert_eq!(
+                    interaction_frame_delay(
+                        DORMANT_FRAME_INTERVAL,
+                        None,
+                        false,
+                        greeting_frame_delay(OrganismMotion::Full, true, false, true, None)
+                    ),
+                    DORMANT_FRAME_INTERVAL,
+                    "retired source cannot create a 1ms loop"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn greeting_tail_keeps_retained_source_but_refresh_owns_retirement() {
+        let source = include_str!("organism.rs");
+        let tail = source
+            .split_once("    fn greeting_frame_delay(&self,")
+            .unwrap()
+            .1
+            .split_once("    fn next_surface_frame_delay(")
+            .unwrap()
+            .0;
+        assert!(tail.contains("self.greeting_source.get().map"));
+        assert!(!tail.contains("active_greeting_source"));
+        assert!(tail.contains("HOLD.saturating_sub"));
+        let refresh = source
+            .split_once("    fn refresh_surface(")
+            .unwrap()
+            .1
+            .split_once("    fn apply_settings(")
+            .unwrap()
+            .0;
+        assert!(refresh
+            .contains("let greeting = active_greeting_source(self.greeting_source.get(), now)"));
+        assert!(refresh.contains("self.greeting_source.set(greeting)"));
+        assert!(
+            refresh.find("self.greeting_source.set(greeting)").unwrap()
+                < refresh
+                    .find(".apply(self.interaction_epoch.elapsed(), context)")
+                    .unwrap()
+        );
     }
 
     #[test]
