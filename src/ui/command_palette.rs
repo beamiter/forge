@@ -799,6 +799,7 @@ impl UiState {
 
         // All disk/config-backed sources are captured once at open. Search
         // changes below are pure in-memory filtering and never do per-key I/O.
+        let greeting_target = self.current_term_view().as_ref().map(Rc::downgrade);
         let snapshot = Rc::new(self.palette_snapshot());
         let dialog = adw::Dialog::builder()
             .title(palette_title(initial_mode))
@@ -877,7 +878,15 @@ impl UiState {
                     return;
                 };
                 dialog.force_close();
-                ui.accept_palette_entry(entry, &snapshot.workflows);
+                if matches!(
+                    &entry.accept,
+                    Accept::Action(crate::keybindings::Action::GreetAsciiOrganism)
+                ) {
+                    let target = greeting_target.as_ref().and_then(Weak::upgrade);
+                    ui.greet_ascii_organism_for(target.as_ref());
+                } else {
+                    ui.accept_palette_entry(entry, &snapshot.workflows);
+                }
             })
         };
         {
@@ -939,6 +948,35 @@ mod tests {
     use super::{compact_one_line, merge_palette_history, palette_toggle_key};
     use crate::palette::PaletteMode;
     use gtk4::gdk::{Key, ModifierType};
+
+    #[test]
+    fn explicit_hello_keeps_the_palette_opening_owner_and_closes_before_request() {
+        let source = include_str!("command_palette.rs");
+        let open = source
+            .split_once(concat!(
+                "    pub(crate) fn show_unified_",
+                "command_palette("
+            ))
+            .unwrap()
+            .1
+            .split_once("#[cfg(test)]")
+            .unwrap()
+            .0;
+        assert!(open.contains("self.current_term_view().as_ref().map(Rc::downgrade)"));
+        let activate = open
+            .split_once("let activate = {")
+            .unwrap()
+            .1
+            .split_once("let keys =")
+            .unwrap()
+            .0;
+        assert!(
+            activate.find("dialog.force_close()").unwrap()
+                < activate.find("greet_ascii_organism_for").unwrap()
+        );
+        assert!(activate.contains("greeting_target.as_ref().and_then(Weak::upgrade)"));
+        assert!(!activate.contains("current_term_view"));
+    }
 
     #[test]
     fn palette_previews_neutralise_untrusted_formatting() {

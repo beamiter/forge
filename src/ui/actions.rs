@@ -191,6 +191,10 @@ impl UiState {
                 log::debug!("Toggle search");
                 self.toggle_search();
             }
+            Action::GreetAsciiOrganism => {
+                let target = self.current_term_view();
+                self.greet_ascii_organism_for(target.as_ref());
+            }
             Action::ToggleCommandPalette => {
                 log::debug!("Toggle command palette");
                 self.toggle_unified_command_palette();

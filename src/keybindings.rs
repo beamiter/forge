@@ -39,6 +39,7 @@ pub(crate) enum Action {
     OpacityDecrease,
     ToggleSearch,
     ToggleCommandPalette,
+    GreetAsciiOrganism,
     ToggleSettings,
     ReloadConfig,
     ToggleSidebar,
@@ -152,6 +153,7 @@ impl Action {
             Action::OpacityDecrease => "Opacity decrease",
             Action::ToggleSearch => "Toggle search",
             Action::ToggleCommandPalette => "Command palette",
+            Action::GreetAsciiOrganism => "Say hello to ASCII companion",
             Action::ToggleSettings => "Toggle settings panel",
             Action::ReloadConfig => "Reload configuration",
             Action::ToggleSidebar => "Toggle sidebar",
@@ -252,6 +254,7 @@ impl Action {
             Action::OpacityDecrease => Some("opacity_decrease"),
             Action::ToggleSearch => Some("toggle_search"),
             Action::ToggleCommandPalette => Some("toggle_command_palette"),
+            Action::GreetAsciiOrganism => Some("greet_ascii_organism"),
             Action::ToggleSettings => Some("toggle_settings"),
             Action::ReloadConfig => Some("reload_config"),
             Action::ToggleSidebar => Some("toggle_sidebar"),
@@ -343,6 +346,7 @@ impl Action {
             Action::OpacityDecrease,
             Action::ToggleSearch,
             Action::ToggleCommandPalette,
+            Action::GreetAsciiOrganism,
             Action::ToggleSettings,
             Action::ReloadConfig,
             Action::ToggleSidebar,
@@ -728,6 +732,20 @@ mod tests {
     //! it) — that needs a GTK event loop and is tracked separately.
     use super::*;
 
+    #[test]
+    fn hello_is_discoverable_without_a_default_shortcut() {
+        let map = KeybindingMap::from_defaults();
+        assert!(map
+            .all_bound_actions()
+            .iter()
+            .any(|(action, _)| *action == Action::GreetAsciiOrganism));
+        assert!(map.binding_display(&Action::GreetAsciiOrganism).is_empty());
+        assert_eq!(
+            Action::from_config_key("greet_ascii_organism"),
+            Some(Action::GreetAsciiOrganism)
+        );
+    }
+
     /// Every action advertised by `all_actions()` either has a default
     /// binding or is on the explicit "palette / TOML-only" allowlist
     /// below. The allowlist exists so a newly-added Action without a
@@ -739,6 +757,7 @@ mod tests {
         // and/or user TOML overrides — they have no default chord on
         // purpose (chord exhaustion + low frequency of use).
         let palette_only: &[Action] = &[
+            Action::GreetAsciiOrganism,
             Action::CloseTab,
             Action::CyclePaneFocusForward,
             Action::CyclePaneFocusBackward,
