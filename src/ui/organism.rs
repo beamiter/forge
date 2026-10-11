@@ -2180,6 +2180,7 @@ impl OrganismRuntime {
     }
 
     fn cancel_pointer_greeting(&self) {
+        self.live_body.remove_css_class("organism-hover-candidate");
         if let Some(source) = self.pointer_timer.borrow_mut().take() {
             source.remove();
         }
@@ -2248,6 +2249,9 @@ impl OrganismRuntime {
             };
             // Clear the fired id before checking its view: a separately held
             // runtime must never try removing an already-fired source in Drop.
+            runtime
+                .live_body
+                .remove_css_class("organism-hover-candidate");
             runtime.pointer_timer.borrow_mut().take();
             let Some(view) = view_weak.upgrade() else {
                 runtime.cancel_pointer_greeting();
@@ -2282,6 +2286,7 @@ impl OrganismRuntime {
             }
         });
         *runtime.pointer_timer.borrow_mut() = Some(source);
+        runtime.live_body.add_css_class("organism-hover-candidate");
     }
 
     fn install_pointer_observer(
@@ -4336,8 +4341,26 @@ mod tests {
                 runtime.pointer_timer.borrow().is_some(),
                 "native pointer must reach the passive observer"
             );
+            assert!(runtime.live_body.has_css_class("organism-hover-candidate"));
+            // Compare CSS geometry synchronously with the same sprite: an
+            // animation frame changing between measurements is unrelated.
+            runtime
+                .live_body
+                .remove_css_class("organism-hover-candidate");
+            let plain_width = runtime.live_body.measure(gtk4::Orientation::Horizontal, -1);
+            let plain_height = runtime.live_body.measure(gtk4::Orientation::Vertical, -1);
+            runtime.live_body.add_css_class("organism-hover-candidate");
+            assert_eq!(
+                runtime.live_body.measure(gtk4::Orientation::Horizontal, -1),
+                plain_width
+            );
+            assert_eq!(
+                runtime.live_body.measure(gtk4::Orientation::Vertical, -1),
+                plain_height
+            );
             native_pointer_button(true);
             settle(Duration::from_millis(40));
+            assert!(!runtime.live_body.has_css_class("organism-hover-candidate"));
             assert!(
                 runtime.pointer_timer.borrow().is_none(),
                 "press without motion cancels pending dwell without consuming the click"
@@ -4363,6 +4386,7 @@ mod tests {
                 "motion within the hit zone never allocates another timer"
             );
             settle(POINTER_GREETING_DWELL);
+            assert!(!runtime.live_body.has_css_class("organism-hover-candidate"));
             let first = presence
                 .state
                 .borrow()
@@ -4400,6 +4424,7 @@ mod tests {
                 Some(first),
                 "repeated entry respects the shared cooldown"
             );
+            assert!(!runtime.live_body.has_css_class("organism-hover-candidate"));
             assert_eq!(
                 format!("{:?}", life.get()),
                 life_before,
@@ -10314,6 +10339,51 @@ mod tests {
         assert_eq!(
             surface_frame_delay(OrganismMotion::Static, true, false, false),
             DORMANT_FRAME_INTERVAL
+        );
+    }
+
+    #[test]
+    fn pointer_candidate_cue_tracks_only_the_existing_dwell_and_changes_paint_only() {
+        let source = include_str!("organism.rs");
+        let cancel = source
+            .split_once(concat!("    fn cancel_pointer_", "greeting(&self) {"))
+            .unwrap()
+            .1
+            .split_once("    fn pointer_can_greet")
+            .unwrap()
+            .0;
+        assert!(cancel.find("remove_css_class").unwrap() < cancel.find("pointer_timer").unwrap());
+        let observe = source
+            .split_once(concat!("    fn observe_", "pointer("))
+            .unwrap()
+            .1
+            .split_once("    fn install_pointer_observer")
+            .unwrap()
+            .0;
+        assert!(
+            observe.find("last_greeting").unwrap()
+                < observe.find("timeout_add_local_once").unwrap()
+        );
+        assert!(
+            observe.find("remove_css_class").unwrap()
+                < observe.find("pointer_timer.borrow_mut().take()").unwrap()
+        );
+        assert!(observe.find("Some(source)").unwrap() < observe.find("add_css_class").unwrap());
+        assert_eq!(observe.matches("timeout_add_local_once").count(), 1);
+        let css = include_str!("../block_view/css.rs");
+        let candidate = css
+            .split_once(".organism-live-body.organism-hover-candidate {{")
+            .unwrap()
+            .1
+            .split_once("}}")
+            .unwrap()
+            .0;
+        assert!(candidate.contains("border-color: rgba({fg_r},{fg_g},{fg_b},0.45)"));
+        assert!(candidate.contains("transition: none"));
+        assert_eq!(
+            candidate.matches(';').count(),
+            2,
+            "candidate changes paint only"
         );
     }
 
