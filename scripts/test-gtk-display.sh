@@ -140,7 +140,7 @@ for test_name in "${tests[@]}"; do
     # Only this existing fixture checks accessible values; GTK caches the backend at init.
     a11y_backend=none
     if [[ "$test_name" == ui::organism::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers ]]; then
-        a11y_backend=test
+        a11y_backend="test"
     fi
     GTK_A11Y="$a11y_backend" dbus-run-session "${dbus_run_args[@]}" -- \
         xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \

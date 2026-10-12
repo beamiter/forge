@@ -1660,13 +1660,16 @@ fn exercise_expanded_fixture(
             let accepted_by_callback = accepted.clone();
             let activate = Rc::new(move |_index| {
                 closing.force_close();
-                accepted_by_callback.set(VteOrganismSurface::present_for_target(
+                let applied = VteOrganismSurface::present_for_target(
                     &captured,
                     current.as_ref(),
                     &host,
                     requested,
-                ));
-                focus_terminal.grab_focus();
+                );
+                accepted_by_callback.set(applied);
+                if applied {
+                    focus_terminal.grab_focus();
+                }
             });
             let queried = Rc::new(Cell::new(false));
             let query_callback = queried.clone();
@@ -1681,7 +1684,15 @@ fn exercise_expanded_fixture(
             );
             dialog.add_controller(keys.clone());
             dialog.present(Some(window));
-            wait("palette controller dialog mapped", &|| dialog.is_mapped());
+            // Adw 1.5 maps before its second-frame open/focus handoff. A
+            // synthetic key signal must wait for the same actual focus a real
+            // keyboard event needs, rather than closing a not-yet-open sheet.
+            wait("palette controller has native keyboard focus", &|| {
+                dialog.is_mapped()
+                    && window.is_active()
+                    && gtk4::prelude::RootExt::focus(window)
+                        .is_some_and(|focus| focus == filter || focus.is_ancestor(&filter))
+            });
             assert!(keys.emit_by_name::<bool>(
                 "key-pressed",
                 &[&key, &0_u32, &gtk4::gdk::ModifierType::empty(),]
@@ -1691,6 +1702,16 @@ fn exercise_expanded_fixture(
                 accepted.get(),
                 target_current && key == gtk4::gdk::Key::Return
             );
+            // Each case owns one opening/closing lifecycle. Do not overlap
+            // dialogs or repair focus after close; production's immediate
+            // focus restoration and the real host lifecycle must suffice.
+            wait("palette original dialog fully removed", &|| {
+                !dialog.is_mapped() && dialog.parent().is_none()
+            });
+            assert!(
+                terminal.has_focus(),
+                "palette close must restore the terminal"
+            );
             wait("palette target action settled", &|| {
                 runtime.expanded.get() == expected
                     && !runtime.mounting.get()
@@ -1699,8 +1720,6 @@ fn exercise_expanded_fixture(
             if key == gtk4::gdk::Key::Escape {
                 assert!(slot.borrow().is_none());
             }
-            dialog.force_close();
-            terminal.grab_focus();
         }
         wait("compact restored after palette controller cases", &|| {
             (terminal.width(), terminal.height(), runtime.row.height()) == compact

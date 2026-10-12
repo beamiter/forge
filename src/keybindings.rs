@@ -765,6 +765,8 @@ mod tests {
         // purpose (chord exhaustion + low frequency of use).
         let palette_only: &[Action] = &[
             Action::GreetAsciiOrganism,
+            Action::ExpandVteCompanion,
+            Action::CollapseVteCompanion,
             Action::CloseTab,
             Action::CyclePaneFocusForward,
             Action::CyclePaneFocusBackward,
