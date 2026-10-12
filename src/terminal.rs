@@ -364,6 +364,10 @@ impl VteTerminalView {
         &self.pane_header
     }
 
+    pub(crate) fn organism_presentation_surface(&self) -> Rc<crate::ui::VteOrganismSurface> {
+        self.organism.clone()
+    }
+
     pub(crate) fn set_organism_local(&self, local: bool) {
         self.organism.set_local(local);
     }

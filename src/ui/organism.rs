@@ -4689,7 +4689,7 @@ mod tests {
     #[test]
     #[ignore = "requires DISPLAY"]
     fn live_settings_reuse_body_preserve_focus_and_stop_disabled_timers() {
-        gtk4::init().expect("gtk4 display");
+        libadwaita::init().expect("GTK/libadwaita display");
         let view = crate::block_view::organism_settings_test_view();
         let presence = OrganismPresence::new();
         presence.remember_view(&view);
@@ -4750,11 +4750,14 @@ mod tests {
             .clamp(280, 900);
         let tooltip_overlay = gtk4::Overlay::new();
         tooltip_overlay.set_child(Some(&content));
-        let window = gtk4::Window::builder()
+        // Keep palette dialogs inside this existing test host, without creating
+        // an additional native window. Production host types are unchanged.
+        let window = libadwaita::Window::builder()
             .default_width(screenshot_width)
             .default_height(500)
-            .child(&tooltip_overlay)
-            .build();
+            .content(&tooltip_overlay)
+            .build()
+            .upcast::<gtk4::Window>();
         window.present();
         entry.grab_focus();
         let main = gtk4::glib::MainContext::default();

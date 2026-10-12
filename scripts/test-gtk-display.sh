@@ -137,7 +137,12 @@ done
 
 for test_name in "${tests[@]}"; do
     printf 'GTK display regression: %s\n' "${test_name}"
-    dbus-run-session "${dbus_run_args[@]}" -- \
+    # Only this existing fixture checks accessible values; GTK caches the backend at init.
+    a11y_backend=none
+    if [[ "$test_name" == ui::organism::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers ]]; then
+        a11y_backend=test
+    fi
+    GTK_A11Y="$a11y_backend" dbus-run-session "${dbus_run_args[@]}" -- \
         xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
         cargo test --lib --all-features --locked "${test_name}" -- \
         --ignored --exact --nocapture

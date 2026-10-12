@@ -191,6 +191,9 @@ impl UiState {
                 log::debug!("Toggle search");
                 self.toggle_search();
             }
+            // Palette-only: these require the opening target, never a fallback
+            // to the pane current at delayed generic action dispatch.
+            Action::ExpandVteCompanion | Action::CollapseVteCompanion => {}
             Action::GreetAsciiOrganism => {
                 let target = self.organism_greeting_target();
                 self.greet_ascii_organism_for(&target);

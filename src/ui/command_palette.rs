@@ -800,6 +800,7 @@ impl UiState {
         // All disk/config-backed sources are captured once at open. Search
         // changes below are pure in-memory filtering and never do per-key I/O.
         let greeting_target = self.organism_greeting_target();
+        let vte_presentation_target = self.vte_companion_target();
         let snapshot = Rc::new(self.palette_snapshot());
         let dialog = adw::Dialog::builder()
             .title(palette_title(initial_mode))
@@ -883,6 +884,15 @@ impl UiState {
                     Accept::Action(crate::keybindings::Action::GreetAsciiOrganism)
                 ) {
                     ui.greet_ascii_organism_for(&greeting_target);
+                } else if let Accept::Action(
+                    action @ (crate::keybindings::Action::ExpandVteCompanion
+                    | crate::keybindings::Action::CollapseVteCompanion),
+                ) = &entry.accept
+                {
+                    ui.set_vte_companion_for(
+                        &vte_presentation_target,
+                        *action == crate::keybindings::Action::ExpandVteCompanion,
+                    );
                 } else {
                     ui.accept_palette_entry(entry, &snapshot.workflows);
                 }
@@ -893,45 +903,15 @@ impl UiState {
             list.connect_row_activated(move |_, row| activate(row.index() as usize));
         }
 
-        let keys = EventControllerKey::new();
-        keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
-        {
-            let list = list.clone();
-            let dialog = dialog.clone();
-            let dialog_slot = self.command_palette_dialog.clone();
-            let activate = activate.clone();
-            let filter = filter.clone();
-            let refresh_query = refresh_query.clone();
-            keys.connect_key_pressed(move |_, key, _, state| {
-                if key == Key::Escape || palette_toggle_key(initial_mode, key, state) {
-                    dialog_slot.borrow_mut().take();
-                    dialog.force_close();
-                    return true.into();
-                }
-                if matches!(key, Key::Return | Key::KP_Enter) {
-                    // search-changed is delayed; accept against the text that is
-                    // visible now, while retaining selection if it has not changed.
-                    refresh_query(&filter.text());
-                    if let Some(row) = list.selected_row() {
-                        activate(row.index() as usize);
-                    }
-                    return true.into();
-                }
-                if matches!(key, Key::Down | Key::Up) {
-                    let current = list.selected_row().map(|row| row.index()).unwrap_or(0);
-                    let next = if key == Key::Down {
-                        current.saturating_add(1)
-                    } else {
-                        current.saturating_sub(1)
-                    };
-                    if let Some(row) = list.row_at_index(next) {
-                        list.select_row(Some(&row));
-                    }
-                    return true.into();
-                }
-                false.into()
-            });
-        }
+        let keys = palette_controller(
+            initial_mode,
+            &list,
+            &dialog,
+            self.command_palette_dialog.clone(),
+            &filter,
+            refresh_query,
+            activate,
+        );
         dialog.add_controller(keys);
 
         let slot = self.command_palette_dialog.clone();
@@ -940,6 +920,54 @@ impl UiState {
         dialog.present(Some(&self.window));
         filter.grab_focus();
     }
+}
+
+/// Shared native controller wiring; pane capture and action routing stay in the
+/// caller. The existing fixture exercises this same Return/Escape controller.
+pub(super) fn palette_controller(
+    initial_mode: PaletteMode,
+    list: &ListBox,
+    dialog: &adw::Dialog,
+    dialog_slot: Rc<RefCell<Option<adw::Dialog>>>,
+    filter: &SearchEntry,
+    refresh_query: Rc<dyn Fn(&str)>,
+    activate: Rc<dyn Fn(usize)>,
+) -> EventControllerKey {
+    let keys = EventControllerKey::new();
+    keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let list = list.clone();
+    let dialog = dialog.clone();
+    let filter = filter.clone();
+    keys.connect_key_pressed(move |_, key, _, state| {
+        if key == Key::Escape || palette_toggle_key(initial_mode, key, state) {
+            dialog_slot.borrow_mut().take();
+            dialog.force_close();
+            return true.into();
+        }
+        if matches!(key, Key::Return | Key::KP_Enter) {
+            // search-changed is delayed; accept against the text that is
+            // visible now, while retaining selection if it has not changed.
+            refresh_query(&filter.text());
+            if let Some(row) = list.selected_row() {
+                activate(row.index() as usize);
+            }
+            return true.into();
+        }
+        if matches!(key, Key::Down | Key::Up) {
+            let current = list.selected_row().map(|row| row.index()).unwrap_or(0);
+            let next = if key == Key::Down {
+                current.saturating_add(1)
+            } else {
+                current.saturating_sub(1)
+            };
+            if let Some(row) = list.row_at_index(next) {
+                list.select_row(Some(&row));
+            }
+            return true.into();
+        }
+        false.into()
+    });
+    keys
 }
 
 #[cfg(test)]
