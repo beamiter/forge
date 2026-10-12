@@ -1269,25 +1269,87 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
         },
     );
     assert!(runtime.source.borrow().is_none());
-    // Reuse the same native Paned and host for horizontal clipping. Scan its
-    // actual allocated positions rather than assuming a font's pixel width.
+    // Reuse the same native Paned and host. Frame time advances before
+    // allocation/paint; wait for actual after-paint and stable geometry before
+    // reading the orientation-dependent scan bound.
+    let clock = paned.frame_clock().unwrap();
+    let painted = Rc::new(Cell::new(0_u64));
+    let observed_paints = painted.clone();
+    struct PaintObserver(gtk4::gdk::FrameClock, Option<glib::SignalHandlerId>);
+    impl Drop for PaintObserver {
+        fn drop(&mut self) {
+            if let Some(handler) = self.1.take() {
+                self.0.disconnect(handler);
+            }
+        }
+    }
+    let paint_observer = PaintObserver(
+        clock.clone(),
+        Some(clock.connect_after_paint(move |_| {
+            observed_paints.set(observed_paints.get().wrapping_add(1));
+        })),
+    );
+    let geometry = || {
+        let bounds = root.compute_bounds(&paned).unwrap();
+        (
+            paned.width(),
+            paned.height(),
+            paned.position(),
+            paned.min_position(),
+            paned.max_position(),
+            bounds.x(),
+            bounds.y(),
+            bounds.width(),
+            bounds.height(),
+        )
+    };
+    let settle_native = |stage: &str| {
+        let last_paint = Cell::new(painted.get());
+        let previous_geometry = Cell::new(None);
+        window.queue_draw();
+        wait(stage, &|| {
+            if painted.get() == last_paint.get() || runtime.geometry_idle.borrow().is_some() {
+                return false;
+            }
+            last_paint.set(painted.get());
+            let current = geometry();
+            if previous_geometry.replace(Some(current)) == Some(current) {
+                return true;
+            }
+            window.queue_draw();
+            false
+        });
+    };
+    let diagnostic = |stage: &str, requested: Option<i32>| {
+        let widgets = runtime.expanded_widgets().unwrap();
+        eprintln!(
+            "VTE_HORIZONTAL stage={stage} requested={requested:?} orientation={:?} geometry={:?} paint={:?} clip={:?} full={:?} fallback={:?}",
+            paned.orientation(), geometry(), runtime.paint_plan(true, false).paint,
+            runtime.clipped_geometry(&runtime.presentation_widget()).as_ref().map(VteOrganismSurface::rect),
+            runtime.candidate_union(&widgets.labels[..2]),
+            runtime.candidate_union(&widgets.labels[2..]),
+        );
+    };
+    diagnostic("before orientation", None);
     paned.set_orientation(gtk4::Orientation::Horizontal);
     paned.set_position(10);
+    settle_native("horizontal orientation allocation settled");
+    assert_eq!(paned.orientation(), gtk4::Orientation::Horizontal);
+    assert!(paned.max_position() > 11 && paned.max_position() <= paned.width());
+    assert!(root.compute_bounds(&paned).is_some_and(|bounds| {
+        bounds.x() > 0.0 && bounds.y() == 0.0 && bounds.height() == paned.height() as f32
+    }));
     wait("horizontal expanded full body", &|| {
         runtime.paint_plan(true, false).paint == Paint::ExpandedSprite
             && runtime.geometry_idle.borrow().is_none()
     });
+    diagnostic("horizontal start", Some(10));
     let mut saw_fallback = false;
     let mut saw_hidden_after_fallback = false;
     let horizontal_height = runtime.row.measure(gtk4::Orientation::Vertical, -1);
-    let clock = paned.frame_clock().unwrap();
     let assert_stable_paint = |expected: Paint| {
         for _ in 0..3 {
-            let before = clock.frame_time();
-            window.queue_draw();
-            wait("three-paint presentation stability", &|| {
-                clock.frame_time() > before && runtime.geometry_idle.borrow().is_none()
-            });
+            settle_native("three-paint presentation stability");
             assert_eq!(runtime.paint_plan(true, false).paint, expected);
             let widgets = runtime.expanded_widgets().unwrap();
             match expected {
@@ -1313,12 +1375,15 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
             );
         }
     };
-    for position in 11..paned.max_position() {
-        let before = clock.frame_time();
+    let horizontal_max = paned.max_position();
+    let last_plan = Cell::new(Paint::ExpandedSprite);
+    for position in 11..horizontal_max {
         paned.set_position(position);
-        wait("horizontal native allocation settled", &|| {
-            clock.frame_time() > before && runtime.geometry_idle.borrow().is_none()
-        });
+        settle_native("horizontal native allocation settled");
+        let current_plan = runtime.paint_plan(true, false).paint;
+        if last_plan.replace(current_plan) != current_plan || position == horizontal_max - 1 {
+            diagnostic("scan transition or final position", Some(position));
+        }
         assert_eq!(
             horizontal_height,
             runtime.row.measure(gtk4::Orientation::Vertical, -1)
@@ -1351,6 +1416,7 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
         "further clipping hides paint without collapsing its envelope"
     );
     paned.set_position(10);
+    settle_native("horizontal recovery allocation settled");
     wait("horizontal Static full-body recovery", &|| {
         runtime.paint_plan(true, false).paint == Paint::ExpandedSprite
             && runtime
@@ -1360,6 +1426,7 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
                 .iter()
                 .any(|label| label.opacity() == 1.0)
     });
+    drop(paint_observer);
     paned.set_orientation(gtk4::Orientation::Vertical);
     paned.set_position(10);
     runtime.apply_settings(true, OrganismMotion::Full);
