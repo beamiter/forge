@@ -108,7 +108,8 @@ impl ExpandedCompanion {
             label.set_can_target(false);
             label.set_focusable(false);
             label.set_accessible_role(gtk4::AccessibleRole::Presentation);
-            label.update_state(&[gtk4::accessible::State::Hidden(true)]);
+            // Presentation leaf nodes are excluded from GTK accessibility trees.
+            // Hidden is managed by GTK map/unmap, not a persistent decoration flag.
             label.set_opacity(0.0);
             label
         });
@@ -1571,6 +1572,23 @@ fn exercise_expanded_fixture(
         };
         assert!(mismatch.is_none(), "Hidden value mismatch: {mismatch:?}");
     }
+    fn assert_presentation_leaves(widgets: &ExpandedCompanion) {
+        for label in &widgets.labels {
+            assert!(
+                label.is_visible(),
+                "all candidates still participate in measurement"
+            );
+            assert_eq!(label.accessible_role(), gtk4::AccessibleRole::Presentation);
+            assert!(gtk4::test_accessible_has_role(
+                label,
+                gtk4::AccessibleRole::Presentation
+            ));
+            assert!(
+                label.first_accessible_child().is_none(),
+                "decorative leaves have no descendants to promote"
+            );
+        }
+    }
     let compact = (terminal.width(), terminal.height(), runtime.row.height());
     let compact_req = (
         runtime.row.measure(gtk4::Orientation::Horizontal, -1),
@@ -1758,33 +1776,7 @@ fn exercise_expanded_fixture(
         assert!(widgets.slot.is_measure_overlay(label));
         assert!(widgets.slot.is_clip_overlay(label));
     }
-    for label in &widgets.labels {
-        assert!(
-            label.is_visible(),
-            "opacity-only candidates all participate in measurement"
-        );
-        assert_eq!(label.accessible_role(), gtk4::AccessibleRole::Presentation);
-        assert_hidden(label, true);
-        assert!(
-            gtk4::test_accessible_has_state(label, gtk4::AccessibleState::Hidden),
-            "Hidden state is registered; production update_state passes true"
-        );
-    }
-    for label in &widgets.labels {
-        label.update_state(&[gtk4::accessible::State::Hidden(false)]);
-        assert_hidden(label, false);
-    }
-    assert_eq!(
-        requisition,
-        (
-            widgets.slot.measure(gtk4::Orientation::Horizontal, -1),
-            widgets.slot.measure(gtk4::Orientation::Vertical, -1)
-        )
-    );
-    for label in &widgets.labels {
-        label.update_state(&[gtk4::accessible::State::Hidden(true)]);
-        assert_hidden(label, true);
-    }
+    assert_presentation_leaves(&widgets);
     assert_eq!(
         requisition,
         (
@@ -1800,6 +1792,11 @@ fn exercise_expanded_fixture(
         runtime.capability.accessible_role(),
         gtk4::AccessibleRole::Presentation
     );
+    assert_ne!(
+        runtime.capability.accessible_role(),
+        gtk4::AccessibleRole::None
+    );
+    assert!(runtime.capability.is_mapped());
     assert_hidden(&runtime.capability, false);
     assert!(VteOrganismSurface::present_for_target(
         &target,
@@ -1939,6 +1936,33 @@ fn exercise_expanded_fixture(
             runtime.row.measure(gtk4::Orientation::Vertical, -1)
         )
     );
+    assert_presentation_leaves(&widgets);
+    assert!(VteOrganismSurface::present_for_target(
+        &target,
+        Some(runtime),
+        window,
+        true
+    ));
+    wait("presentation role survives expanded remap", &|| {
+        widgets.slot.is_mapped() && runtime.row.height() == expanded.2
+    });
+    assert_presentation_leaves(&widgets);
+    assert_eq!(
+        requisition,
+        (
+            widgets.slot.measure(gtk4::Orientation::Horizontal, -1),
+            widgets.slot.measure(gtk4::Orientation::Vertical, -1)
+        )
+    );
+    assert!(VteOrganismSurface::present_for_target(
+        &target,
+        Some(runtime),
+        window,
+        false
+    ));
+    wait("compact restored after accessibility remap", &|| {
+        (terminal.width(), terminal.height(), runtime.row.height()) == compact
+    });
     assert_eq!(runtime.glyph.height_request(), -1);
     assert_eq!(runtime.glyph.width_chars(), 5);
     assert_eq!(runtime.glyph.max_width_chars(), 5);
@@ -2169,7 +2193,8 @@ mod tests {
         assert!(production.contains("gtk4::Overlay::new()"));
         assert!(production.contains("slot.set_measure_overlay(label, true)"));
         assert!(production.contains("slot.set_clip_overlay(label, true)"));
-        assert!(production.contains("gtk4::accessible::State::Hidden(true)"));
+        assert!(!production.contains("gtk4::accessible::State::Hidden(true)"));
+        assert!(production.contains("gtk4::AccessibleRole::Presentation"));
         assert!(!production.contains("gtk4::Grid"));
         assert!(!production.contains("set_height_request"));
         assert!(!production.contains("set_size_request"));
