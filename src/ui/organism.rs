@@ -2322,9 +2322,25 @@ impl OrganismRuntime {
         self.attention_snapshot.set(snapshot);
     }
 
+    fn install_prompt_evidence_observer(runtime: &Rc<Self>, view: &Rc<TermView>) {
+        let runtime_weak = Rc::downgrade(runtime);
+        let view_weak = Rc::downgrade(view);
+        view.connect_prompt_evidence_invalidated(move || {
+            let (Some(runtime), Some(view)) = (runtime_weak.upgrade(), view_weak.upgrade()) else {
+                return;
+            };
+            let previous = runtime.attention_snapshot.get().and_then(|s| s.active);
+            let snapshot = runtime.advance_attention(&view, LiveAttentionEvent::Reconcile);
+            if snapshot.is_some_and(|s| s.active != previous) {
+                runtime.refresh_surface_observing(&view, Instant::now(), false);
+            }
+        });
+    }
+
     fn attention_input(&self, view: &TermView) -> LiveAttentionInput {
         LiveAttentionInput {
             base_context: self.live_context.get(),
+            activity: view.organism_activity_knowledge(),
             hard_eligible: self.greeting_is_eligible(view),
             hover_available: self.live_body.is_mapped()
                 && self.live_body.compute_bounds(&view.widget()).is_some(),
@@ -3859,6 +3875,7 @@ impl UiState {
                 log::warn!("could not attach ASCII organism to the sticky running header");
             }
         }
+        OrganismRuntime::install_prompt_evidence_observer(&runtime, view);
         // Per-body seeding keeps split-window bodies from napping and pacing
         // in perfect lockstep.
         *runtime.ambient.borrow_mut() = AmbientMind::seeded(pane_token(view) as u64);
@@ -4634,6 +4651,27 @@ mod tests {
         }
     }
 
+    fn probe_window_greeting(
+        presence: &OrganismPresence,
+        token: OrganismPaneToken,
+    ) -> LiveAttentionOutcome {
+        let mut copy = presence.attention.borrow().clone();
+        copy.advance(
+            presence.attention_epoch.elapsed(),
+            &token,
+            LiveAttentionInput {
+                base_context: RenderContext::new(Behavior::Idle, BodyLanguage::default(), false),
+                activity: jterm_core::organism_live::LiveActivityKnowledge::KnownIdle,
+                hard_eligible: true,
+                hover_available: false,
+                pointer_inside: false,
+            },
+            LiveAttentionEvent::Explicit,
+        )
+        .expect("current owner")
+        .outcome
+    }
+
     #[test]
     #[ignore = "requires DISPLAY"]
     fn live_settings_reuse_body_preserve_focus_and_stop_disabled_timers() {
@@ -4658,6 +4696,7 @@ mod tests {
         let runtime_owners = Rc::strong_count(&runtime);
         let view_owners = Rc::strong_count(&view);
         OrganismRuntime::install_card_tooltip(&runtime, &view);
+        OrganismRuntime::install_prompt_evidence_observer(&runtime, &view);
         assert_eq!(Rc::strong_count(&runtime), runtime_owners);
         assert_eq!(Rc::strong_count(&view), view_owners);
         assert!(Rc::ptr_eq(&presence.runtime_for(&view).unwrap(), &runtime));
@@ -4711,6 +4750,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert!(view.widget().is_mapped());
+        crate::block_view::organism_settings_test_clean_prompt(&view);
         let wait_for_tooltip_layout = |ready: &dyn Fn() -> bool| {
             let started = Instant::now();
             while !ready() && started.elapsed() < Duration::from_secs(2) {
@@ -4961,6 +5001,32 @@ mod tests {
                 "native pointer must reach the passive observer"
             );
             assert!(runtime.live_body.has_css_class("organism-hover-candidate"));
+            let before_human = runtime.last_human_input.get();
+            let before_cooldown = probe_window_greeting(&presence, token);
+            view.write_input(b"\r")
+                .expect("nonexecuting queue accepts CR");
+            assert_eq!(
+                view.organism_activity_knowledge(),
+                jterm_core::organism_live::LiveActivityKnowledge::Unknown
+            );
+            assert!(runtime.pointer_timer.borrow().is_none());
+            assert_eq!(runtime.last_human_input.get(), before_human);
+            assert_eq!(probe_window_greeting(&presence, token), before_cooldown);
+            assert_eq!(
+                crate::block_view::organism_settings_test_pty_bytes(&view),
+                b"\r"
+            );
+            crate::block_view::organism_settings_test_clean_prompt(&view);
+            runtime.refresh_surface(&view, Instant::now());
+            assert!(
+                runtime.pointer_timer.borrow().is_none(),
+                "prompt recovery is not a pointer entry"
+            );
+            move_native_pointer(&window, 1, 1);
+            settle(Duration::from_millis(40));
+            move_native_pointer(&window, x, y);
+            settle(Duration::from_millis(100));
+            assert!(runtime.pointer_timer.borrow().is_some());
             let retired_ticket = runtime.pointer_timer.borrow().as_ref().unwrap().ticket;
             // Compare CSS geometry synchronously with the same sprite: an
             // animation frame changing between measurements is unrelated.
@@ -5216,6 +5282,25 @@ mod tests {
                 .active
                 .unwrap()
                 .deadline;
+            let explicit_before = runtime.attention_snapshot.get().unwrap().active;
+            let human_before = runtime.last_human_input.get();
+            view.write_input(b"\r")
+                .expect("nonexecuting queue accepts CR");
+            assert_eq!(
+                view.organism_activity_knowledge(),
+                jterm_core::organism_live::LiveActivityKnowledge::Unknown
+            );
+            assert_eq!(
+                runtime.attention_snapshot.get().unwrap().active,
+                explicit_before,
+                "Unknown preserves the accepted Explicit hold and original deadline"
+            );
+            assert_eq!(runtime.last_human_input.get(), human_before);
+            assert_eq!(
+                crate::block_view::organism_settings_test_pty_bytes(&view),
+                b"\r"
+            );
+            crate::block_view::organism_settings_test_clean_prompt(&view);
             OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Calm);
             assert_eq!(
                 runtime
@@ -11412,6 +11497,7 @@ mod tests {
         let base = RenderContext::new(Behavior::Idle, BodyLanguage::default(), false);
         let input = LiveAttentionInput {
             base_context: base,
+            activity: jterm_core::organism_live::LiveActivityKnowledge::KnownIdle,
             hard_eligible: true,
             hover_available: true,
             pointer_inside: true,
@@ -11660,6 +11746,7 @@ mod tests {
         let base = RenderContext::new(Behavior::Idle, BodyLanguage::default(), false);
         let input = LiveAttentionInput {
             base_context: base,
+            activity: jterm_core::organism_live::LiveActivityKnowledge::KnownIdle,
             hard_eligible: true,
             hover_available: false,
             pointer_inside: false,

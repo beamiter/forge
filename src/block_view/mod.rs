@@ -30,6 +30,7 @@ use jterm_core::pty_input::{self, Paste, PasteModes, PastePolicy, UnbracketedMul
 use jterm_core::terminal_report::{classify_terminal_report, TerminalReport};
 use jterm_core::wheel::WheelAccumulator;
 
+mod activity_knowledge;
 mod alt_screen;
 mod ansi;
 mod blocks;
@@ -5224,6 +5225,7 @@ pub(crate) struct CommandFinishedEvent {
 
 type CommandStartedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandStartedEvent)>>>>;
 type CommandFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandFinishedEvent)>>>>;
+type PromptEvidenceInvalidatedCallbacks = Rc<RefCell<Vec<Rc<dyn Fn()>>>>;
 type HumanInputCallbacks = Rc<RefCell<Vec<Box<dyn Fn(HumanInputKind)>>>>;
 type AltScreenCallbacks = Rc<RefCell<Vec<Box<dyn Fn(AltScreenTransition)>>>>;
 type AskAiCallbacks =
@@ -5444,11 +5446,53 @@ struct VerifiedSubmissionCtx {
     pending_agent_generation: Rc<Cell<Option<u64>>>,
     agent_execution_lost_callbacks: AgentExecutionLostCallbacks,
     agent_execution_supported: Rc<Cell<bool>>,
+    prompt_evidence_invalidated: PromptEvidenceInvalidatedCallbacks,
 }
 
 type VerifiedSubmissionCompletion = Box<dyn FnOnce(Result<(), String>)>;
 
 impl VerifiedSubmissionCtx {
+    fn notify_prompt_evidence_invalidated(&self) {
+        let callbacks = self.prompt_evidence_invalidated.borrow().clone();
+        for callback in callbacks {
+            callback();
+        }
+    }
+
+    fn organism_activity_knowledge(
+        &self,
+        fullscreen: bool,
+        active_agent: bool,
+        suggestion_rgb: [u8; 3],
+    ) -> jterm_core::organism_live::LiveActivityKnowledge {
+        let state = self.bstate.get();
+        let typed_shadow_empty = self.typed_cmd.borrow().is_empty();
+        let reviewed_submission_pending = self.submission_pending.get()
+            || self.pending_typeahead.get()
+            || self.source_id.borrow().is_some()
+            || self.completion.borrow().is_some()
+            || self.external_submission.borrow().is_some()
+            || self.external_submission_generation.get().is_some();
+        let agent_execution_pending = active_agent || self.pending_agent_generation.get().is_some();
+        // Reuse the strict existing PromptEnd/cursor/suffix proof. The current
+        // Forge suffix reader ignores color and rejects all non-CR/LF text.
+        // Every field borrow above has ended before these native reads.
+        let prompt_verified_empty = !fullscreen
+            && state == BlockState::AwaitingCommand
+            && typed_shadow_empty
+            && !reviewed_submission_pending
+            && !agent_execution_pending
+            && self.history_editor_is_ready(suggestion_rgb)
+            && self.pty.foreground_owner() == PtyForeground::Shell;
+        activity_knowledge::activity_knowledge(activity_knowledge::ActivityFacts {
+            state,
+            prompt_verified_empty,
+            typed_shadow_empty,
+            reviewed_submission_pending,
+            agent_execution_pending,
+        })
+    }
+
     fn current_anchor(&self) -> (i64, i64) {
         // Through the surface's own policy, never `rebase_prompt_anchor`
         // directly: this pane may not be a Block pane.
@@ -5529,6 +5573,7 @@ impl VerifiedSubmissionCtx {
         self.pty_synced.set(true);
         self.accepted_input_generation
             .set(self.accepted_input_generation.get().wrapping_add(1));
+        self.notify_prompt_evidence_invalidated();
         true
     }
 
@@ -5845,6 +5890,7 @@ impl VerifiedSubmissionCtx {
             glib::ControlFlow::Break
         });
         *self.source_id.borrow_mut() = Some(source_id);
+        self.notify_prompt_evidence_invalidated();
         Ok(())
     }
 }
@@ -7609,6 +7655,8 @@ impl ReaderCtx {
         self.mouse_reporting_rc.set(MouseReporting::OFF);
         self.live_reporting_modes_set.set(false);
         self.dynamic_colors_rc.set(DynamicColors::default());
+        self.verified_submission
+            .notify_prompt_evidence_invalidated();
     }
 
     fn on_decset_mode(&self, mode: u32, set: bool) {
@@ -7927,6 +7975,8 @@ impl ReaderCtx {
                     self.backend.reset_kitty_pipeline();
                     self.bstate_rc.set(BlockState::CollectingPrompt);
                     self.engine.borrow_mut().prompt_buf.clear();
+                    self.verified_submission
+                        .notify_prompt_evidence_invalidated();
                     self.backend.mark_scroll_dirty();
                     return;
                 }
@@ -8146,6 +8196,8 @@ impl ReaderCtx {
         }
         self.bstate_rc.set(BlockState::CollectingPrompt);
         self.engine.borrow_mut().prompt_buf.clear();
+        self.verified_submission
+            .notify_prompt_evidence_invalidated();
         // Reassert the stable viewport grid before the shell
         // renders the next prompt.
         self.backend.sync_geometry_to_pty();
@@ -14203,6 +14255,7 @@ impl TermView {
             pending_agent_generation: pending_verified_agent_generation,
             agent_execution_lost_callbacks: agent_execution_lost_callbacks.clone(),
             agent_execution_supported: agent_execution_supported.clone(),
+            prompt_evidence_invalidated: Rc::new(RefCell::new(Vec::new())),
         };
         let mouse_reporting_mode: Rc<Cell<MouseReporting>> =
             Rc::new(Cell::new(MouseReporting::OFF));
@@ -16151,6 +16204,10 @@ impl TermView {
         }
         self.accepted_input_generation
             .set(self.accepted_input_generation.get().wrapping_add(1));
+        if block_state == BlockState::AwaitingCommand && !data.is_empty() {
+            self.verified_submission
+                .notify_prompt_evidence_invalidated();
+        }
         // `write_input` is the shared Agent/correction/palette boundary.  Feed
         // it through the origin gate so future callback refactors cannot make
         // accepted programmatic bytes look like human attention.
@@ -16575,6 +16632,17 @@ impl TermView {
             .prompt_anchor(self.prompt_end_pos.get(), self.prompt_anchor_rows.get())
     }
 
+    pub(crate) fn organism_activity_knowledge(
+        &self,
+    ) -> jterm_core::organism_live::LiveActivityKnowledge {
+        let suggestion = click_cursor::suggestion_rgb(&self.config.borrow().palette);
+        self.verified_submission.organism_activity_knowledge(
+            self.fullscreen.get(),
+            self.active_agent_generation.get().is_some(),
+            suggestion,
+        )
+    }
+
     /// Content-free, constant-time lifecycle boundary for passive UI. Unknown
     /// or running activity is conservative; only a settled prompt is idle.
     pub(crate) fn organism_activity_settled(&self) -> bool {
@@ -16891,6 +16959,14 @@ impl TermView {
 
     pub fn connect_title_changed<F: Fn(&str) + 'static>(&self, f: F) {
         self.title_callbacks.borrow_mut().push(Box::new(f));
+    }
+
+    /// Loss of an established prompt proof, not human or output activity.
+    pub(crate) fn connect_prompt_evidence_invalidated<F: Fn() + 'static>(&self, f: F) {
+        self.verified_submission
+            .prompt_evidence_invalidated
+            .borrow_mut()
+            .push(Rc::new(f));
     }
 
     pub fn connect_activity<F: Fn() + 'static>(&self, f: F) {
@@ -18148,6 +18224,27 @@ pub(crate) fn organism_settings_test_view() -> Rc<TermView> {
     view.bstate.set(BlockState::AwaitingCommand);
     view.block_onboarding.history_resolved(false);
     view
+}
+
+// The inert display fixture has no shell. Seed an explicit clean PromptEnd
+// witness against its native surface; ReaderHarness tests actual A/B/C/RIS.
+#[cfg(test)]
+pub(crate) fn organism_settings_test_clean_prompt(view: &TermView) {
+    let ctx = &view.verified_submission;
+    ctx.bstate.set(BlockState::AwaitingCommand);
+    ctx.typed_cmd.borrow_mut().clear();
+    ctx.typed_cmd_fidelity.set(TypedShadowFidelity::Inexact);
+    ctx.idle_input_dirty.set(false);
+    ctx.pty_synced.set(false);
+    ctx.submission_pending.set(false);
+    ctx.pending_typeahead.set(false);
+    ctx.prompt_end_pos.set(ctx.surface.cursor_position());
+    ctx.prompt_anchor_rows.set(view.active_vte.row_count());
+    ctx.prompt_anchor_ready.set(true);
+    assert_eq!(
+        view.organism_activity_knowledge(),
+        jterm_core::organism_live::LiveActivityKnowledge::KnownIdle
+    );
 }
 
 #[cfg(test)]
@@ -27013,6 +27110,7 @@ mod tests {
                 pending_agent_generation: Rc::new(Cell::new(None)),
                 agent_execution_lost_callbacks: agent_execution_lost_cbs.clone(),
                 agent_execution_supported: agent_execution_supported.clone(),
+                prompt_evidence_invalidated: Rc::new(RefCell::new(Vec::new())),
             };
 
             let ctx = ReaderCtx {
@@ -30070,6 +30168,125 @@ mod tests {
                     body: "finished".to_string(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn organism_knowledge_uses_real_prompt_proof_and_invalidates_before_fanout() {
+        use jterm_core::organism_live::LiveActivityKnowledge;
+        let harness = ReaderHarness::new();
+        let ctx = &harness.ctx.verified_submission;
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false, [0, 0, 0]),
+            LiveActivityKnowledge::Unknown
+        );
+        harness.arm_verified_prompt();
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false, [0, 0, 0]),
+            LiveActivityKnowledge::KnownIdle
+        );
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, true, [0, 0, 0]),
+            LiveActivityKnowledge::Unknown
+        );
+        assert_eq!(
+            ctx.organism_activity_knowledge(true, false, [0, 0, 0]),
+            LiveActivityKnowledge::Unknown
+        );
+        ctx.typed_cmd.borrow_mut().push(' ');
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false, [0, 0, 0]),
+            LiveActivityKnowledge::Unknown
+        );
+        ctx.typed_cmd.borrow_mut().clear();
+        let notices = Rc::new(Cell::new(0));
+        let seen = notices.clone();
+        let state = ctx.bstate.clone();
+        ctx.prompt_evidence_invalidated
+            .borrow_mut()
+            .push(Rc::new(move || {
+                assert_ne!(state.get(), BlockState::AwaitingCommand);
+                seen.set(seen.get() + 1);
+            }));
+        harness.feed(ParserEvent::PromptStart);
+        assert_eq!(notices.get(), 1);
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false, [0, 0, 0]),
+            LiveActivityKnowledge::Unknown
+        );
+        harness.arm_verified_prompt();
+        let before_reset = notices.get();
+        harness.feed(ParserEvent::HardReset);
+        assert_eq!(notices.get(), before_reset + 1);
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false, [0, 0, 0]),
+            LiveActivityKnowledge::Unknown
+        );
+        harness.arm_verified_prompt();
+        harness.feed(command_start(Some("work")));
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false, [0, 0, 0]),
+            LiveActivityKnowledge::Busy
+        );
+    }
+
+    #[test]
+    fn organism_reviewed_admission_notifies_only_after_successful_proof_loss() {
+        use jterm_core::organism_live::LiveActivityKnowledge;
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        let ctx = &harness.ctx.verified_submission;
+        let notices = Rc::new(Cell::new(0));
+        let seen = notices.clone();
+        let dirty = ctx.idle_input_dirty.clone();
+        ctx.prompt_evidence_invalidated
+            .borrow_mut()
+            .push(Rc::new(move || {
+                assert!(dirty.get());
+                seen.set(seen.get() + 1);
+            }));
+        assert!(ctx.try_recall_command("echo recall", false, [0, 0, 0]));
+        assert_eq!(notices.get(), 1);
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false, [0, 0, 0]),
+            LiveActivityKnowledge::Unknown
+        );
+        assert!(!ctx.try_recall_command("must refuse", false, [0, 0, 0]));
+        assert_eq!(notices.get(), 1);
+    }
+
+    #[test]
+    fn organism_verified_begin_notifies_after_source_install_and_refusal_is_silent() {
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        let ctx = &harness.ctx.verified_submission;
+        let notices = Rc::new(Cell::new(0));
+        let seen = notices.clone();
+        let dirty = ctx.idle_input_dirty.clone();
+        let source = ctx.source_id.clone();
+        ctx.prompt_evidence_invalidated
+            .borrow_mut()
+            .push(Rc::new(move || {
+                assert!(dirty.get());
+                assert!(source.borrow().is_some());
+                seen.set(seen.get() + 1);
+            }));
+        ctx.idle_input_dirty.set(true);
+        assert!(ctx.begin("echo refused", None, [0, 0, 0]).is_err());
+        assert_eq!(notices.get(), 0);
+        ctx.idle_input_dirty.set(false);
+        assert!(ctx.begin("echo reviewed", None, [0, 0, 0]).is_ok());
+        assert_eq!(notices.get(), 1);
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false, [0, 0, 0]),
+            jterm_core::organism_live::LiveActivityKnowledge::Unknown
+        );
+        ctx.invalidate_for_terminal_reset();
+        assert!(ctx.source_id.borrow().is_none());
+        assert_eq!(
+            notices.get(),
+            1,
+            "retirement does not manufacture prompt restoration"
         );
     }
 
