@@ -805,17 +805,35 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
         current_source,
         "retired host notifications cannot reschedule the current pane"
     );
-    window.present();
-    wait("first host active again", &|| {
-        window.is_active() && !second.is_active()
-    });
-    assert!(runtime.source.borrow().is_none());
+    // This first host is now empty and inactive. Remap it normally with its
+    // returning child instead of presenting an already-visible empty X11
+    // window with a potentially stale last-user-interaction timestamp.
+    assert!(window.child().is_none());
+    assert!(!window.is_active());
+    window.set_visible(false);
+    assert!(second.is_active());
+    assert!(terminal.has_focus());
+    assert_eq!(
+        runtime.source.borrow().as_ref().unwrap().as_raw(),
+        current_source,
+        "hiding the retired host cannot affect the active pane"
+    );
     gtk4::prelude::RootExt::set_focus(&second, gtk4::Widget::NONE);
     assert!(gtk4::prelude::RootExt::focus(&second).is_none());
     second.set_child(gtk4::Widget::NONE);
+    assert!(runtime.source.borrow().is_none());
+    assert!(runtime.paint.borrow().is_none());
+    assert!(runtime.geometry_idle.borrow().is_none());
     window.set_child(Some(&root));
+    assert_eq!(
+        root.root().as_ref(),
+        Some(window.upcast_ref::<gtk4::Root>())
+    );
+    window.present();
     wait("pane mapped back in first host", &|| {
-        root.is_mapped()
+        window.is_active()
+            && !second.is_active()
+            && root.is_mapped()
             && terminal.is_mapped()
             && root.root().as_ref() == Some(window.upcast_ref::<gtk4::Root>())
             && root.width() > 0
