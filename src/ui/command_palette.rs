@@ -872,10 +872,13 @@ impl UiState {
         let activate = {
             let ui = self.clone();
             let entries = entries.clone();
-            let dialog = dialog.clone();
+            let dialog = dialog.downgrade();
             let snapshot = snapshot.clone();
             Rc::new(move |index: usize| {
                 let Some(entry) = entries.borrow().get(index).cloned() else {
+                    return;
+                };
+                let Some(dialog) = dialog.upgrade() else {
                     return;
                 };
                 dialog.force_close();
@@ -936,9 +939,13 @@ pub(super) fn palette_controller(
     let keys = EventControllerKey::new();
     keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
     let list = list.clone();
-    let dialog = dialog.clone();
+    let dialog = dialog.downgrade();
     let filter = filter.clone();
     keys.connect_key_pressed(move |_, key, _, state| {
+        // The dialog owns this controller; callbacks must not own it back.
+        let Some(dialog) = dialog.upgrade() else {
+            return false.into();
+        };
         if key == Key::Escape || palette_toggle_key(initial_mode, key, state) {
             dialog_slot.borrow_mut().take();
             dialog.force_close();

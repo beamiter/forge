@@ -1739,11 +1739,14 @@ fn exercise_expanded_fixture(
             let captured = Rc::downgrade(runtime);
             let current = target_current.then(|| runtime.clone());
             let host = window.clone();
-            let closing = dialog.clone();
+            let closing = dialog.downgrade();
             let focus_terminal = terminal.clone();
             let accepted = Rc::new(Cell::new(false));
             let accepted_by_callback = accepted.clone();
             let activate = Rc::new(move |_index| {
+                let Some(closing) = closing.upgrade() else {
+                    return;
+                };
                 closing.force_close();
                 let applied = VteOrganismSurface::present_for_target(
                     &captured,
@@ -1768,6 +1771,13 @@ fn exercise_expanded_fixture(
                 activate,
             );
             dialog.add_controller(keys.clone());
+            let closed_slot = slot.clone();
+            dialog.connect_closed(move |_| *closed_slot.borrow_mut() = None);
+            let weak_dialog = dialog.downgrade();
+            let weak_keys = keys.downgrade();
+            let weak_list = list.downgrade();
+            let weak_filter = filter.downgrade();
+            let weak_row = list.row_at_index(0).unwrap().downgrade();
             dialog.present(Some(window));
             // Adw 1.5 maps before its second-frame open/focus handoff. A
             // synthetic key signal must wait for the same actual focus a real
@@ -1802,9 +1812,25 @@ fn exercise_expanded_fixture(
                     && !runtime.mounting.get()
                     && runtime.geometry_idle.borrow().is_none()
             });
-            if key == gtk4::gdk::Key::Escape {
-                assert!(slot.borrow().is_none());
-            }
+            assert!(
+                slot.borrow().is_none(),
+                "closed clears the production-style slot"
+            );
+            // Release only the fixture's local owners. Native ownership and
+            // callback lifetimes must unwind without detaching the controller.
+            drop(keys);
+            drop(dialog);
+            drop(list);
+            drop(filter);
+            drop(body);
+            drop(slot);
+            wait("palette closed widget graph released", &|| {
+                weak_dialog.upgrade().is_none()
+                    && weak_keys.upgrade().is_none()
+                    && weak_list.upgrade().is_none()
+                    && weak_filter.upgrade().is_none()
+                    && weak_row.upgrade().is_none()
+            });
         }
         wait("compact restored after palette controller cases", &|| {
             (terminal.width(), terminal.height(), runtime.row.height()) == compact
