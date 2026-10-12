@@ -1517,7 +1517,19 @@ mod organism_preview {
                 jterm_core::organism_live::LiveAttention::<u64>::DWELL,
                 Duration::from_millis(600)
             );
-            assert!(runtime.contains("candidate.deadline"));
+            let arm = runtime
+                .split_once("    fn arm_pointer_candidate(")
+                .unwrap()
+                .1
+                .split_once("    fn pointer_candidate_fired(")
+                .unwrap()
+                .0;
+            let compact: String = arm.chars().filter(|ch| !ch.is_whitespace()).collect();
+            assert!(compact.contains(
+                "candidate.deadline.saturating_sub(runtime.presence.attention_epoch.elapsed())"
+            ));
+            assert!(compact.contains(".max(Duration::from_millis(1))"));
+            assert!(compact.contains("timeout_add_local_once(delay,"));
             assert!(runtime.contains("LiveAttentionEvent::CandidateDue { ticket }"));
             assert!(INTERACTION_HINT.contains("600 ms"));
             assert!(INTERACTION_HINT.contains("about 2 seconds"));
