@@ -528,7 +528,18 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
                     eprintln!(
                         "VTE_HOST present={} active={}",
                         actual_host.is_some(),
-                        actual_host.is_some_and(|host| host.is_active())
+                        actual_host.as_ref().is_some_and(|host| host.is_active())
+                    );
+                    let focused = actual_host
+                        .as_ref()
+                        .and_then(|host| gtk4::prelude::RootExt::focus(host));
+                    eprintln!(
+                        "VTE_FOCUS type={:?} in_entry={} is_terminal={}",
+                        focused.as_ref().map(|widget| widget.type_().name()),
+                        focused
+                            .as_ref()
+                            .is_some_and(|widget| widget.is_ancestor(&other)),
+                        focused.as_ref() == Some(terminal.upcast_ref()),
                     );
                     let mut ancestor = Some(runtime.glyph.clone().upcast::<gtk4::Widget>());
                     while let Some(widget) = ancestor {
@@ -625,8 +636,14 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
         minimum,
         runtime.row.measure(gtk4::Orientation::Vertical, -1).0
     );
-    other.grab_focus();
-    wait("focus moved to entry", &|| other.has_focus());
+    assert!(other.grab_focus());
+    // GtkEntry delegates native focus to its internal GtkText child.
+    wait("focus moved to entry", &|| {
+        gtk4::prelude::RootExt::focus(window).is_some_and(|focused| focused.is_ancestor(&other))
+    });
+    assert!(!terminal.has_focus());
+    assert!(runtime.paint.borrow().is_none());
+    assert!(runtime.geometry_idle.borrow().is_none());
     assert!(runtime.source.borrow().is_none());
     assert_eq!(runtime.glyph.opacity(), 0.0);
     assert_eq!(
