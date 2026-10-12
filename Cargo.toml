@@ -18,7 +18,7 @@ bench = false
 
 [dependencies]
 # Pin the shared contract so a branch move cannot silently change a release build.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "b89ce7e0ae657b49a7874a1fdd70dfaf17bf49b3" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "fd21bcdf83a55678b8e4778b23244f9c363d6ad9" }
 jagent = { version = "0.7.0", git = "https://github.com/beamiter/jagent.git", rev = "d1d3bc2251f3fba4468f689a655a932e00a83d86" }
 log = { version = "0.4", features = ["std"] }
 crossbeam-channel = "0.5"

@@ -27461,9 +27461,18 @@ mod tests {
                 ..
             })
         ));
+        harness.backend.marker_trace.borrow_mut().clear();
         harness.feed_raw(b"\x1bc");
+        assert_eq!(
+            harness.backend.marker_trace.borrow().as_slice(),
+            &[MarkerTrace::HardReset, MarkerTrace::Feed(b"\x1bc".to_vec())],
+            "real parser dispatch resets before feeding the original RIS exactly once"
+        );
         assert_eq!(harness.ctx.watch_reader.snapshot().identity, None);
-        assert_eq!(harness.bstate.get(), BlockState::Idle);
+        // Forge dispatches HardReset before the following Bytes(ESC c).
+        // That original Idle byte path selects RawFallback after the reset;
+        // Watch must remain retired across both events in the same read.
+        assert_eq!(harness.bstate.get(), BlockState::RawFallback);
     }
 
     #[test]
