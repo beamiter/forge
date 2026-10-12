@@ -48,6 +48,9 @@ mod palette;
 mod review;
 mod scroll;
 mod selection_hold;
+pub(crate) mod watch_batch;
+pub(crate) mod watch_reader;
+use watch_reader::WatchReader;
 mod unified_chrome;
 mod unified_images;
 mod zone_history;
@@ -5985,6 +5988,7 @@ pub struct TermView {
     bell_callbacks: VoidCallbacks,
     title_callbacks: StrCallbacks,
     activity_callbacks: VoidCallbacks,
+    watch_reader: Rc<WatchReader>,
     human_input_callbacks: HumanInputCallbacks,
     alt_screen_callbacks: AltScreenCallbacks,
     mouse_reporting_mode: Rc<Cell<MouseReporting>>,
@@ -7403,6 +7407,7 @@ struct ReaderCtx {
     remote_session_cbs: StrCallbacks,
     exited_cbs: IntCallbacks,
     activity_cbs: VoidCallbacks,
+    watch_reader: Rc<WatchReader>,
     alt_screen_cbs: AltScreenCallbacks,
     mouse_reporting_rc: Rc<Cell<MouseReporting>>,
     /// See [`LiveInputModes`].
@@ -7480,6 +7485,8 @@ impl ReaderCtx {
         if !std::mem::take(&mut self.engine.borrow_mut().command_finished_event_pending) {
             return None;
         }
+        self.watch_reader
+            .command_finished(std::time::Instant::now());
         Some(CommandFinishedEvent {
             // Keep the engine/UI display copy intact until finalization. Anvil
             // can legitimately resume CollectingOutput after a provisional
@@ -7548,6 +7555,7 @@ impl ReaderCtx {
     }
 
     fn on_hard_reset(&self) {
+        self.watch_reader.reset(std::time::Instant::now());
         self.reset_kitty_keyboard();
         self.live_input_modes_rc.set(LiveInputModes::default());
         self.forget_unanswered_cpr_later();
@@ -7641,6 +7649,7 @@ impl ReaderCtx {
             // Only unwind the frontend ownership/chrome half of alt-screen.
             self.backend.exit_fullscreen();
             self.backend.exit_alt_screen_chrome();
+            self.watch_reader.set_alt(false, std::time::Instant::now());
             emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
             self.backend.layout_active_surface();
         }
@@ -7772,6 +7781,9 @@ impl ReaderCtx {
                 {
                     self.live_raw_output_rc.borrow_mut().append(bytes);
                 }
+                if !bytes.is_empty() {
+                    self.watch_reader.note_output();
+                }
                 emit_activity(&self.activity_cbs);
                 true
             }
@@ -7782,6 +7794,9 @@ impl ReaderCtx {
                 // claude fullscreen tab is working. A full-screen
                 // app repaints at frame rate, so report it at most
                 // once per interval.
+                if !bytes.is_empty() {
+                    self.watch_reader.note_output();
+                }
                 let now = std::time::Instant::now();
                 if alt_screen_activity_due(self.alt_screen_activity_at.get(), now) {
                     self.alt_screen_activity_at.set(Some(now));
@@ -7823,6 +7838,8 @@ impl ReaderCtx {
             if !prompt_boundary_infers_command_end(state, foreground_owner) {
                 return;
             }
+            self.watch_reader
+                .command_finished(std::time::Instant::now());
             take_agent_execution_as_lost(
                 &self.active_agent_generation_rc,
                 &self.agent_execution_lost_cbs,
@@ -7851,6 +7868,7 @@ impl ReaderCtx {
                 }
                 self.backend.exit_fullscreen();
                 self.backend.exit_alt_screen_chrome();
+                self.watch_reader.set_alt(false, std::time::Instant::now());
                 emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
                 self.backend.layout_active_surface();
             }
@@ -8490,6 +8508,7 @@ impl ReaderCtx {
                 cwd: command_cwd,
             },
         );
+        self.watch_reader.command_started(std::time::Instant::now());
         // Match anvil's block-mode runtime model: keep the
         // active VTE as the live surface while the command
         // runs, then snapshot it into a finished block on the
@@ -8532,13 +8551,18 @@ impl ReaderCtx {
             self.pending_typeahead_rc.get(),
             id_correlation,
         ) {
-            AgentCommandEndDecision::Accept => {}
+            AgentCommandEndDecision::Accept => {
+                self.watch_reader
+                    .command_finished(std::time::Instant::now());
+            }
             AgentCommandEndDecision::IgnoreUntilShellOwnsForeground => {
                 // A foreground job can print D as ordinary
                 // output. Wait for the shell's real marker.
                 return;
             }
             AgentCommandEndDecision::AcceptWithoutAgentCorrelation => {
+                self.watch_reader
+                    .command_finished(std::time::Instant::now());
                 take_agent_execution_as_lost(
                     &self.active_agent_generation_rc,
                     &self.agent_execution_lost_cbs,
@@ -8586,6 +8610,7 @@ impl ReaderCtx {
             }
             self.backend.exit_fullscreen();
             self.backend.exit_alt_screen_chrome();
+            self.watch_reader.set_alt(false, std::time::Instant::now());
             emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
             self.backend.layout_active_surface();
         }
@@ -8630,6 +8655,7 @@ impl ReaderCtx {
         ) {
             return;
         }
+        self.watch_reader.set_alt(true, std::time::Instant::now());
         self.engine.borrow_mut().prev_state = from_state;
         self.bstate_rc.set(BlockState::AltScreen);
         self.kitty_keyboard_rc.borrow_mut().enter_alt_screen();
@@ -8676,6 +8702,7 @@ impl ReaderCtx {
         }
         self.backend.exit_fullscreen();
         self.backend.exit_alt_screen_chrome();
+        self.watch_reader.set_alt(false, std::time::Instant::now());
         emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
         self.engine.borrow_mut().osc133_depth = 0;
         self.engine.borrow_mut().pending_completion_provenance = CompletionProvenance::Unknown;
@@ -10851,6 +10878,51 @@ impl RenderBackend for UnifiedBackend {
 }
 
 impl ReaderCtx {
+    /// Exactly one source sequence per nonempty real PTY read, before parking.
+    fn process_fresh_read(&self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let origin = self.watch_reader.fresh_origin(std::time::Instant::now());
+        if self.selection_feed_hold.try_buffer(data) {
+            return;
+        }
+        self.process_watch_input(data, origin);
+    }
+
+    fn process_watch_input(&self, data: &[u8], origin: Option<watch_batch::ReaderBatchOrigin>) {
+        self.watch_reader
+            .begin_dispatch(origin, std::time::Instant::now());
+        let mut events = self.event_buf.borrow_mut();
+        events.clear();
+        self.parser.borrow_mut().feed(data, &mut events);
+        coalesce_bytes_events(&mut events);
+        for event in events.iter() {
+            self.handle_event(event);
+        }
+        drop(events);
+        self.watch_reader.end_dispatch(std::time::Instant::now());
+    }
+
+    fn install_watch_hold(self: &Rc<Self>) {
+        // Fresh identity is issued at the real reader, never by this replay sink.
+        let weak = Rc::downgrade(self);
+        self.selection_feed_hold.set_flush(move |bytes| {
+            if let Some(ctx) = weak.upgrade() {
+                ctx.process_watch_input(
+                    &bytes,
+                    Some(watch_batch::ReaderBatchOrigin::BufferedReplay),
+                );
+            }
+        });
+        let weak = Rc::downgrade(&self.watch_reader);
+        self.selection_feed_hold.set_watch_listener(move |held| {
+            if let Some(watch) = weak.upgrade() {
+                watch.set_held(held, std::time::Instant::now());
+            }
+        });
+    }
+
     /// `live_vte` is passed in rather than read back off the backend:
     /// `ReaderCtx` itself no longer names widget types, and the selection
     /// hold's VTE hooks are wiring, not lifecycle dispatch.
@@ -10866,55 +10938,19 @@ impl ReaderCtx {
 
         let ctx = Rc::new(self);
 
-        // The whole per-chunk pipeline (parser → state machine → live-VTE
-        // feed) behind one re-callable handle, so the selection feed-hold can
-        // replay parked chunks through the exact path it intercepted them from.
-        let process_chunk: Rc<RefCell<dyn FnMut(Vec<u8>)>> = Rc::new(RefCell::new({
-            let ctx = ctx.clone();
-            move |data: Vec<u8>| {
-                let mut events = ctx.event_buf.borrow_mut();
-                events.clear();
-                ctx.parser.borrow_mut().feed(&data, &mut events);
-                // Fold runs of consecutive `Bytes` events into one so the live
-                // VTE feed, autoscroll mark-dirty, and raw-output append happen
-                // once per stretch instead of once per parser chunk. Boundary
-                // events (PromptStart/End, AltScreen*, CommandStart/End) still
-                // run their synchronous mark_dirty between stretches, keeping
-                // the scroll-invariant from [[scroll_synchronous_autoscroll]].
-                coalesce_bytes_events(&mut events);
-
-                for event in events.iter() {
-                    ctx.handle_event(event);
-                }
-            }
-        }));
-
-        // Parked chunks flow back through the pipeline on flush. Weak: the
-        // strong owner is the reader callback below, whose lifetime is the
-        // PTY's — after teardown a late grace-timer flush must not revive it.
-        ctx.selection_feed_hold.set_flush({
-            let process = Rc::downgrade(&process_chunk);
-            move |bytes: Vec<u8>| {
-                if let Some(process) = process.upgrade() {
-                    (process.borrow_mut())(bytes);
-                }
-            }
-        });
-
-        let hold_for_reader = ctx.selection_feed_hold.clone();
-        let hold_for_exit = ctx.selection_feed_hold.clone();
-        let exited_cbs = ctx.exited_cbs.clone();
+        ctx.install_watch_hold();
+        let exit_ctx = ctx.clone();
         pty.start_reader(
             move |data: Vec<u8>| {
-                if hold_for_reader.try_buffer(&data) {
-                    return;
-                }
-                (process_chunk.borrow_mut())(data);
+                ctx.process_fresh_read(&data);
             },
             move |exit_code| {
-                hold_for_exit.flush_then(|| {
+                exit_ctx.selection_feed_hold.flush_then(|| {
+                    exit_ctx
+                        .watch_reader
+                        .source_ended(std::time::Instant::now());
                     log::debug!("Shell exited with code {}", exit_code);
-                    for cb in exited_cbs.borrow().iter() {
+                    for cb in exit_ctx.exited_cbs.borrow().iter() {
                         cb(exit_code);
                     }
                 });
@@ -14332,6 +14368,7 @@ impl TermView {
         // the pointer. Shared by the PTY reader (parking/replay) and the
         // cross-selection gestures (drag lifecycle).
         let selection_feed_hold = SelectionFeedHold::new();
+        let watch_reader = Rc::new(WatchReader::default());
         // Frozen output with no explanation reads as a hang. A small badge
         // appears only once bytes are actually parked (a plain click on the
         // live surface must not flash it) and disappears on flush.
@@ -14758,6 +14795,7 @@ impl TermView {
                 remote_session_cbs: remote_session_callbacks.clone(),
                 exited_cbs,
                 activity_cbs,
+                watch_reader: watch_reader.clone(),
                 alt_screen_cbs,
                 mouse_reporting_rc,
                 live_input_modes_rc: live_input_modes.clone(),
@@ -15767,6 +15805,7 @@ impl TermView {
             bell_callbacks,
             title_callbacks,
             activity_callbacks,
+            watch_reader,
             human_input_callbacks,
             alt_screen_callbacks,
             mouse_reporting_mode,
@@ -16967,6 +17006,17 @@ impl TermView {
             .prompt_evidence_invalidated
             .borrow_mut()
             .push(Rc::new(f));
+    }
+
+    pub(crate) fn connect_watch_observation(
+        &self,
+        listener: impl Fn(&watch_reader::ReaderWatchEvent) + 'static,
+    ) {
+        self.watch_reader.connect(listener);
+    }
+
+    pub(crate) fn watch_observation_snapshot(&self) -> watch_reader::ReaderSnapshot {
+        self.watch_reader.snapshot()
     }
 
     pub fn connect_activity<F: Fn() + 'static>(&self, f: F) {
@@ -26913,7 +26963,7 @@ mod tests {
     /// A `ReaderCtx` wired to [`RecordingBackend`], a bare-`openpty` PTY and
     /// real engine state, plus the observable fan-outs the lifecycle drives.
     struct ReaderHarness {
-        ctx: ReaderCtx,
+        ctx: Rc<ReaderCtx>,
         backend: Rc<RecordingBackend>,
         surface: Rc<RecordingSurface>,
         pty: Rc<crate::pty::OwnedPty>,
@@ -27165,6 +27215,7 @@ mod tests {
                 remote_session_cbs: Rc::new(RefCell::new(Vec::new())),
                 exited_cbs: Rc::new(RefCell::new(Vec::new())),
                 activity_cbs: Rc::new(RefCell::new(Vec::new())),
+                watch_reader: Rc::new(super::WatchReader::default()),
                 alt_screen_cbs,
                 mouse_reporting_rc: Rc::new(Cell::new(MouseReporting::OFF)),
                 live_input_modes_rc: Rc::new(Cell::new(super::LiveInputModes::default())),
@@ -27197,6 +27248,8 @@ mod tests {
                 selection_feed_hold: SelectionFeedHold::new(),
             };
 
+            let ctx = Rc::new(ctx);
+            ctx.install_watch_hold();
             Self {
                 ctx,
                 backend,
@@ -27236,13 +27289,9 @@ mod tests {
             }
         }
 
+        /// Exercise the exact production read/hold/parser/coalescer path.
         fn feed_raw(&self, bytes: &[u8]) {
-            let mut events = Vec::new();
-            self.ctx.parser.borrow_mut().feed(bytes, &mut events);
-            coalesce_bytes_events(&mut events);
-            for event in &events {
-                self.ctx.handle_event(event);
-            }
+            self.ctx.process_fresh_read(bytes);
         }
 
         /// The running command's engine-owned raw-output ring.
@@ -27304,6 +27353,203 @@ mod tests {
 
     fn bytes(text: &str) -> ParserEvent {
         ParserEvent::Bytes(text.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn reader_watch_real_read_coalesces_parser_stretches_and_empty_reads() {
+        use super::watch_batch::{BatchDisposition, BatchFact};
+        use super::watch_reader::ReaderWatchFact;
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let log = events.clone();
+        harness
+            .ctx
+            .watch_reader
+            .connect(move |event| log.borrow_mut().push(event.clone()));
+        harness.feed_raw(b"");
+        harness.feed_raw(b"\x1b]133;C\x07left\x1b]0;title\x07middle\x1b[?2004hfinally");
+        assert_eq!(harness.commands_started.borrow().len(), 1);
+        let events = events.borrow();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.fact == ReaderWatchFact::TrustedStart)
+                .count(),
+            1
+        );
+        let outputs: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e.fact, ReaderWatchFact::Output(_)))
+            .collect();
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(
+            outputs[0].fact,
+            ReaderWatchFact::Output(BatchFact {
+                sequence: 0,
+                disposition: BatchDisposition::Accepted,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn reader_watch_real_selection_hold_replays_without_new_start_or_pulse() {
+        use super::watch_batch::{BatchDisposition, BatchFact};
+        use super::watch_reader::ReaderWatchFact;
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let log = events.clone();
+        harness
+            .ctx
+            .watch_reader
+            .connect(move |event| log.borrow_mut().push(event.clone()));
+        harness.ctx.selection_feed_hold.begin_drag();
+        assert!(!harness.ctx.watch_reader.snapshot().available);
+        harness.feed_raw(b"\x1b]133;C\x07first");
+        harness.feed_raw(b"second\x1b]133;D;0\x07");
+        assert!(harness.commands_started.borrow().is_empty());
+        harness.ctx.selection_feed_hold.flush_now();
+        assert_eq!(harness.commands_started.borrow().len(), 1);
+        assert_eq!(harness.commands_finished.borrow().len(), 1);
+        assert_eq!(harness.ctx.watch_reader.snapshot().identity, None);
+        assert!(harness.ctx.watch_reader.snapshot().available);
+        assert!(events
+            .borrow()
+            .iter()
+            .all(|e| e.fact == ReaderWatchFact::Reconcile));
+        harness.feed_raw(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07new");
+        assert!(matches!(
+            events.borrow().last().unwrap().fact,
+            ReaderWatchFact::Output(BatchFact {
+                sequence: 2,
+                disposition: BatchDisposition::Accepted,
+                ..
+            })
+        ));
+        let before = harness.ctx.watch_reader.snapshot();
+        harness.ctx.selection_feed_hold.begin_drag();
+        harness.ctx.selection_feed_hold.flush_now();
+        let after = harness.ctx.watch_reader.snapshot();
+        assert!(after.available);
+        assert_ne!(
+            before.identity, after.identity,
+            "even an empty hold retires the previous observation context"
+        );
+    }
+
+    #[test]
+    fn reader_watch_mixed_identity_quarantines_old_output_and_ris_retires() {
+        use super::watch_batch::{BatchDisposition, BatchFact};
+        use super::watch_reader::ReaderWatchFact;
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        harness.feed_raw(b"\x1b]133;C\x07");
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let log = events.clone();
+        harness
+            .ctx
+            .watch_reader
+            .connect(move |event| log.borrow_mut().push(event.clone()));
+        harness.feed_raw(b"old\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+        assert_eq!(harness.commands_started.borrow().len(), 2);
+        assert!(matches!(
+            events.borrow().last().unwrap().fact,
+            ReaderWatchFact::Output(BatchFact {
+                disposition: BatchDisposition::Quarantined,
+                ..
+            })
+        ));
+        harness.feed_raw(b"\x1bc");
+        assert_eq!(harness.ctx.watch_reader.snapshot().identity, None);
+        assert_eq!(harness.bstate.get(), BlockState::Idle);
+    }
+
+    #[test]
+    fn reader_watch_foreground_nested_and_meta_gates_preserve_rejected_identity() {
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        harness.feed_raw(b"\x1b]133;C\x07");
+        let original = harness.ctx.watch_reader.snapshot();
+        harness.pty.set_test_foreground(PtyForeground::Other);
+        harness.feed_raw(b"\x1b]133;C\x07\x1b]133;D;7\x07\x1b]133;A\x07");
+        assert_eq!(harness.ctx.watch_reader.snapshot(), original);
+        harness.pty.set_test_foreground(PtyForeground::Shell);
+        harness.feed_raw(b"\x1b]133;C\x07\x1b]133;D;7\x07");
+        assert_eq!(harness.ctx.watch_reader.snapshot(), original);
+        assert!(harness.commands_finished.borrow().is_empty());
+        harness.ctx.active_agent_generation_rc.set(Some(41));
+        harness.ctx.engine.borrow_mut().pending_command_meta.id = Some("original".into());
+        harness.pty.set_test_foreground(PtyForeground::Other);
+        harness.feed(ParserEvent::CommandEnd {
+            exit: Some(0),
+            meta: CommandMeta {
+                id: Some("other".into()),
+                ..CommandMeta::default()
+            },
+        });
+        assert_eq!(harness.ctx.watch_reader.snapshot(), original);
+        let watch = harness.ctx.watch_reader.clone();
+        harness
+            .ctx
+            .agent_execution_lost_cbs
+            .borrow_mut()
+            .push(Box::new(move |_, _| {
+                assert_eq!(
+                    watch.snapshot().identity,
+                    None,
+                    "accepted completion retires Watch before agent-loss fanout"
+                );
+            }));
+        harness.pty.set_test_foreground(PtyForeground::Shell);
+        harness.feed(ParserEvent::CommandEnd {
+            exit: Some(0),
+            meta: CommandMeta {
+                id: Some("other".into()),
+                ..CommandMeta::default()
+            },
+        });
+        assert_eq!(harness.ctx.watch_reader.snapshot().identity, None);
+        assert_eq!(harness.commands_finished.borrow().len(), 1);
+    }
+
+    #[test]
+    fn reader_watch_trusted_a_and_alt_boundaries_retire_before_observers() {
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        harness.feed_raw(b"\x1b]133;C\x07");
+        let primary = harness.ctx.watch_reader.snapshot();
+        harness.feed_raw(b"\x1b[?1049h");
+        assert!(!harness.ctx.watch_reader.snapshot().available);
+        harness.feed_raw(b"\x1b[?1049l");
+        let returned = harness.ctx.watch_reader.snapshot();
+        assert!(returned.available);
+        assert_ne!(primary.identity, returned.identity);
+        harness.ctx.active_agent_generation_rc.set(Some(42));
+        let watch = harness.ctx.watch_reader.clone();
+        harness
+            .ctx
+            .agent_execution_lost_cbs
+            .borrow_mut()
+            .push(Box::new(move |_, _| {
+                assert_eq!(
+                    watch.snapshot().identity,
+                    None,
+                    "trusted A retires Watch before recovery fanout"
+                );
+            }));
+        harness.pty.set_test_foreground(PtyForeground::Unknown);
+        harness.feed_raw(b"\x1b]133;A\x07");
+        assert_eq!(
+            harness.ctx.watch_reader.snapshot(),
+            returned,
+            "Unknown A is not trusted recovery"
+        );
+        harness.pty.set_test_foreground(PtyForeground::Shell);
+        harness.feed_raw(b"\x1b]133;A\x07");
+        assert_eq!(harness.ctx.watch_reader.snapshot().identity, None);
+        assert_eq!(harness.commands_finished.borrow().len(), 1);
     }
 
     #[test]
