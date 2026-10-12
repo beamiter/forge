@@ -530,9 +530,7 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
                         actual_host.is_some(),
                         actual_host.as_ref().is_some_and(|host| host.is_active())
                     );
-                    let focused = actual_host
-                        .as_ref()
-                        .and_then(|host| gtk4::prelude::RootExt::focus(host));
+                    let focused = actual_host.as_ref().and_then(gtk4::prelude::RootExt::focus);
                     eprintln!(
                         "VTE_FOCUS type={:?} in_entry={} is_terminal={}",
                         focused.as_ref().map(|widget| widget.type_().name()),
@@ -553,6 +551,14 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
                             widget.width(),
                             widget.height()
                         );
+                        if let Some(paned) = widget.downcast_ref::<gtk4::Paned>() {
+                            eprintln!(
+                                "VTE_PANED position={} min={} max={}",
+                                paned.position(),
+                                paned.min_position(),
+                                paned.max_position()
+                            );
+                        }
                         ancestor = widget.parent();
                     }
                 }
@@ -711,11 +717,35 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
     paned.set_position(10);
     terminal.grab_focus();
     wait("Paned initially visible", &|| {
-        terminal.has_focus() && runtime.drawable_geometry() && runtime.source.borrow().is_some()
+        paned.height() > 0
+            && paned.max_position() > 1
+            && paned.max_position() <= paned.height()
+            && root.compute_bounds(&paned).is_some_and(|bounds| {
+                finite_positive_rect(&bounds)
+                    && bounds.y() >= -0.01
+                    && bounds.y() + bounds.height() <= paned.height() as f32 + 0.01
+            })
+            && terminal.has_focus()
+            && runtime.drawable_geometry()
+            && runtime.source.borrow().is_some()
     });
-    paned.set_position(paned.height() - 1);
+    // max-position is the allocated extent after subtracting the handle.
+    // With both shrink flags true, max-position itself collapses the end
+    // child. Leave one real pixel of its slot so it stays mapped instead.
+    let clipped_position = paned.max_position() - 1;
+    paned.set_position(clipped_position);
     wait("Paned clipped", &|| {
-        !runtime.drawable_geometry() && runtime.source.borrow().is_none()
+        paned.position() == clipped_position
+            && paned.position() < paned.max_position()
+            && root.is_mapped()
+            && terminal.has_focus()
+            && root.compute_bounds(&paned).is_some_and(|bounds| {
+                finite_positive_rect(&bounds)
+                    && bounds.y() >= 0.0
+                    && bounds.y() < paned.height() as f32
+            })
+            && !runtime.drawable_geometry()
+            && runtime.source.borrow().is_none()
     });
     assert!(
         root.is_mapped(),
