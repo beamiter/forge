@@ -106,7 +106,12 @@ impl VteOrganismSurface {
         row.set_focusable(false);
         row.set_hexpand(true);
         row.add_css_class("dim-label");
-        let glyph = gtk4::Label::new(None);
+        // Establish real neutral content before the first geometry gate. The
+        // row is still hidden until authoritative local admission, and the
+        // glyph opacity remains subject to native eligibility below.
+        let neutral = RenderContext::new(Behavior::Idle, BodyLanguage::default(), false);
+        let initial_frame = sticky_glyph_with_context(neutral, 0);
+        let glyph = gtk4::Label::new(Some(initial_frame.as_ref()));
         glyph.add_css_class("monospace");
         glyph.set_width_chars(5);
         glyph.set_max_width_chars(5);
@@ -486,6 +491,12 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
         "local identity starts unavailable"
     );
     assert!(runtime.source.borrow().is_none());
+    let initial_context = RenderContext::new(Behavior::Idle, BodyLanguage::default(), false);
+    assert_eq!(
+        runtime.glyph.text().as_str(),
+        sticky_glyph_with_context(initial_context, 0).as_ref()
+    );
+    assert_eq!(runtime.glyph.opacity(), 0.0);
     runtime.set_local(true);
     assert!(
         terminal.pty().is_none(),
@@ -494,21 +505,52 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
     window.set_child(Some(&root));
     terminal.grab_focus();
     let main = glib::MainContext::default();
-    let wait = |ready: &dyn Fn() -> bool| {
+    let diagnostic_runtime = Rc::downgrade(&runtime);
+    let wait = |stage: &str, ready: &dyn Fn() -> bool| {
         let start = Instant::now();
         loop {
             while main.iteration(false) {}
             if ready() {
                 break;
             }
-            assert!(
-                start.elapsed() < Duration::from_secs(3),
-                "native VTE presentation did not settle"
-            );
+            if start.elapsed() >= Duration::from_secs(3) {
+                if let Some(runtime) = diagnostic_runtime.upgrade() {
+                    eprintln!(
+                        "VTE_STAGE={stage} enabled={} local={} alive={} mapped_cache={} root_mapped={} terminal_mapped={} terminal_focus={} row_mapped={} glyph_mapped={} drawable={} source={} paint={} idle={} glyph_text={:?}",
+                        runtime.enabled.get(), runtime.local.get(), runtime.alive.get(),
+                        runtime.mapped.get(), root.is_mapped(), terminal.is_mapped(),
+                        terminal.has_focus(), runtime.row.is_mapped(), runtime.glyph.is_mapped(),
+                        runtime.drawable_geometry(), runtime.source.borrow().is_some(),
+                        runtime.paint.borrow().is_some(), runtime.geometry_idle.borrow().is_some(),
+                        runtime.glyph.text(),
+                    );
+                    let actual_host = root.root().and_downcast::<gtk4::Window>();
+                    eprintln!(
+                        "VTE_HOST present={} active={}",
+                        actual_host.is_some(),
+                        actual_host.is_some_and(|host| host.is_active())
+                    );
+                    let mut ancestor = Some(runtime.glyph.clone().upcast::<gtk4::Widget>());
+                    while let Some(widget) = ancestor {
+                        let bounds = widget
+                            .compute_bounds(&root)
+                            .map(|b| (b.x(), b.y(), b.width(), b.height()));
+                        eprintln!(
+                            "VTE_GEOMETRY type={} mapped={} allocation={}x{} bounds={bounds:?}",
+                            widget.type_().name(),
+                            widget.is_mapped(),
+                            widget.width(),
+                            widget.height()
+                        );
+                        ancestor = widget.parent();
+                    }
+                }
+                panic!("native VTE presentation did not settle at {stage}");
+            }
             std::thread::sleep(Duration::from_millis(2));
         }
     };
-    wait(&|| {
+    wait("initial local mapping", &|| {
         window.is_active()
             && terminal.has_focus()
             && runtime.row.is_mapped()
@@ -557,7 +599,9 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
     );
     runtime.cancel_geometry_idle();
     let previous_frame_ticks = runtime.frame_ticks.get();
-    wait(&|| runtime.frame_ticks.get() > previous_frame_ticks && runtime.source.borrow().is_some());
+    wait("first Full frame", &|| {
+        runtime.frame_ticks.get() > previous_frame_ticks && runtime.source.borrow().is_some()
+    });
     assert!(runtime.epoch.elapsed() >= SURFACE_FRAME_INTERVAL);
     let allocation = (terminal.width(), terminal.height(), runtime.row.height());
     let minimum = runtime.row.measure(gtk4::Orientation::Vertical, -1).0;
@@ -582,7 +626,7 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
         runtime.row.measure(gtk4::Orientation::Vertical, -1).0
     );
     other.grab_focus();
-    wait(&|| other.has_focus());
+    wait("focus moved to entry", &|| other.has_focus());
     assert!(runtime.source.borrow().is_none());
     assert_eq!(runtime.glyph.opacity(), 0.0);
     assert_eq!(
@@ -591,9 +635,11 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
     );
     // Absolute input age remains authoritative after losing/reacquiring focus.
     runtime.last_input.set(Some(Duration::ZERO));
-    wait(&|| runtime.epoch.elapsed() >= HUMAN_INPUT_RETREAT);
+    wait("input retreat elapsed", &|| {
+        runtime.epoch.elapsed() >= HUMAN_INPUT_RETREAT
+    });
     terminal.grab_focus();
-    wait(&|| terminal.has_focus());
+    wait("terminal refocused", &|| terminal.has_focus());
     runtime.apply_settings(true, OrganismMotion::Calm);
     assert!(runtime.source.borrow().is_none());
     assert_eq!(runtime.glyph.opacity(), 1.0);
@@ -614,9 +660,11 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
     assert!(runtime.source.borrow().is_none());
     assert!(runtime.host.borrow().is_none());
     root.set_visible(true);
-    wait(&|| root.is_mapped());
+    wait("row remapped", &|| root.is_mapped());
     terminal.grab_focus();
-    wait(&|| terminal.has_focus() && runtime.source.borrow().is_some());
+    wait("source after remap", &|| {
+        terminal.has_focus() && runtime.source.borrow().is_some()
+    });
     runtime.apply_settings(false, OrganismMotion::Full);
     assert!(!runtime.row.is_visible());
     assert!(runtime.source.borrow().is_none());
@@ -626,9 +674,11 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
     assert!(runtime.source.borrow().is_none());
     assert!(runtime.host.borrow().is_none());
     window.set_child(Some(&root));
-    wait(&|| root.is_mapped());
+    wait("root reattached", &|| root.is_mapped());
     terminal.grab_focus();
-    wait(&|| terminal.has_focus() && runtime.source.borrow().is_some());
+    wait("source after reattach", &|| {
+        terminal.has_focus() && runtime.source.borrow().is_some()
+    });
     // A nonzero Paned slot can clip a minimum-sized child without unmapping
     // it. Passive paint observation must stop and recover the animation.
     window.set_child(gtk4::Widget::NONE);
@@ -643,11 +693,13 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
     window.set_child(Some(&paned));
     paned.set_position(10);
     terminal.grab_focus();
-    wait(&|| {
+    wait("Paned initially visible", &|| {
         terminal.has_focus() && runtime.drawable_geometry() && runtime.source.borrow().is_some()
     });
     paned.set_position(paned.height() - 1);
-    wait(&|| !runtime.drawable_geometry() && runtime.source.borrow().is_none());
+    wait("Paned clipped", &|| {
+        !runtime.drawable_geometry() && runtime.source.borrow().is_none()
+    });
     assert!(
         root.is_mapped(),
         "the clipped child still has native mapping"
@@ -658,12 +710,16 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
     );
     assert!(runtime.geometry_idle.borrow().is_none());
     paned.set_position(10);
-    wait(&|| runtime.drawable_geometry() && runtime.source.borrow().is_some());
+    wait("Paned restored", &|| {
+        runtime.drawable_geometry() && runtime.source.borrow().is_some()
+    });
     paned.set_end_child(gtk4::Widget::NONE);
     root.set_size_request(-1, -1);
     window.set_child(Some(&root));
     terminal.grab_focus();
-    wait(&|| terminal.has_focus() && runtime.source.borrow().is_some());
+    wait("Paned removed", &|| {
+        terminal.has_focus() && runtime.source.borrow().is_some()
+    });
 
     // Actual native host activation and reparenting, still with no PTY.
     let second = gtk4::Window::builder()
@@ -672,13 +728,17 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
         .child(&gtk4::Label::new(Some("Native host lifecycle check")))
         .build();
     second.present();
-    wait(&|| second.is_active() && !window.is_active());
+    wait("second host active", &|| {
+        second.is_active() && !window.is_active()
+    });
     assert!(runtime.source.borrow().is_none());
     assert!(runtime.paint.borrow().is_none());
     window.set_child(gtk4::Widget::NONE);
     second.set_child(Some(&root));
     terminal.grab_focus();
-    wait(&|| terminal.has_focus() && runtime.source.borrow().is_some());
+    wait("pane moved to second host", &|| {
+        terminal.has_focus() && runtime.source.borrow().is_some()
+    });
     let current_source = runtime.source.borrow().as_ref().unwrap().as_raw();
     window.notify("is-active");
     assert_eq!(
@@ -687,12 +747,16 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
         "retired host notifications cannot reschedule the current pane"
     );
     window.present();
-    wait(&|| window.is_active() && !second.is_active());
+    wait("first host active again", &|| {
+        window.is_active() && !second.is_active()
+    });
     assert!(runtime.source.borrow().is_none());
     second.set_child(gtk4::Widget::NONE);
     window.set_child(Some(&root));
     terminal.grab_focus();
-    wait(&|| terminal.has_focus() && runtime.source.borrow().is_some());
+    wait("pane returned to first host", &|| {
+        terminal.has_focus() && runtime.source.borrow().is_some()
+    });
     second.close();
     runtime.set_local(false);
     assert!(!runtime.row.is_visible());
@@ -703,7 +767,9 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
         "config cannot override remote identity"
     );
     runtime.set_local(true);
-    wait(&|| runtime.row.is_mapped() && runtime.source.borrow().is_some());
+    wait("local identity restored", &|| {
+        runtime.row.is_mapped() && runtime.source.borrow().is_some()
+    });
     runtime.apply_settings(false, OrganismMotion::Full);
     let weak_reentrant = Rc::downgrade(&runtime);
     let handler = runtime.row.connect_visible_notify(move |row| {
@@ -723,7 +789,9 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
     assert!(runtime.geometry_idle.borrow().is_none());
     runtime.row.disconnect(handler);
     runtime.apply_settings(true, OrganismMotion::Full);
-    wait(&|| runtime.source.borrow().is_some() && runtime.paint.borrow().is_some());
+    wait("active sources before Drop", &|| {
+        runtime.source.borrow().is_some() && runtime.paint.borrow().is_some()
+    });
     runtime.defer_geometry_refresh();
     let pending_frame = main
         .find_source_by_id(&runtime.source.borrow().as_ref().unwrap().id)
