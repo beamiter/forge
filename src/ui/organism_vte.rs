@@ -780,9 +780,21 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
     });
     assert!(runtime.source.borrow().is_none());
     assert!(runtime.paint.borrow().is_none());
+    // Retire the old Root's focus before unparenting. GTK otherwise defers
+    // old-window focus cleanup until after paint, when it could clear the
+    // same terminal's new-window has-focus state.
+    gtk4::prelude::RootExt::set_focus(window, gtk4::Widget::NONE);
+    assert!(gtk4::prelude::RootExt::focus(window).is_none());
     window.set_child(gtk4::Widget::NONE);
     second.set_child(Some(&root));
-    terminal.grab_focus();
+    wait("pane mapped in second host", &|| {
+        root.is_mapped()
+            && terminal.is_mapped()
+            && root.root().as_ref() == Some(second.upcast_ref::<gtk4::Root>())
+            && root.width() > 0
+            && root.height() > 0
+    });
+    assert!(terminal.grab_focus());
     wait("pane moved to second host", &|| {
         terminal.has_focus() && runtime.source.borrow().is_some()
     });
@@ -798,12 +810,28 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
         window.is_active() && !second.is_active()
     });
     assert!(runtime.source.borrow().is_none());
+    gtk4::prelude::RootExt::set_focus(&second, gtk4::Widget::NONE);
+    assert!(gtk4::prelude::RootExt::focus(&second).is_none());
     second.set_child(gtk4::Widget::NONE);
     window.set_child(Some(&root));
-    terminal.grab_focus();
+    wait("pane mapped back in first host", &|| {
+        root.is_mapped()
+            && terminal.is_mapped()
+            && root.root().as_ref() == Some(window.upcast_ref::<gtk4::Root>())
+            && root.width() > 0
+            && root.height() > 0
+    });
+    assert!(terminal.grab_focus());
     wait("pane returned to first host", &|| {
         terminal.has_focus() && runtime.source.borrow().is_some()
     });
+    let current_source = runtime.source.borrow().as_ref().unwrap().as_raw();
+    second.notify("is-active");
+    assert_eq!(
+        runtime.source.borrow().as_ref().unwrap().as_raw(),
+        current_source,
+        "the second retired host cannot reschedule the returned pane"
+    );
     second.close();
     runtime.set_local(false);
     assert!(!runtime.row.is_visible());
