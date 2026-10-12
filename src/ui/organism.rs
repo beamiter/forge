@@ -2209,8 +2209,13 @@ impl OrganismRuntime {
     }
 
     fn pointer_left(&self, view: &TermView) {
-        self.pointer_inside.set(false);
         self.pointer_position.set(None);
+        self.pointer_left_body(view, self.pointer_body_bounds(view));
+    }
+
+    fn pointer_left_body(&self, view: &TermView, bounds: Option<(f64, f64, f64, f64)>) {
+        // Outside the body is still a valid position on the terminal surface.
+        self.pointer_inside.set(false);
         let ticket = {
             let attention = self.presence.attention.borrow();
             (attention.owner() == Some(&self.presence_token))
@@ -2218,7 +2223,7 @@ impl OrganismRuntime {
                 .flatten()
         };
         if let Some(ticket) = ticket {
-            let input = self.attention_input(view);
+            let input = self.attention_input_with_bounds(view, bounds);
             let snapshot = self
                 .presence
                 .attention
@@ -2268,16 +2273,20 @@ impl OrganismRuntime {
     }
 
     fn attention_input(&self, view: &TermView) -> LiveAttentionInput {
+        self.attention_input_with_bounds(view, self.pointer_body_bounds(view))
+    }
+
+    fn attention_input_with_bounds(
+        &self,
+        view: &TermView,
+        bounds: Option<(f64, f64, f64, f64)>,
+    ) -> LiveAttentionInput {
         LiveAttentionInput {
             base_context: self.live_context.get(),
             activity: view.organism_activity_knowledge(),
             hard_eligible: self.greeting_is_eligible(view),
-            hover_available: self.live_body.is_mapped()
-                && self.live_body.compute_bounds(&view.widget()).is_some(),
-            pointer_inside: self
-                .pointer_position
-                .get()
-                .is_some_and(|(x, y)| self.pointer_within_body(view, x, y)),
+            hover_available: bounds.is_some(),
+            pointer_inside: Self::pointer_within_body(bounds, self.pointer_position.get()),
         }
     }
 
@@ -2323,25 +2332,59 @@ impl OrganismRuntime {
         true
     }
 
-    fn pointer_within_body(&self, view: &TermView, x: f64, y: f64) -> bool {
-        self.live_body
-            .compute_bounds(&view.widget())
-            .is_some_and(|bounds| {
-                x >= f64::from(bounds.x()) - POINTER_GREETING_RADIUS
-                    && x <= f64::from(bounds.x() + bounds.width()) + POINTER_GREETING_RADIUS
-                    && y >= f64::from(bounds.y()) - POINTER_GREETING_RADIUS
-                    && y <= f64::from(bounds.y() + bounds.height()) + POINTER_GREETING_RADIUS
-            })
+    fn pointer_within_body(
+        bounds: Option<(f64, f64, f64, f64)>,
+        position: Option<(f64, f64)>,
+    ) -> bool {
+        let (Some((left, top, right, bottom)), Some((x, y))) = (bounds, position) else {
+            return false;
+        };
+        x.is_finite()
+            && y.is_finite()
+            && x >= left - POINTER_GREETING_RADIUS
+            && x <= right + POINTER_GREETING_RADIUS
+            && y >= top - POINTER_GREETING_RADIUS
+            && y <= bottom + POINTER_GREETING_RADIUS
+    }
+
+    fn pointer_body_bounds(&self, view: &TermView) -> Option<(f64, f64, f64, f64)> {
+        if !self.live_body.is_mapped() {
+            return None;
+        }
+        let bounds = self.live_body.compute_bounds(&view.widget())?;
+        let (x, y, width, height) = (
+            f64::from(bounds.x()),
+            f64::from(bounds.y()),
+            f64::from(bounds.width()),
+            f64::from(bounds.height()),
+        );
+        if ![x, y, width, height].into_iter().all(f64::is_finite) || width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        Some((x, y, x + width, y + height))
+    }
+
+    fn sync_pointer_geometry(&self, view: &TermView) {
+        // Geometry updates facts only: never release or create a physical visit.
+        self.pointer_inside.set(Self::pointer_within_body(
+            self.pointer_body_bounds(view),
+            self.pointer_position.get(),
+        ));
     }
 
     fn observe_pointer(runtime: &Rc<Self>, view: &Rc<TermView>, x: f64, y: f64, dragging: bool) {
+        // GTK may allocate between refresh and motion. Compare both positions
+        // against this one current allocation, not the previous frame's edge.
+        let bounds = runtime.pointer_body_bounds(view);
+        let was_inside = Self::pointer_within_body(bounds, runtime.pointer_position.get());
         runtime.pointer_position.set(Some((x, y)));
-        let inside = runtime.live_body.is_mapped() && runtime.pointer_within_body(view, x, y);
+        let inside = Self::pointer_within_body(bounds, Some((x, y)));
         if !inside {
-            runtime.pointer_left(view);
+            runtime.pointer_left_body(view, bounds);
             return;
         }
-        let entered = !runtime.pointer_inside.replace(true);
+        runtime.pointer_inside.set(true);
+        let entered = !was_inside;
         let event = if entered {
             let attention = runtime.presence.attention.borrow();
             if attention.owner() != Some(&runtime.presence_token) {
@@ -2354,7 +2397,7 @@ impl OrganismRuntime {
         } else {
             LiveAttentionEvent::Reconcile
         };
-        let mut input = runtime.attention_input(view);
+        let mut input = runtime.attention_input_with_bounds(view, bounds);
         input.hard_eligible &= !dragging;
         let snapshot = runtime
             .presence
@@ -2939,6 +2982,7 @@ impl OrganismRuntime {
             .with_watch_rhythm(rhythm)
             .with_transition(transition);
         self.live_context.set(context);
+        self.sync_pointer_geometry(view);
         let snapshot = if advance {
             self.advance_attention(view, LiveAttentionEvent::Reconcile)
         } else {
@@ -3095,6 +3139,7 @@ impl OrganismRuntime {
         } else {
             self.hide_live_body(view);
         }
+        self.sync_pointer_geometry(view);
         // The Block layer decides whether the sticky running header is active;
         // this child only follows the same accepted-input retreat window.
         self.sticky_avatar.set_visible(mode != SurfaceMode::Typing);
@@ -11684,6 +11729,71 @@ mod tests {
                 .outcome,
             LiveAttentionOutcome::Accepted(_)
         ));
+    }
+
+    #[test]
+    fn pointer_motion_compares_retained_coordinates_with_one_current_allocation() {
+        let source = include_str!("organism.rs");
+        let motion = source
+            .split_once(concat!("    fn observe_", "pointer("))
+            .unwrap()
+            .1
+            .split_once("    fn arm_pointer_candidate")
+            .unwrap()
+            .0;
+        assert_eq!(
+            motion.matches("runtime.pointer_body_bounds(view)").count(),
+            1
+        );
+        assert!(motion.contains(
+            "let was_inside = Self::pointer_within_body(bounds, runtime.pointer_position.get())"
+        ));
+        assert!(
+            motion.find("let was_inside").unwrap() < motion.find("pointer_position.set").unwrap()
+        );
+        assert!(motion.contains("let entered = !was_inside"));
+        assert!(motion.contains("runtime.attention_input_with_bounds(view, bounds)"));
+        assert!(motion.contains("runtime.pointer_left_body(view, bounds)"));
+        assert!(!motion.contains("runtime.pointer_left(view)"));
+        let body_exit = source
+            .split_once(concat!("    fn pointer_left_", "body("))
+            .unwrap()
+            .1
+            .split_once("    fn sync_attention_snapshot")
+            .unwrap()
+            .0;
+        assert!(!body_exit.contains("pointer_position.set"));
+        assert!(body_exit.contains("LiveAttentionEvent::PointerLeft { ticket }"));
+        let sync = source
+            .split_once(concat!("    fn sync_pointer_", "geometry("))
+            .unwrap()
+            .1
+            .split_once("    fn observe_pointer")
+            .unwrap()
+            .0;
+        assert!(!sync.contains("LiveAttentionEvent"));
+        assert!(!sync.contains("pointer_position.set"));
+    }
+
+    #[test]
+    fn pointer_bounds_preserve_finite_radius_and_reject_missing_positions() {
+        let bounds = Some((100.0, 100.0, 200.0, 140.0));
+        assert!(OrganismRuntime::pointer_within_body(
+            bounds,
+            Some((100.0 - POINTER_GREETING_RADIUS, 110.0))
+        ));
+        assert!(!OrganismRuntime::pointer_within_body(
+            bounds,
+            Some((99.0 - POINTER_GREETING_RADIUS, 110.0))
+        ));
+        assert!(!OrganismRuntime::pointer_within_body(
+            None,
+            Some((150.0, 110.0))
+        ));
+        assert!(!OrganismRuntime::pointer_within_body(bounds, None));
+        for point in [(f64::NAN, 110.0), (150.0, f64::INFINITY)] {
+            assert!(!OrganismRuntime::pointer_within_body(bounds, Some(point)));
+        }
     }
 
     #[test]
