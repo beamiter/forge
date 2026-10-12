@@ -1513,15 +1513,12 @@ mod organism_preview {
             assert_eq!(GentleInteraction::HOLD, Duration::from_secs(2));
             assert_eq!(GentleInteraction::COOLDOWN, Duration::from_secs(8));
             let runtime = include_str!("organism.rs");
-            let dwell = runtime
-                .split_once("const POINTER_GREETING_DWELL:")
-                .unwrap()
-                .1
-                .split_once(';')
-                .unwrap()
-                .0;
-            assert!(dwell.contains("Duration::from_millis(600)"));
-            assert!(runtime.contains("timeout_add_local_once(POINTER_GREETING_DWELL"));
+            assert_eq!(
+                jterm_core::organism_live::LiveAttention::<u64>::DWELL,
+                Duration::from_millis(600)
+            );
+            assert!(runtime.contains("candidate.deadline"));
+            assert!(runtime.contains("LiveAttentionEvent::CandidateDue { ticket }"));
             assert!(INTERACTION_HINT.contains("600 ms"));
             assert!(INTERACTION_HINT.contains("about 2 seconds"));
             assert!(INTERACTION_HINT.contains("at least 8 seconds"));
