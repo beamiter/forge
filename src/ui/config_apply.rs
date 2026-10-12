@@ -212,7 +212,7 @@ impl UiState {
     /// Snapshot every retained pane for settings only. During zoom the
     /// original split has an empty child slot and is outside the Notebook;
     /// PaneNode's complete-tree invariant intentionally does not apply here.
-    fn configuration_leaves(&self) -> Vec<PaneLeaf> {
+    pub(super) fn configuration_leaves(&self) -> Vec<PaneLeaf> {
         let mut roots: Vec<_> = (0..self.notebook.n_pages())
             .filter_map(|page| self.notebook.nth_page(Some(page)))
             .collect();

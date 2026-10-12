@@ -28,6 +28,7 @@ mod jsh;
 mod layout;
 mod notebooks;
 mod organism;
+mod organism_vte;
 mod pane_dnd;
 mod pane_header;
 mod pane_leaf;
@@ -56,6 +57,7 @@ pub(crate) use file_tree::{
 pub(crate) use organism::{
     pane_token, OrganismActivity, OrganismAgentSignal, OrganismCorrectionSignal, OrganismPresence,
 };
+pub(crate) use organism_vte::VteOrganismSurface;
 pub(crate) use pane_header::{PaneHeader, PANE_HEADER_CSS};
 pub(crate) use pane_leaf::PaneLeaf;
 pub(crate) use pane_node::PaneNode;

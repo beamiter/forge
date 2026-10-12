@@ -77,7 +77,7 @@ fn organism_enabled_description(safe_mode: bool, enabled: bool) -> &'static str 
     if safe_mode {
         "Unavailable in safe mode; offline preview is still available."
     } else if enabled {
-        "Local, no-LLM companion for Block/Unified panes"
+        "Local, no-LLM companion for Block, Unified and traditional VTE panes"
     } else {
         "Off. Offline preview is still available below."
     }
@@ -108,6 +108,7 @@ mod organism_preview {
     use crate::config::OrganismMotion;
 
     pub(super) const INTERACTION_HINT: &str = concat!(
+        "Traditional VTE shows a neutral companion only; live greetings are unavailable because command and alternate-screen state cannot be verified. Use this offline preview to explore greetings.\n\n",
         "Changes apply to open panes.\n",
         "In Full or Calm, keep the pointer near an idle companion for 600 ms ",
         "for a brief hello (about 2 seconds). Greetings are at least 8 seconds apart; ",
@@ -6929,7 +6930,7 @@ mod tests {
     fn organism_availability_description_distinguishes_safe_off_and_on() {
         assert_eq!(
             super::organism_enabled_description(false, true),
-            "Local, no-LLM companion for Block/Unified panes"
+            "Local, no-LLM companion for Block, Unified and traditional VTE panes"
         );
         assert_eq!(
             super::organism_enabled_description(false, false),

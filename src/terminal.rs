@@ -213,6 +213,7 @@ pub struct VteTerminalView {
     bell_callbacks: VoidCallbacks,
     title_callbacks: StrCallbacks,
     activity_callbacks: VoidCallbacks,
+    organism: Rc<crate::ui::VteOrganismSurface>,
 }
 
 #[allow(dead_code)]
@@ -240,6 +241,7 @@ impl VteTerminalView {
         root.add_css_class("vte-view-root");
         root.append(pane_header.widget());
         root.append(&content);
+        let organism = crate::ui::VteOrganismSurface::new(&root, &terminal, &config.borrow());
 
         let cwd_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn(&str)>>::new()));
         let exited_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn(i32)>>::new()));
@@ -319,11 +321,15 @@ impl VteTerminalView {
 
         // Spawn errors have no child-exited signal; notify them separately.
         let failed_callbacks = launch_failed_callbacks.clone();
+        let organism_for_failure = Rc::downgrade(&organism);
         let on_resolved = Box::new(move |result: Result<(), String>| {
             if let Some(on_launched) = on_launched {
                 on_launched();
             }
             if let Err(message) = result {
+                if let Some(organism) = organism_for_failure.upgrade() {
+                    organism.retire();
+                }
                 for callback in failed_callbacks.borrow().iter() {
                     callback(&message);
                 }
@@ -350,11 +356,20 @@ impl VteTerminalView {
             bell_callbacks,
             title_callbacks,
             activity_callbacks,
+            organism,
         }
     }
 
     pub(crate) fn pane_header(&self) -> &crate::ui::PaneHeader {
         &self.pane_header
+    }
+
+    pub(crate) fn set_organism_local(&self, local: bool) {
+        self.organism.set_local(local);
+    }
+
+    pub(crate) fn sync_organism(&self, enabled: bool, motion: crate::config::OrganismMotion) {
+        self.organism.apply_settings(enabled, motion);
     }
 
     pub fn widget(&self) -> gtk4::Widget {

@@ -6,7 +6,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use super::{PaneNode, UiState};
+use super::{PaneLeaf, PaneNode, UiState};
 use crate::block_view::{AltScreenTransition, TermView};
 use crate::config::OrganismMotion;
 #[cfg(test)]
@@ -44,8 +44,8 @@ struct PointerCandidateSource {
     source: gtk4::glib::SourceId,
 }
 
-const HUMAN_INPUT_RETREAT: Duration = Duration::from_millis(900);
-const SURFACE_FRAME_INTERVAL: Duration = Duration::from_millis(100);
+pub(super) const HUMAN_INPUT_RETREAT: Duration = Duration::from_millis(900);
+pub(super) const SURFACE_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 /// Heartbeat while the mind rests or the body is static: life goes on, the
 /// process barely wakes. Kept just under the tick's one-second dt clamp so
 /// routine dispatch latency is still simulated instead of clipped away.
@@ -3668,18 +3668,52 @@ fn percent(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 100.0).round() as u8
 }
 
+/// Original invocation target. Native-only weak references never enter the
+/// serialized Action or any worker queue.
+#[derive(Clone)]
+pub(crate) enum OrganismGreetingTarget {
+    Block(std::rc::Weak<TermView>),
+    Vte(gtk4::glib::WeakRef<gtk4::Widget>),
+    Unavailable,
+}
+
 impl UiState {
-    pub(crate) fn greet_ascii_organism_for(&self, target: Option<&Rc<TermView>>) {
-        // The palette has already closed. Resolve actual focus once, then
-        // require its original weak target to still own the visible body.
+    pub(super) fn organism_greeting_target(&self) -> OrganismGreetingTarget {
+        match self.current_pane_leaf() {
+            Some(PaneLeaf::Block(view)) => OrganismGreetingTarget::Block(Rc::downgrade(&view)),
+            Some(PaneLeaf::Vte(view)) => OrganismGreetingTarget::Vte(view.widget().downgrade()),
+            None => OrganismGreetingTarget::Unavailable,
+        }
+    }
+
+    pub(crate) fn greet_ascii_organism_for(&self, target: &OrganismGreetingTarget) {
+        let view = match target {
+            OrganismGreetingTarget::Block(view) => view.upgrade(),
+            OrganismGreetingTarget::Vte(root)
+                if root
+                    .upgrade()
+                    .is_some_and(|root| root.is_ancestor(&self.window)) =>
+            {
+                self.toast_overlay.add_toast(libadwaita::Toast::new(
+                    super::organism_vte::VTE_ORGANISM_HELLO_UNAVAILABLE,
+                ));
+                return;
+            }
+            _ => None,
+        };
+        let Some(view) = view else {
+            self.toast_overlay.add_toast(libadwaita::Toast::new(
+                "The original pane is no longer available.",
+            ));
+            return;
+        };
+        // The palette has already closed. Reconcile actual focus once, then
+        // require its original weak Block target to own the visible body.
         self.sync_organism_presence();
-        let accepted = target
-            .and_then(|view| {
-                self.organism_presence
-                    .runtime_for(view)
-                    .map(|runtime| runtime.request_greeting(view))
-            })
-            .unwrap_or(false);
+        let accepted = self
+            .organism_presence
+            .runtime_for(&view)
+            .is_some_and(|runtime| runtime.request_greeting(&view));
         if !accepted {
             self.toast_overlay.add_toast(libadwaita::Toast::new(
                 "Hello is unavailable. Use an idle, visible companion in Full or Calm mode and wait between greetings.",
@@ -3755,6 +3789,11 @@ impl UiState {
             }
             if let Some(runtime) = self.organism_presence.runtime_for(&view) {
                 OrganismRuntime::apply_settings(&runtime, &view, enabled, motion);
+            }
+        }
+        for leaf in self.configuration_leaves() {
+            if let PaneLeaf::Vte(view) = leaf {
+                view.sync_organism(enabled, motion);
             }
         }
         self.sync_organism_presence();
@@ -5248,6 +5287,7 @@ mod tests {
         assert!(runtime.surface_timer.borrow().is_none());
         assert!(runtime.pointer_timer.borrow().is_none());
         println!("DAILY_RUNTIME_COUNTS disabled_frame_timers=0 disabled_hover_timers=0 static_pose_unchanged=true");
+        super::super::organism_vte::exercise_existing_native_fixture(&window);
         window.close();
     }
 

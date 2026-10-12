@@ -799,7 +799,7 @@ impl UiState {
 
         // All disk/config-backed sources are captured once at open. Search
         // changes below are pure in-memory filtering and never do per-key I/O.
-        let greeting_target = self.current_term_view().as_ref().map(Rc::downgrade);
+        let greeting_target = self.organism_greeting_target();
         let snapshot = Rc::new(self.palette_snapshot());
         let dialog = adw::Dialog::builder()
             .title(palette_title(initial_mode))
@@ -882,8 +882,7 @@ impl UiState {
                     &entry.accept,
                     Accept::Action(crate::keybindings::Action::GreetAsciiOrganism)
                 ) {
-                    let target = greeting_target.as_ref().and_then(Weak::upgrade);
-                    ui.greet_ascii_organism_for(target.as_ref());
+                    ui.greet_ascii_organism_for(&greeting_target);
                 } else {
                     ui.accept_palette_entry(entry, &snapshot.workflows);
                 }
@@ -962,7 +961,7 @@ mod tests {
             .split_once("#[cfg(test)]")
             .unwrap()
             .0;
-        assert!(open.contains("self.current_term_view().as_ref().map(Rc::downgrade)"));
+        assert!(open.contains("let greeting_target = self.organism_greeting_target();"));
         let activate = open
             .split_once("let activate = {")
             .unwrap()
@@ -974,7 +973,8 @@ mod tests {
             activate.find("dialog.force_close()").unwrap()
                 < activate.find("greet_ascii_organism_for").unwrap()
         );
-        assert!(activate.contains("greeting_target.as_ref().and_then(Weak::upgrade)"));
+        assert!(activate.contains("ui.greet_ascii_organism_for(&greeting_target)"));
+        assert!(!activate.contains("organism_greeting_target()"));
         assert!(!activate.contains("current_term_view"));
     }
 
