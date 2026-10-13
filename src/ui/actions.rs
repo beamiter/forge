@@ -9,13 +9,43 @@ use vte4::Terminal;
 use vte4::TerminalExt;
 
 use super::*;
-use crate::block_view::{SessionExportFormat, TermView};
+use crate::block_view::{SessionExportFormat, TermView, UndoClearResult};
 use crate::keybindings::{Action, Direction};
 use crate::terminal::terminal_working_directory;
 
 const MIN_AI_PANEL_WIDTH: i32 = 240;
 const MAX_AI_PANEL_WIDTH: i32 = 1200;
 const MIN_AI_WORKSPACE_WIDTH: i32 = 200;
+
+fn cleared_blocks_message(count: usize) -> Option<String> {
+    (count > 0).then(|| {
+        let plural = if count == 1 { "" } else { "s" };
+        format!("Cleared {count} block{plural}.")
+    })
+}
+
+fn undo_clear_message(result: UndoClearResult) -> String {
+    match result {
+        UndoClearResult::Restored(count) => {
+            let plural = if count == 1 { "" } else { "s" };
+            format!("Restored {count} cleared block{plural}.")
+        }
+        UndoClearResult::Empty => "No cleared blocks to restore.".to_string(),
+        UndoClearResult::Fullscreen => {
+            "Exit the full-screen app before restoring cleared blocks.".to_string()
+        }
+        UndoClearResult::AtCapacity => {
+            "Block history is full. Delete a block, then try Undo again.".to_string()
+        }
+    }
+}
+
+fn undo_clear_is_retryable(result: UndoClearResult) -> bool {
+    matches!(
+        result,
+        UndoClearResult::Fullscreen | UndoClearResult::AtCapacity
+    )
+}
 
 fn apply_ai_panel_width(paned: &gtk4::Paned, requested_width: u32) {
     let total_width = paned.width();
@@ -316,8 +346,50 @@ impl UiState {
             Action::ClearBlocks => {
                 log::info!("Clear finished blocks");
                 if let Some(term_view) = self.current_term_view() {
-                    term_view.clear_blocks();
+                    let cleared = term_view.clear_blocks();
+                    if let Some(message) = cleared_blocks_message(cleared) {
+                        let toast = adw::Toast::new(&message);
+                        toast.set_button_label(Some("Undo"));
+                        toast.set_timeout(8);
+                        let term_view = Rc::downgrade(&term_view);
+                        let toast_overlay = self.toast_overlay.downgrade();
+                        toast.connect_button_clicked(move |toast| {
+                            let restored = term_view
+                                .upgrade()
+                                .map_or(UndoClearResult::Empty, |term_view| {
+                                    term_view.undo_clear_blocks()
+                                });
+                            toast.set_title(&undo_clear_message(restored));
+                            if undo_clear_is_retryable(restored) {
+                                // The stash was not consumed. Keep this exact
+                                // Toast actionable while the user exits the
+                                // full-screen app or frees a history slot.
+                                toast.set_button_label(Some("Undo"));
+                                toast.set_timeout(8);
+                                // Re-adding an already displayed AdwToast is
+                                // the documented way to reset its countdown.
+                                if let Some(toast_overlay) = toast_overlay.upgrade() {
+                                    toast_overlay.add_toast(toast.clone());
+                                }
+                            } else {
+                                toast.set_button_label(None);
+                                toast.set_timeout(3);
+                            }
+                        });
+                        self.toast_overlay.add_toast(toast);
+                    }
                 }
+            }
+            Action::UndoClearBlocks => {
+                log::info!("Restore cleared blocks");
+                let restored = self
+                    .current_term_view()
+                    .map_or(UndoClearResult::Empty, |term_view| {
+                        term_view.undo_clear_blocks()
+                    });
+                let toast = adw::Toast::new(&undo_clear_message(restored));
+                toast.set_timeout(4);
+                self.toast_overlay.add_toast(toast);
             }
             Action::ReinputSelectedCommands => {
                 log::info!("Reinput selected commands");
@@ -571,7 +643,11 @@ impl UiState {
 
 #[cfg(test)]
 mod tests {
-    use super::{ai_panel_width_from_geometry, restored_ai_panel_position};
+    use super::{
+        ai_panel_width_from_geometry, cleared_blocks_message, restored_ai_panel_position,
+        undo_clear_is_retryable, undo_clear_message,
+    };
+    use crate::block_view::UndoClearResult;
 
     #[test]
     fn ai_panel_geometry_preserves_workspace_and_clamps_configured_limits() {
@@ -583,5 +659,42 @@ mod tests {
         assert_eq!(ai_panel_width_from_geometry(800, 440), Some(360));
         assert_eq!(ai_panel_width_from_geometry(2000, 100), Some(1200));
         assert_eq!(ai_panel_width_from_geometry(800, 800), None);
+    }
+
+    #[test]
+    fn clear_block_toasts_cover_empty_singular_and_plural_results() {
+        assert_eq!(cleared_blocks_message(0), None);
+        assert_eq!(
+            cleared_blocks_message(1).as_deref(),
+            Some("Cleared 1 block.")
+        );
+        assert_eq!(
+            cleared_blocks_message(2).as_deref(),
+            Some("Cleared 2 blocks.")
+        );
+        assert_eq!(
+            undo_clear_message(UndoClearResult::Empty),
+            "No cleared blocks to restore."
+        );
+        assert_eq!(
+            undo_clear_message(UndoClearResult::Fullscreen),
+            "Exit the full-screen app before restoring cleared blocks."
+        );
+        assert_eq!(
+            undo_clear_message(UndoClearResult::AtCapacity),
+            "Block history is full. Delete a block, then try Undo again."
+        );
+        assert_eq!(
+            undo_clear_message(UndoClearResult::Restored(1)),
+            "Restored 1 cleared block."
+        );
+        assert_eq!(
+            undo_clear_message(UndoClearResult::Restored(2)),
+            "Restored 2 cleared blocks."
+        );
+        assert!(undo_clear_is_retryable(UndoClearResult::Fullscreen));
+        assert!(undo_clear_is_retryable(UndoClearResult::AtCapacity));
+        assert!(!undo_clear_is_retryable(UndoClearResult::Empty));
+        assert!(!undo_clear_is_retryable(UndoClearResult::Restored(1)));
     }
 }

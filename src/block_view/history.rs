@@ -5,8 +5,8 @@
 //! bounded, since the deque was already seeded from this file on startup.
 
 use super::{
-    estimated_finished_block_height_for_text, install_finished_block_selection, next_block_id,
-    BlockData, FinishedBlock, TermView,
+    estimated_finished_block_height_for_text, install_finished_block_selection,
+    mutate_block_data_and_redraw, next_block_id, BlockData, FinishedBlock, TermView,
 };
 use crate::persistence::{self, PersistenceKey};
 use gtk4::glib;
@@ -1576,12 +1576,15 @@ impl TermView {
         }
 
         let restored_len = restored.len();
-        {
-            let mut blocks = self.block_data.borrow_mut();
-            for block in restored.into_iter().rev() {
-                blocks.push_front(block);
-            }
-        }
+        mutate_block_data_and_redraw(
+            &self.block_data,
+            self.failure_marker_redraw.as_ref(),
+            |blocks| {
+                for block in restored.into_iter().rev() {
+                    blocks.push_front(block);
+                }
+            },
+        );
         self.finished_blocks
             .borrow_mut()
             .splice(0..0, restored_widgets);

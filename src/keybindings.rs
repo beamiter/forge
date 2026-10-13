@@ -64,6 +64,8 @@ pub(crate) enum Action {
     SelectAllBlocks,
     /// Remove every finished block from the active block-mode pane.
     ClearBlocks,
+    /// Restore the most recent contentful Clear Blocks operation.
+    UndoClearBlocks,
     /// Put selected commands back into the live editor in terminal order.
     ReinputSelectedCommands,
     JumpToPrevPinned,
@@ -159,6 +161,7 @@ impl Action {
             Action::ClearBlockFilter => "Jump to oldest block",
             Action::SelectAllBlocks => "Select all blocks",
             Action::ClearBlocks => "Clear blocks",
+            Action::UndoClearBlocks => "Undo clear blocks",
             Action::ReinputSelectedCommands => "Reinput selected commands",
             Action::JumpToPrevPinned => "Jump to previous bookmarked block",
             Action::JumpToNextPinned => "Jump to next bookmarked block",
@@ -227,6 +230,7 @@ impl Action {
             Action::ClearBlockFilter => Some("clear_block_filter"),
             Action::SelectAllBlocks => Some("select_all_blocks"),
             Action::ClearBlocks => Some("clear_blocks"),
+            Action::UndoClearBlocks => Some("undo_clear_blocks"),
             Action::ReinputSelectedCommands => Some("reinput_selected_commands"),
             Action::JumpToPrevPinned => Some("jump_to_prev_pinned"),
             Action::JumpToNextPinned => Some("jump_to_next_pinned"),
@@ -295,6 +299,7 @@ impl Action {
             Action::ClearBlockFilter,
             Action::SelectAllBlocks,
             Action::ClearBlocks,
+            Action::UndoClearBlocks,
             Action::ReinputSelectedCommands,
             Action::JumpToPrevPinned,
             Action::JumpToNextPinned,
@@ -541,6 +546,7 @@ mod tests {
             Action::OpenWelcome,
             Action::FilterSlowBlocks,
             Action::FilterPinnedBlocks,
+            Action::UndoClearBlocks,
             Action::JumpToPrevPinned,
             Action::JumpToNextPinned,
             // anvil leaves session export chordless too; both GTK terminals
@@ -940,6 +946,27 @@ mod tests {
 
         assert_eq!(map.lookup(&markdown), Some(Action::ExportSessionMarkdown));
         assert_eq!(map.lookup(&json), Some(Action::ExportSessionJson));
+    }
+
+    /// Undo Clear stays discoverable in the command palette without taking a
+    /// scarce default chord, while retaining the same opt-in config surface as
+    /// anvil.
+    #[test]
+    fn undo_clear_is_palette_only_yet_bindable_from_config() {
+        let mut map = KeybindingMap::from_defaults();
+        assert!(map.binding_display(&Action::UndoClearBlocks).is_empty());
+
+        let chord = parse("Ctrl+Shift+Alt+U").unwrap();
+        assert_eq!(map.lookup(&chord), None, "chosen chord must start free");
+
+        let mut table = toml::Table::new();
+        table.insert(
+            "undo_clear_blocks".into(),
+            toml::Value::String("Ctrl+Shift+Alt+U".into()),
+        );
+        map.apply_user_overrides(&table);
+
+        assert_eq!(map.lookup(&chord), Some(Action::UndoClearBlocks));
     }
 
     #[test]

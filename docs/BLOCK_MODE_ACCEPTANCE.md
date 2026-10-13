@@ -29,6 +29,7 @@ seq 1 300
 - **右键多选**：检查 `Copy Commands`、`Copy Outputs`、`Copy Blocks`、`Insert Commands at Prompt` 的顺序与内容。
 - **右键块操作**：检查 `Scroll to Top of Block`、`Jump to Bottom of Block`、输出过滤以及 `Bookmark Block` / `Remove Bookmark`。
 - **清空**：`Ctrl+Shift+K` 同时清除块、选择、书签、搜索、未读徽标、虚拟滚动范围与持久化历史；当前提示符仍可输入。
+- **撤销清空**：先选择并收藏旧块，清空后产生新块，再点 Toast 的 **Undo** 或从命令面板执行 `Undo clear blocks`；旧块须以原 ID/顺序恢复到新块之前，原选择与书签（星标及 CSS）和新状态合并，右键菜单与新完成块一致，持久化历史同步恢复。把 `max_visible_blocks` 调小后重复，合并结果不得超限且须保留最新的旧→新后缀；若被截掉的是原 selection active/anchor，仍须给保留下来的选择确定有效 edge。再次撤销显示无 stash；对空 Pane 重复清空不能覆盖待恢复内容；alt-screen 中尝试撤销须提示先退出且不能消费 stash，退出后仍可恢复；历史已满时须提示腾出空间且保留 stash。清空 Toast 在这两个可重试状态下须保留 **Undo** 并重置倒计时，允许退出全屏/删除块后原地重试。
 - **后台输出**：未开始编辑时，异步输出形成无命令的 `Background output` 块；开始编辑后输出保持在输入区，不误拆块。
 
 ## P1 复制与导航
@@ -39,6 +40,7 @@ seq 1 300
 - 跨块拖选后，内容按界面顺序合并。
 - `Ctrl+Shift+Up/Down` 对齐 active 块顶部/底部。
 - sticky header 点击命令区域跳到块顶部；底部按钮跳到长块底部；最小化/恢复状态正常。
+- 总历史超出视口时，滚动条轨道以红色短标记显示每个失败命令的位置；成功、未知退出码和 `Background output` 不得误标。
 - `Ctrl+Shift+B` 切换 active 块书签；`Ctrl+,` / `Ctrl+.` 在书签间跳转。
 - `Alt+Shift+F` 打开 active 或最新块过滤器，关闭后查询内容仍保留。
 

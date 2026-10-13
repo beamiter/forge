@@ -145,6 +145,25 @@ fn normalize_loaded_block_ids(blocks: &mut VecDeque<BlockData>, counter: &Atomic
     repaired
 }
 
+type FailureMarkerRedraw = Rc<dyn Fn()>;
+
+/// Mutate the marker's source document, then request a repaint only after the
+/// mutable borrow has been released. The repaint callback reads the same
+/// `RefCell`, so this ordering remains safe even if queuing ever becomes
+/// synchronous.
+fn mutate_block_data_and_redraw<R>(
+    block_data: &RefCell<VecDeque<BlockData>>,
+    redraw: &dyn Fn(),
+    mutate: impl FnOnce(&mut VecDeque<BlockData>) -> R,
+) -> R {
+    let result = {
+        let mut block_data = block_data.borrow_mut();
+        mutate(&mut block_data)
+    };
+    redraw();
+    result
+}
+
 /// Update the jump-to-bottom FAB's label to show an unread-block badge: just the
 /// chevron when nothing is pending, chevron + count (clamped to "99+") otherwise.
 fn set_jump_fab_label(fab: &gtk4::Button, unread: u32) {
@@ -883,6 +902,11 @@ impl DynamicColors {
     }
 }
 
+/// Per-pane handle shared by the PTY reader and widget rebuild paths. A block
+/// restored by Undo Clear must receive the same live OSC 10/11 overrides as a
+/// block that finishes normally.
+type DynamicColorsRc = Rc<Cell<DynamicColors>>;
+
 /// Parse an OSC 10/11/12 color spec. Apps overwhelmingly send the X11
 /// `rgb:R/G/B` form (1–4 hex digits per channel), which `gdk_rgba_parse`
 /// does not understand; handle it here and delegate everything else
@@ -992,6 +1016,12 @@ struct BlockSelectionRefs<'a> {
     ids: &'a SelectedBlockIds,
     active: &'a Rc<Cell<Option<u64>>>,
     anchor: &'a Rc<Cell<Option<u64>>>,
+}
+
+#[derive(Clone, Copy)]
+struct BlockDataRefs<'a> {
+    data: &'a Rc<RefCell<VecDeque<BlockData>>>,
+    marker_redraw: &'a dyn Fn(),
 }
 
 /// Apply the multi-selection model to every finished block. All selected blocks
@@ -1383,7 +1413,7 @@ fn scroll_selected_finished_block_edge(
 fn remove_finished_block(
     block_id: u64,
     finished_blocks: &Rc<RefCell<Vec<FinishedBlock>>>,
-    block_data: &Rc<RefCell<VecDeque<BlockData>>>,
+    block_data: BlockDataRefs<'_>,
     block_list: &gtk4::Box,
     selection: BlockSelectionRefs<'_>,
     bookmarks: &Rc<RefCell<std::collections::HashSet<u64>>>,
@@ -1399,7 +1429,9 @@ fn remove_finished_block(
     let (removed_pos, block) = removed?;
 
     block_list.remove(block.widget());
-    block_data.borrow_mut().retain(|b| b.id != block_id);
+    mutate_block_data_and_redraw(block_data.data, block_data.marker_redraw, |blocks| {
+        blocks.retain(|block| block.id != block_id);
+    });
     bookmarks.borrow_mut().remove(&block_id);
     // Virtual-scroll visibility is index-based, so shift every surviving index
     // above the removed position down by one.
@@ -1521,6 +1553,359 @@ fn install_finished_block_selection(
     block.widget().add_controller(left_click);
 }
 
+/// Dependencies for the complete finished-block context menu. Both normal
+/// command completion and Undo Clear install this same controller so a rebuilt
+/// card never loses actions that a freshly finished card has.
+#[derive(Clone)]
+struct FinishedBlockMenu {
+    finished_blocks: Weak<RefCell<Vec<FinishedBlock>>>,
+    block_list: glib::WeakRef<gtk4::Box>,
+    active_vte: glib::WeakRef<Terminal>,
+    pty: Rc<OwnedPty>,
+    pty_synced: Rc<Cell<bool>>,
+    active: Weak<RefCell<ActiveBlock>>,
+    bstate: Rc<Cell<BlockState>>,
+    bracketed_paste: Rc<Cell<bool>>,
+    typed_cmd: Rc<RefCell<String>>,
+    selected_ids: SelectedBlockIds,
+    selected_id: Rc<Cell<Option<u64>>>,
+    anchor_id: Rc<Cell<Option<u64>>>,
+    bookmarks: Rc<RefCell<HashSet<u64>>>,
+    visible_indices: Rc<RefCell<HashSet<usize>>>,
+    block_data: Rc<RefCell<VecDeque<BlockData>>>,
+    failure_marker_redraw: FailureMarkerRedraw,
+    block_scroll: glib::WeakRef<ScrolledWindow>,
+}
+
+#[derive(Clone, Copy)]
+enum FinishedBlockMenuAction {
+    CopyCommands,
+    CopyOutputs,
+    CopyBlocks,
+    InsertCommands,
+    ScrollTop,
+    ScrollBottom,
+    ToggleFilter,
+    ToggleBookmark,
+    ExportJson,
+    ExportMarkdown,
+    Delete,
+}
+
+impl FinishedBlockMenu {
+    fn install(&self, block: &FinishedBlock) {
+        let menu = self.clone();
+        let block_id = block.id;
+        let long_output = block.long_output;
+        let widget = block.widget().downgrade();
+        let right_click = gtk4::GestureClick::new();
+        right_click.set_button(3);
+        right_click.connect_pressed(move |gesture, _n_press, x, y| {
+            let (Some(finished_blocks), Some(active_vte), Some(widget)) = (
+                menu.finished_blocks.upgrade(),
+                menu.active_vte.upgrade(),
+                widget.upgrade(),
+            ) else {
+                return;
+            };
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            {
+                let finished = finished_blocks.borrow();
+                clear_vte_text_selections(&finished, &active_vte);
+                activate_finished_block_selection(
+                    &finished,
+                    &menu.selected_ids,
+                    &menu.selected_id,
+                    &menu.anchor_id,
+                    block_id,
+                );
+            }
+
+            let popover = gtk4::Popover::new();
+            popover.set_parent(&widget);
+            popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.set_has_arrow(false);
+            let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            vbox.add_css_class("menu");
+
+            let append_item = |label: &str,
+                               action: FinishedBlockMenuAction,
+                               sensitive: bool,
+                               tooltip: Option<&str>| {
+                let item = gtk4::Button::with_label(label);
+                item.set_has_frame(false);
+                item.set_halign(gtk4::Align::Fill);
+                if let Some(child) = item.child() {
+                    child.set_halign(gtk4::Align::Start);
+                }
+                item.add_css_class("flat");
+                item.set_sensitive(sensitive);
+                item.set_tooltip_text(tooltip);
+                let menu = menu.clone();
+                let popover = popover.downgrade();
+                item.connect_clicked(move |_| {
+                    popdown_if_alive(&popover);
+                    menu.execute(block_id, action);
+                });
+                vbox.append(&item);
+            };
+
+            let selected_count = menu.selected_ids.borrow().len();
+            let has_selected_commands = {
+                let selected = menu.selected_ids.borrow();
+                menu.block_data
+                    .borrow()
+                    .iter()
+                    .any(|block| selected.contains(&block.id) && !block.cmd.trim().is_empty())
+            };
+            if has_selected_commands {
+                append_item(
+                    if selected_count > 1 {
+                        "Copy Commands"
+                    } else {
+                        "Copy Command"
+                    },
+                    FinishedBlockMenuAction::CopyCommands,
+                    true,
+                    None,
+                );
+            }
+            append_item(
+                if selected_count > 1 {
+                    "Copy Outputs"
+                } else {
+                    "Copy Output"
+                },
+                FinishedBlockMenuAction::CopyOutputs,
+                true,
+                None,
+            );
+            append_item(
+                if selected_count > 1 {
+                    "Copy Blocks"
+                } else {
+                    "Copy Block"
+                },
+                FinishedBlockMenuAction::CopyBlocks,
+                true,
+                None,
+            );
+            if has_selected_commands {
+                append_item(
+                    if selected_count > 1 {
+                        "Insert Commands at Prompt"
+                    } else {
+                        "Insert Command at Prompt"
+                    },
+                    FinishedBlockMenuAction::InsertCommands,
+                    command_recall_available(menu.bstate.get()),
+                    Some("Available when the shell prompt is ready"),
+                );
+            }
+            append_item(
+                "Scroll to Top of Block",
+                FinishedBlockMenuAction::ScrollTop,
+                true,
+                None,
+            );
+            if long_output {
+                append_item(
+                    "Jump to Bottom of Block",
+                    FinishedBlockMenuAction::ScrollBottom,
+                    true,
+                    None,
+                );
+            }
+            append_item(
+                "Toggle Output Filter",
+                FinishedBlockMenuAction::ToggleFilter,
+                true,
+                None,
+            );
+            append_item(
+                if menu.bookmarks.borrow().contains(&block_id) {
+                    "Remove Bookmark"
+                } else {
+                    "Bookmark Block"
+                },
+                FinishedBlockMenuAction::ToggleBookmark,
+                true,
+                None,
+            );
+            vbox.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+            append_item(
+                "Export as JSON",
+                FinishedBlockMenuAction::ExportJson,
+                true,
+                None,
+            );
+            append_item(
+                "Export as Markdown",
+                FinishedBlockMenuAction::ExportMarkdown,
+                true,
+                None,
+            );
+            append_item("Delete Block", FinishedBlockMenuAction::Delete, true, None);
+
+            popover.set_child(Some(&vbox));
+            popover.connect_closed(move |popover| popover.unparent());
+            popover.popup();
+        });
+        block.widget().add_controller(right_click);
+    }
+
+    fn execute(&self, block_id: u64, action: FinishedBlockMenuAction) {
+        match action {
+            FinishedBlockMenuAction::CopyCommands => {
+                let Some(vte) = self.active_vte.upgrade() else {
+                    return;
+                };
+                let selected = self.selected_ids.borrow();
+                let blocks = self.block_data.borrow();
+                let text = selected_command_text(
+                    blocks.iter().map(|block| (block.id, block.cmd.as_str())),
+                    &selected,
+                );
+                vte.clipboard().set_text(&text);
+            }
+            FinishedBlockMenuAction::CopyOutputs => {
+                let Some(vte) = self.active_vte.upgrade() else {
+                    return;
+                };
+                let selected = self.selected_ids.borrow();
+                let blocks = self.block_data.borrow();
+                let text = selected_clipboard_text(blocks.iter(), &selected, |block| {
+                    strip_ansi(&block.output)
+                });
+                vte.clipboard().set_text(&text);
+            }
+            FinishedBlockMenuAction::CopyBlocks => {
+                let Some(vte) = self.active_vte.upgrade() else {
+                    return;
+                };
+                let selected = self.selected_ids.borrow();
+                let blocks = self.block_data.borrow();
+                let text = selected_clipboard_text(blocks.iter(), &selected, |block| {
+                    block_clipboard_text(&block.cmd, &strip_ansi(&block.output), false)
+                });
+                vte.clipboard().set_text(&text);
+            }
+            FinishedBlockMenuAction::InsertCommands => {
+                let Some(finished) = self.finished_blocks.upgrade() else {
+                    return;
+                };
+                let finished = finished.borrow();
+                let recalled = {
+                    let selected = self.selected_ids.borrow();
+                    recall_selected_commands_at_prompt(
+                        &self.pty,
+                        &self.pty_synced,
+                        &self.typed_cmd,
+                        self.bstate.get(),
+                        &finished,
+                        &selected,
+                        self.bracketed_paste.get(),
+                    )
+                };
+                if recalled {
+                    clear_finished_block_selection(
+                        &finished,
+                        &self.selected_ids,
+                        &self.selected_id,
+                        &self.anchor_id,
+                    );
+                    if let Some(active) = self.active.upgrade() {
+                        active.borrow().grab_focus();
+                    }
+                }
+            }
+            FinishedBlockMenuAction::ScrollTop | FinishedBlockMenuAction::ScrollBottom => {
+                let (Some(finished), Some(scroll)) =
+                    (self.finished_blocks.upgrade(), self.block_scroll.upgrade())
+                else {
+                    return;
+                };
+                let finished = finished.borrow();
+                if let Some(block) = finished.iter().find(|block| block.id == block_id) {
+                    block.scroll_to_edge(
+                        &scroll,
+                        matches!(action, FinishedBlockMenuAction::ScrollBottom),
+                    );
+                }
+            }
+            FinishedBlockMenuAction::ToggleFilter => {
+                let Some(finished) = self.finished_blocks.upgrade() else {
+                    return;
+                };
+                let finished = finished.borrow();
+                if let Some(block) = finished.iter().find(|block| block.id == block_id) {
+                    (block.toggle_filter)();
+                }
+            }
+            FinishedBlockMenuAction::ToggleBookmark => {
+                let Some(finished) = self.finished_blocks.upgrade() else {
+                    return;
+                };
+                let finished = finished.borrow();
+                let Some(block) = finished.iter().find(|block| block.id == block_id) else {
+                    return;
+                };
+                let mut bookmarks = self.bookmarks.borrow_mut();
+                let bookmarked = if bookmarks.remove(&block_id) {
+                    false
+                } else {
+                    bookmarks.insert(block_id);
+                    true
+                };
+                block.bookmark_star.set_visible(bookmarked);
+                if bookmarked {
+                    block.widget().add_css_class("block-bookmarked");
+                } else {
+                    block.widget().remove_css_class("block-bookmarked");
+                }
+            }
+            FinishedBlockMenuAction::ExportJson | FinishedBlockMenuAction::ExportMarkdown => {
+                let Some(vte) = self.active_vte.upgrade() else {
+                    return;
+                };
+                let blocks = self.block_data.borrow();
+                let Some(block) = blocks.iter().find(|block| block.id == block_id) else {
+                    return;
+                };
+                let text = if matches!(action, FinishedBlockMenuAction::ExportJson) {
+                    block.to_json()
+                } else {
+                    block.to_markdown()
+                };
+                vte.clipboard().set_text(&text);
+            }
+            FinishedBlockMenuAction::Delete => {
+                let (Some(finished), Some(block_list)) =
+                    (self.finished_blocks.upgrade(), self.block_list.upgrade())
+                else {
+                    return;
+                };
+                let _ = remove_finished_block(
+                    block_id,
+                    &finished,
+                    BlockDataRefs {
+                        data: &self.block_data,
+                        marker_redraw: self.failure_marker_redraw.as_ref(),
+                    },
+                    &block_list,
+                    BlockSelectionRefs {
+                        ids: &self.selected_ids,
+                        active: &self.selected_id,
+                        anchor: &self.anchor_id,
+                    },
+                    &self.bookmarks,
+                    &self.visible_indices,
+                );
+            }
+        }
+    }
+}
+
 fn popdown_if_alive(popover: &glib::WeakRef<gtk4::Popover>) {
     if let Some(popover) = popover.upgrade() {
         popover.popdown();
@@ -1547,6 +1932,98 @@ const MIN_INPUT_ROWS: i32 = 6;
 /// enters the PTY.
 type BlockFinishedCallbacks =
     Rc<RefCell<Vec<Box<dyn Fn(String, Option<i32>, String, Option<u64>, Option<u64>)>>>>;
+
+/// One pane-local undo level for Clear Blocks. The serialized block data owns
+/// the durable content; ID-keyed UI state is kept beside it so restoring cannot
+/// leave bookmarks or keyboard selection pointing at missing cards.
+#[derive(Default)]
+struct ClearedBlocksStash {
+    blocks: Vec<BlockData>,
+    bookmarks: HashSet<u64>,
+    selected_ids: HashSet<u64>,
+    active_id: Option<u64>,
+    anchor_id: Option<u64>,
+}
+
+/// Outcome of a pane-local Undo Clear request. Callers must distinguish an
+/// empty undo level from a temporarily hidden block canvas: reporting the
+/// former while a full-screen app owns the pane falsely tells the user their
+/// recoverable history is gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UndoClearResult {
+    Restored(usize),
+    Empty,
+    Fullscreen,
+    AtCapacity,
+}
+
+impl ClearedBlocksStash {
+    /// A contentful clear replaces the single undo level. Clearing an already
+    /// empty pane keeps the previous level, matching anvil's forgiving double-
+    /// keypress behavior.
+    fn replace_if_nonempty(&mut self, next: Self) -> usize {
+        let count = next.blocks.len();
+        if count > 0 {
+            *self = next;
+        }
+        count
+    }
+
+    /// Take the undo level only when it can be used. `capacity` is the number
+    /// of slots left after blocks produced since Clear; keeping the newest
+    /// suffix of the older stash is exactly the newest `max_visible_blocks`
+    /// suffix of the combined old→new timeline.
+    fn take_for_restore(
+        &mut self,
+        fullscreen: bool,
+        capacity: usize,
+    ) -> Result<Self, UndoClearResult> {
+        if fullscreen {
+            return Err(UndoClearResult::Fullscreen);
+        }
+        if self.blocks.is_empty() {
+            return Err(UndoClearResult::Empty);
+        }
+        if capacity == 0 {
+            return Err(UndoClearResult::AtCapacity);
+        }
+
+        let mut taken = std::mem::take(self);
+        let drop_count = taken.blocks.len().saturating_sub(capacity);
+        taken.blocks.drain(..drop_count);
+        Ok(taken)
+    }
+}
+
+fn prepend_restored_block_data(live: &mut VecDeque<BlockData>, restored: Vec<BlockData>) {
+    for block in restored.into_iter().rev() {
+        live.push_front(block);
+    }
+}
+
+/// Repair selection edges after a capacity-limited Undo drops older selected
+/// blocks. A valid post-clear edge wins, then a retained stashed edge; if both
+/// disappeared, use the newest selected block in terminal order and keep the
+/// anchor synchronized so a non-empty selection never has no active edge.
+fn restored_selection_edges(
+    ordered_ids: &[u64],
+    selected: &HashSet<u64>,
+    current_active: Option<u64>,
+    current_anchor: Option<u64>,
+    stashed_active: Option<u64>,
+    stashed_anchor: Option<u64>,
+) -> (Option<u64>, Option<u64>) {
+    let retained = |id: u64| selected.contains(&id);
+    let active = current_active
+        .filter(|id| retained(*id))
+        .or_else(|| stashed_active.filter(|id| retained(*id)))
+        .or_else(|| ordered_ids.iter().rev().copied().find(|id| retained(*id)));
+    let anchor = current_anchor
+        .filter(|id| retained(*id))
+        .or_else(|| stashed_anchor.filter(|id| retained(*id)))
+        .or(active);
+    (active, anchor)
+}
 
 pub struct TermView {
     root: gtk4::Box,
@@ -1606,9 +2083,17 @@ pub struct TermView {
     /// Whether the shell has enabled DECSET 2004. Clipboard input is written
     /// directly to our PTY, so block mode must apply this wrapper itself.
     bracketed_paste: Rc<Cell<bool>>,
+    /// Dynamic colors are reader-owned while commands run and TermView-owned
+    /// while cleared blocks are rebuilt or an explicit theme change resets them.
+    dynamic_colors: DynamicColorsRc,
     config: Rc<RefCell<Config>>,
     block_data: Rc<RefCell<VecDeque<BlockData>>>,
+    /// Repaint the failure-marker overlay after every history metadata change,
+    /// including changes that leave GTK scroll geometry numerically unchanged.
+    failure_marker_redraw: FailureMarkerRedraw,
     finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
+    /// Shared installer used by both newly completed and Undo-restored cards.
+    finished_block_menu: FinishedBlockMenu,
     widget_pool: Rc<RefCell<WidgetPool>>,
     viewport: Rc<RefCell<ViewportState>>,
     visible_indices: Rc<RefCell<std::collections::HashSet<usize>>>,
@@ -1616,6 +2101,8 @@ pub struct TermView {
     selected_block_id: Rc<Cell<Option<u64>>>,
     selection_anchor_id: Rc<Cell<Option<u64>>>,
     bookmarks: Rc<RefCell<std::collections::HashSet<u64>>>,
+    /// Blocks and ID-keyed UI state removed by the last contentful Clear Blocks.
+    cleared_stash: RefCell<ClearedBlocksStash>,
     /// Find-within-blocks state: every match across the finished blocks plus a
     /// cursor into it, so Ctrl+F highlights all hits and Next/Prev step through
     /// them (Warp's FindWithinBlock). Tags are stripped on close via clear_find.
@@ -1711,10 +2198,13 @@ struct ReaderCtx {
     activity_cbs: VoidCallbacks,
     mouse_reporting_rc: Rc<Cell<MouseReportingMode>>,
     bracketed_paste_rc: Rc<Cell<bool>>,
+    dynamic_colors_rc: DynamicColorsRc,
     config_for_cb: Rc<RefCell<Config>>,
     parser: Rc<RefCell<Parser>>,
     block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
+    failure_marker_redraw: FailureMarkerRedraw,
     finished_blocks_for_cb: Rc<RefCell<Vec<FinishedBlock>>>,
+    finished_block_menu: FinishedBlockMenu,
     scroll_debouncer: ScrollDebouncer,
     widget_pool_for_cb: Rc<RefCell<WidgetPool>>,
     pty_synced_rc: Rc<Cell<bool>>,
@@ -1863,10 +2353,13 @@ impl ReaderCtx {
             activity_cbs,
             mouse_reporting_rc,
             bracketed_paste_rc,
+            dynamic_colors_rc,
             config_for_cb,
             parser,
             block_data_for_cb,
+            failure_marker_redraw,
             finished_blocks_for_cb,
+            finished_block_menu,
             scroll_debouncer,
             widget_pool_for_cb,
             pty_synced_rc,
@@ -1904,12 +2397,6 @@ impl ReaderCtx {
         let kitty_pending_images_rc: Rc<RefCell<Vec<gtk4::gdk::Texture>>> =
             Rc::new(RefCell::new(Vec::new()));
         let kitty_pending_bytes_rc: Rc<Cell<usize>> = Rc::new(Cell::new(0));
-        // Dynamic OSC 10/11/12 colors: the set/reset bytes pass through to the
-        // persistent live VTE, which recolors itself natively; this cell only
-        // remembers the override so ColorQuery replies (and freshly created
-        // finished-block snapshots) match what the app actually set.
-        let dynamic_colors_rc: Rc<Cell<DynamicColors>> =
-            Rc::new(Cell::new(DynamicColors::default()));
         // Selection-hold triggers that live on the VTE itself (selection
         // cleared, user typed). Wired before the pipeline closure below takes
         // ownership of `active_vte`.
@@ -2205,7 +2692,11 @@ impl ReaderCtx {
                                     cols: cols.clamp(1, u16::MAX as i64) as u16,
                                 };
 
-                                block_data_for_cb.borrow_mut().push_back(block_data);
+                                mutate_block_data_and_redraw(
+                                    &block_data_for_cb,
+                                    failure_marker_redraw.as_ref(),
+                                    |blocks| blocks.push_back(block_data),
+                                );
 
                                 // Drain the kitty-graphics images decoded during
                                 // this command so the finished block mounts them
@@ -2257,7 +2748,6 @@ impl ReaderCtx {
 
                                 let max_blocks = config_for_cb.borrow().max_visible_blocks as usize;
                                 let finished_clone = finished.clone();
-                                let finished_widget = finished_clone.widget().clone();
 
                                 finished_clone.connect_actions(
                                     &active_vte,
@@ -2297,434 +2787,7 @@ impl ReaderCtx {
                                     }
                                 }
 
-                                // Right-click context menu.
-                                let finished_blocks_for_menu =
-                                    Rc::downgrade(&finished_blocks_for_cb);
-                                let block_list_for_menu = block_list_rc.downgrade();
-                                let vte_for_copy = active_vte.downgrade();
-                                let pty_for_rerun_menu = pty_for_init.clone();
-                                let pty_synced_for_rerun_menu = pty_synced_rc.clone();
-                                let active_for_rerun_menu = Rc::downgrade(&active_rc);
-                                let bstate_for_rerun_menu = bstate_rc.clone();
-                                let bracketed_paste_for_menu = bracketed_paste_rc.clone();
-                                let typed_cmd_for_rerun_menu = typed_cmd_rc.clone();
-                                let selected_ids_for_menu = selected_block_ids_rc.clone();
-                                let selected_for_menu = selected_block_id_rc.clone();
-                                let anchor_for_menu = selection_anchor_id_rc.clone();
-                                let bookmarks_for_menu = bookmarks_for_cb.clone();
-                                let visible_for_menu = visible_indices_rc.clone();
-                                let block_id = finished_clone.id;
-
-                                let right_click = gtk4::GestureClick::new();
-                                right_click.set_button(3);
-
-                                let finished_widget_for_menu = finished_widget.downgrade();
-                                let long_output_for_menu = finished_clone.long_output;
-                                let block_data_for_export = block_data_for_cb.clone();
-                                let block_scroll_for_menu = block_scroll_rc.downgrade();
-                                right_click.connect_pressed(move |gesture, _n_press, x, y| {
-                                    let Some(finished_blocks) = finished_blocks_for_menu.upgrade()
-                                    else {
-                                        return;
-                                    };
-                                    let Some(vte_for_copy) = vte_for_copy.upgrade() else {
-                                        return;
-                                    };
-                                    let Some(finished_widget) = finished_widget_for_menu.upgrade()
-                                    else {
-                                        return;
-                                    };
-                                    gesture.set_state(gtk4::EventSequenceState::Claimed);
-                                    {
-                                        let finished = finished_blocks.borrow();
-                                        clear_vte_text_selections(&finished, &vte_for_copy);
-                                        activate_finished_block_selection(
-                                            &finished,
-                                            &selected_ids_for_menu,
-                                            &selected_for_menu,
-                                            &anchor_for_menu,
-                                            block_id,
-                                        );
-                                    }
-
-                                    let popover = gtk4::Popover::new();
-                                    popover.set_parent(&finished_widget);
-                                    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
-                                        x as i32, y as i32, 1, 1,
-                                    )));
-                                    popover.set_has_arrow(false);
-
-                                    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-                                    vbox.add_css_class("menu");
-
-                                    let make_item = |label: &str| -> gtk4::Button {
-                                        let btn = gtk4::Button::with_label(label);
-                                        btn.set_has_frame(false);
-                                        btn.set_halign(gtk4::Align::Fill);
-                                        if let Some(child) = btn.child() {
-                                            child.set_halign(gtk4::Align::Start);
-                                        }
-                                        btn.add_css_class("flat");
-                                        btn
-                                    };
-
-                                    let selected_count = selected_ids_for_menu.borrow().len();
-                                    let has_selected_commands = {
-                                        let selected = selected_ids_for_menu.borrow();
-                                        block_data_for_export.borrow().iter().any(|block| {
-                                            selected.contains(&block.id)
-                                                && !block.cmd.trim().is_empty()
-                                        })
-                                    };
-
-                                    if has_selected_commands {
-                                        let item = make_item(if selected_count > 1 {
-                                            "Copy Commands"
-                                        } else {
-                                            "Copy Command"
-                                        });
-                                        let popover_c = popover.downgrade();
-                                        let block_data_for_copy = block_data_for_export.clone();
-                                        let selected_ids_for_copy = selected_ids_for_menu.clone();
-                                        let vte_for_action = vte_for_copy.downgrade();
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let Some(vte_for_action) = vte_for_action.upgrade()
-                                            else {
-                                                return;
-                                            };
-                                            let selected = selected_ids_for_copy.borrow();
-                                            let blocks = block_data_for_copy.borrow();
-                                            let text = selected_command_text(
-                                                blocks
-                                                    .iter()
-                                                    .map(|block| (block.id, block.cmd.as_str())),
-                                                &selected,
-                                            );
-                                            vte_for_action.clipboard().set_text(&text);
-                                        });
-                                        vbox.append(&item);
-                                    }
-
-                                    {
-                                        let item = make_item(if selected_count > 1 {
-                                            "Copy Outputs"
-                                        } else {
-                                            "Copy Output"
-                                        });
-                                        let popover_c = popover.downgrade();
-                                        let block_data_for_copy = block_data_for_export.clone();
-                                        let selected_ids_for_copy = selected_ids_for_menu.clone();
-                                        let vte_for_action = vte_for_copy.downgrade();
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let Some(vte_for_action) = vte_for_action.upgrade()
-                                            else {
-                                                return;
-                                            };
-                                            let selected = selected_ids_for_copy.borrow();
-                                            let blocks = block_data_for_copy.borrow();
-                                            let text = selected_clipboard_text(
-                                                blocks.iter(),
-                                                &selected,
-                                                |block| strip_ansi(&block.output),
-                                            );
-                                            vte_for_action.clipboard().set_text(&text);
-                                        });
-                                        vbox.append(&item);
-                                    }
-
-                                    {
-                                        let item = make_item(if selected_count > 1 {
-                                            "Copy Blocks"
-                                        } else {
-                                            "Copy Block"
-                                        });
-                                        let popover_c = popover.downgrade();
-                                        let block_data_for_copy = block_data_for_export.clone();
-                                        let selected_ids_for_copy = selected_ids_for_menu.clone();
-                                        let vte_for_action = vte_for_copy.downgrade();
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let Some(vte_for_action) = vte_for_action.upgrade()
-                                            else {
-                                                return;
-                                            };
-                                            let selected = selected_ids_for_copy.borrow();
-                                            let blocks = block_data_for_copy.borrow();
-                                            let text = selected_clipboard_text(
-                                                blocks.iter(),
-                                                &selected,
-                                                |block| {
-                                                    block_clipboard_text(
-                                                        &block.cmd,
-                                                        &strip_ansi(&block.output),
-                                                        false,
-                                                    )
-                                                },
-                                            );
-                                            vte_for_action.clipboard().set_text(&text);
-                                        });
-                                        vbox.append(&item);
-                                    }
-
-                                    if has_selected_commands {
-                                        let item = make_item(if selected_count > 1 {
-                                            "Insert Commands at Prompt"
-                                        } else {
-                                            "Insert Command at Prompt"
-                                        });
-                                        let popover_c = popover.downgrade();
-                                        let finished_for_rerun = finished_blocks_for_menu.clone();
-                                        let selected_ids_for_rerun = selected_ids_for_menu.clone();
-                                        let selected_for_rerun = selected_for_menu.clone();
-                                        let anchor_for_rerun = anchor_for_menu.clone();
-                                        let pty_for_action = pty_for_rerun_menu.clone();
-                                        let pty_synced_for_action =
-                                            pty_synced_for_rerun_menu.clone();
-                                        let bracketed_for_action = bracketed_paste_for_menu.clone();
-                                        let typed_cmd_for_action = typed_cmd_for_rerun_menu.clone();
-                                        let bstate_for_action = bstate_for_rerun_menu.clone();
-                                        let active_for_action = active_for_rerun_menu.clone();
-                                        item.set_sensitive(command_recall_available(
-                                            bstate_for_rerun_menu.get(),
-                                        ));
-                                        item.set_tooltip_text(Some(
-                                            "Available when the shell prompt is ready",
-                                        ));
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let Some(finished_for_rerun) =
-                                                finished_for_rerun.upgrade()
-                                            else {
-                                                return;
-                                            };
-                                            let finished = finished_for_rerun.borrow();
-                                            let recalled = {
-                                                let selected = selected_ids_for_rerun.borrow();
-                                                recall_selected_commands_at_prompt(
-                                                    &pty_for_action,
-                                                    &pty_synced_for_action,
-                                                    &typed_cmd_for_action,
-                                                    bstate_for_action.get(),
-                                                    &finished,
-                                                    &selected,
-                                                    bracketed_for_action.get(),
-                                                )
-                                            };
-                                            if recalled {
-                                                clear_finished_block_selection(
-                                                    &finished,
-                                                    &selected_ids_for_rerun,
-                                                    &selected_for_rerun,
-                                                    &anchor_for_rerun,
-                                                );
-                                                if let Some(active_for_action) =
-                                                    active_for_action.upgrade()
-                                                {
-                                                    active_for_action.borrow().grab_focus();
-                                                }
-                                            }
-                                        });
-                                        vbox.append(&item);
-                                    }
-
-                                    {
-                                        let item = make_item("Scroll to Top of Block");
-                                        let popover_c = popover.downgrade();
-                                        let finished = finished_blocks_for_menu.clone();
-                                        let scroll = block_scroll_for_menu.clone();
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let (Some(finished), Some(scroll)) =
-                                                (finished.upgrade(), scroll.upgrade())
-                                            else {
-                                                return;
-                                            };
-                                            let finished = finished.borrow();
-                                            if let Some(block) =
-                                                finished.iter().find(|b| b.id == block_id)
-                                            {
-                                                block.scroll_to_edge(&scroll, false);
-                                            }
-                                        });
-                                        vbox.append(&item);
-                                    }
-                                    if long_output_for_menu {
-                                        let item = make_item("Jump to Bottom of Block");
-                                        let popover_c = popover.downgrade();
-                                        let finished = finished_blocks_for_menu.clone();
-                                        let scroll = block_scroll_for_menu.clone();
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let (Some(finished), Some(scroll)) =
-                                                (finished.upgrade(), scroll.upgrade())
-                                            else {
-                                                return;
-                                            };
-                                            let finished = finished.borrow();
-                                            if let Some(block) =
-                                                finished.iter().find(|b| b.id == block_id)
-                                            {
-                                                block.scroll_to_edge(&scroll, true);
-                                            }
-                                        });
-                                        vbox.append(&item);
-                                    }
-                                    {
-                                        let item = make_item("Toggle Output Filter");
-                                        let popover_c = popover.downgrade();
-                                        let finished = finished_blocks_for_menu.clone();
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let Some(finished) = finished.upgrade() else {
-                                                return;
-                                            };
-                                            let finished = finished.borrow();
-                                            if let Some(block) =
-                                                finished.iter().find(|b| b.id == block_id)
-                                            {
-                                                (block.toggle_filter)();
-                                            }
-                                        });
-                                        vbox.append(&item);
-                                    }
-                                    {
-                                        let bookmarked =
-                                            bookmarks_for_menu.borrow().contains(&block_id);
-                                        let item = make_item(if bookmarked {
-                                            "Remove Bookmark"
-                                        } else {
-                                            "Bookmark Block"
-                                        });
-                                        let popover_c = popover.downgrade();
-                                        let finished = finished_blocks_for_menu.clone();
-                                        let bookmarks = bookmarks_for_menu.clone();
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let Some(finished) = finished.upgrade() else {
-                                                return;
-                                            };
-                                            let finished = finished.borrow();
-                                            let Some(block) =
-                                                finished.iter().find(|b| b.id == block_id)
-                                            else {
-                                                return;
-                                            };
-                                            let mut marks = bookmarks.borrow_mut();
-                                            let now_bookmarked = if marks.remove(&block_id) {
-                                                false
-                                            } else {
-                                                marks.insert(block_id);
-                                                true
-                                            };
-                                            block.bookmark_star.set_visible(now_bookmarked);
-                                            if now_bookmarked {
-                                                block.widget().add_css_class("block-bookmarked");
-                                            } else {
-                                                block.widget().remove_css_class("block-bookmarked");
-                                            }
-                                        });
-                                        vbox.append(&item);
-                                    }
-
-                                    let separator =
-                                        gtk4::Separator::new(gtk4::Orientation::Horizontal);
-                                    vbox.append(&separator);
-
-                                    {
-                                        let item = make_item("Export as JSON");
-                                        let popover_c = popover.downgrade();
-                                        let block_data_for_json = block_data_for_export.clone();
-                                        let vte_for_json = vte_for_copy.downgrade();
-                                        let block_id_json = block_id;
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let Some(vte_for_json) = vte_for_json.upgrade() else {
-                                                return;
-                                            };
-                                            let blocks = block_data_for_json.borrow();
-                                            if let Some(block) =
-                                                blocks.iter().find(|b| b.id == block_id_json)
-                                            {
-                                                let json = block.to_json();
-                                                vte_for_json.clipboard().set_text(&json);
-                                            }
-                                        });
-                                        vbox.append(&item);
-                                    }
-
-                                    {
-                                        let item = make_item("Export as Markdown");
-                                        let popover_c = popover.downgrade();
-                                        let block_data_for_md = block_data_for_export.clone();
-                                        let vte_for_md = vte_for_copy.downgrade();
-                                        let block_id_md = block_id;
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let Some(vte_for_md) = vte_for_md.upgrade() else {
-                                                return;
-                                            };
-                                            let blocks = block_data_for_md.borrow();
-                                            if let Some(block) =
-                                                blocks.iter().find(|b| b.id == block_id_md)
-                                            {
-                                                let markdown = block.to_markdown();
-                                                vte_for_md.clipboard().set_text(&markdown);
-                                            }
-                                        });
-                                        vbox.append(&item);
-                                    }
-
-                                    {
-                                        let item = make_item("Delete Block");
-                                        let popover_c = popover.downgrade();
-                                        let finished_blocks_for_delete =
-                                            finished_blocks_for_menu.clone();
-                                        let block_list_for_delete = block_list_for_menu.clone();
-                                        let block_data_for_delete = block_data_for_export.clone();
-                                        let selected_ids_for_delete = selected_ids_for_menu.clone();
-                                        let selected_for_delete = selected_for_menu.clone();
-                                        let anchor_for_delete = anchor_for_menu.clone();
-                                        let bookmarks_for_delete = bookmarks_for_menu.clone();
-                                        let visible_for_delete = visible_for_menu.clone();
-                                        let block_id_del = block_id;
-                                        item.connect_clicked(move |_| {
-                                            popdown_if_alive(&popover_c);
-                                            let (
-                                                Some(finished_blocks_for_delete),
-                                                Some(block_list_for_delete),
-                                            ) = (
-                                                finished_blocks_for_delete.upgrade(),
-                                                block_list_for_delete.upgrade(),
-                                            )
-                                            else {
-                                                return;
-                                            };
-                                            let _ = remove_finished_block(
-                                                block_id_del,
-                                                &finished_blocks_for_delete,
-                                                &block_data_for_delete,
-                                                &block_list_for_delete,
-                                                BlockSelectionRefs {
-                                                    ids: &selected_ids_for_delete,
-                                                    active: &selected_for_delete,
-                                                    anchor: &anchor_for_delete,
-                                                },
-                                                &bookmarks_for_delete,
-                                                &visible_for_delete,
-                                            );
-                                        });
-                                        vbox.append(&item);
-                                    }
-
-                                    popover.set_child(Some(&vbox));
-                                    popover.connect_closed(move |p| {
-                                        p.unparent();
-                                    });
-                                    popover.popup();
-                                });
-                                finished_widget.add_controller(right_click);
+                                finished_block_menu.install(&finished_clone);
 
                                 install_finished_block_selection(
                                     &finished_clone,
@@ -2758,8 +2821,16 @@ impl ReaderCtx {
                                     widget_pool_for_cb.borrow_mut().release(widget_to_release);
                                 }
 
-                                while block_data_for_cb.borrow().len() > max_blocks {
-                                    block_data_for_cb.borrow_mut().pop_front();
+                                if block_data_for_cb.borrow().len() > max_blocks {
+                                    mutate_block_data_and_redraw(
+                                        &block_data_for_cb,
+                                        failure_marker_redraw.as_ref(),
+                                        |blocks| {
+                                            while blocks.len() > max_blocks {
+                                                blocks.pop_front();
+                                            }
+                                        },
+                                    );
                                 }
 
                                 let preserve = config_for_cb.borrow().preserve_live_scrollback;
@@ -3313,6 +3384,44 @@ fn compute_viewport_state(
     }
 }
 
+/// Scrollbar-track fractions for failed finished blocks, oldest first.
+///
+/// Forge's block canvas is widget-backed rather than terminal-row-backed, so
+/// the stable position is the cumulative virtual-scroll height. Those estimates
+/// converge to each card's real allocation as it enters the viewport. The marks
+/// are navigation hints, so that small off-screen approximation is preferable to
+/// realizing every block just to measure it. Keep the newest bounded set, in
+/// line with ember's bounded command marks and frost's bounded command zones.
+fn failed_block_marker_fractions(blocks: &VecDeque<BlockData>) -> Vec<f64> {
+    // This caps only the returned/painted marker count. Computing total-history
+    // geometry and finding the newest failures still deliberately scans every
+    // retained block, so each redraw is O(n) in `max_visible_blocks`.
+    const MAX_FAILURE_MARKERS: usize = 1024;
+
+    let total_height = blocks.iter().fold(0_u64, |total, block| {
+        total.saturating_add(block.estimated_height.max(1) as u64)
+    });
+    if total_height == 0 {
+        return Vec::new();
+    }
+
+    let mut top = 0_u64;
+    let mut markers = VecDeque::new();
+    for block in blocks {
+        if matches!(
+            BlockOutcome::classify(block.is_background(), block.exit_code),
+            BlockOutcome::Failure(_)
+        ) {
+            if markers.len() == MAX_FAILURE_MARKERS {
+                markers.pop_front();
+            }
+            markers.push_back((top as f64 / total_height as f64).clamp(0.0, 1.0));
+        }
+        top = top.saturating_add(block.estimated_height.max(1) as u64);
+    }
+    markers.into()
+}
+
 /// Convert GTK's scroll geometry into a usable block viewport.
 ///
 /// Notebook pages temporarily report a zero-sized adjustment while they are
@@ -3637,6 +3746,7 @@ struct KeyCtx {
     typed_cmd_for_key: Rc<RefCell<String>>,
     finished_blocks_for_key: Weak<RefCell<Vec<FinishedBlock>>>,
     block_data_for_key: Rc<RefCell<VecDeque<BlockData>>>,
+    failure_marker_redraw_for_key: FailureMarkerRedraw,
     block_list_for_key: glib::WeakRef<gtk4::Box>,
     selected_block_ids_for_key: SelectedBlockIds,
     selected_block_id_for_key: Rc<Cell<Option<u64>>>,
@@ -3657,6 +3767,7 @@ impl KeyCtx {
             typed_cmd_for_key,
             finished_blocks_for_key,
             block_data_for_key,
+            failure_marker_redraw_for_key,
             block_list_for_key,
             selected_block_ids_for_key,
             selected_block_id_for_key,
@@ -3844,7 +3955,10 @@ impl KeyCtx {
                     let next_id = remove_finished_block(
                         sel_id,
                         &finished_blocks_for_key,
-                        &block_data_for_key,
+                        BlockDataRefs {
+                            data: &block_data_for_key,
+                            marker_redraw: failure_marker_redraw_for_key.as_ref(),
+                        },
                         &block_list_for_key,
                         BlockSelectionRefs {
                             ids: &selected_block_ids_for_key,
@@ -4279,6 +4393,63 @@ impl TermView {
             Rc::new(RefCell::new(VecDeque::new()));
         let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
 
+        // Ember and frost paint failed commands on the total-history scrollbar.
+        // Do the same over GTK's native scrollbar: the DrawingArea never accepts
+        // input, so dragging/clicking the thumb continues to hit ScrolledWindow.
+        // Its colour comes from CSS and therefore follows live theme changes.
+        let failure_markers = gtk4::DrawingArea::new();
+        failure_markers.add_css_class("block-failure-markers");
+        failure_markers.set_content_width(10);
+        failure_markers.set_hexpand(false);
+        failure_markers.set_vexpand(true);
+        failure_markers.set_halign(gtk4::Align::End);
+        failure_markers.set_valign(gtk4::Align::Fill);
+        failure_markers.set_can_target(false);
+        {
+            let block_data = block_data_rc.clone();
+            let scroll = block_scroll.downgrade();
+            failure_markers.set_draw_func(move |area, cr, width, height| {
+                let Some(scroll) = scroll.upgrade() else {
+                    return;
+                };
+                let adjustment = scroll.vadjustment();
+                if width <= 0 || height <= 0 || adjustment.upper() <= adjustment.page_size() + 0.5 {
+                    return;
+                }
+
+                let color = area.color();
+                cr.set_source_rgba(
+                    color.red() as f64,
+                    color.green() as f64,
+                    color.blue() as f64,
+                    color.alpha() as f64,
+                );
+                const MARKER_HEIGHT: f64 = 3.0;
+                let span = (height as f64 - MARKER_HEIGHT).max(0.0);
+                let marker_width = f64::from(width.min(8));
+                let marker_x = f64::from(width) - marker_width;
+                for fraction in failed_block_marker_fractions(&block_data.borrow()) {
+                    cr.rectangle(marker_x, fraction * span, marker_width, MARKER_HEIGHT);
+                }
+                let _ = cr.fill();
+            });
+        }
+        scroll_overlay.add_overlay(&failure_markers);
+        let failure_marker_redraw: FailureMarkerRedraw = {
+            let failure_markers = failure_markers.downgrade();
+            Rc::new(move || {
+                if let Some(failure_markers) = failure_markers.upgrade() {
+                    failure_markers.queue_draw();
+                }
+            })
+        };
+        {
+            let redraw = failure_marker_redraw.clone();
+            block_scroll.vadjustment().connect_changed(move |_| {
+                redraw();
+            });
+        }
+
         // ── Hybrid live-surface layout ─────────────────────────────────────
         // Idle prompts use a compact visual cell so completed output exists only
         // once, in blocks above. Running commands and terminal apps receive the
@@ -4292,6 +4463,7 @@ impl TermView {
             let typed_cmd = typed_cmd.clone();
             let finished_for_layout = finished_blocks_rc.clone();
             let block_data_for_layout = block_data_rc.clone();
+            let failure_marker_redraw_for_layout = failure_marker_redraw.clone();
             let last_size_target: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
             // Change detector for the finished-block re-fit. Their cap follows
             // the scroll viewport's pixel height and the cell height (font
@@ -4360,12 +4532,17 @@ impl TermView {
                 if resized.is_empty() {
                     return;
                 }
-                let mut block_data = block_data_for_layout.borrow_mut();
-                for (id, height) in resized {
-                    if let Some(data) = block_data.iter_mut().find(|data| data.id == id) {
-                        data.estimated_height = height;
-                    }
-                }
+                mutate_block_data_and_redraw(
+                    &block_data_for_layout,
+                    failure_marker_redraw_for_layout.as_ref(),
+                    |block_data| {
+                        for (id, height) in resized {
+                            if let Some(data) = block_data.iter_mut().find(|data| data.id == id) {
+                                data.estimated_height = height;
+                            }
+                        }
+                    },
+                );
             })
         };
         // Coalesces follow-bottom pins so a burst of contents-changed signals
@@ -4449,6 +4626,14 @@ impl TermView {
         // DECSET 2004 state here so clipboard pastes can be forwarded as one
         // ordered byte stream instead of relying on VTE's unrelated PTY.
         let bracketed_paste: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        // The reader updates this on OSC 10/11/12; Undo Clear reads the same
+        // cell when rebuilding snapshot VTEs.
+        let dynamic_colors: DynamicColorsRc = Rc::new(Cell::new(DynamicColors::default()));
+        // TermView reloads and the long-lived finished-block reader must see
+        // one configuration object. In particular, resetting dynamic colors on
+        // a theme switch is only correct if the next finished card uses the new
+        // static theme rather than the constructor-time clone.
+        let config_rc = Rc::new(RefCell::new(config.clone()));
         // `None` until a CommandEnd reports one. A shell that sends the bare
         // FinalTerm `D` mark with no status leaves it None, which must not be
         // rendered as a success.
@@ -4583,7 +4768,7 @@ impl TermView {
         }
 
         // ── Wire PTY → parser → block events ─────────────────────────────
-        {
+        let finished_block_menu = {
             let active_rc = active.clone();
             let active_vte_rc = active_vte.clone();
             let bstate_rc = bstate.clone();
@@ -4600,7 +4785,7 @@ impl TermView {
             let activity_cbs = activity_callbacks.clone();
             let mouse_reporting_rc = mouse_reporting_mode.clone();
             let bracketed_paste_rc = bracketed_paste.clone();
-            let config_for_cb = Rc::new(RefCell::new(config.clone()));
+            let config_for_cb = config_rc.clone();
             let parser = Rc::new(RefCell::new(Parser::with_config(ParserConfig {
                 mouse_reporting: config.mouse_reporting_enabled,
                 focus_reporting: config.focus_reporting_enabled,
@@ -4627,6 +4812,25 @@ impl TermView {
 
             let event_buf: Rc<RefCell<Vec<ParserEvent>>> =
                 Rc::new(RefCell::new(Vec::with_capacity(32)));
+            let finished_block_menu = FinishedBlockMenu {
+                finished_blocks: Rc::downgrade(&finished_blocks_for_cb),
+                block_list: block_list_rc.downgrade(),
+                active_vte: active_vte_rc.downgrade(),
+                pty: pty_for_init.clone(),
+                pty_synced: pty_synced_rc.clone(),
+                active: Rc::downgrade(&active_rc),
+                bstate: bstate_rc.clone(),
+                bracketed_paste: bracketed_paste_rc.clone(),
+                typed_cmd: typed_cmd_rc.clone(),
+                selected_ids: selected_block_ids.clone(),
+                selected_id: selected_block_id.clone(),
+                anchor_id: selection_anchor_id.clone(),
+                bookmarks: block_bookmarks.clone(),
+                visible_indices: visible_indices_rc.clone(),
+                block_data: block_data_for_cb.clone(),
+                failure_marker_redraw: failure_marker_redraw.clone(),
+                block_scroll: block_scroll_rc.downgrade(),
+            };
             ReaderCtx {
                 active_rc,
                 active_vte: active_vte_rc,
@@ -4649,10 +4853,13 @@ impl TermView {
                 activity_cbs,
                 mouse_reporting_rc,
                 bracketed_paste_rc,
+                dynamic_colors_rc: dynamic_colors.clone(),
                 config_for_cb,
                 parser,
                 block_data_for_cb,
+                failure_marker_redraw: failure_marker_redraw.clone(),
                 finished_blocks_for_cb,
+                finished_block_menu: finished_block_menu.clone(),
                 scroll_debouncer: scroll_debouncer.clone(),
                 widget_pool_for_cb,
                 pty_synced_rc,
@@ -4681,7 +4888,11 @@ impl TermView {
                 selection_feed_hold: selection_feed_hold.clone(),
             }
             .install(&pty);
-        }
+
+            // Keep the same installer on the pane so Undo Clear can equip
+            // rebuilt blocks with the normal finished-block menu.
+            finished_block_menu
+        };
 
         // ── Scroll lock + jump-to-bottom FAB ──────────────────────────────
         // The block list virtualizes (off-screen finished blocks are hidden →
@@ -5142,6 +5353,7 @@ impl TermView {
                 typed_cmd_for_key,
                 finished_blocks_for_key,
                 block_data_for_key,
+                failure_marker_redraw_for_key: failure_marker_redraw.clone(),
                 block_list_for_key: block_list_for_key.downgrade(),
                 selected_block_ids_for_key,
                 selected_block_id_for_key,
@@ -5364,9 +5576,12 @@ impl TermView {
             activity_callbacks,
             mouse_reporting_mode,
             bracketed_paste,
-            config: Rc::new(RefCell::new(config.clone())),
+            dynamic_colors,
+            config: config_rc,
             block_data: block_data_rc,
+            failure_marker_redraw,
             finished_blocks: finished_blocks_rc,
+            finished_block_menu,
             widget_pool: widget_pool.clone(),
             viewport: Rc::new(RefCell::new(ViewportState {
                 first_visible: 0,
@@ -5378,6 +5593,7 @@ impl TermView {
             selected_block_id,
             selection_anchor_id,
             bookmarks: block_bookmarks,
+            cleared_stash: RefCell::new(ClearedBlocksStash::default()),
             find_state: Rc::new(RefCell::new(FindState::default())),
             current_cwd: current_cwd.clone(),
             session_id: session_id_owned,
@@ -5407,6 +5623,7 @@ impl TermView {
             let viewport = term_view.viewport.clone();
             let block_scroll = term_view.block_scroll.clone();
             let block_data = term_view.block_data.clone();
+            let failure_marker_redraw = term_view.failure_marker_redraw.clone();
             let config = term_view.config.clone();
             let finished_blocks = Rc::downgrade(&term_view.finished_blocks);
             let visible_indices = term_view.visible_indices.clone();
@@ -5434,6 +5651,7 @@ impl TermView {
                 let scroll = block_scroll.clone();
                 let finished = finished_blocks.clone();
                 let block_data = block_data.clone();
+                let failure_marker_redraw = failure_marker_redraw.clone();
                 let config = config.clone();
                 let visible = visible_indices.clone();
                 let fullscreen = fullscreen.clone();
@@ -5476,13 +5694,18 @@ impl TermView {
                     *vp.borrow_mut() = next_viewport;
 
                     let finished_ref = finished.borrow();
-                    let mut block_data_ref = block_data.borrow_mut();
                     let mut visible_ref = visible.borrow_mut();
-                    apply_visible_indices(
-                        &finished_ref,
-                        &mut block_data_ref,
-                        &mut visible_ref,
-                        new_visible,
+                    mutate_block_data_and_redraw(
+                        &block_data,
+                        failure_marker_redraw.as_ref(),
+                        |block_data| {
+                            apply_visible_indices(
+                                &finished_ref,
+                                block_data,
+                                &mut visible_ref,
+                                new_visible,
+                            );
+                        },
                     );
                 });
             });
@@ -5982,13 +6205,34 @@ impl TermView {
     }
 
     /// Remove every completed block and all block-indexed UI state.
-    pub fn clear_blocks(&self) {
+    ///
+    /// A contentful clear replaces the pane-local undo level. Clearing an
+    /// already empty pane deliberately preserves that level, so an accidental
+    /// double activation does not destroy the only recovery path.
+    pub fn clear_blocks(&self) -> usize {
         // A background load that completes after Clear must not resurrect the
         // just-deleted history, and its shutdown merge must not prepend it to
         // the empty replacement snapshot.
         self.history_load.discard();
         self.clear_find();
         self.active_vte.unselect_all();
+        self.cross_selection.clear_all();
+
+        let cleared_blocks: Vec<BlockData> = mutate_block_data_and_redraw(
+            &self.block_data,
+            self.failure_marker_redraw.as_ref(),
+            |blocks| blocks.drain(..).collect(),
+        );
+        let cleared_count =
+            self.cleared_stash
+                .borrow_mut()
+                .replace_if_nonempty(ClearedBlocksStash {
+                    blocks: cleared_blocks,
+                    bookmarks: self.bookmarks.borrow().clone(),
+                    selected_ids: self.selected_block_ids.borrow().clone(),
+                    active_id: self.selected_block_id.get(),
+                    anchor_id: self.selection_anchor_id.get(),
+                });
 
         let widgets: Vec<gtk4::Box> = self
             .finished_blocks
@@ -6003,7 +6247,6 @@ impl TermView {
         }
         drop(pool);
 
-        self.block_data.borrow_mut().clear();
         self.bookmarks.borrow_mut().clear();
         self.visible_indices.borrow_mut().clear();
         self.selected_block_ids.borrow_mut().clear();
@@ -6030,6 +6273,178 @@ impl TermView {
         if let Err(err) = self.save_history() {
             log::warn!("save cleared block history: {err}");
         }
+        cleared_count
+    }
+
+    /// Restore the most recently cleared blocks ahead of any blocks produced
+    /// since the clear. The stash is consumed only by a successful restore;
+    /// full-screen applications keep it intact until block mode is visible.
+    pub(crate) fn undo_clear_blocks(&self) -> UndoClearResult {
+        let max_blocks = self.config.borrow().max_visible_blocks as usize;
+        let capacity = max_blocks.saturating_sub(self.block_data.borrow().len());
+        let stash = match self
+            .cleared_stash
+            .borrow_mut()
+            .take_for_restore(self.fullscreen.get(), capacity)
+        {
+            Ok(stash) => stash,
+            Err(result) => return result,
+        };
+        let ClearedBlocksStash {
+            mut blocks,
+            bookmarks,
+            selected_ids,
+            active_id,
+            anchor_id,
+        } = stash;
+        let restored_count = blocks.len();
+
+        let restored_ids: HashSet<u64> = blocks.iter().map(|block| block.id).collect();
+        let fallback_cols = self.active.borrow().grid_cols() as i64;
+        {
+            let config = self.config.borrow();
+            for block in &mut blocks {
+                let cols = if block.cols > 0 {
+                    block.cols as i64
+                } else {
+                    fallback_cols
+                };
+                block.estimated_height = estimated_finished_block_height_for_text(
+                    &config,
+                    &block.cmd,
+                    &block.output,
+                    cols,
+                );
+            }
+        }
+
+        let sibling = self
+            .finished_blocks
+            .borrow()
+            .first()
+            .map(|block| block.widget().clone())
+            .unwrap_or_else(|| self.active.borrow().widget().clone());
+        let mut restored_widgets = Vec::with_capacity(restored_count);
+        {
+            let config = self.config.borrow();
+            for block in &blocks {
+                let cols = if block.cols > 0 {
+                    block.cols as i64
+                } else {
+                    fallback_cols
+                };
+                let recycled = self.widget_pool.borrow_mut().acquire();
+                let finished = FinishedBlock::new_with_pool(
+                    block.id,
+                    &block.prompt,
+                    &block.cmd,
+                    block.cmd_markup.as_deref(),
+                    &block.output,
+                    block.exit_code,
+                    &config,
+                    block.duration_ms,
+                    block.end_time_ms,
+                    block.cwd.as_deref(),
+                    cols,
+                    &[],
+                    recycled,
+                );
+                apply_dynamic_colors_to_finished(&finished, self.dynamic_colors.get());
+                let bookmarked = bookmarks.contains(&block.id);
+                finished.bookmark_star.set_visible(bookmarked);
+                if bookmarked {
+                    finished.widget().add_css_class("block-bookmarked");
+                }
+                finished
+                    .widget()
+                    .insert_before(&self.block_list, Some(&sibling));
+                finished.connect_actions(
+                    &self.active_vte,
+                    &self.pty,
+                    &self.pty_synced,
+                    &self.active,
+                    &self.typed_cmd,
+                    &self.bstate,
+                    &self.bracketed_paste,
+                );
+                finished.connect_scroll_forwarding(&self.block_scroll);
+                self.finished_block_menu.install(&finished);
+                install_finished_block_selection(
+                    &finished,
+                    &self.active,
+                    &self.finished_blocks,
+                    &self.selected_block_ids,
+                    &self.selected_block_id,
+                    &self.selection_anchor_id,
+                );
+                restored_widgets.push(finished);
+            }
+        }
+
+        mutate_block_data_and_redraw(
+            &self.block_data,
+            self.failure_marker_redraw.as_ref(),
+            |live| prepend_restored_block_data(live, blocks),
+        );
+        self.finished_blocks
+            .borrow_mut()
+            .splice(0..0, restored_widgets);
+        let shifted = self
+            .visible_indices
+            .borrow()
+            .iter()
+            .map(|index| index.saturating_add(restored_count))
+            .collect();
+        *self.visible_indices.borrow_mut() = shifted;
+
+        let ordered_ids: Vec<u64> = self
+            .finished_blocks
+            .borrow()
+            .iter()
+            .map(|block| block.id)
+            .collect();
+        let all_ids: HashSet<u64> = ordered_ids.iter().copied().collect();
+        self.bookmarks
+            .borrow_mut()
+            .extend(bookmarks.into_iter().filter(|id| restored_ids.contains(id)));
+        {
+            let mut selected = self.selected_block_ids.borrow_mut();
+            selected.retain(|id| all_ids.contains(id));
+            selected.extend(
+                selected_ids
+                    .into_iter()
+                    .filter(|id| restored_ids.contains(id)),
+            );
+            let (next_active, next_anchor) = restored_selection_edges(
+                &ordered_ids,
+                &selected,
+                self.selected_block_id.get(),
+                self.selection_anchor_id.get(),
+                active_id,
+                anchor_id,
+            );
+            self.selected_block_id.set(next_active);
+            self.selection_anchor_id.set(next_anchor);
+        }
+        {
+            let finished = self.finished_blocks.borrow();
+            sync_finished_block_selection(
+                &finished,
+                &self.selected_block_ids,
+                &self.selected_block_id,
+            );
+        }
+
+        self.block_list.queue_allocate();
+        self.update_viewport();
+        self.update_block_visibility();
+        if !self.user_scrolled_up.get() {
+            self.reveal_live_input();
+        }
+        if let Err(err) = self.save_history() {
+            log::warn!("save restored block history: {err}");
+        }
+        UndoClearResult::Restored(restored_count)
     }
 
     pub fn apply_failed_filter(&self) {
@@ -6104,6 +6519,10 @@ impl TermView {
 
     /// Apply updated theme colors to the block widgets and the live VTE.
     pub fn apply_theme(&self) {
+        // Applying a configured theme replaces any OSC 10/11/12 overrides on
+        // the live terminal, so future and Undo-restored snapshots must stop
+        // inheriting the old dynamic values as well.
+        self.dynamic_colors.set(DynamicColors::default());
         let config = self.config.borrow();
         apply_terminal_theme(&self.active_vte, &config);
         for block in self.finished_blocks.borrow().iter() {
@@ -6161,9 +6580,14 @@ impl TermView {
         let new_visible = visible_indices_for_viewport(&vp);
 
         let finished = self.finished_blocks.borrow();
-        let mut block_data = self.block_data.borrow_mut();
         let mut visible = self.visible_indices.borrow_mut();
-        apply_visible_indices(&finished, &mut block_data, &mut visible, new_visible);
+        mutate_block_data_and_redraw(
+            &self.block_data,
+            self.failure_marker_redraw.as_ref(),
+            |block_data| {
+                apply_visible_indices(&finished, block_data, &mut visible, new_visible);
+            },
+        );
     }
 
     /// Collect a snapshot of internal runtime state for the debug dashboard.
@@ -6277,7 +6701,10 @@ impl TermView {
         let _ = remove_finished_block(
             block_id,
             &self.finished_blocks,
-            &self.block_data,
+            BlockDataRefs {
+                data: &self.block_data,
+                marker_redraw: self.failure_marker_redraw.as_ref(),
+            },
             &self.block_list,
             BlockSelectionRefs {
                 ids: &self.selected_block_ids,
@@ -6354,15 +6781,17 @@ mod tests {
         background_output_has_visible_text, bounded_journal_output, build_clipboard_paste,
         build_command_recall, build_keyboard_query_reply, classify_command_prompt_status,
         coalesce_bytes_events, collapse_repaint_output, command_capture_range_is_bounded,
-        compute_viewport_state, format_color_query_reply, history_edge_navigation_available,
+        compute_viewport_state, failed_block_marker_fractions, format_color_query_reply,
+        history_edge_navigation_available, mutate_block_data_and_redraw,
         normalize_captured_command, normalize_loaded_block_ids, notification_allowed,
-        output_has_vertical_repaint, parse_color_spec, record_external_input,
-        resolve_command_for_block, resolve_submitted_command, scroll_delta_to_reveal,
-        selected_command_text, selected_id_range, should_buffer_background_output,
-        stable_visible_indices, strip_ansi, strip_ansi_with_clear_detect, take_background_output,
-        truncate_plain_output_for_height, viewport_page_size_changed, viewport_state_for_scroll,
-        visible_indices_for_viewport, vte_commit_shadow_rollback, BlockData, BlockState,
-        BoundedByteRing, CommandMeta, CommandPromptStatus, DynamicColors, PendingCommandMeta,
+        output_has_vertical_repaint, parse_color_spec, prepend_restored_block_data,
+        record_external_input, resolve_command_for_block, resolve_submitted_command,
+        restored_selection_edges, scroll_delta_to_reveal, selected_command_text, selected_id_range,
+        should_buffer_background_output, stable_visible_indices, strip_ansi,
+        strip_ansi_with_clear_detect, take_background_output, truncate_plain_output_for_height,
+        viewport_page_size_changed, viewport_state_for_scroll, visible_indices_for_viewport,
+        vte_commit_shadow_rollback, BlockData, BlockState, BoundedByteRing, ClearedBlocksStash,
+        CommandMeta, CommandPromptStatus, DynamicColors, PendingCommandMeta, UndoClearResult,
         ViewportState, MAX_COMMAND_CAPTURE_BYTES, MAX_JOURNAL_OUTPUT_BYTES,
         MAX_PROMPT_CAPTURE_BYTES, MAX_RAW_OUTPUT_BYTES, TRUNCATED_COMMAND_PLACEHOLDER,
     };
@@ -6976,6 +7405,131 @@ mod tests {
     }
 
     #[test]
+    fn clear_undo_stash_is_single_level_and_empty_clear_preserves_it() {
+        let mut stash = ClearedBlocksStash::default();
+        let mut first = block_with_height(10);
+        first.id = 11;
+        assert_eq!(
+            stash.replace_if_nonempty(ClearedBlocksStash {
+                blocks: vec![first],
+                bookmarks: HashSet::from([11]),
+                selected_ids: HashSet::from([11]),
+                active_id: Some(11),
+                anchor_id: Some(11),
+            }),
+            1
+        );
+
+        assert_eq!(stash.replace_if_nonempty(ClearedBlocksStash::default()), 0);
+        assert_eq!(
+            stash
+                .blocks
+                .iter()
+                .map(|block| block.id)
+                .collect::<Vec<_>>(),
+            [11]
+        );
+        assert_eq!(stash.bookmarks, HashSet::from([11]));
+        assert_eq!(stash.selected_ids, HashSet::from([11]));
+        assert_eq!(stash.active_id, Some(11));
+        assert_eq!(stash.anchor_id, Some(11));
+
+        let mut replacement = block_with_height(20);
+        replacement.id = 22;
+        assert_eq!(
+            stash.replace_if_nonempty(ClearedBlocksStash {
+                blocks: vec![replacement],
+                ..ClearedBlocksStash::default()
+            }),
+            1
+        );
+        assert_eq!(
+            stash
+                .blocks
+                .iter()
+                .map(|block| block.id)
+                .collect::<Vec<_>>(),
+            [22]
+        );
+    }
+
+    #[test]
+    fn clear_undo_prepends_restored_history_before_post_clear_blocks() {
+        let block = |id| {
+            let mut block = block_with_height(10);
+            block.id = id;
+            block
+        };
+        let mut live = VecDeque::from([block(30), block(40)]);
+
+        prepend_restored_block_data(&mut live, vec![block(10), block(20)]);
+
+        assert_eq!(
+            live.iter().map(|block| block.id).collect::<Vec<_>>(),
+            [10, 20, 30, 40]
+        );
+    }
+
+    #[test]
+    fn clear_undo_limit_keeps_newest_old_blocks_before_new_blocks() {
+        let block = |id| {
+            let mut block = block_with_height(10);
+            block.id = id;
+            block
+        };
+        let mut stash = ClearedBlocksStash {
+            blocks: vec![block(10), block(20), block(30)],
+            ..ClearedBlocksStash::default()
+        };
+
+        assert!(matches!(
+            stash.take_for_restore(true, 2),
+            Err(UndoClearResult::Fullscreen)
+        ));
+        assert_eq!(stash.blocks.len(), 3, "fullscreen must retain the stash");
+        assert!(matches!(
+            stash.take_for_restore(false, 0),
+            Err(UndoClearResult::AtCapacity)
+        ));
+        assert_eq!(stash.blocks.len(), 3, "a full timeline remains recoverable");
+
+        let restored = stash.take_for_restore(false, 2).unwrap();
+        let mut live = VecDeque::from([block(40), block(50)]);
+        prepend_restored_block_data(&mut live, restored.blocks);
+        assert_eq!(
+            live.iter().map(|block| block.id).collect::<Vec<_>>(),
+            [20, 30, 40, 50],
+            "max=4 keeps the newest combined suffix in old-to-new order"
+        );
+        assert!(
+            stash.blocks.is_empty(),
+            "a successful undo consumes the level"
+        );
+        assert!(matches!(
+            stash.take_for_restore(false, 2),
+            Err(UndoClearResult::Empty)
+        ));
+    }
+
+    #[test]
+    fn capacity_limited_undo_repairs_dropped_selection_edges_in_terminal_order() {
+        let ordered = [20, 30, 40];
+        let selected = HashSet::from([20, 30]);
+
+        assert_eq!(
+            restored_selection_edges(&ordered, &selected, None, None, Some(10), Some(10),),
+            (Some(30), Some(30)),
+            "the newest retained selected block becomes a valid active edge"
+        );
+
+        assert_eq!(
+            restored_selection_edges(&ordered, &selected, Some(20), Some(20), Some(30), Some(30),),
+            (Some(20), Some(20)),
+            "a valid post-clear selection edge takes precedence"
+        );
+    }
+
+    #[test]
     fn viewport_state_keeps_total_height_after_visible_range() {
         let blocks: VecDeque<BlockData> = [10, 20, 30, 40]
             .into_iter()
@@ -6987,6 +7541,69 @@ mod tests {
         assert_eq!(vp.first_visible, 1);
         assert_eq!(vp.last_visible, 2);
         assert_eq!(vp.total_height, 100);
+    }
+
+    #[test]
+    fn failed_block_markers_share_the_family_outcome_rules_and_canvas_positions() {
+        let mut blocks: VecDeque<BlockData> =
+            [10, 30, 60].into_iter().map(block_with_height).collect();
+        blocks[0].cmd = "ok".into();
+        blocks[1].cmd = "cargo test".into();
+        blocks[1].exit_code = Some(101);
+        blocks[2].cmd = "make check".into();
+        blocks[2].exit_code = Some(2);
+
+        assert_eq!(failed_block_marker_fractions(&blocks), vec![0.1, 0.4]);
+
+        // Unknown outcomes and commandless background output are not failures,
+        // even when the latter happens to carry a synthetic nonzero status.
+        blocks[1].exit_code = None;
+        blocks[2].cmd.clear();
+        assert!(failed_block_marker_fractions(&blocks).is_empty());
+    }
+
+    #[test]
+    fn failed_block_markers_keep_the_newest_bounded_set() {
+        let blocks: VecDeque<BlockData> = (0..1025)
+            .map(|_| {
+                let mut block = block_with_height(1);
+                block.cmd = "false".into();
+                block.exit_code = Some(1);
+                block
+            })
+            .collect();
+        let markers = failed_block_marker_fractions(&blocks);
+
+        assert_eq!(markers.len(), 1024);
+        assert!((markers[0] - (1.0 / 1025.0)).abs() < f64::EPSILON);
+        assert!(markers.last().is_some_and(|last| *last < 1.0));
+    }
+
+    #[test]
+    fn equal_geometry_block_mutation_redraws_after_releasing_the_history_borrow() {
+        // max_visible_blocks=1 can replace a failed card with a same-height
+        // successful card without changing vadjustment geometry. The explicit
+        // mutation hook must still let the overlay observe the new outcome.
+        let mut failure = block_with_height(40);
+        failure.cmd = "false".into();
+        failure.exit_code = Some(1);
+        let blocks = RefCell::new(VecDeque::from([failure]));
+        let redraw_count = Cell::new(0);
+        let observed_markers = RefCell::new(Vec::new());
+        let redraw = || {
+            redraw_count.set(redraw_count.get() + 1);
+            *observed_markers.borrow_mut() = failed_block_marker_fractions(&blocks.borrow());
+        };
+
+        mutate_block_data_and_redraw(&blocks, &redraw, |blocks| {
+            let mut success = block_with_height(40);
+            success.cmd = "true".into();
+            success.exit_code = Some(0);
+            blocks[0] = success;
+        });
+
+        assert_eq!(redraw_count.get(), 1);
+        assert!(observed_markers.borrow().is_empty());
     }
 
     #[test]

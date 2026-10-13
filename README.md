@@ -16,7 +16,7 @@ forge 是一个面向开发工作流的原生 GTK4 终端。它默认使用 Bloc
 - 配置热重载、可覆盖快捷键、8 套内置主题
 - CJK 输入法和 Unicode 安全的搜索/通知显示
 
-分屏会继承当前 pane 的后端：Block 创建 Block sibling，VTE 创建 VTE sibling，并可继续嵌套。每个可见 pane 都独立拥有并清理其进程，关闭 pane、标签或窗口前会统一检查前台任务。
+Block pane 分屏时保留原 Block controller 并创建轻量 VTE sibling；VTE pane 创建 VTE sibling，两者都可继续嵌套。每个可见 pane 都独立拥有并清理其进程，关闭 pane、标签或窗口前会统一检查前台任务。
 
 ## 构建与运行
 
@@ -239,6 +239,7 @@ jsh_update_check = "daily"    # "startup" 每次启动联网；"daily" 复用缓
 | Block 历史 / 跨块搜索 | `Ctrl+Shift+H` / `Ctrl+Shift+G` |
 | workflow / 失败块 / 最早块 | `Ctrl+Shift+M` / `Ctrl+Shift+X` / `Ctrl+Shift+N` |
 | 全选 / 回填 / 清空 Block | `Ctrl+Shift+A` / `Ctrl+Shift+I` / `Ctrl+Shift+K` |
+| 撤销清空 Block | 命令面板 `Undo clear blocks`（可自定义绑定） |
 | Block 过滤 / 书签 / 标签栏位置 | `Alt+Shift+F` / `Ctrl+Shift+B` / `Ctrl+Alt+B` |
 | AI 面板 / 询问选中块 | `Ctrl+Alt+Shift+A` / `Ctrl+Shift+Q` |
 | Shell Agent（Block） | `Ctrl+Alt+G` |
@@ -263,6 +264,8 @@ source <(forge --shell-integration bash)
 Block 模式与 anvil 保持相同的选择语义：`Ctrl+Up` 从最新块进入选择，`Shift+Up/Down`
 扩展范围，普通 `Up/Down` 移动 active edge，`Enter` 按终端顺序把所有选中命令回填为
 可编辑文本而不执行，`Escape` 取消选择。右键多选区域可批量复制命令、输出或完整块；长 Block 提供顶部/底部跳转与 sticky header，后台异步输出使用独立 Block 样式。
+清空完成后的 Toast 提供 **Undo**；也可从命令面板执行 `Undo clear blocks`，或用 `[keybindings].undo_clear_blocks` 自定义快捷键。撤销为每个 Pane 保留一级：旧块以原 ID 和历史顺序恢复到清空后新产生的块之前，并合并恢复原书签与块选择；`max_visible_blocks` 空间不足时保留合并时间线中最新的块。对空 Pane 再次清空不会覆盖这一级；全屏程序占用 Pane 或历史已满时会给出可重试提示，而不会误报 stash 为空。
+总历史滚动条会用主题红色短标记标出失败命令的大致位置，判定规则与失败块跳转一致：只有非空命令且已知非零退出码才算失败。
 
 后台输出只会在提示符空闲且用户尚未开始编辑时归入独立 Block；一旦输入开始，后续输出保持在当前终端中，避免把 shell 回显、补全或交互输出错误拆块。
 

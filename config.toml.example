@@ -136,6 +136,7 @@ ai_redact_secrets = true
 # select_all_blocks = "Ctrl+Shift+A"
 # reinput_selected_commands = "Ctrl+Shift+I"
 # clear_blocks = "Ctrl+Shift+K"
+# undo_clear_blocks = "Ctrl+Shift+Alt+U" # 默认通过命令面板或清空后的 Undo 按钮执行
 # toggle_tab_placement = "Ctrl+Alt+B"
 # Pane 焦点/尺寸默认同时绑定方向键和 vim 字母键两套 chord：
 # Ctrl+Alt+方向键 / Ctrl+Alt+H/J/K/L（GNOME 等桌面会抢占 Ctrl+Alt+方向键

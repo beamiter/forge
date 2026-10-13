@@ -119,6 +119,7 @@ terminal_mode = "block"
 | AI 分析选中块 | `Ctrl+Shift+Q` |
 | Shell Agent | `Ctrl+Alt+G` |
 | 全选 / 回填 / 清空 | `Ctrl+Shift+A` / `Ctrl+Shift+I` / `Ctrl+Shift+K` |
+| 撤销清空 | 清空 Toast 的 **Undo** 或命令面板 `Undo clear blocks` |
 
 选择语义与 anvil 对齐：
 
@@ -127,6 +128,7 @@ terminal_mode = "block"
 - `Ctrl+Shift+B` 收藏 active 块，`Ctrl+,` / `Ctrl+.` 在收藏块之间跳转。
 - 多选右键可批量复制命令、输出、完整块或回填命令；复制按界面顺序合并。
 - 长块提供顶部/底部导航与 sticky header，后台异步输出使用独立 Block 样式。
+- 清空为每个 Pane 保留一级撤销；旧块以原 ID 恢复到清空后新块之前，原书签和块选择会与新状态合并。恢复严格遵守 `max_visible_blocks`，空间不足时保留合并时间线中最新的块。命令面板动作可通过 `[keybindings].undo_clear_blocks` 绑定快捷键；空 Pane 上再次清空不会覆盖待恢复内容，全屏程序占用 Pane 或历史已满时会提示退出/腾出空间后重试。
 
 命令运行中或 alt-screen TUI 活跃时，Enter 和应用所需按键继续发送给前台进程，不会误触发旧块回填。
 

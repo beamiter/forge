@@ -64,6 +64,11 @@ impl UiState {
     /// Push the current behavioral configuration into every live Block pane,
     /// including panes nested under splits.
     pub(crate) fn sync_block_configs(&self) {
+        let config = self.config.borrow().clone();
+        self.for_each_block_view(|view| view.reload_config(&config));
+    }
+
+    fn for_each_block_view(&self, f: impl Fn(Rc<TermView>)) {
         for page in 0..self.notebook.n_pages() {
             let Some(widget) = self.notebook.nth_page(Some(page)) else {
                 continue;
@@ -73,7 +78,7 @@ impl UiState {
             };
             for leaf in node.leaves() {
                 if let Some(view) = leaf.block_view() {
-                    view.reload_config(&self.config.borrow());
+                    f(view);
                 }
             }
         }
@@ -130,7 +135,7 @@ impl UiState {
     }
 
     pub(crate) fn apply_colors_all(&self) {
-        let config = self.config.borrow();
+        let config = self.config.borrow().clone();
         let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
         self.for_each_terminal(|term| {
             term.set_colors(
@@ -142,7 +147,14 @@ impl UiState {
             term.set_color_cursor(Some(&config.cursor));
             term.set_color_cursor_foreground(Some(&config.cursor_foreground));
         });
-        drop(config);
+        // Generic terminal traversal also reaches Block snapshot VTEs, but it
+        // cannot reset the pane-shared OSC 10/11/12 tracker or reinstall Block
+        // CSS. Finish through the typed controller after synchronizing its
+        // config; this is the real Settings/config-reload theme path.
+        self.for_each_block_view(|view| {
+            view.reload_config(&config);
+            view.apply_theme();
+        });
         self.apply_dynamic_css();
     }
 

@@ -10,7 +10,10 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use vte4::TerminalExt;
 
-use super::{contains_case_insensitive, replace_finished_block_selection, BlockFilters, TermView};
+use super::{
+    contains_case_insensitive, replace_finished_block_selection, BlockFilters, BlockOutcome,
+    TermView,
+};
 
 /// One hit from a find-within-blocks pass. With VTE-backed blocks the match
 /// position lives inside the VTE itself (highlighted automatically by
@@ -140,9 +143,15 @@ impl TermView {
                     }
                 }
 
-                // Failed only filter. An unknown status is not a failure — it is
-                // not a success either, so it is simply not this filter's answer.
-                if filters.failed_only && !matches!(b.exit_code, Some(code) if code != 0) {
+                // Share one outcome rule with card chrome and scrollbar marks.
+                // Unknown status is not a failure, and commandless output stays
+                // Background even if a legacy/synthetic row carries a code.
+                if filters.failed_only
+                    && !matches!(
+                        BlockOutcome::classify(b.is_background(), b.exit_code),
+                        BlockOutcome::Failure(_)
+                    )
+                {
                     return false;
                 }
 
