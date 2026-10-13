@@ -458,6 +458,7 @@ impl UiState {
         // untouched, but make labels, buttons, and status text readable.
         let semantic = config.semantic_colors();
         let fg = &semantic.foreground;
+        let menu_css = crate::font::menu_theme_css(&config.font_desc, bg, fg);
         let br = (bg.red() * 255.0) as u8;
         let bg_g = (bg.green() * 255.0) as u8;
         let bb = (bg.blue() * 255.0) as u8;
@@ -515,6 +516,7 @@ impl UiState {
              .file-tree-header, .file-tree-header button, .file-tree-header label,
              .file-tree-root {{ color: rgb({fr},{fg_g},{fb}); }}
              .file-tree-root {{ opacity: 1.0; }}
+             {menu_css}
              .tab-strip-btn {{ color: rgb({mut_r},{mut_g},{mut_b}); }}
              .tab-strip-btn:checked {{ color: rgb({fr},{fg_g},{fb}); }}
              .tab-strip-btn.tab-marked {{ background-color: rgba({fr},{fg_g},{fb},0.2); font-weight: bold; }}
@@ -749,6 +751,8 @@ impl UiState {
                 leaf.terminal().set_font(Some(&font_desc));
             }
         }
+        // Existing popovers share the display provider and update in place.
+        self.apply_dynamic_css();
     }
 
     pub(crate) fn apply_scrollback_all(&self) {

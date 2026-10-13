@@ -52,6 +52,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    font::tests::context_menu_tracks_live_theme_and_font_without_parent_emphasis
     ui::dialogs::organism_preview::tests::preview_lifecycle_keeps_motion_local_and_stops_hidden_sources
     ui::organism::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers
     ui::bottom_bar::tests::long_status_segments_keep_compact_geometry_and_full_text

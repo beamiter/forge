@@ -1096,6 +1096,7 @@ impl UiState {
         context.connect_pressed(move |gesture, _, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
             let popover = gtk4::Popover::new();
+            popover.add_css_class("terminal-context-menu");
             popover.set_parent(&button_for_context);
             popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             popover.set_has_arrow(false);
@@ -1182,7 +1183,10 @@ impl UiState {
                 }
             });
             menu.append(&close);
-            popover.set_child(Some(&menu));
+            popover.set_child(Some(&crate::context_menu::scrolled_content(
+                &menu,
+                &button_for_context,
+            )));
             popover.connect_closed(|popover| popover.unparent());
             popover.popup();
         });
@@ -2339,6 +2343,7 @@ impl UiState {
                 .collect();
 
             let popover = gtk4::Popover::new();
+            popover.add_css_class("terminal-context-menu");
             popover.set_parent(&strip_btn_for_ctx);
             popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             popover.set_has_arrow(false);
@@ -2546,7 +2551,10 @@ impl UiState {
                 vbox.append(&item);
             }
 
-            popover.set_child(Some(&vbox));
+            popover.set_child(Some(&crate::context_menu::scrolled_content(
+                &vbox,
+                &strip_btn_for_ctx,
+            )));
 
             // Clean up the parent reference when the popover closes
             popover.connect_closed(move |p| {
