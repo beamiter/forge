@@ -568,22 +568,7 @@ impl AgentRuntime {
             return;
         }
         let state = self.session.borrow().state();
-        let pulse = match state {
-            // An idle session awaiting instruction is not "working"; staying
-            // silent here also keeps panel open/close toggles from pumping
-            // alternating phases past the dedup.
-            AgentState::Ready => None,
-            AgentState::AwaitingModel | AgentState::AwaitingObservation { .. } => {
-                Some(jterm_core::organism::AgentPulse::Working)
-            }
-            AgentState::AwaitingApproval { .. } => {
-                Some(jterm_core::organism::AgentPulse::AskingReview)
-            }
-            AgentState::Completed | AgentState::TurnLimitReached => {
-                Some(jterm_core::organism::AgentPulse::Finished)
-            }
-            AgentState::Cancelled => Some(jterm_core::organism::AgentPulse::Gone),
-        };
+        let pulse = jterm_core::organism::agent_state_pulse(state, false);
         if let Some(pulse) = pulse {
             self.organism_agent.note_phase(pulse);
         }

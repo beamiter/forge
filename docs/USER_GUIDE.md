@@ -122,7 +122,10 @@ pane。关闭会立即收起身体、卡片和该 pane 的动画定时器；重�
 打断工作专注。Agent、纠错和命令面板的程序化写入不会伪装成真人输入。alternate screen
 和放不下完整 sprite 的窄小 surface 会直接隐藏空间身体，结果仍保留在 prompt
 上方的 inline widget。图层不参与 GTK 测量、不改变 PTY 行列、不可点击，也不向
-PTY 注入 ANSI；VTE pane 不显示。
+PTY 注入 ANSI。传统 VTE pane 使用独立的中性伴随体，默认紧凑显示；命令面板中的
+**Expand VTE neutral companion** / **Collapse VTE neutral companion** 可展开或收起它。
+该形态不感知命令或 alternate screen，不显示命令反应，也不提供 live Say hello；
+Settings 中的离线预览仍可使用。
 
 在可见的静息身体旁停留指针约 600ms，它会轻轻抬头回应约 2 秒；同一窗口的分屏共享
 8 秒冷却。点击与拖选仍交给终端，身体不接管键盘或焦点。真实输入、命令开始、切 pane、
@@ -245,7 +248,8 @@ tooltip，避免日常界面长期暴露 `E72 M62 …` 这一类调试仪表盘�
 
 同一窗口现在只有一具完整空间身体：它属于当前真正获焦的本地 Block pane；其他
 pane 仍保留自己的 inline 事件卡和 sticky 微姿态，但不再各自游走。焦点落到搜索、
-对话框、VTE/远程 pane，或窗口失活时，live body 会全部撤下；切回本地 Block 后先
+对话框、VTE/远程 pane，或窗口失活时，Block 的 live body 会撤下；传统 VTE 的
+中性伴随体使用自己的焦点与显示条件。切回本地 Block 后先
 重新测量再出现。切 tab、分屏关闭、zoom 和 alternate screen 都沿用同一弱引用
 仲裁，不搬运 GTK widget，也不会让旧 pane 从 rmcup 恢复一个过期位置。
 Notebook 切页会在 signal 当下先撤销旧 owner，待 GTK 提交新页后再认领，因此切换
