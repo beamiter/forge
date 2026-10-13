@@ -433,7 +433,7 @@ impl UiState {
     }
 
     pub(crate) fn apply_colors_all(&self) {
-        let config = self.config.borrow();
+        let config = self.config.borrow().clone();
         let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
         self.for_each_terminal(|term| {
             term.set_colors(
@@ -445,7 +445,14 @@ impl UiState {
             term.set_color_cursor(Some(&config.cursor));
             term.set_color_cursor_foreground(Some(&config.cursor_foreground));
         });
-        drop(config);
+        // Complete explicit theme changes through the typed controller too:
+        // snapshot VTE traversal cannot reset its OSC color tracker or CSS.
+        for leaf in self.configuration_leaves() {
+            if let Some(view) = leaf.block_view() {
+                view.reload_config(&config);
+                view.apply_theme();
+            }
+        }
         self.apply_dynamic_css();
     }
 
@@ -1203,6 +1210,29 @@ mod tests {
             .split_once("\n    }")
             .unwrap()
             .0;
+        let reset = paint
+            .find("self.dynamic_colors.set(Default::default());")
+            .unwrap();
+        let recolor = paint
+            .find("apply_terminal_theme(&self.active_vte, &config)")
+            .unwrap();
+        assert!(
+            reset < recolor,
+            "explicit themes retire the old OSC color overrides"
+        );
+        let broadcast = production
+            .split_once("pub(crate) fn apply_colors_all(&self) {")
+            .unwrap()
+            .1
+            .split_once("\n    }")
+            .unwrap()
+            .0;
+        assert!(broadcast.contains("self.config.borrow().clone()"));
+        assert!(broadcast.contains("self.configuration_leaves()"));
+        assert!(
+            broadcast.find("view.reload_config(&config);").unwrap()
+                < broadcast.find("view.apply_theme();").unwrap()
+        );
         assert!(paint.contains("let config = self.config.borrow();"));
         assert!(paint.contains("apply_terminal_theme(&self.active_vte, &config)"));
         assert!(paint.contains("install_block_css(&config)"));

@@ -2270,6 +2270,17 @@ impl BookmarkState {
         now_bookmarked
     }
 
+    /// Merge restored membership without resurrecting bookmarks for evicted cards.
+    fn restore_retained(&mut self, saved: HashSet<u64>, retained: &HashSet<u64>) {
+        let mut changed = false;
+        for id in saved.into_iter().filter(|id| retained.contains(id)) {
+            changed |= self.ids.insert(id);
+        }
+        if changed {
+            self.bump_revision();
+        }
+    }
+
     fn remove(&mut self, id: u64) -> bool {
         let removed = self.ids.remove(&id);
         if removed {
@@ -2310,6 +2321,48 @@ fn prune_retired_bookmarks(bookmarks: &mut BookmarkState, retired_ids: &[u64]) -
     bookmarks.remove_all(retired_ids.iter().copied())
 }
 
+/// UI state owned by the last nonempty Clear, kept in the shared removal slot.
+#[derive(Default)]
+struct ClearedBlocksStash {
+    blocks: Vec<BlockData>,
+    bookmarks: HashSet<u64>,
+    selected_ids: HashSet<u64>,
+    active_id: Option<u64>,
+    anchor_id: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UndoClearResult {
+    Restored(usize),
+    Empty,
+    Fullscreen,
+    AtCapacity,
+}
+
+/// Repair selection edges after a capacity-limited Undo drops older selected
+/// blocks. A valid post-clear edge wins, then a retained stashed edge; if both
+/// disappeared, use the newest selected block in terminal order and keep the
+/// anchor synchronized so a non-empty selection never has no active edge.
+fn restored_selection_edges(
+    ordered_ids: &[u64],
+    selected: &HashSet<u64>,
+    current_active: Option<u64>,
+    current_anchor: Option<u64>,
+    stashed_active: Option<u64>,
+    stashed_anchor: Option<u64>,
+) -> (Option<u64>, Option<u64>) {
+    let retained = |id: u64| selected.contains(&id);
+    let active = current_active
+        .filter(|id| retained(*id))
+        .or_else(|| stashed_active.filter(|id| retained(*id)))
+        .or_else(|| ordered_ids.iter().rev().copied().find(|id| retained(*id)));
+    let anchor = current_anchor
+        .filter(|id| retained(*id))
+        .or_else(|| stashed_anchor.filter(|id| retained(*id)))
+        .or(active);
+    (active, anchor)
+}
+
 /// What the last removal took, and therefore how Undo has to put it back.
 ///
 /// Clear-all removes a prefix (everything), so restoring is a prepend and the
@@ -2318,15 +2371,45 @@ fn prune_retired_bookmarks(bookmarks: &mut BookmarkState, retired_ids: &[u64]) -
 /// belongs — document order is id order, since ids are minted monotonically and
 /// restored history is renumbered into the same sequence.
 enum RemovedBlocks {
-    Cleared(Vec<BlockData>),
+    Cleared(ClearedBlocksStash),
     Deleted(Vec<BlockData>),
 }
 
 impl RemovedBlocks {
     fn len(&self) -> usize {
         match self {
-            Self::Cleared(blocks) | Self::Deleted(blocks) => blocks.len(),
+            Self::Cleared(stash) => stash.blocks.len(),
+            Self::Deleted(blocks) => blocks.len(),
         }
+    }
+
+    fn replace_if_nonempty(slot: &mut Option<Self>, next: Self) -> usize {
+        let count = next.len();
+        if count > 0 {
+            *slot = Some(next);
+        }
+        count
+    }
+
+    /// A refused Clear undo must not consume the shared removal slot. Delete
+    /// keeps its existing insertion-and-retention behavior even at capacity.
+    fn take_for_restore(
+        slot: &mut Option<Self>,
+        fullscreen: bool,
+        clear_capacity: usize,
+    ) -> Result<Self, UndoClearResult> {
+        if fullscreen {
+            return Err(UndoClearResult::Fullscreen);
+        }
+        match slot.as_ref() {
+            None => return Err(UndoClearResult::Empty),
+            Some(removed) if removed.len() == 0 => return Err(UndoClearResult::Empty),
+            Some(Self::Cleared(_)) if clear_capacity == 0 => {
+                return Err(UndoClearResult::AtCapacity);
+            }
+            _ => {}
+        }
+        Ok(slot.take().expect("checked removal slot"))
     }
 }
 
@@ -17337,6 +17420,9 @@ impl TermView {
             log::debug!("render backend has no mutable Block document to clear");
             return 0;
         }
+        // Retire the cross-card drag before widgets leave the document. This
+        // also releases held PTY output before we snapshot the removal.
+        self.cross_selection.clear_all();
         // A background load that completes after Clear must not resurrect the
         // just-deleted history, and its shutdown merge must not prepend it to
         // the empty replacement snapshot.
@@ -17362,7 +17448,13 @@ impl TermView {
             self.failure_marker_redraw.as_ref(),
             |blocks| blocks.drain(..).collect(),
         );
-        let cleared_count = self.stash_removed_blocks(RemovedBlocks::Cleared(cleared));
+        let cleared_count = self.stash_removed_blocks(RemovedBlocks::Cleared(ClearedBlocksStash {
+            blocks: cleared,
+            bookmarks: self.bookmarks.borrow().iter().copied().collect(),
+            selected_ids: self.selected_block_ids.borrow().clone(),
+            active_id: self.selected_block_id.get(),
+            anchor_id: self.selection_anchor_id.get(),
+        }));
         self.bookmarks.borrow_mut().clear();
         self.visible_indices.borrow_mut().clear();
         self.selected_block_ids.borrow_mut().clear();
@@ -17517,39 +17609,68 @@ impl TermView {
     /// An empty removal leaves the previous entry alone, so a no-op Clear on an
     /// already-empty pane cannot silently discard a real undo.
     fn stash_removed_blocks(&self, removed: RemovedBlocks) -> usize {
-        let count = removed.len();
-        if count > 0 {
-            *self.removed_blocks.borrow_mut() = Some(removed);
-        }
-        count
+        RemovedBlocks::replace_if_nonempty(&mut self.removed_blocks.borrow_mut(), removed)
     }
 
-    /// Put the most recent removal back — a Clear generation or a Delete,
-    /// whichever happened last. The slot is intentionally single-level.
+    /// Compatibility count for callers that do not display refusal reasons.
     pub fn undo_clear_blocks(&self) -> usize {
-        // Alt-screen applications own the pane. Refusing must leave the stash
-        // intact so Undo still works after the application exits.
-        if self.fullscreen.get() {
-            return 0;
+        match self.undo_clear_blocks_result() {
+            UndoClearResult::Restored(count) => count,
+            _ => 0,
         }
-        let removed = self.removed_blocks.borrow_mut().take();
-        let mut restored = match removed {
-            Some(RemovedBlocks::Cleared(blocks)) => blocks,
-            Some(RemovedBlocks::Deleted(blocks)) => return self.restore_deleted_blocks(blocks),
-            None => return 0,
-        };
-        if restored.is_empty() {
-            return 0;
-        }
-        // Undo inserts restored cards and may evict a live prefix. Invalidate
-        // index-based search metadata before either structural change.
-        self.clear_find();
+    }
 
+    /// Restore the most recent Clear or Delete without consuming a refused undo.
+    pub(crate) fn undo_clear_blocks_result(&self) -> UndoClearResult {
+        if self.fullscreen.get() {
+            return UndoClearResult::Fullscreen;
+        }
+        if !self.supports_block_mutation() {
+            return UndoClearResult::Empty;
+        }
         let max_blocks = self.config.borrow().max_visible_blocks as usize;
         let retention_plan = {
+            let removed = self.removed_blocks.borrow();
+            let restored = match removed.as_ref() {
+                Some(RemovedBlocks::Cleared(stash)) => stash.blocks.as_slice(),
+                _ => &[],
+            };
             let finished = self.finished_blocks.borrow();
-            plan_completed_block_retention_with_restored(&restored, &finished, max_blocks)
+            plan_completed_block_retention_with_restored(restored, &finished, max_blocks)
         };
+        let clear_capacity = {
+            let removed = self.removed_blocks.borrow();
+            match removed.as_ref() {
+                Some(RemovedBlocks::Cleared(stash)) if max_blocks > 0 => stash
+                    .blocks
+                    .len()
+                    .saturating_sub(retention_plan.evict_prefix),
+                _ => 0,
+            }
+        };
+        let removed = match RemovedBlocks::take_for_restore(
+            &mut self.removed_blocks.borrow_mut(),
+            self.fullscreen.get(),
+            clear_capacity,
+        ) {
+            Ok(removed) => removed,
+            Err(result) => return result,
+        };
+        let ClearedBlocksStash {
+            blocks: mut restored,
+            bookmarks,
+            selected_ids,
+            active_id,
+            anchor_id,
+        } = match removed {
+            RemovedBlocks::Cleared(stash) => stash,
+            RemovedBlocks::Deleted(blocks) => {
+                return UndoClearResult::Restored(self.restore_deleted_blocks(blocks));
+            }
+        };
+        // Invalidate index-based search metadata before structural changes.
+        self.clear_find();
+
         log_completed_block_retention("restoring cleared blocks", retention_plan);
         let restored_evictions = retention_plan.evict_prefix.min(restored.len());
         restored.drain(..restored_evictions);
@@ -17634,6 +17755,15 @@ impl TermView {
                 finished.set_output_notice(
                     block.output_notice.as_deref().and_then(known_output_notice),
                 );
+                // Bookmark revisions notify pickers, not card chrome. Rebuilt
+                // widgets need their star and CSS restored explicitly.
+                let bookmarked = bookmarks.contains(&block.id);
+                finished.bookmark_star.set_visible(bookmarked);
+                if bookmarked {
+                    finished.widget().add_css_class("block-bookmarked");
+                } else {
+                    finished.widget().remove_css_class("block-bookmarked");
+                }
                 apply_dynamic_colors_to_finished(&finished, self.dynamic_colors.get());
                 finished
                     .widget()
@@ -17643,6 +17773,7 @@ impl TermView {
             }
         }
 
+        let restored_ids: HashSet<u64> = restored.iter().map(|block| block.id).collect();
         let restored_len = restored.len();
         mutate_block_data_and_redraw(
             &self.block_data,
@@ -17659,6 +17790,45 @@ impl TermView {
             .map(|index| index.saturating_add(restored_len))
             .collect();
         *self.visible_indices.borrow_mut() = shifted;
+
+        let ordered_ids: Vec<u64> = self
+            .finished_blocks
+            .borrow()
+            .iter()
+            .map(|block| block.id)
+            .collect();
+        let all_ids: HashSet<u64> = ordered_ids.iter().copied().collect();
+        self.bookmarks
+            .borrow_mut()
+            .restore_retained(bookmarks, &restored_ids);
+        {
+            let mut selected = self.selected_block_ids.borrow_mut();
+            selected.retain(|id| all_ids.contains(id));
+            selected.extend(
+                selected_ids
+                    .into_iter()
+                    .filter(|id| restored_ids.contains(id)),
+            );
+            let (next_active, next_anchor) = restored_selection_edges(
+                &ordered_ids,
+                &selected,
+                self.selected_block_id.get(),
+                self.selection_anchor_id.get(),
+                active_id,
+                anchor_id,
+            );
+            self.selected_block_id.set(next_active);
+            self.selection_anchor_id.set(next_anchor);
+        }
+        {
+            let finished = self.finished_blocks.borrow();
+            sync_finished_block_selection(
+                &finished,
+                &self.selected_block_ids,
+                &self.selected_block_id,
+            );
+        }
+
         if let Some(kind) = self.block_filter.get() {
             let _ = self.apply_block_filter(kind);
         } else {
@@ -17672,7 +17842,7 @@ impl TermView {
         if let Err(err) = self.save_history() {
             log::warn!("save restored block history: {err}");
         }
-        restored_len
+        UndoClearResult::Restored(restored_len)
     }
 
     /// Whether a card belongs in the stream under `kind`.
@@ -17878,6 +18048,7 @@ impl TermView {
 
     /// Apply updated theme colors to the block widgets and the live VTE.
     pub fn apply_theme(&self) {
+        self.dynamic_colors.set(Default::default());
         let config = self.config.borrow();
         apply_terminal_theme(&self.active_vte, &config);
         for block in self.finished_blocks.borrow().iter() {
@@ -20873,8 +21044,53 @@ mod tests {
             .drain_test_slave(std::time::Duration::from_millis(10))
             .is_empty());
         view.pending_typeahead.set(false);
+        let selected_before_clear = view.selected_block_ids.borrow().clone();
+        let active_before_clear = view.selected_block_id.get();
+        let anchor_before_clear = view.selection_anchor_id.get();
+        let bookmarked_id = view.finished_blocks.borrow()[0].id;
+        if !view.bookmarks.borrow().contains(bookmarked_id) {
+            view.bookmarks.borrow_mut().toggle(bookmarked_id);
+        }
         assert_eq!(view.clear_blocks(), 3);
+        assert_eq!(
+            view.clear_blocks(),
+            0,
+            "empty Clear preserves the undo level"
+        );
+        view.fullscreen.set(true);
+        assert_eq!(
+            view.undo_clear_blocks_result(),
+            super::UndoClearResult::Fullscreen
+        );
+        view.fullscreen.set(false);
+        let limit = view.config.borrow().max_visible_blocks;
+        view.config.borrow_mut().max_visible_blocks = 0;
+        assert_eq!(
+            view.undo_clear_blocks_result(),
+            super::UndoClearResult::AtCapacity
+        );
+        view.config.borrow_mut().max_visible_blocks = limit;
         assert_eq!(view.undo_clear_blocks(), 3);
+        assert_eq!(*view.selected_block_ids.borrow(), selected_before_clear);
+        assert_eq!(view.selected_block_id.get(), active_before_clear);
+        assert_eq!(view.selection_anchor_id.get(), anchor_before_clear);
+        assert!(view.bookmarks.borrow().contains(bookmarked_id));
+        {
+            let finished = view.finished_blocks.borrow();
+            let bookmarked = finished
+                .iter()
+                .find(|card| card.id == bookmarked_id)
+                .unwrap();
+            assert!(bookmarked.bookmark_star.is_visible());
+            assert!(bookmarked.widget().has_css_class("block-bookmarked"));
+            for card in finished
+                .iter()
+                .filter(|card| !view.bookmarks.borrow().contains(card.id))
+            {
+                assert!(!card.bookmark_star.is_visible());
+                assert!(!card.widget().has_css_class("block-bookmarked"));
+            }
+        }
         settle();
         let restored = view
             .finished_blocks
@@ -24174,6 +24390,130 @@ mod tests {
             command_truncated: false,
             output_notice: None,
         }
+    }
+
+    #[test]
+    fn clear_undo_preserves_state_and_refused_or_empty_removals() {
+        use super::{ClearedBlocksStash, RemovedBlocks, UndoClearResult};
+        let mut block = block_with_height(10);
+        block.id = 11;
+        let mut slot = None;
+        assert_eq!(
+            RemovedBlocks::replace_if_nonempty(
+                &mut slot,
+                RemovedBlocks::Cleared(ClearedBlocksStash {
+                    blocks: vec![block],
+                    bookmarks: HashSet::from([11]),
+                    selected_ids: HashSet::from([11]),
+                    active_id: Some(11),
+                    anchor_id: Some(11),
+                }),
+            ),
+            1
+        );
+        assert_eq!(
+            RemovedBlocks::replace_if_nonempty(
+                &mut slot,
+                RemovedBlocks::Cleared(ClearedBlocksStash::default()),
+            ),
+            0
+        );
+        assert!(matches!(
+            RemovedBlocks::take_for_restore(&mut slot, true, 1),
+            Err(UndoClearResult::Fullscreen)
+        ));
+        assert!(matches!(
+            RemovedBlocks::take_for_restore(&mut slot, false, 0),
+            Err(UndoClearResult::AtCapacity)
+        ));
+        let RemovedBlocks::Cleared(stash) =
+            RemovedBlocks::take_for_restore(&mut slot, false, 1).unwrap()
+        else {
+            panic!("Clear must keep its kind and UI state");
+        };
+        assert_eq!(stash.blocks[0].id, 11);
+        assert_eq!(stash.bookmarks, HashSet::from([11]));
+        assert_eq!(stash.selected_ids, HashSet::from([11]));
+        assert_eq!(stash.active_id, Some(11));
+        assert_eq!(stash.anchor_id, Some(11));
+        assert!(slot.is_none());
+        assert!(matches!(
+            RemovedBlocks::take_for_restore(&mut slot, false, 1),
+            Err(UndoClearResult::Empty)
+        ));
+    }
+
+    #[test]
+    fn delete_undo_still_replaces_clear_and_restores_at_clear_capacity() {
+        use super::{ClearedBlocksStash, RemovedBlocks, UndoClearResult};
+        let mut slot = Some(RemovedBlocks::Cleared(ClearedBlocksStash {
+            blocks: vec![block_with_height(10)],
+            ..ClearedBlocksStash::default()
+        }));
+        assert_eq!(
+            RemovedBlocks::replace_if_nonempty(
+                &mut slot,
+                RemovedBlocks::Deleted(vec![block_with_height(20)]),
+            ),
+            1
+        );
+        assert!(matches!(
+            RemovedBlocks::take_for_restore(&mut slot, true, 0),
+            Err(UndoClearResult::Fullscreen)
+        ));
+        assert!(matches!(
+            RemovedBlocks::take_for_restore(&mut slot, false, 0),
+            Ok(RemovedBlocks::Deleted(_))
+        ));
+        assert!(slot.is_none());
+    }
+
+    #[test]
+    fn restored_bookmarks_merge_new_state_and_exclude_evicted_cards() {
+        let mut bookmarks = super::BookmarkState::default();
+        bookmarks.toggle(40);
+        let revision = bookmarks.revision();
+        bookmarks.restore_retained(HashSet::from([10, 20, 30]), &HashSet::from([20, 30]));
+        assert_eq!(bookmarks.ids, HashSet::from([20, 30, 40]));
+        assert_eq!(bookmarks.revision(), revision + 1);
+        bookmarks.restore_retained(HashSet::from([10, 20]), &HashSet::from([20, 30]));
+        assert_eq!(
+            bookmarks.revision(),
+            revision + 1,
+            "unchanged membership is quiet"
+        );
+    }
+
+    #[test]
+    fn restored_selection_keeps_new_edges_and_repairs_evicted_old_edges() {
+        let ordered = [20, 30, 40];
+        let selected = HashSet::from([20, 30, 40]);
+        assert_eq!(
+            super::restored_selection_edges(
+                &ordered,
+                &selected,
+                Some(40),
+                Some(40),
+                Some(20),
+                Some(30),
+            ),
+            (Some(40), Some(40))
+        );
+        assert_eq!(
+            super::restored_selection_edges(&ordered, &selected, None, None, Some(10), Some(10),),
+            (Some(40), Some(40))
+        );
+        assert_eq!(
+            super::restored_selection_edges(
+                &ordered,
+                &HashSet::new(),
+                None,
+                None,
+                Some(10),
+                Some(10),
+            ),
+            (None, None)
+        );
     }
 
     #[test]

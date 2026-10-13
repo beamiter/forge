@@ -480,6 +480,7 @@ AI / Agent / 命令面板的建议仍然只 **Insert for review**，永不自行
 `Delete` 删除**整个选区**（不只是 active edge），并且可撤销：命令面板里的
 **Undo removing blocks** 把它们放回按 id 该在的位置——即使期间又跑过新命令，删掉的块也回到
 中间而不是被塞到最前面。撤销槽是单级的：一次新的移除（删除或清空）会替换掉上一次。
+清空后的 Toast 提供 **Undo**；清空恢复会把仍保留的旧块书签和多选状态与新状态合并。空 Pane 再次清空不会覆盖撤销槽。全屏程序占用 Pane 或历史容量不足时会保留撤销槽并提示重试，Toast 的 **Undo** 也仍可用。
 **Show only failed blocks** / **Show only slow blocks** / **Show only bookmarked blocks** 会真正
 收窄块流：不匹配的卡片被隐藏且不再占据虚拟画布高度（滚动条随之变短），选择用的方向键会跳过
 它们，过滤期间新完成的命令若不匹配也不会冒出来；**Show all blocks** 恢复全部。被信号停止的

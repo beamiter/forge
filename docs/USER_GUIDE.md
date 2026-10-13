@@ -437,6 +437,7 @@ Block Search 4.2 新增 **Bookmarked** 元数据筛选。它与 Failed、Slow、
 - `Delete` 删除整个选区，一次按键即可移除用 `Shift+Up/Down` 建立的整段范围；命令面板中的
   **Undo removing blocks** 把它们放回按 id 该在的位置，因此期间新跑的命令不会把恢复的块挤到
   最前面。撤销槽是单级的：删除和清空共用它，新的一次移除会替换上一次。
+- 清空后的 Toast 提供 **Undo**，也可用命令面板 **Undo removing blocks**；恢复会合并仍保留的旧书签和多选状态。空 Pane 重复清空不会覆盖撤销槽，全屏程序占用 Pane 或历史容量不足时会保留撤销并提示重试。
 - **Show only failed blocks** / **Show only slow blocks**（≥1s）/ **Show only bookmarked blocks**
   把块流收窄到匹配的卡片：不匹配的被隐藏且不再占据虚拟画布高度，`Up/Down` 选择会跳过它们，
   `Ctrl+Shift+A` 只选中可见的，过滤期间新完成且不匹配的命令也不会出现。**Show all blocks** 恢复

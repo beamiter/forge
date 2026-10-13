@@ -10,13 +10,43 @@ use vte4::Terminal;
 use vte4::TerminalExt;
 
 use super::*;
-use crate::block_view::{RecordNavigationResult, SessionExportFormat, TermView};
+use crate::block_view::{RecordNavigationResult, SessionExportFormat, TermView, UndoClearResult};
 use crate::keybindings::{Action, Direction};
 use crate::terminal::terminal_working_directory;
 
 const MIN_AI_PANEL_WIDTH: i32 = 240;
 const MAX_AI_PANEL_WIDTH: i32 = 1200;
 const MIN_AI_WORKSPACE_WIDTH: i32 = 200;
+
+fn cleared_blocks_message(count: usize) -> Option<String> {
+    (count > 0).then(|| {
+        let plural = if count == 1 { "" } else { "s" };
+        format!("Cleared {count} block{plural}.")
+    })
+}
+
+fn undo_clear_message(result: UndoClearResult) -> String {
+    match result {
+        UndoClearResult::Restored(count) => {
+            let plural = if count == 1 { "" } else { "s" };
+            format!("Restored {count} removed block{plural}.")
+        }
+        UndoClearResult::Empty => "No removed blocks to restore.".to_string(),
+        UndoClearResult::Fullscreen => {
+            "Exit the full-screen app before restoring removed blocks.".to_string()
+        }
+        UndoClearResult::AtCapacity => {
+            "History retention limits prevent restoration. Undo is still available.".to_string()
+        }
+    }
+}
+
+fn undo_clear_is_retryable(result: UndoClearResult) -> bool {
+    matches!(
+        result,
+        UndoClearResult::Fullscreen | UndoClearResult::AtCapacity
+    )
+}
 
 fn apply_ai_panel_width(paned: &gtk4::Paned, requested_width: u32) {
     let total_width = paned.width();
@@ -69,6 +99,37 @@ fn record_navigation_toast(result: RecordNavigationResult) -> Option<&'static st
         RecordNavigationResult::Navigated
         | RecordNavigationResult::NoMatchingRecord
         | RecordNavigationResult::SnapshotView { .. } => None,
+    }
+}
+
+/// AdwToast retires its action button and dismisses the old toast after the
+/// click signal. A retry needs a fresh toast, not a reset of the old object's
+/// timeout. Both callbacks retain only weak references to their pane/window.
+fn show_clear_undo_toast(
+    overlay: &adw::ToastOverlay,
+    term_view: std::rc::Weak<TermView>,
+    message: &str,
+) {
+    let toast = adw::Toast::new(message);
+    toast.set_button_label(Some("Undo"));
+    toast.set_timeout(8);
+    let overlay = overlay.downgrade();
+    let retry_overlay = overlay.clone();
+    toast.connect_button_clicked(move |_| {
+        let result = term_view.upgrade().map_or(UndoClearResult::Empty, |view| {
+            view.undo_clear_blocks_result()
+        });
+        let message = undo_clear_message(result);
+        if let Some(overlay) = retry_overlay.upgrade() {
+            if undo_clear_is_retryable(result) {
+                show_clear_undo_toast(&overlay, term_view.clone(), &message);
+            } else {
+                overlay.add_toast(adw::Toast::new(&message));
+            }
+        }
+    });
+    if let Some(overlay) = overlay.upgrade() {
+        overlay.add_toast(toast);
     }
 }
 
@@ -396,12 +457,12 @@ impl UiState {
                 log::info!("Clear finished blocks");
                 if let Some(term_view) = self.current_term_view() {
                     let count = term_view.clear_blocks();
-                    if count > 0 {
-                        let plural = if count == 1 { "" } else { "s" };
-                        let message = format!(
-                            "Cleared {count} block{plural} — \"Undo removing blocks\" restores them."
+                    if let Some(message) = cleared_blocks_message(count) {
+                        show_clear_undo_toast(
+                            &self.toast_overlay,
+                            Rc::downgrade(&term_view),
+                            &message,
                         );
-                        self.toast_overlay.add_toast(adw::Toast::new(&message));
                     } else if !term_view.supports_block_mutation() {
                         // In Block, "nothing to clear" is self-evident from an
                         // empty pane. In Unified the pane is full of output
@@ -438,13 +499,8 @@ impl UiState {
             Action::UndoClearBlocks => {
                 log::info!("Undo clear finished blocks");
                 if let Some(term_view) = self.current_term_view() {
-                    let count = term_view.undo_clear_blocks();
-                    let message = if count == 0 {
-                        "No removed blocks to restore.".to_string()
-                    } else {
-                        let plural = if count == 1 { "" } else { "s" };
-                        format!("Restored {count} removed block{plural}.")
-                    };
+                    let result = term_view.undo_clear_blocks_result();
+                    let message = undo_clear_message(result);
                     self.toast_overlay.add_toast(adw::Toast::new(&message));
                 }
             }
@@ -820,10 +876,11 @@ impl UiState {
 #[cfg(test)]
 mod tests {
     use super::{
-        ai_panel_width_from_geometry, record_navigation_toast, remote_host_index_for_action,
-        restored_ai_panel_position,
+        ai_panel_width_from_geometry, cleared_blocks_message, record_navigation_toast,
+        remote_host_index_for_action, restored_ai_panel_position, undo_clear_is_retryable,
+        undo_clear_message,
     };
-    use crate::block_view::RecordNavigationResult;
+    use crate::block_view::{RecordNavigationResult, UndoClearResult};
 
     #[test]
     fn ai_panel_geometry_preserves_workspace_and_clamps_configured_limits() {
@@ -868,5 +925,42 @@ mod tests {
             None,
             "the snapshot dialog, not a toast, answers this result"
         );
+    }
+
+    #[test]
+    fn clear_block_toasts_cover_empty_singular_and_plural_results() {
+        assert_eq!(cleared_blocks_message(0), None);
+        assert_eq!(
+            cleared_blocks_message(1).as_deref(),
+            Some("Cleared 1 block.")
+        );
+        assert_eq!(
+            cleared_blocks_message(2).as_deref(),
+            Some("Cleared 2 blocks.")
+        );
+        assert_eq!(
+            undo_clear_message(UndoClearResult::Empty),
+            "No removed blocks to restore."
+        );
+        assert_eq!(
+            undo_clear_message(UndoClearResult::Fullscreen),
+            "Exit the full-screen app before restoring removed blocks."
+        );
+        assert_eq!(
+            undo_clear_message(UndoClearResult::AtCapacity),
+            "History retention limits prevent restoration. Undo is still available."
+        );
+        assert_eq!(
+            undo_clear_message(UndoClearResult::Restored(1)),
+            "Restored 1 removed block."
+        );
+        assert_eq!(
+            undo_clear_message(UndoClearResult::Restored(2)),
+            "Restored 2 removed blocks."
+        );
+        assert!(undo_clear_is_retryable(UndoClearResult::Fullscreen));
+        assert!(undo_clear_is_retryable(UndoClearResult::AtCapacity));
+        assert!(!undo_clear_is_retryable(UndoClearResult::Empty));
+        assert!(!undo_clear_is_retryable(UndoClearResult::Restored(1)));
     }
 }
