@@ -593,17 +593,20 @@ impl VteOrganismSurface {
     /// Qualification only, no Pango extents or requisition measurement in the
     /// after-paint observer. GTK owns candidate font/CSS measurement itself.
     fn geometry_signature(&self) -> Vec<u64> {
-        if !self.expanded.get() {
-            return Vec::new();
-        }
         let mut signature = Vec::new();
         if let Some(clip) = self.clipped_geometry(&self.presentation_widget()) {
             for value in [clip.x(), clip.y(), clip.width(), clip.height()] {
                 signature.push(u64::from(value.to_bits()));
             }
         }
-        if let (Some(root), Some(widgets)) = (self.root.upgrade(), self.expanded_widgets()) {
-            for label in &widgets.labels {
+        if let Some(root) = self.root.upgrade() {
+            let widgets = self.expanded_widgets();
+            let labels: &[gtk4::Label] = if self.expanded.get() {
+                widgets.as_ref().map_or(&[], |widgets| &widgets.labels)
+            } else {
+                std::slice::from_ref(&self.glyph)
+            };
+            for label in labels {
                 signature.push(u64::from(label.pango_context().serial()));
                 signature.push(u64::from(label.layout().serial()));
                 let (x, y) = label.layout_offsets();
@@ -612,7 +615,7 @@ impl VteOrganismSurface {
             }
             // Include every ancestor, even when its changed clip has the same
             // final intersection. No opacity or paint state enters this stamp.
-            let mut ancestor = Some(widgets.slot.clone().upcast::<gtk4::Widget>());
+            let mut ancestor = Some(self.presentation_widget());
             while let Some(widget) = ancestor {
                 Self::append_geometry_stamp(&widget, &root, &mut signature);
                 ancestor = widget.parent();
@@ -652,9 +655,13 @@ impl VteOrganismSurface {
         let full = widgets
             .as_ref()
             .and_then(|widgets| self.candidate_union(&widgets.labels[..2]));
-        let fallback = widgets
-            .as_ref()
-            .and_then(|widgets| self.candidate_union(&widgets.labels[2..]));
+        let fallback = if self.expanded.get() {
+            widgets
+                .as_ref()
+                .and_then(|widgets| self.candidate_union(&widgets.labels[2..]))
+        } else {
+            self.candidate_bounds(&self.glyph)
+        };
         presentation::plan(
             self.expanded.get(),
             admitted,
@@ -797,6 +804,19 @@ impl VteOrganismSurface {
             .last_input
             .get()
             .is_some_and(|at| now.saturating_sub(at) < HUMAN_INPUT_RETREAT);
+        // Measure the exact next compact pose before permitting any paint.
+        if !self.expanded.get() {
+            // Idle is only the renderer's neutral pose here, never evidence
+            // about the shell. The semantic label states the capability limit.
+            let context = RenderContext::new(Behavior::Idle, BodyLanguage::default(), false);
+            let frame = sticky_glyph_with_context(context, neutral_frame(self.motion.get(), now));
+            if self.glyph.text().as_str() != frame.as_ref() {
+                self.glyph.set_text(frame.as_ref());
+            }
+        }
+        if !self.current_refresh(&refresh_ticket) {
+            return;
+        }
         let plan = self.paint_plan(eligible, retreat);
         if self.expanded.get() {
             self.paint_expanded(
@@ -814,22 +834,9 @@ impl VteOrganismSurface {
         if !self.current_refresh(&refresh_ticket) {
             return;
         }
-        if !self.expanded.get() && eligible && !retreat {
-            // Idle is only the renderer's neutral pose here, never evidence
-            // about the shell. The semantic label states the capability limit.
-            let context = RenderContext::new(Behavior::Idle, BodyLanguage::default(), false);
-            let frame = sticky_glyph_with_context(context, neutral_frame(self.motion.get(), now));
-            if self.glyph.text().as_str() != frame.as_ref() {
-                self.glyph.set_text(frame.as_ref());
-            }
-        }
-        if !self.current_refresh(&refresh_ticket) {
-            return;
-        }
         let signature = self.geometry_signature();
         *self.geometry_stamp.borrow_mut() = signature;
-        let wake_eligible = eligible
-            && (!self.expanded.get() || self.paint_plan(eligible, false).paint != Paint::Hidden);
+        let wake_eligible = eligible && self.paint_plan(eligible, false).paint != Paint::Hidden;
         if let Some(delay) =
             neutral_wake(wake_eligible, self.motion.get(), now, self.last_input.get())
         {
@@ -1426,6 +1433,70 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
                 .iter()
                 .any(|label| label.opacity() == 1.0)
     });
+    // The same native horizontal fixture also tests compact partial ink.
+    assert!(runtime.set_expanded(false));
+    settle_native("compact horizontal allocation settled");
+    let compact_size = (
+        runtime.row.measure(gtk4::Orientation::Horizontal, -1),
+        runtime.row.measure(gtk4::Orientation::Vertical, -1),
+    );
+    let mut saw_partial_compact = false;
+    for position in (11..paned.max_position()).rev() {
+        paned.set_position(position);
+        settle_native("compact partial allocation settled");
+        if runtime.drawable_geometry() && runtime.paint_plan(true, false).paint == Paint::Hidden {
+            saw_partial_compact = true;
+            for motion in [
+                OrganismMotion::Full,
+                OrganismMotion::Calm,
+                OrganismMotion::Static,
+            ] {
+                runtime.apply_settings(true, motion);
+                settle_native("compact partial settings settled");
+                assert_eq!(runtime.paint_plan(true, false).paint, Paint::Hidden);
+                assert_eq!(runtime.glyph.opacity(), 0.0);
+                assert!(runtime.source.borrow().is_none());
+                assert!(runtime.row.is_mapped());
+                assert!(!runtime.expanded.get());
+                assert_eq!(
+                    compact_size,
+                    (
+                        runtime.row.measure(gtk4::Orientation::Horizontal, -1),
+                        runtime.row.measure(gtk4::Orientation::Vertical, -1)
+                    )
+                );
+            }
+            for _ in 0..3 {
+                clock.emit_by_name::<()>("after-paint", &[]);
+                assert!(runtime.geometry_idle.borrow().is_none());
+                assert_eq!(runtime.glyph.opacity(), 0.0);
+            }
+            break;
+        }
+    }
+    assert!(
+        saw_partial_compact,
+        "compact positive intersection must still require complete ink"
+    );
+    runtime.apply_settings(true, OrganismMotion::Full);
+    assert!(runtime.source.borrow().is_none());
+    paned.set_position(10);
+    settle_native("compact horizontal recovery settled");
+    wait("compact Full recovery without manual refresh", &|| {
+        runtime.paint_plan(true, false).paint == Paint::Compact
+            && runtime.glyph.opacity() == 1.0
+            && runtime.source.borrow().is_some()
+    });
+    assert_eq!(
+        compact_size,
+        (
+            runtime.row.measure(gtk4::Orientation::Horizontal, -1),
+            runtime.row.measure(gtk4::Orientation::Vertical, -1)
+        )
+    );
+    runtime.apply_settings(true, OrganismMotion::Static);
+    assert!(runtime.set_expanded(true));
+    settle_native("expanded state restored before original cleanup");
     drop(paint_observer);
     paned.set_orientation(gtk4::Orientation::Vertical);
     paned.set_position(10);
@@ -2072,6 +2143,37 @@ fn exercise_expanded_fixture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_native_path_checks_exact_pose_and_observes_passive_recovery() {
+        let source = include_str!("organism_vte.rs");
+        let production = source
+            .split("#[cfg(test)]\npub(super) fn exercise_existing_native_fixture")
+            .next()
+            .unwrap();
+        let refresh = production.split("    fn refresh(").nth(1).unwrap();
+        assert!(
+            refresh.find("self.glyph.set_text").unwrap()
+                < refresh.find("let plan = self.paint_plan").unwrap()
+        );
+        assert!(
+            refresh.find("self.bind_paint(eligible)").unwrap()
+                < refresh.find("let drawable =").unwrap()
+        );
+        assert!(refresh.contains("let wake_eligible = eligible && self.paint_plan(eligible, false).paint != Paint::Hidden"));
+        let stamp = production
+            .split("    fn geometry_signature(")
+            .nth(1)
+            .unwrap()
+            .split("    fn append_geometry_stamp(")
+            .next()
+            .unwrap();
+        assert!(stamp.contains("std::slice::from_ref(&self.glyph)"));
+        assert!(!stamp.contains(".opacity("));
+        assert!(!stamp.contains(".set_opacity("));
+        assert!(production.contains("self.candidate_bounds(&self.glyph)"));
+        assert!(source.contains("compact Full recovery without manual refresh"));
+    }
 
     #[test]
     fn neutral_motion_preserves_full_frames_and_static_modes() {

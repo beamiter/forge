@@ -92,7 +92,14 @@ pub(super) fn plan(
     let paint = if !admitted || retreat {
         Paint::Hidden
     } else if !expanded {
-        Paint::Compact
+        if clip
+            .zip(fallback)
+            .is_some_and(|(clip, body)| clip.contains(body))
+        {
+            Paint::Compact
+        } else {
+            Paint::Hidden
+        }
     } else if reservation.is_none() {
         Paint::Hidden
     } else if clip
@@ -153,9 +160,50 @@ mod tests {
         )
     }
     #[test]
+    fn compact_requires_complete_ink_and_logical_fit() {
+        let body = rect(50.0);
+        for clip in [
+            rect(49.5),
+            Rect { x: 0.5, ..body },
+            Rect {
+                height: 29.5,
+                ..body
+            },
+            Rect { y: 0.5, ..body },
+        ] {
+            assert_eq!(
+                plan(false, true, false, None, Some(clip), None, Some(body)),
+                Plan {
+                    paint: Paint::Hidden,
+                    reservation: None
+                }
+            );
+        }
+        assert_eq!(
+            plan(false, true, false, None, Some(body), None, Some(body)),
+            Plan {
+                paint: Paint::Compact,
+                reservation: None
+            }
+        );
+        assert_eq!(
+            plan(false, true, false, None, None, None, Some(body)).paint,
+            Paint::Hidden
+        );
+    }
+
+    #[test]
     fn compact_has_no_new_reservation() {
         assert_eq!(
-            plan(false, true, false, None, None, None, None),
+            plan(
+                false,
+                true,
+                false,
+                None,
+                Some(rect(50.0)),
+                None,
+                Some(rect(50.0))
+            ),
             Plan {
                 paint: Paint::Compact,
                 reservation: None
