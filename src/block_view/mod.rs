@@ -31544,8 +31544,22 @@ mod tests {
                         assert!(!view.active_vte.is_mapped());
                         view.active_vte.set_visible(true);
                         assert!(view.active_vte.is_mapped());
+                        // Mapping may synchronously restore this same terminal.
+                        // Reject any unrelated owner, then recreate the empty
+                        // focus precondition so the queued idle must do the work.
+                        let remapped_owner = GtkWindowExt::focus(&window);
+                        assert!(
+                            remapped_owner.as_ref().is_none_or(|owner| {
+                                owner == view.active_vte.upcast_ref::<gtk4::Widget>()
+                            }),
+                            "{mode:?}: remap selected another owner (alt_exit={alt_exit}): {remapped_owner:?}"
+                        );
+                        GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
                     }
-                    assert!(GtkWindowExt::focus(&window).is_none());
+                    assert!(
+                        GtkWindowExt::focus(&window).is_none(),
+                        "{mode:?}: fixture must clear focus before idle (alt_exit={alt_exit}, remap={remap})"
+                    );
                     drain_native_focus_idle();
                     assert!(
                         view.active_vte.has_focus(),
@@ -31642,19 +31656,26 @@ mod tests {
                 .default_height(480)
                 .child(&other_root)
                 .build();
-            window.present();
+            // The source must own global input focus before each strict
+            // has_focus admission check; the destination only tests rooting.
             other_window.present();
+            window.present();
             replay_native_focus_bytes(&view, b"\x1b]133;A\x07$ \x1b]133;B\x07");
             chat_display_settle();
             for alt_exit in [false, true] {
                 queue_native_focus_transition(&view, alt_exit);
-                view.root.set_visible(false);
                 GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+                view.root.set_visible(false);
                 drain_native_focus_idle();
                 assert!(!view.active_vte.has_focus(), "{mode:?}: hidden target");
                 view.root.set_visible(true);
 
                 queue_native_focus_transition(&view, alt_exit);
+                // GTK defers focused-widget removal cleanup until after paint.
+                // Establish None before detaching so only our pending request
+                // can change it while this fixture drains ready idle sources.
+                GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+                assert!(GtkWindowExt::focus(&window).is_none());
                 root.remove(&view.root);
                 drain_native_focus_idle();
                 assert!(view.active_vte.root().is_none());
@@ -31662,6 +31683,7 @@ mod tests {
                 root.append(&view.root);
 
                 queue_native_focus_transition(&view, alt_exit);
+                GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
                 root.remove(&view.root);
                 other_root.append(&view.root);
                 // Returning to the original root must not resurrect a request
@@ -31716,6 +31738,8 @@ mod tests {
         super::restore_live_focus_deferred(&target);
         let weak_target = target.downgrade();
         let weak_window = window.downgrade();
+        GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+        assert!(GtkWindowExt::focus(&window).is_none());
         root.remove(&target);
         window.destroy();
         drop(target);
