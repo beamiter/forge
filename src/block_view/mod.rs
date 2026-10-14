@@ -31477,6 +31477,138 @@ mod tests {
         window.close();
     }
 
+    fn assert_tab_switch_keeps_search_focus(mode: crate::config::TerminalMode) {
+        use gtk4::prelude::*;
+        gtk4::init().unwrap();
+        let views = Rc::new([
+            chat_display_view(mode.clone()),
+            chat_display_view(mode.clone()),
+        ]);
+        let notebook = gtk4::Notebook::new();
+        for view in views.iter() {
+            notebook.append_page(&view.root, None::<&gtk4::Widget>);
+        }
+        let entry = gtk4::SearchEntry::new();
+        let search = gtk4::SearchBar::new();
+        search.set_child(Some(&entry));
+        search.connect_entry(&entry);
+        let layout = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        layout.append(&search);
+        layout.append(&notebook);
+        let window = gtk4::Window::builder()
+            .default_width(640)
+            .default_height(480)
+            .child(&layout)
+            .build();
+        let generation = Rc::new(Cell::new(0_u64));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        for (index, view) in views.iter().enumerate() {
+            let events = events.clone();
+            view.active_vte
+                .connect_map(move |_| events.borrow_mut().push(format!("map:{index}")));
+        }
+        let views_for_switch = views.clone();
+        let search_for_switch = search.clone();
+        let entry_for_switch = entry.clone();
+        let events_for_switch = events.clone();
+        notebook.connect_switch_page(move |notebook, _, page| {
+            let view = &views_for_switch[page as usize];
+            crate::app::focus_switched_page(
+                &search_for_switch,
+                &entry_for_switch,
+                || generation.set(generation.get().wrapping_add(1)),
+                || {
+                    events_for_switch
+                        .borrow_mut()
+                        .push(format!("search:{page}"))
+                },
+                || Some(view.active_vte.clone()),
+                |terminal| {
+                    view.reveal_live_input();
+                    generation.set(generation.get().wrapping_add(1));
+                    let entry = entry_for_switch.clone();
+                    crate::app::queue_tab_terminal_focus(
+                        notebook,
+                        generation.clone(),
+                        generation.get(),
+                        terminal,
+                        page,
+                        search_for_switch.clone(),
+                        move || {
+                            entry.grab_focus();
+                        },
+                    );
+                },
+            );
+        });
+        window.present();
+        chat_display_settle();
+        // Visit both pages first. The regression is an existing tab remap,
+        // not initial terminal creation or a synthetic visibility toggle.
+        for page in [1_u32, 0] {
+            notebook.set_current_page(Some(page));
+            chat_display_settle();
+            assert!(views[page as usize].active_vte.is_mapped());
+            assert!(
+                views[page as usize].active_vte.has_focus(),
+                "{mode:?}: ordinary switch must focus page {page}"
+            );
+        }
+        search.set_search_mode(true);
+        chat_display_settle();
+        assert!(entry.grab_focus());
+        let search_owns_focus = || {
+            GtkWindowExt::focus(&window).is_some_and(|owner| {
+                owner == entry.clone().upcast::<gtk4::Widget>() || owner.is_ancestor(&entry)
+            })
+        };
+        assert!(
+            search_owns_focus(),
+            "search entry must own focus before switching"
+        );
+        for page in [1_u32, 0] {
+            assert!(
+                !views[page as usize].active_vte.is_mapped(),
+                "destination must begin unmapped"
+            );
+            events.borrow_mut().clear();
+            notebook.set_current_page(Some(page));
+            chat_display_settle();
+            assert!(views[page as usize].active_vte.is_mapped());
+            let observed = events.borrow();
+            assert!(
+                observed.contains(&format!("search:{page}")),
+                "production search branch was not reached: {observed:?}"
+            );
+            assert!(
+                observed.contains(&format!("map:{page}")),
+                "native terminal did not remap: {observed:?}"
+            );
+            eprintln!("{mode:?} page {page} switch/map ordering: {observed:?}");
+            assert!(search_owns_focus(), "{mode:?}: search lost focus after existing-tab switch; events={observed:?}, owner={:?}", GtkWindowExt::focus(&window));
+        }
+        search.set_search_mode(false);
+        notebook.set_current_page(Some(1));
+        chat_display_settle();
+        assert!(
+            views[1].active_vte.has_focus(),
+            "closing search must permit ordinary terminal focus"
+        );
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn existing_block_tab_switch_preserves_global_search_focus() {
+        assert_tab_switch_keeps_search_focus(crate::config::TerminalMode::Block);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn existing_unified_tab_switch_preserves_global_search_focus() {
+        assert_tab_switch_keeps_search_focus(crate::config::TerminalMode::Unified);
+    }
+
     /// Replay through the installed hold/parser/ReaderCtx/backend pipeline
     /// synchronously, so the caller can move focus before its queued idle.
     fn replay_native_focus_bytes(view: &super::TermView, bytes: &[u8]) {

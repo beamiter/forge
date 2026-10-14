@@ -246,48 +246,91 @@ impl UiState {
         page_num: u32,
     ) {
         let generation = self.invalidate_tab_focus_requests();
-        let notebook_for_focus = self.notebook.clone();
         let ui_for_focus = self.clone();
-        let focus_generation = self.tab_focus_generation.clone();
-        let frame_count = Cell::new(0u8);
-        let stable_frames = Cell::new(0u8);
-        self.notebook.add_tick_callback(move |_, _| {
-            if !tab_focus_request_is_current(
-                focus_generation.get(),
-                generation,
-                notebook_for_focus.current_page(),
-                page_num,
-            ) {
-                return glib::ControlFlow::Break;
-            }
-
-            if ui_for_focus.search_bar.is_search_mode() {
+        queue_tab_terminal_focus(
+            &self.notebook,
+            self.tab_focus_generation.clone(),
+            generation,
+            target_terminal,
+            page_num,
+            self.search_bar.clone(),
+            move || {
                 ui_for_focus.search_apply();
                 ui_for_focus.search_entry.grab_focus();
-                return glib::ControlFlow::Break;
-            }
-
-            frame_count.set(frame_count.get() + 1);
-            let focus_frame = next_tab_focus_frame(
-                target_terminal.is_mapped(),
-                target_terminal.has_focus(),
-                stable_frames.get(),
-            );
-            stable_frames.set(focus_frame.stable_frames);
-            if focus_frame.should_grab {
-                target_terminal.grab_focus();
-            }
-            if focus_frame.complete {
-                return glib::ControlFlow::Break;
-            }
-
-            if frame_count.get() >= TAB_SWITCH_FOCUS_MAX_FRAMES {
-                glib::ControlFlow::Break
-            } else {
-                glib::ControlFlow::Continue
-            }
-        });
+            },
+        );
     }
+}
+
+/// The switch-page focus decision, shared with native mapping regressions.
+/// Keep search synchronous here: tests must observe the production ordering.
+pub(crate) fn focus_switched_page(
+    search_bar: &SearchBar,
+    search_entry: &SearchEntry,
+    invalidate: impl FnOnce(),
+    apply_search: impl FnOnce(),
+    terminal: impl FnOnce() -> Option<vte4::Terminal>,
+    focus_terminal: impl FnOnce(vte4::Terminal),
+) {
+    if search_bar.is_search_mode() {
+        invalidate();
+        apply_search();
+        search_entry.grab_focus();
+    } else if let Some(terminal) = terminal() {
+        focus_terminal(terminal);
+    } else {
+        invalidate();
+    }
+}
+
+/// Schedule the exact production mapped-terminal focus reconciliation.
+pub(crate) fn queue_tab_terminal_focus(
+    notebook: &Notebook,
+    focus_generation: Rc<Cell<u64>>,
+    generation: u64,
+    target_terminal: vte4::Terminal,
+    page_num: u32,
+    search_bar: SearchBar,
+    focus_search: impl Fn() + 'static,
+) {
+    let notebook_for_focus = notebook.clone();
+    let frame_count = Cell::new(0u8);
+    let stable_frames = Cell::new(0u8);
+    notebook.add_tick_callback(move |_, _| {
+        if !tab_focus_request_is_current(
+            focus_generation.get(),
+            generation,
+            notebook_for_focus.current_page(),
+            page_num,
+        ) {
+            return glib::ControlFlow::Break;
+        }
+
+        if search_bar.is_search_mode() {
+            focus_search();
+            return glib::ControlFlow::Break;
+        }
+
+        frame_count.set(frame_count.get() + 1);
+        let focus_frame = next_tab_focus_frame(
+            target_terminal.is_mapped(),
+            target_terminal.has_focus(),
+            stable_frames.get(),
+        );
+        stable_frames.set(focus_frame.stable_frames);
+        if focus_frame.should_grab {
+            target_terminal.grab_focus();
+        }
+        if focus_frame.complete {
+            return glib::ControlFlow::Break;
+        }
+
+        if frame_count.get() >= TAB_SWITCH_FOCUS_MAX_FRAMES {
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
 }
 
 fn env_is_unset(k: &str) -> bool {
@@ -1790,23 +1833,21 @@ pub fn run() -> glib::ExitCode {
             // Headers are only maintained for the visible tab, so the newly
             // selected one has to catch up before it is drawn.
             ui_for_switch.refresh_pane_headers_for(widget);
-            if ui_for_switch.search_bar.is_search_mode() {
-                ui_for_switch.invalidate_tab_focus_requests();
-                ui_for_switch.search_apply_in_page(widget);
-                ui_for_switch.search_entry.grab_focus();
-            } else if let Some(target_terminal) = ui_for_switch.terminal_in_page(widget) {
-                if let Some(term_view) = ui_for_switch.term_view_in_page(widget) {
-                    term_view.reveal_live_input();
-                }
-
-                // `switch-page` can run before the selected child has completed
-                // its map/focus reconciliation. The shared request generation
-                // also lets topology DnD replace this target if it moves another
-                // live pane into the still-selected page before the next frame.
-                ui_for_switch.request_tab_terminal_focus(target_terminal, page_num);
-            } else {
-                ui_for_switch.invalidate_tab_focus_requests();
-            }
+            focus_switched_page(
+                &ui_for_switch.search_bar,
+                &ui_for_switch.search_entry,
+                || { ui_for_switch.invalidate_tab_focus_requests(); },
+                || ui_for_switch.search_apply_in_page(widget),
+                || ui_for_switch.terminal_in_page(widget),
+                |target_terminal| {
+                    if let Some(term_view) = ui_for_switch.term_view_in_page(widget) {
+                        term_view.reveal_live_input();
+                    }
+                    // GTK may not have mapped the selected child yet. DnD can
+                    // supersede this target through the shared generation.
+                    ui_for_switch.request_tab_terminal_focus(target_terminal, page_num);
+                },
+            );
             // Clear activity/bell indicators for the tab being switched to
             let tab_name = widget.widget_name();
             ui_for_switch.clear_tab_indicators(tab_name.as_str());

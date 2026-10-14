@@ -52,6 +52,8 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::tests::existing_block_tab_switch_preserves_global_search_focus
+    block_view::tests::existing_unified_tab_switch_preserves_global_search_focus
     block_view::tests::deferred_live_focus_restores_empty_owner_after_prompt_end_and_alt_exit
     block_view::tests::deferred_live_focus_never_steals_new_pane_find_or_history_ownership
     block_view::tests::deferred_live_focus_retires_hidden_detached_and_changed_root_targets
