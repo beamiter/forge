@@ -31495,6 +31495,8 @@ mod tests {
         let layout = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         layout.append(&search);
         layout.append(&notebook);
+        let newer_owner = gtk4::Entry::new();
+        layout.append(&newer_owner);
         let window = gtk4::Window::builder()
             .default_width(640)
             .default_height(480)
@@ -31527,6 +31529,7 @@ mod tests {
                     view.reveal_live_input();
                     generation.set(generation.get().wrapping_add(1));
                     let entry = entry_for_switch.clone();
+                    let queued_events = events_for_switch.clone();
                     crate::app::queue_tab_terminal_focus(
                         notebook,
                         generation.clone(),
@@ -31535,12 +31538,14 @@ mod tests {
                         page,
                         search_for_switch.clone(),
                         move || {
+                            queued_events.borrow_mut().push("queued-search".into());
                             entry.grab_focus();
                         },
                     );
                 },
             );
         });
+        crate::app::connect_tab_search_focus_after_switch(&notebook, &search, &entry);
         window.present();
         chat_display_settle();
         // Visit both pages first. The regression is an existing tab remap,
@@ -31573,6 +31578,10 @@ mod tests {
             );
             events.borrow_mut().clear();
             notebook.set_current_page(Some(page));
+            assert!(
+                search_owns_focus(),
+                "{mode:?}: switch must synchronously restore search"
+            );
             chat_display_settle();
             assert!(views[page as usize].active_vte.is_mapped());
             let observed = events.borrow();
@@ -31587,7 +31596,41 @@ mod tests {
             eprintln!("{mode:?} page {page} switch/map ordering: {observed:?}");
             assert!(search_owns_focus(), "{mode:?}: search lost focus after existing-tab switch; events={observed:?}, owner={:?}", GtkWindowExt::focus(&window));
         }
+        // No main-loop turn between these switches: only the latest page and
+        // search owner may survive. In particular, no stale terminal tick may
+        // replay after the search branch invalidates it.
         search.set_search_mode(false);
+        notebook.set_current_page(Some(1));
+        search.set_search_mode(true);
+        for page in [0_u32, 1, 0, 1] {
+            notebook.set_current_page(Some(page));
+            assert!(search_owns_focus());
+        }
+        chat_display_settle();
+        assert_eq!(notebook.current_page(), Some(1));
+        assert!(search_owns_focus());
+        assert!(
+            !events.borrow().iter().any(|event| event == "queued-search"),
+            "the superseded same-page terminal request must not replay search"
+        );
+        // A newer user focus choice after the synchronous switch must survive
+        // every pending idle/frame. Search stays open deliberately.
+        notebook.set_current_page(Some(0));
+        assert!(search_owns_focus());
+        assert!(newer_owner.grab_focus());
+        chat_display_settle();
+        assert!(GtkWindowExt::focus(&window).is_some_and(|owner| {
+            owner == newer_owner.clone().upcast::<gtk4::Widget>() || owner.is_ancestor(&newer_owner)
+        }));
+        // Closing search immediately after switching must not be undone by a
+        // deferred search grab. Match toggle_search's terminal-focus return.
+        notebook.set_current_page(Some(1));
+        assert!(search_owns_focus());
+        search.set_search_mode(false);
+        assert!(views[1].active_vte.grab_focus());
+        chat_display_settle();
+        assert!(views[1].active_vte.has_focus());
+        notebook.set_current_page(Some(0));
         notebook.set_current_page(Some(1));
         chat_display_settle();
         assert!(

@@ -262,8 +262,38 @@ impl UiState {
     }
 }
 
+/// GTK's RUN_LAST default handler maps the destination after ordinary signal
+/// handlers. Reconcile search synchronously after that mapping, so the live
+/// VTE's map handler cannot overwrite it. No queued search grab survives the
+/// switch to steal a newer user focus change. Normal terminal target selection
+/// and its generation invalidation stay in the original pre-default handler.
+pub(crate) fn connect_tab_search_focus_after_switch(
+    notebook: &Notebook,
+    search_bar: &SearchBar,
+    search_entry: &SearchEntry,
+) {
+    let search_bar = search_bar.clone();
+    let search_entry = search_entry.clone();
+    notebook.connect_closure(
+        "switch-page",
+        true,
+        glib::closure_local!(
+            move |notebook: Notebook, page: gtk4::Widget, page_num: u32| {
+                // A reentrant switch or topology mutation may supersede this
+                // emission before the after-handler is reached.
+                if notebook.current_page() == Some(page_num)
+                    && notebook.nth_page(Some(page_num)).as_ref() == Some(&page)
+                    && search_bar.is_search_mode()
+                {
+                    search_entry.grab_focus();
+                }
+            }
+        ),
+    );
+}
+
 /// The switch-page focus decision, shared with native mapping regressions.
-/// Keep search synchronous here: tests must observe the production ordering.
+/// Search is applied to the explicit destination before GTK commits it.
 pub(crate) fn focus_switched_page(
     search_bar: &SearchBar,
     search_entry: &SearchEntry,
@@ -1861,6 +1891,8 @@ pub fn run() -> glib::ExitCode {
                 ui_ft.sync_organism_presence();
             });
         });
+
+        connect_tab_search_focus_after_switch(&notebook, &search_bar, &search_entry);
 
         window.add_controller(key_controller);
 

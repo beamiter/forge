@@ -12,8 +12,17 @@ mod gtk4 {
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct Widget(pub usize);
 }
+// The production closure body remains unchanged; only GLib's boxing boundary
+// is replaced so no native signal, widget, or display is required.
+macro_rules! closure_local {
+    ($callback:expr) => {
+        $callback
+    };
+}
+pub(crate) use closure_local;
 pub mod glib {
     use super::*;
+    pub(crate) use crate::closure_local;
     pub struct WeakRef<T>(pub Rc<dyn Fn() -> Option<T>>);
     impl<T> WeakRef<T> {
         pub fn upgrade(&self) -> Option<T> {
@@ -139,6 +148,7 @@ mod block_view {
         pub result: FindSearchResult,
         pub queries: Rc<RefCell<Vec<String>>>,
         pub cleared: Rc<Cell<usize>>,
+        pub revealed: Rc<Cell<usize>>,
     }
     impl TermView {
         pub fn clear_find(&self) {
@@ -154,17 +164,27 @@ mod block_view {
         pub fn find_prev(&self) -> FindNavigationResult {
             FindNavigationResult::Inactive
         }
+        pub fn reveal_live_input(&self) {
+            self.revealed.set(self.revealed.get() + 1);
+        }
     }
 }
 #[derive(Clone, Default)]
-struct Entry(Rc<RefCell<String>>);
+struct Entry {
+    text: Rc<RefCell<String>>,
+    focus_count: Rc<Cell<usize>>,
+    focus_events: Rc<RefCell<Vec<&'static str>>>,
+}
 impl Entry {
     fn text(&self) -> String {
-        self.0.borrow().clone()
+        self.text.borrow().clone()
     }
-    fn grab_focus(&self) {}
+    fn grab_focus(&self) {
+        self.focus_count.set(self.focus_count.get() + 1);
+        self.focus_events.borrow_mut().push("entry-focus");
+    }
     fn set_text(&self, s: &str) {
-        *self.0.borrow_mut() = s.into();
+        *self.text.borrow_mut() = s.into();
     }
 }
 #[derive(Clone, Default)]
@@ -184,6 +204,41 @@ impl Label {
         *self.0.borrow_mut() = s.into()
     }
 }
+type SearchEntry = Entry;
+// @search-lifecycle:focus-helper
+// @search-lifecycle:after-helper
+
+type SwitchCallback = Rc<dyn Fn(Notebook, gtk4::Widget, u32)>;
+#[derive(Clone, Default)]
+struct Notebook {
+    current: Rc<Cell<Option<u32>>>,
+    pages: Rc<RefCell<Vec<gtk4::Widget>>>,
+    after: Rc<Cell<bool>>,
+    callback: Rc<RefCell<Option<SwitchCallback>>>,
+}
+impl Notebook {
+    fn connect_closure(
+        &self,
+        signal: &str,
+        after: bool,
+        callback: impl Fn(Notebook, gtk4::Widget, u32) + 'static,
+    ) {
+        assert_eq!(signal, "switch-page");
+        self.after.set(after);
+        *self.callback.borrow_mut() = Some(Rc::new(callback));
+    }
+    fn current_page(&self) -> Option<u32> {
+        self.current.get()
+    }
+    fn nth_page(&self, page: Option<u32>) -> Option<gtk4::Widget> {
+        self.pages.borrow().get(page? as usize).cloned()
+    }
+    fn emit(&self, page: gtk4::Widget, page_num: u32) {
+        let callback = self.callback.borrow().clone().unwrap();
+        callback(self.clone(), page, page_num);
+    }
+}
+
 mod ui {
     use super::*;
     use block_view::TermView;
@@ -198,6 +253,8 @@ mod ui {
         current: Rc<Cell<usize>>,
         terminals: Vec<vte4::Terminal>,
         views: Vec<Option<Rc<TermView>>>,
+        tab_focus_generation: Rc<Cell<u64>>,
+        terminal_focus_requests: Rc<RefCell<Vec<(vte4::Terminal, u32)>>>,
     }
     impl UiState {
         fn current_terminal(&self) -> Option<vte4::Terminal> {
@@ -213,7 +270,17 @@ mod ui {
             self.views.get(w.0).cloned().flatten()
         }
         fn focus_current_terminal(&self) {}
-        fn invalidate_tab_focus_requests(&self) {}
+        fn invalidate_tab_focus_requests(&self) -> u64 {
+            let generation = self.tab_focus_generation.get().wrapping_add(1);
+            self.tab_focus_generation.set(generation);
+            generation
+        }
+        fn request_tab_terminal_focus(&self, terminal: vte4::Terminal, page_num: u32) {
+            self.invalidate_tab_focus_requests();
+            self.terminal_focus_requests
+                .borrow_mut()
+                .push((terminal, page_num));
+        }
     }
     mod search {
         // @search-lifecycle:source
@@ -229,16 +296,170 @@ mod ui {
             current: Rc::new(Cell::new(0)),
             terminals: vec![vte4::Terminal::default(), vte4::Terminal::default()],
             views: vec![None, None],
+            tab_focus_generation: Rc::new(Cell::new(0)),
+            terminal_focus_requests: Rc::new(RefCell::new(Vec::new())),
         }
     }
     fn switch_page(ui: &UiState, target: usize) {
         let ui_for_switch = ui;
         let widget = &gtk4::Widget(target);
-        // GTK switch-page is RUN_LAST: the signal argument is the destination,
-        // while current_page still refers to the source during this callback.
+        let page_num = target as u32;
+        // Deliberately leave current_page stale until after the production call:
+        // even before GTK commits selection, routing must honor its explicit
+        // destination. Native tests separately cover after-handler ordering.
         // @search-lifecycle:switch
         ui.current.set(target);
     }
+
+    fn setup_notebook(ui: &UiState) -> Notebook {
+        let notebook = Notebook::default();
+        *notebook.pages.borrow_mut() = vec![gtk4::Widget(0), gtk4::Widget(1)];
+        notebook.current.set(Some(ui.current.get() as u32));
+        let search_bar = ui.search_bar.clone();
+        let search_entry = ui.search_entry.clone();
+        // @search-lifecycle:after-registration
+        notebook
+    }
+
+    #[test]
+    fn after_switch_reconciles_mapping_synchronously_without_later_focus_theft() {
+        let ui = setup();
+        let notebook = setup_notebook(&ui);
+        assert!(notebook.after.get(), "focus handler ran before GTK mapping");
+        ui.search_entry.set_text("needle");
+        switch_page(&ui, 1);
+        // The deterministic native boundary models the RUN_LAST mapping step.
+        // Both focus decisions on either side are extracted production code.
+        ui.search_entry
+            .focus_events
+            .borrow_mut()
+            .push("mapped-terminal-focus");
+        notebook.current.set(Some(1));
+        notebook.emit(gtk4::Widget(1), 1);
+        assert_eq!(
+            ui.search_entry.focus_events.borrow().as_slice(),
+            ["entry-focus", "mapped-terminal-focus", "entry-focus"]
+        );
+        assert_eq!(*ui.terminals[1].installed.borrow(), Some("needle".into()));
+        ui.search_entry
+            .focus_events
+            .borrow_mut()
+            .push("newer-user-focus");
+        glib::run_pending();
+        assert_eq!(ui.search_entry.focus_count.get(), 2);
+        assert_eq!(
+            ui.search_entry.focus_events.borrow().last(),
+            Some(&"newer-user-focus")
+        );
+    }
+
+    #[test]
+    fn after_switch_ignores_closed_search_stale_pages_and_replaced_widgets() {
+        let ui = setup();
+        let notebook = setup_notebook(&ui);
+        notebook.current.set(Some(1));
+        ui.search_bar.set_search_mode(false);
+        notebook.emit(gtk4::Widget(1), 1);
+        ui.search_bar.set_search_mode(true);
+        notebook.emit(gtk4::Widget(0), 0);
+        notebook.emit(gtk4::Widget(99), 1);
+        notebook.current.set(None);
+        notebook.emit(gtk4::Widget(1), 1);
+        notebook.current.set(Some(2));
+        notebook.emit(gtk4::Widget(2), 2);
+        assert_eq!(ui.search_entry.focus_count.get(), 0);
+        notebook.current.set(Some(1));
+        notebook.emit(gtk4::Widget(1), 1);
+        assert_eq!(ui.search_entry.focus_count.get(), 1);
+        assert!(ui.terminal_focus_requests.borrow().is_empty());
+    }
+
+    #[test]
+    fn search_focus_invalidates_then_applies_before_focusing_entry() {
+        let ui = setup();
+        let events = &ui.search_entry.focus_events;
+        focus_switched_page(
+            &ui.search_bar,
+            &ui.search_entry,
+            || events.borrow_mut().push("invalidate"),
+            || events.borrow_mut().push("apply"),
+            || panic!("search must not resolve a terminal-focus target"),
+            |_| panic!("search must not request terminal focus"),
+        );
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["invalidate", "apply", "entry-focus"]
+        );
+    }
+
+    #[test]
+    fn closed_search_switch_focuses_explicit_destination_and_reveals_live_input() {
+        let mut ui = setup();
+        ui.search_bar.set_search_mode(false);
+        ui.search_entry.set_text("must-not-apply");
+        let view = Rc::new(TermView {
+            result: block_view::FindSearchResult::NoMatches,
+            queries: Rc::new(RefCell::new(Vec::new())),
+            cleared: Rc::new(Cell::new(0)),
+            revealed: Rc::new(Cell::new(0)),
+        });
+        ui.views[1] = Some(view.clone());
+        switch_page(&ui, 1);
+        let requests = ui.terminal_focus_requests.borrow();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].0 == ui.terminals[1]);
+        assert_eq!(requests[0].1, 1);
+        assert_eq!(view.revealed.get(), 1);
+        assert_eq!(ui.tab_focus_generation.get(), 1);
+        assert_eq!(ui.search_entry.focus_count.get(), 0);
+        assert!(ui.search_owner.borrow().is_none());
+        assert!(ui.terminals.iter().all(|t| t.installed.borrow().is_none()));
+    }
+
+    #[test]
+    fn closed_search_switch_without_terminal_invalidates_previous_focus_request() {
+        let ui = setup();
+        ui.search_bar.set_search_mode(false);
+        ui.tab_focus_generation.set(7);
+        switch_page(&ui, 2);
+        assert_eq!(ui.tab_focus_generation.get(), 8);
+        assert_eq!(ui.search_entry.focus_count.get(), 0);
+        assert!(ui.terminal_focus_requests.borrow().is_empty());
+        assert!(ui.search_owner.borrow().is_none());
+    }
+
+    #[test]
+    fn repeated_switches_leave_only_the_latest_search_owner() {
+        let ui = setup();
+        ui.search_entry.set_text("latest");
+        ui.schedule_search_apply();
+        switch_page(&ui, 1);
+        switch_page(&ui, 0);
+        assert_eq!(*ui.terminals[0].installed.borrow(), Some("latest".into()));
+        assert!(ui.terminals[1].installed.borrow().is_none());
+        assert_eq!(ui.search_entry.focus_count.get(), 2);
+        assert_eq!(ui.tab_focus_generation.get(), 2);
+        assert!(ui.terminal_focus_requests.borrow().is_empty());
+        let steps = ui.terminals[0].steps.get();
+        glib::run_pending();
+        assert_eq!(ui.terminals[0].steps.get(), steps);
+        assert_eq!(ui.search_entry.focus_count.get(), 2);
+    }
+
+    #[test]
+    fn closing_search_after_switch_does_not_refocus_entry_later() {
+        let ui = setup();
+        ui.search_entry.set_text("needle");
+        ui.schedule_search_apply();
+        switch_page(&ui, 1);
+        ui.toggle_search();
+        let focuses = ui.search_entry.focus_count.get();
+        glib::run_pending();
+        assert_eq!(ui.search_entry.focus_count.get(), focuses);
+        assert!(ui.terminals.iter().all(|t| t.installed.borrow().is_none()));
+        assert!(ui.search_owner.borrow().is_none());
+    }
+
     #[test]
     fn invalid_regex_removes_previous_native_search() {
         let ui = setup();
@@ -280,6 +501,7 @@ mod ui {
                 result,
                 queries: Rc::new(RefCell::new(Vec::new())),
                 cleared: Rc::new(Cell::new(0)),
+                revealed: Rc::new(Cell::new(0)),
             }));
             ui.search_entry.set_text("new-block-query");
             ui.search_apply();
@@ -304,6 +526,9 @@ mod ui {
             Some("needle".into()),
             "destination never received the query"
         );
+        assert_eq!(ui.tab_focus_generation.get(), 1);
+        assert_eq!(ui.search_entry.focus_count.get(), 1);
+        assert!(ui.terminal_focus_requests.borrow().is_empty());
     }
     #[test]
     fn switch_page_cancels_pending_query_debounce() {
@@ -340,6 +565,7 @@ mod ui {
             }),
             queries: Rc::new(RefCell::new(Vec::new())),
             cleared: Rc::new(Cell::new(0)),
+            revealed: Rc::new(Cell::new(0)),
         });
         ui.views[1] = Some(view.clone());
         ui.search_entry.set_text("needle");
@@ -347,6 +573,8 @@ mod ui {
         assert_eq!(view.queries.borrow().as_slice(), ["needle"]);
         assert_eq!(*ui.search_status.0.borrow(), "1 of 2");
         assert!(ui.terminals[0].installed.borrow().is_none());
+        assert_eq!(ui.search_entry.focus_count.get(), 1);
+        assert_eq!(view.revealed.get(), 0, "search revealed live input");
     }
     #[test]
     fn same_query_moves_between_split_owners_before_navigation() {
@@ -356,14 +584,20 @@ mod ui {
         ui.current.set(1);
         ui.search_next();
         assert!(ui.terminals[0].installed.borrow().is_none());
-        assert_eq!(*ui.terminals[1].installed.borrow(), Some("same-query".into()));
+        assert_eq!(
+            *ui.terminals[1].installed.borrow(),
+            Some("same-query".into())
+        );
         assert_eq!(ui.terminals[1].steps.get(), 1);
         ui.search_next();
         assert_eq!(ui.terminals[1].steps.get(), 2);
         ui.current.set(0);
         ui.search_prev();
         assert!(ui.terminals[1].installed.borrow().is_none());
-        assert_eq!(*ui.terminals[0].installed.borrow(), Some("same-query".into()));
+        assert_eq!(
+            *ui.terminals[0].installed.borrow(),
+            Some("same-query".into())
+        );
         assert_eq!(ui.terminals[0].steps.get(), 2);
     }
 
@@ -374,6 +608,7 @@ mod ui {
             result: block_view::FindSearchResult::NoMatches,
             queries: Rc::new(RefCell::new(Vec::new())),
             cleared: Rc::new(Cell::new(0)),
+            revealed: Rc::new(Cell::new(0)),
         });
         ui.views[0] = Some(view.clone());
         ui.search_entry.set_text("owner-query");
@@ -398,6 +633,7 @@ mod ui {
             result: block_view::FindSearchResult::NoMatches,
             queries: Rc::new(RefCell::new(Vec::new())),
             cleared: Rc::new(Cell::new(0)),
+            revealed: Rc::new(Cell::new(0)),
         });
         let weak_view = Rc::downgrade(&view);
         let weak_terminal = ui.terminals[0].downgrade();
