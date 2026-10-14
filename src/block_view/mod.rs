@@ -18906,6 +18906,7 @@ pub(crate) fn organism_settings_test_pty_bytes(view: &TermView) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    include!("ime_tests.rs");
     use super::{
         accept_agent_integration_token, anchor_tick_exit, apply_visible_indices,
         apply_vte_commit_to_shadow, approved_command_submission_payload,
