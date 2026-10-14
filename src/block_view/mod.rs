@@ -12101,6 +12101,8 @@ trait VirtualizableCard {
     fn set_virtualized_preserving_height(&self, virtualized: bool) -> i32;
     /// The height the toolkit is giving this card right now.
     fn allocated_height(&self) -> i32;
+    /// Keep a rendered card's cache current for allocation-preserving transitions.
+    fn remember_allocated_height(&self, height: i32);
 }
 
 impl VirtualizableCard for FinishedBlock {
@@ -12120,6 +12122,10 @@ impl VirtualizableCard for FinishedBlock {
 
     fn allocated_height(&self) -> i32 {
         self.widget().height()
+    }
+
+    fn remember_allocated_height(&self, height: i32) {
+        FinishedBlock::remember_allocated_height(self, height);
     }
 }
 
@@ -12227,6 +12233,7 @@ fn apply_visible_indices_with_measurement<C: VirtualizableCard>(
             // on screen.
             let allocated = block.allocated_height();
             if allocated > 1 {
+                block.remember_allocated_height(allocated);
                 if let Some(data) = block_data.get_mut(i) {
                     data.estimated_height = allocated;
                     index.set_height(i, allocated);
@@ -17789,11 +17796,13 @@ impl TermView {
                 moved += 1;
                 document_index.mark_stale();
                 if let Some(data) = block_data.get_mut(index) {
-                    data.estimated_height = if card.is_filtered_out() {
-                        0
-                    } else {
-                        collapsed_aware_block_height(&config, data, collapsed, fallback_cols)
-                    };
+                    let height = card.set_placeholder_height(collapsed_aware_block_height(
+                        &config,
+                        data,
+                        collapsed,
+                        fallback_cols,
+                    ));
+                    data.estimated_height = if card.is_filtered_out() { 0 } else { height };
                 }
             }
             moved
@@ -17801,7 +17810,7 @@ impl TermView {
         if moved > 0 {
             (self.failure_marker_redraw)();
             self.update_viewport();
-            self.update_block_visibility();
+            self.update_block_visibility_preserving_heights();
             self.block_list.queue_allocate();
         }
         moved
@@ -17832,18 +17841,20 @@ impl TermView {
             let mut block_data = self.block_data.borrow_mut();
             self.block_document_index.borrow_mut().mark_stale();
             if let Some(data) = block_data.get_mut(index) {
-                data.estimated_height = if card.is_filtered_out() {
-                    0
-                } else {
-                    collapsed_aware_block_height(&config, data, collapsed, fallback_cols)
-                };
+                let height = card.set_placeholder_height(collapsed_aware_block_height(
+                    &config,
+                    data,
+                    collapsed,
+                    fallback_cols,
+                ));
+                data.estimated_height = if card.is_filtered_out() { 0 } else { height };
             }
             true
         };
         if moved {
             (self.failure_marker_redraw)();
             self.update_viewport();
-            self.update_block_visibility();
+            self.update_block_visibility_preserving_heights();
             self.block_list.queue_allocate();
         }
         moved
@@ -25749,6 +25760,39 @@ mod tests {
                 self.rendered_height
             }
         }
+
+        fn remember_allocated_height(&self, height: i32) {
+            self.placeholder.set(height);
+        }
+    }
+
+    #[test]
+    fn rendered_measurements_survive_allocation_preserving_parking() {
+        let cards = vec![FakeCard::rendered(180), FakeCard::rendered(240)];
+        cards[0].placeholder.set(20);
+        cards[1].placeholder.set(30);
+        let mut blocks = VecDeque::from([block_with_height(20), block_with_height(30)]);
+        let mut index = document_index_of(&blocks);
+        let mut visible = std::collections::HashSet::from([0, 1]);
+        super::apply_visible_indices(
+            &cards,
+            &mut blocks,
+            &mut index,
+            &mut visible,
+            std::collections::HashSet::from([0, 1]),
+        );
+        assert_eq!(cards[0].placeholder.get(), 180);
+        assert_eq!(cards[1].placeholder.get(), 240);
+        super::apply_visible_indices_preserving_heights(
+            &cards,
+            &mut blocks,
+            &mut index,
+            &mut visible,
+            std::collections::HashSet::from([1]),
+        );
+        assert_eq!(blocks[0].estimated_height, 180);
+        assert_eq!(blocks[1].estimated_height, 240);
+        assert!(cards[0].is_virtualized());
     }
 
     /// Toggling a pane filter re-measures every card and re-resolves the
@@ -33476,3 +33520,6 @@ mod controller_navigation_regressions {
         assert_eq!(visible_neighbor_after_removal(cards, 3), Some(20));
     }
 }
+
+#[cfg(test)]
+mod fold_geometry_tests;

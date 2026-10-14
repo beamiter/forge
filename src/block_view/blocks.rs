@@ -3787,6 +3787,28 @@ impl FinishedBlock {
         }
     }
 
+    /// Adopt a fold-state estimate before GTK allocates the changed contents.
+    /// Keep the parked widget and its saved placeholder in the same geometry
+    /// as the document; visible cards converge to measured height after layout.
+    pub(crate) fn set_placeholder_height(&self, height: i32) -> i32 {
+        let height = if self.widget.has_css_class("chat-pair") && !self.is_background {
+            height.saturating_add(super::chat::COMMAND_GAP_PX)
+        } else {
+            height
+        };
+        self.remember_allocated_height(height)
+    }
+
+    /// Save a raw card height, already including Chat chrome when measured.
+    pub(crate) fn remember_allocated_height(&self, height: i32) -> i32 {
+        let height = height.max(1);
+        self.virtualized_height.set(height);
+        if self.virtualized.get() {
+            self.widget.set_height_request(height);
+        }
+        height
+    }
+
     /// Whether a pane-level filter is hiding this card.
     pub(crate) fn is_filtered_out(&self) -> bool {
         self.filtered_out.get()
