@@ -760,7 +760,7 @@ pub(crate) struct FinishedBlock {
     /// What the output VTE currently holds. A find pass records this with each
     /// surface it scans; a resize, an expand or a filter changes it, and the
     /// recorded native search cursor for that surface is then meaningless.
-    render_stamp: Rc<Cell<RenderStamp>>,
+    render_stamp: Rc<RenderStampState>,
     /// Font scale a virtualized card has not adopted yet. Ctrl+scroll emits a
     /// notch every 0.025, and each one used to reset the font metrics of two
     /// VTEs on every retained card — including the ones virtualization had
@@ -1791,6 +1791,63 @@ fn finished_snapshot_stream(display_text: &str) -> Vec<u8> {
 /// which moves every match position inside that VTE.
 pub(crate) type RenderStamp = (i64, i64, bool, u64);
 
+/// Keep render identity even when geometry/text stamps repeat. Explicit feeds
+/// advance the revision; map/refit probes that leave the stamp alone do not.
+pub(crate) struct RenderStampState {
+    stamp: Cell<RenderStamp>,
+    revision: Cell<u64>,
+    pending_feed: Cell<Option<u64>>,
+}
+
+impl RenderStampState {
+    fn new(stamp: RenderStamp) -> Self {
+        Self {
+            stamp: Cell::new(stamp),
+            revision: Cell::new(0),
+            pending_feed: Cell::new(None),
+        }
+    }
+
+    fn get(&self) -> RenderStamp {
+        self.stamp.get()
+    }
+
+    fn set(&self, stamp: RenderStamp) {
+        // Never wrap back to a revision an outstanding callback could hold.
+        self.revision.set(
+            self.revision
+                .get()
+                .checked_add(1)
+                .expect("finished-output render revision exhausted"),
+        );
+        self.stamp.set(stamp);
+    }
+
+    fn replace(&self, stamp: RenderStamp) -> RenderStamp {
+        let previous = self.get();
+        if previous != stamp {
+            self.set(stamp);
+        }
+        previous
+    }
+
+    fn revision(&self) -> u64 {
+        self.revision.get()
+    }
+
+    fn mark_feed_pending(&self) {
+        self.pending_feed.set(Some(self.revision()));
+    }
+
+    fn pending_revision(&self) -> Option<u64> {
+        self.pending_feed.get()
+    }
+
+    fn acknowledge_contents_changed(&self) {
+        self.pending_feed.set(None);
+    }
+}
+
 /// The stamp a surface reports when it has no per-record snapshot to
 /// invalidate. It is the value a freshly constructed card starts from, and it
 /// is never produced by `output_render_stamp` (which clamps both row counts to
@@ -1861,6 +1918,8 @@ fn rewindow_finished_vte(
     super::alt_screen::trace_find_render("rewindow-after", vte);
 }
 
+// Keep the existing geometry arguments explicit; render_state only tracks ownership.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_bytes_into_finished_vte(
     vte: &vte4::Terminal,
     text: &str,
@@ -1869,6 +1928,7 @@ pub(crate) fn render_bytes_into_finished_vte(
     viewport_cap: i64,
     capture_rows: i64,
     expand_to_buffer: bool,
+    render_state: &RenderStampState,
 ) {
     #[cfg(test)]
     super::alt_screen::trace_find_render("render-before-reset-feed", vte);
@@ -1895,6 +1955,7 @@ pub(crate) fn render_bytes_into_finished_vte(
     vte.set_size(cols, visible_rows);
     vte.set_scrollback_lines(scrollback);
     vte.feed(&finished_snapshot_stream(display_text));
+    render_state.mark_feed_pending();
     #[cfg(test)]
     super::alt_screen::trace_find_render("render-after-queued-feed", vte);
     let settle_tail = snapshot_settle_tail(display_text);
@@ -2697,7 +2758,17 @@ impl FinishedBlock {
         // document, re-clamps the scroll, and re-toggles boundary cards —
         // the self-sustaining flicker loop on narrow panes. Cols start at 0
         // (below any real value) so the first map always renders.
-        let render_stamp: Rc<Cell<RenderStamp>> = Rc::new(Cell::new(NEUTRAL_RENDER_STAMP));
+        let render_stamp = Rc::new(RenderStampState::new(NEUTRAL_RENDER_STAMP));
+        {
+            let render_stamp = Rc::downgrade(&render_stamp);
+            output_vte.connect_contents_changed(move |_| {
+                if let Some(render_stamp) = render_stamp.upgrade() {
+                    // Finished outputs have no PTY. Supported VTE versions drain
+                    // queued app-fed bytes before emitting this signal.
+                    render_stamp.acknowledge_contents_changed();
+                }
+            });
+        }
         let pending_font_scale: Rc<Cell<Option<f64>>> = Rc::new(Cell::new(None));
         {
             // Virtualization hides `content`, so its map is exactly the moment a
@@ -2792,6 +2863,7 @@ impl FinishedBlock {
                     cap,
                     capture_rows,
                     fit_to_content,
+                    &stamp_for_map,
                 );
                 // Capped snapshots keep grid and pixel request identical.
                 // Full-document snapshots let the post-feed VTE measurement
@@ -2860,6 +2932,7 @@ impl FinishedBlock {
                     cap,
                     capture_rows,
                     fit_to_content,
+                    &stamp_for_btn,
                 );
                 if !fit_to_content {
                     let ch = output_vte_for_btn.char_height() as i32;
@@ -2971,6 +3044,7 @@ impl FinishedBlock {
                         cap,
                         capture_rows,
                         fit_to_content,
+                        &stamp_for_refit,
                     );
                 } else {
                     let settle_tail = snapshot_settle_tail(output_display_text(text));
@@ -3439,6 +3513,7 @@ impl FinishedBlock {
                                     active_cap,
                                     capture_rows,
                                     fit_to_content,
+                                    &render_stamp,
                                 );
                                 if !fit_to_content {
                                     let ch = output_vte.char_height() as i32;
@@ -3885,6 +3960,16 @@ impl FinishedBlock {
     /// the counter keeps counting.
     pub(crate) fn render_stamp(&self) -> RenderStamp {
         self.render_stamp.get()
+    }
+
+    /// Identity of the latest output render, including equal-stamp re-feeds.
+    pub(crate) fn render_revision(&self) -> u64 {
+        self.render_stamp.revision()
+    }
+
+    /// A queued output replay not yet observed at VTE's contents-change boundary.
+    pub(crate) fn pending_render_revision(&self) -> Option<u64> {
+        self.render_stamp.pending_revision()
     }
 
     /// Adopt a new font scale, or defer it if this card is virtualized.
@@ -5996,6 +6081,55 @@ mod tests {
         for required in ["\x1b[H", "\x1b[2J", "\x1b[3J"] {
             assert!(clear.contains(required), "missing {required:?}");
         }
+    }
+
+    #[test]
+    fn pending_render_revision_tracks_only_queued_feeds() {
+        let first = super::output_render_stamp(80, 3, 3, 0);
+        let second = super::output_render_stamp(66, 3, 3, 0);
+        let state = super::RenderStampState::new(first);
+        assert_eq!(state.pending_revision(), None);
+        state.set(first);
+        assert_eq!(state.pending_revision(), None);
+        state.mark_feed_pending();
+        assert_eq!(state.pending_revision(), Some(1));
+        assert_eq!(state.replace(first), first);
+        assert_eq!(state.pending_revision(), Some(1));
+
+        // Re-windowing does not claim a feed or erase one already in the queue.
+        assert_eq!(state.replace(second), first);
+        assert_eq!(state.pending_revision(), Some(1));
+        state.mark_feed_pending();
+        assert_eq!(state.pending_revision(), Some(2));
+        state.acknowledge_contents_changed();
+        assert_eq!(state.pending_revision(), None);
+        assert_eq!(state.revision(), 2);
+    }
+
+    #[test]
+    fn render_revision_distinguishes_refeeds_and_stamp_aba() {
+        let first = super::output_render_stamp(80, 3, 3, 0);
+        let second = super::output_render_stamp(66, 3, 3, 0);
+        let state = super::RenderStampState::new(first);
+        assert_eq!(state.get(), first);
+        assert_eq!(state.revision(), 0);
+
+        // An unchanged map/refit probe is not another render.
+        assert_eq!(state.replace(first), first);
+        assert_eq!(state.revision(), 0);
+
+        // Explicit re-feeds invalidate outstanding work even at the same stamp.
+        state.set(first);
+        assert_eq!(state.get(), first);
+        assert_eq!(state.revision(), 1);
+
+        assert_eq!(state.replace(second), first);
+        assert_eq!(state.revision(), 2);
+        assert_eq!(state.replace(first), second);
+        assert_eq!(state.get(), first);
+        assert_eq!(state.revision(), 3);
+        assert_eq!(state.replace(first), first);
+        assert_eq!(state.revision(), 3);
     }
 
     #[test]

@@ -400,9 +400,7 @@ pub(crate) fn fit_finished_terminal_to_content(terminal: &Terminal) {
     terminal.set_scrollback_lines(scrollback_rows);
     let cell_height = (terminal.char_height() as i32).max(1);
     terminal.set_height_request(finished_vte_height_px(rows, cell_height));
-    if let Some(adj) = terminal.vadjustment() {
-        adj.set_value(adj.lower());
-    }
+    anchor_terminal_top(terminal);
     #[cfg(test)]
     trace_find_render("fit-after", terminal);
 }
@@ -452,6 +450,11 @@ fn feed_tail_applied(terminal: &Terminal, expected_tail: Option<&str>) -> bool {
 }
 
 fn anchor_terminal_top(terminal: &Terminal) {
+    // Native find has already scrolled its confirmed match into view. A
+    // later render-settle pin must not hide that selection again.
+    if terminal.search_get_regex().is_some() && terminal.has_selection() {
+        return;
+    }
     if let Some(adj) = terminal.vadjustment() {
         adj.set_value(adj.lower());
     }
