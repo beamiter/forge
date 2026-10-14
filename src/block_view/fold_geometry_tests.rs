@@ -108,7 +108,21 @@ fn fold_actions_update_visible_and_parked_geometry() {
                 if selected {
                     assert!(view.toggle_selected_block_collapsed());
                 } else {
-                    assert_eq!(view.set_all_blocks_collapsed(collapsed), 32);
+                    let rendered: Vec<u64> = view
+                        .finished_blocks
+                        .borrow()
+                        .iter()
+                        .filter(|card| {
+                            card.widget().height_request() == -1 && !card.is_filtered_out()
+                        })
+                        .map(|card| card.id)
+                        .collect();
+                    eprintln!("bulk fold mode={mode:?} collapsed={collapsed}, rendered ids={rendered:?}, filtered id=31");
+                    assert_eq!(
+                        view.set_all_blocks_collapsed(collapsed),
+                        32,
+                        "bulk fold mode={mode:?} collapsed={collapsed}; rendered ids={rendered:?}"
+                    );
                 }
                 if selected {
                     assert_eq!(
@@ -118,6 +132,18 @@ fn fold_actions_update_visible_and_parked_geometry() {
                     );
                 }
                 assert_eq!(view.block_data.borrow()[30].estimated_height, 0);
+                assert_eq!(
+                    view.finished_blocks.borrow()[31].is_collapsed(),
+                    collapsed,
+                    "parked card keeps its own folded state"
+                );
+                if !selected {
+                    assert_eq!(
+                        view.finished_blocks.borrow()[30].is_collapsed(),
+                        collapsed,
+                        "filtered card keeps its own folded state"
+                    );
+                }
                 let expected = {
                     let data = view.block_data.borrow();
                     collapsed_aware_block_height(&config, &data[31], collapsed, 80)

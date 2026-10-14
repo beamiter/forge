@@ -3834,7 +3834,10 @@ impl FinishedBlock {
     /// Whether this card's output is folded away.
     pub(crate) fn is_collapsed(&self) -> bool {
         use gtk4::prelude::WidgetExt as _;
-        self.collapsed_summary.is_visible()
+        // Folding is stored in the summary's own property. Virtualization
+        // hides content and pane filtering hides the outer card; neither may
+        // turn a folded card into an apparently unfolded one.
+        self.collapsed_summary.get_visible()
     }
 
     /// Fold or unfold this card's output, reporting whether anything moved.
@@ -4768,6 +4771,54 @@ mod tests {
             super::failure_badge_tooltip(137, "SIGKILL"),
             "128 + signal number: terminated by SIGKILL"
         );
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn folded_state_survives_virtualization_and_pane_filtering() {
+        use gtk4::prelude::*;
+        gtk4::init().expect("gtk init");
+        let card = FinishedBlock::new(
+            1,
+            "$ ",
+            "seq 200",
+            None,
+            &"line\r\n".repeat(200),
+            Some(0),
+            &crate::config::Config::safe_defaults(),
+            None,
+            None,
+            None,
+            80,
+        );
+        for filtered in [false, true] {
+            assert!(card.set_collapsed(true));
+            if filtered {
+                card.set_filtered_out(true);
+            } else {
+                card.set_virtualized(true);
+            }
+            assert!(
+                card.collapsed_summary.get_visible(),
+                "folded state is stored locally"
+            );
+            assert!(
+                !card.collapsed_summary.is_visible(),
+                "ancestor hides the summary"
+            );
+            assert!(card.is_collapsed(), "offscreen or filtered is still folded");
+            assert!(
+                card.set_collapsed(false),
+                "hidden folded output must unfold"
+            );
+            assert!(!card.is_collapsed());
+            assert!(!card.collapsed_summary.get_visible());
+            if filtered {
+                card.set_filtered_out(false);
+            } else {
+                card.set_virtualized(false);
+            }
+        }
     }
 
     #[test]
