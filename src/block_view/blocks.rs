@@ -4617,7 +4617,9 @@ mod tests {
             "$ ",
             "printf alpha",
             None,
-            "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n",
+            // Ordinary PTY output has CRLF (OPOST/ONLCR). Bare LF retains
+            // the cursor column, so those stair-step lines rewrap on resize.
+            "alpha\r\nbeta\r\ngamma\r\ndelta\r\nepsilon\r\nzeta\r\neta\r\ntheta\r\n",
             Some(0),
             &crate::config::Config::safe_defaults(),
             Some(1),
@@ -4696,6 +4698,11 @@ mod tests {
             .unwrap()
             .contains("printf alpha"));
         let captured = block.output_vte.text_format(vte4::Format::Text).unwrap();
+        assert_eq!(
+            captured.as_str(),
+            "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n",
+            "ordinary PTY lines start at column zero before any resize"
+        );
         assert!(captured.contains("alpha"));
         assert!(
             captured.contains("theta"),
