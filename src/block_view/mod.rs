@@ -11458,9 +11458,12 @@ fn high_water_under_full_grid(state: BlockState, previous: i64, viewport_rows: i
 /// during the prompt phase (what this used to do) put the origin at the end of
 /// the echoed command line, so however many rows the prompt occupied above it
 /// were never counted and sat below the card's edge — exactly where an inline
-/// TUI such as codex or kimi draws its composer. Latch the LOWEST row instead.
+/// TUI such as codex or kimi draws its composer. A minimum cursor sample is
+/// only provisional: VTE may paint the whole prompt before the first sample.
+/// `displayed_live_origin` independently recovers the actual screen origin
+/// once output exists, including coalesced multiline/wrapped SSH prompts.
 ///
-/// Every reading here comes from `cursor_position()`, so they share one
+/// Every ring reading here uses absolute text/cursor rows, sharing one
 /// coordinate system by construction. Nothing else does: the live adjustment
 /// is ring-relative and stops tracking the cursor past the scrollback limit,
 /// and a literal zero is wrong too, because `vte.reset()` does not rewind
@@ -11481,6 +11484,19 @@ fn live_content_extent(
         origin.set(Some(latched_live_origin(origin.get(), cursor_row)));
         return None;
     }
+    // Prompt bytes and CommandStart can be coalesced into one VTE frame.
+    // In that case the earliest cursor sample is already at the END of the
+    // wrapped command, not at screen row zero. Recover the displayed origin
+    // independently before measuring cursor travel from it. No OSC lifecycle
+    // boundary or adjustment coordinate is involved in this measurement.
+    if origin.get().is_none_or(|row| {
+        live_content_extent_for(row, cursor_high.get().max(cursor_row), vte.row_count())
+            < vte.row_count()
+    }) {
+        if let Some(displayed_origin) = displayed_live_origin(vte) {
+            origin.set(Some(displayed_origin));
+        }
+    }
     let Some(origin_row) = origin.get() else {
         // Output beat every layout pass, so there is no origin to measure
         // against yet. Adopt this cursor and report the sample as provisional,
@@ -11494,8 +11510,45 @@ fn live_content_extent(
     Some(live_content_extent_for(origin_row, high, vte.row_count()))
 }
 
-/// The origin a prompt-phase sample leaves behind: the LOWEST cursor row seen
-/// since `reset_active`, which is the first row the prompt drew on.
+/// Recover the absolute ring row displayed at screen row zero without mixing
+/// VTE's rebased adjustment with its absolute cursor. The viewport snapshot
+/// identifies the last drawn screen row; a bounded ring probe identifies that
+/// same last drawn row in absolute coordinates. The cursor can be above a
+/// footer or below the last text on an empty input line, so probe both sides.
+/// This is only needed while the running card is shorter than the viewport.
+fn displayed_live_origin(vte: &Terminal) -> Option<i64> {
+    // The snapshot is the user's displayed viewport, but the cursor belongs
+    // to the active screen. Never combine them while the user reads history.
+    if vte
+        .vadjustment()
+        .is_some_and(|adj| adj.value() + adj.page_size() + 0.5 < adj.upper())
+    {
+        return None;
+    }
+    let text = vte.text_format(vte4::Format::Text)?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    let rows = vte.row_count().max(1);
+    let drawn = drawn_rows_in_displayed_text(&text, rows);
+    let cursor = vte.cursor_position().1;
+    let cols = vte.column_count().max(1);
+    for row in (cursor.saturating_sub(rows - 1)..=cursor.saturating_add(rows - 1)).rev() {
+        let (line, _) = vte.text_range_format(vte4::Format::Text, row, 0, row, cols - 1);
+        if line.is_some_and(|line| !line.trim().is_empty()) {
+            return Some(displayed_origin_from_last_text(row, drawn));
+        }
+    }
+    None
+}
+
+fn displayed_origin_from_last_text(last_ring_row: i64, drawn_rows: i64) -> i64 {
+    last_ring_row.saturating_sub(drawn_rows.saturating_sub(1))
+}
+
+/// The provisional origin left by samples before output starts: the lowest
+/// cursor row observed since reset. It need not be the first prompt row when
+/// VTE paints several rows before layout; displayed evidence repairs it.
 fn latched_live_origin(previous: Option<i64>, cursor_row: i64) -> i64 {
     previous.map_or(cursor_row, |row| row.min(cursor_row))
 }
@@ -14448,13 +14501,21 @@ impl TermView {
                         }
                         BlockState::CollectingOutput | BlockState::PostCommand => {
                             let output_started = !live_raw_output_for_layout.borrow().is_empty();
-                            let (visible_rows, next_high_water) = live_visible_rows_for_measurement(
+                            // Once any content (including a footer below the
+                            // cursor) filled the card, no origin recovery or
+                            // text probing can make it more visible.
+                            let measured = if live_rows_high_water.get() >= viewport_rows {
+                                Some(viewport_rows)
+                            } else {
                                 live_content_extent(
                                     &vte,
                                     &live_cursor_origin,
                                     &live_cursor_high,
                                     output_started,
-                                ),
+                                )
+                            };
+                            let (visible_rows, next_high_water) = live_visible_rows_for_measurement(
+                                measured,
                                 output_started,
                                 live_force_full_for_layout.get(),
                                 live_rows_high_water.get(),
@@ -19290,6 +19351,168 @@ mod tests {
         // A lower sample still wins while the prompt is drawing.
         assert_eq!(super::latched_live_origin(Some(5), 3), 3);
         assert_eq!(super::latched_live_origin(None, 7), 7);
+    }
+
+    #[test]
+    fn late_ssh_command_origin_is_recovered_from_displayed_rows() {
+        // An entire two-line prompt and wrapped command can paint before the
+        // first cursor sample. The old origin (5002) clips two rows forever.
+        let origin = super::displayed_origin_from_last_text(5009, 10);
+        assert_eq!(origin, 5000);
+        assert_eq!(live_content_extent_for(5002, 5010, 32), 9);
+        assert_eq!(live_content_extent_for(origin, 5010, 32), 11);
+        // A one-line prompt, a cursor above a footer, and a long-lived ring.
+        assert_eq!(super::displayed_origin_from_last_text(200_005, 6), 200_000);
+        assert_eq!(super::displayed_origin_from_last_text(5000, 1), 5000);
+        assert_eq!(live_content_extent_for(origin, 5003, 32), 4);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn ssh_remote_prompt_cursor_stays_inside_live_clip_without_clear() {
+        use gtk4 as gtk;
+        use gtk4::prelude::*;
+        use std::time::{Duration, Instant};
+        use vte4::prelude::*;
+        gtk::init().expect("gtk init");
+        let settle = || {
+            let context = gtk::glib::MainContext::default();
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < deadline {
+                while context.iteration(false) {}
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        for mode in [
+            crate::config::TerminalMode::Block,
+            crate::config::TerminalMode::Chat,
+        ] {
+            for (wrapped, integrated) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let view = super::TermView::new_with_spawner(
+                    &Config::safe_defaults(),
+                    &mode,
+                    &["sh".to_string()],
+                    None,
+                    None,
+                    &[],
+                    |_argv, _cwd, _env, _token| {
+                        crate::pty::OwnedPty::for_tests(PtyForeground::Shell)
+                    },
+                )
+                .expect("nonexecuting SSH fixture PTY");
+                let window = gtk::Window::builder()
+                    .default_width(900)
+                    .default_height(900)
+                    .child(&view.widget())
+                    .build();
+                window.present();
+                settle();
+                view.active_vte
+                    .feed("old history\r\n".repeat(120).as_bytes());
+                settle();
+                let local_prompt = if integrated {
+                    "local@host ~\r\n> "
+                } else {
+                    "$ "
+                };
+                view.pty.write_test_slave(
+                    format!("\x1b]133;A\x07{local_prompt}\x1b]133;B\x07").as_bytes(),
+                );
+                settle();
+                assert_eq!(view.bstate.get(), BlockState::AwaitingCommand);
+                let command = if wrapped {
+                    format!(
+                        "ssh root@{}",
+                        "h".repeat(view.active_vte.column_count() as usize + 20)
+                    )
+                } else {
+                    "command ssh remote".to_string()
+                };
+                // Accept the local command while its shell owns the PTY,
+                // then deliver a complete remote prompt in one write.
+                let start = if integrated { "\x1b]133;A\x07" } else { "" };
+                let end = if integrated { "\x1b]133;B\x07" } else { "" };
+                view.pty
+                    .write_test_slave(format!("{command}\r\n\x1b]133;C\x07").as_bytes());
+                settle();
+                view.pty.set_test_foreground(PtyForeground::Other);
+                view.pty.write_test_slave(format!(
+                    "jsh: bringing jsh for this session\r\nbash: warning: setlocale\r\nwarning two\r\nwarning three\r\n{start}root@remote ~\r\n> {end}"
+                ).as_bytes());
+                settle();
+                assert_eq!(view.bstate.get(), BlockState::CollectingOutput);
+                let winsize = view.pty.test_slave_winsize();
+                let replies = Rc::new(RefCell::new(Vec::<String>::new()));
+                let captured = replies.clone();
+                let signal = view.active_vte.connect_commit(move |_, text, _| {
+                    captured.borrow_mut().push(text.to_string());
+                });
+                let assert_cursor_visible = || {
+                    replies.borrow_mut().clear();
+                    // Ask VTE itself for the screen-relative cursor. This
+                    // bypasses our parser's CPR implementation and avoids
+                    // using the very origin calculation being tested.
+                    view.active_vte.feed(b"\x1b[6n");
+                    settle();
+                    let row = replies
+                        .borrow()
+                        .iter()
+                        .find_map(|reply| {
+                            reply
+                                .strip_prefix("\x1b[")?
+                                .strip_suffix('R')?
+                                .split_once(';')?
+                                .0
+                                .parse::<i64>()
+                                .ok()
+                        })
+                        .expect("native VTE cursor-position response");
+                    let clip = view.active.borrow().live_clip();
+                    let offset = view
+                        .active_vte
+                        .compute_point(&clip, &gtk::graphene::Point::new(0.0, 0.0))
+                        .expect("terminal is inside live clip");
+                    // GTK's replacement has no padding getter; the fixture
+                    // must account for the actual CSS content-box inset.
+                    #[allow(deprecated)]
+                    let padding = view.active_vte.style_context().padding();
+                    let bottom = f64::from(offset.y())
+                        + f64::from(padding.top())
+                        + (row * view.active_vte.char_height()) as f64;
+                    assert!(bottom <= f64::from(clip.height()) + 1.0,
+                        "{mode:?} wrapped={wrapped} integrated={integrated}: cursor bottom {bottom} exceeds clip {} (row {row})", clip.height());
+                    assert_eq!(view.bstate.get(), BlockState::CollectingOutput);
+                    assert!(view.finished_blocks.borrow().is_empty());
+                    assert_eq!(view.pty.test_slave_winsize(), winsize);
+                };
+                assert_cursor_visible();
+                for _ in 0..2 {
+                    view.pty.write_test_slave(
+                        format!(
+                            "\r\n{}{start}root@remote ~\r\n> {end}",
+                            if integrated {
+                                "\x1b]133;C\x07\x1b]133;D;0\x07"
+                            } else {
+                                ""
+                            }
+                        )
+                        .as_bytes(),
+                    );
+                    settle();
+                    assert_cursor_visible();
+                }
+                // A blank input row must count even though text measurement
+                // alone ends on the preceding prompt-header line.
+                view.pty.write_test_slave(b"\r\nroot@remote ~\r\n");
+                settle();
+                assert_cursor_visible();
+                view.active_vte.disconnect(signal);
+                window.close();
+                settle();
+            }
+        }
     }
 
     #[test]
