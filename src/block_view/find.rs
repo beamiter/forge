@@ -1782,6 +1782,8 @@ impl TermView {
                 None => return FindFocusResult::Invalidated,
             }
         };
+        #[cfg(test)]
+        super::alt_screen::trace_find_render(&format!("find-before-select block={} output={} occurrence={occurrence} stamp={current_render_stamp:?}", surface.block_id, surface.is_output), &vte);
         vte.search_set_wrap_around(wrap_once);
         let found = if restart {
             vte.unselect_all();
@@ -1793,6 +1795,8 @@ impl TermView {
             }
         };
         vte.search_set_wrap_around(false);
+        #[cfg(test)]
+        super::alt_screen::trace_find_render(&format!("find-after-select found={found}"), &vte);
         if !found {
             return FindFocusResult::Invalidated;
         }

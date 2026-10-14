@@ -323,6 +323,32 @@ fn finished_content_rows(
     cursor_rows.max(text_rows).clamp(1, fallback.max(1))
 }
 
+#[cfg(test)]
+thread_local! {
+    static FIND_RENDER_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_find_render_trace(enabled: bool) {
+    FIND_RENDER_TRACE.with(|trace| trace.set(enabled));
+}
+
+#[cfg(test)]
+pub(crate) fn trace_find_render(event: &str, terminal: &Terminal) {
+    if !FIND_RENDER_TRACE.with(std::cell::Cell::get) {
+        return;
+    }
+    let adjustment = terminal
+        .vadjustment()
+        .map(|a| (a.lower(), a.value(), a.upper(), a.page_size()));
+    eprintln!(
+        "FIND-RENDER {event} terminal={terminal:?} mapped={} selected={:?} grid={}x{} pixel={}x{} adjustment={adjustment:?}",
+        terminal.is_mapped(),
+        terminal.text_selected(vte4::Format::Text),
+        terminal.column_count(), terminal.row_count(), terminal.width(), terminal.height(),
+    );
+}
+
 /// Fit a read-only finished VTE to the rows it actually rendered.
 ///
 /// Measuring VTE's text/cursor state covers ANSI cursor movement, erases, tabs,
@@ -330,6 +356,9 @@ fn finished_content_rows(
 /// intentionally bidirectional: estimates are only capture capacity, never a
 /// minimum visible height.
 pub(crate) fn fit_finished_terminal_to_content(terminal: &Terminal) {
+    #[cfg(test)]
+    trace_find_render("fit-before", terminal);
+
     let visible_rows = terminal.row_count().max(1);
     let cols = terminal.column_count().max(1);
     let (_, cursor_row) = terminal.cursor_position();
@@ -374,6 +403,8 @@ pub(crate) fn fit_finished_terminal_to_content(terminal: &Terminal) {
     if let Some(adj) = terminal.vadjustment() {
         adj.set_value(adj.lower());
     }
+    #[cfg(test)]
+    trace_find_render("fit-after", terminal);
 }
 
 /// Poll cadence and bound for the feed-applied detectors below. The cap is a
@@ -470,10 +501,18 @@ pub(crate) fn settle_finished_terminal_after_feed(
                 // snapshot. The generic fit deliberately keeps a bounded
                 // recovery ring for stale/mid-feed callers; it is safe to drop
                 // that ring only here.
+                #[cfg(test)]
+                trace_find_render("settle-before-drop-ring", &terminal);
                 terminal.set_scrollback_lines(0);
+                #[cfg(test)]
+                trace_find_render("settle-after-drop-ring", &terminal);
             }
             let terminal = terminal.clone();
-            glib::idle_add_local_once(move || anchor_terminal_top(&terminal));
+            glib::idle_add_local_once(move || {
+                anchor_terminal_top(&terminal);
+                #[cfg(test)]
+                trace_find_render("settle-final-anchor", &terminal);
+            });
         });
         glib::ControlFlow::Break
     });

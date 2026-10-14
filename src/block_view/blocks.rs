@@ -1830,6 +1830,9 @@ fn rewindow_finished_vte(
     expand_to_buffer: bool,
     expected_tail: Option<&str>,
 ) {
+    #[cfg(test)]
+    super::alt_screen::trace_find_render("rewindow-before", vte);
+
     let (cols, visible_rows, scrollback) =
         bounded_finished_vte_geometry(cols, visible_rows.max(1), requested_scrollback.max(64));
     let cell_height = vte.char_height() as i32;
@@ -1854,6 +1857,8 @@ fn rewindow_finished_vte(
     if let Some(adj) = vte.vadjustment() {
         adj.set_value(adj.lower());
     }
+    #[cfg(test)]
+    super::alt_screen::trace_find_render("rewindow-after", vte);
 }
 
 pub(crate) fn render_bytes_into_finished_vte(
@@ -1865,6 +1870,9 @@ pub(crate) fn render_bytes_into_finished_vte(
     capture_rows: i64,
     expand_to_buffer: bool,
 ) {
+    #[cfg(test)]
+    super::alt_screen::trace_find_render("render-before-reset-feed", vte);
+
     let display_text = output_display_text(text);
     // The pixel height request below is based on this same row count. Capping
     // the VTE grid at 32 while requesting a taller widget created the large
@@ -1887,6 +1895,8 @@ pub(crate) fn render_bytes_into_finished_vte(
     vte.set_size(cols, visible_rows);
     vte.set_scrollback_lines(scrollback);
     vte.feed(&finished_snapshot_stream(display_text));
+    #[cfg(test)]
+    super::alt_screen::trace_find_render("render-after-queued-feed", vte);
     let settle_tail = snapshot_settle_tail(display_text);
     if expand_to_buffer {
         settle_finished_terminal_after_feed(vte, settle_tail.as_deref());
@@ -2759,7 +2769,13 @@ impl FinishedBlock {
                     max_expanded_cap_for_map,
                 );
                 let stamp = output_render_stamp(eff_cols, rows, cap, generation_for_map.get());
-                if stamp_for_map.replace(stamp) == stamp {
+                let previous_stamp = stamp_for_map.replace(stamp);
+                #[cfg(test)]
+                super::alt_screen::trace_find_render(
+                    &format!("output-map stamp={previous_stamp:?} -> {stamp:?}"),
+                    w,
+                );
+                if previous_stamp == stamp {
                     return;
                 }
                 let (_, visible_rows, _) =
@@ -2932,6 +2948,11 @@ impl FinishedBlock {
                 let cap = finished_output_cap(rows, fitted_cap, false, max_expanded_cap_for_refit);
                 let stamp = output_render_stamp(eff_cols, rows, cap, generation_for_refit.get());
                 let previous_stamp = stamp_for_refit.replace(stamp);
+                #[cfg(test)]
+                super::alt_screen::trace_find_render(
+                    &format!("output-refit stamp={previous_stamp:?} -> {stamp:?}"),
+                    &output_vte,
+                );
                 if previous_stamp == stamp {
                     return None;
                 }
@@ -3890,6 +3911,11 @@ impl FinishedBlock {
     /// virtualized cards — those refit through `connect_map` on their way back
     /// into the viewport.
     pub(crate) fn refit_output_to_viewport(&self) -> Option<i32> {
+        #[cfg(test)]
+        super::alt_screen::trace_find_render(
+            &format!("output-refit-entry stamp={:?}", self.render_stamp()),
+            &self.output_vte,
+        );
         (self.refit_output)().map(|height| {
             if self.widget.has_css_class("chat-pair") && !self.is_background {
                 height.saturating_add(super::chat::COMMAND_GAP_PX)
