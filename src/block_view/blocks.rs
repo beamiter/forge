@@ -4617,7 +4617,7 @@ mod tests {
             "$ ",
             "printf alpha",
             None,
-            "alpha\n",
+            "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n",
             Some(0),
             &crate::config::Config::safe_defaults(),
             Some(1),
@@ -4662,10 +4662,19 @@ mod tests {
         super::super::install_block_css(&crate::config::Config::safe_defaults());
         let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         root.add_css_class("term-chat-root");
+        // Match TermView's history hierarchy: the list fills the viewport,
+        // while each non-expanding card keeps its content height. A card used
+        // directly as the scroller child gets the viewport's allocation even
+        // when its output is folded, hiding any actual height change.
+        let block_list = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        block_list.set_vexpand(true);
+        block_list.add_css_class("block-list");
+        block_list.add_css_class("chat-transcript");
+        block_list.append(block.widget());
         let scroll = gtk4::ScrolledWindow::new();
-        scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        scroll.set_policy(gtk4::PolicyType::Automatic, gtk4::PolicyType::Automatic);
         scroll.set_vexpand(true);
-        scroll.set_child(Some(block.widget()));
+        scroll.set_child(Some(&block_list));
         root.append(&scroll);
         let window = gtk4::Window::builder()
             .default_width(800)
@@ -4689,15 +4698,36 @@ mod tests {
         let captured = block.output_vte.text_format(vte4::Format::Text).unwrap();
         assert!(captured.contains("alpha"));
         assert!(
+            captured.contains("theta"),
+            "all eight output rows are rendered"
+        );
+        assert!(
             block.output_vte.width() > block.command_vte.width(),
             "result keeps log width"
         );
         let expanded_height = block.widget.height();
+        assert!(
+            expanded_height < block_list.height(),
+            "the card must not inherit the history viewport's spare height"
+        );
+        // Several rows are intentional: a one-line result can legitimately be
+        // shorter than its accessible collapsed-summary button.
+        let expanded_output_height = block.output_vte.height();
         assert!(block.set_collapsed(true));
         settle();
-        assert!(block.widget.height() < expanded_height);
+        assert!(!block.output_vte.is_mapped());
+        assert!(block.collapsed_summary.is_mapped());
+        assert!(expanded_output_height > block.collapsed_summary.height());
+        assert!(
+            block.widget.height() < expanded_height,
+            "folding must shrink the card: expanded={expanded_height}, collapsed={}",
+            block.widget.height()
+        );
         assert!(block.set_collapsed(false));
         settle();
+        assert!(block.output_vte.is_mapped());
+        assert!(!block.collapsed_summary.is_mapped());
+        assert_eq!(block.widget.height(), expanded_height);
         for width in [360, 800, 360, 800] {
             window.set_default_size(width, 500);
             settle();
