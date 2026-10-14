@@ -52,6 +52,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    ui::organism::tests::idle_refresh_skips_unchanged_tooltip_and_non_owner_spatial_render
     block_view::tests::chat_native_activate_preserves_send_and_stop_origins_through_delays
     block_view::tests::chat_stop_stays_bound_across_held_replay_and_pointer_or_key_press
     block_view::tests::chat_send_button_observes_production_queue_admission_and_held_boundaries
