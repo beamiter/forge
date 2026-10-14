@@ -33523,3 +33523,6 @@ mod controller_navigation_regressions {
 
 #[cfg(test)]
 mod fold_geometry_tests;
+
+#[cfg(test)]
+mod search_navigation_tests;
