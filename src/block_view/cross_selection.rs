@@ -164,10 +164,26 @@ pub(crate) struct CrossSelection {
     mouse_reporting: Rc<Cell<MouseReporting>>,
 }
 
+/// The command control owns its held-feed release, after capturing its target.
+/// Ancestor capture must not parse D/A/B/C before the button's own press sees it.
+fn chat_command_control_at(root: &gtk::Widget, x: f64, y: f64) -> bool {
+    let mut target = root.pick(x, y, gtk::PickFlags::DEFAULT);
+    while let Some(widget) = target {
+        if widget.has_css_class("chat-command-control") {
+            return true;
+        }
+        if &widget == root {
+            break;
+        }
+        target = widget.parent();
+    }
+    false
+}
+
 impl CrossSelection {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn install(
-        block_scroll: &gtk::ScrolledWindow,
+        selection_root: &impl IsA<gtk::Widget>,
         finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
         active_vte: vte4::Terminal,
         selected_block_ids: SelectedBlockIds,
@@ -177,6 +193,10 @@ impl CrossSelection {
         bstate: Rc<Cell<BlockState>>,
         mouse_reporting: Rc<Cell<MouseReporting>>,
     ) -> Rc<Self> {
+        // Chat's dock is a sibling of the history scroller. Capture on their
+        // common native ancestor so a new composer selection retires an older
+        // cross-card owner. Ordinary Block still passes its original scroller.
+        let block_scroll = selection_root.upcast_ref::<gtk::Widget>();
         let this = Rc::new(Self {
             finished_blocks,
             active_vte,
@@ -201,6 +221,7 @@ impl CrossSelection {
             }
         });
 
+        let command_control_drag = Rc::new(Cell::new(false));
         // A native selection starts a new selection model. Clear stale text
         // selections on other surfaces and any whole-card selection first.
         let click = gtk::GestureClick::new();
@@ -208,11 +229,20 @@ impl CrossSelection {
         click.set_propagation_phase(gtk::PropagationPhase::Capture);
         let scroll_for_click = block_scroll.downgrade();
         let this_for_click = Rc::downgrade(&this);
+        let control_for_click = command_control_drag.clone();
         click.connect_pressed(move |gesture, _n_press, x, y| {
             let (Some(this), Some(scroll)) = (this_for_click.upgrade(), scroll_for_click.upgrade())
             else {
                 return;
             };
+            let is_control = chat_command_control_at(&scroll, x, y);
+            control_for_click.set(is_control);
+            if is_control {
+                this.drag_generation
+                    .set(this.drag_generation.get().wrapping_add(1));
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
             let target = this.vte_at(&scroll, x, y);
             if target.is_some() {
                 this.clear_block_selection();
@@ -229,6 +259,7 @@ impl CrossSelection {
 
         let scroll_for_begin = block_scroll.downgrade();
         let this_for_begin = Rc::downgrade(&this);
+        let control_for_begin = command_control_drag.clone();
         drag.connect_drag_begin(move |gesture, x, y| {
             let (Some(this), Some(scroll)) = (this_for_begin.upgrade(), scroll_for_begin.upgrade())
             else {
@@ -236,6 +267,16 @@ impl CrossSelection {
             };
             this.drag_generation
                 .set(this.drag_generation.get().wrapping_add(1));
+            let is_control = chat_command_control_at(&scroll, x, y);
+            control_for_begin.set(is_control);
+            if is_control {
+                // No drag ownership was established, so cancellation/end must
+                // not release a selection's earlier hold either.
+                this.start_vte.borrow_mut().take();
+                this.claimed.set(false);
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
             let start = this.vte_at(&scroll, x, y);
             if start.as_ref() == Some(&this.active_vte)
                 && this.mouse_reporting.get().is_reporting()
@@ -297,7 +338,11 @@ impl CrossSelection {
         });
 
         let this_for_end = Rc::downgrade(&this);
+        let control_for_end = command_control_drag.clone();
         drag.connect_drag_end(move |_, _, _| {
+            if control_for_end.get() {
+                return;
+            }
             if let Some(this) = this_for_end.upgrade() {
                 this.start_vte.borrow_mut().take();
                 this.end_active_feed_hold();
@@ -308,6 +353,9 @@ impl CrossSelection {
 
         let this_for_cancel = Rc::downgrade(&this);
         drag.connect_cancel(move |_, _| {
+            if command_control_drag.get() {
+                return;
+            }
             if let Some(this) = this_for_cancel.upgrade() {
                 this.start_vte.borrow_mut().take();
                 this.end_active_feed_hold();
@@ -416,7 +464,12 @@ impl CrossSelection {
         }
     }
 
-    fn vte_at(&self, block_scroll: &gtk::ScrolledWindow, x: f64, y: f64) -> Option<vte4::Terminal> {
+    fn vte_at(
+        &self,
+        block_scroll: &impl IsA<gtk::Widget>,
+        x: f64,
+        y: f64,
+    ) -> Option<vte4::Terminal> {
         let picked = block_scroll.pick(x, y, gtk::PickFlags::DEFAULT)?;
         self.ordered_vtes()
             .into_iter()
@@ -1116,5 +1169,61 @@ mod tests {
 
         window.close();
         pump();
+    }
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn chat_selection_root_reaches_the_docked_native_composer() {
+        use crate::config::{Config, TerminalMode};
+        use gtk4::prelude::*;
+        use vte4::TerminalExt;
+        gtk4::init().expect("gtk init");
+        let view = crate::block_view::TermView::new_with_spawner(
+            &Config::safe_defaults(),
+            &TerminalMode::Chat,
+            &["sh".into()],
+            None,
+            None,
+            &[],
+            |_, _, _, _| crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Shell),
+        )
+        .unwrap();
+        let window = gtk4::Window::builder()
+            .child(&view.root)
+            .default_width(640)
+            .default_height(480)
+            .build();
+        window.present();
+        let settle = || {
+            for _ in 0..25 {
+                while gtk4::glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        settle();
+        view.pty.write_test_slave(b"\x1b]133;A\x07$ \x1b]133;B\x07history\r\n\x1b]133;C;cmdline_url=history\x07old-output\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        settle();
+        view.pty.write_test_slave(b"live-input");
+        settle();
+        let active = &view.active_vte;
+        let card = view.finished_blocks.borrow().last().unwrap().clone();
+        let cross = &view.cross_selection;
+        let bounds = active.compute_bounds(&view.root).unwrap();
+        let (x, y) = (f64::from(bounds.x()) + 4.0, f64::from(bounds.y()) + 4.0);
+        assert_eq!(cross.vte_at(&view.root, x, y), Some(active.clone()));
+        assert!(!active.is_ancestor(&view.block_scroll));
+        cross.paint_range(std::slice::from_ref(&card.output_vte), 0, 0);
+        assert!(cross.surface_selected(&card.output_vte));
+        let controllers = view.root.observe_controllers();
+        let click = (0..controllers.n_items())
+            .filter_map(|i| controllers.item(i))
+            .find_map(|controller| controller.downcast::<gtk4::GestureClick>().ok())
+            .unwrap();
+        click.emit_by_name::<()>("pressed", &[&1_i32, &x, &y]);
+        assert!(!cross.surface_selected(&card.output_vte));
+        active.select_all();
+        let copied = cross.copy_text().unwrap().unwrap();
+        assert!(copied.contains("live-input"));
+        assert!(!copied.contains("old-output"));
+        window.close();
     }
 }

@@ -23,6 +23,8 @@ use crate::keybindings::KeybindingMap;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalMode {
     Block,
+    /// Native conversation layout over the existing PTY and shell editor.
+    Chat,
     Vte,
     /// One long-lived full-size VTE driven by the same OSC 133 lifecycle
     /// engine as Block, with no per-command block chrome: finished commands
@@ -35,6 +37,7 @@ impl TerminalMode {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             TerminalMode::Block => "block",
+            TerminalMode::Chat => "chat",
             TerminalMode::Vte => "vte",
             TerminalMode::Unified => "unified",
         }
@@ -45,6 +48,7 @@ impl TerminalMode {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "block" => Some(TerminalMode::Block),
+            "chat" => Some(TerminalMode::Chat),
             "vte" => Some(TerminalMode::Vte),
             "unified" => Some(TerminalMode::Unified),
             _ => None,
@@ -54,7 +58,10 @@ impl TerminalMode {
     /// Whether this mode is rendered by `TermView` (the OSC 133 engine), as
     /// opposed to a conventional VTE pane.
     pub(crate) fn uses_term_view(&self) -> bool {
-        matches!(self, TerminalMode::Block | TerminalMode::Unified)
+        matches!(
+            self,
+            TerminalMode::Block | TerminalMode::Chat | TerminalMode::Unified
+        )
     }
 
     /// Whether a `TermView` in this mode renders through the Unified backend
@@ -1886,7 +1893,7 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
                 &mut issues,
                 Error,
                 "terminal_mode",
-                "expected 'block', 'vte' or 'unified'",
+                "expected 'block', 'chat', 'vte' or 'unified'",
             );
         }
     }
@@ -3706,6 +3713,7 @@ unknown_action = "F8"
     fn terminal_mode_parses_and_round_trips_every_backend() {
         for (text, mode) in [
             ("block", TerminalMode::Block),
+            ("chat", TerminalMode::Chat),
             ("vte", TerminalMode::Vte),
             ("unified", TerminalMode::Unified),
         ] {
@@ -3717,12 +3725,24 @@ unknown_action = "F8"
             assert_eq!(mode.as_str(), text);
             assert_eq!(TerminalMode::parse(mode.as_str()).as_ref(), Some(&mode));
         }
-        assert_eq!(TerminalMode::parse("warp"), None);
+        for unsupported in ["warp", "chatbot", "capsule", "ai", " chat "] {
+            assert_eq!(TerminalMode::parse(unsupported), None);
+        }
         // Unified is rendered by TermView, so it takes the Block leaf/pane
         // path everywhere a mode is dispatched on.
         assert!(TerminalMode::Unified.uses_term_view());
         assert!(TerminalMode::Block.uses_term_view());
+        assert!(TerminalMode::Chat.uses_term_view());
+        assert!(!TerminalMode::Chat.is_unified());
         assert!(!TerminalMode::Vte.uses_term_view());
+    }
+
+    #[test]
+    fn config_validator_accepts_chat_without_changing_default() {
+        assert!(validate_config_contents("terminal_mode = 'chat'\n")
+            .unwrap()
+            .is_empty());
+        assert_eq!(Config::safe_defaults().terminal_mode, TerminalMode::Vte);
     }
 
     #[test]

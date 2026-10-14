@@ -17,6 +17,7 @@ use crate::config::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
     Block,
+    Chat,
     Vte,
     Unified,
 }
@@ -82,7 +83,7 @@ Launch options:
   -d, --working-directory DIR
                               Start in DIR
   -e, --execute COMMAND ...   Run a command instead of the configured shell
-      --mode block|vte|unified
+      --mode block|chat|vte|unified
                               Override the terminal backend for this window
       --no-restore            Start a fresh workspace
       --safe-mode             Use isolated VTE defaults without restore or persistence
@@ -136,10 +137,11 @@ fn parse_shell(value: &str) -> Result<ShellIntegration, String> {
 fn parse_mode(value: &str) -> Result<Mode, String> {
     match value.to_ascii_lowercase().as_str() {
         "block" => Ok(Mode::Block),
+        "chat" => Ok(Mode::Chat),
         "vte" => Ok(Mode::Vte),
         "unified" => Ok(Mode::Unified),
         _ => Err(format!(
-            "invalid terminal mode '{value}' (use block, vte or unified)"
+            "invalid terminal mode '{value}' (use block, chat, vte or unified)"
         )),
     }
 }
@@ -236,7 +238,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs, St
                 let value = args
                     .get(index)
                     .and_then(|value| value.to_str())
-                    .ok_or_else(|| "--mode requires 'block', 'vte' or 'unified'".to_string())?;
+                    .ok_or_else(|| {
+                        "--mode requires 'block', 'chat', 'vte' or 'unified'".to_string()
+                    })?;
                 parsed.launch.mode = Some(parse_mode(value)?);
             }
             "-e" | "--execute" | "--" => {
@@ -1196,6 +1200,7 @@ pub(crate) fn handle_early_args() -> Option<glib::ExitCode> {
         if let Some(mode) = parsed.launch.mode {
             let value = match mode {
                 Mode::Block => "block",
+                Mode::Chat => "chat",
                 Mode::Vte => "vte",
                 Mode::Unified => "unified",
             };
@@ -1440,6 +1445,21 @@ mod tests {
         assert!(parsed.launch.no_restore);
         assert!(parse(&["--safe-mode", "--mode", "block"]).is_err());
         assert!(parse(&["--safe-mode", "-e", "bash"]).is_err());
+    }
+
+    #[test]
+    fn chat_is_an_explicit_mode_without_new_aliases() {
+        assert_eq!(
+            parse(&["--mode", "chat"]).unwrap().launch.mode,
+            Some(Mode::Chat)
+        );
+        assert_eq!(
+            parse(&["--mode=chat"]).unwrap().launch.mode,
+            Some(Mode::Chat)
+        );
+        for unsupported in ["chatbot", "capsule", "ai"] {
+            assert!(parse(&["--mode", unsupported]).is_err());
+        }
     }
 
     #[test]

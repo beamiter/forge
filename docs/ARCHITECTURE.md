@@ -148,3 +148,16 @@ invoking history control/card and owner; Close/Escape restores a mapped history
 target before considering the live VTE. This path does not clear selection, unread
 state or move the history scroll anchor. Review remains clipboard-only and bounded;
 output and images remain in the original retained blocks.
+
+## Chat presentation
+
+Chat is an explicit `TerminalMode::Chat` routed through the existing TermView
+and BlockBackend lifecycle. `jterm_core::chat_mode` resolves content-free
+surface ownership; it does not parse or execute commands. The per-pane
+`ChatPresentation` keeps the Block history insertion anchor in the transcript
+and reparents only ActiveBlock's existing native clip between that anchor and
+the dock. Its canvas is the stable viewport authority, avoiding a history-height
+feedback loop when input docks. GTK's existing clip owns painting and hit tests.
+FinishedBlock presentation wraps the original command/output VTE widgets, keeping
+copy/search and record identity. All Chat CSS is scoped to the selected pane.
+No shared configuration reload can restyle a live Block or managed-remote pane.

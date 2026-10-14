@@ -2213,6 +2213,7 @@ impl FinishedBlock {
                 reused.remove_css_class(stripe);
             }
             reused.remove_css_class("block-compact");
+            reused.remove_css_class("chat-pair");
             reused
         } else {
             let b = gtk4::Box::new(Orientation::Vertical, 0);
@@ -3651,6 +3652,55 @@ impl FinishedBlock {
         }
     }
 
+    /// Native Chat command/result pairing. The VTEs, record identity, actions,
+    /// find targets and copy sources are unchanged. Output keeps the full width.
+    pub(crate) fn set_chat_layout(&self) {
+        if self.widget.has_css_class("chat-pair") {
+            return;
+        }
+        let Some(command) = self
+            .command_vte
+            .parent()
+            .and_then(|w| w.downcast::<gtk4::Box>().ok())
+        else {
+            return;
+        };
+        self.widget.add_css_class("chat-pair");
+        self.content.remove(&command);
+        let result = gtk4::Box::new(Orientation::Vertical, 0);
+        result.add_css_class("chat-result");
+        result.set_hexpand(true);
+        while let Some(child) = self.content.first_child() {
+            self.content.remove(&child);
+            result.append(&child);
+        }
+        command.add_css_class("chat-command");
+        command.set_halign(gtk4::Align::End);
+        command.set_hexpand(false);
+        command.set_margin_start(12);
+        command.set_margin_bottom(if self.is_background {
+            0
+        } else {
+            super::chat::COMMAND_GAP_PX
+        });
+        self.command_vte.add_css_class("chat-command-terminal");
+        self.command_vte.set_hexpand(false);
+        let cols = super::chat::command_columns(&self.cmd_text, self.command_vte.column_count());
+        let rows = output_visual_row_count(&self.cmd_text, cols).max(1);
+        self.command_vte.set_size(cols, rows);
+        self.command_vte
+            .set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
+        self.content.append(&command);
+        self.content.append(&result);
+        if !self.is_background {
+            self.virtualized_height.set(
+                self.virtualized_height
+                    .get()
+                    .saturating_add(super::chat::COMMAND_GAP_PX),
+            );
+        }
+    }
+
     /// Switch this card between the normal and compact densities in place and
     /// return the height its virtualization placeholder must contribute.
     pub(crate) fn set_compact(&self, compact: bool) -> i32 {
@@ -3782,7 +3832,13 @@ impl FinishedBlock {
     /// virtualized cards — those refit through `connect_map` on their way back
     /// into the viewport.
     pub(crate) fn refit_output_to_viewport(&self) -> Option<i32> {
-        (self.refit_output)()
+        (self.refit_output)().map(|height| {
+            if self.widget.has_css_class("chat-pair") && !self.is_background {
+                height.saturating_add(super::chat::COMMAND_GAP_PX)
+            } else {
+                height
+            }
+        })
     }
 
     /// Scroll this block's top or bottom edge into the outer history canvas.
@@ -4208,8 +4264,11 @@ impl ActiveBlock {
         // `realize` is too early: the VTE's IM context does not have a mapped
         // surface yet. Taking logical focus there can suppress the real
         // focus-in fcitx/ibus need. `map` is the first valid point to focus.
-        active_vte.connect_map(|terminal| {
-            terminal.grab_focus();
+        let first_map = Cell::new(true);
+        active_vte.connect_map(move |terminal| {
+            if !terminal.has_css_class("chat-live-terminal") || first_map.replace(false) {
+                terminal.grab_focus();
+            }
         });
 
         ActiveBlock {
@@ -4545,6 +4604,121 @@ mod tests {
             super::failure_badge_tooltip(137, "SIGKILL"),
             "128 + signal number: terminated by SIGKILL"
         );
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn chat_pair_keeps_native_surfaces_and_gap_is_not_accumulated() {
+        use gtk4::prelude::*;
+        use vte4::TerminalExt;
+        gtk4::init().expect("gtk init");
+        let block = FinishedBlock::new(
+            7,
+            "$ ",
+            "printf alpha",
+            None,
+            "alpha\n",
+            Some(0),
+            &crate::config::Config::safe_defaults(),
+            Some(1),
+            None,
+            None,
+            80,
+        );
+        let command = block.command_vte.clone();
+        let output = block.output_vte.clone();
+        let height = block.virtualized_height.get();
+        block.set_chat_layout();
+        assert_eq!(
+            block.virtualized_height.get(),
+            height + super::super::chat::COMMAND_GAP_PX
+        );
+        block.set_chat_layout();
+        assert_eq!(
+            block.virtualized_height.get(),
+            height + super::super::chat::COMMAND_GAP_PX
+        );
+        let chat_height = block.set_compact(false);
+        block.set_compact(true);
+        assert_eq!(block.set_compact(false), chat_height);
+        assert_eq!(block.set_virtualized(true), chat_height);
+        assert_eq!(block.set_virtualized(false), chat_height);
+        assert!(block.set_collapsed(true));
+        assert!(block.set_collapsed(false));
+        assert_eq!(block.command_vte, command);
+        assert_eq!(block.output_vte, output);
+        assert_eq!(
+            block.content.first_child().unwrap().halign(),
+            gtk4::Align::End
+        );
+        assert!(block
+            .content
+            .last_child()
+            .unwrap()
+            .has_css_class("chat-result"));
+        assert!(block.output_vte.is_ancestor(&block.widget));
+        assert!(!block.output_vte.is_input_enabled());
+
+        super::super::install_block_css(&crate::config::Config::safe_defaults());
+        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        root.add_css_class("term-chat-root");
+        let scroll = gtk4::ScrolledWindow::new();
+        scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        scroll.set_vexpand(true);
+        scroll.set_child(Some(block.widget()));
+        root.append(&scroll);
+        let window = gtk4::Window::builder()
+            .default_width(800)
+            .default_height(500)
+            .child(&root)
+            .build();
+        window.present();
+        let settle = || {
+            for _ in 0..25 {
+                while gtk4::glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        settle();
+        assert!(block.command_vte.is_mapped());
+        assert!(block
+            .command_vte
+            .text_format(vte4::Format::Text)
+            .unwrap()
+            .contains("printf alpha"));
+        let captured = block.output_vte.text_format(vte4::Format::Text).unwrap();
+        assert!(captured.contains("alpha"));
+        assert!(
+            block.output_vte.width() > block.command_vte.width(),
+            "result keeps log width"
+        );
+        let expanded_height = block.widget.height();
+        assert!(block.set_collapsed(true));
+        settle();
+        assert!(block.widget.height() < expanded_height);
+        assert!(block.set_collapsed(false));
+        settle();
+        for width in [360, 800, 360, 800] {
+            window.set_default_size(width, 500);
+            settle();
+            block.refit_output_to_viewport();
+            settle();
+            let height = block.widget.height();
+            assert_eq!(block.set_virtualized(true), height);
+            settle();
+            block.set_virtualized(false);
+            settle();
+            assert_eq!(
+                block.output_vte.text_format(vte4::Format::Text).unwrap(),
+                captured,
+                "remap does not double-feed output"
+            );
+            assert!(
+                block.widget.height() <= expanded_height + block.output_vte.char_height() as i32,
+                "gap does not grow on refit/remap"
+            );
+        }
+        window.close();
     }
 
     #[test]

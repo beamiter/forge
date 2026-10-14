@@ -9,6 +9,8 @@
 # "unified"：实验模式——同一套 OSC 133 生命周期，但只有一块常驻全屏 VTE，
 # 不生成任何命令块外壳（完成的命令仅记录为内存中的 zone）。
 # 三种模式均支持分屏；新 pane 继承被分屏 pane 的后端，与 anvil 一致。
+# "chat"：独立对话布局，右侧命令胶囊、宽输出卡与固定原生 shell 输入区；不需要 LLM。
+# 仅新建/恢复的本地 pane 应用；现有 pane、PTY 与默认值不变。
 terminal_mode = "block"
 opacity = 0.95                 # 0.01 .. 1.0
 scrollback = 5000             # 0 .. 1000000

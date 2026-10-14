@@ -4745,8 +4745,12 @@ impl UiState {
 
         let terminal_group = adw::PreferencesGroup::new();
         terminal_group.set_title(preferences_group_title("Terminal & Blocks").as_str());
-        let terminal_mode_model =
-            gtk4::StringList::new(&["Block", "VTE compatibility", "Unified (experimental)"]);
+        let terminal_mode_model = gtk4::StringList::new(&[
+            "Block",
+            "VTE compatibility",
+            "Unified (experimental)",
+            "Chat",
+        ]);
         let terminal_mode_row = adw::ComboRow::builder()
             .title("Terminal Backend")
             .subtitle("Applies to new and restored local panes")
@@ -4755,6 +4759,7 @@ impl UiState {
                 crate::config::TerminalMode::Block => 0,
                 crate::config::TerminalMode::Vte => 1,
                 crate::config::TerminalMode::Unified => 2,
+                crate::config::TerminalMode::Chat => 3,
             })
             .build();
         let safe_mode = std::env::var_os("FORGE_SAFE_MODE").is_some();
@@ -5051,6 +5056,7 @@ impl UiState {
             ui.config.borrow_mut().terminal_mode = match row.selected() {
                 0 => crate::config::TerminalMode::Block,
                 2 => crate::config::TerminalMode::Unified,
+                3 => crate::config::TerminalMode::Chat,
                 _ => crate::config::TerminalMode::Vte,
             };
             ui.persist_config();

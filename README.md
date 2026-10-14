@@ -198,6 +198,7 @@ forge --check-config ~/my-forge.toml
 ```bash
 forge ~/project
 forge --mode block --no-restore
+forge --mode chat --no-restore
 forge -d /tmp --execute bash -lc 'printf "hello\\n"'
 forge --safe-mode
 ```
@@ -558,3 +559,13 @@ forge 以 **MIT OR Apache-2.0** 双许可证发布，使用者可任选其一；
 远端重命名/移动、复制和目录上传的发布阶段需要 Linux、Python 3，以及 libc 和目标文件系统支持 `renameat2(RENAME_NOREPLACE)`。探针先在目标文件系统检查该能力；不支持时明确失败，不回退到普通 `mv`，也不安装远端软件。浏览、新建空文件和单文件硬链接上传不依赖 Python。
 
 上传目录先在本地生成有界、私有的完整归档，确认 tar 成功后才连接远端发布；远端在私有同父目录 staging 内解包并原子拒绝同名目标。失败不会删除其他进程创建的目标。子进程组在主进程被回收前终止；非阻塞管道和期限确保继承管道的逃逸子进程无法让取消或超时永久等待。
+
+### Native Chat terminal mode
+
+Select `forge --mode chat` or `terminal_mode = "chat"` for right-aligned command
+capsules, wide output cards and a docked native multiline shell composer. This
+is independent of AI Chat and needs no LLM. The original PTY, shell editor,
+completion, password input and interactive applications remain in control;
+running commands and alternate-screen programs temporarily own the same native
+terminal. Existing defaults and existing panes are unchanged. See
+[Chat mode behavior and acceptance](docs/CHAT_MODE_ACCEPTANCE.md).

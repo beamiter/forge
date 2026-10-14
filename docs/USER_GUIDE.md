@@ -790,3 +790,14 @@ Escape 或 Close 关闭窗口并把键盘焦点交回打开审阅的历史操作
 在一个命令或输出 VTE 内拖动仍使用原生按字选区。拖动跨过区域边界后，轮廓标记整区选择；复制包含这些区域的全部保留文本（含其 VTE 滚屏），按界面从旧到新排列，而不是只取端点部分行。区域折叠、卸载或内容改变时会撤销选区；复制超过 32 MiB、读取过慢或任一记录失效时整次拒绝，保留原剪贴板。拖选本身不覆盖 PRIMARY 或普通剪贴板；只有明确复制才更新普通剪贴板。
 
 流式 live 终端仍在拖选时暂停显示刷新；复制、继续输入、取消或达到既有缓冲上限后恢复。真正的单区域原生选区可以接替整区选区。GTK/X11 回归通过实际指针事件检查两个拖动方向、顺序、剪贴板边界与暂停数据恢复；可在隔离 Xvfb 中设置 `FORGE_XTEST_DRIVER="$PWD/scripts/qa-cross-selection-pointer.py"` 运行 `scripts/test-gtk-display.sh`（需 Python 3、libX11、libXtst）。
+
+## Chat 终端模式
+
+用 `forge --mode chat --no-restore` 或 `terminal_mode = "chat"` 开启。
+设置中的 Terminal Backend → Chat 仅应用到新建和恢复的本地 pane。
+右侧显示命令胶囊，左侧保留宽日志输出卡，底部固定原生多行 shell 输入区。
+它不依赖 LLM，也不是 AI Chat：补全、历史、多行、密码与交互进程仍走原来的 VTE/PTY。
+发送箭头等于一次 Enter，不重新粘贴命令；运行时同一个终端进入结果区，底部有耗时和 Stop。
+vim/top 接管原生终端，退出后按实际 shell 状态返回；缺少集成时同一 PTY 继续透传。
+复制、搜索、折叠和历史恢复继续使用原始记录。
+详见 [Chat 验收清单](CHAT_MODE_ACCEPTANCE.md)。

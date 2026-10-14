@@ -466,6 +466,68 @@ pub(crate) fn block_css(config: &Config) -> String {
         .block-list {{
             background-color: {bg_hex};
         }}
+        /* Chat is a per-pane presentation. No selector can restyle Block,
+           Unified, or a managed remote pane in the same window. Native VTE
+           remains the hit-tested surface; there is no painted fake editor. */
+        .term-chat-root .chat-pair {{
+            background-color: transparent;
+            border-color: transparent;
+            outline-color: transparent;
+            box-shadow: none;
+        }}
+        .term-chat-root .chat-command {{
+            font-family: {font_stack};
+            font-size: {font_size};
+            background-color: rgba({agent_r},{agent_g},{agent_b},0.34);
+            border-radius: 18px 18px 5px 18px;
+            padding: 0 10px 0 2px;
+        }}
+        .term-chat-root .chat-result {{
+            background-color: {block_bg_hex};
+            border-radius: 5px 16px 16px 16px;
+            outline: 1px solid rgba({fg_r},{fg_g},{fg_b},0.08);
+            outline-offset: -1px;
+        }}
+        .term-chat-root .block-failed .chat-result {{
+            outline-color: {err_stripe};
+        }}
+        .term-chat-root .block-unknown .chat-result {{
+            outline-color: {warn_stripe};
+        }}
+        .term-chat-root .block-selected .chat-result,
+        .term-chat-root .block-selection-active .chat-result {{
+            outline-color: {accent};
+        }}
+        .term-chat-root .chat-composer {{
+            border-color: transparent;
+            outline-color: rgba({fg_r},{fg_g},{fg_b},0.22);
+            border-radius: 18px;
+            box-shadow: none;
+        }}
+        .term-chat-root .chat-live-anchor {{
+            border-width: 0;
+            outline-width: 0;
+            margin: 0;
+            padding: 0;
+            min-height: 0;
+            background-color: transparent;
+            box-shadow: none;
+        }}
+        .term-chat-root .chat-controls {{
+            color: {dim_fg};
+            margin: 0 10px 0 14px;
+            min-height: 32px;
+        }}
+        .term-chat-root .chat-controls button {{
+            min-width: 24px;
+            min-height: 24px;
+            padding: 0 6px;
+        }}
+        .term-chat-root .chat-submit {{
+            border-radius: 999px;
+            background-color: rgba({agent_r},{agent_g},{agent_b},0.62);
+            color: {fg_hex};
+        }}
         .block-onboarding {{
             color: {dim_fg};
             background-color: rgba({fg_r},{fg_g},{fg_b},0.055);
@@ -1393,6 +1455,23 @@ mod tests {
             rest = &rest[body_start + close + 1..];
         }
         out
+    }
+
+    #[test]
+    fn chat_styles_are_pane_scoped_and_do_not_shrink_output_columns() {
+        let css = block_css(&crate::config::Config::safe_defaults());
+        for line in css
+            .lines()
+            .filter(|line| line.contains(".chat-") && line.contains('{'))
+        {
+            assert!(line.trim_start().starts_with(".term-chat-root"), "{line}");
+        }
+        let result = rule_body(&css, ".term-chat-root .chat-result");
+        assert!(!result.contains("max-width"));
+        assert!(!result.contains("margin-left"));
+        assert!(!result.contains("margin-right"));
+        let anchor = rule_body(&css, ".term-chat-root .chat-live-anchor");
+        assert!(anchor.contains("min-height: 0"));
     }
 
     /// Whether a CSS declaration can change a box's content size: margins,

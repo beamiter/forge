@@ -1669,7 +1669,9 @@ impl UiState {
                 // backend differs, and it follows *this* launch's mode — which
                 // is why a remote tab (pinned to Block above) stays Block even
                 // when `terminal_mode = "unified"`.
-                crate::config::TerminalMode::Block | crate::config::TerminalMode::Unified => {
+                crate::config::TerminalMode::Block
+                | crate::config::TerminalMode::Chat
+                | crate::config::TerminalMode::Unified => {
                     let term_view = {
                         let config = self.config.borrow();
                         TermView::new(
@@ -1684,7 +1686,11 @@ impl UiState {
                     match term_view {
                         Ok(term_view) => {
                             let term_view = Rc::new(term_view);
-                            if matches!(terminal_mode, crate::config::TerminalMode::Block) {
+                            if matches!(
+                                terminal_mode,
+                                crate::config::TerminalMode::Block
+                                    | crate::config::TerminalMode::Chat
+                            ) {
                                 TermView::arm_shell_integration_notice(&term_view, shell_argv);
                             }
                             term_view.start_history_load();
@@ -2846,6 +2852,7 @@ mod tests {
 
         for configured in [
             TerminalMode::Block,
+            TerminalMode::Chat,
             TerminalMode::Vte,
             TerminalMode::Unified,
         ] {

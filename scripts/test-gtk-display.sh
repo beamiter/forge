@@ -52,6 +52,14 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::tests::chat_native_activate_preserves_send_and_stop_origins_through_delays
+    block_view::tests::chat_stop_stays_bound_across_held_replay_and_pointer_or_key_press
+    block_view::tests::chat_send_button_observes_production_queue_admission_and_held_boundaries
+    block_view::tests::chat_long_prompt_shrinks_and_mapped_block_pane_keeps_focus
+    block_view::cross_selection::tests::chat_selection_root_reaches_the_docked_native_composer
+    block_view::blocks::tests::chat_pair_keeps_native_surfaces_and_gap_is_not_accumulated
+    block_view::tests::chat_docking_keeps_pty_rows_and_native_hit_geometry_stable
+    block_view::chat::tests::chat_moves_only_the_native_clip_and_keeps_history_anchor
     font::tests::context_menu_tracks_live_theme_and_font_without_parent_emphasis
     ui::dialogs::organism_preview::tests::preview_lifecycle_keeps_motion_local_and_stops_hidden_sources
     ui::organism::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers

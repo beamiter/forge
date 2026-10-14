@@ -1865,6 +1865,26 @@ mod tests {
     }
 
     #[test]
+    fn chat_mode_is_saved_as_chat_without_changing_other_modes() {
+        let directory = temporary_directory("chat-mode");
+        let path = directory.join("config.toml");
+        let mut config = default_config();
+        config.terminal_mode = crate::config::TerminalMode::Chat;
+        save_config_to_path(&path, &config, Some(&ConfigRevision::missing())).unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        let table = contents.parse::<toml::Table>().unwrap();
+        assert_eq!(
+            table.get("terminal_mode").and_then(toml::Value::as_str),
+            Some("chat")
+        );
+        assert!(crate::config::validate_config_contents(&contents)
+            .unwrap()
+            .iter()
+            .all(|issue| issue.level != crate::config::ConfigIssueLevel::Error));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn ai_provider_settings_round_trip_without_persisting_credentials() {
         let directory = temporary_directory("ai-provider");
         let path = directory.join("config.toml");

@@ -2782,6 +2782,13 @@ impl TermView {
                     &block.cmd,
                     &block.output,
                     cols,
+                )
+                .saturating_add(
+                    if self.root.has_css_class("term-chat-root") && !block.is_background() {
+                        super::chat::COMMAND_GAP_PX
+                    } else {
+                        0
+                    },
                 );
             }
         }
@@ -2843,10 +2850,11 @@ impl TermView {
                         .as_deref()
                         .and_then(crate::block_view::known_output_notice),
                 );
+                // Decorate before map-time native command measurement.
+                self.mount_rebuilt_block(&finished);
                 finished
                     .widget()
                     .insert_before(&self.block_list, Some(&sibling));
-                self.mount_rebuilt_block(&finished);
                 restored_widgets.push(finished);
             }
         }

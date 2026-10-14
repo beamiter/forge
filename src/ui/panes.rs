@@ -302,7 +302,10 @@ impl UiState {
             Some(&sid),
             initial_commands,
         )?);
-        if matches!(mode, crate::config::TerminalMode::Block) {
+        if matches!(
+            mode,
+            crate::config::TerminalMode::Block | crate::config::TerminalMode::Chat
+        ) {
             TermView::arm_shell_integration_notice(&view, shell_argv.as_slice());
         }
         drop(shell_argv);
@@ -413,14 +416,15 @@ impl UiState {
             // leaf: the pane tree, headers and drag/drop are identical, so the
             // requested mode travels on into `TermView::new` and picks the
             // backend there.
-            crate::config::TerminalMode::Block | crate::config::TerminalMode::Unified => self
-                .create_block_leaf(
-                    mode,
-                    working_directory,
-                    session_id,
-                    initial_commands,
-                    tab_widget_name,
-                ),
+            crate::config::TerminalMode::Block
+            | crate::config::TerminalMode::Chat
+            | crate::config::TerminalMode::Unified => self.create_block_leaf(
+                mode,
+                working_directory,
+                session_id,
+                initial_commands,
+                tab_widget_name,
+            ),
             crate::config::TerminalMode::Vte => Ok(self.create_vte_leaf(
                 working_directory,
                 session_id,

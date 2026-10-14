@@ -6,6 +6,12 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Add opt-in native Chat terminal mode (`--mode chat`, `terminal_mode = "chat"`):
+  command capsules, wide result cards, docked real shell input, running/Stop
+  controls and native TUI/passthrough recovery. The existing PTY, input, output,
+  search and history machinery is shared; defaults and other modes stay intact.
+
+
 - Long cwd and Git status labels now ellipsize within the bottom bar instead
   of forcing an oversized window minimum. Their complete composed text stays
   in the label and tooltip; grid, exit and tab metadata keep their sizing.
