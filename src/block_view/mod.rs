@@ -9209,6 +9209,7 @@ fn notification_allowed(last: Option<std::time::Instant>, now: std::time::Instan
 struct DeferredLiveFocus {
     target: glib::WeakRef<Terminal>,
     window: glib::WeakRef<gtk4::Window>,
+    initial_owner: glib::WeakRef<gtk4::Widget>,
     superseded: Rc<Cell<bool>>,
     focus_changed: Option<glib::SignalHandlerId>,
     root_changed: Option<glib::SignalHandlerId>,
@@ -9230,18 +9231,31 @@ impl DeferredLiveFocus {
         if !target.has_focus() || !target.is_mapped() {
             return None;
         }
+        Self::capture(target, target.upcast_ref())
+    }
+
+    /// Clipboard requests may originate on this pane's completed history or
+    /// its child menu. An unrelated search entry/pane grants no focus authority.
+    fn for_paste(target: &Terminal, pane: &gtk4::Box) -> Option<Self> {
         let window = target.root().and_downcast::<gtk4::Window>()?;
+        let owner = GtkWindowExt::focus(&window)?;
+        if !target.is_mapped()
+            || (owner != *pane.upcast_ref::<gtk4::Widget>() && !owner.is_ancestor(pane))
+        {
+            return None;
+        }
+        Self::capture(target, &owner)
+    }
+
+    fn capture(target: &Terminal, owner: &gtk4::Widget) -> Option<Self> {
+        let window = target.root().and_downcast::<gtk4::Window>()?;
+        let initial_owner = owner.downgrade();
         let superseded = Rc::new(Cell::new(false));
-        let target_weak = target.downgrade();
+        let initial_owner_weak = initial_owner.clone();
         let invalidated = superseded.clone();
         let focus_changed = window.connect_focus_widget_notify(move |window| {
             if let Some(owner) = GtkWindowExt::focus(window) {
-                if target_weak
-                    .upgrade()
-                    .as_ref()
-                    .map(|target| target.upcast_ref())
-                    != Some(&owner)
-                {
+                if initial_owner_weak.upgrade().as_ref() != Some(&owner) {
                     invalidated.set(true);
                 }
             }
@@ -9263,6 +9277,7 @@ impl DeferredLiveFocus {
         Some(Self {
             target: target.downgrade(),
             window: window.downgrade(),
+            initial_owner,
             superseded,
             focus_changed: Some(focus_changed),
             root_changed: Some(root_changed),
@@ -9282,7 +9297,7 @@ impl DeferredLiveFocus {
                 || !window.is_mapped()
                 || target.root().as_ref() != Some(window.upcast_ref())
                 || GtkWindowExt::focus(&window)
-                    .is_some_and(|owner| owner != *target.upcast_ref::<gtk4::Widget>())
+                    .is_some_and(|owner| self.initial_owner.upgrade().as_ref() != Some(&owner))
             {
                 return;
             }
@@ -13589,13 +13604,12 @@ struct PasteSink {
     selected_block_ids: SelectedBlockIds,
     selected_block_id: Rc<Cell<Option<u64>>>,
     selection_anchor_id: Rc<Cell<Option<u64>>>,
-    active: Rc<RefCell<ActiveBlock>>,
     selection_feed_hold: Rc<SelectionFeedHold>,
     human_input_callbacks: HumanInputCallbacks,
 }
 
 impl PasteSink {
-    fn paste(&self, text: &str) -> Result<(), PasteRefusal> {
+    fn paste(&self, text: &str) -> Result<bool, PasteRefusal> {
         let PasteSink {
             pty,
             bracketed_paste,
@@ -13611,12 +13625,11 @@ impl PasteSink {
             selected_block_ids,
             selected_block_id,
             selection_anchor_id,
-            active,
             selection_feed_hold,
             human_input_callbacks,
         } = self;
         if text.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         let bracketed_paste = bracketed_paste.get();
@@ -13626,7 +13639,7 @@ impl PasteSink {
 
         let paste = build_clipboard_paste(text, bracketed_paste);
         if paste.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         if paste.risk.had_embedded_paste_marker {
             // The clipboard tried to close the paste frame early so its
@@ -13692,7 +13705,27 @@ impl PasteSink {
                 selection_anchor_id,
             );
         }
-        active.borrow().grab_focus();
+        Ok(true)
+    }
+}
+
+/// Captured before clipboard I/O; focus authority cannot be recreated from a
+/// completion-time snapshot after the user has chosen another input owner.
+struct ClipboardPasteRequest {
+    sink: PasteSink,
+    focus: Option<DeferredLiveFocus>,
+}
+
+impl ClipboardPasteRequest {
+    fn complete(self, text: Option<&str>) -> Result<(), PasteRefusal> {
+        let Some(text) = text else {
+            return Ok(());
+        };
+        if self.sink.paste(text)? {
+            if let Some(focus) = self.focus {
+                focus.defer();
+            }
+        }
         Ok(())
     }
 }
@@ -17416,21 +17449,27 @@ impl TermView {
             selected_block_ids: self.selected_block_ids.clone(),
             selected_block_id: self.selected_block_id.clone(),
             selection_anchor_id: self.selection_anchor_id.clone(),
-            active: self.active.clone(),
             selection_feed_hold: self.selection_feed_hold.clone(),
             human_input_callbacks: self.human_input_callbacks.clone(),
         }
     }
 
+    fn clipboard_paste_request(&self) -> ClipboardPasteRequest {
+        ClipboardPasteRequest {
+            sink: self.paste_sink(),
+            focus: DeferredLiveFocus::for_paste(&self.active_vte, &self.root),
+        }
+    }
+
     pub fn paste_from_clipboard(&self) {
         let clipboard = self.active_vte.clipboard();
-        let sink = self.paste_sink();
+        let request = self.clipboard_paste_request();
         let active_vte = self.active_vte.downgrade();
         clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
             let Ok(Some(text)) = result else {
                 return;
             };
-            if let Err(PasteRefusal::TooLarge(error)) = sink.paste(text.as_str()) {
+            if let Err(PasteRefusal::TooLarge(error)) = request.complete(Some(text.as_str())) {
                 log::warn!("refused oversized clipboard paste: {error}");
                 if let Some(active_vte) = active_vte.upgrade() {
                     show_clipboard_failure(
@@ -17451,7 +17490,12 @@ impl TermView {
     /// than a burst of keystrokes.
     pub(crate) fn paste_text(&self, text: &str) -> Result<(), String> {
         match self.paste_sink().paste(text) {
-            Ok(()) => Ok(()),
+            Ok(admitted) => {
+                if admitted {
+                    self.active.borrow().grab_focus();
+                }
+                Ok(())
+            }
             Err(PasteRefusal::TooLarge(error)) => Err(error),
             Err(PasteRefusal::Write) => Err("the terminal did not accept the input".to_string()),
         }
@@ -18907,6 +18951,7 @@ pub(crate) fn organism_settings_test_pty_bytes(view: &TermView) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     include!("ime_tests.rs");
+    include!("paste_focus_tests.rs");
     use super::{
         accept_agent_integration_token, anchor_tick_exit, apply_visible_indices,
         apply_vte_commit_to_shadow, approved_command_submission_payload,
