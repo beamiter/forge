@@ -11345,7 +11345,7 @@ fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
             .as_ref()
             .is_some_and(|holder| holder.has_css_class(class))
     });
-    let usable = (page - chrome).max(cell_h);
+    let usable = (page - chrome - blocks::terminal_vertical_insets(vte)).max(cell_h);
     Some(((usable / cell_h).max(1)) as i64)
 }
 
@@ -14349,7 +14349,9 @@ impl TermView {
                     vte.set_size(cols, viewport_rows);
                     last_size_target.set(target);
                 }
-                holder.set_height_request((viewport_rows as i32) * cell_h);
+                holder.set_height_request(
+                    (viewport_rows as i32) * cell_h + blocks::terminal_vertical_insets(&vte),
+                );
                 // Unified has one surface and one height; the clip is a no-op
                 // here, but the terminal still needs its size request or the
                 // Fixed would allocate it its bare minimum.
@@ -14584,7 +14586,9 @@ impl TermView {
                     vte.set_size(cols, target_rows);
                     last_size_target.set(target);
                 }
-                holder.set_height_request((visible_rows as i32) * cell_h);
+                holder.set_height_request(
+                    (visible_rows as i32) * cell_h + blocks::terminal_vertical_insets(&vte),
+                );
                 if let Ok(live) = active_block.try_borrow() {
                     live.set_live_geometry(cell_h, target_rows, visible_rows);
                 };
@@ -19409,8 +19413,13 @@ mod tests {
                     .build();
                 window.present();
                 settle();
-                view.active_vte
-                    .feed("old history\r\n".repeat(120).as_bytes());
+                view.pty
+                    .write_test_slave(b"\x1b]133;A\x07$ \x1b]133;B\x07history\r\n\x1b]133;C\x07");
+                settle();
+                view.pty
+                    .write_test_slave("old history\r\n".repeat(120).as_bytes());
+                settle();
+                view.pty.write_test_slave(b"\x1b]133;D;0\x07");
                 settle();
                 let local_prompt = if integrated {
                     "local@host ~\r\n> "
@@ -19422,6 +19431,15 @@ mod tests {
                 );
                 settle();
                 assert_eq!(view.bstate.get(), BlockState::AwaitingCommand);
+                assert!(
+                    view.active_vte.cursor_position().1 > view.active_vte.row_count(),
+                    "prewarm must advance absolute ring coordinates beyond one grid"
+                );
+                let history_cards = view.finished_blocks.borrow().len();
+                assert_eq!(
+                    history_cards, 1,
+                    "prewarm finalized exactly one prior command"
+                );
                 let command = if wrapped {
                     format!(
                         "ssh root@{}",
@@ -19474,18 +19492,26 @@ mod tests {
                         .active_vte
                         .compute_point(&clip, &gtk::graphene::Point::new(0.0, 0.0))
                         .expect("terminal is inside live clip");
-                    // GTK's replacement has no padding getter; the fixture
-                    // must account for the actual CSS content-box inset.
-                    #[allow(deprecated)]
-                    let padding = view.active_vte.style_context().padding();
-                    let bottom = f64::from(offset.y())
-                        + f64::from(padding.top())
-                        + (row * view.active_vte.char_height()) as f64;
-                    assert!(bottom <= f64::from(clip.height()) + 1.0,
-                        "{mode:?} wrapped={wrapped} integrated={integrated}: cursor bottom {bottom} exceeds clip {} (row {row})", clip.height());
+                    // GTK4 compute_point maps the content origin, already
+                    // accounting for CSS padding/border. VTE 0.76's default
+                    // Start alignment adds no internal top offset (vte.cc,
+                    // widget_size_allocate / widget_snapshot). Its Scrollable
+                    // interface has no get_border implementation to query.
+                    assert_eq!(view.active_vte.yalign(), vte4::Align::Start);
+                    let bottom =
+                        f64::from(offset.y()) + (row * view.active_vte.char_height()) as f64;
+                    assert!(
+                        row < view.active_vte.row_count(),
+                        "fixture must exercise a compact card: row={row}, grid={}",
+                        view.active_vte.row_count()
+                    );
+                    assert!(bottom <= f64::from(clip.height()),
+                        "{mode:?} wrapped={wrapped} integrated={integrated}: cursor bottom {bottom} exceeds clip {}; row={row}, grid={}, offset={}, alignment=Start, cell_height={}, terminal_height={}, css_insets={}",
+                        clip.height(), view.active_vte.row_count(), offset.y(), view.active_vte.char_height(), view.active_vte.height(), super::blocks::terminal_vertical_insets(&view.active_vte));
                     assert_eq!(view.bstate.get(), BlockState::CollectingOutput);
-                    assert!(view.finished_blocks.borrow().is_empty());
+                    assert_eq!(view.finished_blocks.borrow().len(), history_cards);
                     assert_eq!(view.pty.test_slave_winsize(), winsize);
+                    assert_eq!(view.active_vte.row_count(), i64::from(winsize.1));
                 };
                 assert_cursor_visible();
                 for _ in 0..2 {
