@@ -9204,6 +9204,106 @@ fn notification_allowed(last: Option<std::time::Instant>, now: std::time::Instan
     last.is_none_or(|prev| now.duration_since(prev) >= NOTIFICATION_MIN_INTERVAL)
 }
 
+/// Signal subscriptions exist only until this one deferred focus request is
+/// consumed. Neither the idle nor the observers keep a pane/window alive.
+struct DeferredLiveFocus {
+    target: glib::WeakRef<Terminal>,
+    window: glib::WeakRef<gtk4::Window>,
+    superseded: Rc<Cell<bool>>,
+    focus_changed: Option<glib::SignalHandlerId>,
+    root_changed: Option<glib::SignalHandlerId>,
+}
+
+impl Drop for DeferredLiveFocus {
+    fn drop(&mut self) {
+        if let (Some(window), Some(handler)) = (self.window.upgrade(), self.focus_changed.take()) {
+            window.disconnect(handler);
+        }
+        if let (Some(target), Some(handler)) = (self.target.upgrade(), self.root_changed.take()) {
+            target.disconnect(handler);
+        }
+    }
+}
+
+impl DeferredLiveFocus {
+    fn new(target: &Terminal) -> Option<Self> {
+        if !target.has_focus() || !target.is_mapped() {
+            return None;
+        }
+        let window = target.root().and_downcast::<gtk4::Window>()?;
+        let superseded = Rc::new(Cell::new(false));
+        let target_weak = target.downgrade();
+        let invalidated = superseded.clone();
+        let focus_changed = window.connect_focus_widget_notify(move |window| {
+            if let Some(owner) = GtkWindowExt::focus(window) {
+                if target_weak
+                    .upgrade()
+                    .as_ref()
+                    .map(|target| target.upcast_ref())
+                    != Some(&owner)
+                {
+                    invalidated.set(true);
+                }
+            }
+        });
+        let window_weak = window.downgrade();
+        let invalidated = superseded.clone();
+        let root_changed = target.connect_root_notify(move |target| {
+            if let Some(root) = target.root() {
+                if window_weak
+                    .upgrade()
+                    .as_ref()
+                    .map(|window| window.upcast_ref())
+                    != Some(&root)
+                {
+                    invalidated.set(true);
+                }
+            }
+        });
+        Some(Self {
+            target: target.downgrade(),
+            window: window.downgrade(),
+            superseded,
+            focus_changed: Some(focus_changed),
+            root_changed: Some(root_changed),
+        })
+    }
+
+    fn defer(self) {
+        glib::idle_add_local_once(move || {
+            if self.superseded.get() {
+                return;
+            }
+            let (Some(target), Some(window)) = (self.target.upgrade(), self.window.upgrade())
+            else {
+                return;
+            };
+            if !target.is_mapped()
+                || !window.is_mapped()
+                || target.root().as_ref() != Some(window.upcast_ref())
+                || GtkWindowExt::focus(&window)
+                    .is_some_and(|owner| owner != *target.upcast_ref::<gtk4::Widget>())
+            {
+                return;
+            }
+            target.grab_focus();
+        });
+    }
+}
+
+/// Restore only this live surface's existing ownership. GTK may temporarily
+/// clear focus while remapping it, so checking `has_focus` again at idle loses
+/// legitimate restoration. Conversely, checking only at scheduling time lets
+/// a prompt/alt-exit steal a newer pane, find, or history focus. Observe every
+/// intervening owner: even an owner that disappears before idle retires this
+/// request. A temporary unroot/remap in the same window remains eligible;
+/// moving to another root, staying hidden, or disposal does not.
+fn restore_live_focus_deferred(target: &Terminal) {
+    if let Some(request) = DeferredLiveFocus::new(target) {
+        request.defer();
+    }
+}
+
 /// The GTK/VTE rendering seam. Bodies moved verbatim from the former
 /// `ReaderCtx` handler statements and `render_finalized_block`; the free
 /// helper functions they wrap stay module-level because non-reader paths
@@ -9227,13 +9327,7 @@ impl RenderBackend for BlockBackend {
     /// output, or the find box — was interrupted whenever any other pane's
     /// shell reached a prompt.
     fn focus_live_deferred(&self) {
-        if !self.active_vte.has_focus() {
-            return;
-        }
-        let active_for_focus = self.active_rc.clone();
-        glib::idle_add_local_once(move || {
-            active_for_focus.borrow().grab_focus();
-        });
+        restore_live_focus_deferred(&self.active_vte);
     }
 
     fn sync_geometry_to_pty(&self) {
@@ -10478,15 +10572,7 @@ impl RenderBackend for UnifiedBackend {
     /// Same pane-focus invariant as the block backend: a background pane must
     /// not pull focus back to its live surface just because a prompt arrived.
     fn focus_live_deferred(&self) {
-        if !self.vte.has_focus() {
-            return;
-        }
-        let vte = self.vte.downgrade();
-        glib::idle_add_local_once(move || {
-            if let Some(vte) = vte.upgrade() {
-                vte.grab_focus();
-            }
-        });
+        restore_live_focus_deferred(&self.vte);
     }
 
     fn sync_geometry_to_pty(&self) {
@@ -31389,6 +31475,254 @@ mod tests {
         assert_eq!(inputs.get(), 2);
         assert!(queue.try_recv().is_err());
         window.close();
+    }
+
+    /// Replay through the installed hold/parser/ReaderCtx/backend pipeline
+    /// synchronously, so the caller can move focus before its queued idle.
+    fn replay_native_focus_bytes(view: &super::TermView, bytes: &[u8]) {
+        view.selection_feed_hold.begin_drag();
+        assert!(view.selection_feed_hold.try_buffer(bytes));
+        view.selection_feed_hold.flush_now();
+    }
+
+    fn queue_native_focus_transition(view: &super::TermView, alt_exit: bool) {
+        use gtk4::prelude::*;
+        if alt_exit {
+            replay_native_focus_bytes(view, b"\x1b[?1049h");
+            assert_eq!(view.bstate.get(), BlockState::AltScreen);
+        } else {
+            replay_native_focus_bytes(view, b"\x1b]133;A\x07$ ");
+            assert_eq!(view.bstate.get(), BlockState::CollectingPrompt);
+        }
+        chat_display_settle();
+        assert!(view.active_vte.grab_focus());
+        assert!(view.active_vte.is_mapped());
+        replay_native_focus_bytes(
+            view,
+            if alt_exit {
+                b"\x1b[?1049l"
+            } else {
+                b"\x1b]133;B\x07"
+            },
+        );
+        assert_eq!(view.bstate.get(), BlockState::AwaitingCommand);
+        assert!(view.active_vte.has_focus());
+    }
+
+    fn drain_native_focus_idle() {
+        let context = gtk4::glib::MainContext::default();
+        while context.iteration(false) {}
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn deferred_live_focus_restores_empty_owner_after_prompt_end_and_alt_exit() {
+        use gtk4::prelude::*;
+        gtk4::init().unwrap();
+        for mode in [
+            crate::config::TerminalMode::Block,
+            crate::config::TerminalMode::Chat,
+            crate::config::TerminalMode::Unified,
+        ] {
+            let view = chat_display_view(mode.clone());
+            let window = gtk4::Window::builder()
+                .default_width(640)
+                .default_height(480)
+                .child(&view.root)
+                .build();
+            window.present();
+            replay_native_focus_bytes(&view, b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            chat_display_settle();
+            for alt_exit in [false, true] {
+                for remap in [false, true] {
+                    queue_native_focus_transition(&view, alt_exit);
+                    GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+                    if remap {
+                        // A temporary mapping gap without a new owner must not
+                        // turn legitimate prompt restoration into a no-op.
+                        view.active_vte.set_visible(false);
+                        assert!(!view.active_vte.is_mapped());
+                        view.active_vte.set_visible(true);
+                        assert!(view.active_vte.is_mapped());
+                    }
+                    assert!(GtkWindowExt::focus(&window).is_none());
+                    drain_native_focus_idle();
+                    assert!(
+                        view.active_vte.has_focus(),
+                        "{mode:?}: empty focus must restore (alt_exit={alt_exit}, remap={remap})"
+                    );
+                }
+            }
+            window.close();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn deferred_live_focus_never_steals_new_pane_find_or_history_ownership() {
+        use gtk4::prelude::*;
+        gtk4::init().unwrap();
+        for mode in [
+            crate::config::TerminalMode::Block,
+            crate::config::TerminalMode::Chat,
+            crate::config::TerminalMode::Unified,
+        ] {
+            let view = chat_display_view(mode.clone());
+            let other = chat_display_view(crate::config::TerminalMode::Block);
+            let find = gtk4::SearchEntry::new();
+            let panes = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+            panes.append(&view.root);
+            panes.append(&other.root);
+            let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            root.append(&find);
+            root.append(&panes);
+            let window = gtk4::Window::builder()
+                .default_width(1200)
+                .default_height(800)
+                .child(&root)
+                .build();
+            window.present();
+            replay_native_focus_bytes(&view, b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            replay_native_focus_bytes(
+                &other,
+                b"\x1b]133;A\x07$ \x1b]133;B\x07history\r\n\x1b]133;C;cmdline_url=history\x07output\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07",
+            );
+            chat_display_settle();
+            let history = other.finished_blocks.borrow()[0].command_vte.clone();
+            for alt_exit in [false, true] {
+                for (name, owner) in [
+                    ("pane", other.active_vte.clone().upcast::<gtk4::Widget>()),
+                    ("find", find.clone().upcast()),
+                    ("history", history.clone().upcast()),
+                ] {
+                    for clear_new_owner in [false, true] {
+                        queue_native_focus_transition(&view, alt_exit);
+                        assert!(owner.is_mapped());
+                        assert!(owner.grab_focus());
+                        let new_owner = GtkWindowExt::focus(&window).unwrap();
+                        assert_ne!(new_owner, view.active_vte.clone().upcast::<gtk4::Widget>());
+                        if clear_new_owner {
+                            GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+                        }
+                        drain_native_focus_idle();
+                        let expected = (!clear_new_owner).then_some(new_owner);
+                        assert_eq!(
+                            GtkWindowExt::focus(&window),
+                            expected,
+                            "{mode:?}: {name} supersedes the pending restore (alt_exit={alt_exit}, clear={clear_new_owner})"
+                        );
+                    }
+                }
+            }
+            window.close();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn deferred_live_focus_retires_hidden_detached_and_changed_root_targets() {
+        use gtk4::prelude::*;
+        gtk4::init().unwrap();
+        for mode in [
+            crate::config::TerminalMode::Block,
+            crate::config::TerminalMode::Chat,
+            crate::config::TerminalMode::Unified,
+        ] {
+            let view = chat_display_view(mode.clone());
+            let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            root.append(&view.root);
+            let window = gtk4::Window::builder()
+                .default_width(640)
+                .default_height(480)
+                .child(&root)
+                .build();
+            let other_root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            let other_window = gtk4::Window::builder()
+                .default_width(640)
+                .default_height(480)
+                .child(&other_root)
+                .build();
+            window.present();
+            other_window.present();
+            replay_native_focus_bytes(&view, b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            chat_display_settle();
+            for alt_exit in [false, true] {
+                queue_native_focus_transition(&view, alt_exit);
+                view.root.set_visible(false);
+                GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+                drain_native_focus_idle();
+                assert!(!view.active_vte.has_focus(), "{mode:?}: hidden target");
+                view.root.set_visible(true);
+
+                queue_native_focus_transition(&view, alt_exit);
+                root.remove(&view.root);
+                drain_native_focus_idle();
+                assert!(view.active_vte.root().is_none());
+                assert!(!view.active_vte.has_focus(), "{mode:?}: detached target");
+                root.append(&view.root);
+
+                queue_native_focus_transition(&view, alt_exit);
+                root.remove(&view.root);
+                other_root.append(&view.root);
+                // Returning to the original root must not resurrect a request
+                // that crossed a different window in the meantime.
+                other_root.remove(&view.root);
+                root.append(&view.root);
+                GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+                drain_native_focus_idle();
+                assert!(
+                    GtkWindowExt::focus(&window).is_none(),
+                    "{mode:?}: changed root"
+                );
+            }
+            other_window.close();
+            window.close();
+        }
+
+        // A pending restore owns no native widget strongly, including when the
+        // target and window disappear before its one idle can consume it.
+        let target = vte4::Terminal::new();
+        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        root.append(&target);
+        let other = gtk4::Entry::new();
+        root.append(&other);
+        let window = gtk4::Window::builder().child(&root).build();
+        window.present();
+        chat_display_settle();
+        // With the native objects still alive, these weak cells can expire
+        // only if both temporary observers have actually been disconnected.
+        for outcome in ["restored", "superseded", "abandoned"] {
+            assert!(target.grab_focus());
+            let request = super::DeferredLiveFocus::new(&target).unwrap();
+            let observer_state = Rc::downgrade(&request.superseded);
+            if outcome == "abandoned" {
+                drop(request);
+            } else {
+                request.defer();
+                if outcome == "superseded" {
+                    assert!(other.grab_focus());
+                } else {
+                    GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+                }
+                drain_native_focus_idle();
+                assert_eq!(target.has_focus(), outcome == "restored");
+            }
+            assert!(
+                observer_state.upgrade().is_none(),
+                "{outcome}: observer leak"
+            );
+        }
+        assert!(target.grab_focus());
+        super::restore_live_focus_deferred(&target);
+        let weak_target = target.downgrade();
+        let weak_window = window.downgrade();
+        root.remove(&target);
+        window.destroy();
+        drop(target);
+        drop(window);
+        assert!(weak_target.upgrade().is_none());
+        assert!(weak_window.upgrade().is_none());
+        drain_native_focus_idle();
     }
 
     #[test]

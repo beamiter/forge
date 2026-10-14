@@ -52,6 +52,9 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::tests::deferred_live_focus_restores_empty_owner_after_prompt_end_and_alt_exit
+    block_view::tests::deferred_live_focus_never_steals_new_pane_find_or_history_ownership
+    block_view::tests::deferred_live_focus_retires_hidden_detached_and_changed_root_targets
     ui::organism::tests::idle_refresh_skips_unchanged_tooltip_and_non_owner_spatial_render
     block_view::tests::chat_native_activate_preserves_send_and_stop_origins_through_delays
     block_view::tests::chat_stop_stays_bound_across_held_replay_and_pointer_or_key_press
