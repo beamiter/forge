@@ -4183,6 +4183,7 @@ impl BlockBackend {
     fn install_finished_block_context_menu(
         &self,
         finished_widget: gtk4::Box,
+        more_button: &gtk4::Button,
         block_id: u64,
         long_output: bool,
     ) {
@@ -4270,10 +4271,6 @@ impl BlockBackend {
         let block_scroll_for_menu = self.block_scroll_rc.downgrade();
         let open_popover = Rc::new(RefCell::new(glib::WeakRef::<gtk4::Popover>::new()));
         let open_menu: Rc<dyn Fn(f64, f64)> = Rc::new(move |x, y| {
-            if let Some(popover) = open_popover.borrow().upgrade() {
-                popover.popup();
-                return;
-            }
             let Some(finished_blocks) = finished_blocks_for_menu.upgrade() else {
                 return;
             };
@@ -4283,6 +4280,21 @@ impl BlockBackend {
             let Some(finished_widget) = finished_widget_for_menu.upgrade() else {
                 return;
             };
+            if !finished_blocks
+                .borrow()
+                .iter()
+                .any(|block| block.id == block_id && block.widget() == &finished_widget)
+                || !block_data_for_export
+                    .borrow()
+                    .iter()
+                    .any(|block| block.id == block_id)
+            {
+                return;
+            }
+            if let Some(popover) = open_popover.borrow().upgrade() {
+                popover.popup();
+                return;
+            }
             {
                 let finished = finished_blocks.borrow();
                 clear_vte_text_selections(&finished, &vte_for_copy);
@@ -5003,6 +5015,10 @@ impl BlockBackend {
         actions.add_action(&inspect);
         actions.add_action(&show_menu);
         finished_widget.insert_action_group("block", Some(&actions));
+        // Local ownership avoids unresolved ancestor action lookup on cards
+        // added to an already mapped pane. Both use the same checked opener.
+        more_button.insert_action_group("block", Some(&actions));
+        more_button.set_action_name(Some("block.show-menu"));
     }
 }
 
@@ -7073,7 +7089,14 @@ trait RenderBackend {
     /// Those cards are indistinguishable from freshly finished ones to the
     /// user, so every card-level action must reach them too. Backends without a
     /// card menu keep the default no-op.
-    fn install_block_context_menu(&self, _widget: &gtk4::Box, _block_id: u64, _long_output: bool) {}
+    fn install_block_context_menu(
+        &self,
+        _widget: &gtk4::Box,
+        _more: &gtk4::Button,
+        _block_id: u64,
+        _long_output: bool,
+    ) {
+    }
     /// Handle keyboard line scrolling on a backend-owned surface. Returning
     /// true means the outer Block scroller must not also move.
     fn scroll_surface_lines(&self, _lines: i32) -> bool {
@@ -9363,8 +9386,14 @@ impl RenderBackend for BlockBackend {
         self.active_vte.feed(bytes);
     }
 
-    fn install_block_context_menu(&self, widget: &gtk4::Box, block_id: u64, long_output: bool) {
-        self.install_finished_block_context_menu(widget.clone(), block_id, long_output);
+    fn install_block_context_menu(
+        &self,
+        widget: &gtk4::Box,
+        more: &gtk4::Button,
+        block_id: u64,
+        long_output: bool,
+    ) {
+        self.install_finished_block_context_menu(widget.clone(), more, block_id, long_output);
     }
 
     fn reset_active_surface(&self, preserve_scrollback: bool) {
@@ -10036,6 +10065,7 @@ impl RenderBackend for BlockBackend {
         // Right-click context menu.
         self.install_finished_block_context_menu(
             finished_widget,
+            &finished_clone.more_btn,
             finished_clone.id,
             finished_clone.long_output,
         );
@@ -16974,6 +17004,7 @@ impl TermView {
         );
         self.render_backend.install_block_context_menu(
             finished.widget(),
+            &finished.more_btn,
             finished.id,
             finished.long_output,
         );
@@ -21430,7 +21461,6 @@ mod tests {
         };
         for restored in [false, true] {
             if restored {
-                assert_eq!(view.clear_blocks(), 1);
                 assert_eq!(view.undo_clear_blocks(), 1);
                 settle();
                 view.pty
@@ -21515,6 +21545,12 @@ mod tests {
             assert_eq!(popovers(&card).len(), 1);
             popovers(&card)[0].popdown();
             settle();
+            assert_eq!(view.clear_blocks(), 1);
+            settle();
+            more.emit_clicked();
+            card.activate_action("block.show-menu", None).unwrap();
+            settle();
+            assert!(popovers(&card).is_empty(), "retired card cannot reopen");
             assert!(
                 view.pty
                     .drain_test_slave(std::time::Duration::from_millis(10))

@@ -758,6 +758,7 @@ pub(crate) struct FinishedBlock {
     pub(crate) copy_output_btn: gtk4::Button,
     pub(crate) rerun_btn: gtk4::Button,
     pub(crate) header_row: gtk4::Box,
+    pub(super) more_btn: gtk4::Button,
     pub(crate) action_box: gtk4::Box,
     /// Keyboard affordances shown only while this block is selected.
     pub(crate) selection_hint: gtk4::Label,
@@ -856,6 +857,7 @@ impl Clone for FinishedBlock {
             copy_output_btn: self.copy_output_btn.clone(),
             rerun_btn: self.rerun_btn.clone(),
             header_row: self.header_row.clone(),
+            more_btn: self.more_btn.clone(),
             action_box: self.action_box.clone(),
             selection_hint: self.selection_hint.clone(),
             review_selection: self.review_selection.clone(),
@@ -2652,7 +2654,8 @@ impl FinishedBlock {
         more_btn.set_tooltip_text(Some("Block actions"));
         more_btn.update_property(&[gtk4::accessible::Property::Label("Block actions")]);
         more_btn.set_focus_on_click(false);
-        more_btn.set_action_name(Some("block.show-menu"));
+        // No action owner until the backend binds this exact card.
+        more_btn.set_sensitive(false);
         header_row.append(&more_btn);
 
         let focus = gtk4::EventControllerFocus::new();
@@ -3771,6 +3774,7 @@ impl FinishedBlock {
             copy_output_btn,
             rerun_btn,
             header_row,
+            more_btn,
             action_box,
             selection_hint,
             review_selection,
@@ -5490,6 +5494,8 @@ mod tests {
         );
         // Mount real pane actions rather than leaving block.show-menu
         // unresolved, which makes GTK disable the permanent More button.
+        assert!(card.more_btn.action_name().is_none());
+        assert!(!card.more_btn.is_sensitive(), "unbound More is inactive");
         view.mount_rebuilt_block(&card);
         let mut child = card.header_row.first_child();
         let mut more = None;
