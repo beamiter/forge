@@ -1181,10 +1181,17 @@ mod tests {
         // Pending repair does not keep a removed terminal alive.
         super::focus_terminal(&terminal);
         let weak = terminal.downgrade();
+        let weak_window = window.downgrade();
+        // Release GTK's window focus ownership before testing the pending
+        // callback's lifetime. Do not drain idle until after these assertions.
+        GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+        assert!(GtkWindowExt::focus(&window).is_none());
         root.remove(&terminal);
+        window.destroy();
         drop(terminal);
+        drop(window);
         assert!(weak.upgrade().is_none());
-        window.close();
+        assert!(weak_window.upgrade().is_none());
         while context.iteration(false) {}
     }
 
