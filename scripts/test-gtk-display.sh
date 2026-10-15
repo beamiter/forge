@@ -30,7 +30,7 @@ export XDG_STATE_HOME="${test_xdg_root}/state"
 export XDG_CACHE_HOME="${test_xdg_root}/cache"
 export XDG_RUNTIME_DIR="${test_xdg_root}/runtime"
 
-for command in dbus-run-session xvfb-run; do
+for command in dbus-run-session xvfb-run xdotool; do
     if ! command -v "${command}" >/dev/null 2>&1; then
         printf 'Error: %s is required for display-backed tests.\n' "${command}" >&2
         exit 1

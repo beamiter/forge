@@ -147,6 +147,7 @@ jobs:
             libvte-2.91-gtk4-dev \
             libpcre2-dev \
             xvfb \
+            xdotool \
             xauth \
             libxtst6 \
             python3 \
