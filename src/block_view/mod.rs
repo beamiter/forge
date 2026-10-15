@@ -15490,6 +15490,7 @@ impl TermView {
             let unread = unread_count.clone();
             let vte_for_fab = active_vte.downgrade();
             let root_for_fab = root.downgrade();
+            let debouncer = scroll_debouncer.clone();
             jump_fab.connect_clicked(move |button| {
                 // Read before the button hides: hiding a focused widget moves
                 // focus to wherever GTK finds next, possibly outside the pane.
@@ -15501,11 +15502,8 @@ impl TermView {
                         focus_terminal(&vte);
                     }
                 }
-                // Returning to the live prompt is not a single set_value: blocks
-                // below the viewport are virtualized to 0 height, so `upper` only
-                // grows as they scroll into view. One jump lands partway; we have
-                // to re-apply `upper - page` across idle passes until `upper` stops
-                // growing (true bottom reached) or we hit a small iteration cap.
+                // Virtualized blocks can grow after the synchronous jump, so
+                // the shared frame-spaced controller finishes settling below.
                 user_scrolled.set(false);
                 unread.set(0);
                 button.set_visible(false);
@@ -15519,39 +15517,9 @@ impl TermView {
                 adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
                 programmatic.set(false);
 
-                let scroll = scroll.clone();
-                let programmatic = programmatic.clone();
-                let tries = Rc::new(Cell::new(0u8));
-                let stable_turns = Rc::new(Cell::new(0u8));
-                let last_target = Rc::new(Cell::new(None::<f64>));
-                glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
-                    // Run on successive frames so virtualized blocks have time to
-                    // remap and grow `upper`. Position stability alone is not
-                    // enough: the current target can be reached before the true
-                    // bottom geometry has appeared.
-                    tries.set(tries.get().saturating_add(1));
-                    let adj = scroll.vadjustment();
-                    let target = (adj.upper() - adj.page_size()).max(adj.lower());
-                    programmatic.set(true);
-                    adj.set_value(target);
-                    programmatic.set(false);
-
-                    let target_is_stable = last_target
-                        .get()
-                        .is_some_and(|previous| (previous - target).abs() < 1.0);
-                    last_target.set(Some(target));
-                    if target_is_stable && (adj.value() - target).abs() < 1.0 {
-                        stable_turns.set(stable_turns.get().saturating_add(1));
-                    } else {
-                        stable_turns.set(0);
-                    }
-
-                    if stable_turns.get() >= 2 || tries.get() >= 12 {
-                        glib::ControlFlow::Break
-                    } else {
-                        glib::ControlFlow::Continue
-                    }
-                });
+                // Share the output/layout settling controller. Its single source
+                // coalesces repeated clicks and yields to newer reading intent.
+                debouncer.pin_to_bottom_deferred(&scroll);
             });
         }
 
@@ -32069,6 +32037,76 @@ mod tests {
         assert_eq!(inputs.get(), 2);
         assert!(queue.try_recv().is_err());
         window.close();
+    }
+
+    fn assert_return_to_live_yields_to_newer_reading(mode: crate::config::TerminalMode) {
+        use gtk4::prelude::*;
+        gtk4::init().unwrap();
+        let view = chat_display_view(mode);
+        let spacer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        spacer.set_height_request(3000);
+        view.block_list.prepend(&spacer);
+        let search = gtk4::SearchEntry::new();
+        let layout = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        layout.append(&search);
+        layout.append(&view.root);
+        let window = gtk4::Window::builder()
+            .default_width(640)
+            .default_height(480)
+            .child(&layout)
+            .build();
+        window.present();
+        chat_display_settle();
+        assert!(search.grab_focus());
+        let focus_before = GtkWindowExt::focus(&window);
+        let adjustment = view.block_scroll.vadjustment();
+        let bottom = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+        assert!(bottom > 500.0, "fixture needs genuine native scroll range");
+        adjustment.set_value(bottom - 300.0);
+        assert!(view.scroll_debouncer.user_scrolled_up.get());
+        for _ in 0..3 {
+            // Exercise the real callback, including its focus and inner-VTE reset.
+            view.jump_fab.emit_clicked();
+        }
+        assert_eq!(GtkWindowExt::focus(&window), focus_before);
+        assert!(!view.scroll_debouncer.user_scrolled_up.get());
+        if let Some(live) = view.active_vte.vadjustment() {
+            assert!(
+                (live.value() - (live.upper() - live.page_size()).max(live.lower())).abs() < 1.0
+            );
+        }
+        // A scrollbar drag or find jump writes this adjustment and sets the
+        // real synchronous intent lock before any deferred pin callback runs.
+        let reading_position = bottom - 200.0;
+        adjustment.set_value(reading_position);
+        assert!(view.scroll_debouncer.user_scrolled_up.get());
+        // Streaming output requests use this same controller and must also yield.
+        view.scroll_debouncer.mark_dirty(&view.block_scroll);
+        view.scroll_debouncer
+            .pin_to_bottom_deferred(&view.block_scroll);
+        chat_display_settle();
+        assert!((adjustment.value() - reading_position).abs() < 1.0);
+        assert!(view.scroll_debouncer.user_scrolled_up.get());
+        assert_eq!(GtkWindowExt::focus(&window), focus_before);
+        // A fresh deliberate request still returns to the current bottom.
+        view.jump_fab.emit_clicked();
+        chat_display_settle();
+        let bottom = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+        assert!((adjustment.value() - bottom).abs() < 1.0);
+        assert_eq!(GtkWindowExt::focus(&window), focus_before);
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn block_return_to_live_yields_to_newer_reading_and_keeps_search_focus() {
+        assert_return_to_live_yields_to_newer_reading(crate::config::TerminalMode::Block);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn chat_return_to_live_yields_to_newer_reading_and_keeps_search_focus() {
+        assert_return_to_live_yields_to_newer_reading(crate::config::TerminalMode::Chat);
     }
 
     fn assert_tab_switch_keeps_search_focus(mode: crate::config::TerminalMode) {

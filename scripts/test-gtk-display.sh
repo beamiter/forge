@@ -86,6 +86,8 @@ tests=(
     block_view::tests::delayed_clipboard_paste_preserves_newer_pane_search_and_empty_focus
     block_view::tests::delayed_clipboard_paste_restores_original_history_only_after_admission
     block_view::tests::delayed_clipboard_paste_closed_or_hidden_target_cannot_reclaim_focus
+    block_view::tests::block_return_to_live_yields_to_newer_reading_and_keeps_search_focus
+    block_view::tests::chat_return_to_live_yields_to_newer_reading_and_keeps_search_focus
     block_view::tests::existing_block_tab_switch_preserves_global_search_focus
     block_view::tests::existing_unified_tab_switch_preserves_global_search_focus
     block_view::tests::deferred_live_focus_restores_empty_owner_after_prompt_end_and_alt_exit
