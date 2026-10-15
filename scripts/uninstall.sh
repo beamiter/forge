@@ -207,6 +207,13 @@ if ((PURGE_CONFIG == 1)); then
     validate_staging_removal_target "${DESTDIR}${STATE_HOME}/forge"
 fi
 
+# Remove only the compatibility link created by the default-path migration.
+LEGACY_BINARY="${DESTDIR}${HOME_DIR}/.cargo/bin/forge"
+if [[ "${BIN_DIR}" == "${HOME_DIR}/.local/bin" && -L "${LEGACY_BINARY}" ]] \
+    && [[ "$(readlink -- "${LEGACY_BINARY}")" == "${BIN_DIR}/forge" ]]; then
+    remove_file "${LEGACY_BINARY}"
+fi
+
 remove_file "${DESTDIR}${BIN_DIR}/forge"
 remove_file "${DESTDIR}${BIN_DIR}/forge-support-bundle"
 SHARE_DIR="${DESTDIR}${PREFIX}/share"

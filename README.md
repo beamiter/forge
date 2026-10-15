@@ -586,3 +586,10 @@ left unchanged. `--dry-run` does not write binaries, configs, or backups.
 An already-running terminal keeps its current process; restart it to use the new
 binary and configuration. If an older copy comes first in PATH, the installer
 prints the conflicting path.
+
+When installing to the default path, an older `~/.cargo/bin/forge` is backed up
+inside a private `.forge.backup.*` directory and replaced with a compatibility
+symlink to `~/.local/bin/forge`. This prevents the old PATH entry from launching
+stale code. Repeated installs reuse that link. Uninstall removes only a matching
+compatibility link and leaves the backup available for recovery. Other prefixes
+and unrelated PATH entries are not modified.

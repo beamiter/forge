@@ -11,7 +11,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../scripts/install-config.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/libexec/install-config.sh"
-# Consumed by the bundled config helper.
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/libexec/migrate-legacy-binary.sh"
+# Consumed by the bundled helpers.
 # shellcheck disable=SC2034
 DRY_RUN=0
 INSTALL_CONFIG=1
@@ -305,3 +307,5 @@ printf '  Support bundle:    %s\n' "${BIN_DIR}/forge-support-bundle"
 printf '  Configuration:     %s\n' "${CONFIG_DIR}/config.toml"
 printf '  Runtime assets:    %s\n' "${ASSET_DIR}"
 printf '\nMake sure %s is in PATH, then run forge --doctor.\n' "${BIN_DIR}"
+
+migrate_legacy_binary "${HOME_DIR}/.cargo/bin/forge" "${BIN_DIR}/forge"

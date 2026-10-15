@@ -12,6 +12,8 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 # The helper is checked separately by the installer regression suite.
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/install-config.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/migrate-legacy-binary.sh"
 HOME_DIR="${HOME:-}"
 DESTDIR="${DESTDIR:-}"
 DESTDIR_ACTIVE=0
@@ -627,6 +629,11 @@ if ((INSTALL_CONFIG == 1)); then
         "${STAGED_CONFIG_DIR}/config.toml" "${CONFIG_DIR}/config.toml"
 fi
 
+if [[ "${BIN_DIR}" == "${HOME_DIR}/.local/bin" ]]; then
+    validate_staging_target "${DESTDIR}${HOME_DIR}/.cargo/bin"
+    migrate_legacy_binary "${DESTDIR}${HOME_DIR}/.cargo/bin/forge" "${BIN_DIR}/forge"
+fi
+
 printf 'Installed forge to %s\n' "${BIN_DIR}/forge"
 printf 'Installed support tool to %s\n' "${BIN_DIR}/forge-support-bundle"
 printf 'Installed runtime assets under %s/share/forge\n' "${PREFIX}"
@@ -639,7 +646,8 @@ if ((DESTDIR_ACTIVE == 1)); then
     printf 'Staged file: %s\n' "${STAGED_BIN_DIR}/forge"
 fi
 if ((DESTDIR_ACTIVE == 0)); then
-    if ! bin_dir_on_path; then
+    SHADOWING_BIN="$(command -v forge 2>/dev/null || true)"
+    if ! bin_dir_on_path && [[ ! "${SHADOWING_BIN}" -ef "${BIN_DIR}/forge" ]]; then
         printf '\nNote: %s is not in PATH; the launcher entry uses the absolute path,\n' \
             "${BIN_DIR}"
         printf 'but shells will not find forge until you add it. In Bash, for this shell:\n'
@@ -649,8 +657,8 @@ if ((DESTDIR_ACTIVE == 0)); then
         # shellcheck disable=SC2016
         printf '  export PATH=%q:"$PATH"\n' "${BIN_DIR}"
     fi
-    SHADOWING_BIN="$(command -v forge 2>/dev/null || true)"
-    if [[ -n "${SHADOWING_BIN}" && "${SHADOWING_BIN}" != "${BIN_DIR}/forge" ]]; then
+    if [[ -n "${SHADOWING_BIN}" && "${SHADOWING_BIN}" != "${BIN_DIR}/forge" \
+        && ! "${SHADOWING_BIN}" -ef "${BIN_DIR}/forge" ]]; then
         printf '\nNote: typing %s still runs %s, an older copy earlier in PATH.\n' \
             'forge' "${SHADOWING_BIN}"
         printf 'Remove it, or put %s ahead of it in PATH.\n' "${BIN_DIR}"
