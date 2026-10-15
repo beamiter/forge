@@ -8634,6 +8634,18 @@ impl ReaderCtx {
             .borrow()
             .pending_command_meta
             .command_end_correlation(meta);
+        // Nested and foreign-foreground marks have already been handled.
+        // Only ordinary commands with two explicit shell IDs gain this guard;
+        // missing IDs and Agent lost/correlation handling retain their policy.
+        if self.active_agent_generation_rc.get().is_none() {
+            let engine = self.engine.borrow();
+            if matches!(
+                (engine.pending_command_meta.id.as_deref(), meta.id.as_deref()),
+                (Some(start), Some(end)) if start != end
+            ) {
+                return;
+            }
+        }
         match decide_agent_command_end(
             self.active_agent_generation_rc.get().is_some(),
             foreground_owner,
@@ -28455,6 +28467,232 @@ mod tests {
 
     fn bytes(text: &str) -> ParserEvent {
         ParserEvent::Bytes(text.as_bytes().to_vec())
+    }
+
+    // Shared raw-byte corpus through the production reader/parser/lifecycle owner.
+    // RecordingBackend observes engine effects; this is not native GTK/VTE proof.
+    fn assert_session_parity_fixture(fixture_id: &str) {
+        use jterm_core::chat_mode::ChatSurface;
+        use jterm_core::session_parity::{chunks, fixtures, Completion, CHUNKINGS};
+
+        let fixture = fixtures().into_iter().find(|f| f.id == fixture_id).unwrap();
+        for chunking in CHUNKINGS {
+            let harness = ReaderHarness::new();
+            let identity = || harness.ctx.engine.borrow().pending_command_meta.id.clone();
+            let mut completed = Vec::new();
+            let mut completed_zone_ids = Vec::new();
+            for (step_index, step) in fixture.steps.iter().enumerate() {
+                for chunk in chunks(step.pty.as_bytes(), chunking) {
+                    // Correlate an actual completion fan-out with the owner's
+                    // identity immediately before this read, never the fixture ID.
+                    let before_id = identity();
+                    let before_count = harness.commands_finished.borrow().len();
+                    let before_zone = harness
+                        .ctx
+                        .engine
+                        .borrow()
+                        .pending_zone
+                        .map(|zone| zone.id());
+                    harness.feed_raw(chunk);
+                    for event in harness.commands_finished.borrow().iter().skip(before_count) {
+                        completed_zone_ids
+                            .push(before_zone.expect("completion retains its original zone"));
+                        completed.push(Completion {
+                            id: before_id
+                                .clone()
+                                .expect("completed execution has an observed start ID"),
+                            command: event.command.clone(),
+                            exit_code: event.exit_code,
+                        });
+                    }
+                }
+                let surface =
+                    super::chat::surface(harness.bstate.get(), harness.ctx.ftcs_seen_rc.get());
+                let running_id = matches!(surface, ChatSurface::Running | ChatSurface::Fullscreen)
+                    .then(identity)
+                    .flatten();
+                let surface_name = match surface {
+                    ChatSurface::Prompt => "prompt",
+                    ChatSurface::Running => "running",
+                    ChatSurface::Passthrough => "passthrough",
+                    ChatSurface::Fullscreen => "fullscreen",
+                };
+                // This recording seam has no terminal emulator. In particular,
+                // expected.draft_text requires a real native renderer; do not
+                // pretend manually seeded grid rows verify terminal editing.
+                assert_eq!(
+                    (surface_name, &completed, &running_id),
+                    (
+                        step.expected.surface.as_str(),
+                        &step.expected.completed,
+                        &step.expected.running_id
+                    ),
+                    "fixture={} step={} chunking={:?}",
+                    fixture.id,
+                    step_index,
+                    chunking
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn session_parity_late_end_does_not_close_new_execution() {
+        use jterm_core::session_parity::{chunks, CHUNKINGS};
+        for chunking in CHUNKINGS {
+            let harness = ReaderHarness::new();
+            let feed = |bytes: &[u8]| {
+                for chunk in chunks(bytes, chunking) {
+                    harness.feed_raw(chunk);
+                }
+            };
+            feed(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;C;id=old;cmdline_url=old\x07\x1b]133;D;0;id=old\x07");
+            feed(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;C;id=new;cmdline_url=new\x07");
+            feed(b"\x1b]133;D;9;id=old\x07");
+            assert_eq!(harness.bstate.get(), BlockState::CollectingOutput);
+            assert_eq!(harness.commands_finished.borrow().len(), 1);
+            feed(b"\x1b]133;D;7;id=new\x07\x1b]133;D;7;id=new\x07");
+            assert_eq!(harness.commands_finished.borrow().len(), 2);
+            assert_eq!(harness.commands_finished.borrow()[1].command, "new");
+            assert_eq!(harness.commands_finished.borrow()[1].exit_code, Some(7));
+        }
+    }
+
+    #[test]
+    fn session_parity_missing_ids_retain_legacy_completion() {
+        use jterm_core::session_parity::{chunks, CHUNKINGS};
+        for chunking in CHUNKINGS {
+            for (start, end) in [
+                (
+                    "\x1b]133;C;cmdline_url=legacy\x07",
+                    "\x1b]133;D;3;id=end-only\x07",
+                ),
+                (
+                    "\x1b]133;C;id=start-only;cmdline_url=legacy\x07",
+                    "\x1b]133;D;3\x07",
+                ),
+            ] {
+                let harness = ReaderHarness::new();
+                let bytes = format!("\x1b]133;A\x07$ \x1b]133;B\x07{start}{end}");
+                for chunk in chunks(bytes.as_bytes(), chunking) {
+                    harness.feed_raw(chunk);
+                }
+                assert_eq!(harness.bstate.get(), BlockState::PostCommand);
+                assert_eq!(harness.commands_finished.borrow().len(), 1);
+                assert_eq!(harness.commands_finished.borrow()[0].exit_code, Some(3));
+            }
+        }
+    }
+
+    #[test]
+    fn session_parity_mismatched_end_recovers_at_shell_prompt() {
+        use jterm_core::session_parity::{chunks, CHUNKINGS};
+        for chunking in CHUNKINGS {
+            let harness = ReaderHarness::new();
+            let feed = |bytes: &[u8]| {
+                for chunk in chunks(bytes, chunking) {
+                    harness.feed_raw(chunk);
+                }
+            };
+            feed(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;C;id=running;cmdline_url=lost-end\x07\x1b]133;D;9;id=unrelated\x07");
+            assert!(harness.commands_finished.borrow().is_empty());
+            feed(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            assert_eq!(harness.bstate.get(), BlockState::AwaitingCommand);
+            let completed = harness.commands_finished.borrow();
+            assert_eq!(completed.len(), 1);
+            assert_eq!(completed[0].exit_code, None);
+            assert_eq!(
+                completed[0].completion_provenance,
+                super::CompletionProvenance::BoundaryInferred
+            );
+        }
+    }
+
+    #[test]
+    fn session_parity_agent_mismatch_keeps_immediate_lost_cleanup() {
+        use jterm_core::session_parity::{chunks, CHUNKINGS};
+        for chunking in CHUNKINGS {
+            let harness = ReaderHarness::new();
+            let feed = |bytes: &[u8]| {
+                for chunk in chunks(bytes, chunking) {
+                    harness.feed_raw(chunk);
+                }
+            };
+            feed(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;C;id=agent-start;cmdline_url=agent\x07");
+            harness.ctx.active_agent_generation_rc.set(Some(59));
+            feed(b"\x1b]133;D;9;id=unrelated\x07");
+            assert_eq!(harness.bstate.get(), BlockState::PostCommand);
+            assert_eq!(harness.commands_finished.borrow().len(), 1);
+            assert_eq!(harness.commands_finished.borrow()[0].exit_code, Some(9));
+            assert!(harness.ctx.active_agent_generation_rc.get().is_none());
+            assert_eq!(harness.agent_lost.borrow().len(), 1);
+            feed(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            assert_eq!(harness.agent_lost.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn session_parity_nested_identity_preserves_outer_execution() {
+        use jterm_core::session_parity::{chunks, CHUNKINGS};
+        for chunking in CHUNKINGS {
+            let harness = ReaderHarness::new();
+            let feed = |bytes: &[u8]| {
+                for chunk in chunks(bytes, chunking) {
+                    harness.feed_raw(chunk);
+                }
+            };
+            feed(
+                b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;C;id=outer;cmdline_url=printf%20outer\x07",
+            );
+            feed(b"\x1b]133;C;id=inner\x07\x1b]133;D;9;id=inner\x07");
+            assert_eq!(harness.bstate.get(), BlockState::CollectingOutput);
+            assert!(harness.commands_finished.borrow().is_empty());
+            feed(b"\x1b]133;D;0;id=outer\x07\x1b]133;D;0;id=outer\x07");
+            let completed = harness.commands_finished.borrow();
+            assert_eq!(completed.len(), 1);
+            assert_eq!(completed[0].command, "printf outer");
+            assert_eq!(completed[0].exit_code, Some(0));
+        }
+    }
+
+    #[test]
+    fn session_parity_draft_history_utf8() {
+        assert_session_parity_fixture("draft_history_utf8");
+    }
+
+    #[test]
+    fn session_parity_exact_success() {
+        assert_session_parity_fixture("exact_success");
+    }
+
+    #[test]
+    fn session_parity_exact_nonzero() {
+        assert_session_parity_fixture("exact_nonzero");
+    }
+
+    #[test]
+    fn session_parity_unknown_exit() {
+        assert_session_parity_fixture("unknown_exit");
+    }
+
+    #[test]
+    fn session_parity_interrupt() {
+        assert_session_parity_fixture("interrupt");
+    }
+
+    #[test]
+    fn session_parity_alternate_screen() {
+        assert_session_parity_fixture("alternate_screen");
+    }
+
+    #[test]
+    fn session_parity_no_integration() {
+        assert_session_parity_fixture("no_integration");
+    }
+
+    #[test]
+    fn session_parity_identity_dedup() {
+        assert_session_parity_fixture("identity_dedup");
     }
 
     #[test]
