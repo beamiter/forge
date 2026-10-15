@@ -223,3 +223,53 @@ fn delayed_clipboard_paste_closed_or_hidden_target_cannot_reclaim_focus() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires DISPLAY; real clipboard delivery and PTY admission"]
+fn truncated_clipboard_feedback_tracks_actual_delivery() {
+    gtk4::init().expect("GTK display");
+    for mode in [
+        crate::config::TerminalMode::Block,
+        crate::config::TerminalMode::Chat,
+    ] {
+        let (first, second, _, window) = paste_focus_fixture(mode);
+        let mut sink = first.paste_sink();
+        let notices = Rc::new(RefCell::new(Vec::<String>::new()));
+        let output = notices.clone();
+        sink.notify = Rc::new(move |message| output.borrow_mut().push(message.to_string()));
+        for (text, bracketed, expected, notice) in [
+            (
+                "界\r\nprivate second line",
+                false,
+                "界",
+                Some(super::paste_feedback::PARTIAL),
+            ),
+            (
+                "\nprivate second line",
+                false,
+                "",
+                Some(super::paste_feedback::EMPTY),
+            ),
+            ("界\r\nsecond", true, "\x1b[200~界\nsecond\x1b[201~", None),
+            ("plain", false, "plain", None),
+        ] {
+            notices.borrow_mut().clear();
+            sink.bracketed_paste.set(bracketed);
+            assert!(sink.paste(text).is_ok());
+            assert_paste_focus_payload(&first, &second, expected.as_bytes());
+            assert_eq!(
+                notices.borrow().as_slice(),
+                &notice.map(str::to_string).into_iter().collect::<Vec<_>>()
+            );
+        }
+        sink.bracketed_paste.set(false);
+        notices.borrow_mut().clear();
+        first.pty.kill();
+        assert!(sink.paste("first\nsecond").is_err());
+        assert!(
+            notices.borrow().is_empty(),
+            "refusal cannot report successful truncation"
+        );
+        window.close();
+    }
+}

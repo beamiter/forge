@@ -47,6 +47,7 @@ mod kitty_graphics;
 mod onboarding;
 #[allow(dead_code)]
 mod palette;
+mod paste_feedback;
 mod review;
 mod scroll;
 mod selection_hold;
@@ -13716,6 +13717,7 @@ enum PasteRefusal {
 
 /// The pane state a paste reads and updates. See [`TermView::paste_text`].
 struct PasteSink {
+    notify: Rc<dyn Fn(&str)>,
     pty: Rc<OwnedPty>,
     bracketed_paste: Rc<Cell<bool>>,
     bstate: Rc<Cell<BlockState>>,
@@ -13737,6 +13739,7 @@ struct PasteSink {
 impl PasteSink {
     fn paste(&self, text: &str) -> Result<bool, PasteRefusal> {
         let PasteSink {
+            notify,
             pty,
             bracketed_paste,
             bstate,
@@ -13765,6 +13768,7 @@ impl PasteSink {
 
         let paste = build_clipboard_paste(text, bracketed_paste);
         if paste.is_empty() {
+            paste_feedback::report(&**notify, paste.risk.truncated_to_first_line, false);
             return Ok(false);
         }
         if paste.risk.had_embedded_paste_marker {
@@ -13831,6 +13835,7 @@ impl PasteSink {
                 selection_anchor_id,
             );
         }
+        paste_feedback::report(&**notify, paste.risk.truncated_to_first_line, true);
         Ok(true)
     }
 }
@@ -17546,6 +17551,7 @@ impl TermView {
     /// own it.
     fn paste_sink(&self) -> PasteSink {
         PasteSink {
+            notify: paste_feedback::notifier(&self.active_vte),
             pty: self.pty.clone(),
             bracketed_paste: self.bracketed_paste.clone(),
             bstate: self.bstate.clone(),
