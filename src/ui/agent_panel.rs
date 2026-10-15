@@ -584,6 +584,9 @@ impl AgentRuntime {
                         "Completed task reopened for a follow-up instruction",
                     ));
                 }
+                // This is an explicit Follow up / New task action. Background
+                // model replies only render state and must not choose focus.
+                runtime.input.grab_focus();
             }
             Err(error) => runtime.render_session_state(Some(&error.to_string())),
         }
@@ -610,7 +613,6 @@ impl AgentRuntime {
                     ready_status.unwrap_or("Ready for the next instruction"),
                     false,
                 );
-                self.input.grab_focus();
             }
             AgentState::AwaitingApproval { proposal_id } => self.set_status(
                 &format!("Proposal #{} is waiting for review", proposal_id.get()),
@@ -916,7 +918,9 @@ impl AgentRuntime {
         });
         runtime.proposal_box.append(&review.root);
         runtime.render_session_state(None);
-        review.focus();
+        // A provider reply may arrive after the user has moved to another
+        // pane, Find, or history. Keep review keyboard-accessible through the
+        // normal focus chain; rendering a proposal does not authorize focus.
 
         let weak = Rc::downgrade(runtime);
         let entry_for_approve = review.entry.clone();
@@ -2889,3 +2893,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "agent_panel_focus_tests.rs"]
+mod focus_tests;
