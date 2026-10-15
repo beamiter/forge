@@ -33824,3 +33824,6 @@ mod task_focus_tests;
 
 #[cfg(test)]
 mod incremental_find_tests;
+
+#[cfg(test)]
+mod font_sync_tests;

@@ -161,6 +161,9 @@ jobs:
         with:
           shared-key: gtk-display
 
+      - name: Check font sizing against native Pango
+        run: python3 scripts/test-font-sync.py
+
       - name: Run display-backed GTK/VTE regressions
         run: GTK_PAINT_DIAGNOSTICS_DIR="$PWD/gtk-paint-diagnostics" FORGE_XTEST_DRIVER="$PWD/scripts/qa-cross-selection-pointer.py" bash scripts/test-gtk-display.sh
 

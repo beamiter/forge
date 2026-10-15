@@ -419,6 +419,9 @@ impl UiState {
                 leaf.terminal().set_font_scale(new_scale);
             }
         }
+        // Repaint chrome in the same idle sweep as every live/history VTE.
+        // Reading font_scale also covers explicit reloads and reset-to-1.0.
+        self.apply_dynamic_css();
     }
 
     pub(crate) fn for_each_terminal(&self, f: impl Fn(&Terminal)) {
@@ -467,6 +470,7 @@ impl UiState {
         let semantic = config.semantic_colors();
         let fg = &semantic.foreground;
         let menu_css = crate::font::menu_theme_css(&config.font_desc, bg, fg);
+        let font_css = crate::font::window_font_css(&config.font_desc, self.font_scale.get());
         let br = (bg.red() * 255.0) as u8;
         let bg_g = (bg.green() * 255.0) as u8;
         let bb = (bg.blue() * 255.0) as u8;
@@ -525,6 +529,7 @@ impl UiState {
              .file-tree-root {{ color: rgb({fr},{fg_g},{fb}); }}
              .file-tree-root {{ opacity: 1.0; }}
              {menu_css}
+             {font_css}
              .tab-strip-btn {{ color: rgb({mut_r},{mut_g},{mut_b}); }}
              .tab-strip-btn:checked {{ color: rgb({fr},{fg_g},{fb}); }}
              .tab-strip-btn.tab-marked {{ background-color: rgba({fr},{fg_g},{fb},0.2); font-weight: bold; }}

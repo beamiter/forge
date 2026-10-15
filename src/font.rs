@@ -189,6 +189,40 @@ pub(crate) fn css_font_stack(family: &str, icon_family: Option<&str>) -> String 
     }
 }
 
+/// The same effective size for GTK text and VTE's configured font × zoom.
+/// Pango owns parsing: styled names, fractional points and absolute pixels must
+/// not take a separate, rounded path through the chrome stylesheet.
+pub(crate) fn effective_font_size_css(desc: &str, scale: f64) -> String {
+    let mut font = FontDescription::from_string(desc);
+    if font.size() <= 0 {
+        font = FontDescription::from_string(crate::config::DEFAULT_FONT_DESC);
+    }
+    let size = f64::from(font.size()) / f64::from(gtk::pango::SCALE);
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let unit = if font.is_size_absolute() { "px" } else { "pt" };
+    format!("{}{unit}", size * scale)
+}
+
+/// Scope the shared text size to this application's window. Target text nodes
+/// directly so nested captions, pane metadata and theme heading classes do not
+/// compound relative sizes. Image sizing and the decorative connection dot keep
+/// their existing geometry. Newly created tabs/rows inherit this provider too.
+pub(crate) fn window_font_css(desc: &str, scale: f64) -> String {
+    let size = effective_font_size_css(desc, scale);
+    format!(
+        "window.forge-window,\n\
+         window.forge-window label:not(.tab-conn-dot),\n\
+         window.forge-window entry,\n\
+         window.forge-window textview,\n\
+         window.forge-window text,\n\
+         window.forge-window treeview {{ font-size: {size}; }}"
+    )
+}
+
 /// Native popup text follows the configured font without inheriting a
 /// selected tab's bold/italic decoration. Pango parses size/style boundaries;
 /// the existing CSS stack encoder quotes family names safely.
@@ -715,6 +749,38 @@ mod tests {
         popover.unparent();
         window.close();
         gtk::style_context_remove_provider_for_display(&display, &provider);
+    }
+
+    #[test]
+    fn chrome_size_preserves_pango_units_and_fractional_zoom() {
+        for (desc, scale, expected) in [
+            ("Monospace 14", 1.0, "14pt"),
+            ("Monospace Bold Italic 13.5", 1.025, "13.837499999999999pt"),
+            ("Monospace 17px", 1.25, "21.25px"),
+            ("Monospace, Serif 12.5", 0.9, "11.25pt"),
+            ("Monospace 14", 0.1, "1.4000000000000001pt"),
+        ] {
+            assert_eq!(effective_font_size_css(desc, scale), expected);
+        }
+        for scale in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            assert_eq!(effective_font_size_css("Monospace 14", scale), "14pt");
+        }
+        assert_eq!(effective_font_size_css("Monospace", 1.0), "14pt");
+    }
+
+    #[test]
+    fn chrome_size_is_scoped_to_text_and_preserves_icon_geometry() {
+        let css = window_font_css("Monospace Bold 12.5", 1.2);
+        assert!(css.contains("font-size: 15pt;"));
+        assert!(css.contains("label:not(.tab-conn-dot)"));
+        assert!(css.contains("window.forge-window text,"));
+        assert!(css.contains("entry"));
+        assert!(!css.contains("image"));
+        assert!(!css.contains("font-family"));
+        assert!(!css.contains("font-weight"));
+        for selector in css.split('{').next().unwrap().split(',') {
+            assert!(selector.trim().starts_with("window.forge-window"));
+        }
     }
 
     #[test]

@@ -586,6 +586,7 @@ pub fn run() -> glib::ExitCode {
             .resizable(true)
             .opacity(window_opacity.get())
             .build();
+        window.add_css_class("forge-window");
 
         // Create notebook for tabs (tabs hidden — custom tab bar is used instead)
         let notebook = Notebook::builder()
@@ -768,6 +769,9 @@ pub fn run() -> glib::ExitCode {
         leading_actions.append(&toggle_placement_btn);
         top_bar.add_overlay(&leading_actions);
         top_bar.add_overlay(&top_tab_scroll);
+        // Font zoom can exceed the compact minimum. Include tab text in the
+        // bar's height while the scroller still clamps its minimum width.
+        top_bar.set_measure_overlay(&top_tab_scroll, true);
 
         // A compact, stateful counterpart to Ctrl+Alt+G. Its checked state
         // follows the lifetime of the approval-gated Shell Agent session;

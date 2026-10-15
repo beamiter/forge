@@ -427,33 +427,19 @@ pub(crate) fn block_css(config: &Config) -> String {
         (bg_b as f32 + (fg_b as f32 - bg_b as f32) * 0.03) as u8,
     );
 
-    // Parse font description to extract font family and size
-    // Format: "FontName Style Size" e.g. "Monospace 14"
-    let parts: Vec<&str> = config.font_desc.split_whitespace().collect();
-    let (font_family, base_size) = if parts.len() >= 2 {
-        // Last part is usually the size. Pango allows float sizes ("Fira Code 12.5"),
-        // so parse as f64 and round rather than rejecting non-integer sizes.
-        if let Ok(size) = parts[parts.len() - 1].parse::<f64>() {
-            let family = parts[..parts.len() - 1].join(" ");
-            (family, size.round().max(1.0) as i32)
-        } else {
-            (config.font_desc.clone(), 14)
-        }
-    } else {
-        (config.font_desc.clone(), 14)
-    };
-    // Block chrome draws command text through GTK labels, so it needs the same
-    // icon fallback the VTE surfaces get; otherwise a prompt's Nerd-Font glyph
-    // lands on whichever font fontconfig happens to sort first. The stack also
-    // escapes each family, so a quote/backslash in a font name can't break the
-    // surrounding CSS string and silently disable the whole stylesheet.
-    let font_stack = crate::font::css_font_stack(&font_family, crate::font::icon_family(config));
-
-    // Apply font scale to the base size
-    let scaled_size = (base_size as f64 * config.default_font_scale)
-        .round()
-        .max(1.0) as i32;
-    let font_size = format!("{}pt", scaled_size);
+    // Parse the configured family through Pango too: style words and a `px`
+    // suffix are not part of a family name. Preserve the ordered icon fallback.
+    let font = crate::font::terminal_font_description(&config.font_desc, config);
+    let font_stack = font
+        .family()
+        .unwrap_or_else(|| "Monospace".into())
+        .split(',')
+        .map(str::trim)
+        .map(|family| crate::font::css_font_stack(family, None))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let font_size =
+        crate::font::effective_font_size_css(&config.font_desc, config.default_font_scale);
 
     let css = format!(
         r#"
@@ -1455,6 +1441,30 @@ mod tests {
             rest = &rest[body_start + close + 1..];
         }
         out
+    }
+
+    #[test]
+    fn block_and_chat_use_the_same_exact_font_size_as_window_chrome() {
+        let mut config = crate::config::Config::safe_defaults();
+        config.icon_font = Some("none".into());
+        for desc in ["Monospace Bold Italic 13.5", "Monospace 17px"] {
+            config.font_desc = desc.into();
+            config.default_font_scale = 1.025;
+            let css = block_css(&config);
+            let size = crate::font::effective_font_size_css(desc, 1.025);
+            for selector in [
+                ".term-chat-root .chat-command",
+                ".block-output",
+                ".block-cmd-finished",
+            ] {
+                let rule = rule_body(&css, selector);
+                assert!(
+                    rule.contains(&format!("font-size: {size};")),
+                    "{selector}: {rule}"
+                );
+                assert!(rule.contains("font-family: \"Monospace\";"));
+            }
+        }
     }
 
     #[test]
