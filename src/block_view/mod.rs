@@ -21443,6 +21443,56 @@ mod tests {
                 .unwrap()
                 .widget()
                 .clone();
+            // Exercise the actual descendant Actionable on a card created
+            // inside an already mapped pane, not just the card action muxer.
+            // Rooting a standalone card after installing its group can hide a
+            // broken late-binding chain through the intermediate containers.
+            view.scroll_to_block(0);
+            settle();
+            let header = view
+                .finished_blocks
+                .borrow()
+                .last()
+                .unwrap()
+                .header_row
+                .clone();
+            let mut child = header.first_child();
+            let mut more = None;
+            while let Some(widget) = child {
+                if widget.has_css_class("block-more-btn") {
+                    more = widget.clone().downcast::<gtk4::Button>().ok();
+                }
+                child = widget.next_sibling();
+            }
+            let more = more.expect("persistent More button");
+            assert!(more.is_mapped(), "More is mapped: restored={restored}");
+            assert!(
+                more.get_sensitive() && more.is_sensitive(),
+                "More action is enabled: restored={restored} own={} effective={} header={} action={:?}",
+                more.get_sensitive(), more.is_sensitive(), header.is_sensitive(), more.action_name()
+            );
+            assert!(more.grab_focus(), "More accepts keyboard focus");
+            assert_eq!(
+                gtk4::prelude::GtkWindowExt::focus(&window),
+                Some(more.clone().upcast()),
+            );
+            let selected = view.selected_block_ids.borrow().clone();
+            more.emit_clicked();
+            settle();
+            assert_eq!(*view.selected_block_ids.borrow(), selected);
+            assert_eq!(popovers(&card).len(), 1);
+            more.emit_clicked();
+            settle();
+            assert_eq!(
+                popovers(&card).len(),
+                1,
+                "native activation reuses the menu"
+            );
+            popovers(&card)[0].popdown();
+            settle();
+            assert!(popovers(&card).is_empty());
+
+            // Retain separate direct action coverage for non-button callers.
             card.activate_action("block.show-menu", None)
                 .expect("installed action");
             settle();
