@@ -4626,11 +4626,7 @@ impl BlockBackend {
             }
 
             if has_selected_commands {
-                let item = make_item(if selected_count > 1 {
-                    "Insert Commands at Prompt"
-                } else {
-                    "Insert Command at Prompt"
-                });
+                let item = make_item(command_reuse_menu_label(selected_count));
                 let popover_c = popover.downgrade();
                 let finished_for_rerun = finished_blocks_for_menu.clone();
                 let selected_ids_for_rerun = selected_ids_for_menu.clone();
@@ -4656,7 +4652,7 @@ impl BlockBackend {
                         && verified_submission_for_menu.can_recall_command(suggestion),
                 );
                 item.set_tooltip_text(Some(
-                    "Inserts only at a visibly empty, verified shell prompt",
+                    "Fill prompt without running; requires a visibly empty, verified shell prompt",
                 ));
                 item.connect_clicked(move |_| {
                     popdown_if_alive(&popover_c);
@@ -7362,6 +7358,15 @@ fn schedule_anchor_settle_on(
         glib::ControlFlow::Break
     });
     *tick_slot.borrow_mut() = Some(tick_id);
+}
+
+/// Review opens a separate confirmation step; recall only fills the prompt.
+fn command_reuse_menu_label(selected_count: usize) -> &'static str {
+    if selected_count > 1 {
+        "Recall commands"
+    } else {
+        "Recall command"
+    }
 }
 
 /// The GTK/VTE implementation of [`RenderBackend`] for Block mode: owns the
@@ -33851,5 +33856,15 @@ impl TermView {
     /// Share the same mutable map as key dispatch; menu rebuilds see reloads.
     pub(crate) fn set_menu_keybindings(&self, map: Rc<RefCell<crate::keybindings::KeybindingMap>>) {
         *self.menu_keybindings.borrow_mut() = Some(map);
+    }
+}
+
+#[cfg(test)]
+mod command_reuse_menu_label_tests {
+    #[test]
+    fn labels_distinguish_the_actual_single_and_multiple_paths() {
+        assert_eq!(super::command_reuse_menu_label(1), "Recall command");
+        assert_eq!(super::command_reuse_menu_label(2), "Recall commands");
+        assert_eq!(super::command_reuse_menu_label(128), "Recall commands");
     }
 }

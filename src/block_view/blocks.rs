@@ -2603,9 +2603,9 @@ impl FinishedBlock {
         copy_output_btn.set_tooltip_text(Some("Copy output"));
         copy_output_btn.update_property(&[gtk4::accessible::Property::Label("Copy output")]);
         let rerun_btn = gtk4::Button::from_icon_name("insert-text-symbolic");
-        rerun_btn.set_tooltip_text(Some("Insert for review · does not run"));
+        rerun_btn.set_tooltip_text(Some("Recall command · fill prompt without running"));
         rerun_btn.update_property(&[gtk4::accessible::Property::Label(
-            "Insert command at prompt without running",
+            "Recall command · fill prompt without running",
         )]);
         copy_cmd_btn.set_visible(!is_background);
         rerun_btn.set_visible(!is_background);
@@ -7012,3 +7012,33 @@ mod tests {
 #[cfg(test)]
 #[path = "fold_preview_tests.rs"]
 mod fold_preview_tests;
+
+#[cfg(test)]
+mod command_reuse_labels_tests {
+    use super::*;
+    use gtk4 as gtk;
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn recall_header_describes_insert_only_action() {
+        gtk::init().expect("GTK display");
+        let config = Config::safe_defaults();
+        let card = FinishedBlock::new(
+            1,
+            "$ ",
+            "printf hello",
+            None,
+            "hello",
+            Some(0),
+            &config,
+            None,
+            None,
+            None,
+            80,
+        );
+        assert_eq!(
+            card.rerun_btn.tooltip_text().as_deref(),
+            Some("Recall command · fill prompt without running")
+        );
+    }
+}
