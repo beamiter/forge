@@ -9,6 +9,7 @@ pub mod cli;
 pub mod config;
 pub mod config_store;
 mod context_menu;
+pub(crate) mod enter_ownership;
 pub(crate) mod font;
 pub mod git_meta;
 /// The OSC/CSI stream parser lives in [`jterm_core::parser`], shared with the

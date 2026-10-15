@@ -53,10 +53,21 @@ fi
 
 tests=(
     ui::tasks_panel::tests::dashboard_filters_preserve_selection_without_actions
+    ui::tasks_panel::tests::dashboard_search_activate_selects_current_visible_result_only
+    ui::tasks_panel::tests::dashboard_filter_counts_follow_search_not_selected_view
+    ui::tasks_panel::tests::task_terminal_buttons_only_emit_focus_for_existing_bindings
+    ui::tasks_panel::tests::task_reason_updates_and_disappears_without_retargeting
+    ui::task_ops::focus_tests::task_terminal_focus_tracks_reordered_split_and_closed_leaf
+    block_view::task_focus_tests::task_button_held_enter_never_submits_to_focused_terminal
     block_view::blocks::tests::folded_state_survives_virtualization_and_pane_filtering
     block_view::fold_geometry_tests::fold_actions_update_visible_and_parked_geometry
     block_view::search_navigation_tests::block_output_search_unfolds_only_target
     block_view::search_navigation_tests::chat_output_search_unfolds_only_target
+    block_view::search_navigation_tests::block_live_find_excludes_retained_scrollback
+    block_view::search_navigation_tests::chat_live_find_excludes_retained_scrollback
+    block_view::search_navigation_tests::block_live_find_rebuilds_after_native_changes
+    block_view::search_navigation_tests::chat_live_find_rebuilds_after_native_changes
+    block_view::find::tests::live_skip_budget_rejects_without_navigation
     block_view::incremental_find_tests::block_incremental_find_reveals_exact_occurrence
     block_view::incremental_find_tests::chat_incremental_find_reveals_exact_occurrence
     block_view::incremental_find_tests::block_filtered_single_hit_reopens_without_taking_focus
@@ -93,6 +104,7 @@ tests=(
     ui::dialogs::organism_preview::tests::preview_lifecycle_keeps_motion_local_and_stops_hidden_sources
     ui::organism::tests::deferred_agent_loss_retires_closed_panes_but_keeps_hidden_outcomes
     ui::organism::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers
+    ui::organism::tests::agent_signal_uses_window_setting_when_one_native_pane_is_disabled
     ui::bottom_bar::tests::long_status_segments_keep_compact_geometry_and_full_text
     ui::file_tree::tests::path_dialog_deep_ancestors_keep_actions_and_focus_reachable
     ui::file_tree::tests::path_dialog_long_components_keep_open_visible_and_full_targets

@@ -14,11 +14,12 @@
 //! released from the spawn-resolved hook VTE runs once the child has entered
 //! its working directory (forge has no `PaneLaunched` message).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
 use gtk4::glib;
+use gtk4::prelude::*;
 use libadwaita as adw;
 
 use crate::agent_task::{
@@ -112,6 +113,20 @@ fn semantic_context_from_evidence(
         started_at: evidence.started_at,
         finished_at: evidence.finished_at,
     })
+}
+
+/// Select the owning current notebook page before focusing this exact leaf.
+fn focus_task_leaf(notebook: &gtk4::Notebook, leaf: &PaneLeaf) -> bool {
+    let target = leaf.root_widget();
+    let page = (0..notebook.n_pages()).find(|index| {
+        notebook
+            .nth_page(Some(*index))
+            .is_some_and(|page| page == target || target.is_ancestor(&page))
+    });
+    let Some(page) = page else { return false };
+    notebook.set_current_page(Some(page));
+    leaf.grab_focus();
+    true
 }
 
 impl UiState {
@@ -279,6 +294,55 @@ impl UiState {
         }
     }
 
+    fn existing_task_terminal(
+        &self,
+        binding: Option<&str>,
+        role: TaskTerminalRole,
+    ) -> Option<PaneLeaf> {
+        agent_task_ui::resolve_task_terminal(
+            binding,
+            self.configuration_leaves()
+                .into_iter()
+                .filter(|leaf| leaf.task_role() == Some(role))
+                .filter_map(|leaf| leaf.task_session_id().map(|identity| (identity, leaf))),
+        )
+    }
+
+    fn focus_task_terminal(&self, task_id: TaskId, role: TaskTerminalRole) {
+        let binding = {
+            let domain = self.agent_tasks.borrow();
+            if !agent_task_ui::task_focus_allowed(
+                domain.panel_visible,
+                domain.selected_task,
+                task_id,
+            ) {
+                return;
+            }
+            domain
+                .task_manager
+                .get(task_id)
+                .and_then(|task| agent_task_ui::task_terminal_binding(task, role))
+                .map(str::to_owned)
+        };
+        let Some(leaf) = self.existing_task_terminal(binding.as_deref(), role) else {
+            self.task_toast("Task terminal is no longer available");
+            return;
+        };
+        crate::enter_ownership::claim_held();
+        if !focus_task_leaf(&self.notebook, &leaf) {
+            // A retained split leaf can be detached while another leaf is zoomed.
+            let state = self.zoom_state.borrow_mut().take();
+            if let Some(state) = state {
+                self.unzoom_pane(state);
+            }
+            if !focus_task_leaf(&self.notebook, &leaf) {
+                self.task_toast("Task terminal is no longer available");
+                return;
+            }
+        }
+        self.sync_tab_strip_active(self.notebook.current_page());
+    }
+
     /// Stage a panel action against the live domain. Every branch resolves
     /// the task again; a stale panel snapshot can never retarget an action.
     pub(crate) fn execute_task_panel_action(&self, action: TaskPanelAction) {
@@ -315,6 +379,12 @@ impl UiState {
                 }
             }
             TaskPanelAction::StartTerminal(task_id) => self.start_task_agent_terminal(task_id),
+            TaskPanelAction::FocusTerminal(task_id) => {
+                self.focus_task_terminal(task_id, TaskTerminalRole::Agent)
+            }
+            TaskPanelAction::FocusValidation(task_id) => {
+                self.focus_task_terminal(task_id, TaskTerminalRole::Validation)
+            }
             TaskPanelAction::StopCodex(task_id) => {
                 let result = {
                     let mut domain = self.agent_tasks.borrow_mut();
@@ -920,6 +990,22 @@ impl UiState {
     pub(crate) fn sync_tasks_panel(&self) {
         let policy = self.task_prompt_policy();
         let native_ai_enabled = policy.share_command_context;
+        let mut agent_terminals = HashSet::new();
+        let mut validation_terminals = HashSet::new();
+        for leaf in self.configuration_leaves() {
+            if let Some(identity) = leaf.task_session_id() {
+                match leaf.task_role() {
+                    Some(TaskTerminalRole::Agent) => {
+                        agent_terminals.insert(identity);
+                    }
+                    Some(TaskTerminalRole::Validation) => {
+                        validation_terminals.insert(identity);
+                    }
+                    None => {}
+                }
+            }
+        }
+
         let domain = self.agent_tasks.borrow();
         let mut rows: Vec<TaskRowSnapshot> = domain
             .task_manager
@@ -932,14 +1018,26 @@ impl UiState {
                 status: task.status,
                 runtime_kind: task.runtime_kind,
                 branch: task.branch.clone(),
-                has_agent_terminal: task.terminal_session_id.is_some(),
-                has_validation_terminal: task.validation.terminal_session_id.is_some(),
+                has_agent_terminal: task
+                    .terminal_session_id
+                    .as_ref()
+                    .is_some_and(|id| agent_terminals.contains(id)),
+                has_validation_terminal: task
+                    .validation
+                    .terminal_session_id
+                    .as_ref()
+                    .is_some_and(|id| validation_terminals.contains(id)),
                 has_active_agent_stream: domain.task_manager.has_active_agent_event_stream(task.id),
                 native_preparing: domain.agent_runtime.has_preparing(task.id),
                 validation_status: task.validation.status,
                 validation_attempt: task.validation.attempt,
                 needs_attention: task.needs_attention(),
                 status_detail: task.status_detail.clone(),
+                validation_detail: task
+                    .validation
+                    .status_detail
+                    .as_deref()
+                    .map(|detail| jterm_core::review_input::safe_inline_display(detail, 1024)),
             })
             .collect();
         let updated: HashMap<TaskId, u64> = domain
@@ -953,7 +1051,19 @@ impl UiState {
         let selected = domain
             .selected_task
             .filter(|id| domain.task_manager.get(*id).is_some());
-        let detail = selected.and_then(|id| task_detail_sync(&domain, id, native_ai_enabled));
+        let detail = selected.and_then(|id| {
+            let task = domain.task_manager.get(id)?;
+            let agent = task
+                .terminal_session_id
+                .as_ref()
+                .is_some_and(|id| agent_terminals.contains(id));
+            let validation = task
+                .validation
+                .terminal_session_id
+                .as_ref()
+                .is_some_and(|id| validation_terminals.contains(id));
+            task_detail_sync(&domain, id, native_ai_enabled, agent, validation)
+        });
 
         let create_hint = if domain.pending_task_creation.is_some() {
             "Creating the isolated task worktree…".to_string()
@@ -996,6 +1106,8 @@ fn task_detail_sync(
     domain: &AgentTaskDomain,
     task_id: TaskId,
     native_ai_enabled: bool,
+    can_focus_terminal: bool,
+    can_focus_validation: bool,
 ) -> Option<TaskDetailSync> {
     let task = domain.task_manager.get(task_id)?;
     let view = domain.agent_runtime.snapshot(task_id);
@@ -1030,6 +1142,11 @@ fn task_detail_sync(
         validation_attempt: task.validation.attempt,
         needs_attention: task.needs_attention(),
         status_detail: task.status_detail.clone(),
+        validation_detail: task
+            .validation
+            .status_detail
+            .as_deref()
+            .map(|detail| jterm_core::review_input::safe_inline_display(detail, 1024)),
     });
     if let Some(detail) = &task.status_detail {
         status_line = format!("{status_line} · {detail}");
@@ -1108,6 +1225,8 @@ fn task_detail_sync(
             && !native_preparing
             && native_ai_enabled,
         can_start_terminal,
+        can_focus_terminal,
+        can_focus_validation,
         can_stop: (native_preparing || has_stream) && !native_idle,
         can_finish: native_idle,
         can_run_validation: task.status == TaskStatus::ReadyForReview
@@ -1119,4 +1238,95 @@ fn task_detail_sync(
         follow_up_hint,
         diff,
     })
+}
+
+#[cfg(test)]
+mod focus_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[test]
+    #[ignore = "requires an isolated GTK process and display"]
+    fn task_terminal_focus_tracks_reordered_split_and_closed_leaf() {
+        gtk4::init().expect("GTK display");
+        let create = |identity: &str| {
+            let view = Rc::new(crate::terminal::VteTerminalView::new(
+                Rc::new(RefCell::new(crate::config::Config::safe_defaults())),
+                &["/forge-test/no-process".into()],
+                None,
+                None,
+                &[],
+                Vec::new(),
+                None,
+            ));
+            let leaf = PaneLeaf::Vte(view);
+            leaf.attach_to(&leaf.root_widget());
+            leaf.set_task_session_id(identity);
+            leaf.set_task_role(TaskTerminalRole::Agent);
+            leaf
+        };
+        let a = create("task-first");
+        let b = create("task-second");
+        let c = create("task-other");
+        let split = gtk4::Paned::new(gtk4::Orientation::Horizontal);
+        split.set_start_child(Some(&a.root_widget()));
+        split.set_end_child(Some(&b.root_widget()));
+        let notebook = gtk4::Notebook::new();
+        notebook.append_page(&split, None::<&gtk4::Widget>);
+        notebook.append_page(&c.root_widget(), None::<&gtk4::Widget>);
+        let window = gtk4::Window::new();
+        window.set_default_size(700, 400);
+        window.set_child(Some(&notebook));
+        window.present();
+        let settle = || {
+            let until = std::time::Instant::now() + Duration::from_millis(120);
+            while std::time::Instant::now() < until {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        settle();
+        let target = agent_task_ui::resolve_task_terminal(
+            Some("task-second"),
+            [&c, &b, &a]
+                .into_iter()
+                .map(|leaf| (leaf.task_session_id().unwrap(), leaf.clone())),
+        )
+        .unwrap();
+        assert!(focus_task_leaf(&notebook, &target));
+        settle();
+        assert!(b.terminal().has_focus());
+        assert_eq!(notebook.current_page(), notebook.page_num(&split));
+        let count = notebook.n_pages();
+        notebook.reorder_child(&split, Some(1));
+        assert!(focus_task_leaf(&notebook, &target));
+        settle();
+        assert_eq!(notebook.current_page(), Some(1));
+        assert!(b.terminal().has_focus());
+        assert_eq!(notebook.n_pages(), count);
+        let split_widget = split.clone().upcast::<gtk4::Widget>();
+        let zoom =
+            crate::ui::detach_leaf_for_zoom(&notebook, &split_widget, &a.root_widget()).unwrap();
+        assert!(
+            !focus_task_leaf(&notebook, &target),
+            "hidden split leaf must first be restored"
+        );
+        crate::ui::restore_zoomed_leaf(&notebook, &zoom).unwrap();
+        assert!(focus_task_leaf(&notebook, &target));
+        settle();
+        assert!(b.terminal().has_focus());
+        split.set_end_child(None::<&gtk4::Widget>);
+        let replacement = create("replacement");
+        split.set_end_child(Some(&replacement.root_widget()));
+        assert!(
+            !focus_task_leaf(&notebook, &target),
+            "a replacement at the same slot is not the old terminal"
+        );
+        assert_eq!(notebook.n_pages(), count);
+        window.close();
+        for leaf in [&a, &b, &c, &replacement] {
+            let _ = PaneLeaf::detach_from(&leaf.root_widget());
+        }
+    }
 }

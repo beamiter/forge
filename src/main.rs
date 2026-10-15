@@ -1257,7 +1257,7 @@ pub fn run() -> glib::ExitCode {
             organism_correction: ui::OrganismCorrectionSignal::new(organism_life.clone()),
             organism_activity: ui::OrganismActivity::new(organism_circadian, organism_growth),
             organism_presence: ui::OrganismPresence::new(),
-            organism_agent: ui::OrganismAgentSignal::new(organism_life.clone()),
+            organism_agent: ui::OrganismAgentSignal::new(organism_life.clone(), config.clone()),
             organism_life,
             agent_toggle: agent_toggle.clone(),
             config_save_error_visible: Rc::new(Cell::new(false)),
@@ -1631,8 +1631,10 @@ pub fn run() -> glib::ExitCode {
 
         // Setup key controller on window level with Capture phase
         // This allows us to intercept shortcuts before the terminal processes them
+        crate::enter_ownership::watch_window(&window);
         let key_controller = EventControllerKey::new();
         key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        crate::enter_ownership::install_controller(&key_controller);
 
         let ui_clone = ui.clone();
         let pending_focus_shortcut: Rc<RefCell<Option<DeferredFocusShortcut>>> =

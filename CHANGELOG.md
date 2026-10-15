@@ -6,6 +6,17 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Failed and waiting task rows show a bounded reason preview without requiring
+  selection; validation failure details take priority when available.
+
+- Task cards can return to an existing Agent terminal or validation output,
+  including a pane in another tab, without creating another session.
+
+- Tasks filters show visible and search-matching counts separately, with one-click
+  filter clearing and recovery of a hidden selected task without changing selection.
+  Enter in task search opens the first matching task through ordinary selection.
+  Each status filter shows its count for the current search.
+
 - Add opt-in native Chat terminal mode (`--mode chat`, `terminal_mode = "chat"`):
   command capsules, wide result cards, docked real shell input, running/Stop
   controls and native TUI/passthrough recovery. The existing PTY, input, output,
@@ -493,6 +504,19 @@ All notable user-visible and operational changes are recorded here.
 - 终端子进程的终止与回收迁移到共享库 `jterm_core::process`（`ChildLifecycle` / `ProcessRef` / `EscalationPolicy`），删除本地的 `process_exists`、`signal_pid_and_group`、`wait_for_process_exit`、`terminate_terminal_process`。pane 现在随 widget 保存一个内核绑定的子进程句柄（Linux 上是 pidfd）而不是裸 pid，并显式记录由谁 `waitpid`：Block pane 的 PTY 由 forge 自己 fork、自己回收；常规 VTE pane 的子进程由 glib/VTE 的 child watch 回收，其生命周期只经 pidfd 发信号、绝不 `waitpid`，退出码由 `child-exited` 记账。HUP → TERM → KILL 阶梯与既有的 120ms/250ms 宽限期不变，但最后一发 KILL 改为按 PTY 会话清扫（两个 backend 都对 PTY 子进程 `setsid`）：关闭 pane 时会一并清掉 shell job control 放进别的进程组、此前只补一发进程组信号会遗漏的后台任务。常规 VTE pane 的 `child-exited` 状态现在按家族约定归一（正常退出取退出码、被信号杀取 128+信号号），与 Block pane 上报的数字一致；此前把 `waitpid` 原始状态字直接当成退出码交给远端重连逻辑（只有 0 的语义碰巧是对的）。窗口快照“属主进程是否还在”改为纯 `/proc` 探测，不再向别的 forge 窗口发信号 0。
 
 ### Fixed
+
+- Task terminal navigation owns its confirming Enter until release, preventing
+  held-key repeats from being sent into the newly focused terminal.
+
+- Disabling the ASCII companion stops Agent phases from changing its life state;
+  re-enabling it does not replay phases observed while disabled.
+
+- Incremental Block/Chat search uses the current command's live VTE range when
+  retained scrollback contains older commands. Forward and backward wrapping
+  stays within that range, and an unreadable or over-budget range is reported
+  as incomplete rather than counted from raw output that cannot be navigated.
+  Output changes and terminal resizing invalidate old live matches before
+  navigation, including the single-match shortcut, so the query can be rebuilt.
 
 - 无 shell 集成（RawFallback）的面板里，kitty 键盘协议的处理补齐了两处：远程标签页的 `ssh`
   和 `forge -e codex` 这类由程序本身充当 PTY 子进程的面板，程序推送的标志现在会真正用于编码

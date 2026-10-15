@@ -18,6 +18,8 @@ P1 四项已在 `jterm_core` `9f94f77` 这一轮全部完成；P2 中的 history
 
 - [x] Finished VTE 因 resize、filter、expand 或重新渲染而 reset 时统一使 `FindState` 失效；每个 surface 记录 render stamp，连单命中/边界不移动的导航也会先校验并用保留查询重建。
 - [ ] 对齐 live block 的搜索数据源与 VTE 实际缓冲区，避免 prompt、command 和保留 scrollback 导致 Rust 计数与 PCRE2 选中项错位。
+  增量 Find 已按当前命令起始行限定范围，并覆盖 Block/Chat 的双向回绕、跨 surface 导航及预算拒绝。
+  本项仍保留：其他跨块搜索入口及 Rust/PCRE2 对所有正则表达式的差异尚未完整对齐。
 - [x] 跨块搜索记录 surface 内 occurrence/line，选择结果会从 surface 顶部精确步进到对应命中；超过 4096 步或中途耗尽时 fail closed，不再高亮较早的错误命中。
 - [x] 将跨块搜索扫描移到可取消 worker，避免大历史扫描阻塞 GTK 主线程。
   （落地形态为 upgrade round 91 的 `CrossBlockSearchCursor` +

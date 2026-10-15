@@ -20,8 +20,25 @@ use gtk4::{
 use crate::agent_task::{ApprovalId, CodexAppServerApproval, TaskId};
 use crate::agent_task_ui::{
     approval_summary, native_follow_up_can_send, plan_list_refresh, render_stream_text,
-    row_status_line, TaskPanelAction, TaskRowSnapshot,
+    row_status_line, task_reason, TaskPanelAction, TaskRowSnapshot,
 };
+
+/// Counts describe current search matches before the selected quick view.
+fn dashboard_filter_label(
+    view: crate::agent_task::DashboardView,
+    counts: &crate::agent_task::DashboardCounts,
+) -> String {
+    use crate::agent_task::DashboardView;
+    let (label, count) = match view {
+        DashboardView::All => ("All", counts.total),
+        DashboardView::NeedsAttention => ("Needs you", counts.attention),
+        DashboardView::Running => ("Running", counts.running),
+        DashboardView::NotStarted => ("Not started", counts.created),
+        DashboardView::Review => ("Review", counts.review),
+        DashboardView::Finished => ("Finished", counts.done + counts.failed + counts.cancelled),
+    };
+    format!("{label} {count}")
+}
 
 const STREAM_PAGE: &str = "stream";
 const DIFF_PAGE: &str = "diff";
@@ -52,6 +69,8 @@ pub(crate) struct TaskDetailSync {
     pub(crate) completed_turns: usize,
     pub(crate) can_start_codex: bool,
     pub(crate) can_start_terminal: bool,
+    pub(crate) can_focus_terminal: bool,
+    pub(crate) can_focus_validation: bool,
     pub(crate) can_stop: bool,
     pub(crate) can_finish: bool,
     pub(crate) can_run_validation: bool,
@@ -77,6 +96,8 @@ pub(crate) struct DiffSync {
 pub(crate) enum ActionKind {
     StartCodex,
     StartTerminal,
+    FocusTerminal,
+    FocusValidation,
     StopCodex,
     FinishCodex,
     RunValidation,
@@ -85,9 +106,11 @@ pub(crate) enum ActionKind {
     Archive,
 }
 
-const ACTION_KINDS: [(ActionKind, &str); 8] = [
+const ACTION_KINDS: [(ActionKind, &str); 10] = [
     (ActionKind::StartCodex, "Start Codex"),
-    (ActionKind::StartTerminal, "Terminal"),
+    (ActionKind::StartTerminal, "Start terminal"),
+    (ActionKind::FocusTerminal, "Agent terminal"),
+    (ActionKind::FocusValidation, "Validation output"),
     (ActionKind::StopCodex, "Stop"),
     (ActionKind::FinishCodex, "Finish"),
     (ActionKind::RunValidation, "Validate"),
@@ -108,6 +131,8 @@ pub(crate) struct TasksPanel {
     dashboard_view: Rc<Cell<crate::agent_task::DashboardView>>,
     dashboard_query: Entry,
     dashboard_summary: Label,
+    dashboard_clear: Button,
+    dashboard_reveal: Button,
     dashboard_buttons: Vec<(crate::agent_task::DashboardView, Button)>,
     /// Per-task follow-up drafts; the app never sees keystrokes, only the
     /// final text carried by `TaskPanelAction::FollowUp`.
@@ -187,7 +212,9 @@ impl TasksPanel {
         root.append(&create_hint);
 
         let dashboard_query = Entry::new();
-        dashboard_query.set_placeholder_text(Some("Search tasks, providers or repositories"));
+        dashboard_query.set_placeholder_text(Some(
+            "Search tasks, providers or repositories · Enter to open",
+        ));
         dashboard_query.set_max_length(256);
         dashboard_query.update_property(&[gtk4::accessible::Property::Label("Search agent tasks")]);
         root.append(&dashboard_query);
@@ -196,15 +223,15 @@ impl TasksPanel {
         filters.set_max_children_per_line(3);
         let mut dashboard_buttons = Vec::new();
         use crate::agent_task::DashboardView;
-        for (view, label) in [
-            (DashboardView::All, "All"),
-            (DashboardView::NeedsAttention, "Needs you"),
-            (DashboardView::Running, "Running"),
-            (DashboardView::NotStarted, "Not started"),
-            (DashboardView::Review, "Review"),
-            (DashboardView::Finished, "Finished"),
+        for view in [
+            DashboardView::All,
+            DashboardView::NeedsAttention,
+            DashboardView::Running,
+            DashboardView::NotStarted,
+            DashboardView::Review,
+            DashboardView::Finished,
         ] {
-            let button = Button::with_label(label);
+            let button = Button::with_label(&dashboard_filter_label(view, &Default::default()));
             button.add_css_class("caption");
             filters.insert(&button, -1);
             dashboard_buttons.push((view, button));
@@ -214,6 +241,15 @@ impl TasksPanel {
         dashboard_summary.set_wrap(true);
         dashboard_summary.add_css_class("caption");
         root.append(&dashboard_summary);
+        let dashboard_clear = Button::with_label("Clear filters");
+        dashboard_clear.set_visible(false);
+        root.append(&dashboard_clear);
+        let dashboard_reveal = Button::new();
+        let reveal_label = Label::new(Some("Selected task hidden · Show selected task"));
+        reveal_label.set_wrap(true);
+        dashboard_reveal.set_child(Some(&reveal_label));
+        dashboard_reveal.set_visible(false);
+        root.append(&dashboard_reveal);
 
         let paned = gtk4::Paned::new(gtk4::Orientation::Vertical);
         paned.set_vexpand(true);
@@ -349,6 +385,8 @@ impl TasksPanel {
             dashboard_view: Rc::new(Cell::new(crate::agent_task::DashboardView::All)),
             dashboard_query,
             dashboard_summary,
+            dashboard_clear,
+            dashboard_reveal,
             dashboard_buttons,
             follow_up_drafts: Rc::new(RefCell::new(HashMap::new())),
             rendered_rows: Rc::new(RefCell::new(Vec::new())),
@@ -398,11 +436,32 @@ impl TasksPanel {
         let panel = self.clone();
         self.dashboard_query
             .connect_changed(move |_| panel.apply_dashboard_filters());
+        let panel = self.clone();
+        self.dashboard_query.connect_activate(move |_| {
+            panel.apply_dashboard_filters();
+            let (target, selected) = {
+                let state = panel.state.borrow();
+                (state.rows.first().map(|row| row.id), state.selected)
+            };
+            if let Some(id) = target.filter(|id| Some(*id) != selected) {
+                panel.emit(TaskPanelAction::Select(id));
+            }
+        });
         for (view, button) in &self.dashboard_buttons {
             let panel = self.clone();
             let view = *view;
             button.connect_clicked(move |_| {
                 panel.dashboard_view.set(view);
+                panel.apply_dashboard_filters();
+            });
+        }
+        for button in [&self.dashboard_clear, &self.dashboard_reveal] {
+            let panel = self.clone();
+            button.connect_clicked(move |_| {
+                panel
+                    .dashboard_view
+                    .set(crate::agent_task::DashboardView::All);
+                panel.dashboard_query.set_text("");
                 panel.apply_dashboard_filters();
             });
         }
@@ -497,6 +556,8 @@ impl TasksPanel {
         let action = match kind {
             ActionKind::StartCodex => TaskPanelAction::StartCodex(id),
             ActionKind::StartTerminal => TaskPanelAction::StartTerminal(id),
+            ActionKind::FocusTerminal => TaskPanelAction::FocusTerminal(id),
+            ActionKind::FocusValidation => TaskPanelAction::FocusValidation(id),
             ActionKind::StopCodex => TaskPanelAction::StopCodex(id),
             ActionKind::FinishCodex => TaskPanelAction::FinishCodex(id),
             ActionKind::RunValidation => TaskPanelAction::RunValidation(id),
@@ -563,17 +624,31 @@ impl TasksPanel {
             sync.detail = None;
         }
         self.dashboard_summary.set_label(&format!(
-            "{} tasks · {} need you · {} awaiting approval{}",
+            "{} shown · {} search matches · {} need you · {} awaiting approval",
+            dashboard.rows.len(),
             dashboard.counts.total,
             dashboard.counts.attention,
             dashboard.counts.pending_approval,
-            if sync.rows.is_empty() {
-                " · No matching tasks"
-            } else {
-                ""
-            }
         ));
+        self.dashboard_clear.set_visible(
+            !self.dashboard_query.text().is_empty()
+                || self.dashboard_view.get() != crate::agent_task::DashboardView::All,
+        );
+        let selected_hidden = sync.selected.is_some_and(|id| {
+            self.unfiltered_state
+                .borrow()
+                .dashboard
+                .rows
+                .iter()
+                .any(|row| row.id == id)
+                && dashboard.selected_index(Some(id)).is_none()
+        });
+        self.dashboard_reveal.set_visible(selected_hidden);
         for (view, button) in &self.dashboard_buttons {
+            let label = dashboard_filter_label(*view, &dashboard.counts);
+            if button.label().as_deref() != Some(label.as_str()) {
+                button.set_label(&label);
+            }
             if *view == self.dashboard_view.get() {
                 button.add_css_class("suggested-action");
             } else {
@@ -601,6 +676,8 @@ impl TasksPanel {
             let sensitive = detail.is_some_and(|detail| match kind {
                 ActionKind::StartCodex => detail.can_start_codex,
                 ActionKind::StartTerminal => detail.can_start_terminal,
+                ActionKind::FocusTerminal => detail.can_focus_terminal,
+                ActionKind::FocusValidation => detail.can_focus_validation,
                 ActionKind::StopCodex => detail.can_stop,
                 ActionKind::FinishCodex => detail.can_finish,
                 ActionKind::RunValidation => detail.can_run_validation,
@@ -734,6 +811,23 @@ impl TasksPanel {
                 lines.set_margin_start(4);
                 lines.append(&title);
                 lines.append(&status);
+                if let Some(reason) = task_reason(
+                    row.status,
+                    row.validation_status,
+                    row.status_detail.as_deref(),
+                    row.validation_detail.as_deref(),
+                ) {
+                    let preview = gtk4::Label::new(Some(&reason));
+                    preview.set_halign(gtk4::Align::Start);
+                    preview.set_single_line_mode(true);
+                    preview.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                    preview.set_max_width_chars(28);
+                    preview.set_tooltip_text(Some(&reason));
+                    preview.add_css_class("caption");
+                    preview.add_css_class("dim-label");
+                    preview.add_css_class("task-reason");
+                    lines.append(&preview);
+                }
                 let list_row = gtk4::ListBoxRow::new();
                 list_row.set_child(Some(&lines));
                 self.task_list.append(&list_row);
@@ -836,6 +930,37 @@ fn set_view_text(view: &TextView, text: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dashboard_filter_labels_map_activity_and_finished_counts() {
+        use crate::agent_task::{DashboardCounts, DashboardView};
+        let counts = DashboardCounts {
+            total: 20,
+            attention: 7,
+            running: 9,
+            created: 3,
+            review: 4,
+            done: 2,
+            failed: 5,
+            cancelled: 1,
+            archived: 99,
+            ..Default::default()
+        };
+        for (view, expected) in [
+            (DashboardView::All, "All 20"),
+            (DashboardView::NeedsAttention, "Needs you 7"),
+            (DashboardView::Running, "Running 9"),
+            (DashboardView::NotStarted, "Not started 3"),
+            (DashboardView::Review, "Review 4"),
+            (DashboardView::Finished, "Finished 8"),
+        ] {
+            assert_eq!(super::dashboard_filter_label(view, &counts), expected);
+        }
+        assert_eq!(
+            super::dashboard_filter_label(DashboardView::Running, &DashboardCounts::default()),
+            "Running 0"
+        );
+    }
+
     use super::*;
 
     use super::replace_approval_cache;
@@ -898,6 +1023,7 @@ mod tests {
                 validation_attempt: 0,
                 needs_attention: task.needs_attention(),
                 status_detail: None,
+                validation_detail: None,
             })
             .collect();
         let detail = TaskDetailSync {
@@ -910,6 +1036,8 @@ mod tests {
             completed_turns: 0,
             can_start_codex: false,
             can_start_terminal: false,
+            can_focus_terminal: false,
+            can_focus_validation: false,
             can_stop: false,
             can_finish: false,
             can_run_validation: false,
@@ -925,6 +1053,233 @@ mod tests {
             detail: Some(Box::new(detail)),
             ..Default::default()
         }
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn task_reason_updates_and_disappears_without_retargeting() {
+        gtk4::init().expect("GTK display");
+        let panel = TasksPanel::build();
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let sink = actions.clone();
+        panel.connect_action(move |action| sink.borrow_mut().push(action));
+        let find_reason = || {
+            let mut pending = vec![panel.task_list.clone().upcast::<gtk4::Widget>()];
+            while let Some(widget) = pending.pop() {
+                if widget.has_css_class("task-reason") {
+                    return Some(widget.downcast::<gtk4::Label>().unwrap());
+                }
+                let mut child = widget.first_child();
+                while let Some(widget) = child {
+                    child = widget.next_sibling();
+                    pending.push(widget);
+                }
+            }
+            None
+        };
+        let mut sync = dashboard_test_sync();
+        let selected = sync.selected.unwrap();
+        let row = sync.rows.iter_mut().find(|row| row.id == selected).unwrap();
+        row.status = crate::agent_task::TaskStatus::Failed;
+        row.status_detail = Some("task reason".into());
+        row.validation_status = crate::agent_task::TaskValidationStatus::Failed;
+        row.validation_detail = Some("validation old".into());
+        let row = sync
+            .dashboard
+            .rows
+            .iter_mut()
+            .find(|row| row.id == selected)
+            .unwrap();
+        row.status = crate::agent_task::TaskStatus::Failed;
+        row.status_detail = Some("task reason".into());
+        row.validation_status = crate::agent_task::TaskValidationStatus::Failed;
+        panel.sync(sync.clone());
+        let reason = find_reason().unwrap();
+        assert_eq!(reason.label(), "validation old");
+        assert_eq!(reason.tooltip_text().as_deref(), Some("validation old"));
+        assert_eq!(reason.ellipsize(), gtk4::pango::EllipsizeMode::End);
+        assert!(reason.is_single_line_mode());
+        sync.rows
+            .iter_mut()
+            .find(|row| row.id == selected)
+            .unwrap()
+            .validation_detail = Some("updated".into());
+        panel.sync(sync.clone());
+        assert_eq!(find_reason().unwrap().label(), "updated");
+        sync.rows
+            .iter_mut()
+            .find(|row| row.id == selected)
+            .unwrap()
+            .validation_detail = None;
+        sync.rows
+            .iter_mut()
+            .find(|row| row.id == selected)
+            .unwrap()
+            .status_detail = None;
+        sync.dashboard
+            .rows
+            .iter_mut()
+            .find(|row| row.id == selected)
+            .unwrap()
+            .status_detail = None;
+        panel.sync(sync);
+        assert!(
+            find_reason().is_none(),
+            "old preview and tooltip must disappear"
+        );
+        assert_eq!(panel.state.borrow().selected, Some(selected));
+        assert!(actions.borrow().is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn task_terminal_buttons_only_emit_focus_for_existing_bindings() {
+        gtk4::init().expect("GTK display");
+        let panel = TasksPanel::build();
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let sink = actions.clone();
+        panel.connect_action(move |action| sink.borrow_mut().push(action));
+        let mut sync = dashboard_test_sync();
+        let id = sync.selected.unwrap();
+        let detail = sync.detail.as_mut().unwrap();
+        detail.can_focus_terminal = true;
+        detail.can_focus_validation = true;
+        panel.sync(sync.clone());
+        for kind in [ActionKind::FocusTerminal, ActionKind::FocusValidation] {
+            let button = panel
+                .action_buttons
+                .borrow()
+                .iter()
+                .find(|(candidate, _)| *candidate == kind)
+                .unwrap()
+                .1
+                .clone();
+            assert!(button.is_sensitive());
+            button.emit_clicked();
+        }
+        assert_eq!(
+            *actions.borrow(),
+            [
+                TaskPanelAction::FocusTerminal(id),
+                TaskPanelAction::FocusValidation(id)
+            ]
+        );
+        assert_eq!(panel.state.borrow().selected, Some(id));
+        assert_eq!(panel.unfiltered_state.borrow().rows, sync.rows);
+        sync.detail.as_mut().unwrap().can_focus_terminal = false;
+        sync.detail.as_mut().unwrap().can_focus_validation = false;
+        panel.sync(sync);
+        assert!(panel
+            .action_buttons
+            .borrow()
+            .iter()
+            .filter(|(kind, _)| matches!(
+                kind,
+                ActionKind::FocusTerminal | ActionKind::FocusValidation
+            ))
+            .all(|(_, button)| !button.is_sensitive()));
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn dashboard_filter_counts_follow_search_not_selected_view() {
+        gtk4::init().expect("GTK display");
+        let panel = TasksPanel::build();
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let sink = actions.clone();
+        panel.connect_action(move |action| sink.borrow_mut().push(action));
+        let sync = dashboard_test_sync();
+        let selected = sync.selected;
+        panel.sync(sync.clone());
+        let labels = || {
+            panel
+                .dashboard_buttons
+                .iter()
+                .map(|(_, button)| button.label().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            labels(),
+            [
+                "All 2",
+                "Needs you 1",
+                "Running 0",
+                "Not started 1",
+                "Review 0",
+                "Finished 1"
+            ]
+        );
+        panel
+            .dashboard_view
+            .set(crate::agent_task::DashboardView::Running);
+        panel.apply_dashboard_filters();
+        assert!(panel.state.borrow().rows.is_empty());
+        assert_eq!(
+            labels()[0],
+            "All 2",
+            "choosing a view must not shrink badges"
+        );
+        panel.dashboard_query.set_text("First");
+        assert_eq!(
+            labels(),
+            [
+                "All 1",
+                "Needs you 0",
+                "Running 0",
+                "Not started 1",
+                "Review 0",
+                "Finished 0"
+            ]
+        );
+        panel.dashboard_query.set_text("missing");
+        assert!(labels().iter().all(|label| label.ends_with(" 0")));
+        assert!(panel
+            .dashboard_buttons
+            .iter()
+            .all(|(_, button)| button.is_sensitive()));
+        assert_eq!(panel.state.borrow().selected, selected);
+        assert_eq!(panel.unfiltered_state.borrow().rows, sync.rows);
+        assert!(actions.borrow().is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn dashboard_search_activate_selects_current_visible_result_only() {
+        gtk4::init().expect("GTK display");
+        let panel = TasksPanel::build();
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let sink = actions.clone();
+        panel.connect_action(move |action| sink.borrow_mut().push(action));
+        let sync = dashboard_test_sync();
+        let expected = sync
+            .dashboard
+            .rows
+            .iter()
+            .find(|row| row.title == "Needs review")
+            .unwrap()
+            .id;
+        panel.sync(sync.clone());
+        panel.dashboard_query.set_text("review");
+        assert!(actions.borrow().is_empty(), "typing must not select");
+        panel
+            .dashboard_view
+            .set(crate::agent_task::DashboardView::Running);
+        panel.dashboard_query.emit_activate();
+        assert!(
+            actions.borrow().is_empty(),
+            "the current view can hide all matches"
+        );
+        panel
+            .dashboard_view
+            .set(crate::agent_task::DashboardView::All);
+        panel.dashboard_query.emit_activate();
+        assert!(
+            matches!(actions.borrow().as_slice(), [TaskPanelAction::Select(id)] if *id == expected)
+        );
+        assert_eq!(panel.unfiltered_state.borrow().rows, sync.rows);
+        panel.dashboard_query.set_text("no matches");
+        panel.dashboard_query.emit_activate();
+        assert_eq!(actions.borrow().len(), 1, "empty results are inert");
     }
 
     #[test]
@@ -950,19 +1305,29 @@ mod tests {
         assert_eq!(panel.state.borrow().selected, selected);
         assert_eq!(panel.rendered_rows.borrow().len(), 1);
         assert!(panel.state.borrow().detail.is_none());
+        assert!(panel.dashboard_clear.is_visible());
+        assert!(panel.dashboard_reveal.is_visible());
         assert!(!panel.page_stack.is_visible());
         panel.dashboard_query.set_text("missing");
         assert!(panel.rendered_rows.borrow().is_empty());
-        panel
-            .dashboard_view
-            .set(crate::agent_task::DashboardView::All);
-        panel.dashboard_query.set_text("");
+        panel.dashboard_reveal.emit_clicked();
+        assert!(!panel.dashboard_reveal.is_visible());
+        assert!(!panel.dashboard_clear.is_visible());
         assert_eq!(panel.rendered_rows.borrow().len(), 2);
         assert_eq!(panel.state.borrow().selected, selected);
         assert_eq!(panel.state.borrow().detail.as_ref().map(|d| d.id), selected);
         assert!(panel.page_stack.is_visible());
-        panel.sync(sync);
+        panel.sync(sync.clone());
         assert_eq!(panel.rendered_selected.get(), selected);
+        let mut removed = sync;
+        removed.rows.retain(|row| Some(row.id) != selected);
+        removed
+            .dashboard
+            .rows
+            .retain(|row| Some(row.id) != selected);
+        removed.detail = None;
+        panel.sync(removed);
+        assert!(!panel.dashboard_reveal.is_visible());
         assert!(
             actions.borrow().is_empty(),
             "filtering must not stage task actions"

@@ -209,7 +209,8 @@ impl ConfigPersistCommit {
 }
 
 impl UiState {
-    /// Snapshot every retained pane for settings only. During zoom the
+    /// Snapshot every retained pane for settings and stable task lookup.
+    /// During zoom the
     /// original split has an empty child slot and is outside the Notebook;
     /// PaneNode's complete-tree invariant intentionally does not apply here.
     pub(super) fn configuration_leaves(&self) -> Vec<PaneLeaf> {

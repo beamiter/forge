@@ -366,6 +366,16 @@ jsh_update_check = "daily"    # "startup" 每次启动联网；"daily" 复用缓
 | Agent 任务面板（需 `agent_tasks_enabled`） | `Ctrl+Alt+Shift+T` |
 | 字号增 / 减 / 复位 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
 
+Tasks 面板显示当前可见数与搜索匹配数，各状态按钮也显示当前搜索下的任务数量；在搜索框按 **Enter** 打开首个匹配任务。
+**Clear filters** 清除搜索和状态筛选；
+当前任务被筛选隐藏时，**Show selected task** 恢复它的详情并保留原选择。
+任务卡的 **Agent terminal** 与 **Validation output** 可返回已有终端或验证输出，
+包括其他标签页中的分屏。
+失败和等待处理的任务会在列表中显示原因预览，悬停可查看有界完整说明。
+
+开启 `ascii_organism_enabled` 后，本地 ASCII 生命体会响应命令与 Agent 状态。
+关闭期间的 Agent 活动不会改变它的生命状态，也不会在重新开启时补发反应。
+
 命令面板中的应用动作及其当前绑定可在 `Ctrl+Shift+P` 中搜索；这些动作可在
 `[keybindings]` 中覆盖，设为 `false` 可解除绑定。Block 视图内的上下文键
 `Alt+Shift+F`（过滤）、`Ctrl+Shift+B`（书签）和 `Ctrl+,` / `Ctrl+.`（前后书签）

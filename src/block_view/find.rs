@@ -223,6 +223,16 @@ impl Drop for FindReplayRepair {
     }
 }
 
+/// Native changes that can invalidate live match counts and coordinates.
+/// Viewport scroll and selection are deliberately absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LiveFindStamp {
+    contents_generation: u64,
+    rows: i64,
+    columns: i64,
+    origin: Option<i64>,
+}
+
 #[derive(Default)]
 pub(crate) struct FindState {
     /// An asynchronous exact step failed; the next action must rebuild rather
@@ -240,6 +250,8 @@ pub(crate) struct FindState {
     /// must deduplicate these handles rather than reconstructing them from the
     /// Block-only finished-widget list.
     highlighted_terminals: Vec<vte4::Terminal>,
+    live_anchor: Option<LiveAnchor>,
+    live_stamp: Option<LiveFindStamp>,
     /// Highlights installed by the flat cross-block palette do not participate
     /// in incremental navigation, but must still be cleared without walking all
     /// retained blocks on every debounced query.
@@ -422,12 +434,100 @@ fn utf8_cut_past(bytes: &[u8], max_bytes: usize) -> usize {
     cut
 }
 
-/// Whether the live VTE's buffer may be too large to dump for one incremental
-/// search: its rows times its columns (a lower bound on an ASCII dump's size
-/// once rows are full) already exceed what the scan may still read. The dump
-/// is written whole before any budget applies, so a million-line scrollback
-/// used to be copied on every keystroke; the bounded byte capture answers
-/// instead, marked incomplete.
+/// Where the live VTE's Find counts from and where its native steps start.
+///
+/// `from_row` is where the running command's card began (`origin`, the
+/// prompt's own row; the ring's first row when unknown). Below it everything
+/// is this command's: with `preserve_live_scrollback` the rows above are
+/// earlier commands' output, which their finished cards already count.
+///
+/// VTE starts a forward search with no selection at the top of its view, so
+/// the view is put at `view_row` before the first step (see
+/// [`anchor_live_native_search`]). A view cannot start below its last page,
+/// so `view_row` is `from_row` clamped there; the matches between the two
+/// are stepped over silently ([`LiveAnchor::skip`]). What is counted is then
+/// exactly what Next walks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LiveAnchor {
+    view_row: i64,
+    from_row: i64,
+    /// Matches in `view_row..from_row`, stepped over before the first one
+    /// counted.
+    skip: usize,
+}
+
+fn live_search_rows(lower: f64, upper: f64, page_size: f64, origin: Option<i64>) -> (i64, i64) {
+    let lower = lower as i64;
+    let last_row = (upper as i64 - 1).max(lower);
+    let last_page = ((upper - page_size) as i64).max(lower);
+    let from_row = origin.unwrap_or(lower).clamp(lower, last_row);
+    (from_row.min(last_page), from_row)
+}
+
+/// Point the live VTE's native search at the ends of the counted range before
+/// the first step into the live surface: a forward step starts at the view's
+/// top row (`anchor`), a backward one at the view's bottom (the buffer's end).
+fn anchor_live_native_search(
+    vte: &vte4::Terminal,
+    direction: FindDirection,
+    anchor: LiveAnchor,
+) -> bool {
+    use gtk4::prelude::*;
+
+    vte.unselect_all();
+    let Some(adjustment) = vte.vadjustment() else {
+        return false;
+    };
+    match direction {
+        FindDirection::Next => {
+            adjustment.set_value(anchor.view_row as f64);
+            vte.search_set_wrap_around(false);
+            for _ in 0..anchor.skip {
+                if !vte.search_find_next() {
+                    return false;
+                }
+            }
+        }
+        FindDirection::Previous => adjustment
+            .set_value((adjustment.upper() - adjustment.page_size()).max(adjustment.lower())),
+    }
+    true
+}
+
+/// Matches in the live rows `view_row..from_row`: on the view's last page,
+/// above the running command, and not counted (see [`LiveAnchor`]).
+fn live_rows_skipped(
+    vte: &vte4::Terminal,
+    regex: &regex::Regex,
+    view_row: i64,
+    from_row: i64,
+    budget: &mut FindScanBudget,
+) -> Option<usize> {
+    if view_row >= from_row {
+        return Some(0);
+    }
+    if budget.remaining_bytes() == 0 || budget.time_exhausted() {
+        return None;
+    }
+    let text = vte
+        .text_range_format(
+            vte4::Format::Text,
+            view_row,
+            0,
+            from_row - 1,
+            vte.column_count(),
+        )
+        .0?;
+    let prefix = budget.take_prefix(&text);
+    if prefix.incomplete {
+        return None;
+    }
+    let count = regex.find_iter(prefix.text).take(FIND_MATCH_LIMIT).count();
+    (!budget.time_exhausted()).then_some(count)
+}
+
+/// Reject an oversized native range before allocating its text. A rejected
+/// range leaves search incomplete rather than inventing navigable raw hits.
 fn live_dump_exceeds_budget(total_rows: f64, columns: i64, remaining_bytes: usize) -> bool {
     let rows = if total_rows.is_finite() {
         total_rows.max(0.0) as u64
@@ -1278,6 +1378,20 @@ fn add_snapshot_jump_fallbacks<'a>(
 
 #[allow(dead_code)]
 impl TermView {
+    fn live_find_stamp(&self) -> LiveFindStamp {
+        LiveFindStamp {
+            contents_generation: self.contents_generation.get(),
+            rows: self.active_vte.row_count(),
+            columns: self.active_vte.column_count(),
+            origin: self.active.borrow().live_cursor_origin().get(),
+        }
+    }
+
+    fn live_find_is_current(&self) -> bool {
+        let expected = self.find_state.borrow().live_stamp;
+        expected.is_none_or(|stamp| stamp == self.live_find_stamp())
+    }
+
     /// Cheap version probe for an open picker. No command/output text is
     /// cloned; callers can poll this and rebuild only when finalized record
     /// identity actually changes.
@@ -1385,8 +1499,10 @@ impl TermView {
             Err(_) => return FindSearchResult::InvalidRegex,
         };
 
+        let live_stamp_at_start = self.live_find_stamp();
         let mut surfaces = Vec::new();
         let mut highlighted_terminals = Vec::new();
+        let mut live_anchor = None;
         let mut total = 0usize;
         let mut match_limited = false;
         let mut scan_limited = false;
@@ -1404,6 +1520,7 @@ impl TermView {
                 .native_fallback
                 .as_ref()
                 .is_some_and(|fallback| fallback.is_live);
+        let mut live_observed = completed_owns_live_surface;
         let completed_incomplete = completed_batch.incomplete;
         let native_fallback = completed_batch.native_fallback;
         for backend_surface in completed_batch.surfaces {
@@ -1502,8 +1619,8 @@ impl TermView {
         // The still-running command's output is searchable too (document
         // order: it sits below every finished block). VTE's own highlighter
         // paints and steps these hits, so they are counted from the live
-        // VTE's own buffer (`live_vte_search_text`): the count must equal
-        // the steps. The raw capture is only a fallback when that dump fails.
+        // current-command range in VTE's own buffer: the count must equal
+        // the native steps, including when older scrollback is retained.
         if !match_limited
             && !scan_limited
             && !completed_owns_live_surface
@@ -1512,19 +1629,52 @@ impl TermView {
                 super::BlockState::CollectingOutput | super::BlockState::PostCommand
             )
         {
-            let dump = if scan_budget.time_exhausted()
-                || live_dump_exceeds_budget(
-                    self.active_vte
-                        .vadjustment()
-                        .map(|adj| adj.upper())
-                        .unwrap_or(f64::INFINITY),
-                    self.active_vte.column_count(),
-                    scan_budget.remaining_bytes(),
-                ) {
-                None
-            } else {
-                live_vte_search_text_prefix(&self.active_vte, scan_budget.remaining_bytes())
-            };
+            live_observed = true;
+            let live_rows = self.active_vte.vadjustment().map(|adjustment| {
+                let (view_row, from_row) = live_search_rows(
+                    adjustment.lower(),
+                    adjustment.upper(),
+                    adjustment.page_size(),
+                    self.active.borrow().live_cursor_origin().get(),
+                );
+                (view_row, from_row, adjustment.upper())
+            });
+            // Read only this command's range. Old retained scrollback belongs
+            // to finished cards, and must neither consume the budget nor be
+            // counted a second time. Never navigate raw-capture guesses when
+            // the native buffer cannot be read within the search budget.
+            let dump = live_rows.and_then(|(view_row, from_row, upper)| {
+                if scan_budget.time_exhausted()
+                    || live_dump_exceeds_budget(
+                        upper - view_row as f64,
+                        self.active_vte.column_count(),
+                        scan_budget.remaining_bytes(),
+                    )
+                {
+                    return None;
+                }
+                let text = self
+                    .active_vte
+                    .text_range_format(
+                        vte4::Format::Text,
+                        from_row,
+                        0,
+                        upper as i64 - 1,
+                        self.active_vte.column_count(),
+                    )
+                    .0?;
+                let skip =
+                    live_rows_skipped(&self.active_vte, &re, view_row, from_row, &mut scan_budget)?;
+                if skip >= FIND_MATCH_LIMIT {
+                    return None;
+                }
+                live_anchor = Some(LiveAnchor {
+                    view_row,
+                    from_row,
+                    skip,
+                });
+                Some(text.to_string())
+            });
             let (live_text, live_raw_incomplete, live_prefix_incomplete) = match dump {
                 Some(mut dump) => {
                     let prefix = scan_budget.take_prefix(&dump);
@@ -1532,18 +1682,7 @@ impl TermView {
                     dump.truncate(kept);
                     (dump, false, incomplete)
                 }
-                None => {
-                    let (live_raw, live_raw_incomplete) = self
-                        .active
-                        .borrow()
-                        .output_text_prefix(scan_budget.remaining_bytes());
-                    let live_prefix = scan_budget.take_prefix(&live_raw);
-                    (
-                        super::strip_ansi(live_prefix.text),
-                        live_raw_incomplete,
-                        live_prefix.incomplete,
-                    )
-                }
+                None => (String::new(), true, false),
             };
             let live = bounded_match_count(&re, &live_text, FIND_MATCH_LIMIT.saturating_sub(total));
             if live.count > 0 {
@@ -1589,6 +1728,7 @@ impl TermView {
             };
         }
         let capped = match_limited || scan_limited;
+        let live_stamp = live_observed.then_some(live_stamp_at_start);
         {
             let mut st = self.find_state.borrow_mut();
             st.surfaces = surfaces;
@@ -1602,6 +1742,8 @@ impl TermView {
             st.capped = capped;
             st.scan_limited = scan_limited;
             st.highlighted_terminals = highlighted_terminals;
+            st.live_anchor = live_anchor;
+            st.live_stamp = live_stamp;
         }
         if let Some(resume) = resume {
             let cursor = resumed_find_cursor(&self.find_state.borrow().surfaces, resume);
@@ -1916,6 +2058,12 @@ impl TermView {
     }
 
     fn step_find(&self, direction: FindDirection) -> FindNavigationResult {
+        // Invalidate before the one-hit/at-boundary shortcut: native output
+        // can erase its selection or add hits without moving our old cursor.
+        if !self.live_find_is_current() {
+            self.clear_find();
+            return FindNavigationResult::Invalidated;
+        }
         if std::mem::take(&mut self.find_state.borrow_mut().invalidated) {
             return FindNavigationResult::Invalidated;
         }
@@ -2012,6 +2160,9 @@ impl TermView {
         direction: FindDirection,
         restart: bool,
     ) -> FindFocusResult {
+        if !self.live_find_is_current() {
+            return FindFocusResult::Invalidated;
+        }
         let (surface, query_at_start, cursor_at_start) = {
             let state = self.find_state.borrow();
             let Some(surface) = state.surfaces.get(surface_index) else {
@@ -2083,7 +2234,7 @@ impl TermView {
         let restart = restart
             || lost_selection
             || (surface.pending_replay.is_some() && pending_replay.is_none());
-        let wrap_once = if restart {
+        let mut wrap_once = if restart {
             if surface.is_live
                 || occurrence >= surface.count
                 || current_render_stamp != Some(surface.render_stamp)
@@ -2103,14 +2254,24 @@ impl TermView {
                 None => return FindFocusResult::Invalidated,
             }
         };
+        if surface.is_live && surface.block_id == 0 && (surface.vte_cursor.is_none() || wrap_once) {
+            let anchor = self.find_state.borrow().live_anchor;
+            if let Some(anchor) = anchor {
+                if !anchor_live_native_search(&vte, direction, anchor) {
+                    return FindFocusResult::Invalidated;
+                }
+                wrap_once = false;
+            }
+        }
         #[cfg(test)]
         super::alt_screen::trace_find_render(&format!("find-before-select block={} output={} occurrence={occurrence} stamp={current_render_stamp:?}", surface.block_id, surface.is_output), &vte);
         let still_current = || {
-            self.find_state.try_borrow().is_ok_and(|state| {
-                state.query == query_at_start
-                    && state.cursor == cursor_at_start
-                    && state.surfaces.get(surface_index) == Some(&surface)
-            })
+            self.live_find_is_current()
+                && self.find_state.try_borrow().is_ok_and(|state| {
+                    state.query == query_at_start
+                        && state.cursor == cursor_at_start
+                        && state.surfaces.get(surface_index) == Some(&surface)
+                })
         };
         vte.search_set_wrap_around(wrap_once);
         let found = if restart {
@@ -2691,6 +2852,47 @@ mod tests {
                 }
             ),
             None
+        );
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn live_skip_budget_rejects_without_navigation() {
+        use vte4::TerminalExt;
+        gtk4::init().expect("GTK display");
+        let terminal = vte4::Terminal::new();
+        let mut budget = super::FindScanBudget::new();
+        budget.consume_bytes(FIND_OVERLAY_SCAN_BYTE_LIMIT);
+        let regex = regex::Regex::new("needle").unwrap();
+        assert_eq!(
+            super::live_rows_skipped(&terminal, &regex, 0, 1, &mut budget),
+            None
+        );
+        assert!(!terminal.has_selection());
+    }
+
+    #[test]
+    fn live_range_budget_excludes_retained_history_and_clamps_origins() {
+        let (view, from) = super::live_search_rows(0.0, 1_000_000.0, 24.0, Some(999_995));
+        assert_eq!((view, from), (999_976, 999_995));
+        assert!(!super::live_dump_exceeds_budget(
+            1_000_000.0 - view as f64,
+            80,
+            4096
+        ));
+        assert!(super::live_dump_exceeds_budget(
+            1_000_000.0 - view as f64,
+            80,
+            0
+        ));
+        assert_eq!(super::live_search_rows(50.0, 100.0, 24.0, None), (50, 50));
+        assert_eq!(
+            super::live_search_rows(50.0, 100.0, 24.0, Some(0)),
+            (50, 50)
+        );
+        assert_eq!(
+            super::live_search_rows(50.0, 100.0, 24.0, Some(200)),
+            (76, 99)
         );
     }
 
