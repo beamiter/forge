@@ -358,6 +358,22 @@ fn restored_history_notice(session: &jterm_core::agent::AgentSession) -> Option<
         .then_some("Earlier activity was omitted to keep the saved session within its size limit")
 }
 
+// Cross-restart history has no terminal/cwd provenance. Keep it readable,
+// but retire its proposals and model request before binding a new pane.
+fn seal_restored_session(mut session: AgentSession) -> AgentSession {
+    session.cancel();
+    session
+}
+
+fn start_fresh_task(session: &mut AgentSession) -> Result<(), crate::agent::SessionError> {
+    if session.state() == AgentState::Cancelled {
+        *session = AgentSession::new(session.max_turns());
+        Ok(())
+    } else {
+        session.start_new_task()
+    }
+}
+
 struct AgentRuntime {
     session: RefCell<AgentSession>,
     history_notice: Label,
@@ -479,7 +495,7 @@ impl AgentRuntime {
             && !self.busy.get()
             && matches!(
                 session.state(),
-                AgentState::Completed | AgentState::TurnLimitReached
+                AgentState::Completed | AgentState::Cancelled | AgentState::TurnLimitReached
             )
             && !can_follow_up;
         self.session_action
@@ -531,7 +547,7 @@ impl AgentRuntime {
             if session.can_continue_after_completion() {
                 session.continue_after_completion().map(|()| false)
             } else {
-                session.start_new_task().map(|()| true)
+                start_fresh_task(&mut session).map(|()| true)
             }
         };
         match result {
@@ -1870,7 +1886,7 @@ impl UiState {
 
         let card: gtk4::Widget = outer.clone().upcast();
         // A snapshot persisted by the previous run is atomically claimed,
-        // consumed once, and rebound to the pane the user opened the Agent on.
+        // consumed once, and retained for review without new pane authority.
         // Pending approval state must never be restorable by two processes.
         let restored_session = match agent_snapshot_path() {
             Ok(path) => load_agent_snapshot(&path),
@@ -1889,7 +1905,11 @@ impl UiState {
         body.prepend(&history_notice);
         let runtime = Rc::new(AgentRuntime {
             history_notice,
-            session: RefCell::new(restored_session.unwrap_or_else(|| AgentSession::new(max_turns))),
+            session: RefCell::new(
+                restored_session
+                    .map(seal_restored_session)
+                    .unwrap_or_else(|| AgentSession::new(max_turns)),
+            ),
             target: target.clone(),
             ui_lifetime: self.agent_ui_lifetime.clone(),
             config: self.config.clone(),
@@ -1928,7 +1948,7 @@ impl UiState {
         if was_restored {
             runtime.append(
                 "Agent",
-                "Restored the previous agent session from your last run.",
+                "Restored the previous Agent transcript for review only. Start a new task to bind this pane.",
             );
             let transcript: Vec<Turn> = runtime.session.borrow().transcript().to_vec();
             for turn in &transcript {
@@ -1960,27 +1980,8 @@ impl UiState {
                     Turn::ProtocolError(message) => runtime.append("Error", message),
                 }
             }
-            // Resume what the snapshot left in flight: a pending proposal is
-            // re-rendered as a manual review card (never auto-approved), and
-            // a lost model turn is simply re-requested.
-            let state = runtime.session.borrow().state();
-            match state {
-                AgentState::AwaitingApproval { proposal_id } => {
-                    let pending = transcript.iter().rev().find_map(|turn| match turn {
-                        Turn::AssistantProposed {
-                            id,
-                            command,
-                            status: ProposalStatus::Pending,
-                        } if *id == proposal_id => Some(command.clone()),
-                        _ => None,
-                    });
-                    if let Some(command) = pending {
-                        AgentRuntime::render_proposal_card(&runtime, proposal_id, command);
-                    }
-                }
-                AgentState::AwaitingModel => AgentRuntime::request_model(runtime.clone()),
-                _ => {}
-            }
+            // Restored history is sealed above. Do not recreate actionable
+            // approval cards or re-request a model turn in this new pane.
         }
         runtime.render_session_state(None);
 
@@ -2114,6 +2115,57 @@ mod tests {
         let mut complete = jterm_core::agent::AgentSession::new(10);
         complete.submit_user("complete task").unwrap();
         assert!(super::restored_history_notice(&complete).is_none());
+    }
+
+    #[test]
+    fn restored_proposal_is_read_only_and_new_task_has_a_fresh_epoch() {
+        use crate::agent::{AgentSession, AgentState, ModelOutcome};
+        let mut old = AgentSession::new(10);
+        old.submit_user("old task").unwrap();
+        let id = match old
+            .accept_model_reply(r#"{"action":"run","command":"pwd"}"#)
+            .unwrap()
+        {
+            ModelOutcome::Proposal { id, .. } => id,
+            other => panic!("expected proposal: {other:?}"),
+        };
+        let mut session = super::seal_restored_session(old);
+        assert_eq!(session.state(), AgentState::Cancelled);
+        assert!(!session.transcript().is_empty());
+        assert!(session.approve(id).is_err());
+        let old_epoch = session.epoch();
+        super::start_fresh_task(&mut session).unwrap();
+        assert_ne!(session.epoch(), old_epoch);
+        assert_eq!(session.state(), AgentState::Ready);
+        assert!(session.transcript().is_empty());
+        session.submit_user("new task").unwrap();
+        let id = match session
+            .accept_model_reply(r#"{"action":"run","command":"pwd"}"#)
+            .unwrap()
+        {
+            ModelOutcome::Proposal { id, .. } => id,
+            other => panic!("expected proposal: {other:?}"),
+        };
+        // The runtime increments its task epoch after this successful reset;
+        // an old card must fail even if the fresh core reuses a numeric id.
+        assert!(!super::proposal_callback_is_current(
+            true,
+            1,
+            0,
+            session.state(),
+            id
+        ));
+        assert!(session.approve(id).is_ok());
+    }
+
+    #[test]
+    fn restored_model_request_is_never_resumed() {
+        use crate::agent::{AgentSession, AgentState};
+        let mut old = AgentSession::new(10);
+        old.submit_user("old task").unwrap();
+        let session = super::seal_restored_session(old);
+        assert_eq!(session.state(), AgentState::Cancelled);
+        assert!(!session.can_continue_after_completion());
     }
 
     #[test]
