@@ -21548,7 +21548,12 @@ mod tests {
             assert_eq!(view.clear_blocks(), 1);
             settle();
             more.emit_clicked();
-            card.activate_action("block.show-menu", None).unwrap();
+            // The pool explicitly removes the outer card's action group.
+            assert!(card.activate_action("block.show-menu", None).is_err());
+            // A retained button still owns its local group; its live-identity
+            // guard must refuse to reopen the retired card through either path.
+            more.activate_action("block.show-menu", None)
+                .expect("retained button still owns the guarded action");
             settle();
             assert!(popovers(&card).is_empty(), "retired card cannot reopen");
             assert!(
