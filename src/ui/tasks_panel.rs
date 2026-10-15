@@ -937,6 +937,8 @@ mod tests {
         panel.connect_action(move |action| sink.borrow_mut().push(action));
         let window = gtk4::Window::new();
         window.set_child(Some(&panel.root));
+        // is_visible includes ancestor visibility, so exercise a shown window.
+        window.present();
         let sync = dashboard_test_sync();
         let selected = sync.selected;
         panel.sync(sync.clone());
