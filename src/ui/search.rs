@@ -131,6 +131,10 @@ impl UiState {
 
     pub(crate) fn schedule_search_apply(&self) {
         self.cancel_pending_search();
+        // GtkSearchEntry can deliver its delayed signal after the bar closes.
+        if !self.search_bar.is_search_mode() {
+            return;
+        }
         if self.search_entry.text().is_empty() {
             self.apply_search_now();
             return;
@@ -173,6 +177,9 @@ impl UiState {
     }
 
     fn apply_search_to(&self, terminal: Option<&vte4::Terminal>, term_view: Option<&Rc<TermView>>) {
+        if !self.search_bar.is_search_mode() {
+            return;
+        }
         self.clear_search_owner();
         *self.search_owner.borrow_mut() = Some(SearchOwner::new(terminal, term_view));
         // A new query retires the live fallback before either backend can
@@ -257,6 +264,9 @@ impl UiState {
     }
 
     pub(crate) fn search_next(&self) {
+        if !self.search_bar.is_search_mode() {
+            return;
+        }
         if self.search_debounce_source.borrow().is_some() || !self.search_owner_is_current() {
             self.search_apply();
             return;
@@ -285,6 +295,9 @@ impl UiState {
     }
 
     pub(crate) fn search_prev(&self) {
+        if !self.search_bar.is_search_mode() {
+            return;
+        }
         if self.search_debounce_source.borrow().is_some() || !self.search_owner_is_current() {
             self.search_apply();
             return;

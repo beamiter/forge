@@ -688,4 +688,69 @@ mod ui {
             assert!(ui.terminals[0].installed.borrow().is_none());
         }
     }
+
+    #[test]
+    fn delayed_entry_signal_after_close_cannot_reinstall_search() {
+        let ui = setup();
+        ui.search_entry.set_text("needle");
+        ui.search_apply();
+        let steps = ui.terminals[0].steps.get();
+        ui.toggle_search();
+        ui.schedule_search_apply();
+        assert!(ui.search_debounce_source.borrow().is_none());
+        assert!(ui.search_status.0.borrow().is_empty());
+        glib::run_pending();
+        assert!(ui.terminals[0].installed.borrow().is_none());
+        assert!(ui.search_owner.borrow().is_none());
+        assert_eq!(ui.terminals[0].steps.get(), steps);
+    }
+
+    #[test]
+    fn hidden_direct_apply_and_navigation_leave_both_backends_idle() {
+        let mut ui = setup();
+        let view = Rc::new(TermView {
+            result: block_view::FindSearchResult::NoMatches,
+            queries: Rc::new(RefCell::new(Vec::new())),
+            cleared: Rc::new(Cell::new(0)),
+            revealed: Rc::new(Cell::new(0)),
+        });
+        ui.views[0] = Some(view.clone());
+        ui.search_entry.set_text("needle");
+        ui.search_apply();
+        ui.toggle_search();
+        let queries = view.queries.borrow().len();
+        let revealed = view.revealed.get();
+        let steps = ui.terminals[0].steps.get();
+        ui.search_apply();
+        ui.search_apply_in_page(&gtk4::Widget(0));
+        ui.search_next();
+        ui.search_prev();
+        assert!(ui.search_debounce_source.borrow().is_none());
+        assert!(ui.search_owner.borrow().is_none());
+        assert!(ui.search_status.0.borrow().is_empty());
+        assert!(ui.terminals[0].installed.borrow().is_none());
+        assert_eq!(view.queries.borrow().len(), queries);
+        assert_eq!(view.revealed.get(), revealed);
+        assert_eq!(ui.terminals[0].steps.get(), steps);
+    }
+
+    #[test]
+    fn reopen_after_delayed_closed_signal_replays_retained_query_once() {
+        let ui = setup();
+        ui.search_entry.set_text("old");
+        ui.search_apply();
+        ui.search_entry.set_text("new");
+        ui.schedule_search_apply();
+        ui.toggle_search();
+        ui.schedule_search_apply();
+        glib::run_pending();
+        assert!(ui.terminals[0].installed.borrow().is_none());
+        let steps = ui.terminals[0].steps.get();
+        ui.toggle_search();
+        assert_eq!(*ui.search_status.0.borrow(), "Searching…");
+        glib::run_pending();
+        assert_eq!(*ui.terminals[0].installed.borrow(), Some("new".into()));
+        assert_eq!(ui.terminals[0].steps.get(), steps + 1);
+        assert!(ui.search_debounce_source.borrow().is_none());
+    }
 }
