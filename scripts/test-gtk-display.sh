@@ -52,6 +52,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::blocks::fold_preview_tests::folded_preview_tracks_filters_and_preserves_output
     ui::agent_panel::focus_tests::asynchronous_agent_renders_preserve_newer_focus_owners
     ui::tasks_panel::tests::dashboard_filters_preserve_selection_without_actions
     ui::tasks_panel::tests::dashboard_search_activate_selects_current_visible_result_only

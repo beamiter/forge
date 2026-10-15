@@ -11,6 +11,51 @@ use std::rc::Rc;
 use vte4::Terminal;
 use vte4::TerminalExt;
 
+/// A compact native reveal target. The preview is display-only and ellipsized;
+/// its width must never become the minimum width of a narrow split pane.
+fn set_folded_summary(button: &gtk4::Button, summary: &str, preview: Option<&str>) {
+    let body = button
+        .child()
+        .and_then(|child| child.downcast::<gtk4::Box>().ok());
+    let body = body.unwrap_or_else(|| {
+        let body = gtk4::Box::new(Orientation::Vertical, 2);
+        for class in ["block-output-summary-title", "block-output-preview"] {
+            let label = gtk4::Label::new(None);
+            label.add_css_class(class);
+            label.set_xalign(0.0);
+            label.set_hexpand(true);
+            label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            label.set_single_line_mode(true);
+            label.set_width_chars(1);
+            label.set_max_width_chars(72);
+            if class == "block-output-preview" {
+                label.add_css_class("dim-label");
+            }
+            body.append(&label);
+        }
+        button.set_child(Some(&body));
+        button.set_halign(gtk4::Align::Fill);
+        button.set_hexpand(true);
+        body
+    });
+    let title = body.first_child().and_downcast::<gtk4::Label>().unwrap();
+    let detail = body.last_child().and_downcast::<gtk4::Label>().unwrap();
+    title.set_text(summary);
+    if let Some(preview) = preview {
+        detail.set_text(&format!("Preview: {preview}"));
+        detail.set_visible(!preview.is_empty());
+    }
+    let accessible = if detail.get_visible() {
+        format!("{summary}. {}", detail.text())
+    } else {
+        summary.to_string()
+    };
+    button.update_property(&[gtk4::accessible::Property::Label(&accessible)]);
+    button.set_tooltip_text(Some(
+        "Show output. Preview shows the last non-empty retained line.",
+    ));
+}
+
 /// Conservative per-pane estimated-memory budget for completed-block objects.
 ///
 /// This is deliberately independent of the configurable record-count limit:
@@ -1566,8 +1611,9 @@ fn finished_block_height_for_rows(
 /// a 1.3 MB transcript a second time for a number the caller was already
 /// holding. `None` keeps the old self-sufficient behavior for restore paths
 /// and tests.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct FinishedBlockPrecomputed {
+    pub(crate) output_preview: Option<String>,
     pub(crate) output_rows: Option<i64>,
 }
 
@@ -3151,6 +3197,12 @@ impl FinishedBlock {
         // summary in the document instead; it both preserves the output's scale
         // and is a large, obvious target to restore it.
         let summary = collapsed_content_summary(output_rows, has_output, !images.is_empty());
+        let original_preview = Rc::new(
+            precomputed
+                .output_preview
+                .filter(|_| !repaint_collapsed)
+                .unwrap_or_else(|| super::fold_preview::from_plain(&strip_ansi(output))),
+        );
         let collapsed_summary = gtk4::Button::with_label(&summary);
         collapsed_summary.add_css_class("block-output-summary");
         collapsed_summary.add_css_class("flat");
@@ -3160,6 +3212,8 @@ impl FinishedBlock {
         collapsed_summary.set_margin_bottom(4);
         collapsed_summary.set_tooltip_text(Some("Show block output"));
         collapsed_summary.set_focus_on_click(false);
+        let summary_title = collapsed_summary.label().unwrap_or_default();
+        set_folded_summary(&collapsed_summary, &summary_title, Some(&original_preview));
         collapsed_summary.set_visible(false);
         content.append(&collapsed_summary);
 
@@ -3297,6 +3351,7 @@ impl FinishedBlock {
             let filter_btn_weak = filter_btn.downgrade();
             let jump_bottom_btn = jump_bottom_btn.downgrade();
             let collapsed_summary = collapsed_summary.downgrade();
+            let original_preview = original_preview.clone();
             let restore_live_focus_for_row = restore_live_focus.clone();
             let filter_toggle_for_row = filter_toggle_handle.clone();
             let build_filter_row: Rc<FilterRowBuilder> = {
@@ -3399,6 +3454,7 @@ impl FinishedBlock {
                         let filter_btn = filter_btn.clone();
                         let jump_bottom_btn = jump_bottom_btn.clone();
                         let collapsed_summary = collapsed_summary.clone();
+                        let original_preview = original_preview.clone();
                         let max_expanded_cap_for_filter = max_expanded_cap;
                         move || {
                             let (
@@ -3556,9 +3612,18 @@ impl FinishedBlock {
                                 filter_status.remove_css_class("block-filter-empty");
                                 filter_status.set_visible(false);
                             }
-                            collapsed_summary.set_label(&collapsed_content_summary(
-                                shown_rows, has_output, has_images,
-                            ));
+                            let preview = display_changed.then(|| {
+                                if display_override.is_none() {
+                                    original_preview.as_ref().clone()
+                                } else {
+                                    super::fold_preview::from_plain(&strip_ansi(shown))
+                                }
+                            });
+                            set_folded_summary(
+                                &collapsed_summary,
+                                &collapsed_content_summary(shown_rows, has_output, has_images),
+                                preview.as_deref(),
+                            );
                             expand_btn.set_visible(can_expand);
                             jump_bottom_btn.set_visible(shown_visual_rows > fitted_cap);
                             // Keep `displayed_output` in sync so a later unmap → remap
@@ -5703,6 +5768,7 @@ mod tests {
             None,
             super::FinishedBlockPrecomputed {
                 output_rows: Some(rows),
+                output_preview: Some(super::super::fold_preview::from_plain(&output)),
             },
         );
         let calls = super::OUTPUT_VISUAL_ROW_COUNT_CALLS.with(Cell::get);
@@ -6942,3 +7008,7 @@ mod tests {
         assert_eq!(snapshot_settle_tail("\r\n   \r\n"), None);
     }
 }
+
+#[cfg(test)]
+#[path = "fold_preview_tests.rs"]
+mod fold_preview_tests;
