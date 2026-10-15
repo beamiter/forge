@@ -70,8 +70,8 @@ uninstall_dry_run() {
         "${UNINSTALLER}" --dry-run "$@"
 }
 
-# The historical source-install default is ~/.cargo/bin. Install and uninstall
-# must agree, while an explicit prefix switches both to PREFIX/bin.
+# All four terminals default to ~/.local/bin. Install and uninstall
+# must agree, while an explicit prefix uses PREFIX/bin.
 # The displayed PATH handoff is executable shell syntax. An apostrophe,
 # dollar, backtick, space, and relative/empty existing PATH components must
 # remain literal data. Assert the whole command before evaluating the fixture.
@@ -107,13 +107,13 @@ path_hint_actual="$(
     || fail "PATH handoff expanded directory bytes or changed the existing PATH"
 
 default_install="$(install_dry_run "")"
-mkdir -p "${TEST_HOME}/.cargo/bin"
-touch "${TEST_HOME}/.cargo/bin/forge"
+mkdir -p "${TEST_HOME}/.local/bin"
+touch "${TEST_HOME}/.local/bin/forge"
 default_uninstall="$(uninstall_dry_run "")"
 assert_contains "default install" "${default_install}" \
-    "Installed forge to ${TEST_HOME}/.cargo/bin/forge"
+    "Installed forge to ${TEST_HOME}/.local/bin/forge"
 assert_contains "default uninstall" "${default_uninstall}" \
-    "${TEST_HOME}/.cargo/bin/forge"
+    "${TEST_HOME}/.local/bin/forge"
 
 custom_prefix="${TEST_ROOT}/prefix"
 mkdir -p "${custom_prefix}/bin"
@@ -555,3 +555,6 @@ assert_regular_file "binary after rejected root-symlink purge" "${root_binary}"
     || fail "root-symlink purge removed outside config"
 
 printf 'install/uninstall path contract: ok\n'
+
+# Exercise the shared repeat-install and recoverable configuration policy.
+bash "${SCRIPT_DIR}/test-install-upgrade.sh"

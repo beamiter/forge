@@ -6,6 +6,24 @@ umask 077
 
 APP_ID="io.github.beamiter.forge"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# The helper is bundled under libexec by package-release.sh.
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../scripts/install-config.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/libexec/install-config.sh"
+# Consumed by the bundled config helper.
+# shellcheck disable=SC2034
+DRY_RUN=0
+INSTALL_CONFIG=1
+for option in "$@"; do
+    case "${option}" in
+        --no-config) INSTALL_CONFIG=0 ;;
+        -h|--help)
+            printf 'Usage: ./install.sh [--no-config]\nDefault: install to ~/.local/bin; back up and replace config.toml.\n'
+            exit 0 ;;
+        *) printf 'Unknown option: %s\n' "${option}" >&2; exit 1 ;;
+    esac
+done
 HOME_DIR="${HOME:-}"
 PREFIX="${HOME_DIR}/.local"
 BIN_DIR="${PREFIX}/bin"
@@ -158,6 +176,11 @@ install_desktop_entry() {
 # means an existing file, symlink, or concurrent writer wins and is preserved.
 install_config_if_absent() {
     local source="$1" dest="$2" directory basename
+    ((INSTALL_CONFIG == 1)) || return 0
+    if [[ -f "${dest}" && ! -L "${dest}" ]]; then
+        install_config_with_backup "${source}" "${dest}" "${dest}"
+        return
+    fi
     if [[ -e "${dest}" || -L "${dest}" ]]; then
         printf 'Keeping existing configuration: %s\n' "${dest}"
         return 0

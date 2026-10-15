@@ -71,7 +71,7 @@ ShellCheck，不会在检查过程中解析出另一份依赖图。
 `make package` 刻意使用宿主 Cargo 与系统 GTK/VTE 开发库：发行归档按兼容系统的动态库
 ABI 分发，不能把 Nix store 解释器/RPATH 烘进裸二进制。日常构建和验收仍使用上面的 Nix 门禁。
 
-安装脚本默认优先使用 Nix；没有 Nix 时自动退回 Cargo，并且不会覆盖已有配置：
+安装脚本默认优先使用 Nix；没有 Nix 时自动退回 Cargo，并在备份已有配置后替换为随版本提供的默认配置（保留自定义配置请加 `--no-config`）：
 
 ```bash
 ./scripts/install.sh
@@ -81,7 +81,7 @@ ABI 分发，不能把 Nix store 解释器/RPATH 烘进裸二进制。日常构�
 ./scripts/install.sh --dry-run
 ```
 
-无参数源码安装沿用 `~/.cargo/bin/forge`，显式 `--prefix` 时二进制改为
+无参数源码安装统一使用 `~/.local/bin/forge`，显式 `--prefix` 时二进制改为
 `PREFIX/bin/forge`；安装与卸载使用同一规则。脚本同时安装 `forge-support-bundle`，并把
 shell 集成、内置 workflow 和欢迎 Notebook 安装到 `~/.local/share/forge/`；安装器会自动纳入
 共享加载器接受的全部 `.toml` / `.yaml` / `.yml` 示例，卸载时只移除这些自带文件并保留同目录的用户 workflow。配置使用
@@ -569,3 +569,20 @@ completion, password input and interactive applications remain in control;
 running commands and alternate-screen programs temporarily own the same native
 terminal. Existing defaults and existing panes are unchanged. See
 [Chat mode behavior and acceptance](docs/CHAT_MODE_ACCEPTANCE.md).
+
+### Source install upgrades
+
+`./scripts/install.sh` installs the executable to `~/.local/bin` by default.
+`--prefix PATH` selects `PATH/bin`; `--bin-dir PATH` overrides only the binary
+directory. Existing binaries are replaced atomically.
+
+The configuration is installed to `${XDG_CONFIG_HOME:-$HOME/.config}/forge/config.toml`.
+An existing regular config is backed up as `config.toml.backup.<unique suffix>`
+before replacing it with the bundled defaults. Identical configs do not create
+extra backups. Use `--no-config` to retain all custom settings, or copy selected
+settings back from the private backup after installation. Symlinked configs are
+left unchanged. `--dry-run` does not write binaries, configs, or backups.
+
+An already-running terminal keeps its current process; restart it to use the new
+binary and configuration. If an older copy comes first in PATH, the installer
+prints the conflicting path.
