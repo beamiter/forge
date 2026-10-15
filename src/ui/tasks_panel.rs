@@ -32,6 +32,7 @@ const CLOSE_TASKS_LABEL: &str = "Close Tasks panel";
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TasksPanelSync {
     pub(crate) rows: Vec<TaskRowSnapshot>,
+    pub(crate) dashboard: crate::agent_task::DashboardSnapshot,
     pub(crate) selected: Option<TaskId>,
     pub(crate) detail: Option<Box<TaskDetailSync>>,
     pub(crate) create_enabled: bool,
@@ -103,6 +104,11 @@ type ActionCallback = Rc<RefCell<Box<dyn Fn(TaskPanelAction)>>>;
 pub(crate) struct TasksPanel {
     pub(crate) root: GBox,
     state: Rc<RefCell<TasksPanelSync>>,
+    unfiltered_state: Rc<RefCell<TasksPanelSync>>,
+    dashboard_view: Rc<Cell<crate::agent_task::DashboardView>>,
+    dashboard_query: Entry,
+    dashboard_summary: Label,
+    dashboard_buttons: Vec<(crate::agent_task::DashboardView, Button)>,
     /// Per-task follow-up drafts; the app never sees keystrokes, only the
     /// final text carried by `TaskPanelAction::FollowUp`.
     follow_up_drafts: Rc<RefCell<HashMap<TaskId, String>>>,
@@ -179,6 +185,35 @@ impl TasksPanel {
         create_hint.add_css_class("caption");
         create_hint.set_visible(false);
         root.append(&create_hint);
+
+        let dashboard_query = Entry::new();
+        dashboard_query.set_placeholder_text(Some("Search tasks, providers or repositories"));
+        dashboard_query.set_max_length(256);
+        dashboard_query.update_property(&[gtk4::accessible::Property::Label("Search agent tasks")]);
+        root.append(&dashboard_query);
+        let filters = FlowBox::new();
+        filters.set_selection_mode(gtk4::SelectionMode::None);
+        filters.set_max_children_per_line(3);
+        let mut dashboard_buttons = Vec::new();
+        use crate::agent_task::DashboardView;
+        for (view, label) in [
+            (DashboardView::All, "All"),
+            (DashboardView::NeedsAttention, "Needs you"),
+            (DashboardView::Running, "Running"),
+            (DashboardView::NotStarted, "Not started"),
+            (DashboardView::Review, "Review"),
+            (DashboardView::Finished, "Finished"),
+        ] {
+            let button = Button::with_label(label);
+            button.add_css_class("caption");
+            filters.insert(&button, -1);
+            dashboard_buttons.push((view, button));
+        }
+        root.append(&filters);
+        let dashboard_summary = Label::new(None);
+        dashboard_summary.set_wrap(true);
+        dashboard_summary.add_css_class("caption");
+        root.append(&dashboard_summary);
 
         let paned = gtk4::Paned::new(gtk4::Orientation::Vertical);
         paned.set_vexpand(true);
@@ -310,6 +345,11 @@ impl TasksPanel {
         let panel = Self {
             root,
             state: Rc::new(RefCell::new(TasksPanelSync::default())),
+            unfiltered_state: Rc::new(RefCell::new(TasksPanelSync::default())),
+            dashboard_view: Rc::new(Cell::new(crate::agent_task::DashboardView::All)),
+            dashboard_query,
+            dashboard_summary,
+            dashboard_buttons,
             follow_up_drafts: Rc::new(RefCell::new(HashMap::new())),
             rendered_rows: Rc::new(RefCell::new(Vec::new())),
             rendered_selected: Rc::new(Cell::new(None)),
@@ -355,6 +395,17 @@ impl TasksPanel {
     }
 
     fn connect_signals(&self) {
+        let panel = self.clone();
+        self.dashboard_query
+            .connect_changed(move |_| panel.apply_dashboard_filters());
+        for (view, button) in &self.dashboard_buttons {
+            let panel = self.clone();
+            let view = *view;
+            button.connect_clicked(move |_| {
+                panel.dashboard_view.set(view);
+                panel.apply_dashboard_filters();
+            });
+        }
         let panel = self.clone();
         self.create_button.connect_clicked(move |_| {
             panel.emit(TaskPanelAction::CreateFromBlock);
@@ -484,6 +535,51 @@ impl TasksPanel {
     /// change, so an unchanged push is allocation-quiet; the domain remains
     /// the only owner of task state.
     pub(crate) fn sync(&self, sync: TasksPanelSync) {
+        *self.unfiltered_state.borrow_mut() = sync;
+        self.apply_dashboard_filters();
+    }
+
+    fn apply_dashboard_filters(&self) {
+        let mut sync = self.unfiltered_state.borrow().clone();
+        let dashboard = crate::agent_task::DashboardSnapshot::filter_rows(
+            &sync.dashboard.rows,
+            self.dashboard_query.text().as_str(),
+            self.dashboard_view.get(),
+        );
+        let mut by_id: HashMap<_, _> = sync.rows.into_iter().map(|row| (row.id, row)).collect();
+        sync.rows = dashboard
+            .rows
+            .iter()
+            .filter_map(|projected| {
+                let mut row = by_id.remove(&projected.id)?;
+                row.title.clone_from(&projected.title);
+                row.branch.clone_from(&projected.branch);
+                row.status_detail.clone_from(&projected.status_detail);
+                row.needs_attention = projected.needs_attention;
+                Some(row)
+            })
+            .collect();
+        if dashboard.selected_index(sync.selected).is_none() {
+            sync.detail = None;
+        }
+        self.dashboard_summary.set_label(&format!(
+            "{} tasks · {} need you · {} awaiting approval{}",
+            dashboard.counts.total,
+            dashboard.counts.attention,
+            dashboard.counts.pending_approval,
+            if sync.rows.is_empty() {
+                " · No matching tasks"
+            } else {
+                ""
+            }
+        ));
+        for (view, button) in &self.dashboard_buttons {
+            if *view == self.dashboard_view.get() {
+                button.add_css_class("suggested-action");
+            } else {
+                button.remove_css_class("suggested-action");
+            }
+        }
         *self.state.borrow_mut() = sync;
         self.refresh_view();
     }
@@ -518,6 +614,15 @@ impl TasksPanel {
         self.actions_box.set_visible(detail.is_some());
         self.detail_title.set_visible(detail.is_some());
         self.detail_status.set_visible(detail.is_some());
+        self.page_stack.set_visible(detail.is_some());
+        self.stream_page_button.set_visible(detail.is_some());
+        self.diff_page_button.set_visible(detail.is_some());
+        self.follow_up_row
+            .set_visible(detail.is_some_and(|d| d.can_follow_up));
+        if detail.is_none() {
+            self.follow_up_hint.set_visible(false);
+            self.follow_up_send.set_sensitive(false);
+        }
 
         if let Some(detail) = detail {
             self.detail_title.set_label(&detail.title);
@@ -606,6 +711,7 @@ impl TasksPanel {
             state.selected,
         );
         if plan.rebuild_rows {
+            self.selection_guard.set(true);
             while let Some(child) = self.task_list.first_child() {
                 self.task_list.remove(&child);
             }
@@ -646,6 +752,7 @@ impl TasksPanel {
             self.selection_guard.set(false);
         }
         if plan.rebuild_rows || plan.apply_selection {
+            self.selection_guard.set(false);
             self.rendered_selected.set(state.selected);
         }
     }
@@ -729,6 +836,8 @@ fn set_view_text(view: &TextView, text: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     use super::replace_approval_cache;
 
     #[test]
@@ -747,5 +856,115 @@ mod tests {
         replace_approval_cache(&mut cache, &incoming);
         replace_approval_cache(&mut cache, &incoming);
         assert_eq!(cache, incoming);
+    }
+    fn dashboard_test_sync() -> TasksPanelSync {
+        use crate::agent_task::{AgentProvider, NewTask, TaskManager, TaskStatus};
+        let mut manager = TaskManager::new();
+        for title in ["First task", "Needs review"] {
+            manager
+                .create(NewTask {
+                    title: title.into(),
+                    provider: AgentProvider::Codex,
+                    repo_root: "/fixture".into(),
+                    worktree_path: "/fixture/worktree".into(),
+                    branch: "test/dashboard".into(),
+                    base_commit: "a".repeat(40),
+                    source_context: None,
+                })
+                .unwrap();
+        }
+        let mut tasks = manager.tasks().to_vec();
+        tasks[1].status = TaskStatus::Failed;
+        let selected = tasks[0].id;
+        let dashboard = crate::agent_task::DashboardSnapshot::project(
+            &tasks,
+            |_| Default::default(),
+            Default::default(),
+        );
+        let rows = tasks
+            .iter()
+            .map(|task| TaskRowSnapshot {
+                id: task.id,
+                title: task.title.clone(),
+                provider: task.provider,
+                status: task.status,
+                runtime_kind: task.runtime_kind,
+                branch: task.branch.clone(),
+                has_agent_terminal: false,
+                has_validation_terminal: false,
+                has_active_agent_stream: false,
+                native_preparing: false,
+                validation_status: task.validation.status,
+                validation_attempt: 0,
+                needs_attention: task.needs_attention(),
+                status_detail: None,
+            })
+            .collect();
+        let detail = TaskDetailSync {
+            id: selected,
+            title: "First task".into(),
+            status_line: "Created".into(),
+            branch: "test/dashboard".into(),
+            stream: None,
+            approvals: Vec::new(),
+            completed_turns: 0,
+            can_start_codex: false,
+            can_start_terminal: false,
+            can_stop: false,
+            can_finish: false,
+            can_run_validation: false,
+            can_complete: false,
+            can_follow_up: false,
+            follow_up_hint: String::new(),
+            diff: None,
+        };
+        TasksPanelSync {
+            rows,
+            dashboard,
+            selected: Some(selected),
+            detail: Some(Box::new(detail)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn dashboard_filters_preserve_selection_without_actions() {
+        gtk4::init().expect("GTK display");
+        let panel = TasksPanel::build();
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let sink = actions.clone();
+        panel.connect_action(move |action| sink.borrow_mut().push(action));
+        let window = gtk4::Window::new();
+        window.set_child(Some(&panel.root));
+        let sync = dashboard_test_sync();
+        let selected = sync.selected;
+        panel.sync(sync.clone());
+        assert_eq!(panel.rendered_rows.borrow().len(), 2);
+        panel
+            .dashboard_view
+            .set(crate::agent_task::DashboardView::NeedsAttention);
+        panel.apply_dashboard_filters();
+        assert_eq!(panel.state.borrow().selected, selected);
+        assert_eq!(panel.rendered_rows.borrow().len(), 1);
+        assert!(panel.state.borrow().detail.is_none());
+        assert!(!panel.page_stack.is_visible());
+        panel.dashboard_query.set_text("missing");
+        assert!(panel.rendered_rows.borrow().is_empty());
+        panel
+            .dashboard_view
+            .set(crate::agent_task::DashboardView::All);
+        panel.dashboard_query.set_text("");
+        assert_eq!(panel.rendered_rows.borrow().len(), 2);
+        assert_eq!(panel.state.borrow().selected, selected);
+        assert_eq!(panel.state.borrow().detail.as_ref().map(|d| d.id), selected);
+        assert!(panel.page_stack.is_visible());
+        panel.sync(sync);
+        assert_eq!(panel.rendered_selected.get(), selected);
+        assert!(
+            actions.borrow().is_empty(),
+            "filtering must not stage task actions"
+        );
+        window.close();
     }
 }
