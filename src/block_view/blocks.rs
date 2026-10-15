@@ -5525,11 +5525,11 @@ mod tests {
         assert!(!card.expand_btn.is_child_visible());
         assert!(card.copy_output_btn.is_child_visible());
         assert!(card.rerun_btn.is_child_visible());
-        assert!(card
-            .rerun_btn
-            .tooltip_text()
-            .unwrap()
-            .contains("does not run"));
+        assert_eq!(
+            card.rerun_btn.tooltip_text().as_deref(),
+            Some("Recall command · fill prompt without running"),
+            "the visible recall action must explicitly promise insert-only behavior",
+        );
         window.close();
     }
 
