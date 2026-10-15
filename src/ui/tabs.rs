@@ -1693,6 +1693,7 @@ impl UiState {
                             ) {
                                 TermView::arm_shell_integration_notice(&term_view, shell_argv);
                             }
+                            term_view.set_menu_keybindings(self.keybinding_map.clone());
                             term_view.start_history_load();
                             let terminal = term_view.vte().clone();
                             (PaneLeaf::Block(term_view), terminal)

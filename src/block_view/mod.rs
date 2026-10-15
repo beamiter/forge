@@ -50,6 +50,7 @@ mod palette;
 mod review;
 mod scroll;
 mod selection_hold;
+pub(crate) mod shortcut_hints;
 pub(crate) mod watch_batch;
 pub(crate) mod watch_reader;
 use watch_reader::WatchReader;
@@ -4207,6 +4208,7 @@ impl BlockBackend {
         let ask_ai_cbs_for_menu = self.ask_ai_cbs.clone();
         let fix_block_cbs_for_menu = self.fix_block_with_agent_cbs.clone();
         let current_cwd_for_menu = self.current_cwd_for_menu.clone();
+        let menu_keybindings = self.menu_keybindings.clone();
 
         // Read-only inspection is shared by the persistent header and menu.
         // Keep only weak native window/card references; no history/VTE copies.
@@ -4808,6 +4810,11 @@ impl BlockBackend {
                 } else {
                     "Hide Output"
                 });
+                shortcut_hints::decorate(
+                    &item,
+                    &menu_keybindings,
+                    crate::keybindings::Action::ToggleBlockCollapsed,
+                );
                 let popover_c = popover.downgrade();
                 let finished = finished_blocks_for_menu.clone();
                 item.connect_clicked(move |_| {
@@ -5994,6 +6001,7 @@ impl VerifiedSubmissionCtx {
 }
 
 pub struct TermView {
+    menu_keybindings: shortcut_hints::MenuKeybindings,
     root: gtk4::Box,
     /// Status strip above the block list, shown only while this pane's tab
     /// is split.
@@ -7363,6 +7371,7 @@ fn schedule_anchor_settle_on(
 /// `ReaderCtx` holds — finished-block actions and the context menu rebind
 /// them when the user re-runs a command from history.
 struct BlockBackend {
+    menu_keybindings: shortcut_hints::MenuKeybindings,
     active_rc: Rc<RefCell<ActiveBlock>>,
     /// The live VTE — every byte is fed here; alt-screen toggles feed it 1049h/l.
     active_vte: Terminal,
@@ -14892,6 +14901,7 @@ impl TermView {
             last_visible: 0,
         }));
         let current_cwd: Rc<RefCell<String>> = Rc::new(RefCell::new(cwd.unwrap_or("").to_string()));
+        let menu_keybindings = shortcut_hints::MenuKeybindings::default();
 
         // CWD updates come from VTE's native OSC 7 signal (the parser passes
         // OSC 7 through unchanged, see parser.rs). Title updates likewise come
@@ -15214,6 +15224,7 @@ impl TermView {
                     ask_ai_cbs: ask_ai_callbacks.clone(),
                     fix_block_with_agent_cbs: fix_block_with_agent_callbacks.clone(),
                     current_cwd_for_menu: current_cwd.clone(),
+                    menu_keybindings: menu_keybindings.clone(),
                     prompt_anchor_tick_id_rc: prompt_anchor_tick_id.clone(),
                     bracketed_paste_rc: bracketed_paste_rc.clone(),
                     verified_submission_for_rerun: verified_submission.clone(),
@@ -16402,6 +16413,7 @@ impl TermView {
             toggle_bookmark,
             find_state,
             current_cwd: current_cwd.clone(),
+            menu_keybindings,
             session_id: session_id_owned,
             history_load: Arc::new(history::HistoryLoadShared::default()),
             persist_history_on_drop: Cell::new(true),
@@ -33834,3 +33846,10 @@ mod incremental_find_tests;
 
 #[cfg(test)]
 mod font_sync_tests;
+
+impl TermView {
+    /// Share the same mutable map as key dispatch; menu rebuilds see reloads.
+    pub(crate) fn set_menu_keybindings(&self, map: Rc<RefCell<crate::keybindings::KeybindingMap>>) {
+        *self.menu_keybindings.borrow_mut() = Some(map);
+    }
+}

@@ -309,6 +309,7 @@ impl UiState {
             TermView::arm_shell_integration_notice(&view, shell_argv.as_slice());
         }
         drop(shell_argv);
+        view.set_menu_keybindings(self.keybinding_map.clone());
         view.start_history_load();
 
         let terminal = view.vte().clone();

@@ -5788,6 +5788,11 @@ impl UiState {
             // Paste
             {
                 let item = make_item("Paste");
+                crate::block_view::shortcut_hints::decorate_with_map(
+                    &item,
+                    &ui.keybinding_map.borrow(),
+                    Action::Paste,
+                );
                 let popover_c = popover.clone();
                 let ui_paste = ui.clone();
                 let term_paste_target = term.clone();
@@ -5807,6 +5812,11 @@ impl UiState {
             // Split Right
             {
                 let item = make_item("Split Right");
+                crate::block_view::shortcut_hints::decorate_with_map(
+                    &item,
+                    &ui.keybinding_map.borrow(),
+                    Action::SplitHorizontal,
+                );
                 let popover_c = popover.clone();
                 let ui_split_h = ui.clone();
                 item.connect_clicked(move |_| {
@@ -5819,6 +5829,11 @@ impl UiState {
             // Split Down
             {
                 let item = make_item("Split Down");
+                crate::block_view::shortcut_hints::decorate_with_map(
+                    &item,
+                    &ui.keybinding_map.borrow(),
+                    Action::SplitVertical,
+                );
                 let popover_c = popover.clone();
                 let ui_split_v = ui.clone();
                 item.connect_clicked(move |_| {
@@ -5831,6 +5846,11 @@ impl UiState {
             // New Tab
             {
                 let item = make_item("New Tab");
+                crate::block_view::shortcut_hints::decorate_with_map(
+                    &item,
+                    &ui.keybinding_map.borrow(),
+                    Action::NewTab,
+                );
                 let popover_c = popover.clone();
                 let ui_new_tab = ui.clone();
                 item.connect_clicked(move |_| {
@@ -5843,6 +5863,11 @@ impl UiState {
             // Close Pane
             {
                 let item = make_item("Close Pane");
+                crate::block_view::shortcut_hints::decorate_with_map(
+                    &item,
+                    &ui.keybinding_map.borrow(),
+                    Action::ClosePaneOrTab,
+                );
                 let popover_c = popover.clone();
                 let ui_close = ui.clone();
                 item.connect_clicked(move |_| {
