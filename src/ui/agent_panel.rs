@@ -365,6 +365,22 @@ fn seal_restored_session(mut session: AgentSession) -> AgentSession {
     session
 }
 
+/// Stop wins over a provider result already queued for the UI poll. Checking
+/// only in the worker leaves a race between enqueueing a successful reply and
+/// the next main-loop tick. Preserve Empty/Disconnected until the worker ends.
+fn poll_model_reply(
+    receiver: &std::sync::mpsc::Receiver<Result<String, crate::ai::AiError>>,
+    cancellation: Option<&crate::ai::AiCancellationToken>,
+) -> Result<Result<String, crate::ai::AiError>, std::sync::mpsc::TryRecvError> {
+    receiver.try_recv().map(|reply| {
+        if cancellation.is_some_and(crate::ai::AiCancellationToken::is_cancelled) {
+            Err(crate::ai::AiError::Cancelled)
+        } else {
+            reply
+        }
+    })
+}
+
 fn start_fresh_task(session: &mut AgentSession) -> Result<(), crate::agent::SessionError> {
     if session.state() == AgentState::Cancelled {
         *session = AgentSession::new(session.max_turns());
@@ -795,7 +811,11 @@ impl AgentRuntime {
             if !runtime.alive.get() {
                 return gtk4::glib::ControlFlow::Break;
             }
-            match rx.borrow().try_recv() {
+            // Finish the RefCell borrows before handling the result: terminal
+            // branches clear the same cancellation slot.
+            let result =
+                poll_model_reply(&rx.borrow(), runtime.request_cancellation.borrow().as_ref());
+            match result {
                 Ok(Ok(reply)) => {
                     runtime.request_cancellation.borrow_mut().take();
                     runtime.busy.set(false);
@@ -2104,6 +2124,50 @@ mod tests {
         snapshot["transcript_truncated"] = serde_json::json!(true);
         AgentSession::restore(AgentSessionSnapshot::from_json(&snapshot.to_string()).unwrap())
             .unwrap()
+    }
+
+    #[test]
+    fn stop_discards_success_already_queued_for_the_ui() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let cancellation = crate::ai::AiCancellationToken::new();
+        sender.send(Ok("queued proposal".to_string())).unwrap();
+        cancellation.cancel();
+        assert!(matches!(
+            super::poll_model_reply(&receiver, Some(&cancellation)),
+            Ok(Err(crate::ai::AiError::Cancelled))
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn model_reply_poll_keeps_live_results_and_channel_lifecycle() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let cancellation = crate::ai::AiCancellationToken::new();
+        assert!(matches!(
+            super::poll_model_reply(&receiver, Some(&cancellation)),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        sender.send(Ok("current reply".to_string())).unwrap();
+        assert!(matches!(
+            super::poll_model_reply(&receiver, Some(&cancellation)),
+            Ok(Ok(reply)) if reply == "current reply"
+        ));
+        cancellation.cancel();
+        drop(sender);
+        assert!(matches!(
+            super::poll_model_reply(&receiver, Some(&cancellation)),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let retry = crate::ai::AiCancellationToken::new();
+        sender.send(Ok("retry reply".to_string())).unwrap();
+        assert!(matches!(
+            super::poll_model_reply(&receiver, Some(&retry)),
+            Ok(Ok(reply)) if reply == "retry reply"
+        ));
     }
 
     #[test]
