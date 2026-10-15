@@ -9328,7 +9328,7 @@ impl DeferredLiveFocus {
 /// intervening owner: even an owner that disappears before idle retires this
 /// request. A temporary unroot/remap in the same window remains eligible;
 /// moving to another root, staying hidden, or disposal does not.
-fn restore_live_focus_deferred(target: &Terminal) {
+pub(crate) fn restore_live_focus_deferred(target: &Terminal) {
     if let Some(request) = DeferredLiveFocus::new(target) {
         request.defer();
     }

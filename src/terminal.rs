@@ -96,6 +96,12 @@ pub(crate) fn focus_terminal(terminal: &Terminal) {
     } else {
         log::debug!("focus_terminal: skipped immediate grab (mapped={mapped} on_page={on_page})");
     }
+    if mapped && on_page && terminal.has_focus() {
+        // The explicit request succeeded. Only repair that ownership; a
+        // reopened search or another pane selected before idle supersedes it.
+        crate::block_view::restore_live_focus_deferred(terminal);
+        return;
+    }
     let deferred = terminal.clone();
     glib::idle_add_local_once(move || {
         if deferred.is_mapped() && belongs_to_selected_notebook_page(&deferred) {
@@ -1130,6 +1136,58 @@ pub(crate) fn reattach_terminal_to_tree(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn explicit_focus_return_respects_reopened_search() {
+        use gtk4::prelude::*;
+        use std::time::{Duration, Instant};
+        gtk4::init().unwrap();
+        let terminal = vte4::Terminal::new();
+        let search = gtk4::SearchEntry::new();
+        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        root.append(&terminal);
+        root.append(&search);
+        let window = gtk4::Window::builder().child(&root).build();
+        window.present();
+        let context = gtk4::glib::MainContext::default();
+        let until = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < until {
+            while context.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(terminal.is_mapped());
+        for transient_owner in [false, true] {
+            // This is the production entry point used when closing Find.
+            super::focus_terminal(&terminal);
+            assert!(terminal.has_focus());
+            assert!(search.grab_focus());
+            if transient_owner {
+                GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+            }
+            while context.iteration(false) {}
+            assert!(!terminal.has_focus(), "newer search ownership wins at idle");
+            if !transient_owner {
+                let owner = GtkWindowExt::focus(&window).unwrap();
+                assert!(
+                    owner == *search.upcast_ref::<gtk4::Widget>() || owner.is_ancestor(&search)
+                );
+            }
+        }
+        // A temporary absence of focus without a newer owner still repairs.
+        super::focus_terminal(&terminal);
+        GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+        while context.iteration(false) {}
+        assert!(terminal.has_focus());
+        // Pending repair does not keep a removed terminal alive.
+        super::focus_terminal(&terminal);
+        let weak = terminal.downgrade();
+        root.remove(&terminal);
+        drop(terminal);
+        assert!(weak.upgrade().is_none());
+        window.close();
+        while context.iteration(false) {}
+    }
+
     use super::InitialCommands;
 
     fn strings(values: &[&str]) -> Vec<String> {

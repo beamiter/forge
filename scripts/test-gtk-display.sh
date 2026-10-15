@@ -58,6 +58,7 @@ tests=(
     ui::tasks_panel::tests::task_terminal_buttons_only_emit_focus_for_existing_bindings
     ui::tasks_panel::tests::task_reason_updates_and_disappears_without_retargeting
     ui::task_ops::focus_tests::task_terminal_focus_tracks_reordered_split_and_closed_leaf
+    terminal::tests::explicit_focus_return_respects_reopened_search
     block_view::task_focus_tests::task_button_held_enter_never_submits_to_focused_terminal
     block_view::blocks::tests::folded_state_survives_virtualization_and_pane_filtering
     block_view::fold_geometry_tests::fold_actions_update_visible_and_parked_geometry
