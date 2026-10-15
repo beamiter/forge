@@ -194,7 +194,9 @@ fn window_chrome_tracks_font_and_zoom_across_native_panes_and_late_rows() {
         let expected = size(&title);
         assert!(expected > 0);
         for label in labels(&root.clone().upcast()) {
-            if !label.has_css_class("tab-conn-dot") {
+            // GTK updates a hidden widget's Pango context lazily. Assert the
+            // rendered contract here; reveal previously hidden text below.
+            if label.is_mapped() && !label.has_css_class("tab-conn-dot") {
                 assert_eq!(
                     size(&label),
                     expected,
@@ -249,6 +251,22 @@ fn window_chrome_tracks_font_and_zoom_across_native_panes_and_late_rows() {
         settle();
         check();
         assert_configured_size(&title, &config);
+        // These native bookmark labels existed before the font change but
+        // stayed hidden through it. Revealing them must resolve the new size.
+        for view in [&block, &chat] {
+            for finished in view.finished_blocks.borrow().iter() {
+                finished.bookmark_star.set_visible(true);
+            }
+        }
+        settle();
+        check();
+        for view in [&block, &chat] {
+            for finished in view.finished_blocks.borrow().iter() {
+                assert!(finished.bookmark_star.is_mapped());
+                assert_configured_size(&finished.bookmark_star, &config);
+                finished.bookmark_star.set_visible(false);
+            }
+        }
     }
     assert_ne!(
         size(&title),
@@ -267,9 +285,13 @@ fn window_chrome_tracks_font_and_zoom_across_native_panes_and_late_rows() {
     finish_command(&chat);
     assert_eq!(block.finished_blocks.borrow().len(), 2);
     assert_eq!(chat.finished_blocks.borrow().len(), 2);
-    notebook.set_current_page(Some(2));
-    settle();
-    check();
+    // Remapping older pages must refresh their text too; hidden contexts are
+    // not an eager GTK contract, but visible stale labels would be a defect.
+    for page in [2, 1, 0, 2] {
+        notebook.set_current_page(Some(page));
+        settle();
+        check();
+    }
     assert_eq!(unified.vte().font_scale(), config.default_font_scale);
     assert_eq!(
         unified.vte().font().unwrap().to_string(),
