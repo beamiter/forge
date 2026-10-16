@@ -1365,6 +1365,80 @@ fn set_view_text(view: &TextView, text: &str) {
 }
 
 #[cfg(test)]
+impl TasksPanel {
+    fn baseline_full_rebuild(&self, state: &TasksPanelSync) {
+        let plan = plan_list_refresh(
+            &self.rendered_rows.borrow(),
+            self.rendered_selected.get(),
+            &state.rows,
+            state.selected,
+        );
+        if plan.rebuild_rows {
+            self.selection_guard.set(true);
+            while let Some(child) = self.task_list.first_child() {
+                self.task_list.remove(&child);
+            }
+            for row in state.rows.iter() {
+                let title = Label::new(Some(&row.title));
+                title.set_halign(gtk4::Align::Start);
+                title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                title.set_max_width_chars(28);
+                let status = Label::new(Some(&row_status_line(row)));
+                status.set_halign(gtk4::Align::Start);
+                status.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                status.add_css_class("dim-label");
+                status.add_css_class("caption");
+                if row.needs_attention {
+                    status.add_css_class("warning");
+                }
+                let lines = GBox::new(gtk4::Orientation::Vertical, 2);
+                lines.set_margin_top(4);
+                lines.set_margin_bottom(4);
+                lines.set_margin_start(4);
+                lines.append(&title);
+                lines.append(&status);
+                if let Some(reason) = task_reason(
+                    row.status,
+                    row.validation_status,
+                    row.status_detail.as_deref(),
+                    row.validation_detail.as_deref(),
+                ) {
+                    let preview = gtk4::Label::new(Some(&reason));
+                    preview.set_halign(gtk4::Align::Start);
+                    preview.set_single_line_mode(true);
+                    preview.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                    preview.set_max_width_chars(28);
+                    preview.set_tooltip_text(Some(&reason));
+                    preview.add_css_class("caption");
+                    preview.add_css_class("dim-label");
+                    preview.add_css_class("task-reason");
+                    lines.append(&preview);
+                }
+                let list_row = gtk4::ListBoxRow::new();
+                list_row.set_child(Some(&lines));
+                self.task_list.append(&list_row);
+            }
+            self.rendered_rows.borrow_mut().clone_from(&state.rows);
+        }
+        if plan.apply_selection {
+            self.selection_guard.set(true);
+            match plan.select_index {
+                Some(index) => {
+                    let row = self.task_list.row_at_index(index as i32);
+                    self.task_list.select_row(row.as_ref());
+                }
+                None => self.task_list.unselect_all(),
+            }
+            self.selection_guard.set(false);
+        }
+        if plan.rebuild_rows || plan.apply_selection {
+            self.selection_guard.set(false);
+            self.rendered_selected.set(state.selected);
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn dashboard_filter_labels_map_activity_and_finished_counts() {
@@ -2049,6 +2123,12 @@ mod tests {
         let sink = actions.clone();
         panel.connect_action(move |action| sink.borrow_mut().push(action));
         let window = gtk4::Window::new();
+        let title = format!(
+            "forge-f07-controller-{}-{}",
+            std::process::id(),
+            TaskId::new()
+        );
+        window.set_title(Some(&title));
         window.set_default_size(420, 800);
         window.set_child(Some(&panel.root));
         window.present();
@@ -2111,6 +2191,14 @@ mod tests {
                 reentrant_panel.sync(next);
             }
         });
+        // has_focus requires an active native toplevel, not only a present request.
+        wait_for_gtk(|| window.is_mapped());
+        let pattern = format!("^{title}$");
+        let ids = x11_input(&["search", "--sync", "--onlyvisible", "--name", &pattern]);
+        let ids = ids.lines().collect::<Vec<_>>();
+        assert_eq!(ids.len(), 1);
+        x11_input(&["windowfocus", "--sync", ids[0]]);
+        wait_for_gtk(|| window.is_active());
         panel.task_list.grab_focus();
         send_list_key(&panel, gtk4::gdk::Key::End);
         let expected = panel.state.borrow().rows.last().unwrap().id;
@@ -2397,79 +2485,5 @@ mod tests {
         wait_for_gtk(|| panel.dashboard_query.text() == "s");
         assert_eq!(panel.state.borrow().selected, selection);
         window.close();
-    }
-}
-
-#[cfg(test)]
-impl TasksPanel {
-    fn baseline_full_rebuild(&self, state: &TasksPanelSync) {
-        let plan = plan_list_refresh(
-            &self.rendered_rows.borrow(),
-            self.rendered_selected.get(),
-            &state.rows,
-            state.selected,
-        );
-        if plan.rebuild_rows {
-            self.selection_guard.set(true);
-            while let Some(child) = self.task_list.first_child() {
-                self.task_list.remove(&child);
-            }
-            for row in state.rows.iter() {
-                let title = Label::new(Some(&row.title));
-                title.set_halign(gtk4::Align::Start);
-                title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-                title.set_max_width_chars(28);
-                let status = Label::new(Some(&row_status_line(row)));
-                status.set_halign(gtk4::Align::Start);
-                status.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-                status.add_css_class("dim-label");
-                status.add_css_class("caption");
-                if row.needs_attention {
-                    status.add_css_class("warning");
-                }
-                let lines = GBox::new(gtk4::Orientation::Vertical, 2);
-                lines.set_margin_top(4);
-                lines.set_margin_bottom(4);
-                lines.set_margin_start(4);
-                lines.append(&title);
-                lines.append(&status);
-                if let Some(reason) = task_reason(
-                    row.status,
-                    row.validation_status,
-                    row.status_detail.as_deref(),
-                    row.validation_detail.as_deref(),
-                ) {
-                    let preview = gtk4::Label::new(Some(&reason));
-                    preview.set_halign(gtk4::Align::Start);
-                    preview.set_single_line_mode(true);
-                    preview.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-                    preview.set_max_width_chars(28);
-                    preview.set_tooltip_text(Some(&reason));
-                    preview.add_css_class("caption");
-                    preview.add_css_class("dim-label");
-                    preview.add_css_class("task-reason");
-                    lines.append(&preview);
-                }
-                let list_row = gtk4::ListBoxRow::new();
-                list_row.set_child(Some(&lines));
-                self.task_list.append(&list_row);
-            }
-            self.rendered_rows.borrow_mut().clone_from(&state.rows);
-        }
-        if plan.apply_selection {
-            self.selection_guard.set(true);
-            match plan.select_index {
-                Some(index) => {
-                    let row = self.task_list.row_at_index(index as i32);
-                    self.task_list.select_row(row.as_ref());
-                }
-                None => self.task_list.unselect_all(),
-            }
-            self.selection_guard.set(false);
-        }
-        if plan.rebuild_rows || plan.apply_selection {
-            self.selection_guard.set(false);
-            self.rendered_selected.set(state.selected);
-        }
     }
 }
