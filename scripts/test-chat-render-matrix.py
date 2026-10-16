@@ -61,6 +61,26 @@ def measured(outputs, tree, pid, scale, window):
                 node_id=node['id'], pid=pid, window_rect=r)
 
 
+
+def horizontal_clearance(report):
+    """Independent native grid extent must fit before the painted scrollbar."""
+    h = report['horizontal']
+    x = h['native_content_origin'][0]
+    width = report['vte_grid'][0] * report['cell'][0]
+    right = x + width
+    bar = h['scrollbar_bounds']
+    available = min(h['clip_width'], bar[0]) if h['scrollbar_paints'] else h['clip_width']
+    if (right != h['grid_right'] or available != h['unobscured_right'] or
+            available - right != h['clearance'] or
+            max(0, right - available) != h['overlap']):
+        raise RuntimeError('Inconsistent native horizontal measurements')
+    # Both edges are in the same GTK logical coordinate system. Tolerate
+    # floating arithmetic noise only, never a visible logical/physical pixel.
+    epsilon = 1e-6
+    if x < -epsilon or right > available + epsilon:
+        raise RuntimeError(f'Native terminal grid intersects painted scrollbar/clip by {right - available:g} logical pixels')
+
+
 def run_case(binary, out, scale, font):
     out.mkdir()
     runtime = out / 'runtime'
@@ -172,6 +192,17 @@ def main():
     for scale in (1, 1.5, 2):
         for index, font in enumerate(FONTS):
             run_case(binary, out / f'scale-{scale}-font-{index}', scale, font)
+    failures = []
+    for case in sorted(out.glob('scale-*')):
+        report = json.loads((case / 'result.json').read_text())
+        for stage in report['stages']:
+            try:
+                horizontal_clearance(stage['native'])
+            except RuntimeError as error:
+                failures.append(dict(case=case.name, stage=stage['native']['stage'], error=str(error)))
+    (out / 'horizontal-clearance.json').write_text(json.dumps(dict(failures=failures), indent=2))
+    if failures:
+        raise RuntimeError(f'{len(failures)} native horizontal-clearance regressions; all captures retained')
     (out / 'PASS').write_text('6 combinations / 108 captures; synthetic rendering only\n')
 
 

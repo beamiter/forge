@@ -161,11 +161,38 @@ fn chat_native_unicode_render_geometry() {
                 .text_format(vte4::Format::Text)
                 .unwrap()
                 .contains("F13-END"));
+            let scrollbar = view.active.borrow().live_scrollbar.clone();
+            let bar = scrollbar.compute_bounds(&clip).unwrap();
+            let native_bounds = native.compute_bounds(&clip).unwrap();
+            let grid_right =
+                f64::from(origin.x()) + (native.column_count() * native.char_width()) as f64;
+            let scrollbar_paints =
+                scrollbar.is_visible() && scrollbar.is_mapped() && scrollbar.opacity() > 0.0;
+            // These are independently allocated native objects: do not infer
+            // scrollbar clearance from the terminal's own reported columns.
+            let visible_right = if scrollbar_paints {
+                f64::from(bar.x()).min(f64::from(clip.width()))
+            } else {
+                f64::from(clip.width())
+            };
+            let bar_min = scrollbar.measure(gtk4::Orientation::Horizontal, -1);
+            assert!(native.is_mapped() && clip.is_mapped());
             let report = serde_json::json!({
                 "stage": stage, "case": label, "font": font, "pango_fallback_faces": fallback_faces, "window": [window.width(), window.height()],
                 "gtk_buffer_scale": window.scale_factor(), "pty_grid": [grid.0, grid.1],
                 "vte_grid": [native.column_count(), native.row_count()],
                 "cell": [native.char_width(), native.char_height()], "cursor_cpr": [row,col],
+                "horizontal": {
+                    "clip_width": clip.width(), "native_content_width": native.width(),
+                    "native_bounds": [native_bounds.x(), native_bounds.y(), native_bounds.width(), native_bounds.height()],
+                    "native_content_origin": [origin.x(), origin.y()],
+                    "grid_right": grid_right, "unobscured_right": visible_right,
+                    "scrollbar_bounds": [bar.x(), bar.y(), bar.width(), bar.height()],
+                    "scrollbar_paints": scrollbar_paints,
+                    "scrollbar_measure": [bar_min.0, bar_min.1],
+                    "clearance": visible_right - grid_right,
+                    "overlap": (grid_right - visible_right).max(0.0)
+                },
                 "cursor_clip_y": [cursor_top,cursor_bottom], "clip_height": clip.height(),
                 "scope": "synthetic PTY render only; shell draft and paste unverified"
             });
