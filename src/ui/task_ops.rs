@@ -1123,8 +1123,16 @@ impl UiState {
             },
             Default::default(),
         );
+        let workspaces = domain
+            .task_manager
+            .tasks()
+            .iter()
+            .filter(|task| task.status != crate::agent_task::TaskStatus::Archived)
+            .map(|task| (task.id, task.repo_root.clone()))
+            .collect();
         let sync = TasksPanelSync {
             rows,
+            workspaces,
             dashboard,
             selected,
             detail: detail.map(Box::new),

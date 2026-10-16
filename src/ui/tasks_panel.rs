@@ -21,10 +21,13 @@ use crate::agent_task::{CodexAppServerApproval, TaskId};
 
 #[path = "approval_details.rs"]
 mod approval_details;
+#[path = "task_filters.rs"]
+mod task_filters;
 use crate::agent_task_ui::{
     approval_summary, native_follow_up_can_send, plan_list_refresh, render_stream_text,
     row_status_line, task_reason, TaskPanelAction, TaskRowSnapshot,
 };
+use task_filters::{TaskFilters, STATES};
 
 /// Counts describe current search matches before the selected quick view.
 fn dashboard_filter_label(
@@ -53,6 +56,7 @@ const CLOSE_TASKS_LABEL: &str = "Close Tasks panel";
 pub(crate) struct TasksPanelSync {
     pub(crate) rows: Vec<TaskRowSnapshot>,
     pub(crate) dashboard: crate::agent_task::DashboardSnapshot,
+    pub(crate) workspaces: HashMap<TaskId, std::path::PathBuf>,
     pub(crate) selected: Option<TaskId>,
     pub(crate) detail: Option<Box<TaskDetailSync>>,
     pub(crate) create_enabled: bool,
@@ -124,6 +128,78 @@ const ACTION_KINDS: [(ActionKind, &str); 10] = [
 
 type ActionCallback = Rc<RefCell<Box<dyn Fn(TaskPanelAction)>>>;
 
+/// Cached by stable task identity, including currently filtered-out live rows.
+#[derive(Clone)]
+struct TaskRowWidgets {
+    row: gtk4::ListBoxRow,
+    title: Label,
+    status: Label,
+    reason: Label,
+    snapshot: TaskRowSnapshot,
+}
+
+impl TaskRowWidgets {
+    fn new(snapshot: &TaskRowSnapshot) -> Self {
+        let title = Label::new(None);
+        title.set_max_width_chars(28);
+        let status = Label::new(None);
+        status.add_css_class("dim-label");
+        status.add_css_class("caption");
+        let reason = Label::new(None);
+        reason.set_single_line_mode(true);
+        reason.set_max_width_chars(28);
+        reason.add_css_class("caption");
+        reason.add_css_class("dim-label");
+        reason.add_css_class("task-reason");
+        let lines = GBox::new(gtk4::Orientation::Vertical, 2);
+        lines.set_margin_top(4);
+        lines.set_margin_bottom(4);
+        lines.set_margin_start(4);
+        for label in [&title, &status, &reason] {
+            label.set_halign(gtk4::Align::Start);
+            label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            lines.append(label);
+        }
+        let row = gtk4::ListBoxRow::new();
+        row.set_child(Some(&lines));
+        let mut widgets = Self {
+            row,
+            title,
+            status,
+            reason,
+            snapshot: snapshot.clone(),
+        };
+        widgets.update(snapshot);
+        widgets
+    }
+
+    fn update(&mut self, snapshot: &TaskRowSnapshot) {
+        self.title.set_label(&snapshot.title);
+        self.status.set_label(&row_status_line(snapshot));
+        if snapshot.needs_attention {
+            self.status.add_css_class("warning");
+        } else {
+            self.status.remove_css_class("warning");
+        }
+        let reason = task_reason(
+            snapshot.status,
+            snapshot.validation_status,
+            snapshot.status_detail.as_deref(),
+            snapshot.validation_detail.as_deref(),
+        );
+        self.reason.set_visible(reason.is_some());
+        // Existing diagnostics identify present previews by this class.
+        if reason.is_some() {
+            self.reason.add_css_class("task-reason");
+        } else {
+            self.reason.remove_css_class("task-reason");
+        }
+        self.reason.set_label(reason.as_deref().unwrap_or_default());
+        self.reason.set_tooltip_text(reason.as_deref());
+        self.snapshot.clone_from(snapshot);
+    }
+}
+
 /// The right-side agent Tasks panel. Cheap to clone; every clone shares the
 /// same widgets and staged state, like the other forge panel handles.
 #[derive(Clone)]
@@ -133,6 +209,13 @@ pub(crate) struct TasksPanel {
     unfiltered_state: Rc<RefCell<TasksPanelSync>>,
     dashboard_view: Rc<Cell<crate::agent_task::DashboardView>>,
     dashboard_query: Entry,
+    filters: Rc<RefCell<TaskFilters>>,
+    provider_filter: gtk4::DropDown,
+    workspace_filter: gtk4::DropDown,
+    status_filter: gtk4::DropDown,
+    workspace_choices: Rc<RefCell<Vec<std::path::PathBuf>>>,
+    filter_guard: Rc<Cell<bool>>,
+    row_widgets: Rc<RefCell<HashMap<TaskId, TaskRowWidgets>>>,
     dashboard_summary: Label,
     dashboard_clear: Button,
     dashboard_reveal: Button,
@@ -223,6 +306,57 @@ impl TasksPanel {
         dashboard_query.set_max_length(256);
         dashboard_query.update_property(&[gtk4::accessible::Property::Label("Search agent tasks")]);
         root.append(&dashboard_query);
+        let provider_labels = std::iter::once("All providers")
+            .chain(
+                crate::agent_task::AgentProvider::ALL
+                    .iter()
+                    .map(|provider| provider.display_name()),
+            )
+            .collect::<Vec<_>>();
+        let provider_filter = gtk4::DropDown::from_strings(&provider_labels);
+        let workspace_filter = gtk4::DropDown::from_strings(&["All workspaces"]);
+        let state_labels = std::iter::once("All states")
+            .chain(STATES.iter().map(|status| status.label()))
+            .collect::<Vec<_>>();
+        let status_filter = gtk4::DropDown::from_strings(&state_labels);
+        let factory = gtk4::SignalListItemFactory::new();
+        factory.connect_setup(|_, item| {
+            let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
+            let label = Label::new(None);
+            label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+            label.set_max_width_chars(24);
+            label.set_halign(gtk4::Align::Start);
+            item.set_child(Some(&label));
+        });
+        factory.connect_bind(|_, item| {
+            let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
+            let value = item
+                .item()
+                .unwrap()
+                .downcast::<gtk4::StringObject>()
+                .unwrap();
+            let label = item.child().unwrap().downcast::<Label>().unwrap();
+            label.set_label(&value.string());
+            label.set_tooltip_text(Some(&value.string()));
+        });
+        workspace_filter.set_factory(Some(&factory));
+        workspace_filter.set_list_factory(Some(&factory));
+        workspace_filter.set_enable_search(true);
+        for (label, control) in [
+            ("Provider", &provider_filter),
+            ("Workspace", &workspace_filter),
+            ("State", &status_filter),
+        ] {
+            control.update_property(&[gtk4::accessible::Property::Label(label)]);
+            control.set_hexpand(true);
+            let line = GBox::new(gtk4::Orientation::Horizontal, 4);
+            let caption = Label::new(Some(label));
+            caption.set_width_chars(9);
+            caption.set_halign(gtk4::Align::Start);
+            line.append(&caption);
+            line.append(control);
+            root.append(&line);
+        }
         let filters = FlowBox::new();
         filters.set_selection_mode(gtk4::SelectionMode::None);
         filters.set_max_children_per_line(3);
@@ -389,6 +523,13 @@ impl TasksPanel {
             unfiltered_state: Rc::new(RefCell::new(TasksPanelSync::default())),
             dashboard_view: Rc::new(Cell::new(crate::agent_task::DashboardView::All)),
             dashboard_query,
+            filters: Rc::new(RefCell::new(TaskFilters::default())),
+            provider_filter,
+            workspace_filter,
+            status_filter,
+            workspace_choices: Rc::new(RefCell::new(Vec::new())),
+            filter_guard: Rc::new(Cell::new(false)),
+            row_widgets: Rc::new(RefCell::new(HashMap::new())),
             dashboard_summary,
             dashboard_clear,
             dashboard_reveal,
@@ -440,6 +581,43 @@ impl TasksPanel {
     }
 
     fn connect_signals(&self) {
+        for control in [
+            &self.provider_filter,
+            &self.workspace_filter,
+            &self.status_filter,
+        ] {
+            let panel = self.clone();
+            control.connect_selected_notify(move |_| {
+                if panel.filter_guard.get() {
+                    return;
+                }
+                *panel.filters.borrow_mut() =
+                    TaskFilters {
+                        provider: panel.provider_filter.selected().checked_sub(1).and_then(
+                            |index| {
+                                crate::agent_task::AgentProvider::ALL
+                                    .get(index as usize)
+                                    .copied()
+                            },
+                        ),
+                        workspace: panel.workspace_filter.selected().checked_sub(1).and_then(
+                            |index| {
+                                panel
+                                    .workspace_choices
+                                    .borrow()
+                                    .get(index as usize)
+                                    .cloned()
+                            },
+                        ),
+                        status: panel
+                            .status_filter
+                            .selected()
+                            .checked_sub(1)
+                            .and_then(|index| STATES.get(index as usize).copied()),
+                    };
+                panel.apply_dashboard_filters();
+            });
+        }
         let panel = self.clone();
         self.dashboard_query
             .connect_changed(move |_| panel.apply_dashboard_filters());
@@ -465,6 +643,12 @@ impl TasksPanel {
         for button in [&self.dashboard_clear, &self.dashboard_reveal] {
             let panel = self.clone();
             button.connect_clicked(move |_| {
+                panel.filter_guard.set(true);
+                *panel.filters.borrow_mut() = TaskFilters::default();
+                panel.provider_filter.set_selected(0);
+                panel.workspace_filter.set_selected(0);
+                panel.status_filter.set_selected(0);
+                panel.filter_guard.set(false);
                 panel
                     .dashboard_view
                     .set(crate::agent_task::DashboardView::All);
@@ -480,6 +664,25 @@ impl TasksPanel {
         self.close_button.connect_clicked(move |_| {
             panel.emit(TaskPanelAction::Close);
         });
+
+        let keys = gtk4::EventControllerKey::new();
+        keys.set_name(Some("task-list-navigation"));
+        let panel = self.clone();
+        keys.connect_key_pressed(move |_, key, _, modifiers| {
+            if modifiers.intersects(
+                gtk4::gdk::ModifierType::CONTROL_MASK
+                    | gtk4::gdk::ModifierType::ALT_MASK
+                    | gtk4::gdk::ModifierType::SUPER_MASK,
+            ) {
+                return gtk4::glib::Propagation::Proceed;
+            }
+            if panel.navigate_task_list(key) {
+                gtk4::glib::Propagation::Stop
+            } else {
+                gtk4::glib::Propagation::Proceed
+            }
+        });
+        self.task_list.add_controller(keys);
 
         let panel = self.clone();
         self.task_list.connect_row_selected(move |_, row| {
@@ -603,14 +806,50 @@ impl TasksPanel {
     /// change, so an unchanged push is allocation-quiet; the domain remains
     /// the only owner of task state.
     pub(crate) fn sync(&self, sync: TasksPanelSync) {
+        let choices = self.filters.borrow().workspace_choices(&sync.workspaces);
+        if *self.workspace_choices.borrow() != choices {
+            // Labels are bounded display text only. Ordinals distinguish collisions.
+            let mut labels = vec!["All workspaces".to_owned()];
+            labels.extend(choices.iter().enumerate().map(|(index, path)| {
+                format!(
+                    "{} · {}",
+                    index + 1,
+                    crate::review_text::visible_bounded(&path.to_string_lossy(), 160)
+                )
+            }));
+            let strings = labels.iter().map(String::as_str).collect::<Vec<_>>();
+            let selected = self
+                .filters
+                .borrow()
+                .workspace
+                .as_ref()
+                .and_then(|path| choices.iter().position(|choice| choice == path))
+                .map_or(0, |index| index as u32 + 1);
+            self.filter_guard.set(true);
+            *self.workspace_choices.borrow_mut() = choices;
+            self.workspace_filter
+                .set_model(Some(&gtk4::StringList::new(&strings)));
+            self.workspace_filter.set_selected(selected);
+            self.filter_guard.set(false);
+        }
+        let live = sync
+            .dashboard
+            .rows
+            .iter()
+            .map(|row| row.id)
+            .collect::<std::collections::HashSet<_>>();
+        self.row_widgets
+            .borrow_mut()
+            .retain(|id, _| live.contains(id));
         *self.unfiltered_state.borrow_mut() = sync;
         self.apply_dashboard_filters();
     }
 
     fn apply_dashboard_filters(&self) {
         let mut sync = self.unfiltered_state.borrow().clone();
-        let dashboard = crate::agent_task::DashboardSnapshot::filter_rows(
-            &sync.dashboard.rows,
+        let dashboard = self.filters.borrow().project(
+            &sync.dashboard,
+            &sync.workspaces,
             self.dashboard_query.text().as_str(),
             self.dashboard_view.get(),
         );
@@ -631,14 +870,15 @@ impl TasksPanel {
             sync.detail = None;
         }
         self.dashboard_summary.set_label(&format!(
-            "{} shown · {} search matches · {} need you · {} awaiting approval",
+            "{} shown · {} provider/workspace/search matches · {} need you · {} awaiting approval (counts before state/view)",
             dashboard.rows.len(),
             dashboard.counts.total,
             dashboard.counts.attention,
             dashboard.counts.pending_approval,
         ));
         self.dashboard_clear.set_visible(
-            !self.dashboard_query.text().is_empty()
+            *self.filters.borrow() != TaskFilters::default()
+                || !self.dashboard_query.text().is_empty()
                 || self.dashboard_view.get() != crate::agent_task::DashboardView::All,
         );
         let selected_hidden = sync.selected.is_some_and(|id| {
@@ -787,6 +1027,32 @@ impl TasksPanel {
     /// these make refreshing unchanged state idempotent; an unguarded
     /// re-select on every refresh would also re-enter the state cell while
     /// refresh still borrows it.
+    fn navigate_task_list(&self, key: gtk4::gdk::Key) -> bool {
+        use gtk4::gdk::Key;
+        if !matches!(key, Key::Up | Key::Down | Key::Home | Key::End) {
+            return false;
+        }
+        let len = self.state.borrow().rows.len();
+        if len == 0 {
+            return true;
+        }
+        let current = self
+            .task_list
+            .selected_row()
+            .map(|row| row.index() as usize);
+        let target = match key {
+            Key::Home => 0,
+            Key::End => len - 1,
+            Key::Up => current.map_or(len - 1, |index| index.saturating_sub(1)),
+            _ => current.map_or(0, |index| (index + 1).min(len - 1)),
+        };
+        if let Some(row) = self.task_list.row_at_index(target as i32) {
+            self.task_list.select_row(Some(&row));
+            row.grab_focus();
+        }
+        true
+    }
+
     fn sync_task_list(&self, state: &TasksPanelSync) {
         let plan = plan_list_refresh(
             &self.rendered_rows.borrow(),
@@ -796,48 +1062,47 @@ impl TasksPanel {
         );
         if plan.rebuild_rows {
             self.selection_guard.set(true);
-            while let Some(child) = self.task_list.first_child() {
-                self.task_list.remove(&child);
+            let old_ids = self
+                .rendered_rows
+                .borrow()
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>();
+            let new_ids = state.rows.iter().map(|row| row.id).collect::<Vec<_>>();
+            let mut cache = self.row_widgets.borrow_mut();
+            let focused = cache
+                .iter()
+                .find_map(|(id, widgets)| widgets.row.has_focus().then_some(*id));
+            // Cache is bounded by the current unfiltered snapshot, not task history.
+            let live = self
+                .unfiltered_state
+                .borrow()
+                .dashboard
+                .rows
+                .iter()
+                .map(|row| row.id)
+                .collect::<std::collections::HashSet<_>>();
+            cache.retain(|id, _| live.contains(id));
+            for row in &state.rows {
+                if let Some(widgets) = cache.get_mut(&row.id) {
+                    if widgets.snapshot != *row {
+                        widgets.update(row);
+                    }
+                } else {
+                    cache.insert(row.id, TaskRowWidgets::new(row));
+                }
             }
-            for row in state.rows.iter() {
-                let title = Label::new(Some(&row.title));
-                title.set_halign(gtk4::Align::Start);
-                title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-                title.set_max_width_chars(28);
-                let status = Label::new(Some(&row_status_line(row)));
-                status.set_halign(gtk4::Align::Start);
-                status.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-                status.add_css_class("dim-label");
-                status.add_css_class("caption");
-                if row.needs_attention {
-                    status.add_css_class("warning");
+            if old_ids != new_ids {
+                while let Some(child) = self.task_list.first_child() {
+                    self.task_list.remove(&child);
                 }
-                let lines = GBox::new(gtk4::Orientation::Vertical, 2);
-                lines.set_margin_top(4);
-                lines.set_margin_bottom(4);
-                lines.set_margin_start(4);
-                lines.append(&title);
-                lines.append(&status);
-                if let Some(reason) = task_reason(
-                    row.status,
-                    row.validation_status,
-                    row.status_detail.as_deref(),
-                    row.validation_detail.as_deref(),
-                ) {
-                    let preview = gtk4::Label::new(Some(&reason));
-                    preview.set_halign(gtk4::Align::Start);
-                    preview.set_single_line_mode(true);
-                    preview.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-                    preview.set_max_width_chars(28);
-                    preview.set_tooltip_text(Some(&reason));
-                    preview.add_css_class("caption");
-                    preview.add_css_class("dim-label");
-                    preview.add_css_class("task-reason");
-                    lines.append(&preview);
+                for id in &new_ids {
+                    self.task_list.append(&cache[id].row);
                 }
-                let list_row = gtk4::ListBoxRow::new();
-                list_row.set_child(Some(&lines));
-                self.task_list.append(&list_row);
+                // Do not steal focus from controls or a task now hidden by filters.
+                if let Some(id) = focused.filter(|id| new_ids.contains(id)) {
+                    cache[&id].row.grab_focus();
+                }
             }
             self.rendered_rows.borrow_mut().clone_from(&state.rows);
         }
@@ -1727,5 +1992,484 @@ mod tests {
             "filtering must not stage task actions"
         );
         window.close();
+    }
+    fn thousand_task_sync() -> TasksPanelSync {
+        let template = dashboard_test_sync();
+        let mut sync = TasksPanelSync::default();
+        for index in 0..1000 {
+            let id = TaskId::new();
+            let mut row = template.rows[0].clone();
+            row.id = id;
+            row.title = "Same task".into();
+            row.provider = crate::agent_task::AgentProvider::ALL[index % 4];
+            row.status = crate::agent_task::TaskStatus::Working;
+            row.has_active_agent_stream = true;
+            let mut dashboard = template.dashboard.rows[0].clone();
+            dashboard.id = id;
+            dashboard.title.clone_from(&row.title);
+            dashboard.provider = row.provider;
+            dashboard.status = row.status;
+            dashboard.needs_attention = false;
+            dashboard.activity.has_active_agent_stream = true;
+            dashboard.updated_at_ms = 42;
+            sync.rows.push(row);
+            sync.dashboard.rows.push(dashboard);
+            sync.workspaces
+                .insert(id, format!("/fixture/workspace-{}", index % 3).into());
+        }
+        sync.selected = Some(sync.rows[0].id);
+        sync
+    }
+
+    fn send_list_key(panel: &TasksPanel, key: gtk4::gdk::Key) {
+        let controllers = panel.task_list.observe_controllers();
+        let keys = (0..controllers.n_items())
+            .find_map(|index| {
+                controllers
+                    .item(index)
+                    .and_then(|item| item.downcast::<gtk4::EventControllerKey>().ok())
+                    .filter(|controller| {
+                        controller.name().as_deref() == Some("task-list-navigation")
+                    })
+            })
+            .unwrap();
+        let stopped = keys.emit_by_name::<bool>(
+            "key-pressed",
+            &[&key, &0u32, &gtk4::gdk::ModifierType::empty()],
+        );
+        assert!(stopped);
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn task_filters_keep_identity_hidden_updates_and_keyboard_routing() {
+        gtk4::init().expect("GTK display");
+        let panel = TasksPanel::build();
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let sink = actions.clone();
+        panel.connect_action(move |action| sink.borrow_mut().push(action));
+        let window = gtk4::Window::new();
+        window.set_default_size(420, 800);
+        window.set_child(Some(&panel.root));
+        window.present();
+        let mut sync = thousand_task_sync();
+        let selected = sync.selected.unwrap();
+        panel.sync(sync.clone());
+        let first_widget = panel.row_widgets.borrow()[&selected].row.clone();
+        panel.provider_filter.set_selected(2); // Claude hides selected Codex.
+        assert_eq!(panel.state.borrow().selected, Some(selected));
+        assert!(panel.dashboard_reveal.is_visible());
+        assert!(panel.state.borrow().detail.is_none());
+        assert_eq!(panel.state.borrow().rows.len(), 250);
+        panel.workspace_filter.set_selected(1);
+        assert!(panel
+            .state
+            .borrow()
+            .rows
+            .iter()
+            .all(|row| sync.workspaces[&row.id].as_path()
+                == std::path::Path::new("/fixture/workspace-0")));
+        panel.status_filter.set_selected(8); // Failed.
+        assert!(panel.state.borrow().rows.is_empty());
+        assert!(panel
+            .dashboard_summary
+            .label()
+            .contains("counts before state/view"));
+        // Hidden native activity still arrives through the authoritative snapshot.
+        sync.rows[0].status = crate::agent_task::TaskStatus::Failed;
+        sync.rows[0].status_detail = Some("Hidden task changed".into());
+        sync.dashboard.rows[0].status = crate::agent_task::TaskStatus::Failed;
+        sync.dashboard.rows[0].status_detail = Some("Hidden task changed".into());
+        sync.dashboard.rows[0].needs_attention = true;
+        panel.sync(sync.clone());
+        assert_eq!(
+            panel.unfiltered_state.borrow().rows[0].status,
+            crate::agent_task::TaskStatus::Failed
+        );
+        assert!(
+            actions.borrow().is_empty(),
+            "filters and hidden updates must never control tasks"
+        );
+        panel.dashboard_reveal.emit_clicked();
+        assert_eq!(panel.state.borrow().selected, Some(selected));
+        assert_eq!(panel.row_widgets.borrow()[&selected].row, first_widget);
+        assert!(panel.row_widgets.borrow()[&selected]
+            .status
+            .label()
+            .contains("Failed"));
+        assert_eq!(panel.provider_filter.selected(), 0);
+        assert_eq!(panel.workspace_filter.selected(), 0);
+        assert_eq!(panel.status_filter.selected(), 0);
+        // Real application callbacks can synchronously push a new snapshot.
+        let reentrant_panel = panel.clone();
+        let sink = actions.clone();
+        panel.connect_action(move |action| {
+            sink.borrow_mut().push(action.clone());
+            if let TaskPanelAction::Select(id) = action {
+                let mut next = reentrant_panel.unfiltered_state.borrow().clone();
+                next.selected = Some(id);
+                reentrant_panel.sync(next);
+            }
+        });
+        panel.task_list.grab_focus();
+        send_list_key(&panel, gtk4::gdk::Key::End);
+        let expected = panel.state.borrow().rows.last().unwrap().id;
+        assert!(
+            matches!(actions.borrow().last(), Some(TaskPanelAction::Select(id)) if *id == expected)
+        );
+        let focused = panel.row_widgets.borrow()[&expected].row.clone();
+        assert!(focused.has_focus());
+        let action_count = actions.borrow().len();
+        // Reordering while a same-name task has focus keeps the exact widget.
+        sync.selected = Some(expected);
+        sync.dashboard
+            .rows
+            .iter_mut()
+            .find(|row| row.id == expected)
+            .unwrap()
+            .updated_at_ms = 500;
+        panel.sync(sync.clone());
+        assert!(focused.has_focus());
+        assert_eq!(
+            actions.borrow().len(),
+            action_count,
+            "programmatic reconciliation emits no selection"
+        );
+        send_list_key(&panel, gtk4::gdk::Key::Home);
+        let first = panel.state.borrow().rows[0].id;
+        assert!(
+            matches!(actions.borrow().last(), Some(TaskPanelAction::Select(id)) if *id == first)
+        );
+        send_list_key(&panel, gtk4::gdk::Key::Down);
+        let second = panel.state.borrow().rows[1].id;
+        assert!(
+            matches!(actions.borrow().last(), Some(TaskPanelAction::Select(id)) if *id == second)
+        );
+        send_list_key(&panel, gtk4::gdk::Key::Up);
+        assert_eq!(
+            panel.task_list.selected_row().unwrap(),
+            panel.row_widgets.borrow()[&first].row
+        );
+        // Archived domain rows remain persisted but must release view widgets.
+        let archived = sync.rows[900].id;
+        sync.rows[900].status = crate::agent_task::TaskStatus::Archived;
+        sync.dashboard.rows.retain(|row| row.id != archived);
+        sync.workspaces.remove(&archived);
+        panel.sync(sync.clone());
+        assert!(!panel.row_widgets.borrow().contains_key(&archived));
+        // Removed hidden rows cannot accumulate in the view cache.
+        panel.dashboard_query.set_text("no matches");
+        let removed = sync.rows.pop().unwrap().id;
+        sync.dashboard.rows.retain(|row| row.id != removed);
+        sync.workspaces.remove(&removed);
+        panel.sync(sync);
+        assert!(!panel.row_widgets.borrow().contains_key(&removed));
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn thousand_task_filter_and_update_native_benchmark() {
+        gtk4::init().expect("GTK display");
+        let panel = TasksPanel::build();
+        let baseline = TasksPanel::build();
+        let baseline_window = gtk4::Window::new();
+        baseline_window.set_default_size(420, 800);
+        baseline_window.set_child(Some(&baseline.root));
+        baseline_window.present();
+        let window = gtk4::Window::new();
+        window.set_default_size(420, 800);
+        window.set_child(Some(&panel.root));
+        window.present();
+        let mut sync = thousand_task_sync();
+        let initial = std::time::Instant::now();
+        panel.sync(sync.clone());
+        let initial_ms = initial.elapsed().as_secs_f64() * 1000.0;
+        let stable = panel
+            .row_widgets
+            .borrow()
+            .iter()
+            .map(|(id, widgets)| (*id, widgets.row.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut baseline_state = panel.state.borrow().clone();
+        baseline.baseline_full_rebuild(&baseline_state);
+        let mut updates = Vec::new();
+        let mut filters = Vec::new();
+        let mut baseline_updates = Vec::new();
+        let pulses = Rc::new(Cell::new(0));
+        let context = gtk4::glib::MainContext::default();
+        for iteration in 0..20 {
+            let marker = format!("Update {iteration}");
+            sync.rows[500].status_detail = Some(marker.clone());
+            sync.dashboard.rows[500].status_detail = Some(marker.clone());
+            let start = std::time::Instant::now();
+            panel.sync(sync.clone());
+            updates.push(start.elapsed().as_secs_f64() * 1000.0);
+            baseline_state
+                .rows
+                .iter_mut()
+                .find(|row| row.id == sync.rows[500].id)
+                .unwrap()
+                .status_detail = Some(marker);
+            let start = std::time::Instant::now();
+            baseline.baseline_full_rebuild(&baseline_state);
+            baseline_updates.push(start.elapsed().as_secs_f64() * 1000.0);
+            let start = std::time::Instant::now();
+            panel
+                .provider_filter
+                .set_selected((iteration % 4 + 1) as u32);
+            panel.provider_filter.set_selected(0);
+            filters.push(start.elapsed().as_secs_f64() * 1000.0);
+            let pulse = pulses.clone();
+            gtk4::glib::idle_add_local_once(move || pulse.set(pulse.get() + 1));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while pulses.get() <= iteration && std::time::Instant::now() < deadline {
+                context.iteration(false);
+            }
+            assert_eq!(
+                pulses.get(),
+                iteration + 1,
+                "GTK idle remains serviceable between bounded updates"
+            );
+            assert!(panel
+                .row_widgets
+                .borrow()
+                .iter()
+                .all(|(id, widgets)| stable[id] == widgets.row));
+        }
+        let p95 = |samples: &mut [f64]| {
+            samples.sort_by(f64::total_cmp);
+            samples[(samples.len() * 95).div_ceil(100) - 1]
+        };
+        let update_p95 = p95(&mut updates);
+        let filter_p95 = p95(&mut filters);
+        let baseline_p95 = p95(&mut baseline_updates);
+        eprintln!("F07 native 1000 tasks: initial={initial_ms:.2}ms; snapshot-update p95={update_p95:.2}ms; provider filter round-trip p95={filter_p95:.2}ms; immutable b7dc full-row-refresh baseline p95={baseline_p95:.2}ms; samples=20; idle pulses={}", pulses.get());
+        assert!(
+            update_p95 < 500.0 && filter_p95 < 500.0,
+            "1000-task interactions exceeded 500ms responsiveness guard"
+        );
+        baseline_window.close();
+        window.close();
+    }
+    /// Every command is a direct official xdotool invocation on the isolated
+    /// fixture display. GTK keeps dispatching while it runs; timeout/panic
+    /// kills and reaps only the child we spawned.
+    fn x11_input(args: &[&str]) -> String {
+        struct InputChild(Option<std::process::Child>);
+        impl Drop for InputChild {
+            fn drop(&mut self) {
+                if let Some(child) = &mut self.0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        let mut child = InputChild(Some(
+            std::process::Command::new("xdotool")
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("hosted fixture requires official xdotool"),
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let context = gtk4::glib::MainContext::default();
+        loop {
+            if child.0.as_mut().unwrap().try_wait().unwrap().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "xdotool command timed out: {args:?}"
+            );
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let output = child.0.take().unwrap().wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "xdotool {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn wait_for_gtk(mut predicate: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let context = gtk4::glib::MainContext::default();
+        while !predicate() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "GTK fixture condition timed out"
+            );
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires isolated X11 display and official xdotool"]
+    fn task_filters_route_real_x11_keyboard_by_identity() {
+        gtk4::init().expect("GTK display");
+        let panel = TasksPanel::build();
+        let window = gtk4::Window::new();
+        let title = format!(
+            "forge-f07-keyboard-{}-{}",
+            std::process::id(),
+            TaskId::new()
+        );
+        window.set_title(Some(&title));
+        window.set_default_size(420, 800);
+        window.set_child(Some(&panel.root));
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let sink = actions.clone();
+        let reentrant = panel.clone();
+        panel.connect_action(move |action| {
+            sink.borrow_mut().push(action.clone());
+            if let TaskPanelAction::Select(id) = action {
+                let mut next = reentrant.unfiltered_state.borrow().clone();
+                next.selected = Some(id);
+                reentrant.sync(next);
+            }
+        });
+        panel.sync(thousand_task_sync());
+        window.present();
+        wait_for_gtk(|| window.is_mapped());
+        let pattern = format!("^{title}$");
+        let ids = x11_input(&["search", "--sync", "--onlyvisible", "--name", &pattern]);
+        let ids = ids.lines().collect::<Vec<_>>();
+        assert_eq!(
+            ids.len(),
+            1,
+            "only the uniquely named fixture window may receive input"
+        );
+        let window_id = ids[0];
+        x11_input(&["windowfocus", "--sync", window_id]);
+        assert_eq!(x11_input(&["getwindowfocus"]).trim(), window_id);
+        let mut initial = panel.unfiltered_state.borrow().clone();
+        initial.selected = Some(panel.state.borrow().rows[0].id);
+        panel.sync(initial);
+        panel.task_list.row_at_index(0).unwrap().grab_focus();
+        for key in ["End", "Home", "Down", "Up"] {
+            let target = match key {
+                "End" => 999,
+                "Down" => 1,
+                _ => 0,
+            };
+            let expected = panel.state.borrow().rows[target].id;
+            actions.borrow_mut().clear();
+            x11_input(&["key", "--clearmodifiers", key]);
+            wait_for_gtk(|| {
+                panel.state.borrow().selected == Some(expected)
+                    && panel.row_widgets.borrow()[&expected].row.has_focus()
+            });
+            assert!(
+                matches!(actions.borrow().as_slice(), [TaskPanelAction::Select(id)] if *id == expected)
+            );
+        }
+        // After filtering, the same physical key reaches the current visible
+        // identity, not an old index in the original 1000-task table.
+        panel.provider_filter.set_selected(2);
+        let mut filtered = panel.unfiltered_state.borrow().clone();
+        filtered.selected = Some(panel.state.borrow().rows[0].id);
+        panel.sync(filtered);
+        panel.task_list.row_at_index(0).unwrap().grab_focus();
+        let expected = panel.state.borrow().rows.last().unwrap().id;
+        actions.borrow_mut().clear();
+        x11_input(&["key", "--clearmodifiers", "End"]);
+        wait_for_gtk(|| {
+            panel.state.borrow().selected == Some(expected)
+                && panel.row_widgets.borrow()[&expected].row.has_focus()
+        });
+        assert!(
+            matches!(actions.borrow().as_slice(), [TaskPanelAction::Select(id)] if *id == expected)
+        );
+        assert_eq!(panel.state.borrow().rows.len(), 250);
+        // Updating/reordering must not steal focus from search; a real key
+        // still edits that control rather than navigating the task list.
+        panel.dashboard_query.grab_focus();
+        let selection = panel.state.borrow().selected;
+        let sync = panel.unfiltered_state.borrow().clone();
+        panel.sync(sync);
+        x11_input(&["key", "--clearmodifiers", "s"]);
+        wait_for_gtk(|| panel.dashboard_query.text() == "s");
+        assert_eq!(panel.state.borrow().selected, selection);
+        window.close();
+    }
+}
+
+#[cfg(test)]
+impl TasksPanel {
+    fn baseline_full_rebuild(&self, state: &TasksPanelSync) {
+        let plan = plan_list_refresh(
+            &self.rendered_rows.borrow(),
+            self.rendered_selected.get(),
+            &state.rows,
+            state.selected,
+        );
+        if plan.rebuild_rows {
+            self.selection_guard.set(true);
+            while let Some(child) = self.task_list.first_child() {
+                self.task_list.remove(&child);
+            }
+            for row in state.rows.iter() {
+                let title = Label::new(Some(&row.title));
+                title.set_halign(gtk4::Align::Start);
+                title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                title.set_max_width_chars(28);
+                let status = Label::new(Some(&row_status_line(row)));
+                status.set_halign(gtk4::Align::Start);
+                status.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                status.add_css_class("dim-label");
+                status.add_css_class("caption");
+                if row.needs_attention {
+                    status.add_css_class("warning");
+                }
+                let lines = GBox::new(gtk4::Orientation::Vertical, 2);
+                lines.set_margin_top(4);
+                lines.set_margin_bottom(4);
+                lines.set_margin_start(4);
+                lines.append(&title);
+                lines.append(&status);
+                if let Some(reason) = task_reason(
+                    row.status,
+                    row.validation_status,
+                    row.status_detail.as_deref(),
+                    row.validation_detail.as_deref(),
+                ) {
+                    let preview = gtk4::Label::new(Some(&reason));
+                    preview.set_halign(gtk4::Align::Start);
+                    preview.set_single_line_mode(true);
+                    preview.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                    preview.set_max_width_chars(28);
+                    preview.set_tooltip_text(Some(&reason));
+                    preview.add_css_class("caption");
+                    preview.add_css_class("dim-label");
+                    preview.add_css_class("task-reason");
+                    lines.append(&preview);
+                }
+                let list_row = gtk4::ListBoxRow::new();
+                list_row.set_child(Some(&lines));
+                self.task_list.append(&list_row);
+            }
+            self.rendered_rows.borrow_mut().clone_from(&state.rows);
+        }
+        if plan.apply_selection {
+            self.selection_guard.set(true);
+            match plan.select_index {
+                Some(index) => {
+                    let row = self.task_list.row_at_index(index as i32);
+                    self.task_list.select_row(row.as_ref());
+                }
+                None => self.task_list.unselect_all(),
+            }
+            self.selection_guard.set(false);
+        }
+        if plan.rebuild_rows || plan.apply_selection {
+            self.selection_guard.set(false);
+            self.rendered_selected.set(state.selected);
+        }
     }
 }

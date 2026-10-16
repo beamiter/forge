@@ -52,6 +52,9 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    ui::tasks_panel::tests::task_filters_route_real_x11_keyboard_by_identity
+    ui::tasks_panel::tests::task_filters_keep_identity_hidden_updates_and_keyboard_routing
+    ui::tasks_panel::tests::thousand_task_filter_and_update_native_benchmark
     block_view::search_navigation_tests::native_search_identity_characterization
     ui::tasks_panel::tests::approval_details_are_paged_read_only_and_stale_controls_cannot_decide
     block_view::incremental_find_tests::block_native_find_controls_keep_query_caret_and_tab_focus
