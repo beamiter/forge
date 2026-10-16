@@ -164,6 +164,11 @@ jobs:
         with:
           shared-key: gtk-display
 
+      - name: Check PTY input rejection and native delivery
+        run: |
+          cargo fetch --locked
+          python3 scripts/test-pty-input.py
+
       - name: Check font sizing against native Pango
         run: python3 scripts/test-font-sync.py
 

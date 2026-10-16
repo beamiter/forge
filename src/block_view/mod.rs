@@ -44,6 +44,7 @@ mod find;
 mod fold_preview;
 mod history;
 mod ime_gate;
+mod input_feedback;
 mod kitty_graphics;
 mod onboarding;
 #[allow(dead_code)]
@@ -5538,6 +5539,7 @@ impl SubmissionSurface for VteSubmissionSurface {
 /// files, hooks and key bindings remain part of the trusted shell boundary.
 #[derive(Clone)]
 struct VerifiedSubmissionCtx {
+    input_feedback: Rc<input_feedback::InputFeedback>,
     /// The live surface the inserted command must render on, behind the
     /// query-only [`SubmissionSurface`] seam.
     surface: Rc<dyn SubmissionSurface>,
@@ -5682,8 +5684,10 @@ impl VerifiedSubmissionCtx {
         if let Err(error) = self.pty.write_bytes(&paste.bytes) {
             self.pty
                 .report_write_error("could not queue recalled command", error);
+            self.input_feedback.rejected(error, None);
             return false;
         }
+        self.input_feedback.accepted();
         *self.typed_cmd.borrow_mut() = paste.echo_text;
         // `Ctrl+U` is conventional, not a portable whole-buffer replacement;
         // keep the shadow below exact-command authority after insertion.
@@ -6100,6 +6104,7 @@ pub struct TermView {
     /// updates and tab activation. Sharing it prevents activation from racing a
     /// still-running output/layout pin.
     scroll_debouncer: ScrollDebouncer,
+    input_feedback: Rc<input_feedback::InputFeedback>,
     pty: Rc<OwnedPty>,
     pty_synced: Rc<Cell<bool>>,
     cwd_callbacks: StrCallbacks,
@@ -12814,6 +12819,7 @@ enum LiveCommitRoute {
 /// press, so all three write through the same accounting.
 #[derive(Clone)]
 struct LiveCommitSink {
+    input_feedback: Rc<input_feedback::InputFeedback>,
     pty: Rc<OwnedPty>,
     bstate: Rc<Cell<BlockState>>,
     typed_cmd: Rc<RefCell<String>>,
@@ -12868,8 +12874,15 @@ fn submit_chat_enter_for_target(
     {
         sink.pty
             .report_write_error("could not immediately send Enter; use keyboard", error);
+        let draft = sink.typed_cmd.borrow();
+        sink.input_feedback.rejected(
+            error,
+            (sink.typed_cmd_fidelity.get() == TypedShadowFidelity::ExactOpen)
+                .then_some(draft.as_str()),
+        );
         return false;
     }
+    sink.input_feedback.accepted();
     // Same native Enter accounting, but only after the kernel accepted the
     // whole byte. A held Alt chord or extended key protocol is never split.
     sink.account_typed(
@@ -12884,14 +12897,17 @@ fn admit_chat_stop_input(
     target: Option<PtyForegroundToken>,
     validate: impl FnOnce() -> bool,
     human_input: &HumanInputCallbacks,
+    feedback: &Rc<input_feedback::InputFeedback>,
 ) -> bool {
     match pty.try_write_control(3, target, validate) {
         Ok(()) => {
+            feedback.accepted();
             emit_accepted_input(human_input, InputOrigin::StickyStop);
             true
         }
         Err(error) => {
             pty.report_write_error("could not immediately interrupt; use keyboard", error);
+            feedback.rejected(error, None);
             false
         }
     }
@@ -12899,14 +12915,20 @@ fn admit_chat_stop_input(
 
 /// One interrupt admission path for the existing sticky action and Chat's
 /// generation-bound controls. A refusal never emits an accepted-input event.
-fn admit_stop_input(pty: &OwnedPty, human_input: &HumanInputCallbacks) -> bool {
+fn admit_stop_input(
+    pty: &OwnedPty,
+    human_input: &HumanInputCallbacks,
+    feedback: &Rc<input_feedback::InputFeedback>,
+) -> bool {
     match pty.write_bytes(b"\x03") {
         Ok(()) => {
+            feedback.accepted();
             emit_accepted_input(human_input, InputOrigin::StickyStop);
             true
         }
         Err(error) => {
             pty.report_write_error("could not queue interrupt", error);
+            feedback.rejected(error, None);
             false
         }
     }
@@ -13036,8 +13058,10 @@ impl LiveCommitSink {
         if let Err(error) = self.pty.write_bytes(encoded) {
             self.pty
                 .report_write_error("could not queue terminal input", error);
+            self.input_feedback.rejected(error, None);
             false
         } else {
+            self.input_feedback.accepted();
             self.accepted_input_generation
                 .set(self.accepted_input_generation.get().wrapping_add(1));
             emit_accepted_input(&self.human_input, InputOrigin::VteCommit);
@@ -13051,9 +13075,11 @@ impl LiveCommitSink {
             Err(error) => {
                 self.pty
                     .report_write_error("could not queue terminal input", error);
+                self.input_feedback.rejected(error, None);
                 return false;
             }
         };
+        self.input_feedback.accepted();
         self.account_typed(bytes, block_state, admitted)
     }
 
@@ -13742,7 +13768,7 @@ enum PasteRefusal {
     /// changed.
     TooLarge(String),
     /// The PTY refused the write (already logged); the shadow was restored.
-    Write,
+    Write(crate::pty::PtyWriteError),
 }
 
 /// The pane state a paste reads and updates. See [`TermView::paste_text`].
@@ -13841,7 +13867,7 @@ impl PasteSink {
             pty_synced.set(previous_pty_synced);
             idle_input_dirty.set(previous_idle_dirty);
             pty.report_write_error("could not queue clipboard paste", error);
-            return Err(PasteRefusal::Write);
+            return Err(PasteRefusal::Write(error));
         }
         if input_is_typeahead_for_existing_submission(
             block_state,
@@ -14093,6 +14119,7 @@ impl TermView {
             live_raw_output.clone(),
         )));
         let active_vte = active.borrow().active_vte.clone();
+        let input_feedback = input_feedback::InputFeedback::new(&active_vte);
         if chat_mode {
             active_vte.add_css_class("chat-live-terminal");
         }
@@ -14837,6 +14864,7 @@ impl TermView {
             Rc::new(RefCell::new(vec![]));
         let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let verified_submission = VerifiedSubmissionCtx {
+            input_feedback: input_feedback.clone(),
             surface: Rc::new(VteSubmissionSurface {
                 vte: active_vte.clone(),
                 // Same bit that selects the render backend below, so this
@@ -15625,6 +15653,7 @@ impl TermView {
         // pin their command after the original header scrolls above the viewport.
         if chat_presentation.is_none() {
             let pty_for_stop = pty.clone();
+            let feedback_for_stop = input_feedback.clone();
             let hold_for_stop = selection_feed_hold.clone();
             let human_input_for_stop = human_input_callbacks.clone();
             let root_for_stop = root.downgrade();
@@ -15633,7 +15662,7 @@ impl TermView {
                 // Resume a parked feed first so the ^C echo and the command's
                 // shutdown output are visible immediately.
                 hold_for_stop.flush_now();
-                admit_stop_input(&pty_for_stop, &human_input_for_stop);
+                admit_stop_input(&pty_for_stop, &human_input_for_stop, &feedback_for_stop);
                 // The next key belongs to the program (or the prompt it
                 // returns to), not to a second activation of Stop.
                 if root_for_stop
@@ -15847,6 +15876,7 @@ impl TermView {
         // The same signal also carries libvte's own reports and the two halves
         // of an Alt chord; `LiveCommitSink` tells them apart.
         let live_commit = LiveCommitSink {
+            input_feedback: input_feedback.clone(),
             pty: pty.clone(),
             bstate: bstate.clone(),
             typed_cmd: typed_cmd.clone(),
@@ -15947,6 +15977,7 @@ impl TermView {
                 let alt = alt_escape.clone();
                 let root = root.downgrade();
                 let vte = active_vte.downgrade();
+                let feedback = input_feedback.clone();
                 chat.bind_stop(&button, move |target| {
                     let is_current = || {
                         current.stop_target_is_current(target)
@@ -15964,6 +15995,7 @@ impl TermView {
                             target.map(|target| target.foreground),
                             is_current,
                             &human_input,
+                            &feedback,
                         )
                     } else {
                         false
@@ -15987,6 +16019,7 @@ impl TermView {
         // GTK's input method context and break CJK composition.
         {
             let pty_for_root_key = pty.clone();
+            let feedback_for_root_key = input_feedback.clone();
             let bstate_for_root_key = bstate.clone();
             let kitty_flags_for_root_key = kitty_flags.clone();
             let human_input_for_root_key = human_input_callbacks.clone();
@@ -16013,7 +16046,9 @@ impl TermView {
                         if let Err(error) = pty_for_root_key.write_bytes(&bytes) {
                             pty_for_root_key
                                 .report_write_error("could not queue process-control key", error);
+                            feedback_for_root_key.rejected(error, None);
                         } else {
+                            feedback_for_root_key.accepted();
                             emit_accepted_input(
                                 &human_input_for_root_key,
                                 InputOrigin::RunningControl,
@@ -16245,6 +16280,7 @@ impl TermView {
             let mouse_mode_for_scroll = mouse_reporting_mode.clone();
             let scroll_enabled = config.scroll_reporting_enabled;
             let pty_for_scroll = pty.clone();
+            let feedback_for_scroll = input_feedback.clone();
             let pointer_for_scroll = pointer_cell.clone();
             let bstate_for_scroll = bstate.clone();
             let input_modes_for_scroll = live_input_modes.clone();
@@ -16303,17 +16339,23 @@ impl TermView {
                         // VTE's `commit`, and the pointer-motion reports that
                         // do no longer count as input.
                         hold_for_scroll.flush_then(|| match pty_for_scroll.write_bytes(&bytes) {
-                            Ok(()) => record_protocol_reply_input(
-                                bstate_for_scroll.get(),
-                                &fidelity_for_scroll,
-                                &dirty_for_scroll,
-                                &synced_for_scroll,
-                                &submitted_for_scroll,
-                                &typeahead_for_scroll,
-                                &input_generation_for_scroll,
-                            ),
-                            Err(error) => pty_for_scroll
-                                .report_write_error("could not queue mouse-wheel input", error),
+                            Ok(()) => {
+                                feedback_for_scroll.accepted();
+                                record_protocol_reply_input(
+                                    bstate_for_scroll.get(),
+                                    &fidelity_for_scroll,
+                                    &dirty_for_scroll,
+                                    &synced_for_scroll,
+                                    &submitted_for_scroll,
+                                    &typeahead_for_scroll,
+                                    &input_generation_for_scroll,
+                                );
+                            }
+                            Err(error) => {
+                                pty_for_scroll
+                                    .report_write_error("could not queue mouse-wheel input", error);
+                                feedback_for_scroll.rejected(error, None);
+                            }
                         });
                     }
                     return glib::Propagation::Stop;
@@ -16339,19 +16381,25 @@ impl TermView {
                     let bytes = alternate_scroll_arrows(notches, rows, modes.app_cursor_keys);
                     if !bytes.is_empty() {
                         hold_for_scroll.flush_then(|| match pty_for_scroll.write_bytes(&bytes) {
-                            Ok(()) => record_protocol_reply_input(
-                                bstate_for_scroll.get(),
-                                &fidelity_for_scroll,
-                                &dirty_for_scroll,
-                                &synced_for_scroll,
-                                &submitted_for_scroll,
-                                &typeahead_for_scroll,
-                                &input_generation_for_scroll,
-                            ),
-                            Err(error) => pty_for_scroll.report_write_error(
-                                "could not queue alternate-scroll input",
-                                error,
-                            ),
+                            Ok(()) => {
+                                feedback_for_scroll.accepted();
+                                record_protocol_reply_input(
+                                    bstate_for_scroll.get(),
+                                    &fidelity_for_scroll,
+                                    &dirty_for_scroll,
+                                    &synced_for_scroll,
+                                    &submitted_for_scroll,
+                                    &typeahead_for_scroll,
+                                    &input_generation_for_scroll,
+                                );
+                            }
+                            Err(error) => {
+                                pty_for_scroll.report_write_error(
+                                    "could not queue alternate-scroll input",
+                                    error,
+                                );
+                                feedback_for_scroll.rejected(error, None);
+                            }
                         });
                     }
                     return glib::Propagation::Stop;
@@ -16434,6 +16482,7 @@ impl TermView {
         );
 
         let term_view = TermView {
+            input_feedback,
             root,
             pane_header,
             block_scroll,
@@ -17636,20 +17685,25 @@ impl TermView {
     pub fn paste_from_clipboard(&self) {
         let clipboard = self.active_vte.clipboard();
         let request = self.clipboard_paste_request();
+        let feedback = self.input_feedback.clone();
         let active_vte = self.active_vte.downgrade();
         clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
             let Ok(Some(text)) = result else {
                 return;
             };
-            if let Err(PasteRefusal::TooLarge(error)) = request.complete(Some(text.as_str())) {
-                log::warn!("refused oversized clipboard paste: {error}");
-                if let Some(active_vte) = active_vte.upgrade() {
-                    show_clipboard_failure(
-                        &active_vte,
-                        "Paste failed",
-                        &format!("{error}. Nothing was pasted."),
-                    );
+            match request.complete(Some(text.as_str())) {
+                Ok(()) => feedback.accepted(),
+                Err(PasteRefusal::TooLarge(error)) => {
+                    log::warn!("refused oversized clipboard paste: {error}");
+                    if let Some(active_vte) = active_vte.upgrade().filter(|vte| vte.is_mapped()) {
+                        show_clipboard_failure(
+                            &active_vte,
+                            "Paste failed",
+                            &format!("{error}. Nothing was pasted. The source remains on your clipboard."),
+                        );
+                    }
                 }
+                Err(PasteRefusal::Write(error)) => feedback.rejected(error, None),
             }
         });
     }
@@ -17669,7 +17723,7 @@ impl TermView {
                 Ok(())
             }
             Err(PasteRefusal::TooLarge(error)) => Err(error),
-            Err(PasteRefusal::Write) => Err("the terminal did not accept the input".to_string()),
+            Err(PasteRefusal::Write(error)) => Err(error.to_string()),
         }
     }
 
@@ -28399,6 +28453,7 @@ mod tests {
             }
 
             let verified_submission = VerifiedSubmissionCtx {
+                input_feedback: super::input_feedback::InputFeedback::detached(),
                 surface: surface.clone(),
                 bstate: bstate.clone(),
                 pty: pty.clone(),
@@ -31416,6 +31471,7 @@ mod tests {
                     .push(Box::new(move |_| human_inputs.set(human_inputs.get() + 1)));
             }
             let sink = super::LiveCommitSink {
+                input_feedback: super::input_feedback::InputFeedback::detached(),
                 pty: pty.clone(),
                 bstate: Rc::new(Cell::new(state)),
                 typed_cmd: Rc::new(RefCell::new(String::new())),
@@ -32850,6 +32906,7 @@ mod tests {
                     harness.pty.foreground_token(),
                     || true,
                     &harness.sink.human_input,
+                    &harness.sink.input_feedback,
                 )
             } else {
                 super::submit_chat_enter(&harness.sink, true)
@@ -32916,6 +32973,7 @@ mod tests {
                     harness.pty.foreground_token(),
                     || true,
                     &harness.sink.human_input,
+                    &harness.sink.input_feedback,
                 )
             } else {
                 super::submit_chat_enter(&harness.sink, true)
@@ -32948,7 +33006,8 @@ mod tests {
             &harness.pty,
             harness.pty.foreground_token(),
             || true,
-            &harness.sink.human_input
+            &harness.sink.human_input,
+            &harness.sink.input_feedback,
         ));
         assert_eq!(harness.human_inputs.get(), 0);
         assert_eq!(queue.try_recv().unwrap(), b"occupied");
@@ -32956,7 +33015,8 @@ mod tests {
             &harness.pty,
             harness.pty.foreground_token(),
             || true,
-            &harness.sink.human_input
+            &harness.sink.human_input,
+            &harness.sink.input_feedback,
         ));
         assert_eq!(harness.written(), b"\x03");
         assert!(queue.try_recv().is_err());
@@ -32966,7 +33026,8 @@ mod tests {
             &harness.pty,
             harness.pty.foreground_token(),
             || true,
-            &harness.sink.human_input
+            &harness.sink.human_input,
+            &harness.sink.input_feedback,
         ));
         assert_eq!(harness.human_inputs.get(), 1);
     }
@@ -33002,8 +33063,15 @@ mod tests {
     #[test]
     fn chat_submit_rejects_closed_writer_without_accepted_input() {
         let harness = CommitHarness::new(BlockState::AwaitingCommand, PtyForeground::Shell);
+        let draft = "echo 你好🙂";
+        *harness.sink.typed_cmd.borrow_mut() = draft.to_string();
         harness.pty.kill();
         assert!(!super::submit_chat_enter(&harness.sink, true));
+        assert_eq!(harness.sink.typed_cmd.borrow().as_str(), draft);
+        assert_eq!(
+            harness.sink.typed_cmd_fidelity.get(),
+            TypedShadowFidelity::ExactOpen
+        );
         assert!(harness.written().is_empty());
         assert!(!harness.sink.submission_pending.get());
         assert_eq!(harness.sink.accepted_input_generation.get(), 0);
@@ -33014,9 +33082,16 @@ mod tests {
     #[test]
     fn chat_submit_rejects_full_queue_then_admits_exactly_one_enter() {
         let harness = CommitHarness::new(BlockState::AwaitingCommand, PtyForeground::Shell);
+        let draft = "echo 你好🙂";
+        *harness.sink.typed_cmd.borrow_mut() = draft.to_string();
         let queue = harness.pty.test_input_queue(1);
         harness.pty.write_bytes(b"occupied").unwrap();
         assert!(!super::submit_chat_enter(&harness.sink, true));
+        assert_eq!(harness.sink.typed_cmd.borrow().as_str(), draft);
+        assert_eq!(
+            harness.sink.typed_cmd_fidelity.get(),
+            TypedShadowFidelity::ExactOpen
+        );
         assert!(!harness.sink.submission_pending.get());
         assert_eq!(harness.sink.accepted_input_generation.get(), 0);
         assert_eq!(harness.human_inputs.get(), 0);

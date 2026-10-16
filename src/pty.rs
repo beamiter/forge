@@ -358,21 +358,21 @@ impl fmt::Display for PtyWriteError {
         match self {
             Self::ImmediateUnavailable => write!(
                 formatter,
-                "Immediate terminal action unavailable; use the keyboard"
+                "Terminal action was not sent; the terminal is busy or the action is no longer available. Use the keyboard after checking the current prompt"
             ),
             Self::TooLarge { bytes, limit } => {
                 write!(
                     formatter,
-                    "PTY input is {bytes} bytes; the limit is {limit} bytes"
+                    "Input was not sent: {bytes} bytes exceeds the {limit}-byte (256 KiB) limit. Use a smaller input"
                 )
             }
             Self::QueueFull { bytes } => write!(
                 formatter,
-                "PTY input queue is full; {bytes}-byte input was not sent"
+                "Input was not sent: the terminal input queue is full ({bytes} bytes rejected). Wait and try again; nothing will be resent automatically"
             ),
             Self::Closed { bytes } => write!(
                 formatter,
-                "PTY input queue is closed; {bytes}-byte input was not sent"
+                "Input was not sent: the terminal input connection is closed ({bytes} bytes rejected). Open a new terminal to continue"
             ),
         }
     }

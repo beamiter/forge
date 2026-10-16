@@ -92,6 +92,7 @@ tests=(
     block_view::incremental_find_tests::chat_large_replay_preserves_narrowed_native_cursor
     block_view::blocks::tests::live_clip_reserves_css_insets_without_an_extra_grid_row
     block_view::paste_feedback::tests::notice_preserves_focus
+    block_view::input_feedback::tests::rejected_input_notice_is_bounded_and_recovers_exact_draft
     block_view::tests::truncated_clipboard_feedback_tracks_actual_delivery
     block_view::tests::ssh_remote_prompt_cursor_stays_inside_live_clip_without_clear
     block_view::tests::native_ime_commit_cancel_and_independent_ptys

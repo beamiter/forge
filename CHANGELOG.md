@@ -6,6 +6,11 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Rejected terminal input now explains whether the 256 KiB byte limit, a full
+  queue, or a closed connection prevented sending. Native input feedback is
+  passive and coalesced; failed Chat Send preserves an exact bounded draft with
+  an explicit Copy draft action. Rejected input is never automatically resent.
+
 - Failed and waiting task rows show a bounded reason preview without requiring
   selection; validation failure details take priority when available.
 
