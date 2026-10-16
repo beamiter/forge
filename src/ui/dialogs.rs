@@ -8131,8 +8131,20 @@ mod native_palette_activation_tests {
         assert_eq!(outcome.get(), CrossBlockJumpOutcome::KeepOpen);
         assert!(dialog.is_visible());
         assert!(status.text().contains("Highlight unavailable"));
-        let focused = window
-            .upcast_ref::<gtk4::Root>()
+        // A Dialog presented from GtkWindow has its own native window.
+        // Read the query's actual root, as production keyboard routing does.
+        let query_root = entry.root().expect("presented query has a root");
+        assert_ne!(&query_root, window.upcast_ref::<gtk4::Root>());
+        let query_window = query_root
+            .downcast_ref::<gtk4::Window>()
+            .expect("dialog query root is a native window");
+        assert!(query_window.is_mapped());
+        eprintln!(
+            "F01 palette focus: separate query root; mapped={}; active={}",
+            query_window.is_mapped(),
+            query_window.is_active()
+        );
+        let focused = query_root
             .focus()
             .expect("failed highlight restores query focus");
         let query = entry.upcast_ref::<gtk4::Widget>();

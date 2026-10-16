@@ -2738,6 +2738,37 @@ pub(super) fn clear_find_state(
     active_vte.search_set_regex(None::<&vte4::Regex>, 0);
 }
 
+/// Nonexecuting native fixture: bytes enter the production PTY reader.
+#[cfg(test)]
+pub(crate) fn palette_activation_test_view(mode: crate::config::TerminalMode) -> Rc<TermView> {
+    Rc::new(
+        TermView::new_with_spawner(
+            &crate::config::Config::safe_defaults(),
+            &mode,
+            &["sh".into()],
+            None,
+            None,
+            &[],
+            |_, _, _, _| crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Shell),
+        )
+        .unwrap(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn palette_activation_test_feed(view: &TermView, bytes: &[u8]) {
+    view.pty.write_test_slave(bytes);
+}
+
+#[cfg(test)]
+pub(crate) fn palette_activation_test_collapsed(view: &TermView, block_id: u64) -> Option<bool> {
+    view.finished_blocks
+        .borrow()
+        .iter()
+        .find(|block| block.id == block_id)
+        .map(|block| block.is_collapsed())
+}
+
 #[cfg(test)]
 mod tests {
     use super::metadata_filter_line;
@@ -23560,35 +23591,4 @@ tail ab";
         assert!(stopped.scan_incomplete);
         assert_eq!(stopped.resume, Some(resume));
     }
-}
-
-/// Nonexecuting native fixture: bytes enter the production PTY reader.
-#[cfg(test)]
-pub(crate) fn palette_activation_test_view(mode: crate::config::TerminalMode) -> Rc<TermView> {
-    Rc::new(
-        TermView::new_with_spawner(
-            &crate::config::Config::safe_defaults(),
-            &mode,
-            &["sh".into()],
-            None,
-            None,
-            &[],
-            |_, _, _, _| crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Shell),
-        )
-        .unwrap(),
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn palette_activation_test_feed(view: &TermView, bytes: &[u8]) {
-    view.pty.write_test_slave(bytes);
-}
-
-#[cfg(test)]
-pub(crate) fn palette_activation_test_collapsed(view: &TermView, block_id: u64) -> Option<bool> {
-    view.finished_blocks
-        .borrow()
-        .iter()
-        .find(|block| block.id == block_id)
-        .map(|block| block.is_collapsed())
 }
