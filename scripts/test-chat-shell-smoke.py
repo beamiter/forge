@@ -10,6 +10,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 
 spec = importlib.util.spec_from_file_location('render_matrix', Path(__file__).with_name('test-chat-render-matrix.py'))
 matrix = importlib.util.module_from_spec(spec)
@@ -35,10 +36,19 @@ def shell_acceptance(records):
             raise RuntimeError('Actual shell accepted bytes differ from expected input')
 
 
+def private_runtime():
+    # AF_UNIX sockaddr paths include Sway's generated IPC basename. Keep the
+    # runtime independent of checkout/artifact depth and inherited TMPDIR.
+    return tempfile.TemporaryDirectory(prefix='forge-f13-', dir='/tmp')
+
+
 def run_case(binary, out, scale, font):
+    with private_runtime() as runtime:
+        _run_case(binary, out, scale, font, Path(runtime))
+
+
+def _run_case(binary, out, scale, font, runtime):
     out.mkdir()
-    runtime = out / 'runtime'
-    runtime.mkdir(mode=0o700)
     env = os.environ.copy()
     for key in ('DISPLAY', 'WAYLAND_DISPLAY', 'SWAYSOCK', 'GDK_SCALE', 'GDK_DPI_SCALE',
                 'GTK_THEME', 'GTK_IM_MODULE'):
