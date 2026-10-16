@@ -1589,10 +1589,10 @@ pub(crate) fn estimated_cell_height_px(config: &Config) -> i32 {
 /// structural rows explicit is important for virtualization: an extra phantom
 /// row makes a card at the viewport boundary alternate between its measured and
 /// placeholder heights.
-/// Non-terminal vertical chrome in a finished card. The ten-pixel difference
+/// Non-terminal vertical chrome in a finished card. The six-pixel difference
 /// is exactly the density switch's imperative geometry: outer top/bottom
-/// margins shrink by six pixels and header top/bottom margins by four.
-const FINISHED_CARD_ROOMY_VCHROME_PX: i32 = 34;
+/// margins shrink by two pixels and header top/bottom margins by four.
+const FINISHED_CARD_ROOMY_VCHROME_PX: i32 = 30;
 const FINISHED_CARD_COMPACT_VCHROME_PX: i32 = 24;
 
 const fn finished_card_vchrome_px(compact: bool) -> i32 {
@@ -2077,8 +2077,9 @@ fn apply_card_density(outer: &gtk4::Box, compact: bool) {
         outer.set_margin_end(4);
     } else {
         outer.remove_css_class("block-compact");
-        outer.set_margin_top(4);
-        outer.set_margin_bottom(4);
+        // Match the native renderers: two 2px edges form a 4px seam.
+        outer.set_margin_top(2);
+        outer.set_margin_bottom(2);
         outer.set_margin_start(8);
         outer.set_margin_end(8);
     }
@@ -5326,6 +5327,7 @@ mod tests {
             block.header_row.margin_top(),
         );
         assert!(!block.widget().has_css_class("block-compact"));
+        assert_eq!(roomy.0 + block.widget().margin_bottom(), 4);
 
         // Virtualize before switching: this is the state whose explicit
         // height request and parallel BlockData model used to stay roomy.
@@ -5333,7 +5335,7 @@ mod tests {
         let mut block_data = VecDeque::from([block_with_exit(Some(0))]);
         block_data[0].estimated_height = roomy_placeholder;
         super::apply_finished_card_density(std::slice::from_ref(&block), &mut block_data, true);
-        let compact_placeholder = roomy_placeholder - 10;
+        let compact_placeholder = roomy_placeholder - 6;
         assert_eq!(block_data[0].estimated_height, compact_placeholder);
         assert_eq!(block.widget().height_request(), compact_placeholder);
         let compact = (
@@ -5343,6 +5345,7 @@ mod tests {
             block.header_row.margin_top(),
         );
         assert!(block.widget().has_css_class("block-compact"));
+        assert_eq!(compact.0 + block.widget().margin_bottom(), 2);
         assert!(
             compact.0 < roomy.0
                 && compact.1 < roomy.1
@@ -5447,7 +5450,7 @@ mod tests {
                 false
             ));
             assert!(!assistant.has_css_class("block-compact"));
-            assert_eq!(assistant.margin_top(), 4);
+            assert_eq!(assistant.margin_top(), 2);
             assert_eq!(header.margin_start(), 12);
             assert_eq!(body.margin_start(), 12);
         }
