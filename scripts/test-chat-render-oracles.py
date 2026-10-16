@@ -75,4 +75,25 @@ class HorizontalClearance(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             m.horizontal_clearance(r)
 
+class GutterOracles(unittest.TestCase):
+    def states(self):
+        return [dict(window_width=w, scrollback=shown, columns=68 if w==800 else 39,
+                     gutter=17, clip_width=w-20, native_bounds=[0,w-37],
+                     grid_right=w-50, scrollbar_left=w-36,
+                     scrollbar_opacity=int(shown), scrollbar_targetable=shown)
+                for w in (800,480,800) for shown in (False,True,False)]
+    def test_stable_measured_gutter(self):
+        m.stable_gutter(self.states())
+    def test_rejects_toggle_column_jitter(self):
+        s=self.states();s[1]['columns']+=1
+        with self.assertRaises(RuntimeError):m.stable_gutter(s)
+    def test_rejects_hidden_pointer_interception(self):
+        s=self.states();s[0]['scrollbar_targetable']=True
+        with self.assertRaises(RuntimeError):m.stable_gutter(s)
+    def test_rejects_allocation_overlap(self):
+        s=self.states();s[0]['scrollbar_left']=s[0]['native_bounds'][1]-0.5
+        with self.assertRaises(RuntimeError):m.stable_gutter(s)
+    def test_rejects_missing_transition(self):
+        with self.assertRaises(RuntimeError):m.stable_gutter(self.states()[:-1])
+
 unittest.main()

@@ -81,6 +81,30 @@ def horizontal_clearance(report):
         raise RuntimeError(f'Native terminal grid intersects painted scrollbar/clip by {right - available:g} logical pixels')
 
 
+def stable_gutter(states):
+    expected = [(width, shown) for width in (800, 480, 800) for shown in (False, True, False)]
+    if len(states) != len(expected):
+        raise RuntimeError('Missing native gutter transitions')
+    columns = {}
+    gutters = set()
+    for state, (width, shown) in zip(states, expected):
+        if (state['window_width'], state['scrollback']) != (width, shown):
+            raise RuntimeError('Unexpected native gutter transition')
+        if state['scrollbar_opacity'] != int(shown) or state['scrollbar_targetable'] != shown:
+            raise RuntimeError('Hidden scrollbar paint or pointer interception')
+        gutter = state['gutter']
+        gutters.add(gutter)
+        x, allocated_width = state['native_bounds']
+        if (gutter <= 0 or allocated_width != state['clip_width'] - gutter or
+                x < -1e-6 or x + allocated_width > state['scrollbar_left'] + 1e-6 or
+                state['grid_right'] > state['scrollbar_left'] + 1e-6):
+            raise RuntimeError('Native allocated gutter does not clear scrollbar')
+        if columns.setdefault(width, state['columns']) != state['columns']:
+            raise RuntimeError('Scrollbar appearance changed native columns')
+    if len(gutters) != 1 or columns[480] >= columns[800]:
+        raise RuntimeError('Unstable gutter or ineffective real resize')
+
+
 def run_case(binary, out, scale, font):
     out.mkdir()
     runtime = out / 'runtime'
@@ -144,6 +168,17 @@ for_window [title="^Forge F13 native render$"] floating enable, border none
                 (out / f'stage-{stage}.ack').touch()
             if fixture.wait(timeout=20) != 0:
                 raise RuntimeError('Native fixture failed; see fixture.log')
+            stable_gutter(json.loads((out / 'gutter-stability.json').read_text()))
+            tiny = json.loads((out / 'tiny-gutter.json').read_text())
+            if len(tiny) != 4 or [r['clip_width'] for r in tiny[:3]] != [1, 10, 17]:
+                raise RuntimeError('Missing actual tiny GTK allocation positive controls')
+            for state in tiny:
+                if (state['request'] != state['clip_width'] - state['gutter'] or
+                        state['request'] <= 0 or state['columns'] <= 0 or
+                        state['native_width'] > max(state['request'], state['native_minimum']) + 1e-6):
+                    raise RuntimeError('Tiny allocation retained stale native geometry')
+            if any(r['gutter'] != 0 or r['columns'] >= tiny[-1]['columns'] for r in tiny[:3]):
+                raise RuntimeError('Tiny allocation did not degrade and restore')
             (out / 'result.json').write_text(json.dumps(dict(status='pass', stages=reports,
                 scope='synthetic PTY render only; screenshots require visual review; shell draft/paste unverified'), indent=2))
         finally:

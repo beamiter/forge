@@ -4401,6 +4401,45 @@ pub(super) fn terminal_vertical_insets(vte: &Terminal) -> i32 {
     .max(0)
 }
 
+// Chat keeps a measured gutter even without scrollback: changing scrollbar
+// paint visibility must never resize the shell's grid. Other presentations
+// retain their existing overlay policy.
+fn chat_live_width_budget(clip: i32, minimum: i32, gutter: i32) -> (i32, i32) {
+    let clip = clip.max(0);
+    let gutter = gutter.max(0);
+    if clip.saturating_sub(gutter) >= minimum.max(1) {
+        (clip - gutter, gutter)
+    } else {
+        // Below the space for one native minimum terminal plus the scrollbar,
+        // prioritize the terminal. Its native minimum cells may be clipped by
+        // live_clip, but its request must not retain a previous wide grid.
+        (clip, 0)
+    }
+}
+
+fn sync_live_scrollbar_visibility(
+    vte: &Terminal,
+    scrollbar: &gtk4::Scrollbar,
+    clip: &gtk4::Overlay,
+    overflows: bool,
+) -> i32 {
+    if vte.has_css_class("chat-live-terminal") {
+        scrollbar.set_visible(true);
+        let natural = scrollbar.measure(Orientation::Horizontal, -1).1;
+        let minimum = vte.measure(Orientation::Horizontal, -1).0;
+        let (_, gutter) = chat_live_width_budget(clip.width(), minimum, natural);
+        let interactive = overflows && gutter > 0;
+        scrollbar.set_opacity(if interactive { 1.0 } else { 0.0 });
+        scrollbar.set_can_target(interactive);
+        scrollbar.set_can_focus(interactive);
+        scrollbar.update_state(&[gtk4::accessible::State::Hidden(!interactive)]);
+        gutter
+    } else {
+        scrollbar.set_visible(overflows);
+        0
+    }
+}
+
 fn live_rows_height_px(cell_h: i32, rows: i64, insets: i32) -> i32 {
     (rows.clamp(1, i32::MAX as i64) as i32)
         .saturating_mul(cell_h.max(1))
@@ -4529,12 +4568,16 @@ impl ActiveBlock {
         // buffer has scrolled past the viewport.
         if let Some(adj) = active_vte.vadjustment() {
             let scrollbar = live_scrollbar.downgrade();
+            let terminal = active_vte.downgrade();
+            let clip = live_clip.downgrade();
             let sync_visibility = move |adj: &gtk4::Adjustment| {
-                let Some(scrollbar) = scrollbar.upgrade() else {
+                let (Some(scrollbar), Some(terminal), Some(clip)) =
+                    (scrollbar.upgrade(), terminal.upgrade(), clip.upgrade())
+                else {
                     return;
                 };
                 let overflows = adj.upper() - adj.lower() > adj.page_size() + f64::EPSILON;
-                scrollbar.set_visible(overflows);
+                sync_live_scrollbar_visibility(&terminal, &scrollbar, &clip, overflows);
             };
             sync_visibility(&adj);
             adj.connect_changed(sync_visibility);
@@ -4612,7 +4655,24 @@ impl ActiveBlock {
         let cell_h = cell_h.max(1);
         let grid_rows = grid_rows.max(1);
         let visible_rows = visible_rows.clamp(1, grid_rows);
-        let width_px = self.live_clip.width();
+        let clip_width = self.live_clip.width();
+        let gutter = if self.active_vte.has_css_class("chat-live-terminal") {
+            let overflows = self
+                .active_vte
+                .vadjustment()
+                .is_some_and(|adj| adj.upper() - adj.lower() > adj.page_size() + f64::EPSILON);
+            // GTK's native natural width includes the current theme's CSS
+            // margins; no fixed pixel constant or font-dependent guess.
+            sync_live_scrollbar_visibility(
+                &self.active_vte,
+                &self.live_scrollbar,
+                &self.live_clip,
+                overflows,
+            )
+        } else {
+            0
+        };
+        let width_px = clip_width.saturating_sub(gutter).max(0);
         let insets = terminal_vertical_insets(&self.active_vte);
         let visible_px = live_rows_height_px(cell_h, visible_rows, insets);
         if width_px <= 0 {
@@ -4635,6 +4695,66 @@ impl ActiveBlock {
         self.vte_overlay.set_size_request(width_px, grid_px);
         self.live_spacer.set_height_request(visible_px);
         true
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_tiny_chat_allocations(&self) -> Vec<serde_json::Value> {
+        let original = (self.live_clip.width(), self.live_clip.height());
+        let rows = self.active_vte.row_count();
+        let cell = self.active_vte.char_height() as i32;
+        let visible_rows = (original.1 / cell).max(1) as i64;
+        let wide_columns = self.active_vte.column_count();
+        let minimum = self.active_vte.measure(Orientation::Horizontal, -1).0;
+        let mut reports = Vec::new();
+        // Drive GTK's actual child allocation directly: a normal toplevel may
+        // enforce a larger minimum, which would make a tiny-window test vacuous.
+        // Do not pump the parent frame clock while exercising these allocations.
+        for width in [1, 10, 17, original.0] {
+            self.live_clip.allocate(width, original.1, -1, None);
+            self.set_live_geometry(cell, rows, visible_rows);
+            self.live_clip.queue_allocate();
+            self.live_clip.allocate(width, original.1, -1, None);
+            assert_eq!(self.live_clip.width(), width);
+            let natural = self.live_scrollbar.measure(Orientation::Horizontal, -1).1;
+            let (requested, gutter) = chat_live_width_budget(width, minimum, natural);
+            assert_eq!(self.vte_overlay.width_request(), requested);
+            assert_eq!(self.live_geometry.get().0, requested);
+            let bounds = self.active_vte.compute_bounds(&self.live_clip).unwrap();
+            assert!(bounds.width() <= requested.max(minimum) as f32 + 1e-6);
+            assert!(self.active_vte.column_count() > 0);
+            if gutter == 0 {
+                assert_eq!(self.live_scrollbar.opacity(), 0.0);
+                assert!(!self.live_scrollbar.can_target());
+                assert!(!self.live_scrollbar.can_focus());
+                assert!(!self.live_scrollbar.grab_focus());
+                assert!(self.active_vte.column_count() < wide_columns);
+                assert_eq!(self.live_clip.overflow(), gtk4::Overflow::Hidden);
+            } else {
+                assert_eq!(width, original.0);
+                assert_eq!(self.active_vte.column_count(), wide_columns);
+            }
+            reports.push(serde_json::json!({
+                "clip_width": self.live_clip.width(), "request": requested,
+                "native_width": bounds.width(), "native_minimum": minimum,
+                "columns": self.active_vte.column_count(), "gutter": gutter,
+                "scope": "direct GTK child allocation; partial cells clipped at tiny widths"
+            }));
+        }
+        // Fresh non-Chat widgets retain the pre-existing overlay visibility
+        // policy. No Chat state or font assumptions enter this assertion.
+        let plain = Terminal::new();
+        let bar = gtk4::Scrollbar::new(Orientation::Vertical, None::<&gtk4::Adjustment>);
+        let clip = gtk4::Overlay::new();
+        for shown in [false, true, false] {
+            assert_eq!(
+                sync_live_scrollbar_visibility(&plain, &bar, &clip, shown),
+                0
+            );
+            assert_eq!(bar.is_visible(), shown);
+            assert_eq!(bar.opacity(), 1.0);
+            assert!(bar.can_target() && bar.can_focus());
+        }
+        reports
     }
 
     /// The measured live card. The frame-clock resize tick watches its width:
@@ -4832,6 +4952,25 @@ pub(crate) fn write_recalled_command(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chat_gutter_tiny_width_budget_is_bounded_and_converges() {
+        for (clip, minimum, gutter, expected) in [
+            (-1, 24, 17, (0, 0)),
+            (0, 24, 17, (0, 0)),
+            (1, 24, 17, (1, 0)),
+            (10, 24, 17, (10, 0)),
+            (17, 24, 17, (17, 0)),
+            (40, 24, 17, (40, 0)),
+            (41, 24, 17, (24, 17)),
+            (780, 24, 17, (763, 17)),
+            (i32::MAX, i32::MAX, 17, (i32::MAX, 0)),
+        ] {
+            assert_eq!(
+                super::chat_live_width_budget(clip, minimum, gutter),
+                expected
+            );
+        }
+    }
     use super::{
         block_clipboard_text, collapsed_output_summary, completed_block_retention_plan,
         estimated_completed_block_retained_bytes, exit_code_for_shared_surface,

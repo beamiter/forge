@@ -213,5 +213,91 @@ fn chat_native_unicode_render_geometry() {
         }
     }
     assert_eq!(stage, 18);
+    // Stable reservation must survive actual native scrollback transitions at
+    // each width, rather than merely hiding a scrollbar in a static screenshot.
+    let mut stability = Vec::new();
+    let mut wide_columns = None;
+    *view.typed_cmd.borrow_mut() = "F13".into();
+    for width in [800, 480, 800] {
+        window.set_default_size(width, 640);
+        settle();
+        let mut columns = None;
+        let mut measured_gutter = None;
+        for overflows in [false, true, false] {
+            native.reset(true, true);
+            if overflows {
+                native.feed("scrollback line\r\n".repeat(80).as_bytes());
+            } else {
+                native.feed(b"F13");
+            }
+            settle();
+            view.render_backend.sync_geometry_to_pty();
+            settle();
+            assert_eq!(window.width(), width);
+            let active = view.active.borrow();
+            let clip = active.live_clip();
+            let bar = &active.live_scrollbar;
+            let adjustment = native.vadjustment().unwrap();
+            assert_eq!(
+                adjustment.upper() - adjustment.lower() > adjustment.page_size() + f64::EPSILON,
+                overflows
+            );
+            assert!(bar.is_visible() && bar.is_mapped());
+            assert_eq!(bar.opacity(), if overflows { 1.0 } else { 0.0 });
+            assert_eq!(bar.can_target(), overflows);
+            assert_eq!(bar.can_focus(), overflows);
+            if !overflows {
+                assert!(!bar.grab_focus());
+            }
+            let gutter = bar.measure(gtk4::Orientation::Horizontal, -1).1;
+            assert!(gutter > 0);
+            assert_eq!(*measured_gutter.get_or_insert(gutter), gutter);
+            let bounds = native.compute_bounds(&clip).unwrap();
+            let bar_bounds = bar.compute_bounds(&clip).unwrap();
+            let origin = native
+                .compute_point(&clip, &gtk4::graphene::Point::new(0.0, 0.0))
+                .unwrap();
+            let right =
+                f64::from(origin.x()) + (native.column_count() * native.char_width()) as f64;
+            assert!(f64::from(origin.x()) >= -1e-6);
+            assert!(right <= f64::from(bar_bounds.x()) + 1e-6);
+            assert!(f64::from(bounds.x() + bounds.width()) <= f64::from(bar_bounds.x()) + 1e-6);
+            assert_eq!(bounds.width(), (clip.width() - gutter) as f32);
+            let grid = pty_grid_size(&native, &view.block_scroll);
+            assert_eq!(view.pty.test_slave_winsize(), grid);
+            assert_eq!(i64::from(grid.0), native.column_count());
+            assert_eq!(*columns.get_or_insert(grid.0), grid.0);
+            if width == 800 {
+                assert_eq!(*wide_columns.get_or_insert(grid.0), grid.0);
+            }
+            stability.push(serde_json::json!({
+                "window_width": width, "scrollback": overflows,
+                "columns": grid.0, "gutter": gutter, "clip_width": clip.width(),
+                "native_bounds": [bounds.x(), bounds.width()],
+                "grid_right": right, "scrollbar_left": bar_bounds.x(),
+                "scrollbar_opacity": bar.opacity(), "scrollbar_targetable": bar.can_target()
+            }));
+        }
+    }
+    std::fs::write(
+        out.join("gutter-stability.json"),
+        serde_json::to_vec_pretty(&stability).unwrap(),
+    )
+    .unwrap();
+    let before_tiny_columns = native.column_count();
+    let tiny = view.active.borrow().test_tiny_chat_allocations();
+    std::fs::write(
+        out.join("tiny-gutter.json"),
+        serde_json::to_vec_pretty(&tiny).unwrap(),
+    )
+    .unwrap();
+    view.render_backend.sync_geometry_to_pty();
+    settle();
+    assert_eq!(window.width(), 800);
+    assert_eq!(native.column_count(), before_tiny_columns);
+    assert_eq!(
+        view.pty.test_slave_winsize(),
+        pty_grid_size(&native, &view.block_scroll)
+    );
     window.close();
 }
