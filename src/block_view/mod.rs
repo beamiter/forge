@@ -14512,12 +14512,20 @@ impl TermView {
                 let Some(active_block) = active_for_layout.upgrade() else {
                     return;
                 };
+                // Resolve once so docking and the row budget agree throughout
+                // an already confirmed shell prompt's SIGWINCH redraw.
+                let chat_surface = chat_presentation
+                    .as_ref()
+                    .map(|chat| chat.presentation_surface(bstate.get(), integration.get()));
                 let holder = if let Some(chat) = &chat_presentation {
                     let Ok(live) = active_block.try_borrow() else {
                         return;
                     };
                     chat.set_compact(live.widget().has_css_class("block-compact"));
-                    chat.sync(&live, chat::surface(bstate.get(), integration.get()))
+                    chat.sync(
+                        &live,
+                        chat_surface.expect("Chat presentation has a surface"),
+                    )
                 } else {
                     holder
                 };
@@ -14551,13 +14559,13 @@ impl TermView {
                 // addressing (`top`, `watch`, a plain `clear`) still has every
                 // row it expects to draw into — and so does a shell drawing a
                 // completion menu at the prompt.
-                let chat_passthrough = chat_presentation.as_ref().is_some_and(|_| {
-                    matches!(
-                        chat::surface(state, integration.get()),
+                let chat_passthrough = matches!(
+                    chat_surface,
+                    Some(
                         jterm_core::chat_mode::ChatSurface::Passthrough
                             | jterm_core::chat_mode::ChatSurface::Fullscreen
                     )
-                });
+                );
                 let target_rows = if idle && !prompt_at_grid_top && !chat_passthrough {
                     compact_card_rows(input_rows, 1, viewport_rows)
                 } else {

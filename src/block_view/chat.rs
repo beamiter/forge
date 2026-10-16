@@ -22,6 +22,19 @@ pub(super) fn surface(state: BlockState, integrated: bool) -> ChatSurface {
     })
 }
 
+/// A shell redraws its confirmed prompt after SIGWINCH, emitting a fresh
+/// PromptStart/PromptEnd pair. Keep that existing presentation throughout the
+/// pair: undocking it would change the row budget, send another SIGWINCH, and
+/// restart the redraw. This does not grant input authority; `surface` remains
+/// the source for submission guards.
+fn presentation_surface(previous: ChatSurface, state: BlockState, integrated: bool) -> ChatSurface {
+    if previous == ChatSurface::Prompt && integrated && state == BlockState::CollectingPrompt {
+        ChatSurface::Prompt
+    } else {
+        surface(state, integrated)
+    }
+}
+
 /// The command and real foreground represented at an action's origin.
 #[derive(Clone, Copy)]
 pub(super) struct StopTarget {
@@ -449,6 +462,10 @@ impl ChatPresentation {
         }
     }
 
+    pub(super) fn presentation_surface(&self, state: BlockState, integrated: bool) -> ChatSurface {
+        presentation_surface(self.current.get(), state, integrated)
+    }
+
     /// Move the one live VTE without moving the stable history insertion anchor.
     /// Reparenting must neither copy terminal text nor feed/reset the terminal.
     pub(super) fn sync(&self, active: &ActiveBlock, surface: ChatSurface) -> gtk4::Box {
@@ -684,6 +701,48 @@ mod tests {
             None,
             "released, abandoned press has expired"
         );
+    }
+
+    #[test]
+    fn confirmed_prompt_redraw_keeps_presentation_but_not_submission_authority() {
+        let mut previous = ChatSurface::Prompt;
+        for _ in 0..8 {
+            previous = presentation_surface(previous, BlockState::CollectingPrompt, true);
+            assert_eq!(previous, ChatSurface::Prompt);
+            assert!(!surface(BlockState::CollectingPrompt, true).allows_submit_affordance());
+            previous = presentation_surface(previous, BlockState::AwaitingCommand, true);
+            assert_eq!(previous, ChatSurface::Prompt);
+        }
+    }
+
+    #[test]
+    fn prompt_presentation_hold_requires_an_uninterrupted_confirmed_prompt() {
+        assert_eq!(
+            presentation_surface(ChatSurface::Passthrough, BlockState::CollectingPrompt, true),
+            ChatSurface::Passthrough,
+            "the first prompt has not been confirmed"
+        );
+        for (state, integrated, expected) in [
+            (BlockState::CollectingOutput, true, ChatSurface::Running),
+            (BlockState::AltScreen, true, ChatSurface::Fullscreen),
+            (BlockState::RawFallback, true, ChatSurface::Passthrough),
+            (BlockState::PostCommand, true, ChatSurface::Passthrough),
+            (BlockState::Idle, true, ChatSurface::Passthrough),
+            (
+                BlockState::CollectingPrompt,
+                false,
+                ChatSurface::Passthrough,
+            ),
+            (BlockState::AwaitingCommand, false, ChatSurface::Passthrough),
+        ] {
+            let next = presentation_surface(ChatSurface::Prompt, state, integrated);
+            assert_eq!(next, expected);
+            assert_eq!(
+                presentation_surface(next, BlockState::CollectingPrompt, true),
+                ChatSurface::Passthrough,
+                "execution, fullscreen, fallback or lost integration must clear the hold"
+            );
+        }
     }
 
     #[test]
