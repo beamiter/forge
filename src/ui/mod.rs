@@ -35,6 +35,7 @@ mod pane_leaf;
 mod pane_node;
 mod pane_tree_edit;
 mod panes;
+pub(crate) mod path_drop;
 mod remote_fs;
 mod search;
 mod session;

@@ -17708,6 +17708,14 @@ impl TermView {
         });
     }
 
+    /// Snapshot the input/prompt evidence owned by an explicit file-drop intent.
+    pub(crate) fn path_drop_generation(&self) -> (u64, u64) {
+        (
+            self.accepted_input_generation.get(),
+            self.verified_submission.prompt_anchor_generation.get(),
+        )
+    }
+
     /// Paste `text` exactly as Ctrl+Shift+V pastes the clipboard: through the
     /// clipboard encoder, so it is framed as a bracketed paste when the
     /// foreground program enabled DECSET 2004, with the same typed-shadow and
@@ -21169,6 +21177,204 @@ mod tests {
         expected.extend_from_slice(b"\x1b[201~");
         assert_eq!(view.pty.drain_test_slave(PTY_REPLY_WAIT), expected);
         assert_eq!(view.selected_block_id.get(), None, "the selection ended");
+        window.close();
+    }
+
+    /// A deterministic stalled-stat substitute uses the production admission,
+    /// main-loop poller, destination proof, paste encoder and real kernel PTYs.
+    /// It does not mount FUSE/NFS or claim to interrupt a kernel stat.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn slow_file_drop_keeps_gtk_responsive_and_discards_stale_delivery() {
+        use crate::image_drop::PathValidation;
+        use crate::ui::path_drop::{DropDestination, DropIntent};
+        use gtk4::prelude::*;
+        use std::time::{Duration, Instant};
+        gtk4::init().expect("gtk init");
+        let make_view = || {
+            super::TermView::new_with_spawner(
+                &crate::config::Config::safe_defaults(),
+                &crate::config::TerminalMode::Block,
+                &["sh".into()],
+                None,
+                None,
+                &[],
+                |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+            )
+            .unwrap()
+        };
+        let a = Rc::new(make_view());
+        let b = Rc::new(make_view());
+        let c = Rc::new(make_view());
+        let leaf_a = crate::ui::PaneLeaf::Block(a.clone());
+        let leaf_b = crate::ui::PaneLeaf::Block(b.clone());
+        let leaf_c = crate::ui::PaneLeaf::Block(c.clone());
+        leaf_a.attach_to(&a.widget());
+        leaf_a.set_session_id("drop-a");
+        leaf_b.attach_to(&b.widget());
+        leaf_b.set_session_id("drop-b");
+        leaf_c.attach_to(&c.widget());
+        leaf_c.set_session_id("drop-c");
+        let split_page = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        split_page.append(&a.widget());
+        split_page.append(&c.widget());
+        let in_pane_find = gtk4::SearchEntry::new();
+        a.root.append(&in_pane_find);
+        let notebook = gtk4::Notebook::new();
+        notebook.append_page(&split_page, None::<&gtk4::Widget>);
+        notebook.append_page(&b.widget(), None::<&gtk4::Widget>);
+        let window = gtk4::Window::builder()
+            .default_width(700)
+            .default_height(400)
+            .child(&notebook)
+            .build();
+        window.present();
+        let pump = |duration: Duration| {
+            let main = gtk4::glib::MainContext::default();
+            let end = Instant::now() + duration;
+            while Instant::now() < end {
+                while main.pending() {
+                    main.iteration(false);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        notebook.set_current_page(Some(0));
+        leaf_a.grab_focus();
+        pump(Duration::from_millis(200));
+        for view in [&a, &b, &c] {
+            view.pty.write_test_slave(
+                b"\x1b]133;A\x07$ \x1b]133;B\x07codex\r\n\x1b]133;C\x07\x1b[?2004h> ",
+            );
+        }
+        pump(Duration::from_millis(200));
+        for view in [&a, &b, &c] {
+            view.pty.drain_test_slave(Duration::from_millis(10));
+        }
+        let intent = DropIntent::install(&leaf_a);
+        let epoch = Rc::new(Cell::new(0_u64));
+        let epoch_for_switch = epoch.clone();
+        notebook.connect_switch_page(move |_, _, _| {
+            epoch_for_switch.set(epoch_for_switch.get().wrapping_add(1))
+        });
+        let reports = Rc::new(RefCell::new(Vec::<String>::new()));
+        let start = |delay: Duration, timeout: Duration| {
+            let destination =
+                DropDestination::capture(&leaf_a, &notebook, epoch.clone(), &intent).unwrap();
+            let (entered, receiver) = std::sync::mpsc::channel();
+            let job =
+                PathValidation::start_for_test(vec!["/tmp/a b's".into()], timeout, move |_| {
+                    entered.send(()).unwrap();
+                    std::thread::sleep(delay);
+                    true
+                })
+                .unwrap();
+            let reports = reports.clone();
+            destination.wait(job, move |error| {
+                reports.borrow_mut().push(error.to_owned())
+            });
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        };
+        // Keep the real main context turning while existence is held for 2s.
+        let ticks = Rc::new(Cell::new(0));
+        let tick_count = ticks.clone();
+        let ticker = gtk4::glib::timeout_add_local(Duration::from_millis(10), move || {
+            tick_count.set(tick_count.get() + 1);
+            gtk4::glib::ControlFlow::Continue
+        });
+        start(Duration::from_secs(2), Duration::from_secs(3));
+        let responsive = Instant::now();
+        a.write_input(b"typed-a").unwrap();
+        assert_eq!(
+            a.pty.drain_test_slave(Duration::from_millis(100)),
+            b"typed-a"
+        );
+        notebook.set_current_page(Some(1));
+        leaf_b.grab_focus();
+        pump(Duration::from_millis(100));
+        assert_eq!(notebook.current_page(), Some(1));
+        b.write_input(b"typed-b").unwrap();
+        assert_eq!(
+            b.pty.drain_test_slave(Duration::from_millis(100)),
+            b"typed-b"
+        );
+        assert!(
+            responsive.elapsed() < Duration::from_secs(1),
+            "GTK/input did not wait for the 2s check"
+        );
+        // A -> B -> A still invalidates the original intent, even with the same
+        // target/session/process restored before the worker replies.
+        notebook.set_current_page(Some(0));
+        leaf_a.grab_focus();
+        pump(Duration::from_millis(2100));
+        assert!(ticks.get() > 20);
+        assert!(a.pty.drain_test_slave(Duration::from_millis(20)).is_empty());
+        assert!(b.pty.drain_test_slave(Duration::from_millis(20)).is_empty());
+        // A current destination receives exactly the existing bracketed paste,
+        // with a trailing space and no Enter.
+        leaf_c.grab_focus();
+        pump(Duration::from_millis(30));
+        assert!(leaf_c.owns_widget(&window.upcast_ref::<gtk4::Root>().focus().unwrap()));
+        // The explicit drop focuses a previously unfocused split leaf now;
+        // the asynchronous completion must not mistake this for later intent.
+        start(Duration::from_millis(60), Duration::from_secs(1));
+        pump(Duration::from_millis(150));
+        let payload = format!("{} ", jterm_core::process::shell_single_quote("/tmp/a b's"));
+        let expected = format!("\x1b[200~{payload}\x1b[201~").into_bytes();
+        assert_eq!(a.pty.drain_test_slave(Duration::from_millis(100)), expected);
+        // A mouse-only focus change within the same pane is new intent too:
+        // the root remains focused, but the delayed paste must not steal focus
+        // from a search entry (or a finished-block VTE) back to live input.
+        start(Duration::from_millis(100), Duration::from_secs(1));
+        assert!(in_pane_find.grab_focus());
+        let search_focus = window.upcast_ref::<gtk4::Root>().focus();
+        pump(Duration::from_millis(150));
+        assert_eq!(window.upcast_ref::<gtk4::Root>().focus(), search_focus);
+        assert!(a.pty.drain_test_slave(Duration::from_millis(20)).is_empty());
+        // Leaving and returning to the exact live VTE is still a new intent.
+        start(Duration::from_millis(100), Duration::from_secs(1));
+        assert!(in_pane_find.grab_focus());
+        leaf_a.grab_focus();
+        pump(Duration::from_millis(150));
+        assert_eq!(
+            window.upcast_ref::<gtk4::Root>().focus().as_ref(),
+            Some(leaf_a.terminal().upcast_ref::<gtk4::Widget>())
+        );
+        assert!(a.pty.drain_test_slave(Duration::from_millis(20)).is_empty());
+        // Typing on the same pane invalidates its captured input generation,
+        // even without a tab or focus change.
+        start(Duration::from_millis(100), Duration::from_secs(1));
+        a.write_input(b"new-input").unwrap();
+        pump(Duration::from_millis(150));
+        assert_eq!(
+            a.pty.drain_test_slave(Duration::from_millis(100)),
+            b"new-input"
+        );
+        // Explicit cancellation and expiry cannot deliver late success.
+        start(Duration::from_millis(100), Duration::from_secs(1));
+        intent.invalidate();
+        pump(Duration::from_millis(150));
+        assert!(a.pty.drain_test_slave(Duration::from_millis(20)).is_empty());
+        start(Duration::from_millis(100), Duration::from_millis(30));
+        pump(Duration::from_millis(150));
+        assert!(reports
+            .borrow()
+            .iter()
+            .any(|text| text.contains("timed out")));
+        assert!(a.pty.drain_test_slave(Duration::from_millis(20)).is_empty());
+        // Closing/detaching the pane, then reusing its session string elsewhere,
+        // must not retarget a late result or retain the removed pane owner.
+        start(Duration::from_millis(100), Duration::from_secs(1));
+        notebook.remove_page(Some(0));
+        crate::ui::PaneLeaf::detach_from(&a.widget());
+        leaf_b.set_session_id("drop-a");
+        leaf_b.grab_focus();
+        pump(Duration::from_millis(150));
+        assert!(a.pty.drain_test_slave(Duration::from_millis(20)).is_empty());
+        assert!(b.pty.drain_test_slave(Duration::from_millis(20)).is_empty());
+        ticker.remove();
+        crate::ui::PaneLeaf::detach_from(&b.widget());
+        crate::ui::PaneLeaf::detach_from(&c.widget());
         window.close();
     }
 

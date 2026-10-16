@@ -160,6 +160,7 @@ tests=(
     block_view::tests::header_button_presses_do_not_select_and_a_hidden_readout_measures
     block_view::tests::a_real_cards_header_buttons_do_not_select_it
     block_view::tests::a_dropped_path_reaches_the_program_as_a_bracketed_paste
+    block_view::tests::slow_file_drop_keeps_gtk_responsive_and_discards_stale_delivery
     block_view::tests::an_alt_screen_round_trip_keeps_a_real_running_cards_height
     block_view::tests::a_truncated_output_shows_its_notice_on_a_real_card
     terminal::tests::a_failed_vte_spawn_retires_task_sessions_without_an_exit_code

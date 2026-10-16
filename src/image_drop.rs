@@ -8,7 +8,124 @@
 //! (bracketed when the program asked for it), as GNOME Terminal and kitty do.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    mpsc, Arc,
+};
+use std::time::{Duration, Instant};
+
+const VALIDATION_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_VALIDATORS: usize = 2;
+static VALIDATORS: AtomicUsize = AtomicUsize::new(0);
+
+/// Admission belongs to the worker, not the UI request. A timed-out stat can
+/// remain blocked in the kernel; it must still occupy its slot until it exits.
+struct Permit;
+impl Drop for Permit {
+    fn drop(&mut self) {
+        VALIDATORS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) struct PathValidation {
+    receiver: mpsc::Receiver<Result<String, DropError>>,
+    cancelled: Arc<AtomicBool>,
+    deadline: Instant,
+}
+
+impl Drop for PathValidation {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+impl PathValidation {
+    pub(crate) fn start(paths: Vec<PathBuf>) -> Result<Self, DropError> {
+        Self::start_with(paths, VALIDATION_TIMEOUT, Path::exists)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_for_test(
+        paths: Vec<PathBuf>,
+        timeout: Duration,
+        exists: impl Fn(&Path) -> bool + Send + 'static,
+    ) -> Result<Self, DropError> {
+        Self::start_with(paths, timeout, exists)
+    }
+
+    fn start_with(
+        paths: Vec<PathBuf>,
+        timeout: Duration,
+        exists: impl Fn(&Path) -> bool + Send + 'static,
+    ) -> Result<Self, DropError> {
+        // Reject malformed/oversized drops before admission or filesystem I/O.
+        let payload = quoted_paths_payload(&paths)?;
+        let mut count = VALIDATORS.load(Ordering::Acquire);
+        loop {
+            if count >= MAX_VALIDATORS {
+                return Err(DropError(
+                    "file checks are busy; try again after the mount responds",
+                ));
+            }
+            match VALIDATORS.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => count = current,
+            }
+        }
+        let permit = Permit;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let deadline = Instant::now() + timeout;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("forge-path-drop".into())
+            .spawn(move || {
+                let _permit = permit;
+                for path in paths {
+                    if worker_cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+                        return;
+                    }
+                    if !exists(&path) {
+                        let _ = sender.send(Err(DropError(
+                            "only existing local files and folders can be dropped",
+                        )));
+                        return;
+                    }
+                }
+                if !worker_cancelled.load(Ordering::Acquire) && Instant::now() < deadline {
+                    let _ = sender.send(Ok(payload));
+                }
+            })
+            .map_err(|_| DropError("could not start the file check"))?;
+        Ok(Self {
+            receiver,
+            cancelled,
+            deadline,
+        })
+    }
+
+    /// Never waits, joins, or touches the filesystem. Expiry wins over a queued
+    /// success so the UI cannot revive a request after its acceptance window.
+    pub(crate) fn poll(&self) -> Option<Result<String, DropError>> {
+        if Instant::now() >= self.deadline {
+            self.cancelled.store(true, Ordering::Release);
+            return Some(Err(DropError("file check timed out; nothing was pasted")));
+        }
+        match self.receiver.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Some(Err(DropError("file check stopped; nothing was pasted")))
+            }
+        }
+    }
+}
 
 const MAX_DROPPED_PATHS: usize = 16;
 const MAX_DROP_PAYLOAD_BYTES: usize = 256 * 1024;
@@ -22,7 +139,7 @@ impl fmt::Display for DropError {
     }
 }
 
-pub(crate) fn dropped_paths_payload(paths: &[PathBuf]) -> Result<String, DropError> {
+fn quoted_paths_payload(paths: &[PathBuf]) -> Result<String, DropError> {
     if paths.is_empty() {
         return Err(DropError("the drop contained no local files"));
     }
@@ -33,14 +150,12 @@ pub(crate) fn dropped_paths_payload(paths: &[PathBuf]) -> Result<String, DropErr
     let mut quoted = Vec::with_capacity(paths.len());
     let mut bytes = 0usize;
     for path in paths {
-        if !path.exists() {
-            return Err(DropError(
-                "only existing local files and folders can be dropped",
-            ));
-        }
         let text = path
             .to_str()
             .ok_or(DropError("the dropped path is not valid UTF-8"))?;
+        if text.len() > MAX_DROP_PAYLOAD_BYTES {
+            return Err(DropError("the dropped paths are too long"));
+        }
         if text.chars().any(char::is_control)
             || jterm_core::review_input::contains_visual_spoofing(text)
         {
@@ -70,6 +185,19 @@ pub(crate) fn dropped_paths_payload(paths: &[PathBuf]) -> Result<String, DropErr
     // Match desktop terminal drag behavior: leave the caret ready for more
     // prompt text without ever adding Enter.
     payload.push(' ');
+    Ok(payload)
+}
+
+// Synchronous compatibility helper only for existing test fixtures. Production
+// callbacks must use PathValidation; existence is not an authorization check.
+#[cfg(test)]
+pub(crate) fn dropped_paths_payload(paths: &[PathBuf]) -> Result<String, DropError> {
+    let payload = quoted_paths_payload(paths)?;
+    if paths.iter().any(|path| !path.exists()) {
+        return Err(DropError(
+            "only existing local files and folders can be dropped",
+        ));
+    }
     Ok(payload)
 }
 
@@ -150,5 +278,123 @@ mod tests {
             dropped_paths_payload(&[]).unwrap_err(),
             DropError("the drop contained no local files")
         );
+    }
+    #[test]
+    fn lexical_limits_and_async_deadline_admission_cancel_are_bounded() {
+        use std::sync::atomic::AtomicUsize;
+        assert!(quoted_paths_payload(&vec![PathBuf::from("/a"); 17]).is_err());
+        assert!(
+            quoted_paths_payload(&[PathBuf::from("a".repeat(MAX_DROP_PAYLOAD_BYTES))]).is_err()
+        );
+        assert!(
+            quoted_paths_payload(&[PathBuf::from("a".repeat(MAX_DROP_PAYLOAD_BYTES - 1))]).is_ok()
+        );
+        assert!(
+            quoted_paths_payload(&[PathBuf::from("'".repeat(MAX_DROP_PAYLOAD_BYTES / 2))]).is_err()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            assert!(
+                quoted_paths_payload(&[PathBuf::from(std::ffi::OsString::from_vec(vec![255]))])
+                    .is_err()
+            );
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (release_a, gate_a) = mpsc::channel();
+        let (release_b, gate_b) = mpsc::channel();
+        let (entered, enter_rx) = mpsc::channel();
+        let (entered_b, enter_b_rx) = mpsc::channel();
+        let a_calls = calls.clone();
+        let a = PathValidation::start_with(
+            vec!["/a".into(), "/b".into()],
+            Duration::from_millis(500),
+            move |_| {
+                a_calls.fetch_add(1, Ordering::SeqCst);
+                entered.send(()).unwrap();
+                gate_a.recv().unwrap();
+                true
+            },
+        )
+        .unwrap();
+        let b = PathValidation::start_with(vec!["/a".into()], Duration::from_secs(5), move |_| {
+            entered_b.send(()).unwrap();
+            gate_b.recv().unwrap();
+            true
+        })
+        .unwrap();
+        enter_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        enter_b_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let started = Instant::now();
+        assert!(a.poll().is_none());
+        assert!(started.elapsed() < Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(530));
+        assert_eq!(
+            a.poll().unwrap().unwrap_err(),
+            DropError("file check timed out; nothing was pasted")
+        );
+        drop(a);
+        drop(b);
+        assert!(
+            PathValidation::start_with(vec!["/a".into()], Duration::from_secs(1), |_| true)
+                .is_err(),
+            "cancelled blocked calls retain admission"
+        );
+        release_a.send(()).unwrap();
+        release_b.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while VALIDATORS.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(VALIDATORS.load(Ordering::Acquire), 0);
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            1,
+            "cancel prevents next path check"
+        );
+        let valid =
+            PathValidation::start_with(vec!["/a b's".into()], Duration::from_secs(2), |_| true)
+                .unwrap();
+        let result = loop {
+            if let Some(result) = valid.poll() {
+                break result;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(
+            result.unwrap(),
+            format!("{} ", jterm_core::process::shell_single_quote("/a b's"))
+        );
+        // Receipt may precede the worker's final destructor by a few
+        // instructions. Avoid making this sequential test race admission.
+        let wait_idle = || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while VALIDATORS.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(VALIDATORS.load(Ordering::Acquire), 0);
+        };
+        wait_idle();
+        let real_path = temporary_file("async check.txt");
+        let real = PathValidation::start(vec![real_path.clone()]).unwrap();
+        loop {
+            if let Some(result) = real.poll() {
+                assert!(result.is_ok());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::fs::remove_file(real_path).unwrap();
+        wait_idle();
+        let missing =
+            PathValidation::start_with(vec!["/gone".into()], Duration::from_secs(2), |_| false)
+                .unwrap();
+        loop {
+            if let Some(result) = missing.poll() {
+                assert!(result.is_err());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }

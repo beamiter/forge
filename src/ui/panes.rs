@@ -450,35 +450,45 @@ impl UiState {
         );
         let ui = self.clone();
         let target_root = leaf.root_widget().downgrade();
+        let drop_intent = super::path_drop::DropIntent::install(leaf);
         path_target.connect_drop(move |_, value, _x, _y| {
             let Ok(files) = value.get::<gtk4::gdk::FileList>() else {
                 return false;
             };
+            // Every new file drop supersedes the previous intent, even when
+            // the new payload has no usable local paths or fails admission.
+            drop_intent.invalidate();
             let paths = files
                 .files()
                 .into_iter()
                 .filter_map(|file| file.path())
+                .take(17)
                 .collect::<Vec<_>>();
             if paths.is_empty() {
                 return false;
             }
-            let result = crate::image_drop::dropped_paths_payload(&paths)
-                .map_err(|error| error.to_string())
-                .and_then(|payload| {
-                    target_root
-                        .upgrade()
-                        .and_then(|root| PaneLeaf::from_widget(&root))
-                        .ok_or_else(|| "the target terminal is no longer available".to_string())
-                        .map(|leaf| (leaf, payload))
+            let result = target_root
+                .upgrade()
+                .and_then(|root| PaneLeaf::from_widget(&root))
+                .and_then(|leaf| {
+                    super::path_drop::DropDestination::capture(
+                        &leaf,
+                        &ui.notebook,
+                        ui.tab_focus_generation.clone(),
+                        &drop_intent,
+                    )
                 })
-                .and_then(|(leaf, payload)| {
-                    leaf.grab_focus();
-                    // A Block pane pastes it (bracketed when the program asked
-                    // for 2004); a plain VTE pane keeps its review-input path.
-                    match leaf.block_view() {
-                        Some(view) => view.paste_text(&payload),
-                        None => leaf.write_review_input(&payload),
-                    }
+                .ok_or_else(|| "the target terminal is no longer available".to_string())
+                .and_then(|destination| {
+                    let validation = crate::image_drop::PathValidation::start(paths)
+                        .map_err(|error| error.to_string())?;
+                    let overlay = ui.toast_overlay.downgrade();
+                    destination.wait(validation, move |error| {
+                        if let Some(overlay) = overlay.upgrade() {
+                            overlay.add_toast(adw::Toast::new(&format!("Drop rejected: {error}")));
+                        }
+                    });
+                    Ok(())
                 });
             if let Err(error) = result {
                 ui.toast_overlay
