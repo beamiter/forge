@@ -1686,6 +1686,7 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
     assert!(weak.upgrade().is_none());
     root.remove(&row);
     assert!(terminal.pty().is_none());
+    lifecycle_tests::exercise(window, &main);
 }
 
 #[cfg(test)]
@@ -2139,6 +2140,9 @@ fn exercise_expanded_fixture(
     runtime.last_input.set(None);
     runtime.refresh();
 }
+
+#[cfg(test)]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
