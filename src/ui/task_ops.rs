@@ -23,9 +23,8 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 
 use crate::agent_task::{
-    AgentProvider, AgentSessionOutcome, ApprovalDecision, CodexAppServerPhase, NativePromptPolicy,
-    NewTask, TaskId, TaskManager, TaskRuntimeKind, TaskStatus, TaskTerminalRole,
-    TaskValidationStatus,
+    AgentProvider, ApprovalDecision, CodexAppServerPhase, NativePromptPolicy, NewTask, TaskId,
+    TaskManager, TaskRuntimeKind, TaskStatus, TaskTerminalRole, TaskValidationStatus,
 };
 use crate::agent_task_ui::{
     self, order_task_rows, row_status_line, TaskPanelAction, TaskRowSnapshot,
@@ -212,31 +211,17 @@ impl UiState {
             };
             if let Some(issue) = report.issues.last() {
                 self.task_toast(format!("Native Agent issue: {}", issue.detail));
-            } else if let Some(completion) = report.completions.last() {
-                let message = if report.completions.len() > 1 {
-                    format!(
-                        "{} native Codex sessions stopped; open Tasks for individual results",
-                        report.completions.len()
-                    )
-                } else {
-                    match completion.outcome {
-                        AgentSessionOutcome::Clean => {
-                            "Native Codex stopped cleanly; review its diff, then run validation"
-                                .to_string()
-                        }
-                        AgentSessionOutcome::Cancelled => {
-                            "Native Codex was cancelled and fully stopped".to_string()
-                        }
-                        AgentSessionOutcome::Failed => format!(
-                            "Native Codex failed: {}",
-                            completion
-                                .detail
-                                .as_deref()
-                                .unwrap_or("provider session did not complete")
-                        ),
-                    }
-                };
-                self.task_toast(message);
+            } else {
+                let message = agent_task_ui::task_completion_feedback(
+                    &self.agent_tasks.borrow().task_manager,
+                    report
+                        .completions
+                        .iter()
+                        .map(|completion| (completion.task_id, completion.outcome)),
+                );
+                if let Some(message) = message {
+                    agent_task_ui::show_task_feedback(&self.toast_overlay, &message);
+                }
             }
             keep_fast |=
                 report.made_progress() || self.agent_tasks.borrow().agent_runtime.needs_fast_poll();
@@ -915,26 +900,18 @@ impl UiState {
                 .and_then(|task_id| {
                     (role == TaskTerminalRole::Validation)
                         .then(|| {
-                            domain.task_manager.get(task_id).map(|task| {
-                                (
-                                    task.validation.status,
-                                    task.validation.status_detail.clone(),
-                                )
-                            })
+                            agent_task_ui::task_validation_feedback(
+                                &domain.task_manager,
+                                task_id,
+                                &session_id,
+                            )
                         })
                         .flatten()
                 });
             (outcome, domain.panel_visible)
         };
-        if let Some((status, detail)) = outcome {
-            let message = match status {
-                TaskValidationStatus::Passed => "Validation passed".to_string(),
-                TaskValidationStatus::Failed => {
-                    format!("Validation failed (exit {exit_code})")
-                }
-                _ => detail.unwrap_or_else(|| "Validation ended".to_string()),
-            };
-            self.task_toast(message);
+        if let Some(message) = outcome {
+            agent_task_ui::show_task_feedback(&self.toast_overlay, &message);
         }
         if panel_visible {
             self.sync_tasks_panel();

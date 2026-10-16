@@ -52,6 +52,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    agent_task_ui::feedback_tests::task_feedback_keeps_input_draft_and_focus
     block_view::ime_gate::tests::preedit_lifecycle_tracks_each_live_context_without_text
     block_view::blocks::command_reuse_labels_tests::recall_header_describes_insert_only_action
     block_view::shortcut_hints::tests::menu_hints_follow_current_mapping_without_dispatch
