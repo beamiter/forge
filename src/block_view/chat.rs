@@ -269,6 +269,7 @@ pub(super) struct ChatPresentation {
     dock: glib::WeakRef<gtk4::Box>,
     composer: glib::WeakRef<gtk4::Box>,
     composer_viewport: glib::WeakRef<gtk4::ScrolledWindow>,
+    resize_observer: glib::WeakRef<gtk4::DrawingArea>,
     controls: glib::WeakRef<gtk4::Box>,
     status: glib::WeakRef<gtk4::Label>,
     submit: glib::WeakRef<gtk4::Button>,
@@ -348,7 +349,21 @@ impl ChatPresentation {
         controls.append(&submit);
         dock.append(&controls);
         canvas.append(&dock);
-        root.append(&canvas);
+        // Observe the stable Chat canvas, not only history adjustments: the
+        // independently docked live editor can be allocated after history has
+        // already settled. This overlay has no size or input contribution.
+        let frame = gtk4::Overlay::new();
+        frame.set_child(Some(&canvas));
+        frame.set_hexpand(true);
+        frame.set_vexpand(true);
+        let observer = gtk4::DrawingArea::new();
+        observer.set_halign(gtk4::Align::Fill);
+        observer.set_valign(gtk4::Align::Fill);
+        observer.set_can_target(false);
+        observer.set_focusable(false);
+        frame.add_overlay(&observer);
+        frame.set_measure_overlay(&observer, false);
+        root.append(&frame);
         dock.set_visible(false);
         let running_command = gtk4::Label::new(None);
         running_command.add_css_class("chat-command");
@@ -367,6 +382,7 @@ impl ChatPresentation {
             dock: dock.downgrade(),
             composer: composer.downgrade(),
             composer_viewport: composer_viewport.downgrade(),
+            resize_observer: observer.downgrade(),
             controls: controls.downgrade(),
             status: status.downgrade(),
             submit: submit.downgrade(),
@@ -375,6 +391,14 @@ impl ChatPresentation {
             reparenting: Cell::new(false),
             command_generation: Cell::new(0),
             displayed_stop_target: Cell::new(None),
+        }
+    }
+
+    /// Re-arm the existing bounded settle; never install a permanent tick or
+    /// retain the canvas through its own resize callback.
+    pub(super) fn connect_resize(&self, arm: Rc<dyn Fn()>) {
+        if let Some(observer) = self.resize_observer.upgrade() {
+            observer.connect_resize(move |_, _, _| arm());
         }
     }
 

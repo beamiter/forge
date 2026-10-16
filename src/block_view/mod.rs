@@ -16612,7 +16612,7 @@ impl TermView {
         }
 
         // ── Resize handler: sync PTY cols/rows when widget allocation changes ──
-        term_view.install_resize_tick();
+        term_view.install_resize_tick(chat_presentation.as_deref());
 
         Ok(term_view)
     }
@@ -16629,7 +16629,7 @@ impl TermView {
     /// pixels nor the grid moved. Every poll reads absolute geometry, so a
     /// change that lands while the tick is dormant is picked up whole by the
     /// next armed poll — nothing accumulates.
-    fn install_resize_tick(&self) {
+    fn install_resize_tick(&self, chat: Option<&chat::ChatPresentation>) {
         let pty_for_resize = self.pty.clone();
         let winsize_for_resize = Rc::downgrade(&self.pty_winsize);
         let scroll_for_resize = self.block_scroll.downgrade();
@@ -16730,6 +16730,14 @@ impl TermView {
         {
             let arm = arm.clone();
             self.block_scroll.connect_map(move |_| arm());
+        }
+        if let Some(chat) = chat {
+            chat.connect_resize(arm.clone());
+            // Docking or pane reparenting can remap the live clip without a
+            // history page-size change. Observe its new allocation through the
+            // same weakly owned, self-terminating settle callback.
+            let arm = arm.clone();
+            self.active.borrow().live_clip().connect_map(move |_| arm());
         }
         // And from every synchronous publish (`sync_active_to_pty`): the grid
         // it read may still be waiting for an allocation — the alt-screen
