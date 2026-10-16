@@ -975,17 +975,18 @@ pub(crate) fn highlight_command_to_ansi(cmd: &str) -> String {
 
 /// Filter raw output (ANSI preserved) to the lines matching `query`, honoring
 /// regex / case / invert and `context` lines of surroundings (Warp's
-/// BlockFilterQuery). Empty query, or an invalid regex, returns `full` verbatim.
-fn filter_output_lines(
-    full: &str,
+/// BlockFilterQuery). An empty query or byte-identical result borrows `full`;
+/// invalid regexes remain errors so the UI can report them.
+fn filter_output_lines<'a>(
+    full: &'a str,
     query: &str,
     use_regex: bool,
     case_sensitive: bool,
     invert: bool,
     context: usize,
-) -> Result<String, regex::Error> {
+) -> Result<std::borrow::Cow<'a, str>, regex::Error> {
     if query.is_empty() {
-        return Ok(full.to_string());
+        return Ok(std::borrow::Cow::Borrowed(full));
     }
     let re = if use_regex {
         Some(
@@ -1031,7 +1032,19 @@ fn filter_output_lines(
             }
         }
     }
-    let mut out = String::new();
+    // Joining lines normalizes CRLF and removes a final LF. Borrow only
+    // when every line is retained and those transformations are inert.
+    if keep.iter().all(|kept| *kept) && !full.ends_with('\n') && !full.contains("\r\n") {
+        return Ok(std::borrow::Cow::Borrowed(full));
+    }
+    let (kept_lines, kept_bytes) = lines
+        .iter()
+        .zip(&keep)
+        .filter(|(_, kept)| **kept)
+        .fold((0usize, 0usize), |(count, bytes), (line, _)| {
+            (count + 1, bytes + line.len())
+        });
+    let mut out = String::with_capacity(kept_bytes + kept_lines.saturating_sub(1));
     let mut wrote_line = false;
     for (line, keep) in lines.iter().zip(keep.iter()) {
         if !*keep {
@@ -1043,7 +1056,7 @@ fn filter_output_lines(
         out.push_str(line);
         wrote_line = true;
     }
-    Ok(out)
+    Ok(std::borrow::Cow::Owned(out))
 }
 
 /// Resolve the text currently shown by a finished output surface. The common
@@ -1056,8 +1069,11 @@ pub(crate) fn resolved_finished_output<'a>(
     display_override.as_deref().unwrap_or(full)
 }
 
-fn filtered_output_override(full: &str, shown: String) -> Option<String> {
-    (shown != full).then_some(shown)
+fn filtered_output_override(full: &str, shown: std::borrow::Cow<'_, str>) -> Option<String> {
+    match shown {
+        std::borrow::Cow::Borrowed(_) => None,
+        std::borrow::Cow::Owned(shown) => (shown != full).then_some(shown),
+    }
 }
 
 fn output_row_count(text: &str) -> i64 {
@@ -6345,6 +6361,112 @@ mod tests {
     }
 
     #[test]
+    fn output_filter_borrows_only_byte_identical_results() {
+        use std::borrow::Cow;
+        for full in ["", "keep", "keep\nkeep", "\x1b[31mkeep\x1b[0m", "keep\r"] {
+            let shown = filter_output_lines(full, "keep", false, true, false, 0).unwrap();
+            assert!(matches!(shown, Cow::Borrowed(_)), "{full:?}");
+            assert_eq!(shown, full);
+            assert!(super::filtered_output_override(full, shown).is_none());
+        }
+        let full = "\r\nkeep\n";
+        assert!(matches!(
+            filter_output_lines(full, "", true, false, true, 10).unwrap(),
+            Cow::Borrowed(_)
+        ));
+        for (full, expected) in [
+            ("keep\n", "keep"),
+            ("keep\r\nkeep", "keep\nkeep"),
+            ("\nkeep\n", "\nkeep"),
+            ("\r\nkeep\r\n", "\nkeep"),
+        ] {
+            let shown = filter_output_lines(full, "keep", false, true, false, 1).unwrap();
+            assert!(matches!(shown, Cow::Owned(_)), "{full:?}");
+            assert_eq!(shown, expected);
+            assert_eq!(
+                super::filtered_output_override(full, shown).as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn output_filter_borrowing_preserves_selection_and_raw_ansi() {
+        for (full, query, regex, case, invert, context, expected) in [
+            (
+                "skip\n\n\nmatch\nafter",
+                "match",
+                false,
+                true,
+                false,
+                2,
+                "\n\nmatch\nafter",
+            ),
+            ("\n\nx", "^$", true, true, false, 0, "\n"),
+            ("\n\nx", "absent", false, true, true, 0, "\n\nx"),
+            (
+                "keep\nER\x1b[31mROR\x1b[0m",
+                "ERROR",
+                false,
+                true,
+                false,
+                0,
+                "",
+            ),
+            (
+                "keep\n\x1b[31mred\x1b[0m",
+                "31m",
+                false,
+                true,
+                false,
+                0,
+                "\x1b[31mred\x1b[0m",
+            ),
+            (
+                "skip\nİΣ你好🙂\nlast",
+                "İσ",
+                false,
+                false,
+                false,
+                0,
+                "İΣ你好🙂",
+            ),
+            (
+                "skip\nERROR\nlast",
+                "^error$",
+                true,
+                false,
+                false,
+                0,
+                "ERROR",
+            ),
+        ] {
+            assert_eq!(
+                filter_output_lines(full, query, regex, case, invert, context).unwrap(),
+                expected
+            );
+        }
+        assert!(filter_output_lines("keep", "[", true, false, false, 0).is_err());
+    }
+
+    #[test]
+    fn output_filter_large_identical_selection_borrows_without_truncation() {
+        use std::borrow::Cow;
+        let full = std::iter::repeat_n("\x1b[31mkeep 你好🙂\x1b[0m", 100_000)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for regex in [false, true] {
+            for context in [0, 2] {
+                let shown =
+                    filter_output_lines(&full, "keep", regex, true, false, context).unwrap();
+                assert!(matches!(shown, Cow::Borrowed(_)));
+                assert_eq!(shown, full);
+                assert_eq!(shown.lines().count(), 100_000);
+            }
+        }
+    }
+
+    #[test]
     fn filter_output_lines_matches_ascii_case_insensitive() {
         assert_eq!(
             filter_output_lines("alpha\nERROR: nope\nomega", "error", false, false, false, 0)
@@ -6382,7 +6504,7 @@ mod tests {
             "\x1b[31mERROR: nope\x1b[0m"
         );
 
-        display_override = super::filtered_output_override(full, full.to_string());
+        display_override = super::filtered_output_override(full, full.to_string().into());
         assert!(display_override.is_none());
         assert_eq!(
             super::resolved_finished_output(full, &display_override),
