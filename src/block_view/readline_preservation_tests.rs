@@ -275,14 +275,22 @@ fn search_and_native_split_preserve_readline_draft_cursor_and_undo() {
         paned.set_position(width / 2);
         holder.append(&paned);
         sibling.0.grab_focus();
-        wait(
-            || {
-                sibling.0.bstate.get() == BlockState::AwaitingCommand
-                    && original.0.root.width() < width
-                    && pty_columns(&original.0) < original_columns
-            },
-            "split must resize the original live pane",
-        );
+        let resize_deadline = Instant::now() + Duration::from_secs(5);
+        while !(sibling.0.bstate.get() == BlockState::AwaitingCommand
+            && original.0.root.width() < width
+            && pty_columns(&original.0) < original_columns)
+        {
+            assert!(
+                Instant::now() < resize_deadline,
+                "split must resize the original live pane: mode={mode:?} original_state={:?} sibling_state={:?} old_width={width} current_width={} window_width={} split_position={} old_columns={original_columns} pty_columns={} vte_columns={} original_mapped={} sibling_mapped={}",
+                original.0.bstate.get(), sibling.0.bstate.get(),
+                original.0.root.width(), window.width(), paned.position(),
+                pty_columns(&original.0), original.0.active_vte.column_count(),
+                original.0.root.is_mapped(), sibling.0.root.is_mapped(),
+            );
+            pump();
+        }
+        settle();
         assert!(owns_focus(&window, &sibling.0.active_vte));
         assert_eq!(snapshot(&sibling.0, &scratch.0), (0, String::new()));
         send(&sibling.0, b"printf SIBLING");
