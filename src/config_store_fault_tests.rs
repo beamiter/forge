@@ -8,7 +8,7 @@ use std::process::{Child, Command, Stdio};
 type Observer = Box<dyn Fn(&str, &Path)>;
 thread_local! {
     static OBSERVER: RefCell<Option<Observer>> = RefCell::new(None);
-    static IO_FAILURE: RefCell<Option<(String, PathBuf)>> = RefCell::new(None);
+    static IO_FAILURE: RefCell<Option<(String, PathBuf)>> = const { RefCell::new(None) };
 }
 pub(super) fn io_fault(operation: &str, target: &Path) -> io::Result<()> {
     IO_FAILURE.with(|fault| {
