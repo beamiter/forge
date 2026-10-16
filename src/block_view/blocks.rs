@@ -997,13 +997,7 @@ fn filter_output_lines<'a>(
     } else {
         None
     };
-    let ascii_query = (!case_sensitive && query.is_ascii()).then(|| {
-        query
-            .as_bytes()
-            .iter()
-            .map(|b| b.to_ascii_lowercase())
-            .collect::<Vec<_>>()
-    });
+    let ascii_query = (!case_sensitive && query.is_ascii()).then(|| query.to_ascii_lowercase());
     let lc_query = if case_sensitive || ascii_query.is_some() {
         String::new()
     } else {
@@ -1016,7 +1010,11 @@ fn filter_output_lines<'a>(
         } else if case_sensitive {
             line.contains(query)
         } else if let Some(ref q) = ascii_query {
-            contains_case_insensitive(line.as_bytes(), q)
+            if line.is_ascii() {
+                contains_case_insensitive(line.as_bytes(), q.as_bytes())
+            } else {
+                line.to_lowercase().contains(q.as_str())
+            }
         } else {
             line.to_lowercase().contains(&lc_query)
         };
@@ -6474,6 +6472,37 @@ mod tests {
                 .unwrap(),
             "ERROR: nope"
         );
+    }
+
+    #[test]
+    fn filter_output_lines_matches_unicode_lowercase_with_ascii_query() {
+        for (output, query) in [
+            ("Kelvin", "kelvin"),
+            ("İstanbul", "i"),
+            ("prefix\nK\nsuffix", "k"),
+            ("ſtraße", "s"),
+            ("Straße", "ss"),
+            ("ÉKİ MIX", "ki"),
+        ] {
+            let expected = output
+                .lines()
+                .filter(|line| line.to_lowercase().contains(query))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(
+                super::filter_output_lines(output, query, false, false, false, 0).unwrap(),
+                expected
+            );
+            let inverted = output
+                .lines()
+                .filter(|line| !line.to_lowercase().contains(query))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(
+                super::filter_output_lines(output, query, false, false, true, 0).unwrap(),
+                inverted
+            );
+        }
     }
 
     #[test]
