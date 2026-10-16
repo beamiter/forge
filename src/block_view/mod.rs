@@ -6181,8 +6181,6 @@ pub struct TermView {
     /// otherwise a pane closed mid-settle would keep the callback's Rc
     /// captures (pty/active/vte/vte_box) alive past tab close.
     resize_tick_id: Rc<RefCell<Option<gtk4::TickCallbackId>>>,
-    #[cfg(test)]
-    resize_diagnostics: Rc<ResizeTickDiagnostics>,
     /// The winsize the child was last told, shared with the render backend's
     /// synchronous publisher; see [`PtyWinsize`].
     pty_winsize: Rc<PtyWinsize>,
@@ -13864,21 +13862,6 @@ impl ClipboardPasteRequest {
     }
 }
 
-#[cfg(test)]
-#[derive(Debug, Default)]
-struct ResizeTickDiagnostics {
-    arms: Cell<u64>,
-    arm_while_installed: Cell<bool>,
-    ticks: Cell<u64>,
-    layouts: Cell<u64>,
-    publishes: Cell<u64>,
-    last_vte_mapped: Cell<bool>,
-    last_clip_mapped: Cell<bool>,
-    last_pane: Cell<(i32, i32)>,
-    last_settling: Cell<bool>,
-    last_reason: Cell<&'static str>,
-}
-
 impl TermView {
     /// Replace the runtime configuration shared by the reader/finalize
     /// callbacks. Existing widgets receive their visual updates through
@@ -16493,8 +16476,6 @@ impl TermView {
             history_load_poll_id: RefCell::new(None),
             retry_save_after_history_load: Cell::new(false),
             resize_tick_id: Rc::new(RefCell::new(None)),
-            #[cfg(test)]
-            resize_diagnostics: Rc::new(ResizeTickDiagnostics::default()),
             sticky_timer_id: RefCell::new(Some(sticky_timer_id)),
             sticky_organism_slot,
             cross_selection,
@@ -16657,8 +16638,6 @@ impl TermView {
     /// change that lands while the tick is dormant is picked up whole by the
     /// next armed poll — nothing accumulates.
     fn install_resize_tick(&self, chat: Option<&chat::ChatPresentation>) {
-        #[cfg(test)]
-        let diagnostics = self.resize_diagnostics.clone();
         let pty_for_resize = self.pty.clone();
         let winsize_for_resize = Rc::downgrade(&self.pty_winsize);
         let scroll_for_resize = self.block_scroll.downgrade();
@@ -16675,13 +16654,6 @@ impl TermView {
         // later contents-driven layout with no TIOCSWINSZ.
         let grace_polls: Rc<Cell<u8>> = Rc::new(Cell::new(0));
         let arm: Rc<dyn Fn()> = Rc::new(move || {
-            #[cfg(test)]
-            {
-                diagnostics.arms.set(diagnostics.arms.get() + 1);
-                diagnostics
-                    .arm_while_installed
-                    .set(tick_slot.borrow().is_some());
-            }
             grace_polls.set(RESIZE_TICK_GRACE_POLLS);
             // Already settling: the running tick reads absolute geometry on
             // every poll, so it observes this change without a second tick.
@@ -16700,18 +16672,8 @@ impl TermView {
             let clip_for_resize = clip_for_resize.clone();
             let last_pane = last_pane.clone();
             let grace_polls = grace_polls.clone();
-            #[cfg(test)]
-            let diagnostics = diagnostics.clone();
             let tick_id = vte_for_tick.add_tick_callback(move |vte, _clock| {
-                #[cfg(test)]
-                {
-                    diagnostics.ticks.set(diagnostics.ticks.get() + 1);
-                    diagnostics.last_vte_mapped.set(vte.is_mapped());
-                    diagnostics.last_reason.set("entered");
-                }
                 let Some(scroll_for_resize) = scroll_for_resize.upgrade() else {
-                    #[cfg(test)]
-                    diagnostics.last_reason.set("scroll destroyed");
                     tick_slot_for_tick.borrow_mut().take();
                     return glib::ControlFlow::Break;
                 };
@@ -16724,38 +16686,20 @@ impl TermView {
                 // read below — follows the window.
                 if let Some(clip) = clip_for_resize.upgrade() {
                     let pane = (clip.width(), viewport_height_px(vte, &scroll_for_resize));
-                    #[cfg(test)]
-                    {
-                        diagnostics.last_pane.set(pane);
-                        diagnostics.last_clip_mapped.set(clip.is_mapped());
-                        diagnostics.last_reason.set(if pane.0 > 0 {
-                            "pane sampled"
-                        } else {
-                            "zero clip width"
-                        });
-                    }
                     if pane != last_pane.get() && pane.0 > 0 {
                         last_pane.set(pane);
                         settling = true;
                         if let Some(backend) = backend_for_resize.upgrade() {
-                            #[cfg(test)]
-                            diagnostics.layouts.set(diagnostics.layouts.get() + 1);
                             backend.layout_active_surface();
                         }
                     }
                 }
                 if let Some(winsize) = winsize_for_tick.upgrade() {
                     if winsize.publish(&pty_for_resize, pty_grid_size(vte, &scroll_for_resize)) {
-                        #[cfg(test)]
-                        diagnostics.publishes.set(diagnostics.publishes.get() + 1);
                         settling = true;
                     }
                 }
-                #[cfg(test)]
-                diagnostics.last_settling.set(settling);
                 if !resize_tick_continues(settling, &grace_polls) {
-                    #[cfg(test)]
-                    diagnostics.last_reason.set("settled and removed");
                     // A full frame with no pane- or grid-level movement, after
                     // the post-layout grace: the change that armed this tick
                     // has been applied end to end. Hand the frame clock back;
