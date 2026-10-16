@@ -1093,6 +1093,13 @@ impl TasksPanel {
                 }
             }
             if old_ids != new_ids {
+                // GTK clears the list's selected-row pointer on removal but
+                // retains the cached row's selected bit. Clear it while attached
+                // or reselecting the same widget after a move/reveal is a no-op.
+                // The existing guard suppresses the synchronous selection signal.
+                if let Some(selected) = self.task_list.selected_row() {
+                    self.task_list.unselect_row(&selected);
+                }
                 while let Some(child) = self.task_list.first_child() {
                     self.task_list.remove(&child);
                 }
@@ -2485,5 +2492,65 @@ mod tests {
         wait_for_gtk(|| panel.dashboard_query.text() == "s");
         assert_eq!(panel.state.borrow().selected, selection);
         window.close();
+    }
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn cached_selected_row_survives_no_focus_move_hide_and_reveal() {
+        gtk4::init().expect("GTK display");
+        let panel = TasksPanel::build();
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let sink = actions.clone();
+        panel.connect_action(move |action| sink.borrow_mut().push(action));
+        let mut sync = dashboard_test_sync();
+        let selected = sync.selected.unwrap();
+        for row in &mut sync.dashboard.rows {
+            row.status = crate::agent_task::TaskStatus::Working;
+            row.needs_attention = false;
+            row.updated_at_ms = if row.id == selected { 20 } else { 10 };
+        }
+        // No window or focus operation: focus must not repair GTK selection as
+        // a side effect and conceal stale selected bits on cached widgets.
+        panel.sync(sync.clone());
+        let cached = panel.row_widgets.borrow()[&selected].row.clone();
+        assert_eq!(cached.index(), 0);
+        assert_eq!(panel.task_list.selected_row(), Some(cached.clone()));
+        assert!(cached.is_selected());
+        assert!(!cached.has_focus());
+        sync.dashboard
+            .rows
+            .iter_mut()
+            .find(|row| row.id == selected)
+            .unwrap()
+            .updated_at_ms = 5;
+        panel.sync(sync.clone());
+        assert_eq!(cached.index(), 1, "the selected widget itself moved");
+        assert_eq!(panel.row_widgets.borrow()[&selected].row, cached);
+        assert_eq!(panel.state.borrow().selected, Some(selected));
+        assert_eq!(
+            panel.task_list.selected_row(),
+            Some(cached.clone()),
+            "TaskId and row flags alone do not prove GTK's selected-row pointer survived"
+        );
+        assert!(cached.is_selected());
+        assert!(!cached.has_focus());
+        panel.dashboard_query.set_text("Needs review");
+        assert!(panel.task_list.selected_row().is_none());
+        assert!(
+            !cached.is_selected(),
+            "hidden retained row must have its selected bit cleared"
+        );
+        assert!(cached.parent().is_none());
+        assert_eq!(panel.state.borrow().selected, Some(selected));
+        assert!(panel.state.borrow().detail.is_none());
+        panel.dashboard_clear.emit_clicked();
+        assert_eq!(panel.row_widgets.borrow()[&selected].row, cached);
+        assert_eq!(panel.task_list.selected_row(), Some(cached.clone()));
+        assert!(cached.is_selected());
+        panel.sync(sync);
+        assert_eq!(panel.task_list.selected_row(), Some(cached));
+        assert!(
+            actions.borrow().is_empty(),
+            "structural reconciliation stages no domain actions"
+        );
     }
 }

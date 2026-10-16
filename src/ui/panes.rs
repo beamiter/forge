@@ -236,6 +236,7 @@ impl UiState {
             None,
         ));
         drop(shell_argv);
+        view.enable_local_launch_recovery();
 
         let terminal = view.vte().clone();
         setup_terminal_click_handler(&terminal);

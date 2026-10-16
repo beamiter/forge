@@ -1827,6 +1827,7 @@ pub(crate) fn kill_widget_child_processes(widget: &gtk4::Widget) -> bool {
 /// so this path never has to guess from the widget type. Calling it a second
 /// time (an explicit close followed by the drop of the same pane) is a no-op.
 pub(crate) fn kill_terminal_child(terminal: &Terminal) {
+    crate::terminal::close_terminal_launch(terminal);
     let Some(lifecycle) = terminal_child_lifecycle(terminal) else {
         return;
     };

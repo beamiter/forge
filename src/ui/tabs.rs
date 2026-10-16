@@ -1656,6 +1656,7 @@ impl UiState {
             .filter(|sid| jterm_core::execution_journal::is_valid_jsh_session_id(sid))
             .unwrap_or_else(generate_session_id);
 
+        let allow_local_recovery = remote.is_none() && task.is_none() && argv_override.is_none();
         let configured_shell = self.shell_argv.borrow();
         let shell_argv: &[String] = argv_override
             .as_deref()
@@ -1739,6 +1740,12 @@ impl UiState {
                 }
             }
         };
+
+        if allow_local_recovery {
+            if let PaneLeaf::Vte(view) = &view_type {
+                view.enable_local_launch_recovery();
+            }
+        }
 
         // Commit tab identity and reconnect state only after the terminal view
         // exists. In particular, a failed Block spawn cannot consume a tab

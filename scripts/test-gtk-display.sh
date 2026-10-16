@@ -52,6 +52,10 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    ui::tasks_panel::tests::cached_selected_row_survives_no_focus_move_hide_and_reveal
+    terminal::launch_owner::tests::successful_spawn_losing_close_and_exit_before_completion_retire_exact_ownership
+    terminal::launch_recovery::tests::manual_recovery_is_single_flight_scoped_and_delivers_startup_once
+    terminal::launch_recovery::tests::close_and_exit_retire_pending_commands_and_background_retry_keeps_focus
     ui::tasks_panel::tests::task_filters_route_real_x11_keyboard_by_identity
     ui::tasks_panel::tests::task_filters_keep_identity_hidden_updates_and_keyboard_routing
     ui::tasks_panel::tests::thousand_task_filter_and_update_native_benchmark

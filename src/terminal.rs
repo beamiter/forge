@@ -1,13 +1,13 @@
 use adw::prelude::*;
-use gtk4::gdk::ffi::GDK_BUTTON_PRIMARY;
+use gtk4::GestureClick;
 use gtk4::gdk::ModifierType;
 use gtk4::gdk::RGBA;
+use gtk4::gdk::ffi::GDK_BUTTON_PRIMARY;
 use gtk4::gio::{self, Cancellable};
-use gtk4::glib::translate::IntoGlib;
 use gtk4::glib::SpawnFlags;
+use gtk4::glib::translate::IntoGlib;
 use gtk4::pango::FontDescription;
-use gtk4::GestureClick;
-use gtk4::{glib, Entry, Label, Orientation, Paned};
+use gtk4::{Entry, Label, Orientation, Paned, glib};
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
 use std::os::fd::AsRawFd;
@@ -15,6 +15,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 use vte4::{CursorBlinkMode, CursorShape, PtyFlags, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
+
+mod launch_owner;
+mod launch_recovery;
+mod launch_state;
+pub(crate) use launch_recovery::close_terminal_launch;
 
 use crate::config::Config;
 use crate::process::{ChildLifecycle, EscalationPolicy, ReapOwner};
@@ -209,6 +214,7 @@ type VoidCallbacks = Rc<RefCell<Vec<Box<dyn Fn()>>>>;
 #[allow(dead_code)]
 pub struct VteTerminalView {
     root: gtk4::Box,
+    launch_recovery: Rc<launch_recovery::LaunchRecovery>,
     /// Status strip above the grid, shown only while this pane's tab is split.
     pane_header: crate::ui::PaneHeader,
     terminal: Terminal,
@@ -256,6 +262,20 @@ impl VteTerminalView {
         let title_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn(&str)>>::new()));
         let activity_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn()>>::new()));
 
+        let launch_recovery = launch_recovery::LaunchRecovery::new(
+            &root,
+            &terminal,
+            &organism,
+            shell_argv,
+            working_directory,
+            session_id,
+            initial_commands,
+            env_extra,
+            on_launched,
+            launch_failed_callbacks.clone(),
+        );
+        root.insert_child_after(&launch_recovery.panel, Some(pane_header.widget()));
+
         // Listen for OSC 7 (CWD changes)
         let cwd_callbacks_clone = cwd_callbacks.clone();
         let terminal_for_cwd = terminal.clone();
@@ -282,13 +302,18 @@ impl VteTerminalView {
         // pid: after this point the lifecycle refuses to signal a number VTE
         // has already released for reuse.
         let exited_callbacks_clone = exited_callbacks.clone();
+        let launch_owner = launch_recovery.owner.clone();
         terminal.connect_child_exited(move |term, status| {
             let Some(code) = crate::process::exit_code_from_wait_status(status) else {
                 // A stop or continue report: the child is still alive.
                 return;
             };
+            let admitted_child = launch_owner.note_exit(code);
             if let Some(lifecycle) = terminal_child_lifecycle(term) {
                 lifecycle.note_foreign_exit(code);
+            }
+            if !admitted_child {
+                return;
             }
             for callback in exited_callbacks_clone.borrow().iter() {
                 callback(code);
@@ -325,34 +350,13 @@ impl VteTerminalView {
             }
         });
 
-        // Spawn errors have no child-exited signal; notify them separately.
-        let failed_callbacks = launch_failed_callbacks.clone();
-        let organism_for_failure = Rc::downgrade(&organism);
-        let on_resolved = Box::new(move |result: Result<(), String>| {
-            if let Some(on_launched) = on_launched {
-                on_launched();
-            }
-            if let Err(message) = result {
-                if let Some(organism) = organism_for_failure.upgrade() {
-                    organism.retire();
-                }
-                for callback in failed_callbacks.borrow().iter() {
-                    callback(&message);
-                }
-            }
-        });
-        spawn_shell(
-            &terminal,
-            shell_argv,
-            working_directory,
-            session_id,
-            initial_commands,
-            env_extra,
-            on_resolved,
-        );
+        // Failure is separate from child-exited. Recovery is opt-in and never
+        // starts another process until its Retry launch button is activated.
+        launch_recovery.start();
 
         VteTerminalView {
             root,
+            launch_recovery,
             pane_header,
             terminal,
             config,
@@ -364,6 +368,11 @@ impl VteTerminalView {
             activity_callbacks,
             organism,
         }
+    }
+
+    /// Ordinary local shells only; never enable this for task or remote views.
+    pub(crate) fn enable_local_launch_recovery(&self) {
+        self.launch_recovery.enable();
     }
 
     pub(crate) fn pane_header(&self) -> &crate::ui::PaneHeader {
@@ -480,6 +489,7 @@ impl VteTerminalView {
     /// followed by the widget's own teardown — finds a termination already in
     /// flight and does nothing.
     pub fn kill(&self) {
+        self.launch_recovery.close();
         if let Some(lifecycle) = terminal_child_lifecycle(&self.terminal) {
             lifecycle.terminate(TERMINAL_ESCALATION);
         }
@@ -620,15 +630,21 @@ impl InitialCommands {
     }
 }
 
-pub(crate) fn spawn_shell(
+#[allow(clippy::too_many_arguments)]
+fn spawn_shell(
     terminal: &Terminal,
     argv_owned: &[String],
     working_directory: Option<&str>,
     session_id: Option<&str>,
-    initial_commands: &[String],
+    launch_owner: Rc<launch_owner::LaunchOwner>,
     env_extra: Vec<(String, String)>,
+    on_settled: Option<Box<dyn FnOnce()>>,
+    cancellable: &Cancellable,
     on_resolved: Box<dyn FnOnce(Result<(), String>)>,
 ) {
+    let Some(generation) = launch_owner.state.borrow_mut().begin() else {
+        return;
+    };
     // Append --session <id> to argv when restoring a session (only for jsh)
     let mut argv_vec: Vec<String> = argv_owned.to_vec();
     if let Some(sid) =
@@ -716,7 +732,6 @@ pub(crate) fn spawn_shell(
         spawn_flags |=
             SpawnFlags::from_bits_retain(jterm_core::child_env::VTE_SPAWN_NO_PARENT_ENVV_BITS);
     }
-    let cancellable: Option<&Cancellable> = None;
     let spawn_working_directory = if crate::host::is_flatpak() {
         None
     } else {
@@ -725,70 +740,193 @@ pub(crate) fn spawn_shell(
     let terminal_for_pid = terminal.clone();
 
     // If initial commands are provided, send them after the shell starts.
-    let init_cmds: Vec<String> = initial_commands.to_vec();
-    let terminal_for_init = terminal.clone();
 
-    terminal.spawn_async(
-        PtyFlags::DEFAULT,
+    // Unlike terminal.spawn_async, this lets us acquire the child's identity
+    // BEFORE installing VTE's foreign watcher. Pty spawn leaves the successful
+    // DO_NOT_REAP_CHILD PID unreaped for its caller to watch.
+    let pty = match terminal.pty_new_sync(PtyFlags::DEFAULT, Some(cancellable)) {
+        Ok(pty) => pty,
+        Err(error) => {
+            // Preserve the constructor's asynchronous observer-registration contract.
+            glib::idle_add_local_once(move || {
+                resolve_spawn(
+                    &terminal_for_pid,
+                    launch_owner,
+                    generation,
+                    None,
+                    Err(error),
+                    on_settled,
+                    on_resolved,
+                );
+            });
+            return;
+        }
+    };
+    let spawned_pty = pty.clone();
+    pty.spawn_async(
         spawn_working_directory,
         &argv,
         envv,
         spawn_flags,
         || {},
         -1,
-        cancellable,
+        Some(cancellable),
         move |res| {
-            log::debug!("spawn_async: {res:?}");
-            // The spawn resolved one way or the other: the child (on success)
-            // has already entered its working directory through the path it
-            // was handed, so launch-time pins may be released now. Runs on
-            // failure too — the pin must not leak on a failed spawn.
-            let pid = match res {
-                Ok(pid) => pid,
-                Err(error) => {
-                    let detail =
-                        jterm_core::review_input::safe_inline_display(&error.to_string(), 2048);
-                    let message = format!("Could not launch terminal: {detail}");
-                    log::error!("{message}");
-                    // Observers must retire the launch before the diagnostic
-                    // can emit contents-changed (remote first-output badges).
-                    let diagnostic = format!("\r\nforge: {message}\r\n");
-                    on_resolved(Err(message));
-                    terminal_for_pid.feed(diagnostic.as_bytes());
+            let unwatched = res
+                .as_ref()
+                .ok()
+                .copied()
+                .map(launch_owner::UnwatchedChild::from_spawn_success);
+            if let Some(child) = &unwatched {
+                if let Err(error) = child.acquire(&launch_owner, generation) {
+                    let report = !launch_owner.state.borrow().closed();
+                    let message = unwind_unowned_spawn(
+                        &launch_owner,
+                        unwatched.unwrap(),
+                        &terminal_for_pid,
+                        &spawned_pty,
+                        error,
+                    );
+                    if let Some(on_settled) = on_settled {
+                        on_settled();
+                    }
+                    if report {
+                        on_resolved(Err(message));
+                    }
                     return;
                 }
-            };
-            let pid_i32: i32 = pid.into_glib();
-            // VTE spawned this child through glib, and glib's child watch
-            // is what calls `waitpid` for it — hence `Foreign`. The
-            // lifecycle only ever signals it (through a pidfd), and learns
-            // the status from `child-exited`; reaping here would consume
-            // the status VTE is waiting for and free the pid behind its
-            // back.
-            match ChildLifecycle::new(pid_i32, ReapOwner::Foreign) {
-                Ok(lifecycle) => set_terminal_child_lifecycle(&terminal_for_pid, lifecycle),
-                Err(error) => {
-                    log::warn!("Cannot manage the lifecycle of VTE child {pid_i32}: {error}")
-                }
             }
-            on_resolved(Ok(()));
-            // Feed initial commands after the shell has fully initialized.
-            // We delay to ensure the shell has entered raw mode; sending \r
-            // too early would hit the kernel's cooked-mode icrnl translation
-            // (turning \r into \n), which raw-mode shells don't treat as Enter.
-            // Each pre-parsed command is fed as exactly one line; splitting
-            // here would let a restored command's own bytes change boundaries.
-            if !init_cmds.is_empty() {
-                let cmds = init_cmds.clone();
-                glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
-                    for line in &cmds {
-                        let text = format!("{line}\r");
-                        terminal_for_init.feed_child(text.as_bytes());
-                    }
-                });
-            }
+            resolve_spawn(
+                &terminal_for_pid,
+                launch_owner,
+                generation,
+                unwatched.map(|child| (child, &spawned_pty)),
+                res,
+                on_settled,
+                on_resolved,
+            );
         },
     );
+}
+
+/// Exceptional pre-watch unwind shared with deterministic native coverage.
+fn unwind_unowned_spawn(
+    owner: &launch_owner::LaunchOwner,
+    child: launch_owner::UnwatchedChild,
+    terminal: &Terminal,
+    pty: &vte4::Pty,
+    error: std::io::Error,
+) -> String {
+    owner.state.borrow_mut().close();
+    owner.retain_for_reap(terminal);
+    let stopped = child.abort_before_watch();
+    child.watch(terminal, pty);
+    let detail = jterm_core::review_input::safe_inline_display(&error.to_string(), 256);
+    let message = if stopped.is_ok() {
+        format!(
+            "Terminal launch aborted: process ownership unavailable ({detail}). Close this pane and try again. Detached descendant cleanup could not be verified."
+        )
+    } else {
+        format!(
+            "Terminal launch could not be safely managed or stopped ({detail}). Close this pane and check the child process."
+        )
+    };
+    log::error!("{message}");
+    message
+}
+
+/// The production completion boundary also used by deterministic native races.
+#[allow(clippy::too_many_arguments)]
+fn resolve_spawn(
+    terminal_for_pid: &Terminal,
+    launch_owner: Rc<launch_owner::LaunchOwner>,
+    generation: launch_state::Generation,
+    unwatched_pty: Option<(launch_owner::UnwatchedChild, &vte4::Pty)>,
+    res: Result<glib::Pid, glib::Error>,
+    on_settled: Option<Box<dyn FnOnce()>>,
+    on_resolved: Box<dyn FnOnce(Result<(), String>)>,
+) {
+    let launch_state = launch_owner.state.clone();
+    let terminal_for_init = terminal_for_pid.clone();
+    log::debug!("spawn_async: {res:?}");
+    // The spawn resolved one way or the other: the child (on success)
+    // has already entered its working directory through the path it
+    // was handed, so launch-time pins may be released now. Runs on
+    // failure too — the pin must not leak on a failed spawn.
+    let accepted = launch_state.borrow_mut().resolve(generation, res.is_ok());
+    if res.is_ok() {
+        if accepted {
+            launch_owner.admit();
+            if let Some(child) = launch_owner.child(generation) {
+                set_terminal_child_lifecycle(terminal_for_pid, child);
+            }
+        }
+        // No watcher exists yet: the successful child/zombie pins its PID
+        // and its own process-group identity. Abort only through this token,
+        // with no delayed numeric signaling or /proc scans.
+        if let Some((child, pty)) = unwatched_pty {
+            if !accepted {
+                launch_owner.retain_for_reap(terminal_for_pid);
+                if let Err(error) = child.abort_before_watch() {
+                    log::error!("Cancelled terminal child could not be stopped: {error}");
+                }
+            }
+            child.watch(terminal_for_pid, pty);
+        }
+    }
+    if let Some(on_settled) = on_settled {
+        on_settled();
+    }
+    if !accepted {
+        return;
+    }
+    match res {
+        Ok(_) => {}
+        Err(error) => {
+            let detail = jterm_core::review_input::safe_inline_display(&error.to_string(), 2048);
+            let message = format!("Could not launch terminal: {detail}");
+            log::error!("{message}");
+            // Observers must retire the launch before the diagnostic
+            // can emit contents-changed (remote first-output badges).
+            let diagnostic = format!("\r\nforge: {message}\r\n");
+            if !launch_state.borrow().failed_generation(generation) {
+                return;
+            }
+            on_resolved(Err(message));
+            if launch_state.borrow().failed_generation(generation) {
+                terminal_for_pid.feed(diagnostic.as_bytes());
+            }
+            return;
+        }
+    };
+    if !launch_state.borrow().running_generation(generation) {
+        return;
+    }
+    on_resolved(Ok(()));
+    // Feed initial commands after the shell has fully initialized.
+    // We delay to ensure the shell has entered raw mode; sending \r
+    // too early would hit the kernel's cooked-mode icrnl translation
+    // (turning \r into \n), which raw-mode shells don't treat as Enter.
+    // Each pre-parsed command is fed as exactly one line; splitting
+    // here would let a restored command's own bytes change boundaries.
+    if launch_state.borrow().pending_count() != 0 {
+        glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
+            if terminal_for_init.root().is_none()
+                || terminal_child_lifecycle(&terminal_for_init)
+                    .is_none_or(|child| child.exit_code().is_some())
+            {
+                return;
+            }
+            let cmds = launch_state.borrow_mut().take_commands(generation);
+            for line in &cmds {
+                if !launch_state.borrow().running_generation(generation) {
+                    break;
+                }
+                let text = format!("{line}\r");
+                terminal_for_init.feed_child(text.as_bytes());
+            }
+        });
+    }
 }
 
 pub(crate) fn open_uri(uri: &str) {
@@ -1213,27 +1351,35 @@ mod tests {
 
     #[test]
     fn configured_commands_fail_closed_on_hidden_oversized_or_excessive_input() {
-        assert!(InitialCommands::from_config(Some("echo safe\u{202e}fake"))
-            .as_slice()
-            .is_empty());
-        assert!(InitialCommands::from_config(Some("echo one\necho two"))
-            .as_slice()
-            .is_empty());
+        assert!(
+            InitialCommands::from_config(Some("echo safe\u{202e}fake"))
+                .as_slice()
+                .is_empty()
+        );
+        assert!(
+            InitialCommands::from_config(Some("echo one\necho two"))
+                .as_slice()
+                .is_empty()
+        );
         let oversized = "x".repeat(jterm_core::review_input::MAX_REVIEW_INPUT_BYTES + 1);
-        assert!(InitialCommands::from_config(Some(&oversized))
-            .as_slice()
-            .is_empty());
+        assert!(
+            InitialCommands::from_config(Some(&oversized))
+                .as_slice()
+                .is_empty()
+        );
         let excessive = std::iter::repeat_n("true", 129)
             .collect::<Vec<_>>()
             .join(", ");
-        assert!(InitialCommands::from_config(Some(&excessive))
-            .as_slice()
-            .is_empty());
+        assert!(
+            InitialCommands::from_config(Some(&excessive))
+                .as_slice()
+                .is_empty()
+        );
     }
 
     #[test]
     fn terminal_links_are_bounded_unambiguous_http_urls() {
-        use jterm_core::link::{is_openable_url, MAX_OPENABLE_URL_BYTES};
+        use jterm_core::link::{MAX_OPENABLE_URL_BYTES, is_openable_url};
 
         assert!(is_openable_url("https://example.com/a?q=1"));
         assert!(is_openable_url("HTTP://example.com"));
@@ -1271,12 +1417,11 @@ mod tests {
         );
         // Unknown shell grammars are not guessed either.
         let plain = strings(&["ssh", "host"]);
-        assert!(InitialCommands::from_restored_argv(
-            Some(&plain),
-            &strings(&["/opt/exotic-shell"])
-        )
-        .as_slice()
-        .is_empty());
+        assert!(
+            InitialCommands::from_restored_argv(Some(&plain), &strings(&["/opt/exotic-shell"]))
+                .as_slice()
+                .is_empty()
+        );
 
         // An attacker-controlled snapshot must not gain arbitrary local code
         // execution merely because it preserved argv boundaries.
