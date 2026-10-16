@@ -226,12 +226,24 @@ fn drain(mut slave: &std::fs::File, started: Instant, iteration: usize, stage: &
     bytes
 }
 
+// Bounded diagnostic output: only the first three cycles, never per-dispatch.
+fn trace(iteration: usize, stage: &str) {
+    if iteration < 3 {
+        use std::io::Write;
+        let mut stderr = std::io::stderr().lock();
+        writeln!(stderr, "F08_STAGE iteration={iteration} stage={stage}").unwrap();
+        stderr.flush().unwrap();
+    }
+}
+
 pub(super) fn exercise(window: &gtk4::Window, main: &glib::MainContext) {
+    trace(0, "soak entry before host detach");
     let host = window.downcast_ref::<libadwaita::Window>().unwrap();
     gtk4::prelude::RootExt::set_focus(window, gtk4::Widget::NONE);
     host.set_content(gtk4::Widget::NONE);
     let started = Instant::now();
     // No shell, fork, command, or input is involved in the lifecycle loop.
+    trace(0, "bare PTY create");
     let pair = nix::pty::openpty(None, None).unwrap();
     let mut attrs = nix::sys::termios::tcgetattr(&pair.slave).unwrap();
     nix::sys::termios::cfmakeraw(&mut attrs);
@@ -245,6 +257,7 @@ pub(super) fn exercise(window: &gtk4::Window, main: &glib::MainContext) {
     }
     let slave = std::fs::File::from(pair.slave);
     let pty = vte4::Pty::foreign_sync(pair.master, None::<&gtk4::gio::Cancellable>).unwrap();
+    trace(0, "bare PTY ready");
     let mut config = Config::safe_defaults();
     config.ascii_organism_enabled = true;
     config.ascii_organism_motion = Some(OrganismMotion::Full);
@@ -264,16 +277,23 @@ pub(super) fn exercise(window: &gtk4::Window, main: &glib::MainContext) {
     }
     for iteration in 0..1000 {
         let stage = Cell::new("construct");
+        let set_stage = |name: &'static str| {
+            stage.set(name);
+            trace(iteration, name);
+        };
+        set_stage("construct");
         let _diagnostic = CycleDiagnostic(iteration, &stage);
         let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         let terminal = vte4::Terminal::new();
         terminal.set_hexpand(true);
         terminal.set_vexpand(true);
+        set_stage("attach PTY");
         terminal.set_pty(Some(&pty));
         root.append(&terminal);
+        set_stage("construct adapter");
         let runtime = VteOrganismSurface::new(&root, &terminal, &config);
         let wait = |name: &'static str, ready: &dyn Fn() -> bool| {
-            stage.set(name);
+            set_stage(name);
             let mut budget = budget::Budget::new(started.elapsed());
             loop {
                 pump(main, started, iteration, name, &mut budget);
@@ -399,8 +419,9 @@ pub(super) fn exercise(window: &gtk4::Window, main: &glib::MainContext) {
         runtime.refresh();
         assert!(retreat.is_destroyed());
         assert!(runtime.source.borrow().is_none());
+        set_stage("disable begin");
         runtime.apply_settings(false, OrganismMotion::Full);
-        stage.set("disabled");
+        set_stage("disabled");
         quiet();
         assert!(!connected(window, host_handler));
         assert!(!connected(&clock, paint_handler));
@@ -410,6 +431,7 @@ pub(super) fn exercise(window: &gtk4::Window, main: &glib::MainContext) {
             runtime.current_refresh(&ticket),
             "retired host callback ran"
         );
+        set_stage("reenable begin");
         runtime.apply_settings(true, OrganismMotion::Full);
         wait("reenabled", &|| runtime.source.borrow().is_some());
         let frame = source(main, &runtime.source);
@@ -419,8 +441,9 @@ pub(super) fn exercise(window: &gtk4::Window, main: &glib::MainContext) {
             let (clock, handler) = paint.as_ref().unwrap();
             (clock.upgrade().unwrap(), unsafe { handler.as_raw() })
         };
+        set_stage("hide begin");
         root.set_visible(false);
-        stage.set("hidden switch");
+        set_stage("hidden switch");
         quiet();
         assert!(!connected(window, hidden_host_handler));
         assert!(!connected(&hidden_clock, hidden_paint_handler));
@@ -438,6 +461,7 @@ pub(super) fn exercise(window: &gtk4::Window, main: &glib::MainContext) {
         gtk4::prelude::RootExt::set_focus(window, gtk4::Widget::NONE);
         host.set_content(gtk4::Widget::NONE);
         quiet();
+        set_stage("remount begin");
         root.set_visible(true);
         host.set_content(Some(&root));
         terminal.grab_focus();
@@ -454,8 +478,9 @@ pub(super) fn exercise(window: &gtk4::Window, main: &glib::MainContext) {
         };
         let stale_refresh = runtime.refresh_ticket.borrow().clone();
         if iteration.is_multiple_of(2) {
+            set_stage("retire begin");
             runtime.retire();
-            stage.set("retired");
+            set_stage("retired");
             quiet();
             assert!(!runtime.current_refresh(&stale_refresh));
             let ticket = runtime.refresh_ticket.borrow().clone();
@@ -476,8 +501,9 @@ pub(super) fn exercise(window: &gtk4::Window, main: &glib::MainContext) {
             8,
             "bounded native/accessibility widget set"
         );
-        stage.set("close/drop");
+        set_stage("close/drop");
         drop(runtime);
+        set_stage("adapter dropped");
         assert!(
             weak_runtime.upgrade().is_none(),
             "iteration={iteration}: adapter retained"
@@ -486,10 +512,12 @@ pub(super) fn exercise(window: &gtk4::Window, main: &glib::MainContext) {
         assert!(geometry.is_destroyed());
         assert!(!connected(window, host_handler));
         assert!(!connected(&clock, paint_handler));
+        set_stage("expanded widgets drop");
         drop(widgets);
+        set_stage("host detach");
         gtk4::prelude::RootExt::set_focus(window, gtk4::Widget::NONE);
         host.set_content(gtk4::Widget::NONE);
-        stage.set("before PTY detach");
+        set_stage("before PTY detach");
         pump(
             main,
             started,
@@ -501,10 +529,13 @@ pub(super) fn exercise(window: &gtk4::Window, main: &glib::MainContext) {
             drain(&slave, started, iteration, stage.get()).is_empty(),
             "iteration={iteration}: unexpected PTY write before detach"
         );
-        stage.set("PTY detach");
+        set_stage("PTY detach");
         terminal.set_pty(None);
+        set_stage("terminal drop");
         drop(terminal);
+        set_stage("root drop");
         drop(root);
+        set_stage("after widget drops");
         pump(
             main,
             started,
@@ -512,7 +543,7 @@ pub(super) fn exercise(window: &gtk4::Window, main: &glib::MainContext) {
             stage.get(),
             &mut budget::Budget::new(started.elapsed()),
         );
-        stage.set("widget release");
+        set_stage("widget release");
         let mut release_budget = budget::Budget::new(started.elapsed());
         loop {
             pump(main, started, iteration, stage.get(), &mut release_budget);
@@ -536,6 +567,7 @@ pub(super) fn exercise(window: &gtk4::Window, main: &glib::MainContext) {
             iteration,
             "cycle success",
         );
+        set_stage("cycle complete");
         if iteration % 100 == 99 {
             eprintln!(
                 "F08 lifecycle: {}/1000 cycles, elapsed={:?}",

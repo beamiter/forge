@@ -211,6 +211,53 @@ for test_name in "${tests[@]}"; do
     fi
 done
 
+# One diagnostic replay only, for this exact failed fixture. This function's
+# result never replaces the original cargo-test failure status below.
+capture_vte_crash() {
+    local original_status="$1" test_binary diagnostic_status=0
+    local diagnostic_dir="${GTK_PAINT_DIAGNOSTICS_DIR:-$PROJECT_ROOT/gtk-paint-diagnostics}/f08-native-crash"
+    mkdir -p "$diagnostic_dir" || return
+    printf 'F08 original cargo-test exit status: %s\n' "$original_status" | tee "$diagnostic_dir/status.txt"
+    command -v gdb >/dev/null || return
+    command -v timeout >/dev/null || return
+    # Resolve the exact current lib-test executable from Cargo's structured
+    # artifact output; never guess a hash or select a stale directory entry.
+    cargo test --lib --all-features --locked --no-run --message-format=json \
+        > "$diagnostic_dir/cargo-artifacts.jsonl" || return
+    test_binary="$(python3 - "$diagnostic_dir/cargo-artifacts.jsonl" <<'PY_BINARY'
+import json, sys
+paths = set()
+for line in open(sys.argv[1]):
+    item = json.loads(line)
+    if item.get("reason") == "compiler-artifact" and item.get("executable") and item.get("profile", {}).get("test") and "lib" in item.get("target", {}).get("kind", []):
+        paths.add(item["executable"])
+if len(paths) != 1:
+    raise SystemExit(f"Expected exactly one current lib-test binary, got {paths!r}")
+print(paths.pop())
+PY_BINARY
+    )" || return
+    {
+        printf 'Exact fixture: %s\n' "$test_name"
+        git rev-parse HEAD
+        sha256sum "$test_binary" src/ui/organism_vte.rs src/ui/organism_vte/lifecycle_tests.rs scripts/test-gtk-display.sh .github/workflows/ci.yml
+        gdb --version
+    } > "$diagnostic_dir/identity.txt" || return
+    # Fresh bus/display, bounded replay. --return-child-result retains the
+    # inferior failure; the caller ALSO retains the original execution status.
+    GTK_IM_MODULE="$fixture_im_module" GTK_A11Y="$a11y_backend" \
+        timeout --signal=TERM --kill-after=10s 240s \
+        dbus-run-session "${dbus_run_args[@]}" -- \
+        xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
+        gdb --batch --return-child-result \
+            -ex 'set pagination off' -ex 'set confirm off' \
+            -ex 'set debuginfod enabled off' -ex run -ex 'thread apply all bt full' \
+            --args "$test_binary" "$test_name" --ignored --exact --nocapture \
+        > "$diagnostic_dir/backtrace.txt" 2>&1 || diagnostic_status=$?
+    cat "$diagnostic_dir/identity.txt" "$diagnostic_dir/backtrace.txt"
+    printf 'F08 diagnostic replay exit status: %s; original status remains: %s\n' \
+        "$diagnostic_status" "$original_status" | tee -a "$diagnostic_dir/status.txt"
+}
+
 for test_name in "${tests[@]}"; do
     printf 'GTK display regression: %s\n' "${test_name}"
     # These fixtures check accessible values; GTK caches the backend at init.
@@ -222,10 +269,18 @@ for test_name in "${tests[@]}"; do
     if [[ "$test_name" == block_view::tests::native_ime_commit_cancel_and_independent_ptys || "$test_name" == block_view::tests::native_ime_send_button_preserves_composition ]]; then
         fixture_im_module=simple
     fi
-    GTK_IM_MODULE="$fixture_im_module" GTK_A11Y="$a11y_backend" dbus-run-session "${dbus_run_args[@]}" -- \
+    if GTK_IM_MODULE="$fixture_im_module" GTK_A11Y="$a11y_backend" dbus-run-session "${dbus_run_args[@]}" -- \
         xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
         cargo test --lib --all-features --locked "${test_name}" -- \
-        --ignored --exact --nocapture
+        --ignored --exact --nocapture; then
+        :
+    else
+        original_status=$?
+        if [[ "${FORGE_NATIVE_CRASH_DIAGNOSTICS:-0}" == 1 && "$test_name" == ui::organism::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers ]]; then
+            capture_vte_crash "$original_status" || printf 'F08 diagnostic collection failed; preserving original status %s\n' "$original_status" >&2
+        fi
+        exit "$original_status"
+    fi
 done
 
 printf 'GTK display regressions passed: %d/%d.\n' "${#tests[@]}" "${#tests[@]}"
