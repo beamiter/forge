@@ -11266,6 +11266,8 @@ fn sync_active_to_pty(
 /// real grid wins.
 struct PtyWinsize {
     sent: Cell<(u16, u16)>,
+    resize_attempt: Cell<((u16, u16), u8)>,
+    resize_retry_pending: Cell<bool>,
     /// Bumped only when a publish really changed the size: the PromptEnd
     /// anchor reads any bump as "the prompt was reflowed by a resize".
     generation: Rc<Cell<u64>>,
@@ -11281,6 +11283,8 @@ impl PtyWinsize {
     fn new(generation: Rc<Cell<u64>>) -> Self {
         Self {
             sent: Cell::new((0, 0)),
+            resize_attempt: Cell::new(((0, 0), 0)),
+            resize_retry_pending: Cell::new(false),
             generation,
             arm: RefCell::new(None),
             #[cfg(test)]
@@ -11288,41 +11292,66 @@ impl PtyWinsize {
         }
     }
 
-    /// Tell the child `sample` unless it already has it. Returns whether the
-    /// PTY was resized.
+    /// Tell the child `sample` unless it already has it. Only successful
+    /// syscalls advance the size/generation used by replay and prompt anchors.
     fn publish(&self, pty: &OwnedPty, sample: (u16, u16)) -> bool {
-        #[cfg(test)]
-        if self.frozen.get() {
-            return false;
-        }
-        let Some((cols, rows)) = winsize_to_publish(self.sent.get(), sample) else {
-            return false;
-        };
-        self.sent.set((cols, rows));
-        self.generation.set(self.generation.get().wrapping_add(1));
-        pty.resize(cols, rows);
-        true
+        self.apply(pty, sample, false)
     }
 
-    /// A state transition's push: issue `TIOCSWINSZ` even when forge's own
-    /// record already says `sample`. Something else may have changed the
-    /// tty's winsize through the slave (`stty cols 60`, `resize`, a program
-    /// that crashed mid-resize), and PromptStart/CommandStart are where the
-    /// real grid is reasserted. The kernel sends no SIGWINCH for an unchanged
-    /// size, so the repeat is free; only a real change bumps the generation.
+    /// Reassert after a state transition even when our last successful size
+    /// matches: a slave-side program may have changed it in the meantime.
     fn reassert(&self, pty: &OwnedPty, sample: (u16, u16)) -> bool {
+        self.apply(pty, sample, true)
+    }
+
+    fn apply(&self, pty: &OwnedPty, sample: (u16, u16), force: bool) -> bool {
         #[cfg(test)]
         if self.frozen.get() {
             return false;
         }
         if sample.0 == 0 || sample.1 == 0 {
+            self.resize_retry_pending.set(false);
             return false;
         }
-        if self.publish(pty, sample) {
-            return true;
+        let (previous, attempts) = self.resize_attempt.get();
+        let attempts = if previous == sample { attempts } else { 0 };
+        // A fresh absolute size replaces failed intent; there is no queued
+        // stale size. Each size gets at most three attempts, one per dispatch.
+        // The settle tick retries on later frames, never in an ioctl loop.
+        self.resize_attempt.set((sample, attempts));
+        if attempts >= 3 {
+            self.resize_retry_pending.set(false);
+            return false;
         }
-        pty.resize(sample.0, sample.1);
-        false
+        let changed = winsize_to_publish(self.sent.get(), sample).is_some();
+        if !changed && !force && !self.resize_retry_pending.get() {
+            return false;
+        }
+        match pty.resize(sample.0, sample.1) {
+            Ok(()) => {
+                self.resize_attempt.set((sample, 0));
+                self.resize_retry_pending.set(false);
+                if changed {
+                    self.sent.set(sample);
+                    self.generation.set(self.generation.get().wrapping_add(1));
+                }
+                changed
+            }
+            Err(error) => {
+                pty.report_resize_error(&error);
+                let retryable = matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                );
+                let attempts = if retryable { attempts + 1 } else { 3 };
+                self.resize_attempt.set((sample, attempts));
+                self.resize_retry_pending.set(retryable && attempts < 3);
+                if self.resize_retry_pending.get() {
+                    self.arm_settle();
+                }
+                false
+            }
+        }
     }
 
     /// The `(cols, rows)` the child was last told — the geometry its absolute
@@ -16695,7 +16724,9 @@ impl TermView {
                     }
                 }
                 if let Some(winsize) = winsize_for_tick.upgrade() {
-                    if winsize.publish(&pty_for_resize, pty_grid_size(vte, &scroll_for_resize)) {
+                    if winsize.publish(&pty_for_resize, pty_grid_size(vte, &scroll_for_resize))
+                        || winsize.resize_retry_pending.get()
+                    {
                         settling = true;
                     }
                 }

@@ -84,6 +84,9 @@ jobs:
       - name: Check bidirectional tab selection
         run: python3 scripts/test-tab-selection.py
 
+      - name: Check PTY resize errors against native Linux PTYs
+        run: python3 scripts/test-pty-resize.py
+
       - name: Check formatting
         id: fmt
         run: cargo fmt --all -- --check

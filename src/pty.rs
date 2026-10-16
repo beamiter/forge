@@ -8,7 +8,7 @@ use std::fs::File;
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{mpsc, Arc};
 
 use crate::process::{ChildLifecycle, ReapOwner};
@@ -97,6 +97,7 @@ pub struct OwnedPty {
     /// Coalesce repeated backpressure logs until one later input is accepted.
     /// Error values contain only byte counts, never terminal content.
     input_error_reported: AtomicBool,
+    resize_error_reported: AtomicI32,
     /// Mirrors the shell's DECSET/DECRST 2004 state so multiline insertion can
     /// be protected at the central input boundary. Fed by the block parser's
     /// `ParserEvent::DecsetMode` (see [`OwnedPty::set_shell_bracketed_paste`]),
@@ -919,6 +920,7 @@ impl OwnedPty {
                     reader_cancel_eventfd: create_reader_cancel_eventfd(),
                     input_guard: std::sync::Mutex::new(InputGuard::new()),
                     input_error_reported: AtomicBool::new(false),
+                    resize_error_reported: AtomicI32::new(0),
                     shell_bracketed_paste: AtomicBool::new(false),
                     shell_integration_token,
                     #[cfg(test)]
@@ -1177,18 +1179,60 @@ impl OwnedPty {
         }
     }
 
-    pub fn resize(&self, cols: u16, rows: u16) {
-        if let Ok(guard) = self.master.lock() {
-            if let Some(fd) = guard.as_ref() {
-                let ws = libc::winsize {
-                    ws_row: rows,
-                    ws_col: cols,
-                    ws_xpixel: 0,
-                    ws_ypixel: 0,
-                };
-                unsafe {
-                    libc::ioctl(fd.as_raw_fd(), libc::TIOCSWINSZ, &ws);
-                }
+    /// Apply one size without waiting for another master-fd user. The lock
+    /// remains held through ioctl, so close cannot recycle the descriptor.
+    pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+        self.resize_with(cols, rows, |fd, ws| {
+            // SAFETY: the locked OwnedFd remains alive and ws is initialized.
+            if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, ws) } == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn resize_with(
+        &self,
+        cols: u16,
+        rows: u16,
+        apply: impl FnOnce(RawFd, &libc::winsize) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let guard = self.master.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
+            std::sync::TryLockError::Poisoned(_) => {
+                io::Error::other("PTY descriptor lock poisoned")
+            }
+        })?;
+        let fd = guard
+            .as_ref()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?;
+        let ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let result = apply(fd.as_raw_fd(), &ws);
+        if result.is_ok() {
+            self.resize_error_reported.store(0, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Coalesce identical failures, but expose a changed failure category.
+    /// Diagnostics contain no terminal input or output.
+    pub fn report_resize_error(&self, error: &io::Error) {
+        let category = error.raw_os_error().unwrap_or(match error.kind() {
+            io::ErrorKind::BrokenPipe => -1,
+            io::ErrorKind::WouldBlock => -2,
+            _ => -3,
+        });
+        if self.resize_error_reported.swap(category, Ordering::Relaxed) != category {
+            if error.kind() == io::ErrorKind::BrokenPipe {
+                log::debug!("PTY resize skipped: descriptor closed ({error})");
+            } else {
+                log::warn!("PTY resize failed: {error}");
             }
         }
     }
@@ -1737,6 +1781,7 @@ impl OwnedPty {
             reader_cancel_eventfd: create_reader_cancel_eventfd(),
             input_guard: std::sync::Mutex::new(InputGuard::new()),
             input_error_reported: AtomicBool::new(false),
+            resize_error_reported: AtomicI32::new(0),
             shell_bracketed_paste: AtomicBool::new(false),
             shell_integration_token: None,
             test_slave: Some(slave),
