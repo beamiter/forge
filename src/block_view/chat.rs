@@ -342,7 +342,7 @@ impl ChatPresentation {
         let submit = gtk4::Button::with_label("↑");
         submit.add_css_class("chat-submit");
         submit.add_css_class("chat-command-control");
-        submit.set_tooltip_text(Some("Send Enter immediately when idle; if unavailable or using enhanced keys, use the keyboard"));
+        submit.set_tooltip_text(Some("Send Enter immediately when idle. Finish or cancel text composition before using Send; if unavailable or using enhanced keys, use the keyboard"));
         submit.update_property(&[gtk4::accessible::Property::Label("Submit shell input")]);
         submit.set_focus_on_click(false);
         controls.append(&submit);

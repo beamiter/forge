@@ -52,6 +52,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::ime_gate::tests::preedit_lifecycle_tracks_each_live_context_without_text
     block_view::blocks::command_reuse_labels_tests::recall_header_describes_insert_only_action
     block_view::shortcut_hints::tests::menu_hints_follow_current_mapping_without_dispatch
     block_view::blocks::fold_preview_tests::folded_preview_tracks_filters_and_preserves_output
@@ -90,7 +91,7 @@ tests=(
     block_view::tests::truncated_clipboard_feedback_tracks_actual_delivery
     block_view::tests::ssh_remote_prompt_cursor_stays_inside_live_clip_without_clear
     block_view::tests::native_ime_commit_cancel_and_independent_ptys
-    block_view::tests::native_ime_send_button_diagnostic
+    block_view::tests::native_ime_send_button_preserves_composition
     block_view::tests::delayed_clipboard_paste_preserves_newer_pane_search_and_empty_focus
     block_view::tests::delayed_clipboard_paste_restores_original_history_only_after_admission
     block_view::tests::delayed_clipboard_paste_closed_or_hidden_target_cannot_reclaim_focus
@@ -206,7 +207,7 @@ for test_name in "${tests[@]}"; do
         a11y_backend="test"
     fi
     fixture_im_module="${GTK_IM_MODULE-}"
-    if [[ "$test_name" == block_view::tests::native_ime_commit_cancel_and_independent_ptys || "$test_name" == block_view::tests::native_ime_send_button_diagnostic ]]; then
+    if [[ "$test_name" == block_view::tests::native_ime_commit_cancel_and_independent_ptys || "$test_name" == block_view::tests::native_ime_send_button_preserves_composition ]]; then
         fixture_im_module=simple
     fi
     GTK_IM_MODULE="$fixture_im_module" GTK_A11Y="$a11y_backend" dbus-run-session "${dbus_run_args[@]}" -- \

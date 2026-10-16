@@ -43,6 +43,7 @@ mod export;
 mod find;
 mod fold_preview;
 mod history;
+mod ime_gate;
 mod kitty_graphics;
 mod onboarding;
 #[allow(dead_code)]
@@ -14007,6 +14008,7 @@ impl TermView {
         // must consume and close its private fd, then echo OSC 7771 with this
         // exact token before reviewed commands may be executed.
         let agent_execution_supported = Rc::new(Cell::new(false));
+        ime_gate::install();
         // ── Build widget tree ──────────────────────────────────────────────
         let root = gtk4::Box::new(Orientation::Vertical, 0);
         root.set_hexpand(true);
@@ -15843,6 +15845,7 @@ impl TermView {
 
         if let Some(chat) = &chat_presentation {
             if let Some(button) = chat.submit_button() {
+                let notify = paste_feedback::notifier(&active_vte);
                 let integrated = ftcs_seen.clone();
                 let sink = live_commit.clone();
                 let hold = selection_feed_hold.clone();
@@ -15853,8 +15856,9 @@ impl TermView {
                     let integrated = integrated.clone();
                     let prompt_generation = prompt_generation.clone();
                     move || {
-                        if !chat::surface(sink.bstate.get(), integrated.get())
-                            .allows_submit_affordance()
+                        if ime_gate::blocked()
+                            || !chat::surface(sink.bstate.get(), integrated.get())
+                                .allows_submit_affordance()
                             || !sink.pty_child_is_shell
                         {
                             return None;
@@ -15865,6 +15869,10 @@ impl TermView {
                     }
                 };
                 chat::bind_control(&button, origin, move |target| {
+                    if ime_gate::blocked() {
+                        notify(ime_gate::notice());
+                        return;
+                    }
                     // A native activation may finish after another prompt has
                     // replaced the represented one. Keep the original prompt
                     // generation and foreground through held replay + syscall.
@@ -15874,7 +15882,7 @@ impl TermView {
                             &sink,
                             integrated.get(),
                             Some(foreground),
-                            || prompt_generation.get() == generation,
+                            || !ime_gate::blocked() && prompt_generation.get() == generation,
                         )
                     });
                     if let Some(vte) = vte.upgrade() {
