@@ -34304,3 +34304,6 @@ mod command_reuse_menu_label_tests {
 
 #[cfg(test)]
 mod readline_preservation_tests;
+
+#[cfg(test)]
+mod chat_render_tests;
