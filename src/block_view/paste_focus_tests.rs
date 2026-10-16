@@ -227,6 +227,7 @@ fn delayed_clipboard_paste_closed_or_hidden_target_cannot_reclaim_focus() {
 #[test]
 #[ignore = "requires DISPLAY; real clipboard delivery and PTY admission"]
 fn truncated_clipboard_feedback_tracks_actual_delivery() {
+    use gtk4::prelude::GtkWindowExt;
     gtk4::init().expect("GTK display");
     for mode in [
         crate::config::TerminalMode::Block,
