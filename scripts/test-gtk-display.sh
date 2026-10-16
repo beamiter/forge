@@ -52,6 +52,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::search_navigation_tests::native_search_identity_characterization
     ui::tasks_panel::tests::approval_details_are_paged_read_only_and_stale_controls_cannot_decide
     block_view::incremental_find_tests::block_native_find_controls_keep_query_caret_and_tab_focus
     block_view::incremental_find_tests::chat_native_find_controls_keep_query_caret_and_tab_focus
