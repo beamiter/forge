@@ -3204,7 +3204,7 @@ impl FinishedBlock {
             precomputed
                 .output_preview
                 .filter(|_| !repaint_collapsed)
-                .unwrap_or_else(|| super::fold_preview::from_plain(&strip_ansi(output))),
+                .unwrap_or_else(|| super::fold_preview::from_output(output)),
         );
         let collapsed_summary = gtk4::Button::with_label(&summary);
         collapsed_summary.add_css_class("block-output-summary");
@@ -3619,7 +3619,7 @@ impl FinishedBlock {
                                 if display_override.is_none() {
                                     original_preview.as_ref().clone()
                                 } else {
-                                    super::fold_preview::from_plain(&strip_ansi(shown))
+                                    super::fold_preview::from_output(shown)
                                 }
                             });
                             set_folded_summary(

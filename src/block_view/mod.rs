@@ -9965,7 +9965,7 @@ impl RenderBackend for BlockBackend {
             recycled,
             FinishedBlockPrecomputed {
                 output_rows: Some(output_rows),
-                output_preview: Some(fold_preview::from_plain(output_plain)),
+                output_preview: Some(fold_preview::from_output(output_with_ansi)),
             },
         );
         if self.block_list_rc.has_css_class("chat-transcript") {
