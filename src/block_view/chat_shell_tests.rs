@@ -120,6 +120,8 @@ fn capture(view: &TermView, window: &gtk4::Window, out: &Path, stage: usize, lab
 #[ignore = "requires isolated Wayland, wtype and Bash; scripts/test-chat-shell-smoke.py"]
 #[allow(deprecated)]
 fn chat_real_bash_keyboard_and_clipboard() {
+    jterm_core::child_env::capture_inherited_environment()
+        .expect("capture child environment before GTK");
     gtk4::init().unwrap();
     let out = PathBuf::from(std::env::var("FORGE_F13_OUTPUT").unwrap());
     assert_eq!(std::env::var("FORGE_F13_FONT").unwrap(), "DejaVu Sans Mono");
