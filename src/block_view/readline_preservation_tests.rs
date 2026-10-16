@@ -147,6 +147,43 @@ fn owns_focus(window: &gtk::Window, widget: &impl IsA<gtk::Widget>) -> bool {
         .is_some_and(|focus| focus == *widget.as_ref() || focus.is_ancestor(widget))
 }
 
+fn geometry_diagnostic(view: &TermView) -> String {
+    let vte = &view.active_vte;
+    let mut chain = Vec::new();
+    let mut widget = Some(view.active.borrow().live_clip().upcast::<gtk::Widget>());
+    for _ in 0..8 {
+        let Some(current) = widget else { break };
+        chain.push(format!(
+            "{}:allocated={}x{},requested={}x{},horizontal_measure={:?}",
+            current.type_().name(),
+            current.width(),
+            current.height(),
+            current.width_request(),
+            current.height_request(),
+            current.measure(gtk::Orientation::Horizontal, -1)
+        ));
+        widget = current.parent();
+    }
+    format!("tick_armed={} sent_winsize={:?} live_vte_allocated={}x{} live_vte_requested={}x{} live_vte_horizontal_measure={:?} clip_ancestors={chain:?}",
+        view.resize_tick_id.borrow().is_some(), view.pty_winsize.sent.get(),
+        vte.width(), vte.height(), vte.width_request(), vte.height_request(),
+        vte.measure(gtk::Orientation::Horizontal, -1))
+}
+
+fn find_canvas(widget: &gtk::Widget) -> Option<gtk::Widget> {
+    if widget.has_css_class("chat-canvas") {
+        return Some(widget.clone());
+    }
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        if let Some(canvas) = find_canvas(&current) {
+            return Some(canvas);
+        }
+        child = current.next_sibling();
+    }
+    None
+}
+
 #[test]
 #[ignore = "requires an isolated GTK process, display, and Bash/readline"]
 fn search_and_native_split_preserve_readline_draft_cursor_and_undo() {
@@ -259,6 +296,19 @@ fn search_and_native_split_preserve_readline_draft_cursor_and_undo() {
             assert_eq!(snapshot(&original.0, &scratch.0), before);
         }
 
+        let canvas_resize_events = Rc::new(Cell::new(0u32));
+        if mode == crate::config::TerminalMode::Chat {
+            let canvas = find_canvas(original.0.root.upcast_ref()).expect("stable Chat canvas");
+            let frame = canvas.parent().unwrap().downcast::<gtk::Overlay>().unwrap();
+            let observer = frame
+                .last_child()
+                .unwrap()
+                .downcast::<gtk::DrawingArea>()
+                .unwrap();
+            let events = canvas_resize_events.clone();
+            observer.connect_resize(move |_, _, _| events.set(events.get() + 1));
+        }
+
         // Native layout/reparent boundary used by split panes. This is not a
         // test of AppModel/UiState's top-level split command or shell selection.
         gtk::prelude::GtkWindowExt::set_focus(&window, None::<&gtk::Widget>);
@@ -282,11 +332,12 @@ fn search_and_native_split_preserve_readline_draft_cursor_and_undo() {
         {
             assert!(
                 Instant::now() < resize_deadline,
-                "split must resize the original live pane: mode={mode:?} original_state={:?} sibling_state={:?} old_width={width} current_width={} window_width={} split_position={} old_columns={original_columns} pty_columns={} vte_columns={} original_mapped={} sibling_mapped={}",
+                "split must resize the original live pane: mode={mode:?} original_state={:?} sibling_state={:?} old_width={width} current_width={} window_width={} split_position={} old_columns={original_columns} pty_columns={} vte_columns={} original_mapped={} sibling_mapped={} canvas_resize_events={} geometry={}",
                 original.0.bstate.get(), sibling.0.bstate.get(),
                 original.0.root.width(), window.width(), paned.position(),
                 pty_columns(&original.0), original.0.active_vte.column_count(),
                 original.0.root.is_mapped(), sibling.0.root.is_mapped(),
+                canvas_resize_events.get(), geometry_diagnostic(&original.0),
             );
             pump();
         }
