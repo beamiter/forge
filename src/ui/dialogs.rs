@@ -2429,7 +2429,11 @@ fn cross_block_search_status(
             "No matches.".to_string()
         }
     } else {
-        let noun = if total == 1 { "match" } else { "matches" };
+        let noun = if total == 1 {
+            "matching line"
+        } else {
+            "matching lines"
+        };
         let position = selected
             .filter(|index| *index < total)
             .map(|index| format!("{} of ", index + 1))
@@ -2444,6 +2448,80 @@ fn cross_block_search_status(
     }
 }
 
+fn cross_block_search_status_for_query(
+    total: usize,
+    selected: Option<usize>,
+    scan_incomplete: bool,
+    query: &str,
+) -> String {
+    let status = cross_block_search_status(total, selected, scan_incomplete);
+    if query.is_empty() {
+        status.replace("matching line", "matching record")
+    } else {
+        status
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrossBlockHighlightPlan {
+    NativeHighlightAttempt,
+    NavigatedWithoutHighlight,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrossBlockHighlightOutcome {
+    Highlighted,
+    NavigatedWithoutHighlight,
+    Unavailable,
+}
+
+fn cross_block_results_are_current(
+    expected_query: Option<&(String, crate::block_view::CrossBlockSearchOptions)>,
+    expected_lease: Option<(u64, crate::block_view::CrossBlockSearchVersion)>,
+    query: &str,
+    options: crate::block_view::CrossBlockSearchOptions,
+    generation: u64,
+    version: crate::block_view::CrossBlockSearchVersion,
+) -> bool {
+    expected_query.is_some_and(|(text, flags)| text == query && *flags == options)
+        && expected_lease == Some((generation, version))
+}
+
+fn cross_block_highlight_plan(
+    kind: crate::block_view::CrossBlockRecordKind,
+) -> CrossBlockHighlightPlan {
+    match kind {
+        crate::block_view::CrossBlockRecordKind::NativeRecord => {
+            CrossBlockHighlightPlan::NativeHighlightAttempt
+        }
+        crate::block_view::CrossBlockRecordKind::MetadataRecord => {
+            CrossBlockHighlightPlan::NavigatedWithoutHighlight
+        }
+        crate::block_view::CrossBlockRecordKind::Missing => CrossBlockHighlightPlan::Unavailable,
+    }
+}
+
+/// A stale lease must not invoke native highlighting, which changes PRIMARY.
+fn cross_block_try_highlight(
+    plan: CrossBlockHighlightPlan,
+    current: bool,
+    highlight: impl FnOnce() -> bool,
+) -> CrossBlockHighlightOutcome {
+    if !current {
+        return CrossBlockHighlightOutcome::Unavailable;
+    }
+    match plan {
+        CrossBlockHighlightPlan::NativeHighlightAttempt if highlight() => {
+            CrossBlockHighlightOutcome::Highlighted
+        }
+        CrossBlockHighlightPlan::NavigatedWithoutHighlight => {
+            CrossBlockHighlightOutcome::NavigatedWithoutHighlight
+        }
+        _ => CrossBlockHighlightOutcome::Unavailable,
+    }
+}
+
 /// Continue slices share the first rebuild's bookmarked-empty copy so a
 /// Bookmarked scan that finishes empty after idle resume does not drop to
 /// generic "No matches."
@@ -2452,13 +2530,14 @@ fn overlay_scan_status(
     selected: Option<usize>,
     scan_incomplete: bool,
     bookmarked_empty: Option<&'static str>,
+    query: &str,
 ) -> String {
     if total == 0 && !scan_incomplete {
         if let Some(message) = bookmarked_empty {
             return message.to_string();
         }
     }
-    cross_block_search_status(total, selected, scan_incomplete)
+    cross_block_search_status_for_query(total, selected, scan_incomplete, query)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2552,7 +2631,8 @@ fn cross_block_search_jump_unavailable_status() -> &'static str {
 /// What the cross-block palette does with one activated hit. Every arm of
 /// [`RecordNavigationResult`] resolves to exactly one of these: a record the
 /// view could reach, or could only show a snapshot of, always closes the
-/// palette; only a record it can do neither for keeps it open with a status.
+/// palette after activation validation; unavailable navigation or highlighting
+/// keeps it open with a status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CrossBlockJumpOutcome {
     Close,
@@ -2572,7 +2652,43 @@ fn cross_block_jump_outcome(result: RecordNavigationResult) -> CrossBlockJumpOut
     }
 }
 
-/// Continuous review is possible only after an exact live terminal jump.
+fn activate_cross_block_palette_hit(
+    current: bool,
+    plan: CrossBlockHighlightPlan,
+    has_pattern: bool,
+    status: &Label,
+    entry: &SearchEntry,
+    navigate: impl FnOnce() -> RecordNavigationResult,
+    highlight: impl FnOnce() -> bool,
+) -> CrossBlockJumpOutcome {
+    if !current || plan == CrossBlockHighlightPlan::Unavailable {
+        status.set_text("Results changed. Refresh the search before opening this result.");
+        entry.grab_focus();
+        return CrossBlockJumpOutcome::KeepOpen;
+    }
+    let outcome = cross_block_jump_outcome(navigate());
+    match outcome {
+        CrossBlockJumpOutcome::Close if has_pattern => {
+            if cross_block_try_highlight(plan, true, highlight)
+                == CrossBlockHighlightOutcome::Unavailable
+            {
+                // Native false conflates no-match, unsupported and runtime errors.
+                status.set_text("Highlight unavailable. Refresh the search or refine the query.");
+                entry.grab_focus();
+                return CrossBlockJumpOutcome::KeepOpen;
+            }
+        }
+        CrossBlockJumpOutcome::KeepOpen => {
+            status.set_text(cross_block_search_jump_unavailable_status());
+            entry.grab_focus();
+        }
+        _ => {}
+    }
+    outcome
+}
+
+/// Continuous review follows a successful native navigation/highlight attempt.
+/// Native success is not proof of an exact regex occurrence.
 /// Snapshot-only results still open their snapshot dialog, and unavailable
 /// results stay selected with their error status instead of silently moving.
 fn cross_block_should_step(outcome: CrossBlockJumpOutcome, requested: bool) -> bool {
@@ -3579,23 +3695,29 @@ impl UiState {
             Rc::new(RefCell::new(None));
         let search_generation = Rc::new(Cell::new(0u64));
         let observed_version = Rc::new(Cell::new(term_view.cross_block_search_version()));
+        let result_lease = Rc::new(Cell::new(None));
+        let result_query = Rc::new(RefCell::new(None));
         let schedule_rebuild_slot: CrossBlockScheduleRebuildSlot = Rc::new(RefCell::new(None));
 
         {
             let hits = hits.clone();
             let scan_incomplete = scan_incomplete.clone();
+            let filter_entry = filter_entry.clone();
             let status_label = status_label.clone();
             list_box.connect_row_selected(move |_, row| {
                 let total = hits.borrow().len();
-                status_label.set_text(&cross_block_search_status(
+                status_label.set_text(&cross_block_search_status_for_query(
                     total,
                     row.map(|row| row.index() as usize),
                     scan_incomplete.get(),
+                    filter_entry.text().as_str(),
                 ));
             });
         }
 
         let rebuild = {
+            let result_lease = result_lease.clone();
+            let result_query = result_query.clone();
             let term_view = term_view.clone();
             let list_box = list_box.clone();
             let hits = hits.clone();
@@ -3621,6 +3743,8 @@ impl UiState {
                     source.remove();
                 }
                 let generation = search_generation.get();
+                let version = term_view.cross_block_search_version();
+                result_lease.set(Some((generation, version)));
                 let query = filter_entry.text().to_string();
                 // Navigation remains available while the short refresh
                 // debounce runs. Re-snapshot at execution time so a Down/Up
@@ -3642,6 +3766,7 @@ impl UiState {
                     regex: regex_toggle.is_active(),
                     whole_word: whole_word_toggle.is_active(),
                 };
+                *result_query.borrow_mut() = Some((query.clone(), options));
                 let filters = crate::block_view::BlockFilters {
                     failed_only: failed_toggle.is_active(),
                     slow_only: slow_toggle.is_active(),
@@ -3692,6 +3817,7 @@ impl UiState {
                             term_view
                                 .bookmarked_search_empty_reason(&query, scope, &filters)
                                 .map(cross_block_bookmarked_empty_status),
+                            &query,
                         );
                         status_label.set_text(&status);
                         let jumpable = term_view.jumpable_search_hits(&results);
@@ -3743,6 +3869,10 @@ impl UiState {
                                     pending_scan_continue_idle.borrow_mut().take();
                                     return glib::ControlFlow::Break;
                                 }
+                                if term_view.cross_block_search_version() != version {
+                                    pending_scan_continue_idle.borrow_mut().take();
+                                    return glib::ControlFlow::Break;
+                                }
                                 let Some(resume) = cursor.borrow().clone() else {
                                     pending_scan_continue_idle.borrow_mut().take();
                                     return glib::ControlFlow::Break;
@@ -3750,10 +3880,11 @@ impl UiState {
                                 let already = hits.borrow().len();
                                 if already >= CROSS_BLOCK_SEARCH_LIMIT {
                                     scan_incomplete.set(false);
-                                    status_label.set_text(&cross_block_search_status(
+                                    status_label.set_text(&cross_block_search_status_for_query(
                                         already,
                                         list_box.selected_row().map(|row| row.index() as usize),
                                         false,
+                                        &query,
                                     ));
                                     pending_scan_continue_idle.borrow_mut().take();
                                     return glib::ControlFlow::Break;
@@ -3797,6 +3928,7 @@ impl UiState {
                                                     &query, scope, &filters,
                                                 )
                                                 .map(cross_block_bookmarked_empty_status),
+                                            &query,
                                         ));
                                         *cursor.borrow_mut() = more.resume;
                                         if cursor.borrow().is_some() {
@@ -4081,6 +4213,9 @@ impl UiState {
         // turn on its per-VTE search highlight at the matching hit. Plain
         // activation closes; Shift+Enter can keep a successful live jump open.
         let jump = {
+            let result_lease = result_lease.clone();
+            let result_query = result_query.clone();
+            let search_generation = search_generation.clone();
             let term_view = term_view.clone();
             let hits = hits.clone();
             let filter_entry = filter_entry.clone();
@@ -4099,30 +4234,31 @@ impl UiState {
                     Some(h) => h.clone(),
                     None => return CrossBlockJumpOutcome::KeepOpen,
                 };
-                let outcome = cross_block_jump_outcome(
-                    term_view.navigate_to_record_id(hit.block_id, hit.is_output),
+                let current = cross_block_results_are_current(
+                    result_query.borrow().as_ref(),
+                    result_lease.get(),
+                    &pattern,
+                    options,
+                    search_generation.get(),
+                    term_view.cross_block_search_version(),
                 );
-                match outcome {
-                    CrossBlockJumpOutcome::Close => {
-                        // The surface has already scrolled and taken focus. A
-                        // highlight that cannot be set is not a reason to
-                        // strand this modal over it.
-                        if !pattern.is_empty() {
-                            term_view.focus_match_in_block(
-                                hit.block_id,
-                                &pattern,
-                                options,
-                                hit.is_output,
-                                hit.occurrence,
-                            );
-                        }
-                    }
-                    CrossBlockJumpOutcome::KeepOpen => {
-                        status_label.set_text(cross_block_search_jump_unavailable_status());
-                    }
-                    CrossBlockJumpOutcome::ShowSnapshot(_) => {}
-                }
-                outcome
+                activate_cross_block_palette_hit(
+                    current,
+                    cross_block_highlight_plan(term_view.cross_block_record_kind(hit.block_id)),
+                    !pattern.is_empty(),
+                    &status_label,
+                    &filter_entry,
+                    || term_view.navigate_to_record_id(hit.block_id, hit.is_output),
+                    || {
+                        term_view.focus_match_in_block(
+                            hit.block_id,
+                            &pattern,
+                            options,
+                            hit.is_output,
+                            hit.occurrence,
+                        )
+                    },
+                )
             }
         };
 
@@ -7079,7 +7215,8 @@ mod tests {
                 0,
                 None,
                 false,
-                Some("No bookmarked blocks in retained history.")
+                Some("No bookmarked blocks in retained history."),
+                "needle",
             ),
             "No bookmarked blocks in retained history."
         );
@@ -7088,7 +7225,8 @@ mod tests {
                 0,
                 None,
                 true,
-                Some("No bookmarked blocks in retained history.")
+                Some("No bookmarked blocks in retained history."),
+                "needle",
             ),
             cross_block_search_status(0, None, true)
         );
@@ -7098,17 +7236,23 @@ mod tests {
         );
         assert_eq!(
             cross_block_search_status(CROSS_BLOCK_SEARCH_LIMIT, None, false),
-            "500 matches (capped) — refine your query."
+            "500 matching lines (capped) — refine your query."
         );
-        assert_eq!(cross_block_search_status(37, None, false), "37 matches");
+        assert_eq!(
+            cross_block_search_status(37, None, false),
+            "37 matching lines"
+        );
         assert_eq!(
             cross_block_search_status(37, None, true),
-            "37 matches (scan budget reached — later blocks not examined)"
+            "37 matching lines (scan budget reached — later blocks not examined)"
         );
-        assert_eq!(cross_block_search_status(1, Some(0), false), "1 of 1 match");
+        assert_eq!(
+            cross_block_search_status(1, Some(0), false),
+            "1 of 1 matching line"
+        );
         assert_eq!(
             cross_block_search_status(CROSS_BLOCK_SEARCH_LIMIT, Some(36), false),
-            "37 of 500 matches (capped) — refine your query."
+            "37 of 500 matching lines (capped) — refine your query."
         );
         assert_eq!(
             cross_block_search_jump_unavailable_status(),
@@ -7699,5 +7843,359 @@ mod tests {
         assert!(!oversized.bookmarked_only);
         assert!(!super::CrossBlockSearchMemory::default().background_only);
         assert!(!super::CrossBlockSearchMemory::default().bookmarked_only);
+    }
+}
+
+#[cfg(test)]
+mod palette_activation_contract_tests {
+    use super::*;
+    #[test]
+    fn stale_activation_never_calls_native_and_false_stays_unsuccessful() {
+        use CrossBlockHighlightOutcome as Outcome;
+        use CrossBlockHighlightPlan as Plan;
+        let called = Cell::new(0);
+        assert_eq!(
+            cross_block_try_highlight(Plan::NativeHighlightAttempt, false, || {
+                called.set(99);
+                true
+            }),
+            Outcome::Unavailable
+        );
+        assert_eq!(
+            cross_block_try_highlight(Plan::NavigatedWithoutHighlight, true, || {
+                called.set(99);
+                false
+            }),
+            Outcome::NavigatedWithoutHighlight
+        );
+        assert_eq!(
+            cross_block_try_highlight(Plan::NavigatedWithoutHighlight, false, || {
+                called.set(99);
+                false
+            }),
+            Outcome::Unavailable
+        );
+        assert_eq!(
+            cross_block_try_highlight(Plan::Unavailable, true, || {
+                called.set(99);
+                true
+            }),
+            Outcome::Unavailable
+        );
+        assert_eq!(called.get(), 0);
+        assert_eq!(
+            cross_block_try_highlight(Plan::NativeHighlightAttempt, true, || {
+                called.set(called.get() + 1);
+                false
+            }),
+            Outcome::Unavailable
+        );
+        assert_eq!(
+            cross_block_try_highlight(Plan::NativeHighlightAttempt, true, || {
+                called.set(called.get() + 1);
+                true
+            }),
+            Outcome::Highlighted
+        );
+        assert_eq!(called.get(), 2);
+    }
+    #[test]
+    fn missing_native_lease_is_not_a_metadata_navigation_lease() {
+        assert_eq!(
+            cross_block_highlight_plan(crate::block_view::CrossBlockRecordKind::Missing),
+            CrossBlockHighlightPlan::Unavailable
+        );
+        assert_eq!(
+            cross_block_highlight_plan(crate::block_view::CrossBlockRecordKind::MetadataRecord),
+            CrossBlockHighlightPlan::NavigatedWithoutHighlight
+        );
+    }
+    #[test]
+    fn result_lease_rejects_query_options_and_generation_changes() {
+        let version = crate::block_view::CrossBlockSearchVersion::default();
+        let options = crate::block_view::CrossBlockSearchOptions {
+            case_sensitive: true,
+            regex: false,
+            whole_word: false,
+        };
+        let query = ("needle".to_owned(), options);
+        assert!(cross_block_results_are_current(
+            Some(&query),
+            Some((3, version)),
+            "needle",
+            options,
+            3,
+            version
+        ));
+        assert!(!cross_block_results_are_current(
+            Some(&query),
+            Some((3, version)),
+            "new",
+            options,
+            3,
+            version
+        ));
+        let changed = crate::block_view::CrossBlockSearchOptions {
+            regex: true,
+            ..options
+        };
+        assert!(!cross_block_results_are_current(
+            Some(&query),
+            Some((3, version)),
+            "needle",
+            changed,
+            3,
+            version
+        ));
+        assert!(!cross_block_results_are_current(
+            Some(&query),
+            Some((3, version)),
+            "needle",
+            options,
+            4,
+            version
+        ));
+    }
+    #[test]
+    fn palette_counts_lines_for_queries_and_records_for_filters() {
+        assert_eq!(
+            cross_block_search_status_for_query(2, None, false, "word"),
+            "2 matching lines"
+        );
+        assert_eq!(
+            cross_block_search_status_for_query(2, None, false, ""),
+            "2 matching records"
+        );
+        assert_eq!(
+            cross_block_search_status_for_query(1, Some(0), false, ""),
+            "1 of 1 matching record"
+        );
+    }
+}
+
+#[cfg(test)]
+mod native_palette_activation_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an isolated GTK process and display"]
+    fn palette_activation_preserves_snapshot_unfold_failure_focus_and_stale_ownership() {
+        gtk4::init().expect("GTK display");
+        let pump = || {
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            while std::time::Instant::now() < until {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        let seed = |view: &crate::block_view::TermView| {
+            crate::block_view::palette_activation_test_feed(
+                view,
+                b"\x1b]133;A\x07$ \x1b]133;B\x07",
+            );
+            pump();
+            crate::block_view::palette_activation_test_feed(view, b"printf needle\r\n\x1b]133;C\x07needle\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+            pump();
+        };
+        let options = crate::block_view::CrossBlockSearchOptions {
+            case_sensitive: true,
+            regex: false,
+            whole_word: false,
+        };
+        let view =
+            crate::block_view::palette_activation_test_view(crate::config::TerminalMode::Block);
+        let window = gtk4::Window::builder()
+            .default_width(700)
+            .default_height(500)
+            .child(&view.widget())
+            .build();
+        window.present();
+        pump();
+        seed(&view);
+        let hits = view
+            .cross_block_search_in_scope(
+                "needle",
+                options,
+                crate::block_view::CrossBlockSearchScope::Output,
+                10,
+                &crate::block_view::BlockFilters::default(),
+            )
+            .unwrap()
+            .hits;
+        let hit = hits
+            .first()
+            .expect("production PTY completion creates output search row")
+            .clone();
+        assert_eq!(
+            view.cross_block_record_kind(hit.block_id),
+            crate::block_view::CrossBlockRecordKind::NativeRecord
+        );
+
+        let entry = SearchEntry::new();
+        entry.set_text("needle");
+        let status = Label::new(None);
+        let list = ListBox::new();
+        list.append(&Label::new(Some("needle")));
+        let body = gtk4::Box::new(Orientation::Vertical, 0);
+        body.append(&entry);
+        body.append(&status);
+        body.append(&list);
+        let dialog = adw::Dialog::new();
+        dialog.set_child(Some(&body));
+        dialog.present(Some(&window));
+        pump();
+        let lease = view.cross_block_search_version();
+        let generation = Rc::new(Cell::new(0));
+        let fail = Rc::new(Cell::new(false));
+        let calls = Rc::new(Cell::new(0));
+        let outcome = Rc::new(Cell::new(CrossBlockJumpOutcome::KeepOpen));
+        {
+            let view = view.clone();
+            let entry = entry.clone();
+            let status = status.clone();
+            let generation = generation.clone();
+            let fail = fail.clone();
+            let calls = calls.clone();
+            let outcome = outcome.clone();
+            list.connect_row_activated(move |_, _| {
+                outcome.set(activate_cross_block_palette_hit(
+                    cross_block_results_are_current(
+                        Some(&("needle".to_owned(), options)),
+                        Some((0, lease)),
+                        entry.text().as_str(),
+                        options,
+                        generation.get(),
+                        view.cross_block_search_version(),
+                    ),
+                    cross_block_highlight_plan(view.cross_block_record_kind(hit.block_id)),
+                    true,
+                    &status,
+                    &entry,
+                    || {
+                        calls.set(calls.get() + 1);
+                        view.navigate_to_record_id(hit.block_id, hit.is_output)
+                    },
+                    || {
+                        calls.set(calls.get() + 1);
+                        view.focus_match_in_block(
+                            hit.block_id,
+                            if fail.get() {
+                                "absent-fixture-word"
+                            } else {
+                                "needle"
+                            },
+                            options,
+                            hit.is_output,
+                            hit.occurrence,
+                        )
+                    },
+                ));
+            });
+        }
+        let activate = || {
+            list.emit_by_name::<()>("row-activated", &[&list.row_at_index(0).unwrap()]);
+            pump();
+        };
+        activate();
+        assert_eq!(
+            outcome.get(),
+            CrossBlockJumpOutcome::Close,
+            "expanded native target succeeds"
+        );
+        assert!(view.set_all_blocks_collapsed(true) > 0);
+        pump();
+        assert_eq!(
+            crate::block_view::palette_activation_test_collapsed(&view, hit.block_id),
+            Some(true),
+            "target is actually collapsed before activation"
+        );
+        activate();
+        assert_eq!(
+            crate::block_view::palette_activation_test_collapsed(&view, hit.block_id),
+            Some(false),
+            "activation actually unfolds the target"
+        );
+        assert_eq!(
+            outcome.get(),
+            CrossBlockJumpOutcome::Close,
+            "one-time unfold preserves successful highlight"
+        );
+        activate();
+        assert_eq!(
+            outcome.get(),
+            CrossBlockJumpOutcome::Close,
+            "repeated expanded activation succeeds"
+        );
+        fail.set(true);
+        activate();
+        assert_eq!(outcome.get(), CrossBlockJumpOutcome::KeepOpen);
+        assert!(dialog.is_visible());
+        assert!(status.text().contains("Highlight unavailable"));
+        let focused = window
+            .upcast_ref::<gtk4::Root>()
+            .focus()
+            .expect("failed highlight restores query focus");
+        let query = entry.upcast_ref::<gtk4::Widget>();
+        assert!(
+            focused == *query || focused.is_ancestor(query),
+            "failed highlight focuses the query entry, not the result list"
+        );
+        let before = calls.get();
+        entry.set_text("new query before debounce");
+        activate();
+        assert_eq!(outcome.get(), CrossBlockJumpOutcome::KeepOpen);
+        assert_eq!(
+            calls.get(),
+            before,
+            "stale activation never navigates or highlights"
+        );
+        assert!(status.text().contains("Results changed"));
+        entry.set_text("needle");
+        generation.set(1);
+        activate();
+        assert_eq!(calls.get(), before, "new UI generation rejects old rows");
+        generation.set(0);
+        assert!(view.clear_blocks() > 0);
+        assert_ne!(lease, view.cross_block_search_version());
+        activate();
+        assert_eq!(
+            calls.get(),
+            before,
+            "retired finalized record rejects old rows"
+        );
+        dialog.force_close();
+        window.close();
+        pump();
+
+        // An unmapped Unified view has retained metadata/snapshot but no
+        // draw-proven zone projection. The actual backend returns SnapshotView.
+        let unified =
+            crate::block_view::palette_activation_test_view(crate::config::TerminalMode::Unified);
+        seed(&unified);
+        let hit = unified
+            .cross_block_search_in_scope(
+                "needle",
+                options,
+                crate::block_view::CrossBlockSearchScope::Output,
+                10,
+                &crate::block_view::BlockFilters::default(),
+            )
+            .unwrap()
+            .hits
+            .into_iter()
+            .next()
+            .unwrap();
+        let plan = cross_block_highlight_plan(unified.cross_block_record_kind(hit.block_id));
+        assert_eq!(plan, CrossBlockHighlightPlan::NavigatedWithoutHighlight);
+        let outcome = activate_cross_block_palette_hit(
+            true,
+            plan,
+            true,
+            &status,
+            &entry,
+            || unified.navigate_to_record_id(hit.block_id, hit.is_output),
+            || panic!("metadata snapshot must not invoke native highlighter"),
+        );
+        assert_eq!(outcome, CrossBlockJumpOutcome::ShowSnapshot(hit.block_id));
     }
 }

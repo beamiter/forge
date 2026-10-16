@@ -56,6 +56,7 @@ tests=(
     ui::tasks_panel::tests::task_filters_keep_identity_hidden_updates_and_keyboard_routing
     ui::tasks_panel::tests::thousand_task_filter_and_update_native_benchmark
     block_view::search_navigation_tests::native_search_identity_characterization
+    ui::dialogs::native_palette_activation_tests::palette_activation_preserves_snapshot_unfold_failure_focus_and_stale_ownership
     ui::tasks_panel::tests::approval_details_are_paged_read_only_and_stale_controls_cannot_decide
     block_view::incremental_find_tests::block_native_find_controls_keep_query_caret_and_tab_focus
     block_view::incremental_find_tests::chat_native_find_controls_keep_query_caret_and_tab_focus

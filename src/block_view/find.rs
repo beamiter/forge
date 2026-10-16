@@ -742,6 +742,14 @@ fn find_progress(state: &FindState) -> Option<FindProgress> {
     })
 }
 
+/// Record kind only; NativeRecord does not assert a mounted widget exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CrossBlockRecordKind {
+    NativeRecord,
+    MetadataRecord,
+    Missing,
+}
+
 /// Finalized-record identity observed by an open cross-block picker. Length
 /// alone is insufficient because retention can evict one old record while a
 /// new one arrives in the same update.
@@ -1401,6 +1409,15 @@ impl TermView {
     fn live_find_is_current(&self) -> bool {
         let expected = self.find_state.borrow().live_stamp;
         expected.is_none_or(|stamp| stamp == self.live_find_stamp())
+    }
+
+    pub(crate) fn cross_block_record_kind(&self, block_id: u64) -> CrossBlockRecordKind {
+        let records = self.render_backend.records();
+        match records.iter().find(|record| record.id() == block_id) {
+            Some(record) if record.is_metadata_only() => CrossBlockRecordKind::MetadataRecord,
+            Some(_) => CrossBlockRecordKind::NativeRecord,
+            None => CrossBlockRecordKind::Missing,
+        }
     }
 
     /// Cheap version probe for an open picker. No command/output text is
@@ -23543,4 +23560,35 @@ tail ab";
         assert!(stopped.scan_incomplete);
         assert_eq!(stopped.resume, Some(resume));
     }
+}
+
+/// Nonexecuting native fixture: bytes enter the production PTY reader.
+#[cfg(test)]
+pub(crate) fn palette_activation_test_view(mode: crate::config::TerminalMode) -> Rc<TermView> {
+    Rc::new(
+        TermView::new_with_spawner(
+            &crate::config::Config::safe_defaults(),
+            &mode,
+            &["sh".into()],
+            None,
+            None,
+            &[],
+            |_, _, _, _| crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Shell),
+        )
+        .unwrap(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn palette_activation_test_feed(view: &TermView, bytes: &[u8]) {
+    view.pty.write_test_slave(bytes);
+}
+
+#[cfg(test)]
+pub(crate) fn palette_activation_test_collapsed(view: &TermView, block_id: u64) -> Option<bool> {
+    view.finished_blocks
+        .borrow()
+        .iter()
+        .find(|block| block.id == block_id)
+        .map(|block| block.is_collapsed())
 }
