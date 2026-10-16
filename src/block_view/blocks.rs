@@ -6690,11 +6690,11 @@ mod tests {
         // block below it in the virtualized document.
         assert_eq!(
             super::finished_block_height_for_rows(20, 1, 10, false),
-            12 * 20 + 34
+            12 * 20 + 30
         );
         assert_eq!(
             super::finished_block_height_for_rows(20, 1, 1, false),
-            3 * 20 + 34
+            3 * 20 + 30
         );
         assert_eq!(
             super::finished_block_height_for_rows(20, 1, 1, true),
@@ -6702,7 +6702,7 @@ mod tests {
         );
         assert_eq!(
             super::finished_block_height_for_rows(0, 1, 1, false),
-            3 + 34
+            3 + 30
         );
     }
 
@@ -6712,8 +6712,8 @@ mod tests {
         let command_with_output = super::finished_block_height_for_rows(20, 1, 1, false);
         let command_without_output = super::finished_block_height_for_rows(20, 1, 0, false);
 
-        assert_eq!(background, 2 * 20 + 34);
-        assert_eq!(command_without_output, 2 * 20 + 34);
+        assert_eq!(background, 2 * 20 + 30);
+        assert_eq!(command_without_output, 2 * 20 + 30);
         assert_eq!(command_with_output - background, 20);
     }
 
