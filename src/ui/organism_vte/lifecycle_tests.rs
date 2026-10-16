@@ -294,7 +294,14 @@ pub(super) fn exercise(window: &gtk4::Window, main: &glib::MainContext) {
             assert!(runtime.geometry_idle.borrow().is_none());
             assert!(runtime.host.borrow().is_none());
             assert!(runtime.paint.borrow().is_none());
-            assert_eq!(runtime.glyph.opacity(), 0.0);
+            if runtime.expanded.get() {
+                // Expanded presentation detaches the cached compact glyph.
+                // Its old opacity is not paint: it has no native parent/map.
+                assert!(runtime.glyph.parent().is_none());
+                assert!(!runtime.glyph.is_mapped());
+            } else {
+                assert_eq!(runtime.glyph.opacity(), 0.0);
+            }
             if let Some(widgets) = runtime.expanded_widgets() {
                 assert!(widgets.labels.iter().all(|label| label.opacity() == 0.0));
             }
