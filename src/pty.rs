@@ -2617,7 +2617,8 @@ mod tests {
         let error = try_enqueue_input(&sender, b"private command".to_vec()).unwrap_err();
         assert_eq!(error, PtyWriteError::Closed { bytes: 15 });
         let display = error.to_string();
-        assert!(display.contains("15-byte"));
+        assert!(display.contains("15 bytes rejected"));
+        assert!(display.contains("not sent"));
         assert!(!display.contains("private"));
     }
 
