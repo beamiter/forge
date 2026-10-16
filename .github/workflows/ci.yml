@@ -160,6 +160,7 @@ jobs:
             gdb \
             dbus-x11 \
             sway \
+            wtype \
             grim \
             fonts-dejavu-core \
             fonts-liberation \
@@ -186,6 +187,11 @@ jobs:
         run: |
           python3 scripts/test-chat-render-oracles.py
           python3 scripts/test-chat-render-matrix.py
+
+      - name: Check F13 real Bash keyboard and clipboard smoke
+        run: |
+          python3 scripts/test-chat-shell-oracles.py
+          python3 scripts/test-chat-shell-smoke.py
 
       - name: Run display-backed GTK/VTE regressions
         run: FORGE_NATIVE_CRASH_DIAGNOSTICS=1 GTK_PAINT_DIAGNOSTICS_DIR="$PWD/gtk-paint-diagnostics" FORGE_XTEST_DRIVER="$PWD/scripts/qa-cross-selection-pointer.py" bash scripts/test-gtk-display.sh

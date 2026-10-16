@@ -34307,3 +34307,6 @@ mod readline_preservation_tests;
 
 #[cfg(test)]
 mod chat_render_tests;
+
+#[cfg(test)]
+mod chat_shell_tests;
