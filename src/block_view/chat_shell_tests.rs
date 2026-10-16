@@ -247,7 +247,29 @@ fn chat_real_bash_keyboard_and_clipboard() {
             Err(error) => eprintln!("focus diagnostic {kind}: {error}"),
         }
     }
+    wait(
+        || window.is_active() && view.active_vte.has_focus(),
+        "native keyboard focus readiness",
+    );
     assert!(view.active_vte.has_focus());
+    assert!(window.is_active());
+    let input_ready_tmp = out.join("input-ready.tmp");
+    std::fs::write(
+        &input_ready_tmp,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "window": [window.width(), window.height()],
+            "has_focus": view.active_vte.has_focus(),
+            "window_active": window.is_active(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::rename(input_ready_tmp, out.join("input-ready.json")).unwrap();
+    wait(
+        || out.join("input-ready.ack").exists(),
+        "owned compositor focus before input",
+    );
+    assert!(view.active_vte.has_focus() && window.is_active());
     let shell_pid = view.pty.pid_i32();
     let mut records = Vec::new();
     let mut metrics = None;

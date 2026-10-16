@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import struct
@@ -19,6 +20,70 @@ wait_for, measured = matrix.wait_for, matrix.measured
 horizontal_clearance, PHYSICAL = matrix.horizontal_clearance, matrix.PHYSICAL
 TEST = 'block_view::chat_shell_tests::chat_real_bash_keyboard_and_clipboard'
 FONTS = ('DejaVu Sans Mono',)
+
+# The nonempty F24 keymap is parsed before command execution. The first command
+# blocks on our unwritten stdin pipe; it is NEVER released, even on cleanup.
+SEAT_KEYBOARD_ARGS = ['wtype', '-', '-k', 'F24']
+
+
+def keyboard_trace_ready(trace):
+    if re.search(r'-> zwp_virtual_keyboard_v1[@#]\d+\.(key|modifiers)\(', trace):
+        raise RuntimeError('Seat-only keyboard emitted input')
+    return bool(re.search(r'-> zwp_virtual_keyboard_v1[@#]\d+\.keymap\(', trace))
+
+
+def keyboard_seat_ready(inputs, seats):
+    keyboards = [i for i in inputs if i.get('type') == 'keyboard']
+    if len(keyboards) != 1 or len(inputs) != 1:
+        return False
+    identifier = keyboards[0].get('identifier')
+    return bool(identifier and len(seats) == 1 and seats[0].get('name') == 'seat0'
+                and seats[0].get('capabilities', 0) & 2
+                and [d.get('identifier') for d in seats[0].get('devices', [])] == [identifier])
+
+
+def stop_owned(process):
+    # Kill/reap BEFORE closing stdin: EOF must never release a queued key.
+    if process.poll() is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass  # Already exited between poll and terminate; still reap it.
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
+    if process.stdin is not None and not process.stdin.closed:
+        process.stdin.close()
+
+
+def finish_outcome(out, result, original_error, processes):
+    errors = []
+    for process in reversed(processes):
+        try:
+            stop_owned(process)
+        except Exception as error:
+            errors.append(f'cleanup: {error!r}')
+    try:
+        if not keyboard_trace_ready((out / 'seat-keyboard.log').read_text()):
+            raise RuntimeError('Missing persistent keyboard keymap trace')
+    except Exception as error:
+        errors.append(f'keyboard trace: {error!r}')
+    passed = result is not None and original_error is None and not errors
+    outcome = dict(result or {})
+    outcome.update(status='pass' if passed else 'fail',
+                   original_error=repr(original_error) if original_error is not None else None,
+                   cleanup_errors=errors)
+    if not passed:
+        (out / 'result.json').write_text(json.dumps(outcome, indent=2))
+    if errors and original_error is None:
+        raise RuntimeError('Owned fixture cleanup failed: ' + '; '.join(errors))
+    return outcome
+
 
 def shell_acceptance(records):
     if len(records) != 2 or [r['path'] for r in records] != ['key', 'pst']:
@@ -43,8 +108,18 @@ def private_runtime():
 
 
 def run_case(binary, out, scale, font):
-    with private_runtime() as runtime:
-        _run_case(binary, out, scale, font, Path(runtime))
+    try:
+        with private_runtime() as runtime:
+            outcome = _run_case(binary, out, scale, font, Path(runtime))
+    except BaseException as error:
+        if out.is_dir():
+            report = out / 'result.json'
+            previous = json.loads(report.read_text()) if report.exists() else {}
+            previous.update(status='fail', outer_error=repr(error))
+            report.write_text(json.dumps(previous, indent=2))
+        raise
+    # Only publish pass after process AND owned runtime-directory cleanup.
+    (out / 'result.json').write_text(json.dumps(outcome, indent=2))
 
 
 def _run_case(binary, out, scale, font, runtime):
@@ -69,20 +144,47 @@ focus_follows_mouse no
 for_window [title="^Forge F13 native render$"] floating enable, border none
 ''')
     processes = []
+    result = None
+    original_error = None
     def run(args):
         return subprocess.run(args, env=env, check=True, capture_output=True, text=True, timeout=10).stdout
     def query(kind):
         return json.loads(run(['swaymsg', '-r', '-t', 'get_' + kind]))
-    with (out / 'sway.log').open('w') as sway_log, (out / 'fixture.log').open('w') as fixture_log:
+    with (out / 'sway.log').open('w') as sway_log, (out / 'fixture.log').open('w') as fixture_log, (out / 'seat-keyboard.log').open('w') as keyboard_log:
         try:
             sway = subprocess.Popen(['sway', '-d', '-c', str(config)], env=env, stdout=sway_log, stderr=subprocess.STDOUT)
             processes.append(sway)
             sock = wait_for(lambda: next((p for p in runtime.glob('wayland-*') if p.is_socket()), None), 'Wayland socket', sway)
             ipc = wait_for(lambda: next(runtime.glob('sway-ipc.*.sock'), None), 'Sway IPC', sway)
             env.update(WAYLAND_DISPLAY=sock.name, SWAYSOCK=str(ipc))
+            initial_inputs, initial_seats = query('inputs'), query('seats')
+            (out / 'keyboard-before.json').write_text(json.dumps(dict(inputs=initial_inputs, seats=initial_seats)))
+            if (initial_inputs or len(initial_seats) != 1 or initial_seats[0].get('name') != 'seat0'
+                    or initial_seats[0].get('capabilities') != 0 or initial_seats[0].get('devices')):
+                raise RuntimeError('Expected fresh empty owned headless seat')
+            keyboard = subprocess.Popen(SEAT_KEYBOARD_ARGS, env=dict(env, WAYLAND_DEBUG='client'),
+                                        stdin=subprocess.PIPE, stdout=keyboard_log, stderr=keyboard_log)
+            processes.append(keyboard)
+            def seat_ready():
+                trace = (out / 'seat-keyboard.log').read_text()
+                inputs, seats = query('inputs'), query('seats')
+                if keyboard_trace_ready(trace) and keyboard_seat_ready(inputs, seats):
+                    (out / 'keyboard-ready.json').write_text(json.dumps(dict(inputs=inputs, seats=seats)))
+                    return True
+                return False
+            wait_for(seat_ready, 'persistent native keyboard seat', keyboard)
             fixture = subprocess.Popen([str(binary), TEST, '--ignored', '--exact', '--nocapture'],
                                        env=env, stdout=fixture_log, stderr=subprocess.STDOUT)
             processes.append(fixture)
+            wait_for((out / 'input-ready.json').exists, 'GTK focus before input', fixture)
+            ready = json.loads((out / 'input-ready.json').read_text())
+            actual = measured(query('outputs'), query('tree'), fixture.pid, scale, ready['window'])
+            seats = query('seats')
+            if (not seat_ready() or seats[0].get('focus') != actual['node_id'] or
+                    not ready['has_focus'] or not ready['window_active']):
+                raise RuntimeError('Owned view/seat/GTK focus is not ready for input')
+            (out / 'input-ready-compositor.json').write_text(json.dumps(dict(native=ready, compositor=actual, seats=seats)))
+            (out / 'input-ready.ack').touch()
             reports = []
             for stage in range(8):
                 path = out / f'stage-{stage}.json'
@@ -104,22 +206,22 @@ for_window [title="^Forge F13 native render$"] floating enable, border none
                 for label, value in [('outputs-before', before_outputs), ('tree-before', before_tree),
                                      ('outputs-after', after_outputs), ('tree-after', after_tree)]:
                     (out / f'stage-{stage}-{label}.json').write_text(json.dumps(value, indent=2))
+                if keyboard.poll() is not None or not keyboard_trace_ready((out / 'seat-keyboard.log').read_text()):
+                    raise RuntimeError('Seat keyboard lost or contaminated')
                 reports.append(dict(native=report, compositor=before, screenshot_sha256=hashlib.sha256(png).hexdigest()))
                 (out / f'stage-{stage}.ack').touch()
             if fixture.wait(timeout=20) != 0:
                 raise RuntimeError('Native fixture failed; see fixture.log')
             shell_acceptance(json.loads((out / 'shell-acceptance.json').read_text()))
-            (out / 'result.json').write_text(json.dumps(dict(status='pass', stages=reports,
-                scope='real Bash acceptance bytes; global paste shortcut and complete draft snapshot unverified'), indent=2))
+            result = dict(stages=reports,
+                scope='real Bash acceptance bytes; global paste shortcut and complete draft snapshot unverified')
+        except BaseException as error:
+            original_error = error
+            raise
         finally:
-            for process in reversed(processes):
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
+            outcome = finish_outcome(out, result, original_error, processes)
+    return outcome
+
 
 
 def main():
