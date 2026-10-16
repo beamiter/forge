@@ -154,8 +154,10 @@ fn geometry_diagnostic(view: &TermView) -> String {
     for _ in 0..8 {
         let Some(current) = widget else { break };
         chain.push(format!(
-            "{}:allocated={}x{},requested={}x{},horizontal_measure={:?}",
+            "{}:own_visible={},effective_visible={},child_visible={},mapped={},allocated={}x{},requested={}x{},horizontal_measure={:?}",
             current.type_().name(),
+            current.get_visible(),
+            current.is_visible(), current.is_child_visible(), current.is_mapped(),
             current.width(),
             current.height(),
             current.width_request(),
@@ -164,8 +166,10 @@ fn geometry_diagnostic(view: &TermView) -> String {
         ));
         widget = current.parent();
     }
-    format!("tick_armed={} sent_winsize={:?} live_vte_allocated={}x{} live_vte_requested={}x{} live_vte_horizontal_measure={:?} clip_ancestors={chain:?}",
-        view.resize_tick_id.borrow().is_some(), view.pty_winsize.sent.get(),
+    format!("tick_armed={} diagnostics={:?} expected_surface={:?} live_vte_own_visible={} live_vte_effective_visible={} live_vte_child_visible={} live_vte_mapped={} sent_winsize={:?} live_vte_allocated={}x{} live_vte_requested={}x{} live_vte_horizontal_measure={:?} clip_ancestors={chain:?}",
+        view.resize_tick_id.borrow().is_some(), view.resize_diagnostics,
+        chat::surface(view.bstate.get(), view.ftcs_seen.get()),
+        vte.get_visible(), vte.is_visible(), vte.is_child_visible(), vte.is_mapped(), view.pty_winsize.sent.get(),
         vte.width(), vte.height(), vte.width_request(), vte.height_request(),
         vte.measure(gtk::Orientation::Horizontal, -1))
 }
@@ -296,6 +300,46 @@ fn search_and_native_split_preserve_readline_draft_cursor_and_undo() {
             assert_eq!(snapshot(&original.0, &scratch.0), before);
         }
 
+        let before_split_geometry = format!(
+            "diagnostics={:?} vte_mapped={} clip_mapped={} clip_width={}",
+            original.0.resize_diagnostics,
+            original.0.active_vte.is_mapped(),
+            original.0.active.borrow().live_clip().is_mapped(),
+            original.0.active.borrow().live_clip().width(),
+        );
+        let lifecycle_events = Rc::new(Cell::new((0u32, 0u32, 0u32, 0u32)));
+        {
+            let events = lifecycle_events.clone();
+            original.0.active_vte.connect_map(move |_| {
+                let (a, b, c, d) = events.get();
+                events.set((a + 1, b, c, d));
+            });
+            let events = lifecycle_events.clone();
+            original.0.active_vte.connect_unmap(move |_| {
+                let (a, b, c, d) = events.get();
+                events.set((a, b + 1, c, d));
+            });
+            let events = lifecycle_events.clone();
+            original
+                .0
+                .active
+                .borrow()
+                .live_clip()
+                .connect_map(move |_| {
+                    let (a, b, c, d) = events.get();
+                    events.set((a, b, c + 1, d));
+                });
+            let events = lifecycle_events.clone();
+            original
+                .0
+                .active
+                .borrow()
+                .live_clip()
+                .connect_unmap(move |_| {
+                    let (a, b, c, d) = events.get();
+                    events.set((a, b, c, d + 1));
+                });
+        }
         let canvas_resize_events = Rc::new(Cell::new(0u32));
         if mode == crate::config::TerminalMode::Chat {
             let canvas = find_canvas(original.0.root.upcast_ref()).expect("stable Chat canvas");
@@ -332,12 +376,12 @@ fn search_and_native_split_preserve_readline_draft_cursor_and_undo() {
         {
             assert!(
                 Instant::now() < resize_deadline,
-                "split must resize the original live pane: mode={mode:?} original_state={:?} sibling_state={:?} old_width={width} current_width={} window_width={} split_position={} old_columns={original_columns} pty_columns={} vte_columns={} original_mapped={} sibling_mapped={} canvas_resize_events={} geometry={}",
+                "split must resize the original live pane: mode={mode:?} original_state={:?} sibling_state={:?} old_width={width} current_width={} window_width={} split_position={} old_columns={original_columns} pty_columns={} vte_columns={} original_mapped={} sibling_mapped={} canvas_resize_events={} before_split_geometry={before_split_geometry} lifecycle_events_vte_map_unmap_clip_map_unmap={:?} geometry={}",
                 original.0.bstate.get(), sibling.0.bstate.get(),
                 original.0.root.width(), window.width(), paned.position(),
                 pty_columns(&original.0), original.0.active_vte.column_count(),
                 original.0.root.is_mapped(), sibling.0.root.is_mapped(),
-                canvas_resize_events.get(), geometry_diagnostic(&original.0),
+                canvas_resize_events.get(), lifecycle_events.get(), geometry_diagnostic(&original.0),
             );
             pump();
         }
