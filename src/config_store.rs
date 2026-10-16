@@ -815,11 +815,25 @@ fn stage_private_file_in_directory(
             unlink_relative(directory, name);
             return Err(error);
         }
-        if let Err(error) = file.write_all(contents).and_then(|_| file.sync_all()) {
+        #[cfg(test)]
+        fault_tests::checkpoint("created", target);
+        let write_result = (|| {
+            #[cfg(test)]
+            fault_tests::io_fault("write", target)?;
+            file.write_all(contents)?;
+            #[cfg(test)]
+            fault_tests::checkpoint("written", target);
+            #[cfg(test)]
+            fault_tests::io_fault("file-sync", target)?;
+            file.sync_all()
+        })();
+        if let Err(error) = write_result {
             drop(file);
             unlink_relative(directory, name);
             return Err(io_error("write", &path, error));
         }
+        #[cfg(test)]
+        fault_tests::checkpoint("file-synced", target);
         return Ok(name.to_os_string());
     }
     Err(ConfigWriteError::Io(format!(
@@ -851,6 +865,10 @@ fn replace_with_staged_in_directory(
         .map_err(|error| io_error("inspect staged name for", target, error))?;
     let target_name = path_name_cstring(target, "configuration")
         .map_err(|error| io_error("inspect name for", target, error))?;
+    #[cfg(test)]
+    fault_tests::checkpoint("before-rename", target);
+    #[cfg(test)]
+    fault_tests::io_fault("rename", target).map_err(|error| io_error("replace", target, error))?;
     // SAFETY: both names are relative to the same retained directory and no
     // pointers survive the call.
     if unsafe {
@@ -864,9 +882,17 @@ fn replace_with_staged_in_directory(
     {
         return Err(io_error("replace", target, io::Error::last_os_error()));
     }
+    #[cfg(test)]
+    fault_tests::checkpoint("renamed", target);
+    #[cfg(test)]
+    fault_tests::io_fault("directory-sync", target)
+        .map_err(|error| io_error("sync directory for", target, error))?;
     directory
         .sync_all()
-        .map_err(|error| io_error("sync directory for", target, error))
+        .map_err(|error| io_error("sync directory for", target, error))?;
+    #[cfg(test)]
+    fault_tests::checkpoint("directory-synced", target);
+    Ok(())
 }
 
 fn atomic_replace_in_directory(
@@ -2230,3 +2256,7 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "config_store_fault_tests.rs"]
+mod fault_tests;
