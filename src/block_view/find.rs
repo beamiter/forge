@@ -2723,6 +2723,7 @@ pub(super) fn clear_find_state(
 
 #[cfg(test)]
 mod tests {
+    use super::metadata_filter_line;
     use super::{
         add_snapshot_jump_fallbacks, bookmarked_search_empty_reason, bounded_match_count,
         command_preview, cross_block_match_count, cross_block_pattern,
