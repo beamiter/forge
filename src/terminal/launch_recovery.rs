@@ -299,6 +299,21 @@ mod tests {
             .to_string()
     }
 
+    // GtkEntry delegates focus to its internal GtkText. Assert actual root
+    // ownership and keyboard focus, rather than has_focus on the outer Entry.
+    fn focused_entry_widget(entry: &Entry) -> gtk4::Widget {
+        let focus = entry
+            .root()
+            .and_then(|root| root.focus())
+            .expect("entry root focus");
+        assert!(
+            focus == *entry.upcast_ref::<gtk4::Widget>() || focus.is_ancestor(entry),
+            "the entry or its editable child must own root focus"
+        );
+        assert!(focus.has_focus(), "entry delegate must have keyboard focus");
+        focus
+    }
+
     #[test]
     #[ignore = "requires an isolated GTK display and synthetic Python PTY child"]
     fn manual_recovery_is_single_flight_scoped_and_delivers_startup_once() {
@@ -378,7 +393,11 @@ mod tests {
         assert!(!recovery.panel.is_visible());
         assert!(view.vte().has_focus());
         assert_eq!(recovery.state.borrow().pending_count(), 0);
-        other.grab_focus();
+        assert!(
+            other.grab_focus(),
+            "entry must accept focus before the action"
+        );
+        let other_focus = focused_entry_widget(&other);
         recovery.retry.emit_clicked();
         wait(&main, Duration::from_millis(650));
         assert_eq!(view.pid_i32(), pid);
@@ -388,7 +407,12 @@ mod tests {
                 .count(),
             1
         );
-        assert!(other.has_focus());
+        assert_eq!(
+            focused_entry_widget(&other),
+            other_focus,
+            "ignored retry must preserve the exact focus owner"
+        );
+        assert!(!view.vte().has_focus());
         assert_eq!(failures.get(), 2);
         view.kill();
         pump_until(&main, "child cleanup", || exits.get() == 1);
@@ -558,14 +582,20 @@ mod tests {
         recovery.shell.set_text("/usr/bin/python3");
         recovery.retry.grab_focus();
         recovery.retry.emit_clicked();
-        other.grab_focus();
+        assert!(
+            other.grab_focus(),
+            "entry must accept focus before the action"
+        );
+        let other_focus = focused_entry_widget(&other);
         pump_until(&main, "background retry ready", || {
             text(background.vte()).contains("F10-ACK:never-replay")
         });
-        assert!(
-            other.has_focus(),
-            "completion must not steal another pane's focus"
+        assert_eq!(
+            focused_entry_widget(&other),
+            other_focus,
+            "completion must preserve the exact other-pane focus owner"
         );
+        assert!(!background.vte().has_focus());
         background.kill();
         pump_until(&main, "background child cleanup", || {
             recovery.state.borrow().child_exited()
