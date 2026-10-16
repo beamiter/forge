@@ -6422,9 +6422,10 @@ mod tests {
                 0,
                 "\x1b[31mred\x1b[0m",
             ),
+            ("skip\nİΣ你好🙂\nlast", "İσ", false, false, false, 0, ""),
             (
                 "skip\nİΣ你好🙂\nlast",
-                "İσ",
+                "İς",
                 false,
                 false,
                 false,
