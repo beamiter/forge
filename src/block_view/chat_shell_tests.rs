@@ -198,6 +198,55 @@ fn chat_real_bash_keyboard_and_clipboard() {
     );
     view.grab_focus();
     settle();
+    // Snapshot before the strict focus oracle; do not pump GTK or inject input.
+    let root_focus = gtk4::prelude::GtkWindowExt::focus(&window);
+    let focus_diagnostic = serde_json::json!({
+        "pid": std::process::id(),
+        "native_mapped": view.active_vte.is_mapped(),
+        "native_visible": view.active_vte.is_visible(),
+        "native_focusable": view.active_vte.is_focusable(),
+        "native_can_focus": view.active_vte.can_focus(),
+        "native_sensitive": view.active_vte.is_sensitive(),
+        "native_has_focus": view.active_vte.has_focus(),
+        "window_active": window.is_active(),
+        "window_mapped": window.is_mapped(),
+        "root_focus_type": root_focus.as_ref().map(|w| w.type_().name().to_string()),
+        "root_focus_is_native": root_focus.as_ref() == Some(view.active_vte.upcast_ref()),
+    });
+    std::fs::write(
+        out.join("focus-native-before-assert.json"),
+        serde_json::to_vec_pretty(&focus_diagnostic).unwrap(),
+    )
+    .unwrap();
+    for kind in ["inputs", "seats", "tree"] {
+        // Read-only public compositor diagnostics, bounded even on IPC failure.
+        // Preserve the native oracle below regardless of diagnostic status.
+        let result = Command::new("timeout")
+            .args([
+                "--kill-after=1s",
+                "5s",
+                "swaymsg",
+                "-r",
+                "-t",
+                &format!("get_{kind}"),
+            ])
+            .output();
+        match result {
+            Ok(output) => {
+                std::fs::write(out.join(format!("focus-{kind}.json")), output.stdout).unwrap();
+                std::fs::write(
+                    out.join(format!("focus-{kind}.status")),
+                    format!(
+                        "status={}\nstderr={}\n",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                )
+                .unwrap();
+            }
+            Err(error) => eprintln!("focus diagnostic {kind}: {error}"),
+        }
+    }
     assert!(view.active_vte.has_focus());
     let shell_pid = view.pty.pid_i32();
     let mut records = Vec::new();
