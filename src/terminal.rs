@@ -1,13 +1,13 @@
 use adw::prelude::*;
-use gtk4::GestureClick;
+use gtk4::gdk::ffi::GDK_BUTTON_PRIMARY;
 use gtk4::gdk::ModifierType;
 use gtk4::gdk::RGBA;
-use gtk4::gdk::ffi::GDK_BUTTON_PRIMARY;
 use gtk4::gio::{self, Cancellable};
-use gtk4::glib::SpawnFlags;
 use gtk4::glib::translate::IntoGlib;
+use gtk4::glib::SpawnFlags;
 use gtk4::pango::FontDescription;
-use gtk4::{Entry, Label, Orientation, Paned, glib};
+use gtk4::GestureClick;
+use gtk4::{glib, Entry, Label, Orientation, Paned};
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
 use std::os::fd::AsRawFd;
@@ -1351,35 +1351,27 @@ mod tests {
 
     #[test]
     fn configured_commands_fail_closed_on_hidden_oversized_or_excessive_input() {
-        assert!(
-            InitialCommands::from_config(Some("echo safe\u{202e}fake"))
-                .as_slice()
-                .is_empty()
-        );
-        assert!(
-            InitialCommands::from_config(Some("echo one\necho two"))
-                .as_slice()
-                .is_empty()
-        );
+        assert!(InitialCommands::from_config(Some("echo safe\u{202e}fake"))
+            .as_slice()
+            .is_empty());
+        assert!(InitialCommands::from_config(Some("echo one\necho two"))
+            .as_slice()
+            .is_empty());
         let oversized = "x".repeat(jterm_core::review_input::MAX_REVIEW_INPUT_BYTES + 1);
-        assert!(
-            InitialCommands::from_config(Some(&oversized))
-                .as_slice()
-                .is_empty()
-        );
+        assert!(InitialCommands::from_config(Some(&oversized))
+            .as_slice()
+            .is_empty());
         let excessive = std::iter::repeat_n("true", 129)
             .collect::<Vec<_>>()
             .join(", ");
-        assert!(
-            InitialCommands::from_config(Some(&excessive))
-                .as_slice()
-                .is_empty()
-        );
+        assert!(InitialCommands::from_config(Some(&excessive))
+            .as_slice()
+            .is_empty());
     }
 
     #[test]
     fn terminal_links_are_bounded_unambiguous_http_urls() {
-        use jterm_core::link::{MAX_OPENABLE_URL_BYTES, is_openable_url};
+        use jterm_core::link::{is_openable_url, MAX_OPENABLE_URL_BYTES};
 
         assert!(is_openable_url("https://example.com/a?q=1"));
         assert!(is_openable_url("HTTP://example.com"));
@@ -1417,11 +1409,12 @@ mod tests {
         );
         // Unknown shell grammars are not guessed either.
         let plain = strings(&["ssh", "host"]);
-        assert!(
-            InitialCommands::from_restored_argv(Some(&plain), &strings(&["/opt/exotic-shell"]))
-                .as_slice()
-                .is_empty()
-        );
+        assert!(InitialCommands::from_restored_argv(
+            Some(&plain),
+            &strings(&["/opt/exotic-shell"])
+        )
+        .as_slice()
+        .is_empty());
 
         // An attacker-controlled snapshot must not gain arbitrary local code
         // execution merely because it preserved argv boundaries.

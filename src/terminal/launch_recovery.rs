@@ -75,9 +75,9 @@ impl LaunchRecovery {
         panel.append(&Label::new(Some("Working directory")));
         panel.append(&cwd_entry);
         let notice = Label::new(Some(if commands.is_empty() {
-            "Retry starts this shell only. No startup commands are pending."
+            "If the working directory is unavailable, the shell may start in your home directory. No startup commands are pending."
         } else {
-            "Retry starts this shell. Pending configured startup commands will run once after this launch succeeds."
+            "If the working directory is unavailable, the shell may start in your home directory. Pending startup commands will run once after launch succeeds, including in the fallback directory."
         }));
         notice.set_wrap(true);
         notice.set_xalign(0.0);
@@ -266,7 +266,7 @@ mod tests {
 
     // Synthetic no-shell child: isolated Python only reads terminal bytes and
     // acknowledges them. No rc files, user commands, credentials or network.
-    const SENSOR: &str = "import os,tty\ntty.setraw(0)\nos.write(1,b'F10-READY\\r\\n')\nb=b''\nwhile True:\n c=os.read(0,1)\n if not c: break\n if c==b'\\r':\n  os.write(1,b'F10-ACK:'+b+b'\\r\\n'); b=b''\n else: b+=c\n";
+    const SENSOR: &str = "import os,sys,tty\ntty.setraw(0)\nos.write(1,b'F10-CWD-MATCH\\r\\n' if os.path.samefile(os.getcwd(),sys.argv[1] if len(sys.argv)>1 else '/tmp') else b'F10-CWD-MISMATCH\\r\\n')\nos.write(1,b'F10-READY\\r\\n')\nb=b''\nwhile True:\n c=os.read(0,1)\n if not c: break\n if c==b'\\r':\n  os.write(1,b'F10-ACK:'+b+b'\\r\\n'); b=b''\n else: b+=c\n";
 
     fn pump_until(main: &glib::MainContext, stage: &str, ready: impl Fn() -> bool) {
         let start = Instant::now();
@@ -351,14 +351,19 @@ mod tests {
         recovery.retry.emit_clicked();
         assert!(recovery.state.borrow().failed());
         leaf.set_remote(false);
-        recovery.shell.set_text("/usr/bin/python3");
+        // VTE falls back home for missing cwd. Only a genuine exec failure
+        // belongs to the failed-launch/retry path.
+        recovery.shell.set_text("/forge-test/another-missing-shell");
         recovery.cwd.set_text("/forge-test/missing-directory");
         recovery.retry.emit_clicked();
         recovery.retry.emit_clicked();
-        pump_until(&main, "bad cwd", || recovery.state.borrow().failed());
+        pump_until(&main, "second missing shell", || {
+            recovery.state.borrow().failed()
+        });
         assert_eq!(failures.get(), 2);
         assert_eq!(exits.get(), 0);
         assert!(!text(view.vte()).contains("F10-ACK:"));
+        recovery.shell.set_text("/usr/bin/python3");
         recovery.cwd.set_text("/tmp");
         recovery.retry.grab_focus();
         recovery.retry.emit_clicked();
@@ -366,6 +371,8 @@ mod tests {
         pump_until(&main, "synthetic child", || {
             text(view.vte()).contains("F10-ACK:synthetic-startup")
         });
+        assert!(text(view.vte()).contains("F10-CWD-MATCH"));
+        assert!(!text(view.vte()).contains("F10-CWD-MISMATCH"));
         let pid = view.pid_i32();
         assert!(pid > 0);
         assert!(!recovery.panel.is_visible());
@@ -388,6 +395,82 @@ mod tests {
         crate::ui::PaneLeaf::detach_from(&view.widget());
         window.close();
     }
+    #[test]
+    #[ignore = "requires an isolated GTK display and synthetic Python PTY child"]
+    fn unavailable_cwd_falls_back_home_and_pending_commands_run_once() {
+        gtk4::init().expect("GTK display");
+        let main = glib::MainContext::default();
+        let _guard = main.acquire().unwrap();
+        // VTE uses g_get_home_dir(), which need not match a later HOME edit.
+        // The sensor compares directory identity; it writes no home files and
+        // never prints either the requested path or the real home directory.
+        let home = glib::home_dir()
+            .to_str()
+            .expect("UTF-8 test home")
+            .to_owned();
+        let argv = vec![
+            "/forge-test/missing-shell".into(),
+            "-I".into(),
+            "-S".into(),
+            "-c".into(),
+            SENSOR.into(),
+            home,
+        ];
+        let view = Rc::new(VteTerminalView::new(
+            Rc::new(RefCell::new(Config::safe_defaults())),
+            &argv,
+            Some("/forge-test/missing-directory"),
+            None,
+            &["fallback-startup".into()],
+            Vec::new(),
+            None,
+        ));
+        view.enable_local_launch_recovery();
+        let leaf = crate::ui::PaneLeaf::Vte(view.clone());
+        leaf.attach_to(&view.widget());
+        leaf.set_remote(false);
+        let window = gtk4::Window::new();
+        window.set_child(Some(&view.widget()));
+        window.present();
+        let failures = Rc::new(Cell::new(0));
+        let recorded = failures.clone();
+        view.connect_launch_failed(move |_| recorded.set(recorded.get() + 1));
+        let exits = Rc::new(Cell::new(0));
+        let recorded = exits.clone();
+        view.connect_exited(move |_| recorded.set(recorded.get() + 1));
+        let recovery = &view.launch_recovery;
+        pump_until(&main, "missing executable before fallback", || {
+            recovery.state.borrow().failed()
+        });
+        assert_eq!(failures.get(), 1);
+        assert_eq!(recovery.state.borrow().pending_count(), 1);
+        assert_eq!(exits.get(), 0);
+        recovery.shell.set_text("/usr/bin/python3");
+        recovery.retry.emit_clicked();
+        recovery.retry.emit_clicked();
+        pump_until(&main, "home fallback startup", || {
+            text(view.vte()).contains("F10-ACK:fallback-startup")
+        });
+        assert!(text(view.vte()).contains("F10-CWD-MATCH"));
+        assert!(!text(view.vte()).contains("F10-CWD-MISMATCH"));
+        assert!(!recovery.panel.is_visible());
+        assert_eq!(recovery.state.borrow().pending_count(), 0);
+        let pid = view.pid_i32();
+        assert!(pid > 0);
+        recovery.retry.emit_clicked();
+        wait(&main, Duration::from_millis(650));
+        assert_eq!(view.pid_i32(), pid);
+        assert_eq!(
+            text(view.vte()).matches("F10-ACK:fallback-startup").count(),
+            1
+        );
+        assert_eq!(failures.get(), 1, "cwd fallback is not a launch failure");
+        view.kill();
+        pump_until(&main, "fallback child cleanup", || exits.get() == 1);
+        crate::ui::PaneLeaf::detach_from(&view.widget());
+        window.close();
+    }
+
     #[test]
     #[ignore = "requires an isolated GTK display and synthetic Python PTY child"]
     fn close_and_exit_retire_pending_commands_and_background_retry_keeps_focus() {
