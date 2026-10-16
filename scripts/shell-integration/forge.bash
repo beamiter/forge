@@ -40,7 +40,7 @@ __forge_command_end() {
 __forge_report_cwd() {
     local host=${HOSTNAME:-localhost}
     local out= i ch
-    LC_ALL=C
+    local LC_ALL=C
     for ((i = 0; i < ${#PWD}; i++)); do
         ch=${PWD:i:1}
         case $ch in

@@ -121,6 +121,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y shellcheck
 
+      - name: Check Bash integration locale and native readline
+        run: python3 scripts/test-bash-integration-locale.py
+
       - name: Check tracked shell scripts
         run: |
           set -euo pipefail
