@@ -33973,3 +33973,6 @@ mod command_reuse_menu_label_tests {
         assert_eq!(super::command_reuse_menu_label(128), "Recall commands");
     }
 }
+
+#[cfg(test)]
+mod readline_preservation_tests;
