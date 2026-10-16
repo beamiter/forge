@@ -70,6 +70,73 @@ fn winsize(view: &TermView) -> (u16, u16) {
     );
     (size.ws_col, size.ws_row)
 }
+// Public text APIs expose no cell attributes or soft-wrap flags on VTE >=0.72.
+// Record their exact strings without guessing which spaces are presentation.
+fn extraction_snapshot(native: &vte4::Terminal) -> serde_json::Value {
+    let (column, row) = native.cursor_position();
+    let start = (row - 12).max(0);
+    let columns = native.column_count();
+    let read = |first, last| {
+        native
+            .text_range_format(vte4::Format::Text, first, 0, last, columns)
+            .0
+            .map(|text| text.to_string())
+    };
+    serde_json::json!({
+        "cursor": [column, row], "columns": columns, "first_row": start,
+        "range_text": read(start, row),
+        "physical_rows": (start..=row).map(|r| serde_json::json!({"row":r,"text":read(r,r)})).collect::<Vec<_>>(),
+        "cell_attributes_available": false, "soft_wrap_flags_available": false,
+    })
+}
+
+fn bare_extraction_contrasts(out: &Path) {
+    let cases = [
+        ("fullwidth_at_last_cell", "aaaaaaaaＣ"),
+        ("genuine_space_before_fullwidth", "aaaaaaaa Ｃ"),
+        ("cjk_at_last_cell", "aaaaaaaa中"),
+        ("combining_at_edge", "aaaaaaaae\u{301}Z"),
+        ("zwj_at_edge", "aaaaaaaa👩\u{200d}💻"),
+        ("ascii_soft_wrap", "aaaaaaaaXYZ"),
+        ("explicit_hard_break", "aaaaaaaa\r\nＣ"),
+    ];
+    let mut records = Vec::new();
+    for (label, bytes) in cases {
+        // Separate native parser instance: never feed synthetic bytes to Bash's
+        // VTE. This is extraction/rewrap evidence, not mapped render geometry.
+        let native = vte4::Terminal::new();
+        native.set_font(Some(&gtk4::pango::FontDescription::from_string(
+            "DejaVu Sans Mono 14",
+        )));
+        native.set_size(9, 20);
+        native.feed(bytes.as_bytes());
+        let mut snapshots = Vec::new();
+        for columns in [9, 6, 9] {
+            native.set_size(columns, 20);
+            // An ordered title fence proves the native parser consumed the
+            // preceding feed; no guessed delay is the readiness oracle.
+            let marker = glib::uuid_string_random().to_string();
+            native.feed(format!("\x1b]2;{marker}\x07").as_bytes());
+            wait(
+                || {
+                    native.window_title().as_deref() == Some(marker.as_str())
+                        && native.column_count() == columns
+                },
+                "bare native parser fence and resized columns",
+            );
+            assert_eq!(native.column_count(), columns);
+            snapshots.push(extraction_snapshot(&native));
+        }
+        records
+            .push(serde_json::json!({"case":label,"controlled_feed":bytes,"controlled_feed_bytes":bytes.as_bytes(),"controlled_feed_sha256":glib::compute_checksum_for_data(glib::ChecksumType::Sha256, bytes.as_bytes()).unwrap().to_string(),"snapshots":snapshots}));
+    }
+    std::fs::write(
+        out.join("bare-extraction-contrasts.json"),
+        serde_json::to_vec_pretty(&records).unwrap(),
+    )
+    .unwrap();
+}
+
 fn capture(view: &TermView, window: &gtk4::Window, out: &Path, stage: usize, label: &str) {
     settle();
     view.render_backend.sync_geometry_to_pty();
@@ -105,6 +172,8 @@ fn capture(view: &TermView, window: &gtk4::Window, out: &Path, stage: usize, lab
             "native_content_origin": [origin.x(),origin.y()], "grid_right":grid_right, "unobscured_right":right,
             "scrollbar_bounds": [bar.x(),bar.y(),bar.width(),bar.height()], "scrollbar_paints":paints,
             "clearance":right-grid_right, "overlap":(grid_right-right).max(0.0)},
+        "public_extraction": extraction_snapshot(native),
+        "typed_shadow_fidelity": format!("{:?}", view.typed_cmd_fidelity.get()),
         "scope":"real Bash final accepted bytes; observed application draft is not a readline snapshot"
     });
     let tmp = out.join("stage.tmp");
@@ -125,6 +194,7 @@ fn chat_real_bash_keyboard_and_clipboard() {
     gtk4::init().unwrap();
     let out = PathBuf::from(std::env::var("FORGE_F13_OUTPUT").unwrap());
     assert_eq!(std::env::var("FORGE_F13_FONT").unwrap(), "DejaVu Sans Mono");
+    bare_extraction_contrasts(&out);
     let home = out.join("owned-shell");
     std::fs::create_dir(&home).unwrap();
     std::fs::write(
@@ -352,6 +422,16 @@ fn chat_real_bash_keyboard_and_clipboard() {
                 .iter()
                 .find(|b| !b.is_background && b.cmd_text.contains(&token))
                 .unwrap();
+            // Persist independent truth before the unchanged identity oracle
+            // can fail, so screen padding ambiguity is inspectable.
+            std::fs::write(
+                out.join(format!("{path}-capsule-identity.json")),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "expected_command":command,"capsule_command":block.cmd_text,
+                    "accepted_parts":parts.iter().map(|part| String::from_utf8_lossy(part).to_string()).collect::<Vec<_>>(),
+                    "shell_pid":shell_pid,"tty":actual_tty,
+                })).unwrap(),
+            ).unwrap();
             assert_eq!(block.cmd_text, command);
             assert!(block.widget.has_css_class("chat-pair"));
             let terminal = &block.command_vte;
