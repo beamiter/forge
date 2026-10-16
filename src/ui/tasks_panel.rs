@@ -1271,6 +1271,15 @@ mod tests {
         assert!(summary.ends_with('…'));
         sync.detail.as_mut().unwrap().approvals = vec![approval.clone()];
         panel.sync(sync.clone());
+        let expander = descendants(&panel.approvals_box)
+            .into_iter()
+            .find_map(|widget| widget.downcast::<gtk4::Expander>().ok())
+            .unwrap();
+        // A collapsed GtkExpander keeps its content detached from the widget tree.
+        expander.set_expanded(true);
+        while gtk4::glib::MainContext::default().pending() {
+            gtk4::glib::MainContext::default().iteration(false);
+        }
         let widgets = descendants(&panel.approvals_box);
         let button = |label: &str| {
             widgets
@@ -1284,11 +1293,6 @@ mod tests {
         let next = button("Next page");
         let previous = button("Previous page");
         let close = button("Close details");
-        let expander = widgets
-            .iter()
-            .find_map(|widget| widget.clone().downcast::<gtk4::Expander>().ok())
-            .unwrap();
-        expander.set_expanded(true);
         let view = widgets
             .iter()
             .find_map(|widget| widget.clone().downcast::<TextView>().ok())
@@ -1414,11 +1418,18 @@ mod tests {
             .filter_map(|widget| widget.downcast::<Button>().ok())
             .find(|button| button.label().as_deref() == Some("Approve"))
             .unwrap();
-        let retired_view = descendants(&panel.approvals_box)
+        let retired_body = descendants(&panel.approvals_box)
+            .into_iter()
+            .find_map(|widget| widget.downcast::<gtk4::Expander>().ok())
+            .unwrap()
+            .child()
+            .unwrap();
+        let retired_view = descendants(&retired_body)
             .into_iter()
             .find_map(|widget| widget.downcast::<TextView>().ok())
             .unwrap()
             .downgrade();
+        drop(retired_body);
         // Switching task with identical approval values also invalidates old controls.
         let other = sync.rows.iter().find(|row| row.id != task).unwrap().id;
         sync.selected = Some(other);
