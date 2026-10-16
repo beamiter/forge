@@ -6,6 +6,8 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Approval cards now expose read-only, paged request details from the exact frozen protocol evidence. Missing fields and display limits are explicit; stale task/request controls cannot dispatch decisions.
+
 - Rejected terminal input now explains whether the 256 KiB byte limit, a full
   queue, or a closed connection prevented sending. Native input feedback is
   passive and coalesced; failed Chat Send preserves an exact bounded draft with

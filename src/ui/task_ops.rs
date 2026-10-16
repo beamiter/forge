@@ -532,6 +532,32 @@ impl UiState {
         };
         let result = {
             let mut domain = self.agent_tasks.borrow_mut();
+            // A panel snapshot can lag cancellation/replacement. Re-check the live
+            // runtime immediately before dispatch; the worker still checks its
+            // private request identity and all existing authority guards.
+            let current = domain.panel_visible
+                && domain.selected_task == Some(task_id)
+                && domain
+                    .task_manager
+                    .get(task_id)
+                    .is_some_and(|task| task.status == TaskStatus::WaitingForApproval)
+                && domain
+                    .agent_runtime
+                    .snapshot(task_id)
+                    .is_some_and(|snapshot| {
+                        snapshot.phase == CodexAppServerPhase::WaitingForApproval
+                            && snapshot
+                                .pending_approvals
+                                .iter()
+                                .any(|approval| approval.id == approval_id)
+                    });
+            if !current {
+                drop(domain);
+                self.task_toast(
+                    "This approval is no longer current. Review the current task request.",
+                );
+                return;
+            }
             domain
                 .agent_runtime
                 .decide_approval(task_id, approval_id, decision)

@@ -17,7 +17,10 @@ use gtk4::{
     ToggleButton,
 };
 
-use crate::agent_task::{ApprovalId, CodexAppServerApproval, TaskId};
+use crate::agent_task::{CodexAppServerApproval, TaskId};
+
+#[path = "approval_details.rs"]
+mod approval_details;
 use crate::agent_task_ui::{
     approval_summary, native_follow_up_can_send, plan_list_refresh, render_stream_text,
     row_status_line, task_reason, TaskPanelAction, TaskRowSnapshot,
@@ -144,6 +147,8 @@ pub(crate) struct TasksPanel {
     rendered_rows: Rc<RefCell<Vec<TaskRowSnapshot>>>,
     rendered_selected: Rc<Cell<Option<TaskId>>>,
     rendered_approvals: Rc<RefCell<Vec<CodexAppServerApproval>>>,
+    approval_owner: Rc<Cell<Option<TaskId>>>,
+    approval_generation: Rc<Cell<u64>>,
     /// Set while refresh applies a programmatic selection, so the resulting
     /// `row-selected` emission is not mistaken for a user gesture.
     selection_guard: Rc<Cell<bool>>,
@@ -392,6 +397,8 @@ impl TasksPanel {
             rendered_rows: Rc::new(RefCell::new(Vec::new())),
             rendered_selected: Rc::new(Cell::new(None)),
             rendered_approvals: Rc::new(RefCell::new(Vec::new())),
+            approval_owner: Rc::new(Cell::new(None)),
+            approval_generation: Rc::new(Cell::new(0)),
             selection_guard: Rc::new(Cell::new(false)),
             on_action: Rc::new(RefCell::new(Box::new(|_| {}))),
             create_button,
@@ -851,6 +858,153 @@ impl TasksPanel {
         }
     }
 
+    fn approval_is_current(
+        &self,
+        task: TaskId,
+        approval: &CodexAppServerApproval,
+        generation: u64,
+    ) -> bool {
+        let state = self.state.borrow();
+        self.root.is_mapped()
+            && state.selected == Some(task)
+            && state.detail.as_deref().is_some_and(|detail| {
+                approval_details::is_current(
+                    task,
+                    approval,
+                    generation,
+                    detail.id,
+                    &detail.approvals,
+                    self.approval_generation.get(),
+                )
+            })
+    }
+
+    fn approval_details(
+        &self,
+        task: TaskId,
+        approval: &CodexAppServerApproval,
+        generation: u64,
+    ) -> gtk4::Expander {
+        let expander = gtk4::Expander::new(Some("Read request details"));
+        let body = GBox::new(gtk4::Orientation::Vertical, 4);
+        let view = TextView::new();
+        view.set_editable(false);
+        view.set_accepts_tab(false);
+        view.set_cursor_visible(true);
+        view.set_wrap_mode(gtk4::WrapMode::WordChar);
+        view.set_monospace(true);
+        view.update_property(&[gtk4::accessible::Property::Label(
+            "Read-only approval request details",
+        )]);
+        let scroll = ScrolledWindow::new();
+        scroll.set_min_content_height(180);
+        scroll.set_max_content_height(260);
+        scroll.set_propagate_natural_height(true);
+        scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        scroll.set_child(Some(&view));
+        body.append(&scroll);
+        let nav = GBox::new(gtk4::Orientation::Horizontal, 6);
+        let previous = Button::with_label("Previous page");
+        let next = Button::with_label("Next page");
+        let position = Label::new(None);
+        position.set_wrap(true);
+        position.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        position.set_max_width_chars(30);
+        let close = Button::with_label("Close details");
+        for widget in [previous.clone(), next.clone(), close.clone()] {
+            nav.append(&widget);
+        }
+        body.append(&nav);
+        body.append(&position);
+        expander.set_child(Some(&body));
+        let pages = Rc::new(approval_details::pages(approval));
+        let index = Rc::new(Cell::new(0usize));
+        let render: Rc<dyn Fn()> = {
+            let pages = pages.clone();
+            let index = index.clone();
+            let view = view.downgrade();
+            let previous = previous.downgrade();
+            let next = next.downgrade();
+            let position = position.downgrade();
+            Rc::new(move || {
+                let (Some(view), Some(previous), Some(next), Some(position)) = (
+                    view.upgrade(),
+                    previous.upgrade(),
+                    next.upgrade(),
+                    position.upgrade(),
+                ) else {
+                    return;
+                };
+                view.buffer().set_text(&pages[index.get()]);
+                let mut start = view.buffer().start_iter();
+                view.buffer().place_cursor(&start);
+                view.scroll_to_iter(&mut start, 0.0, true, 0.0, 0.0);
+                view.update_property(&[gtk4::accessible::Property::Label(&format!(
+                    "Read-only approval request details, page {} of {}",
+                    index.get() + 1,
+                    pages.len()
+                ))]);
+                position.set_text(&format!(
+                    "Page {} of {} (other pages are not shown)",
+                    index.get() + 1,
+                    pages.len()
+                ));
+                previous.set_sensitive(index.get() > 0);
+                next.set_sensitive(index.get() + 1 < pages.len());
+            })
+        };
+        render();
+        for (button, forward) in [(previous, false), (next, true)] {
+            let index = index.clone();
+            let pages = pages.clone();
+            let render = render.clone();
+            let panel = self.clone();
+            let frozen = approval.clone();
+            button.connect_clicked(move |_| {
+                if !panel.approval_is_current(task, &frozen, generation) {
+                    return;
+                }
+                let target = if forward {
+                    index.get().saturating_add(1)
+                } else {
+                    index.get().saturating_sub(1)
+                };
+                index.set(target.min(pages.len() - 1));
+                render();
+            });
+        }
+        let weak = expander.downgrade();
+        let panel = self.clone();
+        let frozen = approval.clone();
+        close.connect_clicked(move |_| {
+            if !panel.approval_is_current(task, &frozen, generation) {
+                return;
+            }
+            if let Some(expander) = weak.upgrade() {
+                expander.set_expanded(false);
+                expander.grab_focus();
+            }
+        });
+        let keys = gtk4::EventControllerKey::new();
+        let weak = expander.downgrade();
+        let panel = self.clone();
+        let frozen = approval.clone();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk4::gdk::Key::Escape && panel.approval_is_current(task, &frozen, generation)
+            {
+                if let Some(expander) = weak.upgrade() {
+                    expander.set_expanded(false);
+                    expander.grab_focus();
+                }
+                gtk4::glib::Propagation::Stop
+            } else {
+                gtk4::glib::Propagation::Proceed
+            }
+        });
+        body.add_controller(keys);
+        expander
+    }
+
     /// Rebuild the approval cards only when the pushed approval set changed;
     /// an unchanged Sync leaves the existing cards (and their wired
     /// Approve/Deny closures) untouched.
@@ -861,10 +1015,20 @@ impl TasksPanel {
             .as_deref()
             .map(|detail| detail.approvals.as_slice())
             .unwrap_or(&[]);
-        if self.rendered_approvals.borrow().as_slice() == incoming {
+        let owner = state.detail.as_deref().map(|detail| detail.id);
+        if self.approval_owner.get() == owner
+            && self.rendered_approvals.borrow().as_slice() == incoming
+        {
             self.approvals_box.set_visible(!incoming.is_empty());
             return;
         }
+        self.approval_owner.set(owner);
+        let generation = self
+            .approval_generation
+            .get()
+            .checked_add(1)
+            .expect("approval generation exhausted");
+        self.approval_generation.set(generation);
         while let Some(child) = self.approvals_box.first_child() {
             self.approvals_box.remove(&child);
         }
@@ -883,6 +1047,7 @@ impl TasksPanel {
                 summary_label.set_margin_start(6);
                 summary_label.set_margin_end(6);
                 card.append(&summary_label);
+                card.append(&self.approval_details(task_id, approval, generation));
                 let buttons = GBox::new(gtk4::Orientation::Horizontal, 6);
                 buttons.set_halign(gtk4::Align::End);
                 buttons.set_margin_bottom(4);
@@ -890,14 +1055,20 @@ impl TasksPanel {
                 approve.add_css_class("suggested-action");
                 let deny = Button::with_label("Deny");
                 deny.add_css_class("destructive-action");
-                let approval_id: ApprovalId = approval.id;
+                let approval_id = approval.id;
+                let frozen = approval.clone();
                 let panel = self.clone();
                 approve.connect_clicked(move |_| {
-                    panel.emit(TaskPanelAction::Approve(task_id, approval_id));
+                    if panel.approval_is_current(task_id, &frozen, generation) {
+                        panel.emit(TaskPanelAction::Approve(task_id, approval_id));
+                    }
                 });
                 let panel = self.clone();
+                let frozen = approval.clone();
                 deny.connect_clicked(move |_| {
-                    panel.emit(TaskPanelAction::Deny(task_id, approval_id));
+                    if panel.approval_is_current(task_id, &frozen, generation) {
+                        panel.emit(TaskPanelAction::Deny(task_id, approval_id));
+                    }
                 });
                 buttons.append(&approve);
                 buttons.append(&deny);
@@ -1053,6 +1224,218 @@ mod tests {
             detail: Some(Box::new(detail)),
             ..Default::default()
         }
+    }
+
+    fn descendants(root: &impl IsA<gtk4::Widget>) -> Vec<gtk4::Widget> {
+        let mut result = vec![root.as_ref().clone()];
+        let mut index = 0;
+        while index < result.len() {
+            let mut child = result[index].first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                result.push(widget);
+            }
+            index += 1;
+        }
+        result
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn approval_details_are_paged_read_only_and_stale_controls_cannot_decide() {
+        gtk4::init().expect("GTK display");
+        let panel = TasksPanel::build();
+        let window = gtk4::Window::new();
+        window.set_child(Some(&panel.root));
+        window.present();
+        while gtk4::glib::MainContext::default().pending() {
+            gtk4::glib::MainContext::default().iteration(false);
+        }
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let sink = actions.clone();
+        panel.connect_action(move |action| sink.borrow_mut().push(action));
+        let mut sync = dashboard_test_sync();
+        let task = sync.selected.unwrap();
+        let approval = crate::agent_task::CodexAppServerApproval {
+            id: crate::agent_task::ApprovalId::new(),
+            kind: crate::agent_task::CodexAppServerApprovalKind::Command,
+            item_id: "request-1".into(),
+            command: Some(format!("{} <b>END</b>", "x".repeat(2000))),
+            cwd: Some("/tmp/project".into()),
+            reason: Some("r".repeat(4096)),
+            file_paths: vec![],
+            file_changes: vec![],
+        };
+        let summary = approval_summary(&approval);
+        assert!(summary.len() <= 256);
+        assert!(summary.ends_with('…'));
+        sync.detail.as_mut().unwrap().approvals = vec![approval.clone()];
+        panel.sync(sync.clone());
+        let widgets = descendants(&panel.approvals_box);
+        let button = |label: &str| {
+            widgets
+                .iter()
+                .filter_map(|widget| widget.clone().downcast::<Button>().ok())
+                .find(|button| button.label().as_deref() == Some(label))
+                .unwrap()
+        };
+        let approve = button("Approve");
+        let deny = button("Deny");
+        let next = button("Next page");
+        let previous = button("Previous page");
+        let close = button("Close details");
+        let expander = widgets
+            .iter()
+            .find_map(|widget| widget.clone().downcast::<gtk4::Expander>().ok())
+            .unwrap();
+        expander.set_expanded(true);
+        let view = widgets
+            .iter()
+            .find_map(|widget| widget.clone().downcast::<TextView>().ok())
+            .unwrap();
+        assert!(!view.is_editable());
+        assert!(!view.accepts_tab());
+        assert!(view.is_focusable());
+        fn assert_page_label(view: &TextView, expected: &str) {
+            use gtk4::glib::translate::{from_glib_full, IntoGlib, ToGlibPtr};
+            let expected = std::ffi::CString::new(expected).unwrap();
+            // GTK's test API returns null when the string property matches.
+            let mismatch: Option<gtk4::glib::GString> = unsafe {
+                from_glib_full(gtk4::ffi::gtk_test_accessible_check_property(
+                    view.upcast_ref::<gtk4::Accessible>().to_glib_none().0,
+                    gtk4::AccessibleProperty::Label.into_glib(),
+                    expected.as_ptr(),
+                ))
+            };
+            assert!(
+                mismatch.is_none(),
+                "Accessible label mismatch: {mismatch:?}"
+            );
+        }
+        assert_page_label(&view, "Read-only approval request details, page 1 of 2");
+        let body = expander.child().unwrap();
+        assert!(descendants(&body)
+            .iter()
+            .filter_map(|widget| widget.clone().downcast::<Button>().ok())
+            .all(|button| !matches!(button.label().as_deref(), Some("Approve" | "Deny"))));
+
+        assert!(view
+            .buffer()
+            .text(
+                &view.buffer().start_iter(),
+                &view.buffer().end_iter(),
+                false
+            )
+            .contains("<b>END</b>"));
+        assert!(next.is_sensitive());
+        assert!(!previous.is_sensitive());
+        assert!(next.grab_focus());
+        let focus = gtk4::prelude::GtkWindowExt::focus(&window);
+        panel.sync(sync.clone());
+        assert_eq!(gtk4::prelude::GtkWindowExt::focus(&window), focus);
+        assert!(expander.is_expanded());
+        assert!(view.grab_focus());
+        // The standard text-view keyboard action remains usable while read-only.
+        view.emit_by_name::<()>(
+            "move-cursor",
+            &[&gtk4::MovementStep::BufferEnds, &1i32, &false],
+        );
+        assert_eq!(view.buffer().cursor_position(), view.buffer().char_count());
+        assert!(body.child_focus(gtk4::DirectionType::TabForward));
+        assert!(
+            next.has_focus(),
+            "Tab leaves the read-only text and reaches page navigation"
+        );
+        assert!(gtk4::prelude::WidgetExt::activate(&next));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !previous.is_sensitive() && std::time::Instant::now() < deadline {
+            gtk4::glib::MainContext::default().iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(view.buffer().cursor_position(), 0);
+        assert_page_label(&view, "Read-only approval request details, page 2 of 2");
+        assert!(close.grab_focus());
+        assert!(body.child_focus(gtk4::DirectionType::TabBackward));
+        assert!(
+            previous.has_focus(),
+            "Shift-Tab reaches the previous page button"
+        );
+        assert!(previous.is_sensitive());
+        assert!(!next.is_sensitive());
+        previous.emit_clicked();
+        assert!(!previous.is_sensitive());
+        let controllers = body.observe_controllers();
+        let keys = (0..controllers.n_items())
+            .find_map(|index| {
+                controllers
+                    .item(index)
+                    .unwrap()
+                    .downcast::<gtk4::EventControllerKey>()
+                    .ok()
+            })
+            .unwrap();
+        let propagation = keys.emit_by_name::<bool>(
+            "key-pressed",
+            &[
+                &gtk4::gdk::Key::Escape,
+                &0u32,
+                &gtk4::gdk::ModifierType::empty(),
+            ],
+        );
+        assert!(propagation);
+        assert!(!expander.is_expanded());
+        expander.set_expanded(true);
+        close.emit_clicked();
+        assert!(!expander.is_expanded());
+        panel.root.set_visible(false);
+        approve.emit_clicked();
+        assert!(actions.borrow().is_empty());
+        panel.root.set_visible(true);
+
+        // Same task and same approval remain actionable after read-only navigation.
+        approve.emit_clicked();
+        assert!(
+            matches!(actions.borrow().last(), Some(TaskPanelAction::Approve(id, request)) if *id == task && *request == approval.id)
+        );
+        actions.borrow_mut().clear();
+        // Same task/request ID, changed frozen content invalidates old callbacks.
+        sync.detail.as_mut().unwrap().approvals[0].reason = Some("replaced".into());
+        panel.sync(sync.clone());
+        approve.emit_clicked();
+        deny.emit_clicked();
+        assert!(actions.borrow().is_empty());
+        // ABA: restore identical request; the first generation still cannot decide.
+        sync.detail.as_mut().unwrap().approvals = vec![approval.clone()];
+        panel.sync(sync.clone());
+        approve.emit_clicked();
+        assert!(actions.borrow().is_empty());
+        let current = descendants(&panel.approvals_box)
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<Button>().ok())
+            .find(|button| button.label().as_deref() == Some("Approve"))
+            .unwrap();
+        let retired_view = descendants(&panel.approvals_box)
+            .into_iter()
+            .find_map(|widget| widget.downcast::<TextView>().ok())
+            .unwrap()
+            .downgrade();
+        // Switching task with identical approval values also invalidates old controls.
+        let other = sync.rows.iter().find(|row| row.id != task).unwrap().id;
+        sync.selected = Some(other);
+        sync.detail.as_mut().unwrap().id = other;
+        panel.sync(sync.clone());
+        current.emit_clicked();
+        assert!(actions.borrow().is_empty());
+        assert!(
+            retired_view.upgrade().is_none(),
+            "removed details must not be retained by signal cycles"
+        );
+        sync.detail.as_mut().unwrap().approvals.clear();
+        panel.sync(sync);
+        current.emit_clicked();
+        next.emit_clicked();
+        assert!(actions.borrow().is_empty());
+        window.close();
     }
 
     #[test]

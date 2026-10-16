@@ -52,6 +52,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    ui::tasks_panel::tests::approval_details_are_paged_read_only_and_stale_controls_cannot_decide
     block_view::incremental_find_tests::block_native_find_controls_keep_query_caret_and_tab_focus
     block_view::incremental_find_tests::chat_native_find_controls_keep_query_caret_and_tab_focus
     block_view::readline_preservation_tests::search_and_native_split_preserve_readline_draft_cursor_and_undo
@@ -206,9 +207,9 @@ done
 
 for test_name in "${tests[@]}"; do
     printf 'GTK display regression: %s\n' "${test_name}"
-    # Only this existing fixture checks accessible values; GTK caches the backend at init.
+    # These fixtures check accessible values; GTK caches the backend at init.
     a11y_backend=none
-    if [[ "$test_name" == ui::organism::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers ]]; then
+    if [[ "$test_name" == ui::organism::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers || "$test_name" == ui::tasks_panel::tests::approval_details_are_paged_read_only_and_stale_controls_cannot_decide ]]; then
         a11y_backend="test"
     fi
     fixture_im_module="${GTK_IM_MODULE-}"
