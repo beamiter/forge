@@ -90,6 +90,7 @@ tests=(
     block_view::tests::truncated_clipboard_feedback_tracks_actual_delivery
     block_view::tests::ssh_remote_prompt_cursor_stays_inside_live_clip_without_clear
     block_view::tests::native_ime_commit_cancel_and_independent_ptys
+    block_view::tests::native_ime_send_button_diagnostic
     block_view::tests::delayed_clipboard_paste_preserves_newer_pane_search_and_empty_focus
     block_view::tests::delayed_clipboard_paste_restores_original_history_only_after_admission
     block_view::tests::delayed_clipboard_paste_closed_or_hidden_target_cannot_reclaim_focus
@@ -205,7 +206,7 @@ for test_name in "${tests[@]}"; do
         a11y_backend="test"
     fi
     fixture_im_module="${GTK_IM_MODULE-}"
-    if [[ "$test_name" == block_view::tests::native_ime_commit_cancel_and_independent_ptys ]]; then
+    if [[ "$test_name" == block_view::tests::native_ime_commit_cancel_and_independent_ptys || "$test_name" == block_view::tests::native_ime_send_button_diagnostic ]]; then
         fixture_im_module=simple
     fi
     GTK_IM_MODULE="$fixture_im_module" GTK_A11Y="$a11y_backend" dbus-run-session "${dbus_run_args[@]}" -- \
