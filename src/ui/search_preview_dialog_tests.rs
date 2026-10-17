@@ -126,6 +126,16 @@ fn production_dialog_is_frozen_stale_safe_and_primary_neutral() {
     let (dialog, controls) = present_exact_preview(&window, a.clone(), "needle").unwrap();
     let input = entry(&dialog);
     until(|| status(&controls) == "Preview: 1 of 3");
+    settle(); // Include Adwaita's deferred initial-focus map ticks.
+    let delegate = input.delegate().unwrap().downcast::<gtk4::Text>().unwrap();
+    assert!(
+        delegate.has_focus(),
+        "initial keyboard focus stays in search input"
+    );
+    assert!(
+        input.selection_bounds().is_none(),
+        "initial seed must not be selected"
+    );
     check_primary();
     assert!(controls
         .location

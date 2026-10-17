@@ -408,8 +408,13 @@ fn present_exact_preview(
     controls.submit(query, use_regex);
     let controls_poll = controls.clone();
     glib::timeout_add_local(Duration::from_millis(25), move || controls_poll.poll());
+    // Set the wrapper as the initial focus target before Adwaita maps it.
+    // Grabbing focus immediately after present caches its GtkText delegate;
+    // Adwaita's later map tick would grab that delegate directly and select
+    // the seed, publishing it to PRIMARY. SearchEntry's own focus override
+    // deliberately does not select, so let the initial map use that wrapper.
+    dialog.set_focus(Some(&entry));
     dialog.present(Some(parent));
-    entry.grab_focus();
     Ok((dialog, controls))
 }
 
