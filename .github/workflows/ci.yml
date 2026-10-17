@@ -305,6 +305,13 @@ jobs:
             cargo test --lib --all-features --locked "$test_name" -- \
             --ignored --exact --nocapture 2>&1 | tee gtk-paint-diagnostics/exact-search-preview.log
 
+          test_name=ui::search_preview::dialog_tests::production_dialog_is_frozen_stale_safe_and_primary_neutral
+          grep -Fqx -- "${test_name}: test" <<<"${listed_tests}"
+          dbus-run-session -- \
+            xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
+            cargo test --lib --all-features --locked "$test_name" -- \
+            --ignored --exact --nocapture 2>&1 | tee gtk-paint-diagnostics/exact-search-preview-dialog.log
+
       - name: Run display-backed GTK/VTE regressions
         run: FORGE_NATIVE_CRASH_DIAGNOSTICS=1 GTK_PAINT_DIAGNOSTICS_DIR="$PWD/gtk-paint-diagnostics" FORGE_XTEST_DRIVER="$PWD/scripts/qa-cross-selection-pointer.py" bash scripts/test-gtk-display.sh
 

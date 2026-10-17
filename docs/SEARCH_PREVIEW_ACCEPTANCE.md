@@ -100,3 +100,32 @@ ignored tag test; missing test names fail before execution. Display tests must
 not be run in a restricted/headless executor. Native build, actual GTK execution
 and complete application interaction remain unverified until their corresponding
 hosted checks run. Existing lifecycle and Chat failure gates are unchanged.
+
+
+## Production dialog lifecycle fixture (hosted only)
+
+`ui::search_preview::dialog_tests::production_dialog_is_frozen_stale_safe_and_primary_neutral`
+uses the same `present_exact_preview` builder called by the application entry,
+real nonexecuting TermView PTYs and completed records, the real worker, actual GTK
+changed/toggled/clicked/closed signals, and the production 25 ms reply poll.
+It checks repeat Next/Previous wrapping, rejected regex, old-query publication,
+hiding the source while another pane is visible, removing it, frozen-versus-new
+capture, normal/force close and parent destruction. Test-only rendezvous blocks
+one real worker after its generation check but before publication, then waits
+after storing the stale reply until the actual UI gate has rejected it; both waits
+are bounded by five-second timeouts and does not inject fabricated matches. Retirement checks
+worker exit and the absence of further timer polls.
+
+Retained-tail metadata is explicitly synthetic fixture metadata on a real
+completed record, not a test of terminal truncation mechanics. PRIMARY checks
+an owned synthetic GDK content provider and zero changed signals on an isolated
+Xvfb display. It never reads a user's clipboard and is not an external-process
+selection-owner interoperability test. GTK signals are driven programmatically;
+physical keyboard, full UiState tab actions and complete application interaction
+remain outside this fixture. The application entry wiring remains source-guarded.
+
+libadwaita emits `closed` at sheet closing start, so the existing handler retires
+the worker synchronously; `close-attempt` is not a universal closing signal (it
+is for denied close attempts when can-close is false). No speculative replacement
+of that lifecycle was made. This remains retained completed-text preview coverage,
+not native VTE selection or completion of original F01.

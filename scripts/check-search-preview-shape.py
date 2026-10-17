@@ -22,6 +22,7 @@ class PreviewWiring(unittest.TestCase):
         main = (ROOT / "src/main.rs").read_text()
         self.assertIn('search_box.append(&search_preview_btn);', main)
         self.assertRegex(main, r'search_preview_btn\.connect_clicked\(move \|_\| \{\s*ui_for_search_preview\.show_exact_search_preview\(\);\s*\}\);')
+        self.assertIn("present_exact_preview(&self.window, owner, original.as_str())", (ROOT / "src/ui/search_preview.rs").read_text())
         self.assertIn("mod search_preview;", (ROOT / "src/ui/mod.rs").read_text())
         self.assertIn("pub(crate) mod search_preview;", (ROOT / "src/block_view/mod.rs").read_text())
 

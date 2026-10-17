@@ -2769,6 +2769,16 @@ pub(crate) fn palette_activation_test_collapsed(view: &TermView, block_id: u64) 
         .map(|block| block.is_collapsed())
 }
 
+/// Synthetic retention metadata for the hosted dialog fixture only.
+#[cfg(test)]
+pub(crate) fn preview_test_mark_partial(view: &TermView) {
+    view.block_data
+        .borrow_mut()
+        .back_mut()
+        .unwrap()
+        .output_notice = Some("Earlier output not retained".into());
+}
+
 impl TermView {
     /// A frozen copy of retained completed-record text, never live VTE data.
     /// Its snapshot id is the content revision for all preview hit ranges.

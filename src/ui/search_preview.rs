@@ -75,6 +75,10 @@ struct PreviewControls {
     previous: glib::WeakRef<gtk4::Button>,
     next: glib::WeakRef<gtk4::Button>,
     tag: gtk4::TextTag,
+    #[cfg(test)]
+    poll_calls: Cell<usize>,
+    #[cfg(test)]
+    rejected_replies: Cell<usize>,
 }
 impl PreviewControls {
     fn clear(&self, message: &str) {
@@ -178,6 +182,8 @@ impl PreviewControls {
         }
     }
     fn poll(&self) -> glib::ControlFlow {
+        #[cfg(test)]
+        self.poll_calls.set(self.poll_calls.get() + 1);
         if self.closed.get() || self.text.upgrade().is_none() {
             self.worker.stop();
             return glib::ControlFlow::Break;
@@ -205,6 +211,9 @@ impl PreviewControls {
                     }
                     Err(error) => self.clear(error.message()),
                 }
+            } else {
+                #[cfg(test)]
+                self.rejected_replies.set(self.rejected_replies.get() + 1);
             }
         }
         glib::ControlFlow::Continue
@@ -221,183 +230,187 @@ impl UiState {
             ));
             return;
         };
-        let snapshot = match owner.capture_search_preview() {
-            Ok(snapshot) => Arc::new(snapshot),
-            Err(error) => {
-                self.toast_overlay
-                    .add_toast(adw::Toast::new(error.message()));
-                return;
-            }
-        };
-        let worker = match Worker::new(snapshot.clone()) {
-            Ok(worker) => worker,
-            Err(error) => {
-                self.toast_overlay
-                    .add_toast(adw::Toast::new(error.message()));
-                return;
-            }
-        };
-        let dialog = adw::Dialog::builder()
-            .title("Retained text search preview")
-            .content_width(760)
-            .content_height(560)
-            .build();
-        let body = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-        body.set_margin_start(16);
-        body.set_margin_end(16);
-        body.set_margin_top(12);
-        body.set_margin_bottom(12);
-        let scope = gtk4::Label::new(Some(&format!("Frozen completed-record text only; live terminal and unavailable history are excluded. {} prompts and {} outputs are unavailable. Partial output may retain only a tail or prefix. Close and reopen to refresh.", snapshot.missing_prompts, snapshot.missing_outputs)));
-        scope.set_wrap(true);
-        scope.set_xalign(0.0);
-        body.append(&scope);
-        let help = gtk4::Label::new(Some("Case-insensitive, non-overlapping matches within each line and field. Regex uses Rust syntax; empty-match patterns, lookaround and backreferences are unsupported. Controls are shown as escapes and searched as displayed. Visual wrapping does not change matches."));
-        help.set_wrap(true);
-        help.set_xalign(0.0);
-        help.add_css_class("dim-label");
-        body.append(&help);
-        let entry = gtk4::SearchEntry::new();
-        // One sentinel character beyond the byte limit prevents oversized
-        // pastes from silently becoming a valid shorter query. Regardless of
-        // delegate availability, chars() below bounds every GTK->Rust copy.
-        if let Some(delegate) = entry
-            .delegate()
-            .and_then(|entry| entry.downcast::<gtk4::Text>().ok())
-        {
-            delegate.set_max_length((search_preview::QUERY_LIMIT + 1) as i32);
-        }
-        entry.set_hexpand(true);
-        entry.set_placeholder_text(Some("Search this frozen snapshot…"));
-        let regex = gtk4::CheckButton::with_label("Regex");
-        let previous = gtk4::Button::with_label("Previous");
-        let next = gtk4::Button::with_label("Next");
-        let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-        row.append(&entry);
-        row.append(&regex);
-        row.append(&previous);
-        row.append(&next);
-        body.append(&row);
-        let status = gtk4::Label::new(None);
-        status.set_xalign(0.0);
-        status.set_accessible_role(gtk4::AccessibleRole::Status);
-        body.append(&status);
-        let location = gtk4::Label::new(None);
-        location.set_wrap(true);
-        location.set_xalign(0.0);
-        body.append(&location);
-        let text = gtk4::TextView::new();
-        text.set_editable(false);
-        text.set_cursor_visible(false);
-        text.set_monospace(true);
-        text.set_wrap_mode(gtk4::WrapMode::WordChar);
-        let tag = gtk4::TextTag::builder()
-            .name("exact-preview-current")
-            .background("#e5a50a")
-            .foreground("#000000")
-            .build();
-        text.buffer().tag_table().add(&tag);
-        body.append(
-            &gtk4::ScrolledWindow::builder()
-                .vexpand(true)
-                .child(&text)
-                .build(),
-        );
-        let toolbar = adw::ToolbarView::new();
-        toolbar.add_top_bar(&adw::HeaderBar::new());
-        toolbar.set_content(Some(&body));
-        dialog.set_child(Some(&toolbar));
-        let controls = Rc::new(PreviewControls {
-            snapshot,
-            worker,
-            owner: Rc::downgrade(&owner),
-            closed: Cell::new(false),
-            generation: Cell::new(0),
-            matches: RefCell::new(None),
-            current: Cell::new(0),
-            displayed_document: Cell::new(None),
-            text: text.downgrade(),
-            status: status.downgrade(),
-            location: location.downgrade(),
-            previous: previous.downgrade(),
-            next: next.downgrade(),
-            tag,
-        });
-        // Exact preview starts with its own controls; changing them never calls
-        // the native Find controller or changes the original entry.
-        // Allow two slash delimiters plus one oversize sentinel. Reading a
-        // prefix of at most 8195 scalars allocates at most 32780 UTF-8 bytes;
-        // no unbounded text() copy precedes the worker's byte-limit check.
         let original = self
             .search_entry
             .chars(0, (search_preview::QUERY_LIMIT + 3) as i32);
-        let (query, use_regex) =
-            if original.starts_with('/') && original.ends_with('/') && original.len() > 2 {
-                (&original[1..original.len() - 1], true)
-            } else {
-                (original.as_str(), false)
-            };
-        if query.len() <= search_preview::QUERY_LIMIT {
-            entry.set_text(query);
+        if let Err(error) = present_exact_preview(&self.window, owner, original.as_str()) {
+            self.toast_overlay
+                .add_toast(adw::Toast::new(error.message()));
         }
-        regex.set_active(use_regex);
-        let controls_changed = controls.clone();
-        let regex_weak = regex.downgrade();
-        entry.connect_changed(move |entry| {
-            if let Some(regex) = regex_weak.upgrade() {
-                controls_changed.submit(
-                    entry
-                        .chars(0, (search_preview::QUERY_LIMIT + 1) as i32)
-                        .as_str(),
-                    regex.is_active(),
-                );
-            }
-        });
-        let controls_regex = controls.clone();
-        let entry_weak = entry.downgrade();
-        regex.connect_toggled(move |regex| {
-            if let Some(entry) = entry_weak.upgrade() {
-                controls_regex.submit(
-                    entry
-                        .chars(0, (search_preview::QUERY_LIMIT + 1) as i32)
-                        .as_str(),
-                    regex.is_active(),
-                );
-            }
-        });
-        let controls_previous = controls.clone();
-        previous.connect_clicked(move |_| controls_previous.navigate(true));
-        let controls_next = controls.clone();
-        next.connect_clicked(move |_| controls_next.navigate(false));
-        let controls_closed = controls.clone();
-        dialog.connect_closed(move |_| {
-            controls_closed.closed.set(true);
-            controls_closed.worker.stop();
-            controls_closed.clear("");
-        });
-        let keys = gtk4::EventControllerKey::new();
-        keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
-        let controls_keys = controls.clone();
-        let dialog_weak = dialog.downgrade();
-        keys.connect_key_pressed(move |_, key, _, modifiers| {
-            if key == gtk4::gdk::Key::Escape {
-                if let Some(dialog) = dialog_weak.upgrade() {
-                    dialog.force_close();
-                }
-                return true.into();
-            }
-            if key == gtk4::gdk::Key::Return || key == gtk4::gdk::Key::KP_Enter {
-                controls_keys.navigate(modifiers.contains(gtk4::gdk::ModifierType::SHIFT_MASK));
-                return true.into();
-            }
-            false.into()
-        });
-        dialog.add_controller(keys);
-        controls.submit(query, use_regex);
-        let controls_poll = controls.clone();
-        glib::timeout_add_local(Duration::from_millis(25), move || controls_poll.poll());
-        dialog.present(Some(&self.window));
-        entry.grab_focus();
     }
+}
+
+/// The single production dialog path, shared by the UI entry and native tests.
+/// The caller chooses the owner once; this never resolves a later active pane.
+fn present_exact_preview(
+    parent: &impl IsA<gtk4::Widget>,
+    owner: Rc<TermView>,
+    original: &str,
+) -> Result<(adw::Dialog, Rc<PreviewControls>), search_preview::PreviewError> {
+    let snapshot = Arc::new(owner.capture_search_preview()?);
+    let worker = Worker::new(snapshot.clone())?;
+    let dialog = adw::Dialog::builder()
+        .title("Retained text search preview")
+        .content_width(760)
+        .content_height(560)
+        .build();
+    let body = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    body.set_margin_start(16);
+    body.set_margin_end(16);
+    body.set_margin_top(12);
+    body.set_margin_bottom(12);
+    let scope = gtk4::Label::new(Some(&format!("Frozen completed-record text only; live terminal and unavailable history are excluded. {} prompts and {} outputs are unavailable. Partial output may retain only a tail or prefix. Close and reopen to refresh.", snapshot.missing_prompts, snapshot.missing_outputs)));
+    scope.set_wrap(true);
+    scope.set_xalign(0.0);
+    body.append(&scope);
+    let help = gtk4::Label::new(Some("Case-insensitive, non-overlapping matches within each line and field. Regex uses Rust syntax; empty-match patterns, lookaround and backreferences are unsupported. Controls are shown as escapes and searched as displayed. Visual wrapping does not change matches."));
+    help.set_wrap(true);
+    help.set_xalign(0.0);
+    help.add_css_class("dim-label");
+    body.append(&help);
+    let entry = gtk4::SearchEntry::new();
+    // One sentinel character beyond the byte limit prevents oversized
+    // pastes from silently becoming a valid shorter query. Regardless of
+    // delegate availability, chars() below bounds every GTK->Rust copy.
+    if let Some(delegate) = entry
+        .delegate()
+        .and_then(|entry| entry.downcast::<gtk4::Text>().ok())
+    {
+        delegate.set_max_length((search_preview::QUERY_LIMIT + 1) as i32);
+    }
+    entry.set_hexpand(true);
+    entry.set_placeholder_text(Some("Search this frozen snapshot…"));
+    let regex = gtk4::CheckButton::with_label("Regex");
+    let previous = gtk4::Button::with_label("Previous");
+    let next = gtk4::Button::with_label("Next");
+    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    row.append(&entry);
+    row.append(&regex);
+    row.append(&previous);
+    row.append(&next);
+    body.append(&row);
+    let status = gtk4::Label::new(None);
+    status.set_xalign(0.0);
+    status.set_accessible_role(gtk4::AccessibleRole::Status);
+    body.append(&status);
+    let location = gtk4::Label::new(None);
+    location.set_wrap(true);
+    location.set_xalign(0.0);
+    body.append(&location);
+    let text = gtk4::TextView::new();
+    text.set_editable(false);
+    text.set_cursor_visible(false);
+    text.set_monospace(true);
+    text.set_wrap_mode(gtk4::WrapMode::WordChar);
+    let tag = gtk4::TextTag::builder()
+        .name("exact-preview-current")
+        .background("#e5a50a")
+        .foreground("#000000")
+        .build();
+    text.buffer().tag_table().add(&tag);
+    body.append(
+        &gtk4::ScrolledWindow::builder()
+            .vexpand(true)
+            .child(&text)
+            .build(),
+    );
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&body));
+    dialog.set_child(Some(&toolbar));
+    let controls = Rc::new(PreviewControls {
+        snapshot,
+        worker,
+        owner: Rc::downgrade(&owner),
+        closed: Cell::new(false),
+        generation: Cell::new(0),
+        matches: RefCell::new(None),
+        current: Cell::new(0),
+        displayed_document: Cell::new(None),
+        text: text.downgrade(),
+        status: status.downgrade(),
+        location: location.downgrade(),
+        previous: previous.downgrade(),
+        next: next.downgrade(),
+        tag,
+        #[cfg(test)]
+        poll_calls: Cell::new(0),
+        #[cfg(test)]
+        rejected_replies: Cell::new(0),
+    });
+    // Exact preview starts with its own controls; changing them never calls
+    // the native Find controller or changes the original entry.
+    // Allow two slash delimiters plus one oversize sentinel. Reading a
+    // prefix of at most 8195 scalars allocates at most 32780 UTF-8 bytes;
+    // no unbounded text() copy precedes the worker's byte-limit check.
+    let (query, use_regex) =
+        if original.starts_with('/') && original.ends_with('/') && original.len() > 2 {
+            (&original[1..original.len() - 1], true)
+        } else {
+            (original, false)
+        };
+    if query.len() <= search_preview::QUERY_LIMIT {
+        entry.set_text(query);
+    }
+    regex.set_active(use_regex);
+    let controls_changed = controls.clone();
+    let regex_weak = regex.downgrade();
+    entry.connect_changed(move |entry| {
+        if let Some(regex) = regex_weak.upgrade() {
+            controls_changed.submit(
+                entry
+                    .chars(0, (search_preview::QUERY_LIMIT + 1) as i32)
+                    .as_str(),
+                regex.is_active(),
+            );
+        }
+    });
+    let controls_regex = controls.clone();
+    let entry_weak = entry.downgrade();
+    regex.connect_toggled(move |regex| {
+        if let Some(entry) = entry_weak.upgrade() {
+            controls_regex.submit(
+                entry
+                    .chars(0, (search_preview::QUERY_LIMIT + 1) as i32)
+                    .as_str(),
+                regex.is_active(),
+            );
+        }
+    });
+    let controls_previous = controls.clone();
+    previous.connect_clicked(move |_| controls_previous.navigate(true));
+    let controls_next = controls.clone();
+    next.connect_clicked(move |_| controls_next.navigate(false));
+    let controls_closed = controls.clone();
+    dialog.connect_closed(move |_| {
+        controls_closed.closed.set(true);
+        controls_closed.worker.stop();
+        controls_closed.clear("");
+    });
+    let keys = gtk4::EventControllerKey::new();
+    keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let controls_keys = controls.clone();
+    let dialog_weak = dialog.downgrade();
+    keys.connect_key_pressed(move |_, key, _, modifiers| {
+        if key == gtk4::gdk::Key::Escape {
+            if let Some(dialog) = dialog_weak.upgrade() {
+                dialog.force_close();
+            }
+            return true.into();
+        }
+        if key == gtk4::gdk::Key::Return || key == gtk4::gdk::Key::KP_Enter {
+            controls_keys.navigate(modifiers.contains(gtk4::gdk::ModifierType::SHIFT_MASK));
+            return true.into();
+        }
+        false.into()
+    });
+    dialog.add_controller(keys);
+    controls.submit(query, use_regex);
+    let controls_poll = controls.clone();
+    glib::timeout_add_local(Duration::from_millis(25), move || controls_poll.poll());
+    dialog.present(Some(parent));
+    entry.grab_focus();
+    Ok((dialog, controls))
 }
 
 #[cfg(test)]
@@ -544,3 +557,7 @@ mod tests {
         window.close();
     }
 }
+
+#[cfg(test)]
+#[path = "search_preview_dialog_tests.rs"]
+mod dialog_tests;

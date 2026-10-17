@@ -299,7 +299,25 @@ pub(crate) struct Worker {
     request: Arc<Mutex<Option<Request>>>,
     reply: Arc<Mutex<Option<Reply>>>,
     wake: mpsc::SyncSender<()>,
+    #[cfg(test)]
+    publication_gate: Arc<Mutex<Option<PublicationGate>>>,
+    #[cfg(test)]
+    exited: Arc<AtomicBool>,
 }
+#[cfg(test)]
+struct PublicationGate {
+    reached: mpsc::SyncSender<()>,
+    release: mpsc::Receiver<()>,
+    published: mpsc::SyncSender<()>,
+    finish: mpsc::Receiver<()>,
+}
+#[cfg(test)]
+pub(crate) type PublicationHandshake = (
+    mpsc::Receiver<()>,
+    mpsc::SyncSender<()>,
+    mpsc::Receiver<()>,
+    mpsc::SyncSender<()>,
+);
 impl Worker {
     pub(crate) fn new(snapshot: Arc<Snapshot>) -> Result<Self, PreviewError> {
         let generation = Arc::new(AtomicU64::new(0));
@@ -313,6 +331,14 @@ impl Worker {
             request.clone(),
             reply.clone(),
         );
+        #[cfg(test)]
+        let publication_gate = Arc::new(Mutex::new(None::<PublicationGate>));
+        #[cfg(test)]
+        let publication_gate_thread = publication_gate.clone();
+        #[cfg(test)]
+        let exited = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let exited_thread = exited.clone();
         std::thread::Builder::new()
             .name("search-preview".into())
             .spawn(move || {
@@ -331,13 +357,29 @@ impl Worker {
                     if !stopped_thread.load(Ordering::Acquire)
                         && generation_thread.load(Ordering::Acquire) == request.generation
                     {
+                        // Test the real check-to-store race: newer UI state may
+                        // arrive after validation but before this publication.
+                        #[cfg(test)]
+                        let gate = publication_gate_thread.lock().unwrap().take();
+                        #[cfg(test)]
+                        if let Some(gate) = &gate {
+                            let _ = gate.reached.send(());
+                            let _ = gate.release.recv_timeout(Duration::from_secs(5));
+                        }
                         *reply_thread.lock().expect("preview reply") = Some(Reply {
                             snapshot_id: snapshot.id,
                             generation: request.generation,
                             result,
                         });
+                        #[cfg(test)]
+                        if let Some(gate) = gate {
+                            let _ = gate.published.send(());
+                            let _ = gate.finish.recv_timeout(Duration::from_secs(5));
+                        }
                     }
                 }
+                #[cfg(test)]
+                exited_thread.store(true, Ordering::Release);
             })
             .map_err(|_| PreviewError::WorkerUnavailable)?;
         Ok(Self {
@@ -346,6 +388,10 @@ impl Worker {
             request,
             reply,
             wake,
+            #[cfg(test)]
+            publication_gate,
+            #[cfg(test)]
+            exited,
         })
     }
     pub(crate) fn submit(&self, query: &str, use_regex: bool) -> Result<u64, PreviewError> {
@@ -368,6 +414,24 @@ impl Worker {
             Ok(()) | Err(mpsc::TrySendError::Full(())) => Ok(generation),
             Err(mpsc::TrySendError::Disconnected(())) => Err(PreviewError::WorkerUnavailable),
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn has_exited(&self) -> bool {
+        self.exited.load(Ordering::Acquire)
+    }
+    #[cfg(test)]
+    pub(crate) fn pause_next_publication(&self) -> PublicationHandshake {
+        let (reached, arrived) = mpsc::sync_channel(1);
+        let (release, wait) = mpsc::sync_channel(1);
+        let (published, stored) = mpsc::sync_channel(1);
+        let (finish, resume) = mpsc::sync_channel(1);
+        *self.publication_gate.lock().unwrap() = Some(PublicationGate {
+            reached,
+            release: wait,
+            published,
+            finish: resume,
+        });
+        (arrived, release, stored, finish)
     }
     pub(crate) fn take_reply(&self) -> Option<Reply> {
         self.reply.lock().expect("preview reply").take()
