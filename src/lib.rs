@@ -13,6 +13,7 @@ pub(crate) mod enter_ownership;
 pub(crate) mod font;
 pub(crate) mod font_zoom;
 pub mod git_meta;
+pub(crate) mod history_gc;
 /// The OSC/CSI stream parser lives in [`jterm_core::parser`], shared with the
 /// other terminals; re-exported here so `crate::parser::…` paths keep working.
 pub mod parser {
