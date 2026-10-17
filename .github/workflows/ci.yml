@@ -205,6 +205,29 @@ jobs:
           python3 scripts/test-chat-metadata-oracles.py
           python3 scripts/test-chat-shell-smoke.py --metadata --output gtk-paint-diagnostics/f13-metadata
 
+      - name: Check historical command provenance labels
+        if: ${{ !cancelled() }}
+        run: |
+          set -Eeuo pipefail
+          test_name=block_view::blocks::command_reuse_labels_tests::recall_header_describes_insert_only_action
+          listed_tests="$(cargo test --lib --all-features --locked -- --ignored --list)"
+          grep -Fqx -- "${test_name}: test" <<<"${listed_tests}"
+          test_xdg_root="$(mktemp -d)"
+          trap 'rm -rf -- "$test_xdg_root"' EXIT
+          mkdir -p "$test_xdg_root"/{config,data,state,cache,runtime}
+          chmod 700 "$test_xdg_root/runtime"
+          export XDG_CONFIG_HOME="$test_xdg_root/config"
+          export XDG_DATA_HOME="$test_xdg_root/data"
+          export XDG_STATE_HOME="$test_xdg_root/state"
+          export XDG_CACHE_HOME="$test_xdg_root/cache"
+          export XDG_RUNTIME_DIR="$test_xdg_root/runtime"
+          export RUST_TEST_THREADS=1 GDK_BACKEND=x11 GSK_RENDERER=cairo
+          export LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1 GTK_A11Y=none
+          dbus-run-session -- \
+            xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
+            cargo test --lib --all-features --locked "$test_name" -- \
+            --ignored --exact --nocapture
+
       - name: Run display-backed GTK/VTE regressions
         run: FORGE_NATIVE_CRASH_DIAGNOSTICS=1 GTK_PAINT_DIAGNOSTICS_DIR="$PWD/gtk-paint-diagnostics" FORGE_XTEST_DRIVER="$PWD/scripts/qa-cross-selection-pointer.py" bash scripts/test-gtk-display.sh
 
