@@ -326,9 +326,19 @@ fn font_groups_stay_independent_across_native_panes_and_late_rows() {
     // An enlarged top tab must grow the overlay above its compact minimum,
     // without turning its natural text width into a window minimum.
     config.chrome_font_size = "60px".into();
-    config.default_font_scale = 1.0;
+    // Reset the group being measured: the earlier chrome-only test used 1.8.
+    // Preserve the original 60px geometry oracle, not an accidental 108px.
+    config.chrome_font_scale = 1.0;
+    assert_eq!(
+        crate::font::effective_font_size_css(&config.chrome_font_size, config.chrome_font_scale),
+        "60px",
+        "geometry fixture must keep the original absolute 60px size"
+    );
     refresh(&config);
     settle();
+    let mut chrome_config = config.clone();
+    chrome_config.font_desc = config.chrome_font_size.clone();
+    assert_configured_size(&title, &chrome_config, config.chrome_font_scale);
     let title_height = title.measure(gtk::Orientation::Vertical, -1).0;
     let top_height = top.measure(gtk::Orientation::Vertical, -1).0;
     assert!(

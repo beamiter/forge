@@ -9,6 +9,7 @@ from pathlib import Path
 import argparse
 import ctypes.util
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -42,12 +43,17 @@ def main():
         raise SystemExit("Native Pango runtime required; run in the GTK development environment")
     fixture = r'''
 #![allow(dead_code)]
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 unsafe extern "C" {
     fn pango_font_description_from_string(desc: *const c_char) -> *mut c_void;
     fn pango_font_description_get_size(desc: *const c_void) -> c_int;
     fn pango_font_description_get_size_is_absolute(desc: *const c_void) -> c_int;
     fn pango_font_description_free(desc: *mut c_void);
+    fn pango_font_description_set_family(desc: *mut c_void, family: *const c_char);
+    fn pango_font_description_set_size(desc: *mut c_void, size: c_int);
+    fn pango_font_description_set_absolute_size(desc: *mut c_void, size: f64);
+    fn pango_font_description_to_string(desc: *const c_void) -> *mut c_char;
+    fn g_free(ptr: *mut c_void);
 }
 struct FontDescription(*mut c_void);
 impl FontDescription {
@@ -58,6 +64,22 @@ impl FontDescription {
         font
     }
     fn size(&self) -> i32 { unsafe { pango_font_description_get_size(self.0) } }
+    fn set_family(&mut self, family: &str) {
+        let family = CString::new(family).unwrap();
+        unsafe { pango_font_description_set_family(self.0, family.as_ptr()) }
+    }
+    fn set_size(&mut self, size: i32) { unsafe { pango_font_description_set_size(self.0, size) } }
+    fn set_absolute_size(&mut self, size: f64) {
+        unsafe { pango_font_description_set_absolute_size(self.0, size) }
+    }
+    fn to_string(&self) -> String {
+        unsafe {
+            let value = pango_font_description_to_string(self.0);
+            let text = CStr::from_ptr(value).to_string_lossy().into_owned();
+            g_free(value.cast());
+            text
+        }
+    }
     fn is_size_absolute(&self) -> bool {
         unsafe { pango_font_description_get_size_is_absolute(self.0) != 0 }
     }
@@ -93,13 +115,17 @@ fn native_pango_fallback_is_finite_and_reset_is_exact() {
 }
 '''.replace("@helper@", helper).replace("@default@", default)
     if args.root.resolve() == ROOT:
-        fixture += "\n" + item(source, "pub(crate) fn window_font_css(")
-        for name in ["chrome_size_preserves_pango_units_and_fractional_zoom", "chrome_size_is_scoped_to_text_and_preserves_icon_geometry"]:
+        for helper_name in ["window_font_css", "unscaled_font_size", "font_description_with_family", "font_description_with_size"]:
+            fixture += "\n" + item(source, f"pub(crate) fn {helper_name}(")
+        policy_path = json.dumps(str((ROOT / "src/font_zoom.rs").resolve()))
+        fixture += f"\n#[path = {policy_path}] mod font_zoom;\n"
+        for name in ["chrome_size_preserves_pango_units_and_fractional_zoom", "chrome_size_is_scoped_to_text_and_preserves_icon_geometry", "size_only_description_retains_units_and_fractional_points", "settings_font_size_changes_do_not_cross_group_boundaries", "settings_edits_preserve_units_fractional_sizes_and_style"]:
             fixture += "\n#[test]\n" + item(source, f"fn {name}(")
         controller = (ROOT / "src/ui/config_apply.rs").read_text()
         harness = (ROOT / "scripts/font_sync_harness.rs").read_text()
         for slot, signature in [
             ("apply-scale", "pub(crate) fn apply_font_scale("),
+            ("apply-group-scale", "pub(crate) fn apply_font_group_scale("),
             ("set-scale-all", "pub(crate) fn set_font_scale_all("),
             ("apply-font-all", "pub(crate) fn apply_font_all("),
             ("claim-sweep", "fn claim_font_scale_sweep("),
@@ -107,13 +133,22 @@ fn native_pango_fallback_is_finite_and_reset_is_exact() {
             marker = f"// @font-sync:{slot}"
             assert harness.count(marker) == 1
             harness = harness.replace(marker, item(controller, signature))
+        settings = (ROOT / "src/ui/dialogs.rs").read_text()
+        for slot, row in [("main-size", "font_size_row"), ("chrome-size", "chrome_size_row")]:
+            signature = f'{row}.connect_notify_local(Some("value"), move |row, _| {{'
+            assert settings.count(signature) == 1, signature
+            body = settings.split(signature, 1)[1].split("\n        });", 1)[0]
+            marker = f"// @font-sync:{slot}"
+            assert harness.count(marker) == 1
+            harness = harness.replace(marker, textwrap.dedent(body))
         fixture += "\n" + "\n".join(line for line in harness.splitlines() if not line.startswith("//!"))
         main_source = (ROOT / "src/main.rs").read_text()
         assert 'window.add_css_class("forge-window");' in main_source
         assert 'ui.apply_dynamic_css();' in main_source
         assert 'top_bar.set_measure_overlay(&top_tab_scroll, true);' in main_source
         assert 'top_tab_scroll.set_propagate_natural_width(false);' in main_source
-        assert 'crate::font::window_font_css(&config.font_desc, self.font_scale.get())' in controller
+        compact = re.sub(r"\s+", "", controller)
+        assert 'crate::font::window_font_css(&config.font_desc,self.font_scale.get(),&config.chrome_font_size,config.chrome_font_scale,)' in compact
         assert '{font_css}' in controller
         css = (ROOT / "src/block_view/css.rs").read_text()
         assert 'crate::font::effective_font_size_css(&config.font_desc, config.default_font_scale)' in css
@@ -128,7 +163,7 @@ fn native_pango_fallback_is_finite_and_reset_is_exact() {
         binary = path.with_suffix("")
         path.write_text(fixture)
         subprocess.run([os.environ.get("RUSTC", "rustc"), "--edition=2021", "--test", str(path),
-                        "-l", f"dylib:+verbatim={library}", "-o", str(binary)], check=True)
+                        "-l", f"dylib:+verbatim={library}", "-l", f"dylib:+verbatim={ctypes.util.find_library('glib-2.0')}", "-o", str(binary)], check=True)
         print(f"{args.root.name}: production helper + native {library}; "
               f"ELF SHA256 {hashlib.sha256(binary.read_bytes()).hexdigest()}", flush=True)
         subprocess.run([str(binary), "--test-threads=1"], check=True)
