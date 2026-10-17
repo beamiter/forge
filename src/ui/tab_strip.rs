@@ -219,10 +219,9 @@ pub(crate) fn install_top_tab_geometry_reveal(scroll: &gtk4::ScrolledWindow) {
             return;
         }
         let pending = pending.clone();
-        let mut after_first_layout = false;
+        let after_first_layout = Cell::new(false);
         scroll.add_tick_callback(move |scroll, _| {
-            if !after_first_layout {
-                after_first_layout = true;
+            if !after_first_layout.replace(true) {
                 return glib::ControlFlow::Continue;
             }
             pending.set(false);
@@ -255,13 +254,12 @@ pub(super) fn install_tab_reveal_on_map(button: &ToggleButton) {
     button.connect_map(|button| {
         // Tick callbacks precede layout. Wait one complete frame so a newly
         // mapped tab has its allocation, then recheck selection and parentage.
-        let mut after_first_layout = false;
+        let after_first_layout = Cell::new(false);
         button.add_tick_callback(move |button, _| {
             if !button.is_active() {
                 return glib::ControlFlow::Break;
             }
-            if !after_first_layout {
-                after_first_layout = true;
+            if !after_first_layout.replace(true) {
                 return glib::ControlFlow::Continue;
             }
             reveal_strip_button(button);
