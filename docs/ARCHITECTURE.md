@@ -13,6 +13,18 @@ The availability result is cached for the process lifetime; restart after instal
 a new font. The Pango description retains its size, weight and style, and config
 is never rewritten. Custom family names and lists keep their existing behavior.
 
+Font zoom has two independently persisted effective scales: content `font_scale`
+and top-bar/sidebar `chrome_font_scale`. UI base size is stored independently as
+`chrome_font_size`, a size-only Pango description retaining fractional points or
+absolute pixels. Both UI values inherit legacy values once during config loading.
+Capture-phase scroll controllers attach to disjoint region roots (top handle,
+left sidebar, right AI/Tasks stack, center notebook/search column, bottom bar), so pointer ancestry
+selects the group and consumes Ctrl+wheel before Block/VTE handlers. Window-level overlays and separate dialogs have no
+underlying-region zoom handler. Native popup routing and GTK visual behavior
+require a display-backed acceptance pass; headless routing guards do not prove them. Surface deltas normalize through the pinned shared
+wheel constant, preserving fractional steps. Separate idle slots coalesce rendering;
+the existing config debounce persists both values in one atomic snapshot.
+
 ## Terminal models
 
 forge has two explicit terminal models:

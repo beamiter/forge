@@ -965,6 +965,14 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         toml::Value::Float(config.default_font_scale),
     );
     table.insert(
+        "chrome_font_scale".into(),
+        toml::Value::Float(config.chrome_font_scale),
+    );
+    table.insert(
+        "chrome_font_size".into(),
+        toml::Value::String(config.chrome_font_size.clone()),
+    );
+    table.insert(
         "theme".into(),
         toml::Value::String(config.theme_name.clone()),
     );
@@ -1445,6 +1453,69 @@ mod tests {
         // No environment mutation is required because the path-specific test
         // helpers receive their target explicitly.
         config::load_config().0
+    }
+
+    #[test]
+    fn font_groups_persist_as_independent_valid_numbers() {
+        let mut config = default_config();
+        config.default_font_scale = 1.75;
+        config.chrome_font_scale = 0.8;
+        config.chrome_font_size = "13.5px".into();
+        let mut table = toml::Table::new();
+        apply_config_to_table(&config, &mut table);
+        let text = toml::to_string(&table).unwrap();
+        let reloaded: toml::Table = toml::from_str(&text).unwrap();
+        assert_eq!(reloaded["font_scale"].as_float(), Some(1.75));
+        assert_eq!(reloaded["chrome_font_scale"].as_float(), Some(0.8));
+        assert_eq!(reloaded["chrome_font_size"].as_str(), Some("13.5px"));
+        let issues = config::validate_config_contents(&text).unwrap();
+        assert!(!issues
+            .iter()
+            .any(|issue| issue.path.starts_with("chrome_font_")));
+    }
+
+    #[test]
+    fn legacy_font_groups_survive_first_single_group_edit_and_serialization() {
+        for (desc, size) in [("Monospace 13.5", "13.5"), ("Monospace 17px", "17px")] {
+            for legacy_scale in [0.1, 1.75, 10.0] {
+                for edit_chrome in [false, true] {
+                    let mut config = Config::safe_defaults();
+                    config.font_desc = desc.into();
+                    config.default_font_scale = legacy_scale;
+                    // The exact legacy migration helpers used by load_config.
+                    config.chrome_font_size = crate::font::unscaled_font_size(&config.font_desc);
+                    config.chrome_font_scale =
+                        crate::font_zoom::initial_chrome_scale(None, legacy_scale);
+                    if edit_chrome {
+                        config.chrome_font_size = "19px".into();
+                        config.chrome_font_scale = 0.8;
+                    } else {
+                        config.font_desc = "Monospace 24".into();
+                        config.default_font_scale = 1.1;
+                    }
+                    let mut table = toml::Table::new();
+                    apply_config_to_table(&config, &mut table);
+                    let reloaded: toml::Table =
+                        toml::from_str(&toml::to_string(&table).unwrap()).unwrap();
+                    let content = reloaded["font_scale"].as_float().unwrap();
+                    let chrome = crate::font_zoom::initial_chrome_scale(
+                        reloaded["chrome_font_scale"].as_float(),
+                        content,
+                    );
+                    if edit_chrome {
+                        assert_eq!(reloaded["font"].as_str(), Some(desc));
+                        assert_eq!(content, legacy_scale);
+                        assert_eq!(chrome, 0.8);
+                        assert_eq!(reloaded["chrome_font_size"].as_str(), Some("19px"));
+                    } else {
+                        assert_eq!(reloaded["font"].as_str(), Some("Monospace 24"));
+                        assert_eq!(content, 1.1);
+                        assert_eq!(chrome, legacy_scale);
+                        assert_eq!(reloaded["chrome_font_size"].as_str(), Some(size));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

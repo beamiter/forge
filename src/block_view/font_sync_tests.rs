@@ -58,10 +58,10 @@ fn size(widget: &impl IsA<gtk::Widget>) -> i32 {
     widget.pango_context().font_description().unwrap().size()
 }
 
-fn assert_configured_size(widget: &impl IsA<gtk::Widget>, config: &Config) {
+fn assert_configured_size(widget: &impl IsA<gtk::Widget>, config: &Config, scale: f64) {
     let configured = gtk::pango::FontDescription::from_string(&config.font_desc);
     let actual = widget.pango_context().font_description().unwrap();
-    let mut expected = f64::from(configured.size()) * config.default_font_scale;
+    let mut expected = f64::from(configured.size()) * scale;
     // CSS resolves absolute pixels against the pinned 96 dpi. Account for
     // whether GTK exposes its Pango context description in points or pixels.
     match (configured.is_size_absolute(), actual.is_size_absolute()) {
@@ -73,13 +73,13 @@ fn assert_configured_size(widget: &impl IsA<gtk::Widget>, config: &Config) {
         (f64::from(actual.size()) - expected).abs() <= 1.0,
         "configured {} × {} must resolve to {expected}, got {actual:?}",
         config.font_desc,
-        config.default_font_scale,
+        scale,
     );
 }
 
 #[test]
 #[ignore = "requires an isolated GTK/VTE display"]
-fn window_chrome_tracks_font_and_zoom_across_native_panes_and_late_rows() {
+fn font_groups_stay_independent_across_native_panes_and_late_rows() {
     gtk::init().expect("GTK display");
     // Make point/pixel expectations independent of the runner's Xft defaults.
     gtk::Settings::default()
@@ -88,6 +88,7 @@ fn window_chrome_tracks_font_and_zoom_across_native_panes_and_late_rows() {
     let mut config = Config::safe_defaults();
     config.font_desc = "Monospace 12.5".into();
     config.default_font_scale = 1.025;
+    config.chrome_font_size = "12.5".into();
     config.icon_font = Some("none".into());
     let display = gtk::gdk::Display::default().unwrap();
     let base = gtk::CssProvider::new();
@@ -115,7 +116,12 @@ fn window_chrome_tracks_font_and_zoom_across_native_panes_and_late_rows() {
         chrome.load_from_string(&format!(
             "{} {}",
             crate::font::menu_theme_css(&config.font_desc, &config.background, &config.foreground),
-            crate::font::window_font_css(&config.font_desc, config.default_font_scale),
+            crate::font::window_font_css(
+                &config.font_desc,
+                config.default_font_scale,
+                &config.chrome_font_size,
+                config.chrome_font_scale
+            ),
         ));
     };
     refresh(&config);
@@ -125,6 +131,7 @@ fn window_chrome_tracks_font_and_zoom_across_native_panes_and_late_rows() {
     // width clamp which keeps long tabs from widening the application window.
     let top = gtk::Overlay::new();
     top.add_css_class("top-bar");
+    top.add_css_class("forge-font-chrome");
     top.set_height_request(40);
     top.set_child(Some(&gtk::Box::new(gtk::Orientation::Horizontal, 0)));
     let tab_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -148,6 +155,7 @@ fn window_chrome_tracks_font_and_zoom_across_native_panes_and_late_rows() {
     let body = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
     sidebar.add_css_class("sidebar-box");
+    sidebar.add_css_class("forge-font-chrome");
     let file = gtk::Label::new(Some("Files"));
     file.add_css_class("file-tree-root");
     sidebar.append(&file);
@@ -190,20 +198,23 @@ fn window_chrome_tracks_font_and_zoom_across_native_panes_and_late_rows() {
     finish_command(&block);
     finish_command(&chat);
 
-    let check = || {
+    let check = |config: &Config| {
         let expected = size(&title);
         assert!(expected > 0);
         for label in labels(&root.clone().upcast()) {
             // GTK updates a hidden widget's Pango context lazily. Assert the
             // rendered contract here; reveal previously hidden text below.
             if label.is_mapped() && !label.has_css_class("tab-conn-dot") {
-                assert_eq!(
-                    size(&label),
-                    expected,
-                    "{} {:?}",
-                    label.text(),
-                    label.css_classes()
-                );
+                let scale = if label.is_ancestor(&top) || label.is_ancestor(&sidebar) {
+                    config.chrome_font_scale
+                } else {
+                    config.default_font_scale
+                };
+                let mut expected_config = config.clone();
+                if label.is_ancestor(&top) || label.is_ancestor(&sidebar) {
+                    expected_config.font_desc = config.chrome_font_size.clone();
+                }
+                assert_configured_size(&label, &expected_config, scale);
             }
         }
         assert_eq!(size(&entry), expected);
@@ -215,8 +226,8 @@ fn window_chrome_tracks_font_and_zoom_across_native_panes_and_late_rows() {
         assert_eq!(icon.pixel_size(), 16, "text zoom must not resize images");
         assert!(errors.borrow().is_empty(), "{:?}", errors.borrow());
     };
-    check();
-    assert_configured_size(&title, &config);
+    check(&config);
+    assert_eq!(size(&title), size(&entry));
     let original_size = size(&title);
     // Setting change, fractional hotkey steps, reset, and absolute-pixel fonts.
     for (desc, scale) in [
@@ -249,8 +260,8 @@ fn window_chrome_tracks_font_and_zoom_across_native_panes_and_late_rows() {
         classic.set_font_scale(scale);
         refresh(&config);
         settle();
-        check();
-        assert_configured_size(&title, &config);
+        check(&config);
+        assert_eq!(size(&title), size(&entry));
         // These native bookmark labels existed before the font change but
         // stayed hidden through it. Revealing them must resolve the new size.
         for view in [&block, &chat] {
@@ -259,20 +270,30 @@ fn window_chrome_tracks_font_and_zoom_across_native_panes_and_late_rows() {
             }
         }
         settle();
-        check();
+        check(&config);
         for view in [&block, &chat] {
             for finished in view.finished_blocks.borrow().iter() {
                 assert!(finished.bookmark_star.is_mapped());
-                assert_configured_size(&finished.bookmark_star, &config);
+                assert_configured_size(&finished.bookmark_star, &config, config.default_font_scale);
                 finished.bookmark_star.set_visible(false);
             }
         }
     }
-    assert_ne!(
+    assert_eq!(
         size(&title),
         original_size,
-        "the existing widgets actually resized"
+        "main font edits leave chrome fixed"
     );
+
+    // Chrome-only zoom must not resize any live/history VTE.
+    let content_scale = classic.font_scale();
+    config.chrome_font_scale = 1.8;
+    refresh(&config);
+    settle();
+    check(&config);
+    assert_eq!(classic.font_scale(), content_scale);
+    assert_eq!(block.vte().font_scale(), content_scale);
+    assert_eq!(chat.vte().font_scale(), content_scale);
 
     // Rows, tabs, pane headers and finished cards created after zoom need no
     // one-off style patch. A Unified pane uses the same native font contract.
@@ -290,7 +311,7 @@ fn window_chrome_tracks_font_and_zoom_across_native_panes_and_late_rows() {
     for page in [2, 1, 0, 2] {
         notebook.set_current_page(Some(page));
         settle();
-        check();
+        check(&config);
     }
     assert_eq!(unified.vte().font_scale(), config.default_font_scale);
     assert_eq!(
@@ -299,12 +320,12 @@ fn window_chrome_tracks_font_and_zoom_across_native_panes_and_late_rows() {
     );
     assert_eq!(classic.font().unwrap().size(), 17 * gtk::pango::SCALE);
     assert_eq!(classic.font_scale(), 1.25);
-    assert_configured_size(&late_file, &config);
+    assert_eq!(size(&late_file), size(&title));
     assert!(css::block_css(&config).contains("font-size: 21.25px;"));
 
     // An enlarged top tab must grow the overlay above its compact minimum,
     // without turning its natural text width into a window minimum.
-    config.font_desc = "Monospace 60px".into();
+    config.chrome_font_size = "60px".into();
     config.default_font_scale = 1.0;
     refresh(&config);
     settle();
@@ -322,7 +343,7 @@ fn window_chrome_tracks_font_and_zoom_across_native_panes_and_late_rows() {
         top.height() >= title_height,
         "the allocated top bar must fit its text"
     );
-    assert_configured_size(&title, &config);
+    assert_eq!(size(&title), size(&entry));
     assert!(top.measure(gtk::Orientation::Horizontal, -1).0 < 400);
     assert_eq!(icon.pixel_size(), 16);
     window.close();

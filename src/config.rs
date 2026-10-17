@@ -821,6 +821,8 @@ pub struct Config {
     /// the glyphs to fontconfig's global sort.
     pub(crate) icon_font: Option<String>,
     pub(crate) default_font_scale: f64,
+    pub(crate) chrome_font_scale: f64,
+    pub(crate) chrome_font_size: String,
     pub(crate) theme_name: String,
     pub(crate) foreground: RGBA,
     pub(crate) background: RGBA,
@@ -993,6 +995,8 @@ impl Config {
             font_desc: DEFAULT_FONT_DESC.to_string(),
             icon_font: None,
             default_font_scale: 1.0,
+            chrome_font_scale: 1.0,
+            chrome_font_size: crate::font::unscaled_font_size(DEFAULT_FONT_DESC),
             theme_name: theme.name.clone(),
             foreground: theme.foreground,
             background: theme.background,
@@ -1529,6 +1533,8 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "scrollback",
     "font",
     "font_scale",
+    "chrome_font_scale",
+    "chrome_font_size",
     "theme",
     "colors",
     "keybindings",
@@ -1662,6 +1668,7 @@ fn validate_remote_host_string(
 fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
     let strings = [
         "font",
+        "chrome_font_size",
         "theme",
         "shell",
         "startup_commands",
@@ -1739,7 +1746,7 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
             );
         }
     }
-    for key in ["opacity", "font_scale"] {
+    for key in ["opacity", "font_scale", "chrome_font_scale"] {
         if table.get(key).is_some_and(|v| !v.is_float()) {
             config_issue(
                 issues,
@@ -1801,6 +1808,7 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
     };
     warn_float_range(&mut issues, "opacity", 0.01, 1.0);
     warn_float_range(&mut issues, "font_scale", 0.1, 10.0);
+    warn_float_range(&mut issues, "chrome_font_scale", 0.1, 10.0);
     warn_int_range(&mut issues, "scrollback", 0, 1_000_000);
     warn_int_range(&mut issues, "sidebar_width", 120, 800);
     warn_int_range(
@@ -1854,6 +1862,7 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
 
     for (key, max_bytes) in [
         ("font", MAX_FONT_DESC_BYTES),
+        ("chrome_font_size", MAX_FONT_DESC_BYTES),
         ("shell", MAX_CONFIG_PATH_BYTES),
         ("startup_commands", MAX_STARTUP_COMMANDS_BYTES),
         ("ai_model", MAX_AI_IDENTIFIER_BYTES),
@@ -2320,6 +2329,8 @@ struct FileConfig {
     font: Option<String>,
     icon_font: Option<String>,
     font_scale: Option<f64>,
+    chrome_font_scale: Option<f64>,
+    chrome_font_size: Option<String>,
     theme: Option<String>,
     foreground: Option<String>,
     background: Option<String>,
@@ -2519,6 +2530,11 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         font_scale: table.get("font_scale").and_then(|v| v.as_float()),
+        chrome_font_scale: table.get("chrome_font_scale").and_then(|v| v.as_float()),
+        chrome_font_size: table
+            .get("chrome_font_size")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
         theme: table
             .get("theme")
             .and_then(|v| v.as_str())
@@ -2859,8 +2875,14 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         0.1,
         10.0,
     );
+    // An old single-scale config keeps exactly the same initial appearance.
+    let chrome_font_scale =
+        crate::font_zoom::initial_chrome_scale(fc.chrome_font_scale, default_font_scale);
     let font_desc = resolve_setting_text(env_string("FORGE_FONT"), fc.font, MAX_FONT_DESC_BYTES)
         .unwrap_or_else(|| DEFAULT_FONT_DESC.to_string());
+    let chrome_font_size = resolve_setting_text(None, fc.chrome_font_size, MAX_FONT_DESC_BYTES)
+        .map(|size| crate::font::unscaled_font_size(&size))
+        .unwrap_or_else(|| crate::font::unscaled_font_size(&font_desc));
     // Left unset so `crate::font` can pick whichever icon font is installed.
     let icon_font = resolve_setting_text(
         env_string("FORGE_ICON_FONT"),
@@ -3039,6 +3061,8 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         font_desc,
         icon_font,
         default_font_scale,
+        chrome_font_scale,
+        chrome_font_size,
         theme_name: theme.name.clone(),
         foreground,
         background,
@@ -4661,8 +4685,10 @@ session = "bad/session"
         assert_eq!(finite_clamp_f64(Some(4.0), 0.95, 0.01, 1.0), 1.0);
         assert_eq!(finite_clamp_f64(Some(0.7), 0.95, 0.01, 1.0), 0.7);
 
-        let issues = validate_config_contents("opacity = nan\nfont_scale = inf\n").unwrap();
-        for key in ["opacity", "font_scale"] {
+        let issues =
+            validate_config_contents("opacity = nan\nfont_scale = inf\nchrome_font_scale = nan\n")
+                .unwrap();
+        for key in ["opacity", "font_scale", "chrome_font_scale"] {
             assert!(issues.iter().any(|issue| {
                 issue.path == key
                     && issue.level == ConfigIssueLevel::Warning

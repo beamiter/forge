@@ -19,7 +19,9 @@ font = "JetBrainsMono Nerd Font Mono 14"
 # separators, devicons, codicons). Unset auto-picks an installed Nerd Font;
 # set "none" to leave those glyphs to fontconfig's own fallback.
 # icon_font = "Symbols Nerd Font Mono"
-font_scale = 1.0              # 0.1 .. 10.0
+font_scale = 1.0              # 主内容区，0.1 .. 10.0
+# chrome_font_scale = 1.0     # 顶部栏 + 侧栏，0.1 .. 10.0；缺省沿用旧 font_scale
+# chrome_font_size = "14"     # 侧顶栏基础字号；点数或 "17px"，缺省从 font 固定初值
 
 # default, light, solarized-dark, solarized-light, gruvbox-dark,
 # gruvbox-light, dracula, nord

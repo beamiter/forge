@@ -283,6 +283,7 @@ pub(crate) struct UiState {
     /// through in a few milliseconds. `Some` means a sweep is already queued
     /// and only needs its target updated.
     pub(crate) pending_font_scale: Rc<Cell<Option<f64>>>,
+    pub(crate) pending_chrome_font_scale: Rc<Cell<Option<f64>>>,
     pub(crate) window_opacity: Rc<Cell<f64>>,
     pub(crate) shell_argv: Rc<RefCell<Vec<String>>>,
     pub(crate) config: Rc<RefCell<Config>>,

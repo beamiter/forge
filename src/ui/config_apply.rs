@@ -382,18 +382,44 @@ impl UiState {
     /// live value — and the expensive widget sweep runs once, on the idle after
     /// the burst has been dispatched.
     pub(crate) fn apply_font_scale(&self, new_scale: f64) {
-        self.font_scale.set(new_scale);
-        self.config.borrow_mut().default_font_scale = new_scale;
+        self.apply_font_group_scale(crate::font_zoom::FontGroup::Content, new_scale);
+    }
+
+    pub(crate) fn apply_font_group_scale(
+        &self,
+        group: crate::font_zoom::FontGroup,
+        new_scale: f64,
+    ) {
+        use crate::font_zoom::FontGroup;
+        let new_scale = crate::font_zoom::clamp_scale(new_scale);
+        let pending = match group {
+            FontGroup::Content => {
+                self.font_scale.set(new_scale);
+                self.config.borrow_mut().default_font_scale = new_scale;
+                &self.pending_font_scale
+            }
+            FontGroup::Chrome => {
+                self.config.borrow_mut().chrome_font_scale = new_scale;
+                &self.pending_chrome_font_scale
+            }
+        };
         // The generic persist below is still 400 ms of debounce away, and the
         // config already differs from the file. Mark it dirty now so a reload
         // arriving inside a held Ctrl+wheel gesture cannot undo the zoom.
         self.config_dirty.record_edit();
 
-        if claim_font_scale_sweep(&self.pending_font_scale, new_scale) {
+        if claim_font_scale_sweep(pending, new_scale) {
             let ui = self.clone();
-            glib::idle_add_local_once(move || {
-                if let Some(scale) = ui.pending_font_scale.take() {
-                    ui.set_font_scale_all(scale);
+            glib::idle_add_local_once(move || match group {
+                FontGroup::Content => {
+                    if let Some(scale) = ui.pending_font_scale.take() {
+                        ui.set_font_scale_all(scale);
+                    }
+                }
+                FontGroup::Chrome => {
+                    if ui.pending_chrome_font_scale.take().is_some() {
+                        ui.apply_dynamic_css();
+                    }
                 }
             });
         }
@@ -470,7 +496,12 @@ impl UiState {
         let semantic = config.semantic_colors();
         let fg = &semantic.foreground;
         let menu_css = crate::font::menu_theme_css(&config.font_desc, bg, fg);
-        let font_css = crate::font::window_font_css(&config.font_desc, self.font_scale.get());
+        let font_css = crate::font::window_font_css(
+            &config.font_desc,
+            self.font_scale.get(),
+            &config.chrome_font_size,
+            config.chrome_font_scale,
+        );
         let br = (bg.red() * 255.0) as u8;
         let bg_g = (bg.green() * 255.0) as u8;
         let bb = (bg.blue() * 255.0) as u8;
@@ -1016,6 +1047,7 @@ impl UiState {
             // old sweep before installing it so an idle callback cannot put
             // the discarded scale back over the newly loaded configuration.
             self.pending_font_scale.set(None);
+            self.pending_chrome_font_scale.set(None);
             self.config_dirty.abandon_unsaved_edits();
         }
 

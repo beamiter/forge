@@ -837,6 +837,7 @@ pub fn run() -> glib::ExitCode {
 
         let top_bar_handle = gtk4::WindowHandle::new();
         top_bar_handle.set_child(Some(&top_bar));
+        top_bar_handle.add_css_class("forge-font-chrome");
 
         {
             let window = window.clone();
@@ -876,6 +877,7 @@ pub fn run() -> glib::ExitCode {
 
         let sidebar = gtk4::Box::new(Orientation::Vertical, 0);
         sidebar.add_css_class("sidebar-box");
+        sidebar.add_css_class("forge-font-chrome");
 
         // Tab search entry for filtering. It always lives in the sidebar's Tabs
         // view, in both tab placements: the top bar is reserved for the tabs
@@ -1107,6 +1109,7 @@ pub fn run() -> glib::ExitCode {
         // AI Chats, and Tasks rides the same chrome without its own config.
         let tasks_panel_widget = ui::TasksPanel::build();
         let side_stack = gtk4::Stack::new();
+        side_stack.add_css_class("forge-font-chrome");
         side_stack.add_named(&ai_panel_widget.root, Some("chats"));
         side_stack.add_named(&tasks_panel_widget.root, Some("tasks"));
         side_stack.set_visible_child_name("chats");
@@ -1140,6 +1143,7 @@ pub fn run() -> glib::ExitCode {
         // Main layout: draggable top bar + content box (vertical), with the
         // status bar spanning the full window width underneath both.
         let (bottom_bar, bottom_bar_left, bottom_bar_right) = ui::build_bottom_bar();
+        bottom_bar.add_css_class("forge-font-chrome");
         let main_box = gtk4::Box::new(Orientation::Vertical, 0);
         main_box.append(&top_bar_handle);
         main_box.append(&content_box);
@@ -1198,6 +1202,7 @@ pub fn run() -> glib::ExitCode {
             config_persist_generation: Rc::new(Cell::new(0)),
             font_persist_generation: Rc::new(Cell::new(0)),
             pending_font_scale: Rc::new(Cell::new(None)),
+            pending_chrome_font_scale: Rc::new(Cell::new(None)),
             window_opacity: window_opacity.clone(),
             shell_argv: shell_argv.clone(),
             config: config.clone(),
@@ -1902,28 +1907,43 @@ pub fn run() -> glib::ExitCode {
 
         window.add_controller(key_controller);
 
-        // Ctrl+scroll to zoom font
-        let scroll_controller = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
-        scroll_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-        let ui_for_scroll = ui.clone();
-        scroll_controller.connect_scroll(move |controller, _dx, dy| {
-            let state = controller.current_event_state();
-            // Touchpads emit fractional deltas; a zero step would still claim
-            // the event, so let those through untouched.
-            if state.contains(ModifierType::CONTROL_MASK) && dy != 0.0 {
-                let font_step = 0.025;
-                let current = ui_for_scroll.font_scale.get();
-                let new_scale = if dy < 0.0 {
-                    (current + font_step).min(10.0)
+        // Each capture controller owns a disjoint widget subtree. GTK routes
+        // scrolls through the pointer target's ancestors, never keyboard focus.
+        // Window-level overlays and separate dialogs have no region controller;
+        // only inter-region split handles lack a group. Internal terminal
+        // split handles remain in the Content subtree.
+        use crate::font_zoom::FontGroup;
+        for (root, group) in [
+            (top_bar_handle.clone().upcast::<gtk4::Widget>(), FontGroup::Chrome),
+            (sidebar.clone().upcast::<gtk4::Widget>(), FontGroup::Chrome),
+            (right_col.clone().upcast::<gtk4::Widget>(), FontGroup::Content),
+            (side_stack.clone().upcast::<gtk4::Widget>(), FontGroup::Chrome),
+            (bottom_bar.clone().upcast::<gtk4::Widget>(), FontGroup::Chrome),
+        ] {
+            let controller = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
+            controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            let ui = ui.clone();
+            controller.connect_scroll(move |controller, _dx, dy| {
+                let control = controller.current_event_state().contains(ModifierType::CONTROL_MASK);
+                let steps = if controller.unit() == gtk4::gdk::ScrollUnit::Surface {
+                    dy / jterm_core::wheel::SURFACE_UNITS_PER_STEP
                 } else {
-                    (current - font_step).max(0.1)
+                    dy
                 };
-                ui_for_scroll.apply_font_scale(new_scale);
-                return true.into();
-            }
-            false.into()
-        });
-        window.add_controller(scroll_controller);
+                let current = match group {
+                    FontGroup::Content => ui.font_scale.get(),
+                    FontGroup::Chrome => ui.config.borrow().chrome_font_scale,
+                };
+                if let Some(scale) = crate::font_zoom::wheel_scale(current, control, steps) {
+                    ui.apply_font_group_scale(group, scale);
+                    // Stop before any Block/VTE scroll handler or ancestor can
+                    // process this same gesture, including at a clamp boundary.
+                    return true.into();
+                }
+                false.into()
+            });
+            root.add_controller(controller);
+        }
 
         // Save state *before* GTK starts destroying widgets.
         let notebook_for_close_request = notebook.clone();

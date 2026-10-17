@@ -129,7 +129,7 @@ tests=(
     block_view::tests::chat_docking_keeps_pty_rows_and_native_hit_geometry_stable
     block_view::chat::tests::chat_moves_only_the_native_clip_and_keeps_history_anchor
     font::tests::context_menu_tracks_live_theme_and_font_without_parent_emphasis
-    block_view::font_sync_tests::window_chrome_tracks_font_and_zoom_across_native_panes_and_late_rows
+    block_view::font_sync_tests::font_groups_stay_independent_across_native_panes_and_late_rows
     ui::dialogs::organism_preview::tests::preview_lifecycle_keeps_motion_local_and_stops_hidden_sources
     ui::organism::tests::deferred_agent_loss_retires_closed_panes_but_keeps_hidden_outcomes
     ui::organism::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers

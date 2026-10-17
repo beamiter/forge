@@ -801,3 +801,11 @@ Escape 或 Close 关闭窗口并把键盘焦点交回打开审阅的历史操作
 vim/top 接管原生终端，退出后按实际 shell 状态返回；缺少集成时同一 PTY 继续透传。
 复制、搜索、折叠和历史恢复继续使用原始记录。
 详见 [Chat 验收清单](CHAT_MODE_ACCEPTANCE.md)。
+
+## 分组字号
+
+Ctrl+滚轮根据鼠标所在区域缩放，而不是键盘焦点：顶部栏、左右侧栏（标签、文件树、AI Chats/Tasks）和底部状态栏共用 UI 组；中心终端区域的 Block/Chat/VTE、全部分屏及中心搜索栏使用主内容组。普通滚轮保持原来的滚动行为；独立对话框、全窗浮层及区域之间的分隔条不绑定分组缩放控制器；主内容内部的终端分屏分隔条仍归主内容组。
+
+两组基础字号及倍率独立保存，倍率范围为 0.1–10.0，连续触控板滚动保留小数增量。旧配置加载时从 `font` 和 `font_scale` 固定 UI 组的初值；之后只改其中一组不会改变另一组，重启后亦然。UI 组使用 `chrome_font_size`（如 "14" 点或 "17px"）和 `chrome_font_scale`，主内容使用原来的 `font` 与 `font_scale`。
+
+设置中的 Main Content Font Size/Scale 只改主内容；Sidebar & Top Bar Font Size/Scale 只改 UI 组。`Ctrl+=` / `Ctrl+-` / `Ctrl+0` 仍控制主内容组。更改主内容的基础字号不会再连带改变侧顶栏字号。

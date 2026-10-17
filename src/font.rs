@@ -207,19 +207,59 @@ pub(crate) fn effective_font_size_css(desc: &str, scale: f64) -> String {
     format!("{}{unit}", size * scale)
 }
 
+/// Edit one property without losing the user's size unit, style or weight.
+pub(crate) fn font_description_with_family(desc: &str, family: &str) -> String {
+    let mut font = FontDescription::from_string(desc);
+    font.set_family(family);
+    font.to_string()
+}
+
+/// Settings edits keep absolute pixels absolute and fractional points fractional.
+pub(crate) fn font_description_with_size(desc: &str, size: f64) -> String {
+    let mut font = FontDescription::from_string(desc);
+    if size.is_finite() && size > 0.0 {
+        let scaled = size.clamp(6.0, 72.0) * f64::from(gtk::pango::SCALE);
+        if font.is_size_absolute() {
+            font.set_absolute_size(scaled);
+        } else {
+            font.set_size(scaled.round() as i32);
+        }
+    }
+    font.to_string()
+}
+
+/// A size-only Pango description preserves absolute pixels and fractional points.
+pub(crate) fn unscaled_font_size(desc: &str) -> String {
+    effective_font_size_css(desc, 1.0)
+        .trim_end_matches("pt")
+        .to_owned()
+}
+
 /// Scope the shared text size to this application's window. Target text nodes
 /// directly so nested captions, pane metadata and theme heading classes do not
 /// compound relative sizes. Image sizing and the decorative connection dot keep
 /// their existing geometry. Newly created tabs/rows inherit this provider too.
-pub(crate) fn window_font_css(desc: &str, scale: f64) -> String {
+pub(crate) fn window_font_css(
+    desc: &str,
+    scale: f64,
+    chrome_size: &str,
+    chrome_scale: f64,
+) -> String {
     let size = effective_font_size_css(desc, scale);
+    let chrome = effective_font_size_css(chrome_size, chrome_scale);
     format!(
         "window.forge-window,\n\
          window.forge-window label:not(.tab-conn-dot),\n\
          window.forge-window entry,\n\
          window.forge-window textview,\n\
          window.forge-window text,\n\
-         window.forge-window treeview {{ font-size: {size}; }}"
+         window.forge-window treeview {{ font-size: {size}; }}\n\
+         window.forge-window .forge-font-chrome,\n\
+         window.forge-window .forge-font-chrome label:not(.tab-conn-dot),\n\
+         window.forge-window .forge-font-chrome entry,\n\
+         window.forge-window .forge-font-chrome textview,\n\
+         window.forge-window .forge-font-chrome text,\n\
+         window.forge-window .forge-font-chrome treeview {{ font-size: {chrome}; }}"
     )
 }
 
@@ -770,8 +810,10 @@ mod tests {
 
     #[test]
     fn chrome_size_is_scoped_to_text_and_preserves_icon_geometry() {
-        let css = window_font_css("Monospace Bold 12.5", 1.2);
+        let css = window_font_css("Monospace Bold 12.5", 1.2, "12.5", 0.8);
         assert!(css.contains("font-size: 15pt;"));
+        assert!(css.contains("font-size: 10pt;"));
+        assert!(css.contains(".forge-font-chrome label:not(.tab-conn-dot)"));
         assert!(css.contains("label:not(.tab-conn-dot)"));
         assert!(css.contains("window.forge-window text,"));
         assert!(css.contains("entry"));
@@ -781,6 +823,38 @@ mod tests {
         for selector in css.split('{').next().unwrap().split(',') {
             assert!(selector.trim().starts_with("window.forge-window"));
         }
+    }
+
+    #[test]
+    fn size_only_description_retains_units_and_fractional_points() {
+        assert_eq!(unscaled_font_size("Monospace Bold 13.5"), "13.5");
+        assert_eq!(unscaled_font_size("Monospace 17px"), "17px");
+        assert_eq!(effective_font_size_css("13.5", 1.0), "13.5pt");
+        assert_eq!(effective_font_size_css("17px", 1.0), "17px");
+    }
+
+    #[test]
+    fn settings_font_size_changes_do_not_cross_group_boundaries() {
+        let initial = window_font_css("Monospace 14", 1.25, "13.5", 0.8);
+        let main_changed = window_font_css("Monospace 28", 1.25, "13.5", 0.8);
+        let marker = "window.forge-window .forge-font-chrome,";
+        assert_eq!(
+            initial.split(marker).nth(1),
+            main_changed.split(marker).nth(1)
+        );
+        assert_ne!(
+            initial.split(marker).next(),
+            main_changed.split(marker).next()
+        );
+        let chrome_changed = window_font_css("Monospace 14", 1.25, "17px", 0.8);
+        assert_eq!(
+            initial.split(marker).next(),
+            chrome_changed.split(marker).next()
+        );
+        assert_ne!(
+            initial.split(marker).nth(1),
+            chrome_changed.split(marker).nth(1)
+        );
     }
 
     #[test]
@@ -810,6 +884,27 @@ mod tests {
         assert_eq!(
             css_font_stack("ev\"il", Some("Symbols Nerd Font Mono")),
             "\"ev\\\"il\", \"Symbols Nerd Font Mono\""
+        );
+    }
+    #[test]
+    fn settings_edits_preserve_units_fractional_sizes_and_style() {
+        let pixel = font_description_with_size("Monospace Bold Italic 17px", 18.25);
+        assert_eq!(effective_font_size_css(&pixel, 1.0), "18.25px");
+        assert!(pixel.contains("Bold"));
+        assert!(pixel.contains("Italic"));
+        let points = font_description_with_family("Monospace Bold Italic 13.5", "Serif");
+        assert_eq!(effective_font_size_css(&points, 1.0), "13.5pt");
+        assert!(points.contains("Bold"));
+        assert!(points.contains("Italic"));
+        assert!(points.contains("Serif"));
+        let pixels = font_description_with_family(&pixel, "Serif");
+        assert_eq!(effective_font_size_css(&pixels, 1.0), "18.25px");
+        let css = window_font_css(&pixels, 1.0, "13.5", 1.0);
+        assert!(css.contains("font-size: 18.25px"));
+        assert!(css.contains("font-size: 13.5pt"));
+        assert_eq!(
+            effective_font_size_css(&font_description_with_size(&points, f64::NAN), 1.0),
+            "13.5pt"
         );
     }
 }

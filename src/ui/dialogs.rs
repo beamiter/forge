@@ -4844,16 +4844,38 @@ impl UiState {
 
         // --- Font Size ---
         let current_size = current_font_desc.size() as f64 / gtk4::pango::SCALE as f64;
-        let font_size_adj = Adjustment::new(current_size, 6.0, 72.0, 1.0, 4.0, 0.0);
-        let font_size_row = adw::SpinRow::new(Some(&font_size_adj), 1.0, 0);
-        font_size_row.set_title("Font Size");
+        let font_size_adj = Adjustment::new(current_size, 6.0, 72.0, 0.25, 4.0, 0.0);
+        let font_size_row = adw::SpinRow::new(Some(&font_size_adj), 0.25, 2);
+        font_size_row.set_title("Main Content Font Size");
+        font_size_row.set_subtitle(if current_font_desc.is_size_absolute() {
+            "Pixels"
+        } else {
+            "Points"
+        });
         group.add(&font_size_row);
 
         // --- Font Scale ---
         let font_scale_adj = Adjustment::new(self.font_scale.get(), 0.1, 10.0, 0.025, 0.1, 0.0);
         let font_scale_row = adw::SpinRow::new(Some(&font_scale_adj), 0.025, 3);
-        font_scale_row.set_title("Font Scale");
+        font_scale_row.set_title("Main Content Font Scale");
         group.add(&font_scale_row);
+
+        let chrome_desc = FontDescription::from_string(&config.chrome_font_size);
+        let chrome_size = f64::from(chrome_desc.size()) / f64::from(gtk4::pango::SCALE);
+        let chrome_size_adj = Adjustment::new(chrome_size, 6.0, 72.0, 0.25, 4.0, 0.0);
+        let chrome_size_row = adw::SpinRow::new(Some(&chrome_size_adj), 0.25, 2);
+        chrome_size_row.set_title("Sidebar & Top Bar Font Size");
+        chrome_size_row.set_subtitle(if chrome_desc.is_size_absolute() {
+            "Pixels"
+        } else {
+            "Points"
+        });
+        group.add(&chrome_size_row);
+        let chrome_scale_adj =
+            Adjustment::new(config.chrome_font_scale, 0.1, 10.0, 0.025, 0.1, 0.0);
+        let chrome_scale_row = adw::SpinRow::new(Some(&chrome_scale_adj), 0.025, 3);
+        chrome_scale_row.set_title("Sidebar & Top Bar Font Scale");
+        group.add(&chrome_scale_row);
 
         // --- Opacity ---
         let opacity_row = adw::ActionRow::builder().title("Opacity").build();
@@ -5126,12 +5148,13 @@ impl UiState {
         // --- Signal: Font ---
         let ui = self.clone();
         let mono_fonts_clone = mono_fonts.clone();
-        let font_size_row_clone = font_size_row.clone();
         font_row.connect_notify_local(Some("selected"), move |row, _| {
             let idx = row.selected() as usize;
             if let Some(family) = mono_fonts_clone.get(idx) {
-                let size = font_size_row_clone.value() as i32;
-                let new_desc = format!("{} {}", family, size);
+                let new_desc = crate::font::font_description_with_family(
+                    &ui.config.borrow().font_desc,
+                    family,
+                );
                 ui.config.borrow_mut().font_desc = new_desc;
                 ui.apply_font_all();
                 ui.persist_config();
@@ -5140,16 +5163,9 @@ impl UiState {
 
         // --- Signal: Font Size ---
         let ui = self.clone();
-        let mono_fonts_clone2 = mono_fonts;
-        let font_row_clone = font_row.clone();
         font_size_row.connect_notify_local(Some("value"), move |row, _| {
-            let idx = font_row_clone.selected() as usize;
-            let family = mono_fonts_clone2
-                .get(idx)
-                .map(|s| s.as_str())
-                .unwrap_or("Monospace");
-            let size = row.value() as i32;
-            let new_desc = format!("{} {}", family, size);
+            let new_desc =
+                crate::font::font_description_with_size(&ui.config.borrow().font_desc, row.value());
             ui.config.borrow_mut().font_desc = new_desc;
             ui.apply_font_all();
             ui.persist_config();
@@ -5159,6 +5175,20 @@ impl UiState {
         let ui = self.clone();
         font_scale_row.connect_notify_local(Some("value"), move |row, _| {
             ui.apply_font_scale(row.value());
+        });
+
+        let ui = self.clone();
+        // Chrome size has its own fixed base, independent of the main font description.
+        let chrome_absolute = chrome_desc.is_size_absolute();
+        chrome_size_row.connect_notify_local(Some("value"), move |row, _| {
+            let unit = if chrome_absolute { "px" } else { "" };
+            ui.config.borrow_mut().chrome_font_size = format!("{}{unit}", row.value());
+            ui.apply_dynamic_css();
+            ui.persist_config();
+        });
+        let ui = self.clone();
+        chrome_scale_row.connect_notify_local(Some("value"), move |row, _| {
+            ui.apply_font_group_scale(crate::font_zoom::FontGroup::Chrome, row.value());
         });
 
         // --- Signal: Opacity ---

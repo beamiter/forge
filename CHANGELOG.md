@@ -6,6 +6,10 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Ctrl+wheel now independently zooms the top-bar/sidebar text group or the main
+  content group under the pointer. Both scales persist; legacy configs retain
+  their initial appearance, and fractional touchpad motion stays proportional.
+
 - Approval cards now expose read-only, paged request details from the exact frozen protocol evidence. Missing fields and display limits are explicit; stale task/request controls cannot dispatch decisions.
 
 - Rejected terminal input now explains whether the 256 KiB byte limit, a full
