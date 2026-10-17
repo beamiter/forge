@@ -199,6 +199,12 @@ jobs:
           python3 scripts/test-chat-shell-oracles.py
           python3 scripts/test-chat-shell-smoke.py
 
+      - name: Check F13 history-enabled same-execution metadata
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/test-chat-metadata-oracles.py
+          python3 scripts/test-chat-shell-smoke.py --metadata --output gtk-paint-diagnostics/f13-metadata
+
       - name: Run display-backed GTK/VTE regressions
         run: FORGE_NATIVE_CRASH_DIAGNOSTICS=1 GTK_PAINT_DIAGNOSTICS_DIR="$PWD/gtk-paint-diagnostics" FORGE_XTEST_DRIVER="$PWD/scripts/qa-cross-selection-pointer.py" bash scripts/test-gtk-display.sh
 

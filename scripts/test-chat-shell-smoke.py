@@ -19,6 +19,7 @@ spec.loader.exec_module(matrix)
 wait_for, measured = matrix.wait_for, matrix.measured
 horizontal_clearance, PHYSICAL = matrix.horizontal_clearance, matrix.PHYSICAL
 TEST = 'block_view::chat_shell_tests::chat_real_bash_keyboard_and_clipboard'
+METADATA_TEST = 'block_view::chat_shell_tests::chat_real_bash_history_metadata'
 FONTS = ('DejaVu Sans Mono',)
 
 # The nonempty F24 keymap is parsed before command execution. The first command
@@ -85,7 +86,7 @@ def finish_outcome(out, result, original_error, processes):
     return outcome
 
 
-def shell_acceptance(records):
+def shell_acceptance(records, metadata=False):
     if len(records) != 2 or [r['path'] for r in records] != ['key', 'pst']:
         raise RuntimeError('Missing independent keyboard/clipboard results')
     first, second = records
@@ -97,8 +98,44 @@ def shell_acceptance(records):
         parts = bytes.fromhex(record['accepted_hex']).split(b'\0')
         expected = [record['token'].encode(), ('中文 e\u0301 ＡＢＣ ' * 8).encode(),
                     str(record['pid']).encode(), record['tty'].encode(), b'']
+        if metadata:
+            identity = record['metadata_identity']
+            execution_id = identity['execution_id']
+            command = ("printf '%s\\0' '" + record['token'] + "' '" +
+                       ('中文 e\u0301 ＡＢＣ ' * 8) +
+                       "' \"$BASHPID\" \"$(tty)\" \"$__forge_command_id\" \"$BASH_COMMAND\" > \"$HOME/" + record['path'] + "\"")
+            expected[-1:] = [execution_id.encode(), command.encode(), b'']
+            if (not re.fullmatch(r'forge-bash-' + str(record['pid']) + r'-[1-9][0-9]*', execution_id)
+                    or identity['expected_command'] != command or identity['capsule_command'] != command
+                    or identity['stored_command_exact'] is not True):
+                raise RuntimeError('Metadata command identity/provenance differs from accepted Bash')
+            events = identity['events']
+            if (len(events) != 3 or [event['phase'] for event in events] != ['start', 'end', 'record']
+                    or any(event['execution_id'] != execution_id for event in events)):
+                raise RuntimeError('Missing same-execution C/D/record chain')
+            start, end, complete = events
+            if (start['parsed_command'] != command or start['resolved_command'] != command
+                    or complete['command'] != command
+                    or start['command_source'] != 'ShellReported'
+                    or complete['command_source'] != 'ShellReported'
+                    or complete['completion_provenance'] != 'ShellReported'
+                    or start['block_id'] != identity['block_id']
+                    or complete['block_id'] != identity['block_id']
+                    or end['correlation'] != 'MatchedUntrusted' or end['exit_code'] != 0):
+                raise RuntimeError('Wrong parsed command, exactness or capsule correlation')
         if parts != expected:
             raise RuntimeError('Actual shell accepted bytes differ from expected input')
+    if metadata:
+        if first['metadata_identity']['execution_id'] == second['metadata_identity']['execution_id']:
+            raise RuntimeError('Reused execution id')
+        if first['metadata_identity']['block_id'] == second['metadata_identity']['block_id']:
+            raise RuntimeError('Reused capsule id')
+
+
+def metadata_events_acceptance(records, events):
+    expected = [event for record in records for event in record['metadata_identity']['events']]
+    if len(events) != 6 or events != expected:
+        raise RuntimeError('Extra or reordered accepted command lifecycles')
 
 
 def private_runtime():
@@ -107,10 +144,10 @@ def private_runtime():
     return tempfile.TemporaryDirectory(prefix='forge-f13-', dir='/tmp')
 
 
-def run_case(binary, out, scale, font):
+def run_case(binary, out, scale, font, metadata=False):
     try:
         with private_runtime() as runtime:
-            outcome = _run_case(binary, out, scale, font, Path(runtime))
+            outcome = _run_case(binary, out, scale, font, Path(runtime), metadata)
     except BaseException as error:
         if out.is_dir():
             report = out / 'result.json'
@@ -122,7 +159,7 @@ def run_case(binary, out, scale, font):
     (out / 'result.json').write_text(json.dumps(outcome, indent=2))
 
 
-def _run_case(binary, out, scale, font, runtime):
+def _run_case(binary, out, scale, font, runtime, metadata=False):
     out.mkdir()
     env = os.environ.copy()
     for key in ('DISPLAY', 'WAYLAND_DISPLAY', 'SWAYSOCK', 'GDK_SCALE', 'GDK_DPI_SCALE',
@@ -173,7 +210,7 @@ for_window [title="^Forge F13 native render$"] floating enable, border none
                     return True
                 return False
             wait_for(seat_ready, 'persistent native keyboard seat', keyboard)
-            fixture = subprocess.Popen([str(binary), TEST, '--ignored', '--exact', '--nocapture'],
+            fixture = subprocess.Popen([str(binary), METADATA_TEST if metadata else TEST, '--ignored', '--exact', '--nocapture'],
                                        env=env, stdout=fixture_log, stderr=subprocess.STDOUT)
             processes.append(fixture)
             wait_for((out / 'input-ready.json').exists, 'GTK focus before input', fixture)
@@ -212,9 +249,13 @@ for_window [title="^Forge F13 native render$"] floating enable, border none
                 (out / f'stage-{stage}.ack').touch()
             if fixture.wait(timeout=20) != 0:
                 raise RuntimeError('Native fixture failed; see fixture.log')
-            shell_acceptance(json.loads((out / 'shell-acceptance.json').read_text()))
-            result = dict(stages=reports,
-                scope='real Bash acceptance bytes; global paste shortcut and complete draft snapshot unverified')
+            accepted = json.loads((out / 'shell-acceptance.json').read_text())
+            shell_acceptance(accepted, metadata)
+            if metadata:
+                metadata_events_acceptance(accepted, json.loads((out / 'metadata-events.json').read_text()))
+            result = dict(stages=reports, history_metadata=metadata,
+                scope=('owned simple printf accepted BASH_COMMAND bytes, parsed C/D id, ShellReported record and capsule identity; global paste shortcut unverified' if metadata else
+                       'real Bash acceptance bytes; global paste shortcut and complete draft snapshot unverified'))
         except BaseException as error:
             original_error = error
             raise
@@ -228,9 +269,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', type=Path, default=Path('gtk-paint-diagnostics/f13-shell'))
     parser.add_argument('--session', action='store_true')
+    parser.add_argument('--metadata', action='store_true', help='Separate history-enabled same-execution identity lane')
     args = parser.parse_args()
     if not args.session:
-        subprocess.run(['dbus-run-session', '--', sys.executable, __file__, '--session', '--output', str(args.output)], check=True)
+        subprocess.run(['dbus-run-session', '--', sys.executable, __file__, '--session', '--output', str(args.output)] + (['--metadata'] if args.metadata else []), check=True)
         return
     for command in ('cargo', 'sway', 'swaymsg', 'grim', 'fc-match', 'wtype'):
         if shutil.which(command) is None:
@@ -252,13 +294,14 @@ def main():
         raise RuntimeError('Expected one exact lib-test binary')
     binary = Path(paths.pop()).resolve(strict=True)
     listed = subprocess.check_output([str(binary), '--ignored', '--list'], text=True)
-    if TEST + ': test' not in listed.splitlines():
+    selected_test = METADATA_TEST if args.metadata else TEST
+    if selected_test + ': test' not in listed.splitlines():
         raise RuntimeError('F13 native fixture not registered')
     (out / 'identity.json').write_text(json.dumps(dict(binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
-        commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), fonts=faces), indent=2))
+        test=selected_test, history_metadata=args.metadata, commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), fonts=faces), indent=2))
     for scale in (1,):
         for index, font in enumerate(FONTS):
-            run_case(binary, out / f'scale-{scale}-font-{index}', scale, font)
+            run_case(binary, out / f'scale-{scale}-font-{index}', scale, font, args.metadata)
     failures = []
     for case in sorted(out.glob('scale-*')):
         report = json.loads((case / 'result.json').read_text())
@@ -270,7 +313,9 @@ def main():
     (out / 'horizontal-clearance.json').write_text(json.dumps(dict(failures=failures), indent=2))
     if failures:
         raise RuntimeError(f'{len(failures)} native horizontal-clearance regressions; all captures retained')
-    (out / 'PASS').write_text('1 combination / 8 captures; real Bash keyboard and clipboard smoke\n')
+    (out / 'PASS').write_text('1 combination / 8 captures; ' +
+        ('history-enabled same-execution command identity\n' if args.metadata else
+         'real Bash keyboard and clipboard smoke\n'))
 
 
 if __name__ == '__main__':

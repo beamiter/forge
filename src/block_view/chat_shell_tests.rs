@@ -185,10 +185,45 @@ fn capture(view: &TermView, window: &gtk4::Window, out: &Path, stage: usize, lab
     );
 }
 
+// Read-only test observations at the actual accepted marker/finalize sites.
+// Disabled except for this owned fixture; no production field or state changes.
+thread_local! {
+    static METADATA_EVENTS: RefCell<Option<Vec<serde_json::Value>>> = const { RefCell::new(None) };
+}
+pub(super) fn metadata_observe(event: impl FnOnce() -> serde_json::Value) {
+    METADATA_EVENTS.with(|events| {
+        if let Some(events) = events.borrow_mut().as_mut() {
+            assert!(events.len() < 32, "bounded native metadata observations");
+            events.push(event());
+        }
+    });
+}
+struct MetadataObservation;
+impl Drop for MetadataObservation {
+    fn drop(&mut self) {
+        METADATA_EVENTS.with(|events| *events.borrow_mut() = None);
+    }
+}
+
+#[test]
+#[ignore = "requires isolated Wayland, wtype and Bash; scripts/test-chat-shell-smoke.py --metadata"]
+fn chat_real_bash_history_metadata() {
+    run_real_bash_keyboard_and_clipboard(true);
+}
+
 #[test]
 #[ignore = "requires isolated Wayland, wtype and Bash; scripts/test-chat-shell-smoke.py"]
 #[allow(deprecated)]
 fn chat_real_bash_keyboard_and_clipboard() {
+    run_real_bash_keyboard_and_clipboard(false);
+}
+
+#[allow(deprecated)]
+fn run_real_bash_keyboard_and_clipboard(metadata: bool) {
+    let _observations = MetadataObservation;
+    if metadata {
+        METADATA_EVENTS.with(|events| *events.borrow_mut() = Some(Vec::new()));
+    }
     jterm_core::child_env::capture_inherited_environment()
         .expect("capture child environment before GTK");
     gtk4::init().unwrap();
@@ -203,6 +238,11 @@ fn chat_real_bash_keyboard_and_clipboard() {
     )
     .unwrap();
     std::fs::write(home.join("rc"),"set +o history\nset -o emacs\nbind 'set enable-bracketed-paste on'\nPS1='$ '\nsource \"$HOME/integration.bash\"\n").unwrap();
+    if metadata {
+        // Only the owned history-enabled lane opts in. The legacy rc above
+        // and its history-disabled strict identity oracle remain unchanged.
+        std::fs::write(home.join("rc"), "set -o history\nshopt -s cmdhist\nHISTCONTROL=ignoreboth\nunset HISTIGNORE HISTTIMEFORMAT\nset -o emacs\nbind 'set enable-bracketed-paste on'\nPS1='$ '\nsource \"$HOME/integration.bash\"\n").unwrap();
+    }
     let mut config = crate::config::Config::safe_defaults();
     config.font_desc = "DejaVu Sans Mono 14".into();
     config.default_font_scale = 1.0;
@@ -348,9 +388,16 @@ fn chat_real_bash_keyboard_and_clipboard() {
     for path in ["key", "pst"] {
         let token = glib::uuid_string_random().to_string();
         let literal = "中文 e\u{301} ＡＢＣ ".repeat(8);
-        let command = format!(
+        let mut command = format!(
             "printf '%s\\0' '{token}' '{literal}' \"$BASHPID\" \"$(tty)\" > \"$HOME/{path}\""
         );
+        if metadata {
+            // BASH_COMMAND is Bash's currently executing simple command. It is
+            // independent of the history field consumed by the OSC reporter.
+            command = format!(
+                "printf '%s\\0' '{token}' '{literal}' \"$BASHPID\" \"$(tty)\" \"$__forge_command_id\" \"$BASH_COMMAND\" > \"$HOME/{path}\""
+            );
+        }
         let target = home.join(path);
         assert_eq!(view.pty.pid_i32(), shell_pid);
         if path == "key" {
@@ -400,7 +447,7 @@ fn chat_real_bash_keyboard_and_clipboard() {
         );
         let bytes = std::fs::read(&target).unwrap();
         let parts = bytes.split(|b| *b == 0).collect::<Vec<_>>();
-        assert_eq!(parts.len(), 5);
+        assert_eq!(parts.len(), if metadata { 7 } else { 5 });
         assert_eq!(parts[0], token.as_bytes());
         assert_eq!(parts[1], literal.as_bytes());
         assert_eq!(parts[2], shell_pid.to_string().as_bytes());
@@ -416,6 +463,7 @@ fn chat_real_bash_keyboard_and_clipboard() {
             },
             "real completed command capsule",
         );
+        let mut identity = serde_json::Value::Null;
         let capsule = {
             let blocks = view.finished_blocks.borrow();
             let block = blocks
@@ -432,6 +480,49 @@ fn chat_real_bash_keyboard_and_clipboard() {
                     "shell_pid":shell_pid,"tty":actual_tty,
                 })).unwrap(),
             ).unwrap();
+            if metadata {
+                let execution_id = std::str::from_utf8(parts[4]).unwrap();
+                assert!(execution_id.starts_with(&format!("forge-bash-{shell_pid}-")));
+                assert_eq!(parts[5], command.as_bytes(), "Bash accepted simple command");
+                assert!(parts[6].is_empty());
+                let events =
+                    METADATA_EVENTS.with(|events| events.borrow().as_ref().unwrap().clone());
+                let matching = events
+                    .iter()
+                    .filter(|event| event["execution_id"] == execution_id)
+                    .collect::<Vec<_>>();
+                identity = serde_json::json!({"execution_id":execution_id,"block_id":block.id,
+                    "expected_command":command,"capsule_command":block.cmd_text,"events":matching});
+                std::fs::write(
+                    out.join(format!("{path}-metadata-identity.json")),
+                    serde_json::to_vec_pretty(&identity).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(matching.len(), 3, "one accepted C, D and completed record");
+                assert_eq!(matching[0]["phase"], "start");
+                assert_eq!(matching[0]["parsed_command"], command);
+                assert_eq!(matching[0]["resolved_command"], command);
+                assert_eq!(matching[0]["command_source"], "ShellReported");
+                assert_eq!(matching[1]["phase"], "end");
+                assert_eq!(matching[1]["correlation"], "MatchedUntrusted");
+                assert_eq!(matching[1]["exit_code"], 0);
+                assert_eq!(matching[2]["phase"], "record");
+                assert_eq!(matching[2]["command"], command);
+                assert_eq!(matching[2]["command_source"], "ShellReported");
+                assert_eq!(matching[2]["completion_provenance"], "ShellReported");
+                assert_eq!(matching[0]["block_id"], block.id);
+                assert_eq!(matching[2]["block_id"], block.id);
+                let stored = view.block_data.borrow();
+                let record = stored.iter().find(|record| record.id == block.id).unwrap();
+                assert_eq!(record.cmd, command);
+                assert!(record.command_exact && !record.command_truncated);
+                identity["stored_command_exact"] = serde_json::json!(record.command_exact);
+                std::fs::write(
+                    out.join(format!("{path}-metadata-identity.json")),
+                    serde_json::to_vec_pretty(&identity).unwrap(),
+                )
+                .unwrap();
+            }
             assert_eq!(block.cmd_text, command);
             assert!(block.widget.has_css_class("chat-pair"));
             let terminal = &block.command_vte;
@@ -448,9 +539,36 @@ fn chat_real_bash_keyboard_and_clipboard() {
         } else {
             metrics = Some(capsule.clone());
         }
-        records.push(serde_json::json!({"path":path,"token":token,"pid":shell_pid,"tty":actual_tty,"accepted_hex":bytes.iter().map(|b|format!("{b:02x}")).collect::<String>(),"observed_draft_before_resize":observed,"capsule":capsule}));
+        records.push(serde_json::json!({"path":path,"token":token,"pid":shell_pid,"tty":actual_tty,"metadata_identity":identity,"accepted_hex":bytes.iter().map(|b|format!("{b:02x}")).collect::<String>(),"observed_draft_before_resize":observed,"capsule":capsule}));
         capture(&view, &window, &out, stage, "finished");
         stage += 1;
+    }
+    if metadata {
+        let events = METADATA_EVENTS.with(|events| events.borrow().as_ref().unwrap().clone());
+        assert_eq!(
+            events.len(),
+            6,
+            "exactly two complete real command lifecycles"
+        );
+        let expected = records
+            .iter()
+            .flat_map(|record| {
+                record["metadata_identity"]["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events, expected,
+            "no extra or reordered accepted lifecycles"
+        );
+        std::fs::write(
+            out.join("metadata-events.json"),
+            serde_json::to_vec_pretty(&events).unwrap(),
+        )
+        .unwrap();
     }
     assert_eq!(stage, 8);
     assert_ne!(records[0]["token"], records[1]["token"]);

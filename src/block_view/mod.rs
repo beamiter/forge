@@ -8306,6 +8306,14 @@ impl ReaderCtx {
                 }
                 resolved => resolved,
             };
+            #[cfg(test)]
+            chat_shell_tests::metadata_observe(|| {
+                serde_json::json!({
+                    "phase":"record", "execution_id":command_meta.id, "block_id":record.id,
+                    "command":record.cmd, "command_source":format!("{:?}", record.command_source),
+                    "completion_provenance":format!("{:?}", record.completion_provenance),
+                })
+            });
             self.backend.finalize_block(&record, &payload);
             // DECISION: the block-finished fan-out is engine policy and now
             // runs AFTER the whole backend finalize. Pre-split it ran
@@ -8636,6 +8644,14 @@ impl ReaderCtx {
         // The exactness provenance rides the same accepted-C authority as the
         // resolved text: only this site may mark a command shell-reported.
         self.engine.borrow_mut().pending_command_source = command_source;
+        #[cfg(test)]
+        chat_shell_tests::metadata_observe(|| {
+            serde_json::json!({
+                "phase":"start", "execution_id":meta.id, "parsed_command":meta.command,
+                "resolved_command":submitted_command, "command_source":format!("{command_source:?}"),
+                "block_id":command_zone_id,
+            })
+        });
         self.submission_pending_rc.set(false);
         self.engine.borrow_mut().vte_typed_cmd = submitted_command.clone();
         *self.running_cmd_rc.borrow_mut() = submitted_command.clone();
@@ -8787,6 +8803,13 @@ impl ReaderCtx {
             engine.pending_command_meta.duration_ms = duration_ms;
             (engine.pending_command_meta.cwd.clone(), duration_ms)
         };
+        #[cfg(test)]
+        chat_shell_tests::metadata_observe(|| {
+            serde_json::json!({
+                "phase":"end", "execution_id":meta.id, "exit_code":exit,
+                "correlation":format!("{id_correlation:?}"),
+            })
+        });
         let command_finished = self.take_command_finished_event(
             command_cwd,
             exit,
