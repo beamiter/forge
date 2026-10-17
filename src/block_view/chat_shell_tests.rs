@@ -85,6 +85,7 @@ fn extraction_snapshot(native: &vte4::Terminal) -> serde_json::Value {
     serde_json::json!({
         "cursor": [column, row], "columns": columns, "first_row": start,
         "range_text": read(start, row),
+        "range_html": native.text_range_format(vte4::Format::Html, start, 0, row, columns).0.map(|text| text.to_string()),
         "physical_rows": (start..=row).map(|r| serde_json::json!({"row":r,"text":read(r,r)})).collect::<Vec<_>>(),
         "cell_attributes_available": false, "soft_wrap_flags_available": false,
     })
@@ -92,26 +93,42 @@ fn extraction_snapshot(native: &vte4::Terminal) -> serde_json::Value {
 
 fn bare_extraction_contrasts(out: &Path) {
     let cases = [
-        ("fullwidth_at_last_cell", "aaaaaaaaＣ"),
-        ("genuine_space_before_fullwidth", "aaaaaaaa Ｃ"),
-        ("cjk_at_last_cell", "aaaaaaaa中"),
-        ("combining_at_edge", "aaaaaaaae\u{301}Z"),
-        ("zwj_at_edge", "aaaaaaaa👩\u{200d}💻"),
-        ("ascii_soft_wrap", "aaaaaaaaXYZ"),
-        ("explicit_hard_break", "aaaaaaaa\r\nＣ"),
+        ("fullwidth_at_last_cell", 9, "aaaaaaaaＣ"),
+        ("genuine_space_before_fullwidth", 9, "aaaaaaaa Ｃ"),
+        ("cjk_at_last_cell", 9, "aaaaaaaa中"),
+        ("combining_at_edge", 9, "aaaaaaaae\u{301}Z"),
+        ("zwj_at_edge", 9, "aaaaaaaa👩\u{200d}💻"),
+        ("ascii_soft_wrap", 9, "aaaaaaaaXYZ"),
+        ("explicit_hard_break", 9, "aaaaaaaa\r\nＣ"),
+        // Controlled raw Readline redisplays from owned history-disabled Bash
+        // PTYs. Only the synthetic UUID is replaced (same byte/cell length).
+        // These streams never enter the actual shell terminal. EL controls and
+        // genuine-space rewrites are evidence, never whitespace repair rules.
+        ("readline_padding_el", 9, "aaaaaaaa \u{001b}[KＣ"),
+        ("genuine_boundary_space", 9, "aaaaaaaa Ｃ"),
+        ("erased_space_then_wide", 9, "aaaaaaaa \r\u{001b}[8C\u{001b}[KＣ"),
+        ("erased_space_then_retyped_space", 9, "aaaaaaaa \r\u{001b}[8C\u{001b}[K Ｃ"),
+        ("overwrite_boundary_space", 9, "aaaaaaaa \r\u{001b}[8CＣ"),
+        ("genuine_space_hard_break", 9, "aaaaaaaa \r\nＣ"),
+        ("owned_readline_no_input_space", 69, "\u{001b}[H\u{001b}[2J$ \u{001b}]133;B\u{0007}printf '%s\\0' '00000000-0000-4000-8000-000000000001' '中文 é ＡＢＣ 中文 é ＡＢＣ 中文 é ＡＢＣ 中文 é ＡＢＣ 中文 é ＡＢＣ 中文 é ＡＢ \u{001b}[KＣ 中文 é ＡＢＣ 中文 é ＡＢＣ ' \"$BASHPID\" \"$(tty)\" > \"$HOME/key\""),
+        ("owned_readline_genuine_input_space", 69, "\u{001b}[H\u{001b}[2J$ \u{001b}]133;B\u{0007}printf '%s\\0' '00000000-0000-4000-8000-000000000001' '中文 é ＡＢＣ 中文 é ＡＢＣ 中文 é ＡＢＣ 中文 é ＡＢＣ 中文 é ＡＢＣ 中文 é ＡＢ Ｃ 中文 é ＡＢＣ 中文 é ＡＢＣ ' \"$BASHPID\" \"$(tty)\" > \"$HOME/key\""),
     ];
     let mut records = Vec::new();
-    for (label, bytes) in cases {
+    for (label, initial_columns, bytes) in cases {
         // Separate native parser instance: never feed synthetic bytes to Bash's
         // VTE. This is extraction/rewrap evidence, not mapped render geometry.
         let native = vte4::Terminal::new();
         native.set_font(Some(&gtk4::pango::FontDescription::from_string(
             "DejaVu Sans Mono 14",
         )));
-        native.set_size(9, 20);
+        native.set_size(initial_columns, 20);
         native.feed(bytes.as_bytes());
         let mut snapshots = Vec::new();
-        for columns in [9, 6, 9] {
+        for columns in [
+            initial_columns,
+            if initial_columns == 69 { 40 } else { 6 },
+            initial_columns,
+        ] {
             native.set_size(columns, 20);
             // An ordered title fence proves the native parser consumed the
             // preceding feed; no guessed delay is the readiness oracle.
@@ -128,7 +145,7 @@ fn bare_extraction_contrasts(out: &Path) {
             snapshots.push(extraction_snapshot(&native));
         }
         records
-            .push(serde_json::json!({"case":label,"controlled_feed":bytes,"controlled_feed_bytes":bytes.as_bytes(),"controlled_feed_sha256":glib::compute_checksum_for_data(glib::ChecksumType::Sha256, bytes.as_bytes()).unwrap().to_string(),"snapshots":snapshots}));
+            .push(serde_json::json!({"case":label,"initial_columns":initial_columns,"controlled_feed":bytes,"controlled_feed_bytes":bytes.as_bytes(),"controlled_feed_sha256":glib::compute_checksum_for_data(glib::ChecksumType::Sha256, bytes.as_bytes()).unwrap().to_string(),"snapshots":snapshots}));
     }
     std::fs::write(
         out.join("bare-extraction-contrasts.json"),
