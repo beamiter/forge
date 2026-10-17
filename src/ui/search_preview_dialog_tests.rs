@@ -198,6 +198,33 @@ fn production_dialog_is_frozen_stale_safe_and_primary_neutral() {
             true
         )
         .contains("needle"));
+    // Hiding/unmapping the root does not unrealize it or retire this snapshot.
+    let before_hide = controls.snapshot.id;
+    window.set_visible(false);
+    settle();
+    assert!(window.is_realized());
+    assert!(controls.owner_present());
+    assert!(!controls.worker.has_exited());
+    window.present();
+    settle();
+    assert_eq!(controls.snapshot.id, before_hide);
+    controls.next.upgrade().unwrap().emit_clicked();
+    assert_current(&controls, 2, 3);
+    assert!(delegate.has_focus());
+    assert!(input.selection_bounds().is_none());
+    check_primary();
+    let regex_focus = regex(&dialog);
+    regex_focus.grab_focus();
+    window.set_visible(false);
+    settle();
+    window.present();
+    settle();
+    assert!(
+        regex_focus.has_focus(),
+        "remap must preserve non-entry focus"
+    );
+    assert!(!delegate.has_focus());
+    check_primary();
     seed(&a, "fresh");
     input.set_text("fresh");
     until(|| status(&controls) == "No matches in this snapshot.");
@@ -227,7 +254,7 @@ fn production_dialog_is_frozen_stale_safe_and_primary_neutral() {
     entry(&reopened).set_text("needle");
     until(|| arrived.try_recv().is_ok());
     stack.remove(&a.widget());
-    until(|| status(&refreshed).starts_with("Source pane closed"));
+    until(|| status(&refreshed).starts_with("Source pane unavailable"));
     release.send(()).unwrap();
     until(|| published.try_recv().is_ok());
     finish.send(()).unwrap();
@@ -246,9 +273,16 @@ fn production_dialog_is_frozen_stale_safe_and_primary_neutral() {
     assert!(force_controls.closed.get());
     assert_retired(&force_controls);
     settle();
-    let (_last, last_controls) = present_exact_preview(&window, b.clone(), "different").unwrap();
+    let (last, last_controls) = present_exact_preview(&window, b.clone(), "different").unwrap();
     until(|| status(&last_controls) == "Preview: 1 of 3");
+    let (arrived, release, published, finish) = last_controls.worker.pause_next_publication();
+    entry(&last).set_text("differ");
+    until(|| arrived.try_recv().is_ok());
     window.destroy();
+    until(|| !last_controls.owner_present());
+    release.send(()).unwrap();
+    until(|| published.try_recv().is_ok());
+    finish.send(()).unwrap();
     settle();
     assert!(!last_controls.owner_present());
     assert_retired(&last_controls);

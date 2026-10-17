@@ -100,18 +100,21 @@ impl PreviewControls {
         }
     }
     fn owner_present(&self) -> bool {
+        // A destroyed window may still root retained child objects. A root
+        // unrealize conservatively retires the preview; hidden panes in a
+        // realized window remain valid frozen sources. Reopen after retirement.
         !self.closed.get()
             && self
                 .owner
                 .upgrade()
-                .is_some_and(|owner| owner.widget().root().is_some())
+                .is_some_and(|owner| owner.widget().root().is_some_and(|root| root.is_realized()))
     }
     fn submit(&self, query: &str, use_regex: bool) {
         self.clear("Searching this frozen snapshot…");
         self.generation.set(0);
         if !self.owner_present() {
             self.worker.stop();
-            self.clear("Source pane closed. Reopen the preview from an available pane.");
+            self.clear("Source pane unavailable. Reopen the preview from an available pane.");
             return;
         }
         match self.worker.submit(query, use_regex) {
@@ -121,7 +124,7 @@ impl PreviewControls {
     }
     fn render(&self) {
         if !self.owner_present() {
-            self.clear("Source pane closed. Reopen the preview from an available pane.");
+            self.clear("Source pane unavailable. Reopen the preview from an available pane.");
             return;
         }
         let matches_borrow = self.matches.borrow();
@@ -190,7 +193,7 @@ impl PreviewControls {
         }
         if !self.owner_present() {
             self.worker.stop();
-            self.clear("Source pane closed. Reopen the preview from an available pane.");
+            self.clear("Source pane unavailable. Reopen the preview from an available pane.");
             return glib::ControlFlow::Break;
         }
         if let Some(reply) = self.worker.take_reply() {
@@ -414,6 +417,20 @@ fn present_exact_preview(
     // the seed, publishing it to PRIMARY. SearchEntry's own focus override
     // deliberately does not select, so let the initial map use that wrapper.
     dialog.set_focus(Some(&entry));
+    let entry_on_map = entry.downgrade();
+    dialog.connect_map(move |dialog| {
+        let Some(entry) = entry_on_map.upgrade() else {
+            return;
+        };
+        let focus = dialog.property::<Option<gtk4::Widget>>("focus-widget");
+        if focus.as_ref().is_some_and(|focus| {
+            focus == entry.upcast_ref::<gtk4::Widget>() || focus.is_ancestor(&entry)
+        }) {
+            // Remapping repeats Adwaita's focus tick. Preserve search-input
+            // focus through its non-selecting wrapper, not its cached delegate.
+            dialog.set_focus(Some(&entry));
+        }
+    });
     dialog.present(Some(parent));
     Ok((dialog, controls))
 }

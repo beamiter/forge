@@ -129,3 +129,10 @@ the worker synchronously; `close-attempt` is not a universal closing signal (it
 is for denied close attempts when can-close is false). No speculative replacement
 of that lifecycle was made. This remains retained completed-text preview coverage,
 not native VTE selection or completion of original F01.
+
+A source must still belong to a realized root window. GTK can keep a root object
+after parent destruction; merely having a root is insufficient. Root unrealize
+conservatively retires the preview, even if temporary; reopen it afterward.
+Hiding a pane within a realized window does not retire its frozen snapshot.
+The hosted fixture also hides/unmaps and shows the root without unrealizing it;
+actual window-manager minimization is not claimed by the isolated Xvfb test.

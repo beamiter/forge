@@ -48,7 +48,7 @@ class PreviewWiring(unittest.TestCase):
         self.assertNotRegex(code, r"search_find|search_set|select_range|select_all|clipboard|primary_clipboard|vte4")
         self.assertEqual(code.count("self.current_term_view()"), 1)
         self.assertIn("owner: Rc::downgrade(&owner)", source)
-        self.assertIn("owner.widget().root().is_some()", source)
+        self.assertIn("root.is_realized()", source)
         self.assertIn("search_preview::reply_is_current(", source)
         self.assertIn("self.snapshot.id", source)
         self.assertIn("self.generation.get()", source)
