@@ -6,9 +6,16 @@
 __FORGE_BASH_LOADED=1
 __forge_integration_source=${BASH_SOURCE[0]}
 
-__forge_osc() { printf '\033]%s\007' "$1"; }
+# Integration records belong to the controlling terminal, including when Bash
+# applies a compound command's redirections before invoking DEBUG. Open only
+# for this write: no persistent descriptor can leak into child commands. If
+# there is no controlling terminal, omit the record rather than pollute stdout.
+__forge_osc_shell_pid=${BASHPID:-$$}
+__forge_osc() {
+    [[ ${BASHPID:-$$} == "$__forge_osc_shell_pid" && ${BASH_SUBSHELL:-0} == 0 ]] || return 0
+    builtin printf '\033]%s\007' "$1" 2>/dev/null >/dev/tty || :
+}
 __forge_prompt_start() { __forge_osc "133;A"; }
-__forge_prompt_end() { __forge_osc "133;B"; }
 __forge_command_token=
 __forge_token_fd=${FORGE_SHELL_INTEGRATION_FD:-}
 unset FORGE_SHELL_INTEGRATION_FD FORGE_SHELL_INTEGRATION_TOKEN
@@ -83,7 +90,8 @@ __forge_precmd() {
     __forge_prompt_start
     __forge_agent_ready
     if [[ -z ${__FORGE_PS1_HOOKED:-} ]]; then
-        PS1="${PS1}\[$(__forge_prompt_end)\]"
+        # This marker is prompt data, rendered by Bash after the visible PS1.
+        PS1+=$'\\[\033]133;B\007\\]'
         __FORGE_PS1_HOOKED=1
     fi
 }
