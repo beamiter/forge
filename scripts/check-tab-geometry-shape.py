@@ -71,6 +71,10 @@ def main():
     ]:
         assert compact(production) in compact(source), production
         assert compact(native) in compact(fixture), native
+    assert 'ui::install_top_tab_geometry_reveal(&top_tab_scroll);' in source
+    assert 'super::tab_strip::install_top_tab_geometry_reveal(&scroll);' in fixture
+    assert 'super::tab_strip::install_tab_reveal_on_map(button);' in tabs
+    assert 'super::tab_strip::sync_strip_buttons_active(&strip, (count - 1) as u32);' in fixture
     assert 'font_groups_stay_independent_across_native_panes_and_late_rows' in (ROOT / 'src/block_view/font_sync_tests.rs').read_text()
     print('PASS: scroller, full production CSS, fresh/moved tab shape, resize handle, placement and overlay source contracts')
 

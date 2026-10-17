@@ -63,6 +63,7 @@ fn tab(label_text: String, status: bool, width: i32) -> (ToggleButton, Label, gt
     strip_btn.set_active(true);
     strip_btn.set_hexpand(false);
     strip_btn.set_width_request(width);
+    super::tab_strip::install_tab_reveal_on_map(&strip_btn);
     process_label.set_label("synthetic-process-with-a-long-name");
     process_label.set_visible(status);
     pin_icon.set_visible(status);
@@ -85,7 +86,7 @@ fn scroller() -> ScrolledWindow {
     let top_tab_scroll = ScrolledWindow::new();
     top_tab_scroll.set_hexpand(true);
     top_tab_scroll.set_vexpand(false);
-    top_tab_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Never);
+    top_tab_scroll.set_policy(gtk4::PolicyType::External, gtk4::PolicyType::Never);
     top_tab_scroll.set_overflow(gtk4::Overflow::Hidden);
     top_tab_scroll.set_width_request(0);
     top_tab_scroll.set_min_content_width(0);
@@ -97,6 +98,25 @@ fn scroller() -> ScrolledWindow {
     top_tab_scroll.set_margin_end(104);
 
     top_tab_scroll
+}
+
+fn assert_tab_revealed(button: &ToggleButton, scroll: &ScrolledWindow) {
+    let bounds = button
+        .compute_bounds(scroll)
+        .expect("tab in viewport hierarchy");
+    let right = bounds.x() + bounds.width();
+    let viewport_width = scroll.width() as f32;
+    if bounds.width() <= viewport_width {
+        assert!(
+            bounds.x() >= -1.0 && right <= viewport_width + 1.0,
+            "fitting tab must be fully visible: {bounds:?}, viewport={viewport_width}"
+        );
+    } else {
+        assert!(
+            bounds.x() < viewport_width && right > 0.0,
+            "oversize tab must intersect viewport: {bounds:?}"
+        );
+    }
 }
 
 fn measure(widget: &impl IsA<gtk::Widget>) -> (i32, i32, i32, i32, i32, i32) {
@@ -119,6 +139,11 @@ fn production_top_tabs_bound_viewport_minimum_across_font_extremes() {
     gtk::Settings::default()
         .unwrap()
         .set_property("gtk-xft-dpi", 96 * 1024);
+    // Make viewport scroll-to assertions deterministic instead of sampling
+    // midway through GTK's adjustment animation.
+    gtk::Settings::default()
+        .unwrap()
+        .set_property("gtk-enable-animations", false);
     let display = gtk::gdk::Display::default().unwrap();
     let base = gtk::CssProvider::new();
     base.load_from_string(&format!("{} {}", super::PANE_HEADER_CSS, r#".tab-strip-btn { transition: none; padding: 4px 8px; border-radius: 4px; border-bottom: 1px solid alpha(currentColor, 0.1); margin-bottom: 2px; }
@@ -190,6 +215,7 @@ fn production_top_tabs_bound_viewport_minimum_across_font_extremes() {
     }
     top.add_overlay(&leading);
     let scroll = scroller();
+    super::tab_strip::install_top_tab_geometry_reveal(&scroll);
     top.add_overlay(&scroll);
     top.set_measure_overlay(&scroll, true);
     let trailing = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -231,6 +257,7 @@ fn production_top_tabs_bound_viewport_minimum_across_font_extremes() {
     window.set_default_size(1200, 900);
     window.present();
     let mut failures = Vec::new();
+    let mut measurements = 0;
     let mut icon_requisition = None;
     let mut last_strip = None;
     // Points and absolute pixels both resolve to the explicitly named pixel size at 96 dpi.
@@ -305,7 +332,8 @@ fn production_top_tabs_bound_viewport_minimum_across_font_extremes() {
                                 "font expected {expected_px}px, got {actual:?}"
                             );
                             assert_eq!(tabs[0].1.ellipsize(), gtk::pango::EllipsizeMode::End);
-                            assert_eq!(scroll.hscrollbar_policy(), gtk::PolicyType::Never);
+                            assert_eq!(scroll.hscrollbar_policy(), gtk::PolicyType::External);
+                            measurements += 1;
                             println!("TAB_GEOMETRY font={description} scale={scale} px={px} width={width} status={status} long={long} count={count} requested={requested} policy={:?} scroll={:?} strip={:?} top={:?} window={:?} title={:?} image={:?}", scroll.hscrollbar_policy(), measure(&scroll), measure(&strip), measure(&top), measure(&window), measure(&tabs[0].1), measure(&tabs[0].2));
                             // Compare like-for-like single/multiple tabs. Fixed tab requests,
                             // icon/handle minima and large font ellipsis are legitimate in the
@@ -319,12 +347,42 @@ fn production_top_tabs_bound_viewport_minimum_across_font_extremes() {
                             } else if viewport_min > single_tab_minimum[size_index] {
                                 failures.push(format!("{description}x{scale}/{width}/{status}/{long}/{count}/{requested}: viewport minimum {viewport_min} exceeds single-tab baseline {}", single_tab_minimum[size_index]));
                             }
+                            if window.width() != requested {
+                                failures.push(format!("{description}x{scale}/{width}/{status}/{long}/{count}: requested width {requested}, allocated {}", window.width()));
+                            }
                             println!("TAB_GEOMETRY_RESIZE requested={requested} allocated={} honored={} single_tab_min={} viewport_min={viewport_min}", window.width(), window.width() == requested, single_tab_minimum[size_index]);
                             if tabs[0].1.height()
                                 < tabs[0].1.measure(gtk::Orientation::Vertical, -1).0
                             {
                                 failures.push(format!("{description}x{scale}/{width}/{count}: title vertically clipped"));
                             }
+                        }
+                        // External must retain a usable scroll range, not merely clip tabs.
+                        // This exercises GTK adjustment/viewport allocation, not physical input.
+                        let adjustment = scroll.hadjustment();
+                        let end = adjustment.upper() - adjustment.page_size();
+                        if strip.measure(gtk::Orientation::Horizontal, -1).0 > scroll.width() {
+                            assert!(
+                                end > adjustment.lower(),
+                                "overflow must expose horizontal scroll range"
+                            );
+                            super::tab_strip::sync_strip_buttons_active(&strip, (count - 1) as u32);
+                            settle();
+                            if count > 1 {
+                                assert!(
+                                    adjustment.value() > adjustment.lower(),
+                                    "selecting trailing tab must scroll"
+                                );
+                            }
+                            let bounds = tabs[count - 1]
+                                .0
+                                .compute_bounds(&scroll)
+                                .expect("tab in scroll hierarchy");
+                            assert_tab_revealed(&tabs[count - 1].0, &scroll);
+                            println!("TAB_GEOMETRY_OVERFLOW count={count} value={} upper={} page={} last={bounds:?}", adjustment.value(), adjustment.upper(), adjustment.page_size());
+                            super::tab_strip::sync_strip_buttons_active(&strip, 0);
+                            settle();
+                            assert_tab_revealed(&tabs[0].0, &scroll);
                         }
                         // Exercise hidden/remapped rows and placement transfer, without PTYs.
                         tabs[count - 1].0.set_visible(false);
@@ -371,9 +429,10 @@ fn production_top_tabs_bound_viewport_minimum_across_font_extremes() {
                         scroll.set_child(Some(&strip));
                         last_strip = Some(strip.clone());
                         settle();
-                        // Programmatic activation is deliberately not a pointer/keyboard oracle.
-                        tabs[count - 1].0.set_active(false);
-                        tabs[count - 1].0.set_active(true);
+                        // Exercise authoritative selection, not a fixture-only toggle.
+                        super::tab_strip::sync_strip_buttons_active(&strip, (count - 1) as u32);
+                        settle();
+                        assert_tab_revealed(&tabs[count - 1].0, &scroll);
                         assert!(tabs[count - 1].0.is_active());
                         println!("TAB_GEOMETRY_REMAP font={description} count={count} scroll={:?} strip={:?}", measure(&scroll), measure(&strip));
                     }
@@ -381,10 +440,33 @@ fn production_top_tabs_bound_viewport_minimum_across_font_extremes() {
             }
         }
     }
+    assert_eq!(measurements, 432, "all matrix measurements must complete");
+    println!("TAB_GEOMETRY_MATRIX_COMPLETE measurements={measurements}");
     let live_strip = last_strip.unwrap();
+    super::tab_strip::sync_strip_buttons_active(&live_strip, 19);
+    settle();
+    let trailing = live_strip
+        .last_child()
+        .unwrap()
+        .downcast::<ToggleButton>()
+        .unwrap();
+    assert_tab_revealed(&trailing, &scroll);
+    assert!(scroll.hadjustment().value() > scroll.hadjustment().lower());
+    // A value-only user scroll must not be overridden by the geometry hook.
+    let adjustment = scroll.hadjustment();
+    adjustment.set_value(adjustment.lower());
+    settle();
+    assert_eq!(
+        adjustment.value(),
+        adjustment.lower(),
+        "manual scrolling must remain in place"
+    );
+    super::tab_strip::sync_strip_buttons_active(&live_strip, 19);
+    settle();
     for (description, scale, expected_px) in [
         ("60px", 1.0, 60.0),
         ("60px", 1.8, 108.0),
+        ("72px", 10.0, 720.0),
         ("12px", 1.0, 12.0),
     ] {
         font.load_from_string(&crate::font::window_font_css(
@@ -420,7 +502,45 @@ fn production_top_tabs_bound_viewport_minimum_across_font_extremes() {
             (px - expected_px).abs() < 0.02,
             "live font change {description} x {scale}: {actual:?}"
         );
+        let active = live_strip
+            .last_child()
+            .unwrap()
+            .downcast::<ToggleButton>()
+            .unwrap();
+        assert_tab_revealed(&active, &scroll);
         println!("TAB_GEOMETRY_LIVE_FONT font={description} scale={scale} scroll={:?} strip={:?} title={:?}", measure(&scroll), measure(&live_strip), measure(&title));
+    }
+    // Same widget width requests as preview_tab_width: let the production
+    // adjustment notification reveal selection, without calling sync here.
+    for width in [80, 480] {
+        let mut child = live_strip.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            widget.set_width_request(width);
+        }
+        settle();
+        let active = live_strip
+            .last_child()
+            .unwrap()
+            .downcast::<ToggleButton>()
+            .unwrap();
+        assert_tab_revealed(&active, &scroll);
+        println!(
+            "TAB_GEOMETRY_LIVE_WIDTH width={width} scroll={:?} strip={:?}",
+            measure(&scroll),
+            measure(&live_strip)
+        );
+    }
+    for width in [1200, 360] {
+        window.set_default_size(width, 900);
+        settle();
+        assert_eq!(window.width(), width);
+        let active = live_strip
+            .last_child()
+            .unwrap()
+            .downcast::<ToggleButton>()
+            .unwrap();
+        assert_tab_revealed(&active, &scroll);
     }
     window.close();
     gtk::style_context_remove_provider_for_display(&display, &font);

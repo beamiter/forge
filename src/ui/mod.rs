@@ -48,6 +48,8 @@ mod task_ops;
 mod tasks_panel;
 mod zoom;
 
+pub(crate) use tab_strip::install_top_tab_geometry_reveal;
+
 pub(crate) use agent_panel::{AgentHandle, AgentUiLifetime};
 pub(crate) use ai_panel::AiPanel;
 pub(crate) use bottom_bar::build_bottom_bar;

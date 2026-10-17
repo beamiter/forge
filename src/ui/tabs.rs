@@ -275,6 +275,7 @@ impl UiState {
         // must still be able to reach and activate every visible tab.
         button.set_focus_on_click(false);
         button.set_focusable(true);
+        super::tab_strip::install_tab_reveal_on_map(button);
         button.update_relation(&[gtk4::accessible::Relation::LabelledBy(
             &[label.upcast_ref()],
         )]);

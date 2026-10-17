@@ -183,12 +183,102 @@ fn widget_pinned(widget: &gtk4::Widget) -> bool {
     }
 }
 
+// Top tabs keep terminal focus on activation, so GtkViewport's scroll-to-focus
+// cannot reveal them. Request native scrolling without changing focus or gestures.
+fn reveal_strip_button(button: &ToggleButton) {
+    let Some(strip) = button
+        .parent()
+        .and_then(|parent| parent.downcast::<gtk4::Box>().ok())
+    else {
+        return;
+    };
+    if strip.orientation() != gtk4::Orientation::Horizontal {
+        return;
+    }
+    let Some(viewport) = strip
+        .parent()
+        .and_then(|parent| parent.downcast::<gtk4::Viewport>().ok())
+    else {
+        return;
+    };
+    if button.is_mapped() && viewport.is_mapped() {
+        viewport.scroll_to(button, None);
+    }
+}
+
+pub(crate) fn install_top_tab_geometry_reveal(scroll: &gtk4::ScrolledWindow) {
+    let weak_scroll = scroll.downgrade();
+    let pending = Rc::new(Cell::new(false));
+    // changed means range/page geometry changed, not value-changed: manual
+    // wheel/trackpad scrolling must not be snapped back to the active tab.
+    scroll.hadjustment().connect_changed(move |_| {
+        let Some(scroll) = weak_scroll.upgrade() else {
+            return;
+        };
+        if pending.replace(true) {
+            return;
+        }
+        let pending = pending.clone();
+        let mut after_first_layout = false;
+        scroll.add_tick_callback(move |scroll, _| {
+            if !after_first_layout {
+                after_first_layout = true;
+                return glib::ControlFlow::Continue;
+            }
+            pending.set(false);
+            let Some(strip) = scroll
+                .child()
+                .and_then(|child| child.downcast::<gtk4::Viewport>().ok())
+                .and_then(|viewport| viewport.child())
+                .and_then(|child| child.downcast::<gtk4::Box>().ok())
+            else {
+                return glib::ControlFlow::Break;
+            };
+            let mut child = strip.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                if let Ok(button) = widget.downcast::<ToggleButton>() {
+                    if button.is_active() {
+                        reveal_strip_button(&button);
+                        break;
+                    }
+                }
+            }
+            glib::ControlFlow::Break
+        });
+    });
+}
+
+pub(super) fn install_tab_reveal_on_map(button: &ToggleButton) {
+    // Covers new tabs and sidebar/top transfers before a selection sync has
+    // allocated geometry. Read current state, not a captured/stale tab index.
+    button.connect_map(|button| {
+        // Tick callbacks precede layout. Wait one complete frame so a newly
+        // mapped tab has its allocation, then recheck selection and parentage.
+        let mut after_first_layout = false;
+        button.add_tick_callback(move |button, _| {
+            if !button.is_active() {
+                return glib::ControlFlow::Break;
+            }
+            if !after_first_layout {
+                after_first_layout = true;
+                return glib::ControlFlow::Continue;
+            }
+            reveal_strip_button(button);
+            glib::ControlFlow::Break
+        });
+    });
+}
+
 pub(super) fn sync_strip_buttons_active(tab_strip: &gtk4::Box, active: u32) {
     let mut idx = 0u32;
     let mut child = tab_strip.first_child();
     while let Some(c) = child {
         if let Ok(btn) = c.clone().downcast::<ToggleButton>() {
             btn.set_active(idx == active);
+            if idx == active {
+                reveal_strip_button(&btn);
+            }
         }
         idx += 1;
         child = c.next_sibling();

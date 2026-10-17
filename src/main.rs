@@ -741,7 +741,9 @@ pub fn run() -> glib::ExitCode {
         let top_tab_scroll = ScrolledWindow::new();
         top_tab_scroll.set_hexpand(true);
         top_tab_scroll.set_vexpand(false);
-        top_tab_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Never);
+        // Never propagates the sum of tab minimum widths into the window.
+        // External keeps native horizontal scrolling without a visible scrollbar.
+        top_tab_scroll.set_policy(gtk4::PolicyType::External, gtk4::PolicyType::Never);
         top_tab_scroll.set_overflow(gtk4::Overflow::Hidden);
         top_tab_scroll.set_width_request(0);
         top_tab_scroll.set_min_content_width(0);
@@ -838,6 +840,7 @@ pub fn run() -> glib::ExitCode {
         let top_bar_handle = gtk4::WindowHandle::new();
         top_bar_handle.set_child(Some(&top_bar));
         top_bar_handle.add_css_class("forge-font-chrome");
+        ui::install_top_tab_geometry_reveal(&top_tab_scroll);
 
         {
             let window = window.clone();
