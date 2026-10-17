@@ -2572,6 +2572,33 @@ fn historical_command_is_rerunnable(command: &str) -> bool {
     historical_rerun_paste(command).is_some()
 }
 
+/// A rendered capture can be replayable text without being what the shell ran.
+/// Every historical execution entry point must re-read the current record and
+/// pass it through this gate before the prompt-verification boundary. The card
+/// id and text must both match; missing or replaced records never grant replay.
+fn historical_rerun_disabled_reason(
+    block_id: u64,
+    command: &str,
+    record: Option<&BlockData>,
+) -> Option<&'static str> {
+    let Some(record) = record else {
+        return Some("The command record is unavailable; recall the capture to review it");
+    };
+    if record.id != block_id || record.cmd != command || record.is_background() {
+        return Some("The command record changed; review the current capture first");
+    }
+    if record.command_truncated {
+        return Some("The command report was shortened; recall the capture to review it");
+    }
+    if !record.command_exact {
+        return Some("Command text is unverified; recall the capture to review it");
+    }
+    if !historical_command_is_rerunnable(command) {
+        return Some("The recorded command cannot be re-run exactly");
+    }
+    None
+}
+
 /// Whether a history command may enter the shared two-phase verified-submission
 /// boundary. Split out so every refusal remains testable without GTK or a PTY.
 fn rerun_is_admissible(guards: PromptSubmitGuards, command: &str, bracketed_paste: bool) -> bool {
@@ -3223,6 +3250,7 @@ enum SelectionAction {
 enum SelectionActionRefusal {
     Prompt(CommandPromptStatus),
     UnsafeRecall,
+    CommandProvenance(&'static str),
     NotRunnable,
     PromptChanged,
 }
@@ -3240,6 +3268,7 @@ fn selection_refusal_hint(action: SelectionAction, refusal: SelectionActionRefus
         | SelectionActionRefusal::PromptChanged => "Prompt changed",
         SelectionActionRefusal::Prompt(status) => status.short_label(),
         SelectionActionRefusal::UnsafeRecall => "Selection cannot be recalled safely",
+        SelectionActionRefusal::CommandProvenance(reason) => reason,
         SelectionActionRefusal::NotRunnable => "Select one runnable command",
     };
     format!("Esc cancel  ·  {reason}  ·  {consequence}")
@@ -3333,7 +3362,9 @@ fn sync_finished_block_selection(
     let active_command_is_rerunnable = active
         .and_then(|id| finished.iter().find(|block| block.id == id))
         .is_some_and(|block| {
-            !block.is_background && historical_command_is_rerunnable(&block.cmd_text)
+            !block.is_background
+                && block.command_replay_is_exact.get()
+                && historical_command_is_rerunnable(&block.cmd_text)
         });
     let hint = finished_selection_hint(selected.len(), can_recall, active_command_is_rerunnable);
     for block in finished {
@@ -4350,8 +4381,24 @@ impl BlockBackend {
                     .any(|block| selected.contains(&block.id) && !block.cmd.trim().is_empty())
             };
 
+            let selected_commands_are_exact = {
+                let selected = selected_ids_for_menu.borrow();
+                let data = block_data_for_export.borrow();
+                !selected.is_empty()
+                    && selected.iter().all(|id| {
+                        data.iter()
+                            .find(|block| block.id == *id)
+                            .is_some_and(|block| {
+                                block.command_exact
+                                    && !block.command_truncated
+                                    && !block.is_background()
+                            })
+                    })
+            };
             if has_selected_commands {
-                let item = make_item(if selected_count > 1 {
+                let item = make_item(if !selected_commands_are_exact {
+                    "Copy Captured Text"
+                } else if selected_count > 1 {
                     "Copy Commands"
                 } else {
                     "Copy Command"
@@ -4528,9 +4575,23 @@ impl BlockBackend {
                                 }
                             }
                         };
+                        let data = block_data_for_retry.borrow();
+                        let record = data.iter().find(|block| block.id == block_id);
+                        let guard_refusal = guard_refusal.or_else(|| {
+                            historical_rerun_disabled_reason(
+                                block_id,
+                                &clicked_cmd_for_retry,
+                                record,
+                            )
+                        });
                         let submitted = guard_refusal.is_none()
-                            && verified_submission_for_retry
-                                .try_submit_historical_rerun(&clicked_cmd_for_retry, suggestion);
+                            && verified_submission_for_retry.try_submit_historical_rerun(
+                                block_id,
+                                &clicked_cmd_for_retry,
+                                record,
+                                suggestion,
+                            );
+                        drop(data);
                         if submitted {
                             clear_finished_block_selection(
                                 &finished,
@@ -4641,7 +4702,11 @@ impl BlockBackend {
             }
 
             if has_selected_commands {
-                let item = make_item(command_reuse_menu_label(selected_count));
+                let item = make_item(if selected_commands_are_exact {
+                    command_reuse_menu_label(selected_count)
+                } else {
+                    "Insert Captured Text for Review"
+                });
                 let popover_c = popover.downgrade();
                 let finished_for_rerun = finished_blocks_for_menu.clone();
                 let selected_ids_for_rerun = selected_ids_for_menu.clone();
@@ -4716,6 +4781,7 @@ impl BlockBackend {
                 let config_for_run = config_for_menu.clone();
                 let active_for_run = active_for_rerun_menu.clone();
                 let error_bell_for_run = vte_for_copy.downgrade();
+                let block_data_for_run = block_data_for_export.clone();
                 let command = finished_blocks_for_menu.upgrade().and_then(|finished| {
                     finished
                         .borrow()
@@ -4728,13 +4794,19 @@ impl BlockBackend {
                 {
                     let suggestion =
                         click_cursor::suggestion_rgb(&config_for_menu.borrow().palette);
+                    let data = block_data_for_export.borrow();
+                    let record = data.iter().find(|block| block.id == block_id);
+                    let provenance_refusal =
+                        historical_rerun_disabled_reason(block_id, &command, record);
                     item.set_sensitive(
                         verified_submission_for_menu
-                            .can_submit_historical_rerun(&command, suggestion),
+                            .can_submit_historical_rerun(block_id, &command, record, suggestion),
                     );
-                    item.set_tooltip_text(Some(
-                        "Runs this command again only at a verified empty shell prompt",
-                    ));
+                    let explanation = provenance_refusal
+                        .unwrap_or("Runs this command again only at a verified empty shell prompt");
+                    item.set_tooltip_text(Some(explanation));
+                    item.update_property(&[gtk4::accessible::Property::Description(explanation)]);
+                    drop(data);
                     item.connect_clicked(move |_| {
                         popdown_if_alive(&popover_c);
                         let Some(finished_for_run) = finished_for_run.upgrade() else {
@@ -4750,8 +4822,13 @@ impl BlockBackend {
                         };
                         let suggestion =
                             click_cursor::suggestion_rgb(&config_for_run.borrow().palette);
+                        let data = block_data_for_run.borrow();
+                        let record = data.iter().find(|block| block.id == block_id);
+                        let provenance_refusal =
+                            historical_rerun_disabled_reason(block_id, &command, record);
                         let submitted = verified_submission_for_run
-                            .try_submit_historical_rerun(&command, suggestion);
+                            .try_submit_historical_rerun(block_id, &command, record, suggestion);
+                        drop(data);
                         if submitted {
                             clear_finished_block_selection(
                                 &finished,
@@ -4762,8 +4839,24 @@ impl BlockBackend {
                             if let Some(active_for_run) = active_for_run.upgrade() {
                                 active_for_run.borrow().grab_focus();
                             }
-                        } else if let Some(vte) = error_bell_for_run.upgrade() {
-                            vte.error_bell();
+                        } else {
+                            let refusal = provenance_refusal.map_or_else(
+                                || {
+                                    SelectionActionRefusal::Prompt(
+                                        verified_submission_for_run
+                                            .historical_rerun_refusal_status(suggestion),
+                                    )
+                                },
+                                SelectionActionRefusal::CommandProvenance,
+                            );
+                            flash_finished_selection_refusal(
+                                &finished,
+                                selected_for_run.get(),
+                                selection_refusal_hint(SelectionAction::Run, refusal),
+                            );
+                            if let Some(vte) = error_bell_for_run.upgrade() {
+                                vte.error_bell();
+                            }
                         }
                     });
                     vbox.append(&item);
@@ -5740,8 +5833,15 @@ impl VerifiedSubmissionCtx {
     /// synchronously proven empty. The shared submission path then inserts the
     /// command without Enter, verifies its exact stable render, and admits CR
     /// in phase two; history provenance never weakens that race boundary.
-    fn historical_rerun_is_ready(&self, command: &str, suggestion_rgb: [u8; 3]) -> bool {
-        if !self.history_editor_is_ready(suggestion_rgb)
+    fn historical_rerun_is_ready(
+        &self,
+        block_id: u64,
+        command: &str,
+        record: Option<&BlockData>,
+        suggestion_rgb: [u8; 3],
+    ) -> bool {
+        if historical_rerun_disabled_reason(block_id, command, record).is_some()
+            || !self.history_editor_is_ready(suggestion_rgb)
             || self.pty.foreground_owner() != PtyForeground::Shell
         {
             return false;
@@ -5762,8 +5862,14 @@ impl VerifiedSubmissionCtx {
         true
     }
 
-    fn can_submit_historical_rerun(&self, command: &str, suggestion_rgb: [u8; 3]) -> bool {
-        self.historical_rerun_is_ready(command, suggestion_rgb)
+    fn can_submit_historical_rerun(
+        &self,
+        block_id: u64,
+        command: &str,
+        record: Option<&BlockData>,
+        suggestion_rgb: [u8; 3],
+    ) -> bool {
+        self.historical_rerun_is_ready(block_id, command, record, suggestion_rgb)
     }
 
     /// Best user-facing explanation after the strict history re-run boundary
@@ -5810,8 +5916,14 @@ impl VerifiedSubmissionCtx {
         }
     }
 
-    fn try_submit_historical_rerun(&self, command: &str, suggestion_rgb: [u8; 3]) -> bool {
-        if !self.historical_rerun_is_ready(command, suggestion_rgb) {
+    fn try_submit_historical_rerun(
+        &self,
+        block_id: u64,
+        command: &str,
+        record: Option<&BlockData>,
+        suggestion_rgb: [u8; 3],
+    ) -> bool {
+        if !self.historical_rerun_is_ready(block_id, command, record, suggestion_rgb) {
             return false;
         }
         // Re-use the reviewed two-phase boundary: insert without Enter, wait
@@ -10003,6 +10115,10 @@ impl RenderBackend for BlockBackend {
             record.lifecycle_health(),
             record.lifecycle_notice().as_deref(),
         );
+        finished.set_command_provenance(
+            record.command_source == CommandTextSource::ShellReported,
+            record.command_source == CommandTextSource::ScreenAfterTruncation,
+        );
         finished.set_output_notice(payload.output_notice());
         // A block finishing after an app recolored the
         // terminal must not pop in with static theme
@@ -13487,12 +13603,17 @@ impl KeyCtx {
                 let target = {
                     let selected = selected_block_ids_for_key.borrow();
                     lone_rerunnable_selection(&finished, &selected, selected_block_id_for_key.get())
-                        .map(|block| block.cmd_text.clone())
+                        .map(|block| (block.id, block.cmd_text.clone()))
                 };
-                let refusal = if let Some(command) = target {
+                let refusal = if let Some((block_id, command)) = target {
                     let suggestion = click_cursor::suggestion_rgb(&config_for_key.borrow().palette);
+                    let data = block_data_for_key.borrow();
+                    let record = data.iter().find(|block| block.id == block_id);
+                    let provenance_refusal =
+                        historical_rerun_disabled_reason(block_id, &command, record);
                     let submitted = verified_submission_for_key
-                        .try_submit_historical_rerun(&command, suggestion);
+                        .try_submit_historical_rerun(block_id, &command, record, suggestion);
+                    drop(data);
                     if submitted {
                         clear_finished_block_selection(
                             &finished,
@@ -13503,8 +13624,14 @@ impl KeyCtx {
                         active_vte_for_key.grab_focus();
                         return glib::Propagation::Stop;
                     }
-                    SelectionActionRefusal::Prompt(
-                        verified_submission_for_key.historical_rerun_refusal_status(suggestion),
+                    provenance_refusal.map_or_else(
+                        || {
+                            SelectionActionRefusal::Prompt(
+                                verified_submission_for_key
+                                    .historical_rerun_refusal_status(suggestion),
+                            )
+                        },
+                        SelectionActionRefusal::CommandProvenance,
                     )
                 } else {
                     SelectionActionRefusal::NotRunnable
@@ -18237,6 +18364,7 @@ impl TermView {
                     block.lifecycle_health(),
                     block.lifecycle_notice().as_deref(),
                 );
+                finished.set_command_provenance(block.command_exact, block.command_truncated);
                 finished.set_output_notice(
                     block.output_notice.as_deref().and_then(known_output_notice),
                 );
@@ -18479,6 +18607,7 @@ impl TermView {
                     block.lifecycle_health(),
                     block.lifecycle_notice().as_deref(),
                 );
+                finished.set_command_provenance(block.command_exact, block.command_truncated);
                 finished.set_output_notice(
                     block.output_notice.as_deref().and_then(known_output_notice),
                 );
@@ -20653,6 +20782,7 @@ mod tests {
             None,
             80,
         );
+        card.set_command_provenance(true, false);
         let selected = Rc::new(RefCell::new(HashSet::from([91])));
         let active = Rc::new(Cell::new(Some(91)));
         super::sync_finished_block_selection(std::slice::from_ref(&card), &selected, &active);
@@ -33984,10 +34114,12 @@ mod tests {
         let harness = ReaderHarness::new();
         harness.arm_verified_prompt();
 
-        assert!(harness
-            .ctx
-            .verified_submission
-            .try_submit_historical_rerun("printf SAFE", [0, 0, 0]));
+        assert!(harness.ctx.verified_submission.try_submit_historical_rerun(
+            71,
+            "printf SAFE",
+            Some(&super::historical_replay_tests::record("printf SAFE")),
+            [0, 0, 0]
+        ));
         assert_eq!(
             harness.pty.drain_test_slave(PTY_REPLY_WAIT),
             b"printf SAFE",
@@ -34108,10 +34240,12 @@ mod tests {
             }
 
             assert!(
-                !harness
-                    .ctx
-                    .verified_submission
-                    .try_submit_historical_rerun(command, [0, 0, 0]),
+                !harness.ctx.verified_submission.try_submit_historical_rerun(
+                    71,
+                    command,
+                    Some(&super::historical_replay_tests::record(command)),
+                    [0, 0, 0]
+                ),
                 "{refusal:?} must refuse"
             );
             assert_eq!(
@@ -34121,6 +34255,48 @@ mod tests {
                 b"",
                 "{refusal:?} must write no PTY bytes"
             );
+        }
+    }
+    #[test]
+    fn historical_provenance_refusals_write_no_pty_bytes() {
+        for refusal in [
+            "missing",
+            "screen",
+            "truncated",
+            "wrong-id",
+            "changed-command",
+            "restored",
+        ] {
+            let harness = ReaderHarness::new();
+            harness.arm_verified_prompt();
+            let _ = harness.pty.drain_test_slave(PTY_REPLY_WAIT);
+            let command = "printf '%s' 'Ａ Ｂ Ｃ'";
+            let mut record = super::historical_replay_tests::record(command);
+            match refusal {
+                "screen" | "restored" => record.command_exact = false,
+                "truncated" => record.command_truncated = true,
+                "wrong-id" => record.id += 1,
+                "changed-command" => record.cmd = "printf changed".into(),
+                _ => {}
+            }
+            let current = (refusal != "missing").then_some(&record);
+            assert!(
+                !harness.ctx.verified_submission.try_submit_historical_rerun(
+                    71,
+                    command,
+                    current,
+                    [0, 0, 0]
+                ),
+                "{refusal}"
+            );
+            assert_eq!(
+                harness
+                    .pty
+                    .drain_test_slave(std::time::Duration::from_millis(5)),
+                b"",
+                "{refusal} wrote bytes"
+            );
+            assert!(!harness.ctx.submission_pending_rc.get());
         }
     }
 }
@@ -34333,3 +34509,71 @@ mod chat_render_tests;
 
 #[cfg(test)]
 mod chat_shell_tests;
+
+#[cfg(test)]
+mod historical_replay_tests {
+    use super::*;
+
+    pub(super) fn record(command: &str) -> BlockData {
+        serde_json::from_value(serde_json::json!({
+            "id": 71, "prompt": "$ ", "cmd": command, "cmd_markup": null,
+            "output": "", "exit_code": 0, "estimated_height": 40,
+            "line_count": 0, "command_exact": true, "command_truncated": false
+        }))
+        .expect("owned historical record")
+    }
+
+    #[test]
+    fn exact_history_preserves_spaces_and_fullwidth_bytes() {
+        for command in ["printf SAFE", "  printf '%s' 'ＡＢＣ  中文'  "] {
+            let record = record(command);
+            assert_eq!(
+                historical_rerun_disabled_reason(71, command, Some(&record)),
+                None
+            );
+            assert_eq!(
+                historical_rerun_paste(command).unwrap().bytes,
+                command.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn history_replay_rejects_uncertain_truncated_missing_and_stale_records() {
+        let command = "printf '%s' 'Ａ Ｂ Ｃ'";
+        let exact = record(command);
+        assert!(historical_rerun_disabled_reason(71, command, None).is_some());
+        assert!(historical_rerun_disabled_reason(72, command, Some(&exact)).is_some());
+        assert!(historical_rerun_disabled_reason(71, "printf changed", Some(&exact)).is_some());
+        for (is_exact, truncated) in [(false, false), (false, true), (true, true)] {
+            let mut capture = exact.clone();
+            capture.command_exact = is_exact;
+            capture.command_truncated = truncated;
+            assert!(historical_rerun_disabled_reason(71, command, Some(&capture)).is_some());
+            assert_eq!(
+                capture.cmd, command,
+                "never repair fullwidth padding by guessing"
+            );
+        }
+    }
+
+    #[test]
+    fn old_records_default_uncertain_and_unsafe_exact_records_still_fail() {
+        let mut value = serde_json::to_value(record("printf SAFE")).unwrap();
+        value.as_object_mut().unwrap().remove("command_exact");
+        value.as_object_mut().unwrap().remove("command_truncated");
+        let old: BlockData = serde_json::from_value(value).unwrap();
+        assert!(historical_rerun_disabled_reason(71, &old.cmd, Some(&old)).is_some());
+        for command in [
+            "",
+            "  ",
+            "printf A\nprintf B",
+            "printf \x1b[201~B",
+            TRUNCATED_COMMAND_PLACEHOLDER,
+            UNAVAILABLE_COMMAND_PLACEHOLDER,
+        ] {
+            let record = record(command);
+            assert!(historical_rerun_disabled_reason(71, command, Some(&record)).is_some());
+        }
+    }
+}

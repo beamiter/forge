@@ -754,6 +754,9 @@ pub(crate) struct FinishedBlock {
     /// the lifetime of the block (finished blocks are append-once in practice).
     pub(crate) stripped_output: Rc<RefCell<Option<String>>>,
     pub(crate) cmd_text: String,
+    /// Presentation cache only; execution re-checks the current BlockData.
+    pub(crate) command_replay_is_exact: Rc<Cell<bool>>,
+    command_source_notice: gtk4::Label,
     pub(crate) copy_cmd_btn: gtk4::Button,
     pub(crate) copy_output_btn: gtk4::Button,
     pub(crate) rerun_btn: gtk4::Button,
@@ -850,6 +853,8 @@ impl Clone for FinishedBlock {
             output_vte: self.output_vte.clone(),
             output_scrollbar: self.output_scrollbar.clone(),
             cmd_text: self.cmd_text.clone(),
+            command_replay_is_exact: self.command_replay_is_exact.clone(),
+            command_source_notice: self.command_source_notice.clone(),
             full_output: self.full_output.clone(),
             displayed_output: self.displayed_output.clone(),
             stripped_output: self.stripped_output.clone(),
@@ -2461,6 +2466,15 @@ impl FinishedBlock {
         lifecycle_chip.set_visible(false);
         header_row.append(&lifecycle_chip);
 
+        let command_source_notice = gtk4::Label::new(None);
+        command_source_notice.add_css_class("block-output-notice");
+        command_source_notice.set_halign(gtk4::Align::Start);
+        command_source_notice.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        command_source_notice.set_width_chars(1);
+        command_source_notice.set_max_width_chars(24);
+        command_source_notice.set_visible(false);
+        header_row.append(&command_source_notice);
+
         // Lost output is stated, not hidden: a long session whose capture
         // outgrew its bounds would otherwise start partway through with
         // nothing saying so. A header note rather than a row above the output,
@@ -3769,7 +3783,7 @@ impl FinishedBlock {
             toggle
         };
 
-        FinishedBlock {
+        let block = FinishedBlock {
             id,
             is_background,
             widget: outer,
@@ -3784,6 +3798,8 @@ impl FinishedBlock {
             displayed_output,
             stripped_output: Rc::new(RefCell::new(None)),
             cmd_text: cmd.to_string(),
+            command_replay_is_exact: Rc::new(Cell::new(false)),
+            command_source_notice,
             output_scrollbar,
             copy_cmd_btn,
             copy_output_btn,
@@ -3816,7 +3832,11 @@ impl FinishedBlock {
             viewport_cap,
             long_output,
             estimated_retained_bytes,
-        }
+        };
+        // Constructors do not receive provenance. Old/restored records and
+        // direct callers start uncertain until the owner supplies metadata.
+        block.set_command_provenance(false, false);
+        block
     }
 
     pub(crate) const fn estimated_retained_bytes(&self) -> usize {
@@ -3825,6 +3845,48 @@ impl FinishedBlock {
 
     pub(crate) fn widget(&self) -> &gtk4::Box {
         &self.widget
+    }
+
+    /// Qualify captured command text separately from its completion or exit.
+    /// This cache controls presentation only; it never authorizes replay.
+    pub(crate) fn set_command_provenance(&self, exact: bool, truncated: bool) {
+        let exact = exact && !truncated && !self.is_background;
+        self.command_replay_is_exact.set(exact);
+        let (label, detail) = if truncated {
+            (
+                "Command report incomplete",
+                "The complete command is unavailable. Captured text is for review only.",
+            )
+        } else {
+            (
+                "Unverified command text",
+                "Best-effort terminal capture. Spacing or wrapping may differ from what the shell ran. Insert the capture to review it before running.",
+            )
+        };
+        self.command_source_notice.set_text(label);
+        self.command_source_notice.set_tooltip_text(Some(detail));
+        self.command_source_notice.update_property(&[
+            gtk4::accessible::Property::Label(label),
+            gtk4::accessible::Property::Description(detail),
+        ]);
+        self.command_source_notice
+            .set_visible(!self.is_background && !exact);
+        let copy = if exact {
+            "Copy command"
+        } else {
+            "Copy captured text"
+        };
+        let recall = if exact {
+            "Recall command · fill prompt without running"
+        } else {
+            "Insert captured text for review · fill prompt without running"
+        };
+        self.copy_cmd_btn.set_tooltip_text(Some(copy));
+        self.copy_cmd_btn
+            .update_property(&[gtk4::accessible::Property::Label(copy)]);
+        self.rerun_btn.set_tooltip_text(Some(recall));
+        self.rerun_btn
+            .update_property(&[gtk4::accessible::Property::Label(recall)]);
     }
 
     /// Show lifecycle provenance only when the completion is not fully trusted.
@@ -4244,13 +4306,22 @@ impl FinishedBlock {
 
         let vte_for_cmd = vte.downgrade();
         let cmd_for_copy = self.cmd_text.clone();
+        let copy_is_exact = self.command_replay_is_exact.clone();
         let feedback = ButtonFeedback::new(&self.copy_cmd_btn);
         self.copy_cmd_btn.connect_clicked(move |btn| {
             let Some(vte_for_cmd) = vte_for_cmd.upgrade() else {
                 return;
             };
             vte_for_cmd.clipboard().set_text(&cmd_for_copy);
-            feedback.flash(btn, "object-select-symbolic", "Command copied");
+            feedback.flash(
+                btn,
+                "object-select-symbolic",
+                if copy_is_exact.get() {
+                    "Command copied"
+                } else {
+                    "Captured text copied"
+                },
+            );
         });
 
         let vte_for_out = vte.downgrade();
@@ -4277,6 +4348,7 @@ impl FinishedBlock {
         let active_for_rerun = Rc::downgrade(active);
         let bracketed_for_rerun = bracketed_paste.clone();
         let cmd_for_rerun = self.cmd_text.clone();
+        let recall_is_exact = self.command_replay_is_exact.clone();
         let feedback = ButtonFeedback::new(&self.rerun_btn);
         self.rerun_btn.connect_clicked(move |btn| {
             let suggestion = click_cursor::suggestion_rgb(&config_for_rerun.borrow().palette);
@@ -4288,7 +4360,15 @@ impl FinishedBlock {
                 if let Some(active_for_rerun) = active_for_rerun.upgrade() {
                     active_for_rerun.borrow().grab_focus();
                 }
-                feedback.flash(btn, "object-select-symbolic", "Command inserted");
+                feedback.flash(
+                    btn,
+                    "object-select-symbolic",
+                    if recall_is_exact.get() {
+                        "Command inserted"
+                    } else {
+                        "Capture inserted; review before running"
+                    },
+                );
             } else {
                 feedback.flash(
                     btn,
@@ -4931,22 +5011,15 @@ pub(crate) fn write_recalled_command(
     pty: &crate::pty::OwnedPty,
     cmd: &str,
     bracketed_paste: bool,
-    execute: bool,
 ) -> Result<bool, crate::pty::PtyWriteError> {
     let paste = build_command_recall(cmd, bracketed_paste);
     if paste.is_empty() {
         return Ok(false);
     }
     let truncated = paste.risk.truncated_to_first_line;
-    let mut payload = paste.bytes;
-    if execute {
-        // Outside the frame: readline does not execute a newline contained in a
-        // bracketed paste, so a CR inside the frame would be swallowed. Keep it
-        // in this same queue item: saturation can reject the whole submission,
-        // never the command while accepting its Enter (or vice versa).
-        payload.push(b'\r');
-    }
-    pty.write_bytes(&payload)?;
+    // This API is insertion-only. Historical execution must use the live
+    // record/provenance gate and verified-submission boundary in the owner.
+    pty.write_bytes(&paste.bytes)?;
     Ok(truncated)
 }
 
@@ -5689,7 +5762,7 @@ mod tests {
         assert!(card.rerun_btn.is_child_visible());
         assert_eq!(
             card.rerun_btn.tooltip_text().as_deref(),
-            Some("Recall command · fill prompt without running"),
+            Some("Insert captured text for review · fill prompt without running"),
             "the visible recall action must explicitly promise insert-only behavior",
         );
         window.close();
@@ -7338,7 +7411,25 @@ mod command_reuse_labels_tests {
         );
         assert_eq!(
             card.rerun_btn.tooltip_text().as_deref(),
+            Some("Insert captured text for review · fill prompt without running")
+        );
+        assert!(!card.command_replay_is_exact.get());
+        assert!(card.command_source_notice.is_visible());
+        card.set_command_provenance(true, false);
+        assert!(card.command_replay_is_exact.get());
+        assert!(!card.command_source_notice.is_visible());
+        assert_eq!(
+            card.rerun_btn.tooltip_text().as_deref(),
             Some("Recall command · fill prompt without running")
+        );
+        card.set_command_provenance(true, true);
+        assert!(
+            !card.command_replay_is_exact.get(),
+            "truncation wins over contradictory exactness"
+        );
+        assert_eq!(
+            card.command_source_notice.text().as_str(),
+            "Command report incomplete"
         );
     }
 }
