@@ -40,6 +40,8 @@ mod remote_fs;
 mod search;
 mod session;
 mod sidebar_tabs;
+#[cfg(test)]
+mod tab_geometry_tests;
 mod tab_strip;
 mod tabs;
 mod task_ops;
