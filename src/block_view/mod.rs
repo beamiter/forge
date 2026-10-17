@@ -52,6 +52,7 @@ mod palette;
 mod paste_feedback;
 mod review;
 mod scroll;
+pub(crate) mod search_preview;
 mod selection_hold;
 pub(crate) mod shortcut_hints;
 pub(crate) mod watch_batch;

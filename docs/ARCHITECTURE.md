@@ -173,3 +173,28 @@ feedback loop when input docks. GTK's existing clip owns painting and hit tests.
 FinishedBlock presentation wraps the original command/output VTE widgets, keeping
 copy/search and record identity. All Chat CSS is scoped to the selected pane.
 No shared configuration reload can restyle a live Block or managed-remote pane.
+
+
+## Exact retained-text search preview
+
+The Find bar's Preview action captures `RenderBackend::records()` through
+`TermView::capture_search_preview`, without VTE extraction, search cursors or
+selection. A failed capture is never published. `block_view::search_preview`
+contains the GTK-free snapshot/regex/range model and a single background worker;
+`ui::search_preview` owns its independent read-only dialog. The snapshot id is
+its immutable content revision. Hits carry document identity and UTF-8 ranges
+plus scalar offsets for TextBuffer; no native-terminal coordinates are inferred.
+
+Only retained completed-record text is searched. Source truncation and missing
+metadata are disclosed; a truncated retained source is a declared scope, while
+an interrupted scan is an error without an exact count. All query/navigation
+callbacks stay bound to one weak pane; detached/dead panes and closed dialogs
+stop publication. Snapshot and monotonically checked query generations gate
+worker replies. There is one replaceable request and one replaceable reply slot,
+so rapid edits cannot create unbounded threads or result queues. Cancellation
+and the deadline are cooperative around regex operations, not hard preemption.
+
+The rendering path applies a TextTag to the exact display text that was searched.
+It never drives VTE or programmatically creates a selection. Existing native
+Find remains a separate feature with its existing cursor semantics. See
+[search preview acceptance](SEARCH_PREVIEW_ACCEPTANCE.md) for limits and tests.

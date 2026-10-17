@@ -23592,3 +23592,47 @@ tail ab";
         assert_eq!(stopped.resume, Some(resume));
     }
 }
+
+impl TermView {
+    /// A frozen copy of retained completed-record text, never live VTE data.
+    /// Its snapshot id is the content revision for all preview hit ranges.
+    /// No later refresh can reinterpret an old hit against another snapshot.
+    pub(crate) fn capture_search_preview(
+        &self,
+    ) -> Result<super::search_preview::Snapshot, super::search_preview::PreviewError> {
+        use super::search_preview::{Field, PreviewError, Snapshot};
+        let records = self.render_backend.records();
+        if records.len() > 4096 {
+            return Err(PreviewError::TextLimit);
+        }
+        let mut snapshot = Snapshot::new()?;
+        for record in records.iter() {
+            let (command_partial, output_partial) = match record {
+                BackendRecordRef::Block(block) => {
+                    (block.command_truncated, block.output_notice.is_some())
+                }
+                BackendRecordRef::Metadata { record, snapshot } => (
+                    record.command_source == super::CommandTextSource::ScreenAfterTruncation,
+                    snapshot.is_some_and(|output| output.truncated),
+                ),
+            };
+            if let Some(prompt) = record.prompt() {
+                snapshot.push(record.id(), Field::Prompt, prompt, false)?;
+            } else {
+                snapshot.missing_prompts += 1;
+            }
+            snapshot.push(
+                record.id(),
+                Field::Command,
+                record.command(),
+                command_partial,
+            )?;
+            if let Some(output) = record.output() {
+                snapshot.push(record.id(), Field::Output, output, output_partial)?;
+            } else {
+                snapshot.missing_outputs += 1;
+            }
+        }
+        Ok(snapshot)
+    }
+}

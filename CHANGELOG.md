@@ -6,6 +6,11 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- The Find bar's new Preview button searches a frozen, bounded copy of retained
+  completed-record text. Repeated matches on one line have exact Unicode-aware
+  preview ranges and forward/backward navigation. Partial/missing history is
+  explicit; limits fail closed. Preview does not replace native terminal Find.
+
 - Ctrl+wheel now independently zooms the top-bar/sidebar text group or the main
   content group under the pointer. Both scales persist; legacy configs retain
   their initial appearance, and fractional touchpad motion stays proportional.

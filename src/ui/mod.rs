@@ -38,6 +38,7 @@ mod panes;
 pub(crate) mod path_drop;
 mod remote_fs;
 mod search;
+mod search_preview;
 mod session;
 mod sidebar_tabs;
 #[cfg(test)]

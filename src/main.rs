@@ -623,6 +623,9 @@ pub fn run() -> glib::ExitCode {
         search_next_btn.set_focus_on_click(false);
         search_next_btn
             .update_property(&[gtk4::accessible::Property::Label("Next search match")]);
+        let search_preview_btn = gtk4::Button::with_label("Preview");
+        search_preview_btn.set_tooltip_text(Some("Search a frozen copy of retained completed-record text"));
+
         let search_close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
         search_close_btn.set_tooltip_text(Some("Close search (Escape)"));
         search_close_btn.set_focus_on_click(false);
@@ -633,6 +636,7 @@ pub fn run() -> glib::ExitCode {
         search_box.append(&search_status);
         search_box.append(&search_prev_btn);
         search_box.append(&search_next_btn);
+        search_box.append(&search_preview_btn);
         search_box.append(&search_close_btn);
         search_box.set_margin_start(4);
         search_box.set_margin_end(4);
@@ -1828,6 +1832,11 @@ pub fn run() -> glib::ExitCode {
         let ui_for_search_prev = ui.clone();
         search_prev_btn.connect_clicked(move |_| {
             ui_for_search_prev.search_prev();
+        });
+
+        let ui_for_search_preview = ui.clone();
+        search_preview_btn.connect_clicked(move |_| {
+            ui_for_search_preview.show_exact_search_preview();
         });
 
         let ui_for_search_close = ui.clone();
