@@ -29032,6 +29032,36 @@ mod tests {
         ParserEvent::Bytes(text.as_bytes().to_vec())
     }
 
+    fn assert_session_parity_finalization(
+        completed_zone_ids: &[u64],
+        finalized_ids: &[u64],
+        at_final_prompt: bool,
+        context: &str,
+    ) {
+        let unique: std::collections::HashSet<_> = finalized_ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            finalized_ids.len(),
+            "{context}: duplicate finalization"
+        );
+        assert!(
+            finalized_ids.len() <= completed_zone_ids.len(),
+            "{context}: finalization without accepted completion"
+        );
+        assert_eq!(
+            finalized_ids,
+            &completed_zone_ids[..finalized_ids.len()],
+            "{context}: finalization belongs to a different completion zone"
+        );
+        if at_final_prompt {
+            assert_eq!(
+                finalized_ids.len(),
+                completed_zone_ids.len(),
+                "{context}: final prompt must finalize every completed zone"
+            );
+        }
+    }
+
     // Shared raw-byte corpus through the production reader/parser/lifecycle owner.
     // RecordingBackend observes engine effects; this is not native GTK/VTE proof.
     fn assert_session_parity_fixture(fixture_id: &str) {
@@ -29069,6 +29099,19 @@ mod tests {
                         });
                     }
                 }
+                // D emits completion before the next A finalizes the card.
+                // Compare actual backend calls with the zones observed at that
+                // completion, and require all of them at the final prompt.
+                let context = format!(
+                    "fixture={} step={} chunking={chunking:?}",
+                    fixture.id, step_index
+                );
+                assert_session_parity_finalization(
+                    &completed_zone_ids,
+                    &harness.backend.finalized_ids.borrow(),
+                    step_index + 1 == fixture.steps.len() && step.expected.surface == "prompt",
+                    &context,
+                );
                 let surface =
                     super::chat::surface(harness.bstate.get(), harness.ctx.ftcs_seen_rc.get());
                 let running_id = matches!(surface, ChatSurface::Running | ChatSurface::Fullscreen)
