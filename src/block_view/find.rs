@@ -23646,3 +23646,7 @@ tail ab";
         assert_eq!(stopped.resume, Some(resume));
     }
 }
+
+#[cfg(test)]
+#[path = "find_cursor_properties.rs"]
+mod cursor_properties;
