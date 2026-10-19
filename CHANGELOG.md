@@ -6,6 +6,17 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Unified now has a compact, separately allocated command navigation row with
+  Live/Reading history feedback, unread completed-command counts, Previous/Next,
+  Copy current command, pane-owned Find/Browse, and Return to live. Navigation
+  uses authenticated native locations and stable retained record identities;
+  missing locations remain explicit. Native selection and shell shortcuts stay
+  intact, and the row hides while an alternate-screen application owns the grid.
+
+- Unified Find rebuilds an active query after a command completes or the terminal
+  resets. Find launched from a pane keeps that owner for Preview, stepping and
+  focus restoration, including when another split previously held input focus.
+
 - The Find bar's new Preview button searches a frozen, bounded copy of retained
   completed-record text. Repeated matches on one line have exact Unicode-aware
   preview ranges and forward/backward navigation. Partial/missing history is

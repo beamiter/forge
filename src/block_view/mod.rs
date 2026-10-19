@@ -63,6 +63,9 @@ pub(crate) mod watch_reader;
 use watch_reader::WatchReader;
 mod unified_chrome;
 mod unified_images;
+mod unified_navigation;
+#[cfg(test)]
+mod unified_navigation_tests;
 mod zone_history;
 pub(crate) use alt_screen::*;
 pub(crate) use ansi::*;
@@ -6149,6 +6152,7 @@ pub struct TermView {
     /// document cannot scroll to a mounted card; empty and hidden otherwise.
     notice_dock: gtk4::Box,
     jump_fab: gtk4::Button,
+    unified_navigation: Option<Rc<unified_navigation::NavigationBar>>,
     unread_count: Rc<Cell<u32>>,
     /// The single persistent live VTE (anvil model): prompt + typing + output all
     /// render here natively; finished commands snapshot into styled blocks above.
@@ -6267,7 +6271,7 @@ pub struct TermView {
     /// `selected_block_id` — which only ever holds an id that passes the
     /// finished-block lookup — stays `None` for the pane's whole life. Holds
     /// the record this view last navigated to, so next/previous can advance.
-    navigated_record_id: Cell<Option<u64>>,
+    navigated_record_id: Rc<Cell<Option<u64>>>,
     selection_anchor_id: Rc<Cell<Option<u64>>>,
     bookmarks: SharedBookmarks,
     /// Shared backend-neutral transition. It validates/synchronizes Block card
@@ -7150,6 +7154,11 @@ trait RenderBackend {
     /// indexed should override [`Self::jumpable_records`] to batch this query.
     fn can_scroll_to_record(&self, _block_id: u64) -> bool {
         false
+    }
+    /// Authenticated head in the native adjustment's coordinate system.
+    /// Used only for explicit viewport-relative Unified navigation.
+    fn record_scroll_value(&self, _block_id: u64) -> Option<f64> {
+        None
     }
     /// Resolve every currently reachable cross-block-search target in one
     /// pass. The default preserves the per-target proof used by backends with
@@ -10703,6 +10712,10 @@ struct UnifiedBackend {
     /// bounded output snapshot captured at finalize; the terminal text
     /// remains on `vte`, so no finished widget is mounted.
     zones: Rc<RefCell<UnifiedZoneStore>>,
+    navigation: Rc<unified_navigation::NavigationBar>,
+    user_scrolled_up: Rc<Cell<bool>>,
+    unread_count: Rc<Cell<u32>>,
+    navigated_record_id: Rc<Cell<Option<u64>>>,
     /// Pane-local runtime bookmark state shared with TermView and the picker.
     /// Only record-table retirement prunes ids; snapshot/chrome eviction does not.
     bookmarks: SharedBookmarks,
@@ -10777,7 +10790,7 @@ impl RenderBackend for UnifiedBackend {
         // ring, so a reset cannot resurrect anything through them.
         self.zone_marker.borrow_mut().close_zone(None);
         self.chrome.clear_authority();
-        find::clear_find_state(self.find_state_for_cb.as_ref(), &self.vte);
+        find::invalidate_live_find_state(self.find_state_for_cb.as_ref(), &self.vte);
         self.kitty_assembler.borrow_mut().reset();
         self.kitty_pending_admission.borrow_mut().take();
         self.image_layer.hard_reset();
@@ -10855,6 +10868,10 @@ impl RenderBackend for UnifiedBackend {
         self.chrome
             .proven_zone_scroll_value(&self.vte, block_id)
             .is_some()
+    }
+
+    fn record_scroll_value(&self, block_id: u64) -> Option<f64> {
+        self.chrome.proven_zone_scroll_value(&self.vte, block_id)
     }
 
     fn completed_search_surfaces(
@@ -11075,7 +11092,7 @@ impl RenderBackend for UnifiedBackend {
     fn reset_scroll_lock(&self) {}
 
     fn user_scrolled_up(&self) -> bool {
-        false
+        self.user_scrolled_up.get()
     }
 
     /// Record the zone with a bounded output snapshot and paint nothing.
@@ -11090,7 +11107,7 @@ impl RenderBackend for UnifiedBackend {
         record: &CompletedCommandRecord,
         payload: &dyn BlockRenderPayloadAccessor,
     ) {
-        find::clear_find_state(self.find_state_for_cb.as_ref(), &self.vte);
+        find::invalidate_live_find_state(self.find_state_for_cb.as_ref(), &self.vte);
         let max_zones = self.config_for_cb.borrow().max_visible_blocks as usize;
         // The engine keeps the raw ring alive through the whole finalize
         // fan-out, so this bounded read still sees the command's bytes.
@@ -11115,6 +11132,11 @@ impl RenderBackend for UnifiedBackend {
                 is_background: record.is_background,
                 lifecycle_health: record.lifecycle_health(),
             });
+        if !record.is_background && self.user_scrolled_up.get() && !self.navigation.is_suspended() {
+            self.unread_count
+                .set(self.unread_count.get().saturating_add(1));
+        }
+        self.navigation.schedule_refresh();
         log::debug!(
             "unified zone {} recorded: exit={:?} duration_ms={:?} background={} zones={}",
             record.id,
@@ -11140,6 +11162,8 @@ impl RenderBackend for UnifiedBackend {
     /// the alt-screen override alone would restore the pre-TUI coordinates
     /// synchronously on rmcup, before the heartbeat has remeasured.
     fn enter_alt_screen_chrome(&self) {
+        self.navigation.set_suspended(true);
+        self.navigated_record_id.set(None);
         self.chrome.set_alt_screen(true);
         self.image_layer.set_alt_screen(true);
         let active = self.active_rc.borrow();
@@ -11155,6 +11179,7 @@ impl RenderBackend for UnifiedBackend {
         self.chrome.set_alt_screen(false);
         self.image_layer.set_alt_screen(false);
         self.active_rc.borrow().set_live_organism_alt_screen(false);
+        self.navigation.set_suspended(false);
     }
 
     /// No-op: "give the viewport to the alt-screen app" is already the
@@ -14292,6 +14317,12 @@ impl TermView {
         // constructor — that mode has no `TermView` at all — and is treated as
         // Block if it somehow does.
         let unified = mode.is_unified();
+        let unified_navigation = unified.then(unified_navigation::NavigationBar::new);
+        if let Some(navigation) = &unified_navigation {
+            // A permanent compact row in the normal document; it never
+            // covers terminal text and leaves the grid on AltScreen entry.
+            root.append(&navigation.root);
+        }
         // Allocated in both modes (an empty store costs nothing) so the reader
         // wiring below stays a single expression; only a Unified pane hands it
         // to a backend.
@@ -14531,6 +14562,7 @@ impl TermView {
         // marks our own adjustment writes so the value_changed detector doesn't
         // mistake them for a user drag.
         let user_scrolled_up: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let navigated_record_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         let programmatic_scroll: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let scroll_debouncer = ScrollDebouncer::with_scroll_lock(
             user_scrolled_up.clone(),
@@ -15445,6 +15477,10 @@ impl TermView {
                     prompt_anchor_tick_id_rc: prompt_anchor_tick_id.clone(),
                     find_state_for_cb: find_state.clone(),
                     zones: unified_records.clone(),
+                    navigation: unified_navigation.clone().expect("Unified navigation row"),
+                    user_scrolled_up: user_scrolled_up.clone(),
+                    unread_count: unread_count.clone(),
+                    navigated_record_id: navigated_record_id.clone(),
                     bookmarks: block_bookmarks.clone(),
                     zone_marker,
                     chrome,
@@ -15597,7 +15633,7 @@ impl TermView {
         // the invariant that matters: whether the live holder still intersects
         // the viewport. Once its top moves below the viewport, the user is reading
         // history and follow mode must stop. Sample on idle after layout settles.
-        {
+        if !unified {
             let user_scrolled = user_scrolled_up.clone();
             let fab = jump_fab.downgrade();
             let unread = unread_count.clone();
@@ -15693,40 +15729,19 @@ impl TermView {
         }
 
         // ── Unified scroll-position detector ──────────────────────────────
-        // The outer scroller holds one full-viewport surface, so its
-        // adjustment never moves and the detector above never fires. Reading
-        // history here means scrolling the VTE's own adjustment, which is what
-        // must drive the same flag: the sticky running header and the jump FAB
-        // both key off it, and both were unreachable in this mode without it.
-        if unified {
-            let user_scrolled = user_scrolled_up.clone();
-            let fab = jump_fab.downgrade();
-            let unread = unread_count.clone();
-            let fullscreen = fullscreen.clone();
-            if let Some(adjustment) = active_vte.vadjustment() {
-                adjustment.connect_value_changed(move |adj| {
-                    let Some(fab) = fab.upgrade() else {
-                        return;
-                    };
-                    if fullscreen.get() {
-                        user_scrolled.set(false);
-                        unread.set(0);
-                        fab.set_visible(false);
-                        return;
-                    }
-                    // One row of slack: a partially scrolled last row still
-                    // counts as following the bottom.
-                    let at_bottom = adj.value() >= adj.upper() - adj.page_size() - 1.0;
-                    user_scrolled.set(!at_bottom);
-                    if at_bottom {
-                        unread.set(0);
-                        fab.set_visible(false);
-                    } else {
-                        set_jump_fab_label(&fab, unread.get());
-                        fab.set_visible(true);
-                    }
-                });
-            }
+        // The outer Block scroller cannot describe the persistent terminal's
+        // viewport. Native value and range changes exclusively own Unified's
+        // reading state; the separate navigation row replaces the jump FAB.
+        if let Some(navigation) = &unified_navigation {
+            navigation.observe(unified_navigation::NavigationBindings {
+                terminal: active_vte.clone(),
+                fullscreen: fullscreen.clone(),
+                reading: user_scrolled_up.clone(),
+                unread: unread_count.clone(),
+                cursor: navigated_record_id.clone(),
+                programmatic: programmatic_scroll.clone(),
+                records: unified_records.clone(),
+            });
         }
 
         // ── Recompute the live grid on viewport resize ────────────────────
@@ -16646,6 +16661,7 @@ impl TermView {
             block_onboarding,
             notice_dock,
             jump_fab: jump_fab.clone(),
+            unified_navigation,
             unread_count: unread_count.clone(),
             active_vte,
             contents_generation,
@@ -16697,7 +16713,7 @@ impl TermView {
             visible_indices,
             selected_block_ids,
             selected_block_id,
-            navigated_record_id: Cell::new(None),
+            navigated_record_id,
             selection_anchor_id,
             bookmarks: block_bookmarks,
             toggle_bookmark,
@@ -18038,6 +18054,10 @@ impl TermView {
     /// all twelve retries before GTK produced another allocation, so a newly
     /// selected tab sometimes stopped above its bottom input block.
     pub(crate) fn reveal_live_input(&self) {
+        if self.unified_navigation.is_some() {
+            self.reveal_unified_live_input();
+            return;
+        }
         reveal_live_input_now(
             &self.scroll_debouncer,
             &self.unread_count,

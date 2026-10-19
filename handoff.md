@@ -1,5 +1,57 @@
 # Engineering handoff
 
+## 2026-10-19 — Unified native navigation and pane-owned Find
+
+- `block_view/unified_navigation.rs` owns the compact row and pure command-step
+  policy. The row is a normal vertical-layout sibling above the scroll surface;
+  it never overlays terminal glyphs. Its own `suspended` flag hides it for
+  alternate-screen apps; Unified's historical no-op `fullscreen` backend hooks
+  remain unchanged. Existing allocation settling updates the real VTE/PTY grid.
+- Native adjustment `value_changed` and `changed` synchronously update the
+  scalar reading/unread state using the original one-row following slack. Only
+  label and retained metadata work is coalesced into one idle. Unified no longer
+  allows the outer Block scroller detector to overwrite native state. Zero-page
+  or invalid geometry shows Preparing terminal. Foreground command completion
+  adds unread only while reading; Return to live clears it and focuses that
+  pane, while tab activation reveals the live viewport without stealing Find
+  entry focus.
+- The record cursor is explicit stable identity. Actual external native value
+  movement and every Find apply/step release it; range-only changes and guarded
+  programmatic navigation do not. Reading without a cursor scans proven zone
+  heads at invocation, never inferred rows. Clamped equal-value groups preserve
+  chronological stepping. A latest retained head proven before the viewport
+  allows forward navigation to live; an absent proof never does. Retired IDs
+  fail without redirecting to a different record.
+- `RenderBackend::record_scroll_value` is a default-None read-only seam; Unified
+  delegates to the existing authenticated `proven_zone_scroll_value`. Targets
+  are revalidated by the existing record navigation path; retained output
+  snapshots remain honest fallbacks where supported.
+- Copy current command is explicit-record only: non-background, nonblank,
+  at most 256 KiB, full `safe_multiline_display` equality, and no
+  `ScreenAfterTruncation` provenance. It preserves the native selection and
+  sends no PTY bytes. Four palette/TOML actions have no new default chords.
+- Navigation callbacks capture weak pane and original `Rc<UiState>` owners.
+  Find and Browse accept the emitting pane directly. Pinned Find ownership is
+  shared by debounced apply, steps, exact Preview and close-focus restoration;
+  closed/hidden owners never resolve to a sibling. Page switches still rebind
+  global Find to their explicit destination. Completion/RIS invalidation
+  preserves the need to rebuild an active native or structured query.
+- Validation: `cargo fmt --all -- --check`, `cargo check --locked --tests -j2`,
+  `cargo clippy --locked --all-targets -j2 -- -D warnings` and `git diff --check`
+  passed. The focused non-display run over `block_view::find::tests`,
+  `ui::search::tests`, `keybindings::tests`, `unified_navigation::tests` and the
+  captured snapshot-owner contract passed **327 tests** (7 display fixtures
+  excluded). Three isolated native GTK/VTE regressions passed: the new
+  `unified_navigation_preserves_reading_identity_selection_and_tui`, existing
+  `existing_unified_tab_switch_preserves_global_search_focus`, and
+  `unified_complete_windows_step_visible_then_wrapped_history_on_real_vte`.
+  The new fixture feeds real OSC 133/PTY output, checks same-value record
+  identity, native selection/clipboard, range-only reading, unread completion,
+  both matched and initially empty Find invalidation, Return-to-live focus,
+  360 px layout, alternate-screen VTE/PTY grids, and reset/retention fallbacks.
+  `FORGE_UNIFIED_SCREENSHOT_DIR` optionally exports its wide/narrow PNGs through
+  the existing WidgetPaintable/GSK path. The display runner registers this test.
+
 Updated: 2026-10-04 (10009 find beside rounds 1236–1239)
 
 ## 2026-10-04 (sticky/find/organism edges — round 1240)

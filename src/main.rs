@@ -1200,6 +1200,7 @@ pub fn run() -> glib::ExitCode {
         toast_overlay.set_child(Some(&main_box));
 
         let ui = Rc::new(UiState {
+            unified_navigation_owner: Rc::new(RefCell::new(std::rc::Weak::new())),
             window: window.clone(),
             toast_overlay: toast_overlay.clone(),
             opacity_toast: Rc::new(RefCell::new(None)),
@@ -1296,6 +1297,7 @@ pub fn run() -> glib::ExitCode {
             ai_panel_width_restoring: Rc::new(Cell::new(false)),
         });
 
+        *ui.unified_navigation_owner.borrow_mut() = Rc::downgrade(&ui);
         ui.observe_ascii_organism_motion();
 
         // A configuration that could not be read leaves every setting at its

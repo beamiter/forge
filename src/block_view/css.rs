@@ -1306,6 +1306,19 @@ pub(crate) fn block_css(config: &Config) -> String {
         .block-show-more:hover {{
             background-color: rgba({acc_r},{acc_g},{acc_b},0.18);
         }}
+        .unified-navigation {{
+            padding: 3px 6px;
+            border-bottom: 1px solid rgba({acc_r},{acc_g},{acc_b},0.20);
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.06);
+        }}
+        .unified-navigation button {{
+            min-width: 22px;
+            min-height: 22px;
+            padding: 2px 4px;
+        }}
+        .unified-navigation label {{
+            font-size: 0.88em;
+        }}
         .jump-bottom-fab {{
             color: {bg_hex};
             background-color: {accent};

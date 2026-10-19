@@ -1835,6 +1835,7 @@ impl UiState {
                 // remains governed by block_history_path; this record contains
                 // only command metadata and is safe for palette use.
                 self.connect_block_command_history(term_view);
+                self.connect_unified_navigation(term_view);
                 self.connect_block_ai_action(term_view);
                 self.connect_block_tab_attention(term_view, term_view.widget().upcast_ref());
                 self.connect_bottom_bar_block_status(term_view);

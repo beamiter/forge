@@ -252,6 +252,14 @@ impl UiState {
                 log::debug!("Toggle search");
                 self.toggle_search();
             }
+            Action::PreviousCommand
+            | Action::NextCommand
+            | Action::ReturnToLive
+            | Action::CopyCurrentCommand => {
+                if let Some(view) = self.current_term_view() {
+                    self.execute_unified_navigation_for(&view, action);
+                }
+            }
             // Palette-only: these require the opening target, never a fallback
             // to the pane current at delayed generic action dispatch.
             Action::ExpandVteCompanion | Action::CollapseVteCompanion => {}
@@ -875,6 +883,38 @@ impl UiState {
             .and_then(|page_num| self.notebook.nth_page(Some(page_num)))
             .and_then(|widget| PaneNode::from_widget(&widget))
             .and_then(|node| node.active_leaf())
+    }
+
+    /// Receive the emitting pane directly; no operation depends on a delayed
+    /// focus event making that pane the application-wide current terminal.
+    pub(super) fn execute_unified_navigation_for(&self, view: &Rc<TermView>, action: Action) {
+        if !view.widget().is_mapped() || !view.unified_navigation_available() {
+            return;
+        }
+        match action {
+            Action::PreviousCommand | Action::NextCommand => {
+                match view.navigate_command(action == Action::NextCommand) {
+                    Ok(RecordNavigationResult::SnapshotView { record_id }) => {
+                        self.show_record_snapshot_dialog_for(view, record_id);
+                    }
+                    Ok(result) => self.report_record_navigation(result),
+                    Err(message) => self.toast_overlay.add_toast(adw::Toast::new(message)),
+                }
+            }
+            Action::ReturnToLive => {
+                view.return_to_live();
+            }
+            Action::CopyCurrentCommand => {
+                let message = match view.copy_current_command() {
+                    Ok(()) => "Current command copied.",
+                    Err(message) => message,
+                };
+                self.toast_overlay.add_toast(adw::Toast::new(message));
+            }
+            Action::ToggleSearch => self.show_search_for(view),
+            Action::CrossBlockSearch => self.show_cross_block_search_for(view.clone()),
+            _ => {}
+        }
     }
 
     pub(crate) fn current_term_view(&self) -> Option<Rc<TermView>> {

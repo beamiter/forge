@@ -266,6 +266,9 @@ pub(crate) fn tab_display_title(
 
 #[derive(Clone)]
 pub(crate) struct UiState {
+    /// Navigation widgets upgrade the window controller only for a click;
+    /// they must not retain the notebook that contains themselves.
+    pub(crate) unified_navigation_owner: Rc<RefCell<std::rc::Weak<UiState>>>,
     pub(crate) window: adw::ApplicationWindow,
     /// Window-level toast host wrapping the main layout.
     pub(crate) toast_overlay: adw::ToastOverlay,

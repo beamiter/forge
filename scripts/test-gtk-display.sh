@@ -198,6 +198,7 @@ tests=(
     block_view::tests::real_vte_prompt_area_covers_a_menu_after_the_pane_has_scrolled
     block_view::unified_chrome::tests::real_vte_osc8_row_probe_and_rewrap_smoke
     block_view::unified_chrome::tests::real_vte_non_bottom_anchor_calibrates_and_wide_badge_probe_fails_closed
+    block_view::unified_navigation_tests::unified_navigation_preserves_reading_identity_selection_and_tui
     block_view::unified_images::tests::real_vte_keeps_nonzero_marker_column_through_narrow_wide_rewrap
 )
 

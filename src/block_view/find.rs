@@ -1496,6 +1496,7 @@ impl TermView {
         resume: Option<FindResume>,
         allow_rebuild: bool,
     ) -> FindSearchResult {
+        self.release_unified_navigation_cursor();
         self.clear_find();
         if query.is_empty() {
             return FindSearchResult::NoMatches;
@@ -1757,11 +1758,21 @@ impl TermView {
         }
 
         if surfaces.is_empty() {
-            return if scan_limited {
-                FindSearchResult::ScanLimit
-            } else {
-                FindSearchResult::NoMatches
-            };
+            if scan_limited {
+                return FindSearchResult::ScanLimit;
+            }
+            // A complete empty pass still belongs to the open Find query.
+            // Future live output or completion may add its first match;
+            // keeping only this small stamp lets Next request a fresh pass
+            // without inventing a hit or retaining terminal surfaces.
+            let mut state = self.find_state.borrow_mut();
+            state.query = Some(FindQuery {
+                text: query.to_string(),
+                use_regex,
+                case_sensitive,
+            });
+            state.live_stamp = live_observed.then_some(live_stamp_at_start);
+            return FindSearchResult::NoMatches;
         }
         let capped = match_limited || scan_limited;
         let live_stamp = live_observed.then_some(live_stamp_at_start);
@@ -2084,12 +2095,14 @@ impl TermView {
     /// Step to the next match. Exact result sets wrap; capped sets stop at the
     /// known edge rather than entering uncounted VTE matches.
     pub(crate) fn find_next(&self) -> FindNavigationResult {
+        self.release_unified_navigation_cursor();
         self.step_find(FindDirection::Next)
     }
 
     /// Step to the previous match. Exact result sets wrap; capped sets stop at
     /// the known edge rather than entering the unknown real tail.
     pub(crate) fn find_prev(&self) -> FindNavigationResult {
+        self.release_unified_navigation_cursor();
         self.step_find(FindDirection::Previous)
     }
 
@@ -2542,7 +2555,13 @@ impl TermView {
         else {
             // No per-record surface: an exact proven scroll is still allowed,
             // then the retained snapshot, then the honest toast.
-            let result = if self.render_backend.scroll_to_record(block_id) {
+            let previous = self.programmatic_scroll.get();
+            if self.unified_navigation.is_some() {
+                self.programmatic_scroll.set(true);
+            }
+            let navigated = self.render_backend.scroll_to_record(block_id);
+            self.programmatic_scroll.set(previous);
+            let result = if navigated {
                 RecordNavigationResult::Navigated
             } else {
                 let records = self.render_backend.records();
@@ -2555,6 +2574,9 @@ impl TermView {
             // record forever.
             if result != RecordNavigationResult::NoMatchingRecord {
                 self.navigated_record_id.set(Some(block_id));
+            }
+            if let Some(bar) = &self.unified_navigation {
+                bar.schedule_refresh();
             }
             return result;
         };
@@ -2745,6 +2767,24 @@ pub(super) fn clear_find_state(
     // The UI's no-record fallback installs a regex directly on the live VTE,
     // outside `FindState`; always clear it before a new structured pass too.
     active_vte.search_set_regex(None::<&vte4::Regex>, 0);
+}
+
+/// Completion/reset changes the searched document while the user's Find bar
+/// remains open. Retire the old regex but request a rebuild on Next/Previous
+/// instead of falling through to a native search whose regex was just removed.
+pub(super) fn invalidate_live_find_state(
+    find_state: &std::cell::RefCell<FindState>,
+    active_vte: &vte4::Terminal,
+) {
+    let active = {
+        let state = find_state.borrow();
+        state.query.is_some()
+            || state.invalidated
+            || state.live_stamp.is_some()
+            || active_vte.search_get_regex().is_some()
+    };
+    clear_find_state(find_state, active_vte);
+    find_state.borrow_mut().invalidated = active;
 }
 
 /// Nonexecuting native fixture: bytes enter the production PTY reader.

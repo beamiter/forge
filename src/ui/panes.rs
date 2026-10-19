@@ -299,6 +299,7 @@ impl UiState {
         });
 
         self.connect_block_command_history(&view);
+        self.connect_unified_navigation(&view);
         self.connect_block_ai_action(&view);
         self.connect_bottom_bar_block_status(&view);
         self.attach_ascii_organism_to_view(&view, false);
@@ -331,6 +332,16 @@ impl UiState {
             self.connect_tab_activity(&leaf, &root);
         }
         Ok(leaf)
+    }
+
+    pub(crate) fn connect_unified_navigation(&self, view: &Rc<TermView>) {
+        let ui = self.unified_navigation_owner.borrow().clone();
+        let weak = Rc::downgrade(view);
+        view.connect_unified_navigation(move |action| {
+            if let (Some(view), Some(ui)) = (weak.upgrade(), ui.upgrade()) {
+                ui.execute_unified_navigation_for(&view, action);
+            }
+        });
     }
 
     /// Append finished Block commands to the cross-session command history.

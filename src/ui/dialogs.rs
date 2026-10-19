@@ -3533,6 +3533,11 @@ impl UiState {
             log::debug!("[xsearch] no active block-mode tab");
             return;
         };
+        self.show_cross_block_search_for(term_view);
+    }
+
+    pub(super) fn show_cross_block_search_for(&self, term_view: Rc<crate::block_view::TermView>) {
+        self.close_cross_block_search();
         let remembered = self.cross_block_search_memory.borrow().clone();
 
         let dialog = adw::Dialog::builder()
@@ -6457,7 +6462,7 @@ impl UiState {
 
     /// A search result belongs to its captured pane even if that pane exits
     /// while the dialog is open. Never look up its record in the current pane.
-    fn show_record_snapshot_dialog_for(
+    pub(super) fn show_record_snapshot_dialog_for(
         &self,
         term_view: &crate::block_view::TermView,
         record_id: u64,
@@ -7690,7 +7695,7 @@ mod tests {
         assert!(outcome.contains("ui.show_record_snapshot_dialog_for(&term_view, record_id)"));
         assert!(!outcome.contains("current_term_view"));
         let explicit = source
-            .split("    fn show_record_snapshot_dialog_for(")
+            .split("    pub(super) fn show_record_snapshot_dialog_for(")
             .nth(1)
             .unwrap()
             .split("\n#[cfg(test)]\nmod tests {")
@@ -7711,7 +7716,7 @@ mod tests {
             .split("pub(crate) fn show_record_snapshot_dialog(")
             .nth(1)
             .unwrap()
-            .split("    fn show_record_snapshot_dialog_for(")
+            .split("    pub(super) fn show_record_snapshot_dialog_for(")
             .next()
             .unwrap();
         assert!(wrapper.contains("self.current_term_view()"));

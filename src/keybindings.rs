@@ -51,6 +51,11 @@ pub(crate) enum Action {
     NextTab,
     ScrollUp,
     ScrollDown,
+    /// Unified command navigation is explicit and has no default shell chord.
+    PreviousCommand,
+    NextCommand,
+    ReturnToLive,
+    CopyCurrentCommand,
     CyclePaneFocusForward,
     CyclePaneFocusBackward,
     QuickSwitchTab(u8),
@@ -170,6 +175,10 @@ impl Action {
             Action::NextTab => "Next tab",
             Action::ScrollUp => "Scroll up",
             Action::ScrollDown => "Scroll down",
+            Action::PreviousCommand => "Previous command",
+            Action::NextCommand => "Next command",
+            Action::ReturnToLive => "Return to live",
+            Action::CopyCurrentCommand => "Copy current command",
             Action::CyclePaneFocusForward => "Cycle pane focus forward",
             Action::CyclePaneFocusBackward => "Cycle pane focus backward",
             Action::QuickSwitchTab(n) => match n {
@@ -274,6 +283,10 @@ impl Action {
             Action::NextTab => Some("next_tab"),
             Action::ScrollUp => Some("scroll_up"),
             Action::ScrollDown => Some("scroll_down"),
+            Action::PreviousCommand => Some("previous_command"),
+            Action::NextCommand => Some("next_command"),
+            Action::ReturnToLive => Some("return_to_live"),
+            Action::CopyCurrentCommand => Some("copy_current_command"),
             Action::CyclePaneFocusForward => Some("cycle_pane_focus_forward"),
             Action::CyclePaneFocusBackward => Some("cycle_pane_focus_backward"),
             Action::QuickSwitchTab(_) => None,
@@ -370,6 +383,10 @@ impl Action {
             Action::NextTab,
             Action::ScrollUp,
             Action::ScrollDown,
+            Action::PreviousCommand,
+            Action::NextCommand,
+            Action::ReturnToLive,
+            Action::CopyCurrentCommand,
             Action::CyclePaneFocusForward,
             Action::CyclePaneFocusBackward,
             Action::ConnectRemote(0),
@@ -809,6 +826,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unified_navigation_is_discoverable_bindable_and_preserves_shell_keys() {
+        let defaults = KeybindingMap::from_defaults();
+        for (action, key) in [
+            (Action::PreviousCommand, "previous_command"),
+            (Action::NextCommand, "next_command"),
+            (Action::ReturnToLive, "return_to_live"),
+            (Action::CopyCurrentCommand, "copy_current_command"),
+        ] {
+            assert_eq!(Action::from_config_key(key), Some(action));
+            assert!(defaults
+                .all_bound_actions()
+                .iter()
+                .any(|(candidate, _)| *candidate == action));
+            assert!(defaults.binding_display(&action).is_empty());
+            let table = format!("'{key}' = 'F8'").parse::<toml::Table>().unwrap();
+            let customized = KeybindingMap::from_user_overrides(&table).unwrap();
+            assert_eq!(customized.lookup(&parse("F8").unwrap()), Some(action));
+        }
+        assert_eq!(
+            defaults.lookup(&parse("Ctrl+Up").unwrap()),
+            Some(Action::ScrollUp)
+        );
+        assert_eq!(
+            defaults.lookup(&parse("Ctrl+Down").unwrap()),
+            Some(Action::ScrollDown)
+        );
+    }
+
     /// Every action advertised by `all_actions()` either has a default
     /// binding or is on the explicit "palette / TOML-only" allowlist
     /// below. The allowlist exists so a newly-added Action without a
@@ -849,6 +895,10 @@ mod tests {
             Action::UndoClearBlocks,
             Action::JumpToPrevFailed,
             Action::JumpToNextFailed,
+            Action::PreviousCommand,
+            Action::NextCommand,
+            Action::ReturnToLive,
+            Action::CopyCurrentCommand,
             // Folding is a triage gesture, not a hot key: reachable from the
             // palette and bindable in TOML, like the rest of this list.
             Action::CollapseAllBlocks,
