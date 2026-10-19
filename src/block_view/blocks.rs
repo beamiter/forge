@@ -51,9 +51,7 @@ fn set_folded_summary(button: &gtk4::Button, summary: &str, preview: Option<&str
         summary.to_string()
     };
     button.update_property(&[gtk4::accessible::Property::Label(&accessible)]);
-    button.set_tooltip_text(Some(
-        "Show output. Preview shows the last non-empty retained line.",
-    ));
+    button.set_tooltip_text(Some(&accessible));
 }
 
 /// Conservative per-pane estimated-memory budget for completed-block objects.
@@ -1265,11 +1263,26 @@ fn collapsed_output_summary(rows: i64) -> String {
     format!("▸ {} hidden — click to show", line_count_text(rows))
 }
 
-fn collapsed_content_summary(rows: i64, has_text: bool, has_images: bool) -> String {
-    if !has_text && has_images {
-        "▸ Images hidden — click to show".to_string()
+fn collapsed_content_summary(rows: i64, has_text: bool, hidden_image_count: usize) -> String {
+    if hidden_image_count == 0 {
+        return if has_text {
+            collapsed_output_summary(rows)
+        } else {
+            "▸ No output to show".to_string()
+        };
+    }
+    let images = if hidden_image_count == 1 {
+        "1 image".to_string()
     } else {
-        collapsed_output_summary(rows)
+        format!("{hidden_image_count} images")
+    };
+    if has_text {
+        format!(
+            "▸ {} and {images} hidden — click to show",
+            line_count_text(rows)
+        )
+    } else {
+        format!("▸ {images} hidden — click to show")
     }
 }
 
@@ -3201,6 +3214,9 @@ impl FinishedBlock {
         // a max-height bound so a tall plot doesn't push the next block
         // off-screen; one shared box lets the collapse chevron hide them
         // together with the text output.
+        // Count only Pictures actually owned by this foldable box. Live
+        // Unified images and text/preview placeholders are not hidden here.
+        let mut hidden_image_count = 0;
         let images_box: Option<gtk4::Box> = if images.is_empty() {
             None
         } else {
@@ -3218,6 +3234,7 @@ impl FinishedBlock {
                 // rows of block real estate; the outer history scrolls past.
                 pic.set_size_request(-1, tex.height().clamp(64, 600));
                 ib.append(&pic);
+                hidden_image_count += 1;
             }
             content.append(&ib);
             Some(ib)
@@ -3228,7 +3245,7 @@ impl FinishedBlock {
         // had scrolled away from the pointer. Keep a compact, keyboard-focusable
         // summary in the document instead; it both preserves the output's scale
         // and is a large, obvious target to restore it.
-        let summary = collapsed_content_summary(output_rows, has_output, !images.is_empty());
+        let summary = collapsed_content_summary(output_rows, has_output, hidden_image_count);
         let original_preview = Rc::new(
             precomputed
                 .output_preview
@@ -3278,7 +3295,7 @@ impl FinishedBlock {
             crate::terminal::install_hyperlink_hover_tooltip(&output_vte);
         }
 
-        let has_images = images_box.is_some();
+        let has_images = hidden_image_count > 0;
         // Output-only controls are noise for commands such as `cd`,
         // `mkdir`, and successful redirects. Image-only commands (`kitten
         // icat`) still keep the collapse chevron so their Pictures fold away.
@@ -3653,7 +3670,11 @@ impl FinishedBlock {
                             });
                             set_folded_summary(
                                 &collapsed_summary,
-                                &collapsed_content_summary(shown_rows, has_output, has_images),
+                                &collapsed_content_summary(
+                                    shown_rows,
+                                    !shown.trim().is_empty(),
+                                    hidden_image_count,
+                                ),
                                 preview.as_deref(),
                             );
                             expand_btn.set_visible(can_expand);
@@ -5152,17 +5173,76 @@ mod tests {
     #[test]
     fn image_only_fold_summary_never_invents_text_rows() {
         for rows in [0, 1, 20] {
-            let summary = super::collapsed_content_summary(rows, false, true);
-            assert!(summary.contains("Images hidden"));
-            assert!(!summary.contains("line"));
+            assert_eq!(
+                super::collapsed_content_summary(rows, false, 1),
+                "▸ 1 image hidden — click to show"
+            );
+            assert_eq!(
+                super::collapsed_content_summary(rows, false, 3),
+                "▸ 3 images hidden — click to show"
+            );
         }
+    }
+
+    #[test]
+    fn mixed_fold_summary_discloses_lines_and_images() {
+        for (rows, lines) in [(1, "1 line"), (2, "2 lines")] {
+            for (images, label) in [(1, "1 image"), (3, "3 images")] {
+                assert_eq!(
+                    super::collapsed_content_summary(rows, true, images),
+                    format!("▸ {lines} and {label} hidden — click to show")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn text_only_fold_summary_does_not_infer_images_from_content() {
+        for rows in [0, 1, 2, 42] {
+            assert_eq!(
+                super::collapsed_content_summary(rows, true, 0),
+                super::collapsed_output_summary(rows)
+            );
+        }
+    }
+
+    #[test]
+    fn empty_fold_summary_never_invents_text_rows() {
+        for rows in [0, 1, 20] {
+            assert_eq!(
+                super::collapsed_content_summary(rows, false, 0),
+                "▸ No output to show"
+            );
+        }
+    }
+
+    #[test]
+    fn filtering_text_preserves_folded_image_count() {
+        let images = 3;
+        for _ in 0..3 {
+            for (shown, rows, expected) in [
+                (
+                    "first\nlast",
+                    2,
+                    "▸ 2 lines and 3 images hidden — click to show",
+                ),
+                ("last", 1, "▸ 1 line and 3 images hidden — click to show"),
+                ("", 1, "▸ 3 images hidden — click to show"),
+                (" \r\n", 2, "▸ 3 images hidden — click to show"),
+            ] {
+                assert_eq!(
+                    super::collapsed_content_summary(rows, !shown.trim().is_empty(), images),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn folded_image_count_is_not_truncated() {
         assert_eq!(
-            super::collapsed_content_summary(2, true, false),
-            super::collapsed_output_summary(2)
-        );
-        assert_eq!(
-            super::collapsed_content_summary(2, true, true),
-            super::collapsed_output_summary(2)
+            super::collapsed_content_summary(1, false, usize::MAX),
+            format!("▸ {} images hidden — click to show", usize::MAX)
         );
     }
 
