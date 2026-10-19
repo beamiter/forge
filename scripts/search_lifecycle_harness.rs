@@ -11,6 +11,12 @@ mod gtk4 {
     pub use crate::glib;
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct Widget(pub usize);
+    impl Widget {
+        pub fn is_ancestor(&self, bar: &super::SearchBar) -> bool {
+            // The entry is the only descendant in this fixture's widget tree.
+            self == &bar.entry_widget
+        }
+    }
 }
 // The production closure body remains unchanged; only GLib's boxing boundary
 // is replaced so no native signal, widget, or display is required.
@@ -149,8 +155,40 @@ mod block_view {
         pub queries: Rc<RefCell<Vec<String>>>,
         pub cleared: Rc<Cell<usize>>,
         pub revealed: Rc<Cell<usize>>,
+        pub terminal: vte4::Terminal,
+        pub root: MappedWidget,
+        pub focused: Rc<Cell<usize>>,
+    }
+    #[derive(Clone)]
+    pub struct MappedWidget(pub Rc<Cell<bool>>);
+    impl MappedWidget {
+        pub fn is_mapped(&self) -> bool {
+            self.0.get()
+        }
+    }
+    impl Default for TermView {
+        fn default() -> Self {
+            Self {
+                result: FindSearchResult::NoMatches,
+                queries: Default::default(),
+                cleared: Default::default(),
+                revealed: Default::default(),
+                terminal: Default::default(),
+                root: MappedWidget(Rc::new(Cell::new(true))),
+                focused: Default::default(),
+            }
+        }
     }
     impl TermView {
+        pub fn vte(&self) -> &vte4::Terminal {
+            &self.terminal
+        }
+        pub fn widget(&self) -> &MappedWidget {
+            &self.root
+        }
+        pub fn grab_focus(&self) {
+            self.focused.set(self.focused.get() + 1);
+        }
         pub fn clear_find(&self) {
             self.cleared.set(self.cleared.get() + 1)
         }
@@ -174,6 +212,7 @@ struct Entry {
     text: Rc<RefCell<String>>,
     focus_count: Rc<Cell<usize>>,
     focus_events: Rc<RefCell<Vec<&'static str>>>,
+    focus_target: Option<(FocusRoot, gtk4::Widget)>,
 }
 impl Entry {
     fn text(&self) -> String {
@@ -182,19 +221,58 @@ impl Entry {
     fn grab_focus(&self) {
         self.focus_count.set(self.focus_count.get() + 1);
         self.focus_events.borrow_mut().push("entry-focus");
+        if let Some((root, widget)) = &self.focus_target {
+            *root.0.borrow_mut() = Some(widget.clone());
+        }
     }
     fn set_text(&self, s: &str) {
         *self.text.borrow_mut() = s.into();
     }
 }
 #[derive(Clone, Default)]
-struct SearchBar(Rc<Cell<bool>>);
+struct FocusRoot(Rc<RefCell<Option<gtk4::Widget>>>);
+impl FocusRoot {
+    fn focus(&self) -> Option<gtk4::Widget> {
+        self.0.borrow().clone()
+    }
+}
+#[derive(Clone)]
+struct SearchBar {
+    mode: Rc<Cell<bool>>,
+    root: Option<FocusRoot>,
+    widget: gtk4::Widget,
+    entry_widget: gtk4::Widget,
+}
+impl Default for SearchBar {
+    fn default() -> Self {
+        Self {
+            mode: Default::default(),
+            root: Some(FocusRoot::default()),
+            widget: gtk4::Widget(usize::MAX),
+            entry_widget: gtk4::Widget(usize::MAX - 1),
+        }
+    }
+}
+impl AsRef<gtk4::Widget> for SearchBar {
+    fn as_ref(&self) -> &gtk4::Widget {
+        &self.widget
+    }
+}
 impl SearchBar {
     fn is_search_mode(&self) -> bool {
-        self.0.get()
+        self.mode.get()
     }
     fn set_search_mode(&self, b: bool) {
-        self.0.set(b)
+        self.mode.set(b)
+    }
+    fn root(&self) -> Option<FocusRoot> {
+        self.root.clone()
+    }
+    fn upcast_ref<T>(&self) -> &T
+    where
+        Self: AsRef<T>,
+    {
+        self.as_ref()
     }
 }
 #[derive(Clone, Default)]
@@ -255,6 +333,7 @@ mod ui {
         views: Vec<Option<Rc<TermView>>>,
         tab_focus_generation: Rc<Cell<u64>>,
         terminal_focus_requests: Rc<RefCell<Vec<(vte4::Terminal, u32)>>>,
+        current_terminal_focuses: Rc<Cell<usize>>,
     }
     impl UiState {
         fn current_terminal(&self) -> Option<vte4::Terminal> {
@@ -269,7 +348,10 @@ mod ui {
         fn term_view_in_page(&self, w: &gtk4::Widget) -> Option<Rc<TermView>> {
             self.views.get(w.0).cloned().flatten()
         }
-        fn focus_current_terminal(&self) {}
+        fn focus_current_terminal(&self) {
+            self.current_terminal_focuses
+                .set(self.current_terminal_focuses.get() + 1);
+        }
         fn invalidate_tab_focus_requests(&self) -> u64 {
             let generation = self.tab_focus_generation.get().wrapping_add(1);
             self.tab_focus_generation.set(generation);
@@ -286,9 +368,18 @@ mod ui {
         // @search-lifecycle:source
     }
     fn setup() -> UiState {
+        let search_bar = SearchBar::default();
+        search_bar.set_search_mode(true);
+        let search_entry = Entry {
+            focus_target: Some((
+                search_bar.root.clone().unwrap(),
+                search_bar.entry_widget.clone(),
+            )),
+            ..Entry::default()
+        };
         UiState {
-            search_bar: SearchBar(Rc::new(Cell::new(true))),
-            search_entry: Entry::default(),
+            search_bar,
+            search_entry,
             search_status: Label::default(),
             search_generation: Rc::new(Cell::new(0)),
             search_owner: Rc::new(RefCell::new(None)),
@@ -298,6 +389,7 @@ mod ui {
             views: vec![None, None],
             tab_focus_generation: Rc::new(Cell::new(0)),
             terminal_focus_requests: Rc::new(RefCell::new(Vec::new())),
+            current_terminal_focuses: Rc::new(Cell::new(0)),
         }
     }
     fn switch_page(ui: &UiState, target: usize) {
@@ -319,6 +411,113 @@ mod ui {
         let search_entry = ui.search_entry.clone();
         // @search-lifecycle:after-registration
         notebook
+    }
+
+    #[test]
+    fn pane_find_pins_edits_and_steps_until_an_explicit_page_switch() {
+        let mut ui = setup();
+        let owner = Rc::new(TermView {
+            terminal: ui.terminals[0].clone(),
+            ..TermView::default()
+        });
+        let sibling = Rc::new(TermView {
+            terminal: ui.terminals[1].clone(),
+            ..TermView::default()
+        });
+        ui.views = vec![Some(owner.clone()), Some(sibling.clone())];
+        ui.current.set(1);
+        ui.search_entry.set_text("captured");
+        ui.show_search_for(&owner);
+        assert_eq!(*ui.terminals[0].installed.borrow(), Some("captured".into()));
+        assert!(ui.terminals[1].installed.borrow().is_none());
+        ui.search_entry.set_text("edited");
+        ui.schedule_search_apply();
+        glib::run_pending();
+        let steps = ui.terminals[0].steps.get();
+        ui.search_next();
+        ui.search_prev();
+        assert_eq!(ui.terminals[0].steps.get(), steps + 2);
+        assert_eq!(owner.queries.borrow().as_slice(), ["captured", "edited"]);
+        assert!(sibling.queries.borrow().is_empty());
+        assert!(ui.terminals[1].installed.borrow().is_none());
+        switch_page(&ui, 1);
+        assert!(ui.terminals[0].installed.borrow().is_none());
+        assert_eq!(*ui.terminals[1].installed.borrow(), Some("edited".into()));
+        assert_eq!(sibling.queries.borrow().as_slice(), ["edited"]);
+    }
+
+    #[test]
+    fn hidden_or_destroyed_pinned_owner_never_retargets_its_sibling() {
+        for hidden in [true, false] {
+            let mut ui = setup();
+            let owner = Rc::new(TermView {
+                terminal: ui.terminals[0].clone(),
+                ..TermView::default()
+            });
+            let weak = Rc::downgrade(&owner);
+            ui.views[0] = Some(owner.clone());
+            ui.search_entry.set_text("old");
+            ui.show_search_for(&owner);
+            ui.current.set(1);
+            if hidden {
+                owner.root.0.set(false);
+            } else {
+                ui.views[0] = None;
+            }
+            drop(owner);
+            assert_eq!(weak.upgrade().is_some(), hidden);
+            ui.search_entry.set_text("must-not-rebind");
+            ui.schedule_search_apply();
+            glib::run_pending();
+            ui.search_next();
+            ui.search_prev();
+            assert_eq!(
+                ui.search_status.0.borrow().as_str(),
+                "The search pane is no longer available"
+            );
+            assert!(ui
+                .terminals
+                .iter()
+                .all(|term| term.installed.borrow().is_none()));
+            assert_eq!(ui.terminals[1].steps.get(), 0);
+            ui.toggle_search();
+            assert_eq!(ui.current_terminal_focuses.get(), 0);
+        }
+    }
+
+    #[test]
+    fn closing_pinned_search_restores_only_focus_still_owned_by_the_bar() {
+        // Direct bar focus, its entry, a newer sibling, no focus, and unrooting
+        // exercise both ownership predicates without native GTK side effects.
+        for focus in 0..5 {
+            let mut ui = setup();
+            let owner = Rc::new(TermView {
+                terminal: ui.terminals[0].clone(),
+                ..TermView::default()
+            });
+            ui.views[0] = Some(owner.clone());
+            ui.search_entry.set_text("owner");
+            ui.show_search_for(&owner);
+            ui.current.set(1);
+            if focus == 4 {
+                ui.search_bar.root = None;
+            } else {
+                *ui.search_bar.root.as_ref().unwrap().0.borrow_mut() = match focus {
+                    0 => Some(ui.search_bar.widget.clone()),
+                    1 => Some(ui.search_bar.entry_widget.clone()),
+                    2 => Some(gtk4::Widget(42)),
+                    _ => None,
+                };
+            }
+            ui.toggle_search();
+            assert_eq!(owner.focused.get(), usize::from(focus < 2));
+            assert_eq!(ui.current_terminal_focuses.get(), 0);
+            assert!(ui.search_owner.borrow().is_none());
+            assert!(ui
+                .terminals
+                .iter()
+                .all(|term| term.installed.borrow().is_none()));
+        }
     }
 
     #[test]
@@ -402,6 +601,7 @@ mod ui {
             queries: Rc::new(RefCell::new(Vec::new())),
             cleared: Rc::new(Cell::new(0)),
             revealed: Rc::new(Cell::new(0)),
+            ..TermView::default()
         });
         ui.views[1] = Some(view.clone());
         switch_page(&ui, 1);
@@ -502,6 +702,7 @@ mod ui {
                 queries: Rc::new(RefCell::new(Vec::new())),
                 cleared: Rc::new(Cell::new(0)),
                 revealed: Rc::new(Cell::new(0)),
+                ..TermView::default()
             }));
             ui.search_entry.set_text("new-block-query");
             ui.search_apply();
@@ -566,6 +767,7 @@ mod ui {
             queries: Rc::new(RefCell::new(Vec::new())),
             cleared: Rc::new(Cell::new(0)),
             revealed: Rc::new(Cell::new(0)),
+            ..TermView::default()
         });
         ui.views[1] = Some(view.clone());
         ui.search_entry.set_text("needle");
@@ -609,6 +811,7 @@ mod ui {
             queries: Rc::new(RefCell::new(Vec::new())),
             cleared: Rc::new(Cell::new(0)),
             revealed: Rc::new(Cell::new(0)),
+            ..TermView::default()
         });
         ui.views[0] = Some(view.clone());
         ui.search_entry.set_text("owner-query");
@@ -634,6 +837,7 @@ mod ui {
             queries: Rc::new(RefCell::new(Vec::new())),
             cleared: Rc::new(Cell::new(0)),
             revealed: Rc::new(Cell::new(0)),
+            ..TermView::default()
         });
         let weak_view = Rc::downgrade(&view);
         let weak_terminal = ui.terminals[0].downgrade();
@@ -713,6 +917,7 @@ mod ui {
             queries: Rc::new(RefCell::new(Vec::new())),
             cleared: Rc::new(Cell::new(0)),
             revealed: Rc::new(Cell::new(0)),
+            ..TermView::default()
         });
         ui.views[0] = Some(view.clone());
         ui.search_entry.set_text("needle");

@@ -11629,7 +11629,15 @@ mod tests {
 
     #[test]
     fn reactions_and_presence_cues_start_on_their_canonical_frame() {
-        let global = 57;
+        // Weighted sprite cadence can revisit the canonical pose at any
+        // particular global tick. Choose a real alternate frame so the
+        // regression keeps proving that a new event resets that live epoch.
+        let global = (1..240)
+            .find(|&frame| {
+                sprite_frame(Behavior::Celebrate, BodyLanguage::default(), false, frame)
+                    != Behavior::Celebrate.sprite()
+            })
+            .expect("Celebrate must expose an alternate live frame in the sampled cycle");
         let (baseline, live) = animation_frames(global, global, 0, SurfaceMode::Reacting, None);
         assert_eq!((baseline, live), (0, 0));
         assert_eq!(

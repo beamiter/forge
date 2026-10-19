@@ -34,7 +34,7 @@
                 # d5492320686879c8b92106d2e31e4293ff125a5a
                 "jagent-0.7.0" = "sha256-VoockpfPMDhYutNOVaY8Rp2juKYt8dWz031PBfGUIvM=";
                 # d7dc25ef8d3a54c9126571589591b26f70854f18
-                "jterm_core-0.2.0" = "sha256-gUtGYt/en9T3JUK6kjDtnkmNJdgatMiCo16ElxULSzM=";
+                "jterm_core-0.2.0" = "sha256-De4IVnKZ56RTtxbXD/bFoPfI/OXUpgMbgWKxBplRm/4=";
               };
             };
             strictDeps = true;

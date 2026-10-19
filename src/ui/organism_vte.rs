@@ -2268,9 +2268,13 @@ mod tests {
             .split_once("    pub(crate) fn greet_ascii_organism_for(")
             .unwrap()
             .1
-            .split_once("    /// Revoke synchronously")
+            // Only this rustfmt-indented method owns the greeting contract;
+            // adjacent inspector methods legitimately resolve current panes.
+            .split_once("\n    }\n")
             .unwrap()
             .0;
+        assert!(request.contains("runtime.request_greeting(&view)"));
+        assert!(!request.contains("pub(crate) fn "));
         assert!(!request.contains("current_pane"));
         assert!(!request.contains("current_term_view"));
         let rejection = request
