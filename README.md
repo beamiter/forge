@@ -408,8 +408,10 @@ pane 重播。它是不可点击且不参与测量
 Out` 可把搜索限制到全部文本、命令或输出，`Ctrl+O` 循环切换；范围过滤发生在 500 条结果
 上限之前，因此另一类文本不会挤占所选范围的结果预算。`Failed` 只保留真正失败的块（不把用户
 主动中断算失败），`Slow`
-只保留耗时至少 1 秒的块；两者可组合且同样先于结果上限执行。查询为空时，任一元数据筛选仍会
-为每个符合条件且在所选范围有内容的保留块生成一条可定位代表结果，因此可独立浏览失败或慢块。
+只保留耗时至少 1 秒的块；两者可组合且同样先于结果上限执行。查询为空时直接浏览保留块，无需
+先开启筛选；每个符合条件且在所选范围有内容的块生成一条代表结果，筛选可进一步收窄到失败、慢块
+或书签。`All` / `Cmd` 的命令行直接来自命令元数据，无需为未使用的大段输出消耗扫描预算。
+同一 pane 的连续扫描与刷新会复用已编译查询；无效正则也只编译一次，直到查询或匹配选项变化。
 结果列表显示当前位置，并支持
 `↑/↓` 循环、`Home/End` 首尾跳转及 `PageUp/PageDown` 十条分页；查询框保持焦点且选中行
 会自动滚入可视区域。`Enter` 定位并关闭；`Shift+Enter` 在成功定位实时终端结果后保持面板并
@@ -502,7 +504,12 @@ AI / Agent / 命令面板的建议仍然只 **Insert for review**，永不自行
 **Collapse all blocks** / **Expand all blocks** / **Collapse or expand block** 同样在命令面板里，
 用于快速收拢一长串输出；这三个和 Undo 一样默认不占快捷键，可在 `[keybindings]` 里自行绑定
 （`collapse_all_blocks`、`expand_all_blocks`、`toggle_block_collapsed`、`undo_clear_blocks`）。
-折叠状态目前不跨重启保存。
+**Collapse selected output** / **Expand selected output** 则明确处理完整的已选完成块集合，
+混合选区可直接统一收拢或展开；对应 `collapse_selected_blocks` / `expand_selected_blocks`，默认
+不占快捷键。空选区不会退回最新块，任何已选 id 过期都会拒绝整批，无可折叠输出的块保持原状，
+提示只统计实际改变的块数。选区、焦点、实时输入与运行中命令状态保持不变，虚拟化高度按批次更新。
+折叠状态目前不跨重启保存。空查询浏览、四端一致的相邻 pane 定位与验证命令见
+[Block workspace navigation and triage](docs/block-workspace.md)。
 卡片 header 的 **Block actions**（⋮）始终可见，鼠标、触摸和 Tab 键都能找到完整操作，
 与右键菜单共用同一动作和安全门禁；不必先知道右键或快捷键。菜单高度有界，长菜单可滚动，
 反复点击不会叠出多个实例。header 快捷区只保留复制输出与 **Insert for review**，后者只回填

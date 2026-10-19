@@ -490,6 +490,15 @@ impl UiState {
                     }
                 }
             }
+            Action::CollapseSelectedBlocks | Action::ExpandSelectedBlocks => {
+                let collapse = action == Action::CollapseSelectedBlocks;
+                let result = self.current_term_view().map_or(
+                    crate::block_view::FoldSelectionResult::Unavailable,
+                    |view| view.set_selected_blocks_collapsed(collapse),
+                );
+                self.toast_overlay
+                    .add_toast(adw::Toast::new(&result.notice(collapse)));
+            }
             Action::ToggleBlockCollapsed => {
                 log::info!("Toggle block output");
                 if let Some(term_view) = self.current_term_view() {

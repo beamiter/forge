@@ -1869,7 +1869,7 @@ fn cross_block_search_dialog_title() -> &'static str {
 }
 
 fn cross_block_search_idle_status() -> &'static str {
-    "Type to search. F5 refreshes; Ctrl+Shift+B bookmarks; Shift+Enter jumps and advances."
+    "Browse blocks or type to search. F5 refreshes; Ctrl+Shift+B bookmarks; Shift+Enter jumps and advances."
 }
 
 fn cross_block_search_pending_status() -> &'static str {
@@ -2271,16 +2271,6 @@ impl CrossBlockRefreshFrameGate {
 fn cross_block_search_query_error(query: &str) -> Option<&'static str> {
     (query.len() > CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES)
         .then_some("Query is too long (maximum 8 KiB).")
-}
-
-fn cross_block_search_has_intent(
-    query: &str,
-    failed_only: bool,
-    slow_only: bool,
-    background_only: bool,
-    bookmarked_only: bool,
-) -> bool {
-    !query.is_empty() || failed_only || slow_only || background_only || bookmarked_only
 }
 
 fn cross_block_search_compact_layout(
@@ -3630,7 +3620,7 @@ impl UiState {
         let compact_scroll = cross_block_search_compact_layout(&matching_row, &filter_row);
 
         let filter_entry = SearchEntry::new();
-        filter_entry.set_placeholder_text(Some("Search across blocks…"));
+        filter_entry.set_placeholder_text(Some("Browse blocks or type to search…"));
         filter_entry.set_hexpand(true);
         case_toggle.set_active(remembered.options.case_sensitive);
         regex_toggle.set_active(remembered.options.regex);
@@ -3649,7 +3639,7 @@ impl UiState {
         list_box.set_margin_end(12);
         list_box.set_margin_bottom(12);
 
-        let status_label = Label::new(None);
+        let status_label = Label::new(Some(cross_block_search_idle_status()));
         status_label.add_css_class("dim-label");
         status_label.set_accessible_role(gtk4::AccessibleRole::Status);
         status_label.set_xalign(0.0);
@@ -3777,18 +3767,6 @@ impl UiState {
                 };
                 clear_list_box(&list_box);
                 row_bookmark_buttons.borrow_mut().clear();
-                if !cross_block_search_has_intent(
-                    &query,
-                    filters.failed_only,
-                    filters.slow_only,
-                    filters.background_only,
-                    filters.bookmarked_only,
-                ) {
-                    hits.borrow_mut().clear();
-                    scan_incomplete.set(false);
-                    status_label.set_text(cross_block_search_idle_status());
-                    return;
-                }
                 if let Some(message) = cross_block_search_query_error(&query) {
                     hits.borrow_mut().clear();
                     scan_incomplete.set(false);
@@ -3968,10 +3946,6 @@ impl UiState {
             let status_label = status_label.clone();
             let filter_entry = filter_entry.clone();
             let retained_hit = retained_hit.clone();
-            let failed_toggle = failed_toggle.clone();
-            let slow_toggle = slow_toggle.clone();
-            let background_toggle = background_toggle.clone();
-            let bookmarked_toggle = bookmarked_toggle.clone();
             Rc::new(move |preserve_selection: bool| {
                 let generation = search_generation.get().wrapping_add(1);
                 search_generation.set(generation);
@@ -3996,18 +3970,6 @@ impl UiState {
                 } else {
                     None
                 };
-                if !cross_block_search_has_intent(
-                    filter_entry.text().as_str(),
-                    failed_toggle.is_active(),
-                    slow_toggle.is_active(),
-                    background_toggle.is_active(),
-                    bookmarked_toggle.is_active(),
-                ) {
-                    clear_list_box(&list_box);
-                    hits.borrow_mut().clear();
-                    status_label.set_text(cross_block_search_idle_status());
-                    return;
-                }
                 if let Some(message) = cross_block_search_query_error(filter_entry.text().as_str())
                 {
                     clear_list_box(&list_box);
@@ -4561,15 +4523,7 @@ impl UiState {
 
         *self.cross_block_search_dialog.borrow_mut() = Some(dialog.clone());
         dialog.present(Some(&self.window));
-        if cross_block_search_has_intent(
-            &remembered.query,
-            remembered.failed_only,
-            remembered.slow_only,
-            remembered.background_only,
-            remembered.bookmarked_only,
-        ) {
-            schedule_rebuild(false);
-        }
+        schedule_rebuild(false);
         filter_entry.grab_focus();
     }
 
@@ -6706,13 +6660,13 @@ mod tests {
         cross_block_focus_confirms_result, cross_block_jump_outcome,
         cross_block_refresh_selection_index, cross_block_search_compact_layout,
         cross_block_search_dialog_for_close, cross_block_search_dialog_title,
-        cross_block_search_has_intent, cross_block_search_idle_status,
-        cross_block_search_is_bookmark_shortcut, cross_block_search_is_plain_refresh_key,
-        cross_block_search_jump_unavailable_status, cross_block_search_memory,
-        cross_block_search_pending_status, cross_block_search_query_error,
-        cross_block_search_refresh_status, cross_block_search_status, cross_block_selection_index,
-        cross_block_should_step, finish_workflow_insertion, overlay_scan_status,
-        preferences_group_title, record_snapshot_dialog_title, record_snapshot_status_line,
+        cross_block_search_idle_status, cross_block_search_is_bookmark_shortcut,
+        cross_block_search_is_plain_refresh_key, cross_block_search_jump_unavailable_status,
+        cross_block_search_memory, cross_block_search_pending_status,
+        cross_block_search_query_error, cross_block_search_refresh_status,
+        cross_block_search_status, cross_block_selection_index, cross_block_should_step,
+        finish_workflow_insertion, overlay_scan_status, preferences_group_title,
+        record_snapshot_dialog_title, record_snapshot_status_line,
         record_snapshot_unavailable_message, record_workflow_arg_entry_change, remote_picker_guard,
         CrossBlockBookmarkKeyDecision, CrossBlockBookmarkKeyLatch, CrossBlockEnterKeyRoute,
         CrossBlockJumpOutcome, CrossBlockRefreshFrameDecision, CrossBlockRefreshFrameGate,
@@ -7235,7 +7189,7 @@ mod tests {
         assert_eq!(cross_block_search_dialog_title(), "Search Blocks");
         assert_eq!(
             cross_block_search_idle_status(),
-            "Type to search. F5 refreshes; Ctrl+Shift+B bookmarks; Shift+Enter jumps and advances."
+            "Browse blocks or type to search. F5 refreshes; Ctrl+Shift+B bookmarks; Shift+Enter jumps and advances."
         );
         assert_eq!(cross_block_search_pending_status(), "Searching blocks…");
         assert_eq!(cross_block_search_refresh_status(), "Refreshing blocks…");
@@ -7814,21 +7768,6 @@ mod tests {
             &"界".repeat(CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES / 3 + 1)
         )
         .is_some());
-    }
-
-    #[test]
-    fn cross_block_search_metadata_filters_are_intent_without_text() {
-        assert!(!cross_block_search_has_intent(
-            "", false, false, false, false
-        ));
-        assert!(cross_block_search_has_intent(
-            "needle", false, false, false, false
-        ));
-        assert!(cross_block_search_has_intent("", true, false, false, false));
-        assert!(cross_block_search_has_intent("", false, true, false, false));
-        assert!(cross_block_search_has_intent("", false, false, true, false));
-        assert!(cross_block_search_has_intent("", false, false, false, true));
-        assert!(cross_block_search_has_intent("", true, true, true, true));
     }
 
     #[test]

@@ -97,6 +97,9 @@ pub(crate) enum Action {
     CollapseAllBlocks,
     /// Unfold every finished block's output.
     ExpandAllBlocks,
+    /// Fold or unfold only the explicit selection; palette-only by default.
+    CollapseSelectedBlocks,
+    ExpandSelectedBlocks,
     /// Fold or unfold the selected block (or the newest one).
     ToggleBlockCollapsed,
     /// Put selected commands back into the live editor in terminal order.
@@ -222,6 +225,8 @@ impl Action {
             Action::UndoClearBlocks => "Undo removing blocks",
             Action::CollapseAllBlocks => "Collapse all blocks",
             Action::ExpandAllBlocks => "Expand all blocks",
+            Action::CollapseSelectedBlocks => "Collapse selected output",
+            Action::ExpandSelectedBlocks => "Expand selected output",
             Action::ToggleBlockCollapsed => "Collapse or expand block",
             Action::ReinputSelectedCommands => "Reinput selected commands",
             Action::JumpToPrevPinned => "Jump to previous bookmarked block",
@@ -314,6 +319,8 @@ impl Action {
             Action::UndoClearBlocks => Some("undo_clear_blocks"),
             Action::CollapseAllBlocks => Some("collapse_all_blocks"),
             Action::ExpandAllBlocks => Some("expand_all_blocks"),
+            Action::CollapseSelectedBlocks => Some("collapse_selected_blocks"),
+            Action::ExpandSelectedBlocks => Some("expand_selected_blocks"),
             Action::ToggleBlockCollapsed => Some("toggle_block_collapsed"),
             Action::ReinputSelectedCommands => Some("reinput_selected_commands"),
             Action::JumpToPrevPinned => Some("jump_to_prev_pinned"),
@@ -404,6 +411,8 @@ impl Action {
             Action::UndoClearBlocks,
             Action::CollapseAllBlocks,
             Action::ExpandAllBlocks,
+            Action::CollapseSelectedBlocks,
+            Action::ExpandSelectedBlocks,
             Action::ToggleBlockCollapsed,
             Action::ReinputSelectedCommands,
             Action::JumpToPrevPinned,
@@ -430,6 +439,8 @@ impl Action {
     /// returned by [`Self::config_key`].
     pub(crate) fn from_config_key(key: &str) -> Option<Action> {
         let alias = match key {
+            "block:collapse_selected" => Some(Action::CollapseSelectedBlocks),
+            "block:expand_selected" => Some(Action::ExpandSelectedBlocks),
             "open_ai_panel" => Some(Action::OpenAiPanel),
             "open_history_palette" => Some(Action::HistoryPalette),
             "open_workflows" => Some(Action::WorkflowsPalette),
@@ -444,13 +455,7 @@ impl Action {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Direction {
-    Left,
-    Right,
-    Up,
-    Down,
-}
+pub(crate) use jterm_core::pane_layout::PaneDirection as Direction;
 
 #[derive(Clone)]
 pub(crate) struct KeybindingMap {
@@ -764,6 +769,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn selected_output_actions_are_discoverable_bindable_and_do_not_reserve_keys() {
+        let defaults = KeybindingMap::from_defaults();
+        for (action, key, alias) in [
+            (
+                Action::CollapseSelectedBlocks,
+                "collapse_selected_blocks",
+                "block:collapse_selected",
+            ),
+            (
+                Action::ExpandSelectedBlocks,
+                "expand_selected_blocks",
+                "block:expand_selected",
+            ),
+        ] {
+            assert_eq!(Action::from_config_key(key), Some(action));
+            assert_eq!(Action::from_config_key(alias), Some(action));
+            assert!(Action::all_actions().contains(&action));
+            assert!(defaults.binding_display(&action).is_empty());
+            for name in [key, alias] {
+                let table = format!("'{name}' = 'F8'").parse::<toml::Table>().unwrap();
+                let customized = KeybindingMap::from_user_overrides(&table).unwrap();
+                assert_eq!(customized.lookup(&parse("F8").unwrap()), Some(action));
+            }
+        }
+    }
+
+    #[test]
     fn hello_is_discoverable_without_a_default_shortcut() {
         let map = KeybindingMap::from_defaults();
         assert!(map
@@ -821,6 +853,8 @@ mod tests {
             // palette and bindable in TOML, like the rest of this list.
             Action::CollapseAllBlocks,
             Action::ExpandAllBlocks,
+            Action::CollapseSelectedBlocks,
+            Action::ExpandSelectedBlocks,
             Action::ToggleBlockCollapsed,
             // anvil leaves session export chordless too; both GTK terminals
             // reach it from the command palette only.

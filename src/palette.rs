@@ -284,6 +284,8 @@ mod tests {
             // a keyboard user triages a long session at all.
             Action::CollapseAllBlocks,
             Action::ExpandAllBlocks,
+            Action::CollapseSelectedBlocks,
+            Action::ExpandSelectedBlocks,
             Action::ToggleBlockCollapsed,
         ] {
             let entries = gather(

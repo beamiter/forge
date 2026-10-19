@@ -1,6 +1,7 @@
 //! panes — UiState methods extracted from ui (mechanical split, no logic changes)
 use gtk4::prelude::*;
 use gtk4::{Orientation, Paned};
+use jterm_core::pane_layout::{directional_focus_target, PaneRect, Rect as PaneBounds};
 use libadwaita as adw;
 use std::io;
 use std::rc::Rc;
@@ -59,40 +60,6 @@ fn balanced_split_position(extent: i32, start_span: u32, end_span: u32) -> Optio
     let total_span = u64::from(start_span) + u64::from(end_span);
     let position = i64::from(extent) * i64::from(start_span) / total_span as i64;
     Some(position.clamp(1, i64::from(extent - 1)) as i32)
-}
-
-fn nearest_directional_index(
-    centers: &[(f32, f32)],
-    focused: usize,
-    direction: Direction,
-) -> Option<usize> {
-    let (focused_x, focused_y) = *centers.get(focused)?;
-    centers
-        .iter()
-        .enumerate()
-        .filter_map(|(index, &(x, y))| {
-            if index == focused {
-                return None;
-            }
-            let dx = x - focused_x;
-            let dy = y - focused_y;
-            let in_direction = match direction {
-                Direction::Left => dx < -1.0,
-                Direction::Right => dx > 1.0,
-                Direction::Up => dy < -1.0,
-                Direction::Down => dy > 1.0,
-            };
-            if !in_direction {
-                return None;
-            }
-            let distance = match direction {
-                Direction::Left | Direction::Right => dx.abs() + dy.abs() * 0.1,
-                Direction::Up | Direction::Down => dy.abs() + dx.abs() * 0.1,
-            };
-            Some((index, distance))
-        })
-        .min_by(|(_, left), (_, right)| left.total_cmp(right))
-        .map(|(index, _)| index)
 }
 
 /// The pane `focused` should swap with: the next entry in visual order,
@@ -1158,12 +1125,21 @@ impl UiState {
         let mut positioned = Vec::with_capacity(leaves.len());
         for leaf in leaves {
             let root = leaf.root_widget();
+            if !root.is_mapped() {
+                continue;
+            }
             let Some(bounds) = root.compute_bounds(&page_widget) else {
                 continue;
             };
-            let cx = bounds.x() + bounds.width() / 2.0;
-            let cy = bounds.y() + bounds.height() / 2.0;
-            positioned.push((leaf, (cx, cy)));
+            positioned.push((
+                leaf,
+                PaneBounds {
+                    x: bounds.x(),
+                    y: bounds.y(),
+                    width: bounds.width(),
+                    height: bounds.height(),
+                },
+            ));
         }
 
         let Some(focused_index) = positioned
@@ -1173,29 +1149,33 @@ impl UiState {
             log::debug!("focus_pane_directional: focused leaf not in positioned set");
             return;
         };
-        let centers = positioned
+        let rects = positioned
             .iter()
-            .map(|(_, center)| *center)
+            .enumerate()
+            .map(|(session, (_, rect))| PaneRect {
+                session,
+                rect: *rect,
+            })
             .collect::<Vec<_>>();
-        let Some(target) = nearest_directional_index(&centers, focused_index, direction) else {
+        let Some(target) = directional_focus_target(&rects, focused_index, direction) else {
             log::debug!(
                 "focus_pane_directional: no pane {direction:?} of index {focused_index} \
-                 (centers: {centers:?})"
+                 (rects: {rects:?})"
             );
             return;
         };
         log::debug!("focus_pane_directional: focusing pane {target}");
         positioned[target].0.grab_focus();
+        self.refresh_pane_headers();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        balanced_split_position, equalize_pane_tree, nearest_directional_index,
-        prepare_then_commit, swap_target_in_visual_order,
+        balanced_split_position, equalize_pane_tree, prepare_then_commit,
+        swap_target_in_visual_order,
     };
-    use crate::keybindings::Direction;
     use std::cell::Cell;
 
     #[test]
@@ -1352,48 +1332,6 @@ mod tests {
         assert_eq!(swap_target_in_visual_order(1, 0), None);
         // A pane missing from the order cannot be swapped at all.
         assert_eq!(swap_target_in_visual_order(2, 2), None);
-    }
-
-    #[test]
-    fn directional_focus_selects_the_nearest_pane_on_each_axis() {
-        // 2x2 pane grid in visual order.
-        let centers = [(25.0, 25.0), (75.0, 25.0), (25.0, 75.0), (75.0, 75.0)];
-
-        assert_eq!(
-            nearest_directional_index(&centers, 3, Direction::Left),
-            Some(2)
-        );
-        assert_eq!(
-            nearest_directional_index(&centers, 2, Direction::Right),
-            Some(3)
-        );
-        assert_eq!(
-            nearest_directional_index(&centers, 3, Direction::Up),
-            Some(1)
-        );
-        assert_eq!(
-            nearest_directional_index(&centers, 1, Direction::Down),
-            Some(3)
-        );
-    }
-
-    #[test]
-    fn directional_focus_does_not_wrap_at_an_outer_edge() {
-        let centers = [(25.0, 25.0), (75.0, 25.0)];
-
-        assert_eq!(
-            nearest_directional_index(&centers, 0, Direction::Left),
-            None
-        );
-        assert_eq!(
-            nearest_directional_index(&centers, 1, Direction::Right),
-            None
-        );
-        assert_eq!(nearest_directional_index(&centers, 0, Direction::Up), None);
-        assert_eq!(
-            nearest_directional_index(&centers, 0, Direction::Down),
-            None
-        );
     }
 
     #[test]

@@ -181,6 +181,9 @@ ai_redact_secrets = true
 # undo_clear_blocks = "Ctrl+Shift+U"
 # collapse_all_blocks = "Ctrl+Shift+Left"
 # expand_all_blocks = "Ctrl+Shift+Right"
+# 以下两项仅作用于明确选中的完成块；默认没有快捷键。
+# collapse_selected_blocks = "F8"
+# expand_selected_blocks = "F9"
 # toggle_block_collapsed = "Ctrl+Shift+Slash"
 # jump_to_prev_failed = "Ctrl+Shift+Alt+Up"
 # jump_to_next_failed = "Ctrl+Shift+Alt+Down"
