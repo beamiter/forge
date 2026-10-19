@@ -179,6 +179,12 @@ impl UiState {
         let current_terminal = self.current_terminal();
 
         match action {
+            Action::CompareSelectedOutputs
+            | Action::ExportSelectedMarkdown
+            | Action::ExportSelectedJson => {
+                let owner = self.current_term_view().map(|view| Rc::downgrade(&view));
+                self.review_command_output_for(&owner, action);
+            }
             Action::NewTab => {
                 log::info!("New tab");
                 let working_directory = current_terminal
@@ -826,6 +832,46 @@ impl UiState {
         }
     }
 
+    /// Palette and toolbar callers capture the owner before focus moves into
+    /// their UI. A disappeared pane cannot be replaced by a new active tab.
+    pub(super) fn review_command_output_for(
+        &self,
+        owner: &Option<std::rc::Weak<TermView>>,
+        action: Action,
+    ) {
+        let Some(owner) = owner
+            .as_ref()
+            .and_then(std::rc::Weak::upgrade)
+            .filter(|view| view.widget().root().is_some_and(|root| root.is_realized()))
+        else {
+            self.toast_overlay.add_toast(adw::Toast::new(
+                "The source pane has no retained command records or is no longer available.",
+            ));
+            return;
+        };
+        let result = match action {
+            Action::CompareSelectedOutputs => owner.show_command_output_review().map(|_| None),
+            Action::ExportSelectedMarkdown => {
+                owner.export_selected_records_or_review(SessionExportFormat::Markdown)
+            }
+            Action::ExportSelectedJson => {
+                owner.export_selected_records_or_review(SessionExportFormat::Json)
+            }
+            _ => return,
+        };
+        match result {
+            Ok(Some(path)) => self.show_session_export_result(
+                "Selected records exported",
+                &format!(
+                    "Wrote {}",
+                    jterm_core::review_input::safe_inline_display(&path.to_string_lossy(), 4096)
+                ),
+            ),
+            Ok(None) => {}
+            Err(message) => self.toast_overlay.add_toast(adw::Toast::new(&message)),
+        }
+    }
+
     fn show_session_export_result(&self, heading: &str, message: &str) {
         let dialog = adw::AlertDialog::new(Some(heading), Some(message));
         dialog.add_response("ok", "OK");
@@ -917,6 +963,9 @@ impl UiState {
             }
             Action::ToggleSearch => self.show_search_for(view),
             Action::CrossBlockSearch => self.show_cross_block_search_for(view.clone()),
+            Action::CompareSelectedOutputs => {
+                self.review_command_output_for(&Some(Rc::downgrade(view)), action);
+            }
             _ => {}
         }
     }

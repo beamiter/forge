@@ -12,6 +12,421 @@ const MAX_RECORDS: usize = 64;
 const MAX_COMMAND_BYTES: usize = 256 * 1024;
 const MAX_FIELD_BYTES: usize = 16 * 1024;
 
+const MAX_OUTPUT_REVIEW_CHOICES: usize = 256;
+
+struct OutputReviewChoice {
+    id: u64,
+    command: String,
+    context: String,
+}
+
+fn output_review_choices(
+    records: &super::BackendRecords<'_>,
+    selected: &HashSet<u64>,
+) -> Result<(Vec<OutputReviewChoice>, usize), String> {
+    if selected.len() > super::export::MAX_SELECTED_RECORDS {
+        return Err("Select at most 64 records before opening output review.".into());
+    }
+    let mut total = 0usize;
+    let mut choices = Vec::new();
+    for record in records.iter().rev() {
+        total += 1;
+        // Keep an explicitly selected older command visible even when the
+        // retained session has more candidates than the picker budget.
+        if total > MAX_OUTPUT_REVIEW_CHOICES && !selected.contains(&record.id()) {
+            continue;
+        }
+        let status = if record.is_background() {
+            "background output".to_string()
+        } else {
+            record
+                .exit_code()
+                .map_or_else(|| "exit unknown".to_string(), |code| format!("exit {code}"))
+        };
+        let output = match record.output() {
+            None => "output unavailable",
+            Some(_) if super::export::output_is_partial(record) => "partial retained output",
+            Some(_) => "retained output",
+        };
+        let cwd = record.cwd().map_or_else(
+            || "directory unknown".to_string(),
+            |cwd| jterm_core::review_input::safe_inline_display(cwd, 512),
+        );
+        choices.push(OutputReviewChoice {
+            id: record.id(),
+            command: if record.is_background() {
+                "Background output".to_string()
+            } else {
+                jterm_core::review_input::safe_inline_display(record.command(), 512)
+            },
+            context: format!("#{id} · {status} · {output} · {cwd}", id = record.id()),
+        });
+    }
+    choices.reverse();
+    let present: HashSet<_> = choices.iter().map(|choice| choice.id).collect();
+    let mut missing: Vec<_> = selected.difference(&present).copied().collect();
+    missing.sort_unstable();
+    // Keep retired selections explicit and removable. Reopening the picker
+    // must not silently replace them or trap the user with a stale cursor.
+    for id in missing.into_iter().rev() {
+        choices.insert(
+            0,
+            OutputReviewChoice {
+                id,
+                command: "Selected record is no longer retained".into(),
+                context: format!("#{id} · unavailable · deselect this record to continue"),
+            },
+        );
+    }
+    Ok((choices, total))
+}
+
+fn comparison_document(
+    records: &super::BackendRecords<'_>,
+    selected: &HashSet<u64>,
+) -> Result<(String, String), String> {
+    if selected.len() != 2 {
+        return Err("Select exactly two completed commands to compare their output.".into());
+    }
+    let pair =
+        super::export::selected_records(records, selected).map_err(|error| error.to_string())?;
+    if pair.iter().any(|record| record.is_background()) {
+        return Err("Choose two command records; background output has no command result.".into());
+    }
+    let before = pair[0];
+    let after = pair[1];
+    let before_output = before.output().ok_or_else(|| {
+        format!(
+            "Record #{} has no retained output snapshot. Nothing compared.",
+            before.id()
+        )
+    })?;
+    let after_output = after.output().ok_or_else(|| {
+        format!(
+            "Record #{} has no retained output snapshot. Nothing compared.",
+            after.id()
+        )
+    })?;
+    let compared = jterm_core::output_compare::compare(
+        jterm_core::output_compare::OutputSnapshot {
+            text: before_output,
+            truncated: super::export::output_is_partial(before),
+        },
+        jterm_core::output_compare::OutputSnapshot {
+            text: after_output,
+            truncated: super::export::output_is_partial(after),
+        },
+    );
+    let describe = |role: &str, record: super::BackendRecordRef<'_>| {
+        let command = jterm_core::review_input::safe_multiline_display(record.command(), 4096);
+        let cwd = record.cwd().map_or_else(
+            || "unknown".to_string(),
+            |cwd| jterm_core::review_input::safe_inline_display(cwd, 4096),
+        );
+        let status = record
+            .exit_code()
+            .map_or_else(|| "unknown".to_string(), |code| code.to_string());
+        format!(
+            "{role} · record #{}\n{command}\nDirectory: {cwd}\nExit: {status}\n",
+            record.id()
+        )
+    };
+    let text = format!(
+        "{}\n{}\n{}\n\n{}",
+        describe("Before (older)", before),
+        describe("After (newer)", after),
+        compared.summary(),
+        compared.text,
+    );
+    Ok((compared.summary(), text))
+}
+
+struct OutputReviewControls {
+    owner: std::rc::Weak<super::TermView>,
+    selected: RefCell<HashSet<u64>>,
+    status: glib::WeakRef<gtk4::Label>,
+    result: glib::WeakRef<gtk4::TextView>,
+    compare: glib::WeakRef<gtk4::Button>,
+    exports: [glib::WeakRef<gtk4::Button>; 2],
+}
+
+impl OutputReviewControls {
+    fn owner(&self) -> Result<Rc<super::TermView>, String> {
+        self.owner
+            .upgrade()
+            .filter(|owner| owner.widget().root().is_some_and(|root| root.is_realized()))
+            .ok_or_else(|| {
+                "The source pane is no longer available. Reopen review from a retained pane.".into()
+            })
+    }
+
+    fn message(&self, message: &str) {
+        if let Some(status) = self.status.upgrade() {
+            status.set_text(message);
+        }
+    }
+
+    fn selection_changed(&self) {
+        let count = self.selected.borrow().len();
+        if let Some(compare) = self.compare.upgrade() {
+            compare.set_sensitive(count == 2);
+        }
+        for export in &self.exports {
+            if let Some(export) = export.upgrade() {
+                export.set_sensitive((1..=super::export::MAX_SELECTED_RECORDS).contains(&count));
+            }
+        }
+        // A report always belongs to one exact pair. Changing the selection
+        // retires it immediately so it cannot be mistaken for the new pair.
+        if let Some(result) = self.result.upgrade() {
+            result.buffer().set_text("");
+        }
+        self.message(&format!(
+            "{count} selected · choose exactly 2 to compare, or 1–64 to export."
+        ));
+    }
+
+    fn compare(&self) {
+        let comparison = self.owner().and_then(|owner| {
+            comparison_document(&owner.render_backend.records(), &self.selected.borrow())
+        });
+        match comparison {
+            Ok((summary, text)) => {
+                if let Some(result) = self.result.upgrade() {
+                    result.buffer().set_text(&text);
+                }
+                self.message(&summary);
+            }
+            Err(error) => {
+                if let Some(result) = self.result.upgrade() {
+                    result.buffer().set_text("");
+                }
+                self.message(&error);
+            }
+        }
+    }
+
+    fn export(&self, format: super::SessionExportFormat) {
+        let result = self.owner().and_then(|owner| {
+            owner
+                .export_record_selection_to_file(&self.selected.borrow(), format)
+                .map_err(|error| error.to_string())
+        });
+        match result {
+            Ok(path) => self.message(&format!(
+                "Exported {} selected records to {}",
+                self.selected.borrow().len(),
+                jterm_core::review_input::safe_inline_display(&path.to_string_lossy(), 4096),
+            )),
+            Err(error) => self.message(&error),
+        }
+    }
+}
+
+impl super::TermView {
+    pub(crate) fn export_selected_records_or_review(
+        self: &Rc<Self>,
+        format: super::SessionExportFormat,
+    ) -> Result<Option<std::path::PathBuf>, String> {
+        let mut selected = self.selected_block_ids.borrow().clone();
+        if selected.is_empty() {
+            selected.extend(self.navigated_record_id.get());
+        }
+        if selected.is_empty() {
+            self.show_command_output_review()?;
+            return Ok(None);
+        }
+        self.export_record_selection_to_file(&selected, format)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Backend-neutral, stable-ID review. The native window owns only small
+    /// metadata and weak pane references; opening it cannot change terminal
+    /// selection, scroll, PTY input, or the live grid's dimensions.
+    pub(crate) fn show_command_output_review(self: &Rc<Self>) -> Result<(), String> {
+        let parent = self
+            .widget()
+            .root()
+            .and_downcast::<gtk4::Window>()
+            .ok_or_else(|| "The source pane is no longer available.".to_string())?;
+        let mut selected = self.selected_block_ids.borrow().clone();
+        if selected.is_empty() {
+            if let Some(id) = self.navigated_record_id.get() {
+                selected.insert(id);
+            }
+        }
+        let (choices, total) = output_review_choices(&self.render_backend.records(), &selected)?;
+        if choices.is_empty() {
+            return Err("No completed command records are retained in this pane yet.".into());
+        }
+        let window = gtk4::Window::builder()
+            .title("Review command output")
+            .transient_for(&parent)
+            .modal(true)
+            .destroy_with_parent(true)
+            .default_width(parent.width().clamp(420, 860))
+            .default_height(parent.height().clamp(420, 780))
+            .build();
+        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        root.set_margin_start(16);
+        root.set_margin_end(16);
+        root.set_margin_top(12);
+        root.set_margin_bottom(12);
+        let heading = gtk4::Label::new(Some("Review command output"));
+        heading.add_css_class("title-2");
+        heading.set_xalign(0.0);
+        root.append(&heading);
+        let scope = gtk4::Label::new(Some(&format!(
+            "{total} retained records · showing up to {MAX_OUTPUT_REVIEW_CHOICES} recent records plus the current selection, oldest to newest. Comparisons stay frozen until you compare again; missing or partial output is identified. Nothing is inserted or run.",
+        )));
+        scope.set_wrap(true);
+        scope.set_xalign(0.0);
+        root.append(&scope);
+        let filter = gtk4::SearchEntry::new();
+        filter.set_placeholder_text(Some("Filter by command, directory, or record ID…"));
+        root.append(&filter);
+        let list = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+        let list_scroll = gtk4::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .vscrollbar_policy(gtk4::PolicyType::Automatic)
+            .min_content_height(120)
+            .max_content_height(240)
+            .vexpand(true)
+            .child(&list)
+            .build();
+        root.append(&list_scroll);
+        let buttons = gtk4::FlowBox::new();
+        buttons.set_selection_mode(gtk4::SelectionMode::None);
+        buttons.set_min_children_per_line(1);
+        buttons.set_max_children_per_line(3);
+        buttons.set_row_spacing(4);
+        buttons.set_column_spacing(4);
+        let compare = gtk4::Button::with_label("Compare 2 outputs");
+        compare.add_css_class("suggested-action");
+        let markdown = gtk4::Button::with_label("Export selected Markdown");
+        let json = gtk4::Button::with_label("Export selected JSON");
+        for button in [&compare, &markdown, &json] {
+            buttons.insert(button, -1);
+        }
+        root.append(&buttons);
+        let status = gtk4::Label::new(None);
+        status.set_wrap(true);
+        status.set_selectable(true);
+        status.set_xalign(0.0);
+        status.set_accessible_role(gtk4::AccessibleRole::Status);
+        root.append(&status);
+        let result = read_only_text("");
+        result.update_property(&[gtk4::accessible::Property::Label(
+            "Selected command output comparison",
+        )]);
+        let result_scroll = gtk4::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .vscrollbar_policy(gtk4::PolicyType::Automatic)
+            .min_content_height(140)
+            .vexpand(true)
+            .child(&result)
+            .build();
+        root.append(&result_scroll);
+        let controls = Rc::new(OutputReviewControls {
+            owner: Rc::downgrade(self),
+            selected: RefCell::new(selected),
+            status: status.downgrade(),
+            result: result.downgrade(),
+            compare: compare.downgrade(),
+            exports: [markdown.downgrade(), json.downgrade()],
+        });
+        let mut searchable = Vec::new();
+        for choice in choices {
+            let check = gtk4::CheckButton::new();
+            let text = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+            for (value, dim) in [(&choice.command, false), (&choice.context, true)] {
+                let label = gtk4::Label::new(Some(value));
+                label.set_xalign(0.0);
+                label.set_wrap(true);
+                label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+                label.set_max_width_chars(72);
+                if dim {
+                    label.add_css_class("dim-label");
+                }
+                text.append(&label);
+            }
+            check.set_child(Some(&text));
+            check.update_property(&[gtk4::accessible::Property::Label(&format!(
+                "{} · {}",
+                choice.command, choice.context
+            ))]);
+            check.set_active(controls.selected.borrow().contains(&choice.id));
+            let controls = controls.clone();
+            check.connect_toggled(move |check| {
+                {
+                    let mut selected = controls.selected.borrow_mut();
+                    if check.is_active() {
+                        selected.insert(choice.id);
+                    } else {
+                        selected.remove(&choice.id);
+                    }
+                }
+                controls.selection_changed();
+            });
+            searchable.push((
+                check.downgrade(),
+                format!("{} {}", choice.command, choice.context).to_lowercase(),
+            ));
+            list.append(&check);
+        }
+        filter.connect_search_changed(move |filter| {
+            let query = filter.text().to_lowercase();
+            for (check, text) in &searchable {
+                if let Some(check) = check.upgrade() {
+                    check.set_visible(query.is_empty() || text.contains(&query));
+                }
+            }
+        });
+        {
+            let controls = controls.clone();
+            compare.connect_clicked(move |_| controls.compare());
+        }
+        for (button, format) in [
+            (&markdown, super::SessionExportFormat::Markdown),
+            (&json, super::SessionExportFormat::Json),
+        ] {
+            let controls = controls.clone();
+            button.connect_clicked(move |_| controls.export(format));
+        }
+        controls.selection_changed();
+        if controls.selected.borrow().len() == 2 {
+            controls.compare();
+        }
+        let close = gtk4::Button::with_label("Close");
+        close.set_halign(gtk4::Align::End);
+        let weak = window.downgrade();
+        close.connect_clicked(move |_| {
+            if let Some(window) = weak.upgrade() {
+                window.close();
+            }
+        });
+        root.append(&close);
+        let keys = gtk4::EventControllerKey::new();
+        let weak = window.downgrade();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk4::gdk::Key::Escape {
+                if let Some(window) = weak.upgrade() {
+                    window.close();
+                }
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        window.add_controller(keys);
+        window.set_child(Some(&root));
+        window.present();
+        filter.grab_focus();
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct ReviewRecord {
     id: u64,
@@ -517,6 +932,213 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+        }
+    }
+
+    #[test]
+    fn output_comparison_uses_temporal_order_metadata_and_real_retained_changes() {
+        let mut before = record(80, "cargo check");
+        before.output = "building\nold failure\n".into();
+        before.cwd = Some("/project/older".into());
+        before.exit_code = Some(1);
+        let mut after = record(3, "cargo check");
+        after.output = "building\nfinished\n".into();
+        after.cwd = Some("/project/newer".into());
+        after.exit_code = Some(0);
+        let blocks = RefCell::new(VecDeque::from([before, record(4, "unselected"), after]));
+        let records = super::super::BackendRecords::Blocks(blocks.borrow());
+        let (summary, document) = comparison_document(&records, &HashSet::from([3, 80])).unwrap();
+        assert!(summary.contains("+1 added / -1 removed / 1 unchanged"));
+        assert!(document.contains("Before (older) · record #80"));
+        assert!(document.contains("After (newer) · record #3"));
+        assert!(document.contains("Directory: /project/older\nExit: 1"));
+        assert!(document.contains("Directory: /project/newer\nExit: 0"));
+        assert!(document.contains("-old failure"));
+        assert!(document.contains("+finished"));
+        assert!(!document.contains("unselected"));
+        assert!(comparison_document(&records, &HashSet::from([3])).is_err());
+        assert!(comparison_document(&records, &HashSet::from([3, 99])).is_err());
+    }
+
+    #[test]
+    fn output_comparison_propagates_capture_limits_and_accepts_available_empty_output() {
+        let mut partial = record(1, "before");
+        partial.output_notice = Some(super::super::FINISHED_OUTPUT_NOT_RETAINED.into());
+        let blocks = RefCell::new(VecDeque::from([partial, record(2, "after")]));
+        let records = super::super::BackendRecords::Blocks(blocks.borrow());
+        let (summary, _) = comparison_document(&records, &HashSet::from([1, 2])).unwrap();
+        assert!(summary.contains("+0 added / -0 removed / 0 unchanged"));
+        assert!(summary.contains("partial captured output"));
+    }
+
+    #[test]
+    fn unified_comparison_never_substitutes_empty_text_for_a_missing_snapshot() {
+        let mut store = super::super::UnifiedZoneStore::new();
+        for id in [9, 2] {
+            store
+                .records
+                .push_back(super::super::CompletedCommandRecord {
+                    id,
+                    cmd: format!("command {id}"),
+                    exit_code: Some(0),
+                    start_time_ms: None,
+                    end_time_ms: None,
+                    duration_ms: None,
+                    cwd: None,
+                    is_background: false,
+                    completion_provenance: CompletionProvenance::Unknown,
+                    command_source: super::super::CommandTextSource::Screen,
+                    start_mark_seen: false,
+                });
+        }
+        store.insert_snapshot(
+            2,
+            super::super::ZoneOutputSnapshot {
+                plain: String::new(),
+                truncated: false,
+            },
+        );
+        let store = RefCell::new(store);
+        let records = super::super::BackendRecords::Metadata(store.borrow());
+        let error = comparison_document(&records, &HashSet::from([2, 9])).unwrap_err();
+        assert!(error.contains("Record #9 has no retained output snapshot"));
+    }
+
+    #[test]
+    fn output_picker_keeps_selected_older_and_retired_ids_without_neighbour_fallback() {
+        let blocks: VecDeque<_> = (1..=300).map(|id| record(id, "same command")).collect();
+        let blocks = RefCell::new(blocks);
+        let records = super::super::BackendRecords::Blocks(blocks.borrow());
+        let (choices, total) = output_review_choices(&records, &HashSet::from([1, 999])).unwrap();
+        assert_eq!(total, 300);
+        assert_eq!(choices.len(), MAX_OUTPUT_REVIEW_CHOICES + 2);
+        assert_eq!(choices[0].id, 999);
+        assert!(choices[0].context.contains("unavailable"));
+        assert_eq!(choices[1].id, 1);
+        assert_eq!(choices[2].id, 45);
+        assert_eq!(choices.last().unwrap().id, 300);
+        assert!(!choices.iter().any(|choice| choice.id == 2));
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK/VTE display; run explicitly under Xvfb"]
+    fn selected_output_review_is_read_only_and_owner_bound() {
+        use super::super::find::{palette_activation_test_feed, palette_activation_test_view};
+        use crate::config::TerminalMode;
+        use std::time::{Duration, Instant};
+
+        fn settle() {
+            let context = glib::MainContext::default();
+            let until = Instant::now() + Duration::from_millis(100);
+            while Instant::now() < until {
+                for _ in 0..128 {
+                    if !context.iteration(false) {
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        fn descendants(root: &gtk4::Widget) -> Vec<gtk4::Widget> {
+            let mut out = vec![root.clone()];
+            let mut index = 0;
+            while index < out.len() {
+                let mut child = out[index].first_child();
+                while let Some(widget) = child {
+                    child = widget.next_sibling();
+                    out.push(widget);
+                }
+                index += 1;
+            }
+            out
+        }
+
+        gtk4::init().unwrap();
+        for mode in [TerminalMode::Block, TerminalMode::Unified] {
+            let view = palette_activation_test_view(mode);
+            let owner = gtk4::Window::builder()
+                .default_width(800)
+                .default_height(680)
+                .child(&view.widget())
+                .build();
+            owner.present();
+            palette_activation_test_feed(&view, b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            settle();
+            for (command, output) in [
+                ("check-before", "old result"),
+                ("check-after", "new result"),
+            ] {
+                palette_activation_test_feed(&view, format!(
+                    "{command}\r\n\x1b]133;C;cmdline={command}\x07{output}\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07"
+                ).as_bytes());
+                settle();
+            }
+            let records: Vec<_> = view
+                .render_backend
+                .records()
+                .iter()
+                .filter(|record| !record.is_background())
+                .map(|record| record.id())
+                .collect();
+            assert_eq!(records.len(), 2);
+            let before_selection = view.selected_block_ids.borrow().clone();
+            let before_unread = view.unread_count.get();
+            let before_grid = view.pty.test_slave_winsize();
+            let before_scroll = view.active_vte.vadjustment().unwrap().value();
+            view.pty.drain_test_slave(Duration::from_millis(30));
+            view.show_command_output_review().unwrap();
+            settle();
+            let review = gtk4::Window::list_toplevels()
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk4::Window>().ok())
+                .find(|window| window.title().as_deref() == Some("Review command output"))
+                .unwrap();
+            let widgets = descendants(review.upcast_ref());
+            let checks: Vec<_> = widgets
+                .iter()
+                .filter_map(|widget| widget.clone().downcast::<gtk4::CheckButton>().ok())
+                .collect();
+            assert_eq!(checks.len(), 2);
+            for check in checks {
+                check.set_active(true);
+            }
+            let compare = widgets
+                .iter()
+                .filter_map(|widget| widget.clone().downcast::<gtk4::Button>().ok())
+                .find(|button| button.label().as_deref() == Some("Compare 2 outputs"))
+                .unwrap();
+            assert!(compare.is_sensitive());
+            compare.emit_clicked();
+            let text = widgets
+                .iter()
+                .find_map(|widget| widget.clone().downcast::<gtk4::TextView>().ok())
+                .unwrap();
+            assert!(!text.is_editable());
+            let buffer = text.buffer();
+            let displayed = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+            assert!(displayed.contains("-old result"));
+            assert!(displayed.contains("+new result"));
+            assert_eq!(*view.selected_block_ids.borrow(), before_selection);
+            assert_eq!(view.unread_count.get(), before_unread);
+            assert_eq!(view.pty.test_slave_winsize(), before_grid);
+            assert_eq!(
+                view.active_vte.vadjustment().unwrap().value(),
+                before_scroll
+            );
+            assert!(view
+                .pty
+                .drain_test_slave(Duration::from_millis(30))
+                .is_empty());
+            owner.set_child(gtk4::Widget::NONE);
+            compare.emit_clicked();
+            assert_eq!(
+                buffer.char_count(),
+                0,
+                "a detached source retires its report"
+            );
+            review.close();
+            owner.close();
+            settle();
         }
     }
     #[test]

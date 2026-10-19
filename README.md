@@ -13,6 +13,7 @@ forge 是一个面向开发工作流的原生 GTK4 终端。它默认使用 Bloc
 - 跨终端区域拖选以整区轮廓标记，按显示顺序复制完整保留文本；单区域仍使用原生按字选区，不抢占 PRIMARY
 - 活动选择卡片常驻 Review selection 操作；审阅关闭后恢复原历史操作焦点，保留滚动和未读状态
 - 原生 Block review：完整命令、工作目录、完成/捕获来源，以及按历史顺序审阅与安全复制多选命令
+- Block / Unified 输出审阅：明确选择两次命令比较输出，或仅导出所选记录为 Markdown / JSON
 - 统一模糊面板：动作、历史、YAML/TOML workflow 和自然语言命令入口
 - 可执行 `.jtnb.md` Notebook，逐 cell 运行/停止并分离 stdout 与 stderr
 - 基于现代 GTK4 列表模型的异步文件树、Git 分支/脏状态条、长命令桌面通知
@@ -57,6 +58,35 @@ Unified 在一个持续运行的原生 VTE 中保留命令、输出和 shell 提
 | Next command | `next_command` |
 | Return to live | `return_to_live` |
 | Copy current command | `copy_current_command` |
+
+## 比较两次命令与导出所选记录
+
+在命令面板选择 **Review and compare command output**，或点击 Unified 导航条的输出审阅按钮。
+审阅窗列出当前 pane 保留的最近 256 条记录，以及已选中的更早记录；可按命令、目录和记录 ID
+筛选。Block 模式沿用已选卡片，Unified 模式预选明确导航到的命令，然后用复选框补选另一条。
+选择只发生在审阅窗内，不改动终端文本选区、滚动位置或 shell 输入。
+
+选择 **恰好两条命令** 后点击 **Compare 2 outputs**，按终端先后顺序显示 Before / After、
+命令、目录、退出状态，以及逐行 `+` / `-` 差异与增加、删除、相同行数。同名命令仍按记录 ID
+区分。比较是冻结的只读结果；修改选择会立即清空旧报告，再次比较才获取新的保留快照。
+缺失快照会明确提示；已截断的尾部或前缀、比较预算限制以及粗略对齐均会标记，不能当作完整输出一致。
+
+**Export selected Markdown / JSON** 只导出勾选的 1–64 条记录，按原终端顺序保存稳定 ID、
+命令、目录、退出/捕获信息和仍保留的输出。JSON 明确区分“输出不可用”和“可用的空输出”，
+并记录 `output_truncated`；Markdown 直接说明缺失与部分保留。单次文件上限 8 MiB，超过时
+拒绝整份导出，不会悄悄少导出几条。文件保存到 `$XDG_DATA_HOME/forge/exports/`
+（未设置时为 `~/.local/share/forge/exports/`），完成后显示完整路径；同秒重试不会覆盖已有文件。
+
+命令面板同时提供以下可自定义、默认不占快捷键的动作。若尚未选择记录，导出动作先打开审阅窗：
+
+| 动作 | 配置键 |
+| --- | --- |
+| Review and compare command output | `compare_selected_outputs` |
+| Export selected command records as Markdown | `export_selected_markdown` |
+| Export selected command records as JSON | `export_selected_json` |
+
+源 pane 与记录身份在打开时绑定。记录被淘汰后会保留一个明确的不可用选择项，取消它才能继续；
+导出与比较都不会把邻近的新记录当作原选择。传统 VTE 后端不保留此类结构化记录，因此没有该能力。
 
 ## 构建与运行
 

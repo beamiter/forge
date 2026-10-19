@@ -57,6 +57,10 @@ pub(crate) enum Action {
     NextCommand,
     ReturnToLive,
     CopyCurrentCommand,
+    /// Read-only comparison and exports over explicitly selected records.
+    CompareSelectedOutputs,
+    ExportSelectedMarkdown,
+    ExportSelectedJson,
     CyclePaneFocusForward,
     CyclePaneFocusBackward,
     QuickSwitchTab(u8),
@@ -181,6 +185,9 @@ impl Action {
             Action::NextCommand => "Next command",
             Action::ReturnToLive => "Return to live",
             Action::CopyCurrentCommand => "Copy current command",
+            Action::CompareSelectedOutputs => "Review and compare command output",
+            Action::ExportSelectedMarkdown => "Export selected command records as Markdown",
+            Action::ExportSelectedJson => "Export selected command records as JSON",
             Action::CyclePaneFocusForward => "Cycle pane focus forward",
             Action::CyclePaneFocusBackward => "Cycle pane focus backward",
             Action::QuickSwitchTab(n) => match n {
@@ -290,6 +297,9 @@ impl Action {
             Action::NextCommand => Some("next_command"),
             Action::ReturnToLive => Some("return_to_live"),
             Action::CopyCurrentCommand => Some("copy_current_command"),
+            Action::CompareSelectedOutputs => Some("compare_selected_outputs"),
+            Action::ExportSelectedMarkdown => Some("export_selected_markdown"),
+            Action::ExportSelectedJson => Some("export_selected_json"),
             Action::CyclePaneFocusForward => Some("cycle_pane_focus_forward"),
             Action::CyclePaneFocusBackward => Some("cycle_pane_focus_backward"),
             Action::QuickSwitchTab(_) => None,
@@ -391,6 +401,9 @@ impl Action {
             Action::NextCommand,
             Action::ReturnToLive,
             Action::CopyCurrentCommand,
+            Action::CompareSelectedOutputs,
+            Action::ExportSelectedMarkdown,
+            Action::ExportSelectedJson,
             Action::CyclePaneFocusForward,
             Action::CyclePaneFocusBackward,
             Action::ConnectRemote(0),
@@ -862,6 +875,9 @@ mod tests {
             (Action::NextCommand, "next_command"),
             (Action::ReturnToLive, "return_to_live"),
             (Action::CopyCurrentCommand, "copy_current_command"),
+            (Action::CompareSelectedOutputs, "compare_selected_outputs"),
+            (Action::ExportSelectedMarkdown, "export_selected_markdown"),
+            (Action::ExportSelectedJson, "export_selected_json"),
         ] {
             assert_eq!(Action::from_config_key(key), Some(action));
             assert!(defaults
@@ -928,6 +944,9 @@ mod tests {
             Action::NextCommand,
             Action::ReturnToLive,
             Action::CopyCurrentCommand,
+            Action::CompareSelectedOutputs,
+            Action::ExportSelectedMarkdown,
+            Action::ExportSelectedJson,
             // Folding is a triage gesture, not a hot key: reachable from the
             // palette and bindable in TOML, like the rest of this list.
             Action::CollapseAllBlocks,

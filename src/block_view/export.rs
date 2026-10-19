@@ -7,6 +7,7 @@
 
 use gtk4::glib;
 use gtk4::prelude::*;
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -179,6 +180,233 @@ impl SessionExportFormat {
     }
 }
 
+pub(super) const MAX_SELECTED_RECORDS: usize = 64;
+const MAX_SELECTED_EXPORT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Resolve exact identities in terminal order. A removed selection is never
+/// replaced by its neighbour or silently omitted from an otherwise valid file.
+pub(super) fn selected_records<'a>(
+    records: &'a BackendRecords<'_>,
+    selected: &HashSet<u64>,
+) -> io::Result<Vec<BackendRecordRef<'a>>> {
+    if selected.is_empty() || selected.len() > MAX_SELECTED_RECORDS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Select between 1 and 64 retained command records.",
+        ));
+    }
+    let found: Vec<_> = records
+        .iter()
+        .filter(|record| selected.contains(&record.id()))
+        .collect();
+    if found.len() != selected.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "A selected record is no longer retained. Reopen review and select again.",
+        ));
+    }
+    Ok(found)
+}
+
+/// A retained output can be a tail or prefix. Never infer completeness just
+/// from a nonempty String, and never turn an unavailable snapshot into "".
+pub(super) fn output_is_partial(record: BackendRecordRef<'_>) -> bool {
+    match record {
+        BackendRecordRef::Block(record) => record
+            .output_notice
+            .as_deref()
+            .and_then(super::known_output_notice)
+            .is_some(),
+        BackendRecordRef::Metadata { snapshot, .. } => {
+            snapshot.is_some_and(|snapshot| snapshot.truncated)
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct SelectedRecordExport<'a> {
+    id: u64,
+    cmd: &'a str,
+    cwd: Option<&'a str>,
+    exit_code: Option<i32>,
+    duration_ms: Option<u64>,
+    command_exact: bool,
+    command_truncated: bool,
+    completion_provenance: &'static str,
+    lifecycle_health: &'static str,
+    is_background: bool,
+    output_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_truncated: Option<bool>,
+}
+
+impl<'a> From<BackendRecordRef<'a>> for SelectedRecordExport<'a> {
+    fn from(record: BackendRecordRef<'a>) -> Self {
+        let (command_exact, command_truncated, completion_provenance, lifecycle_health) =
+            match record {
+                BackendRecordRef::Block(block) => (
+                    block.command_exact,
+                    block.command_truncated,
+                    super::CompletionProvenance::from(block.completion_provenance).schema_name(),
+                    block.lifecycle_health().schema_name(),
+                ),
+                BackendRecordRef::Metadata { record, .. } => (
+                    record.command_source == super::CommandTextSource::ShellReported,
+                    record.command_source == super::CommandTextSource::ScreenAfterTruncation,
+                    record.completion_provenance.schema_name(),
+                    record.lifecycle_health().schema_name(),
+                ),
+            };
+        let duration_ms = match record {
+            BackendRecordRef::Block(record) => record
+                .timing_is_authoritative()
+                .then_some(record.duration_ms)
+                .flatten(),
+            BackendRecordRef::Metadata { record, .. } => record
+                .timing_is_authoritative()
+                .then_some(record.duration_ms)
+                .flatten(),
+        };
+        let output = record.output();
+        Self {
+            id: record.id(),
+            cmd: record.command(),
+            cwd: record.cwd(),
+            exit_code: record.exit_code(),
+            duration_ms,
+            command_exact,
+            command_truncated,
+            completion_provenance,
+            lifecycle_health,
+            is_background: record.is_background(),
+            output_available: output.is_some(),
+            output,
+            output_truncated: output.map(|_| output_is_partial(record)),
+        }
+    }
+}
+
+struct BoundedExport(Vec<u8>);
+
+impl Write for BoundedExport {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > MAX_SELECTED_EXPORT_BYTES.saturating_sub(self.0.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Selected export exceeds 8 MiB. Select fewer records; nothing was written.",
+            ));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn selected_export_document(
+    records: &BackendRecords<'_>,
+    selected: &HashSet<u64>,
+    format: SessionExportFormat,
+) -> io::Result<String> {
+    let records = selected_records(records, selected)?;
+    let exports: Vec<_> = records
+        .into_iter()
+        .map(SelectedRecordExport::from)
+        .collect();
+    let source_bytes = exports.iter().fold(0usize, |total, record| {
+        total
+            .saturating_add(record.cmd.len())
+            .saturating_add(record.cwd.map_or(0, str::len))
+            .saturating_add(record.output.map_or(0, str::len))
+    });
+    if source_bytes > MAX_SELECTED_EXPORT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Selected export exceeds 8 MiB. Select fewer records; nothing was written.",
+        ));
+    }
+    let mut out = BoundedExport(Vec::new());
+    match format {
+        SessionExportFormat::Json => {
+            #[derive(serde::Serialize)]
+            struct Document<'a> {
+                schema_version: u8,
+                scope: &'static str,
+                order: &'static str,
+                records: &'a [SelectedRecordExport<'a>],
+            }
+            serde_json::to_writer_pretty(
+                &mut out,
+                &Document {
+                    schema_version: 1,
+                    scope: "selected_records",
+                    order: "oldest_to_newest",
+                    records: &exports,
+                },
+            )
+            .map_err(io::Error::other)?;
+        }
+        SessionExportFormat::Markdown => {
+            writeln!(out, "# Selected Command Records\n")?;
+            writeln!(
+                out,
+                "{} selected records · oldest to newest · retained output only\n",
+                exports.len()
+            )?;
+            for record in exports {
+                writeln!(out, "## Record #{}\n", record.id)?;
+                if record.is_background {
+                    writeln!(out, "Background output (no command result).\n")?;
+                } else {
+                    let fence = markdown_fence(record.cmd);
+                    writeln!(out, "**Command:**\n{fence}sh\n{}\n{fence}\n", record.cmd)?;
+                    match record.exit_code {
+                        Some(code) => writeln!(out, "**Exit code:** {code}\n")?,
+                        None => writeln!(out, "**Exit code:** unknown\n")?,
+                    }
+                    let capture = if record.command_truncated {
+                        "truncated command report"
+                    } else if record.command_exact {
+                        "shell-reported command"
+                    } else {
+                        "best-effort capture"
+                    };
+                    writeln!(out, "**Command capture:** {capture}\n")?;
+                    writeln!(
+                        out,
+                        "**Lifecycle:** {} ({})\n",
+                        record.lifecycle_health, record.completion_provenance
+                    )?;
+                }
+                if let Some(cwd) = record.cwd {
+                    let fence = markdown_fence(cwd);
+                    writeln!(out, "**Working directory:**\n{fence}\n{cwd}\n{fence}\n")?;
+                }
+                if let Some(duration) = record.duration_ms {
+                    writeln!(out, "**Duration:** {duration} ms\n")?;
+                }
+                match record.output {
+                    Some(output) => {
+                        if record.output_truncated == Some(true) {
+                            writeln!(out, "**Output:** partial retained text (a tail or prefix; the full output is unavailable).\n")?;
+                        } else {
+                            writeln!(out, "**Output:** retained text\n")?;
+                        }
+                        let fence = markdown_fence(output);
+                        writeln!(out, "{fence}\n{output}\n{fence}\n")?;
+                    }
+                    None => writeln!(out, "**Output:** unavailable (no retained snapshot).\n")?,
+                }
+            }
+        }
+    }
+    String::from_utf8(out.0).map_err(io::Error::other)
+}
+
 /// `session-<stamp>.<ext>` with a numeric suffix for same-second collisions.
 /// Same shape as anvil's exports so a user who runs both terminals gets one
 /// recognizable naming scheme in their data directory.
@@ -261,6 +489,22 @@ fn write_session_export(
 }
 
 impl TermView {
+    /// Export precisely these retained record IDs. The frozen selection is
+    /// checked before any file is created; serialization is bounded too.
+    pub(super) fn export_record_selection_to_file(
+        &self,
+        selected: &HashSet<u64>,
+        format: SessionExportFormat,
+    ) -> io::Result<PathBuf> {
+        let contents = selected_export_document(&self.render_backend.records(), selected, format)?;
+        write_session_export(
+            &exports_dir(),
+            &format!("selected-{}", export_stamp()),
+            format.extension(),
+            &contents,
+        )
+    }
+
     /// Export a block by ID to JSON format
     pub fn export_block_json(&self, block_id: u64) -> Option<String> {
         let records = self.render_backend.records();
@@ -341,6 +585,189 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn selected_record(id: u64, command: &str) -> CompletedCommandRecord {
+        CompletedCommandRecord {
+            id,
+            cmd: command.into(),
+            exit_code: Some(0),
+            start_time_ms: Some(100),
+            end_time_ms: Some(200),
+            duration_ms: Some(100),
+            cwd: Some("/project".into()),
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::ShellReported,
+            start_mark_seen: true,
+        }
+    }
+
+    #[test]
+    fn selected_export_uses_exact_ids_in_terminal_order_and_rejects_retirement() {
+        let mut store = UnifiedZoneStore::new();
+        store.records.extend([
+            selected_record(90, "older"),
+            selected_record(30, "not selected"),
+            selected_record(2, "newer"),
+        ]);
+        store.insert_snapshot(
+            90,
+            ZoneOutputSnapshot {
+                plain: "old\n".into(),
+                truncated: false,
+            },
+        );
+        store.insert_snapshot(
+            2,
+            ZoneOutputSnapshot {
+                plain: "tail\n".into(),
+                truncated: true,
+            },
+        );
+        let store = RefCell::new(store);
+        let selected = std::collections::HashSet::from([2, 90]);
+        let document = super::selected_export_document(
+            &BackendRecords::Metadata(store.borrow()),
+            &selected,
+            SessionExportFormat::Json,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&document).unwrap();
+        assert_eq!(value["scope"], "selected_records");
+        let records = value["records"].as_array().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["id"], 90);
+        assert_eq!(records[1]["id"], 2);
+        assert_eq!(records[1]["output_truncated"], true);
+        assert!(!document.contains("not selected"));
+        store.borrow_mut().records.pop_front();
+        assert!(super::selected_export_document(
+            &BackendRecords::Metadata(store.borrow()),
+            &selected,
+            SessionExportFormat::Json,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("no longer retained"));
+    }
+
+    #[test]
+    fn selected_export_distinguishes_missing_from_empty_output_and_untrusted_timing() {
+        let mut store = UnifiedZoneStore::new();
+        let mut unknown = selected_record(1, "unknown status");
+        unknown.exit_code = None;
+        unknown.completion_provenance = super::super::CompletionProvenance::BoundaryInferred;
+        store
+            .records
+            .extend([unknown, selected_record(2, "empty output")]);
+        store.insert_snapshot(
+            2,
+            ZoneOutputSnapshot {
+                plain: String::new(),
+                truncated: false,
+            },
+        );
+        let store = RefCell::new(store);
+        let document = super::selected_export_document(
+            &BackendRecords::Metadata(store.borrow()),
+            &std::collections::HashSet::from([1, 2]),
+            SessionExportFormat::Json,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&document).unwrap();
+        let records = value["records"].as_array().unwrap();
+        assert_eq!(records[0]["output_available"], false);
+        assert!(records[0].get("output").is_none());
+        assert!(records[0].get("output_truncated").is_none());
+        assert_eq!(records[0]["exit_code"], serde_json::Value::Null);
+        assert_eq!(records[0]["duration_ms"], serde_json::Value::Null);
+        assert_eq!(records[1]["output_available"], true);
+        assert_eq!(records[1]["output"], "");
+        assert_eq!(records[1]["output_truncated"], false);
+    }
+
+    #[test]
+    fn selected_markdown_preserves_fences_and_explicit_partial_capture() {
+        let mut store = UnifiedZoneStore::new();
+        store.records.push_back(selected_record(7, "printf '```'"));
+        store.insert_snapshot(
+            7,
+            ZoneOutputSnapshot {
+                plain: "```\nretained tail\n".into(),
+                truncated: true,
+            },
+        );
+        let store = RefCell::new(store);
+        let document = super::selected_export_document(
+            &BackendRecords::Metadata(store.borrow()),
+            &std::collections::HashSet::from([7]),
+            SessionExportFormat::Markdown,
+        )
+        .unwrap();
+        assert!(document.contains("## Record #7"));
+        assert!(document.contains("````sh\nprintf '```'\n````"));
+        assert!(document.contains("````\n```\nretained tail\n\n````"));
+        assert!(document.contains("partial retained text"));
+    }
+
+    #[test]
+    fn selected_exports_reject_empty_selection_and_bound_encoded_bytes() {
+        // The largest permitted selection remains exportable; adding one
+        // retained record must reject the entire selection in both formats.
+        let mut boundary_store = UnifiedZoneStore::new();
+        boundary_store.records.extend(
+            (1..=super::MAX_SELECTED_RECORDS as u64 + 1)
+                .map(|id| selected_record(id, "small output")),
+        );
+        let boundary_store = RefCell::new(boundary_store);
+        let allowed = (1..=super::MAX_SELECTED_RECORDS as u64).collect();
+        let too_many = (1..=super::MAX_SELECTED_RECORDS as u64 + 1).collect();
+        for format in [SessionExportFormat::Json, SessionExportFormat::Markdown] {
+            assert!(super::selected_export_document(
+                &BackendRecords::Metadata(boundary_store.borrow()),
+                &allowed,
+                format,
+            )
+            .is_ok());
+            assert!(super::selected_export_document(
+                &BackendRecords::Metadata(boundary_store.borrow()),
+                &too_many,
+                format,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("between 1 and 64"));
+        }
+
+        let mut store = UnifiedZoneStore::new();
+        store
+            .records
+            .push_back(selected_record(1, "control output"));
+        // JSON expands every retained NUL to six bytes. The serialized-byte
+        // ceiling must reject it even though raw capture fits its own budget.
+        store.insert_snapshot(
+            1,
+            ZoneOutputSnapshot {
+                plain: "\0".repeat(super::MAX_SELECTED_EXPORT_BYTES / 6 + 1),
+                truncated: false,
+            },
+        );
+        let store = RefCell::new(store);
+        assert!(super::selected_export_document(
+            &BackendRecords::Metadata(store.borrow()),
+            &std::collections::HashSet::new(),
+            SessionExportFormat::Json,
+        )
+        .is_err());
+        assert!(super::selected_export_document(
+            &BackendRecords::Metadata(store.borrow()),
+            &std::collections::HashSet::from([1]),
+            SessionExportFormat::Json,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("8 MiB"));
+    }
 
     struct TestDir(PathBuf);
 

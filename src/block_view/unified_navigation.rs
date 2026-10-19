@@ -158,6 +158,7 @@ pub(super) struct NavigationBar {
     pub(super) copy: gtk4::Button,
     pub(super) find: gtk4::Button,
     pub(super) browse: gtk4::Button,
+    pub(super) review: gtk4::Button,
     pub(super) live: gtk4::Button,
     pub(super) status: gtk4::Label,
     refresh_pending: Cell<bool>,
@@ -202,6 +203,10 @@ impl NavigationBar {
             "go-bottom-symbolic",
             "Return to live output and focus the terminal",
         );
+        let review = control(
+            "document-open-recent-symbolic",
+            "Review, compare, or export selected command output",
+        );
         let status = gtk4::Label::new(Some("Live"));
         status.set_xalign(0.0);
         status.set_hexpand(true);
@@ -216,7 +221,7 @@ impl NavigationBar {
         root.append(&previous);
         root.append(&next);
         root.append(&status);
-        for button in [&copy, &find, &browse, &live] {
+        for button in [&copy, &find, &browse, &review, &live] {
             root.append(button);
         }
         Rc::new(Self {
@@ -226,6 +231,7 @@ impl NavigationBar {
             copy,
             find,
             browse,
+            review,
             live,
             status,
             refresh_pending: Cell::new(false),
@@ -438,6 +444,7 @@ impl super::TermView {
             (&bar.copy, Action::CopyCurrentCommand),
             (&bar.find, Action::ToggleSearch),
             (&bar.browse, Action::CrossBlockSearch),
+            (&bar.review, Action::CompareSelectedOutputs),
             (&bar.live, Action::ReturnToLive),
         ] {
             let callback = callback.clone();

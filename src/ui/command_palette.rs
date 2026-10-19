@@ -801,6 +801,7 @@ impl UiState {
         // changes below are pure in-memory filtering and never do per-key I/O.
         let greeting_target = self.organism_greeting_target();
         let vte_presentation_target = self.vte_companion_target();
+        let output_review_target = self.current_term_view().map(|view| Rc::downgrade(&view));
         let snapshot = Rc::new(self.palette_snapshot());
         let dialog = adw::Dialog::builder()
             .title(palette_title(initial_mode))
@@ -882,7 +883,14 @@ impl UiState {
                     return;
                 };
                 dialog.force_close();
-                if matches!(
+                if let Accept::Action(
+                    action @ (crate::keybindings::Action::CompareSelectedOutputs
+                    | crate::keybindings::Action::ExportSelectedMarkdown
+                    | crate::keybindings::Action::ExportSelectedJson),
+                ) = &entry.accept
+                {
+                    ui.review_command_output_for(&output_review_target, *action);
+                } else if matches!(
                     &entry.accept,
                     Accept::Action(crate::keybindings::Action::GreetAsciiOrganism)
                 ) {
