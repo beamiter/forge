@@ -277,6 +277,33 @@ impl UiState {
                 let target = self.organism_greeting_target();
                 self.inspect_ascii_organism_for(&target);
             }
+            Action::OpenVim9Ide => {
+                if std::env::var_os("FORGE_SAFE_MODE").is_some() {
+                    self.toast_overlay
+                        .add_toast(adw::Toast::new("Vim9 IDE is unavailable in safe mode."));
+                    return;
+                }
+                if self
+                    .current_pane_leaf()
+                    .is_some_and(|leaf| leaf.is_remote())
+                {
+                    self.toast_overlay.add_toast(adw::Toast::new(
+                        "Vim9 IDE opens local projects. Select a local terminal pane first.",
+                    ));
+                    return;
+                }
+                let root = current_terminal
+                    .as_ref()
+                    .and_then(terminal_working_directory)
+                    .map(std::path::PathBuf::from)
+                    .filter(|path| path.is_dir())
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| std::path::PathBuf::from("/"));
+                if let Err(error) = crate::vim9_ide::launch(root) {
+                    self.toast_overlay
+                        .add_toast(adw::Toast::new(&format!("Cannot open Vim9 IDE: {error}")));
+                }
+            }
             Action::ToggleCommandPalette => {
                 log::debug!("Toggle command palette");
                 self.toggle_unified_command_palette();

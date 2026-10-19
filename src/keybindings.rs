@@ -39,6 +39,7 @@ pub(crate) enum Action {
     OpacityDecrease,
     ToggleSearch,
     ToggleCommandPalette,
+    OpenVim9Ide,
     GreetAsciiOrganism,
     InspectAsciiOrganism,
     ExpandVteCompanion,
@@ -168,6 +169,7 @@ impl Action {
             Action::OpacityDecrease => "Opacity decrease",
             Action::ToggleSearch => "Toggle search",
             Action::ToggleCommandPalette => "Command palette",
+            Action::OpenVim9Ide => "Open Vim9 IDE workbench",
             Action::GreetAsciiOrganism => "Say hello to ASCII companion",
             Action::InspectAsciiOrganism => "Inspect ASCII companion",
             Action::ExpandVteCompanion => "Expand VTE neutral companion",
@@ -281,6 +283,7 @@ impl Action {
             Action::OpacityDecrease => Some("opacity_decrease"),
             Action::ToggleSearch => Some("toggle_search"),
             Action::ToggleCommandPalette => Some("toggle_command_palette"),
+            Action::OpenVim9Ide => Some("open_vim9_ide"),
             Action::GreetAsciiOrganism => Some("greet_ascii_organism"),
             Action::InspectAsciiOrganism => Some("inspect_ascii_organism"),
             Action::ExpandVteCompanion | Action::CollapseVteCompanion => None,
@@ -384,6 +387,7 @@ impl Action {
             Action::OpacityDecrease,
             Action::ToggleSearch,
             Action::ToggleCommandPalette,
+            Action::OpenVim9Ide,
             Action::GreetAsciiOrganism,
             Action::InspectAsciiOrganism,
             Action::ExpandVteCompanion,
@@ -519,6 +523,7 @@ impl KeybindingMap {
         bind("Ctrl+Alt+minus", Action::OpacityDecrease);
         bind("Ctrl+Shift+F", Action::ToggleSearch);
         bind("Ctrl+Shift+P", Action::ToggleCommandPalette);
+        bind("Ctrl+Alt+I", Action::OpenVim9Ide);
         bind("Ctrl+Shift+O", Action::ToggleSettings);
         bind("Ctrl+Shift+R", Action::ReloadConfig);
         bind("Ctrl+backslash", Action::ToggleSidebar);
@@ -1137,6 +1142,7 @@ mod tests {
             // Block-discovery surface.
             ("Ctrl+Shift+F", Action::ToggleSearch),
             ("Ctrl+Shift+P", Action::ToggleCommandPalette),
+            ("Ctrl+Alt+I", Action::OpenVim9Ide),
             ("Ctrl+Shift+R", Action::ReloadConfig),
             ("Ctrl+Shift+S", Action::ShowRemotePicker),
             // Selection copy out of finished blocks.
@@ -1196,6 +1202,7 @@ mod tests {
             ("Ctrl+Shift+V", Action::Paste),
             ("Ctrl+Shift+F", Action::ToggleSearch),
             ("Ctrl+Shift+P", Action::ToggleCommandPalette),
+            ("Ctrl+Alt+I", Action::OpenVim9Ide),
             ("Ctrl+Shift+O", Action::ToggleSettings),
             ("Ctrl+backslash", Action::ToggleSidebar),
             ("Ctrl+Shift+E", Action::SplitHorizontal),

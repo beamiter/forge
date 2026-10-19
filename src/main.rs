@@ -560,6 +560,13 @@ pub fn run() -> glib::ExitCode {
 
     app.connect_activate(move |app| {
         let launch = launch_options.clone();
+        if launch.ide {
+            let root = launch.working_directory.clone()
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| PathBuf::from("/"));
+            crate::vim9_ide::open(app.upcast_ref(), None, root);
+            return;
+        }
         let (config, themes, keybinding_map) = if launch.safe_mode {
             load_safe_config()
         } else {
@@ -710,6 +717,15 @@ pub fn run() -> glib::ExitCode {
         ]);
         command_palette_btn.add_css_class("flat");
 
+        let vim9_ide_btn = gtk4::Button::from_icon_name("text-editor-symbolic");
+        vim9_ide_btn.set_focus_on_click(false);
+        vim9_ide_btn.set_tooltip_text(Some("Open Vim9 IDE (Ctrl+Alt+I)"));
+        vim9_ide_btn.update_property(&[
+            gtk4::accessible::Property::Label("Open Vim9 IDE"),
+            gtk4::accessible::Property::KeyShortcuts("Control+Alt+I"),
+        ]);
+        vim9_ide_btn.add_css_class("flat");
+
         let toggle_sidebar_btn = gtk4::Button::from_icon_name("sidebar-show-symbolic");
         toggle_sidebar_btn.set_focus_on_click(false);
         toggle_sidebar_btn.set_focusable(true);
@@ -755,7 +771,7 @@ pub fn run() -> glib::ExitCode {
         top_tab_scroll.set_propagate_natural_width(false);
         top_tab_scroll.add_css_class("top-tab-scroll");
         top_tab_scroll.set_visible(false);
-        top_tab_scroll.set_margin_start(128);
+        top_tab_scroll.set_margin_start(164);
         top_tab_scroll.set_margin_end(104);
 
         // Overlay the leading controls, tab strip, and trailing actions so tab
@@ -773,6 +789,7 @@ pub fn run() -> glib::ExitCode {
         leading_actions.append(&command_palette_btn);
         leading_actions.append(&toggle_sidebar_btn);
         leading_actions.append(&toggle_placement_btn);
+        leading_actions.append(&vim9_ide_btn);
         top_bar.add_overlay(&leading_actions);
         top_bar.add_overlay(&top_tab_scroll);
         // Font zoom can exceed the compact minimum. Include tab text in the
@@ -1426,6 +1443,10 @@ pub fn run() -> glib::ExitCode {
         let ui_for_palette = ui.clone();
         command_palette_btn.connect_clicked(move |_| {
             ui_for_palette.execute_action(crate::keybindings::Action::ToggleCommandPalette);
+        });
+        let ui_for_ide = ui.clone();
+        vim9_ide_btn.connect_clicked(move |_| {
+            ui_for_ide.execute_action(crate::keybindings::Action::OpenVim9Ide);
         });
 
         // Wire toggle sidebar button

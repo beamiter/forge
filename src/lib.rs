@@ -14,6 +14,7 @@ pub(crate) mod font;
 pub(crate) mod font_zoom;
 pub mod git_meta;
 pub(crate) mod history_gc;
+pub(crate) mod vim9_ide;
 /// The OSC/CSI stream parser lives in [`jterm_core::parser`], shared with the
 /// other terminals; re-exported here so `crate::parser::…` paths keep working.
 pub mod parser {
@@ -29,6 +30,7 @@ pub mod identity {
     pub use jterm_core::identity::*;
 }
 pub mod keybindings;
+mod launch_path;
 pub mod logging;
 pub mod notebook;
 mod palette;

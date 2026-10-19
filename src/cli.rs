@@ -35,6 +35,8 @@ pub(crate) struct LaunchOptions {
     pub(crate) no_restore: bool,
     pub(crate) safe_mode: bool,
     pub(crate) mode: Option<Mode>,
+    /// Open the native Vim9 workbench instead of restoring terminal tabs.
+    pub(crate) ide: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,13 +78,15 @@ pub(crate) const HELP: &str = r#"forge — a session-aware GTK4 terminal workspa
 
 Usage:
   forge [OPTIONS] [DIRECTORY]
+  forge --ide [DIRECTORY|FILE]
   forge [OPTIONS] --execute COMMAND [ARG...]
 
 Launch options:
   -c, --config PATH           Use an alternate config file
-  -d, --working-directory DIR
-                              Start in DIR
+  -d, --working-directory PATH
+                              Start in PATH (directory, or file with --ide)
   -e, --execute COMMAND ...   Run a command instead of the configured shell
+      --ide                  Open the native Vim9 IDE for a directory or file
       --mode block|chat|vte|unified
                               Override the terminal backend for this window
       --no-restore            Start a fresh workspace
@@ -104,6 +108,8 @@ Utilities:
 
 Examples:
   forge ~/project
+  forge --ide ~/project
+  forge --ide ~/project/src/main.rs
   forge --mode block --no-restore
   forge --safe-mode
   forge -d /tmp -e bash -lc 'printf "hello\\n"'
@@ -222,6 +228,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs, St
                 )?;
             }
             "--no-restore" => parsed.launch.no_restore = true,
+            "--ide" => parsed.launch.ide = true,
             "--safe-mode" => {
                 parsed.launch.safe_mode = true;
                 parsed.launch.no_restore = true;
@@ -353,6 +360,13 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs, St
         if parsed.launch.execute.is_some() {
             return Err("--safe-mode cannot be combined with --execute".to_string());
         }
+    }
+    if parsed.launch.ide
+        && (parsed.launch.execute.is_some()
+            || parsed.launch.mode.is_some()
+            || parsed.launch.safe_mode)
+    {
+        return Err("--ide cannot be combined with --execute, --mode, or --safe-mode".into());
     }
     Ok(parsed)
 }
@@ -1104,6 +1118,12 @@ fn print_completion(shell: ShellIntegration) {
 }
 
 fn validate_launch_options(options: &LaunchOptions) -> Result<(), String> {
+    if options.ide {
+        if let Some(target) = &options.working_directory {
+            crate::launch_path::resolve(target, true)?;
+        }
+        return Ok(());
+    }
     let requested_cwd = if let Some(directory) = &options.working_directory {
         let directory = directory.to_str().ok_or_else(|| {
             "working directory must be valid UTF-8 (the terminal backend cannot represent this path)"
@@ -1320,6 +1340,28 @@ mod tests {
     }
 
     #[test]
+    fn vim9_ide_launch_preserves_project_path_and_rejects_shell_modes() {
+        let parsed = parse(&["--ide", "project with spaces"]).unwrap();
+        assert!(parsed.launch.ide);
+        assert_eq!(
+            parsed.launch.working_directory,
+            Some(PathBuf::from("project with spaces"))
+        );
+        assert!(parsed.launch.execute.is_none());
+        for args in [
+            vec!["--ide", "--execute", "bash"],
+            vec!["--ide", "--mode", "unified"],
+            vec!["--ide", "--safe-mode"],
+            vec!["--ide", "--doctor"],
+        ] {
+            assert!(
+                parse(&args).is_err(),
+                "accepted conflicting flags: {args:?}"
+            );
+        }
+    }
+
+    #[test]
     fn parses_launch_options_and_execute_remainder() {
         let parsed = parse(&[
             "--mode", "block", "-d", "/tmp", "-e", "bash", "-lc", "echo hi",
@@ -1333,6 +1375,7 @@ mod tests {
                 no_restore: false,
                 safe_mode: false,
                 mode: Some(Mode::Block),
+                ide: false,
             }
         );
     }
@@ -1421,6 +1464,33 @@ mod tests {
             ..LaunchOptions::default()
         };
         assert!(validate_launch_options(&not_executable).is_err());
+    }
+
+    #[test]
+    fn file_targets_are_valid_only_for_ide_launches() {
+        let root = std::env::temp_dir().join(format!("forge-ide-target-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let existing = root.join("existing file.txt");
+        let new_file = root.join("new file.txt");
+        std::fs::write(&existing, "preserved\n").unwrap();
+        for ide in [false, true] {
+            for (target, accepted) in [
+                (&root, true),
+                (&existing, ide),
+                (&new_file, ide),
+                (&root.join("missing/new.txt"), false),
+            ] {
+                let options = LaunchOptions {
+                    working_directory: Some(target.clone()),
+                    ide,
+                    ..LaunchOptions::default()
+                };
+                assert_eq!(validate_launch_options(&options).is_ok(), accepted);
+            }
+        }
+        assert_eq!(std::fs::read_to_string(existing).unwrap(), "preserved\n");
+        assert!(!new_file.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
