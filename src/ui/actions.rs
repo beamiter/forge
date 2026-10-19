@@ -267,6 +267,10 @@ impl UiState {
                 let target = self.organism_greeting_target();
                 self.greet_ascii_organism_for(&target);
             }
+            Action::InspectAsciiOrganism => {
+                let target = self.organism_greeting_target();
+                self.inspect_ascii_organism_for(&target);
+            }
             Action::ToggleCommandPalette => {
                 log::debug!("Toggle command palette");
                 self.toggle_unified_command_palette();

@@ -1,6 +1,7 @@
 //! Native local Block/Unified body for the experimental ASCII organism.
 
 mod inline_card;
+mod inspector;
 #[cfg(all(test, target_os = "linux"))]
 mod surface_probe;
 mod watch_adapter;
@@ -24,7 +25,9 @@ use jterm_core::organism::{
 };
 use jterm_core::organism_attention::{AttentionArbiter, AttentionCue};
 use jterm_core::organism_clock::{InputActivity, MAX_TICK};
+#[cfg(test)]
 use jterm_core::organism_daily::behavior_explanation;
+use jterm_core::organism_daily::context_explanation;
 #[cfg(test)]
 use jterm_core::organism_daily::GentleInteraction;
 #[cfg(test)]
@@ -2847,6 +2850,7 @@ impl OrganismRuntime {
             self.surface_behavior.get(),
             self.presented_surface.get(),
             self.live_body.is_mapped(),
+            state,
         );
         let words = format!("{explanation} · {}", state_words(state));
         if self.state.text().as_str() != words {
@@ -2855,6 +2859,73 @@ impl OrganismRuntime {
         let detail = format!("{explanation}\n{}", state_summary(state));
         if self.state.tooltip_text().as_deref() != Some(detail.as_str()) {
             self.state.set_tooltip_text(Some(&detail));
+        }
+    }
+
+    /// Read existing facts once. Inspection has no refresh/tick/attention path
+    /// and never retains the pane behind the dialog.
+    fn inspection_snapshot(&self, view: &TermView) -> inspector::Snapshot {
+        let now = Instant::now();
+        let running = self.command_running.get();
+        let elapsed = self
+            .command_started_at
+            .get()
+            .map(|at| now.saturating_duration_since(at));
+        let behavior = if running {
+            watching_behavior(self.agent_watching.get(), elapsed)
+        } else if self.surface_behavior.get() == Behavior::Idle {
+            self.ambient_display.get().display()
+        } else {
+            self.surface_behavior.get()
+        };
+        let life = self.shared_life.get();
+        let growth = self.activity.growth();
+        let context = RenderContext::new(behavior, BodyLanguage::from_state(life), false)
+            .with_growth_stage(visual_growth_stage(growth.stage()))
+            .with_watch_rhythm(if running {
+                self.visible_watch_rhythm.get()
+            } else {
+                WatchRhythm::Steady
+            });
+        let activity = if self.awaiting_unobserved_work.get() {
+            "Waiting for the current terminal activity to settle.".to_owned()
+        } else if running {
+            let who = if self.agent_watching.get() {
+                "Shell Agent is working"
+            } else {
+                "A command is running"
+            };
+            elapsed.map_or_else(
+                || who.to_owned(),
+                |elapsed| format!("{who} · {} elapsed", elapsed_label(elapsed)),
+            )
+        } else {
+            match view.organism_activity_knowledge() {
+                jterm_core::organism_live::LiveActivityKnowledge::KnownIdle => {
+                    "At an idle prompt.".to_owned()
+                }
+                jterm_core::organism_live::LiveActivityKnowledge::Busy => {
+                    "The terminal is busy; no new companion command outcome is available."
+                        .to_owned()
+                }
+                jterm_core::organism_live::LiveActivityKnowledge::Unknown => {
+                    "Current command activity is not yet confirmed.".to_owned()
+                }
+            }
+        };
+        inspector::Snapshot {
+            context,
+            life,
+            growth,
+            activity,
+            latest: self.status_base.borrow().clone(),
+            memory: GrowthTooltip::new(self.memory_badge.get(), growth).text(),
+            motion: match self.motion.get() {
+                OrganismMotion::Full => "Full · movement and animated poses",
+                OrganismMotion::Calm => "Calm · still poses that follow observed events",
+                OrganismMotion::Static => "Static · inline companion only",
+            },
+            vigil: self.organism.borrow().repo_vigil(),
         }
     }
 
@@ -3768,6 +3839,7 @@ impl Drop for OrganismRuntime {
 
 /// Describe the actual visible surface. Hidden/static bodies fall back to
 /// the inline card's own pose rather than an internal typing/watch placeholder.
+#[cfg(test)]
 fn state_explanation(
     inline: Behavior,
     presented: Option<Behavior>,
@@ -3787,28 +3859,16 @@ fn state_explanation_with_rhythm(
     inline: Behavior,
     presented: Option<(Behavior, WatchRhythm)>,
     live_mapped: bool,
+    state: LifeState,
 ) -> String {
-    let explanation =
-        state_explanation(inline, presented.map(|(behavior, _)| behavior), live_mapped);
-    let observation = if live_mapped {
-        presented.and_then(|(behavior, rhythm)| {
-            if !matches!(behavior, Behavior::WatchCommand | Behavior::WatchSettled) {
-                return None;
-            }
-            match rhythm {
-                WatchRhythm::Steady => None,
-                WatchRhythm::Busy => Some("Recent output activity."),
-                WatchRhythm::Waiting => Some("No new output observed recently."),
-                WatchRhythm::Resumed => Some("Output activity resumed."),
-            }
-        })
+    let (behavior, rhythm) = if live_mapped {
+        presented.unwrap_or((inline, WatchRhythm::Steady))
     } else {
-        None
+        (inline, WatchRhythm::Steady)
     };
-    match observation {
-        Some(observation) => format!("{explanation} {observation}"),
-        None => explanation.to_owned(),
-    }
+    let context = RenderContext::new(behavior, BodyLanguage::from_state(state), false)
+        .with_watch_rhythm(rhythm);
+    context_explanation(context).to_owned()
 }
 
 fn state_summary(state: LifeState) -> String {
@@ -3918,6 +3978,55 @@ impl UiState {
                 "Hello is unavailable. Use an idle, visible companion in Full or Calm mode and wait between greetings.",
             ));
         }
+    }
+
+    pub(crate) fn inspect_ascii_organism_for(&self, target: &OrganismGreetingTarget) {
+        if std::env::var_os("FORGE_SAFE_MODE").is_some() {
+            self.toast_overlay.add_toast(libadwaita::Toast::new(
+                "ASCII companion is unavailable in safe mode.",
+            ));
+            return;
+        }
+        if !self.config.borrow().ascii_organism_enabled {
+            self.toast_overlay.add_toast(libadwaita::Toast::new(
+                "ASCII companion is off. Enable it in Settings to begin.",
+            ));
+            return;
+        }
+        let view = match target {
+            OrganismGreetingTarget::Block(view) => view.upgrade().filter(|view| {
+                self.current_term_view()
+                    .is_some_and(|current| Rc::ptr_eq(&current, view))
+                    && view.widget().is_ancestor(&self.window)
+                    && !PaneLeaf::Block(view.clone()).is_remote()
+            }),
+            OrganismGreetingTarget::Vte(root)
+                if root.upgrade().is_some_and(|root| {
+                    self.current_pane_leaf()
+                        .is_some_and(|pane| pane.root_widget() == root && !pane.is_remote())
+                        && root.is_ancestor(&self.window)
+                }) =>
+            {
+                inspector::present_capability(&self.window, "Traditional VTE shows a neutral companion. It has no confirmed command outcomes or live organism state to inspect. The offline pose gallery is available in Settings; Block and Unified modes support the living companion.");
+                return;
+            }
+            _ => None,
+        };
+        let Some(runtime) = view
+            .as_ref()
+            .and_then(|view| self.organism_presence.runtime_for(view))
+            .filter(|runtime| runtime.enabled.get())
+        else {
+            self.toast_overlay.add_toast(libadwaita::Toast::new(
+                "The original local companion pane is no longer available.",
+            ));
+            return;
+        };
+        let snapshot = runtime.inspection_snapshot(
+            view.as_ref()
+                .expect("a runtime belongs to the validated view"),
+        );
+        inspector::present(&self.window, snapshot);
     }
 
     /// Revoke synchronously when Notebook announces a page transition. GTK's
@@ -4685,6 +4794,83 @@ impl UiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_explanation_reflects_life_but_never_relabels_an_outcome() {
+        let life = LifeState {
+            energy: 0.1,
+            ..LifeState::default()
+        };
+        let describe = |behavior| state_explanation_with_rhythm(behavior, None, false, life);
+        assert!(describe(Behavior::Idle).starts_with("Dozing"));
+        assert!(describe(Behavior::WatchCommand)
+            .starts_with(behavior_explanation(Behavior::WatchCommand)));
+        assert!(describe(Behavior::UnknownOutcome)
+            .starts_with(behavior_explanation(Behavior::UnknownOutcome)));
+        assert!(describe(Behavior::InspectError)
+            .starts_with(behavior_explanation(Behavior::InspectError)));
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn inspection_captures_real_state_without_attention_or_lifecycle_changes() {
+        gtk4::init().expect("gtk display");
+        let view = crate::block_view::organism_settings_test_view();
+        let presence = OrganismPresence::new();
+        let token = presence.reserve();
+        let life = Rc::new(Cell::new(LifeState::default()));
+        let growth = GrowthProgress {
+            days_seen: 14,
+            lifetime_recoveries: 3,
+        };
+        let activity = OrganismActivity::new(None, growth);
+        let runtime = OrganismRuntime::new(
+            life.clone(),
+            activity.clone(),
+            presence.clone(),
+            token,
+            OrganismMotion::Calm,
+            true,
+        );
+        presence.bind(token, &view, &runtime);
+        runtime.command_running.set(true);
+        activity.command_started(Instant::now());
+        runtime
+            .command_started_at
+            .set(Some(Instant::now() - Duration::from_secs(42)));
+        runtime.agent_watching.set(true);
+        runtime.visible_watch_rhythm.set(WatchRhythm::Waiting);
+        runtime.surface_behavior.set(Behavior::WatchAgent);
+        *runtime.status_base.borrow_mut() = "Watching the local Shell Agent work".to_owned();
+        let state = state_summary(life.get());
+        let generation = runtime.generation.get();
+        let frame = runtime.surface_frame.get();
+        let snapshot = runtime.inspection_snapshot(&view);
+        assert_eq!(snapshot.context.behavior, Behavior::WatchAgent);
+        assert_eq!(snapshot.context.watch_rhythm, WatchRhythm::Waiting);
+        assert_eq!(snapshot.growth, growth);
+        assert!(snapshot.activity.contains("42s elapsed"));
+        assert_eq!(snapshot.latest, "Watching the local Shell Agent work");
+        assert!(context_explanation(snapshot.context).contains("has not finished"));
+        assert_eq!(state_summary(life.get()), state);
+        assert_eq!(runtime.generation.get(), generation);
+        assert_eq!(runtime.surface_frame.get(), frame);
+        assert_eq!(activity.commands_running.get(), 1);
+        assert!(runtime.surface_timer.borrow().is_none());
+        assert!(runtime.pointer_timer.borrow().is_none());
+        assert!(runtime.settle_timer.borrow().is_none());
+        assert!(crate::block_view::organism_settings_test_pty_bytes(&view).is_empty());
+        let weak_runtime = Rc::downgrade(&runtime);
+        let weak_view = Rc::downgrade(&view);
+        drop(runtime);
+        drop(view);
+        assert!(weak_runtime.upgrade().is_none());
+        assert!(weak_view.upgrade().is_none());
+        assert_eq!(
+            snapshot.growth, growth,
+            "owned snapshots cannot retain a pane"
+        );
+    }
 
     #[test]
     fn growth_tooltip_keys_cover_counts_and_memory_transitions() {
@@ -12142,18 +12328,41 @@ mod tests {
 
     #[test]
     fn watch_explanation_uses_only_the_visible_final_observation() {
-        for behavior in [Behavior::WatchCommand, Behavior::WatchSettled] {
+        for behavior in [
+            Behavior::WatchCommand,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+        ] {
             for (rhythm, observation) in [
-                (WatchRhythm::Busy, "Recent output activity."),
-                (WatchRhythm::Waiting, "No new output observed recently."),
-                (WatchRhythm::Resumed, "Output activity resumed."),
+                (
+                    WatchRhythm::Busy,
+                    "Following an active stream of command output.",
+                ),
+                (
+                    WatchRhythm::Waiting,
+                    "Keeping watch while output is quiet; the command has not finished.",
+                ),
+                (
+                    WatchRhythm::Resumed,
+                    "Perking up as command output resumes.",
+                ),
             ] {
                 assert_eq!(
-                    state_explanation_with_rhythm(Behavior::Idle, Some((behavior, rhythm)), true),
-                    format!("{} {observation}", behavior_explanation(behavior))
+                    state_explanation_with_rhythm(
+                        Behavior::Idle,
+                        Some((behavior, rhythm)),
+                        true,
+                        LifeState::default()
+                    ),
+                    observation
                 );
                 assert_eq!(
-                    state_explanation_with_rhythm(Behavior::Idle, Some((behavior, rhythm)), false),
+                    state_explanation_with_rhythm(
+                        Behavior::Idle,
+                        Some((behavior, rhythm)),
+                        false,
+                        LifeState::default()
+                    ),
                     behavior_explanation(Behavior::Idle)
                 );
             }
@@ -12163,26 +12372,27 @@ mod tests {
             Behavior::Approach,
             Behavior::Celebrate,
             Behavior::InspectError,
-            Behavior::WatchAgent,
         ] {
             assert_eq!(
                 state_explanation_with_rhythm(
                     Behavior::Idle,
                     Some((behavior, WatchRhythm::Busy)),
-                    true
+                    true,
+                    LifeState::default()
                 ),
                 behavior_explanation(behavior)
             );
         }
         assert_eq!(
-            state_explanation_with_rhythm(Behavior::Idle, None, true),
+            state_explanation_with_rhythm(Behavior::Idle, None, true, LifeState::default()),
             behavior_explanation(Behavior::Idle)
         );
         assert_eq!(
             state_explanation_with_rhythm(
                 Behavior::Idle,
                 Some((Behavior::WatchCommand, WatchRhythm::Steady)),
-                true
+                true,
+                LifeState::default()
             ),
             behavior_explanation(Behavior::WatchCommand)
         );

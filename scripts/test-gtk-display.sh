@@ -52,6 +52,8 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    ui::organism::inspector::tests::snapshot_dialog_is_scrollable_and_closes_without_an_animation_source
+    ui::organism::tests::inspection_captures_real_state_without_attention_or_lifecycle_changes
     ui::tasks_panel::tests::cached_selected_row_survives_no_focus_move_hide_and_reveal
     ui::tasks_panel::tests::task_filters_route_real_x11_keyboard_by_identity
     ui::tasks_panel::tests::task_filters_keep_identity_hidden_updates_and_keyboard_routing

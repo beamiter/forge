@@ -887,6 +887,11 @@ impl UiState {
                     Accept::Action(crate::keybindings::Action::GreetAsciiOrganism)
                 ) {
                     ui.greet_ascii_organism_for(&greeting_target);
+                } else if matches!(
+                    &entry.accept,
+                    Accept::Action(crate::keybindings::Action::InspectAsciiOrganism)
+                ) {
+                    ui.inspect_ascii_organism_for(&greeting_target);
                 } else if let Accept::Action(
                     action @ (crate::keybindings::Action::ExpandVteCompanion
                     | crate::keybindings::Action::CollapseVteCompanion),
