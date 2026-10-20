@@ -46,7 +46,26 @@ class PreviewWiring(unittest.TestCase):
         source = (ROOT / "src/ui/search_preview.rs").read_text()
         code = re.sub(r"//[^\n]*", "", source)
         self.assertNotRegex(code, r"search_find|search_set|select_range|select_all|clipboard|primary_clipboard|vte4")
-        self.assertEqual(code.count("self.current_term_view()"), 1)
+        opening = function(code, "    pub(crate) fn show_exact_search_preview(")
+        self.assertEqual(code.count("self.search_targets()"), 1)
+        self.assertIn("let Some(owner) = self.search_targets().1 else {", opening)
+        self.assertNotRegex(code, r"self\.current_(?:terminal|term_view)\(\)")
+        # Resolve the captured Find owner once, without changing live Find or
+        # falling back to a sibling when a pinned owner is unavailable.
+        targets = function(
+            (ROOT / "src/ui/search.rs").read_text(),
+            "    pub(super) fn search_targets(",
+        )
+        targets = re.sub(r"//[^\n]*", "", targets)
+        self.assertIn("let owner = self.search_owner.borrow();", targets)
+        self.assertIn("owner.as_ref().filter(|owner| owner.pinned)", targets)
+        self.assertIn(".and_then(Weak::upgrade)", targets)
+        self.assertIn(".filter(|view| view.widget().is_mapped())", targets)
+        self.assertRegex(targets, r"return match view \{\s*Some\(view\) => \(Some\(view\.vte\(\)\.clone\(\)\), Some\(view\)\),\s*None => \(None, None\),\s*\};")
+        self.assertIn("(self.current_terminal(), self.current_term_view())", targets)
+        self.assertNotRegex(targets, r"borrow_mut|search_find|search_set|select_range|select_all|clipboard|grab_focus|clear_find|search_apply")
+        self.assertEqual(code.count("owner.capture_search_preview()?"), 1)
+        self.assertIn("Arc::new(owner.capture_search_preview()?)", source)
         self.assertIn("owner: Rc::downgrade(&owner)", source)
         self.assertIn("root.is_realized()", source)
         self.assertIn("search_preview::reply_is_current(", source)
@@ -60,7 +79,14 @@ class PreviewWiring(unittest.TestCase):
         self.assertIn("dialog.connect_closed", source)
         self.assertIn("controls_closed.worker.stop()", source)
         self.assertNotRegex(code, r"\b(?:entry|search_entry)\s*\.\s*text\s*\(")
-        self.assertIn(".chars(0, (search_preview::QUERY_LIMIT + 1) as i32)", source)
+        # The seed permits two / delimiters plus one oversize sentinel;
+        # subsequent edits need only the sentinel. Byte limits still apply.
+        self.assertIn(".chars(0, (search_preview::QUERY_LIMIT + 3) as i32)", opening)
+        self.assertIn("original.starts_with('/') && original.ends_with('/')", source)
+        self.assertIn("(&original[1..original.len() - 1], true)", source)
+        self.assertIn("if query.len() <= search_preview::QUERY_LIMIT", source)
+        self.assertIn("controls.submit(query, use_regex)", source)
+        self.assertEqual(code.count(".chars(0, (search_preview::QUERY_LIMIT + 1) as i32)"), 2)
         self.assertIn("delegate.set_max_length((search_preview::QUERY_LIMIT + 1) as i32)", source)
         self.assertIn("entry.connect_changed", source)
         self.assertIn("regex.connect_toggled", source)
