@@ -106,13 +106,13 @@ Unified 遵守这些单元格坐标；Block 保留既有“图片作为完成卡
 
 ### 实验性 ASCII organism
 
-Block pane 可以显式启用一个完全本地、无 LLM 的 ASCII organism：
+ASCII organism 默认开启，完全本地、无 LLM。可通过配置关闭：
 
 ```toml
-ascii_organism_enabled = true
+ascii_organism_enabled = false
 ```
 
-临时试用可设置 `FORGE_ASCII_ORGANISM_ENABLED=1`。Settings 的启停和动作等级会立即
+临时关闭可设置 `FORGE_ASCII_ORGANISM_ENABLED=0`。Settings 的启停和动作等级会立即
 作用于已打开的本地 Block / Unified pane；修改配置文件后使用 Reload Config，无需重建
 pane。关闭会立即收起身体、卡片和该 pane 的动画定时器；重复启停不会重复挂接。它监听 Forge 从 OSC 133
 边界捕获的真实 command start/finished 事件。生命体平时沿 live terminal surface

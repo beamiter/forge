@@ -3015,7 +3015,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .unwrap_or(true);
     let ascii_organism_enabled = env_bool("FORGE_ASCII_ORGANISM_ENABLED")
         .or(fc.ascii_organism_enabled)
-        .unwrap_or(false);
+        .unwrap_or(true);
     let ascii_organism_motion = resolve_setting_text(
         env_string("FORGE_ASCII_ORGANISM_MOTION"),
         fc.ascii_organism_motion,
@@ -3897,7 +3897,7 @@ open_palette = "F8"
     }
 
     #[test]
-    fn ascii_organism_is_a_boolean_opt_in_config_key() {
+    fn ascii_organism_is_a_boolean_config_key() {
         let valid = validate_config_contents("ascii_organism_enabled = true\n").unwrap();
         assert!(valid.is_empty(), "unexpected issues: {valid:?}");
 
