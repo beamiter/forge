@@ -4,7 +4,7 @@ forge 是一个面向开发工作流的原生 GTK4 终端。它默认使用 Bloc
 
 ## 能力概览
 
-- 原生 [Vim9 IDE 工作台](docs/VIM9_IDE.md)：真实 Vim 9 + VTE 编辑区，GTK 项目/缓冲区导航、保存、项目搜索、诊断定位、异步构建与输出，以及按 Vim 实际能力启用的语言服务按钮。使用 `forge --ide ~/project` 或 `Ctrl+Alt+I` 进入。
+- 原生 [Vim9 IDE 工作台](docs/VIM9_IDE.md)：真实 Vim 9 + VTE 编辑区，GTK 项目/缓冲区导航、全项目模糊快速打开、行列跳转、Vim 双向分屏、受保护的缓冲区关闭、保存全部后构建、项目搜索、诊断定位、异步构建与输出，以及按 Vim 实际能力启用的语言服务按钮。使用 `forge --ide ~/project` 或 `Ctrl+Alt+I` 进入。
 - 默认 Block、连续滚屏 Unified、传统 VTE 的三终端后端
 - Unified 专用命令导航条：实时/阅读历史状态、未读完成计数、前后命令、复制当前命令、Find、Browse 和返回实时
 - 标签页、混合后端分屏、方向导航、缩放、前台进程关闭确认与多窗口独立会话恢复

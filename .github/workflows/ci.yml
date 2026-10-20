@@ -157,6 +157,8 @@ jobs:
             libgtk-4-dev \
             libadwaita-1-dev \
             libvte-2.91-gtk4-dev \
+            vim \
+            ripgrep \
             libpcre2-dev \
             xvfb \
             xdotool \
@@ -188,6 +190,16 @@ jobs:
 
       - name: Check font sizing against native Pango
         run: python3 scripts/test-font-sync.py
+
+      - name: Check native Vim9 editing and navigation
+        timeout-minutes: 10
+        env:
+          GDK_BACKEND: x11
+          GSK_RENDERER: cairo
+          GTK_A11Y: none
+        run: |
+          dbus-run-session -- xvfb-run --auto-servernum \
+            cargo test --lib --all-features --locked vim9_ide -- --include-ignored --test-threads=1
 
       - name: Check F13 native fractional-scale Chat rendering
         run: |

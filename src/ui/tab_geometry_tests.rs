@@ -94,7 +94,7 @@ fn scroller() -> ScrolledWindow {
     top_tab_scroll.set_propagate_natural_width(false);
     top_tab_scroll.add_css_class("top-tab-scroll");
     top_tab_scroll.set_visible(true);
-    top_tab_scroll.set_margin_start(128);
+    top_tab_scroll.set_margin_start(164);
     top_tab_scroll.set_margin_end(104);
 
     top_tab_scroll
@@ -208,6 +208,7 @@ fn production_top_tabs_bound_viewport_minimum_across_font_extremes() {
         "system-search-symbolic",
         "sidebar-show-symbolic",
         "view-list-symbolic",
+        "text-editor-symbolic",
     ] {
         let button = gtk::Button::from_icon_name(icon);
         button.add_css_class("flat");
