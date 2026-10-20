@@ -558,13 +558,22 @@ pub fn run() -> glib::ExitCode {
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
+    let ide_entry = std::cell::RefCell::new(launch_options.ide.then(|| {
+        let root = launch_options
+            .working_directory
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        jterm_core::vim9::Vim9EntryRequest::command_line(root)
+    }));
     app.connect_activate(move |app| {
         let launch = launch_options.clone();
         if launch.ide {
-            let root = launch.working_directory.clone()
-                .or_else(|| std::env::current_dir().ok())
-                .unwrap_or_else(|| PathBuf::from("/"));
-            crate::vim9_ide::open(app.upcast_ref(), None, root);
+            if let Some(request) = ide_entry.borrow_mut().take() {
+                crate::vim9_ide::open(app.upcast_ref(), None, request);
+            } else if let Some(window) = app.active_window() {
+                window.present();
+            }
             return;
         }
         let (config, themes, keybinding_map) = if launch.safe_mode {

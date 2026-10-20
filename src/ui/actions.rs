@@ -299,7 +299,9 @@ impl UiState {
                     .filter(|path| path.is_dir())
                     .or_else(|| std::env::current_dir().ok())
                     .unwrap_or_else(|| std::path::PathBuf::from("/"));
-                if let Err(error) = crate::vim9_ide::launch(root) {
+                if let Err(error) =
+                    crate::vim9_ide::launch(jterm_core::vim9::Vim9EntryRequest::user_action(root))
+                {
                     self.toast_overlay
                         .add_toast(adw::Toast::new(&format!("Cannot open Vim9 IDE: {error}")));
                 }
