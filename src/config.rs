@@ -677,7 +677,7 @@ fn wrap_jsh_argv_in_interactive_bash(jsh_path: &str) -> Option<Vec<String>> {
         // shell path therefore travels as `$0`, and a `--session <id>` the
         // caller appends reaches the shell through `$@` instead of being
         // consumed as the wrapper's own operands.
-        "exec \"$0\" \"$@\"".to_string(),
+        jterm_core::vim9::VIM9_SHELL_EXEC.to_string(),
         jsh_path.to_string(),
     ])
 }
@@ -3200,11 +3200,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
 /// after `load_config`, this cannot block on or inherit a user-selected config
 /// path, and it also resets custom keybindings.
 pub(crate) fn load_safe_config() -> (Config, Vec<Theme>, KeybindingMap) {
-    (
-        Config::safe_defaults(),
-        builtin_themes(),
-        KeybindingMap::from_defaults(),
-    )
+    let mut config = Config::safe_defaults();
+    config.vim9.auto_gui = false;
+    (config, builtin_themes(), KeybindingMap::from_defaults())
 }
 
 // ---------------------------------------------------------------------------
@@ -3621,7 +3619,7 @@ mod tests {
         assert_eq!(argv[1], "-ic");
         // The shell travels as `$0` and appended operands as `$@`, so a
         // `--session <id>` the spawn path adds reaches the shell.
-        assert_eq!(argv[2], "exec \"$0\" \"$@\"");
+        assert_eq!(argv[2], jterm_core::vim9::VIM9_SHELL_EXEC);
         assert_eq!(argv[3], "/home/tester/.cargo/bin/jsh");
     }
 
@@ -3636,7 +3634,7 @@ mod tests {
         assert_eq!(
             &argv[2..],
             &[
-                "exec \"$0\" \"$@\"".to_string(),
+                jterm_core::vim9::VIM9_SHELL_EXEC.to_string(),
                 "/home/tester/.cargo/bin/jsh".to_string(),
                 "--session".to_string(),
                 "home-main".to_string(),

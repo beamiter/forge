@@ -271,6 +271,7 @@ impl VteTerminalView {
             session_id,
             initial_commands,
             env_extra,
+            config.borrow().vim9.auto_gui,
             on_launched,
             launch_failed_callbacks.clone(),
         );
@@ -638,6 +639,7 @@ fn spawn_shell(
     session_id: Option<&str>,
     launch_owner: Rc<launch_owner::LaunchOwner>,
     env_extra: Vec<(String, String)>,
+    auto_gui: bool,
     on_settled: Option<Box<dyn FnOnce()>>,
     cancellable: &Cancellable,
     on_resolved: Box<dyn FnOnce(Result<(), String>)>,
@@ -666,8 +668,14 @@ fn spawn_shell(
     // for ordinary shells; task terminals use it to pin validation children to
     // no-rc startup files. The pairs must reach both a native child (through
     // the frozen envv) and a flatpak-spawn host wrapper (through wrap_argv).
-    let env_extra_pairs: Vec<(&str, &str)> = env_extra
+    let vim_environment = if env_extra.is_empty() {
+        crate::vim9_ide::shell_environment(argv_owned, auto_gui)
+    } else {
+        Vec::new()
+    };
+    let env_extra_pairs: Vec<(&str, &str)> = vim_environment
         .iter()
+        .chain(env_extra.iter())
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
     let home = std::env::var("HOME").ok();

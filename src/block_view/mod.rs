@@ -14220,7 +14220,11 @@ impl TermView {
         // documented `[[ $TERM_PROGRAM == forge ]] && source ...` rc gate reads)
         // and the `LESS=R` pager default come from `child_env` inside the PTY
         // spawner, so the fork site and the Flatpak host bridge cannot drift.
-        let mut env_extra: Vec<(&str, &str)> = Vec::new();
+        let vim_environment = crate::vim9_ide::shell_environment(shell_argv, config.vim9.auto_gui);
+        let mut env_extra: Vec<(&str, &str)> = vim_environment
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
         let session_id_owned = session_id.map(str::to_owned);
         if let Some(ref sid) = session_id_owned {
             if is_jsh {

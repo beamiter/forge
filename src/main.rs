@@ -544,6 +544,24 @@ pub fn run() -> glib::ExitCode {
     // by the compiler. Registration is first-call-wins, so it must precede the
     // first `OrganismMemory::load`.
     jterm_core::organism_memory::init_scheduler(Box::new(OrganismLane));
+    let shell_request =
+        match jterm_core::vim9::shell_vim_request(&std::env::args_os().skip(1).collect::<Vec<_>>())
+        {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("forge: {error}");
+                return glib::ExitCode::from(2u8);
+            }
+        };
+    if let Some(request) = shell_request {
+        if let Some(path) = std::env::var_os("JTERM_VIM9_CONFIG") {
+            std::env::set_var("FORGE_CONFIG", path);
+        }
+        init_logging();
+        init_input_method_env();
+        let status = crate::vim9_ide::run_shell(request, crate::host::APP_ID);
+        return glib::ExitCode::from(status.clamp(0, 255) as u8);
+    }
     if let Some(code) = crate::cli::handle_early_args() {
         return code;
     }

@@ -20,6 +20,7 @@ pub(super) struct LaunchRecovery {
     directory: RefCell<Option<String>>,
     session_id: Option<String>,
     env_extra: Vec<(String, String)>,
+    auto_gui: bool,
     on_settled: RefCell<Option<Box<dyn FnOnce()>>>,
     failed_callbacks: StrCallbacks,
 }
@@ -35,6 +36,7 @@ impl LaunchRecovery {
         session_id: Option<&str>,
         commands: &[String],
         env_extra: Vec<(String, String)>,
+        auto_gui: bool,
         on_settled: Option<Box<dyn FnOnce()>>,
         failed_callbacks: StrCallbacks,
     ) -> Rc<Self> {
@@ -102,6 +104,7 @@ impl LaunchRecovery {
             directory: RefCell::new(cwd.map(str::to_owned)),
             session_id: session_id.map(str::to_owned),
             env_extra,
+            auto_gui,
             on_settled: RefCell::new(on_settled),
             failed_callbacks,
         });
@@ -178,6 +181,7 @@ impl LaunchRecovery {
             self.session_id.as_deref(),
             self.owner.clone(),
             self.env_extra.clone(),
+            self.auto_gui,
             self.on_settled.borrow_mut().take(),
             &self.cancellable,
             Box::new(move |result| {

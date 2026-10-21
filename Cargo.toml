@@ -17,8 +17,8 @@ test = false
 bench = false
 
 [dependencies]
-# Pin the shared explicit IDE entry contract to its published revision.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "40c2e0a482bd5334b2607e9426de7617af9fc680" }
+# Pin the shared shell GUI entry and precise scrolling contract.
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "f53528e553bd95de10e1650ca4c77eedda48d397" }
 jagent = { version = "0.7.0", git = "https://github.com/beamiter/jagent.git", rev = "d5492320686879c8b92106d2e31e4293ff125a5a" }
 log = { version = "0.4", features = ["std"] }
 crossbeam-channel = "0.5"
@@ -44,7 +44,7 @@ gtk4 = { version = "0.11.4", features = ["v4_14"] }
 libadwaita = { version = "0.9.2", features = ["v1_5"] }
 
 [dev-dependencies]
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "40c2e0a482bd5334b2607e9426de7617af9fc680", features = ["session-parity-tests"] }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "f53528e553bd95de10e1650ca4c77eedda48d397", features = ["session-parity-tests"] }
 env_logger = "0.11"
 
 [profile.dev]
