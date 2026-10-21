@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: beamiter/anvil
-          ref: c977952489cced72ea1ac0b23af62c0521fdbfc7
+          ref: de8986d233cf72ea2a0d6af73317d257089df6b2
           path: .pixel-tooling
           sparse-checkout: .maintenance
           persist-credentials: false
@@ -39,7 +39,9 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq pkg-config libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev libpcre2-dev xvfb dbus-x11 vim-nox ripgrep > /tmp/deps.log 2>&1 || { tail -60 /tmp/deps.log; exit 1; }
-      - run: python3 .pixel-tooling/.maintenance/apply-pixel-gtk.py
+      - run: |
+          python3 .pixel-tooling/.maintenance/apply-pixel-gtk.py
+          python3 .pixel-tooling/.maintenance/refine-pixel-gtk.py
       - run: cargo fmt --all && git diff --check
       - run: cargo check --quiet --locked --all-targets
       - run: cargo test --quiet --locked vim9 -- --test-threads=1
