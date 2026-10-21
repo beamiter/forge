@@ -544,6 +544,15 @@ pub fn run() -> glib::ExitCode {
     // by the compiler. Registration is first-call-wins, so it must precede the
     // first `OrganismMemory::load`.
     jterm_core::organism_memory::init_scheduler(Box::new(OrganismLane));
+    if let Some(result) =
+        jterm_core::vim9::forward_shell_vim(&std::env::args_os().skip(1).collect::<Vec<_>>())
+    {
+        let status = result.unwrap_or_else(|error| {
+            eprintln!("forge: {error}");
+            1
+        });
+        return glib::ExitCode::from(status.clamp(0, 255) as u8);
+    }
     let shell_request =
         match jterm_core::vim9::shell_vim_request(&std::env::args_os().skip(1).collect::<Vec<_>>())
         {
@@ -1365,6 +1374,8 @@ pub fn run() -> glib::ExitCode {
             });
         }
 
+        crate::vim9_ide::install_shell_host(&window);
+
         // Background persistence failures arrive from a Send-only worker.
         // Polling a bounded queue keeps GTK objects on the main thread and
         // turns otherwise invisible fsync/permission failures into one concise
@@ -2025,6 +2036,7 @@ pub fn run() -> glib::ExitCode {
         let close_allowed = Rc::new(Cell::new(false));
         let close_confirmation_open = Rc::new(Cell::new(false));
         window.connect_close_request(move |window| {
+            if crate::vim9_ide::request_embedded_close(window) { return glib::Propagation::Stop; }
             if !close_allowed.get() {
                 // A zoomed split keeps the sibling tree outside the Notebook.
                 // Restore it before scanning/saving so no hidden pane escapes

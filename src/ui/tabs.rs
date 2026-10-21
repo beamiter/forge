@@ -458,6 +458,9 @@ impl UiState {
         term_widget: &gtk4::Widget,
         exit_code: Option<i32>,
     ) {
+        if exit_code.is_none() && crate::vim9_ide::request_embedded_close(term_widget) {
+            return;
+        }
         let leaf_root = pane_leaf_root_of(term_widget).unwrap_or_else(|| term_widget.clone());
         if let Some(leaf) = PaneLeaf::from_widget(&leaf_root) {
             if leaf.task_role().is_some() {
@@ -587,6 +590,9 @@ impl UiState {
         // replace a Notebook page or emit focus/switch notifications.
         let leaf = PaneNode::from_widget(&page_widget).and_then(|node| node.active_leaf());
         let target = leaf.as_ref().map_or(page_widget, PaneLeaf::root_widget);
+        if crate::vim9_ide::request_embedded_close(&target) {
+            return;
+        }
         self.restore_zoom_before_close(&target);
         if let Some(leaf) = leaf {
             let leaf_root = leaf.root_widget();
