@@ -18,7 +18,7 @@ bench = false
 
 [dependencies]
 # Pin the shared shell GUI entry and precise scrolling contract.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "2fa91124b7890acb97b2d628c57b84e92d9b6d38" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "20a1c694792f5737c8b92b32ef02e40f6e2c08d9" }
 jagent = { version = "0.7.0", git = "https://github.com/beamiter/jagent.git", rev = "d5492320686879c8b92106d2e31e4293ff125a5a" }
 log = { version = "0.4", features = ["std"] }
 crossbeam-channel = "0.5"
@@ -44,7 +44,7 @@ gtk4 = { version = "0.11.4", features = ["v4_14"] }
 libadwaita = { version = "0.9.2", features = ["v1_5"] }
 
 [dev-dependencies]
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "2fa91124b7890acb97b2d628c57b84e92d9b6d38", features = ["session-parity-tests"] }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "20a1c694792f5737c8b92b32ef02e40f6e2c08d9", features = ["session-parity-tests"] }
 env_logger = "0.11"
 
 [profile.dev]
