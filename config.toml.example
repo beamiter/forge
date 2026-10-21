@@ -237,3 +237,14 @@ ai_redact_secrets = true
 #                  一个字节都不写——共享账号该用这个
 # 两种模式都不修改远端的 .bashrc/.profile/登录 shell，也不需要 root。
 # 开启 deploy 后 remote_shell 会被忽略：选哪个 shell 是启动器的事。
+
+
+# Vim buffer-first GUI. These settings apply to newly opened --ide windows.
+# Turn individual workbench surfaces on explicitly; missing keys use these defaults.
+[vim9]
+native_buffer = true
+toolbar = false
+buffer_tabs = false
+status_bar = false
+project_panel = false
+tool_panel = false

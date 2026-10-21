@@ -813,6 +813,8 @@ pub(crate) const DEFAULT_FONT_DESC: &str = "JetBrainsMono Nerd Font Mono 14";
 
 #[derive(Clone)]
 pub struct Config {
+    /// Native buffer rendering is independent of optional Vim workbench chrome.
+    pub(crate) vim9: jterm_core::vim9::Vim9UiConfig,
     pub(crate) window_opacity: f64,
     pub(crate) terminal_scrollback_lines: u32,
     pub(crate) font_desc: String,
@@ -990,6 +992,7 @@ impl Config {
         let themes = builtin_themes();
         let theme = &themes[0];
         Self {
+            vim9: jterm_core::vim9::Vim9UiConfig::default(),
             window_opacity: 0.95,
             terminal_scrollback_lines: 5_000,
             font_desc: DEFAULT_FONT_DESC.to_string(),
@@ -1529,6 +1532,7 @@ impl std::fmt::Display for ConfigIssue {
 }
 
 const KNOWN_CONFIG_KEYS: &[&str] = &[
+    "vim9",
     "opacity",
     "scrollback",
     "font",
@@ -1762,6 +1766,11 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
     use ConfigIssueLevel::{Error, Warning};
 
     let mut issues = Vec::new();
+    if let Some(value) = table.get("vim9") {
+        if let Err(error) = value.clone().try_into::<jterm_core::vim9::Vim9UiConfig>() {
+            config_issue(&mut issues, Error, "vim9", error.to_string());
+        }
+    }
     for key in table.keys() {
         if !KNOWN_CONFIG_KEYS.contains(&key.as_str()) {
             let message = match key.as_str() {
@@ -2321,9 +2330,24 @@ pub(crate) fn config_syntax_diagnostic(
     }
 }
 
+/// Missing Vim settings preserve the buffer-first defaults. This section is
+/// file-owned and survives ordinary terminal settings saves unchanged.
+fn parse_vim9_config(table: &toml::Table) -> jterm_core::vim9::Vim9UiConfig {
+    table
+        .get("vim9")
+        .map(|value| {
+            value.clone().try_into().unwrap_or_else(|error| {
+                log::warn!("Invalid [vim9] configuration: {error}");
+                jterm_core::vim9::Vim9UiConfig::default()
+            })
+        })
+        .unwrap_or_default()
+}
+
 /// Parsed TOML config file structure.
 #[derive(Default)]
 struct FileConfig {
+    vim9: jterm_core::vim9::Vim9UiConfig,
     opacity: Option<f64>,
     scrollback: Option<u32>,
     font: Option<String>,
@@ -2519,6 +2543,7 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
     let remote_hosts = parse_remote_hosts(&table);
 
     let file_config = FileConfig {
+        vim9: parse_vim9_config(&table),
         opacity: table.get("opacity").and_then(|v| v.as_float()),
         scrollback: table_u32(&table, "scrollback"),
         font: table
@@ -3056,6 +3081,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         ai_api_key_file_env_override().or_else(|| ai_api_key_file_configured.clone());
 
     let config = Config {
+        vim9: fc.vim9,
         window_opacity,
         terminal_scrollback_lines,
         font_desc,
@@ -3304,6 +3330,23 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vim9_settings_load_independently_from_terminal_and_workbench_defaults() {
+        let empty = toml::Table::new();
+        assert_eq!(
+            parse_vim9_config(&empty),
+            jterm_core::vim9::Vim9UiConfig::default()
+        );
+        let table: toml::Table = "[vim9]\nproject_panel = true\ntool_panel = true\n"
+            .parse()
+            .unwrap();
+        let settings = parse_vim9_config(&table);
+        assert!(settings.native_buffer && settings.project_panel && settings.tool_panel);
+        assert!(!settings.toolbar && !settings.buffer_tabs && !settings.status_bar);
+        let disabled: toml::Table = "[vim9]\nnative_buffer = false\n".parse().unwrap();
+        assert!(!parse_vim9_config(&disabled).native_buffer);
+    }
 
     #[cfg(unix)]
     #[test]
