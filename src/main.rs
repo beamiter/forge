@@ -1719,6 +1719,11 @@ pub fn run() -> glib::ExitCode {
         let pending_for_press = pending_focus_shortcut.clone();
 
         key_controller.connect_key_pressed(move |_controller, keyval, keycode, state| {
+            // Embedded Vim owns Quick Open before the shell's global
+            // command-palette binding can consume this capture event.
+            if crate::vim9_ide::embedded_owns_quick_open_key(&ui_clone.window, keyval, state) {
+                return glib::Propagation::Proceed;
+            }
             // Composer Enter semantics must win over optional user-defined
             // global bindings. The focused TextView controller also gives IME
             // candidate confirmation first refusal.
