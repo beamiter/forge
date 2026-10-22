@@ -1721,7 +1721,10 @@ pub fn run() -> glib::ExitCode {
         key_controller.connect_key_pressed(move |_controller, keyval, keycode, state| {
             // Embedded Vim owns Quick Open before the shell's global
             // command-palette binding can consume this capture event.
-            if crate::vim9_ide::embedded_owns_quick_open_key(&ui_clone.window, keyval, state) {
+            if crate::vim9_ide::native_dialog_owns_keyboard(&ui_clone.window)
+                    || crate::vim9_ide::embedded_owns_quick_open_key(&ui_clone.window, keyval, state)
+                    || crate::vim9_ide::embedded_owns_font_key(&ui_clone.window, keyval, state)
+                {
                 return glib::Propagation::Proceed;
             }
             // Composer Enter semantics must win over optional user-defined
@@ -2003,6 +2006,9 @@ pub fn run() -> glib::ExitCode {
             let ui = ui.clone();
             controller.connect_scroll(move |controller, _dx, dy| {
                 let control = controller.current_event_state().contains(ModifierType::CONTROL_MASK);
+                if crate::vim9_zoom::owns_wheel(control, controller.widget().is_some_and(|root| crate::vim9_ide::embedded_owns_font_scroll(&root))) {
+                    return glib::Propagation::Proceed;
+                }
                 let steps = if controller.unit() == gtk4::gdk::ScrollUnit::Surface {
                     dy / jterm_core::wheel::SURFACE_UNITS_PER_STEP
                 } else {
