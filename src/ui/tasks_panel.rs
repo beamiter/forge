@@ -208,6 +208,8 @@ pub(crate) struct TasksPanel {
     state: Rc<RefCell<TasksPanelSync>>,
     unfiltered_state: Rc<RefCell<TasksPanelSync>>,
     dashboard_view: Rc<Cell<crate::agent_task::DashboardView>>,
+    dashboard_sort: gtk4::DropDown,
+    next_attention: Button,
     dashboard_query: Entry,
     filters: Rc<RefCell<TaskFilters>>,
     provider_filter: gtk4::DropDown,
@@ -380,6 +382,18 @@ impl TasksPanel {
         dashboard_summary.set_wrap(true);
         dashboard_summary.add_css_class("caption");
         root.append(&dashboard_summary);
+        let dashboard_controls = GBox::new(gtk4::Orientation::Horizontal, 6);
+        let dashboard_sort = gtk4::DropDown::from_strings(
+            &crate::agent_task::DashboardSort::ALL.map(|sort| sort.label()),
+        );
+        dashboard_sort.set_hexpand(true);
+        dashboard_sort.set_tooltip_text(Some("Order visible tasks"));
+        dashboard_sort.update_property(&[gtk4::accessible::Property::Label("Task sort order")]);
+        let next_attention = Button::with_label("Next needs you");
+        next_attention.set_tooltip_text(Some("Select the next visible task needing attention"));
+        dashboard_controls.append(&dashboard_sort);
+        dashboard_controls.append(&next_attention);
+        root.append(&dashboard_controls);
         let dashboard_clear = Button::with_label("Clear filters");
         dashboard_clear.set_visible(false);
         root.append(&dashboard_clear);
@@ -522,6 +536,8 @@ impl TasksPanel {
             state: Rc::new(RefCell::new(TasksPanelSync::default())),
             unfiltered_state: Rc::new(RefCell::new(TasksPanelSync::default())),
             dashboard_view: Rc::new(Cell::new(crate::agent_task::DashboardView::All)),
+            dashboard_sort,
+            next_attention,
             dashboard_query,
             filters: Rc::new(RefCell::new(TaskFilters::default())),
             provider_filter,
@@ -622,6 +638,26 @@ impl TasksPanel {
         self.dashboard_query
             .connect_changed(move |_| panel.apply_dashboard_filters());
         let panel = self.clone();
+        self.dashboard_sort.connect_selected_notify(move |_| {
+            if !panel.filter_guard.get() {
+                panel.apply_dashboard_filters();
+            }
+        });
+        let panel = self.clone();
+        self.next_attention.connect_clicked(move |_| {
+            panel.apply_dashboard_filters();
+            let (target, selected) = {
+                let state = panel.state.borrow();
+                (
+                    state.dashboard.next_attention(state.selected),
+                    state.selected,
+                )
+            };
+            if let Some(id) = target.filter(|id| Some(*id) != selected) {
+                panel.emit(TaskPanelAction::Select(id));
+            }
+        });
+        let panel = self.clone();
         self.dashboard_query.connect_activate(move |_| {
             panel.apply_dashboard_filters();
             let (target, selected) = {
@@ -648,6 +684,7 @@ impl TasksPanel {
                 panel.provider_filter.set_selected(0);
                 panel.workspace_filter.set_selected(0);
                 panel.status_filter.set_selected(0);
+                panel.dashboard_sort.set_selected(0);
                 panel.filter_guard.set(false);
                 panel
                     .dashboard_view
@@ -847,11 +884,17 @@ impl TasksPanel {
 
     fn apply_dashboard_filters(&self) {
         let mut sync = self.unfiltered_state.borrow().clone();
-        let dashboard = self.filters.borrow().project(
+        let mut dashboard = self.filters.borrow().project(
             &sync.dashboard,
             &sync.workspaces,
             self.dashboard_query.text().as_str(),
             self.dashboard_view.get(),
+        );
+        dashboard.sort_rows(
+            crate::agent_task::DashboardSort::ALL
+                .get(self.dashboard_sort.selected() as usize)
+                .copied()
+                .unwrap_or_default(),
         );
         let mut by_id: HashMap<_, _> = sync.rows.into_iter().map(|row| (row.id, row)).collect();
         sync.rows = dashboard
@@ -879,6 +922,7 @@ impl TasksPanel {
         self.dashboard_clear.set_visible(
             *self.filters.borrow() != TaskFilters::default()
                 || !self.dashboard_query.text().is_empty()
+                || self.dashboard_sort.selected() != 0
                 || self.dashboard_view.get() != crate::agent_task::DashboardView::All,
         );
         let selected_hidden = sync.selected.is_some_and(|id| {
@@ -902,6 +946,9 @@ impl TasksPanel {
                 button.remove_css_class("suggested-action");
             }
         }
+        self.next_attention
+            .set_sensitive(dashboard.next_attention(sync.selected).is_some());
+        sync.dashboard = dashboard;
         *self.state.borrow_mut() = sync;
         self.refresh_view();
     }
@@ -1980,6 +2027,24 @@ mod tests {
         assert_eq!(panel.state.borrow().selected, selected);
         assert_eq!(panel.unfiltered_state.borrow().rows, sync.rows);
         assert!(actions.borrow().is_empty());
+        panel.dashboard_clear.emit_clicked();
+        panel.dashboard_sort.set_selected(3);
+        assert_eq!(panel.state.borrow().rows[0].title, "First task");
+        assert!(actions.borrow().is_empty(), "sorting never operates a task");
+        let attention = sync.rows.iter().find(|row| row.needs_attention).unwrap().id;
+        panel.next_attention.emit_clicked();
+        assert_eq!(
+            actions.borrow().as_slice(),
+            &[TaskPanelAction::Select(attention)]
+        );
+        actions.borrow_mut().clear();
+        panel.dashboard_query.set_text("First");
+        assert!(!panel.next_attention.is_sensitive());
+        panel.next_attention.emit_clicked();
+        assert!(
+            actions.borrow().is_empty(),
+            "next-attention cannot select a hidden task"
+        );
     }
 
     #[test]
