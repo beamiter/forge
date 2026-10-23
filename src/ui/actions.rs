@@ -610,11 +610,18 @@ impl UiState {
             }
             Action::OpenAgentSessions => {
                 let owner = self.unified_navigation_owner.borrow().clone();
-                super::agent_sessions::show(&self.window, move |launch, title| {
-                    if let Some(ui) = owner.upgrade() {
-                        ui.add_agent_session_tab(launch, &title);
-                    }
-                });
+                super::agent_sessions::show(
+                    &self.window,
+                    current_terminal
+                        .as_ref()
+                        .and_then(terminal_working_directory)
+                        .map(PathBuf::from),
+                    move |launch, title| {
+                        if let Some(ui) = owner.upgrade() {
+                            ui.add_agent_session_tab(launch, &title);
+                        }
+                    },
+                );
             }
             Action::OpenAgent => self.toggle_agent_panel(),
             Action::ToggleTasksPanel => {
