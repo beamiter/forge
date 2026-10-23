@@ -19,6 +19,7 @@ use vte4::{TerminalExt, TerminalExtManual};
 mod launch_owner;
 mod launch_recovery;
 mod launch_state;
+mod launch_success;
 pub(crate) use launch_recovery::close_terminal_launch;
 
 use crate::config::Config;
@@ -412,6 +413,12 @@ impl VteTerminalView {
         F: Fn(i32) + 'static,
     {
         self.exited_callbacks.borrow_mut().push(Box::new(callback));
+    }
+
+    /// Observe an admitted successful spawn, never an exec failure or a
+    /// settlement-only cleanup notification.
+    pub(crate) fn connect_launched(&self, callback: impl FnOnce() + 'static) {
+        self.launch_recovery.connect_launched(callback);
     }
 
     pub(crate) fn connect_launch_failed<F>(&self, callback: F)

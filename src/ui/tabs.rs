@@ -1268,12 +1268,8 @@ impl UiState {
     /// Used for one-shot helper processes such as the jsh installer: they emit
     /// no shell-integration sequences, so Block mode would have nothing to
     /// build blocks from, and the tab deserves a better name than argv[0].
-    pub(crate) fn add_agent_session_tab(
-        &self,
-        launch: jterm_core::agent_sessions::SessionLaunch,
-        title: &str,
-    ) {
-        let key = format!("{}:{:?}", launch.program, launch.args);
+    pub(crate) fn add_agent_session_tab(&self, request: super::agent_sessions::ResumeRequest) {
+        let key = (request.provider, request.id.clone());
         let existing = self
             .agent_session_tabs
             .borrow()
@@ -1298,22 +1294,33 @@ impl UiState {
             }) {
                 self.notebook.set_current_page(Some(page));
                 terminal.grab_focus();
+                let _ = self
+                    .agent_session_library
+                    .borrow_mut()
+                    .record_resumed(request.provider, &request.id);
+                let _ = request.completion.send(Ok(()));
                 return;
             }
         }
         self.agent_session_tabs.borrow_mut().remove(&key);
-        let launch = match launch.resolve_for_spawn() {
-            Ok(launch) => launch,
-            Err(error) => {
-                self.toast_overlay.add_toast(adw::Toast::new(&error));
-                return;
-            }
+        let Some(plan) = request.launch.as_ref() else {
+            let _ = request.completion.send(Err(
+                "That session's terminal has closed. Check readiness and resume it again.".into(),
+            ));
+            return;
         };
+        let launch = plan.clone();
         let mut argv = vec![launch.program];
         argv.extend(launch.args);
+        let library = self.agent_session_library.clone();
+        let completion = request.completion.clone();
+        let provider = request.provider;
+        let id = request.id.clone();
+        let settled = Rc::new(Cell::new(false));
+        let successful = settled.clone();
         let terminal = self.add_tab_with_argv(TabLaunch {
             working_directory: Some(launch.cwd.to_string_lossy().into_owned()),
-            tab_name: Some(title.to_string()),
+            tab_name: Some(request.title),
             session_id: None,
             initial_commands: crate::terminal::InitialCommands::default(),
             argv_override: Some(argv),
@@ -1324,6 +1331,38 @@ impl UiState {
         self.agent_session_tabs
             .borrow_mut()
             .insert(key.clone(), terminal.downgrade());
+        // Resolve against the newly created leaf, never whichever tab is
+        // current when an asynchronous spawn failure eventually arrives.
+        if let Some(leaf) = self
+            .notebook
+            .current_page()
+            .and_then(|index| self.notebook.nth_page(Some(index)))
+            .and_then(|page| PaneNode::from_widget(&page))
+            .and_then(|node| {
+                node.leaves()
+                    .into_iter()
+                    .find(|leaf| leaf.terminal() == &terminal)
+            })
+        {
+            if let PaneLeaf::Vte(view) = &leaf {
+                view.connect_launched(move || {
+                    if !successful.replace(true) {
+                        let _ = library.borrow_mut().record_resumed(provider, &id);
+                        let _ = completion.send(Ok(()));
+                    }
+                });
+                let root = leaf.root_widget().downgrade();
+                let owner = self.unified_navigation_owner.borrow().clone();
+                view.connect_launch_failed(move |message| {
+                    if !settled.replace(true) {
+                        let _ = request.completion.send(Err(message.to_owned()));
+                        if let (Some(ui), Some(root)) = (owner.upgrade(), root.upgrade()) {
+                            ui.handle_terminal_exited(&root);
+                        }
+                    }
+                });
+            }
+        }
         let owner = self.unified_navigation_owner.borrow().clone();
         terminal.connect_child_exited(move |terminal, _| {
             if let Some(ui) = owner.upgrade() {

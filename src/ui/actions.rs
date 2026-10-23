@@ -616,9 +616,15 @@ impl UiState {
                         .as_ref()
                         .and_then(terminal_working_directory)
                         .map(PathBuf::from),
-                    move |launch, title| {
+                    self.agent_session_library.clone(),
+                    self.agent_session_tabs.borrow().keys().cloned().collect(),
+                    move |request| {
                         if let Some(ui) = owner.upgrade() {
-                            ui.add_agent_session_tab(launch, &title);
+                            ui.add_agent_session_tab(request);
+                        } else {
+                            let _ = request
+                                .completion
+                                .send(Err("The terminal window closed.".into()));
                         }
                     },
                 );

@@ -22,6 +22,7 @@ pub(super) struct LaunchRecovery {
     env_extra: Vec<(String, String)>,
     auto_gui: bool,
     on_settled: RefCell<Option<Box<dyn FnOnce()>>>,
+    success: launch_success::LaunchSuccess,
     failed_callbacks: StrCallbacks,
 }
 
@@ -106,6 +107,7 @@ impl LaunchRecovery {
             env_extra,
             auto_gui,
             on_settled: RefCell::new(on_settled),
+            success: launch_success::LaunchSuccess::default(),
             failed_callbacks,
         });
         let weak = Rc::downgrade(&recovery);
@@ -199,7 +201,12 @@ impl LaunchRecovery {
         self.panel.set_visible(false);
     }
 
+    pub(super) fn connect_launched(&self, callback: impl FnOnce() + 'static) {
+        self.success.connect(callback);
+    }
+
     fn resolved(&self, result: Result<(), String>) {
+        self.success.resolved(result.is_ok());
         match result {
             Err(message) => {
                 self.diagnostic.set_text(&message);
@@ -353,6 +360,9 @@ mod tests {
         window.set_child(Some(&row));
         window.present();
         let recovery = &view.launch_recovery;
+        let successes = Rc::new(Cell::new(0));
+        let recorded = successes.clone();
+        view.connect_launched(move || recorded.set(recorded.get() + 1));
         let failures = Rc::new(Cell::new(0));
         let recorded = failures.clone();
         view.connect_launch_failed(move |_| recorded.set(recorded.get() + 1));
@@ -362,6 +372,7 @@ mod tests {
         pump_until(&main, "missing shell", || recovery.state.borrow().failed());
         assert!(recovery.panel.is_visible());
         assert_eq!(failures.get(), 1);
+        assert_eq!(successes.get(), 0);
         assert_eq!(exits.get(), 0);
         assert_eq!(recovery.state.borrow().pending_count(), 1);
         // Remote/task metadata remains authoritative even if a stale local
@@ -380,6 +391,7 @@ mod tests {
             recovery.state.borrow().failed()
         });
         assert_eq!(failures.get(), 2);
+        assert_eq!(successes.get(), 0);
         assert_eq!(exits.get(), 0);
         assert!(!text(view.vte()).contains("F10-ACK:"));
         recovery.shell.set_text("/usr/bin/python3");
@@ -391,6 +403,7 @@ mod tests {
             text(view.vte()).contains("F10-ACK:synthetic-startup")
         });
         assert!(text(view.vte()).contains("F10-CWD-MATCH"));
+        assert_eq!(successes.get(), 1);
         assert!(!text(view.vte()).contains("F10-CWD-MISMATCH"));
         let pid = view.pid_i32();
         assert!(pid > 0);
@@ -405,6 +418,7 @@ mod tests {
         recovery.retry.emit_clicked();
         wait(&main, Duration::from_millis(650));
         assert_eq!(view.pid_i32(), pid);
+        assert_eq!(successes.get(), 1);
         assert_eq!(
             text(view.vte())
                 .matches("F10-ACK:synthetic-startup")

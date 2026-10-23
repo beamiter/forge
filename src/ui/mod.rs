@@ -278,7 +278,9 @@ pub(crate) struct UiState {
     /// separate toast per step.
     pub(crate) opacity_toast: Rc<RefCell<Option<adw::Toast>>>,
     pub(crate) notebook: Notebook,
-    pub(crate) agent_session_tabs: RefCell<HashMap<String, gtk4::glib::WeakRef<Terminal>>>,
+    pub(crate) agent_session_tabs:
+        RefCell<HashMap<agent_sessions::SessionIdentity, gtk4::glib::WeakRef<Terminal>>>,
+    pub(crate) agent_session_library: Rc<RefCell<jterm_core::agent_sessions::SessionLibraryStore>>,
     pub(crate) tab_counter: Rc<Cell<u32>>,
     pub(crate) font_scale: Rc<Cell<f64>>,
     /// Generation token for generic debounced config writes. Sliders, paned

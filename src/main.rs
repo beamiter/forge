@@ -1263,6 +1263,7 @@ pub fn run() -> glib::ExitCode {
             opacity_toast: Rc::new(RefCell::new(None)),
             notebook: notebook.clone(),
             agent_session_tabs: RefCell::new(HashMap::new()),
+            agent_session_library: Rc::new(RefCell::new(jterm_core::agent_sessions::SessionLibraryStore::new())),
             tab_counter: tab_counter.clone(),
             font_scale: font_scale.clone(),
             config_persist_generation: Rc::new(Cell::new(0)),
