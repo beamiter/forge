@@ -1302,6 +1302,13 @@ impl UiState {
             }
         }
         self.agent_session_tabs.borrow_mut().remove(&key);
+        let launch = match launch.resolve_for_spawn() {
+            Ok(launch) => launch,
+            Err(error) => {
+                self.toast_overlay.add_toast(adw::Toast::new(&error));
+                return;
+            }
+        };
         let mut argv = vec![launch.program];
         argv.extend(launch.args);
         let terminal = self.add_tab_with_argv(TabLaunch {
