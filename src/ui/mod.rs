@@ -13,6 +13,7 @@ use crate::keybindings::KeybindingMap;
 
 mod actions;
 mod agent_panel;
+mod agent_sessions;
 mod ai_chat_store;
 mod ai_panel;
 mod bottom_bar;
@@ -277,6 +278,7 @@ pub(crate) struct UiState {
     /// separate toast per step.
     pub(crate) opacity_toast: Rc<RefCell<Option<adw::Toast>>>,
     pub(crate) notebook: Notebook,
+    pub(crate) agent_session_tabs: RefCell<HashMap<String, gtk4::glib::WeakRef<Terminal>>>,
     pub(crate) tab_counter: Rc<Cell<u32>>,
     pub(crate) font_scale: Rc<Cell<f64>>,
     /// Generation token for generic debounced config writes. Sliders, paned

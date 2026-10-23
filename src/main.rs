@@ -887,6 +887,10 @@ pub fn run() -> glib::ExitCode {
         close_window_button
             .update_property(&[gtk4::accessible::Property::Label("Close window")]);
 
+        let sessions_button = gtk4::Button::from_icon_name("view-grid-symbolic");
+        sessions_button.set_tooltip_text(Some("Agent Sessions: resume Codex / Claude (Ctrl+Alt+Shift+G)"));
+        sessions_button.add_css_class("flat");
+        trailing_actions.append(&sessions_button);
         trailing_actions.append(&agent_toggle);
         trailing_actions.append(&add_tab_button);
         trailing_actions.append(&minimize_window_button);
@@ -1258,6 +1262,7 @@ pub fn run() -> glib::ExitCode {
             toast_overlay: toast_overlay.clone(),
             opacity_toast: Rc::new(RefCell::new(None)),
             notebook: notebook.clone(),
+            agent_session_tabs: RefCell::new(HashMap::new()),
             tab_counter: tab_counter.clone(),
             font_scale: font_scale.clone(),
             config_persist_generation: Rc::new(Cell::new(0)),
@@ -1497,6 +1502,11 @@ pub fn run() -> glib::ExitCode {
         let ui_for_placement = ui.clone();
         toggle_placement_btn.connect_clicked(move |_| {
             ui_for_placement.toggle_tab_placement();
+        });
+
+        let ui_for_sessions = ui.clone();
+        sessions_button.connect_clicked(move |_| {
+            ui_for_sessions.execute_action(crate::keybindings::Action::OpenAgentSessions);
         });
 
         // Wire the visible Shell Agent state toggle.

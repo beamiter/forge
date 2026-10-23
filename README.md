@@ -673,3 +673,31 @@ symlink to `~/.local/bin/forge`. This prevents the old PATH entry from launching
 stale code. Repeated installs reuse that link. Uninstall removes only a matching
 compatibility link and leaves the backup available for recovery. Other prefixes
 and unrelated PATH entries are not modified.
+
+
+### Agent session manager
+
+Open **Agent Sessions** using the grid button in the top bar,
+**Ctrl+Alt+Shift+G**, or the command palette. The `open_agent_sessions`
+keybinding (also accepted as `agent:sessions`) can be rebound in configuration.
+This manager discovers existing Codex and Claude CLI history across projects,
+including custom `CODEX_HOME` and `CLAUDE_CONFIG_DIR` locations. It is separate
+from the isolated-worktree Tasks dashboard and does not require an API key.
+
+Search by project, title, session ID, branch, or conversation preview; combine
+provider and recorded-state filters. Select a conversation to inspect its
+original directory, branch, recent text and exact resume command, then choose
+**Resume in New Tab**. The provider receives an argv directly in a conventional
+PTY at the original project directory. Selecting a session already opened by
+this window focuses its existing terminal. Missing directories and archived
+sessions show an explanation instead of launching in the wrong project.
+
+Discovery runs on a bounded background worker and refreshes while the manager
+is open. Transcript states are labeled as *last recorded*; they do not claim a
+process is still alive. No provider is started until explicit confirmation.
+
+Development builds use the sibling `../jterm_core` checkout. Isolated Nix
+builds unpack the deterministic `packaging/jterm-core-src.tar.gz` snapshot
+beside this application. After shared-core changes, refresh it with
+`scripts/package-shared-core.sh`; its companion SHA-256 file records the exact
+packaged source. Targets and Git internals are excluded.

@@ -1268,6 +1268,71 @@ impl UiState {
     /// Used for one-shot helper processes such as the jsh installer: they emit
     /// no shell-integration sequences, so Block mode would have nothing to
     /// build blocks from, and the tab deserves a better name than argv[0].
+    pub(crate) fn add_agent_session_tab(
+        &self,
+        launch: jterm_core::agent_sessions::SessionLaunch,
+        title: &str,
+    ) {
+        let key = format!("{}:{:?}", launch.program, launch.args);
+        let existing = self
+            .agent_session_tabs
+            .borrow()
+            .get(&key)
+            .and_then(|terminal| terminal.upgrade());
+        if let Some(terminal) = existing {
+            let hidden_by_zoom = self
+                .zoom_state
+                .borrow()
+                .as_ref()
+                .is_some_and(|state| terminal.is_ancestor(&state.swap.original_page));
+            if hidden_by_zoom {
+                let zoom = self.zoom_state.borrow_mut().take();
+                if let Some(zoom) = zoom {
+                    self.unzoom_pane(zoom);
+                }
+            }
+            if let Some(page) = (0..self.notebook.n_pages()).find(|index| {
+                self.notebook
+                    .nth_page(Some(*index))
+                    .is_some_and(|page| terminal.is_ancestor(&page))
+            }) {
+                self.notebook.set_current_page(Some(page));
+                terminal.grab_focus();
+                return;
+            }
+        }
+        self.agent_session_tabs.borrow_mut().remove(&key);
+        let mut argv = vec![launch.program];
+        argv.extend(launch.args);
+        let terminal = self.add_tab_with_argv(TabLaunch {
+            working_directory: Some(launch.cwd.to_string_lossy().into_owned()),
+            tab_name: Some(title.to_string()),
+            session_id: None,
+            initial_commands: crate::terminal::InitialCommands::default(),
+            argv_override: Some(argv),
+            remote: None,
+            terminal_mode: crate::config::TerminalMode::Vte,
+            task: None,
+        });
+        self.agent_session_tabs
+            .borrow_mut()
+            .insert(key.clone(), terminal.downgrade());
+        let owner = self.unified_navigation_owner.borrow().clone();
+        terminal.connect_child_exited(move |terminal, _| {
+            if let Some(ui) = owner.upgrade() {
+                let mut sessions = ui.agent_session_tabs.borrow_mut();
+                if sessions
+                    .get(&key)
+                    .and_then(|bound| bound.upgrade())
+                    .as_ref()
+                    == Some(terminal)
+                {
+                    sessions.remove(&key);
+                }
+            }
+        });
+    }
+
     pub(crate) fn add_named_tab_with_argv(&self, tab_name: &str, argv: Vec<String>) -> Terminal {
         self.add_tab_with_argv(TabLaunch {
             working_directory: None,

@@ -608,6 +608,14 @@ impl UiState {
                 log::debug!("Ask AI about selected block");
                 self.ask_ai_about_selected_block();
             }
+            Action::OpenAgentSessions => {
+                let owner = self.unified_navigation_owner.borrow().clone();
+                super::agent_sessions::show(&self.window, move |launch, title| {
+                    if let Some(ui) = owner.upgrade() {
+                        ui.add_agent_session_tab(launch, &title);
+                    }
+                });
+            }
             Action::OpenAgent => self.toggle_agent_panel(),
             Action::ToggleTasksPanel => {
                 log::debug!("Toggle agent Tasks panel");
