@@ -143,6 +143,7 @@ fn task_action_allowed(enabled: bool, action: &TaskPanelAction) -> bool {
                 | TaskPanelAction::ReviewDiff(_)
                 | TaskPanelAction::Archive(_)
                 | TaskPanelAction::Complete(_)
+                | TaskPanelAction::AcceptReviewed(_)
         )
 }
 
@@ -265,6 +266,9 @@ impl UiState {
                     if self.config.borrow().agent_tasks_enabled {
                         self.register_prepared_task(prepared);
                     } else {
+                        if let Some(request) = prepared.project_request {
+                            request.finish(Err("Agent tasks were disabled while preparing the worktree. Your draft is preserved.".into()));
+                        }
                         self.task_toast("Task creation finished after tasks were disabled; its worktree was preserved without starting an agent");
                     }
                 }
@@ -366,11 +370,16 @@ impl UiState {
     /// the task again; a stale panel snapshot can never retarget an action.
     pub(crate) fn execute_task_panel_action(&self, action: TaskPanelAction) {
         if !task_action_allowed(self.config.borrow().agent_tasks_enabled, &action) {
+            if let TaskPanelAction::CreateProject(request) = &action {
+                request.finish(Err("Agent tasks are disabled in the configuration".into()));
+            }
             self.task_toast("Agent tasks are disabled in the configuration");
             return;
         }
         match action {
             TaskPanelAction::CreateFromBlock => self.create_task_from_block(),
+            TaskPanelAction::ComposeProject => self.compose_project_task(),
+            TaskPanelAction::CreateProject(draft) => self.create_project_task(draft),
             TaskPanelAction::Select(task_id) => {
                 self.agent_tasks.borrow_mut().selected_task = Some(task_id);
                 self.sync_tasks_panel();
@@ -379,22 +388,39 @@ impl UiState {
                 self.agent_tasks.borrow_mut().panel_visible = false;
                 self.sync_side_panel();
             }
-            TaskPanelAction::StartCodex(task_id) => {
+            TaskPanelAction::StartNative(task_id) => {
                 let policy = self.task_prompt_policy();
                 let result = {
                     let mut domain = self.agent_tasks.borrow_mut();
+                    let Some(provider) = domain.task_manager.get(task_id).map(|task| task.provider)
+                    else {
+                        return;
+                    };
                     let AgentTaskDomain {
                         agent_runtime,
                         task_manager,
                         ..
                     } = &mut *domain;
-                    agent_runtime.start_codex(task_manager, task_id, policy)
+                    match provider {
+                        AgentProvider::Codex => {
+                            agent_runtime.start_codex(task_manager, task_id, policy)
+                        }
+                        AgentProvider::Claude => {
+                            agent_runtime.start_claude(task_manager, task_id, policy)
+                        }
+                        AgentProvider::Kimi => {
+                            agent_runtime.start_kimi(task_manager, task_id, policy)
+                        }
+                        AgentProvider::OpenCode => {
+                            drop(domain);
+                            self.task_toast("Use Start terminal for OpenCode");
+                            return;
+                        }
+                    }
                 };
                 match result {
-                    Ok(()) => {
-                        self.task_toast("Preparing native Codex prerequisites in the background…")
-                    }
-                    Err(error) => self.task_toast(format!("Could not start native Codex: {error}")),
+                    Ok(()) => self.task_toast("Preparing the selected provider in the background…"),
+                    Err(error) => self.task_toast(format!("Could not start the provider: {error}")),
                 }
             }
             TaskPanelAction::StartTerminal(task_id) => self.start_task_agent_terminal(task_id),
@@ -471,6 +497,17 @@ impl UiState {
                 };
                 match result {
                     Ok(()) => self.task_toast("Task marked complete after passing validation"),
+                    Err(error) => self.task_toast(error.to_string()),
+                }
+            }
+            TaskPanelAction::AcceptReviewed(task_id) => {
+                let result = self
+                    .agent_tasks
+                    .borrow_mut()
+                    .task_manager
+                    .complete_after_manual_review(task_id);
+                match result {
+                    Ok(()) => self.task_toast("Reviewed work accepted"),
                     Err(error) => self.task_toast(error.to_string()),
                 }
             }
@@ -599,6 +636,47 @@ impl UiState {
         self.create_task_from_block_in_leaf(leaf, true);
     }
 
+    fn compose_project_task(&self) {
+        if self.agent_tasks.borrow().pending_task_creation.is_some() {
+            self.task_toast("Another task worktree is still being created");
+            return;
+        }
+        let directory = self
+            .active_pane_leaf()
+            .and_then(|leaf| crate::terminal::terminal_working_directory(leaf.terminal()))
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_dir().ok());
+        let state = self.clone();
+        agent_task_ui::task_composer::show(
+            &self.window,
+            directory,
+            self.shell_argv.borrow().first().cloned(),
+            move |draft| {
+                state.execute_task_panel_action(TaskPanelAction::CreateProject(draft));
+            },
+        );
+    }
+
+    fn create_project_task(&self, request: agent_task_ui::TaskProjectRequest) {
+        if self.agent_tasks.borrow().pending_task_creation.is_some() {
+            self.task_toast("Another task worktree is still being created");
+            request.finish(Err("Another task worktree is still being created".into()));
+            return;
+        }
+        match agent_task_ui::begin_project_worktree_creation(request.clone()) {
+            Ok(pending) => {
+                self.agent_tasks.borrow_mut().pending_task_creation = Some(pending);
+                self.task_toast("Creating the isolated project task…");
+                self.ensure_agent_tasks_timer();
+                self.sync_tasks_panel();
+            }
+            Err(error) => {
+                request.finish(Err(error.clone()));
+                self.task_toast(format!("Could not create task: {error}"));
+            }
+        }
+    }
+
     /// Shared task creation from one pane's selected block. `require_failed`
     /// is the block menu's Fix gate: only a genuinely failed command block
     /// may anchor a fix task, re-checked here because the menu's visibility
@@ -655,6 +733,14 @@ impl UiState {
     }
 
     fn register_prepared_task(&self, prepared: agent_task_ui::PreparedTask) {
+        if prepared
+            .project_request
+            .as_ref()
+            .is_some_and(|request| request.cancelled())
+        {
+            return;
+        }
+        let project_request = prepared.project_request;
         let new_task = NewTask {
             title: prepared.title,
             provider: prepared.provider,
@@ -662,16 +748,22 @@ impl UiState {
             worktree_path: prepared.worktree.path.clone(),
             branch: prepared.worktree.branch.clone(),
             base_commit: prepared.worktree.head.clone(),
-            source_context: Some(prepared.context),
+            source_context: prepared.context,
         };
         let result = {
             let mut domain = self.agent_tasks.borrow_mut();
-            domain.task_manager.create(new_task)
+            match prepared.brief {
+                Some(brief) => domain.task_manager.create_with_brief(new_task, brief),
+                None => domain.task_manager.create(new_task),
+            }
         };
+        if let Some(request) = &project_request {
+            request.finish(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+        }
         match result {
             Ok(task_id) => {
                 self.agent_tasks.borrow_mut().selected_task = Some(task_id);
-                self.task_toast("Task created in an isolated worktree; start Codex when ready");
+                self.task_toast("Task created in an isolated worktree; choose Start when ready");
             }
             Err(error) => {
                 self.task_toast(format!("Could not register task: {error}"));
@@ -751,6 +843,22 @@ impl UiState {
                     return;
                 }
             };
+        let prepared_launch = {
+            let domain = self.agent_tasks.borrow();
+            let Some(task) = domain.task_manager.get(task_id) else {
+                return;
+            };
+            let authored = task.brief.is_some();
+            agent_task_ui::prepare_authored_terminal(task, self.task_prompt_policy(), launch)
+                .map(|launch| (launch, authored))
+        };
+        let (launch, authored) = match prepared_launch {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.task_toast(error);
+                return;
+            }
+        };
         if failed_terminal_retry.is_none() && !native_recovery {
             let _ = self.agent_tasks.borrow_mut().task_manager.update_status(
                 task_id,
@@ -826,10 +934,18 @@ impl UiState {
         }
         // No explicit persist: the Notebook page-added signal already queues
         // the snapshot, and the pruning side drops this tab from it.
-        self.task_toast(format!(
-            "Opened {} in an isolated task terminal; task context remains in Forge",
-            provider.display_name()
-        ));
+        self.task_toast(if authored {
+            format!(
+                "Opened {} · Task brief: {}. Ask the Agent to read this file before working.",
+                provider.display_name(),
+                crate::agent_task::pty_task_brief_relative()
+            )
+        } else {
+            format!(
+                "Opened {} in an isolated task terminal; task context remains in Forge",
+                provider.display_name()
+            )
+        });
     }
 
     /// Rerun the task's exact validation command in a fresh PTY inside the
@@ -1255,6 +1371,13 @@ fn task_detail_sync(
         title: task.title.clone(),
         status_line,
         branch: task.branch.clone(),
+        inspector: agent_task_ui::task_inspector_text(task),
+        native_label: format!("Start {}", task.provider.display_name()),
+        manual_review: task.requires_manual_review(),
+        can_accept_review: task.requires_manual_review()
+            && task.status == TaskStatus::ReadyForReview
+            && task.validation.status == TaskValidationStatus::NotRun
+            && !has_stream,
         stream: view.map(Box::new),
         approvals: domain
             .agent_runtime
@@ -1265,7 +1388,8 @@ fn task_detail_sync(
             .agent_runtime
             .snapshot(task_id)
             .map_or(0, |snapshot| snapshot.completed_turns),
-        can_start_codex: task.status == TaskStatus::Created
+        can_start_native: task.provider.supports_native_driver()
+            && task.status == TaskStatus::Created
             && task.runtime_kind == TaskRuntimeKind::Unassigned
             && !native_preparing
             && native_ai_enabled,
@@ -1274,7 +1398,8 @@ fn task_detail_sync(
         can_focus_validation,
         can_stop: (native_preparing || has_stream) && !native_idle,
         can_finish: native_idle,
-        can_run_validation: task.status == TaskStatus::ReadyForReview
+        can_run_validation: task.validation_command().is_some()
+            && task.status == TaskStatus::ReadyForReview
             && task.validation.status != TaskValidationStatus::Running
             && !has_stream,
         can_complete: task.status == TaskStatus::ReadyForReview
@@ -1386,7 +1511,7 @@ mod disabled_task_lifecycle_tests {
         let approval = crate::agent_task::ApprovalId::new();
         for action in [
             TaskPanelAction::CreateFromBlock,
-            TaskPanelAction::StartCodex(task),
+            TaskPanelAction::StartNative(task),
             TaskPanelAction::StartTerminal(task),
             TaskPanelAction::FollowUp(task, "next turn".into()),
             TaskPanelAction::Approve(task, approval),

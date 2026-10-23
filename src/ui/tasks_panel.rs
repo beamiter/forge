@@ -48,6 +48,7 @@ fn dashboard_filter_label(
 
 const STREAM_PAGE: &str = "stream";
 const DIFF_PAGE: &str = "diff";
+const INSPECTOR_PAGE: &str = "details";
 const CREATE_TASK_LABEL: &str = "New agent task from selected block";
 const CLOSE_TASKS_LABEL: &str = "Close Tasks panel";
 
@@ -71,10 +72,14 @@ pub(crate) struct TaskDetailSync {
     pub(crate) title: String,
     pub(crate) status_line: String,
     pub(crate) branch: String,
+    pub(crate) inspector: String,
+    pub(crate) native_label: String,
+    pub(crate) manual_review: bool,
+    pub(crate) can_accept_review: bool,
     pub(crate) stream: Option<Box<crate::agent_task::CodexAppServerViewSnapshot>>,
     pub(crate) approvals: Vec<crate::agent_task::CodexAppServerApproval>,
     pub(crate) completed_turns: usize,
-    pub(crate) can_start_codex: bool,
+    pub(crate) can_start_native: bool,
     pub(crate) can_start_terminal: bool,
     pub(crate) can_focus_terminal: bool,
     pub(crate) can_focus_validation: bool,
@@ -101,7 +106,7 @@ pub(crate) struct DiffSync {
 /// the action fires, never captured into a stale GTK closure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActionKind {
-    StartCodex,
+    StartNative,
     StartTerminal,
     FocusTerminal,
     FocusValidation,
@@ -109,12 +114,13 @@ pub(crate) enum ActionKind {
     FinishCodex,
     RunValidation,
     Complete,
+    AcceptReviewed,
     ReviewDiff,
     Archive,
 }
 
-const ACTION_KINDS: [(ActionKind, &str); 10] = [
-    (ActionKind::StartCodex, "Start Codex"),
+const ACTION_KINDS: [(ActionKind, &str); 11] = [
+    (ActionKind::StartNative, "Start provider"),
     (ActionKind::StartTerminal, "Start terminal"),
     (ActionKind::FocusTerminal, "Agent terminal"),
     (ActionKind::FocusValidation, "Validation output"),
@@ -122,6 +128,7 @@ const ACTION_KINDS: [(ActionKind, &str); 10] = [
     (ActionKind::FinishCodex, "Finish"),
     (ActionKind::RunValidation, "Validate"),
     (ActionKind::Complete, "Complete"),
+    (ActionKind::AcceptReviewed, "Accept reviewed work"),
     (ActionKind::ReviewDiff, "Diff"),
     (ActionKind::Archive, "Archive"),
 ];
@@ -239,6 +246,7 @@ pub(crate) struct TasksPanel {
     selection_guard: Rc<Cell<bool>>,
     on_action: ActionCallback,
     create_button: Button,
+    compose_button: Button,
     close_button: Button,
     create_hint: Label,
     task_list: ListBox,
@@ -246,9 +254,12 @@ pub(crate) struct TasksPanel {
     detail_status: Label,
     actions_box: FlowBox,
     action_buttons: Rc<RefCell<Vec<(ActionKind, Button)>>>,
+    action_owner: Rc<Cell<Option<TaskId>>>,
     approvals_box: GBox,
     stream_page_button: ToggleButton,
     diff_page_button: ToggleButton,
+    inspector_page_button: Button,
+    inspector_view: TextView,
     page_stack: Stack,
     stream_view: TextView,
     diff_header: Label,
@@ -279,6 +290,10 @@ impl TasksPanel {
         title.set_hexpand(true);
         title.add_css_class("heading");
         header.append(&title);
+        let compose_button = Button::with_label("New task");
+        compose_button.add_css_class("suggested-action");
+        compose_button.set_tooltip_text(Some("Create a project task from your own goal"));
+        header.append(&compose_button);
         let create_button = Button::from_icon_name("list-add-symbolic");
         create_button.add_css_class("flat");
         create_button.set_tooltip_text(Some("New agent task from the selected block"));
@@ -460,6 +475,10 @@ impl TasksPanel {
         stream_page_button.add_css_class("flat");
         stream_page_button.add_css_class("caption");
         page_buttons.append(&stream_page_button);
+        let inspector_page_button = Button::with_label("Details");
+        inspector_page_button.add_css_class("flat");
+        inspector_page_button.add_css_class("caption");
+        page_buttons.append(&inspector_page_button);
         let diff_page_button = ToggleButton::with_label("Diff");
         diff_page_button.add_css_class("flat");
         diff_page_button.add_css_class("caption");
@@ -480,6 +499,20 @@ impl TasksPanel {
         stream_view.set_right_margin(4);
         stream_scroll.set_child(Some(&stream_view));
         page_stack.add_named(&stream_scroll, Some(STREAM_PAGE));
+
+        let inspector_view = TextView::new();
+        inspector_view.set_editable(false);
+        inspector_view.set_cursor_visible(false);
+        inspector_view.set_wrap_mode(gtk4::WrapMode::WordChar);
+        inspector_view.set_left_margin(6);
+        inspector_view.set_right_margin(6);
+        inspector_view.set_top_margin(8);
+        inspector_view.set_bottom_margin(8);
+        let inspector_scroll = ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .child(&inspector_view)
+            .build();
+        page_stack.add_named(&inspector_scroll, Some(INSPECTOR_PAGE));
 
         let diff_box = GBox::new(gtk4::Orientation::Vertical, 2);
         let diff_header = Label::new(None);
@@ -559,6 +592,7 @@ impl TasksPanel {
             selection_guard: Rc::new(Cell::new(false)),
             on_action: Rc::new(RefCell::new(Box::new(|_| {}))),
             create_button,
+            compose_button,
             close_button,
             create_hint,
             task_list,
@@ -566,9 +600,12 @@ impl TasksPanel {
             detail_status,
             actions_box,
             action_buttons: Rc::new(RefCell::new(Vec::new())),
+            action_owner: Rc::new(Cell::new(None)),
             approvals_box,
             stream_page_button,
             diff_page_button,
+            inspector_page_button,
+            inspector_view,
             page_stack,
             stream_view,
             diff_header,
@@ -694,6 +731,14 @@ impl TasksPanel {
             });
         }
         let panel = self.clone();
+        self.compose_button.connect_clicked(move |_| {
+            panel.emit(TaskPanelAction::ComposeProject);
+        });
+        let panel = self.clone();
+        self.inspector_page_button.connect_clicked(move |_| {
+            panel.show_page(INSPECTOR_PAGE);
+        });
+        let panel = self.clone();
         self.create_button.connect_clicked(move |_| {
             panel.emit(TaskPanelAction::CreateFromBlock);
         });
@@ -801,7 +846,7 @@ impl TasksPanel {
             return;
         };
         let action = match kind {
-            ActionKind::StartCodex => TaskPanelAction::StartCodex(id),
+            ActionKind::StartNative => TaskPanelAction::StartNative(id),
             ActionKind::StartTerminal => TaskPanelAction::StartTerminal(id),
             ActionKind::FocusTerminal => TaskPanelAction::FocusTerminal(id),
             ActionKind::FocusValidation => TaskPanelAction::FocusValidation(id),
@@ -809,6 +854,7 @@ impl TasksPanel {
             ActionKind::FinishCodex => TaskPanelAction::FinishCodex(id),
             ActionKind::RunValidation => TaskPanelAction::RunValidation(id),
             ActionKind::Complete => TaskPanelAction::Complete(id),
+            ActionKind::AcceptReviewed => TaskPanelAction::AcceptReviewed(id),
             ActionKind::ReviewDiff => TaskPanelAction::ReviewDiff(id),
             ActionKind::Archive => TaskPanelAction::Archive(id),
         };
@@ -955,6 +1001,8 @@ impl TasksPanel {
 
     fn refresh_view(&self) {
         let state = self.state.borrow();
+        self.compose_button
+            .set_sensitive(state.create_enabled && !state.pending_creation);
         self.create_button
             .set_sensitive(state.create_enabled && !state.pending_creation);
         let show_hint = !state.create_hint.is_empty();
@@ -966,9 +1014,15 @@ impl TasksPanel {
         self.sync_task_list(&state);
 
         let detail = state.detail.as_deref();
+        let owner = detail.map(|detail| detail.id);
+        if self.action_owner.replace(owner) != owner {
+            for (_, button) in self.action_buttons.borrow().iter() {
+                cancel_task_action_activation(button);
+            }
+        }
         for (kind, button) in self.action_buttons.borrow().iter() {
             let sensitive = detail.is_some_and(|detail| match kind {
-                ActionKind::StartCodex => detail.can_start_codex,
+                ActionKind::StartNative => detail.can_start_native,
                 ActionKind::StartTerminal => detail.can_start_terminal,
                 ActionKind::FocusTerminal => detail.can_focus_terminal,
                 ActionKind::FocusValidation => detail.can_focus_validation,
@@ -976,16 +1030,32 @@ impl TasksPanel {
                 ActionKind::FinishCodex => detail.can_finish,
                 ActionKind::RunValidation => detail.can_run_validation,
                 ActionKind::Complete => detail.can_complete,
+                ActionKind::AcceptReviewed => detail.can_accept_review,
                 ActionKind::ReviewDiff => true,
                 // Archiving is always safe to offer for a selected task.
                 ActionKind::Archive => true,
             });
             button.set_sensitive(sensitive);
+            let visible = detail.is_some_and(|detail| match kind {
+                ActionKind::Complete => !detail.manual_review,
+                ActionKind::AcceptReviewed => detail.manual_review,
+                _ => true,
+            });
+            button.set_visible(visible);
+            if let Some(holder) = button.parent().and_downcast::<gtk4::FlowBoxChild>() {
+                holder.set_visible(visible);
+            }
+            if *kind == ActionKind::StartNative {
+                if let Some(detail) = detail {
+                    button.set_label(&detail.native_label);
+                }
+            }
         }
         self.actions_box.set_visible(detail.is_some());
         self.detail_title.set_visible(detail.is_some());
         self.detail_status.set_visible(detail.is_some());
         self.page_stack.set_visible(detail.is_some());
+        self.inspector_page_button.set_visible(detail.is_some());
         self.stream_page_button.set_visible(detail.is_some());
         self.diff_page_button.set_visible(detail.is_some());
         self.follow_up_row
@@ -996,6 +1066,7 @@ impl TasksPanel {
         }
 
         if let Some(detail) = detail {
+            set_view_text(&self.inspector_view, &detail.inspector);
             self.detail_title.set_label(&detail.title);
             self.detail_status
                 .set_label(&format!("{} · {}", detail.status_line, detail.branch));
@@ -1004,9 +1075,7 @@ impl TasksPanel {
                 .stream
                 .as_deref()
                 .map(render_stream_text)
-                .unwrap_or_else(|| {
-                    "No native Codex session snapshot for this task yet.".to_string()
-                });
+                .unwrap_or_else(|| "No native session snapshot for this task yet.".to_string());
             set_view_text(&self.stream_view, &stream_text);
 
             if let Some(diff) = &detail.diff {
@@ -1407,6 +1476,16 @@ fn replace_approval_cache<T: Clone>(cache: &mut Vec<T>, incoming: &[T]) {
 
 /// Set a read-only text view's buffer only when the content actually
 /// changed; re-setting identical text still forces a fresh layout pass.
+// GTK's delayed keyboard activation survives a sensitivity toggle. Reparenting
+// cancels that pending activation before a button can acquire another task.
+fn cancel_task_action_activation(button: &gtk4::Button) {
+    button.set_sensitive(false);
+    if let Some(holder) = button.parent().and_downcast::<gtk4::FlowBoxChild>() {
+        holder.set_child(None::<&gtk4::Widget>);
+        holder.set_child(Some(button));
+    }
+}
+
 fn set_view_text(view: &TextView, text: &str) {
     let buffer = view.buffer();
     if buffer
@@ -1595,10 +1674,14 @@ mod tests {
             title: "First task".into(),
             status_line: "Created".into(),
             branch: "test/dashboard".into(),
+            inspector: "Repository\n/tmp/project".into(),
+            native_label: "Start Codex".into(),
+            manual_review: false,
+            can_accept_review: false,
             stream: None,
             approvals: Vec::new(),
             completed_turns: 0,
-            can_start_codex: false,
+            can_start_native: false,
             can_start_terminal: false,
             can_focus_terminal: false,
             can_focus_validation: false,
@@ -1631,6 +1714,99 @@ mod tests {
             index += 1;
         }
         result
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn agent_management_v3_inspector_and_manual_review_keep_task_identity() {
+        gtk4::init().expect("GTK display");
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let sink = actions.clone();
+        let panel = TasksPanel::build();
+        panel.connect_action(move |action| sink.borrow_mut().push(action));
+        let window = gtk4::Window::builder()
+            .default_width(520)
+            .default_height(920)
+            .build();
+        window.set_child(Some(&panel.root));
+        window.present();
+        let drain = || {
+            while gtk4::glib::MainContext::default().pending() {
+                gtk4::glib::MainContext::default().iteration(false);
+            }
+        };
+        let mut sync = dashboard_test_sync();
+        let selected = sync.selected.unwrap();
+        let detail = sync.detail.as_mut().unwrap();
+        detail.manual_review = true;
+        detail.can_accept_review = true;
+        detail.native_label = "Start Claude".into();
+        detail.inspector = "Provider\nClaude\n\nRepository\n/tmp/project\n\nGoal\nReview the work before accepting it".into();
+        panel.sync(sync);
+        drain();
+        let action_button = |kind| {
+            panel
+                .action_buttons
+                .borrow()
+                .iter()
+                .find(|(candidate, _)| *candidate == kind)
+                .unwrap()
+                .1
+                .clone()
+        };
+        let accept = action_button(ActionKind::AcceptReviewed);
+        assert!(accept.is_visible() && accept.is_sensitive());
+        assert!(!action_button(ActionKind::Complete).is_visible());
+        assert_eq!(
+            action_button(ActionKind::StartNative).label().as_deref(),
+            Some("Start Claude")
+        );
+        panel.inspector_page_button.emit_clicked();
+        drain();
+        assert_eq!(
+            panel.page_stack.visible_child_name().as_deref(),
+            Some(INSPECTOR_PAGE)
+        );
+        assert!(!panel.inspector_view.is_editable());
+        assert!(
+            actions.borrow().is_empty(),
+            "reading details does not operate a task"
+        );
+        if let Some(path) = std::env::var_os("JTERM_TASK_INSPECTOR_SCREENSHOT") {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
+            while std::time::Instant::now() < deadline {
+                drain();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(std::process::Command::new("import")
+                .args(["-window", "root"])
+                .arg(path)
+                .status()
+                .unwrap()
+                .success());
+        }
+        accept.emit_clicked();
+        drain();
+        assert_eq!(
+            actions.borrow().as_slice(),
+            &[TaskPanelAction::AcceptReviewed(selected)]
+        );
+        actions.borrow_mut().clear();
+        accept.emit_by_name::<()>("activate", &[]);
+        let mut replacement = dashboard_test_sync();
+        replacement.detail.as_mut().unwrap().manual_review = true;
+        replacement.detail.as_mut().unwrap().can_accept_review = true;
+        panel.sync(replacement);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(320);
+        while std::time::Instant::now() < deadline {
+            drain();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            actions.borrow().is_empty(),
+            "a delayed review action cannot accept a newly selected task"
+        );
+        window.close();
     }
 
     #[test]
