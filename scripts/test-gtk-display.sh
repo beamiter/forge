@@ -79,6 +79,7 @@ tests=(
     ui::tasks_panel::tests::dashboard_filter_counts_follow_search_not_selected_view
     ui::tasks_panel::tests::task_terminal_buttons_only_emit_focus_for_existing_bindings
     ui::tasks_panel::tests::task_reason_updates_and_disappears_without_retargeting
+    ui::tasks_panel::control_tests::task_control_center_preserves_search_action_identity_and_rejected_drafts
     ui::task_ops::focus_tests::task_terminal_focus_tracks_reordered_split_and_closed_leaf
     terminal::tests::explicit_focus_return_respects_reopened_search
     block_view::task_focus_tests::task_button_held_enter_never_submits_to_focused_terminal
